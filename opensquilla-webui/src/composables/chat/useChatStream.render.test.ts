@@ -233,6 +233,65 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('clears suppressed answer text while preserving tools and artifacts', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('stale streamed answer')
+    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
+    api.appendToolResult({
+      tool_use_id: 'tool-1',
+      tool_name: 'web_search',
+      result: 'found',
+    })
+    api.appendArtifact({ id: 'artifact-1', name: 'result.txt', mime: 'text/plain' })
+
+    api.endStreaming({ suppressed: true })
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'assistant',
+      text: '',
+      artifacts: [{ id: 'artifact-1', name: 'result.txt', mime: 'text/plain' }],
+    })
+    expect(messages.value[0]?.tool_calls).toHaveLength(1)
+    expect(messages.value[0]?.timeline?.some(segment => segment.type === 'text')).toBe(false)
+    expect(messages.value[0]?.timeline?.some(segment => segment.type === 'tool-group')).toBe(true)
+    api.cleanup()
+  })
+
+  it('drops a suppressed text-only bubble without losing the legacy exact fallback', () => {
+    const suppressed = makeStream()
+    suppressed.api.appendDelta('stale streamed answer')
+    suppressed.api.endStreaming({ suppressed: true })
+    expect(suppressed.messages.value).toEqual([])
+    suppressed.api.cleanup()
+
+    const legacy = makeStream()
+    legacy.api.appendDelta('\nNO_REPLY\nHEARTBEAT_OK\n')
+    legacy.api.endStreaming()
+    expect(legacy.messages.value).toEqual([])
+    legacy.api.cleanup()
+  })
+
+  it('keeps legacy sentinel-turn tools while removing the marker text', () => {
+    const { api, messages } = makeStream()
+
+    api.appendDelta('NO_REPLY')
+    api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
+    api.appendToolResult({
+      tool_use_id: 'tool-1',
+      tool_name: 'web_search',
+      result: 'found',
+    })
+    api.endStreaming()
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]?.text).toBe('')
+    expect(messages.value[0]?.tool_calls).toHaveLength(1)
+    expect(messages.value[0]?.timeline?.some(segment => segment.type === 'text')).toBe(false)
+    api.cleanup()
+  })
+
   it('keeps intermediate and answer text in separate live segments', () => {
     const { api } = makeStream()
 

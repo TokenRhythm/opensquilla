@@ -34,7 +34,6 @@
         v-if="!isNewChatLanding"
         ref="chatHeaderActionsRef"
         :title="currentChatTitle"
-        :session-key="sessionKey"
         :copy-state="sessionCopyState"
         :copy-icon="sessionCopyIcon"
         :copy-live-text="sessionCopyLiveText"
@@ -799,6 +798,7 @@ import { useChatAnswerReveal } from '@/composables/chat/useChatAnswerReveal'
 import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandlers'
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
+import { useChatSteerDelivery } from '@/composables/chat/useChatSteerDelivery'
 import {
   composerRunModeSelectionAction,
   effectiveComposerRunMode,
@@ -1486,7 +1486,7 @@ const {
   enqueuePendingInput,
   enqueueRecoveredInput,
   enqueueHiddenControl,
-  enqueuePendingSteerRetry,
+  enqueuePendingSteerAttempt,
   removePendingChip,
   beginPendingDelivery,
   settlePendingDelivery,
@@ -1858,6 +1858,19 @@ const {
   cleanup: cleanupHistory,
 } = chatHistory
 planMutationAccepted = () => scheduleHistorySync()
+
+const steerDelivery = useChatSteerDelivery({
+  messages,
+  pendingQueue,
+  checkpointForUserMessage: turnId => chatStream.checkpointForUserMessage?.(turnId),
+  scheduleHistorySync,
+  removePendingItem: item => settlePendingDelivery(item, 'accepted'),
+  restoreSteerIntoComposer: text => appendComposerText(text),
+  onProjected: () => {
+    autoScroll.value = true
+    scrollToBottom()
+  },
+})
 
 // The durable artifact index fills gaps left by the bounded/compacted message
 // history. History and the in-flight ArtifactEvent stream remain live fallback
@@ -2592,7 +2605,8 @@ const chatSend = useChatSend({
   enqueuePendingInput,
   enqueuePendingPayload,
   enqueueHiddenControl,
-  enqueuePendingSteerRetry,
+  enqueuePendingSteerAttempt,
+  steerDelivery,
   restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
   executeSlashCommand,
@@ -2858,7 +2872,7 @@ dispatchQueuedItem = sendQueuedFollowup
 
 function takeVisiblePendingItem(index: number) {
   const item = pendingQueue.value[index]
-  if (!item || item.hiddenControl || item.deliveryState) return null
+  if (!item || item.hiddenControl || item.deliveryState || item.steerAttempt) return null
   pendingQueue.value.splice(index, 1)
   return item
 }
@@ -2873,10 +2887,22 @@ function editPendingMessage(index: number) {
   nextTick(() => composerRef.value?.focusTextarea())
 }
 
+const pendingSteerClicks = new WeakSet<ChatPendingItem>()
+
 async function steerPendingMessage(index: number) {
   const candidate = pendingQueue.value[index]
-  const item = beginPendingDelivery(index, candidate?.hiddenControl === true)
+  if (
+    candidate?.steerAttempt
+    && (
+      candidate.steerAttempt.phase === 'submitting'
+      || pendingSteerClicks.has(candidate)
+    )
+  ) return
+  const item = candidate?.steerAttempt
+    ? candidate
+    : beginPendingDelivery(index, candidate?.hiddenControl === true)
   if (!item) return
+  if (candidate?.steerAttempt) pendingSteerClicks.add(candidate)
 
   let outcome: ChatSendOutcome = 'retryable_failure'
   try {
@@ -2885,6 +2911,7 @@ async function steerPendingMessage(index: number) {
       : await sendQueuedSteer(item)
   } finally {
     settlePendingDelivery(item, outcome)
+    pendingSteerClicks.delete(item)
   }
 }
 
@@ -2931,6 +2958,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   aborted,
   messages,
   pendingQueue,
+  steerDelivery,
   usageAccum,
   usageModel,
   stream: chatStream,

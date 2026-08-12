@@ -89,3 +89,19 @@ describe('useChatTextRendering goal status markers', () => {
     expect(stripGeneratedArtifactMarkers(text)).toBe(text)
   })
 })
+
+describe('useChatTextRendering silent sentinel copy projection', () => {
+  it('removes only assistant boundary marker lines from copied text', () => {
+    const { sanitizeCopyText } = useChatTextRendering()
+
+    expect(sanitizeCopyText('NO_REPLY\nVisible answer.\nHEARTBEAT_OK', {
+      provenance: { runKind: 'goal' },
+    }))
+      .toBe('Visible answer.')
+    expect(sanitizeCopyText('NO_REPLY\nVisible answer.\nHEARTBEAT_OK'))
+      .toBe('NO_REPLY\nVisible answer.\nHEARTBEAT_OK')
+    expect(sanitizeCopyText('Before\nNO_REPLY\nAfter')).toBe('Before\nNO_REPLY\nAfter')
+    expect(sanitizeCopyText(['```text', 'NO_REPLY', '```'].join('\n')))
+      .toBe(['```text', 'NO_REPLY', '```'].join('\n'))
+  })
+})

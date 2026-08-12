@@ -1276,7 +1276,14 @@
     "tests/test_gateway/test_goal_rpc.py": 0.01,
     "tests/test_migrations/test_v033_goal_runs.py": 0.01,
     "tests/test_migrations/test_v034_goal_message_anchor.py": 0.01,
+    "tests/test_scripts/test_bench_skill_integrity.py": 0.15,
     "tests/test_session/test_goal_storage.py": 0.01,
-    "tests/test_session/test_goals.py": 0.01
+    "tests/test_session/test_goals.py": 0.01,
+    "tests/functional/test_gateway_silent_reply_process_e2e.py": 0.01,
+    "tests/test_engine/test_history_silent_reply.py": 0.01,
+    "tests/test_engine/test_silent_reply.py": 0.01,
+    "tests/test_engine/test_silent_reply_runtime.py": 0.01,
+    "tests/test_skills_hash_consumers.py": 0.02,
+    "tests/test_skills_tree.py": 0.02
   }
 }

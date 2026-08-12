@@ -49,73 +49,6 @@
   width: 100%;
 }
 
-.chat-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 48px;
-  padding: 0 20px;
-  border-bottom: 0;
-  background: var(--bg-surface);
-  flex-shrink: 0;
-  /* The absolutely-positioned topbar right cluster (connection pill + language
-     switcher + theme) floats over this band's right edge at every width and
-     intercepts pointer events. Reserve exactly its measured width so the
-     header actions never slide under the pill. The value is published live by
-     App.vue's ResizeObserver (--topbar-right-reserve), so it tracks the
-     connection state and the locale's language-label width instead of a brittle
-     constant; the fallback only covers the first paint before measurement. */
-  padding-right: var(--topbar-right-reserve, 224px);
-}
-
-.chat-header-left {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  min-width: 0;
-}
-
-.chat-header-right {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  flex-shrink: 0;
-  /* The clearance for the floating topbar cluster lives on .chat-header's
-     padding-right (var(--topbar-right-reserve)); this group just hugs the
-     right edge of that reserved content box. */
-}
-
-/* 769–959px fine-pointer windows keep a docked compact sidebar. In that band
-   collapse secondary action labels to icons and guarantee a readable title
-   allocation instead of letting the fixed right-side groups squeeze it away. */
-.main--sidebar-compact .chat-header {
-  padding-left: 0.75rem;
-}
-
-.main--sidebar-compact .chat-header-left {
-  flex: 1 1 auto;
-  min-width: 5rem;
-}
-
-.main--sidebar-compact .chat-header .chat-label {
-  flex: 1 1 auto;
-  min-width: 3.5rem;
-}
-
-.main--sidebar-compact .chat-header-right {
-  gap: var(--sp-1);
-}
-
-.main--sidebar-compact .chat-header .chat-share-btn__label {
-  display: none;
-}
-
-.main--sidebar-compact .chat-header .chat-share-btn {
-  width: 1.875rem;
-  min-width: 1.875rem;
-  padding-inline: 0;
-}
-
 .chat-share-banner {
   display: flex;
   align-items: center;
@@ -182,7 +115,7 @@
     box-shadow var(--dur-fast) var(--ease-standard);
 }
 
-.chat-share-btn:hover:not(:disabled) {
+.chat-share-btn:hover:not(:disabled):not([aria-disabled='true']) {
   transform: translateY(-1px);
   border-color: color-mix(in srgb, var(--accent) 30%, transparent);
   color: var(--accent);
@@ -191,7 +124,8 @@
 
 /* Disabled must stay legible, not vanish: keep the icon/label readable and
    explain the state via cursor + title instead of fading the control away. */
-.chat-share-btn:disabled {
+.chat-share-btn:disabled,
+.chat-share-btn[aria-disabled='true'] {
   cursor: not-allowed;
   opacity: 0.65;
   color: var(--text-dim);
@@ -205,15 +139,6 @@
   outline: none;
   border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
   box-shadow: var(--focus-ring);
-}
-
-.chat-deliverables-btn {
-  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
-  color: var(--accent);
-}
-
-.chat-deliverables-btn:hover:not(:disabled) {
-  color: var(--accent);
 }
 
 .chat-share-btn--save {

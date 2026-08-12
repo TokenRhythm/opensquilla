@@ -28,7 +28,7 @@
         v-if="
           showTurnOutcome
           && message.turnOutcome
-          && !hasActivity
+          && !showAnyTurnDisclosure
           && !hasPlan
         "
         :outcome="message.turnOutcome"
@@ -46,7 +46,7 @@
       />
       <template v-if="activityProjection.canSeparateActivity">
         <ActivityDisclosure
-          v-if="hasActivity"
+          v-if="showActivityDisclosure"
           :lifecycle="activityLifecycle"
           :step-count="activityStepCount"
           :failure-count="0"
@@ -59,6 +59,11 @@
           :state-key="activityStateKey"
           :continuity-key="activityContinuityKey"
         >
+          <TurnUsageDetails
+            v-if="showReceiptUsage && message.meta"
+            :meta="message.meta"
+            :fmt-tok="fmtTok"
+          />
           <ReasoningPart
             v-if="reasoningPart"
             :part="reasoningPart"
@@ -100,7 +105,7 @@
         <div
           v-if="activityProjection.answerPart && !hasPlan"
           class="assistant-answer"
-          :class="{ 'assistant-answer--separated': hasActivity }"
+          :class="{ 'assistant-answer--separated': showActivityDisclosure }"
         >
           <TextPart
             :part="activityProjection.answerPart"
@@ -114,6 +119,26 @@
            but no canonical message.text. Preserve their original order and
            visibility instead of guessing which fragment was the answer. -->
       <template v-else>
+        <ActivityDisclosure
+          v-if="showUsageOnlyReceipt"
+          :lifecycle="activityLifecycle"
+          :step-count="1"
+          :failure-count="0"
+          :duration-seconds="activityDurationSeconds"
+          :summary-label="displayActivitySummaryLabel"
+          :detail-label="displayActivityDetailLabel"
+          :phase-label="hasPlan ? t('chat.plan.process') : ''"
+          :completion-confirmed="activityCompletionConfirmed"
+          :default-open="activityDefaultOpen"
+          :state-key="activityStateKey"
+          :continuity-key="activityContinuityKey"
+        >
+          <TurnUsageDetails
+            v-if="message.meta"
+            :meta="message.meta"
+            :fmt-tok="fmtTok"
+          />
+        </ActivityDisclosure>
         <ReasoningPart v-if="reasoningPart" :part="reasoningPart" />
         <ToolCallTimeline
           :items="visibleLegacyTimelineItems"
@@ -192,7 +217,7 @@
           <Icon name="cron" :size="11" />
           {{ t('chat.provenance.scheduled') }}
         </span>
-        <div v-if="message.meta" class="msg-ai-meta">
+        <div v-if="showLegacyUsageFallback && message.meta" class="msg-ai-meta">
           <span
             v-if="hasMetaDetails"
             ref="metaMoreRef"
@@ -246,7 +271,10 @@
                   <span class="msg-meta-popover__label">{{ t('chat.msgMeta.ensemble') }}</span>
                   <span class="msg-meta-popover__value">{{ ensembleSummary }}</span>
                 </div>
-                <div class="msg-meta-popover__row">
+                <div
+                  v-if="message.meta.ensemble.costUsd || message.meta.costUsd || !usageIncomplete"
+                  class="msg-meta-popover__row"
+                >
                   <span class="msg-meta-popover__label">{{ t('chat.msgMeta.cost') }}</span>
                   <span class="msg-meta-popover__value">{{ fmtUsd(message.meta.ensemble.costUsd || message.meta.costUsd) }}</span>
                 </div>
@@ -262,10 +290,20 @@
                   >
                     <span class="msg-meta-popover__model-role">{{ ensembleRole(member.role, member.label) }}</span>
                     <span class="msg-meta-popover__model-name" :title="member.model">{{ member.modelShort }}</span>
-                    <span class="msg-meta-popover__model-cost">{{ fmtUsd(member.costUsd) }}</span>
+                    <span class="msg-meta-popover__model-cost">
+                      {{ member.costUsd || !usageIncomplete ? fmtUsd(member.costUsd) : '—' }}
+                    </span>
                   </div>
                 </div>
               </template>
+              <div
+                v-if="usageCoverageDetail"
+                class="msg-meta-popover__row msg-meta-popover__row--coverage"
+                data-turn-usage-coverage="incomplete"
+              >
+                <span class="msg-meta-popover__label">{{ t('chat.msgMeta.coverage') }}</span>
+                <span class="msg-meta-popover__value">{{ usageCoverageDetail }}</span>
+              </div>
             </div>
           </span>
         </div>
@@ -361,9 +399,14 @@ import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import StatusHistoryPart from '@/components/chat/parts/StatusHistoryPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
+import TurnUsageDetails from '@/components/chat/TurnUsageDetails.vue'
 import { useChatRouteFeedback } from '@/composables/chat/useChatRouteFeedback'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
+import {
+  hasIncompleteUsageCoverage,
+  usageCoverageText,
+} from '@/utils/chat/usageCoverage'
 import type {
   ChatRenderedMessage,
   ChatStreamTimelineItem,
@@ -542,7 +585,8 @@ const showFooter = computed(() =>
   planParts.value.length === 0
   && (
     !!props.goalOutcome
-    || !!props.message.meta
+    || isCronMessage.value
+    || showLegacyUsageFallback.value
     || (!props.shareMode && !props.message.stopNotice)
   ),
 )
@@ -582,8 +626,21 @@ const hasMetaDetails = computed(() => {
     || meta.cachedTokens > 0
     || meta.reasoningTokens > 0
     || meta.ensemble
+    || hasIncompleteUsageCoverage(meta)
   )
 })
+
+const usageIncomplete = computed(() => (
+  props.message.meta ? hasIncompleteUsageCoverage(props.message.meta) : false
+))
+const usageCoverageDetail = computed(() => (
+  props.message.meta
+    ? usageCoverageText(
+        props.message.meta,
+        (key, named) => String(named ? t(key, named) : t(key)),
+      )
+    : ''
+))
 
 const ensembleSummary = computed(() => {
   const ensemble = props.message.meta?.ensemble
@@ -750,6 +807,30 @@ const hasActivity = computed(() =>
   !!reasoningPart.value
   || hasVisibleActivityItem.value
   || statusHistory.value.length > 0,
+)
+const hasAuthoritativeTurnReceipt = computed(() =>
+  props.showTurnOutcome === true && !!props.message.turnOutcome,
+)
+const showActivityDisclosure = computed(() =>
+  activityProjection.value.canSeparateActivity
+  && (
+    hasActivity.value
+    || (hasMetaDetails.value && hasAuthoritativeTurnReceipt.value)
+  ),
+)
+const showReceiptUsage = computed(() =>
+  hasMetaDetails.value && showActivityDisclosure.value,
+)
+const showUsageOnlyReceipt = computed(() =>
+  !activityProjection.value.canSeparateActivity
+  && hasMetaDetails.value
+  && hasAuthoritativeTurnReceipt.value,
+)
+const showAnyTurnDisclosure = computed(() =>
+  showActivityDisclosure.value || showUsageOnlyReceipt.value,
+)
+const showLegacyUsageFallback = computed(() =>
+  hasMetaDetails.value && !showAnyTurnDisclosure.value,
 )
 
 const activityStepCount = computed(() => Math.max(
@@ -1269,6 +1350,22 @@ function ensembleRole(role: string, label: string): string {
   align-items: baseline;
   justify-content: space-between;
   gap: 0.75rem;
+}
+
+.msg-meta-popover__row--coverage {
+  align-items: flex-start;
+  margin-top: 0.125rem;
+  padding-top: 0.375rem;
+  border-top: 1px solid var(--hairline);
+  white-space: normal;
+}
+
+.msg-meta-popover__row--coverage .msg-meta-popover__value {
+  max-width: 18rem;
+  color: var(--warn);
+  font-family: inherit;
+  font-variant-numeric: normal;
+  text-align: right;
 }
 
 .msg-meta-popover__label {

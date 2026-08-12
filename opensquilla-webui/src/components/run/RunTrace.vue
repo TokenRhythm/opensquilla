@@ -145,7 +145,12 @@
               <Icon v-if="presentation !== 'activity'" class="step-chevron" name="chevronRight" :size="14" />
             </span>
           </button>
-          <div v-if="groupOpen(item.group)" class="step-group-members">
+          <TransitionGroup
+            v-if="groupOpen(item.group)"
+            name="tool-member"
+            tag="div"
+            class="step-group-members"
+          >
             <div v-for="call in item.group.calls" :key="call.renderKey" class="tool-row-wrap">
               <button
                 type="button"
@@ -203,7 +208,7 @@
                 />
               </div>
             </div>
-          </div>
+          </TransitionGroup>
         </template>
         <template v-else>
           <div v-for="call in item.group.calls" :key="call.renderKey" class="tool-row-wrap">
@@ -1268,26 +1273,38 @@ function fmtTok(n?: number | null): string {
   color: var(--text-muted);
 }
 .msg-ai-text :deep(pre) {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  background: var(--code-block-bg);
+  border: 1px solid var(--code-block-border);
   border-radius: var(--radius-md);
   padding: 0.625rem;
   overflow-x: auto;
   margin: 0.375rem 0;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
 }
 .msg-ai-text :deep(pre.code-block) {
   position: relative;
-  padding-top: 1.9rem;
+  padding-top: 2.375rem;
+  background: linear-gradient(
+    to bottom,
+    var(--code-block-header-bg) 0,
+    var(--code-block-header-bg) 1.75rem,
+    var(--code-block-bg) 1.75rem,
+    var(--code-block-bg) 100%
+  );
 }
 
 .msg-ai-text :deep(pre.code-block > .code-lang) {
-  right: 2.75rem;
+  top: 0.375rem;
+  right: 2.5rem;
+  line-height: 1rem;
+  background: transparent;
+  color: var(--text-dim);
 }
 
 .msg-ai-text :deep(.code-copy-btn) {
   position: absolute;
-  top: 0.375rem;
-  right: 0.375rem;
+  top: 0;
+  right: 0.25rem;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -1767,7 +1784,11 @@ function fmtTok(n?: number | null): string {
 
 .tool-timeline--activity .tool-row__activity-icon {
   color: color-mix(in srgb, var(--text) 46%, transparent);
-  transition: color var(--dur-fast) var(--ease-standard);
+  transform-origin: center;
+  transition:
+    color var(--dur-fast) var(--ease-standard),
+    opacity var(--dur-fast) var(--ease-standard),
+    transform var(--dur-fast) var(--ease-standard);
 }
 
 .tool-timeline--activity .tool-row:hover .tool-row__activity-icon,
@@ -1776,10 +1797,12 @@ function fmtTok(n?: number | null): string {
   color: color-mix(in srgb, var(--text) 62%, transparent);
 }
 
-/* The header dot is the single working signal for a live turn; the running
-   row's icon identifies itself with the static accent colour alone. */
+/* The icon breathes locally while this exact call is live. It is deliberately
+   opacity/scale-only: enough feedback to make appended calls feel active,
+   without moving copy or adding another progress label. */
 .tool-timeline--activity .tool-row__activity-icon--running {
   color: var(--accent);
+  animation: activity-tool-breathe var(--dur-pulse) var(--ease-standard) infinite;
 }
 
 .tool-timeline--activity .tool-row__activity-icon--error {
@@ -1913,6 +1936,32 @@ function fmtTok(n?: number | null): string {
   100% { transform: scale(1); opacity: 1; }
 }
 
+@keyframes activity-tool-breathe {
+  0%, 100% {
+    opacity: 0.68;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Calls appended to an already-open batch previously appeared in place because
+   the outer group key did not change. Animate the member collection itself so
+   each new local action is perceptible at the moment it arrives. */
+.tool-member-enter-from {
+  opacity: 0;
+  transform: translateY(0.25rem);
+}
+
+.tool-member-enter-active,
+.tool-member-move {
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+}
+
 /* ── Tool-row enter transition ─────────────────────────────────────────
    New rows slide up from a few pixels below and fade in. Leave is
    instant so completed rows don't visually linger. The TransitionGroup
@@ -1951,6 +2000,15 @@ function fmtTok(n?: number | null): string {
 
   .tool-row__activity-icon,
   .tool-row__activity-arrow {
+    transition: none;
+  }
+
+  .tool-row__activity-icon--running {
+    animation: none;
+  }
+
+  .tool-member-enter-active,
+  .tool-member-move {
     transition: none;
   }
 

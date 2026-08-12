@@ -129,7 +129,12 @@ async def test_initialize_cutover_snapshots_legacy_totals_once(tmp_path: Path) -
         )
         repeated = await storage.initialize_usage_ledger(2_000)
         assert repeated.ledger_started_at_ms == 1_000
-        assert len(await storage.list_usage_legacy_baselines()) == 1
+        baselines = await storage.list_usage_legacy_baselines()
+        assert [(row.session_id, row.session_epoch) for row in baselines] == [
+            ("session-1", 3),
+            ("session-2", 0),
+        ]
+        assert baselines[1].captured_at_ms >= 1_000
     finally:
         await storage.close()
 
@@ -608,5 +613,261 @@ async def test_live_start_resolves_session_attribution_and_boot_recovers_started
         await storage.upsert_session(session)
         replay = await storage.start_usage_event(_start(started_at_ms=500))
         assert replay.session_epoch == 4
+    finally:
+        await storage.close()
+
+
+async def test_cancelled_turn_projection_keeps_finalized_usage_and_unknown_coverage(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        await storage.upsert_session(
+            SessionNode(
+                session_key="agent:main:webchat:cancelled",
+                session_id="session-1",
+            )
+        )
+        await storage.initialize_usage_ledger(1)
+        await storage.start_usage_event(_start())
+        await storage.finalize_usage_event("event-1", _completion(), items=(_item(),))
+        await storage.start_usage_event(
+            _start(
+                event_id="event-2",
+                execution_id="execution-1",
+                call_index=1,
+                started_at_ms=300,
+            )
+        )
+        await storage.mark_usage_event_unknown(
+            "event-2",
+            completed_at_ms=350,
+            reason="cancelled",
+        )
+
+        projection = await storage.get_turn_usage_projection(
+            session_id="session-1",
+            session_epoch=0,
+            turn_id="turn-1",
+        )
+
+        assert projection is not None
+        assert projection["input_tokens"] == 100
+        assert projection["output_tokens"] == 20
+        assert projection["total_tokens"] == 120
+        assert projection["coverage_status"] == "usage_unknown"
+        assert projection["usage_unknown"] is True
+        assert projection["unknown_usage_events"] == 1
+        assert projection["missing_cost_entries"] == 1
+        batch = await storage.get_turn_usage_projections(
+            session_id="session-1",
+            session_epoch=0,
+            turn_ids=["turn-1"],
+        )
+        assert batch == {"turn-1": projection}
+    finally:
+        await storage.close()
+
+
+async def test_session_usage_ledger_reconciliation_is_absolute_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    session_key = "agent:main:webchat:reconcile"
+    try:
+        await storage.initialize_usage_ledger(1)
+        await storage.upsert_session(
+            SessionNode(
+                session_key=session_key,
+                session_id="session-1",
+                input_tokens=12,
+                output_tokens=4,
+                total_tokens=16,
+                cache_read=2,
+                total_cost_usd=0.001,
+                estimated_cost_usd=0.001,
+                estimated_cost_component_usd=0.001,
+                cost_source="opensquilla_estimate",
+            )
+        )
+        baselines = await storage.list_usage_legacy_baselines()
+        assert [(row.session_id, row.session_epoch) for row in baselines] == [
+            ("session-1", 0)
+        ]
+        await storage.start_usage_event(_start())
+        await storage.finalize_usage_event("event-1", _completion(), items=(_item(),))
+
+        first = await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=session_key,
+            expected_epoch=0,
+        )
+        second = await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=session_key,
+            expected_epoch=0,
+        )
+
+        assert first is not None
+        assert second is not None
+        assert (second.input_tokens, second.output_tokens, second.total_tokens) == (112, 24, 136)
+        assert second.cache_read == 2
+        assert second.total_cost_usd == pytest.approx(0.0102)
+        assert second.estimated_cost_component_usd == pytest.approx(0.0102)
+        assert second.model_override == "gpt-test"
+        assert second.model_provider == "openai"
+        assert first.input_tokens == second.input_tokens
+        assert first.total_cost_usd == second.total_cost_usd
+
+        assert await storage.advance_reset_epoch(session_key) == 1
+        baselines = await storage.list_usage_legacy_baselines()
+        assert {(row.session_id, row.session_epoch) for row in baselines} == {
+            ("session-1", 0),
+            ("session-1", 1),
+        }
+    finally:
+        await storage.close()
+
+
+async def test_existing_cutover_repairs_post_cutover_epoch_without_double_counting(
+    tmp_path: Path,
+) -> None:
+    """Upgrade repair uses ledger ancestry, not already-rolled session totals."""
+
+    db_path = tmp_path / "sessions.db"
+    storage = await SessionStorage.open(str(db_path))
+    session_key = "agent:main:webchat:pre-fix-mixed-turns"
+    session_id = "session-pre-fix-mixed-turns"
+    try:
+        await storage.initialize_usage_ledger(100)
+        # Simulate an old atomic generation path after cutover. Reset preserves
+        # created_at, so the cutover transaction's complete baseline snapshot --
+        # not this timestamp -- is the proof that the generation is post-cutover.
+        await storage.conn.execute(
+            """
+            INSERT INTO sessions (session_key, session_id, created_at, updated_at)
+            VALUES (?, ?, 50, 200)
+            """,
+            (session_key, session_id),
+        )
+        await storage.conn.commit()
+
+        epoch_zero = replace(
+            _start(
+                "event-epoch-zero-done",
+                execution_id="execution-epoch-zero-done",
+                session_id=session_id,
+                started_at_ms=300,
+            ),
+            turn_id="turn-epoch-zero-done",
+        )
+        assert (await storage.start_usage_event(epoch_zero)).session_epoch == 0
+        await storage.finalize_usage_event(
+            epoch_zero.event_id,
+            _completion(completed_at_ms=400),
+            items=(_item(epoch_zero.event_id),),
+        )
+        # The pre-upgrade Done path already copied this event into the mutable
+        # compatibility totals.
+        await storage.conn.execute(
+            """
+            UPDATE sessions
+            SET input_tokens = 100, output_tokens = 20, total_tokens = 120,
+                total_tokens_fresh = 1,
+                estimated_cost_usd = 0.0092, total_cost_usd = 0.0092,
+                estimated_cost_component_usd = 0.0092,
+                cost_source = 'opensquilla_estimate', epoch = 1
+            WHERE session_key = ?
+            """,
+            (session_key,),
+        )
+        await storage.conn.commit()
+
+        epoch_one_done = replace(
+            _start(
+                "event-epoch-one-done",
+                execution_id="execution-epoch-one-done",
+                session_id=session_id,
+                started_at_ms=500,
+            ),
+            turn_id="turn-epoch-one-done",
+        )
+        assert (await storage.start_usage_event(epoch_one_done)).session_epoch == 1
+        await storage.finalize_usage_event(
+            epoch_one_done.event_id,
+            _completion(completed_at_ms=600),
+            items=(_item(epoch_one_done.event_id),),
+        )
+        await storage.conn.execute(
+            """
+            UPDATE sessions
+            SET input_tokens = 200, output_tokens = 40, total_tokens = 240,
+                estimated_cost_usd = 0.0184, total_cost_usd = 0.0184,
+                estimated_cost_component_usd = 0.0184
+            WHERE session_key = ?
+            """,
+            (session_key,),
+        )
+        await storage.conn.commit()
+
+        # A cancelled turn can still have a complete provider receipt. The old
+        # path finalized this ledger event but never emitted Done, so it is not
+        # present in the compatibility totals above.
+        epoch_one_cancelled = replace(
+            _start(
+                "event-epoch-one-cancelled",
+                execution_id="execution-epoch-one-cancelled",
+                session_id=session_id,
+                started_at_ms=700,
+            ),
+            turn_id="turn-epoch-one-cancelled",
+        )
+        assert (await storage.start_usage_event(epoch_one_cancelled)).session_epoch == 1
+        await storage.finalize_usage_event(
+            epoch_one_cancelled.event_id,
+            _completion(completed_at_ms=800),
+            items=(_item(epoch_one_cancelled.event_id),),
+        )
+
+        assert await storage.list_usage_legacy_baselines() == []
+        await storage.close()
+        storage = await SessionStorage.open(str(db_path))
+
+        state = await storage.initialize_usage_ledger(1_000)
+        assert state.ledger_started_at_ms == 100
+        baseline = (await storage.list_usage_legacy_baselines())[0]
+        assert (baseline.session_id, baseline.session_epoch) == (session_id, 1)
+        assert baseline.captured_at_ms > state.ledger_started_at_ms
+        # Epoch zero is carried exactly once from the ledger. Snapshotting the
+        # current 200/40 totals here would double-count both normal Done turns.
+        assert (baseline.input_tokens, baseline.output_tokens, baseline.total_tokens) == (
+            100,
+            20,
+            120,
+        )
+        assert baseline.cost_nanos == 9_200_000
+
+        first = await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=session_key,
+            expected_epoch=1,
+        )
+        second = await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=session_key,
+            expected_epoch=1,
+        )
+        assert first is not None
+        assert second is not None
+        assert (second.input_tokens, second.output_tokens, second.total_tokens) == (
+            300,
+            60,
+            360,
+        )
+        assert second.total_cost_usd == pytest.approx(0.0276)
+        assert first.input_tokens == second.input_tokens
+        assert first.total_cost_usd == second.total_cost_usd
+
+        baseline_before_retry = (await storage.list_usage_legacy_baselines())[0]
+        repeated = await storage.initialize_usage_ledger(2_000)
+        baseline_after_retry = (await storage.list_usage_legacy_baselines())[0]
+        assert repeated.ledger_started_at_ms == 100
+        assert baseline_after_retry == baseline_before_retry == baseline
     finally:
         await storage.close()

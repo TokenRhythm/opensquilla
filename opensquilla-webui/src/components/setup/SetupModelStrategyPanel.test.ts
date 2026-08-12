@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
 import i18n from '@/i18n'
@@ -432,22 +433,45 @@ describe('SetupModelStrategyPanel', () => {
     }, { onUpdateFixedProvider, onUpdateFixedModel })
 
     const detail = el.querySelector('.setup-model-strategy__detail')?.textContent || ''
-    const provider = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_fixed_provider"]')
+    const provider = el.querySelector<HTMLButtonElement>('[data-testid="setup-model-strategy-fixed-provider-trigger"]')
     const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model_strategy_fixed_model"]')
     expect(detail).toContain('Current model provider')
     expect(detail).toContain('OpenRouter')
-    expect(provider?.value).toBe('openrouter')
-    expect(Array.from(provider?.options || []).map(option => option.value))
-      .toEqual(['openrouter', 'deepseek', 'tokenrhythm'])
+    expect(provider?.getAttribute('role')).toBe('combobox')
+    expect(provider?.getAttribute('aria-expanded')).toBe('false')
+    expect(provider?.textContent).toContain('OpenRouter')
+    expect(provider?.closest('.setup-model-strategy__single-provider-control')).toBeTruthy()
+    expect(provider?.parentElement?.querySelector('.setup-model-strategy__single-provider-chevron')).toBeTruthy()
     expect(input?.value).toBe(discoveredModel.id)
     expect(detail).not.toContain('default tier')
 
     if (provider) {
-      provider.value = 'deepseek'
-      provider.dispatchEvent(new Event('change', { bubbles: true }))
+      provider.click()
+      await nextTick()
+      expect(provider.getAttribute('aria-expanded')).toBe('true')
+      const options = Array.from(document.querySelectorAll<HTMLElement>('#setup-model-strategy-fixed-provider-listbox [role="option"]'))
+      expect(options.map(option => option.textContent?.trim()))
+        .toEqual(['OpenRouter', 'DeepSeek', 'TokenRhythm'])
+      expect(options.every(option => option.tabIndex === -1)).toBe(true)
+      provider.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }))
+      await nextTick()
+      expect(provider.getAttribute('aria-expanded')).toBe('false')
+      provider.click()
+      await nextTick()
+      provider.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+      provider.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
       await nextTick()
     }
     expect(onUpdateFixedProvider).toHaveBeenCalledWith('deepseek')
+    expect(provider?.getAttribute('aria-expanded')).toBe('false')
+
+    const source = readFileSync('src/components/setup/SetupModelStrategyPanel.vue', 'utf8')
+    expect(source).toContain('rotate(180deg)')
+    expect(source).toContain('FIXED_PROVIDER_MENU_MAX_HEIGHT = 272')
+    expect(source).toContain('<Teleport to="body">')
+    expect(source).toContain('position: fixed')
+    expect(source).toContain('scrollIntoView')
+    expect(source).toContain('fixed-provider-menu-enter-from')
 
     if (input) {
       input.value = 'deepseek/deepseek-v4-pro'
@@ -455,6 +479,43 @@ describe('SetupModelStrategyPanel', () => {
       await nextTick()
     }
     expect(onUpdateFixedModel).toHaveBeenCalledWith('deepseek/deepseek-v4-pro')
+
+    app.unmount()
+  })
+
+  it('keeps a long provider menu keyboard-visible and closes when focus leaves', async () => {
+    const providerOptions = Array.from({ length: 24 }, (_, index) => ({
+      providerId: `provider-${index}`,
+      label: `Provider ${index}`,
+    }))
+    const { app, el } = await mountPanel({
+      activeStrategy: 'single',
+      router: { providerOptions },
+      single: {
+        providerId: 'provider-0',
+        providerLabel: 'Provider 0',
+      },
+    })
+    const trigger = el.querySelector<HTMLButtonElement>('[data-testid="setup-model-strategy-fixed-provider-trigger"]')!
+    trigger.click()
+    await nextTick()
+
+    const listbox = document.getElementById('setup-model-strategy-fixed-provider-listbox')!
+    const options = Array.from(listbox.querySelectorAll<HTMLElement>('[role="option"]'))
+    expect(options).toHaveLength(24)
+    const scrollIntoView = vi.fn()
+    options[23]!.scrollIntoView = scrollIntoView
+    trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }))
+    await nextTick()
+    await nextTick()
+    expect(trigger.getAttribute('aria-activedescendant'))
+      .toBe('setup-model-strategy-fixed-provider-option-23')
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' })
+
+    const modelInput = el.querySelector<HTMLInputElement>('input[name="setup_provider_model_strategy_fixed_model"]')!
+    trigger.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: modelInput }))
+    await nextTick()
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
 
     app.unmount()
   })

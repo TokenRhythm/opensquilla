@@ -230,6 +230,12 @@ class FakeStorage:
             result = result[:limit]
         return result
 
+    async def count_sessions(self, guest_owner_id: str | None = None) -> int:
+        if guest_owner_id is not None:
+            prefix = f"agent:main:webchat:guest:{guest_owner_id}:"
+            return sum(key.startswith(prefix) for key in self._sessions)
+        return len(self._sessions)
+
     async def get_session(self, key: str) -> FakeSession | None:
         return self._sessions.get(key)
 
@@ -1158,6 +1164,104 @@ class TestSessionsList:
         assert row["messageCount"] == row["message_count"]
         assert row["runStatus"] == "idle"
         assert row["interactive"] is True
+
+    @pytest.mark.asyncio
+    async def test_count_view_returns_exact_total_beyond_list_page_limit(self, dispatcher):
+        sessions = [
+            FakeSession(
+                session_key=f"agent:main:webchat:session-{index}",
+                session_id=f"session-{index}",
+            )
+            for index in range(201)
+        ]
+        ctx = make_ctx(session_manager=FakeSessionManager(sessions))
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.list",
+            {"limit": 200, "view": "session-count-v1"},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["sessions"] == []
+        assert res.payload["count"] == 0
+        assert res.payload["totalCount"] == 201
+
+    @pytest.mark.asyncio
+    async def test_count_view_is_scoped_to_the_guest_owner(self, dispatcher):
+        owner_id = "a" * 64
+        other_owner_id = "b" * 64
+        sessions = [
+            FakeSession(
+                session_key=guest_owned_session_key(owner_id, "one"),
+                session_id="guest-one",
+            ),
+            FakeSession(
+                session_key=guest_owned_session_key(owner_id, "two"),
+                session_id="guest-two",
+            ),
+            FakeSession(
+                session_key=guest_owned_session_key(other_owner_id, "other"),
+                session_id="guest-other",
+            ),
+            FakeSession(session_key="agent:main:webchat:host", session_id="host"),
+        ]
+        guest = Principal(
+            role="operator",
+            scopes=frozenset({"operator.read"}),
+            is_owner=False,
+            authenticated=False,
+            auth_state="guest",
+            guest_owner_id=owner_id,
+            guest_session_key="osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager(sessions),
+            principal=guest,
+        )
+
+        res = await dispatcher.dispatch(
+            "guest-count",
+            "sessions.list",
+            {"limit": 200, "view": "session-count-v1"},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["sessions"] == []
+        assert res.payload["totalCount"] == 2
+
+    @pytest.mark.asyncio
+    async def test_count_view_rejects_guest_without_owner_before_listing(
+        self, dispatcher
+    ):
+        sessions = [
+            FakeSession(session_key="agent:main:webchat:host", session_id="host"),
+        ]
+        guest = Principal(
+            role="operator",
+            scopes=frozenset({"operator.read"}),
+            is_owner=False,
+            authenticated=False,
+            auth_state="guest",
+            guest_owner_id=None,
+            guest_session_key="osqg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        )
+        ctx = make_ctx(
+            session_manager=FakeSessionManager(sessions),
+            principal=guest,
+        )
+
+        res = await dispatcher.dispatch(
+            "guest-count-without-owner",
+            "sessions.list",
+            {"limit": 200, "view": "session-count-v1"},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "UNAUTHORIZED"
 
     @pytest.mark.asyncio
     async def test_list_includes_workspace_from_run_context(self, dispatcher, tmp_path):

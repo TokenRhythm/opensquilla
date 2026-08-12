@@ -3,7 +3,12 @@
     v-if="statusSteps.length || items.length"
     class="assistant-activity-timeline"
   >
-    <ol v-if="statusSteps.length" class="assistant-activity-status">
+    <TransitionGroup
+      v-if="statusSteps.length"
+      name="activity-step"
+      tag="ol"
+      class="assistant-activity-status"
+    >
       <li
         v-for="step in statusSteps"
         :key="step.key"
@@ -34,7 +39,7 @@
           </span>
         </span>
       </li>
-    </ol>
+    </TransitionGroup>
     <template v-for="segment in segments" :key="segment.key">
       <ActivityNarration
         v-if="segment.type === 'narration'"
@@ -307,6 +312,18 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
   color: color-mix(in srgb, var(--text) 82%, transparent);
 }
 
+.activity-step-enter-from {
+  opacity: 0;
+  transform: translateY(0.25rem);
+}
+
+.activity-step-enter-active,
+.activity-step-move {
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out);
+}
+
 /* The dot centers in the same 0.875rem marker column the tool-row icons use,
    so phase text and tool-row labels share one left origin (1.625rem). */
 .assistant-activity-status__dot {
@@ -411,6 +428,11 @@ function toolBatchSummary(batchItems: ChatStreamTimelineItem[]): string {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .activity-step-enter-active,
+  .activity-step-move {
+    transition: none;
+  }
+
   .assistant-activity-tool-batch__chevron {
     transition: none;
   }

@@ -36,6 +36,7 @@ import {
 import { segmentsToTimelineItems } from '@/utils/chat/segmentsToTimelineItems'
 import { reconcileTextSnapshot } from '@/utils/chat/foldTurn'
 import { useChatTurnLog } from '@/composables/chat/useChatTurnLog'
+import { isLegacySilentSentinelOnly } from '@/utils/chat/silentSentinels'
 
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 630_000
 const THINKING_DELAY_MS = 400
@@ -367,8 +368,32 @@ export function useChatStream(options: UseChatStreamOptions) {
     resetStreamIdleTimer()
   }
 
-  function endStreaming(opts?: { reason?: string }) {
+  function endStreaming(opts?: { reason?: string, suppressed?: boolean }) {
     const wasAborted = opts?.reason === 'aborted'
+    const preReconcileText = options.stripDirectiveTags(
+      options.stripGeneratedArtifactMarkers(streamRaw.value),
+    ).trim()
+    // Compatibility for gateways predating the explicit delivery contract.
+    // This only recognizes a response made entirely from standalone boundary
+    // marker lines; mixed substantive text stays canonical and is cleaned only
+    // in the assistant presentation projection.
+    const legacySentinelOnly = !wasAborted
+      && isLegacySilentSentinelOnly(preReconcileText)
+    const suppressText = !wasAborted
+      && (opts?.suppressed === true || legacySentinelOnly)
+    // `delivery=suppressed` is authoritative even if stale text deltas arrived
+    // first. Reconcile to an explicit empty snapshot while leaving tool groups,
+    // artifacts, and interrupts intact. The guard avoids a duplicate final-text
+    // frame when the RPC handler already reconciled the Done receipt.
+    if (
+      suppressText
+      && (
+        streamRaw.value !== ''
+        || streamSegments.value.some(segment => segment.type === 'text')
+      )
+    ) {
+      reconcileFinalText('')
+    }
     hideThinkingIndicator()
     clearStreamActivity()
     clearStreamIdleTimer()
@@ -385,7 +410,6 @@ export function useChatStream(options: UseChatStreamOptions) {
         options.stripGeneratedArtifactMarkers(streamRaw.value),
       ).trim()
 
-      const sentinelOnly = !wasAborted && ['NO_REPLY', 'HEARTBEAT_OK'].includes(cleanedText)
       // After Stop, partial streamed output (text, tool rows, artifacts) is
       // kept; only a bubble with nothing visible at all is dropped.
       const foldedInterrupts = foldedTurn.value.parts.filter(
@@ -396,7 +420,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         && streamArtifacts.value.length === 0
         && streamToolCalls.value.length === 0
         && foldedInterrupts.length === 0
-      if (sentinelOnly || emptyStream) {
+      if (emptyStream) {
         streamBubble.value = false
         isStreaming.value = false
         resetStreamState()

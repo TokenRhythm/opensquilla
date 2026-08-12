@@ -141,7 +141,7 @@ describe('ChatMessageList Goal anchors', () => {
     expect(assistants).toHaveLength(3)
     expect(assistants[0]?.querySelector('.msg-goal-outcome')).toBeNull()
     expect(assistants[1]?.querySelector('.msg-goal-outcome')?.textContent)
-      .toContain('Goal achieved · 1m 03s active')
+      .toContain('Goal achieved · 1 turns · 15 tokens')
     expect(assistants[2]?.querySelector('.msg-goal-outcome')).toBeNull()
   })
 
@@ -176,7 +176,7 @@ describe('ChatMessageList Goal anchors', () => {
 
     expect(host.querySelector('.msg-user-goal-origin')?.textContent).toContain('已作为目标发送')
     expect(host.querySelector('.msg-goal-outcome')?.textContent)
-      .toContain('目标已完成 · 活跃用时 1m 03s')
+      .toContain('目标已完成 · 1 轮 · 15 个令牌')
   })
 
 })

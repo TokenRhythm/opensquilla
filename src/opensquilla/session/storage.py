@@ -28,6 +28,7 @@ from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 from opensquilla.compat import aiosqlite
+from opensquilla.session.cost_rollup import rollup_cost_source
 from opensquilla.session.goals import (
     GOAL_EFFECTIVE_CONTEXT_DETAIL_KEY,
     GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
@@ -101,6 +102,7 @@ from opensquilla.session.usage_ledger import (
     UsageLedgerConflictError,
     UsageLedgerState,
     UsageLegacyBaseline,
+    nanos_to_usd,
     usd_to_nanos,
     validate_usage_billing_receipt,
     validate_usage_completion,
@@ -2847,6 +2849,13 @@ class SessionStorage:
         async with self._write_transaction("initialize_usage_ledger") as conn:
             existing = await self._get_usage_state_on_conn(conn)
             if existing is not None:
+                await self._repair_post_cutover_usage_baselines_on_conn(
+                    conn,
+                    captured_at_ms=max(
+                        captured_at_ms,
+                        existing.ledger_started_at_ms + 1,
+                    ),
+                )
                 return existing
 
             await conn.execute(
@@ -2983,6 +2992,265 @@ class SessionStorage:
             assert state is not None
             return state
 
+    @staticmethod
+    async def _repair_post_cutover_usage_baselines_on_conn(
+        conn: Any,
+        *,
+        captured_at_ms: int,
+        session_key: str | None = None,
+    ) -> None:
+        """Repair only generations whose ledger-only ancestry is provable.
+
+        Cutover state and every then-current generation baseline are committed
+        by one transaction. Consequently, a current ``(session_id, epoch)``
+        missing from an existing cutover was created later and has no legacy
+        usage, even when reset preserved an older session ``created_at`` value.
+        Its first baseline is zero; for a later epoch, the baseline is the
+        latest earlier baseline plus intervening live-provider ledger events.
+
+        Mutable compatibility totals are intentionally ignored: normal Done
+        turns may already be present there while cancelled turns may not be, so
+        snapshotting or subtracting them is not authoritative.
+        """
+
+        await conn.execute(
+            """
+            WITH ranked_candidates AS (
+                SELECT
+                    s.session_key,
+                    s.session_id,
+                    usage_nonnegative_int(s.epoch) AS session_epoch,
+                    COALESCE(NULLIF(s.agent_id, ''), 'main') AS agent_id,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY s.session_id, usage_nonnegative_int(s.epoch)
+                        ORDER BY s.session_key
+                    ) AS candidate_rank
+                FROM sessions AS s
+                JOIN usage_ledger_state AS state ON state.singleton_id = 1
+                WHERE (? IS NULL OR s.session_key = ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM usage_legacy_baselines AS current_baseline
+                      WHERE current_baseline.session_id = s.session_id
+                        AND current_baseline.session_epoch =
+                            usage_nonnegative_int(s.epoch)
+                  )
+            ), candidates AS (
+                SELECT session_id, session_epoch, agent_id
+                FROM ranked_candidates
+                WHERE candidate_rank = 1
+            ), anchor_epochs AS (
+                SELECT
+                    candidate.*,
+                    MAX(baseline.session_epoch) AS anchor_epoch
+                FROM candidates AS candidate
+                LEFT JOIN usage_legacy_baselines AS baseline
+                  ON baseline.session_id = candidate.session_id
+                 AND baseline.session_epoch < candidate.session_epoch
+                GROUP BY
+                    candidate.session_id,
+                    candidate.session_epoch,
+                    candidate.agent_id
+            ), anchored AS (
+                SELECT
+                    anchor.session_id,
+                    anchor.session_epoch,
+                    anchor.agent_id,
+                    COALESCE(anchor.anchor_epoch, 0) AS ledger_from_epoch,
+                    COALESCE(baseline.input_tokens, 0) AS base_input_tokens,
+                    COALESCE(baseline.output_tokens, 0) AS base_output_tokens,
+                    COALESCE(baseline.cache_read_tokens, 0) AS base_cache_read_tokens,
+                    COALESCE(baseline.cache_write_tokens, 0) AS base_cache_write_tokens,
+                    COALESCE(baseline.cost_nanos, 0) AS base_cost_nanos,
+                    COALESCE(baseline.billed_cost_nanos, 0) AS base_billed_cost_nanos,
+                    COALESCE(baseline.estimated_cost_nanos, 0)
+                        AS base_estimated_cost_nanos,
+                    COALESCE(baseline.cost_source, 'none') AS base_cost_source,
+                    COALESCE(baseline.missing_cost_entries, 0)
+                        AS base_missing_cost_entries
+                FROM anchor_epochs AS anchor
+                LEFT JOIN usage_legacy_baselines AS baseline
+                  ON baseline.session_id = anchor.session_id
+                 AND baseline.session_epoch = anchor.anchor_epoch
+            ), rolled AS (
+                SELECT
+                    anchored.*,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.input_tokens ELSE 0 END), 0) AS live_input_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.output_tokens ELSE 0 END), 0) AS live_output_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.cache_read_tokens ELSE 0 END), 0)
+                        AS live_cache_read_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.cache_write_tokens ELSE 0 END), 0)
+                        AS live_cache_write_tokens,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.cost_nanos ELSE 0 END), 0) AS live_cost_nanos,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.billed_cost_nanos ELSE 0 END), 0)
+                        AS live_billed_cost_nanos,
+                    COALESCE(SUM(CASE WHEN event.status = 'finalized'
+                        THEN event.estimated_cost_nanos ELSE 0 END), 0)
+                        AS live_estimated_cost_nanos,
+                    COALESCE(SUM(CASE
+                        WHEN event.event_id IS NULL THEN 0
+                        WHEN event.status = 'finalized' THEN event.missing_cost_entries
+                        ELSE MAX(1, event.missing_cost_entries)
+                    END), 0) AS live_missing_cost_entries,
+                    COALESCE(SUM(CASE
+                        WHEN event.status = 'finalized'
+                         AND event.cost_source IN ('provider_billed', 'mixed')
+                        THEN 1 ELSE 0 END), 0) AS live_provider_billed_entries,
+                    COALESCE(SUM(CASE
+                        WHEN event.status = 'finalized'
+                         AND event.estimated_cost_nanos > 0
+                        THEN 1 ELSE 0 END), 0) AS live_estimated_cost_entries
+                FROM anchored
+                LEFT JOIN usage_events AS event
+                  ON event.session_id = anchored.session_id
+                 AND event.session_epoch >= anchored.ledger_from_epoch
+                 AND event.session_epoch < anchored.session_epoch
+                 AND event.origin = 'live_provider'
+                GROUP BY
+                    anchored.session_id,
+                    anchored.session_epoch,
+                    anchored.agent_id,
+                    anchored.ledger_from_epoch,
+                    anchored.base_input_tokens,
+                    anchored.base_output_tokens,
+                    anchored.base_cache_read_tokens,
+                    anchored.base_cache_write_tokens,
+                    anchored.base_cost_nanos,
+                    anchored.base_billed_cost_nanos,
+                    anchored.base_estimated_cost_nanos,
+                    anchored.base_cost_source,
+                    anchored.base_missing_cost_entries
+            ), classified AS (
+                SELECT
+                    rolled.*,
+                    (
+                        rolled.base_cost_source IN ('provider_billed', 'mixed')
+                        OR rolled.base_billed_cost_nanos + rolled.live_billed_cost_nanos > 0
+                        OR rolled.live_provider_billed_entries > 0
+                    ) AS has_billed,
+                    (
+                        rolled.base_estimated_cost_nanos
+                            + rolled.live_estimated_cost_nanos > 0
+                        OR rolled.live_estimated_cost_entries > 0
+                    ) AS has_estimate,
+                    (
+                        rolled.base_missing_cost_entries
+                            + rolled.live_missing_cost_entries > 0
+                    ) AS has_unavailable
+                FROM rolled
+            )
+            INSERT OR IGNORE INTO usage_legacy_baselines (
+                session_id, session_epoch, agent_id, captured_at_ms,
+                input_tokens, output_tokens, total_tokens, cache_read_tokens,
+                cache_write_tokens, cost_nanos, billed_cost_nanos,
+                estimated_cost_nanos, cost_source, missing_cost_entries
+            )
+            SELECT
+                session_id,
+                session_epoch,
+                agent_id,
+                MAX(
+                    ?,
+                    (SELECT ledger_started_at_ms + 1
+                     FROM usage_ledger_state WHERE singleton_id = 1)
+                ),
+                base_input_tokens + live_input_tokens,
+                base_output_tokens + live_output_tokens,
+                base_input_tokens + live_input_tokens
+                    + base_output_tokens + live_output_tokens,
+                base_cache_read_tokens + live_cache_read_tokens,
+                base_cache_write_tokens + live_cache_write_tokens,
+                base_cost_nanos + live_cost_nanos,
+                base_billed_cost_nanos + live_billed_cost_nanos,
+                base_estimated_cost_nanos + live_estimated_cost_nanos,
+                CASE
+                    WHEN has_billed + has_estimate + has_unavailable > 1 THEN 'mixed'
+                    WHEN has_billed THEN 'provider_billed'
+                    WHEN has_estimate THEN 'opensquilla_estimate'
+                    WHEN has_unavailable THEN 'unavailable'
+                    ELSE 'none'
+                END,
+                base_missing_cost_entries + live_missing_cost_entries
+            FROM classified
+            """,
+            (session_key, session_key, captured_at_ms),
+        )
+
+    @staticmethod
+    async def _ensure_usage_baseline_for_session_on_conn(
+        conn: Any,
+        *,
+        session_key: str,
+    ) -> None:
+        """Snapshot a new durable session generation after ledger cutover.
+
+        This helper is only called in the transaction that creates a generation,
+        before its compatibility totals can contain that generation's live
+        ledger events. Persisted missing generations are repaired separately
+        only when their post-cutover ancestry is provable.
+        """
+
+        captured_at_ms = _now_ms()
+        await conn.execute(
+            """
+            INSERT OR IGNORE INTO usage_legacy_baselines (
+                session_id, session_epoch, agent_id, captured_at_ms,
+                input_tokens, output_tokens, total_tokens, cache_read_tokens,
+                cache_write_tokens, cost_nanos, billed_cost_nanos,
+                estimated_cost_nanos, cost_source, missing_cost_entries
+            )
+            SELECT
+                session_id,
+                usage_nonnegative_int(epoch),
+                COALESCE(NULLIF(agent_id, ''), 'main'),
+                MAX(
+                    ?,
+                    (SELECT ledger_started_at_ms + 1
+                     FROM usage_ledger_state WHERE singleton_id = 1)
+                ),
+                usage_nonnegative_int(input_tokens),
+                usage_nonnegative_int(output_tokens),
+                usage_nonnegative_int(input_tokens) + usage_nonnegative_int(output_tokens),
+                usage_nonnegative_int(cache_read),
+                usage_nonnegative_int(cache_write),
+                usage_cost_total(
+                    total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                ),
+                usage_cost_billed(
+                    total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                ),
+                usage_cost_estimated(
+                    total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                ),
+                COALESCE(NULLIF(cost_source, ''), 'none'),
+                usage_nonnegative_int(missing_cost_entries)
+                    + usage_invalid_int(epoch)
+                    + usage_invalid_int(input_tokens)
+                    + usage_invalid_int(output_tokens)
+                    + usage_invalid_int(total_tokens)
+                    + usage_invalid_int(cache_read)
+                    + usage_invalid_int(cache_write)
+                    + usage_invalid_int(missing_cost_entries)
+                    + CASE WHEN usage_nonnegative_int(total_tokens)
+                        != usage_nonnegative_int(input_tokens)
+                           + usage_nonnegative_int(output_tokens)
+                      THEN 1 ELSE 0 END
+                    + usage_cost_anomaly(
+                        total_cost_usd, billed_cost_usd, estimated_cost_component_usd
+                      )
+            FROM sessions
+            WHERE session_key = ?
+              AND EXISTS (SELECT 1 FROM usage_ledger_state WHERE singleton_id = 1)
+            """,
+            (captured_at_ms, session_key),
+        )
+
     @_serialized_read
     async def get_usage_ledger_state(self) -> UsageLedgerState | None:
         async with self.conn.execute(
@@ -3073,6 +3341,422 @@ class SessionStorage:
         async with self.conn.execute(sql, params) as cur:
             rows = await cur.fetchall()
         return [_usage_event_from_row(row) for row in rows]
+
+    @_serialized_read
+    async def get_turn_usage_projection(
+        self,
+        *,
+        session_id: str,
+        session_epoch: int,
+        turn_id: str,
+    ) -> dict[str, Any] | None:
+        """Project one turn's durable provider-call ledger into chat metadata.
+
+        Finalized calls contribute measured usage. Started/unknown calls never
+        fabricate token counts, but they do make the projection explicitly
+        incomplete so cancellation cannot look fully accounted.
+        """
+
+        async with self.conn.execute(
+            """
+            SELECT
+                COUNT(*) AS event_count,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN input_tokens ELSE 0 END), 0)
+                    AS input_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN output_tokens ELSE 0 END), 0)
+                    AS output_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN reasoning_tokens ELSE 0 END), 0)
+                    AS reasoning_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN cache_read_tokens ELSE 0 END), 0)
+                    AS cache_read_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN cache_write_tokens ELSE 0 END), 0)
+                    AS cache_write_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN total_tokens ELSE 0 END), 0)
+                    AS total_tokens,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN cost_nanos ELSE 0 END), 0)
+                    AS cost_nanos,
+                COALESCE(SUM(CASE WHEN status = 'finalized' THEN billed_cost_nanos ELSE 0 END), 0)
+                    AS billed_cost_nanos,
+                COALESCE(SUM(CASE WHEN status = 'finalized'
+                    THEN estimated_cost_nanos ELSE 0 END), 0)
+                    AS estimated_cost_nanos,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' THEN missing_cost_entries
+                    ELSE MAX(1, missing_cost_entries)
+                END), 0) AS missing_cost_entries,
+                COALESCE(SUM(CASE WHEN status != 'finalized' THEN 1 ELSE 0 END), 0)
+                    AS unknown_event_count,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND cost_source IN ('provider_billed', 'mixed')
+                    THEN 1 ELSE 0 END), 0) AS provider_billed_entries,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND estimated_cost_nanos > 0
+                    THEN 1 ELSE 0 END), 0) AS estimated_cost_entries,
+                COALESCE(SUM(CASE
+                    WHEN status = 'finalized' AND coverage_status != 'complete'
+                    THEN 1 ELSE 0 END), 0) AS incomplete_finalized_count
+            FROM usage_events
+            WHERE session_id = ? AND session_epoch = ? AND turn_id = ?
+              AND origin = 'live_provider'
+            """,
+            (session_id, session_epoch, turn_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or int(row["event_count"] or 0) == 0:
+            return None
+
+        async with self.conn.execute(
+            """
+            SELECT provider, model
+            FROM usage_events
+            WHERE session_id = ? AND session_epoch = ? AND turn_id = ?
+              AND origin = 'live_provider'
+            ORDER BY call_index DESC, event_id DESC
+            LIMIT 1
+            """,
+            (session_id, session_epoch, turn_id),
+        ) as cur:
+            identity = await cur.fetchone()
+
+        billed_cost = nanos_to_usd(int(row["billed_cost_nanos"] or 0))
+        estimated_cost = nanos_to_usd(int(row["estimated_cost_nanos"] or 0))
+        missing_entries = max(0, int(row["missing_cost_entries"] or 0))
+        unknown_events = max(0, int(row["unknown_event_count"] or 0))
+        incomplete = max(0, int(row["incomplete_finalized_count"] or 0))
+        cost_source = rollup_cost_source(
+            billed_cost_usd=billed_cost,
+            estimated_cost_component_usd=estimated_cost,
+            missing_cost_entries=missing_entries,
+            provider_billed_entries=max(0, int(row["provider_billed_entries"] or 0)),
+            estimated_cost_entries=max(0, int(row["estimated_cost_entries"] or 0)),
+        )
+        coverage_status = "usage_unknown" if unknown_events or incomplete else "complete"
+        return {
+            "input_tokens": max(0, int(row["input_tokens"] or 0)),
+            "output_tokens": max(0, int(row["output_tokens"] or 0)),
+            "reasoning_tokens": max(0, int(row["reasoning_tokens"] or 0)),
+            "cached_tokens": max(0, int(row["cache_read_tokens"] or 0)),
+            "cache_write_tokens": max(0, int(row["cache_write_tokens"] or 0)),
+            "total_tokens": max(0, int(row["total_tokens"] or 0)),
+            "cost_usd": nanos_to_usd(int(row["cost_nanos"] or 0)),
+            "billed_cost": billed_cost,
+            "estimated_cost_component_usd": estimated_cost,
+            "cost_source": cost_source,
+            "missing_cost_entries": missing_entries,
+            "coverage_status": coverage_status,
+            "usage_unknown": coverage_status != "complete",
+            "unknown_usage_events": unknown_events,
+            "provider": str(identity["provider"] or "") if identity is not None else "",
+            "model": str(identity["model"] or "") if identity is not None else "",
+        }
+
+    @_serialized_read
+    async def get_turn_usage_projections(
+        self,
+        *,
+        session_id: str,
+        session_epoch: int,
+        turn_ids: Sequence[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Batch-project ledger usage for a bounded transcript page."""
+
+        stable_turn_ids = list(dict.fromkeys(value for value in turn_ids if value))
+        if not stable_turn_ids:
+            return {}
+        if len(stable_turn_ids) > _SQLITE_VARIABLE_CHUNK_SIZE:
+            raise ValueError("too many turn ids for one usage projection page")
+        placeholders = ", ".join("?" for _ in stable_turn_ids)
+        async with self.conn.execute(
+            f"""
+            SELECT * FROM usage_events
+            WHERE session_id = ? AND session_epoch = ?
+              AND origin = 'live_provider'
+              AND turn_id IN ({placeholders})
+            ORDER BY turn_id, call_index, event_id
+            """,  # noqa: S608 - placeholders are generated from a bounded list
+            (session_id, session_epoch, *stable_turn_ids),
+        ) as cur:
+            rows = await cur.fetchall()
+
+        grouped: dict[str, list[UsageEventRecord]] = {}
+        for row in rows:
+            event = _usage_event_from_row(row)
+            if event.turn_id:
+                grouped.setdefault(event.turn_id, []).append(event)
+
+        projections: dict[str, dict[str, Any]] = {}
+        for stable_turn_id, events in grouped.items():
+            totals = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "reasoning_tokens": 0,
+                "cached_tokens": 0,
+                "cache_write_tokens": 0,
+                "total_tokens": 0,
+                "cost_nanos": 0,
+                "billed_cost_nanos": 0,
+                "estimated_cost_nanos": 0,
+                "missing_cost_entries": 0,
+            }
+            unknown_events = 0
+            incomplete = False
+            provider_billed_entries = 0
+            estimated_cost_entries = 0
+            for event in events:
+                if event.status != "finalized":
+                    unknown_events += 1
+                    totals["missing_cost_entries"] += max(
+                        1, int(event.missing_cost_entries or 0)
+                    )
+                    continue
+                totals["input_tokens"] += max(0, int(event.input_tokens or 0))
+                totals["output_tokens"] += max(0, int(event.output_tokens or 0))
+                totals["reasoning_tokens"] += max(0, int(event.reasoning_tokens or 0))
+                totals["cached_tokens"] += max(0, int(event.cache_read_tokens or 0))
+                totals["cache_write_tokens"] += max(
+                    0, int(event.cache_write_tokens or 0)
+                )
+                totals["total_tokens"] += max(0, int(event.total_tokens or 0))
+                totals["cost_nanos"] += max(0, int(event.cost_nanos or 0))
+                totals["billed_cost_nanos"] += max(
+                    0, int(event.billed_cost_nanos or 0)
+                )
+                totals["estimated_cost_nanos"] += max(
+                    0, int(event.estimated_cost_nanos or 0)
+                )
+                totals["missing_cost_entries"] += max(
+                    0, int(event.missing_cost_entries or 0)
+                )
+                provider_billed_entries += int(
+                    event.cost_source in {"provider_billed", "mixed"}
+                )
+                estimated_cost_entries += int(event.estimated_cost_nanos > 0)
+                incomplete = incomplete or event.coverage_status != "complete"
+
+            billed_cost = nanos_to_usd(totals["billed_cost_nanos"])
+            estimated_cost = nanos_to_usd(totals["estimated_cost_nanos"])
+            coverage_status = (
+                "usage_unknown" if unknown_events or incomplete else "complete"
+            )
+            latest = events[-1]
+            projections[stable_turn_id] = {
+                "input_tokens": totals["input_tokens"],
+                "output_tokens": totals["output_tokens"],
+                "reasoning_tokens": totals["reasoning_tokens"],
+                "cached_tokens": totals["cached_tokens"],
+                "cache_write_tokens": totals["cache_write_tokens"],
+                "total_tokens": totals["total_tokens"],
+                "cost_usd": nanos_to_usd(totals["cost_nanos"]),
+                "billed_cost": billed_cost,
+                "estimated_cost_component_usd": estimated_cost,
+                "cost_source": rollup_cost_source(
+                    billed_cost_usd=billed_cost,
+                    estimated_cost_component_usd=estimated_cost,
+                    missing_cost_entries=totals["missing_cost_entries"],
+                    provider_billed_entries=provider_billed_entries,
+                    estimated_cost_entries=estimated_cost_entries,
+                ),
+                "missing_cost_entries": totals["missing_cost_entries"],
+                "coverage_status": coverage_status,
+                "usage_unknown": coverage_status != "complete",
+                "unknown_usage_events": unknown_events,
+                "provider": latest.provider or "",
+                "model": latest.model or "",
+            }
+        return projections
+
+    async def reconcile_session_usage_totals_from_ledger(
+        self,
+        *,
+        session_key: str,
+        expected_epoch: int,
+    ) -> SessionNode | None:
+        """Set compatibility session totals from the ledger, idempotently.
+
+        The cutover baseline owns pre-ledger totals. Only live provider events
+        are added, because backfilled transcript events describe usage already
+        captured by that baseline.
+        """
+
+        stable_key = canonicalize_session_key(session_key)
+        async with self._write_transaction("reconcile_session_usage_totals") as conn:
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?",
+                (stable_key,),
+            ) as cur:
+                session_row = await cur.fetchone()
+            if session_row is None:
+                return None
+            actual_epoch = max(0, int(session_row["epoch"] or 0))
+            if actual_epoch != expected_epoch:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=stable_key,
+                    expected_epoch=expected_epoch,
+                )
+            session_id = str(session_row["session_id"])
+
+            async with conn.execute(
+                """
+                SELECT * FROM usage_legacy_baselines
+                WHERE session_id = ? AND session_epoch = ?
+                """,
+                (session_id, expected_epoch),
+            ) as cur:
+                baseline = await cur.fetchone()
+            if baseline is None:
+                await self._repair_post_cutover_usage_baselines_on_conn(
+                    conn,
+                    captured_at_ms=_now_ms(),
+                    session_key=stable_key,
+                )
+                async with conn.execute(
+                    """
+                    SELECT * FROM usage_legacy_baselines
+                    WHERE session_id = ? AND session_epoch = ?
+                    """,
+                    (session_id, expected_epoch),
+                ) as cur:
+                    baseline = await cur.fetchone()
+            if baseline is None:
+                # No cutover means this storage is not ledger-authoritative;
+                # preserve the legacy DoneEvent rollup path.
+                return None
+
+            async with conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN input_tokens ELSE 0 END), 0)
+                        AS input_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN output_tokens ELSE 0 END), 0)
+                        AS output_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN cache_read_tokens ELSE 0 END), 0)
+                        AS cache_read_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN cache_write_tokens ELSE 0 END), 0)
+                        AS cache_write_tokens,
+                    COALESCE(SUM(CASE WHEN status = 'finalized' THEN cost_nanos ELSE 0 END), 0)
+                        AS cost_nanos,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN billed_cost_nanos ELSE 0 END), 0)
+                        AS billed_cost_nanos,
+                    COALESCE(SUM(CASE WHEN status = 'finalized'
+                        THEN estimated_cost_nanos ELSE 0 END), 0)
+                        AS estimated_cost_nanos,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'finalized' THEN missing_cost_entries
+                        ELSE MAX(1, missing_cost_entries)
+                    END), 0) AS missing_cost_entries,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'finalized' AND cost_source IN ('provider_billed', 'mixed')
+                        THEN 1 ELSE 0 END), 0) AS provider_billed_entries,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'finalized' AND estimated_cost_nanos > 0
+                        THEN 1 ELSE 0 END), 0) AS estimated_cost_entries
+                FROM usage_events
+                WHERE session_id = ? AND session_epoch = ? AND origin = 'live_provider'
+                """,
+                (session_id, expected_epoch),
+            ) as cur:
+                live = await cur.fetchone()
+            assert live is not None
+            async with conn.execute(
+                """
+                SELECT provider, model
+                FROM usage_events
+                WHERE session_id = ? AND session_epoch = ?
+                  AND origin = 'live_provider' AND status = 'finalized'
+                ORDER BY completed_at_ms DESC, call_index DESC, event_id DESC
+                LIMIT 1
+                """,
+                (session_id, expected_epoch),
+            ) as cur:
+                latest_identity = await cur.fetchone()
+
+            input_tokens = max(0, int(baseline["input_tokens"] or 0)) + max(
+                0, int(live["input_tokens"] or 0)
+            )
+            output_tokens = max(0, int(baseline["output_tokens"] or 0)) + max(
+                0, int(live["output_tokens"] or 0)
+            )
+            cache_read = max(0, int(baseline["cache_read_tokens"] or 0)) + max(
+                0, int(live["cache_read_tokens"] or 0)
+            )
+            cache_write = max(0, int(baseline["cache_write_tokens"] or 0)) + max(
+                0, int(live["cache_write_tokens"] or 0)
+            )
+            cost_nanos = max(0, int(baseline["cost_nanos"] or 0)) + max(
+                0, int(live["cost_nanos"] or 0)
+            )
+            billed_nanos = max(0, int(baseline["billed_cost_nanos"] or 0)) + max(
+                0, int(live["billed_cost_nanos"] or 0)
+            )
+            estimated_nanos = max(0, int(baseline["estimated_cost_nanos"] or 0)) + max(
+                0, int(live["estimated_cost_nanos"] or 0)
+            )
+            missing_entries = max(0, int(baseline["missing_cost_entries"] or 0)) + max(
+                0, int(live["missing_cost_entries"] or 0)
+            )
+            baseline_source = str(baseline["cost_source"] or "none")
+            cost_source = rollup_cost_source(
+                billed_cost_usd=nanos_to_usd(billed_nanos),
+                estimated_cost_component_usd=nanos_to_usd(estimated_nanos),
+                missing_cost_entries=missing_entries,
+                provider_billed_entries=(
+                    int(baseline_source in {"provider_billed", "mixed"})
+                    + max(0, int(live["provider_billed_entries"] or 0))
+                ),
+                estimated_cost_entries=(
+                    int(int(baseline["estimated_cost_nanos"] or 0) > 0)
+                    + max(0, int(live["estimated_cost_entries"] or 0))
+                ),
+            )
+            await conn.execute(
+                """
+                UPDATE sessions
+                SET input_tokens = ?, output_tokens = ?, total_tokens = ?,
+                    total_tokens_fresh = 1, estimated_cost_usd = ?, total_cost_usd = ?,
+                    billed_cost_usd = ?, estimated_cost_component_usd = ?,
+                    cost_source = ?, missing_cost_entries = ?,
+                    cache_read = ?, cache_write = ?,
+                    model_override = COALESCE(?, model_override),
+                    model_provider = COALESCE(?, model_provider)
+                WHERE session_key = ? AND epoch = ?
+                """,
+                (
+                    input_tokens,
+                    output_tokens,
+                    input_tokens + output_tokens,
+                    nanos_to_usd(cost_nanos),
+                    nanos_to_usd(cost_nanos),
+                    nanos_to_usd(billed_nanos),
+                    nanos_to_usd(estimated_nanos),
+                    cost_source,
+                    missing_entries,
+                    cache_read,
+                    cache_write,
+                    (
+                        str(latest_identity["model"])
+                        if latest_identity is not None and latest_identity["model"]
+                        else None
+                    ),
+                    (
+                        str(latest_identity["provider"])
+                        if latest_identity is not None and latest_identity["provider"]
+                        else None
+                    ),
+                    stable_key,
+                    expected_epoch,
+                ),
+            )
+            async with conn.execute(
+                "SELECT * FROM sessions WHERE session_key = ?",
+                (stable_key,),
+            ) as cur:
+                updated = await cur.fetchone()
+            assert updated is not None
+            return SessionNode(**_deserialize_row(dict(updated)))
 
     @_serialized_read
     async def query_usage_event_items(
@@ -3969,6 +4653,11 @@ class SessionStorage:
             f"ON CONFLICT(session_key) DO UPDATE SET {updates}"
         )
         async with self._write_transaction("upsert_session") as conn:
+            async with conn.execute(
+                "SELECT session_id, epoch FROM sessions WHERE session_key = ?",
+                (node.session_key,),
+            ) as cursor:
+                previous_identity = await cursor.fetchone()
             if expected_session_id is not None:
                 if node.session_id != expected_session_id:
                     raise KeyError(
@@ -3984,6 +4673,14 @@ class SessionStorage:
                         f"Session generation changed: {node.session_key}"
                     )
             await conn.execute(sql, values)
+            if previous_identity is None or (
+                str(previous_identity["session_id"]) != node.session_id
+                or int(previous_identity["epoch"] or 0) != int(node.epoch or 0)
+            ):
+                await self._ensure_usage_baseline_for_session_on_conn(
+                    conn,
+                    session_key=node.session_key,
+                )
 
     @_serialized_read
     async def get_session(self, session_key: str) -> SessionNode | None:
@@ -4245,8 +4942,22 @@ class SessionStorage:
         return len(await self.prune_stale_session_records(before_ms))
 
     @_serialized_read
-    async def count_sessions(self) -> int:
-        async with self.conn.execute("SELECT COUNT(*) FROM sessions") as cur:
+    async def count_sessions(self, guest_owner_id: str | None = None) -> int:
+        where = ""
+        params: tuple[str, ...] = ()
+        if guest_owner_id is not None:
+            owner_id = str(guest_owner_id).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", owner_id):
+                return 0
+            where = (
+                "WHERE session_key GLOB ? "
+                "AND (length(session_key) - length(replace(session_key, ':', ''))) = 5"
+            )
+            params = (f"agent:?*:webchat:guest:{owner_id}:?*",)
+        async with self.conn.execute(
+            f"SELECT COUNT(*) FROM sessions {where}",  # noqa: S608 - fixed clause
+            params,
+        ) as cur:
             row = await cur.fetchone()
         return row[0] if row else 0
 
@@ -4271,6 +4982,10 @@ class SessionStorage:
                 row = await cur.fetchone()
             if row is None:
                 raise KeyError(f"Session not found: {session_key}")
+            await self._ensure_usage_baseline_for_session_on_conn(
+                conn,
+                session_key=session_key,
+            )
             return int(row[0])
 
     async def advance_reset_epoch(self, session_key: str) -> int:
@@ -4295,6 +5010,10 @@ class SessionStorage:
                 row = await cur.fetchone()
             if row is None:
                 raise KeyError(f"Session not found: {session_key}")
+            await self._ensure_usage_baseline_for_session_on_conn(
+                conn,
+                session_key=session_key,
+            )
             await self._tombstone_meta_launches_for_boundary(
                 conn,
                 session_key=session_key,
@@ -9755,6 +10474,10 @@ class SessionStorage:
                     session_key=node.session_key,
                     expected_epoch=expected_epoch,
                 )
+            await self._ensure_usage_baseline_for_session_on_conn(
+                conn,
+                session_key=node.session_key,
+            )
 
             await self._delete_reset_history(conn, expected_session_id)
             # Reset rotates the Goal generation boundary.  Command receipts
@@ -10241,6 +10964,10 @@ class SessionStorage:
                         f"VALUES ({session_placeholders})",
                         [_serialize(session_data[col]) for col in session_cols],
                     )
+                    await self._ensure_usage_baseline_for_session_on_conn(
+                        conn,
+                        session_key=session_node.session_key,
+                    )
                 else:
                     previous_epoch = max(0, expected_epoch - 1)
                     async with conn.execute(
@@ -10311,6 +11038,10 @@ class SessionStorage:
                             session_key=session_node.session_key,
                             expected_epoch=previous_epoch,
                         )
+                    await self._ensure_usage_baseline_for_session_on_conn(
+                        conn,
+                        session_key=session_node.session_key,
+                    )
                     await self._delete_reset_history(conn, reset_from_session_id)
                     await conn.execute(
                         "DELETE FROM session_goals WHERE session_key = ?",

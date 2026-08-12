@@ -75,6 +75,8 @@ describe('useChatHistory canonical pagination', () => {
           timestamp: '2026-07-06T00:00:00Z',
           turn_context: {
             turn_id: 'turn-send',
+            target_turn_id: 'turn-send',
+            client_request_id: 'request-send',
             client_message_id: 'client-send',
             intent: 'send',
             disposition: 'applied',
@@ -94,7 +96,214 @@ describe('useChatHistory canonical pagination', () => {
     })
     expect(messages.value[0]?.inputDisposition).toBeUndefined()
     expect(messages.value[0]?.inputDispositionRevision).toBeUndefined()
+    expect(messages.value[0]?.steerClientRequestId).toBeUndefined()
     expect(messages.value[0]?.steerClientMessageId).toBeUndefined()
+  })
+
+  it('restores an explicit Steer intent without relying on shared transport IDs', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'current-steer',
+          message_id: 'current-steer',
+          role: 'user',
+          text: 'current same-turn correction',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: {
+            turn_id: 'turn-steer',
+            client_request_id: 'request-steer',
+            client_message_id: 'client-steer',
+            intent: 'steer',
+            disposition: 'applied',
+            revision: 2,
+          },
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      inputDisposition: 'applied',
+      inputDispositionRevision: 2,
+      steerClientRequestId: 'request-steer',
+      steerClientMessageId: 'client-steer',
+    })
+  })
+
+  it('does not infer legacy Steer UX from shared primary-input fields', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: (['applied', 'cancelled', 'rejected'] as const).map((disposition, index) => ({
+          id: `legacy-send-${disposition}`,
+          message_id: `legacy-send-${disposition}`,
+          role: 'user' as const,
+          text: `legacy primary ${disposition}`,
+          timestamp: `2026-07-06T00:00:0${index}Z`,
+          turn_context: {
+            turn_id: 'turn-send',
+            target_turn_id: 'turn-send',
+            client_request_id: `request-${disposition}`,
+            client_message_id: `client-${disposition}`,
+            disposition,
+            revision: 2,
+            applied_iteration: null,
+          },
+        })),
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    for (const message of messages.value) {
+      expect(message.inputDisposition).toBeUndefined()
+      expect(message.inputDispositionRevision).toBeUndefined()
+      expect(message.steerClientRequestId).toBeUndefined()
+      expect(message.steerClientMessageId).toBeUndefined()
+    }
+  })
+
+  it('restores an applied legacy steer from model-call evidence when intent is absent', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'legacy-steer',
+          message_id: 'legacy-steer',
+          role: 'user',
+          text: 'legacy same-turn correction',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: {
+            turn_id: 'turn-steer',
+            client_request_id: 'request-steer',
+            client_message_id: 'client-steer',
+            disposition: 'applied',
+            revision: 2,
+            model_call_id: '2.0',
+            applied_iteration: 2,
+          },
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      role: 'user',
+      text: 'legacy same-turn correction',
+      turnId: 'turn-steer',
+      inputDisposition: 'applied',
+      inputDispositionRevision: 2,
+      steerClientRequestId: 'request-steer',
+      steerClientMessageId: 'client-steer',
+      steerModelCallId: '2.0',
+      steerAppliedIteration: 2,
+    })
+  })
+
+  it('projects durable internal turn provenance without mutating history context', async () => {
+    const turnContext = {
+      turn_id: 'turn-goal',
+      input_mode: 'system_event',
+      run_kind: 'goal',
+    }
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-goal',
+          message_id: 'assistant-goal',
+          role: 'assistant',
+          text: 'NO_REPLY\nGoal progress',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: turnContext,
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      turnId: 'turn-goal',
+      turnInputMode: 'system_event',
+      turnRunKind: 'goal',
+    })
+    expect(turnContext).toEqual({
+      turn_id: 'turn-goal',
+      input_mode: 'system_event',
+      run_kind: 'goal',
+    })
+  })
+
+  it('derives internal goal provenance from a legacy goal_continuation intent', async () => {
+    const turnContext = {
+      turn_id: 'turn-legacy-goal',
+      intent: 'goal_continuation',
+    }
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-legacy-goal',
+          message_id: 'assistant-legacy-goal',
+          role: 'assistant',
+          text: 'NO_REPLY\nGoal progress',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: turnContext,
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      turnId: 'turn-legacy-goal',
+      turnInputMode: 'system_event',
+      turnRunKind: 'goal',
+    })
+    expect(turnContext).toEqual({
+      turn_id: 'turn-legacy-goal',
+      intent: 'goal_continuation',
+    })
+  })
+
+  it('preserves additive cancellation usage coverage from canonical history', async () => {
+    const usage = {
+      input_tokens: 1,
+      output_tokens: 1,
+      cost_usd: 0,
+      coverage_status: 'usage_unknown',
+      usage_unknown: true,
+      unknown_usage_events: 1,
+    }
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-cancelled',
+          message_id: 'assistant-cancelled',
+          role: 'assistant',
+          text: 'Partial answer',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: { turn_id: 'turn-cancelled' },
+          usage,
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]?.usage).toEqual(usage)
+    expect(usage).toEqual({
+      input_tokens: 1,
+      output_tokens: 1,
+      cost_usd: 0,
+      coverage_status: 'usage_unknown',
+      usage_unknown: true,
+      unknown_usage_events: 1,
+    })
   })
 
   it('requests canonical messages with durable compaction summaries', async () => {

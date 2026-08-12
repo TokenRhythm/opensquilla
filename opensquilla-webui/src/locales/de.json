@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "Einklappen der Seitenleiste abgebrochen",
     "openBlockedSession": "Blockierte Sitzung öffnen",
     "approvalRequired": "Genehmigung erforderlich",
+    "approvalRequiredCount": "Genehmigungen erforderlich: {count}",
+    "systemStatus": "Systemstatus",
+    "systemStatusSummary": "Systemstatus: {state}; {count} Hinweise",
     "manageConnection": "Gateway-Verbindung verwalten",
     "connectionTitle": "Verbindung: {state} — in den Einstellungen verwalten",
     "connectionState": {
@@ -3637,6 +3640,7 @@
       "pausedTitle": "Ziel angehalten",
       "completeTitle": "Ziel abgeschlossen",
       "sentAsGoal": "Als Ziel gesendet",
+      "achieved": "Ziel erreicht",
       "achievedIn": "Ziel erreicht · {duration} aktiv",
       "blockedTitle": "Ziel blockiert",
       "usageLimitedTitle": "Zielnutzung begrenzt",
@@ -3736,6 +3740,12 @@
       "label": "Ausstehend {count}/{max}",
       "hint": "Alt+↑ holt die neueste zurück in die Eingabe · ESC stellt alle in die Eingabe zurück · sendet FIFO, wenn die aktuelle Antwort abgeschlossen ist",
       "steerHint": "Lenkmodus: Neuer Text wird an der nächsten sicheren Grenze angewendet, ohne die aktuelle Aufgabe zu stoppen; Nachrichten in der Warteschlange werden nach dem Durchlauf gesendet",
+      "steerSubmitting": "Anleitung wird übermittelt…",
+      "steerRetryRejected": "Nicht gesendet · Erneut versuchen",
+      "steerRetryUnknown": "Übermittlungsstatus unbekannt · Erneut bestätigen",
+      "steerRetryRejectedHint": "Das Gateway hat diese Anleitung nicht angenommen. Ein erneuter Versuch wiederholt exakt die ursprüngliche Anfrage.",
+      "steerRetryUnknownHint": "OpenSquilla konnte nicht bestätigen, ob diese Anleitung angenommen wurde. Ein erneuter Versuch wiederholt die ursprüngliche Anfrage sicher und unverändert.",
+      "removeUnknownSteer": "Lokalen Wiederholungsversuch für ausstehende Nachricht {index} verwerfen; dies bedeutet nicht, dass der Server sie nicht empfangen hat",
       "queueHint": "Warteschlangenmodus: Diese Nachrichten werden der Reihe nach automatisch gesendet, wenn die aktuelle Antwort abgeschlossen ist",
       "clearAll": "Alle löschen",
       "editMessage": "Nachricht bearbeiten",
@@ -3945,7 +3955,12 @@
       "saved": "gespart",
       "fallback": "Fallback",
       "fallbackUsed": "genutzt",
-      "ensembleModelsAria": "Ensemble-Modelle"
+      "ensembleRequests": "{count} Anfragen",
+      "ensembleModelsAria": "Ensemble-Modelle",
+      "coverage": "Abdeckung",
+      "usageIncompleteSubtotal": "Unvollständig · angezeigte Werte sind eine bekannte Zwischensumme",
+      "usageIncompleteUnknown": "Unvollständig · exakte Nutzungssumme nicht verfügbar",
+      "unknownProviderCalls": "{count} Provider-Aufruf mit unbekannter Nutzung | {count} Provider-Aufrufe mit unbekannter Nutzung"
     },
     "modelRouting": {
       "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Prüfen Sie die Gateway-Verbindung und versuchen Sie es erneut."

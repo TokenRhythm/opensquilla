@@ -18,7 +18,6 @@ import inspect
 import json
 import os
 import platform
-import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Mapping, Sequence
@@ -825,17 +824,6 @@ _TOOL_RESULT_METADATA_KEYS: Final[frozenset[str]] = frozenset(
         "selected_provider",
     }
 )
-_SENTINELS: Final[frozenset[str]] = frozenset({"NO_REPLY", "HEARTBEAT_OK"})
-_HEARTBEAT_ACK_TOKEN: Final[str] = "HEARTBEAT_OK"
-_HEARTBEAT_THINK_BLOCK_RE: Final[re.Pattern[str]] = re.compile(
-    r"<think>.*?</think>",
-    re.DOTALL,
-)
-_HEARTBEAT_UNCLOSED_THINK_RE: Final[re.Pattern[str]] = re.compile(
-    r"<think>.*\Z",
-    re.DOTALL,
-)
-_HEARTBEAT_FINAL_TAG_RE: Final[re.Pattern[str]] = re.compile(r"</?final>")
 _THINKING_ALIASES: Final[dict[str, str]] = {
     "x-high": "xhigh",
     "x_high": "xhigh",
@@ -1438,39 +1426,21 @@ def _normalize_heartbeat_text(
     *,
     run_kind: str,
     heartbeat_ack_max_chars: int,
+    input_mode: str | None = None,
 ) -> str:
-    stripped = text.strip()
-    if stripped in _SENTINELS:
-        log.debug("turn_runner.sentinel_suppressed", sentinel=stripped)
-        return ""
-    if run_kind != "heartbeat":
-        return text
+    """Backward-compatible text-only wrapper around the shared protocol."""
 
-    normalized = _HEARTBEAT_THINK_BLOCK_RE.sub("", text)
-    normalized = _HEARTBEAT_UNCLOSED_THINK_RE.sub("", normalized)
-    normalized = _HEARTBEAT_FINAL_TAG_RE.sub("", normalized)
-    if normalized != text:
-        text = normalized.strip()
-        stripped = text.strip()
+    from opensquilla.engine.silent_reply import normalize_silent_reply
 
-    if stripped in _SENTINELS:
-        log.debug("turn_runner.sentinel_suppressed", sentinel=stripped)
-        return ""
-
-    def _suppressed(payload: str) -> bool:
-        return len(payload.strip()) <= heartbeat_ack_max_chars
-
-    if stripped.startswith(_HEARTBEAT_ACK_TOKEN):
-        remainder = stripped[len(_HEARTBEAT_ACK_TOKEN) :].strip()
-        if _suppressed(remainder):
-            return ""
-
-    if stripped.endswith(_HEARTBEAT_ACK_TOKEN):
-        remainder = stripped[: -len(_HEARTBEAT_ACK_TOKEN)].strip()
-        if _suppressed(remainder):
-            return ""
-
-    return text
+    result = normalize_silent_reply(
+        text,
+        run_kind=run_kind,
+        input_mode=input_mode,
+        heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+    )
+    if result.suppressed:
+        log.debug("turn_runner.sentinel_suppressed", sentinel=result.sentinel)
+    return result.text
 
 
 def _drop_unpaired_tool_use_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3750,6 +3720,7 @@ class TurnRunner:
         turn_segments: list[dict] = []
         turn_artifacts: list[dict[str, Any]] = []
         artifact_delivery_failures: list[str] = []
+        pipeline_usage_context: UsageExecutionContext | None = None
         # current_text_parts holds text streamed since the last tool boundary;
         # hoisted here (passed by reference into _StreamState) so the
         # CancelledError handler can flush a trailing text segment the same way
@@ -3856,7 +3827,6 @@ class TurnRunner:
             tool_metadata = pt_out.tool_metadata
             skill_catalog = pt_out.skill_catalog
 
-            pipeline_usage_context: UsageExecutionContext | None = None
             turn_usage_scope: UsageAccountingScope | None = None
             if self._usage_event_sink is not None:
                 pipeline_usage_context = UsageExecutionContext(
@@ -4614,6 +4584,7 @@ class TurnRunner:
                 compaction_source_boundary_entry_id=(
                     compaction_source_boundary_entry_id
                 ),
+                input_mode=input_mode,
             )
             router_control_replay_event: RouterControlReplayEvent | None = None
             with bind_usage_accounting_scope(turn_usage_scope):
@@ -4846,7 +4817,99 @@ class TurnRunner:
             if trailing:
                 turn_segments.append({"type": "text", "text": trailing})
                 current_text_parts.clear()
-            partial_text = "".join(final_text_parts).rstrip()
+            from opensquilla.engine.silent_reply import (
+                is_silent_reply_prefix,
+                normalize_silent_reply,
+                sanitize_silent_reply_segments,
+            )
+
+            raw_partial_text = "".join(final_text_parts).rstrip()
+            partial_normalization = normalize_silent_reply(
+                raw_partial_text,
+                run_kind=run_kind,
+                input_mode=input_mode,
+                heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+            )
+            partial_text = partial_normalization.text.rstrip()
+            if (
+                input_mode == "system_event"
+                and run_kind in {"goal", "heartbeat"}
+                and is_silent_reply_prefix(raw_partial_text)
+            ):
+                # The shared stream stage deliberately holds internal text.
+                # A Stop can therefore land between chunks of a control token;
+                # never persist that distinctive unfinished marker as prose.
+                partial_text = ""
+
+            raw_segment_text = "".join(
+                str(segment.get("text") or "")
+                for segment in turn_segments
+                if isinstance(segment, dict) and segment.get("type") == "text"
+            ).rstrip()
+            segment_normalization = sanitize_silent_reply_segments(
+                turn_segments,
+                run_kind=run_kind,
+                input_mode=input_mode,
+                heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+            )
+            normalized_segments = segment_normalization.segments
+            segment_text = "".join(
+                str(segment.get("text") or "")
+                for segment in normalized_segments
+                if isinstance(segment, dict) and segment.get("type") == "text"
+            ).rstrip()
+            if (
+                raw_segment_text == raw_partial_text
+                and segment_normalization.changed
+                and (
+                    not partial_normalization.changed
+                    or segment_text == partial_text
+                )
+            ):
+                # A completed tool boundary is also a presentation boundary.
+                # Prefer a validated deletion-only segment projection when the
+                # flat aggregate cannot see an outer marker adjacent to a tool.
+                partial_text = segment_text
+            elif segment_text != partial_text:
+                # Cross-chunk markers can straddle a tool boundary. Collapse
+                # only the text carriers to the aggregate canonical payload;
+                # all tool/result/interrupt records keep their order and ids.
+                reconciled_segments: list[dict[str, Any]] = []
+                inserted_text = False
+                for segment in normalized_segments:
+                    if segment.get("type") != "text":
+                        reconciled_segments.append(segment)
+                        continue
+                    if partial_text and not inserted_text:
+                        reconciled_segments.append(
+                            {"type": "text", "text": partial_text}
+                        )
+                        inserted_text = True
+                if partial_text and not inserted_text:
+                    reconciled_segments.append({"type": "text", "text": partial_text})
+                normalized_segments = reconciled_segments
+            turn_segments[:] = normalized_segments
+            final_text_parts[:] = [partial_text] if partial_text else []
+            cancelled_turn_usage: dict[str, Any] | None = None
+            if self._session_manager is not None and pipeline_usage_context is not None:
+                storage = getattr(self._session_manager, "storage", None)
+                project_usage = getattr(storage, "get_turn_usage_projection", None)
+                if callable(project_usage):
+                    try:
+                        cancelled_turn_usage = await _finish_required_cancel_cleanup(
+                            project_usage(
+                                session_id=pipeline_usage_context.session_id,
+                                session_epoch=pipeline_usage_context.session_epoch,
+                                turn_id=pipeline_usage_context.turn_id or turn_id,
+                            )
+                        )
+                    except Exception:
+                        log.warning(
+                            "turn_runner.cancelled_usage_projection_failed",
+                            session_key=session_key,
+                            turn_id=turn_id,
+                            exc_info=True,
+                        )
             if (
                 partial_text or turn_segments or turn_artifacts
             ) and self._session_manager is not None:
@@ -4857,12 +4920,24 @@ class TurnRunner:
                             {"text": body, "artifacts": turn_artifacts},
                             ensure_ascii=False,
                         )
+                    append_kwargs: dict[str, Any] = {
+                        "role": "assistant",
+                        "content": body,
+                        "tool_calls": turn_segments if turn_segments else None,
+                    }
+                    append_message = self._session_manager.append_message
+                    if _accepts_keyword_arg(append_message, "turn_usage"):
+                        append_kwargs["turn_usage"] = cancelled_turn_usage
+                    if _accepts_keyword_arg(append_message, "token_count"):
+                        append_kwargs["token_count"] = (
+                            int(cancelled_turn_usage.get("output_tokens", 0) or 0)
+                            if cancelled_turn_usage is not None
+                            else None
+                        )
                     await _finish_required_cancel_cleanup(
                         self._append_session_message(
                             session_key,
-                            role="assistant",
-                            content=body,
-                            tool_calls=turn_segments if turn_segments else None,
+                            **append_kwargs,
                         )
                     )
                     log.info(
@@ -4885,6 +4960,28 @@ class TurnRunner:
                 await _finish_required_cancel_cleanup(
                     self._rollback_cancelled_prompt(session_key, bound_user_message_id)
                 )
+            if self._session_manager is not None and pipeline_usage_context is not None:
+                storage = getattr(self._session_manager, "storage", None)
+                reconcile_usage = getattr(
+                    storage,
+                    "reconcile_session_usage_totals_from_ledger",
+                    None,
+                )
+                if callable(reconcile_usage):
+                    try:
+                        await _finish_required_cancel_cleanup(
+                            reconcile_usage(
+                                session_key=session_key,
+                                expected_epoch=pipeline_usage_context.session_epoch,
+                            )
+                        )
+                    except Exception:
+                        log.warning(
+                            "turn_runner.cancelled_usage_rollup_failed",
+                            session_key=session_key,
+                            turn_id=turn_id,
+                            exc_info=True,
+                        )
             if turn_call_logger is not None:
                 try:
                     turn_call_logger.write(
@@ -9752,15 +9849,26 @@ class TurnRunner:
 
     @staticmethod
     def _entry_for_emergency_compaction(entry: Any) -> dict[str, Any]:
+        from opensquilla.engine.silent_reply import sanitize_historical_silent_reply
+
+        role = str(getattr(entry, "role", "user") or "user")
+        turn_context = getattr(entry, "turn_context", None)
+        silent_reply = sanitize_historical_silent_reply(
+            getattr(entry, "content", "") or "",
+            getattr(entry, "tool_calls", None),
+            role=role,
+            turn_context=turn_context if isinstance(turn_context, dict) else None,
+        )
         return {
             "message_id": getattr(entry, "message_id", None),
-            "role": getattr(entry, "role", "user"),
-            "content": getattr(entry, "content", "") or "",
+            "role": role,
+            "content": silent_reply.content or "",
             "token_count": getattr(entry, "token_count", None),
-            "tool_calls": getattr(entry, "tool_calls", None),
+            "tool_calls": silent_reply.segments,
             "tool_call_id": getattr(entry, "tool_call_id", None),
             "reasoning_content": getattr(entry, "reasoning_content", None),
             "turn_usage": getattr(entry, "turn_usage", None),
+            "turn_context": turn_context,
         }
 
     @staticmethod
@@ -9774,6 +9882,7 @@ class TurnRunner:
             tool_call_id=raw.get("tool_call_id"),
             reasoning_content=raw.get("reasoning_content"),
             turn_usage=raw.get("turn_usage"),
+            turn_context=raw.get("turn_context"),
         )
 
     async def _record_emergency_ephemeral_compaction(
@@ -10078,6 +10187,11 @@ class TurnRunner:
                     content,
                     entry.tool_calls,
                     getattr(entry, "reasoning_content", None),
+                    turn_context=(
+                        getattr(entry, "turn_context", None)
+                        if isinstance(getattr(entry, "turn_context", None), dict)
+                        else None
+                    ),
                 )
             )
             last_entry_was_user = entry.role == "user"

@@ -11,6 +11,7 @@ from opensquilla.meta_preflight_protocol import (
     display_text_from_preflight_confirmation,
     strip_preflight_confirmation_protocol_text,
 )
+from opensquilla.silent_reply import sanitize_historical_silent_reply
 from opensquilla.turn_outcome_projection import public_turn_context
 
 _LEGACY_PLAN_IMPLEMENTATION_PROMPT = re.compile(
@@ -62,7 +63,15 @@ def transcript_entries_to_chat_messages(
     selected = entries[-limit:] if limit is not None else entries
     messages: list[dict[str, Any]] = []
     for entry in selected:
-        content = getattr(entry, "content", "") or ""
+        role = getattr(entry, "role", "unknown")
+        turn_context = getattr(entry, "turn_context", None)
+        silent_reply = sanitize_historical_silent_reply(
+            getattr(entry, "content", "") or "",
+            getattr(entry, "tool_calls", None),
+            role=role,
+            turn_context=turn_context if isinstance(turn_context, dict) else None,
+        )
+        content = silent_reply.content or ""
         attachments = None
         artifacts = None
         if content and content.startswith("{"):
@@ -91,7 +100,7 @@ def transcript_entries_to_chat_messages(
             content = "\n".join(t.replace("\\n", "\n") for t in texts) if texts else ""
             if not content.strip():
                 continue
-        if getattr(entry, "role", "unknown") == "user":
+        if role == "user":
             display_text = display_text_from_preflight_confirmation(content)
             if display_text is not None:
                 content = display_text
@@ -103,7 +112,7 @@ def transcript_entries_to_chat_messages(
         msg: dict[str, Any] = {
             "id": getattr(entry, "message_id", None),
             "message_id": getattr(entry, "message_id", None),
-            "role": getattr(entry, "role", "unknown"),
+            "role": role,
             "text": content,
             "timestamp": getattr(entry, "created_at", None),
             "provenance_kind": getattr(entry, "provenance_kind", None),
@@ -116,7 +125,6 @@ def transcript_entries_to_chat_messages(
         reasoning = getattr(entry, "reasoning_content", None)
         if isinstance(reasoning, str) and reasoning.strip():
             msg["reasoning_content"] = reasoning
-        turn_context = getattr(entry, "turn_context", None)
         if isinstance(turn_context, dict):
             if public_context := public_turn_context(turn_context):
                 msg["turn_context"] = public_context
@@ -138,8 +146,16 @@ def transcript_entries_to_chat_messages(
             msg["output_tokens"] = output_tokens
             if usage.get("cost_usd") is not None:
                 msg["cost_usd"] = float(usage.get("cost_usd") or 0.0)
-        tool_calls = getattr(entry, "tool_calls", None)
+        tool_calls = silent_reply.segments
         if tool_calls:
             msg["tool_calls"] = _sanitize_display_protocol_payload(tool_calls)
+        if (
+            silent_reply.suppressed
+            and not content
+            and not artifacts
+            and not attachments
+            and not tool_calls
+        ):
+            continue
         messages.append(msg)
     return messages

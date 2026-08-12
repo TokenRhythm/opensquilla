@@ -1564,6 +1564,50 @@ class _TurnRunnerSessionTotalsAdapter(SessionTotalsPort):
             if current_session is None:
                 return None
 
+            # The durable per-provider-call ledger is authoritative once its
+            # cutover baseline exists. Re-projecting absolute totals makes this
+            # path idempotent if a terminal event is replayed after reconnect.
+            # Direct/legacy SessionManager implementations keep the original
+            # additive DoneEvent behavior below.
+            storage = getattr(session_manager, "storage", None)
+            reconcile = getattr(storage, "reconcile_session_usage_totals_from_ledger", None)
+            if callable(reconcile):
+                reconciled = await reconcile(
+                    session_key=session_key,
+                    expected_epoch=max(0, int(getattr(current_session, "epoch", 0) or 0)),
+                )
+                if reconciled is not None:
+                    return CostRollupResult(
+                        input_tokens=max(0, int(getattr(reconciled, "input_tokens", 0) or 0)),
+                        output_tokens=max(0, int(getattr(reconciled, "output_tokens", 0) or 0)),
+                        total_tokens=max(0, int(getattr(reconciled, "total_tokens", 0) or 0)),
+                        estimated_cost_usd=float(
+                            getattr(reconciled, "estimated_cost_usd", 0.0) or 0.0
+                        ),
+                        total_cost_usd=float(
+                            getattr(reconciled, "total_cost_usd", 0.0) or 0.0
+                        ),
+                        billed_cost_usd=float(
+                            getattr(reconciled, "billed_cost_usd", 0.0) or 0.0
+                        ),
+                        estimated_cost_component_usd=float(
+                            getattr(reconciled, "estimated_cost_component_usd", 0.0) or 0.0
+                        ),
+                        cost_source=str(
+                            getattr(reconciled, "cost_source", "none") or "none"
+                        ),
+                        missing_cost_entries=max(
+                            0,
+                            int(getattr(reconciled, "missing_cost_entries", 0) or 0),
+                        ),
+                        cache_read=max(0, int(getattr(reconciled, "cache_read", 0) or 0)),
+                        cache_write=max(
+                            0, int(getattr(reconciled, "cache_write", 0) or 0)
+                        ),
+                        model_override=getattr(reconciled, "model_override", None),
+                        model_provider=getattr(reconciled, "model_provider", None),
+                    )
+
             done_total_tokens = done_event.input_tokens + done_event.output_tokens
             event_cost_source = normalize_event_cost_source(
                 done_event.cost_source,

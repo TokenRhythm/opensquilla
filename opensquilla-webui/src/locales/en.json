@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "Sidebar collapse canceled",
     "openBlockedSession": "Open the blocked session",
     "approvalRequired": "Approval required",
+    "approvalRequiredCount": "Approval required: {count}",
+    "systemStatus": "System status",
+    "systemStatusSummary": "System status: {state}; {count} notices",
     "manageConnection": "Manage gateway connection",
     "connectionTitle": "Connection: {state} — manage in Settings",
     "connectionState": {
@@ -3690,6 +3693,7 @@
       "pausedTitle": "Goal paused",
       "completeTitle": "Goal complete",
       "sentAsGoal": "Sent as goal",
+      "achieved": "Goal achieved",
       "achievedIn": "Goal achieved · {duration} active",
       "blockedTitle": "Goal blocked",
       "usageLimitedTitle": "Goal usage limited",
@@ -3789,6 +3793,12 @@
       "label": "Pending {count}/{max}",
       "hint": "Alt+↑ pulls the most recent back into the input · ESC recovers all to input · sends FIFO when the current response finishes",
       "steerHint": "Steer mode: new text is applied at the next safe boundary without stopping the current task; queued messages still send after the turn",
+      "steerSubmitting": "Submitting guidance…",
+      "steerRetryRejected": "Not sent · Retry",
+      "steerRetryUnknown": "Delivery status unknown · Retry confirmation",
+      "steerRetryRejectedHint": "The gateway did not accept this guidance. Retry replays the exact original request.",
+      "steerRetryUnknownHint": "OpenSquilla could not confirm whether this guidance was accepted. Retry safely replays the exact original request.",
+      "removeUnknownSteer": "Discard local retry for pending message {index}; this does not mean the server did not receive it",
       "queueHint": "Queue mode: these messages auto-send in order when the current response finishes",
       "clearAll": "Clear all",
       "editMessage": "Edit message",
@@ -3998,7 +4008,12 @@
       "saved": "saved",
       "fallback": "fallback",
       "fallbackUsed": "used",
-      "ensembleModelsAria": "Ensemble models"
+      "ensembleRequests": "{count} requests",
+      "ensembleModelsAria": "Ensemble models",
+      "coverage": "coverage",
+      "usageIncompleteSubtotal": "Incomplete · shown values are a known subtotal",
+      "usageIncompleteUnknown": "Incomplete · exact usage total unavailable",
+      "unknownProviderCalls": "{count} provider call has unknown usage | {count} provider calls have unknown usage"
     },
     "modelRouting": {
       "updateFailed": "Couldn't switch model routing — reverted. Check the gateway connection and try again."

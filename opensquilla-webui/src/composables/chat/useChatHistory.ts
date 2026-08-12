@@ -88,15 +88,37 @@ function historyContextText(value: unknown, key: string): string | undefined {
   return typeof raw === 'string' && raw ? raw : undefined
 }
 
+function historyTurnPresentationProvenance(value: unknown): {
+  inputMode?: string
+  runKind?: string
+} {
+  const explicitInputMode = historyContextText(value, 'input_mode')
+    ?? historyContextText(value, 'inputMode')
+  const explicitRunKind = historyContextText(value, 'run_kind')
+    ?? historyContextText(value, 'runKind')
+  const isLegacyGoalContinuation = historyContextText(value, 'intent') === 'goal_continuation'
+  return {
+    inputMode: explicitInputMode
+      ?? (isLegacyGoalContinuation ? 'system_event' : undefined),
+    runKind: explicitRunKind
+      ?? (isLegacyGoalContinuation ? 'goal' : undefined),
+  }
+}
+
 function historyHasSteerEvidence(value: unknown): boolean {
   const disposition = historyContextText(value, 'disposition')
   const intent = historyContextText(value, 'intent')
-  return intent === 'steer'
-    || disposition === 'steering'
+  // Current gateways persist an intent for both primary sends and Steers.
+  // Treat that explicit value as authoritative: primary sends also carry a
+  // client_request_id, so transport identity alone cannot prove Steer UX.
+  if (intent) return intent === 'steer'
+  // Older gateways omitted intent. Preserve their Steer rows using fields
+  // that are specific to same-turn admission/application rather than IDs
+  // shared by every durable user input.
+  return disposition === 'steering'
     || disposition === 'promoted'
-    || disposition === 'cancelled'
-    || disposition === 'rejected'
-    || Boolean(historyContextText(value, 'client_request_id'))
+    || Boolean(historyContextText(value, 'promoted_turn_id'))
+    || Boolean(historyContextText(value, 'promoted_from_turn_id'))
     || Boolean(historyContextText(value, 'model_call_id'))
     || historyContextInteger(value, 'applied_iteration') !== undefined
 }
@@ -124,7 +146,10 @@ function historyDispositionRevision(value: unknown): number | undefined {
 
 function historyContextInteger(value: unknown, key: string): number | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
-  const number = Number((value as Record<string, unknown>)[key])
+  const raw = (value as Record<string, unknown>)[key]
+  if (typeof raw !== 'number' && typeof raw !== 'string') return undefined
+  if (typeof raw === 'string' && !raw.trim()) return undefined
+  const number = Number(raw)
   return Number.isInteger(number) && number >= 0 ? number : undefined
 }
 
@@ -431,6 +456,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     const reasoningText = typeof msg.reasoning_content === 'string' ? msg.reasoning_content.trim() : ''
     const messageId = msg.message_id || msg.id || ''
     const steerContext = historyHasSteerEvidence(msg.turn_context)
+    const turnProvenance = historyTurnPresentationProvenance(msg.turn_context)
     return {
       role: msg.role || 'assistant',
       text: msg.role === 'user' ? options.stripTimePrefix(msg.text || '') : msg.text || '',
@@ -446,6 +472,8 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       provenanceSourceSessionKey: msg.provenance_source_session_key || '',
       provenanceSourceTool: msg.provenance_source_tool || '',
       turnId: historyTurnId(msg.turn_context),
+      turnInputMode: turnProvenance.inputMode,
+      turnRunKind: turnProvenance.runKind,
       inputDisposition: historyInputDisposition(msg.turn_context),
       inputDispositionRevision: historyDispositionRevision(msg.turn_context),
       steerClientRequestId: steerContext

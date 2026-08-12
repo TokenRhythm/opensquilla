@@ -938,12 +938,23 @@ body > .settings-overlay .settings-modal .setup-provider-editor-head {
   border: 0;
 }
 
-body > .settings-overlay .settings-modal .setup-provider-card {
+body > .settings-overlay .settings-modal .setup-provider-list {
   background: var(--bg-surface-2);
-  border: 0;
+  border: 1px solid color-mix(in srgb, var(--text) 8%, transparent);
   border-radius: var(--radius-card);
-  min-height: 64px;
-  padding: var(--sp-3) var(--sp-4);
+}
+
+body > .settings-overlay .settings-modal .setup-provider-card {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  border-top: 1px solid color-mix(in srgb, var(--text) 7%, transparent);
+  min-height: 58px;
+  padding: var(--sp-2) var(--sp-3);
+}
+
+body > .settings-overlay .settings-modal .setup-provider-card:first-child {
+  border-top: 0;
 }
 
 body > .settings-overlay .settings-modal .setup-provider-card.is-selected {

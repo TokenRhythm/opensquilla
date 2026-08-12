@@ -1823,23 +1823,59 @@ async def _resolve_session_node(storage: Any, key: str) -> Any:
     raise KeyError(f"Session not found: {key}")
 
 
+_SESSION_COUNT_VIEW = "session-count-v1"
+
+
 @_d.method("sessions.list", scope="operator.read")
 async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
     """List all sessions."""
     now_ms = int(time.time() * 1000)
+    request = params or {}
+    count_only = request.get("view") == _SESSION_COUNT_VIEW
+
+    def empty_payload() -> dict[str, Any]:
+        payload: dict[str, Any] = {"sessions": [], "count": 0, "ts": now_ms}
+        if count_only:
+            payload.update({"totalCount": 0, "total_count": 0})
+        return payload
 
     if ctx.session_manager is None:
-        return {"sessions": [], "count": 0, "ts": now_ms}
+        return empty_payload()
 
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
-        return {"sessions": [], "count": 0, "ts": now_ms}
+        return empty_payload()
 
-    limit = (params or {}).get("limit", 50)
+    limit = request.get("limit", 50)
     from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, guest_owns_session_key
 
-    if GuestRpcPolicy.is_guest(ctx):
-        owner_id = getattr(ctx.principal, "guest_owner_id", None)
+    is_guest = GuestRpcPolicy.is_guest(ctx)
+    owner_id = getattr(ctx.principal, "guest_owner_id", None) if is_guest else None
+    if count_only:
+        count_sessions = getattr(storage, "count_sessions", None)
+        if callable(count_sessions):
+            try:
+                total_count = (
+                    await count_sessions(guest_owner_id=owner_id)
+                    if is_guest
+                    else await count_sessions()
+                )
+            except TypeError:
+                # Older test doubles and alternative storage adapters may not
+                # implement the additive count contract. Fall through to the
+                # legacy list response so mixed-version clients still render.
+                pass
+            else:
+                total_count = max(0, int(total_count))
+                return {
+                    "sessions": [],
+                    "count": 0,
+                    "totalCount": total_count,
+                    "total_count": total_count,
+                    "ts": now_ms,
+                }
+
+    if is_guest:
         try:
             guest_limit = int(limit)
         except (TypeError, ValueError):

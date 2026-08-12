@@ -1,4 +1,5 @@
 import type { ArtifactPayload } from './rpc'
+import type { SessionSteerV2Params } from './rpc'
 import type { IconName } from '@/utils/icons'
 
 export interface Attachment {
@@ -33,12 +34,35 @@ export interface DisplayAttachment {
   sha256_ref?: string
 }
 
+/**
+ * Local delivery state for a same-turn steer that has not yet been proven
+ * durable. A pending attempt is deliberately not a transcript message: only
+ * an accepted response, typed disposition event, or matching history row may
+ * project it into `ChatMessage`.
+ */
+export type PendingSteerPhase =
+  | 'submitting'
+  | 'retryable_rejected'
+  | 'acceptance_unknown'
+
+export interface PendingSteerAttempt {
+  phase: PendingSteerPhase
+  /** Immutable idempotent request replayed byte-for-byte on manual retry. */
+  request: Readonly<SessionSteerV2Params>
+  errorCode?: string
+  retryAfterMs?: number
+  /** Stop raced admission; the authoritative disposition still decides. */
+  stopRequested?: boolean
+}
+
 export interface ChatPendingItem {
   text: string
   attachments: Attachment[]
   intent: string | null
-  /** Delivery state for an explicit steer attempt that still owns this queue item. */
+  /** Generic non-v2 queue/hidden-control delivery lease. V2 Steer uses `steerAttempt`. */
   deliveryState?: 'steering' | 'retryable'
+  /** Canonical transport identity/state for a not-yet-durable steer. */
+  steerAttempt?: PendingSteerAttempt
   /** Session that owned this item when it entered the in-memory queue. */
   ownerSessionKey?: string
   /** chat.send request whose canonical response may carry this item to a child. */
@@ -59,12 +83,6 @@ export interface ChatPendingItem {
   hiddenClientMessageId?: string
   /** The visible confirmation bubble was already rendered optimistically. */
   hiddenVisibleCommitted?: boolean
-  /** Stable identity for retrying a same-turn steer without creating a second input. */
-  steerClientRequestId?: string
-  steerClientMessageId?: string
-  steerExpectedTurnId?: string
-  /** The optimistic user row already exists in the transcript surface. */
-  steerVisibleCommitted?: boolean
 }
 
 export type HiddenControlDispatchStatus =
@@ -324,6 +342,13 @@ export interface ChatUsagePayload {
   routePlan?: Record<string, unknown>
   model_call_segments?: ChatModelCallSegment[]
   modelCallSegments?: ChatModelCallSegment[]
+  /** Per-turn ledger coverage. Older gateways omit these additive fields. */
+  coverage_status?: string
+  coverageStatus?: string
+  usage_unknown?: boolean
+  usageUnknown?: boolean
+  unknown_usage_events?: number
+  unknownUsageEvents?: number
   /** V017 routing-decision id — presence is what makes a turn rateable. */
   decision_id?: string
   __savings_ui_suppressed?: boolean
@@ -442,6 +467,10 @@ export interface ChatMessage {
   provenanceSourceTool?: string
   /** Durable causal turn identity restored from transcript turn_context. */
   turnId?: string
+  /** Internal-input provenance used by presentation-only compatibility rules. */
+  turnInputMode?: string
+  /** Runtime turn kind used by presentation-only compatibility rules. */
+  turnRunKind?: string
   /** Same-turn input lifecycle, sourced only from durable context or typed events. */
   inputDisposition?: ChatSteerDisposition
   /** Monotonic server revision for the disposition state machine. */
@@ -498,6 +527,12 @@ export interface ChatMessageMeta {
   savedLabel: string
   turnSavedPct?: number
   ensemble?: ChatEnsembleMeta
+  /** Normalized additive coverage metadata from the per-turn usage receipt. */
+  coverageStatus?: string
+  usageUnknown?: boolean
+  unknownUsageEvents?: number
+  /** True when at least one measured token/cost fact contributes to the receipt. */
+  hasKnownUsage?: boolean
   /** Routing-decision id from turn usage; thumbs render only when present. */
   decisionId?: string
 }
@@ -522,6 +557,10 @@ export interface ChatRenderedMessage {
   turnKey?: string
   /** Durable server turn identity restored from transcript turn_context. */
   turnId?: string
+  /** Internal-input provenance copied from the source ChatMessage. */
+  turnInputMode?: string
+  /** Runtime turn kind copied from the source ChatMessage. */
+  turnRunKind?: string
   inputDisposition?: ChatSteerDisposition
   maintenance?: ChatMaintenanceEvent
   inputDispositionRevision?: number

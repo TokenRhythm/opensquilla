@@ -75,7 +75,7 @@ function toolGroup(
 }
 
 describe('projectAssistantActivity', () => {
-  it('separates an aggregated answer at a single ordinary tool boundary', () => {
+  it('fails open when an ordinary tool group did not settle successfully', () => {
     const failed = call('failed', {
       status: 'error',
       isError: true,
@@ -95,15 +95,11 @@ describe('projectAssistantActivity', () => {
     )
 
     expect(projection.canSeparateActivity).toBe(true)
-    expect(projection.answerSource).toBe('terminal-timeline-boundary')
-    expect(projection.activityItems.map(item => item.type)).toEqual(['text', 'tool-group'])
-    expect(projection.activityItems[0]).toMatchObject({
-      key: 'prefix',
-      rawText: 'Canonical prefix',
-    })
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.activityItems.map(item => item.type)).toEqual(['tool-group'])
     expect(projection.answerPart).toMatchObject({
-      rawText: ' and suffix',
-      html: '<p> and suffix</p>',
+      rawText: 'Canonical prefix and suffix',
+      html: '<p>Canonical prefix and suffix</p>',
     })
     expect(projection.toolCount).toBe(2)
     expect(projection.failureCount).toBe(1)
@@ -224,7 +220,84 @@ describe('projectAssistantActivity', () => {
     ])
   })
 
-  it('folds the transition before a terminal Markdown answer boundary', () => {
+  it.each([
+    ['dash thematic break', 'Summary before.\n\n---\n\nSummary after.'],
+    ['asterisk thematic break', 'Summary before.\n\n***\n\nSummary after.'],
+    ['underscore thematic break', 'Summary before.\n\n___\n\nSummary after.'],
+    ['fenced code containing a break', '```md\n---\n```\n\nSummary after.'],
+  ])('keeps the complete terminal Markdown answer across a %s', (_name, answer) => {
+    const projection = projectAssistantActivity(
+      message({
+        text: answer,
+        timelineItems: [
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          { type: 'text', key: 'answer', html: answer, rawText: answer },
+        ],
+      }),
+      text => `<rendered>${text}</rendered>`,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe(answer)
+    expect(projection.activityItems.map(item => item.key)).toEqual(['inspect'])
+  })
+
+  it.each([
+    ['leading code indentation', '    Final code', 'Final code'],
+    ['trailing hard-break spaces', 'Final line  \nNext line', 'Final line\nNext line'],
+  ])('fails open when comparison would erase %s', (_name, canonical, timelineText) => {
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          { type: 'text', key: 'answer', html: timelineText, rawText: timelineText },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('uses the readable aggregate for consecutive terminal text segments', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Work.\n\nFinal part one.\n\nFinal part two.',
+        timelineItems: [
+          { type: 'text', key: 'work', html: 'Work.', rawText: 'Work.' },
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          { type: 'text', key: 'answer-a', html: 'Final part one.', rawText: 'Final part one.' },
+          { type: 'text', key: 'answer-b', html: 'Final part two.', rawText: 'Final part two.' },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final part one.\n\nFinal part two.')
+    expect(projection.activityItems.map(item => item.key)).toEqual(['work', 'inspect'])
+  })
+
+  it('preserves terminal Markdown hard-break and trailing newline bytes', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Final line  \n',
+        timelineItems: [
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          { type: 'text', key: 'answer', html: 'Final line', rawText: 'Final line  ' },
+          { type: 'text', key: 'newline', html: '', rawText: '\n' },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final line  \n')
+  })
+
+  it('treats a thematic break as terminal answer content, never as a protocol boundary', () => {
     const projection = projectAssistantActivity(
       message({
         text: 'Inspecting.\n\nPreparing the report.\n\n---\n\n## Final report\nResult.',
@@ -248,16 +321,13 @@ describe('projectAssistantActivity', () => {
     )
 
     expect(projection.answerSource).toBe('terminal-timeline-boundary')
-    expect(projection.answerPart?.rawText).toBe('## Final report\nResult.')
+    expect(projection.answerPart?.rawText).toBe(
+      'Preparing the report.\n\n---\n\n## Final report\nResult.',
+    )
     expect(projection.activityItems.map(item => item.key)).toEqual([
       'opening',
       'weather',
-      'terminal:activity-prefix',
     ])
-    expect(projection.activityItems[2]).toMatchObject({
-      rawText: 'Preparing the report.',
-      html: '<rendered>Preparing the report.</rendered>',
-    })
   })
 
   it('separates an aggregated PlanRun answer at a successful terminal control boundary', () => {
@@ -404,6 +474,94 @@ describe('projectAssistantActivity', () => {
       text => text,
       [],
       { lifecycle: 'interrupted' },
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('keeps repeated narration in activity and takes only the final run after multiple tools', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Repeat.\n\nMiddle.\n\nRepeat.',
+        timelineItems: [
+          { type: 'text', key: 'repeat-before', html: 'Repeat.', rawText: 'Repeat.' },
+          toolGroup([call('read', { name: 'read_file' })], 'read'),
+          { type: 'text', key: 'middle', html: 'Middle.', rawText: 'Middle.' },
+          toolGroup([call('verify', { name: 'execute_code' })], 'verify'),
+          { type: 'text', key: 'repeat-after', html: 'Repeat.', rawText: 'Repeat.' },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Repeat.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'repeat-before',
+      'read',
+      'middle',
+      'verify',
+    ])
+  })
+
+  it.each([
+    ['running tool', call('run', { isRunning: true, status: '' })],
+    ['pending tool', call('pending', { status: '' })],
+  ])('fails open for a %s', (_name, unsettledCall) => {
+    const canonical = 'Narration.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          { type: 'text', key: 'narration', html: 'Narration.', rawText: 'Narration.' },
+          toolGroup([unsettledCall], 'unsettled'),
+          { type: 'text', key: 'answer', html: 'Final answer.', rawText: 'Final answer.' },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('fails open when a transparent control precedes rather than follows the answer', () => {
+    const canonical = 'Narration.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          { type: 'text', key: 'narration', html: 'Narration.', rawText: 'Narration.' },
+          toolGroup([call('checkpoint', { name: 'plan_run_checkpoint' })], 'checkpoint'),
+          { type: 'text', key: 'answer', html: 'Final answer.', rawText: 'Final answer.' },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it.each([
+    ['streaming', { isStreaming: true }, 'working' as const],
+    ['terminal failure', { terminalFailure: true }, 'failed' as const],
+  ])('fails open while the turn is %s', (_name, messageState, lifecycle) => {
+    const canonical = 'Narration.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        ...messageState,
+        timelineItems: [
+          { type: 'text', key: 'narration', html: 'Narration.', rawText: 'Narration.' },
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          { type: 'text', key: 'answer', html: 'Final answer.', rawText: 'Final answer.' },
+        ],
+      }),
+      text => text,
+      [],
+      { lifecycle },
     )
 
     expect(projection.answerSource).toBe('canonical')

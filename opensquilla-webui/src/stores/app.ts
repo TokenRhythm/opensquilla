@@ -107,11 +107,17 @@ export const useAppStore = defineStore('app', () => {
     return systemDark.value ? 'dark' : 'light'
   })
 
-  const desktopNativeThemeSource = computed<'light' | 'dark'>(() => {
-    const colorScheme = getManifest(resolvedTheme.value)?.capabilities.colorScheme
+  const desktopNativeThemeSource = computed<'light' | 'dark' | 'system'>(() => {
+    // Keep Electron on its native system source while the UI is in system mode.
+    // Resolving that choice to a fixed light/dark source would override the OS,
+    // which in turn freezes the renderer's prefers-color-scheme media query.
+    if (theme.value === 'system') return 'system'
+    const colorScheme = getManifest(theme.value)?.capabilities.colorScheme
     if (colorScheme === 'light') return 'light'
     if (colorScheme === 'dark') return 'dark'
-    return systemDark.value ? 'dark' : 'light'
+    // A theme that supports both schemes (or omits the capability) should leave
+    // native chrome under OS control instead of snapshotting the current scheme.
+    return 'system'
   })
 
   let mq: MediaQueryList | null = null
@@ -128,7 +134,9 @@ export const useAppStore = defineStore('app', () => {
     // Lazily bring in the theme's global "world" layer (structure/type/texture)
     // if it has one; flat value themes have no world and this is a no-op.
     void ensureThemeWorld(resolvedTheme.value)
-    void platform.setNativeTheme({ source: desktopNativeThemeSource.value })
+    void platform
+      .setNativeTheme({ source: desktopNativeThemeSource.value })
+      .catch(() => undefined)
   }
 
   function initTheme() {
@@ -159,19 +167,33 @@ export const useAppStore = defineStore('app', () => {
       // ignore
     }
 
+    // Wire the OS listener before the immediate apply. On desktop, applying a
+    // fixed theme also changes Electron's prefers-color-scheme; listening first
+    // ensures that feedback cannot land between the initial apply and setup.
+    if (!mq) {
+      mq = window.matchMedia('(prefers-color-scheme: dark)')
+      mqHandler = (e: MediaQueryListEvent) => {
+        systemDark.value = e.matches
+      }
+      if (mq.addEventListener) mq.addEventListener('change', mqHandler)
+      else if (mq.addListener) mq.addListener(mqHandler)
+    }
+    // Re-snapshot on every init so destroy/re-init cannot retain a stale OS
+    // preference from the previous listener lifetime.
+    systemDark.value = mq.matches
+
     if (!themeWatchStop) {
-      themeWatchStop = watch(resolvedTheme, applyTheme, { immediate: true })
+      // Both axes matter: dark -> system can leave resolvedTheme at "dark" but
+      // must still send source:"system" to Electron. Conversely, an OS change
+      // in system mode changes resolvedTheme while the native source stays system.
+      themeWatchStop = watch(
+        [resolvedTheme, desktopNativeThemeSource],
+        applyTheme,
+        { immediate: true },
+      )
     } else {
       applyTheme()
     }
-
-    if (mq) return // idempotent
-    mq = window.matchMedia('(prefers-color-scheme: dark)')
-    mqHandler = (e: MediaQueryListEvent) => {
-      systemDark.value = e.matches
-    }
-    if (mq.addEventListener) mq.addEventListener('change', mqHandler)
-    else if (mq.addListener) mq.addListener(mqHandler)
   }
 
   function destroyTheme() {

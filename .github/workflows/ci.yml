@@ -2,6 +2,8 @@ name: CI
 
 "on":
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
   workflow_dispatch:
@@ -54,6 +56,19 @@ jobs:
               git diff --name-only \
                 "${{ github.event.pull_request.base.sha }}" \
                 "${{ github.event.pull_request.head.sha }}" > "${changed_files}"
+              ;;
+            merge_group)
+              base="${{ github.event.merge_group.base_sha }}"
+              head="${{ github.event.merge_group.head_sha }}"
+              if [[ -n "${base}" && -n "${head}" ]] \
+                && git cat-file -e "${base}^{commit}" \
+                && git cat-file -e "${head}^{commit}" \
+                && git diff --name-only "${base}" "${head}" > "${changed_files}"; then
+                :
+              else
+                echo "Merge-group diff is unavailable; running the full CI matrix." >&2
+                printf '.ci/run-all\n' > "${changed_files}"
+              fi
               ;;
             push)
               before="${{ github.event.before }}"
@@ -261,8 +276,11 @@ jobs:
         working-directory: opensquilla-webui
         run: >-
           npm run test:e2e --
+          assistant-activity.spec.ts
           history-hydration.spec.ts
           goal-mode.spec.ts
+          queue-steer.spec.ts
+          share.spec.ts
           --project=chromium
           --workers=1
 
@@ -433,7 +451,16 @@ jobs:
             tests/test_recovery \
             tests/test_migration/test_opensquilla_home_migration.py \
             tests/test_engine/test_coding_mode.py \
+            tests/test_engine/test_cancelled_turn_segments.py \
+            tests/test_engine/test_history_silent_reply.py \
+            tests/test_engine/test_silent_reply.py \
+            tests/test_engine/test_silent_reply_runtime.py \
             tests/test_engine/test_stream_wrappers.py \
+            tests/test_engine/turn_runner/test_stream_consumer_stage_unit.py \
+            tests/test_engine/turn_runner/test_turn_finalizer_stage_unit.py \
+            tests/test_gateway/test_rpc_chat_history.py \
+            tests/test_persistence/test_usage_ledger.py \
+            tests/functional/test_gateway_silent_reply_process_e2e.py \
             tests/test_tools/test_shell_process_isolation.py \
             -q -m "${markers}" --durations=50
 
@@ -721,7 +748,7 @@ jobs:
         run: |
           set -euo pipefail
           maxfail_args=()
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group" ]]; then
             maxfail_args+=(--maxfail=3)
           fi
 
@@ -755,7 +782,7 @@ jobs:
           set -euo pipefail
           markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
           maxfail_args=()
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group" ]]; then
             maxfail_args+=(--maxfail=3)
           fi
 
@@ -857,7 +884,7 @@ jobs:
             --durations=50
             --junitxml="${CI_REPORT_DIR}/junit.xml"
           )
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group" ]]; then
             pytest_args+=(--maxfail=3)
           fi
 
@@ -1041,6 +1068,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'theme-flow:scripts/test-desktop-theme-flow.mjs'
                 'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
                 'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
                 'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
@@ -1060,6 +1088,7 @@ jobs:
                 'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
                 'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
                 'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'theme-flow:scripts/test-desktop-theme-flow.mjs'
               )
               ;;
             workbench)

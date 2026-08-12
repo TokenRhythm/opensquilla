@@ -236,6 +236,10 @@ class DoneEvent:
     # Offsets are Unicode codepoint indexes into ``text_snapshot``/``text``.
     # Appended for wire and positional-construction compatibility.
     model_call_segments: list[dict[str, Any]] = field(default_factory=list)
+    # Typed presentation contract for silent replies. Appended so existing
+    # positional DoneEvent construction keeps its historical field order.
+    delivery: Literal["visible", "suppressed"] = "visible"
+    suppression_reason: Literal["no_reply", "heartbeat_ack"] | None = None
 
     @property
     def upstream_cost_usd(self) -> float:

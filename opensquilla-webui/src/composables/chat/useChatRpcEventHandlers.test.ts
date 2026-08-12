@@ -801,10 +801,17 @@ describe('useChatRpcEventHandlers steer disposition', () => {
       text: steer.text,
       attachments: [],
       intent: null,
-      deliveryState: 'retryable',
-      steerClientRequestId: 'request-1',
-      steerClientMessageId: 'client-1',
-      steerExpectedTurnId: 'turn-old',
+      steerAttempt: {
+        phase: 'acceptance_unknown',
+        request: {
+          key: 'agent:main:test',
+          message: steer.text,
+          expected_turn_id: 'turn-old',
+          client_request_id: 'request-1',
+          client_message_id: 'client-1',
+          surface_id: 'webui',
+        },
+      },
     }
     const { api, messages, pendingQueue, scheduleHistorySync, stop } = createHarness({
       messages: [
@@ -1182,6 +1189,86 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
     }
   })
 
+  it('honors only the outer suppressed delivery contract and clears stale text', () => {
+    const previous: ChatMessage = { role: 'assistant', text: 'previous', ts: 'before' }
+    const { api, messages, stream, stop } = createHarness({ messages: [previous] })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text_snapshot: 'stale streamed answer',
+        delivery: 'suppressed',
+        suppression_reason: 'no_reply',
+        input_tokens: 10,
+        output_tokens: 1,
+        model: 'z-ai/glm-5.2',
+      })
+
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('')
+      expect(stream.endStreaming).toHaveBeenLastCalledWith({ suppressed: true })
+      expect(messages.value).toEqual([previous])
+      expect(previous.usage).toBeUndefined()
+
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text_snapshot: 'visible despite diagnostic reason',
+        suppression_reason: 'heartbeat_ack',
+      })
+
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith(
+        'visible despite diagnostic reason',
+      )
+      expect(stream.endStreaming).toHaveBeenLastCalledWith(undefined)
+    } finally {
+      stop()
+    }
+  })
+
+  it('attaches suppressed-turn usage only to the preserved tool and artifact row', () => {
+    const previous: ChatMessage = { role: 'assistant', text: 'previous', ts: 'before' }
+    const { api, messages, stream, stop } = createHarness({
+      messages: [previous],
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: '',
+          ts: 'now',
+          tool_calls: [{ type: 'tool_use', name: 'web_search', tool_use_id: 'tool-1' }],
+          artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text_snapshot: '',
+        delivery: 'suppressed',
+        suppression_reason: 'heartbeat_ack',
+        input_tokens: 10,
+        output_tokens: 1,
+        model: 'z-ai/glm-5.2',
+      })
+
+      expect(stream.endStreaming).toHaveBeenLastCalledWith({ suppressed: true })
+      expect(messages.value).toHaveLength(2)
+      expect(messages.value[0]?.usage).toBeUndefined()
+      expect(messages.value[1]).toMatchObject({
+        text: '',
+        model: 'z-ai/glm-5.2',
+        input_tokens: 10,
+        output_tokens: 1,
+        artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
+      })
+      expect(messages.value[1]?.usage).toBeDefined()
+    } finally {
+      stop()
+    }
+  })
+
   it('attaches done usage to the assistant message pushed by endStreaming', () => {
     const previous: ChatMessage = { role: 'assistant', text: 'previous', ts: 'before' }
     const { api, messages, stop } = createHarness({
@@ -1195,12 +1282,18 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
       api.handlers.onAny('session.event.done', {
         session_key: 'agent:main:test',
         stream_seq: 1,
+        turn_id: 'goal-turn-1',
         text: 'current',
         input_tokens: 10,
         output_tokens: 1,
         model: 'z-ai/glm-5.2',
+        input_mode: 'system_event',
+        run_kind: 'goal',
         model_usage_breakdown: [{ model: 'z-ai/glm-5.2', role: 'aggregator' }],
         ensemble_trace: { profile: 'default', llm_request_count: 5 },
+        coverage_status: 'usage_unknown',
+        usage_unknown: true,
+        unknown_usage_events: 1,
       })
 
       expect(messages.value[0].usage).toBeUndefined()
@@ -1208,9 +1301,44 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
         profile: 'default',
         llm_request_count: 5,
       })
+      expect(messages.value[1].usage).toMatchObject({
+        coverage_status: 'usage_unknown',
+        usage_unknown: true,
+        unknown_usage_events: 1,
+      })
       expect(messages.value[1].model).toBe('z-ai/glm-5.2')
       expect(messages.value[1].input_tokens).toBe(10)
       expect(messages.value[1].output_tokens).toBe(1)
+      expect(messages.value[1].turnId).toBe('goal-turn-1')
+      expect(messages.value[1].turnInputMode).toBe('system_event')
+      expect(messages.value[1].turnRunKind).toBe('goal')
+    } finally {
+      stop()
+    }
+  })
+
+  it('binds an aborted partial assistant to the terminal task identity', () => {
+    const { api, messages, stream, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'partial answer', ts: 'now' })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        task_id: 'stopped-turn-1',
+        reason: 'aborted',
+        text_snapshot: 'partial answer',
+      })
+
+      expect(stream.endStreaming).toHaveBeenLastCalledWith({ reason: 'aborted' })
+      expect(messages.value[0]).toMatchObject({
+        role: 'assistant',
+        text: 'partial answer',
+        turnId: 'stopped-turn-1',
+      })
     } finally {
       stop()
     }

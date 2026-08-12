@@ -2,7 +2,7 @@
   <section
     v-if="items.length > 0"
     class="chat-pending"
-    :aria-label="t('chat.pending.label', { count: items.length, max: maxPending })"
+    :aria-label="t('chat.pending.label', { count: items.length, max: effectiveMaxPending })"
   >
     <article
       v-for="(item, index) in items"
@@ -37,13 +37,13 @@
           @click="emit('steer', index)"
         >
           <span aria-hidden="true">↪</span>
-          <span>{{ item.deliveryState === 'retryable' ? t('chat.retry') : t('chat.steerMode') }}</span>
+          <span>{{ steerActionLabel(item) }}</span>
         </button>
         <button
           type="button"
           class="chat-pending-action chat-pending-action--icon"
-          :aria-label="t('chat.pending.removeMessage', { index: index + 1 })"
-          :title="t('chat.remove')"
+          :aria-label="removeLabel(item, index)"
+          :title="removeLabel(item, index)"
           :disabled="isSteering(item)"
           @click="emit('remove', index)"
         >
@@ -72,7 +72,7 @@
             <button
               type="button"
               role="menuitem"
-              :disabled="!!item.deliveryState"
+              :disabled="!!item.deliveryState || !!item.steerAttempt"
               @click="chooseEdit(index)"
             >
               <Icon name="pencil" :size="15" />
@@ -90,11 +90,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue'
+import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
-import type { Attachment } from '@/types/chat'
+import type { Attachment, PendingSteerAttempt } from '@/types/chat'
 import {
   hasSendableModelInputImageAttachment,
   isSendableAttachment,
@@ -109,6 +109,7 @@ interface PendingQueueItem {
   hiddenControl?: boolean
   attachments?: Attachment[]
   deliveryState?: 'steering' | 'retryable'
+  steerAttempt?: PendingSteerAttempt
 }
 
 type PendingSteerBlocker =
@@ -134,13 +135,45 @@ const emit = defineEmits<{
 }>()
 
 const openMenuIndex = ref<number | null>(null)
+const effectiveMaxPending = computed(() => (
+  props.maxPending + (
+    props.items.some(item => item.steerAttempt) || props.items.length > props.maxPending
+      ? 1
+      : 0
+  )
+))
 
 function displayText(item: PendingQueueItem): string {
   return item.displayTextOverride || item.text
 }
 
 function isSteering(item: PendingQueueItem): boolean {
-  return item.deliveryState === 'steering'
+  return item.deliveryState === 'steering' || item.steerAttempt?.phase === 'submitting'
+}
+
+function isSteerRetry(item: PendingQueueItem): boolean {
+  return item.steerAttempt?.phase === 'retryable_rejected'
+    || item.steerAttempt?.phase === 'acceptance_unknown'
+}
+
+function steerActionLabel(item: PendingQueueItem): string {
+  switch (item.steerAttempt?.phase) {
+    case 'submitting':
+      return t('chat.pending.steerSubmitting')
+    case 'retryable_rejected':
+      return t('chat.pending.steerRetryRejected')
+    case 'acceptance_unknown':
+      return t('chat.pending.steerRetryUnknown')
+    default:
+      return item.deliveryState === 'retryable' ? t('chat.retry') : t('chat.steerMode')
+  }
+}
+
+function removeLabel(item: PendingQueueItem, index: number): string {
+  if (item.steerAttempt?.phase === 'acceptance_unknown') {
+    return t('chat.pending.removeUnknownSteer', { index: index + 1 })
+  }
+  return t('chat.pending.removeMessage', { index: index + 1 })
 }
 
 function canShowSteer(item: PendingQueueItem): boolean {
@@ -167,9 +200,11 @@ function attachmentBlockMessage(item: PendingQueueItem): string {
 function pendingSteerBlocker(item: PendingQueueItem): PendingSteerBlocker | null {
   if (isControlInput(item.text)) return 'controlInput'
   if (item.attachments?.length) return 'attachment'
-  if (!props.steerAvailable && item.deliveryState !== 'retryable') return 'capability'
+  if (!props.steerAvailable && item.deliveryState !== 'retryable' && !isSteerRetry(item)) {
+    return 'capability'
+  }
   if (props.items.some(
-    candidate => candidate !== item && Boolean(candidate.deliveryState),
+    candidate => candidate !== item && Boolean(candidate.deliveryState || candidate.steerAttempt),
   )) return 'otherDelivery'
   if (isSteering(item)) return 'steering'
   return null
@@ -192,9 +227,13 @@ function steerTitle(item: PendingQueueItem): string {
     case 'steering':
       return t('chat.pending.steerUnavailable.steeringInProgress')
     default:
-      return item.deliveryState === 'retryable'
-        ? t('chat.retry')
-        : t('chat.pending.steerHint')
+      if (item.steerAttempt?.phase === 'retryable_rejected') {
+        return t('chat.pending.steerRetryRejectedHint')
+      }
+      if (item.steerAttempt?.phase === 'acceptance_unknown') {
+        return t('chat.pending.steerRetryUnknownHint')
+      }
+      return item.deliveryState === 'retryable' ? t('chat.retry') : t('chat.pending.steerHint')
   }
 }
 
@@ -209,7 +248,7 @@ function toggleMenu(index: number) {
 
 function chooseEdit(index: number) {
   openMenuIndex.value = null
-  if (props.items[index]?.deliveryState) return
+  if (props.items[index]?.deliveryState || props.items[index]?.steerAttempt) return
   emit('edit', index)
 }
 

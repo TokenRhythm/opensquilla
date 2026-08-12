@@ -71,8 +71,7 @@
         </form>
         <span
           v-if="metaText && !editing"
-          class="goal-ribbon__meta"
-          :class="{ 'goal-ribbon__meta--visible': showMetaInline }"
+          class="goal-ribbon__meta goal-ribbon__meta--visible"
         >
           {{ metaText }}
         </span>
@@ -312,13 +311,6 @@ const progressSummary = computed(() => {
   const completed = steps.filter(step => step.status === 'completed').length
   return t('chat.goal.progressSummary', { completed, total: steps.length })
 })
-
-const showMetaInline = computed(() => (
-  objectiveExpanded.value
-  || props.goal.status !== 'active'
-  || props.goal.continuationDeferredReason !== null
-  || props.planModeActive === true
-))
 
 function beginEdit() {
   closeMenu()

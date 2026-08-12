@@ -168,7 +168,7 @@
       'main--tabbar-hidden': mobileKeyboardOpen,
     }"
   >
-    <header class="topbar" :class="{ 'topbar--chat': isChatRoute }">
+    <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }">
       <div class="topbar-left">
         <!-- Sidebar toggle — visible when sidebar is collapsed -->
         <button
@@ -201,28 +201,44 @@
         class="topbar-right"
         :class="{ 'topbar-right--attention': appStore.approvalCount > 0 }"
       >
-        <button
-          v-if="appStore.approvalCount > 0"
-          class="approval-inline"
-          @click="openBlockedApprovalSession"
-          :title="t('chrome.openBlockedSession')"
-        >
-          {{ t('chrome.approvalRequired') }}
-        </button>
-        <button
-          v-if="webConfigEnabled"
-          type="button"
-          class="conn-pill conn-pill--link"
-          :class="rpcStore.state"
-          :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
-          :aria-label="t('chrome.manageConnection')"
-          @click="openConnectionSettings"
-        >{{ connectionStateLabel }}</button>
-        <span v-else class="conn-pill" :class="rpcStore.state">{{ connectionStateLabel }}</span>
-        <DesktopUpdateIndicator />
+        <ChatSystemStatus
+          v-if="isChatRoute"
+          :layout="systemHeaderLayout"
+          :connection-state="rpcStore.state"
+          :connection-label="connectionStateLabel"
+          :approval-count="appStore.approvalCount"
+          :can-manage-connection="webConfigEnabled"
+          @open-connection="openConnectionSettings"
+          @open-approval="openBlockedApprovalSession"
+          @open-update="openDesktopRuntimeSettings"
+        />
+        <template v-else>
+          <button
+            v-if="appStore.approvalCount > 0"
+            class="approval-inline"
+            @click="openBlockedApprovalSession"
+            :title="t('chrome.openBlockedSession')"
+          >
+            {{ t('chrome.approvalRequired') }}
+          </button>
+          <button
+            v-if="webConfigEnabled"
+            type="button"
+            class="conn-pill conn-pill--link"
+            :class="rpcStore.state"
+            :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
+            :aria-label="t('chrome.manageConnection')"
+            @click="openConnectionSettings"
+          >{{ connectionStateLabel }}</button>
+          <span v-else class="conn-pill" :class="rpcStore.state">{{ connectionStateLabel }}</span>
+          <DesktopUpdateIndicator />
+        </template>
         <!-- Opt-in (Settings → Appearance or the command palette); off by
              default so the topbar stays music-free until asked for. -->
-        <BgmControl v-if="bgmEnabled" />
+        <BgmControl
+          v-if="bgmEnabled"
+          :presentation="isChatRoute && systemHeaderLayout !== 'wide' ? 'pause-only' : 'full'"
+        />
         <LanguageSwitcher />
         <div class="theme-menu-wrap">
           <button
@@ -236,7 +252,13 @@
           >
             <Icon :name="themeIconName" :size="16" />
           </button>
-          <div v-if="themeMenuOpen" class="theme-menu" role="menu" :aria-label="t('chrome.theme')">
+          <div
+            v-if="themeMenuOpen"
+            class="theme-menu"
+            role="menu"
+            :aria-label="t('chrome.theme')"
+            data-chat-topbar-popover="theme"
+          >
             <button
               v-for="opt in themeOptions"
               :key="opt.mode"
@@ -420,6 +442,7 @@ import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.
 import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
+import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarSetupBanner from './components/SidebarSetupBanner.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
@@ -429,9 +452,15 @@ import BgmControl from './components/BgmControl.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import { useBgm } from './composables/useBgm'
+import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
+import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
-import { useDialogLayer } from './composables/useDialogA11y'
+import { hasOpenDialogLayer, useDialogLayer } from './composables/useDialogA11y'
+import {
+  provideChatTopbarPopoverCoordinator,
+  useChatTopbarPopoverCoordination,
+} from './composables/useChatTopbarPopoverCoordinator'
 import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
 import { useAgentOptions } from './composables/useAgentOptions'
 import { useSessionListSubscription } from './composables/useSessionListSubscription'
@@ -474,9 +503,14 @@ const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
+// Chat-only transient chrome is coordinated independently from every modal and
+// from the non-chat topbar. The local menu refs remain authoritative elsewhere.
+const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const chatTopbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(isChatRoute)
 const sidebarRef = ref<HTMLElement | null>(null)
 const sidebarDockToggleRef = ref<HTMLButtonElement | null>(null)
 const topbarSidebarToggleRef = ref<HTMLButtonElement | null>(null)
+const topbarRef = ref<HTMLElement | null>(null)
 type SidebarResizerHandle = { cancel: () => boolean }
 const sidebarResizerRef = ref<SidebarResizerHandle | null>(null)
 
@@ -561,6 +595,7 @@ watch(
 // Feature-gated topbar music control; the singleton `enabled` ref is written by
 // Settings → Appearance and the command palette.
 const { enabled: bgmEnabled } = useBgm()
+const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
 interface AppCronRunFinishedPayload {
@@ -664,7 +699,12 @@ const themeIconName = computed(() => {
 })
 
 const themeMenuOpen = ref(false)
-useDialogLayer(themeMenuOpen)
+useChatTopbarPopoverCoordination(
+  'theme',
+  themeMenuOpen,
+  chatTopbarPopoverCoordinator,
+)
+const themeMenuIsTopmost = useDialogLayer(themeMenuOpen)
 const themeButtonRef = ref<HTMLButtonElement | null>(null)
 
 // The compact topbar menu deliberately lists only the basic modes (Light / Dark
@@ -727,7 +767,17 @@ watch(currentSessionKey, markCurrentSessionReadIfVisible, {
 })
 
 // Chat layout applies to both the session view and the draft route.
-const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const systemHeaderPressureCount = computed(() => (
+  Number(rpcStore.state !== 'connected')
+  + Number(appStore.approvalCount > 0)
+  + Number(desktopUpdate.visible.value)
+  + Number(bgmEnabled.value)
+))
+const systemHeaderLayout = useSystemHeaderLayout({
+  target: topbarRef,
+  active: isChatRoute,
+  pressureCount: systemHeaderPressureCount,
+})
 const activeProjectDraftId = computed(() =>
   $route.path === '/chat/new' ? String($route.query.project || '') : '',
 )
@@ -1537,6 +1587,12 @@ function openConnectionSettings() {
   router.push('/settings/connection')
 }
 
+// Compact chat headers hand off to the complete Desktop update workflow rather
+// than recreating update actions inside the status summary.
+function openDesktopRuntimeSettings() {
+  router.push('/settings/runtime')
+}
+
 function scheduleSessionRefresh() {
   sidebarRefreshPending = true
   if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
@@ -1678,21 +1734,24 @@ function handleKeydown(e: KeyboardEvent) {
   // consumed the key: the composer textarea (@keydown, target phase) and any
   // earlier-registered document listener (e.g. ChatView). Overlays (drawers,
   // modals) attach their document listeners on open — AFTER this one — so they
-  // run later and are NOT covered by this guard; their collision with the
-  // sidebar-Escape branch is ruled out by the mobile-only gate below instead.
+  // run later and are covered separately by the shared dialog-layer guard.
   if (e.defaultPrevented) return
 
-  if (e.key === 'Escape' && themeMenuOpen.value) {
+  if (e.key === 'Escape' && themeMenuOpen.value && themeMenuIsTopmost.value) {
+    e.preventDefault()
     themeMenuOpen.value = false
     themeButtonRef.value?.focus()
     return
   }
+  // Child topbar controls and routed dialogs install their Escape handlers
+  // after App's listener. Let the current dialog-stack owner handle the key
+  // instead of pre-emptively collapsing the mobile sidebar beneath it.
+  if (e.key === 'Escape' && hasOpenDialogLayer()) return
   // Escape dismisses the sidebar only as the mobile slide-over. On desktop the
   // sidebar is a persistent dock toggled by its own button, so it must never
   // collapse as a side effect of an Escape meant for an overlay opened on top of
-  // it. Because those overlays run after this handler (see above), this
-  // mobile-only gate — not the defaultPrevented check — is what prevents that
-  // collision; keep it. The settings overlay owns Escape while open and is excluded.
+  // it. The shared dialog-layer guard above handles that ordering collision;
+  // this branch remains mobile-only because desktop uses a persistent dock.
   if (e.key === 'Escape' && appStore.sidebarOpen && !settingsOverlayOpen.value && isSidebarDrawer.value) {
     closeSidebarDrawer()
   }

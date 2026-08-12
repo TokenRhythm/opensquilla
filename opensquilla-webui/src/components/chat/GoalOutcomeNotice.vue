@@ -38,9 +38,18 @@ const props = withDefaults(defineProps<{
 
 const { t } = useI18n()
 
-const titleText = computed(() => props.inline
-  ? t('chat.goal.achievedIn', { duration: props.elapsed || '0s' })
-  : t('chat.goal.completeTitle'))
+const titleText = computed(() => {
+  if (!props.inline) return t('chat.goal.completeTitle')
+
+  const parts = [t('chat.goal.achieved')]
+  if (props.goal.turnsSettled > 0) {
+    parts.push(t('chat.goal.turns', { turns: props.goal.turnsSettled }))
+  }
+  if (props.goal.usage.totalTokens > 0) {
+    parts.push(t('chat.goal.tokens', { tokens: props.goal.usage.totalTokens.toLocaleString() }))
+  }
+  return parts.join(' · ')
+})
 
 const metaText = computed(() => {
   const parts: string[] = []

@@ -1,6 +1,7 @@
 import { expect, test, type Page } from '@playwright/test'
 
 import { startRealGoalGateway } from './real-goal-gateway'
+import { test as isolatedGatewayTest } from './real-gateway.fixture'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-goal-mode'
@@ -853,4 +854,372 @@ test('Goal lifecycle controls preserve the current Task and serialize later cont
   } finally {
     await gateway.stop()
   }
+})
+
+isolatedGatewayTest.describe('Goal silent-reply normalization through an isolated real Gateway', () => {
+  isolatedGatewayTest.use({ isolatedRealGatewayScenario: 'silent-reply' })
+
+  isolatedGatewayTest('keeps protocol sentinels out of live, done, and hydrated UI', async ({
+    page,
+    isolatedRealGateway,
+  }) => {
+    isolatedGatewayTest.setTimeout(120_000)
+    const initialReply = 'The initial Goal turn completed normally.'
+    const mixedBody = 'The deterministic silent-reply body is visible.'
+    const formattedBody = 'The formatted heartbeat body is visible.'
+    type RpcFrame = Record<string, unknown> & { direction: 'sent' | 'received' }
+    const frames: RpcFrame[] = []
+    const socketUrls: string[] = []
+    page.on('websocket', socket => {
+      socketUrls.push(socket.url())
+      socket.on('framesent', ({ payload }) => {
+        try {
+          frames.push({
+            ...(JSON.parse(String(payload)) as Record<string, unknown>),
+            direction: 'sent',
+          })
+        } catch {
+          // Binary/non-JSON frames are outside the RPC contract under test.
+        }
+      })
+      socket.on('framereceived', ({ payload }) => {
+        try {
+          frames.push({
+            ...(JSON.parse(String(payload)) as Record<string, unknown>),
+            direction: 'received',
+          })
+        } catch {
+          // Binary/non-JSON frames are outside the RPC contract under test.
+        }
+      })
+    })
+    const sentRequests = (method: string) => frames.filter(frame => (
+      frame.direction === 'sent' && frame.type === 'req' && frame.method === method
+    ))
+    const responseAfter = (request: RpcFrame) => {
+      const index = frames.indexOf(request)
+      return frames.slice(index + 1).find(frame => (
+        frame.direction === 'received'
+        && frame.type === 'res'
+        && frame.id === request.id
+      ))
+    }
+    const eventPayloads = (event: string) => frames.flatMap(frame => {
+      if (
+        frame.direction !== 'received'
+        || frame.type !== 'event'
+        || frame.event !== event
+        || !frame.payload
+        || typeof frame.payload !== 'object'
+      ) return []
+      return [frame.payload as Record<string, unknown>]
+    })
+    const providerCallNumbers = async () => (
+      (await isolatedRealGateway.readProviderCalls()).map(call => call.callNumber)
+    )
+    const providerWaitingCalls = async () => (
+      (await isolatedRealGateway.readProviderEvents())
+        .filter(event => event.event === 'provider.waiting')
+        .map(event => event.callNumber)
+    )
+    const assertNoProtocolText = async () => {
+      await expect(page.locator('.chat-thread')).not.toContainText('NO_REPLY')
+      await expect(page.locator('.chat-thread')).not.toContainText('HEARTBEAT_OK')
+    }
+    const eventFrameIndex = (
+      event: string,
+      predicate: (payload: Record<string, unknown>) => boolean,
+      startAt = 0,
+    ) => frames.findIndex((frame, index) => {
+      if (
+        index < startAt
+        || frame.direction !== 'received'
+        || frame.type !== 'event'
+        || frame.event !== event
+        || !frame.payload
+        || typeof frame.payload !== 'object'
+      ) return false
+      return predicate(frame.payload as Record<string, unknown>)
+    })
+    const assertCanonicalHistoryPayload = (payload: unknown) => {
+      const serialized = JSON.stringify(payload)
+      expect(serialized).not.toMatch(/NO_REPLY|HEARTBEAT_OK/)
+      const historyMessages = (
+        payload
+        && typeof payload === 'object'
+        && Array.isArray((payload as { messages?: unknown }).messages)
+      ) ? (payload as { messages: Array<Record<string, unknown>> }).messages : []
+      expect(historyMessages.filter(message => message.text === initialReply)).toHaveLength(1)
+      expect(historyMessages.filter(message => message.text === mixedBody)).toHaveLength(1)
+      expect(historyMessages.filter(message => message.text === formattedBody)).toHaveLength(1)
+    }
+    const assertVisibleTurnReceipt = async (
+      body: string,
+      inputTokens: number,
+      outputTokens: number,
+    ) => {
+      const message = page.locator('.msg-ai').filter({ hasText: body })
+      await expect(message).toHaveCount(1)
+      await expect(message.locator('.msg-meta__more-btn')).toHaveCount(0)
+      const receipt = message.getByTestId('assistant-activity')
+      await expect(receipt).toHaveCount(1)
+      const trigger = receipt.locator('.assistant-activity__summary')
+      if (await trigger.getAttribute('aria-expanded') !== 'true') await trigger.click()
+      await expect(trigger).toHaveAttribute('aria-expanded', 'true')
+      const usage = receipt.locator('[data-turn-usage-details]')
+      await expect(usage).toBeVisible()
+      await expect(usage).toContainText('qwen3:4b')
+      await expect(usage).toContainText(`↑${inputTokens} ↓${outputTokens}`)
+    }
+
+    await page.goto(`${isolatedRealGateway.controlUrl}chat/new`)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    expect(socketUrls).toContain(
+      isolatedRealGateway.webuiOrigin.replace(/^http:/, 'ws:') + '/ws',
+    )
+    expect(socketUrls).not.toContain(isolatedRealGateway.wsUrl)
+
+    const composer = page.locator('.chat-textarea')
+    await expect(composer).toBeEditable({ timeout: 15_000 })
+    await composer.fill('/goal')
+    await expect(page.locator('.chat-slash-item').filter({ hasText: '/goal' }))
+      .toBeVisible({ timeout: 15_000 })
+    await composer.fill(`/goal ${OBJECTIVE}`)
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+
+    // Call 1 is ordinary Goal-set ingress. Call 2 is the first automatic
+    // system event and is held after its raw mixed provider delta, before Done.
+    await expect.poll(providerCallNumbers, { timeout: 30_000 }).toEqual([1, 2])
+    await expect.poll(providerWaitingCalls).toEqual([2])
+    await expect(page.locator('.goal-ribbon')).toBeVisible()
+    await expect(page.locator('.msg-ai').filter({ hasText: initialReply })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(0)
+    await assertNoProtocolText()
+    // Buffered internal text is not released until it has been normalized at
+    // Done, so neither the raw marker nor the body appears as a premature delta.
+    expect(eventPayloads('session.event.text_delta').map(payload => payload.text))
+      .not.toContain(expect.stringContaining('NO_REPLY'))
+
+    await isolatedRealGateway.releaseFirstTask()
+
+    // Call 2 settles as canonical mixed text; call 3 is pure NO_REPLY and
+    // suppressed; call 4 keeps a body after a formatted HEARTBEAT_OK line;
+    // call 5 then waits before update_goal so this state is reloadable.
+    await expect.poll(providerCallNumbers, { timeout: 30_000 })
+      .toEqual([1, 2, 3, 4, 5])
+    await expect.poll(providerWaitingCalls).toEqual([2, 5])
+    await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: formattedBody })).toHaveCount(1)
+    await assertNoProtocolText()
+
+    // The pure NO_REPLY turn (call 3) is accounted for by the Goal ledger but
+    // creates no ghost bubble. Every visible turn exposes its own settled usage
+    // through the shared completion receipt, never through the legacy footer.
+    await expect(page.locator('.chat-message-surface .msg-ai')).toHaveCount(3)
+    await assertVisibleTurnReceipt(initialReply, 12, 4)
+    await assertVisibleTurnReceipt(mixedBody, 11, 5)
+    await assertVisibleTurnReceipt(formattedBody, 10, 4)
+
+    const donePayloads = eventPayloads('session.event.done')
+    expect(donePayloads).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        delivery: 'visible',
+        suppression_reason: null,
+        text: mixedBody,
+        text_snapshot: mixedBody,
+        input_mode: 'system_event',
+        run_kind: 'goal',
+      }),
+      expect.objectContaining({
+        delivery: 'suppressed',
+        suppression_reason: 'no_reply',
+        text: '',
+        text_snapshot: '',
+        input_mode: 'system_event',
+        run_kind: 'goal',
+      }),
+      expect.objectContaining({
+        delivery: 'visible',
+        suppression_reason: null,
+        text: formattedBody,
+        text_snapshot: formattedBody,
+        input_mode: 'system_event',
+        run_kind: 'goal',
+      }),
+    ]))
+    for (const payload of eventPayloads('session.event.text_delta')) {
+      expect(String(payload.text || '')).not.toMatch(/NO_REPLY|HEARTBEAT_OK/)
+    }
+    const mixedDeltaIndex = eventFrameIndex(
+      'session.event.text_delta',
+      payload => String(payload.text || '').includes(mixedBody),
+    )
+    const mixedDoneIndex = eventFrameIndex(
+      'session.event.done',
+      payload => payload.text_snapshot === mixedBody,
+      mixedDeltaIndex + 1,
+    )
+    const formattedDeltaIndex = eventFrameIndex(
+      'session.event.text_delta',
+      payload => String(payload.text || '').includes(formattedBody),
+    )
+    const formattedDoneIndex = eventFrameIndex(
+      'session.event.done',
+      payload => payload.text_snapshot === formattedBody,
+      formattedDeltaIndex + 1,
+    )
+    expect(mixedDeltaIndex).toBeGreaterThanOrEqual(0)
+    expect(mixedDoneIndex).toBeGreaterThan(mixedDeltaIndex)
+    expect(formattedDeltaIndex).toBeGreaterThanOrEqual(0)
+    expect(formattedDoneIndex).toBeGreaterThan(formattedDeltaIndex)
+
+    const callsBeforeCompletion = await isolatedRealGateway.readProviderCalls()
+    expect(callsBeforeCompletion[1]).toMatchObject({
+      callNumber: 2,
+      requestHasInternalContinuation: true,
+    })
+    expect(callsBeforeCompletion[4]).toMatchObject({
+      callNumber: 5,
+      historyHasSilentSentinel: false,
+      silentVisibleBodyInAssistantHistory: true,
+    })
+
+    // A new real socket hydrates the SQLite transcript while call 5 remains
+    // gated. Canonical bodies render once and neither suppressed turn grows a
+    // ghost assistant row.
+    const hydrateCountBeforeReload = sentRequests('sessions.messages.hydrate').length
+    const historyCountBeforeReload = sentRequests('chat.history').length
+    const socketCountBeforeReload = socketUrls.length
+    await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect.poll(() => socketUrls.length, { timeout: 15_000 })
+      .toBeGreaterThan(socketCountBeforeReload)
+    await expect.poll(
+      () => sentRequests('sessions.messages.hydrate').length,
+      { timeout: 15_000 },
+    ).toBeGreaterThan(hydrateCountBeforeReload)
+    await expect.poll(
+      () => sentRequests('chat.history').length,
+      { timeout: 15_000 },
+    ).toBeGreaterThan(historyCountBeforeReload)
+    const hydrateRequest = sentRequests('sessions.messages.hydrate').at(-1)!
+    await expect.poll(() => Boolean(responseAfter(hydrateRequest)), { timeout: 15_000 })
+      .toBe(true)
+    expect(responseAfter(hydrateRequest)?.payload).toMatchObject({
+      hydration_complete: true,
+    })
+    expect(JSON.stringify(responseAfter(hydrateRequest)?.payload))
+      .not.toMatch(/NO_REPLY|HEARTBEAT_OK/)
+    const historyRequest = sentRequests('chat.history').at(-1)!
+    await expect.poll(() => Boolean(responseAfter(historyRequest)), { timeout: 15_000 })
+      .toBe(true)
+    assertCanonicalHistoryPayload(responseAfter(historyRequest)?.payload)
+    await expect(page.locator('.msg-ai').filter({ hasText: initialReply })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: formattedBody })).toHaveCount(1)
+    await expect(page.locator('.chat-message-surface .msg-ai')).toHaveCount(3)
+    await assertVisibleTurnReceipt(initialReply, 12, 4)
+    await assertVisibleTurnReceipt(mixedBody, 11, 5)
+    await assertVisibleTurnReceipt(formattedBody, 10, 4)
+    await assertNoProtocolText()
+
+    await isolatedRealGateway.releaseSecondTask()
+    await expect.poll(providerCallNumbers, { timeout: 30_000 })
+      .toEqual([1, 2, 3, 4, 5, 6])
+    await expect(page.locator('.goal-ribbon')).toHaveCount(0, { timeout: 30_000 })
+    const outcome = page.locator('.goal-outcome').last()
+    await expect(outcome).toBeVisible({ timeout: 30_000 })
+    await expect(outcome).toContainText('Goal achieved')
+    await assertNoProtocolText()
+    await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: formattedBody })).toHaveCount(1)
+
+    await expect.poll(() => eventPayloads('session.event.done').some(payload => (
+      payload.delivery === 'suppressed'
+      && payload.suppression_reason === 'heartbeat_ack'
+      && payload.text === ''
+      && payload.text_snapshot === ''
+    )), { timeout: 15_000 }).toBe(true)
+    let terminalGoal: Record<string, unknown> | null = null
+    await expect.poll(() => {
+      terminalGoal = eventPayloads('session.event.goal')
+        .map(payload => payload.goal)
+        .filter((goal): goal is Record<string, unknown> => (
+          Boolean(goal) && typeof goal === 'object'
+        ))
+        .filter(goal => goal.status === 'complete')
+        .at(-1) ?? null
+      return Boolean(terminalGoal)
+    }, { timeout: 15_000 }).toBe(true)
+    expect(terminalGoal?.objective).toBe(OBJECTIVE)
+    const terminalUsage = terminalGoal?.usage as Record<string, unknown> | undefined
+    const terminalTurns = Number(
+      terminalGoal?.turnsSettled ?? terminalGoal?.turns_settled ?? 0,
+    )
+    const terminalTokens = Number(
+      terminalUsage?.totalTokens ?? terminalUsage?.total_tokens ?? 0,
+    )
+    const uniqueDoneByTask = new Map<string, Record<string, unknown>>()
+    for (const payload of eventPayloads('session.event.done')) {
+      const taskId = String(payload.task_id ?? payload.taskId ?? '')
+      expect(taskId).not.toBe('')
+      uniqueDoneByTask.set(taskId, payload)
+    }
+    const allSettledProviderTokens = [...uniqueDoneByTask.values()].reduce(
+      (sum, payload) => sum
+        + Number(payload.input_tokens ?? payload.inputTokens ?? 0)
+        + Number(payload.output_tokens ?? payload.outputTokens ?? 0),
+      0,
+    )
+    expect(terminalTurns).toBeGreaterThan(0)
+    expect(terminalTokens).toBe(allSettledProviderTokens)
+    // The visible text receipts account for 46 tokens. The larger Goal total
+    // proves that suppressed and tool-only work remains in the billing ledger.
+    expect(terminalTokens).toBeGreaterThan(46)
+    await expect(outcome).toContainText(`${terminalTurns} turns`)
+    await expect(outcome).toContainText(`${terminalTokens} tokens`)
+
+    const completedCalls = await isolatedRealGateway.readProviderCalls()
+    expect(completedCalls[5]).toMatchObject({
+      callNumber: 6,
+      toolNames: [],
+      historyHasSilentSentinel: false,
+      silentVisibleBodyInAssistantHistory: true,
+    })
+
+    // Terminal refresh exercises the persisted fallback Goal outcome as well
+    // as the sanitized transcript one final time.
+    const finalHydrateCount = sentRequests('sessions.messages.hydrate').length
+    const finalHistoryCount = sentRequests('chat.history').length
+    const finalSocketCount = socketUrls.length
+    await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 15_000 })
+    await expect.poll(() => socketUrls.length, { timeout: 15_000 })
+      .toBeGreaterThan(finalSocketCount)
+    await expect.poll(() => sentRequests('sessions.messages.hydrate').length, {
+      timeout: 15_000,
+    }).toBeGreaterThan(finalHydrateCount)
+    await expect.poll(() => sentRequests('chat.history').length, { timeout: 15_000 })
+      .toBeGreaterThan(finalHistoryCount)
+    const terminalHydrateRequest = sentRequests('sessions.messages.hydrate').at(-1)!
+    const terminalHistoryRequest = sentRequests('chat.history').at(-1)!
+    await expect.poll(
+      () => Boolean(responseAfter(terminalHydrateRequest)),
+      { timeout: 15_000 },
+    ).toBe(true)
+    await expect.poll(
+      () => Boolean(responseAfter(terminalHistoryRequest)),
+      { timeout: 15_000 },
+    ).toBe(true)
+    expect(JSON.stringify(responseAfter(terminalHydrateRequest)?.payload))
+      .not.toMatch(/NO_REPLY|HEARTBEAT_OK/)
+    assertCanonicalHistoryPayload(responseAfter(terminalHistoryRequest)?.payload)
+    await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(1)
+    await expect(page.locator('.msg-ai').filter({ hasText: formattedBody })).toHaveCount(1)
+    const hydratedOutcome = page.locator('.goal-outcome').last()
+    await expect(hydratedOutcome).toBeVisible({ timeout: 15_000 })
+    await expect(hydratedOutcome).toContainText(`${terminalTurns} turns`)
+    await expect(hydratedOutcome).toContainText(`${terminalTokens} tokens`)
+    await assertNoProtocolText()
+  })
 })

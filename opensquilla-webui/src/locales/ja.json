@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "サイドバーの折りたたみをキャンセルしました",
     "openBlockedSession": "ブロックされたセッションを開く",
     "approvalRequired": "承認が必要です",
+    "approvalRequiredCount": "承認が必要: {count} 件",
+    "systemStatus": "システム状態",
+    "systemStatusSummary": "システム状態: {state}、通知 {count} 件",
     "manageConnection": "ゲートウェイ接続を管理",
     "connectionTitle": "接続: {state} — 設定で管理",
     "connectionState": {
@@ -3637,6 +3640,7 @@
       "pausedTitle": "目標を一時停止中",
       "completeTitle": "目標完了",
       "sentAsGoal": "目標として送信",
+      "achieved": "目標を達成",
       "achievedIn": "目標を達成 · 稼働時間 {duration}",
       "blockedTitle": "目標がブロックされました",
       "usageLimitedTitle": "目標の使用量が制限されました",
@@ -3736,6 +3740,12 @@
       "label": "保留中 {count}/{max}",
       "hint": "Alt+↑ で最新のものを入力欄に戻す · ESC ですべて入力欄に戻す · 現在の応答が完了すると FIFO で送信",
       "steerHint": "誘導モード: 新しいテキストは現在のタスクを停止せず、次の安全な境界で適用されます。キュー済みメッセージはターン後に送信されます",
+      "steerSubmitting": "誘導を送信中…",
+      "steerRetryRejected": "未送信 · 再試行",
+      "steerRetryUnknown": "配信状態不明 · 再試行を確認",
+      "steerRetryRejectedHint": "ゲートウェイはこの誘導を受け付けませんでした。再試行すると元のリクエストをそのまま再送します。",
+      "steerRetryUnknownHint": "OpenSquilla はこの誘導が受け付けられたか確認できませんでした。再試行すると元のリクエストを変更せず安全に再送します。",
+      "removeUnknownSteer": "保留中メッセージ {index} のこの端末での再試行を破棄します。サーバーが未受信という意味ではありません",
       "queueHint": "キューモード: これらのメッセージは現在の応答が完了すると順番に自動送信されます",
       "clearAll": "すべてクリア",
       "editMessage": "メッセージを編集",
@@ -3945,7 +3955,12 @@
       "saved": "節約",
       "fallback": "フォールバック",
       "fallbackUsed": "使用",
-      "ensembleModelsAria": "アンサンブルモデル"
+      "ensembleRequests": "{count} リクエスト",
+      "ensembleModelsAria": "アンサンブルモデル",
+      "coverage": "集計範囲",
+      "usageIncompleteSubtotal": "不完全 · 表示値は判明分の小計",
+      "usageIncompleteUnknown": "不完全 · 正確な使用量合計は不明",
+      "unknownProviderCalls": "{count} 件のプロバイダー呼び出しの使用量が不明"
     },
     "modelRouting": {
       "updateFailed": "モデルルーティングを切り替えられませんでした。元に戻しました。ゲートウェイ接続を確認して再試行してください。"

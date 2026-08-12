@@ -135,6 +135,12 @@ export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): Cha
     if (prev.turnId) merged.turnId = prev.turnId
   }
   if (!server.turnOutcome && prev.turnOutcome) merged.turnOutcome = prev.turnOutcome
+  if (!server.turnInputMode && prev.turnInputMode) {
+    merged.turnInputMode = prev.turnInputMode
+  }
+  if (!server.turnRunKind && prev.turnRunKind) {
+    merged.turnRunKind = prev.turnRunKind
+  }
   if (!server.steerClientRequestId && prev.steerClientRequestId) {
     merged.steerClientRequestId = prev.steerClientRequestId
   }
@@ -261,6 +267,52 @@ function reconcileOptimisticTurnFields(
     const serverAssistant = merged[incomingAssistantIndex]
     merged[incomingAssistantIndex] = mergeLiveOnlyFields(previousAssistant, serverAssistant)
     consumedOptimisticRows?.add(previousAssistant)
+  })
+
+  // Automatic Goal/heartbeat turns have no durable user row of their own, so
+  // the user-owned turn heuristic above cannot associate their completed live
+  // assistant with the canonical history row. Done and history both carry the
+  // same server-issued turn id: use that identity plus exact role/text, but
+  // only for a unique one-to-one match. The uniqueness fence deliberately
+  // keeps repeated same-text rows within one turn rather than guessing, while
+  // distinct turn ids remain independent even when their text is identical.
+  const optimisticBySignature = new Map<string, ChatMessage[]>()
+  const incomingSignatureCounts = new Map<string, number>()
+  const assistantSignature = (message: ChatMessage): string | null => {
+    if (message.role !== 'assistant' || !message.turnId) return null
+    return `${message.turnId}\u0000${message.role}\u0000${message.text}`
+  }
+
+  for (const message of prev) {
+    if (
+      message.messageId
+      || message.restoredFromHistory === true
+      || consumedOptimisticRows?.has(message)
+    ) continue
+    const signature = assistantSignature(message)
+    if (!signature) continue
+    const candidates = optimisticBySignature.get(signature) ?? []
+    candidates.push(message)
+    optimisticBySignature.set(signature, candidates)
+  }
+  for (const message of incoming) {
+    if (!message.messageId || message.restoredFromHistory !== true) continue
+    const signature = assistantSignature(message)
+    if (!signature) continue
+    incomingSignatureCounts.set(
+      signature,
+      (incomingSignatureCounts.get(signature) ?? 0) + 1,
+    )
+  }
+  incoming.forEach((message, index) => {
+    if (!message.messageId || message.restoredFromHistory !== true) return
+    const signature = assistantSignature(message)
+    if (!signature || incomingSignatureCounts.get(signature) !== 1) return
+    const candidates = optimisticBySignature.get(signature) ?? []
+    if (candidates.length !== 1) return
+    const optimistic = candidates[0]
+    merged[index] = mergeLiveOnlyFields(optimistic, merged[index])
+    consumedOptimisticRows?.add(optimistic)
   })
 
   return merged

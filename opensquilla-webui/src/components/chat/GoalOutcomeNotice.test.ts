@@ -10,7 +10,7 @@ import GoalOutcomeNotice from './GoalOutcomeNotice.vue'
 const apps: ReturnType<typeof createApp>[] = []
 const i18n = createI18n({ legacy: false, locale: 'en', messages: { en } })
 
-function completedGoal(): GoalSnapshot {
+function completedGoal(overrides: Partial<GoalSnapshot> = {}): GoalSnapshot {
   return {
     goalId: 'goal-complete',
     sessionKey: 'agent:main:webchat:test',
@@ -45,6 +45,7 @@ function completedGoal(): GoalSnapshot {
     createdAt: 1,
     updatedAt: 2,
     finishedAt: 2,
+    ...overrides,
   }
 }
 
@@ -82,8 +83,34 @@ describe('GoalOutcomeNotice', () => {
   it('uses the compact achieved label when embedded in the assistant footer', () => {
     const host = mountNotice({ inline: true })
 
-    expect(host.textContent).toContain('Goal achieved · 1m 03s active')
+    expect(host.textContent).toContain(
+      'Goal achieved · 2 turns · 15 tokens',
+    )
+    expect(host.textContent).not.toContain('1m 03s active')
     expect(host.querySelector('.goal-outcome--inline')).not.toBeNull()
     expect(host.querySelector('button')).toBeNull()
+  })
+
+  it('omits zero accounting values from the inline achieved label', () => {
+    const host = mountNotice({
+      inline: true,
+      goal: completedGoal({
+        turnsStarted: 0,
+        turnsSettled: 0,
+        usage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          totalTokens: 0,
+        },
+      }),
+    })
+
+    expect(host.textContent).toContain('Goal achieved')
+    expect(host.textContent).not.toContain('1m 03s active')
+    expect(host.textContent).not.toContain('turns')
+    expect(host.textContent).not.toContain('tokens')
   })
 })

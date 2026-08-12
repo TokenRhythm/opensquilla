@@ -336,6 +336,66 @@ async def test_terminal_projection_waits_for_authoritative_task_persistence() ->
 
 
 @pytest.mark.asyncio
+async def test_terminal_handoff_keeps_session_queued_without_idle_projection() -> None:
+    session = _make_session(status=SessionStatus.RUNNING)
+    manager = _SessionManager(session)
+    events: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emit(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        events.append((session_key, event_name, payload))
+
+    listener = _make_task_session_lifecycle_listener(
+        session_manager=manager,
+        event_emitter=_emit,
+    )
+
+    await listener(
+        TaskLifecycleEvent(
+            phase="terminal",
+            session_key=session.session_key,
+            task_id="task-old",
+            task_status=AgentTaskStatus.SUCCEEDED,
+            run_kind="default",
+            terminal_reason="completed",
+            continuation_task_id="task-next",
+        )
+    )
+
+    assert session.status == SessionStatus.RUNNING
+    assert session.ended_at is None
+    assert session.runtime_ms is None
+    assert manager.update_calls == [
+        (
+            session.session_key,
+            {
+                "status": SessionStatus.RUNNING,
+                "ended_at": None,
+                "runtime_ms": None,
+            },
+        )
+    ]
+    assert events == [
+        (
+            session.session_key,
+            "sessions.changed",
+            {
+                "schema_version": 1,
+                "key": session.session_key,
+                "reason": "task_terminal",
+                "status": "running",
+                "run_status": "queued",
+                "last_task": {
+                    "task_id": "task-old",
+                    "status": "succeeded",
+                    "terminal_reason": "completed",
+                },
+                "active_task": {"task_id": "task-next", "status": "queued"},
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_task_running_broadcasts_change_for_already_running_session() -> None:
     session = _make_session(status=SessionStatus.RUNNING)
     manager = _SessionManager(session)

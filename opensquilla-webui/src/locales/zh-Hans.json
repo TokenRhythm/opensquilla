@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "已取消收起侧边栏",
     "openBlockedSession": "打开被阻塞的会话",
     "approvalRequired": "需要审批",
+    "approvalRequiredCount": "需要审批：{count}",
+    "systemStatus": "系统状态",
+    "systemStatusSummary": "系统状态：{state}；{count} 项提醒",
     "manageConnection": "管理网关连接",
     "connectionTitle": "连接：{state} — 在设置中管理",
     "connectionState": {
@@ -3690,6 +3693,7 @@
       "pausedTitle": "目标已暂停",
       "completeTitle": "目标已完成",
       "sentAsGoal": "已作为目标发送",
+      "achieved": "目标已完成",
       "achievedIn": "目标已完成 · 活跃用时 {duration}",
       "blockedTitle": "目标受阻",
       "usageLimitedTitle": "目标受用量限制",
@@ -3789,6 +3793,12 @@
       "label": "待发送 {count}/{max}",
       "hint": "Alt+↑ 将最近一条拉回输入框 · ESC 将全部恢复到输入框 · 当前回复结束后按先进先出顺序发送",
       "steerHint": "引导模式：新文本会在下一个安全边界应用，不会停止当前任务；排队消息仍会在本轮结束后发送",
+      "steerSubmitting": "正在提交引导…",
+      "steerRetryRejected": "未发送 · 重试",
+      "steerRetryUnknown": "发送状态未知 · 重试确认",
+      "steerRetryRejectedHint": "网关未接受这条引导。重试会原样重放首次请求。",
+      "steerRetryUnknownHint": "OpenSquilla 无法确认这条引导是否已被接受。重试会安全地原样重放首次请求。",
+      "removeUnknownSteer": "放弃待发送消息 {index} 在本设备上的重试；这不代表服务端未接收",
       "queueHint": "排队模式：这些消息会在当前回复结束后按顺序自动发送",
       "clearAll": "全部清除",
       "editMessage": "编辑消息",
@@ -3998,7 +4008,12 @@
       "saved": "节省",
       "fallback": "降级",
       "fallbackUsed": "已使用",
-      "ensembleModelsAria": "参与融合的模型"
+      "ensembleRequests": "{count} 次请求",
+      "ensembleModelsAria": "参与融合的模型",
+      "coverage": "统计完整性",
+      "usageIncompleteSubtotal": "不完整 · 显示值为已知小计",
+      "usageIncompleteUnknown": "不完整 · 无法获得准确用量总计",
+      "unknownProviderCalls": "{count} 次服务商调用的用量未知"
     },
     "modelRouting": {
       "updateFailed": "切换模型路由失败，已恢复原设置。请检查网关连接后重试。"

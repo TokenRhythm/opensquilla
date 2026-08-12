@@ -40,6 +40,12 @@ import type { InterruptViewState } from '@/types/parts'
 import { toParts, toolState, type ToPartsInterrupt } from '@/utils/chat/toParts'
 import { toSources } from '@/utils/chat/toSources'
 import { relativeTime, type TimeTranslator } from '@/utils/messageTime'
+import {
+  isLegacySilentSentinelOnly,
+  sanitizeAssistantPresentationSegments,
+  sanitizeAssistantPresentationText,
+} from '@/utils/chat/silentSentinels'
+import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
 
 export interface NormalizedRouterDecision extends Record<string, unknown> {
   tier: string
@@ -342,6 +348,18 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       }))
       const isPlanMessage = msg.role === 'assistant' && planRevisions.length > 0
       const normalizedToolCalls = normalizeToolCalls(msg.tool_calls)
+      const assistantRawText = msg.role === 'assistant'
+        ? options.stripGeneratedArtifactMarkers(msg.text)
+        : msg.text
+      const assistantProvenance: AssistantPresentationProvenance = {
+        inputMode: msg.turnInputMode,
+        runKind: msg.turnRunKind,
+      }
+      const assistantDisplayText = msg.role === 'assistant'
+        ? sanitizeAssistantPresentationText(assistantRawText, assistantProvenance)
+        : assistantRawText
+      const legacySilentOnly = msg.role === 'assistant'
+        && isLegacySilentSentinelOnly(assistantRawText)
       const rendered: ChatRenderedMessage = {
         id: `${msg.role}-${i}`,
         ...(msg.clientId ? { clientId: msg.clientId } : {}),
@@ -351,9 +369,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         roleLabel,
         text: isPlanMessage
           ? ''
-          : msg.role === 'assistant'
-            ? options.stripGeneratedArtifactMarkers(msg.text)
-            : msg.text,
+          : assistantDisplayText,
         timeStr: relativeTime(msg.ts, Date.now(), options.timeTranslator),
         ts: msg.ts ?? null,
         showHeader: !sameGroup,
@@ -361,6 +377,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         restoredFromHistory: msg.restoredFromHistory,
         turnKey: `turn:${turnIdentity === 'turn-0' ? ownerKey : turnIdentity}`,
         turnId: messageTurnId || undefined,
+        turnInputMode: msg.turnInputMode,
+        turnRunKind: msg.turnRunKind,
         inputDisposition: msg.inputDisposition,
         inputDispositionRevision: msg.inputDispositionRevision,
         maintenance: msg.maintenance,
@@ -404,6 +422,19 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       rendered.statusHistory = rendered.displayRole === 'assistant'
         ? (msg.statusHistory ?? [])
         : []
+      // Match the live suppressed-turn behavior for legacy exact-sentinel rows:
+      // no empty assistant bubble, while a turn that contains tools, artifacts,
+      // reasoning, interrupts, or activity history remains inspectable.
+      if (
+        legacySilentOnly
+        && rendered.parts.length === 0
+        && rendered.statusHistory.length === 0
+        && !rendered.artifacts?.length
+        && !rendered.stopNotice
+      ) {
+        prevRole = ''
+        continue
+      }
       if (import.meta.env.DEV && rendered.displayRole === 'assistant') {
         assertPartsParity(rendered, ownerKey)
       }
@@ -515,6 +546,33 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const turnSavedPct = typeof u.total_savings_pct === 'number' && u.total_savings_pct > 0 ? u.total_savings_pct : 0
     const hasSaved = hasTier && turnSavedPct > 0 && !u.__savings_ui_suppressed
     const ensemble = ensembleMeta(u)
+    const rawCoverageStatus = u.coverage_status ?? u.coverageStatus
+    const coverageStatus = typeof rawCoverageStatus === 'string'
+      ? rawCoverageStatus.trim()
+      : ''
+    const unknownUsageEvents = Math.max(
+      0,
+      Math.floor(numeric(u.unknown_usage_events ?? u.unknownUsageEvents)),
+    )
+    const usageUnknown = (u.usage_unknown ?? u.usageUnknown) === true
+      || unknownUsageEvents > 0
+      || Boolean(coverageStatus && coverageStatus.toLowerCase() !== 'complete')
+    const hasKnownUsage = [
+      input,
+      output,
+      cached,
+      reasoning,
+      cost,
+      numeric(u.total_tokens ?? u.totalTokens),
+      numeric(u.cache_write_tokens ?? u.cacheWriteTokens ?? u.cache_write),
+      numeric(u.billed_cost ?? u.billedCost),
+      numeric(u.estimated_cost_component_usd ?? u.estimatedCostComponentUsd),
+    ].some(value => value > 0) || Boolean(ensemble && (
+      ensemble.costUsd > 0
+      || ensemble.models.some(member =>
+        member.input > 0 || member.output > 0 || member.costUsd > 0,
+      )
+    ))
     return {
       model,
       modelShort: model.includes('/') ? (model.split('/').pop() || model) : model,
@@ -528,6 +586,10 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       turnSavedPct,
       savedLabel: turnSavedPct > 0 ? `Saved ~${Math.round(turnSavedPct)}%` : 'Cost optimized',
       ensemble,
+      coverageStatus: coverageStatus || undefined,
+      usageUnknown,
+      unknownUsageEvents,
+      hasKnownUsage,
       decisionId: typeof u.decision_id === 'string' && u.decision_id ? u.decision_id : undefined,
     }
   }
@@ -742,12 +804,44 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const explicitTimeline = Array.isArray(msg.timeline) ? msg.timeline : []
     if (explicitTimeline.length) {
       const calls = normalizeToolCalls(msg.tool_calls)
-      return timelineFromSegments(explicitTimeline, calls, ownerKey, msg.interrupts)
+      return sanitizeAssistantTimelineItems(
+        timelineFromSegments(explicitTimeline, calls, ownerKey, msg.interrupts),
+        { inputMode: msg.turnInputMode, runKind: msg.turnRunKind },
+      )
     }
     const rawSegments = Array.isArray(msg.tool_calls) ? msg.tool_calls : []
     const hasPersistedTimeline = rawSegments.some(seg => ['text', 'tool_use', 'tool_result'].includes(String(seg?.type || '')))
     if (!hasPersistedTimeline) return []
-    return timelineFromPersistedSegments(rawSegments, ownerKey)
+    return sanitizeAssistantTimelineItems(
+      timelineFromPersistedSegments(rawSegments, ownerKey),
+      { inputMode: msg.turnInputMode, runKind: msg.turnRunKind },
+    )
+  }
+
+  function sanitizeAssistantTimelineItems(
+    items: ChatStreamTimelineItem[],
+    provenance: AssistantPresentationProvenance,
+  ): ChatStreamTimelineItem[] {
+    const textItems = items.filter(
+      (item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> => item.type === 'text',
+    )
+    if (!textItems.length) return items
+    const projected = sanitizeAssistantPresentationSegments(
+      textItems.map(item => item.rawText || ''),
+      provenance,
+    )
+    let textIndex = 0
+    return items.flatMap((item): ChatStreamTimelineItem[] => {
+      if (item.type !== 'text') return [item]
+      const rawText = projected[textIndex++] ?? ''
+      if (!rawText) return []
+      if (rawText === item.rawText) return [item]
+      return [{
+        ...item,
+        rawText,
+        html: options.renderMarkdown(rawText),
+      }]
+    })
   }
 
   function timelineFromSegments(

@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "Se canceló la contracción de la barra lateral",
     "openBlockedSession": "Abrir la sesión bloqueada",
     "approvalRequired": "Aprobación requerida",
+    "approvalRequiredCount": "Aprobaciones requeridas: {count}",
+    "systemStatus": "Estado del sistema",
+    "systemStatusSummary": "Estado del sistema: {state}; {count} avisos",
     "manageConnection": "Gestionar conexión de la puerta de enlace",
     "connectionTitle": "Conexión: {state} — gestionar en Ajustes",
     "connectionState": {
@@ -3637,6 +3640,7 @@
       "pausedTitle": "Objetivo en pausa",
       "completeTitle": "Objetivo completado",
       "sentAsGoal": "Enviado como objetivo",
+      "achieved": "Objetivo alcanzado",
       "achievedIn": "Objetivo alcanzado · {duration} activo",
       "blockedTitle": "Objetivo bloqueado",
       "usageLimitedTitle": "Uso del objetivo limitado",
@@ -3736,6 +3740,12 @@
       "label": "Pendientes {count}/{max}",
       "hint": "Alt+↑ devuelve el más reciente a la entrada · ESC recupera todos a la entrada · se envían en orden FIFO cuando termina la respuesta actual",
       "steerHint": "Modo redirigir: el texto nuevo se aplica en el siguiente límite seguro sin detener la tarea actual; los mensajes en cola se envían tras el turno",
+      "steerSubmitting": "Enviando indicación…",
+      "steerRetryRejected": "No enviado · Reintentar",
+      "steerRetryUnknown": "Estado de entrega desconocido · Confirmar reintento",
+      "steerRetryRejectedHint": "El gateway no aceptó esta indicación. Al reintentar se repite exactamente la solicitud original.",
+      "steerRetryUnknownHint": "OpenSquilla no pudo confirmar si se aceptó esta indicación. Al reintentar se repite de forma segura la solicitud original sin cambios.",
+      "removeUnknownSteer": "Descartar el reintento local del mensaje pendiente {index}; esto no significa que el servidor no lo haya recibido",
       "queueHint": "Modo cola: estos mensajes se envían automáticamente en orden cuando termina la respuesta actual",
       "clearAll": "Borrar todo",
       "editMessage": "Editar mensaje",
@@ -3945,7 +3955,12 @@
       "saved": "ahorro",
       "fallback": "reserva",
       "fallbackUsed": "usado",
-      "ensembleModelsAria": "Modelos del conjunto"
+      "ensembleRequests": "{count} solicitudes",
+      "ensembleModelsAria": "Modelos del conjunto",
+      "coverage": "cobertura",
+      "usageIncompleteSubtotal": "Incompleto · los valores mostrados son un subtotal conocido",
+      "usageIncompleteUnknown": "Incompleto · total exacto de uso no disponible",
+      "unknownProviderCalls": "{count} llamada al proveedor tiene uso desconocido | {count} llamadas al proveedor tienen uso desconocido"
     },
     "modelRouting": {
       "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. Comprueba la conexión con la pasarela e inténtalo de nuevo."
