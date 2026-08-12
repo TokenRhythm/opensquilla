@@ -12,6 +12,7 @@ import type {
   CronResultPayload,
   EnsembleProgressPayload,
   InputDispositionPayload,
+  ProviderActivityPayload,
   RouterDecisionPayload,
   SessionDonePayload,
   SessionEventPayload,
@@ -80,9 +81,9 @@ export interface ChatRpcStreamApi {
   appendArtifact: (payload: ArtifactPayload) => void
   reconcileFinalText: (finalText: string | null | undefined) => void
   resetLiveTurnState?: () => void
-  resetStreamIdleTimer: () => void
+  resetStreamIdleTimer: (opts?: { progress?: boolean }) => void
   clearStreamIdleTimer: () => void
-  setStreamActivity: (label: string) => void
+  setStreamActivity: (label: string, key?: string) => void
   recordCompactionActivity?: (payload: CompactionPayload) => void
   showThinkingIndicator: () => void
   hideThinkingIndicator: () => void
@@ -90,6 +91,7 @@ export interface ChatRpcStreamApi {
   // its own thinking frames into the stream-owned log after the legacy mutation.
   appendFrame: (frame: FrameInput) => void
   useReducer: Ref<FoldLiveTurnMode>
+  getThinkingText?: () => string
 }
 
 type ChatCompactionPlacement = 'activity' | 'standalone'
@@ -99,6 +101,7 @@ export interface UseChatRpcEventHandlersOptions {
   sessionKey: Ref<string>
   currentEpoch: Ref<number>
   lastStreamSeq: Ref<number>
+  observeStreamGeneration?: (payload: unknown) => boolean
   activeTaskGroups: Ref<Set<string>>
   // Task id of the turn whose output the live stream is currently rendering.
   // Empty = unknown (no guard). Set when a fresh turn starts (see useChatSend)
@@ -201,6 +204,25 @@ const MAX_PENDING_TASK_BUCKETS = 8
 const MAX_PENDING_STREAM_EVENTS_PER_TASK = 64
 const SERVER_CLOCK_TOLERANCE_MS = 5_000
 const MAX_TRUSTED_REASONING_AGE_MS = 60 * 60 * 1_000
+const PROVIDER_ACTIVITY_PHASES = new Set([
+  'requesting',
+  'reasoning',
+  'retry_wait',
+  'retrying',
+  'fallback',
+])
+const PROVIDER_ACTIVITY_REASONS = new Set([
+  'initial',
+  'rate_limited',
+  'provider_overloaded',
+  'transport_transient',
+  'reasoning_only',
+  'empty_response',
+  'stream_incomplete',
+  'invalid_response',
+  'context_overflow',
+  'unknown',
+])
 
 const COMPACTION_TERMINAL_STATUSES = new Set([
   'completed',
@@ -513,6 +535,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       handleRpcStateChange(payload)
     } else if (event === 'session.event.run_heartbeat') {
       handleRpcRunHeartbeat(payload)
+    } else if (event === 'session.event.provider_activity') {
+      handleRpcProviderActivity(payload as ProviderActivityPayload)
     } else if (event === 'session.event.router_decision') {
       handleRpcRouterDecision(payload as RouterDecisionPayload)
     } else if (event === 'session.event.ensemble_progress') {
@@ -659,12 +683,17 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!stream.isStreaming.value) stream.startStreaming()
     const current = streamThinking.value
     if (current) {
-      streamThinking.value = { ...current, text: current.text + text }
+      // Production renders reasoning from the non-reactive accumulator on the
+      // shared publish clock. Rebuilding this reactive prefix for every delta
+      // invalidated Vue 20,000 times and retained old strings between frames.
+      if (stream.useReducer.value !== true) {
+        streamThinking.value = { ...current, text: current.text + text }
+      }
     } else {
       const now = Date.now()
       const serverStartedAt = trustedReasoningStartedAt(payload.started_at, now)
       streamThinking.value = {
-        text,
+        text: stream.useReducer.value === true ? '' : text,
         startedAt: serverStartedAt ?? now,
         serverStartedAt,
       }
@@ -789,6 +818,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   }
 
   function acceptStreamSeq(payload: StreamEventEnvelope): boolean {
+    options.observeStreamGeneration?.(payload)
     const decision = decideStreamSeq(payload, sessionKey.value, lastStreamSeq.value)
     if (decision.accepted) lastStreamSeq.value = decision.nextStreamSeq
     return decision.accepted
@@ -949,22 +979,61 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     if (!stream.isStreaming.value) stream.startStreaming()
-    stream.resetStreamIdleTimer()
-    if (stream.streamBubble.value && !stream.streamHasVisibleOutput.value) {
-      const phase = String(payload.phase || '')
-      // The channel wrapper emits a generic keepalive on the same cadence as
-      // ensemble heartbeats. It proves liveness but does not represent a phase
-      // transition, so changing the activity would restart its timer.
-      const isPhaseAgnosticKeepalive = phase === 'channel'
-      if (phase.startsWith('ensemble_proposers')) {
-        stream.setStreamActivity('Generating candidates')
-      } else if (phase.startsWith('ensemble_aggregator')) {
-        stream.setStreamActivity('Synthesizing candidates')
-      } else if (!isPhaseAgnosticKeepalive) {
-        stream.setStreamActivity('Planning next step')
-      }
-    } else if (!stream.streamBubble.value) {
+    // Transport heartbeat proves liveness only. It must neither replace the
+    // current structured provider phase nor postpone the 20s no-progress UI.
+    stream.resetStreamIdleTimer({ progress: false })
+    if (!stream.streamBubble.value) {
       stream.showThinkingIndicator()
+    }
+  }
+
+  function providerActivityCounter(raw: unknown, maximum: number): number {
+    const value = Number(raw)
+    if (!Number.isFinite(value)) return 0
+    return Math.min(maximum, Math.max(0, Math.floor(value)))
+  }
+
+  function handleRpcProviderActivity(payload: ProviderActivityPayload) {
+    if (isStaleEpoch(payload)) return
+    if (aborted.value) return
+    if (bufferPendingStreamEvent('session.event.provider_activity', payload)) return
+    if (!isCurrentTaskPayload(payload)) return
+    if (!acceptStreamSeq(payload)) return
+
+    const phase = String(payload.phase || '')
+    const reason = String(payload.reason || 'unknown')
+    if (!PROVIDER_ACTIVITY_PHASES.has(phase)) return
+    const safeReason = PROVIDER_ACTIVITY_REASONS.has(reason) ? reason : 'unknown'
+    const attempt = providerActivityCounter(payload.retry_attempt, 10_000)
+    const limit = providerActivityCounter(payload.retry_limit, 10_000)
+    const retryAfterMs = providerActivityCounter(payload.retry_after_ms, 900_000)
+    const retryAfterSeconds = Math.ceil(retryAfterMs / 1000)
+
+    if (!stream.isStreaming.value) stream.startStreaming()
+    stream.resetStreamIdleTimer()
+    options.markEnsembleHandoff()
+
+    if (phase === 'requesting') {
+      stream.setStreamActivity('Waiting for model', 'provider:requesting')
+    } else if (phase === 'reasoning') {
+      stream.setStreamActivity('Thinking deeply', 'provider:reasoning')
+    } else if (phase === 'retry_wait' && safeReason === 'rate_limited') {
+      stream.setStreamActivity(
+        `Rate limited · ${retryAfterSeconds}s`,
+        `provider:rate_limited:${retryAfterSeconds}`,
+      )
+    } else if (phase === 'retry_wait') {
+      stream.setStreamActivity(
+        `Waiting to retry · ${retryAfterSeconds}s`,
+        `provider:retry_wait:${retryAfterSeconds}`,
+      )
+    } else if (phase === 'retrying') {
+      stream.setStreamActivity(
+        `Retrying ${attempt}/${limit}`,
+        `provider:retrying:${attempt}:${limit}`,
+      )
+    } else if (phase === 'fallback') {
+      stream.setStreamActivity('Switching to backup model', 'provider:fallback')
     }
   }
 
@@ -1372,7 +1441,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         ? rawReasoningContent.trim()
         : ''
       const liveThinking = streamThinking.value
-      const reasoningText = doneReasoning || liveThinking?.text.trim() || ''
+      const foldedReasoning = stream.useReducer.value === true
+        ? stream.getThinkingText?.().trim() || ''
+        : ''
+      const reasoningText = doneReasoning || foldedReasoning || liveThinking?.text.trim() || ''
       const reasoningSeconds = (() => {
         if (!liveThinking) return 0
         const now = Date.now()
@@ -1525,7 +1597,10 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         options.loadCurrentSessionUsage()
         options.loadHistory?.()
       }
-      if (stream.isStreaming.value) stream.resetStreamIdleTimer()
+      // Reconnect restores transport liveness, not model progress. Keep the
+      // 20-second provider-silence clock honest while re-arming the separate
+      // hard-idle watchdog.
+      if (stream.isStreaming.value) stream.resetStreamIdleTimer({ progress: false })
     }
     if (state === 'disconnected' && stream.isStreaming.value) {
       // Keep the idle watchdog armed so a run whose events never resume still
@@ -1551,6 +1626,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     onArtifact: handleRpcArtifact,
     onStateChange: handleRpcStateChange,
     onRunHeartbeat: handleRpcRunHeartbeat,
+    onProviderActivity: handleRpcProviderActivity,
     onCompaction: handleRpcCompaction,
     onWarning: handleRpcWarning,
     onInputDisposition: handleRpcInputDisposition,

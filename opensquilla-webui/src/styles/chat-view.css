@@ -214,6 +214,9 @@
 .chat-thread {
   flex: 1;
   overflow-y: auto;
+  /* ChatMessageList owns variable-row anchor correction. Native scroll
+     anchoring would apply the same height delta a second time. */
+  overflow-anchor: none;
   padding: 0.25rem 0 1.5rem;
   display: flex;
   flex-direction: column;

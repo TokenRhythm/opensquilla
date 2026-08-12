@@ -8,14 +8,15 @@
   >
     <article
       v-for="(item, index) in items"
-      :key="itemKey(item)"
+      :key="item.pendingUiId"
       class="chat-pending-card"
       :class="{
         'is-reorderable': canReorderItem(item),
         'is-reorder-arming': pointerReorder?.item === item && !pointerReorder.active,
         'is-reordering': draggingItem === item,
       }"
-      :data-queue-key="itemKey(item)"
+      :data-queue-key="item.pendingUiId"
+      :data-pending-ui-id="item.pendingUiId"
       :data-delivery-state="pendingCardState(item)"
       :aria-busy="isSteering(item) ? 'true' : undefined"
       :aria-label="canReorderItem(item)
@@ -30,6 +31,13 @@
       <p class="chat-pending-text" :title="displayText(item)">
         {{ displayText(item) }}
       </p>
+      <span
+        v-if="item.pendingPersistenceState === 'saving'"
+        class="chat-pending-save-status"
+        role="status"
+      >
+        {{ t('chat.saving') }}
+      </span>
       <span v-if="item.attachments?.length" class="chat-pending-attachments">
         {{ item.attachments.length }} · 📎
         <span
@@ -50,7 +58,7 @@
           :title="steerTitle(item)"
           :disabled="isSteerDisabled(item)"
           :aria-describedby="attachmentBlockMessage(item) ? attachmentStatusId(item) : undefined"
-          @click="emit('steer', index)"
+          @click="emit('steer', item.pendingUiId)"
         >
           <span aria-hidden="true">↪</span>
           <span :aria-live="pendingCardState(item) !== 'queued' ? 'polite' : undefined">
@@ -63,7 +71,7 @@
           :aria-label="removeLabel(item, index)"
           :title="removeLabel(item, index)"
           :disabled="isSteering(item) || isQueueReordering"
-          @click="emit('remove', index)"
+          @click="emit('remove', item.pendingUiId)"
         >
           <Icon name="trash" :size="14" />
         </button>
@@ -71,18 +79,18 @@
           <button
             type="button"
             class="chat-pending-action chat-pending-action--icon"
-            :class="{ 'is-active': openMenuIndex === index }"
+            :class="{ 'is-active': openMenuUiId === item.pendingUiId }"
             :aria-label="t('chrome.more')"
             :title="t('chrome.more')"
             aria-haspopup="menu"
-            :aria-expanded="openMenuIndex === index && !isSteering(item) ? 'true' : 'false'"
+            :aria-expanded="openMenuUiId === item.pendingUiId && !isSteering(item) ? 'true' : 'false'"
             :disabled="isSteering(item) || isQueueReordering"
-            @click.stop="toggleMenu(index)"
+            @click.stop="toggleMenu(item.pendingUiId)"
           >
             <Icon name="moreHorizontal" :size="16" />
           </button>
           <div
-            v-if="openMenuIndex === index && !isSteering(item)"
+            v-if="openMenuUiId === item.pendingUiId && !isSteering(item)"
             class="chat-pending-menu"
             role="menu"
             :aria-label="t('chrome.more')"
@@ -90,8 +98,8 @@
             <button
               type="button"
               role="menuitem"
-              :disabled="!!item.deliveryState || !!item.steerAttempt"
-              @click="chooseEdit(index)"
+              :disabled="!!item.deliveryState || !!item.steerAttempt || hasUneditableMaterial(item)"
+              @click="chooseEdit(item.pendingUiId)"
             >
               <Icon name="pencil" :size="15" />
               <span>{{ t('chat.pending.editMessage') }}</span>
@@ -125,12 +133,14 @@ import { isControlInput } from '@/utils/chat/inputSemantics'
 const { t } = useI18n()
 
 interface PendingQueueItem {
+  pendingUiId: string
   text: string
   displayTextOverride?: string
   hiddenControl?: boolean
   attachments?: Attachment[]
   deliveryState?: 'steering' | 'retryable'
   steerAttempt?: PendingSteerAttempt
+  pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
 }
 
 type PendingSteerBlocker =
@@ -150,21 +160,19 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   clear: []
-  edit: [index: number]
-  remove: [index: number]
+  edit: [pendingUiId: string]
+  remove: [pendingUiId: string]
   reorder: [fromIndex: number, toIndex: number]
   reorderEnd: []
   reorderStart: [index: number]
-  steer: [index: number]
+  steer: [pendingUiId: string]
 }>()
 
 const LONG_PRESS_MS = 750
 const LONG_PRESS_DEADZONE_PX = 7
-const openMenuIndex = ref<number | null>(null)
+const openMenuUiId = ref<string | null>(null)
 const draggingItem = shallowRef<PendingQueueItem | null>(null)
 const reorderAnnouncement = ref('')
-const itemKeys = new WeakMap<PendingQueueItem, string>()
-let nextItemKey = 0
 let longPressTimer: ReturnType<typeof setTimeout> | null = null
 const pointerReorder = shallowRef<{
   active: boolean
@@ -187,20 +195,13 @@ function displayText(item: PendingQueueItem): string {
   return item.displayTextOverride || item.text
 }
 
-function itemKey(item: PendingQueueItem): string {
-  const existing = itemKeys.get(item)
-  if (existing) return existing
-  nextItemKey += 1
-  const key = `pending-${nextItemKey}`
-  itemKeys.set(item, key)
-  return key
-}
-
 function queueCanReorder(): boolean {
   return props.items.length > 1 && props.items.every(item => (
     !item.hiddenControl
     && !item.deliveryState
     && !item.steerAttempt
+    && item.pendingPersistenceState !== 'saving'
+    && item.pendingPersistenceState !== 'cancelling'
   ))
 }
 
@@ -209,7 +210,10 @@ function canReorderItem(item: PendingQueueItem): boolean {
 }
 
 function isSteering(item: PendingQueueItem): boolean {
-  return item.deliveryState === 'steering' || item.steerAttempt?.phase === 'submitting'
+  return item.deliveryState === 'steering'
+    || item.steerAttempt?.phase === 'submitting'
+    || item.pendingPersistenceState === 'saving'
+    || item.pendingPersistenceState === 'cancelling'
 }
 
 function isSteerRetry(item: PendingQueueItem): boolean {
@@ -248,7 +252,18 @@ function canShowSteer(item: PendingQueueItem): boolean {
 }
 
 function hasUnsendableAttachment(item: PendingQueueItem): boolean {
-  return item.attachments?.some(attachment => !isSendableAttachment(attachment)) === true
+  return item.attachments?.some(attachment => (
+    !attachment.durable_material && !isSendableAttachment(attachment)
+  )) === true
+}
+
+function hasUneditableMaterial(item: PendingQueueItem): boolean {
+  return item.attachments?.some(attachment => (
+    attachment.durable_material
+    || (item.pendingPersistenceState === 'staged'
+      && attachment.kind === 'staged'
+      && !attachment.file)
+  )) === true
 }
 
 function attachmentBlockMessage(item: PendingQueueItem): string {
@@ -305,22 +320,28 @@ function steerTitle(item: PendingQueueItem): string {
 }
 
 function attachmentStatusId(item: PendingQueueItem): string {
-  return `chat-pending-attachment-status-${itemKey(item)}`
+  return `chat-pending-attachment-status-${item.pendingUiId}`
 }
 
-function toggleMenu(index: number) {
-  if (isQueueReordering.value || props.items[index]?.deliveryState === 'steering') return
-  openMenuIndex.value = openMenuIndex.value === index ? null : index
+function itemByUiId(pendingUiId: string): PendingQueueItem | undefined {
+  return props.items.find(item => item.pendingUiId === pendingUiId)
 }
 
-function chooseEdit(index: number) {
-  openMenuIndex.value = null
-  if (props.items[index]?.deliveryState || props.items[index]?.steerAttempt) return
-  emit('edit', index)
+function toggleMenu(pendingUiId: string) {
+  const item = itemByUiId(pendingUiId)
+  if (isQueueReordering.value || !item || isSteering(item)) return
+  openMenuUiId.value = openMenuUiId.value === pendingUiId ? null : pendingUiId
+}
+
+function chooseEdit(pendingUiId: string) {
+  openMenuUiId.value = null
+  const item = itemByUiId(pendingUiId)
+  if (!item || item.deliveryState || item.steerAttempt) return
+  emit('edit', pendingUiId)
 }
 
 function chooseClear() {
-  openMenuIndex.value = null
+  openMenuUiId.value = null
   emit('clear')
 }
 
@@ -362,7 +383,7 @@ function activatePointerReorder(reorder: NonNullable<typeof pointerReorder.value
   if (pointerReorder.value !== reorder || !canReorderItem(reorder.item)) return
   reorder.active = true
   draggingItem.value = reorder.item
-  openMenuIndex.value = null
+  openMenuUiId.value = null
   reorder.card.setPointerCapture?.(reorder.pointerId)
   const index = props.items.indexOf(reorder.item)
   if (index < 0) return cancelPointerReorder()
@@ -407,10 +428,16 @@ function onCardKeydown(item: PendingQueueItem, event: KeyboardEvent) {
   announcePosition(item)
 }
 
+watch(() => props.items.map(item => item.pendingUiId), ids => {
+  if (openMenuUiId.value && !ids.includes(openMenuUiId.value)) {
+    openMenuUiId.value = null
+  }
+})
+
 useDocumentEvent('pointerdown', (event) => {
   const target = event.target
   if (target instanceof Element && target.closest('.chat-pending-more-wrap')) return
-  openMenuIndex.value = null
+  openMenuUiId.value = null
 })
 
 useDocumentEvent('pointermove', (event) => {
@@ -428,7 +455,7 @@ useDocumentEvent('pointermove', (event) => {
   const target = document.elementFromPoint(event.clientX, event.clientY)
     ?.closest<HTMLElement>('.chat-pending-card[data-queue-key]')
   if (!target) return
-  const targetItem = props.items.find(item => itemKey(item) === target.dataset.queueKey)
+  const targetItem = props.items.find(item => item.pendingUiId === target.dataset.queueKey)
   if (!targetItem || targetItem === reorder.item || !canReorderItem(targetItem)) return
   const fromIndex = props.items.indexOf(reorder.item)
   const toIndex = props.items.indexOf(targetItem)
@@ -458,9 +485,9 @@ useDocumentEvent('keydown', (event) => {
     cancelPointerReorder()
     return
   }
-  if (event.key !== 'Escape' || openMenuIndex.value === null) return
+  if (event.key !== 'Escape' || openMenuUiId.value === null) return
   event.preventDefault()
-  openMenuIndex.value = null
+  openMenuUiId.value = null
 })
 
 watch(

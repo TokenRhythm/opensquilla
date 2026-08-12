@@ -109,6 +109,12 @@ export interface AssistantActivityCluster {
 export type AssistantActivityStatusCode =
   | AssistantActivityLifecycleCode
   | AssistantActivityPurposeCode
+  | 'chat.activity.provider.waiting'
+  | 'chat.activity.provider.reasoning'
+  | 'chat.activity.provider.rateLimited'
+  | 'chat.activity.provider.retryWait'
+  | 'chat.activity.provider.retrying'
+  | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
   | 'chat.compact.withinBudget'
@@ -770,6 +776,29 @@ function statusLabelFor(
   }
   const action = String(entry.action || '').trim()
   const normalized = action.toLowerCase()
+  if (normalized.startsWith('provider:')) {
+    const [, phase = '', first = '0', second = '0'] = normalized.split(':')
+    if (phase === 'requesting') return codeDescriptor('chat.activity.provider.waiting')
+    if (phase === 'reasoning') return codeDescriptor('chat.activity.provider.reasoning')
+    if (phase === 'rate_limited') {
+      return codeDescriptor('chat.activity.provider.rateLimited', {
+        seconds: Math.max(0, Number.parseInt(first, 10) || 0),
+      })
+    }
+    if (phase === 'retry_wait') {
+      return codeDescriptor('chat.activity.provider.retryWait', {
+        seconds: Math.max(0, Number.parseInt(first, 10) || 0),
+      })
+    }
+    if (phase === 'retrying') {
+      return codeDescriptor('chat.activity.provider.retrying', {
+        attempt: Math.max(0, Number.parseInt(first, 10) || 0),
+        limit: Math.max(0, Number.parseInt(second, 10) || 0),
+      })
+    }
+    if (phase === 'fallback') return codeDescriptor('chat.activity.provider.fallback')
+    return codeDescriptor('chat.activity.lifecycle.working')
+  }
   if (normalized.startsWith('tool:')) {
     const toolId = action.slice(action.indexOf(':') + 1)
     const cluster = clusters.find(candidate =>
@@ -798,6 +827,29 @@ export function isSemanticActivityStatusStep(step: AssistantActivityStatusStep):
   return step.category !== 'maintenance'
     && !step.isCurrent
     && !step.label.code.startsWith('chat.activity.lifecycle.')
+}
+
+/**
+ * Return the client-side retry countdown for a current provider wait step.
+ *
+ * Provider activity events deliberately carry only a safe, bounded initial
+ * delay.  Keeping the one-second ticking local avoids turning countdown UI
+ * into wire traffic while still making a long Retry-After visibly progress.
+ */
+export function providerActivityRemainingSeconds(
+  step: AssistantActivityStatusStep,
+  nowMs: number = Date.now(),
+): number | null {
+  if (
+    step.label.code !== 'chat.activity.provider.rateLimited'
+    && step.label.code !== 'chat.activity.provider.retryWait'
+  ) {
+    return null
+  }
+  const initialSeconds = Number(step.label.params.seconds ?? 0)
+  if (!Number.isFinite(initialSeconds)) return 0
+  const elapsedSeconds = Math.floor(Math.max(0, nowMs - step.at) / 1000)
+  return Math.max(0, Math.floor(initialSeconds) - elapsedSeconds)
 }
 
 function isAutomaticCompletedMaintenance(step: AssistantActivityStatusStep): boolean {

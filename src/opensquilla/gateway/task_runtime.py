@@ -49,6 +49,8 @@ from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, QueueMo
 from opensquilla.session.terminal_reply import (
     build_terminal_reply,
     is_context_payload_too_large,
+    safe_provider_failure_code,
+    safe_provider_failure_message,
     sanitize_agent_error,
 )
 
@@ -5146,7 +5148,12 @@ class TaskRuntime:
             "error_class": error_class,
             "error_message": error_message,
         }
-        if (
+        if failure_kind:
+            error_class = safe_provider_failure_code(error_class, failure_kind)
+            error_message = safe_provider_failure_message(failure_kind)
+            terminal_payload["error_class"] = error_class
+            terminal_payload["error_message"] = error_message
+        elif (
             (status == AgentTaskStatus.TIMEOUT and terminal_reason != "hard_deadline_exceeded")
             or terminal_reason == "timeout"
             or is_context_payload_too_large(terminal_payload)

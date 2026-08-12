@@ -3482,6 +3482,14 @@
         "interrupted": "已中断",
         "failed": "已失败"
       },
+      "provider": {
+        "waiting": "等待模型",
+        "reasoning": "深度思考",
+        "rateLimited": "受到限流 · {seconds} 秒后重试",
+        "retryWait": "{seconds} 秒后重试",
+        "retrying": "正在重试 {attempt}/{limit}",
+        "fallback": "正在切换备用模型"
+      },
       "purpose": {
         "discover": "发现链接",
         "search": "搜索网页",

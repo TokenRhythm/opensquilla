@@ -97,9 +97,11 @@ const UNAVAILABLE_SUBSCRIPTION: SessionSubscriptionOutcome = {
 
 export function useChatSessionSubscription(options: UseChatSessionSubscriptionOptions) {
   const isHydrating = ref(false)
+  const streamGeneration = ref<string | null>(null)
   let subscriptionAttempt = 0
   let activeSubscription: {
     key: string
+    sinceStreamGeneration: string | null
     sinceStreamSeq: number
     bootstrapGeneration: number
     bootstrapAttempt: number
@@ -115,11 +117,13 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   ): Promise<SessionSubscriptionOutcome> {
     if (!options.sessionKey.value) return Promise.resolve(UNAVAILABLE_SUBSCRIPTION)
     const key = options.sessionKey.value
+    const sinceStreamGeneration = streamGeneration.value
     const sinceStreamSeq = options.lastStreamSeq.value
     const bootstrapGeneration = bootstrap?.generation ?? -1
     const bootstrapAttempt = bootstrap?.attempt ?? -1
     if (
       activeSubscription?.key === key
+      && activeSubscription.sinceStreamGeneration === sinceStreamGeneration
       && activeSubscription.sinceStreamSeq === sinceStreamSeq
       && activeSubscription.bootstrapGeneration === bootstrapGeneration
       && activeSubscription.bootstrapAttempt === bootstrapAttempt
@@ -138,6 +142,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     const token = Symbol('session-subscription')
     const outcome = runSubscription(
       key,
+      sinceStreamGeneration,
       sinceStreamSeq,
       token,
       controller,
@@ -147,6 +152,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     })
     activeSubscription = {
       key,
+      sinceStreamGeneration,
       sinceStreamSeq,
       bootstrapGeneration,
       bootstrapAttempt,
@@ -156,17 +162,96 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     return outcome
   }
 
-  function applyReplayCursor(res: SessionMessagesSubscribeResponse) {
-    if (res.replay_complete === false) {
-      options.lastStreamSeq.value = typeof res.current_stream_seq === 'number'
-        ? Math.max(options.lastStreamSeq.value, res.current_stream_seq)
-        : options.lastStreamSeq.value
+  function generationFrom(source: unknown): string | null {
+    if (typeof source === 'string') return source || null
+    if (!source || typeof source !== 'object') return null
+    const envelope = source as {
+      stream_generation?: unknown
+      streamGeneration?: unknown
+    }
+    const value = envelope.stream_generation ?? envelope.streamGeneration
+    return typeof value === 'string' && value ? value : null
+  }
+
+  /**
+   * Observe a generation-bearing live event before applying its numeric cursor.
+   * The event-handler integration calls this first so a restarted Gateway's low
+   * sequence numbers are accepted instead of compared with the retired stream.
+   */
+  function observeStreamGeneration(source: unknown): boolean {
+    const generation = generationFrom(source)
+    if (!generation || generation === streamGeneration.value) return false
+    const previous = streamGeneration.value
+    streamGeneration.value = generation
+    if (previous === null) {
+      // A page can survive an in-place upgrade from a legacy Gateway which did
+      // not expose generations.  In that case the client owns a numeric cursor
+      // but cannot prove it belongs to the newly observed stream.  Reset when
+      // the new stream is visibly behind, or explicitly reports a generation
+      // gap; otherwise merely adopt the generation (the ordinary first
+      // subscribe response has an equal/current cursor).
+      const envelope = source && typeof source === 'object'
+        ? source as {
+            current_stream_seq?: unknown
+            replay_gap_reason?: unknown
+            stream_seq?: unknown
+          }
+        : null
+      const sequence = envelope?.stream_seq ?? envelope?.current_stream_seq
+      const newStreamIsBehind = typeof sequence === 'number'
+        && Number.isFinite(sequence)
+        && sequence < options.lastStreamSeq.value
+      const generationGap = envelope?.replay_gap_reason === 'stream_generation_changed'
+      if (!newStreamIsBehind && !generationGap) return false
+    }
+    options.lastStreamSeq.value = 0
+    options.resetStreamLiveTurnState()
+    return true
+  }
+
+  function reconcileSubscriptionGeneration(
+    res: SessionMessagesSubscribeResponse,
+    sinceStreamGeneration: string | null,
+  ): boolean {
+    const received = generationFrom(res)
+    // Keep the ACK envelope intact: the legacy -> generation-aware upgrade
+    // path needs its current sequence/replay-gap fields to decide whether a
+    // pre-existing numeric cursor belongs to the retired stream. Passing only
+    // the generation string would adopt the generation while still rejecting
+    // every low-sequence event from the restarted Gateway.
+    if (received) return observeStreamGeneration(res)
+    if (sinceStreamGeneration === null) return false
+
+    // A mixed-version reconnect can land on an older Gateway which ignores
+    // generation fields. Treat that capability downgrade as a new stream so
+    // its lower sequence numbers are not hidden behind the modern cursor.
+    streamGeneration.value = null
+    options.lastStreamSeq.value = 0
+    options.resetStreamLiveTurnState()
+    return true
+  }
+
+  function applyReplayCursor(
+    res: SessionMessagesSubscribeResponse,
+    generationReset: boolean,
+  ) {
+    const current = typeof res.current_stream_seq === 'number'
+      && Number.isFinite(res.current_stream_seq)
+      ? Math.max(0, res.current_stream_seq)
+      : null
+    if (res.replay_complete === false || generationReset) {
+      if (current !== null) {
+        options.lastStreamSeq.value = generationReset
+          && options.lastStreamSeq.value === 0
+          ? current
+          : Math.max(options.lastStreamSeq.value, current)
+      }
       options.loadHistory()
-    } else if (typeof res.current_stream_seq === 'number') {
-      options.lastStreamSeq.value = Math.max(
-        options.lastStreamSeq.value,
-        res.current_stream_seq,
-      )
+    } else if (current !== null) {
+      options.lastStreamSeq.value = generationReset
+        && options.lastStreamSeq.value === 0
+        ? current
+        : Math.max(options.lastStreamSeq.value, current)
     }
   }
 
@@ -302,6 +387,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
 
   async function runSubscription(
     key: string,
+    sinceStreamGeneration: string | null,
     sinceStreamSeq: number,
     token: symbol,
     controller: AbortController,
@@ -327,6 +413,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       }
       const params: SessionMessagesSubscribeParams = {
         key,
+        ...(sinceStreamGeneration
+          ? { since_stream_generation: sinceStreamGeneration }
+          : {}),
         since_stream_seq: sinceStreamSeq,
         fast_ack: true,
       }
@@ -406,6 +495,16 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
 
+      if (subscribeResult.status === 'rejected') throw subscribeResult.reason
+      const res = subscribeResult.value
+      if (res && res.subscribed === false) {
+        throw new Error('No subscription manager available')
+      }
+      const generationReset = reconcileSubscriptionGeneration(
+        res,
+        sinceStreamGeneration,
+      )
+
       let snapshotTaskLive = false
       if (snapshotPromise) {
         skipSnapshotOnRetry = true
@@ -427,10 +526,16 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           // bounded replay protocol so mixed-version client updates still work.
         } else {
           const snapshot = snapshotResult.value
+          const snapshotGeneration = generationFrom(snapshot)
           if (
             snapshot?.key === key
             && Array.isArray(snapshot.events)
             && typeof snapshot.current_stream_seq === 'number'
+            && (
+              !snapshotGeneration
+              || !streamGeneration.value
+              || snapshotGeneration === streamGeneration.value
+            )
             // Events delivered after registration are newer than a late
             // snapshot response. Never reset the live surface behind them.
             && snapshot.current_stream_seq >= options.lastStreamSeq.value
@@ -441,12 +546,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           }
         }
       }
-      if (subscribeResult.status === 'rejected') throw subscribeResult.reason
-      const res = subscribeResult.value
-      if (res && res.subscribed === false) {
-        throw new Error('No subscription manager available')
-      }
-      applyReplayCursor(res)
+      applyReplayCursor(res, generationReset)
       const hydrationComplete = (
         res.hydration_complete
         ?? res.hydrationComplete
@@ -674,6 +774,8 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
 
   return {
     isHydrating,
+    streamGeneration,
+    observeStreamGeneration,
     subscribeSession,
     retrySessionMetadata,
     unsubscribeSession,

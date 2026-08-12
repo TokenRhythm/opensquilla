@@ -90,7 +90,7 @@ def test_nano_usd_conversion_is_decimal_and_bounded() -> None:
 
 
 def test_session_schema_version_includes_plans_meta_launch_and_goals() -> None:
-    assert SCHEMA_VERSION == 20
+    assert SCHEMA_VERSION == 21
 
 
 async def test_initialize_cutover_snapshots_legacy_totals_once(tmp_path: Path) -> None:

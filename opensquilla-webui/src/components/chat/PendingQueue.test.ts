@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick, reactive } from 'vue'
+import { createApp, defineComponent, h, nextTick, reactive, ref } from 'vue'
 import i18n, { loadLocaleMessages } from '@/i18n'
 import PendingQueue from './PendingQueue.vue'
 import type { Attachment, PendingSteerAttempt } from '@/types/chat'
@@ -14,14 +14,15 @@ afterEach(() => {
 async function mountQueue(
   listeners: Partial<{
     onClear: () => void
-    onEdit: (index: number) => void
-    onRemove: (index: number) => void
+    onEdit: (pendingUiId: string) => void
+    onRemove: (pendingUiId: string) => void
     onReorder: (fromIndex: number, toIndex: number) => void
     onReorderEnd: () => void
     onReorderStart: (index: number) => void
-    onSteer: (index: number) => void
+    onSteer: (pendingUiId: string) => void
   }> = {},
   items: Array<{
+    pendingUiId?: string
     text: string
     deliveryState?: 'steering' | 'retryable'
     steerAttempt?: PendingSteerAttempt
@@ -39,6 +40,9 @@ async function mountQueue(
 ) {
   const el = document.createElement('div')
   document.body.appendChild(el)
+  items.forEach((item, index) => {
+    item.pendingUiId ||= `pending-ui-${index}`
+  })
   const app = createApp(PendingQueue, {
     items,
     maxPending: 5,
@@ -95,11 +99,11 @@ describe('PendingQueue', () => {
   })
 
   it('offers steer, remove, and quiet overflow actions on each queued message', async () => {
-    let steered = 0
-    let removed = 0
+    const steered: string[] = []
+    const removed: string[] = []
     const { app, el } = await mountQueue({
-      onSteer: () => { steered += 1 },
-      onRemove: () => { removed += 1 },
+      onSteer: (pendingUiId: string) => { steered.push(pendingUiId) },
+      onRemove: (pendingUiId: string) => { removed.push(pendingUiId) },
     })
 
     const steer = [...el.querySelectorAll<HTMLButtonElement>('button')]
@@ -107,8 +111,8 @@ describe('PendingQueue', () => {
     steer?.click()
     el.querySelector<HTMLButtonElement>('[aria-label="Remove pending message 1"]')?.click()
 
-    expect(steered).toBe(1)
-    expect(removed).toBe(1)
+    expect(steered).toEqual(['pending-ui-0'])
+    expect(removed).toEqual(['pending-ui-0'])
     expect(el.querySelector('.chat-pending-card')).not.toBeNull()
     app.unmount()
   })
@@ -504,6 +508,44 @@ describe('PendingQueue', () => {
       .toEqual(['First queued message', 'Last queued message'])
     expect(after[0]).toBe(before[0])
     expect(after[1]).toBe(before[2])
+    app.unmount()
+  })
+
+  it('keeps menu focus and action identity when a peer removes an earlier item', async () => {
+    const items = ref([
+      { pendingUiId: 'pending-peer-a', text: 'Peer A' },
+      { pendingUiId: 'pending-peer-b', text: 'Peer B' },
+    ])
+    const edited: string[] = []
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const Host = defineComponent(() => () => h(PendingQueue, {
+      items: items.value,
+      maxPending: 5,
+      steerAvailable: true,
+      onEdit: (pendingUiId: string) => edited.push(pendingUiId),
+    }))
+    const app = createApp(Host)
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    const secondMore = el.querySelectorAll<HTMLButtonElement>('[aria-label="More"]')[1]
+    secondMore?.click()
+    await nextTick()
+    const edit = [...el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find(button => button.textContent?.includes('Edit message'))
+    edit?.focus()
+    expect(document.activeElement).toBe(edit)
+
+    items.value.splice(0, 1)
+    await nextTick()
+
+    const survivingCard = el.querySelector<HTMLElement>('[data-pending-ui-id="pending-peer-b"]')
+    expect(survivingCard?.querySelector('[role="menu"]')).not.toBeNull()
+    expect(document.activeElement).toBe(edit)
+    edit?.click()
+    expect(edited).toEqual(['pending-peer-b'])
     app.unmount()
   })
 })

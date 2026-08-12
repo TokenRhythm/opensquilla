@@ -34,6 +34,7 @@ function createHarness() {
 
   function addPending(): ChatPendingItem {
     const item: ChatPendingItem = {
+      pendingUiId: `pending-ui-${pendingQueue.value.length}`,
       text: REQUEST.message,
       attachments: [],
       intent: null,

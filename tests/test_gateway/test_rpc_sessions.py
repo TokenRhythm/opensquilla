@@ -2962,6 +2962,28 @@ class TestSessionsSend:
         )
         assert payload["turn_outcome"]["kind"] == "failed"
 
+    def test_terminal_error_preserves_transient_retryability(self):
+        payload = _normalize_terminal_event_payload(
+            "session.event.error",
+            {
+                "message": "raw provider body with private prompt material",
+                "code": "PRIVATE_PROVIDER_CODE_BODY",
+                "response_body": "private upstream response body",
+                "request_payload_head": "private prompt payload",
+                "turn_outcome": {
+                    "failure_kind": "rate_limited",
+                },
+            },
+        )
+
+        assert payload["turn_outcome"]["failure_kind"] == "rate_limited"
+        assert payload["turn_outcome"]["retryable"] is True
+        assert payload["code"] == "provider_rate_limited"
+        assert payload["error_message"] == (
+            "The model provider is rate-limiting requests. Try again later."
+        )
+        assert "private" not in repr(payload).lower()
+
     @pytest.mark.asyncio
     async def test_send_reset_same_key_intent_applies_before_append(
         self, dispatcher, ctx_with_sessions, session
@@ -7582,6 +7604,7 @@ class TestSessionsMessagesSubscribe:
         assert res.payload == {
             "key": key,
             "task_id": "task-live-snapshot",
+            "stream_generation": stream_registry.stream_generation,
             "current_stream_seq": 2,
             "events": [
                 {
@@ -7590,6 +7613,7 @@ class TestSessionsMessagesSubscribe:
                         "task_id": "task-live-snapshot",
                         "text": "Inspecting",
                         "session_key": key,
+                        "stream_generation": stream_registry.stream_generation,
                         "stream_seq": 1,
                         "emitted_at": ANY,
                     },
@@ -8247,6 +8271,79 @@ class TestSessionsMessagesSubscribe:
         assert conn.events == [("session.event.done", second, {"replayed": True})]
 
     @pytest.mark.asyncio
+    async def test_messages_subscribe_reports_generation_change_without_legacy_promotion(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        key = "agent:main:generation-restart"
+        streams = SessionStreamRegistry(stream_generation="gateway-generation-new")
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+        current = streams.record(
+            key,
+            "session.event.text_delta",
+            {"task_id": "task-new", "text": "new"},
+        )
+        context = make_ctx(
+            session_manager=FakeSessionManager([FakeSession(session_key=key)]),
+            conn_id="generation-restart-conn",
+            subscription_manager=SubscriptionManager(),
+        )
+
+        response = await dispatcher.dispatch(
+            "generation-restart",
+            "sessions.messages.subscribe",
+            {
+                "key": key,
+                "since_stream_generation": "gateway-generation-old",
+                "since_stream_seq": 9_000,
+                "fast_ack": True,
+            },
+            context,
+        )
+
+        assert response.ok is True
+        assert response.payload["stream_generation"] == "gateway-generation-new"
+        assert response.payload["current_stream_seq"] == current["stream_seq"]
+        assert response.payload["replay_complete"] is False
+        assert response.payload["replay_gap_reason"] == "stream_generation_changed"
+        assert response.payload["replayed_count"] == 0
+        assert streams.current_seq(key) == current["stream_seq"]
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_promotes_legacy_cursor_before_next_event(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        key = "agent:main:legacy-generation-restart"
+        streams = SessionStreamRegistry(stream_generation="gateway-generation-new")
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+        context = make_ctx(
+            session_manager=FakeSessionManager([FakeSession(session_key=key)]),
+            conn_id="legacy-generation-restart-conn",
+            subscription_manager=SubscriptionManager(),
+        )
+
+        response = await dispatcher.dispatch(
+            "legacy-generation-restart",
+            "sessions.messages.subscribe",
+            {"key": key, "since_stream_seq": 9_000, "fast_ack": True},
+            context,
+        )
+        following = streams.record(
+            key,
+            "session.event.text_delta",
+            {"task_id": "task-new", "text": "visible"},
+        )
+
+        assert response.ok is True
+        assert response.payload["stream_generation"] == "gateway-generation-new"
+        assert response.payload["current_stream_seq"] == 9_000
+        assert response.payload["replay_complete"] is True
+        assert following["stream_seq"] == 9_001
+
+    @pytest.mark.asyncio
     async def test_messages_subscribe_ack_is_not_blocked_by_writer_queue_socket(
         self,
         dispatcher,
@@ -8380,13 +8477,17 @@ class TestSessionsMessagesSubscribe:
         res = await dispatcher.dispatch(
             "r1",
             "sessions.messages.subscribe",
-            {"key": key, "since_stream_seq": 7},
+            {
+                "key": key,
+                "since_stream_generation": "retired-gateway-generation",
+                "since_stream_seq": 7,
+            },
             ctx,
         )
 
         assert res.ok is True
         assert res.payload["replay_complete"] is False
-        assert res.payload["replay_gap_reason"] == "stream_buffer_reset"
+        assert res.payload["replay_gap_reason"] == "stream_generation_changed"
         assert res.payload["last_task"]["task_id"] == "task-abandoned"
         assert res.payload["run_status"] == "interrupted"
         assert res.payload["hydration_complete"] is True

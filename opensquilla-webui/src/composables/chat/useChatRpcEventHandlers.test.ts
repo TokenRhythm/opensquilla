@@ -29,6 +29,7 @@ function createHarness(options: {
   pendingQueue?: ChatPendingItem[]
   restoreSteerIntoComposer?: (text: string) => void
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
+  observeStreamGeneration?: (payload: unknown) => boolean
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -78,6 +79,7 @@ function createHarness(options: {
     sessionKey,
     currentEpoch: ref(0),
     lastStreamSeq,
+    observeStreamGeneration: options.observeStreamGeneration,
     activeTaskGroups,
     activeStreamTaskId,
     aborted: ref(false),
@@ -283,6 +285,37 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
   })
 })
 
+describe('useChatRpcEventHandlers stream generation', () => {
+  it('observes a restarted generation before rejecting its lower sequence', () => {
+    let lastStreamSeqRef = ref(500)
+    const observeStreamGeneration = vi.fn((payload: unknown) => {
+      if ((payload as { stream_generation?: string }).stream_generation === 'new-generation') {
+        lastStreamSeqRef.value = 0
+        return true
+      }
+      return false
+    })
+    const harness = createHarness({ observeStreamGeneration })
+    lastStreamSeqRef = harness.lastStreamSeq
+    harness.lastStreamSeq.value = 500
+    try {
+      harness.api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-new',
+        stream_generation: 'new-generation',
+        stream_seq: 1,
+        text: 'first token after restart',
+      })
+
+      expect(observeStreamGeneration).toHaveBeenCalledOnce()
+      expect(harness.stream.appendDelta).toHaveBeenCalledWith('first token after restart')
+      expect(harness.lastStreamSeq.value).toBe(1)
+    } finally {
+      harness.stop()
+    }
+  })
+})
+
 describe('useChatRpcEventHandlers compaction ownership', () => {
   it('buffers compaction while task identity is pending and replays only for its owner', () => {
     const {
@@ -404,7 +437,12 @@ describe('useChatRpcEventHandlers compaction ownership', () => {
         schedulePendingDrainAfterTerminal,
         stop,
       } = createHarness({
-        pendingQueue: [{ text: 'Follow up', attachments: [], intent: null }],
+        pendingQueue: [{
+          pendingUiId: 'pending-terminal-follow-up',
+          text: 'Follow up',
+          attachments: [],
+          intent: null,
+        }],
       })
       try {
         activeStreamTaskId.value = 'task-failed'
@@ -824,6 +862,7 @@ describe('useChatRpcEventHandlers steer disposition', () => {
       steerClientMessageId: 'client-1',
     }
     const pending: ChatPendingItem = {
+      pendingUiId: 'pending-ui-promoted-adjustment',
       text: steer.text,
       attachments: [],
       intent: null,
@@ -1372,6 +1411,39 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
 })
 
 describe('useChatRpcEventHandlers reasoning timer replay', () => {
+  it('keeps production reasoning text on the shared accumulator publish clock', () => {
+    const { api, stream, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'answer', ts: 'now' })
+      },
+    })
+    stream.useReducer.value = true
+    stream.getThinkingText = vi.fn(() => 'folded reasoning')
+    try {
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'folded ',
+      })
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text: 'reasoning',
+      })
+
+      expect(api.streamThinkingText.value).toBe('')
+      expect(stream.appendFrame).toHaveBeenCalledTimes(2)
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        text: 'answer',
+      })
+      expect(messages.value[0]?.reasoning?.text).toBe('folded reasoning')
+    } finally {
+      stop()
+    }
+  })
+
   it('keeps elapsed time across A to B to A replay without leaking into B', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(105_000)
@@ -1600,21 +1672,94 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
-  it('maps ensemble heartbeats without letting channel keepalives replace the phase', () => {
+  it('treats every run heartbeat as transport liveness without replacing the phase', () => {
     const { api, stream, stop } = createHarness()
 
     try {
       api.handlers.onRunHeartbeat({ stream_seq: 1, phase: 'ensemble_proposers_wait' })
-      expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Generating candidates')
-
       api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'channel' })
-      expect(stream.setStreamActivity).toHaveBeenCalledTimes(1)
-
       api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'ensemble_aggregator_stream' })
-      expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Synthesizing candidates')
-
       api.handlers.onRunHeartbeat({ stream_seq: 4, phase: 'provider_wait' })
-      expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Planning next step')
+
+      expect(stream.setStreamActivity).not.toHaveBeenCalled()
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(4)
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledWith({ progress: false })
+    } finally {
+      stop()
+    }
+  })
+
+  it('maps structured provider activity without rendering provider error text', () => {
+    const { api, stream, stop } = createHarness()
+
+    try {
+      api.handlers.onProviderActivity({
+        stream_seq: 1,
+        schema_version: 1,
+        phase: 'requesting',
+        reason: 'initial',
+        activity_id: 'activity-safe',
+      })
+      api.handlers.onProviderActivity({
+        stream_seq: 2,
+        schema_version: 1,
+        phase: 'reasoning',
+        reason: 'reasoning_only',
+        activity_id: 'activity-safe',
+      })
+      api.handlers.onProviderActivity({
+        stream_seq: 3,
+        schema_version: 1,
+        phase: 'retry_wait',
+        reason: 'rate_limited',
+        retry_after_ms: 8_000,
+        activity_id: 'activity-safe',
+        message: 'secret provider body',
+      } as never)
+      api.handlers.onProviderActivity({
+        stream_seq: 4,
+        schema_version: 1,
+        phase: 'retrying',
+        reason: 'rate_limited',
+        retry_attempt: 2,
+        retry_limit: 3,
+        activity_id: 'activity-safe',
+      })
+      api.handlers.onProviderActivity({
+        stream_seq: 5,
+        schema_version: 1,
+        phase: 'fallback',
+        reason: 'provider_overloaded',
+        activity_id: 'activity-safe',
+      })
+
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        1,
+        'Waiting for model',
+        'provider:requesting',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        2,
+        'Thinking deeply',
+        'provider:reasoning',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        3,
+        'Rate limited · 8s',
+        'provider:rate_limited:8',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        4,
+        'Retrying 2/3',
+        'provider:retrying:2:3',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        5,
+        'Switching to backup model',
+        'provider:fallback',
+      )
+      expect(JSON.stringify(vi.mocked(stream.setStreamActivity).mock.calls))
+        .not.toContain('secret provider body')
     } finally {
       stop()
     }
@@ -1627,6 +1772,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       vi.mocked(stream.resetStreamIdleTimer).mockClear()
       api.handlers.onConnectionState('connected')
       expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(1)
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledWith({ progress: false })
     } finally {
       stop()
     }

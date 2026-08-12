@@ -129,6 +129,7 @@ from opensquilla.engine.tool_token_estimate import estimate_tokens as get_approx
 from opensquilla.engine.usage import model_usage_cost_fields
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
+    UsageAccountingUnavailableError,
     UsageCallResult,
     UsageCallStart,
     UsageEventSink,
@@ -164,6 +165,9 @@ from opensquilla.provider import (
 )
 from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
+)
+from opensquilla.provider import (
+    ProviderActivityEvent as ProviderDomainActivityEvent,
 )
 from opensquilla.provider import (
     ReasoningDeltaEvent as ProviderReasoningDelta,
@@ -243,7 +247,7 @@ from opensquilla.session.compaction_lifecycle import (
     pre_compaction_flush_requires_safe_receipt,
 )
 from opensquilla.session.context_view import format_compaction_summary_context
-from opensquilla.session.terminal_reply import build_terminal_reply
+from opensquilla.session.terminal_reply import build_terminal_reply, safe_provider_failure_code
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
@@ -282,6 +286,7 @@ from .types import (
     DoneEvent,
     EnsembleProgressEvent,
     ErrorEvent,
+    ProviderActivityEvent,
     RunHeartbeatEvent,
     StateChangeEvent,
     TextDeltaEvent,
@@ -2213,8 +2218,175 @@ class _ProviderAttemptKind(StrEnum):
     LENGTH_CAPPED = "length_capped"
 
 
+_PROVIDER_REASONING_PULSE_INTERVAL_SECONDS = 5.0
+_MAX_PROVIDER_RETRY_WAIT_SECONDS = 900.0
+
+_ProviderActivityPhase = Literal[
+    "requesting",
+    "reasoning",
+    "retry_wait",
+    "retrying",
+    "fallback",
+]
+_ProviderActivityReason = Literal[
+    "initial",
+    "rate_limited",
+    "provider_overloaded",
+    "transport_transient",
+    "reasoning_only",
+    "empty_response",
+    "stream_incomplete",
+    "invalid_response",
+    "context_overflow",
+    "unknown",
+]
+
+_PROVIDER_ACTIVITY_PHASES: dict[str, _ProviderActivityPhase] = {
+    "requesting": "requesting",
+    "reasoning": "reasoning",
+    "retry_wait": "retry_wait",
+    "retrying": "retrying",
+    "fallback": "fallback",
+}
+_PROVIDER_ACTIVITY_REASONS: dict[str, _ProviderActivityReason] = {
+    "initial": "initial",
+    "rate_limited": "rate_limited",
+    "provider_overloaded": "provider_overloaded",
+    "transport_transient": "transport_transient",
+    "reasoning_only": "reasoning_only",
+    "empty_response": "empty_response",
+    "stream_incomplete": "stream_incomplete",
+    "invalid_response": "invalid_response",
+    "context_overflow": "context_overflow",
+    "unknown": "unknown",
+}
+
+
+def _normalize_provider_activity_phase(value: object) -> _ProviderActivityPhase:
+    if not isinstance(value, str):
+        return "requesting"
+    return _PROVIDER_ACTIVITY_PHASES.get(value, "requesting")
+
+
+def _normalize_provider_activity_reason(value: object) -> _ProviderActivityReason:
+    if not isinstance(value, str):
+        return "unknown"
+    return _PROVIDER_ACTIVITY_REASONS.get(value, "unknown")
+
+
+def _provider_activity_reason_for_failure(
+    kind: ProviderFailureKind,
+) -> _ProviderActivityReason:
+    if kind is ProviderFailureKind.RATE_LIMITED:
+        return "rate_limited"
+    if kind is ProviderFailureKind.PROVIDER_OVERLOADED:
+        return "provider_overloaded"
+    if kind is ProviderFailureKind.TRANSPORT_TRANSIENT:
+        return "transport_transient"
+    if kind is ProviderFailureKind.EMPTY_RESPONSE:
+        return "empty_response"
+    if kind is ProviderFailureKind.CONTEXT_OVERFLOW:
+        return "context_overflow"
+    if kind is ProviderFailureKind.MALFORMED_RESPONSE:
+        return "invalid_response"
+    return "unknown"
+
+
+def _safe_provider_terminal_message(
+    kind: ProviderFailureKind,
+    raw_code: str | None = None,
+) -> str:
+    """Return an actionable terminal message without upstream error prose."""
+
+    stable_code = safe_provider_failure_code(raw_code, kind.value)
+    if stable_code == "incomplete_tool_stream":
+        return "Provider stream ended with an incomplete tool call"
+    if stable_code == "provider_protocol_error":
+        return "The model provider returned an invalid tool stream."
+
+    messages = {
+        ProviderFailureKind.RATE_LIMITED: (
+            "The model provider is rate-limiting requests. Try again later."
+        ),
+        ProviderFailureKind.PROVIDER_OVERLOADED: (
+            "The model provider is temporarily overloaded. Try again later."
+        ),
+        ProviderFailureKind.AUTH_INVALID: (
+            "The model provider rejected the configured credentials."
+        ),
+        ProviderFailureKind.CONTEXT_OVERFLOW: (
+            "The request exceeds the model provider's context window."
+        ),
+        ProviderFailureKind.UNSUPPORTED_FEATURE: (
+            "The model provider does not support this request."
+        ),
+        ProviderFailureKind.INSUFFICIENT_CREDITS: (
+            "The model provider account has insufficient credits."
+        ),
+        ProviderFailureKind.MODEL_NOT_FOUND: (
+            "The configured model is unavailable from the provider."
+        ),
+        ProviderFailureKind.TRANSPORT_TRANSIENT: (
+            "The connection to the model provider was interrupted. Try again."
+        ),
+        ProviderFailureKind.POLICY_REFUSAL: (
+            "The model provider refused this request under its policy."
+        ),
+        ProviderFailureKind.EMPTY_RESPONSE: (
+            "The model provider returned an empty response."
+        ),
+        ProviderFailureKind.MALFORMED_RESPONSE: (
+            "The model provider returned an invalid response."
+        ),
+        ProviderFailureKind.BAD_REQUEST: "The model provider rejected the request.",
+    }
+    return messages.get(kind, "The model provider request failed.")
+
+
+def _provider_activity_reason_for_attempt(
+    kind: _ProviderAttemptKind,
+) -> _ProviderActivityReason:
+    if kind is _ProviderAttemptKind.REASONING_ONLY:
+        return "reasoning_only"
+    if kind is _ProviderAttemptKind.STREAM_INCOMPLETE:
+        return "stream_incomplete"
+    if kind is _ProviderAttemptKind.MALFORMED_EMPTY:
+        return "invalid_response"
+    return "unknown"
+
+
+def _provider_retry_delay_seconds(
+    *,
+    local_delay_s: float,
+    provider_retry_after_s: float | None,
+) -> float | None:
+    """Resolve a policy-safe wait, or ``None`` when the hint is too long.
+
+    A provider hint over the 15-minute automatic wait ceiling must not be
+    clamped and retried early.  The caller may select a fallback; otherwise it
+    surfaces a retryable terminal outcome.
+    """
+
+    local = max(0.0, float(local_delay_s))
+    hint = 0.0
+    if provider_retry_after_s is not None:
+        try:
+            parsed_hint = float(provider_retry_after_s)
+        except (TypeError, ValueError):
+            parsed_hint = 0.0
+        if math.isfinite(parsed_hint) and parsed_hint > 0:
+            hint = parsed_hint
+    if hint > _MAX_PROVIDER_RETRY_WAIT_SECONDS:
+        return None
+    return min(max(local, hint), _MAX_PROVIDER_RETRY_WAIT_SECONDS)
+
+
 class _IterationStreamTimeoutError(TimeoutError):
     """Raised when provider streaming exceeds the active Agent iteration budget."""
+
+
+class _RaisedProviderBoundaryError(RuntimeError):
+    """Content-free marker for an exception raised by provider call/iteration."""
 
 
 _STREAM_DEADLINE_ATTRIBUTE = "_opensquilla_stream_deadline_at_monotonic"
@@ -7632,6 +7804,8 @@ class Agent:
                 _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
                 _message_limit_recovery_done = False
+                provider_activity_id = uuid.uuid4().hex
+                next_provider_activity_reason: _ProviderActivityReason = "initial"
                 while _retry_attempt <= _fallback.max_retries:
                     provider_error = None
                     assistant_text_parts = []
@@ -7994,6 +8168,12 @@ class Agent:
                     if deadline_thinking_off_armed:
                         call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
                         _attempt_thinking_disabled = True
+                    if _total_deadline is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "turn_deadline_at_monotonic": _total_deadline,
+                            }
+                        )
                     if self._provider_request_correlation is not None:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={
@@ -8122,6 +8302,9 @@ class Agent:
 
                     _got_done_event = False
                     attempt_user_visible_emitted = False
+                    attempt_irreversible_output_emitted = False
+                    reasoning_activity_started_at_ms = 0
+                    last_reasoning_activity_pulse_at = 0.0
                     # Time-to-first-event for this provider call, stamped once
                     # at the first streamed event (diagnostics only).
                     first_event_at: float | None = None
@@ -8151,23 +8334,41 @@ class Agent:
                     ):
                         usage_call = await self._usage_call_start(usage_scope)
 
+                    yield ProviderActivityEvent(
+                        activity_id=provider_activity_id,
+                        phase="requesting",
+                        reason=next_provider_activity_reason,
+                        retry_attempt=_retry_attempt,
+                        retry_limit=_fallback.max_retries,
+                        started_at=time.time_ns() // 1_000_000,
+                    )
+
                     try:
-                        if self._failure_injector is None:
-                            raw_stream = self.provider.chat(
-                                request_messages,
-                                tools=provider_tools_for_call,
-                                config=call_chat_cfg,
-                            )
-                        else:
-                            # Test-only seam: the injector either delegates this
-                            # exact call to self.provider or replaces it with one
-                            # scripted synthetic failure (see provider/types.py).
-                            raw_stream = self._failure_injector.chat(
-                                self.provider,
-                                request_messages,
-                                tools=provider_tools_for_call,
-                                config=call_chat_cfg,
-                            )
+                        try:
+                            if self._failure_injector is None:
+                                raw_stream = self.provider.chat(
+                                    request_messages,
+                                    tools=provider_tools_for_call,
+                                    config=call_chat_cfg,
+                                )
+                            else:
+                                # Test-only seam: the injector either delegates this
+                                # exact call to self.provider or replaces it with one
+                                # scripted synthetic failure (see provider/types.py).
+                                raw_stream = self._failure_injector.chat(
+                                    self.provider,
+                                    request_messages,
+                                    tools=provider_tools_for_call,
+                                    config=call_chat_cfg,
+                                )
+                        except (asyncio.CancelledError, UsageAccountingUnavailableError):
+                            raise
+                        except Exception:  # noqa: BLE001 - provider boundary
+                            # Never retain upstream prose on the exception that
+                            # crosses into the agent loop.  The original
+                            # exception is deliberately not chained because SDK
+                            # messages may contain response bodies or secrets.
+                            raise _RaisedProviderBoundaryError from None
                         pending_install_deadline: float | None = (
                             self._pending_durable_compaction_event
                             .compaction_deadline_at_monotonic
@@ -8208,10 +8409,34 @@ class Agent:
                                     yield pending_event
                             if first_event_at is None:
                                 first_event_at = time.monotonic()
-                            if isinstance(raw_ev, ProviderTextDelta):
+                            if isinstance(raw_ev, ProviderDomainActivityEvent):
+                                activity_phase = _normalize_provider_activity_phase(
+                                    raw_ev.phase
+                                )
+                                if activity_phase == "reasoning":
+                                    if reasoning_activity_started_at_ms == 0:
+                                        reasoning_activity_started_at_ms = (
+                                            max(0, raw_ev.started_at)
+                                            or time.time_ns() // 1_000_000
+                                        )
+                                    last_reasoning_activity_pulse_at = time.monotonic()
+                                yield ProviderActivityEvent(
+                                    schema_version=1,
+                                    activity_id=provider_activity_id,
+                                    phase=activity_phase,
+                                    reason=_normalize_provider_activity_reason(raw_ev.reason),
+                                    retry_attempt=max(0, raw_ev.retry_attempt),
+                                    retry_limit=max(0, raw_ev.retry_limit),
+                                    retry_after_ms=max(0, raw_ev.retry_after_ms),
+                                    started_at=max(0, raw_ev.started_at),
+                                    heartbeat=bool(raw_ev.heartbeat),
+                                )
+
+                            elif isinstance(raw_ev, ProviderTextDelta):
                                 assistant_text_parts.append(raw_ev.text)
                                 if raw_ev.text:
                                     attempt_user_visible_emitted = True
+                                    attempt_irreversible_output_emitted = True
                                 if text_presentation_decided:
                                     # A tool already appeared this call, so all
                                     # text here is intermediate narration.
@@ -8240,6 +8465,37 @@ class Agent:
                                 # still arrives via DoneEvent.reasoning_content.
                                 if raw_ev.text and reasoning_started_at_ms == 0:
                                     reasoning_started_at_ms = time.time_ns() // 1_000_000
+                                if raw_ev.text:
+                                    # Bare providers reach Agent without the
+                                    # selector's pre-text buffer. This thinking
+                                    # delta therefore crosses the live-client
+                                    # boundary immediately and cannot later be
+                                    # discarded in favour of another attempt.
+                                    attempt_irreversible_output_emitted = True
+                                    now_monotonic = time.monotonic()
+                                    first_reasoning_activity = (
+                                        reasoning_activity_started_at_ms == 0
+                                    )
+                                    if first_reasoning_activity:
+                                        reasoning_activity_started_at_ms = (
+                                            time.time_ns() // 1_000_000
+                                        )
+                                    if (
+                                        first_reasoning_activity
+                                        or now_monotonic
+                                        - last_reasoning_activity_pulse_at
+                                        >= _PROVIDER_REASONING_PULSE_INTERVAL_SECONDS
+                                    ):
+                                        yield ProviderActivityEvent(
+                                            activity_id=provider_activity_id,
+                                            phase="reasoning",
+                                            reason="initial",
+                                            retry_attempt=_retry_attempt,
+                                            retry_limit=_fallback.max_retries,
+                                            started_at=reasoning_activity_started_at_ms,
+                                            heartbeat=not first_reasoning_activity,
+                                        )
+                                        last_reasoning_activity_pulse_at = now_monotonic
                                 yield ThinkingEvent(
                                     text=raw_ev.text,
                                     started_at=reasoning_started_at_ms,
@@ -8484,6 +8740,7 @@ class Agent:
                                 )
                                 tool_argument_heartbeat_chars[raw_ev.tool_use_id] = 0
                                 attempt_user_visible_emitted = True
+                                attempt_irreversible_output_emitted = True
                                 yield ToolUseStartEvent(
                                     tool_use_id=raw_ev.tool_use_id,
                                     tool_name=raw_ev.tool_name,
@@ -9114,12 +9371,30 @@ class Agent:
                             yield TextDeltaEvent(text=response_text)
                             break
                         raise
-                    except Exception:
-                        # A provider stream that raises (instead of yielding a
-                        # ProviderErrorEvent) must still enter the stats before
-                        # the exception propagates unchanged.
+                    except UsageAccountingUnavailableError as exc:
+                        # Usage-ledger admission is an engine control-plane
+                        # failure, not an upstream provider exception. Preserve
+                        # its stable retryable code for TurnRunner/Gateway.
+                        usage_unknown_reason = str(
+                            getattr(exc, "code", "usage_accounting_unavailable")
+                        )
+                        _notify_call_outcome(
+                            ok=False,
+                            failure_kind=usage_unknown_reason,
+                        )
+                        raise
+                    except _RaisedProviderBoundaryError:
+                        # Some SDKs raise from call creation or async iteration
+                        # instead of yielding a ProviderErrorEvent.  Only those
+                        # two provider-boundary operations are wrapped in this
+                        # content-free marker.  Exceptions raised while the
+                        # engine applies pending input or processes events stay
+                        # internal and propagate unchanged.
                         usage_unknown_reason = "provider_exception"
-                        _notify_call_outcome(ok=False, failure_kind="raised")
+                        _notify_call_outcome(
+                            ok=False,
+                            failure_kind=ProviderFailureKind.TRANSPORT_TRANSIENT.value,
+                        )
                         if goal_terminal_final_response_pending:
                             response_text = _goal_terminal_final_response_text()
                             assistant_text_parts.append(response_text)
@@ -9134,7 +9409,24 @@ class Agent:
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
-                        raise
+                        provider_error = ProviderErrorEvent(
+                            message=(
+                                "The connection to the model provider ended before "
+                                "the response completed."
+                                if attempt_irreversible_output_emitted
+                                else (
+                                    "The connection to the model provider was "
+                                    "interrupted."
+                                )
+                            ),
+                            code=(
+                                "response_incomplete"
+                                if attempt_irreversible_output_emitted
+                                else "request_error"
+                            ),
+                        )
+                        provider_error_for_log = provider_error
+                        _got_error = True
                     finally:
                         if usage_call is not None and not usage_call_terminal:
                             await self._usage_call_unknown(
@@ -9200,8 +9492,12 @@ class Agent:
                             response_payload["ensemble_trace"] = ensemble_trace
                     if provider_error_for_log is not None:
                         response_payload["error"] = {
-                            "message": provider_error_for_log.message,
-                            "code": provider_error_for_log.code,
+                            "code": safe_provider_failure_code(
+                                provider_error_for_log.code,
+                                None,
+                            ),
+                            "code_chars": len(provider_error_for_log.code),
+                            "message_chars": len(provider_error_for_log.message),
                         }
                         self._write_turn_call_log("llm_error", **response_payload)
                     else:
@@ -9256,6 +9552,7 @@ class Agent:
                         if response_text:
                             assistant_text_parts.append(response_text)
                             attempt_user_visible_emitted = True
+                            attempt_irreversible_output_emitted = True
                             yield TextDeltaEvent(text=response_text)
                     post_tool_turn = _tail_has_tool_result(request_messages)
                     if (
@@ -9595,6 +9892,18 @@ class Agent:
                                 )
                             ):
                                 _invalid_response_fallback_done = True
+                                fallback_reason = _provider_activity_reason_for_attempt(
+                                    attempt_classification.kind
+                                )
+                                next_provider_activity_reason = fallback_reason
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    phase="fallback",
+                                    reason=fallback_reason,
+                                    retry_attempt=_call_attempt + 1,
+                                    retry_limit=_fallback.max_retries,
+                                    started_at=time.time_ns() // 1_000_000,
+                                )
                                 yield WarningEvent(
                                     code="provider_large_context_fallback",
                                     message=(
@@ -9655,6 +9964,19 @@ class Agent:
                                             else "retrying once to request visible content."
                                         )
                                     ),
+                                )
+                                next_provider_activity_reason = "reasoning_only"
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    phase="retrying",
+                                    reason="reasoning_only",
+                                    retry_attempt=_attempt_retries_used[
+                                        _ProviderAttemptKind.REASONING_ONLY
+                                    ],
+                                    retry_limit=_retry_policy.attempt_budgets[
+                                        _ProviderAttemptKind.REASONING_ONLY
+                                    ],
+                                    started_at=time.time_ns() // 1_000_000,
                                 )
                                 _call_attempt += 1
                                 continue
@@ -9736,6 +10058,19 @@ class Agent:
                                         "retrying once to request visible content."
                                     ),
                                 )
+                            next_provider_activity_reason = "reasoning_only"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retrying",
+                                reason="reasoning_only",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.REASONING_ONLY
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.REASONING_ONLY
+                                ],
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
 
@@ -9757,7 +10092,33 @@ class Agent:
                                 code="provider_empty_retry",
                                 message="The provider returned an empty response; retrying once.",
                             )
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retry_wait",
+                                reason="invalid_response",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             await asyncio.sleep(delay)
+                            next_provider_activity_reason = "invalid_response"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retrying",
+                                reason="invalid_response",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
 
@@ -9782,7 +10143,33 @@ class Agent:
                                     "The provider stream ended before completion; retrying once."
                                 ),
                             )
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retry_wait",
+                                reason="stream_incomplete",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             await asyncio.sleep(delay)
+                            next_provider_activity_reason = "stream_incomplete"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retrying",
+                                reason="stream_incomplete",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
 
@@ -9842,6 +10229,18 @@ class Agent:
                             )
                         ):
                             _invalid_response_fallback_done = True
+                            fallback_reason = _provider_activity_reason_for_attempt(
+                                attempt_classification.kind
+                            )
+                            next_provider_activity_reason = fallback_reason
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="fallback",
+                                reason=fallback_reason,
+                                retry_attempt=_call_attempt + 1,
+                                retry_limit=_fallback.max_retries,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             yield WarningEvent(
                                 code="provider_empty_retry",
                                 message=(
@@ -9979,12 +10378,41 @@ class Agent:
                             raw_code=provider_error.code,
                             message=provider_error.message,
                         )
+                        safe_provider_error_code = safe_provider_failure_code(
+                            provider_error.code,
+                            failure_kind.value,
+                        )
                         kind = _fallback.classify_error(
                             provider_error.message,
                             provider_name=getattr(self.provider, "provider_name", ""),
                             status_code=provider_error_status_code,
                             raw_code=provider_error.code,
                         )
+                        if attempt_irreversible_output_emitted:
+                            # Text, reasoning, and tool lifecycle frames are
+                            # streamed to the client immediately and cannot be
+                            # rolled back. A retry or fallback after that commit
+                            # would replay or mix attempts, while the terminal
+                            # transcript would retain only the later attempt.
+                            # Selector-buffered failed-leg reasoning remains
+                            # retryable because it never reaches this boundary.
+                            _log.warning(
+                                "provider.retry_suppressed",
+                                reason="user_visible_output_committed",
+                                kind=kind.value,
+                                provider=getattr(self.provider, "provider_name", ""),
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_error_code,
+                                failure_kind=failure_kind.value,
+                            )
+                            yield terminal_error
+                            break
                         if goal_terminal_final_response_pending:
                             response_text = _goal_terminal_final_response_text()
                             assistant_text_parts.append(response_text)
@@ -9996,7 +10424,7 @@ class Agent:
                                 action="terminal_after_summary_provider_error",
                                 reason="goal_terminal",
                                 code=goal_terminal_final_status or "goal_terminal",
-                                provider_error_code=provider_error.code,
+                                provider_error_code=safe_provider_error_code,
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
@@ -10140,8 +10568,11 @@ class Agent:
                             continue
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
-                                reason=provider_error.message,
-                                code=provider_error.code,
+                                reason=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_error_code,
                             )
                             break
                         if max_iterations_finalization_pending:
@@ -10160,7 +10591,7 @@ class Agent:
                                 action="partial_after_finalization_provider_error",
                                 reason="max_iterations",
                                 code="max_iterations",
-                                provider_error_code=provider_error.code,
+                                provider_error_code=safe_provider_error_code,
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
@@ -10180,7 +10611,7 @@ class Agent:
                                 action="partial_after_finalization_provider_error",
                                 reason="post_write_convergence",
                                 code="post_write_convergence",
-                                provider_error_code=provider_error.code,
+                                provider_error_code=safe_provider_error_code,
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
@@ -10199,7 +10630,7 @@ class Agent:
                                 call_attempt=_call_attempt,
                                 provider_retry_attempt=_retry_attempt,
                                 post_tool_turn=post_tool_turn,
-                                provider_error_code=provider_error.code,
+                                provider_error_code=safe_provider_error_code,
                                 retrying=True,
                             )
                             delay = backoff_sleep(
@@ -10221,8 +10652,26 @@ class Agent:
                                     "execution; retrying once."
                                 ),
                             )
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retry_wait",
+                                reason="empty_response",
+                                retry_attempt=_retry_attempt + 1,
+                                retry_limit=_fallback.max_retries,
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             await asyncio.sleep(delay)
                             _retry_attempt += 1
+                            next_provider_activity_reason = "empty_response"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retrying",
+                                reason="empty_response",
+                                retry_attempt=_retry_attempt,
+                                retry_limit=_fallback.max_retries,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
@@ -11073,7 +11522,17 @@ class Agent:
                                 message_count_request_view = None
                             _call_attempt += 1
                             continue
-                        should_retry = _fallback.should_retry(kind, _retry_attempt)
+                        # The selector has already proved that honoring this
+                        # authority's Retry-After would cross the absolute turn
+                        # deadline (or the bounded 15-minute wait ceiling).
+                        # Retrying through Agent's outer loop could advance the
+                        # same selector again and accidentally call another
+                        # same-authority leg early, so this typed outcome is
+                        # terminal for the current turn.
+                        should_retry = (
+                            provider_error.code != "provider_retry_after_deadline"
+                            and _fallback.should_retry(kind, _retry_attempt)
+                        )
                         retry_failed_call_safe = (
                             getattr(
                                 self.provider,
@@ -11093,26 +11552,98 @@ class Agent:
                         if not should_retry:
                             yield self._transition(AgentState.ERROR)
                             terminal_error = ErrorEvent(
-                                message=provider_error.message,
-                                code=provider_error.code,
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_failure_code(
+                                    provider_error.code,
+                                    failure_kind.value,
+                                ),
                                 failure_kind=failure_kind.value,
                             )
                             yield terminal_error
                             break
-                        delay = backoff_sleep(
+                        local_delay = backoff_sleep(
                             _retry_attempt,
                             _fallback.base_backoff_ms,
                             _fallback.max_backoff_ms,
                             _fake=True,
                         )
+                        resolved_retry_delay = _provider_retry_delay_seconds(
+                            local_delay_s=local_delay,
+                            provider_retry_after_s=provider_error.retry_after_s,
+                        )
+                        reason = _provider_activity_reason_for_failure(failure_kind)
+                        retry_exceeds_deadline = bool(
+                            resolved_retry_delay is not None
+                            and _total_deadline is not None
+                            and _loop.time() + resolved_retry_delay >= _total_deadline
+                        )
+                        if resolved_retry_delay is None or retry_exceeds_deadline:
+                            if self._switch_to_invalid_response_fallback(
+                                failure_kind.value
+                            ):
+                                next_provider_activity_reason = reason
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    phase="fallback",
+                                    reason=reason,
+                                    retry_attempt=_retry_attempt + 1,
+                                    retry_limit=_fallback.max_retries,
+                                    retry_after_ms=(
+                                        math.ceil(
+                                            max(
+                                                0.0,
+                                                float(provider_error.retry_after_s or 0.0),
+                                            )
+                                            * 1000
+                                        )
+                                    ),
+                                    started_at=time.time_ns() // 1_000_000,
+                                )
+                                _call_attempt += 1
+                                continue
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_failure_code(
+                                    provider_error.code,
+                                    failure_kind.value,
+                                ),
+                                failure_kind=failure_kind.value,
+                            )
+                            yield terminal_error
+                            break
                         _log.warning(
                             "provider.retry",
                             attempt=_retry_attempt + 1,
                             kind=kind.value,
-                            delay_s=round(delay, 2),
+                            delay_s=round(resolved_retry_delay, 2),
                         )
-                        await asyncio.sleep(delay)
+                        yield ProviderActivityEvent(
+                            activity_id=provider_activity_id,
+                            phase="retry_wait",
+                            reason=reason,
+                            retry_attempt=_retry_attempt + 1,
+                            retry_limit=_fallback.max_retries,
+                            retry_after_ms=math.ceil(resolved_retry_delay * 1000),
+                            started_at=time.time_ns() // 1_000_000,
+                        )
+                        await asyncio.sleep(resolved_retry_delay)
                         _retry_attempt += 1
+                        next_provider_activity_reason = reason
+                        yield ProviderActivityEvent(
+                            activity_id=provider_activity_id,
+                            phase="retrying",
+                            reason=reason,
+                            retry_attempt=_retry_attempt,
+                            retry_limit=_fallback.max_retries,
+                            started_at=time.time_ns() // 1_000_000,
+                        )
                         _call_attempt += 1
 
                 if terminal_error is not None:
@@ -16356,7 +16887,12 @@ class Agent:
         total_deadline: float | None,
         deadline_provider: Callable[[], float | None] | None = None,
     ) -> AsyncIterator[Any]:
-        stream_iter = stream.__aiter__()
+        try:
+            stream_iter = stream.__aiter__()
+        except (asyncio.CancelledError, UsageAccountingUnavailableError):
+            raise
+        except Exception:  # noqa: BLE001 - provider boundary
+            raise _RaisedProviderBoundaryError from None
         while True:
             dynamic_deadline = (
                 deadline_provider()
@@ -16407,9 +16943,17 @@ class Agent:
                     )
                 raise _IterationStreamTimeoutError
             try:
-                yield next_event.result()
+                event = next_event.result()
             except StopAsyncIteration:
                 return
+            except (asyncio.CancelledError, UsageAccountingUnavailableError):
+                raise
+            except Exception:  # noqa: BLE001 - provider boundary
+                # TimeoutError raised *by the provider* is different from the
+                # deadline timeouts raised above by this wrapper.  Project it
+                # through the same content-free provider failure path.
+                raise _RaisedProviderBoundaryError from None
+            yield event
 
     @staticmethod
     async def _close_provider_stream(stream_iter: AsyncIterator[Any]) -> None:
@@ -16419,7 +16963,10 @@ class Agent:
         try:
             await aclose()
         except Exception as exc:  # noqa: BLE001 - cleanup must not mask timeout
-            logger.debug("provider_stream.close_failed", error=str(exc))
+            logger.debug(
+                "provider_stream.close_failed",
+                error_type=type(exc).__name__,
+            )
 
     def _provider_request_messages(
         self,

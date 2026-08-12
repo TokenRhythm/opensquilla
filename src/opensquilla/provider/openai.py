@@ -4024,24 +4024,12 @@ class OpenAIProvider:
                                 message_limit_proof=message_limit_proof,
                             )
                             return
-                        # Diagnostic: dump payload head (no auth headers)
-                        # so 400s from picky upstreams are debuggable. Truncated
-                        # to keep memory low.
-                        try:
-                            _payload_head = json.dumps(
-                                payload,
-                                ensure_ascii=False,
-                            )[:4000]
-                        except Exception:  # noqa: BLE001
-                            _payload_head = repr(payload)[:4000]
                         log.warning(
                             "provider.chat_http_error",
                             provider=self._provider_kind,
                             model=self._model,
                             status_code=response.status_code,
-                            message=message,
-                            response_body=safe_body_text[:2000],
-                            request_payload_head=_payload_head,
+                            response_body_chars=len(response.text),
                         )
                         trace.record_error(
                             code=str(response.status_code),
@@ -4128,8 +4116,7 @@ class OpenAIProvider:
                                 "provider.stream_error_frame",
                                 provider=self._provider_kind,
                                 model=self._model,
-                                code=err_code,
-                                message=err_message,
+                                error_message_chars=len(err_message),
                             )
                             trace.record_error(
                                 code=err_code,
@@ -5228,7 +5215,6 @@ class OpenAIProvider:
                     model=self._model,
                     timeout_seconds=cfg.timeout,
                     timeout_phase=type(exc).__name__,
-                    error=safe_error,
                 )
                 yield ProviderHeartbeatEvent(
                     phase="llm_fallback",
@@ -5285,7 +5271,6 @@ class OpenAIProvider:
                         "provider.stream_internal_error",
                         provider=self._provider_kind,
                         model=self._model,
-                        error=fallback_error,
                         exception_type=type(fallback_exc).__name__,
                     )
                     trace.record_error(code="provider_internal", message=fallback_error)
@@ -5405,7 +5390,6 @@ class OpenAIProvider:
                 "provider.stream_internal_error",
                 provider=self._provider_kind,
                 model=self._model,
-                error=safe_error,
                 exception_type=type(exc).__name__,
             )
             trace.record_error(
@@ -5513,7 +5497,7 @@ class OpenAIProvider:
                 "openrouter.non_stream_fallback_timeout",
                 model=self._model,
                 timeout_seconds=cfg.timeout,
-                stream_error=safe_error,
+                timeout_phase=type(timeout_exc).__name__,
             )
             trace.record_error(
                 code="timeout",

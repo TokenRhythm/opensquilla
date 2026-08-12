@@ -107,6 +107,7 @@ interface DispatchSendOptions {
   cancelIfComposerChanged?: boolean
   retryAttempt?: SendAttempt | null
   rememberRetryableAttempt?: (attempt: SendAttempt) => void
+  durablePendingItem?: ChatPendingItem
 }
 
 interface ResponseHandoffGate {
@@ -328,7 +329,10 @@ export interface UseChatSendOptions {
     isCurrent?: () => boolean
     attachments?: Attachment[]
   }) => Promise<boolean>
-  enqueuePendingInput: (text: string, owner?: PendingQueueOwner) => boolean
+  enqueuePendingInput: (
+    text: string,
+    owner?: PendingQueueOwner,
+  ) => boolean | Promise<boolean>
   enqueuePendingPayload?: (
     payload: {
       text: string
@@ -336,7 +340,7 @@ export interface UseChatSendOptions {
       intent?: string | null
     },
     owner?: PendingQueueOwner,
-  ) => boolean
+  ) => boolean | Promise<boolean>
   enqueueHiddenControl?: (
     item: {
       text: string
@@ -1082,8 +1086,9 @@ export function useChatSend(options: UseChatSendOptions) {
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     if (options.stream.isStreaming.value || compactInFlight || handoffInFlight) {
       if (!bypassSlashCommand && !isLiteralSlash && isControlInput(text)) {
-        const queued = options.enqueuePendingInput(text, pendingQueueOwner())
-        if (!queued) pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
+        // Slash and bang inputs are client control-plane commands. Running
+        // them later can target a different task/session, so keep the exact
+        // command editable in the composer while the current turn is busy.
         return
       }
       if (!hasPayload) return
@@ -1103,13 +1108,15 @@ export function useChatSend(options: UseChatSendOptions) {
       // preserved (enqueue returns false before clearing the composer).
       const composerChanged = !composerMatchesSnapshot(composerSnapshot)
       if (invocation.cancelIfComposerChanged && composerChanged) return
-      const queued = composerChanged || invocation.textOverride !== undefined
-        ? options.enqueuePendingPayload?.({
+      const queued = await Promise.resolve(
+        composerChanged || invocation.textOverride !== undefined
+          ? options.enqueuePendingPayload?.({
             text,
             attachments: composerSnapshot.payloadAttachments,
             intent: composerSnapshot.intent,
           }, pendingQueueOwner()) ?? false
-        : options.enqueuePendingInput(text, pendingQueueOwner())
+          : options.enqueuePendingInput(text, pendingQueueOwner()),
+      )
       if (!queued) {
         pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
       }
@@ -1187,7 +1194,12 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       return preserveRetryState(delivery === 'followup' ? 'deferred' : 'not_sent')
     }
-    if (item.attachments.some(attachment => !isSendableAttachment(attachment))) {
+    const serverStagedItem = item.pendingPersistenceState === 'staged'
+      && Boolean(item.pendingInputId)
+    if (
+      !serverStagedItem
+      && item.attachments.some(attachment => !isSendableAttachment(attachment))
+    ) {
       return preserveRetryState('not_sent')
     }
     if (
@@ -1237,6 +1249,11 @@ export function useChatSend(options: UseChatSendOptions) {
       rememberRetryableAttempt: attempt => {
         recoveredQueuedAttempts.set(item, attempt)
       },
+      ...(item.pendingInputId
+        && item.pendingClientRequestId
+        && item.pendingClientMessageId
+        ? { durablePendingItem: item }
+        : {}),
     })
     if (outcome === 'accepted') {
       recoveredQueuedAttempts.delete(item)
@@ -1318,7 +1335,10 @@ export function useChatSend(options: UseChatSendOptions) {
     )
     // A recovered attempt must keep the exact serialized attachment tokens and
     // metadata that were fingerprinted with its idempotency key.
-    if (!retryAttempt && options.prepareAttachmentsForSend) {
+    const serverStagedPendingItem = sendOpts.durablePendingItem?.pendingPersistenceState === 'staged'
+      ? sendOpts.durablePendingItem
+      : undefined
+    if (!retryAttempt && !serverStagedPendingItem && options.prepareAttachmentsForSend) {
       const ready = await options.prepareAttachmentsForSend({
         isCurrent: () => options.sessionKey.value === requestSessionKey,
         ...(sendOpts.payload ? { attachments: sourceAttachments } : {}),
@@ -1335,6 +1355,7 @@ export function useChatSend(options: UseChatSendOptions) {
       ?? options.pendingAttachments.value
     if (
       preserveComposer
+      && !serverStagedPendingItem
       && sendOpts.payload
       && currentSourceAttachments.some(attachment => !isSendableAttachment(attachment))
     ) {
@@ -1351,7 +1372,9 @@ export function useChatSend(options: UseChatSendOptions) {
     const attachmentsToKeep = currentSourceAttachments.filter(
       attachment => !sendAttachmentIds.has(attachment.local_id) || !isSendableAttachment(attachment),
     )
-    if (!text && attachmentsToSend.length === 0) return 'not_sent'
+    if (!text && attachmentsToSend.length === 0 && !serverStagedPendingItem) {
+      return 'not_sent'
+    }
 
     options.aborted.value = false
     if (!preserveComposer) options.closeSlashMenu()
@@ -1363,9 +1386,12 @@ export function useChatSend(options: UseChatSendOptions) {
     const userText = text
     let attempt = retryAttempt
     if (!attempt) {
-      const clientMessageId = createClientMessageId()
+      const durablePendingItem = sendOpts.durablePendingItem
+      const clientMessageId = durablePendingItem?.pendingClientMessageId
+        || createClientMessageId()
       const params: ChatSendParams = {
-        clientRequestId: createClientRequestId(),
+        clientRequestId: durablePendingItem?.pendingClientRequestId
+          || createClientRequestId(),
         clientMessageId,
         message: text || 'Describe these attachments',
         // The Vue client never uses the legacy cancel-style steer path. Make
@@ -1444,7 +1470,18 @@ export function useChatSend(options: UseChatSendOptions) {
     )
 
     try {
-      const res = await options.rpc.call<ChatSendResponse>('chat.send', attempt.params)
+      const stagedPendingItem = serverStagedPendingItem
+      const res = await options.rpc.call<ChatSendResponse>(
+        stagedPendingItem ? 'sessions.pending_inputs.dispatch' : 'chat.send',
+        stagedPendingItem
+          ? {
+              key: requestSessionKey,
+              pendingInputId: stagedPendingItem.pendingInputId,
+              clientRequestId: stagedPendingItem.pendingClientRequestId,
+              requestFingerprint: stagedPendingItem.pendingRequestFingerprint,
+            }
+          : attempt.params,
+      )
       if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
         recoveredAttempt = null
       }

@@ -457,12 +457,12 @@ describe('RpcClient', () => {
     firstSocket.close()
 
     const timedWait = client.waitForConnection(
-      825,
+      1_025,
       undefined,
       { timeoutAction: 'reconnect' },
     ).catch((error: unknown) => error)
 
-    await vi.advanceTimersByTimeAsync(800)
+    await vi.advanceTimersByTimeAsync(1_000)
     const replacement = MockWebSocket.instances[1]
     expect(replacement).toBeDefined()
     expect(client.state).toBe('connecting')
@@ -476,6 +476,29 @@ describe('RpcClient', () => {
     expect(retrySocket).toBeDefined()
     establishConnection(retrySocket)
     await expect(client.waitForConnection(25)).resolves.toBeUndefined()
+    client.disconnect()
+  })
+
+  it('reconnects with the fixed 1/2/4/8/15 second backoff and resets after hello', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+
+    const delays = [1_000, 2_000, 4_000, 8_000, 15_000, 15_000]
+    for (const [index, delay] of delays.entries()) {
+      MockWebSocket.instances[index].close()
+      await vi.advanceTimersByTimeAsync(delay - 1)
+      expect(MockWebSocket.instances).toHaveLength(index + 1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(MockWebSocket.instances).toHaveLength(index + 2)
+    }
+
+    const recovered = MockWebSocket.instances[MockWebSocket.instances.length - 1]!
+    establishConnection(recovered)
+    recovered.close()
+    await vi.advanceTimersByTimeAsync(999)
+    expect(MockWebSocket.instances).toHaveLength(delays.length + 1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(MockWebSocket.instances).toHaveLength(delays.length + 2)
     client.disconnect()
   })
 

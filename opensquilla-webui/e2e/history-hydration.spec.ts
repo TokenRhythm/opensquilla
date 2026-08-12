@@ -429,6 +429,7 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
   let heldHistoryRequests = 0
   let heldSubscribeRequests = 0
   let recoveredHistorySocket = 0
+  let recoveredSubscribeSocket = 0
   const tickSenders: Array<() => void> = []
 
   await page.clock.install({ time: new Date('2026-07-28T00:00:00Z') })
@@ -496,6 +497,7 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
             heldSubscribeRequests += 1
             return
           }
+          recoveredSubscribeSocket = socketId
           ws.send(successResponse(String(frame.id), {
             subscribed: true,
             replay_complete: true,
@@ -528,7 +530,11 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
   // Advance past the 15-second aggregate bootstrap budget one second at a
   // time, delivering a server tick after each increment. This models a socket
   // that remains healthy while individual RPCs never produce responses.
-  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1)
+  // Leave enough headroom for the RPC round-trip between reading the mocked
+  // clock and pausing it. A 1 ms target can already be in the past on a busy
+  // hosted runner, which makes Playwright reject the retry before exercising
+  // the recovery contract.
+  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1_000)
   for (let elapsed = 0; elapsed < 16_000; elapsed += 1000) {
     await page.clock.runFor(1000)
     tickSenders.forEach(sendTick => sendTick())
@@ -555,8 +561,24 @@ test('terminates stalled history and live hydration despite ongoing ticks, then 
   const liveFailure = page.locator(
     '[data-testid="chat-session-recovery-status"][data-recovery-state="live-degraded"]',
   )
-  await expect(liveFailure).toBeVisible()
-  await liveFailure.getByTestId('chat-session-recovery-retry').click()
+  // The page clock is paused for this deterministic timeout scenario. Keep
+  // advancing it after the history retry so an in-flight subscribe on the
+  // recycled socket can either recover or reach its bounded degraded state.
+  for (let elapsed = 0; elapsed < 16_000 && !await send.isEnabled(); elapsed += 1000) {
+    await page.clock.runFor(1000)
+    tickSenders.forEach(sendTick => sendTick())
+  }
+  // Depending on whether the replacement socket connected before or after
+  // recovery was allowed, the live phase may already be ready or may expose
+  // its explicit retry control. Both paths must converge without losing the
+  // recovered history or composer draft.
+  await expect.poll(async () => (
+    (await send.isEnabled()) || (await liveFailure.isVisible())
+  )).toBe(true)
+  if (await liveFailure.isVisible()) {
+    await liveFailure.getByTestId('chat-session-recovery-retry').click()
+  }
+  await expect.poll(() => recoveredSubscribeSocket).toBeGreaterThan(1)
   await expect(liveFailure).toHaveCount(0)
   await expect(send).toBeEnabled()
   await expect(composer).toHaveValue('Keep this draft through timeout and reconnect.')

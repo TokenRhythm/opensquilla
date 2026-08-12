@@ -84,6 +84,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
   const enqueuePendingSteerAttempt = overrides.enqueuePendingSteerAttempt
     ?? ((payload) => {
       const item: ChatPendingItem = {
+        pendingUiId: `pending-ui-${pendingQueue.value.length}`,
         text: payload.request.message,
         attachments: [],
         intent: null,
@@ -649,13 +650,14 @@ describe('useChatSend attachment payloads', () => {
   })
 
   it.each(['/status', '!pwd'])(
-    'queues busy control input %s without sending it as same-turn steer',
+    'keeps busy control input %s in the composer without delayed delivery',
     async input => {
       const enqueuePendingInput = vi.fn(() => true)
       const executeSlashCommand = vi.fn(async () => true)
+      const inputText = ref(input)
       const { api, rpc, stream } = makeOptions({
         ...sameTurnSteerOptions(),
-        inputText: ref(input),
+        inputText,
         busySendMode: ref<BusySendMode>('steer'),
         enqueuePendingInput,
         executeSlashCommand,
@@ -664,9 +666,10 @@ describe('useChatSend attachment payloads', () => {
 
       await api.onSend()
 
-      expect(enqueuePendingInput).toHaveBeenCalledWith(input, undefined)
+      expect(enqueuePendingInput).not.toHaveBeenCalled()
       expect(executeSlashCommand).not.toHaveBeenCalled()
       expect(rpc.call).not.toHaveBeenCalled()
+      expect(inputText.value).toBe(input)
     },
   )
 
@@ -680,6 +683,7 @@ describe('useChatSend attachment payloads', () => {
       stream.isStreaming.value = true
 
       await expect(api.sendQueuedSteer({
+        pendingUiId: `pending-ui-control-${input}`,
         text: input,
         attachments: [],
         intent: null,
@@ -744,6 +748,7 @@ describe('useChatSend attachment payloads', () => {
   it('preserves queued and hidden sends while live delivery is blocked', async () => {
     const blocker = ref<string | null>('Live updates are unavailable')
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-live-blocked',
       text: 'keep this queued',
       attachments: [],
       intent: null,
@@ -756,6 +761,7 @@ describe('useChatSend attachment payloads', () => {
 
     expect(rpc.call).not.toHaveBeenCalled()
     expect(queued).toEqual({
+      pendingUiId: 'pending-ui-live-blocked',
       text: 'keep this queued',
       attachments: [],
       intent: null,
@@ -800,6 +806,7 @@ describe('useChatSend attachment payloads', () => {
         }),
     }
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-hidden-retry',
       text: 'provider confirmation',
       displayTextOverride: 'Confirmed',
       attachments: [],
@@ -1037,6 +1044,7 @@ describe('useChatSend attachment payloads', () => {
   it('keeps queued delivery owned when project validation blocks it', async () => {
     const validateActiveProjectBeforeSend = vi.fn(async () => 'removed')
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-project-blocked',
       text: 'keep queued',
       attachments: [],
       intent: null,
@@ -1070,6 +1078,7 @@ describe('useChatSend attachment payloads', () => {
       },
     ))
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-project-race',
       text: 'queued follow-up',
       attachments: [],
       intent: null,
@@ -1155,6 +1164,104 @@ describe('useChatSend attachment payloads', () => {
       workspaceId: 'project-a',
     }))
     expect(pendingWorkspaceId.value).toBeNull()
+  })
+
+  it('dispatches a server-staged follow-up by its durable identity', async () => {
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-pending-dispatch',
+        message_id: 'message-pending-dispatch',
+      }),
+    }
+    const { api } = makeOptions({ rpc })
+    const item: ChatPendingItem = {
+      pendingUiId: 'pending-stable-id',
+      text: 'dispatch this staged input',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+      pendingInputId: 'pending-stable-id',
+      pendingClientRequestId: 'request-stable-id',
+      pendingClientMessageId: 'message-stable-id',
+      pendingRequestFingerprint: 'fingerprint-stable-id',
+      pendingPersistenceState: 'staged',
+    }
+
+    await expect(api.sendQueuedFollowup(item)).resolves.toBe('accepted')
+    expect(rpc.call).toHaveBeenCalledWith('sessions.pending_inputs.dispatch', {
+      key: 'agent:main:webchat:test',
+      pendingInputId: 'pending-stable-id',
+      clientRequestId: 'request-stable-id',
+      requestFingerprint: 'fingerprint-stable-id',
+    })
+  })
+
+  it('reuses IndexedDB-only identities when an older Gateway lacks staged dispatch', async () => {
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-local-only-dispatch',
+        message_id: 'message-local-only-dispatch',
+      }),
+    }
+    const { api } = makeOptions({ rpc })
+    const item: ChatPendingItem = {
+      pendingUiId: 'pending-local-only-id',
+      text: 'dispatch this browser-only input',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+      pendingInputId: 'pending-local-only-id',
+      pendingClientRequestId: 'request-local-only-id',
+      pendingClientMessageId: 'message-local-only-id',
+      pendingPersistenceState: 'local_only',
+    }
+
+    await expect(api.sendQueuedFollowup(item)).resolves.toBe('accepted')
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId: 'request-local-only-id',
+      clientMessageId: 'message-local-only-id',
+      message: 'dispatch this browser-only input',
+    }))
+  })
+
+  it('dispatches server-restored attachment material without an upload UUID', async () => {
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-pending-material',
+        message_id: 'message-pending-material',
+      }),
+    }
+    const { api } = makeOptions({ rpc })
+    const item: ChatPendingItem = {
+      pendingUiId: 'pending-material-id',
+      text: '',
+      attachments: [{
+        kind: 'staged',
+        local_id: -1,
+        name: 'restored.txt',
+        mime: 'text/plain',
+        size: 12,
+        durable_material: true,
+      }],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+      pendingInputId: 'pending-material-id',
+      pendingClientRequestId: 'request-material-id',
+      pendingClientMessageId: 'message-material-id',
+      pendingRequestFingerprint: 'fingerprint-material-id',
+      pendingPersistenceState: 'staged',
+    }
+
+    await expect(api.sendQueuedFollowup(item)).resolves.toBe('accepted')
+    expect(rpc.call).toHaveBeenCalledWith('sessions.pending_inputs.dispatch', {
+      key: 'agent:main:webchat:test',
+      pendingInputId: 'pending-material-id',
+      clientRequestId: 'request-material-id',
+      requestFingerprint: 'fingerprint-material-id',
+    })
   })
 
   it('does not materialize a project draft before chat.send accepts it', async () => {
@@ -2035,6 +2142,7 @@ describe('useChatSend attachment payloads', () => {
       },
     ])
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-late-adjustment',
       text: 'late adjustment',
       attachments: [],
       intent: null,
@@ -2120,6 +2228,7 @@ describe('useChatSend attachment payloads', () => {
     })
     stream.isStreaming.value = true
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-composer-snapshot',
       text: 'steer with the queued snapshot',
       attachments: [],
       intent: null,
@@ -2167,6 +2276,7 @@ describe('useChatSend attachment payloads', () => {
     const inputText = ref('new live draft')
     const { api, rpc, stream } = makeOptions({ inputText })
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-active-run',
       text: 'wait for the active run',
       attachments: [],
       intent: null,
@@ -2198,6 +2308,7 @@ describe('useChatSend attachment payloads', () => {
       hasPendingAttachmentWork: () => preparing,
     })
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-attachment-preparation',
       text: 'wait for composer preparation',
       attachments: [],
       intent: null,
@@ -2239,6 +2350,7 @@ describe('useChatSend attachment payloads', () => {
     })
     stream.isStreaming.value = true
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-ambiguous-steer',
       text: 'retry this queued steer',
       attachments: [],
       intent: null,
@@ -2272,6 +2384,7 @@ describe('useChatSend attachment payloads', () => {
   it('does not send a queued steer when the gateway exposes no same-turn capability', async () => {
     const { api, options, rpc, stream } = makeOptions()
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-no-capability',
       text: 'send after the prior turn',
       attachments: [],
       intent: null,
@@ -2293,6 +2406,7 @@ describe('useChatSend attachment payloads', () => {
       error: 'upload failed',
     }
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-failed-attachment',
       text: 'keep the failed attachment recoverable',
       attachments: [failed],
       intent: null,
@@ -2315,6 +2429,7 @@ describe('useChatSend attachment payloads', () => {
     }
     const inputText = ref('unrelated live draft')
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-ensemble-image',
       text: 'inspect the queued image',
       attachments: [image],
       intent: null,
@@ -2341,6 +2456,7 @@ describe('useChatSend attachment payloads', () => {
       file_uuid: 'queued-image-busy',
     }
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-routing-update',
       text: 'wait for the routing update',
       attachments: [image],
       intent: null,
@@ -3906,6 +4022,7 @@ describe('useChatSend Ensemble image guard', () => {
       const { stream } = makeOptions()
       stream.isStreaming.value = true
       let sendCurrentInput: () => void = () => {}
+      const pendingRecords = new Map<string, import('@/utils/chat/pendingInputWal').PendingInputWalRecord>()
       const pending = useChatPendingQueue({
         sessionKey,
         inputText,
@@ -3917,6 +4034,15 @@ describe('useChatSend Ensemble image guard', () => {
         sendCurrentInput: () => sendCurrentInput(),
         resetInputHistory: vi.fn(),
         hasComposer: () => true,
+        pendingInputWal: {
+          put: async record => { pendingRecords.set(record.pendingInputId, record) },
+          list: async key => [...pendingRecords.values()].filter(record => (
+            record.sessionKey === key
+          )),
+          delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
+          close: () => {},
+        },
+        supportsMethod: () => false,
       })
       const { api, options, rpc } = makeOptions({
         inputText,

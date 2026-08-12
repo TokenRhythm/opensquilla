@@ -16,11 +16,21 @@ import copy
 import hashlib
 import inspect
 import json
+import math
 import os
 import platform
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Mapping, Sequence
+from collections import deque
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Hashable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -202,10 +212,24 @@ from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
 )
 from opensquilla.provider import (
+    ProviderActivityEvent,
+    ProviderFailureKind,
     ProviderHeartbeatEvent,
     ProviderRecoveryAction,
     classify_provider_error,
     decide_recovery_action,
+)
+from opensquilla.provider import (
+    ReasoningDeltaEvent as ProviderReasoningDeltaEvent,
+)
+from opensquilla.provider import (
+    ToolUseDeltaEvent as ProviderToolUseDeltaEvent,
+)
+from opensquilla.provider import (
+    ToolUseEndEvent as ProviderToolUseEndEvent,
+)
+from opensquilla.provider import (
+    ToolUseStartEvent as ProviderToolUseStartEvent,
 )
 from opensquilla.provider.model_catalog import (
     resolve_effective_context_window,
@@ -268,6 +292,8 @@ from opensquilla.session.keys import (
 from opensquilla.session.terminal_reply import (
     append_error_ref,
     build_terminal_reply,
+    safe_provider_failure_code,
+    safe_provider_failure_message,
     sanitize_agent_error,
 )
 from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
@@ -1416,6 +1442,7 @@ def _report_credential_pool_failure(
             pool_provider,
             str(pool_info.get("session_key") or ""),
             kind,
+            retry_after_seconds=getattr(event, "retry_after_s", None),
         )
     except Exception:  # noqa: BLE001 — credential bookkeeping only
         log.debug("credential_pool.report_failed", provider=pool_provider)
@@ -1479,6 +1506,498 @@ def _fallback_deployment_identity(config: Any) -> _FallbackDeploymentIdentity:
         base_url=str(getattr(config, "base_url", "") or "").strip(),
         proxy=str(getattr(config, "proxy", "") or "").strip(),
     )
+
+
+_SELECTOR_PRE_TEXT_REASONING_LIMIT_BYTES: Final[int] = 2 * 1024 * 1024
+_SELECTOR_REASONING_PULSE_INTERVAL_SECONDS: Final[float] = 5.0
+_SELECTOR_MAX_RETRY_AFTER_SECONDS: Final[float] = 900.0
+_SELECTOR_REASONING_TRUNCATED_NOTICE: Final[str] = (
+    "[Earlier model reasoning was truncated for display.]\n\n"
+)
+_SELECTOR_PRE_TEXT_BUFFER_OVERFLOW_CODE: Final[str] = (
+    "provider_pretext_buffer_exhausted"
+)
+_SELECTOR_PRE_TEXT_BUFFER_OVERFLOW_MESSAGE: Final[str] = (
+    "The model response exceeded the safe pre-answer buffer limit."
+)
+
+
+@dataclass(slots=True)
+class _BufferedReasoningDeltas:
+    """Adjacent reasoning chunks retained without quadratic string joins."""
+
+    chunks: deque[str] = field(default_factory=deque)
+    byte_count: int = 0
+
+
+@dataclass(slots=True)
+class _BufferedToolUseDeltas:
+    """Adjacent JSON fragments for one tool call, retained as one entry."""
+
+    tool_use_id: str
+    chunks: deque[str] = field(default_factory=deque)
+    byte_count: int = 0
+
+
+class _SelectorPreTextBuffer:
+    """Bound attempt-scoped content until a provider leg commits successfully."""
+
+    def __init__(
+        self,
+        *,
+        reasoning_limit_bytes: int = _SELECTOR_PRE_TEXT_REASONING_LIMIT_BYTES,
+    ) -> None:
+        self._reasoning_limit_bytes = max(0, int(reasoning_limit_bytes))
+        self._entries: deque[Any] = deque()
+        self._reasoning_bytes = 0
+        self._buffered_bytes = 0
+        self._reasoning_truncated = False
+        self._has_completed_tool_call = False
+        self._open_tool_use_ids: set[str] = set()
+        self._open_tool_names: dict[str, str] = {}
+        self._seen_tool_use_ids: set[str] = set()
+        self._protocol_error = False
+        self._overflowed = False
+
+    @property
+    def has_completed_tool_call(self) -> bool:
+        """Whether the buffered leg completed a provider tool call."""
+
+        return self._has_completed_tool_call
+
+    @property
+    def has_incomplete_tool_call(self) -> bool:
+        """Whether the leg started, but never completed, a provider tool call."""
+
+        return bool(self._open_tool_use_ids)
+
+    @property
+    def protocol_error(self) -> bool:
+        """Whether tool frames violated the provider stream ordering contract."""
+
+        return self._protocol_error
+
+    @property
+    def overflowed(self) -> bool:
+        """Whether non-discardable attempt content exceeded the hard limit."""
+
+        return self._overflowed
+
+    @property
+    def buffered_bytes(self) -> int:
+        """Approximate retained payload bytes, exposed for deterministic tests."""
+
+        return self._buffered_bytes
+
+    @staticmethod
+    def _event_buffer_bytes(event: Any) -> int:
+        if isinstance(event, ProviderToolUseDeltaEvent):
+            return len(event.tool_use_id.encode("utf-8")) + len(
+                event.json_fragment.encode("utf-8")
+            )
+        try:
+            payload = asdict(event)
+            serialized = json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+            return len(serialized.encode("utf-8"))
+        except (TypeError, ValueError):
+            # Unknown provider extensions must still consume bounded space.
+            # Attribute strings cover the common dataclass-like shapes while
+            # the fixed floor prevents a stream of zero-sized objects.
+            values = getattr(event, "__dict__", {})
+            return max(
+                64,
+                sum(len(str(value).encode("utf-8")) for value in values.values()),
+            )
+
+    def _mark_overflowed(self) -> None:
+        self._entries.clear()
+        self._reasoning_bytes = 0
+        self._buffered_bytes = 0
+        self._reasoning_truncated = False
+        self._has_completed_tool_call = False
+        self._open_tool_use_ids.clear()
+        self._open_tool_names.clear()
+        self._seen_tool_use_ids.clear()
+        self._overflowed = True
+
+    def _mark_protocol_error(self) -> None:
+        """Discard a malformed provisional leg without retaining its payload."""
+
+        self._entries.clear()
+        self._reasoning_bytes = 0
+        self._buffered_bytes = 0
+        self._reasoning_truncated = False
+        self._has_completed_tool_call = False
+        self._open_tool_use_ids.clear()
+        self._open_tool_names.clear()
+        self._seen_tool_use_ids.clear()
+        self._protocol_error = True
+
+    def _accept_tool_frame(self, event: Any) -> bool:
+        """Validate one tool frame against an id-keyed open-call set.
+
+        Providers may interleave deltas for several tool calls.  A single
+        started/completed boolean therefore cannot distinguish a valid
+        interleave from an unknown id, duplicate start/end, or a late delta.
+        Every invalid ordering clears the whole provisional leg so no failed
+        tool arguments can cross the selector boundary.
+        """
+
+        if isinstance(event, ProviderToolUseStartEvent):
+            tool_use_id = str(event.tool_use_id or "")
+            tool_name = str(event.tool_name or "")
+            if (
+                not tool_use_id
+                or not tool_name
+                or tool_use_id in self._seen_tool_use_ids
+            ):
+                self._mark_protocol_error()
+                return False
+            self._seen_tool_use_ids.add(tool_use_id)
+            self._open_tool_use_ids.add(tool_use_id)
+            self._open_tool_names[tool_use_id] = tool_name
+            return True
+        if isinstance(event, ProviderToolUseDeltaEvent):
+            tool_use_id = str(event.tool_use_id or "")
+            if (
+                not tool_use_id
+                or tool_use_id not in self._open_tool_use_ids
+                or not isinstance(event.json_fragment, str)
+            ):
+                self._mark_protocol_error()
+                return False
+            return True
+        if isinstance(event, ProviderToolUseEndEvent):
+            tool_use_id = str(event.tool_use_id or "")
+            tool_name = str(event.tool_name or "")
+            invalid_arguments = not isinstance(event.arguments, dict)
+            if not invalid_arguments:
+                try:
+                    json.dumps(event.arguments, allow_nan=False)
+                except (OverflowError, RecursionError, TypeError, ValueError):
+                    invalid_arguments = True
+            if (
+                not tool_use_id
+                or tool_use_id not in self._open_tool_use_ids
+                or not tool_name
+                or tool_name != self._open_tool_names.get(tool_use_id)
+                or invalid_arguments
+            ):
+                self._mark_protocol_error()
+                return False
+            self._open_tool_use_ids.remove(tool_use_id)
+            self._open_tool_names.pop(tool_use_id, None)
+            self._has_completed_tool_call = True
+            return True
+        return True
+
+    def append(self, event: Any) -> None:
+        if self._overflowed or self._protocol_error:
+            return
+        if not self._accept_tool_frame(event):
+            return
+        if isinstance(event, ProviderReasoningDeltaEvent):
+            text = str(event.text or "")
+            if not text:
+                return
+            byte_count = len(text.encode("utf-8"))
+            tail = self._entries[-1] if self._entries else None
+            if not isinstance(tail, _BufferedReasoningDeltas):
+                tail = _BufferedReasoningDeltas()
+                self._entries.append(tail)
+            tail.chunks.append(text)
+            tail.byte_count += byte_count
+            self._reasoning_bytes += byte_count
+            self._buffered_bytes += byte_count
+            self._trim_reasoning_prefix()
+            return
+        if isinstance(event, ProviderToolUseDeltaEvent):
+            fragment = str(event.json_fragment or "")
+            byte_count = len(event.tool_use_id.encode("utf-8")) + len(
+                fragment.encode("utf-8")
+            )
+            tail = self._entries[-1] if self._entries else None
+            if not (
+                isinstance(tail, _BufferedToolUseDeltas)
+                and tail.tool_use_id == event.tool_use_id
+            ):
+                tail = _BufferedToolUseDeltas(tool_use_id=event.tool_use_id)
+                self._entries.append(tail)
+            tail.chunks.append(fragment)
+            tail.byte_count += byte_count
+            self._buffered_bytes += byte_count
+            self._trim_reasoning_prefix()
+            if self._buffered_bytes > self._reasoning_limit_bytes:
+                self._mark_overflowed()
+            return
+        self._entries.append(event)
+        self._buffered_bytes += self._event_buffer_bytes(event)
+        self._trim_reasoning_prefix()
+        if self._buffered_bytes > self._reasoning_limit_bytes:
+            self._mark_overflowed()
+
+    @staticmethod
+    def _trim_text_prefix_bytes(text: str, count: int) -> tuple[str, int]:
+        encoded = text.encode("utf-8")
+        if count >= len(encoded):
+            return "", len(encoded)
+        # ``ignore`` only drops a leading partial code point when the byte
+        # boundary lands inside one; complete retained characters are intact.
+        retained = encoded[count:].decode("utf-8", errors="ignore")
+        retained_bytes = len(retained.encode("utf-8"))
+        return retained, len(encoded) - retained_bytes
+
+    def _trim_reasoning_prefix(self) -> None:
+        overflow = self._buffered_bytes - self._reasoning_limit_bytes
+        if overflow <= 0:
+            return
+        self._reasoning_truncated = True
+        for entry in self._entries:
+            if overflow <= 0:
+                break
+            if not isinstance(entry, _BufferedReasoningDeltas):
+                continue
+            while entry.chunks and overflow > 0:
+                chunk = entry.chunks[0]
+                retained, removed = self._trim_text_prefix_bytes(chunk, overflow)
+                self._reasoning_bytes -= removed
+                self._buffered_bytes -= removed
+                entry.byte_count -= removed
+                overflow -= removed
+                if retained:
+                    entry.chunks[0] = retained
+                else:
+                    entry.chunks.popleft()
+
+    def drain(self, *, successful_leg: bool) -> list[Any]:
+        drained: list[Any] = []
+        notice_pending = successful_leg and self._reasoning_truncated
+        for entry in self._entries if successful_leg else ():
+            if isinstance(entry, _BufferedReasoningDeltas):
+                if not entry.chunks:
+                    continue
+                if notice_pending:
+                    drained.append(
+                        ProviderReasoningDeltaEvent(
+                            text=_SELECTOR_REASONING_TRUNCATED_NOTICE,
+                        )
+                    )
+                    notice_pending = False
+                drained.append(ProviderReasoningDeltaEvent(text="".join(entry.chunks)))
+            elif isinstance(entry, _BufferedToolUseDeltas):
+                drained.append(
+                    ProviderToolUseDeltaEvent(
+                        tool_use_id=entry.tool_use_id,
+                        json_fragment="".join(entry.chunks),
+                    )
+                )
+            else:
+                drained.append(entry)
+        self._entries.clear()
+        self._reasoning_bytes = 0
+        self._buffered_bytes = 0
+        self._reasoning_truncated = False
+        self._has_completed_tool_call = False
+        self._open_tool_use_ids.clear()
+        self._open_tool_names.clear()
+        self._seen_tool_use_ids.clear()
+        self._protocol_error = False
+        self._overflowed = False
+        return drained
+
+
+def _selector_pre_text_buffer_overflow_error() -> ProviderErrorEvent:
+    return ProviderErrorEvent(
+        message=_SELECTOR_PRE_TEXT_BUFFER_OVERFLOW_MESSAGE,
+        code=_SELECTOR_PRE_TEXT_BUFFER_OVERFLOW_CODE,
+    )
+
+
+def _selector_invalid_stream_order_error() -> ProviderErrorEvent:
+    return ProviderErrorEvent(
+        message="The model provider returned tool frames in an invalid order.",
+        code="invalid_stream_order",
+    )
+
+
+def _selector_stream_exception_error(*, content_started: bool = False) -> ProviderErrorEvent:
+    """Stable, provider-prose-free projection for an exception-raised stream."""
+
+    return ProviderErrorEvent(
+        message=(
+            "The connection to the model provider ended before the response completed."
+            if content_started
+            else "The connection to the model provider was interrupted."
+        ),
+        code="response_incomplete" if content_started else "request_error",
+    )
+
+
+async def _selector_safe_stream(
+    stream_factory: Callable[[], AsyncIterator[Any]],
+    *,
+    content_started: Callable[[], bool],
+) -> AsyncGenerator[Any, None]:
+    """Convert provider-raised exceptions while preserving engine control flow."""
+
+    stream: AsyncIterator[Any] | None = None
+    try:
+        stream = stream_factory()
+        async for event in stream:
+            yield event
+    except (asyncio.CancelledError, UsageAccountingUnavailableError):
+        raise
+    except Exception:  # noqa: BLE001 - raw provider prose must stop here
+        yield _selector_stream_exception_error(content_started=content_started())
+    finally:
+        # ``aclose`` on this wrapper must deterministically unwind the usage
+        # accounting generator beneath it. Relying on async-generator GC left
+        # a failed physical leg without its required ``unknown`` settlement.
+        close = getattr(stream, "aclose", None) if stream is not None else None
+        if callable(close):
+            try:
+                await close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A close-path provider exception carries the same untrusted
+                # prose as an iteration exception, but there is no additional
+                # event to emit while this generator is itself closing.
+                pass
+
+
+@dataclass(frozen=True, slots=True)
+class _ProviderAuthorityIdentity:
+    provider: str
+    api_key: str = field(repr=False)
+    base_url: str = ""
+    org_id: str = ""
+
+
+def _provider_authority_identity(config: Any) -> _ProviderAuthorityIdentity | None:
+    """Return the account/endpoint authority that owns Retry-After policy.
+
+    Duck-typed selector fakes that expose only ``provider``/``model`` have no
+    credential or endpoint authority, so compatibility tests keep treating
+    them as independent.  Real ``ProviderConfig`` instances always expose all
+    three authority fields, including an intentionally empty API key.
+    """
+
+    if not all(hasattr(config, name) for name in ("api_key", "base_url", "org_id")):
+        return None
+    return _ProviderAuthorityIdentity(
+        provider=str(getattr(config, "provider", "") or "").strip().lower(),
+        api_key=str(getattr(config, "api_key", "") or ""),
+        base_url=str(getattr(config, "base_url", "") or "").strip().rstrip("/"),
+        org_id=str(getattr(config, "org_id", "") or "").strip(),
+    )
+
+
+def _same_provider_authority(before: Any, after: Any) -> bool:
+    before_identity = _provider_authority_identity(before)
+    after_identity = _provider_authority_identity(after)
+    return bool(
+        before_identity is not None
+        and after_identity is not None
+        and before_identity == after_identity
+    )
+
+
+def _provider_retry_after_hint(event: ProviderErrorEvent) -> float:
+    try:
+        hint = float(event.retry_after_s or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if math.isnan(hint) or hint <= 0:
+        return 0.0
+    if math.isinf(hint):
+        # Treat an unbounded positive hint as over the automatic wait ceiling,
+        # never as "no hint" (which would allow an immediate same-authority
+        # request). Keep the projected value finite for activity serialization.
+        return _SELECTOR_MAX_RETRY_AFTER_SECONDS + 1.0
+    return hint
+
+
+def _selector_retry_after_deadline_error(
+    *,
+    retry_after_s: float,
+) -> ProviderErrorEvent:
+    return ProviderErrorEvent(
+        message=(
+            "The model provider requested a retry delay beyond this turn's "
+            "remaining deadline."
+        ),
+        code="provider_retry_after_deadline",
+        retry_after_s=retry_after_s,
+    )
+
+
+def _provider_activity_reason_for_error(
+    provider_name: str,
+    event: ProviderErrorEvent,
+) -> Literal[
+    "rate_limited",
+    "provider_overloaded",
+    "transport_transient",
+    "empty_response",
+    "invalid_response",
+    "context_overflow",
+    "unknown",
+]:
+    kind = classify_provider_error(
+        provider_name=provider_name,
+        status_code=int(event.code) if str(event.code).isdigit() else None,
+        raw_code=event.code,
+        message=event.message,
+    )
+    if kind is ProviderFailureKind.RATE_LIMITED:
+        return "rate_limited"
+    if kind is ProviderFailureKind.PROVIDER_OVERLOADED:
+        return "provider_overloaded"
+    if kind is ProviderFailureKind.TRANSPORT_TRANSIENT:
+        return "transport_transient"
+    if kind is ProviderFailureKind.EMPTY_RESPONSE:
+        return "empty_response"
+    if kind is ProviderFailureKind.CONTEXT_OVERFLOW:
+        return "context_overflow"
+    if kind is ProviderFailureKind.MALFORMED_RESPONSE:
+        return "invalid_response"
+    return "unknown"
+
+
+def _selector_failure_for_hook(
+    provider_name: str,
+    event: ProviderErrorEvent,
+) -> RuntimeError:
+    """Build a plugin-safe failure without relaying provider-controlled prose."""
+
+    kind = classify_provider_error(
+        provider_name=provider_name,
+        status_code=int(event.code) if str(event.code).isdigit() else None,
+        raw_code=event.code,
+        message=event.message,
+    )
+    return RuntimeError(safe_provider_failure_message(kind.value))
+
+
+def _selector_execution_leg_failure_code(
+    provider_name: str,
+    event: ProviderErrorEvent,
+) -> str:
+    """Project provider-controlled failure data to a bounded execution-leg code."""
+
+    kind = classify_provider_error(
+        provider_name=provider_name,
+        status_code=int(event.code) if str(event.code).isdigit() else None,
+        raw_code=event.code,
+        message=event.message,
+    )
+    return safe_provider_failure_code(event.code, kind.value)
 
 
 class _SelectorFallbackProvider:
@@ -2060,12 +2579,10 @@ class _SelectorFallbackProvider:
             return
 
         emitted_user_visible_content = False
-        pre_text_buffer: list[Any] = []
-
-        def drain_pre_text_buffer() -> list[Any]:
-            drained = list(pre_text_buffer)
-            pre_text_buffer.clear()
-            return drained
+        pre_text_buffer = _SelectorPreTextBuffer()
+        primary_activity_id = uuid.uuid4().hex
+        primary_reasoning_started_at_ms = 0
+        primary_reasoning_last_pulse_at = 0.0
 
         active_provider = self._provider
         active_provider_id, active_model = self._active_deployment()
@@ -2082,7 +2599,14 @@ class _SelectorFallbackProvider:
             int(getattr(active_config, "physical_attempt_limit", 0) or 0),
         )
         primary_stream = account_provider_stream(
-            lambda: active_provider.chat(messages, tools=tools, config=active_config),
+            lambda: _selector_safe_stream(
+                lambda: active_provider.chat(
+                    messages,
+                    tools=tools,
+                    config=active_config,
+                ),
+                content_started=lambda: emitted_user_visible_content,
+            ),
             provider=active_provider_id,
             model=active_model,
         )
@@ -2092,7 +2616,14 @@ class _SelectorFallbackProvider:
                 # unchanged and in real time.  Agent is the sole Provider→Engine
                 # normalization boundary.  Neither event counts as user-visible
                 # content, so a later pre-content error may still select fallback.
-                if isinstance(event, (ProviderHeartbeatEvent, ProviderEnsembleProgressEvent)):
+                if isinstance(
+                    event,
+                    (
+                        ProviderActivityEvent,
+                        ProviderHeartbeatEvent,
+                        ProviderEnsembleProgressEvent,
+                    ),
+                ):
                     yield event
                     continue
                 if isinstance(event, ProviderErrorEvent):
@@ -2105,6 +2636,68 @@ class _SelectorFallbackProvider:
                     yield event
                     continue
 
+                if isinstance(event, ProviderReasoningDeltaEvent) and event.text:
+                    now_monotonic = time.monotonic()
+                    first_reasoning = primary_reasoning_started_at_ms == 0
+                    if first_reasoning:
+                        primary_reasoning_started_at_ms = time.time_ns() // 1_000_000
+                    if (
+                        first_reasoning
+                        or now_monotonic - primary_reasoning_last_pulse_at
+                        >= _SELECTOR_REASONING_PULSE_INTERVAL_SECONDS
+                    ):
+                        yield ProviderActivityEvent(
+                            activity_id=primary_activity_id,
+                            phase="reasoning",
+                            reason="initial",
+                            started_at=primary_reasoning_started_at_ms,
+                            heartbeat=not first_reasoning,
+                        )
+                        primary_reasoning_last_pulse_at = now_monotonic
+                    pre_text_buffer.append(event)
+                    continue
+
+                if (
+                    not isinstance(event, ProviderErrorEvent)
+                    and not _is_non_empty_provider_text_delta(event)
+                    and getattr(event, "kind", "") != "done"
+                ):
+                    pre_text_buffer.append(event)
+                    if pre_text_buffer.protocol_error:
+                        event = _selector_invalid_stream_order_error()
+                    elif not pre_text_buffer.overflowed:
+                        continue
+                    else:
+                        # Re-enter the ordinary pre-content failure path so a
+                        # configured selector fallback is tried before Agent-level
+                        # retries. The whole provisional leg was cleared by the
+                        # bounded buffer and no tool frame can escape.
+                        event = _selector_pre_text_buffer_overflow_error()
+
+                if (
+                    _is_non_empty_provider_text_delta(event)
+                    and pre_text_buffer.has_incomplete_tool_call
+                ):
+                    # Text cannot commit a provisional leg while any tool id is
+                    # still open.  Otherwise a later selector failure could
+                    # expose an argument prefix for a tool that never completed.
+                    pre_text_buffer.drain(successful_leg=False)
+                    event = _selector_invalid_stream_order_error()
+
+                if (
+                    getattr(event, "kind", "") == "done"
+                    and pre_text_buffer.has_incomplete_tool_call
+                ):
+                    # The provisional tool frame must not escape a leg that
+                    # never completed its tool lifecycle.  Convert the
+                    # provider terminal into the stable protocol error that
+                    # Agent emitted before selector buffering was introduced.
+                    pre_text_buffer.drain(successful_leg=False)
+                    event = ProviderErrorEvent(
+                        message="Provider stream ended with an incomplete tool call",
+                        code="incomplete_tool_stream",
+                    )
+
                 local_admission_escalation = bool(
                     isinstance(event, ProviderErrorEvent)
                     and event.code == "provider_request_budget_exhausted"
@@ -2112,27 +2705,81 @@ class _SelectorFallbackProvider:
                 )
                 if isinstance(event, ProviderErrorEvent) and (
                     _should_use_selector_fallback(self.provider_name, event)
+                    or event.code == "invalid_stream_order"
                     or local_admission_escalation
                 ):
                     if not local_admission_escalation:
                         self._record_health_failure(event)
                     if 0 < physical_attempt_limit <= 1:
-                        for buffered_event in drain_pre_text_buffer():
+                        for buffered_event in pre_text_buffer.drain(successful_leg=False):
                             yield buffered_event
                         yield event
                         return
+                    failed_authority_config = getattr(
+                        self._selector,
+                        "current_config",
+                        None,
+                    )
                     try:
                         if local_admission_escalation:
                             self._provider = self._selector.next_fallback()
                         else:
                             self._provider = self._selector.next_fallback_after_failure(
-                                RuntimeError(event.message)
+                                _selector_failure_for_hook(
+                                    active_provider_id or self.provider_name,
+                                    event,
+                                )
                             )
                     except Exception:
-                        for buffered_event in drain_pre_text_buffer():
+                        for buffered_event in pre_text_buffer.drain(successful_leg=False):
                             yield buffered_event
                         yield event
                         return
+                    fallback_authority_config = getattr(
+                        self._selector,
+                        "current_config",
+                        None,
+                    )
+                    retry_after_hint = _provider_retry_after_hint(event)
+                    if (
+                        retry_after_hint > 0
+                        and _same_provider_authority(
+                            failed_authority_config,
+                            fallback_authority_config,
+                        )
+                    ):
+                        retry_reason = _provider_activity_reason_for_error(
+                            active_provider_id or self.provider_name,
+                            event,
+                        )
+                        yield ProviderActivityEvent(
+                            activity_id=primary_activity_id,
+                            phase="retry_wait",
+                            reason=retry_reason,
+                            retry_attempt=1,
+                            retry_limit=max(1, physical_attempt_limit - 1),
+                            retry_after_ms=math.ceil(retry_after_hint * 1000),
+                            started_at=time.time_ns() // 1_000_000,
+                        )
+                        turn_deadline = getattr(
+                            active_config,
+                            "turn_deadline_at_monotonic",
+                            None,
+                        )
+                        deadline_exhausted = bool(
+                            isinstance(turn_deadline, int | float)
+                            and not isinstance(turn_deadline, bool)
+                            and time.monotonic() + retry_after_hint >= float(turn_deadline)
+                        )
+                        if (
+                            retry_after_hint > _SELECTOR_MAX_RETRY_AFTER_SECONDS
+                            or deadline_exhausted
+                        ):
+                            yield _selector_retry_after_deadline_error(
+                                retry_after_s=retry_after_hint,
+                            )
+                            return
+                        await asyncio.sleep(retry_after_hint)
                     self._note_fallback_hop()
                     if local_admission_escalation and self._turn_metadata is not None:
                         self._turn_metadata["router_fallback_reason"] = (
@@ -2147,32 +2794,177 @@ class _SelectorFallbackProvider:
                     fallback_provider = self._provider
                     fallback_provider_id, fallback_model = self._active_deployment()
                     fallback_config = self._config_for_active_leg(config)
+                    # The phase frame is yielded before the fallback adapter is
+                    # even asked for its first event, making ordering observable
+                    # and preventing a fast fallback token from racing the UI.
+                    yield ProviderActivityEvent(
+                        activity_id=uuid.uuid4().hex,
+                        phase="fallback",
+                        reason=(
+                            "context_overflow"
+                            if local_admission_escalation
+                            else _provider_activity_reason_for_error(
+                                active_provider_id or self.provider_name,
+                                event,
+                            )
+                        ),
+                        retry_attempt=1,
+                        retry_limit=max(1, physical_attempt_limit - 1),
+                        started_at=time.time_ns() // 1_000_000,
+                    )
                     record_execution_leg(
                         self._turn_metadata,
                         provider=fallback_provider_id,
                         model=fallback_model,
                         kind="provider_fallback",
                         config=fallback_config,
-                        reason=str(event.code or "provider_error"),
+                        reason=_selector_execution_leg_failure_code(
+                            active_provider_id or self.provider_name,
+                            event,
+                        ),
                     )
                     fallback_stream = account_provider_stream(
-                        lambda: fallback_provider.chat(
-                            messages,
-                            tools=tools,
-                            config=fallback_config,
+                        lambda: _selector_safe_stream(
+                            lambda: fallback_provider.chat(
+                                messages,
+                                tools=tools,
+                                config=fallback_config,
+                            ),
+                            content_started=lambda: fallback_committed,
                         ),
                         provider=fallback_provider_id,
                         model=fallback_model,
                     )
+                    fallback_buffer = _SelectorPreTextBuffer()
+                    fallback_committed = False
+                    fallback_activity_id = uuid.uuid4().hex
+                    fallback_reasoning_started_at_ms = 0
+                    fallback_reasoning_last_pulse_at = 0.0
                     try:
                         async for fallback_event in fallback_stream:
-                            yield fallback_event
+                            if isinstance(
+                                fallback_event,
+                                (
+                                    ProviderActivityEvent,
+                                    ProviderHeartbeatEvent,
+                                    ProviderEnsembleProgressEvent,
+                                ),
+                            ):
+                                yield fallback_event
+                                continue
+                            if isinstance(fallback_event, ProviderErrorEvent):
+                                _report_credential_pool_failure(
+                                    self.provider_name,
+                                    self._turn_metadata,
+                                    fallback_event,
+                                )
+                                if not fallback_committed:
+                                    self._record_health_failure(fallback_event)
+                                    fallback_buffer.drain(successful_leg=False)
+                                yield fallback_event
+                                return
+                            if fallback_committed:
+                                yield fallback_event
+                                continue
+                            if (
+                                isinstance(fallback_event, ProviderReasoningDeltaEvent)
+                                and fallback_event.text
+                            ):
+                                now_monotonic = time.monotonic()
+                                first_reasoning = fallback_reasoning_started_at_ms == 0
+                                if first_reasoning:
+                                    fallback_reasoning_started_at_ms = (
+                                        time.time_ns() // 1_000_000
+                                    )
+                                if (
+                                    first_reasoning
+                                    or now_monotonic - fallback_reasoning_last_pulse_at
+                                    >= _SELECTOR_REASONING_PULSE_INTERVAL_SECONDS
+                                ):
+                                    yield ProviderActivityEvent(
+                                        activity_id=fallback_activity_id,
+                                        phase="reasoning",
+                                        reason="initial",
+                                        started_at=fallback_reasoning_started_at_ms,
+                                        heartbeat=not first_reasoning,
+                                    )
+                                    fallback_reasoning_last_pulse_at = now_monotonic
+                                fallback_buffer.append(fallback_event)
+                                continue
+                            if (
+                                not isinstance(fallback_event, ProviderErrorEvent)
+                                and not _is_non_empty_provider_text_delta(fallback_event)
+                                and getattr(fallback_event, "kind", "") != "done"
+                            ):
+                                fallback_buffer.append(fallback_event)
+                                if fallback_buffer.protocol_error:
+                                    invalid_order_error = (
+                                        _selector_invalid_stream_order_error()
+                                    )
+                                    self._record_health_failure(invalid_order_error)
+                                    yield invalid_order_error
+                                    return
+                                if not fallback_buffer.overflowed:
+                                    continue
+                                overflow_error = _selector_pre_text_buffer_overflow_error()
+                                self._record_health_failure(overflow_error)
+                                yield overflow_error
+                                return
+                            if (
+                                _is_non_empty_provider_text_delta(fallback_event)
+                                and fallback_buffer.has_incomplete_tool_call
+                            ):
+                                fallback_buffer.drain(successful_leg=False)
+                                invalid_order_error = _selector_invalid_stream_order_error()
+                                self._record_health_failure(invalid_order_error)
+                                yield invalid_order_error
+                                return
+                            if _is_non_empty_provider_text_delta(fallback_event):
+                                for buffered_event in fallback_buffer.drain(
+                                    successful_leg=True
+                                ):
+                                    yield buffered_event
+                                fallback_committed = True
+                                self._record_health_success()
+                                yield fallback_event
+                                continue
+                            if getattr(fallback_event, "kind", "") == "done":
+                                if fallback_buffer.has_incomplete_tool_call:
+                                    fallback_buffer.drain(successful_leg=False)
+                                    incomplete_error = ProviderErrorEvent(
+                                        message=(
+                                            "Provider stream ended with an incomplete "
+                                            "tool call"
+                                        ),
+                                        code="incomplete_tool_stream",
+                                    )
+                                    self._record_health_failure(incomplete_error)
+                                    yield incomplete_error
+                                    return
+                                tool_leg_committed = (
+                                    fallback_buffer.has_completed_tool_call
+                                )
+                                for buffered_event in fallback_buffer.drain(
+                                    # A no-text/no-tool Done is classified by
+                                    # Agent as an invalid or reasoning-only
+                                    # attempt.  Do not reveal that failed leg's
+                                    # buffered reasoning before the retry/fallback
+                                    # decision is made.
+                                    successful_leg=tool_leg_committed
+                                ):
+                                    yield buffered_event
+                                if tool_leg_committed:
+                                    self._record_health_success()
+                                yield fallback_event
+                                continue
                     finally:
                         await fallback_stream.aclose()
+                    # An incomplete fallback stream is not a committed leg.
+                    fallback_buffer.drain(successful_leg=False)
                     return
 
                 if _is_non_empty_provider_text_delta(event):
-                    for buffered_event in drain_pre_text_buffer():
+                    for buffered_event in pre_text_buffer.drain(successful_leg=True):
                         yield buffered_event
                     emitted_user_visible_content = True
                     self._record_health_success()
@@ -2180,22 +2972,23 @@ class _SelectorFallbackProvider:
                     continue
 
                 if getattr(event, "kind", "") == "done":
-                    for buffered_event in drain_pre_text_buffer():
+                    for buffered_event in pre_text_buffer.drain(
+                        successful_leg=pre_text_buffer.has_completed_tool_call
+                    ):
                         yield buffered_event
                     yield event
                     continue
 
                 if isinstance(event, ProviderErrorEvent):
-                    for buffered_event in drain_pre_text_buffer():
+                    for buffered_event in pre_text_buffer.drain(successful_leg=False):
                         yield buffered_event
                     yield event
                     continue
 
-                pre_text_buffer.append(event)
         finally:
             await primary_stream.aclose()
 
-        for buffered_event in drain_pre_text_buffer():
+        for buffered_event in pre_text_buffer.drain(successful_leg=False):
             yield buffered_event
 
     async def list_models(self) -> list[Any]:
@@ -5005,6 +5798,9 @@ class TurnRunner:
             raise
 
         except Exception as exc:
+            provider_boundary_failure_kind = str(
+                getattr(exc, "failure_kind", "") or ""
+            ).strip()
             error_code, error_message = sanitize_agent_error(
                 {
                     "status": "failed",
@@ -5015,7 +5811,16 @@ class TurnRunner:
                 fallback_error_class="agent_error",
                 fallback_error_message=str(exc) or "Agent error",
             )
-            if isinstance(exc, UsageAccountingUnavailableError):
+            if provider_boundary_failure_kind:
+                event_code = safe_provider_failure_code(
+                    str(getattr(exc, "code", "") or ""),
+                    provider_boundary_failure_kind,
+                )
+                error_code = event_code
+                error_message = safe_provider_failure_message(
+                    provider_boundary_failure_kind
+                )
+            elif isinstance(exc, UsageAccountingUnavailableError):
                 event_code = str(
                     getattr(exc, "code", UsageAccountingUnavailableError.code)
                     or UsageAccountingUnavailableError.code
@@ -5034,8 +5839,9 @@ class TurnRunner:
             log.error(
                 "turn_runner.failed",
                 session_key=session_key,
-                error=str(exc),
-                exc_info=True,
+                error_type=type(exc).__name__,
+                provider_failure_kind=provider_boundary_failure_kind or None,
+                exc_info=not bool(provider_boundary_failure_kind),
             )
             fallback_hops = 0
             if turn_obj is not None:
@@ -5054,7 +5860,10 @@ class TurnRunner:
                 surface=input_mode or "unknown",
                 error_class=error_code or type(exc).__name__,
                 message=error_message,
-                exc=exc,
+                # Typed provider-boundary exceptions may retain the upstream
+                # exception as ``__cause__``. Never serialize that traceback
+                # into turn_errors; the stable kind/code above is sufficient.
+                exc=None if provider_boundary_failure_kind else exc,
                 provider=(
                     type(provider_for_log).__name__
                     if provider_for_log is not None
@@ -5086,7 +5895,10 @@ class TurnRunner:
                     "turn_error",
                     {
                         "error_type": type(exc).__name__,
-                        "error": str(exc),
+                        "provider_failure_kind": (
+                            provider_boundary_failure_kind or None
+                        ),
+                        "message_chars": len(str(exc)),
                     },
                 )
             if trace_context is not None:
@@ -5104,7 +5916,12 @@ class TurnRunner:
                         "error_chars": len(str(exc)),
                     },
                 )
-            yield ErrorEvent(message=error_message, code=event_code, error_id=error_id or "")
+            yield ErrorEvent(
+                message=error_message,
+                code=event_code,
+                error_id=error_id or "",
+                failure_kind=provider_boundary_failure_kind,
+            )
 
     @staticmethod
     def _write_trace_event(
@@ -5395,6 +6212,7 @@ class TurnRunner:
                 code=event_code,
                 message=message,
                 error_class=event_code,
+                failure_kind=event.failure_kind,
             )
         )
         if event_code == "provider_output_truncated":

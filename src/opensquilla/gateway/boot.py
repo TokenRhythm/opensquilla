@@ -54,7 +54,7 @@ from opensquilla.gateway.session_lifecycle import (
     session_status_for_task_status,
 )
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
-from opensquilla.gateway.session_streams import get_session_streams
+from opensquilla.gateway.session_streams import get_session_streams, reset_session_streams
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.permissions import configured_default_elevated
@@ -62,6 +62,8 @@ from opensquilla.session.models import SessionStatus
 from opensquilla.session.terminal_reply import (
     append_error_ref,
     build_terminal_reply,
+    safe_provider_failure_code,
+    safe_provider_failure_message,
     sanitize_agent_error,
 )
 
@@ -1711,18 +1713,6 @@ async def _emit_task_runtime_stream_events(
         heartbeat_interval=heartbeat_interval,
         heartbeat_message="Agent run is still active",
     ):
-        if stream_event_sink is not None:
-            try:
-                result = stream_event_sink(event)
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                log.debug(
-                    "task_runtime.stream_event_sink_failed",
-                    session_key=session_key,
-                    event_kind=getattr(event, "kind", event.__class__.__name__),
-                    exc_info=True,
-                )
         if is_dataclass(event):
             event_dict = asdict(event)
         else:
@@ -1747,6 +1737,11 @@ async def _emit_task_runtime_stream_events(
             failure_kind = (
                 str(raw_failure_kind) if isinstance(raw_failure_kind, str) else None
             )
+            if failure_kind:
+                error_message = safe_provider_failure_message(failure_kind)
+                error_code = safe_provider_failure_code(error_code, failure_kind)
+                event_dict["code"] = error_code
+                code = error_code
             code_text = str(code or "").lower()
             is_timeout = "timeout" in code_text or "stream idle" in error_message.lower()
             is_output_truncated = code_text == "provider_output_truncated"
@@ -1779,6 +1774,39 @@ async def _emit_task_runtime_stream_events(
             event_dict["terminal_message"] = terminal_message
             event_dict["terminal_reason"] = terminal_payload["terminal_reason"]
             event_dict["error_message"] = safe_error_message
+            # Preserve the stable provider taxonomy inside the typed outcome,
+            # without exposing a second raw top-level field. Clients can now
+            # offer an explicit retry for transient terminal failures even
+            # when a Retry-After hint exceeded the remaining turn deadline.
+            if failure_kind:
+                from opensquilla.engine.outcome import outcome_from_error
+
+                event_dict["turn_outcome"] = outcome_from_error(
+                    code=error_code,
+                    message=safe_error_message,
+                    error_class=error_code,
+                    failure_kind=failure_kind,
+                ).to_dict()
+        if stream_event_sink is not None:
+            # Internal stream relays normally consume only text/done/artifact
+            # events. Still, project provider failures through the same safe
+            # Gateway boundary before invoking an arbitrary sink: a sink that
+            # logs or persists its input must never receive a raw upstream
+            # body from an ErrorEvent.
+            sink_event: Any = event
+            if event_kind == "error":
+                sink_event = {"kind": "error", **event_dict}
+            try:
+                result = stream_event_sink(sink_event)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                log.debug(
+                    "task_runtime.stream_event_sink_failed",
+                    session_key=session_key,
+                    event_kind=event_kind,
+                    exc_info=True,
+                )
         if task_id:
             event_dict["task_id"] = task_id
             event_dict["turn_id"] = task_id
@@ -3675,6 +3703,19 @@ async def start_gateway_server(
         except BaseException:
             _pid_lock.release()
             raise
+
+    # Stream cursors belong to the Gateway lifecycle that owns every startup
+    # claim, not merely to an attempted call to ``start_gateway_server``. In
+    # Desktop and embedded processes a second start may be attempted while the
+    # active Gateway still owns its generation; resetting before PID/Desktop
+    # ownership made that failed contender erase the live generation and seq.
+    # Only publish the new process-local generation after all applicable
+    # ownership claims succeed and before any service can emit session events.
+    try:
+        reset_session_streams()
+    except BaseException:
+        _pid_lock.release()
+        raise
     startup_phase_started_at = _log_gateway_startup_phase(
         "ownership",
         startup_started_at=startup_started_at,

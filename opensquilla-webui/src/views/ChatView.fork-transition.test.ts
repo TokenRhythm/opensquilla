@@ -16,7 +16,7 @@ describe('chat fork hand-off contract', () => {
   it('uses durable inclusive turn ids for historical assistant branches', () => {
     expect(messageListSource).toContain("forkConversation: [throughTurnId?: string]")
     expect(messageListSource).toContain("turnOutcome?.turnId?.trim()")
-    expect(messageListSource).toContain("@fork=\"$emit('forkConversation', forkThroughTurnId(index))\"")
+    expect(messageListSource).toContain("@fork=\"$emit('forkConversation', forkThroughTurnId(entry.index))\"")
     expect(transitionSource).toContain("method: 'sessions.forkThroughTurn'")
     expect(transitionSource).toContain("params: { key: parentKey, throughTurnId }")
     expect(chatViewSource).toContain('rpc.call<ForkRpcResponse>(request.method, request.params)')

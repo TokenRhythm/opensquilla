@@ -1,5 +1,5 @@
-import { describe, it, expect } from 'vitest'
-import { foldTurn } from './foldTurn'
+import { describe, it, expect, vi } from 'vitest'
+import { foldTurn, TurnAccumulator } from './foldTurn'
 import type { ChatToolCall, ChatToolCallGroup } from '@/types/chat'
 import type { ArtifactPayload } from '@/types/rpc'
 import type { Frame } from '@/types/turnlog'
@@ -250,5 +250,54 @@ describe('foldTurn — purity', () => {
     const b = fold(events)
     expect(a.rawText).toBe(b.rawText)
     expect(a.toolCalls).toEqual(b.toolCalls)
+  })
+})
+
+describe('TurnAccumulator — incremental live projection', () => {
+  it('matches the pure replay oracle across text, tools, status, and terminal reconcile', () => {
+    const events: Frame[] = [
+      { kind: 'status', seq: 0, action: 'requesting', label: 'Waiting', at: 1 },
+      { kind: 'thinking', seq: 1, text: 'checking', at: 2 },
+      { kind: 'text', seq: 2, text: 'stale', presentation: 'intermediate' },
+      { kind: 'tool-start', seq: 3, toolId: 't', name: 'bash', input: '{', at: 3 },
+      { kind: 'tool-delta', seq: 4, toolId: 't', fragment: '}' },
+      { kind: 'tool-result', seq: 5, toolId: 't', name: 'bash', input: '{}', result: 'ok', isError: false, at: 4 },
+      { kind: 'final-text', seq: 6, text: 'canonical' },
+    ]
+    const accumulator = new TurnAccumulator()
+    events.forEach(event => accumulator.append(event))
+
+    const incremental = accumulator.snapshot(renderMarkdown, toolCallGroups)
+    const replayed = fold(events)
+    expect(incremental.rawText).toBe(replayed.rawText)
+    expect(incremental.thinkingText).toBe(replayed.thinkingText)
+    expect(incremental.timelineSegments).toEqual(replayed.timelineSegments)
+    expect(incremental.toolCalls).toEqual(replayed.toolCalls)
+    expect(incremental.statusHistory).toEqual(replayed.statusHistory)
+    expect(incremental.parts).toEqual(replayed.parts)
+  })
+
+  it('does not invoke Markdown for a tool-only burst', () => {
+    const accumulator = new TurnAccumulator()
+    accumulator.append({
+      kind: 'tool-start',
+      seq: 0,
+      toolId: 'tool-1',
+      name: 'bash',
+      input: '',
+      at: 1,
+    })
+    for (let index = 0; index < 10_000; index += 1) {
+      accumulator.append({
+        kind: 'tool-delta',
+        seq: index + 1,
+        toolId: 'tool-1',
+        fragment: 'x',
+      })
+    }
+    const renderer = vi.fn((text: string) => text)
+    const snapshot = accumulator.snapshot(renderer, toolCallGroups)
+    expect(renderer).not.toHaveBeenCalled()
+    expect(snapshot.toolCalls[0]?.inputRaw).toHaveLength(10_000)
   })
 })

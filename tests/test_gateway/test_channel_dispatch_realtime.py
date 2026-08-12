@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import structlog
 
 from opensquilla.artifacts import ArtifactStore
 from opensquilla.channels.contract import ChannelCapabilityProfile
@@ -25,6 +26,7 @@ from opensquilla.channels.types import (
 from opensquilla.engine.types import (
     ArtifactEvent,
     DoneEvent,
+    ErrorEvent,
     TextDeltaEvent,
     ToolResultEvent,
     ToolUseStartEvent,
@@ -371,6 +373,44 @@ async def test_direct_channel_batch_uses_authoritative_done_snapshot() -> None:
     )
 
     assert [message.content for message in channel.sent] == ["canonical"]
+
+
+@pytest.mark.asyncio
+async def test_direct_channel_error_log_does_not_expose_provider_prose() -> None:
+    raw_detail = "RAW_PROVIDER_BODY_DO_NOT_PERSIST"
+
+    class FakeTurnRunner:
+        async def run(self, message: str, session_key: str, **kwargs):
+            del message, session_key, kwargs
+            yield ErrorEvent(
+                message=f"provider rejected request: {raw_detail}",
+                code="400",
+                failure_kind="bad_request",
+            )
+
+    channel = _FakeChannel()
+    with structlog.testing.capture_logs() as logs:
+        await _run_turn_batch_path(
+            channel,
+            FakeTurnRunner(),
+            _message(),
+            "agent:main:provider-error",
+            _tool_ctx(),
+            None,
+            None,
+            SimpleNamespace(
+                agent_stream_heartbeat_interval_seconds=0.0,
+                agent_stream_idle_timeout_seconds=1.0,
+            ),
+        )
+
+    assert raw_detail not in json.dumps(logs)
+    agent_error = next(
+        row for row in logs if row["event"] == "channel_dispatch.agent_error"
+    )
+    assert agent_error["failure_kind"] == "bad_request"
+    assert "message" not in agent_error
+    assert channel.sent[-1].content == "The task failed before it could finish."
 
 
 @pytest.mark.asyncio

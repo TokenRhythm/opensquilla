@@ -14,10 +14,26 @@ import {
 } from './useChatSend'
 import { useChatSessionRuntime } from './useChatSessionRuntime'
 import { useChatSteerDelivery } from './useChatSteerDelivery'
+import type {
+  PendingInputWal,
+  PendingInputWalRecord,
+} from '@/utils/chat/pendingInputWal'
 
 vi.mock('@/composables/useToasts', () => ({
   useToasts: () => ({ pushToast: vi.fn() }),
 }))
+
+function memoryPendingWal(): PendingInputWal {
+  const records = new Map<string, PendingInputWalRecord>()
+  return {
+    put: async record => { records.set(record.pendingInputId, structuredClone(record)) },
+    list: async sessionKey => [...records.values()].filter(record => (
+      record.sessionKey === sessionKey
+    )),
+    delete: async pendingInputId => { records.delete(pendingInputId) },
+    close: () => {},
+  }
+}
 
 describe('chat send session handoff', () => {
   it('resumes one deferred queue drain after response hydration releases', async () => {
@@ -33,6 +49,7 @@ describe('chat send session handoff', () => {
       const pendingSessionIntent = ref<string | null>(null)
       const isStreaming = ref(false)
       const sendCurrentInput = vi.fn()
+      const pendingInputWal = memoryPendingWal()
       const pendingQueue = useChatPendingQueue({
         sessionKey,
         ownerContext,
@@ -45,13 +62,15 @@ describe('chat send session handoff', () => {
         sendCurrentInput,
         resetInputHistory: vi.fn(),
         hasComposer: () => true,
+        pendingInputWal,
+        supportsMethod: () => false,
       })
 
       // The child terminal replay can precede both history hydration and the
       // user's follow-up. Preserve it without draining through the handoff gate.
       pendingQueue.schedulePendingDrainAfterTerminal()
       inputText.value = 'follow-up after edit'
-      pendingQueue.enqueuePendingInput(inputText.value)
+      await pendingQueue.enqueuePendingInput(inputText.value)
       await vi.advanceTimersByTimeAsync(50)
 
       expect(pendingQueue.pendingQueue.value).toHaveLength(1)
@@ -150,9 +169,11 @@ describe('chat send session handoff', () => {
       hasComposer: () => true,
       dispatchHiddenControl: (item, ownerSessionKey) =>
         dispatchHiddenControl(item, ownerSessionKey),
+      pendingInputWal: memoryPendingWal(),
+      supportsMethod: () => false,
     })
     inputText.value = 'existing parent follow-up'
-    pendingQueueRuntime.enqueuePendingInput(
+    await pendingQueueRuntime.enqueuePendingInput(
       inputText.value,
       { ownerRequestId: 'older-parent-request' },
     )
@@ -290,7 +311,7 @@ describe('chat send session handoff', () => {
       mime: 'text/plain',
       file_uuid: 'file-queued',
     }]
-    pendingQueueRuntime.enqueuePendingInput(inputText.value)
+    await pendingQueueRuntime.enqueuePendingInput(inputText.value)
     pendingQueueRuntime.enqueueHiddenControl({
       text: 'hidden control',
       displayText: 'Hidden control',

@@ -476,7 +476,7 @@ describe('useChatSessionBootstrap', () => {
     expect(api.livePhase.value).toBe('ready')
   })
 
-  it('does not restart a terminal bootstrap when its final timeout reconnects', async () => {
+  it('automatically subscribes on a late replacement socket after a recovery budget expires', async () => {
     let resolveHistory!: (result: SessionPhaseResult) => void
     let resolveLive!: (result: SessionSubscriptionOutcome) => void
     let historyCalls = 0
@@ -490,7 +490,9 @@ describe('useChatSessionBootstrap', () => {
             resolveHistory = resolve
           })
         }
-        return { ok: false, error: timeout }
+        return historyCalls === 2
+          ? { ok: false, error: timeout }
+          : { ok: true }
       },
       subscribeSession: async () => {
         liveCalls += 1
@@ -499,7 +501,9 @@ describe('useChatSessionBootstrap', () => {
             resolveLive = resolve
           })
         }
-        return { ...UNAVAILABLE_FOR_TEST, error: timeout }
+        return liveCalls === 2
+          ? { ...UNAVAILABLE_FOR_TEST, error: timeout }
+          : LIVE_READY
       },
     })
 
@@ -515,13 +519,13 @@ describe('useChatSessionBootstrap', () => {
 
     api.handleConnectionState('disconnected')
     expect(api.livePhase.value).toBe('degraded')
-    api.handleConnectionState('connected')
-    await Promise.resolve()
+    const lateRecovery = api.handleConnectionState('connected')
+    await Promise.all([lateRecovery!.history, lateRecovery!.live])
 
     expect(loadHistory).toHaveBeenCalledTimes(2)
-    expect(subscribeSession).toHaveBeenCalledTimes(2)
+    expect(subscribeSession).toHaveBeenCalledTimes(3)
     expect(api.historyPhase.value).toBe('error')
-    expect(api.livePhase.value).toBe('degraded')
+    expect(api.livePhase.value).toBe('ready')
   })
 
   it('does not grant a degraded live phase more attempts when history recycles the socket', async () => {

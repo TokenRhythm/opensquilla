@@ -3429,6 +3429,14 @@
         "interrupted": "中断",
         "failed": "失敗"
       },
+      "provider": {
+        "waiting": "モデルを待機中",
+        "reasoning": "深く思考中",
+        "rateLimited": "レート制限 · {seconds}秒後に再試行",
+        "retryWait": "{seconds}秒後に再試行",
+        "retrying": "再試行中 {attempt}/{limit}",
+        "fallback": "予備モデルに切り替え中"
+      },
       "purpose": {
         "discover": "リンクを検出",
         "search": "ウェブを検索",

@@ -3429,6 +3429,14 @@
         "interrupted": "Unterbrochen",
         "failed": "Fehlgeschlagen"
       },
+      "provider": {
+        "waiting": "Warten auf das Modell",
+        "reasoning": "Tiefes Nachdenken",
+        "rateLimited": "Ratenlimit · neuer Versuch in {seconds}s",
+        "retryWait": "Neuer Versuch in {seconds}s",
+        "retrying": "Neuer Versuch {attempt}/{limit}",
+        "fallback": "Wechsel zum Ersatzmodell"
+      },
       "purpose": {
         "discover": "Links gefunden",
         "search": "Web durchsucht",

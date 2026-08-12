@@ -82,6 +82,39 @@ class RunHeartbeatEvent:
 
 
 @dataclass
+class ProviderActivityEvent:
+    """Public, provider-neutral progress for long model operations.
+
+    Fields are deliberately closed enums and counters: provider error bodies
+    and failed-leg reasoning must never cross this boundary.
+    """
+
+    kind: Literal["provider_activity"] = field(default="provider_activity", init=False)
+    schema_version: int = 1
+    activity_id: str = ""
+    phase: Literal["requesting", "reasoning", "retry_wait", "retrying", "fallback"] = (
+        "requesting"
+    )
+    reason: Literal[
+        "initial",
+        "rate_limited",
+        "provider_overloaded",
+        "transport_transient",
+        "reasoning_only",
+        "empty_response",
+        "stream_incomplete",
+        "invalid_response",
+        "context_overflow",
+        "unknown",
+    ] = "initial"
+    retry_attempt: int = 0
+    retry_limit: int = 0
+    retry_after_ms: int = 0
+    started_at: int = 0
+    heartbeat: bool = False
+
+
+@dataclass
 class ToolUseStartEvent:
     kind: Literal["tool_use_start"] = field(default="tool_use_start", init=False)
     tool_use_id: str = ""
@@ -463,6 +496,7 @@ AgentEvent = (
     ThinkingEvent
     | TextDeltaEvent
     | RunHeartbeatEvent
+    | ProviderActivityEvent
     | ToolUseStartEvent
     | ToolUseDeltaEvent
     | ToolResultEvent

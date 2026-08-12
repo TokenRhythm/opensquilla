@@ -3482,6 +3482,14 @@
         "interrupted": "Interrupted",
         "failed": "Failed"
       },
+      "provider": {
+        "waiting": "Waiting for model",
+        "reasoning": "Thinking deeply",
+        "rateLimited": "Rate limited · retrying in {seconds}s",
+        "retryWait": "Retrying in {seconds}s",
+        "retrying": "Retrying {attempt}/{limit}",
+        "fallback": "Switching to backup model"
+      },
       "purpose": {
         "discover": "Discovered links",
         "search": "Searched the web",

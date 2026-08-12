@@ -80,6 +80,12 @@ class _BusySink(_RecordingSink):
         raise UsageAccountingBusyError("ledger remained busy")
 
 
+class _InternalFailureSink(_RecordingSink):
+    async def start(self, call: UsageCallStart) -> None:
+        self.started.append(call)
+        raise RuntimeError("usage accounting internal failure")
+
+
 class _DoneProvider:
     provider_name = "fake"
 
@@ -389,6 +395,28 @@ async def test_selector_preflight_rejects_ensemble_image_before_usage_or_fallbac
     assert sink.started == []
     assert sink.finalized == []
     assert sink.unknown == []
+
+
+@pytest.mark.asyncio
+async def test_selector_does_not_project_usage_accounting_error_as_provider_failure() -> None:
+    sink = _InternalFailureSink()
+    primary = _PhysicalLegProvider(
+        "openai",
+        [ProviderText(text="must not run"), ProviderDone(model="primary-model")],
+    )
+    fallback = _PhysicalLegProvider(
+        "anthropic",
+        [ProviderText(text="must not run"), ProviderDone(model="fallback-model")],
+    )
+    wrapper = _SelectorFallbackProvider(primary, _FallbackSelector(fallback))
+    scope = UsageAccountingScope(sink=sink, context=_context())
+
+    with bind_usage_accounting_scope(scope):
+        with pytest.raises(RuntimeError, match="usage accounting internal failure"):
+            _ = [event async for event in wrapper.chat([])]
+
+    assert primary.calls == 0
+    assert fallback.calls == 0
 
 
 @pytest.mark.asyncio
@@ -1391,7 +1419,14 @@ async def test_selector_wrapper_without_ledger_scope_is_streaming_compatible() -
 
     events = [event async for event in wrapper.chat([])]
 
-    assert [getattr(event, "kind", "") for event in events] == ["text_delta", "done"]
+    assert [getattr(event, "kind", "") for event in events] == [
+        "provider_activity",
+        "text_delta",
+        "done",
+    ]
+    assert (events[0].phase, events[0].reason) == ("fallback", "rate_limited")
+    assert events[0].retry_attempt == 1
+    assert events[0].started_at > 0
     assert primary.calls == fallback.calls == 1
 
 

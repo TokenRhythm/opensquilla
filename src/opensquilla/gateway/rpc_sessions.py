@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
 import os
 import re
 import sqlite3
@@ -20,6 +21,16 @@ import structlog
 
 from opensquilla.agents.scope import default_workspace_dir, resolve_agent_workspace_dir
 from opensquilla.artifacts import enrich_artifact_event_dict
+from opensquilla.attachment_refs import (
+    PENDING_CHAT_INPUT_MATERIAL_STORE,
+    PendingChatInputManifestConflictError,
+    PendingChatInputManifestCorruptError,
+    cleanup_pending_chat_input_material,
+    promote_pending_chat_input_attachments,
+    read_pending_chat_input_manifest,
+    read_pending_chat_input_promotions,
+    transcript_material_path,
+)
 from opensquilla.engine.cache_break_monitor import (
     cancel_active_compactions,
     compaction_terminal_status,
@@ -72,12 +83,13 @@ from opensquilla.gateway.subagent_announce import (
 from opensquilla.gateway.turn_ingress import (
     accepted_turn_payload,
     complete_durable_ingress,
+    request_fingerprint,
     request_identity,
 )
 from opensquilla.observability.network_policy import (
     provider_request_correlation_disabled,
 )
-from opensquilla.paths import media_root_from_config
+from opensquilla.paths import media_root_from_config, native_io_path
 from opensquilla.project_workspaces import (
     ProjectWorkspaceStateError,
     resolve_validated_project_workspace,
@@ -149,6 +161,12 @@ from opensquilla.session.naming import (
 from opensquilla.session.plans import PlanConflictError, PlanRunConflictError
 from opensquilla.session.storage import (
     MetaControlIntentConflictError,
+    PendingChatInput,
+    PendingChatInputAlreadyDispatchedError,
+    PendingChatInputCancelledError,
+    PendingChatInputCapacityError,
+    PendingChatInputConflictError,
+    PendingChatInputNotFoundError,
     PlanImplementationSessionBusyError,
     SessionStorage,
     StaleEpochError,
@@ -161,10 +179,43 @@ from opensquilla.session.storage import (
 from opensquilla.session.terminal_reply import (
     append_error_ref,
     build_terminal_reply,
+    safe_provider_failure_code,
+    safe_provider_failure_message,
     sanitize_agent_error,
 )
 
 _d = get_dispatcher()
+
+_PENDING_INPUT_LOCKS: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _pending_input_lock_for(pending_input_id: str) -> asyncio.Lock:
+    """Serialize filesystem ownership with the SQLite pending-row lifecycle."""
+
+    lock = _PENDING_INPUT_LOCKS.get(pending_input_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _PENDING_INPUT_LOCKS[pending_input_id] = lock
+    return lock
+
+
+@contextlib.asynccontextmanager
+async def _pending_input_enqueue_lock(
+    ctx: RpcContext,
+    session_key: str,
+    pending_input_id: str,
+):
+    """Fence enqueue against session reset/delete after serializing its id."""
+
+    async with _pending_input_lock_for(pending_input_id):
+        session_lock = get_session_lock(ctx.turn_runner, session_key)
+        if session_lock is None:
+            yield
+        else:
+            async with session_lock:
+                yield
 log = structlog.get_logger(__name__)
 _ELEVATED_MODES = frozenset({"full"})
 _TRUSTED_ELEVATED_ALIASES = frozenset({"on", "bypass"})
@@ -970,6 +1021,19 @@ def _optional_stream_seq(params: dict | None) -> int | None:
     return max(0, value)
 
 
+def _optional_stream_generation(params: dict | None) -> str | None:
+    if not isinstance(params, dict):
+        return None
+    raw = params.get(
+        "since_stream_generation",
+        params.get("sinceStreamGeneration"),
+    )
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip()
+    return value if value else None
+
+
 def _buffer_session_event(
     session_key: str,
     event_name: str,
@@ -1457,11 +1521,24 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
     if event_name != "session.event.error":
         return payload
 
+    prior_outcome = payload.get("turn_outcome")
+    prior_failure_kind = (
+        prior_outcome.get("failure_kind")
+        if isinstance(prior_outcome, dict)
+        else payload.get("failure_kind")
+    )
     message = payload.get("message")
     error_message = payload.get("error_message")
     raw_message = error_message if isinstance(error_message, str) and error_message else message
     raw_text = raw_message if isinstance(raw_message, str) and raw_message else "Agent error"
+    if isinstance(prior_failure_kind, str) and prior_failure_kind:
+        raw_text = safe_provider_failure_message(prior_failure_kind)
     code = payload.get("code")
+    if isinstance(prior_failure_kind, str) and prior_failure_kind:
+        code = safe_provider_failure_code(
+            str(code) if code is not None else None,
+            prior_failure_kind,
+        )
     code_text = str(code or "").lower()
     is_timeout = "timeout" in code_text or "stream idle" in raw_text.lower()
     terminal_payload = {
@@ -1493,9 +1570,28 @@ def _normalize_terminal_event_payload(event_name: str, payload: dict[str, Any]) 
         code=str(code) if code else None,
         message=safe_error_message,
         error_class=str(code) if code else None,
+        failure_kind=(
+            str(prior_failure_kind)
+            if isinstance(prior_failure_kind, str)
+            else None
+        ),
     )
+    sensitive_provider_fields = {
+        "provider_error_message",
+        "provider_response_body",
+        "raw_error_body",
+        "request_payload",
+        "request_payload_head",
+        "response_body",
+    }
+    safe_payload = {
+        key: value
+        for key, value in payload.items()
+        if key not in sensitive_provider_fields
+    }
     return {
-        **payload,
+        **safe_payload,
+        "code": code,
         "message": terminal_message,
         "terminal_message": terminal_message,
         "terminal_reason": terminal_payload["terminal_reason"],
@@ -2563,6 +2659,9 @@ async def _handle_sessions_send_impl(
     expected_active_plan_revision_id: str | None = None,
     require_idle_for_current_plan_implementation: bool = False,
     atomic_collaboration_mode_update: bool = False,
+    pending_input_id: str | None = None,
+    pending_input_fingerprint: str | None = None,
+    pending_input_revision: int | None = None,
 ) -> dict:
     key = _require_key(params)
     if not isinstance(params, dict) or "message" not in params:
@@ -2719,6 +2818,26 @@ async def _handle_sessions_send_impl(
                     "clientRequestId was already used for a different turn",
                     retryable=False,
                     accepted=False,
+                )
+            if pending_input_id is not None:
+                if (
+                    requested_client_message_id is None
+                    or pending_input_fingerprint is None
+                    or pending_input_revision is None
+                    or pending_input_fingerprint
+                    != ingress_identity.request_fingerprint
+                ):
+                    raise PendingChatInputConflictError(
+                        "pending input replay identity is incomplete or inconsistent"
+                    )
+                await storage.consume_replayed_pending_chat_input(
+                    pending_input_id=pending_input_id,
+                    session_key=ingress_identity.request_session_key,
+                    source_scope=ingress_identity.source_scope,
+                    client_request_id=ingress_identity.client_request_id,
+                    client_message_id=requested_client_message_id,
+                    request_fingerprint=ingress_identity.request_fingerprint,
+                    expected_revision=pending_input_revision,
                 )
             replay_response = await _accepted_turn_response(
                 previous_acceptance,
@@ -3037,6 +3156,39 @@ async def _handle_sessions_send_impl(
     generate_title = await _should_auto_title(ctx, storage, session, key, session_id)
     disk_budget = getattr(attachments_cfg, "transcript_disk_budget_bytes", None)
     opaque_cap = getattr(attachments_cfg, "opaque_max_bytes", None)
+    if pending_input_id is not None:
+        # SQLite deliberately retains queue-owned references. Only after the
+        # target session identity has been resolved do we promote those bytes
+        # into its canonical transcript store. The request fingerprint still
+        # uses the immutable staged payload supplied by the dispatch handler.
+        promoted_attachments: list[dict[str, Any]] = []
+        try:
+            for attachment in combined_attachments:
+                if (
+                    isinstance(attachment, dict)
+                    and attachment.get("store") == PENDING_CHAT_INPUT_MATERIAL_STORE
+                ):
+                    promoted_attachments.extend(
+                        promote_pending_chat_input_attachments(
+                            [attachment],
+                            media_root=media_root,
+                            pending_input_id=pending_input_id,
+                            target_session_id=session_id,
+                            disk_budget_bytes=(
+                                disk_budget if isinstance(disk_budget, int) else None
+                            ),
+                        )
+                    )
+                else:
+                    promoted_attachments.append(attachment)
+        except (OSError, ValueError) as exc:
+            raise RpcHandlerError(
+                "PENDING_ATTACHMENT_MATERIAL_UNAVAILABLE",
+                "A queued attachment could not be recovered; keep the item and retry",
+                retryable=True,
+                accepted=False,
+            ) from exc
+        combined_attachments = promoted_attachments
     try:
         ingested_attachments = await _attachment_ingest.ingest_attachments(
             message_text,
@@ -3047,6 +3199,8 @@ async def _handle_sessions_send_impl(
             disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
             accept_opaque=bool(getattr(attachments_cfg, "accept_opaque", True)),
             opaque_limit_bytes=opaque_cap if isinstance(opaque_cap, int) else None,
+            allow_material_refs=pending_input_id is not None,
+            expected_material_scope=session_id if pending_input_id is not None else None,
         )
     except _attachment_ingest.AttachmentResolutionError as exc:
         # A staged upload expired / was lost before this send. Surface a typed,
@@ -3771,6 +3925,14 @@ async def _handle_sessions_send_impl(
             accepted=False,
         )
 
+    if pending_input_id is not None and not prepared_acceptance:
+        raise RpcHandlerError(
+            "PENDING_DISPATCH_UNAVAILABLE",
+            "Durable pending-input dispatch is temporarily unavailable",
+            retryable=True,
+            accepted=False,
+        )
+
     if prepared_acceptance:
         persist_content = message_text
         if raw_attachments or display_text is not None:
@@ -3926,6 +4088,9 @@ async def _handle_sessions_send_impl(
                     require_idle_for_current_plan_implementation
                 ),
                 goal_mutation=goal_claim_mutation,
+                pending_input_id=pending_input_id,
+                pending_input_fingerprint=pending_input_fingerprint,
+                pending_input_revision=pending_input_revision,
             )
             if not acceptance.replayed and not merge_into_task:
                 # This synchronous in-memory transition sits strictly after
@@ -4456,6 +4621,9 @@ async def _handle_sessions_send_impl(
                     else None
                 ),
                 workspace_guard=workspace_guard,
+                pending_input_id=pending_input_id,
+                pending_input_fingerprint=pending_input_fingerprint,
+                pending_input_revision=pending_input_revision,
             )
             if acceptance.replayed:
                 return acceptance
@@ -4961,6 +5129,9 @@ async def _handle_sessions_send(
     expected_active_plan_revision_id: str | None = None,
     require_idle_for_current_plan_implementation: bool = False,
     atomic_collaboration_mode_update: bool = False,
+    pending_input_id: str | None = None,
+    pending_input_fingerprint: str | None = None,
+    pending_input_revision: int | None = None,
     _explicit_ingress_intent_registered: bool = False,
 ) -> dict:
     """Register explicit intent before any asynchronous send preparation.
@@ -4994,6 +5165,9 @@ async def _handle_sessions_send(
                     require_idle_for_current_plan_implementation
                 ),
                 atomic_collaboration_mode_update=atomic_collaboration_mode_update,
+                pending_input_id=pending_input_id,
+                pending_input_fingerprint=pending_input_fingerprint,
+                pending_input_revision=pending_input_revision,
             ),
         )
 
@@ -5001,6 +5175,717 @@ async def _handle_sessions_send(
         return await _send()
     async with register(key):
         return await _send()
+
+
+def _pending_input_param(params: dict | None, *names: str) -> str:
+    value = _optional_string_param(params, *names)
+    if value is None:
+        raise ValueError(f"params.{names[0]} is required")
+    if len(value) > 256:
+        raise ValueError(f"params.{names[0]} must not exceed 256 characters")
+    return value
+
+
+def _pending_input_key(params: dict | None) -> str:
+    if not isinstance(params, dict):
+        raise ValueError("params.key is required")
+    raw = params.get("key", params.get("sessionKey"))
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("params.key is required")
+    return canonicalize_session_key(raw)
+
+
+def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> dict[str, Any]:
+    payload = row.payload
+    attachments = []
+    for attachment in payload.get("attachments") or []:
+        if not isinstance(attachment, dict):
+            continue
+        # The material store and owner id are internal capabilities. Queue
+        # hydration only needs safe display metadata; dispatch is identified by
+        # the pending row, never by client-echoed material references.
+        attachments.append(
+            {
+                "name": attachment.get("name"),
+                "mime": attachment.get("mime") or attachment.get("type"),
+                "type": attachment.get("type") or attachment.get("mime"),
+                "size": attachment.get("size"),
+            }
+        )
+    return {
+        "pendingInputId": row.pending_input_id,
+        "pending_input_id": row.pending_input_id,
+        "sessionKey": row.session_key,
+        "session_key": row.session_key,
+        "clientRequestId": row.client_request_id,
+        "client_request_id": row.client_request_id,
+        "clientMessageId": row.client_message_id,
+        "client_message_id": row.client_message_id,
+        "requestFingerprint": row.request_fingerprint,
+        "request_fingerprint": row.request_fingerprint,
+        "message": str(payload.get("message") or ""),
+        "intent": payload.get("intent"),
+        "attachments": attachments,
+        "position": row.position,
+        "revision": row.state_revision,
+        "createdAt": row.created_at,
+        "updatedAt": row.updated_at,
+        "replayed": replayed,
+        "schemaVersion": row.schema_version,
+    }
+
+
+def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str, Any]:
+    message = params.get("message")
+    if not isinstance(message, str) or not message.strip():
+        raise ValueError("params.message must be a non-empty string")
+    control = message.strip()
+    if control.startswith("!") or (
+        control.startswith("/") and not control.startswith("//")
+    ):
+        raise RpcHandlerError(
+            "PENDING_CONTROL_COMMAND_UNSUPPORTED",
+            "Client control commands cannot be staged for later dispatch",
+            retryable=False,
+            accepted=False,
+        )
+    attachments = params.get("attachments", [])
+    if attachments is None:
+        attachments = []
+    if not isinstance(attachments, list):
+        raise ValueError("params.attachments must be an array")
+
+    payload: dict[str, Any] = {
+        "key": key,
+        "message": message,
+        "attachments": attachments,
+        "queueMode": "followup",
+        "clientRequestId": _pending_input_param(
+            params,
+            "clientRequestId",
+            "client_request_id",
+        ),
+        "clientMessageId": _pending_input_param(
+            params,
+            "clientMessageId",
+            "client_message_id",
+        ),
+        "_source": _normalize_session_send_source_hint(params),
+    }
+    for source_names, target in (
+        (("intent",), "intent"),
+        (("workspaceId", "workspace_id"), "workspaceId"),
+        (("collaborationMode", "collaboration_mode"), "collaborationMode"),
+        (("displayText", "display_text"), "displayText"),
+    ):
+        value = _optional_string_param(params, *source_names)
+        if value is not None:
+            payload[target] = value
+    return payload
+
+
+def _pending_input_storage(ctx: RpcContext) -> SessionStorage:
+    if ctx.session_manager is None:
+        raise RpcUnavailableError("Session manager is unavailable")
+    candidate = get_session_storage(ctx.session_manager)
+    if candidate is None:
+        raise RpcUnavailableError("Session storage is unavailable")
+    return cast(SessionStorage, candidate)
+
+
+def _pending_input_attachment_scopes(row: PendingChatInput | None) -> set[str]:
+    scopes: set[str] = set()
+    if row is None:
+        return scopes
+    for attachment in row.payload.get("attachments") or []:
+        if (
+            isinstance(attachment, dict)
+            and attachment.get("store") == PENDING_CHAT_INPUT_MATERIAL_STORE
+            and attachment.get("pending_input_id") == row.pending_input_id
+            and isinstance(attachment.get("scope"), str)
+            and attachment["scope"]
+        ):
+            scopes.add(cast(str, attachment["scope"]))
+    return scopes
+
+
+async def _pending_input_current_session_id(
+    storage: SessionStorage,
+    session_key: str,
+) -> str | None:
+    session = await storage.get_session(session_key)
+    session_id = getattr(session, "session_id", None)
+    return session_id if isinstance(session_id, str) and session_id else None
+
+
+def _cleanup_pending_input_scopes(
+    *,
+    ctx: RpcContext,
+    pending_input_id: str,
+    session_ids: set[str],
+) -> None:
+    media_root = media_root_from_config(ctx.config)
+    for session_id in session_ids:
+        try:
+            cleanup_pending_chat_input_material(
+                media_root=media_root,
+                session_id=session_id,
+                pending_input_id=pending_input_id,
+            )
+        except OSError:
+            # The durable row lifecycle is authoritative. A filesystem cleanup
+            # failure is retried by session deletion and must not turn a
+            # committed cancel/dispatch into a misleading RPC failure.
+            log.warning(
+                "pending_inputs.material_cleanup_failed",
+                pending_input_id=pending_input_id,
+                session_id=session_id,
+            )
+
+
+def _material_ids_in_transcript_content(content: Any) -> set[str]:
+    if not isinstance(content, str):
+        return set()
+    try:
+        root = json.loads(content)
+    except (json.JSONDecodeError, TypeError):
+        return set()
+    found: set[str] = set()
+    stack = [root]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            material_id = value.get("sha256_ref")
+            if isinstance(material_id, str) and len(material_id) == 64:
+                found.add(material_id.lower())
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return found
+
+
+async def _cleanup_unreferenced_pending_promotions(
+    *,
+    ctx: RpcContext,
+    storage: SessionStorage,
+    session_key: str,
+    pending_input_id: str,
+    source_session_ids: set[str],
+) -> None:
+    """Delete failed-dispatch canonical copies only when no durable owner remains."""
+
+    media_root = media_root_from_config(ctx.config)
+    promotions: dict[str, set[str]] = {}
+    for source_session_id in source_session_ids:
+        for target_session_id, material_ids in read_pending_chat_input_promotions(
+            media_root=media_root,
+            source_session_id=source_session_id,
+            pending_input_id=pending_input_id,
+        ).items():
+            promotions.setdefault(target_session_id, set()).update(material_ids)
+    if not promotions:
+        return
+
+    current_session = await storage.get_session(session_key)
+    current_session_id = getattr(current_session, "session_id", None)
+    if not isinstance(current_session_id, str) or not current_session_id:
+        return
+
+    # Another staged input with the same content is a live reference even if
+    # its canonical promotion has not yet been accepted.
+    other_pending_ids: set[str] = set()
+    try:
+        for pending in await storage.list_pending_chat_inputs(session_key):
+            if pending.pending_input_id == pending_input_id:
+                continue
+            for attachment in pending.payload.get("attachments") or []:
+                if not isinstance(attachment, dict):
+                    continue
+                material_id = attachment.get("sha256") or attachment.get("material_id")
+                if isinstance(material_id, str) and len(material_id) == 64:
+                    other_pending_ids.add(material_id.lower())
+    except Exception:  # noqa: BLE001 - cleanup must fail closed.
+        return
+
+    for target_session_id, material_ids in promotions.items():
+        if target_session_id != current_session_id:
+            # A reset archive or child session can still reference a retired
+            # generation outside the active SQLite transcript. Without a
+            # complete reference proof, preserve its canonical material.
+            continue
+        try:
+            transcript = await storage.get_canonical_transcript(target_session_id)
+        except Exception:  # noqa: BLE001 - never delete without a reference proof.
+            continue
+        transcript_ids: set[str] = set()
+        for entry in transcript:
+            transcript_ids.update(_material_ids_in_transcript_content(entry.content))
+        for material_id in material_ids - transcript_ids - other_pending_ids:
+            path = native_io_path(
+                transcript_material_path(media_root, target_session_id, material_id)
+            )
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                log.warning(
+                    "pending_inputs.promotion_cleanup_failed",
+                    pending_input_id=pending_input_id,
+                    session_id=target_session_id,
+                    material_id=material_id,
+                )
+
+
+@_d.method("sessions.pending_inputs.enqueue", scope="operator.write")
+async def _handle_pending_inputs_enqueue(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    key = _pending_input_key(params)
+    pending_input_id = _pending_input_param(
+        params,
+        "pendingInputId",
+        "pending_input_id",
+    )
+    raw_payload = _pending_input_send_payload(params, key=key)
+    source_scope = _turn_source_scope(
+        cast(dict[str, Any], raw_payload["_source"]),
+        ctx,
+    )
+    storage = _pending_input_storage(ctx)
+    attachments = list(raw_payload.get("attachments") or [])
+
+    async def _materialize_and_enqueue() -> tuple[PendingChatInput, bool]:
+        async with _pending_input_enqueue_lock(ctx, key, pending_input_id):
+            payload = dict(raw_payload)
+            staged_scope = await _pending_input_current_session_id(storage, key)
+            if staged_scope is None:
+                raise RpcHandlerError(
+                    "PENDING_SESSION_UNAVAILABLE",
+                    "Queued messages require an existing durable session",
+                    retryable=True,
+                    accepted=False,
+                )
+            had_recovery_manifest = False
+            consumed_file_uuids: list[str] = []
+            if attachments:
+                media_root = media_root_from_config(ctx.config)
+                enqueue_fingerprint = request_fingerprint(raw_payload)
+                existing_manifest = read_pending_chat_input_manifest(
+                    media_root=media_root,
+                    session_id=staged_scope,
+                    pending_input_id=pending_input_id,
+                )
+                had_recovery_manifest = existing_manifest is not None
+                attachments_cfg = getattr(ctx.config, "attachments", None)
+
+                def cleanup_incomplete_owner() -> None:
+                    if not had_recovery_manifest and staged_scope is not None:
+                        _cleanup_pending_input_scopes(
+                            ctx=ctx,
+                            pending_input_id=pending_input_id,
+                            session_ids={staged_scope},
+                        )
+
+                try:
+                    staged = await _attachment_ingest.stage_pending_chat_input_attachments(
+                        attachments,
+                        material_root=media_root,
+                        session_id=staged_scope,
+                        pending_input_id=pending_input_id,
+                        enqueue_fingerprint=enqueue_fingerprint,
+                        disk_budget_bytes=(
+                            getattr(attachments_cfg, "transcript_disk_budget_bytes", None)
+                            if isinstance(
+                                getattr(
+                                    attachments_cfg,
+                                    "transcript_disk_budget_bytes",
+                                    None,
+                                ),
+                                int,
+                            )
+                            else None
+                        ),
+                        accept_opaque=bool(
+                            getattr(attachments_cfg, "accept_opaque", True)
+                        ),
+                        opaque_limit_bytes=(
+                            getattr(attachments_cfg, "opaque_max_bytes", None)
+                            if isinstance(
+                                getattr(attachments_cfg, "opaque_max_bytes", None),
+                                int,
+                            )
+                            else None
+                        ),
+                    )
+                except PendingChatInputManifestConflictError as exc:
+                    raise RpcHandlerError(
+                        "PENDING_INPUT_CONFLICT",
+                        "A pending input id was reused for different content",
+                        retryable=False,
+                        accepted=False,
+                    ) from exc
+                except PendingChatInputManifestCorruptError as exc:
+                    raise RpcHandlerError(
+                        "PENDING_ATTACHMENT_RECOVERY_CORRUPT",
+                        "Queued attachment recovery data is invalid; cancel and requeue it",
+                        retryable=False,
+                        accepted=False,
+                    ) from exc
+                except _attachment_ingest.AttachmentResolutionError as exc:
+                    cleanup_incomplete_owner()
+                    raise RpcHandlerError(
+                        exc.code,
+                        str(exc),
+                        details={
+                            "attachmentIndex": exc.attachment_index,
+                            "fileUuid": exc.file_uuid,
+                            "recovery": "reupload" if exc.recoverable else None,
+                        },
+                        retryable=exc.recoverable,
+                        accepted=False,
+                    ) from exc
+                except (OSError, ValueError) as exc:
+                    cleanup_incomplete_owner()
+                    raise RpcHandlerError(
+                        "PENDING_ATTACHMENT_INVALID",
+                        str(exc),
+                        retryable=False,
+                        accepted=False,
+                    ) from exc
+                payload["attachments"] = staged.attachments
+                consumed_file_uuids = list(staged.consumed_file_uuids)
+
+            fingerprint = request_fingerprint(payload)
+            try:
+                row, replayed = await storage.enqueue_pending_chat_input(
+                    pending_input_id=pending_input_id,
+                    session_key=key,
+                    source_scope=source_scope,
+                    client_request_id=cast(str, payload["clientRequestId"]),
+                    client_message_id=cast(str, payload["clientMessageId"]),
+                    request_fingerprint=fingerprint,
+                    payload=payload,
+                )
+            except (
+                PendingChatInputAlreadyDispatchedError,
+                PendingChatInputCancelledError,
+                PendingChatInputCapacityError,
+                PendingChatInputConflictError,
+            ):
+                # A newly-created owner has no durable DB reference. Existing
+                # recovery manifests belong to an earlier ambiguous request and
+                # remain intact for its exact retry.
+                if staged_scope is not None and not had_recovery_manifest:
+                    current = await storage.get_pending_chat_input(pending_input_id)
+                    if current is None:
+                        _cleanup_pending_input_scopes(
+                            ctx=ctx,
+                            pending_input_id=pending_input_id,
+                            session_ids={staged_scope},
+                        )
+                raise
+
+            if consumed_file_uuids:
+                from opensquilla.gateway.uploads import get_upload_store
+
+                upload_store = get_upload_store()
+                for file_uuid in consumed_file_uuids:
+                    try:
+                        await upload_store.evict(file_uuid)
+                    except Exception:  # noqa: BLE001 - durable owner already exists.
+                        log.warning(
+                            "pending_inputs.upload_evict_failed",
+                            file_uuid=file_uuid[:8],
+                        )
+            return row, replayed
+
+    try:
+        row, replayed = await complete_durable_ingress(_materialize_and_enqueue())
+    except PendingChatInputCapacityError as exc:
+        raise RpcHandlerError(
+            "PENDING_INPUTS_FULL",
+            "This session already has five queued messages",
+            details={"maxPending": 5},
+            retryable=False,
+            accepted=False,
+        ) from exc
+    except PendingChatInputCancelledError as exc:
+        raise RpcHandlerError(
+            "PENDING_INPUT_CANCELLED",
+            "This queued message was already cancelled",
+            retryable=False,
+            accepted=False,
+        ) from exc
+    except PendingChatInputAlreadyDispatchedError as exc:
+        raise RpcHandlerError(
+            "PENDING_INPUT_ALREADY_DISPATCHED",
+            "This queued message was already dispatched",
+            retryable=False,
+            accepted=False,
+        ) from exc
+    except PendingChatInputConflictError as exc:
+        raise RpcHandlerError(
+            "PENDING_INPUT_CONFLICT",
+            "A pending input id was reused for different content",
+            retryable=False,
+            accepted=False,
+        ) from exc
+    return {"status": "staged", **_pending_input_payload(row, replayed=replayed)}
+
+
+@_d.method("sessions.pending_inputs.list", scope="operator.read")
+async def _handle_pending_inputs_list(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    key = _pending_input_key(params)
+    rows = await _pending_input_storage(ctx).list_pending_chat_inputs(key)
+    return {
+        "sessionKey": key,
+        "items": [_pending_input_payload(row) for row in rows],
+        "maxPending": 5,
+    }
+
+
+@_d.method("sessions.pending_inputs.update", scope="operator.write")
+async def _handle_pending_inputs_update(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    key = _pending_input_key(params)
+    pending_input_id = _pending_input_param(
+        params,
+        "pendingInputId",
+        "pending_input_id",
+    )
+    expected_revision = params.get("expectedRevision", params.get("expected_revision"))
+    position = params.get("position")
+    if isinstance(expected_revision, bool) or not isinstance(expected_revision, int):
+        raise ValueError("params.expectedRevision must be an integer")
+    if isinstance(position, bool) or not isinstance(position, int):
+        raise ValueError("params.position must be an integer")
+    try:
+        row = await _pending_input_storage(ctx).update_pending_chat_input(
+            pending_input_id,
+            session_key=key,
+            expected_revision=expected_revision,
+            position=position,
+        )
+    except PendingChatInputNotFoundError as exc:
+        raise RpcHandlerError(
+            "PENDING_INPUT_NOT_FOUND",
+            "Pending input no longer exists",
+            retryable=False,
+            accepted=False,
+        ) from exc
+    except PendingChatInputConflictError as exc:
+        raise RpcHandlerError(
+            "PENDING_INPUT_CONFLICT",
+            "Pending input changed before update",
+            retryable=True,
+            accepted=False,
+        ) from exc
+    return {"status": "updated", **_pending_input_payload(row)}
+
+
+@_d.method("sessions.pending_inputs.cancel", scope="operator.write")
+async def _handle_pending_inputs_cancel(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    key = _pending_input_key(params)
+    pending_input_id = _pending_input_param(
+        params,
+        "pendingInputId",
+        "pending_input_id",
+    )
+    expected_revision = params.get("expectedRevision", params.get("expected_revision"))
+    if expected_revision is not None and (
+        isinstance(expected_revision, bool) or not isinstance(expected_revision, int)
+    ):
+        raise ValueError("params.expectedRevision must be an integer")
+    storage = _pending_input_storage(ctx)
+    try:
+        async with _pending_input_lock_for(pending_input_id):
+            existing = await storage.get_pending_chat_input(pending_input_id)
+            session_ids = _pending_input_attachment_scopes(existing)
+            current_session_id = await _pending_input_current_session_id(storage, key)
+            if current_session_id is not None:
+                # Also covers a crash after materialization but before the DB
+                # insert: cancel remains able to remove that orphan owner.
+                session_ids.add(current_session_id)
+            removed = await storage.cancel_pending_chat_input(
+                pending_input_id,
+                session_key=key,
+                expected_revision=expected_revision,
+            )
+            await _cleanup_unreferenced_pending_promotions(
+                ctx=ctx,
+                storage=storage,
+                session_key=key,
+                pending_input_id=pending_input_id,
+                source_session_ids=session_ids,
+            )
+            _cleanup_pending_input_scopes(
+                ctx=ctx,
+                pending_input_id=pending_input_id,
+                session_ids=session_ids,
+            )
+    except PendingChatInputConflictError as exc:
+        raise RpcHandlerError(
+            "PENDING_INPUT_CONFLICT",
+            "Pending input changed before cancellation",
+            retryable=True,
+            accepted=False,
+        ) from exc
+    return {
+        "status": "cancelled",
+        "cancelled": True,
+        "alreadyMissing": not removed,
+        "pendingInputId": pending_input_id,
+        "sessionKey": key,
+    }
+
+
+@_d.method("sessions.pending_inputs.dispatch", scope="operator.write")
+async def _handle_pending_inputs_dispatch(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    key = _pending_input_key(params)
+    pending_input_id = _pending_input_param(
+        params,
+        "pendingInputId",
+        "pending_input_id",
+    )
+    client_request_id = _pending_input_param(
+        params,
+        "clientRequestId",
+        "client_request_id",
+    )
+    supplied_fingerprint = _optional_string_param(
+        params,
+        "requestFingerprint",
+        "request_fingerprint",
+    )
+    if supplied_fingerprint is None:
+        raise RpcHandlerError(
+            "PENDING_INPUT_FINGERPRINT_REQUIRED",
+            "Pending input dispatch requires its staged fingerprint",
+            retryable=False,
+            accepted=False,
+        )
+    storage = _pending_input_storage(ctx)
+    async with _pending_input_lock_for(pending_input_id):
+        row = await storage.get_pending_chat_input(pending_input_id)
+        if row is None:
+            # A response can be lost after the atomic transaction deletes the
+            # staged row. The ingress receipt is the durable completion
+            # tombstone. Cleaning both the current and accepted session scopes
+            # also reclaims an owner left by a crash immediately after commit.
+            source_scope = _turn_source_scope(
+                _normalize_session_send_source_hint(params),
+                ctx,
+            )
+            dispatch_receipt = (
+                await storage.get_pending_chat_input_dispatch_receipt(
+                    pending_input_id
+                )
+            )
+            if dispatch_receipt is None or (
+                dispatch_receipt.session_key != key
+                or dispatch_receipt.source_scope != source_scope
+                or dispatch_receipt.client_request_id != client_request_id
+                or dispatch_receipt.request_fingerprint != supplied_fingerprint
+            ):
+                raise RpcHandlerError(
+                    "PENDING_INPUT_NOT_FOUND",
+                    "Pending input no longer exists",
+                    retryable=False,
+                    accepted=False,
+                )
+            replay = await storage.replay_turn_ingress_receipt(
+                source_scope=source_scope,
+                request_session_key=key,
+                client_request_id=client_request_id,
+            )
+            if replay is None:
+                raise RpcHandlerError(
+                    "PENDING_INPUT_NOT_FOUND",
+                    "Pending input no longer exists",
+                    retryable=False,
+                    accepted=False,
+                )
+            if replay.receipt.request_fingerprint != supplied_fingerprint:
+                raise RpcHandlerError(
+                    "PENDING_INPUT_CONFLICT",
+                    "Pending input fingerprint does not match its accepted turn",
+                    retryable=False,
+                    accepted=False,
+                )
+            response = await _accepted_turn_response(
+                replay,
+                client_request_id=client_request_id,
+                storage=storage,
+            )
+            session_ids = {replay.receipt.session_id}
+            current_session_id = await _pending_input_current_session_id(storage, key)
+            if current_session_id is not None:
+                session_ids.add(current_session_id)
+            _cleanup_pending_input_scopes(
+                ctx=ctx,
+                pending_input_id=pending_input_id,
+                session_ids=session_ids,
+            )
+            return response
+        if (
+            row.session_key != key
+            or row.client_request_id != client_request_id
+            or supplied_fingerprint != row.request_fingerprint
+        ):
+            raise RpcHandlerError(
+                "PENDING_INPUT_CONFLICT",
+                "Pending input dispatch identity does not match the staged row",
+                retryable=False,
+                accepted=False,
+            )
+        try:
+            response = await _handle_sessions_send(
+                dict(row.payload),
+                ctx,
+                fingerprint_params=dict(row.payload),
+                pending_input_id=row.pending_input_id,
+                pending_input_fingerprint=row.request_fingerprint,
+                pending_input_revision=row.state_revision,
+            )
+        except PendingChatInputNotFoundError as exc:
+            raise RpcHandlerError(
+                "PENDING_INPUT_NOT_FOUND",
+                "Pending input disappeared before dispatch",
+                retryable=True,
+                accepted=False,
+            ) from exc
+        except PendingChatInputConflictError as exc:
+            raise RpcHandlerError(
+                "PENDING_INPUT_CONFLICT",
+                "Pending input changed before dispatch",
+                retryable=True,
+                accepted=False,
+            ) from exc
+        _cleanup_pending_input_scopes(
+            ctx=ctx,
+            pending_input_id=pending_input_id,
+            session_ids=_pending_input_attachment_scopes(row),
+        )
+        return response
 
 
 def _steer_v2_failure(
@@ -6791,6 +7676,18 @@ async def _delete_session_with_lifecycle(
         if not isinstance(session_id, str) or not session_id:
             session_id = None
 
+        # Pending owners can still live under a pre-reset session id while the
+        # stable session key points at a newer generation. Capture every owner
+        # before the DB cascade removes the rows, then reclaim only those
+        # private directories after the delete commits.
+        pending_material_owners: dict[str, set[str]] = {}
+        list_pending = getattr(storage, "list_pending_chat_inputs", None)
+        if callable(list_pending):
+            for pending in await list_pending(canonical_key):
+                scopes = _pending_input_attachment_scopes(pending)
+                if scopes:
+                    pending_material_owners[pending.pending_input_id] = scopes
+
         # Terminal task cleanup normally expires owned approvals. Repeat the
         # operation here so already-orphaned and claimed approvals also fail
         # closed before their session record is removed.
@@ -6798,6 +7695,12 @@ async def _delete_session_with_lifecycle(
 
         get_approval_queue().expire_pending_for_session(canonical_key)
         await storage.delete_session(canonical_key)
+        for pending_input_id, session_ids in pending_material_owners.items():
+            _cleanup_pending_input_scopes(
+                ctx=ctx,
+                pending_input_id=pending_input_id,
+                session_ids=session_ids,
+            )
         keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
         if keepalive_service is not None:
             await keepalive_service.invalidate(canonical_key)
@@ -7876,7 +8779,23 @@ async def _build_sessions_messages_subscription_payload(
     subscribed: bool,
     fast_ack: bool,
 ) -> dict[str, Any]:
-    replay = get_session_streams().replay(key, _optional_stream_seq(params))
+    streams = get_session_streams()
+    since_stream_seq = _optional_stream_seq(params)
+    since_stream_generation = _optional_stream_generation(params)
+    if since_stream_generation is None:
+        # Pre-generation clients retain only a numeric cursor.  Lift the new
+        # process counter before replay/ACK so the next live event is visible
+        # even when this Gateway restarted at sequence zero.
+        promote_legacy_cursor = getattr(streams, "promote_legacy_cursor", None)
+        if callable(promote_legacy_cursor):
+            promote_legacy_cursor(key, since_stream_seq)
+        replay = streams.replay(key, since_stream_seq)
+    else:
+        replay = streams.replay(
+            key,
+            since_stream_seq,
+            since_stream_generation,
+        )
     replayed_count = 0
     if subscribed and replay.events:
         from opensquilla.gateway.websocket import get_registry
@@ -7902,6 +8821,7 @@ async def _build_sessions_messages_subscription_payload(
     replay_payload = {
         "subscribed": subscribed,
         "key": key,
+        "stream_generation": replay.stream_generation,
         "current_stream_seq": replay.current_stream_seq,
         "replay_complete": replay.replay_complete,
         "replay_gap_reason": replay.gap_reason,
@@ -8138,6 +9058,7 @@ async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContex
     return {
         "key": key,
         "task_id": snapshot.task_id,
+        "stream_generation": snapshot.stream_generation,
         "current_stream_seq": snapshot.current_stream_seq,
         "events": [
             {

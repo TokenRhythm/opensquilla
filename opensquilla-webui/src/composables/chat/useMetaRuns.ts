@@ -85,6 +85,8 @@ export interface UseMetaRunsOptions {
    * session.event.*). Used read-only here to drop stale/duplicate meta frames.
    */
   lastStreamSeq: Ref<number>
+  /** Reset the shared cursor before comparing a restarted Gateway generation. */
+  observeStreamGeneration?: (payload: unknown) => boolean
   /**
    * Send the hidden preflight confirmation (provider text with markers +
    * visible bubble text). Wired from ChatView's send path.
@@ -138,6 +140,7 @@ export function useMetaRuns(options: UseMetaRunsOptions) {
     if (!payload || typeof payload !== 'object') return false
     if (isStaleEpoch(payload, currentEpoch.value)) return false
     if (!isCurrentSessionPayload(payload, sessionKey.value)) return false
+    options.observeStreamGeneration?.(payload)
     // Drop stale/duplicate stream frames (e.g. replayed on reconnect). Without
     // this, a re-delivered meta_run_announced would reset the ribbon to
     // all-pending and lose progress. The wildcard handleRpcAny advances

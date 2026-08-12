@@ -3429,6 +3429,14 @@
         "interrupted": "Interrompu",
         "failed": "Échec"
       },
+      "provider": {
+        "waiting": "En attente du modèle",
+        "reasoning": "Réflexion approfondie",
+        "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
+        "retryWait": "Nouvel essai dans {seconds}s",
+        "retrying": "Nouvel essai {attempt}/{limit}",
+        "fallback": "Passage au modèle de secours"
+      },
       "purpose": {
         "discover": "Liens découverts",
         "search": "Recherche sur le Web",
