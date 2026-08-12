@@ -241,8 +241,9 @@ def test_sessions_spawn_exposes_optional_bounded_title_schema() -> None:
     assert registered.spec.parameters["title"] == {
         "type": "string",
         "description": (
-            "Short human-readable title for the spawned session. Omit or leave "
-            "blank to derive a bounded title from the task description."
+            "Short human-readable task title (3-8 words). Name the work, not "
+            "the agent, and avoid generic labels such as 'Subagent task'. Omit "
+            "or leave blank to derive a bounded title from the task description."
         ),
         "maxLength": 512,
     }
