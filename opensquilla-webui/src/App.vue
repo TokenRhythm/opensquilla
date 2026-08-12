@@ -80,6 +80,7 @@
     <!-- Recent conversations -->
     <SidebarConversations
       :sections="sidebarSections"
+      :session-order="sidebarSessionOrder"
       :error="sessionListError"
       :loading="isLoading"
       :current-key="sidebarCurrentKey"
@@ -480,6 +481,7 @@ import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
 import { bindingMatches, formatBinding } from './utils/keychord'
 import { SIDEBAR_MIN_WIDTH, type SidebarWidthPreference } from './utils/sidebarLayout'
+import { sidebarSessionOrderKeys } from './utils/sidebarDisplayProjection'
 import {
   dispatchLocalSessionsDeleted,
   localSessionsDeletedDetail,
@@ -1042,10 +1044,10 @@ function onReorderSidebarSession(payload: {
   targetKey: string
   position: 'before' | 'after'
 }) {
-  const orderedKeys = sidebarSections.value
-    .flatMap(section => section.rows)
-    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
-    .map(row => row.key)
+  const orderedKeys = sidebarSessionOrderKeys(
+    sidebarSections.value,
+    sidebarSessionOrder.value,
+  )
   const from = orderedKeys.indexOf(payload.draggedKey)
   if (from < 0 || !orderedKeys.includes(payload.targetKey) || payload.draggedKey === payload.targetKey) return
 
@@ -1064,10 +1066,10 @@ function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
   writeStoredSessionKeys(SIDEBAR_PINNED_SESSIONS_KEY, sidebarPinnedSessionKeys.value)
 
   if (!payload.pinned) return
-  const currentOrder = sidebarSections.value
-    .flatMap(section => section.rows)
-    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
-    .map(row => row.key)
+  const currentOrder = sidebarSessionOrderKeys(
+    sidebarSections.value,
+    sidebarSessionOrder.value,
+  )
     .filter(key => key !== payload.key)
   currentOrder.unshift(payload.key)
   sidebarSessionOrder.value = currentOrder
@@ -1450,7 +1452,7 @@ function switchToSession(key: string, source = 'app.switchToSession') {
 }
 
 // Optimistic rename: show the new title immediately, then persist via
-// sessions.patch (display_name is the top-precedence title) and reload so the
+// sessions.rename (display_name is the top-precedence title) and reload so the
 // backend's canonical title wins. The override clears once the reload lands.
 async function onRenameSession({ key, title }: { key: string; title: string }) {
   const next = title.trim()
@@ -1459,10 +1461,10 @@ async function onRenameSession({ key, title }: { key: string; title: string }) {
   const local = localChatSessions.value[key]
   if (local) localChatSessions.value[key] = { ...local, title: next }
   try {
-    await rpcStore.call('sessions.patch', { key, displayName: next })
+    await rpcStore.call('sessions.rename', { key, displayName: next })
     pushToast('Session renamed', { tone: 'ok' })
   } catch (err: unknown) {
-    console.warn('[App] sessions.patch error:', errorMessage(err))
+    console.warn('[App] sessions.rename error:', errorMessage(err))
     pushToast('Failed to rename session', { tone: 'danger' })
   } finally {
     await loadSessions()

@@ -183,7 +183,7 @@
           :data-preview-session="forkTransition?.parentKey"
         >
         <ChatMessageList
-          :messages="forkTransition?.previewMessages || renderedMessages"
+          :messages="forkTransition?.previewMessages || visibleRenderedMessages"
           :session-key="forkTransition?.parentKey || sessionKey"
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
@@ -218,6 +218,7 @@
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
           @show-tool-result="showToolResultModal"
+          @open-session="switchToSession"
           @resolve-interrupt="resolveInterrupt"
           @extend-interrupt="extendInterrupt"
           @clarify-submit="submitClarify"
@@ -956,6 +957,10 @@ import {
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
+import {
+  hasRouterAfterLatestUser,
+  projectSessionCreationRouterPresentation,
+} from '@/utils/chat/sessionCreationRouterPresentation'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { shouldDisableLandingSuggestions } from '@/utils/chat/landingSuggestions'
 import { handoffPlanQuestionnaireWheel } from '@/utils/chat/planQuestionnaireWheel'
@@ -1764,6 +1769,10 @@ const chatRenderedMessages = useChatRenderedMessages({
   timeTranslator: t,
 })
 const { renderedMessages, routerDecisionCells } = chatRenderedMessages
+const sessionCreationRouterPresentation = computed(() => (
+  projectSessionCreationRouterPresentation(renderedMessages.value, isStreaming.value)
+))
+const visibleRenderedMessages = computed(() => sessionCreationRouterPresentation.value.messages)
 
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // Always surface the router strip — the live ensemble strip is the primary
@@ -1778,16 +1787,12 @@ function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
  */
 const routerStripReserve = computed<ChatRenderedMessage | null>(() => {
   if (!isStreaming.value || !routerEnabled.value || !routerVisualEffectsEnabled.value) return null
-  const rendered = renderedMessages.value
-  const liveTurnKey = [...rendered]
-    .reverse()
-    .find(message => message.displayRole === 'user')
-    ?.turnKey
-  for (let i = rendered.length - 1; i >= 0; i--) {
-    const msg = rendered[i]
-    if (msg.isRouterStrip && (!liveTurnKey || msg.turnKey === liveTurnKey)) return null
-    if (msg.displayRole === 'user' && msg.turnKey !== liveTurnKey) break
-  }
+  const rendered = visibleRenderedMessages.value
+  // A subagent handoff can resume the same visible user interaction under a
+  // different engine turn id. Any router already visible after that user owns
+  // the single route slot; comparing turnKey here would append a duplicate
+  // reserve below it during the handoff/reconnect window.
+  if (hasRouterAfterLatestUser(rendered)) return null
   if (modelRoutingMode.value === 'llm_ensemble') {
     return {
       id: 'router-strip-reserve',

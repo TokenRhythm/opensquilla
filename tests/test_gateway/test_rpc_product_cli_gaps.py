@@ -204,6 +204,32 @@ def test_sessions_delete_is_write_scope_and_allows_remote_operator():
     assert missing_admin == ADMIN_SCOPE
 
 
+def test_sessions_rename_is_write_scope_without_weakening_patch():
+    dispatcher = get_dispatcher()
+    rename_entry = dispatcher.get_entry("sessions.rename")
+    patch_entry = dispatcher.get_entry("sessions.patch")
+
+    assert METHOD_SCOPES["sessions.rename"] == WRITE_SCOPE
+    assert rename_entry is not None
+    assert rename_entry.required_scope == WRITE_SCOPE
+    assert authorize_call(
+        "sessions.rename",
+        rename_entry.required_scope,
+        "operator",
+        REMOTE_OPERATOR_SCOPES,
+    ) == (True, None)
+
+    assert METHOD_SCOPES["sessions.patch"] == ADMIN_SCOPE
+    assert patch_entry is not None
+    assert patch_entry.required_scope == ADMIN_SCOPE
+    assert authorize_call(
+        "sessions.patch",
+        patch_entry.required_scope,
+        "operator",
+        REMOTE_OPERATOR_SCOPES,
+    ) == (False, ADMIN_SCOPE)
+
+
 @pytest.mark.asyncio
 async def test_memory_search_uses_admin_intent_and_returns_wire_rows(tmp_path):
     manager = FakeMemoryManager(workspace_dir=tmp_path)

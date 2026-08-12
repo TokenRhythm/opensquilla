@@ -249,6 +249,9 @@ METHOD_SCOPES: dict[str, str] = {
     # REMOTE_OPERATOR_SCOPES (no admin) — surfacing as "Failed to delete session"
     # (issues #357, #307).
     "sessions.delete": WRITE_SCOPE,
+    # Display-name-only session rename. Deployment/model rebinding remains on
+    # the separately admin-gated sessions.patch surface.
+    "sessions.rename": WRITE_SCOPE,
     "sessions.promptCacheKeepalive.set": WRITE_SCOPE,
     "sandbox.workspace.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.mount.add": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.

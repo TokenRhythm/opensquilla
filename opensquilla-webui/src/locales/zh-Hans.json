@@ -3225,6 +3225,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "聊天已创建",
+      "open": "打开聊天"
+    },
     "promptCacheKeepalive": {
       "action": "提示词缓存保活",
       "title": "提示词缓存保活",
@@ -4065,6 +4069,7 @@
     "sidebar": {
       "recentConversations": "最近任务",
       "recents": "最近",
+      "pinned": "置顶",
       "refresh": "重新加载任务",
       "clearAgentFilter": "清除智能体筛选：{name}",
       "loadError": "无法加载任务",

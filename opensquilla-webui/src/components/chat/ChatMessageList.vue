@@ -63,6 +63,7 @@
       @toggle-tool-group="$emit('toggleToolGroup', $event)"
       @toggle-tool-item="$emit('toggleToolItem', $event)"
       @show-tool-result="(content, title, context) => $emit('showToolResult', content, title, context)"
+      @open-session="$emit('openSession', $event)"
       @resolve-interrupt="(id, decision) => $emit('resolveInterrupt', id, decision)"
       @extend-interrupt="id => $emit('extendInterrupt', id)"
       @clarify-submit="(fields, request) => $emit('clarifySubmit', fields, request)"
@@ -140,6 +141,7 @@ defineEmits<{
   toggleToolGroup: [groupId: string]
   toggleToolItem: [renderKey: string]
   showToolResult: [content: string, title: string, context?: ToolResultContext]
+  openSession: [sessionKey: string]
   forkConversation: [throughTurnId?: string]
   resolveInterrupt: [id: string, decision: 'allow-once' | 'allow-always' | 'deny']
   extendInterrupt: [id: string]
