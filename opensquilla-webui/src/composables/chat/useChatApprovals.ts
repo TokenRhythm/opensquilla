@@ -535,6 +535,28 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     return composite === '|' ? `clarify:${sessionKey.value}` : composite
   }
 
+  function resetClarifyPresentation() {
+    clarifySubmitted.value = false
+    clarifyBusy.value = false
+    clarifyError.value = ''
+  }
+
+  function pendingClarifyMatches(key: string): boolean {
+    return pendingClarify.value != null && clarifyFrameKey(pendingClarify.value) === key
+  }
+
+  /**
+   * Remove only the request whose terminal state was just confirmed. This
+   * identity guard prevents a delayed submit response from dismissing a newer
+   * questionnaire that arrived while the earlier RPC was in flight.
+   */
+  function clearPendingClarify(key: string): boolean {
+    if (!pendingClarifyMatches(key)) return false
+    pendingClarify.value = null
+    resetClarifyPresentation()
+    return true
+  }
+
   let pollTimer: ReturnType<typeof setInterval> | null = null
   let fetchInFlight = false
   let refetchQueued = false
@@ -846,18 +868,18 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
         busy: false,
         error: '',
       })
-      if (pendingClarify.value?.requestId === outcome.requestId) {
-        clarifySubmitted.value = true
-        clarifyBusy.value = false
-        clarifyError.value = ''
-      }
+      clearPendingClarify(outcome.requestId)
       return
     }
     const request = parseClarifyRequest(payload)
     if (!request) return
+    const key = clarifyFrameKey(request)
+    // Tool-result replay and reconnect delivery can surface the paused half
+    // after its terminal outcome. Never resurrect an already-settled request or
+    // let a duplicate paused event undo optimistic submit feedback.
+    if (interruptState.value.get(key)?.resolution === 'replied') return
     pendingClarify.value = request
-    clarifySubmitted.value = false
-    clarifyError.value = ''
+    resetClarifyPresentation()
     // Mirror the clarify into the turn log so it folds into an inline interrupt
     // part. The clarify keeps no approval id, so the runId|step composite keys it.
     const clarifyData: InterruptClarifyData = {
@@ -868,7 +890,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       runId: request.runId,
       step: request.step,
     }
-    const key = clarifyFrameKey(request)
     if (!interruptState.value.has(key)) setInterruptState(key, {})
     if (!stream.isStreaming.value) stream.ensureInterruptBubble()
     stream.appendInterruptFrame({
@@ -972,9 +993,12 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     const key = clarifyFrameKey(request)
     if (interruptState.value.get(key)?.resolution === 'replied') return
     if (!requestOverride && clarifySubmitted.value) return
-    clarifyBusy.value = true
-    clarifySubmitted.value = true
-    clarifyError.value = ''
+    const controlsPendingPresentation = pendingClarifyMatches(key)
+    if (controlsPendingPresentation) {
+      clarifyBusy.value = true
+      clarifySubmitted.value = true
+      clarifyError.value = ''
+    }
     setInterruptState(key, { resolution: 'replied', busy: true, error: '' })
     const params: Record<string, unknown> = { sessionKey: sessionKey.value, fields }
     if (request.requestId) params.request_id = request.requestId
@@ -982,20 +1006,26 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     try {
       await rpc.call('chat.clarify_submit', params)
       setInterruptState(key, { resolution: 'replied', busy: false })
+      // request_id submissions resolve the exact paused tool call in the same
+      // turn. A successful RPC is therefore authoritative and can release the
+      // dock/composer immediately. Legacy clarifications create a new chat turn
+      // and intentionally retain their existing submitted receipt.
+      if (request.requestId) clearPendingClarify(key)
     } catch (err) {
       const message = 'Send failed — ' + (err instanceof Error ? err.message : String(err))
-      clarifySubmitted.value = false
-      clarifyError.value = message
+      if (pendingClarifyMatches(key)) {
+        clarifySubmitted.value = false
+        clarifyError.value = message
+      }
       setInterruptState(key, { resolution: null, busy: false, error: message })
     } finally {
-      clarifyBusy.value = false
+      if (pendingClarifyMatches(key)) clarifyBusy.value = false
     }
   }
 
   function dismissClarify() {
     pendingClarify.value = null
-    clarifySubmitted.value = false
-    clarifyError.value = ''
+    resetClarifyPresentation()
   }
 
   function applyUserInputBootstrap(snapshot: {
@@ -1007,8 +1037,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       const request = clarifyRequestFromValue(value)
       if (!request) continue
       pendingClarify.value = request
-      clarifySubmitted.value = false
-      clarifyError.value = ''
+      resetClarifyPresentation()
       const key = clarifyFrameKey(request)
       if (!interruptState.value.has(key)) setInterruptState(key, {})
       if (!stream.isStreaming.value) stream.ensureInterruptBubble()

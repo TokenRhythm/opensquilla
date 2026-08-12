@@ -560,9 +560,6 @@ const timelineResolvedInterruptKeys = computed(() => new Set(
     )
     .map(item => item.part.key) ?? [],
 ))
-const standaloneInterruptParts = computed(() =>
-  interruptParts.value.filter(part => !timelineResolvedInterruptKeys.value.has(part.key)),
-)
 const planParts = computed(
   () =>
     props.message.parts?.filter(
@@ -570,6 +567,17 @@ const planParts = computed(
     ) ?? [],
 )
 const hasPlan = computed(() => planParts.value.length > 0)
+const standaloneInterruptParts = computed(() =>
+  interruptParts.value.filter(part => (
+    !timelineResolvedInterruptKeys.value.has(part.key)
+    && !(
+      hasPlan.value
+      && part.interruptKind === 'clarify'
+      && part.clarify?.presentation === 'plan_questionnaire_v1'
+      && part.resolution === 'replied'
+    )
+  )),
+)
 // The persisted activity timeline for this finished turn. Empty (fold hidden)
 // for OFF-mode turns and reloaded threads, which carry no snapshot.
 const statusHistory = computed(() => props.message.statusHistory ?? [])

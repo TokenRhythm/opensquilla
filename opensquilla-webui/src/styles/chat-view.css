@@ -586,9 +586,10 @@
   pointer-events: auto;
 }
 
-/* The transcript retains the unresolved interrupt for chronological folding,
-   while the active Plan questionnaire is owned by the composer dock. */
-.chat--plan-questionnaire-open .chat-thread :deep(.clarify-card--plan) {
+/* The transcript retains the interrupt for chronological folding, while the
+   active Plan questionnaire (pending or submitting) has one owner: the dock. */
+.chat--plan-questionnaire-open .chat-thread :deep(.clarify-card--plan),
+.chat--plan-questionnaire-open .chat-thread :deep(.clarify-outcome--plan) {
   display: none;
 }
 

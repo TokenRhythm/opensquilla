@@ -348,6 +348,13 @@ describe('clarify tool-result recovery', () => {
       }],
     },
   }
+  const planClarifyResult = {
+    ...clarifyResult,
+    clarify_schema: {
+      ...clarifyResult.clarify_schema,
+      presentation: 'plan_questionnaire_v1',
+    },
+  }
 
   it.each([
     ['object result', clarifyResult],
@@ -389,6 +396,9 @@ describe('clarify tool-result recovery', () => {
         request_id: 'input-request-1',
         run_id: 'plan-run-1',
       })
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.approvals.clarifySubmitted.value).toBe(false)
+      expect(runtime.approvals.clarifyBusy.value).toBe(false)
     } finally {
       runtime.unsubscribe()
       runtime.scope.stop()
@@ -444,7 +454,187 @@ describe('clarify tool-result recovery', () => {
         busy: false,
         error: '',
       })
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.approvals.clarifySubmitted.value).toBe(false)
+      expect(runtime.approvals.clarifyBusy.value).toBe(false)
+      expect(runtime.approvals.clarifyError.value).toBe('')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('keeps a Plan questionnaire actionable when submission fails', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      runtime.rpcCall.mockRejectedValueOnce(new Error('gateway unavailable'))
+
+      await runtime.approvals.submitClarify({ scope: 'focused' })
+
+      expect(runtime.approvals.pendingClarify.value).toEqual(expect.objectContaining({
+        requestId: 'input-request-1',
+        presentation: 'plan_questionnaire_v1',
+      }))
+      expect(runtime.approvals.clarifySubmitted.value).toBe(false)
+      expect(runtime.approvals.clarifyBusy.value).toBe(false)
+      expect(runtime.approvals.clarifyError.value).toContain('gateway unavailable')
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual(expect.objectContaining({
+        resolution: null,
+        busy: false,
+      }))
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('does not let a delayed submit response dismiss a newer questionnaire', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    const submitted = deferred<unknown>()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      runtime.rpcCall.mockImplementationOnce(async <T,>() => await submitted.promise as T)
+      const firstSubmit = runtime.approvals.submitClarify({ scope: 'focused' })
+      await vi.waitFor(() => expect(runtime.rpcCall).toHaveBeenCalledWith(
+        'chat.clarify_submit',
+        expect.objectContaining({ request_id: 'input-request-1' }),
+      ))
+
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-2',
+        name: 'request_user_input',
+        result: {
+          ...planClarifyResult,
+          request_id: 'input-request-2',
+          run_id: 'plan-run-2',
+        },
+      })
+      submitted.resolve({ resolved: true, request_id: 'input-request-1' })
+      await firstSubmit
+
+      expect(runtime.approvals.pendingClarify.value).toEqual(expect.objectContaining({
+        requestId: 'input-request-2',
+        runId: 'plan-run-2',
+      }))
+      expect(runtime.approvals.clarifySubmitted.value).toBe(false)
+      expect(runtime.approvals.clarifyBusy.value).toBe(false)
+      expect(runtime.approvals.clarifyError.value).toBe('')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('does not clear a newer request for a non-matching terminal outcome', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-2',
+        name: 'request_user_input',
+        result: {
+          ...planClarifyResult,
+          request_id: 'input-request-2',
+          run_id: 'plan-run-2',
+        },
+      })
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: {
+          kind: 'user_input',
+          status: 'answered',
+          paused: false,
+          request_id: 'input-request-1',
+          answers: { scope: 'focused' },
+        },
+      })
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-2')
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBe('replied')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('does not resurrect a settled request from a late paused-event replay', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      const handler = runtime.handlers.get('session.event.tool_result')
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: {
+          kind: 'user_input',
+          status: 'answered',
+          paused: false,
+          request_id: 'input-request-1',
+          answers: { scope: 'focused' },
+        },
+      })
+      const appendCount = runtime.appendInterruptFrame.mock.calls.length
+
+      handler?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.appendInterruptFrame).toHaveBeenCalledTimes(appendCount)
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBe('replied')
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('retains the legacy cross-turn clarify receipt after a successful send acknowledgement', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'legacy-clarify',
+        name: 'request_user_input',
+        result: {
+          ...clarifyResult,
+          request_id: undefined,
+        },
+      })
+
+      await runtime.approvals.submitClarify({ scope: 'focused' })
+
+      expect(runtime.rpcCall).toHaveBeenLastCalledWith('chat.clarify_submit', {
+        sessionKey: 'agent:main:web',
+        fields: { scope: 'focused' },
+        run_id: 'plan-run-1',
+      })
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBeUndefined()
       expect(runtime.approvals.clarifySubmitted.value).toBe(true)
+      expect(runtime.approvals.clarifyBusy.value).toBe(false)
     } finally {
       runtime.unsubscribe()
       runtime.scope.stop()
