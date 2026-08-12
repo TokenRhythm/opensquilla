@@ -29,6 +29,10 @@ import {
   listPendingMetaDiscards,
   persistPendingMetaDiscard,
 } from '@/utils/chat/metaDiscardOutbox'
+import type {
+  PendingInputWal,
+  ResponseHandoffWalRecord,
+} from '@/utils/chat/pendingInputWal'
 
 const pushToast = vi.hoisted(() => vi.fn())
 
@@ -42,6 +46,31 @@ function memoryStorage(): HiddenControlStorage {
     getItem: key => values.get(key) ?? null,
     setItem: (key, value) => { values.set(key, value) },
     removeItem: key => { values.delete(key) },
+  }
+}
+
+function memoryHandoffWal(): PendingInputWal {
+  const handoffs = new Map<string, ResponseHandoffWalRecord>()
+  return {
+    put: async () => {},
+    list: async () => [],
+    delete: async () => {},
+    putHandoff: async record => { handoffs.set(record.ownerRequestId, structuredClone(record)) },
+    listHandoffs: async () => [...handoffs.values()].map(record => structuredClone(record)),
+    acceptHandoff: async (ownerRequestId, acceptedSessionKey) => {
+      const record = handoffs.get(ownerRequestId)
+      if (!record) throw new Error('missing handoff')
+      const handoff = {
+        ...record,
+        state: 'accepted' as const,
+        acceptedSessionKey,
+        updatedAt: Date.now(),
+      }
+      handoffs.set(ownerRequestId, handoff)
+      return { handoff, records: [] }
+    },
+    deleteHandoff: async ownerRequestId => { handoffs.delete(ownerRequestId) },
+    close: () => {},
   }
 }
 
@@ -103,6 +132,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     messages,
     sessionKey: ref('agent:main:webchat:test'),
     pendingQueueOwnerContext: ref(null),
+    pendingInputWal: memoryHandoffWal(),
     busySendMode: ref<BusySendMode>('queue'),
     modelRoutingMode: ref<'off'>('off'),
     modelRoutingSettingsBusy: ref(false),
@@ -153,6 +183,249 @@ function sameTurnSteerOptions(
 }
 
 describe('useChatSend attachment payloads', () => {
+  it('replays a persisted handoff identity after refresh and repairs its owner queue', async () => {
+    const parent = 'agent:main:webchat:parent'
+    const child = 'agent:main:webchat:child'
+    const other = 'agent:main:webchat:other'
+    const params = {
+      sessionKey: parent,
+      clientRequestId: 'fork-refresh-request',
+      clientMessageId: 'fork-refresh-message',
+      message: 'fork request',
+      forkBeforeMessageId: 'fork-before',
+      _source: { runMode: 'safe' as const },
+    }
+    const handoffs = new Map<string, ResponseHandoffWalRecord>([[
+      params.clientRequestId,
+      {
+        schemaVersion: 1,
+        ownerRequestId: params.clientRequestId,
+        requestSessionKey: parent,
+        clientRequestId: params.clientRequestId,
+        clientMessageId: params.clientMessageId,
+        composerText: 'fork request',
+        recoveryAttachments: [],
+        params,
+        state: 'submitting',
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ]])
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { handoffs.set(record.ownerRequestId, structuredClone(record)) },
+      listHandoffs: async () => [...handoffs.values()].map(record => structuredClone(record)),
+      deleteHandoff: async ownerRequestId => { handoffs.delete(ownerRequestId) },
+      close: () => {},
+    }
+    const recoverPendingQueueHandoff = vi.fn(async () => {})
+    const adoptResponseSession = vi.fn()
+    const rpc = {
+      call: vi.fn(async () => ({ sessionKey: child, replayed: true })),
+    } as unknown as UseChatSendOptions['rpc']
+    const { api } = makeOptions({
+      rpc,
+      sessionKey: ref(other),
+      pendingInputWal,
+      recoverPendingQueueHandoff,
+      adoptResponseSession,
+    })
+
+    await api.recoverResponseHandoffs()
+
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', params)
+    expect(recoverPendingQueueHandoff).toHaveBeenCalledWith(
+      parent,
+      child,
+      params.clientRequestId,
+    )
+    expect(adoptResponseSession).not.toHaveBeenCalled()
+    expect(handoffs.size).toBe(0)
+  })
+
+  it('restores a failed handoff draft from durable attachment recovery material', async () => {
+    const sessionKey = 'agent:main:webchat:failed-fork'
+    const attachment = {
+      kind: 'staged' as const,
+      local_id: 84,
+      name: 'recover.txt',
+      mime: 'text/plain',
+      file_uuid: 'expired-upload',
+    }
+    const record: ResponseHandoffWalRecord = {
+      schemaVersion: 1,
+      ownerRequestId: 'failed-fork-request',
+      requestSessionKey: sessionKey,
+      clientRequestId: 'failed-fork-request',
+      clientMessageId: 'failed-fork-message',
+      composerText: 'restore the fork draft',
+      recoveryAttachments: [attachment],
+      params: {
+        sessionKey,
+        clientRequestId: 'failed-fork-request',
+        clientMessageId: 'failed-fork-message',
+        message: 'restore the fork draft',
+        forkBeforeMessageId: 'fork-source-message',
+      },
+      state: 'failed',
+      errorCode: 'ATTACHMENT_EXPIRED',
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    let retained: ResponseHandoffWalRecord | null = record
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const inputText = ref('')
+    const pendingAttachments = ref<Attachment[]>([])
+    const pendingForkBeforeMessageId = ref<string | null>(null)
+    const { api, rpc } = makeOptions({
+      sessionKey: ref(sessionKey),
+      inputText,
+      pendingAttachments,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+    })
+
+    await api.recoverResponseHandoffs()
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('restore the fork draft')
+    expect(pendingAttachments.value).toEqual([attachment])
+    expect(pendingForkBeforeMessageId.value).toBe('fork-source-message')
+    expect(retained).toBeNull()
+  })
+
+  it('refreshes expired handoff attachments only after a definite rejection', async () => {
+    const parent = 'agent:main:webchat:expired-fork-parent'
+    const child = 'agent:main:webchat:expired-fork-child'
+    const file = new File(['durable'], 'durable.txt', { type: 'text/plain' })
+    const attachment: Attachment = {
+      kind: 'staged',
+      local_id: 85,
+      name: 'durable.txt',
+      mime: 'text/plain',
+      size: file.size,
+      file_uuid: 'expired-upload',
+      expires_at: 1,
+      file,
+    }
+    let retained: ResponseHandoffWalRecord | null = {
+      schemaVersion: 1,
+      ownerRequestId: 'expired-fork-request',
+      requestSessionKey: parent,
+      clientRequestId: 'expired-fork-request',
+      clientMessageId: 'expired-fork-message',
+      composerText: 'retry the fork attachment',
+      recoveryAttachments: [attachment],
+      params: {
+        sessionKey: parent,
+        clientRequestId: 'expired-fork-request',
+        clientMessageId: 'expired-fork-message',
+        message: 'retry the fork attachment',
+        forkBeforeMessageId: 'fork-source-message',
+        attachments: [{
+          type: attachment.mime,
+          name: attachment.name,
+          mime: attachment.mime,
+          file_uuid: 'expired-upload',
+        }],
+      },
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      acceptHandoff: async (_ownerRequestId, acceptedSessionKey) => ({
+        handoff: { ...retained!, state: 'accepted', acceptedSessionKey },
+        records: [],
+      }),
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const prepareAttachmentsForSend = vi.fn(async ({ attachments }) => {
+      const staged = attachments?.[0]
+      if (staged?.kind === 'staged') {
+        staged.file_uuid = 'refreshed-upload'
+        staged.expires_at = Date.now() + 60_000
+      }
+      return true
+    })
+    const recoverPendingQueueHandoff = vi.fn().mockResolvedValue(undefined)
+    const { api, rpc } = makeOptions({
+      sessionKey: ref('agent:main:webchat:another-session'),
+      pendingInputWal,
+      prepareAttachmentsForSend,
+      recoverPendingQueueHandoff,
+    })
+    rpc.call
+      .mockRejectedValueOnce(Object.assign(new Error('expired'), {
+        accepted: false,
+        retryable: true,
+        code: 'ATTACHMENT_EXPIRED',
+      }))
+      .mockResolvedValueOnce({ sessionKey: child, task_id: 'task-refreshed' })
+
+    await api.recoverResponseHandoffs()
+
+    expect(prepareAttachmentsForSend).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    const replay = rpc.call.mock.calls[1]?.[1] as { attachments?: Array<{ file_uuid?: string }> }
+    expect(replay.attachments?.[0]?.file_uuid).toBe('refreshed-upload')
+    expect(replay).toMatchObject({
+      clientRequestId: 'expired-fork-request',
+      clientMessageId: 'expired-fork-message',
+      sessionKey: parent,
+    })
+    expect(recoverPendingQueueHandoff).toHaveBeenCalledWith(
+      parent,
+      child,
+      'expired-fork-request',
+    )
+    expect(retained).toBeNull()
+  })
+
+  it('keeps a follow-up in the composer when fork handoff WAL is unavailable', async () => {
+    let resolveSend!: (value: unknown) => void
+    const rpc = {
+      call: vi.fn(<T = unknown>() => new Promise<T>(resolve => {
+        resolveSend = resolve as (value: unknown) => void
+      })) as UseChatSendOptions['rpc']['call'],
+    }
+    const inputText = ref('fork without browser WAL')
+    const enqueuePendingInput = vi.fn(() => true)
+    const harness = makeOptions({
+      rpc,
+      inputText,
+      pendingInputWal: null,
+      pendingForkBeforeMessageId: ref('fork-before-message'),
+      enqueuePendingInput,
+    })
+
+    const forkSend = harness.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    inputText.value = 'must remain editable'
+    await harness.api.onSend()
+
+    expect(enqueuePendingInput).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('must remain editable')
+    resolveSend({ sessionKey: 'agent:main:webchat:fork-child' })
+    await forkSend
+  })
+
   it('uses a supplied stable ingress id for a resumed hidden control', async () => {
     const { api, rpc } = makeOptions()
 

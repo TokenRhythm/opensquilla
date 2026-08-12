@@ -543,6 +543,8 @@
     <PendingQueue
       :items="pendingQueue"
       :max-pending="maxPending"
+      :reorder-enabled="canReorderPendingQueue"
+      :reorder-pending="pendingQueueReorderPending"
       :image-blocked-message="queuedImageSendBlockedMessage"
       :steer-available="sameTurnSteerAvailable"
       :steer-unavailable-message="sameTurnSteerUnavailableMessage"
@@ -1477,12 +1479,16 @@ const chatPendingQueue = useChatPendingQueue({
   connectionState: computed(() => rpc.state),
   prepareAttachmentsForSend,
   onPendingPersistenceError: reason => {
-    const message = reason === 'attachments_unsupported'
+    const message = reason === 'order_conflict'
+      ? 'Queue order changed in another tab. The server order was restored.'
+      : reason === 'attachments_unsupported'
       ? 'Queued attachments are not supported yet. Your draft was kept.'
       : reason === 'wal_failed'
         ? 'Could not save the queued message locally. Your draft was kept.'
         : 'The queued message is still saved locally and will retry after reconnecting.'
-    pushToast(message, { tone: reason === 'server_rejected' ? 'warn' : 'danger' })
+    pushToast(message, {
+      tone: ['server_rejected', 'order_conflict'].includes(reason) ? 'warn' : 'danger',
+    })
   },
   dispatchHiddenControl: (item, ownerSessionKey) =>
     dispatchQueuedHiddenControl(item, ownerSessionKey),
@@ -1506,6 +1512,8 @@ const chatPendingQueue = useChatPendingQueue({
 const {
   pendingQueue,
   canQueueMore,
+  canReorder: canReorderPendingQueue,
+  isReordering: pendingQueueReorderPending,
   busySendMode,
   maxPending,
   enqueuePendingPayload,
@@ -1519,6 +1527,8 @@ const {
   clearPendingQueue,
   switchPendingQueue,
   adoptPendingQueue,
+  recoverPendingQueueHandoff,
+  failPendingQueueHandoff,
   editPendingItem,
   popPendingTail,
   popAllPendingIntoComposer,
@@ -2594,6 +2604,7 @@ const chatSend = useChatSend({
   messages,
   sessionKey,
   pendingQueueOwnerContext,
+  pendingInputWal,
   busySendMode,
   modelRoutingMode,
   modelRoutingSettingsBusy,
@@ -2633,6 +2644,8 @@ const chatSend = useChatSend({
     }
     return adoptResponseSession(key, ownerRequestId)
   },
+  recoverPendingQueueHandoff,
+  failPendingQueueHandoff,
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   flushDeferredPendingDrain,
@@ -2665,7 +2678,15 @@ const {
   flushPendingMetaDiscards,
   restoreHiddenControls,
   sendHiddenMetaPreflightConfirmation,
+  recoverResponseHandoffs,
 } = chatSend
+void recoverResponseHandoffs()
+watch(
+  [() => rpc.state, sessionKey],
+  ([state]) => {
+    if (state === 'connected') void recoverResponseHandoffs()
+  },
+)
 async function onSend(
   sendOptions?: Parameters<typeof dispatchCurrentInput>[0],
 ): Promise<void> {

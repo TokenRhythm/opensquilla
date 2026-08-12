@@ -1810,6 +1810,82 @@ async def test_sessions_send_atomically_accepts_message_task_and_receipt(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_pending_input_rpc_reorders_complete_queue_atomically(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-input-reorder.db") as stack:
+        staged_items: list[dict[str, object]] = []
+        for index in range(3):
+            staged = await get_dispatcher().dispatch(
+                f"pending-reorder-enqueue-{index}",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": f"pending-reorder-{index}",
+                    "clientRequestId": f"pending-reorder-request-{index}",
+                    "clientMessageId": f"pending-reorder-message-{index}",
+                    "message": f"queued reorder {index}",
+                    "position": 10 - index,
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            staged_items.append(staged.payload)
+
+        reordered = await get_dispatcher().dispatch(
+            "pending-reorder",
+            "sessions.pending_inputs.reorder",
+            {
+                "key": SESSION_KEY,
+                "items": [
+                    {
+                        "pendingInputId": staged_items[index]["pendingInputId"],
+                        "expectedRevision": staged_items[index]["revision"],
+                    }
+                    for index in (2, 0, 1)
+                ],
+            },
+            stack.context,
+        )
+        assert reordered.ok is True
+        assert [item["pendingInputId"] for item in reordered.payload["items"]] == [
+            "pending-reorder-2",
+            "pending-reorder-0",
+            "pending-reorder-1",
+        ]
+        assert [item["position"] for item in reordered.payload["items"]] == [0, 1, 2]
+        assert [item["revision"] for item in reordered.payload["items"]] == [2, 2, 2]
+
+        stale = await get_dispatcher().dispatch(
+            "pending-reorder-stale",
+            "sessions.pending_inputs.reorder",
+            {
+                "key": SESSION_KEY,
+                "items": [
+                    {"pendingInputId": "pending-reorder-1", "expectedRevision": 2},
+                    {"pendingInputId": "pending-reorder-2", "expectedRevision": 1},
+                    {"pendingInputId": "pending-reorder-0", "expectedRevision": 2},
+                ],
+            },
+            stack.context,
+        )
+        assert stale.ok is False
+        assert stale.error is not None
+        assert stale.error.code == "PENDING_INPUT_CONFLICT"
+        listed = await get_dispatcher().dispatch(
+            "pending-reorder-list",
+            "sessions.pending_inputs.list",
+            {"key": SESSION_KEY},
+            stack.context,
+        )
+        assert [item["pendingInputId"] for item in listed.payload["items"]] == [
+            "pending-reorder-2",
+            "pending-reorder-0",
+            "pending-reorder-1",
+        ]
+
+
+@pytest.mark.asyncio
 async def test_atomic_direct_send_enters_registry_admission_before_accept_turn(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

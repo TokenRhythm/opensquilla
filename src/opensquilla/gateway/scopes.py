@@ -219,6 +219,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.send": WRITE_SCOPE,
     "sessions.pending_inputs.enqueue": WRITE_SCOPE,
     "sessions.pending_inputs.update": WRITE_SCOPE,
+    "sessions.pending_inputs.reorder": WRITE_SCOPE,
     "sessions.pending_inputs.cancel": WRITE_SCOPE,
     "sessions.pending_inputs.dispatch": WRITE_SCOPE,
     "plans.capabilities": READ_SCOPE,

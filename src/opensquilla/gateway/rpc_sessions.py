@@ -5455,6 +5455,13 @@ async def _handle_pending_inputs_enqueue(
     )
     storage = _pending_input_storage(ctx)
     attachments = list(raw_payload.get("attachments") or [])
+    position = params.get("position")
+    if position is not None and (
+        isinstance(position, bool)
+        or not isinstance(position, int)
+        or position < 0
+    ):
+        raise ValueError("params.position must be a non-negative integer")
 
     async def _materialize_and_enqueue() -> tuple[PendingChatInput, bool]:
         async with _pending_input_enqueue_lock(ctx, key, pending_input_id):
@@ -5567,6 +5574,7 @@ async def _handle_pending_inputs_enqueue(
                     client_message_id=cast(str, payload["clientMessageId"]),
                     request_fingerprint=fingerprint,
                     payload=payload,
+                    position=position,
                 )
             except (
                 PendingChatInputAlreadyDispatchedError,
@@ -5690,6 +5698,62 @@ async def _handle_pending_inputs_update(
             accepted=False,
         ) from exc
     return {"status": "updated", **_pending_input_payload(row)}
+
+
+@_d.method("sessions.pending_inputs.reorder", scope="operator.write")
+async def _handle_pending_inputs_reorder(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    key = _pending_input_key(params)
+    raw_items = params.get("items")
+    if not isinstance(raw_items, list) or not 2 <= len(raw_items) <= 5:
+        raise ValueError("params.items must contain 2-5 rows")
+    expected_revisions: list[tuple[str, int]] = []
+    for index, raw_item in enumerate(raw_items):
+        if not isinstance(raw_item, dict):
+            raise ValueError(f"params.items[{index}] must be an object")
+        pending_input_id = _pending_input_param(
+            raw_item,
+            "pendingInputId",
+            "pending_input_id",
+        )
+        expected_revision = raw_item.get(
+            "expectedRevision",
+            raw_item.get("expected_revision"),
+        )
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError(
+                f"params.items[{index}].expectedRevision must be a positive integer"
+            )
+        expected_revisions.append((pending_input_id, expected_revision))
+    if len({pending_input_id for pending_input_id, _ in expected_revisions}) != len(
+        expected_revisions
+    ):
+        raise ValueError("params.items pendingInputId values must be unique")
+    try:
+        rows = await _pending_input_storage(ctx).reorder_pending_chat_inputs(
+            session_key=key,
+            expected_revisions=expected_revisions,
+        )
+    except PendingChatInputConflictError as exc:
+        raise RpcHandlerError(
+            "PENDING_INPUT_CONFLICT",
+            "Pending inputs changed before reorder",
+            retryable=True,
+            accepted=False,
+        ) from exc
+    return {
+        "status": "reordered",
+        "sessionKey": key,
+        "items": [_pending_input_payload(row) for row in rows],
+    }
 
 
 @_d.method("sessions.pending_inputs.cancel", scope="operator.write")

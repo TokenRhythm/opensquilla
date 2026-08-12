@@ -48,8 +48,11 @@ export interface UseChatSessionRuntimeOptions {
   setCompactInFlight: (active: boolean, key?: string) => void
   hideCompactStatus: () => void
   clearPendingQueue: () => void
-  switchPendingQueue: (targetSessionKey: string) => void
-  adoptPendingQueue: (targetSessionKey: string, ownerRequestId: string) => void
+  switchPendingQueue: (targetSessionKey: string) => void | Promise<void>
+  adoptPendingQueue: (
+    targetSessionKey: string,
+    ownerRequestId: string,
+  ) => void | Promise<void>
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
@@ -116,9 +119,9 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.cancelSessionBootstrap()
     resetCompactState()
     if (pendingQueuePolicy.kind === 'response_handoff') {
-      options.adoptPendingQueue(key, pendingQueuePolicy.ownerRequestId)
+      await options.adoptPendingQueue(key, pendingQueuePolicy.ownerRequestId)
     } else {
-      options.switchPendingQueue(key)
+      await options.switchPendingQueue(key)
     }
     options.persistSession(key, { source: 'runtime.switchToSession' })
     resetSessionRuntimeState()

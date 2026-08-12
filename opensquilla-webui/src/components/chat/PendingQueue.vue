@@ -38,6 +38,13 @@
       >
         {{ t('chat.saving') }}
       </span>
+      <span
+        v-if="reorderPending && !draggingItem && index === 0"
+        class="chat-pending-save-status"
+        role="status"
+      >
+        {{ t('chat.pending.reorderRecovering') }}
+      </span>
       <span v-if="item.attachments?.length" class="chat-pending-attachments">
         {{ item.attachments.length }} · 📎
         <span
@@ -150,13 +157,17 @@ type PendingSteerBlocker =
   | 'otherDelivery'
   | 'steering'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   items: PendingQueueItem[]
   maxPending: number
+  reorderEnabled?: boolean
+  reorderPending?: boolean
   imageBlockedMessage?: string
   steerAvailable?: boolean
   steerUnavailableMessage?: string
-}>()
+}>(), {
+  reorderEnabled: true,
+})
 
 const emit = defineEmits<{
   clear: []
@@ -182,7 +193,9 @@ const pointerReorder = shallowRef<{
   startX: number
   startY: number
 } | null>(null)
-const isQueueReordering = computed(() => draggingItem.value !== null)
+const isQueueReordering = computed(() => (
+  draggingItem.value !== null || props.reorderPending === true
+))
 const effectiveMaxPending = computed(() => (
   props.maxPending + (
     props.items.some(item => item.steerAttempt) || props.items.length > props.maxPending
@@ -196,7 +209,9 @@ function displayText(item: PendingQueueItem): string {
 }
 
 function queueCanReorder(): boolean {
-  return props.items.length > 1 && props.items.every(item => (
+  return props.reorderEnabled !== false
+    && props.reorderPending !== true
+    && props.items.length > 1 && props.items.every(item => (
     !item.hiddenControl
     && !item.deliveryState
     && !item.steerAttempt

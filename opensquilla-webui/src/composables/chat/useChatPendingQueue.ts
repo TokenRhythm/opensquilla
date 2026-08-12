@@ -13,6 +13,7 @@ import {
   serializeSendableAttachment,
 } from '@/utils/chat/attachments'
 import type {
+  AcceptedHandoffCommit,
   PendingInputWal,
   PendingInputWalRecord,
   PendingInputWalState,
@@ -21,6 +22,14 @@ import { snapshotSteerRequest } from './useChatSteerDelivery'
 
 const MAX_PENDING = 5
 const MAX_REMOVAL_TOMBSTONES = 256
+
+type PendingReorderMode = 'local' | 'server'
+
+interface PendingReorderSnapshot {
+  mode: PendingReorderMode
+  originalOrder: string[]
+  expectedWalRevisions: Record<string, number>
+}
 
 interface ComposerAttachmentSnapshotEntry {
   readonly identity: Attachment
@@ -113,7 +122,7 @@ export interface UseChatPendingQueueOptions {
     isCurrent?: () => boolean
   }) => Promise<boolean>
   onPendingPersistenceError?: (
-    reason: 'wal_failed' | 'attachments_unsupported' | 'server_rejected',
+    reason: 'wal_failed' | 'attachments_unsupported' | 'server_rejected' | 'order_conflict',
   ) => void
   // Drain a queued hidden-control send (e.g. meta-preflight confirmation)
   // directly through the dedicated hidden-send path instead of the composer.
@@ -139,6 +148,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
   let deferredDrainRequested = false
   const isReordering = ref(false)
+  let reorderSnapshot: PendingReorderSnapshot | null = null
+  let reorderCommitPromise: Promise<void> | null = null
+  let deferredHydrateSession = ''
   let hydrateGeneration = 0
   let disposed = false
   const stagingOperations = new Map<string, Promise<void>>()
@@ -157,6 +169,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     pendingQueue.value.filter(item => !item.steerAttempt).length,
   )
   const canQueueMore = computed(() => ordinaryPendingCount.value < MAX_PENDING)
+  const canReorder = computed(() => pendingReorderMode() !== null)
   // A direct queued delivery owns its item until it succeeds, is removed, or
   // becomes eligible for another explicit retry.
   const hasDeliveryBarrier = computed(() =>
@@ -190,7 +203,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   })
   if (options.connectionState) {
     watch(options.connectionState, state => {
-      if (state === 'connected') void hydratePendingQueue(options.sessionKey.value)
+      if (state !== 'connected') return
+      if (isReordering.value && reorderSnapshot?.mode === 'server') {
+        void recoverServerReorder().then(recovered => {
+          if (recovered) finishPendingReorder()
+        })
+        return
+      }
+      void hydratePendingQueue(options.sessionKey.value)
     })
   }
   watch(options.sessionKey, (sessionKey, previousSessionKey) => {
@@ -203,6 +223,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return Boolean(
       options.rpc
       && options.supportsMethod?.('sessions.pending_inputs.enqueue'),
+    )
+  }
+
+  function supportsServerReorder(): boolean {
+    return Boolean(
+      supportsServerQueue()
+      && options.supportsMethod?.('sessions.pending_inputs.reorder')
+      && (!options.connectionState || options.connectionState.value === 'connected'),
     )
   }
 
@@ -232,6 +260,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         : {}),
       ...(item.pendingServerRevision
         ? { serverRevision: item.pendingServerRevision }
+        : {}),
+      ...(Number.isSafeInteger(item.pendingPosition)
+        ? { position: item.pendingPosition }
+        : {}),
+      ...(Number.isSafeInteger(item.pendingWalRevision)
+        ? { walRevision: item.pendingWalRevision }
         : {}),
       createdAt: Number(item.pendingCreatedAt) || now,
       updatedAt: now,
@@ -263,6 +297,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...(record.serverRevision
         ? { pendingServerRevision: record.serverRevision }
         : {}),
+      ...(Number.isSafeInteger(record.position)
+        ? { pendingPosition: record.position }
+        : {}),
+      pendingWalRevision: record.walRevision ?? 1,
       pendingCreatedAt: record.createdAt,
     } as ChatPendingItem
   }
@@ -333,8 +371,39 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const trackedItem = pendingQueue.value.find(candidate => (
       candidate.pendingInputId === item.pendingInputId
     )) || item
+    const previousWalRevision = trackedItem.pendingWalRevision
     trackedItem.pendingPersistenceState = state
-    await options.pendingInputWal.put(walRecordForItem(trackedItem, state))
+    trackedItem.pendingWalRevision = (previousWalRevision ?? 0) + 1
+    try {
+      await options.pendingInputWal.put(walRecordForItem(trackedItem, state))
+    } catch (error) {
+      trackedItem.pendingWalRevision = previousWalRevision
+      throw error
+    }
+  }
+
+  function ordinaryDurableItem(item: ChatPendingItem): boolean {
+    return Boolean(
+      item.pendingInputId
+      && !item.hiddenControl
+      && !item.steerAttempt
+      && !item.deliveryState,
+    )
+  }
+
+  function sortOrdinaryPendingItems() {
+    const ordinary = pendingQueue.value
+      .filter(ordinaryDurableItem)
+      .sort((left, right) => (
+        (left.pendingPosition ?? Number.MAX_SAFE_INTEGER)
+        - (right.pendingPosition ?? Number.MAX_SAFE_INTEGER)
+        || (left.pendingCreatedAt ?? 0) - (right.pendingCreatedAt ?? 0)
+        || String(left.pendingInputId).localeCompare(String(right.pendingInputId))
+      ))
+    let ordinaryIndex = 0
+    pendingQueue.value = pendingQueue.value.map(item => (
+      ordinaryDurableItem(item) ? ordinary[ordinaryIndex++]! : item
+    ))
   }
 
   function rpcErrorCode(error: unknown): string {
@@ -438,6 +507,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
                 attachments: sendable.map(serializeSendableAttachment),
                 ...(sendable.length > 0 ? { displayText: item.text } : {}),
                 ...(item.intent ? { intent: item.intent } : {}),
+                ...(Number.isSafeInteger(item.pendingPosition)
+                  ? { position: item.pendingPosition }
+                  : {}),
               },
             )
             if (wasRemoved(sessionKey, pendingInputId)) {
@@ -455,6 +527,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             }
             item.pendingRequestFingerprint = fingerprint
             item.pendingServerRevision = typeof revision === 'number' ? revision : 1
+            item.pendingPosition = typeof response.position === 'number'
+              ? response.position
+              : item.pendingPosition
             // The server ACK proves the session material store owns the bytes.
             // Drop base64, File objects and expiring upload capabilities from
             // IndexedDB; dispatch now needs only the stable pending identity.
@@ -531,11 +606,16 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       pendingQueue.value.push(itemFromWalRecord(record))
       existingIds.add(record.pendingInputId)
     }
+    sortOrdinaryPendingItems()
   }
 
   async function hydratePendingQueue(sessionKey = options.sessionKey.value): Promise<void> {
     const wal = options.pendingInputWal
     if (!wal || !sessionKey || disposed) return
+    if (isReordering.value) {
+      deferredHydrateSession = sessionKey
+      return
+    }
     const generation = ++hydrateGeneration
     let records: PendingInputWalRecord[]
     try {
@@ -645,9 +725,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         item.pendingServerRevision = typeof serverItem.revision === 'number'
           ? serverItem.revision
           : 1
+        item.pendingPosition = typeof serverItem.position === 'number'
+          ? serverItem.position
+          : item.pendingPosition
         item.pendingMayHaveServerCopy = true
         await writeWalItem(item, 'staged')
       }
+
+      sortOrdinaryPendingItems()
 
       for (const item of [...pendingQueue.value]) {
         if (!durableItem(item) || item.ownerSessionKey !== sessionKey) continue
@@ -746,6 +831,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     item.pendingPersistenceState = 'saving'
     item.pendingMayHaveServerCopy = false
     item.pendingCreatedAt = now
+    item.pendingPosition = pendingQueue.value.filter(ordinaryDurableItem).length
+    item.pendingWalRevision = 0
     pendingQueue.value.push(item)
     flushDeferredPendingDrain()
     locallyCreatingIds.add(item.pendingInputId)
@@ -753,7 +840,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       try {
         await writeWalItem(item, 'saving')
       } catch {
-        const index = pendingQueue.value.indexOf(item)
+        const index = pendingQueue.value.findIndex(candidate => (
+          candidate.pendingInputId === item.pendingInputId
+        ))
         if (index >= 0) pendingQueue.value.splice(index, 1)
         options.onPendingPersistenceError?.('wal_failed')
         return false
@@ -1109,8 +1198,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return result !== false
   }
 
-  function switchPendingQueue(targetSessionKey: string) {
-    cancelPendingReorder()
+  async function switchPendingQueue(targetSessionKey: string) {
+    if (reorderCommitPromise) await reorderCommitPromise
+    else cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
     if (sourceSessionKey && pendingQueue.value.length > 0) {
@@ -1129,10 +1219,99 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     nextTick(() => void hydratePendingQueue(targetSessionKey))
   }
 
-  function adoptPendingQueue(targetSessionKey: string, ownerRequestId: string) {
-    cancelPendingReorder()
+  function applyAcceptedHandoffCommit(
+    commit: AcceptedHandoffCommit,
+    targetSessionKey: string,
+    ownerRequestId: string,
+  ) {
+    const committedById = new Map(
+      commit.records.map(record => [record.pendingInputId, itemFromWalRecord(record)]),
+    )
+    const migrated: ChatPendingItem[] = []
+    const updateOwned = (items: ChatPendingItem[]) => items.flatMap(item => {
+      if (item.ownerRequestId !== ownerRequestId) return [item]
+      const committed = item.pendingInputId
+        ? committedById.get(item.pendingInputId)
+        : undefined
+      if (!committed) return [item]
+      Object.assign(item, committed)
+      item.ownerRequestId = undefined
+      committedById.delete(committed.pendingInputId!)
+      migrated.push(item)
+      return []
+    })
+    pendingQueue.value = updateOwned(pendingQueue.value)
+    for (const [sessionKey, items] of parkedQueues) {
+      const retained = updateOwned(items)
+      if (retained.length > 0) parkedQueues.set(sessionKey, retained)
+      else parkedQueues.delete(sessionKey)
+    }
+    const targetItems = parkedQueues.get(targetSessionKey) || []
+    const targetIds = new Set(targetItems.map(item => item.pendingInputId).filter(Boolean))
+    for (const committed of [...migrated, ...committedById.values()]) {
+      if (!targetIds.has(committed.pendingInputId)) targetItems.push(committed)
+    }
+    if (targetItems.length > 0) parkedQueues.set(targetSessionKey, targetItems)
+  }
+
+  async function acceptDurableHandoff(
+    targetSessionKey: string,
+    ownerRequestId: string,
+  ): Promise<boolean> {
+    if (!options.pendingInputWal?.acceptHandoff) return false
+    if (options.pendingInputWal.listHandoffs) {
+      const records = await options.pendingInputWal.listHandoffs()
+      if (!records.some(record => record.ownerRequestId === ownerRequestId)) return false
+    }
+    const commit = await options.pendingInputWal.acceptHandoff(
+      ownerRequestId,
+      targetSessionKey,
+    )
+    applyAcceptedHandoffCommit(commit, targetSessionKey, ownerRequestId)
+    return true
+  }
+
+  async function recoverPendingQueueHandoff(
+    sourceSessionKey: string,
+    targetSessionKey: string,
+    ownerRequestId: string,
+  ): Promise<void> {
+    if (!sourceSessionKey || !targetSessionKey || !ownerRequestId) return
+    const committed = await acceptDurableHandoff(targetSessionKey, ownerRequestId)
+    if (!committed) return
+    if (options.sessionKey.value === targetSessionKey) {
+      const restored = parkedQueues.get(targetSessionKey) || []
+      parkedQueues.delete(targetSessionKey)
+      pendingQueue.value = [...pendingQueue.value, ...restored]
+      sortOrdinaryPendingItems()
+      for (const item of pendingQueue.value) {
+        if (item.ownerSessionKey === targetSessionKey) void ensureServerStaged(item)
+      }
+    }
+    broadcastChange(sourceSessionKey)
+    broadcastChange(targetSessionKey)
+  }
+
+  async function failPendingQueueHandoff(ownerRequestId: string): Promise<void> {
+    const owned = [
+      ...pendingQueue.value,
+      ...[...parkedQueues.values()].flat(),
+    ].filter(item => item.ownerRequestId === ownerRequestId && durableItem(item))
+    await Promise.all(owned.map(item => writeWalItem(item, 'retryable').catch(() => {})))
+    for (const item of owned) {
+      broadcastChange(item.ownerSessionKey || options.sessionKey.value, item.pendingInputId)
+    }
+  }
+
+  async function adoptPendingQueue(targetSessionKey: string, ownerRequestId: string) {
+    if (reorderCommitPromise) await reorderCommitPromise
+    else cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
+    const durableCommitApplied = await acceptDurableHandoff(
+      targetSessionKey,
+      ownerRequestId,
+    )
     const carried: ChatPendingItem[] = []
     const stayingVisible: ChatPendingItem[] = []
     const stayingHidden: ChatPendingItem[] = []
@@ -1142,7 +1321,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         continue
       }
       if (
-        ownerRequestId
+        !durableCommitApplied
+        && ownerRequestId
         && item.ownerSessionKey === sourceSessionKey
         && item.ownerRequestId === ownerRequestId
       ) {
@@ -1170,6 +1350,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const targetItems = parkedQueues.get(targetSessionKey) || []
     parkedQueues.delete(targetSessionKey)
     pendingQueue.value = [...targetItems, ...carried]
+    sortOrdinaryPendingItems()
+    for (const item of pendingQueue.value) {
+      if (item.ownerSessionKey === targetSessionKey) void ensureServerStaged(item)
+    }
+    broadcastChange(sourceSessionKey)
+    broadcastChange(targetSessionKey)
     nextTick(() => void hydratePendingQueue(targetSessionKey))
   }
 
@@ -1447,14 +1633,110 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     armPendingDrainTimer()
   }
 
+  function pendingReorderMode(): PendingReorderMode | null {
+    if (
+      pendingQueue.value.length < 2
+      || pendingQueue.value.some(item => (
+        !ordinaryDurableItem(item)
+        || Boolean(item.ownerRequestId)
+        || !Number.isSafeInteger(item.pendingWalRevision)
+        || item.pendingPersistenceState === 'saving'
+        || item.pendingPersistenceState === 'retryable'
+        || item.pendingPersistenceState === 'cancelling'
+      ))
+    ) return null
+    if (
+      pendingQueue.value.every(item => (
+        item.pendingPersistenceState === 'local_only'
+        && item.pendingMayHaveServerCopy === false
+      ))
+      && options.pendingInputWal?.commitOrder
+    ) return 'local'
+    if (
+      pendingQueue.value.every(item => (
+        item.pendingPersistenceState === 'staged'
+        && Number.isSafeInteger(item.pendingServerRevision)
+      ))
+      && supportsServerReorder()
+    ) return 'server'
+    return null
+  }
+
   function canReorderPendingQueue(): boolean {
-    return pendingQueue.value.length > 1 && pendingQueue.value.every(item => (
-      !item.hiddenControl
-      && !item.deliveryState
-      && !item.steerAttempt
-      && item.pendingPersistenceState !== 'saving'
-      && item.pendingPersistenceState !== 'cancelling'
-    ))
+    return pendingReorderMode() !== null
+  }
+
+  function restorePendingOrder(orderedIds: string[]) {
+    const byId = new Map(
+      pendingQueue.value.map(item => [item.pendingInputId || '', item]),
+    )
+    if (orderedIds.some(id => !byId.has(id))) return
+    pendingQueue.value = orderedIds.map(id => byId.get(id)!)
+  }
+
+  function finishPendingReorder() {
+    reorderSnapshot = null
+    isReordering.value = false
+    const hydrateSession = deferredHydrateSession
+    deferredHydrateSession = ''
+    if (hydrateSession) void hydratePendingQueue(hydrateSession)
+    flushDeferredPendingDrain()
+  }
+
+  async function applyServerReorderItems(
+    rawItems: Array<Record<string, unknown>>,
+  ): Promise<void> {
+    const byId = new Map(
+      rawItems.map(raw => [String(raw.pendingInputId || raw.pending_input_id || ''), raw]),
+    )
+    const orderedIds = rawItems
+      .slice()
+      .sort((left, right) => Number(left.position) - Number(right.position))
+      .map(raw => String(raw.pendingInputId || raw.pending_input_id || ''))
+    if (
+      orderedIds.length !== pendingQueue.value.length
+      || orderedIds.some(id => !id || !byId.has(id))
+    ) throw new Error('Gateway returned an incomplete pending order')
+    restorePendingOrder(orderedIds)
+    for (const item of pendingQueue.value) {
+      const raw = byId.get(item.pendingInputId || '')!
+      item.pendingPosition = Number(raw.position)
+      item.pendingServerRevision = Number(raw.revision)
+      item.pendingWalRevision = (item.pendingWalRevision ?? 0) + 1
+    }
+    if (!options.pendingInputWal?.putMany) {
+      for (const item of pendingQueue.value) {
+        await options.pendingInputWal?.put(walRecordForItem(item, 'staged'))
+      }
+    } else {
+      await options.pendingInputWal.putMany(
+        pendingQueue.value.map(item => walRecordForItem(item, 'staged')),
+      )
+    }
+  }
+
+  async function recoverServerReorder(): Promise<boolean> {
+    if (!options.rpc || !supportsServerQueue()) return false
+    const expectedOrder = pendingQueue.value.map(item => item.pendingInputId)
+    try {
+      const response = await options.rpc.call<{ items?: Array<Record<string, unknown>> }>(
+        'sessions.pending_inputs.list',
+        { key: options.sessionKey.value },
+      )
+      const items = Array.isArray(response.items) ? response.items : []
+      const serverOrder = items
+        .slice()
+        .sort((left, right) => Number(left.position) - Number(right.position))
+        .map(item => String(item.pendingInputId || item.pending_input_id || ''))
+      await applyServerReorderItems(items)
+      if (serverOrder.some((id, index) => id !== expectedOrder[index])) {
+        options.onPendingPersistenceError?.('order_conflict')
+      }
+      broadcastChange(options.sessionKey.value)
+      return true
+    } catch {
+      return false
+    }
   }
 
   function beginPendingReorder(index: number): boolean {
@@ -1464,6 +1746,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || !pendingQueue.value[index]
     ) return false
     cancelPendingDrainTimer()
+    const mode = pendingReorderMode()!
+    reorderSnapshot = {
+      mode,
+      originalOrder: pendingQueue.value.map(item => item.pendingInputId!),
+      expectedWalRevisions: Object.fromEntries(
+        pendingQueue.value.map(item => [item.pendingInputId!, item.pendingWalRevision!]),
+      ),
+    }
     isReordering.value = true
     return true
   }
@@ -1471,7 +1761,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function reorderPendingItem(fromIndex: number, toIndex: number): boolean {
     if (
       !isReordering.value
-      || !canReorderPendingQueue()
+      || !reorderSnapshot
       || fromIndex === toIndex
       || fromIndex < 0
       || toIndex < 0
@@ -1484,14 +1774,71 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     return true
   }
 
-  function endPendingReorder() {
-    if (!isReordering.value) return
-    isReordering.value = false
-    flushDeferredPendingDrain()
+  async function commitPendingReorder() {
+    const snapshot = reorderSnapshot
+    if (!isReordering.value || !snapshot) return
+    const orderedIds = pendingQueue.value.map(item => item.pendingInputId!)
+    if (orderedIds.every((id, index) => id === snapshot.originalOrder[index])) {
+      finishPendingReorder()
+      return
+    }
+    if (snapshot.mode === 'local') {
+      try {
+        const result = await options.pendingInputWal!.commitOrder!(
+          options.sessionKey.value,
+          orderedIds,
+          snapshot.expectedWalRevisions,
+        )
+        const byId = new Map(result.records.map(record => [record.pendingInputId, record]))
+        for (const item of pendingQueue.value) {
+          const record = byId.get(item.pendingInputId!)!
+          item.pendingPosition = record.position
+          item.pendingWalRevision = record.walRevision
+        }
+        broadcastChange(options.sessionKey.value)
+      } catch {
+        finishPendingReorder()
+        await hydratePendingQueue(options.sessionKey.value)
+        options.onPendingPersistenceError?.('wal_failed')
+        return
+      }
+      finishPendingReorder()
+      return
+    }
+    try {
+      const response = await options.rpc!.call<{ items?: Array<Record<string, unknown>> }>(
+        'sessions.pending_inputs.reorder',
+        {
+          key: options.sessionKey.value,
+          items: pendingQueue.value.map(item => ({
+            pendingInputId: item.pendingInputId,
+            expectedRevision: item.pendingServerRevision,
+          })),
+        },
+      )
+      await applyServerReorderItems(Array.isArray(response.items) ? response.items : [])
+      broadcastChange(options.sessionKey.value)
+      finishPendingReorder()
+    } catch {
+      // An unknown RPC result may have committed. Keep the delivery barrier
+      // until an authoritative list proves which order won.
+      if (await recoverServerReorder()) finishPendingReorder()
+      else options.onPendingPersistenceError?.('server_rejected')
+    }
+  }
+
+  function endPendingReorder(): Promise<void> {
+    if (reorderCommitPromise) return reorderCommitPromise
+    reorderCommitPromise = commitPendingReorder().finally(() => {
+      reorderCommitPromise = null
+    })
+    return reorderCommitPromise
   }
 
   function cancelPendingReorder() {
-    isReordering.value = false
+    if (reorderCommitPromise) return
+    if (reorderSnapshot) restorePendingOrder(reorderSnapshot.originalOrder)
+    finishPendingReorder()
   }
 
   function cancelPendingDrainTimer() {
@@ -1519,6 +1866,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   return {
     pendingQueue,
     canQueueMore,
+    canReorder,
     busySendMode,
     isReordering,
     maxPending: MAX_PENDING,
@@ -1533,6 +1881,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     clearPendingQueue,
     switchPendingQueue,
     adoptPendingQueue,
+    recoverPendingQueueHandoff,
+    failPendingQueueHandoff,
     editPendingItem,
     popPendingTail,
     popAllPendingIntoComposer,

@@ -25,15 +25,33 @@ type PendingRow = {
   clientRequestId: string
   message: string
   pendingInputId: string
+  position: number
   requestFingerprint: string
+  revision: number
+}
+
+type MockGatewayState = {
+  chatSends: Array<Record<string, unknown>>
+  dispatchMessages: string[]
+  dispatchCount: number
+  enqueueCount: number
+  firstFinished: boolean
+  firstSessionKey: string
+  handoffTargets: Record<string, string>
+  pendingRows: PendingRow[]
+  reorderCount: number
+  supportsPendingQueue: boolean
 }
 
 type MockGateway = {
   chatSends: Array<Record<string, unknown>>
+  dispatchMessages: string[]
   dispatchCount: number
   enqueueCount: number
   finishFirst: () => void
   pendingRow: () => PendingRow | null
+  pendingRows: () => PendingRow[]
+  reorderCount: number
   releaseFirstAck: () => void
 }
 
@@ -64,7 +82,16 @@ function basePayload(method: string): unknown {
   return payloads[method] ?? {}
 }
 
-function hello() {
+function hello(supportsPendingQueue = true) {
+  const pendingMethods = supportsPendingQueue
+    ? [
+        'sessions.pending_inputs.enqueue',
+        'sessions.pending_inputs.list',
+        'sessions.pending_inputs.dispatch',
+        'sessions.pending_inputs.cancel',
+        'sessions.pending_inputs.reorder',
+      ]
+    : []
   return JSON.stringify({
     protocol: 3,
     policy: { tick_interval_ms: 30_000, concurrent_history_reads: true },
@@ -73,10 +100,7 @@ function hello() {
         'sessions.messages.subscribe',
         'sessions.messages.snapshot',
         'sessions.messages.hydrate',
-        'sessions.pending_inputs.enqueue',
-        'sessions.pending_inputs.list',
-        'sessions.pending_inputs.dispatch',
-        'sessions.pending_inputs.cancel',
+        ...pendingMethods,
       ],
       events: [
         'session.event.provider_activity',
@@ -110,24 +134,38 @@ async function preparePage(page: Page) {
   }))
 }
 
-async function installMockGateway(page: Page, scenario: Scenario): Promise<MockGateway> {
+function createMockGatewayState(): MockGatewayState {
+  return {
+    chatSends: [],
+    dispatchMessages: [],
+    dispatchCount: 0,
+    enqueueCount: 0,
+    firstFinished: false,
+    firstSessionKey: '',
+    handoffTargets: {},
+    pendingRows: [],
+    reorderCount: 0,
+    supportsPendingQueue: true,
+  }
+}
+
+async function installMockGateway(
+  page: Page,
+  scenario: Scenario,
+  state: MockGatewayState = createMockGatewayState(),
+): Promise<MockGateway> {
   const sockets = new Set<WebSocketRoute>()
-  const chatSends: Array<Record<string, unknown>> = []
   let firstAck: (() => void) | null = null
-  let firstSessionKey = ''
   let firstTaskId = 'p1-5-first-task'
   let streamSeq = 0
-  let dispatchCount = 0
-  let enqueueCount = 0
-  let row: PendingRow | null = null
 
   const emit = (event: string, payload: Record<string, unknown>) => {
     for (const socket of sockets) socket.send(eventFrame(event, payload))
   }
 
   const sendDone = (taskId: string) => emit('session.event.done', {
-    key: firstSessionKey,
-    sessionKey: firstSessionKey,
+    key: state.firstSessionKey,
+    sessionKey: state.firstSessionKey,
     task_id: taskId,
     stream_generation: 'p1-5-generation',
     stream_seq: ++streamSeq,
@@ -151,7 +189,7 @@ async function installMockGateway(page: Page, scenario: Scenario): Promise<MockG
       const method = String(frame.method || '')
 
       if (method === 'connect') {
-        ws.send(hello())
+        ws.send(hello(state.supportsPendingQueue))
         return
       }
       if (method === 'chat.history') {
@@ -163,16 +201,19 @@ async function installMockGateway(page: Page, scenario: Scenario): Promise<MockG
         return
       }
       if (method === 'sessions.messages.snapshot') {
+        const running = Boolean(state.firstSessionKey && !state.firstFinished)
         ws.send(successResponse(frame.id, {
           key: String(frame.params?.key || ''),
           events: [],
           current_stream_seq: streamSeq,
           stream_generation: 'p1-5-generation',
-          run_status: 'idle',
+          run_status: running ? 'running' : 'idle',
+          active_task: running ? { task_id: firstTaskId, state: 'running' } : null,
         }))
         return
       }
       if (method === 'sessions.messages.subscribe' || method === 'sessions.messages.hydrate') {
+        const running = Boolean(state.firstSessionKey && !state.firstFinished)
         ws.send(successResponse(frame.id, {
           subscribed: true,
           hydration_complete: true,
@@ -180,56 +221,95 @@ async function installMockGateway(page: Page, scenario: Scenario): Promise<MockG
           current_stream_seq: streamSeq,
           stream_generation: 'p1-5-generation',
           workspaceId: null,
-          run_status: 'idle',
-          active_task: null,
+          run_status: running ? 'running' : 'idle',
+          active_task: running ? { task_id: firstTaskId, state: 'running' } : null,
         }))
         return
       }
       if (method === 'sessions.pending_inputs.list') {
-        ws.send(successResponse(frame.id, { items: row ? [{ ...row, status: 'staged' }] : [] }))
+        ws.send(successResponse(frame.id, {
+          items: state.pendingRows
+            .slice()
+            .sort((left, right) => left.position - right.position)
+            .map(row => ({ ...row, status: 'staged' })),
+        }))
         return
       }
       if (method === 'sessions.pending_inputs.enqueue') {
-        enqueueCount += 1
+        state.enqueueCount += 1
         const params = frame.params || {}
+        const pendingInputId = String(params.pendingInputId || '')
+        let row = state.pendingRows.find(item => item.pendingInputId === pendingInputId)
         row ||= {
           pendingInputId: String(params.pendingInputId || ''),
           clientRequestId: String(params.clientRequestId || ''),
           clientMessageId: String(params.clientMessageId || ''),
           requestFingerprint: `fingerprint:${String(params.pendingInputId || '')}`,
           message: String(params.message || ''),
+          position: Number.isSafeInteger(params.position)
+            ? Number(params.position)
+            : state.pendingRows.length,
+          revision: 1,
         }
+        if (!state.pendingRows.includes(row)) state.pendingRows.push(row)
         ws.send(successResponse(frame.id, { ...row, status: 'staged' }))
         return
       }
+      if (method === 'sessions.pending_inputs.reorder') {
+        state.reorderCount += 1
+        const requested = Array.isArray(frame.params?.items) ? frame.params.items : []
+        const byId = new Map(state.pendingRows.map(row => [row.pendingInputId, row]))
+        state.pendingRows = requested.map((item, position) => {
+          const raw = item as Record<string, unknown>
+          const row = byId.get(String(raw.pendingInputId || ''))!
+          row.position = position
+          row.revision += 1
+          return row
+        })
+        ws.send(successResponse(frame.id, {
+          status: 'reordered',
+          items: state.pendingRows.map(row => ({ ...row, status: 'staged' })),
+        }))
+        return
+      }
       if (method === 'sessions.pending_inputs.dispatch') {
-        dispatchCount += 1
-        const committed = row
-        row = null
+        state.dispatchCount += 1
+        const pendingInputId = String(frame.params?.pendingInputId || '')
+        const rowIndex = state.pendingRows.findIndex(row => row.pendingInputId === pendingInputId)
+        const [committed] = rowIndex >= 0 ? state.pendingRows.splice(rowIndex, 1) : []
+        if (committed) state.dispatchMessages.push(committed.message)
+        const queuedTaskId = `p1-5-queued-task-${state.dispatchCount}`
         ws.send(successResponse(frame.id, {
           accepted: true,
-          replayed: dispatchCount > 1,
-          sessionKey: firstSessionKey,
-          task_id: 'p1-5-queued-task',
+          replayed: !committed,
+          sessionKey: state.firstSessionKey,
+          task_id: queuedTaskId,
           message_id: committed?.clientMessageId,
         }))
-        queueMicrotask(() => sendDone('p1-5-queued-task'))
+        queueMicrotask(() => sendDone(queuedTaskId))
         return
       }
       if (method === 'sessions.pending_inputs.cancel') {
-        row = null
+        const pendingInputId = String(frame.params?.pendingInputId || '')
+        state.pendingRows = state.pendingRows.filter(row => row.pendingInputId !== pendingInputId)
         ws.send(successResponse(frame.id, { cancelled: true }))
         return
       }
       if (method === 'chat.send') {
         const params = { ...(frame.params || {}) }
-        chatSends.push(params)
-        const ordinal = chatSends.length
+        state.chatSends.push(params)
+        const ordinal = state.chatSends.length
         const sessionKey = String(params.sessionKey || '')
-        if (ordinal === 1) firstSessionKey = sessionKey
+        const responseSessionKey = state.handoffTargets[String(params.clientRequestId || '')]
+          || sessionKey
+        if (ordinal === 1) state.firstSessionKey = responseSessionKey
         const taskId = ordinal === 1 ? firstTaskId : `p1-5-follow-up-${ordinal}`
         const acknowledge = () => {
-          ws.send(successResponse(frame.id, { sessionKey, task_id: taskId, status: 'accepted' }))
+          ws.send(successResponse(frame.id, {
+            sessionKey: responseSessionKey,
+            task_id: taskId,
+            status: 'accepted',
+          }))
         }
 
         if (ordinal === 1 && scenario !== 'immediate') {
@@ -262,7 +342,10 @@ async function installMockGateway(page: Page, scenario: Scenario): Promise<MockG
         }
 
         acknowledge()
-        queueMicrotask(() => sendDone(taskId))
+        queueMicrotask(() => {
+          if (taskId === firstTaskId) state.firstFinished = true
+          sendDone(taskId)
+        })
         return
       }
 
@@ -271,11 +354,17 @@ async function installMockGateway(page: Page, scenario: Scenario): Promise<MockG
   })
 
   return {
-    chatSends,
-    get dispatchCount() { return dispatchCount },
-    get enqueueCount() { return enqueueCount },
-    finishFirst() { sendDone(firstTaskId) },
-    pendingRow: () => row,
+    chatSends: state.chatSends,
+    dispatchMessages: state.dispatchMessages,
+    get dispatchCount() { return state.dispatchCount },
+    get enqueueCount() { return state.enqueueCount },
+    finishFirst() {
+      state.firstFinished = true
+      sendDone(firstTaskId)
+    },
+    pendingRow: () => state.pendingRows[0] || null,
+    pendingRows: () => state.pendingRows.slice(),
+    get reorderCount() { return state.reorderCount },
     releaseFirstAck() {
       const release = firstAck
       if (!release) throw new Error('first chat.send acknowledgement is not pending')
@@ -312,7 +401,7 @@ async function expectSingletonChat(page: Page) {
 
 async function expectWalContains(page: Page, text: string) {
   await expect.poll(() => page.evaluate(async expectedText => {
-    const request = indexedDB.open('opensquilla-chat-pending-inputs', 1)
+    const request = indexedDB.open('opensquilla-chat-pending-inputs')
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       request.onsuccess = () => resolve(request.result)
       request.onerror = () => reject(request.error)
@@ -330,6 +419,93 @@ async function expectWalContains(page: Page, text: string) {
       database.close()
     }
   }, text)).toBe(true)
+}
+
+async function seedDurableHandoff(
+  page: Page,
+  input: {
+    ownerRequestId: string
+    parentSessionKey: string
+    clientMessageId: string
+    followups: string[]
+  },
+) {
+  await page.evaluate(async seed => {
+    const open = indexedDB.open('opensquilla-chat-pending-inputs', 2)
+    const database = await new Promise<IDBDatabase>((resolve, reject) => {
+      open.onupgradeneeded = () => {
+        const db = open.result
+        if (!db.objectStoreNames.contains('pending_chat_inputs')) {
+          const store = db.createObjectStore('pending_chat_inputs', { keyPath: 'pendingInputId' })
+          store.createIndex('session_created', ['sessionKey', 'createdAt'], { unique: false })
+        }
+        if (!db.objectStoreNames.contains('response_handoffs')) {
+          db.createObjectStore('response_handoffs', { keyPath: 'ownerRequestId' })
+        }
+      }
+      open.onsuccess = () => resolve(open.result)
+      open.onerror = () => reject(open.error)
+    })
+    try {
+      const transaction = database.transaction(
+        ['pending_chat_inputs', 'response_handoffs'],
+        'readwrite',
+      )
+      const now = Date.now()
+      transaction.objectStore('response_handoffs').put({
+        schemaVersion: 1,
+        ownerRequestId: seed.ownerRequestId,
+        requestSessionKey: seed.parentSessionKey,
+        clientRequestId: seed.ownerRequestId,
+        clientMessageId: seed.clientMessageId,
+        params: {
+          clientRequestId: seed.ownerRequestId,
+          clientMessageId: seed.clientMessageId,
+          message: 'P1-5 durable fork prompt',
+          queueMode: 'followup',
+          sessionKey: seed.parentSessionKey,
+          forkBeforeMessageId: 'synthetic-parent-message',
+          _source: { channel: 'webui' },
+        },
+        composerText: 'P1-5 durable fork prompt',
+        recoveryAttachments: [],
+        state: 'submitting',
+        createdAt: now,
+        updatedAt: now,
+      })
+      seed.followups.forEach((message, position) => {
+        const pendingInputId = `pending-handoff-${position}`
+        transaction.objectStore('pending_chat_inputs').put({
+          schemaVersion: 1,
+          pendingInputId,
+          sessionKey: seed.parentSessionKey,
+          clientRequestId: `request-handoff-${position}`,
+          clientMessageId: `message-handoff-${position}`,
+          text: message,
+          attachments: [],
+          intent: null,
+          ownerRequestId: seed.ownerRequestId,
+          state: 'saving',
+          mayHaveServerCopy: false,
+          position,
+          walRevision: 1,
+          createdAt: now + position,
+          updatedAt: now + position,
+        })
+      })
+      await new Promise<void>((resolve, reject) => {
+        transaction.oncomplete = () => resolve()
+        transaction.onerror = () => reject(transaction.error)
+        transaction.onabort = () => reject(transaction.error)
+      })
+    } finally {
+      database.close()
+    }
+  }, input)
+}
+
+async function pendingCardOrder(page: Page): Promise<string[]> {
+  return page.locator('.chat-pending-card .chat-pending-text').allTextContents()
 }
 
 async function runFirstSendIteration(page: Page, scenario: Scenario, iteration: number) {
@@ -427,4 +603,171 @@ test.describe('P1-5 first-send renderer release gate', () => {
       })
     }
   }
+})
+
+test.describe('durable handoff and pending order release gate', () => {
+  test.describe.configure({ mode: 'serial' })
+
+  test('refresh replays a fork receipt and moves owner follow-ups exactly once', async ({ page }) => {
+    test.setTimeout(45_000)
+    const errors = collectRendererErrors(page)
+    await preparePage(page)
+    const state = createMockGatewayState()
+    const parentSessionKey = 'agent:main:webchat:handoff-parent'
+    const childSessionKey = 'agent:main:webchat:handoff-child'
+    const ownerRequestId = 'request-durable-handoff'
+    state.handoffTargets[ownerRequestId] = childSessionKey
+    const gateway = await installMockGateway(page, 'immediate', state)
+
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(parentSessionKey)}`)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await seedDurableHandoff(page, {
+      ownerRequestId,
+      parentSessionKey,
+      clientMessageId: 'message-durable-handoff',
+      followups: ['handoff follow-up A', 'handoff follow-up B'],
+    })
+
+    await page.reload()
+    await expect(page).toHaveURL(url => url.searchParams.get('session') === childSessionKey)
+    await expect.poll(() => gateway.chatSends.length).toBe(1)
+    expect(gateway.chatSends[0]).toMatchObject({
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'message-durable-handoff',
+      sessionKey: parentSessionKey,
+      forkBeforeMessageId: 'synthetic-parent-message',
+    })
+    await expect.poll(() => gateway.enqueueCount).toBe(2)
+    // The fork task remains the delivery barrier. Complete it only after the
+    // refreshed page has adopted the child and staged every owner follow-up.
+    gateway.finishFirst()
+    await expect.poll(() => gateway.dispatchMessages, { timeout: 15_000 }).toEqual([
+      'handoff follow-up A',
+      'handoff follow-up B',
+    ])
+    await expect.poll(() => gateway.pendingRows()).toEqual([])
+    await expect.poll(() => page.evaluate(async () => {
+      const request = indexedDB.open('opensquilla-chat-pending-inputs')
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+      try {
+        const transaction = database.transaction('response_handoffs', 'readonly')
+        const rows = await new Promise<unknown[]>((resolve, reject) => {
+          const all = transaction.objectStore('response_handoffs').getAll()
+          all.onsuccess = () => resolve(all.result)
+          all.onerror = () => reject(all.error)
+        })
+        return rows.length
+      } finally {
+        database.close()
+      }
+    })).toBe(0)
+
+    const allErrors = [...errors.pageErrors, ...errors.consoleErrors]
+    expect(allErrors, allErrors.join('\n')).toEqual([])
+  })
+
+  test('server reorder survives route refresh, reconnect, and a peer tab', async ({
+    page,
+    context,
+  }) => {
+    test.setTimeout(60_000)
+    await preparePage(page)
+    const state = createMockGatewayState()
+    const gateway = await installMockGateway(page, 'delayed', state)
+
+    await page.goto(CONTROL_URL)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await page.locator('.sidebar-new-session').click()
+    const composer = page.locator('.chat-textarea')
+    await composer.fill('keep task active for durable reorder')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => gateway.chatSends.length).toBe(1)
+
+    for (const message of ['queue A', 'queue B', 'queue C']) {
+      await composer.fill(message)
+      await composer.press('Enter')
+    }
+    await expect.poll(() => gateway.enqueueCount).toBe(3)
+    await expect.poll(() => pendingCardOrder(page)).toEqual(['queue A', 'queue B', 'queue C'])
+
+    const queueC = page.locator('.chat-pending-card').filter({ hasText: 'queue C' })
+    await queueC.press('Alt+ArrowUp')
+    await expect.poll(() => gateway.reorderCount).toBe(1)
+    await expect.poll(() => pendingCardOrder(page)).toEqual(['queue A', 'queue C', 'queue B'])
+    await expect(queueC).toHaveAttribute('tabindex', '0')
+    await queueC.press('Alt+ArrowUp')
+    await expect.poll(() => gateway.reorderCount).toBe(2)
+    await expect.poll(() => pendingCardOrder(page)).toEqual(['queue C', 'queue A', 'queue B'])
+
+    gateway.releaseFirstAck()
+    await expect(page).toHaveURL(/\/chat\?session=/)
+    const materializedUrl = page.url()
+    await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect.poll(() => pendingCardOrder(page)).toEqual(['queue C', 'queue A', 'queue B'])
+
+    const peer = await context.newPage()
+    await preparePage(peer)
+    await installMockGateway(peer, 'immediate', state)
+    await peer.goto(materializedUrl)
+    await expect(peer.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect.poll(() => pendingCardOrder(peer)).toEqual(['queue C', 'queue A', 'queue B'])
+    await peer.close()
+
+    gateway.finishFirst()
+    await expect.poll(() => gateway.dispatchMessages, { timeout: 15_000 }).toEqual([
+      'queue C',
+      'queue A',
+      'queue B',
+    ])
+    await expect.poll(() => gateway.pendingRows()).toEqual([])
+  })
+
+  test('IndexedDB-only reorder survives refresh against an older Gateway', async ({ page }) => {
+    test.setTimeout(45_000)
+    await preparePage(page)
+    const state = createMockGatewayState()
+    state.supportsPendingQueue = false
+    const gateway = await installMockGateway(page, 'delayed', state)
+
+    await page.goto(CONTROL_URL)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await page.locator('.sidebar-new-session').click()
+    const composer = page.locator('.chat-textarea')
+    await composer.fill('keep old Gateway task active')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => gateway.chatSends.length).toBe(1)
+
+    for (const message of ['local A', 'local B', 'local C']) {
+      await composer.fill(message)
+      await composer.press('Enter')
+    }
+    await expect.poll(() => pendingCardOrder(page)).toEqual(['local A', 'local B', 'local C'])
+    const localC = page.locator('.chat-pending-card').filter({ hasText: 'local C' })
+    await localC.press('Alt+ArrowUp')
+    await expect.poll(() => pendingCardOrder(page)).toEqual(['local A', 'local C', 'local B'])
+    await expect(localC).toHaveAttribute('tabindex', '0')
+    await localC.press('Alt+ArrowUp')
+    await expect.poll(() => pendingCardOrder(page)).toEqual(['local C', 'local A', 'local B'])
+    expect(gateway.reorderCount).toBe(0)
+
+    gateway.releaseFirstAck()
+    await expect(page).toHaveURL(/\/chat\?session=/)
+    await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect.poll(() => pendingCardOrder(page)).toEqual(['local C', 'local A', 'local B'])
+
+    gateway.finishFirst()
+    await expect.poll(() => gateway.chatSends.map(send => String(send.message || '')), {
+      timeout: 15_000,
+    }).toEqual([
+      'keep old Gateway task active',
+      'local C',
+      'local A',
+      'local B',
+    ])
+  })
 })

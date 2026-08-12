@@ -93,6 +93,8 @@ export interface ChatPendingItem {
   pendingClientMessageId?: string
   pendingRequestFingerprint?: string
   pendingServerRevision?: number
+  pendingPosition?: number
+  pendingWalRevision?: number
   pendingCreatedAt?: number
   /**
    * The stable identity may already exist in a Gateway even when its enqueue

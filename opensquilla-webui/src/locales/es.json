@@ -3762,6 +3762,7 @@
       "reorderHint": "Mantén pulsado durante 0,75 segundos y arrastra para cambiar el orden. Alt+Flecha también mueve el mensaje.",
       "reorderStarted": "Reordenando {label}. Arrastra a la nueva posición y suelta.",
       "reorderPosition": "{label} se movió a la posición {position} de {count}.",
+      "reorderRecovering": "Restaurando el orden de la cola…",
       "clearAll": "Borrar todo",
       "editMessage": "Editar mensaje",
       "editWhileStreaming": "Espera a que termine la respuesta actual antes de editar",
@@ -3940,6 +3941,7 @@
       "waitCompactionBeforeCommand": "Espera a que termine la compactación del contexto antes de ejecutar {command}.",
       "waitResponseBeforeCommand": "Espera a la respuesta actual antes de ejecutar {command}.",
       "queueFull": "La cola está llena — espera a que termine la respuesta actual.",
+      "queuePersistenceUnavailable": "Conserva este mensaje en el editor hasta que termine la bifurcación; la recuperación duradera no está disponible.",
       "messageStillSaving": "Este mensaje aún no se ha guardado — inténtalo de nuevo en un momento.",
       "artifactOpenFailed": "No se pudo abrir el artefacto. Usa Descargar en su lugar."
     },

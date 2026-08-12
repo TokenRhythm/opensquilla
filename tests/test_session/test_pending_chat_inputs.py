@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -117,6 +118,147 @@ async def test_pending_input_update_and_cancel_use_revision_cas(tmp_path) -> Non
             row.pending_input_id,
             session_key=SESSION_KEY,
         )
+    finally:
+        await storage.close()
+
+
+async def test_pending_input_reorder_is_complete_atomic_and_revision_guarded(
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        staged = [(await _stage(storage, index))[0] for index in range(3)]
+        reordered = await storage.reorder_pending_chat_inputs(
+            session_key=SESSION_KEY,
+            expected_revisions=[
+                (staged[2].pending_input_id, staged[2].state_revision),
+                (staged[0].pending_input_id, staged[0].state_revision),
+                (staged[1].pending_input_id, staged[1].state_revision),
+            ],
+        )
+        assert [row.pending_input_id for row in reordered] == [
+            "pending-2",
+            "pending-0",
+            "pending-1",
+        ]
+        assert [row.position for row in reordered] == [0, 1, 2]
+        assert [row.state_revision for row in reordered] == [2, 2, 2]
+
+        with pytest.raises(PendingChatInputConflictError):
+            await storage.reorder_pending_chat_inputs(
+                session_key=SESSION_KEY,
+                expected_revisions=[
+                    ("pending-1", 2),
+                    ("pending-2", 1),
+                    ("pending-0", 2),
+                ],
+            )
+        unchanged = await storage.list_pending_chat_inputs(SESSION_KEY)
+        assert [row.pending_input_id for row in unchanged] == [
+            "pending-2",
+            "pending-0",
+            "pending-1",
+        ]
+        assert [row.state_revision for row in unchanged] == [2, 2, 2]
+
+        with pytest.raises(PendingChatInputConflictError):
+            await storage.reorder_pending_chat_inputs(
+                session_key=SESSION_KEY,
+                expected_revisions=[("pending-0", 2), ("pending-1", 2)],
+            )
+
+        with pytest.raises(ValueError, match="unique"):
+            await storage.reorder_pending_chat_inputs(
+                session_key=SESSION_KEY,
+                expected_revisions=[
+                    ("pending-2", 2),
+                    ("pending-2", 2),
+                    ("pending-0", 2),
+                ],
+            )
+
+        other, _ = await storage.enqueue_pending_chat_input(
+            pending_input_id="pending-other-session",
+            session_key="agent:main:webchat:other-session",
+            source_scope="web:web:operator",
+            client_request_id="request-other-session",
+            client_message_id="message-other-session",
+            request_fingerprint="sha256:fingerprint-other-session",
+            payload={**_payload(9), "key": "agent:main:webchat:other-session"},
+        )
+        with pytest.raises(PendingChatInputConflictError):
+            await storage.reorder_pending_chat_inputs(
+                session_key=SESSION_KEY,
+                expected_revisions=[
+                    ("pending-2", 2),
+                    ("pending-0", 2),
+                    (other.pending_input_id, other.state_revision),
+                ],
+            )
+    finally:
+        await storage.close()
+
+
+async def test_pending_input_reorder_rolls_back_and_loses_cleanly_to_cancel(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    try:
+        staged = [(await _stage(storage, index))[0] for index in range(3)]
+        original_decoder = storage._pending_chat_input_from_row
+        decode_count = 0
+
+        def fail_after_updates(row):
+            nonlocal decode_count
+            decode_count += 1
+            if decode_count == 4:
+                raise RuntimeError("synthetic reorder result failure")
+            return original_decoder(row)
+
+        monkeypatch.setattr(storage, "_pending_chat_input_from_row", fail_after_updates)
+        with pytest.raises(RuntimeError, match="synthetic reorder result failure"):
+            await storage.reorder_pending_chat_inputs(
+                session_key=SESSION_KEY,
+                expected_revisions=[
+                    (staged[2].pending_input_id, 1),
+                    (staged[0].pending_input_id, 1),
+                    (staged[1].pending_input_id, 1),
+                ],
+            )
+        monkeypatch.setattr(storage, "_pending_chat_input_from_row", original_decoder)
+        unchanged = await storage.list_pending_chat_inputs(SESSION_KEY)
+        assert [row.pending_input_id for row in unchanged] == [
+            "pending-0",
+            "pending-1",
+            "pending-2",
+        ]
+        assert [row.state_revision for row in unchanged] == [1, 1, 1]
+
+        reordered, cancelled = await asyncio.gather(
+            storage.reorder_pending_chat_inputs(
+                session_key=SESSION_KEY,
+                expected_revisions=[
+                    (staged[2].pending_input_id, 1),
+                    (staged[0].pending_input_id, 1),
+                    (staged[1].pending_input_id, 1),
+                ],
+            ),
+            storage.cancel_pending_chat_input(
+                staged[1].pending_input_id,
+                session_key=SESSION_KEY,
+                expected_revision=1,
+            ),
+            return_exceptions=True,
+        )
+        assert sum(isinstance(result, PendingChatInputConflictError) for result in (
+            reordered,
+            cancelled,
+        )) == 1
+        assert sum(not isinstance(result, BaseException) for result in (
+            reordered,
+            cancelled,
+        )) == 1
     finally:
         await storage.close()
 

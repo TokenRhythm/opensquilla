@@ -17,6 +17,7 @@ import { useChatSteerDelivery } from './useChatSteerDelivery'
 import type {
   PendingInputWal,
   PendingInputWalRecord,
+  ResponseHandoffWalRecord,
 } from '@/utils/chat/pendingInputWal'
 
 vi.mock('@/composables/useToasts', () => ({
@@ -25,12 +26,39 @@ vi.mock('@/composables/useToasts', () => ({
 
 function memoryPendingWal(): PendingInputWal {
   const records = new Map<string, PendingInputWalRecord>()
+  const handoffs = new Map<string, ResponseHandoffWalRecord>()
   return {
     put: async record => { records.set(record.pendingInputId, structuredClone(record)) },
     list: async sessionKey => [...records.values()].filter(record => (
       record.sessionKey === sessionKey
     )),
     delete: async pendingInputId => { records.delete(pendingInputId) },
+    putHandoff: async record => { handoffs.set(record.ownerRequestId, structuredClone(record)) },
+    listHandoffs: async () => [...handoffs.values()].map(record => structuredClone(record)),
+    acceptHandoff: async (ownerRequestId, acceptedSessionKey) => {
+      const handoff = handoffs.get(ownerRequestId)
+      if (!handoff) throw new Error('missing handoff')
+      const accepted = {
+        ...handoff,
+        state: 'accepted' as const,
+        acceptedSessionKey,
+        updatedAt: Date.now(),
+      }
+      handoffs.set(ownerRequestId, accepted)
+      const moved = [...records.values()]
+        .filter(record => record.ownerRequestId === ownerRequestId)
+        .map(record => ({
+          ...record,
+          sessionKey: acceptedSessionKey,
+          ownerRequestId: undefined,
+          state: 'saving' as const,
+          walRevision: (record.walRevision ?? 1) + 1,
+          updatedAt: Date.now(),
+        }))
+      for (const record of moved) records.set(record.pendingInputId, record)
+      return { handoff: accepted, records: moved }
+    },
+    deleteHandoff: async ownerRequestId => { handoffs.delete(ownerRequestId) },
     close: () => {},
   }
 }
@@ -155,6 +183,7 @@ describe('chat send session handoff', () => {
       trace.push(`reset:${sessionKey.value}`)
       isStreaming.value = false
     })
+    const pendingInputWal = memoryPendingWal()
     const pendingQueueRuntime = useChatPendingQueue({
       sessionKey,
       ownerContext: pendingQueueOwnerContext,
@@ -169,7 +198,7 @@ describe('chat send session handoff', () => {
       hasComposer: () => true,
       dispatchHiddenControl: (item, ownerSessionKey) =>
         dispatchHiddenControl(item, ownerSessionKey),
-      pendingInputWal: memoryPendingWal(),
+      pendingInputWal,
       supportsMethod: () => false,
     })
     inputText.value = 'existing parent follow-up'
@@ -263,6 +292,7 @@ describe('chat send session handoff', () => {
       messages,
       sessionKey,
       pendingQueueOwnerContext,
+      pendingInputWal,
       busySendMode: pendingQueueRuntime.busySendMode,
       modelRoutingMode: ref<'off'>('off'),
       modelRoutingSettingsBusy: ref(false),
@@ -279,6 +309,8 @@ describe('chat send session handoff', () => {
       stream,
       normalizeElevatedMode: mode => mode,
       adoptResponseSession: sessionRuntime.adoptResponseSession,
+      recoverPendingQueueHandoff: pendingQueueRuntime.recoverPendingQueueHandoff,
+      failPendingQueueHandoff: pendingQueueRuntime.failPendingQueueHandoff,
       scheduleHistorySync,
       schedulePendingDrainAfterTerminal: pendingQueueRuntime.schedulePendingDrainAfterTerminal,
       flushDeferredPendingDrain: pendingQueueRuntime.flushDeferredPendingDrain,

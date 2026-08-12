@@ -3762,6 +3762,7 @@
       "reorderHint": "Maintenez pendant 0,75 seconde puis faites glisser pour réorganiser. Alt+Flèche déplace aussi ce message.",
       "reorderStarted": "Réorganisation de {label}. Faites glisser vers la nouvelle position puis relâchez.",
       "reorderPosition": "{label} a été déplacé en position {position} sur {count}.",
+      "reorderRecovering": "Restauration de l’ordre de la file…",
       "clearAll": "Tout effacer",
       "editMessage": "Modifier le message",
       "editWhileStreaming": "Attendez la fin de la réponse en cours avant de modifier",
@@ -3940,6 +3941,7 @@
       "waitCompactionBeforeCommand": "Attendez le compactage du contexte avant d'exécuter {command}.",
       "waitResponseBeforeCommand": "Attendez la réponse actuelle avant d'exécuter {command}.",
       "queueFull": "La file d'attente est pleine — attendez la fin de la réponse actuelle.",
+      "queuePersistenceUnavailable": "Conservez ce message dans l’éditeur jusqu’à la fin de la bifurcation ; la récupération durable est indisponible.",
       "messageStillSaving": "Ce message n'est pas encore enregistré — réessayez dans un instant.",
       "artifactOpenFailed": "Échec de l'ouverture de l'artefact. Utilisez Télécharger à la place."
     },

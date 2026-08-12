@@ -10243,6 +10243,102 @@ class SessionStorage:
             assert row is not None
             return row
 
+    async def reorder_pending_chat_inputs(
+        self,
+        *,
+        session_key: str,
+        expected_revisions: list[tuple[str, int]],
+    ) -> list[PendingChatInput]:
+        """Replace one session's complete pending order atomically.
+
+        The caller supplies every currently staged row in the desired order.
+        Comparing the complete identity set and every state revision prevents a
+        concurrent enqueue, cancel, dispatch, or peer reorder from producing a
+        partially-applied order.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        if not 2 <= len(expected_revisions) <= MAX_PENDING_CHAT_INPUTS:
+            raise ValueError(
+                f"expected_revisions must contain 2-{MAX_PENDING_CHAT_INPUTS} rows"
+            )
+        pending_ids: list[str] = []
+        revisions: dict[str, int] = {}
+        for raw_pending_id, revision in expected_revisions:
+            pending_input_id = raw_pending_id.strip()
+            if not pending_input_id or len(pending_input_id) > 256:
+                raise ValueError("pending_input_id must be a non-empty bounded string")
+            if pending_input_id in revisions:
+                raise ValueError("pending_input_id values must be unique")
+            if (
+                isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 1
+            ):
+                raise ValueError("expected revision must be a positive integer")
+            pending_ids.append(pending_input_id)
+            revisions[pending_input_id] = revision
+
+        async with self._write_transaction("reorder_pending_chat_inputs") as conn:
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE session_key = ?
+                ORDER BY position ASC, created_at ASC, pending_input_id ASC
+                """,
+                (session_key,),
+            ) as cur:
+                current_rows = await cur.fetchall()
+            current = [self._pending_chat_input_from_row(row) for row in current_rows]
+            if len(current) != len(pending_ids):
+                raise PendingChatInputConflictError(
+                    "pending input set changed before reorder"
+                )
+            current_by_id = {row.pending_input_id: row for row in current}
+            if set(current_by_id) != set(pending_ids):
+                raise PendingChatInputConflictError(
+                    "pending input set changed before reorder"
+                )
+            for pending_input_id, expected_revision in revisions.items():
+                if current_by_id[pending_input_id].state_revision != expected_revision:
+                    raise PendingChatInputConflictError(
+                        "pending input revision changed before reorder"
+                    )
+
+            updated_at = _now_ms()
+            for position, pending_input_id in enumerate(pending_ids):
+                async with conn.execute(
+                    """
+                    UPDATE pending_chat_inputs
+                    SET position = ?, state_revision = state_revision + 1,
+                        updated_at = ?
+                    WHERE pending_input_id = ? AND session_key = ?
+                      AND state_revision = ?
+                    """,
+                    (
+                        position,
+                        updated_at,
+                        pending_input_id,
+                        session_key,
+                        revisions[pending_input_id],
+                    ),
+                ) as cur:
+                    if int(cur.rowcount or 0) != 1:
+                        raise PendingChatInputConflictError(
+                            "pending input changed during reorder"
+                        )
+
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE session_key = ?
+                ORDER BY position ASC, created_at ASC, pending_input_id ASC
+                """,
+                (session_key,),
+            ) as cur:
+                reordered_rows = await cur.fetchall()
+            return [self._pending_chat_input_from_row(row) for row in reordered_rows]
+
     async def cancel_pending_chat_input(
         self,
         pending_input_id: str,

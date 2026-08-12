@@ -30,6 +30,7 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "sessions.pending_inputs.enqueue",
         "sessions.pending_inputs.list",
         "sessions.pending_inputs.update",
+        "sessions.pending_inputs.reorder",
         "sessions.pending_inputs.cancel",
         "sessions.pending_inputs.dispatch",
     }
@@ -50,6 +51,7 @@ _SESSION_KEY_FIELDS = {
     "sessions.pending_inputs.enqueue": ("key", "sessionKey"),
     "sessions.pending_inputs.list": ("key", "sessionKey"),
     "sessions.pending_inputs.update": ("key", "sessionKey"),
+    "sessions.pending_inputs.reorder": ("key", "sessionKey"),
     "sessions.pending_inputs.cancel": ("key", "sessionKey"),
     "sessions.pending_inputs.dispatch": ("key", "sessionKey"),
 }

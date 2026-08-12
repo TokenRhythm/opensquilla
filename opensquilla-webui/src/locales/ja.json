@@ -3762,6 +3762,7 @@
       "reorderHint": "0.75 秒間長押ししてからドラッグすると順序を変更できます。Alt+矢印キーでも移動できます。",
       "reorderStarted": "「{label}」を並べ替えています。新しい位置までドラッグして離してください。",
       "reorderPosition": "「{label}」を {count} 件中 {position} 番目に移動しました。",
+      "reorderRecovering": "キューの順序を復元しています…",
       "clearAll": "すべてクリア",
       "editMessage": "メッセージを編集",
       "editWhileStreaming": "現在の返信が終わってから編集してください",
@@ -3940,6 +3941,7 @@
       "waitCompactionBeforeCommand": "{command} を実行する前にコンテキストの圧縮が完了するまでお待ちください。",
       "waitResponseBeforeCommand": "{command} を実行する前に現在の応答が完了するまでお待ちください。",
       "queueFull": "キューがいっぱいです — 現在の応答が完了するまでお待ちください。",
+      "queuePersistenceUnavailable": "分岐が完了するまでこのメッセージを入力欄に残してください。永続的な復旧は現在利用できません。",
       "messageStillSaving": "このメッセージはまだ保存が完了していません — しばらくしてからもう一度お試しください。",
       "artifactOpenFailed": "成果物を開けませんでした。代わりにダウンロードを使用してください。"
     },

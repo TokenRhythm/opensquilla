@@ -10,6 +10,7 @@ import {
   createPendingInputWal,
   type PendingInputWal,
   type PendingInputWalRecord,
+  type ResponseHandoffWalRecord,
 } from '@/utils/chat/pendingInputWal'
 
 function makeQueue(
@@ -71,19 +72,84 @@ function pendingUiId(
 
 function memoryWal(initial: PendingInputWalRecord[] = []) {
   const records = new Map(initial.map(record => [record.pendingInputId, record]))
+  const handoffs = new Map<string, ResponseHandoffWalRecord>()
   const wal: PendingInputWal = {
     put: vi.fn(async record => {
       records.set(record.pendingInputId, structuredClone(record))
     }),
     list: vi.fn(async sessionKey => [...records.values()]
       .filter(record => record.sessionKey === sessionKey)
-      .sort((left, right) => left.createdAt - right.createdAt)),
+      .sort((left, right) => (
+        (left.position ?? Number.MAX_SAFE_INTEGER)
+        - (right.position ?? Number.MAX_SAFE_INTEGER)
+        || left.createdAt - right.createdAt
+      ))),
+    putMany: vi.fn(async nextRecords => {
+      for (const record of nextRecords) {
+        records.set(record.pendingInputId, structuredClone(record))
+      }
+    }),
+    commitOrder: vi.fn(async (
+      sessionKey: string,
+      orderedIds: string[],
+      expectedWalRevisions: Record<string, number>,
+    ) => {
+      const current = [...records.values()].filter(record => record.sessionKey === sessionKey)
+      if (
+        current.length !== orderedIds.length
+        || orderedIds.some(id => !current.some(record => record.pendingInputId === id))
+      ) throw new Error('conflict')
+      const committed = orderedIds.map((pendingInputId, position) => {
+        const record = records.get(pendingInputId)!
+        const revision = record.walRevision ?? 1
+        if (expectedWalRevisions[pendingInputId] !== revision) throw new Error('conflict')
+        const next = {
+          ...record,
+          position,
+          walRevision: revision + 1,
+          updatedAt: Date.now(),
+        }
+        records.set(pendingInputId, structuredClone(next))
+        return next
+      })
+      return { records: committed }
+    }),
+    putHandoff: vi.fn(async record => {
+      handoffs.set(record.ownerRequestId, structuredClone(record))
+    }),
+    listHandoffs: vi.fn(async () => [...handoffs.values()].map(record => (
+      structuredClone(record)
+    ))),
+    acceptHandoff: vi.fn(async (ownerRequestId, acceptedSessionKey) => {
+      const existing = handoffs.get(ownerRequestId)
+      if (!existing) throw new Error('missing handoff')
+      const handoff = {
+        ...existing,
+        state: 'accepted' as const,
+        acceptedSessionKey,
+        updatedAt: Date.now(),
+      }
+      handoffs.set(ownerRequestId, handoff)
+      const moved = [...records.values()]
+        .filter(record => record.ownerRequestId === ownerRequestId)
+        .map(record => ({
+          ...record,
+          sessionKey: acceptedSessionKey,
+          ownerRequestId: undefined,
+          state: 'saving' as const,
+          walRevision: (record.walRevision ?? 1) + 1,
+          updatedAt: Date.now(),
+        }))
+      for (const record of moved) records.set(record.pendingInputId, structuredClone(record))
+      return { handoff, records: moved }
+    }),
+    deleteHandoff: vi.fn(async ownerRequestId => { handoffs.delete(ownerRequestId) }),
     delete: vi.fn(async pendingInputId => {
       records.delete(pendingInputId)
     }),
     close: vi.fn(),
   }
-  return { records, wal }
+  return { records, handoffs, wal }
 }
 
 class TestBroadcastChannel {
@@ -1171,7 +1237,7 @@ describe('useChatPendingQueue delivery state', () => {
     await queue.enqueuePendingInput(inputText.value, { ownerRequestId: 'owner-a' })
     const item = queue.beginPendingDelivery(pendingUiId(queue, 0))
 
-    queue.adoptPendingQueue('agent:main:webchat:child', 'owner-b')
+    await queue.adoptPendingQueue('agent:main:webchat:child', 'owner-b')
     expect(queue.pendingQueue.value).toEqual([])
 
     queue.settlePendingDelivery(item!, 'accepted')
@@ -1499,5 +1565,182 @@ describe('useChatPendingQueue delivery state', () => {
     expect(inputText.value).toBe('existing draft')
     expect(queue.pendingQueue.value[0]?.deliveryState).toBe('retryable')
     queue.cleanup()
+  })
+
+  it('recovers owner rows after refresh by atomically accepting the handoff', async () => {
+    const parent = 'agent:main:webchat:test'
+    const child = 'agent:main:webchat:child'
+    const ownerRequestId = 'fork-request-refresh'
+    const { wal, handoffs } = memoryWal()
+    await wal.putHandoff!({
+      schemaVersion: 1,
+      ownerRequestId,
+      requestSessionKey: parent,
+      clientRequestId: ownerRequestId,
+      clientMessageId: 'fork-message-refresh',
+      composerText: 'fork me',
+      recoveryAttachments: [],
+      params: {
+        sessionKey: parent,
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'fork-message-refresh',
+        message: 'fork me',
+        forkBeforeMessageId: 'message-before-fork',
+      },
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    })
+
+    const first = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      supportsMethod: () => false,
+    })
+    first.inputText.value = 'follow-up A'
+    await first.queue.enqueuePendingInput(first.inputText.value, { ownerRequestId })
+    first.inputText.value = 'follow-up B'
+    await first.queue.enqueuePendingInput(first.inputText.value, { ownerRequestId })
+    first.queue.cleanup()
+
+    const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      supportsMethod: () => false,
+    })
+    await reloaded.queue.hydratePendingQueue(parent)
+    expect(reloaded.queue.pendingQueue.value.map(item => item.ownerRequestId)).toEqual([
+      ownerRequestId,
+      ownerRequestId,
+    ])
+
+    await reloaded.queue.recoverPendingQueueHandoff(parent, child, ownerRequestId)
+    expect(reloaded.queue.pendingQueue.value).toEqual([])
+    expect(handoffs.get(ownerRequestId)).toMatchObject({
+      state: 'accepted',
+      acceptedSessionKey: child,
+    })
+
+    reloaded.queue.switchPendingQueue(child)
+    reloaded.sessionKey.value = child
+    await nextTick()
+    await reloaded.queue.hydratePendingQueue(child)
+    expect(reloaded.queue.pendingQueue.value.map(item => item.text)).toEqual([
+      'follow-up A',
+      'follow-up B',
+    ])
+    expect(reloaded.queue.pendingQueue.value.map(item => ({
+      ownerSessionKey: item.ownerSessionKey,
+      ownerRequestId: item.ownerRequestId,
+    }))).toEqual([
+      { ownerSessionKey: child, ownerRequestId: undefined },
+      { ownerSessionKey: child, ownerRequestId: undefined },
+    ])
+    reloaded.queue.cleanup()
+  })
+
+  it('persists a local-only reorder across remount with WAL revision CAS', async () => {
+    const { wal } = memoryWal()
+    const first = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      supportsMethod: () => false,
+    })
+    for (const text of ['A', 'B', 'C']) {
+      first.inputText.value = text
+      await first.queue.enqueuePendingInput(text)
+    }
+    await vi.waitFor(() => expect(first.queue.pendingQueue.value.every(item => (
+      item.pendingPersistenceState === 'local_only'
+    ))).toBe(true))
+    expect(first.queue.beginPendingReorder(2)).toBe(true)
+    expect(first.queue.reorderPendingItem(2, 0)).toBe(true)
+    await first.queue.endPendingReorder()
+    expect(first.queue.pendingQueue.value.map(item => item.text)).toEqual(['C', 'A', 'B'])
+    first.queue.cleanup()
+
+    const reloaded = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      supportsMethod: () => false,
+    })
+    await reloaded.queue.hydratePendingQueue(reloaded.sessionKey.value)
+    expect(reloaded.queue.pendingQueue.value.map(item => item.text)).toEqual(['C', 'A', 'B'])
+    reloaded.queue.cleanup()
+  })
+
+  it('commits a staged reorder through the batch RPC before releasing drain', async () => {
+    const sessionKey = 'agent:main:webchat:test'
+    const initial = ['A', 'B', 'C'].map((text, position): PendingInputWalRecord => ({
+      schemaVersion: 1,
+      pendingInputId: `pending-${text}`,
+      sessionKey,
+      clientRequestId: `request-${text}`,
+      clientMessageId: `message-${text}`,
+      text,
+      attachments: [],
+      intent: null,
+      state: 'staged',
+      mayHaveServerCopy: true,
+      requestFingerprint: `fingerprint-${text}`,
+      serverRevision: 1,
+      position,
+      walRevision: 1,
+      createdAt: position + 1,
+      updatedAt: position + 1,
+    }))
+    const { wal, records } = memoryWal(initial)
+    let serverRows = initial.map(record => ({
+      pendingInputId: record.pendingInputId,
+      clientRequestId: record.clientRequestId,
+      clientMessageId: record.clientMessageId,
+      requestFingerprint: record.requestFingerprint,
+      message: record.text,
+      attachments: [],
+      position: record.position,
+      revision: record.serverRevision,
+    }))
+    const rpcCall = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'sessions.pending_inputs.list') return { items: serverRows }
+        if (method === 'sessions.pending_inputs.reorder') {
+          const requested = params?.items as Array<{
+            pendingInputId: string
+            expectedRevision: number
+          }>
+          serverRows = requested.map((item, position) => ({
+            ...serverRows.find(row => row.pendingInputId === item.pendingInputId)!,
+            position,
+            revision: item.expectedRevision + 1,
+          }))
+          return { items: serverRows }
+        }
+        return {}
+      })
+    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+      call: rpcCall as unknown as NonNullable<UseChatPendingQueueOptions['rpc']>['call'],
+    }
+    const first = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      rpc,
+      supportsMethod: method => [
+        'sessions.pending_inputs.enqueue',
+        'sessions.pending_inputs.reorder',
+      ].includes(method),
+      connectionState: ref('connected'),
+    })
+    await first.queue.hydratePendingQueue(sessionKey)
+    expect(first.queue.beginPendingReorder(2)).toBe(true)
+    expect(first.queue.reorderPendingItem(2, 0)).toBe(true)
+    await first.queue.endPendingReorder()
+
+    expect(rpcCall).toHaveBeenCalledWith('sessions.pending_inputs.reorder', {
+      key: sessionKey,
+      items: [
+        { pendingInputId: 'pending-C', expectedRevision: 1 },
+        { pendingInputId: 'pending-A', expectedRevision: 1 },
+        { pendingInputId: 'pending-B', expectedRevision: 1 },
+      ],
+    })
+    expect(first.queue.pendingQueue.value.map(item => item.text)).toEqual(['C', 'A', 'B'])
+    expect([...records.values()]
+      .sort((left, right) => (left.position ?? 0) - (right.position ?? 0))
+      .map(record => record.text)).toEqual(['C', 'A', 'B'])
+    first.queue.cleanup()
   })
 })

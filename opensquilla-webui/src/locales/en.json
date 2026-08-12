@@ -3815,6 +3815,7 @@
       "reorderHint": "Press and hold for 0.75 seconds, then drag to reorder. Alt+Arrow also moves this message.",
       "reorderStarted": "Reordering {label}. Drag to a new position, then release.",
       "reorderPosition": "{label} moved to position {position} of {count}.",
+      "reorderRecovering": "Restoring queue order…",
       "clearAll": "Clear all",
       "editMessage": "Edit message",
       "editWhileStreaming": "Wait for the current reply to finish before editing",
@@ -3993,6 +3994,7 @@
       "waitCompactionBeforeCommand": "Wait for context compaction before running {command}.",
       "waitResponseBeforeCommand": "Wait for the current response before running {command}.",
       "queueFull": "Queue is full — wait for the current response to finish.",
+      "queuePersistenceUnavailable": "Keep this message in the composer until the fork finishes; durable recovery is unavailable.",
       "messageStillSaving": "This message hasn't finished saving — try again in a moment.",
       "artifactOpenFailed": "Artifact open failed. Use Download instead."
     },

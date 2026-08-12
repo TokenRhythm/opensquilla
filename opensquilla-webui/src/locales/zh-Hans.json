@@ -3815,6 +3815,7 @@
       "reorderHint": "长按 0.75 秒后拖动可调整发送顺序，也可使用 Alt+方向键移动。",
       "reorderStarted": "正在调整“{label}”的位置，拖动到新位置后松开。",
       "reorderPosition": "“{label}”已移动到第 {position} 位，共 {count} 条。",
+      "reorderRecovering": "正在恢复队列顺序…",
       "clearAll": "全部清除",
       "editMessage": "编辑消息",
       "editWhileStreaming": "等待当前回复完成后再编辑",
@@ -3993,6 +3994,7 @@
       "waitCompactionBeforeCommand": "请等待上下文压缩完成后再运行 {command}。",
       "waitResponseBeforeCommand": "请等待当前回复结束后再运行 {command}。",
       "queueFull": "队列已满 — 请等待当前回复结束。",
+      "queuePersistenceUnavailable": "请将此消息保留在输入框，等待分支完成；当前无法进行持久恢复。",
       "messageStillSaving": "这条消息尚未保存完成 — 请稍后再试。",
       "artifactOpenFailed": "产物打开失败。请改为下载。"
     },

@@ -3762,6 +3762,7 @@
       "reorderHint": "0,75 Sekunden gedrückt halten und dann ziehen, um die Reihenfolge zu ändern. Alt+Pfeiltaste verschiebt die Nachricht ebenfalls.",
       "reorderStarted": "{label} wird neu angeordnet. An die neue Position ziehen und loslassen.",
       "reorderPosition": "{label} wurde an Position {position} von {count} verschoben.",
+      "reorderRecovering": "Warteschlangenreihenfolge wird wiederhergestellt…",
       "clearAll": "Alle löschen",
       "editMessage": "Nachricht bearbeiten",
       "editWhileStreaming": "Warten Sie, bis die aktuelle Antwort fertig ist, bevor Sie bearbeiten",
@@ -3940,6 +3941,7 @@
       "waitCompactionBeforeCommand": "Warten Sie auf die Kontextverdichtung, bevor Sie {command} ausführen.",
       "waitResponseBeforeCommand": "Warten Sie auf die aktuelle Antwort, bevor Sie {command} ausführen.",
       "queueFull": "Warteschlange ist voll — warten Sie, bis die aktuelle Antwort abgeschlossen ist.",
+      "queuePersistenceUnavailable": "Behalten Sie diese Nachricht im Eingabefeld, bis die Verzweigung abgeschlossen ist; dauerhafte Wiederherstellung ist nicht verfügbar.",
       "messageStillSaving": "Diese Nachricht ist noch nicht gespeichert — versuchen Sie es gleich erneut.",
       "artifactOpenFailed": "Öffnen des Artefakts fehlgeschlagen. Verwenden Sie stattdessen Herunterladen."
     },
