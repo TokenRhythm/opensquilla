@@ -55,6 +55,38 @@ def _is_legacy_generated_plan_implementation(
     return _LEGACY_PLAN_IMPLEMENTATION_PROMPT.fullmatch(visible) is not None
 
 
+# Compaction collapses structured tool_use/tool_result content blocks into
+# plain-text markers so a summarized turn still names what ran; see
+# engine.agent._flatten_content_blocks ("[Used tool: <name>]" and
+# "[Tool result (<id>): <snippet>]"). Those markers are an internal transcript
+# representation, not conversation, so a compacted turn that is later loaded for
+# display must not render them as raw chat text.
+_FLATTENED_USED_TOOL_LINE = re.compile(r"^\[Used tool: [^\]]*\]$")
+
+
+def _strip_flattened_tool_markers(content: str) -> str:
+    """Drop flattened tool-call markers from a compacted turn's display text.
+
+    Returns the human-readable remainder. A turn whose content is a
+    ``[Tool result (...)]`` dump collapses to an empty string (the caller then
+    drops the entry, mirroring the ``[ContentBlock ...]`` handling); an
+    assistant turn keeps its narration with any ``[Used tool: ...]`` lines
+    removed. Content without these markers is returned unchanged.
+    """
+
+    text = content or ""
+    if text.lstrip().startswith("[Tool result ("):
+        return ""
+    if "[Used tool: " not in text:
+        return text
+    kept = [
+        line
+        for line in text.split("\n")
+        if not _FLATTENED_USED_TOOL_LINE.match(line.strip())
+    ]
+    return "\n".join(kept).strip()
+
+
 def transcript_entries_to_chat_messages(
     entries: list[object],
     *,
@@ -100,6 +132,16 @@ def transcript_entries_to_chat_messages(
             content = "\n".join(t.replace("\\n", "\n") for t in texts) if texts else ""
             if not content.strip():
                 continue
+        if content:
+            cleaned = _strip_flattened_tool_markers(content)
+            if cleaned != content:
+                # The entry carried OpenSquilla's flattened tool serialization.
+                # Drop it when nothing but internal tool transcript remains and
+                # there is no structured tool timeline to render instead;
+                # otherwise keep the narration that surrounded the markers.
+                if not cleaned.strip() and not silent_reply.segments:
+                    continue
+                content = cleaned
         if role == "user":
             display_text = display_text_from_preflight_confirmation(content)
             if display_text is not None:
