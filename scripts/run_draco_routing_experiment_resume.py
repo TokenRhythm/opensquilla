@@ -8674,7 +8674,7 @@ async def run_one(
         generation_policy,
         model=spec["model"] if spec["kind"] == "single" else None,
         tool_choice=tool_policy.get("openrouter_fusion_tool_choice"),
-    )
+    ).model_copy(update={"timeout": effective_timeout})
     try:
         build = await build_experiment_provider(
             config=config,

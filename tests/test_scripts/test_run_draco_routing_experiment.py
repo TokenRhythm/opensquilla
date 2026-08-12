@@ -6335,6 +6335,72 @@ async def test_run_one_records_and_forwards_agent_finalization_policy(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
+async def test_run_one_binds_effective_timeout_to_agent_generation_config(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config, inherited = _openrouter_config()
+    captured: dict[str, object] = {}
+    result = module.RunResult(
+        final_text="answer",
+        done=DoneEvent(model="test/model", stop_reason="stop"),
+    )
+
+    async def fake_build_experiment_provider(**_kwargs):
+        return module.ProviderBuildResult(provider=object(), prompt="prompt")
+
+    async def fake_collect_generation_with_retries(*_args, **kwargs):
+        captured.update(kwargs)
+        return result, [], 1
+
+    monkeypatch.setattr(
+        module,
+        "build_experiment_provider",
+        fake_build_experiment_provider,
+    )
+    monkeypatch.setattr(
+        module,
+        "collect_generation_with_retries",
+        fake_collect_generation_with_retries,
+    )
+
+    await module.run_one(
+        task={"id": "task-1", "prompt": "prompt"},
+        group="B3",
+        config=config,
+        inherited=inherited,
+        dry_run=False,
+        judge_provider=None,
+        judge_candidates=False,
+        judge_repeats=1,
+        judge_concurrency=1,
+        judge_max_attempts=1,
+        judge_semaphore=None,
+        timeout=10_800,
+        ensemble_proposer_timeout=907.5,
+        ensemble_aggregator_timeout=2_662.5,
+        ensemble_proposer_early_stop_success_count=None,
+        ensemble_proposer_early_stop_after=None,
+        expand_ensemble_timeouts_to_task_timeout=False,
+        tool_policy={"tools_enabled": False, "tool_mode": "provider_only"},
+        generation_policy={},
+        runner_mode=module.RUNNER_MODE_AGENT_LOOP,
+    )
+
+    assert captured["timeout"] == pytest.approx(10_800)
+    generation_config = captured["config"]
+    assert generation_config.timeout == pytest.approx(10_800)
+    agent_config = module.agent_config_from_chat_config(
+        generation_config,
+        timeout=float(captured["timeout"]),
+        model_id="",
+        max_iterations=1,
+    )
+    assert agent_config.request_timeout == pytest.approx(10_800)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("module", [runner, resume_runner], ids=["main", "resume"])
 async def test_run_one_records_dynamic_cumulative_generation_budget(
     module,
     monkeypatch: pytest.MonkeyPatch,
