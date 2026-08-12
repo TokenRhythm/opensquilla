@@ -158,7 +158,7 @@ const emit = defineEmits<{
   steer: [index: number]
 }>()
 
-const LONG_PRESS_MS = 1000
+const LONG_PRESS_MS = 750
 const LONG_PRESS_DEADZONE_PX = 7
 const openMenuIndex = ref<number | null>(null)
 const draggingItem = shallowRef<PendingQueueItem | null>(null)

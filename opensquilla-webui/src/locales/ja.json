@@ -3747,7 +3747,7 @@
       "steerRetryUnknownHint": "OpenSquilla はこの誘導が受け付けられたか確認できませんでした。再試行すると元のリクエストを変更せず安全に再送します。",
       "removeUnknownSteer": "保留中メッセージ {index} のこの端末での再試行を破棄します。サーバーが未受信という意味ではありません",
       "queueHint": "キューモード: これらのメッセージは現在の応答が完了すると順番に自動送信されます",
-      "reorderHint": "1 秒間長押ししてからドラッグすると順序を変更できます。Alt+矢印キーでも移動できます。",
+      "reorderHint": "0.75 秒間長押ししてからドラッグすると順序を変更できます。Alt+矢印キーでも移動できます。",
       "reorderStarted": "「{label}」を並べ替えています。新しい位置までドラッグして離してください。",
       "reorderPosition": "「{label}」を {count} 件中 {position} 番目に移動しました。",
       "clearAll": "すべてクリア",

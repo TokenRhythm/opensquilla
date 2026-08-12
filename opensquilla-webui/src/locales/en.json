@@ -3800,7 +3800,7 @@
       "steerRetryUnknownHint": "OpenSquilla could not confirm whether this guidance was accepted. Retry safely replays the exact original request.",
       "removeUnknownSteer": "Discard local retry for pending message {index}; this does not mean the server did not receive it",
       "queueHint": "Queue mode: these messages auto-send in order when the current response finishes",
-      "reorderHint": "Press and hold for 1 second, then drag to reorder. Alt+Arrow also moves this message.",
+      "reorderHint": "Press and hold for 0.75 seconds, then drag to reorder. Alt+Arrow also moves this message.",
       "reorderStarted": "Reordering {label}. Drag to a new position, then release.",
       "reorderPosition": "{label} moved to position {position} of {count}.",
       "clearAll": "Clear all",

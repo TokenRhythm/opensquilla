@@ -3747,7 +3747,7 @@
       "steerRetryUnknownHint": "OpenSquilla n’a pas pu confirmer l’acceptation de cette instruction. Réessayer rejoue de façon sûre la demande d’origine inchangée.",
       "removeUnknownSteer": "Abandonner la nouvelle tentative locale du message en attente {index} ; cela ne signifie pas que le serveur ne l’a pas reçu",
       "queueHint": "Mode file d'attente : ces messages s'envoient automatiquement dans l'ordre à la fin de la réponse actuelle",
-      "reorderHint": "Maintenez pendant 1 seconde puis faites glisser pour réorganiser. Alt+Flèche déplace aussi ce message.",
+      "reorderHint": "Maintenez pendant 0,75 seconde puis faites glisser pour réorganiser. Alt+Flèche déplace aussi ce message.",
       "reorderStarted": "Réorganisation de {label}. Faites glisser vers la nouvelle position puis relâchez.",
       "reorderPosition": "{label} a été déplacé en position {position} sur {count}.",
       "clearAll": "Tout effacer",

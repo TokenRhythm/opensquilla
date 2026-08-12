@@ -3800,7 +3800,7 @@
       "steerRetryUnknownHint": "OpenSquilla 无法确认这条引导是否已被接受。重试会安全地原样重放首次请求。",
       "removeUnknownSteer": "放弃待发送消息 {index} 在本设备上的重试；这不代表服务端未接收",
       "queueHint": "排队模式：这些消息会在当前回复结束后按顺序自动发送",
-      "reorderHint": "长按 1 秒后拖动可调整发送顺序，也可使用 Alt+方向键移动。",
+      "reorderHint": "长按 0.75 秒后拖动可调整发送顺序，也可使用 Alt+方向键移动。",
       "reorderStarted": "正在调整“{label}”的位置，拖动到新位置后松开。",
       "reorderPosition": "“{label}”已移动到第 {position} 位，共 {count} 条。",
       "clearAll": "全部清除",

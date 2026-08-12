@@ -363,7 +363,7 @@ describe('PendingQueue', () => {
     app.unmount()
   })
 
-  it('activates pointer sorting only after a one-second hold and reorders past a midpoint', async () => {
+  it('activates pointer sorting only after a 750 ms hold and reorders past a midpoint', async () => {
     vi.useFakeTimers()
     const starts: number[] = []
     const moves: Array<[number, number]> = []
@@ -390,7 +390,7 @@ describe('PendingQueue', () => {
       }))
       await nextTick()
       expect(cards[0]?.classList.contains('is-reorder-arming')).toBe(true)
-      await vi.advanceTimersByTimeAsync(999)
+      await vi.advanceTimersByTimeAsync(749)
       expect(starts).toEqual([])
       expect(cards[0]?.classList.contains('is-reordering')).toBe(false)
 
@@ -444,7 +444,7 @@ describe('PendingQueue', () => {
         clientX: 25,
         clientY: 10,
       }))
-      await vi.advanceTimersByTimeAsync(1000)
+      await vi.advanceTimersByTimeAsync(750)
       expect(started).toBe(0)
     } finally {
       app.unmount()

@@ -3747,7 +3747,7 @@
       "steerRetryUnknownHint": "OpenSquilla konnte nicht bestätigen, ob diese Anleitung angenommen wurde. Ein erneuter Versuch wiederholt die ursprüngliche Anfrage sicher und unverändert.",
       "removeUnknownSteer": "Lokalen Wiederholungsversuch für ausstehende Nachricht {index} verwerfen; dies bedeutet nicht, dass der Server sie nicht empfangen hat",
       "queueHint": "Warteschlangenmodus: Diese Nachrichten werden der Reihe nach automatisch gesendet, wenn die aktuelle Antwort abgeschlossen ist",
-      "reorderHint": "1 Sekunde gedrückt halten und dann ziehen, um die Reihenfolge zu ändern. Alt+Pfeiltaste verschiebt die Nachricht ebenfalls.",
+      "reorderHint": "0,75 Sekunden gedrückt halten und dann ziehen, um die Reihenfolge zu ändern. Alt+Pfeiltaste verschiebt die Nachricht ebenfalls.",
       "reorderStarted": "{label} wird neu angeordnet. An die neue Position ziehen und loslassen.",
       "reorderPosition": "{label} wurde an Position {position} von {count} verschoben.",
       "clearAll": "Alle löschen",
