@@ -1903,18 +1903,26 @@ def in_process_network_precondition(
     the network — so a surface cannot report a tool ready and then have the very
     next query refused.
 
-    Only the two preconditions :func:`guard_in_process_network_action` settles
-    before any approval machinery are reported, so this stays a pure read: a
-    readiness poll must not enqueue approvals or write denial-ledger entries. A
-    ``None`` result therefore means nothing known blocks the call, not that a
-    particular host will be allowed.
+    Only the preconditions :func:`run_in_process_network_action` settles before
+    any approval machinery are reported, so this stays a pure read: a readiness
+    poll must not enqueue approvals or write denial-ledger entries. A ``None``
+    result therefore means nothing known blocks the call, not that a particular
+    host will be allowed.
     """
     mode = effective_network_mode(action_kind, runtime=runtime)
     if mode is None:
         return None
-    if mode == NetworkMode.NONE and _is_in_process_network_action(action_kind):
-        return "Sandbox network is disabled for this in-process network tool."
-    if mode == NetworkMode.PROXY_ALLOWLIST and _current_run_context_for_network_proxy() is None:
+    context = _current_run_context_for_network_proxy()
+    if (
+        mode == NetworkMode.NONE
+        and _is_in_process_network_action(action_kind)
+        and context is None
+    ):
+        return (
+            "Network-disabled in-process tools require Run Context grants before "
+            "they can request or use network approvals."
+        )
+    if mode == NetworkMode.PROXY_ALLOWLIST and context is None:
         return (
             "NetworkMode.PROXY_ALLOWLIST requires Run Context grants to run "
             "in-process network tools through the managed proxy."

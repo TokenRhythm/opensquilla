@@ -14,7 +14,6 @@ implementation would have to keep in step.
 from __future__ import annotations
 
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -90,7 +89,7 @@ async def test_the_reported_posture_reports_the_reason_it_will_refuse(tmp_path: 
 
 
 @pytest.mark.asyncio
-async def test_a_disabled_network_says_so_instead_of_blaming_run_context(
+async def test_a_disabled_network_without_run_context_reports_required_grant(
     tmp_path: Path,
 ) -> None:
     configure_runtime(_POSTURES["no-managed-network"], workspace=tmp_path)
@@ -98,19 +97,22 @@ async def test_a_disabled_network_says_so_instead_of_blaming_run_context(
     reason = in_process_network_precondition()
 
     assert reason is not None
-    assert "network is disabled" in reason
-    assert "Run Context" not in reason
+    assert "Network-disabled" in reason
+    assert "Run Context grants" in reason
 
 
 @pytest.mark.asyncio
-async def test_an_established_run_context_clears_the_precondition(tmp_path: Path) -> None:
-    from opensquilla.tools.types import current_tool_context
+@pytest.mark.parametrize("posture", ["recommended", "no-managed-network"])
+async def test_an_established_run_context_clears_the_precondition_and_the_call_runs(
+    posture: str, tmp_path: Path
+) -> None:
+    from opensquilla.tools.types import ToolContext, current_tool_context
 
-    configure_runtime(_POSTURES["recommended"], workspace=tmp_path)
+    configure_runtime(_POSTURES[posture], workspace=tmp_path)
     assert in_process_network_precondition() is not None
 
     token = current_tool_context.set(
-        SimpleNamespace(
+        ToolContext(
             sandbox_run_context=RunContext(run_mode=RunMode.SAFE, workspace=str(tmp_path)),
             session_key=None,
             workspace_dir=str(tmp_path),
@@ -118,6 +120,7 @@ async def test_an_established_run_context_clears_the_precondition(tmp_path: Path
     )
     try:
         assert in_process_network_precondition() is None
+        assert not await _query_denied(tmp_path)
     finally:
         current_tool_context.reset(token)
 
