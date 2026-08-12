@@ -5255,9 +5255,9 @@ class TestSessionsRename:
     @pytest.mark.parametrize(
         ("display_name", "expected_ok"),
         [
-            ("界" * 512, True),
-            ("界" * 513, False),
-            ("界" * 100_000, False),
+            pytest.param("界" * 512, True, id="unicode-512"),
+            pytest.param("界" * 513, False, id="unicode-513"),
+            pytest.param("界" * 100_000, False, id="unicode-100000"),
         ],
     )
     async def test_rename_enforces_bounded_display_name(
