@@ -4,6 +4,7 @@ import type {
   ChatEnsembleMetaModel,
   ChatEnsembleTrace,
   ChatEnsembleUsageRow,
+  ChatCreatedSessionLink,
   ChatMessage,
   ChatMessageMeta,
   ChatRenderedMessage,
@@ -39,6 +40,7 @@ import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { InterruptViewState } from '@/types/parts'
 import { toParts, toolState, type ToPartsInterrupt } from '@/utils/chat/toParts'
 import { toSources } from '@/utils/chat/toSources'
+import { createdSessionFromToolCall } from '@/utils/chat/createdSessions'
 import { relativeTime, type TimeTranslator } from '@/utils/messageTime'
 import {
   isLegacySilentSentinelOnly,
@@ -183,6 +185,67 @@ function terminatesPriorAssistant(message: ChatMessage, priorAssistant?: ChatMes
     && message.turnId === priorAssistant.turnId
 }
 
+function createdSessionLinksFromCalls(calls: ChatToolCall[]): ChatCreatedSessionLink[] {
+  return calls.flatMap((call) => {
+    const link = createdSessionFromToolCall(call)
+    return link ? [link] : []
+  })
+}
+
+function completionChildSessionKey(message: ChatMessage): string {
+  const provenanceKey = String(message.provenanceSourceSessionKey || '').trim()
+  if (provenanceKey) return provenanceKey
+  try {
+    const payload = JSON.parse(message.text) as Record<string, unknown>
+    return typeof payload.child_session_key === 'string'
+      ? payload.child_session_key.trim()
+      : ''
+  } catch {
+    return ''
+  }
+}
+
+function rehomeCompletedSessionCards(
+  rawMessages: readonly ChatMessage[],
+  renderedMessages: ChatRenderedMessage[],
+  isCompletion: UseChatRenderedMessagesOptions['isSubagentCompletionMessage'],
+): void {
+  const completionIndices = new Map<string, number>()
+  rawMessages.forEach((message, index) => {
+    if (!isCompletion(message.role, message.text, message)) return
+    const childSessionKey = completionChildSessionKey(message)
+    if (childSessionKey && !completionIndices.has(childSessionKey)) {
+      completionIndices.set(childSessionKey, index)
+    }
+  })
+
+  for (const source of renderedMessages) {
+    const links = source.createdSessionLinks ?? []
+    if (!links.length || source.sourceIndex === undefined) continue
+    const sourceOwnsCards = (source.toolCalls ?? [])
+      .some(call => createdSessionFromToolCall(call) !== null)
+    if (!sourceOwnsCards) continue
+    const boundaries = links.map(link => completionIndices.get(link.sessionKey))
+    if (boundaries.some(index => index === undefined)) continue
+    const completionBoundary = Math.max(source.sourceIndex, ...boundaries as number[])
+    const target = renderedMessages.find(message => (
+      message.displayRole === 'assistant'
+      && message.sourceIndex !== undefined
+      && message.sourceIndex > completionBoundary
+      && message.text.trim().length > 0
+    ))
+    if (!target) continue
+
+    const existing = target.createdSessionLinks ?? []
+    const seen = new Set(existing.map(link => link.callId))
+    target.createdSessionLinks = [
+      ...existing,
+      ...links.filter(link => !seen.has(link.callId)),
+    ]
+    source.createdSessionLinks = []
+  }
+}
+
 export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions) {
   const renderedMessages = computed((): ChatRenderedMessage[] => {
     const result: ChatRenderedMessage[] = []
@@ -279,6 +342,15 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         }
       }
 
+      // Subagent completion is a durable control-plane row used to wake the
+      // parent model. It belongs in the parent transcript, but it is not a
+      // parent-chat message and must never project its JSON (or any metadata
+      // attached by compatibility gateways) into the visible conversation.
+      if (options.isSubagentCompletionMessage(msg.role, msg.text, msg)) {
+        prevRole = ''
+        continue
+      }
+
       const routerDecision = normalizeRouterDecision(msg.routerDecision || (msg.provenanceKind === 'router_decision' ? msg : null))
       if (routerDecision) {
         const stripItem = renderedRouterStrip(
@@ -316,7 +388,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         }
         prevRole = ''
       } else {
-        const usageRouterDecision = routerDecisionFromUsage(msg)
+        const usageRouterDecision = routerDecisionFromUsage(msg, inheritedSubagentRoute(msg))
         if (usageRouterDecision) {
           const stripItem = renderedRouterStrip(
             msg,
@@ -332,9 +404,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         }
       }
 
-      const isSubagent = options.isSubagentCompletionMessage(msg.role, msg.text, msg)
-      const displayRole = isSubagent ? 'subagent' : msg.role
-      const roleLabel = displayRole === 'user' ? 'You' : displayRole === 'assistant' ? 'Assistant' : displayRole === 'subagent' ? 'Sub-agent' : displayRole.charAt(0).toUpperCase() + displayRole.slice(1)
+      const displayRole = msg.role
+      const roleLabel = displayRole === 'user' ? 'You' : displayRole === 'assistant' ? 'Assistant' : displayRole.charAt(0).toUpperCase() + displayRole.slice(1)
       const collapsible = displayRole === 'user' || displayRole === 'assistant'
       const sameGroup = collapsible && displayRole === prevRole && day === prevDay && day !== ''
       if (collapsible) prevRole = displayRole
@@ -385,6 +456,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         turnOutcome: msg.turnOutcome,
         hasAttachments: !!msg.attachments?.length,
         attachments: msg.attachments,
+        createdSessionLinks: createdSessionLinksFromCalls(normalizedToolCalls),
         // submit_plan is a transport/control detail. Once a typed immutable
         // plan part exists, the plan card is the authoritative visible item;
         // do not also render the same payload as an expandable tool timeline.
@@ -444,6 +516,11 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       }
     }
 
+    rehomeCompletedSessionCards(
+      options.messages.value,
+      result,
+      options.isSubagentCompletionMessage,
+    )
     return result
   })
 
@@ -493,6 +570,31 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       winnerIdx: routerWinnerCellIndex(cells, decision.tier),
       messageId: messageId || `${index}-router`,
     }
+  }
+
+  function inheritedSubagentRoute(msg: ChatMessage): NormalizedRouterDecision | null {
+    if (!options.sessionKey.value.includes(':subagent:')) return null
+    const usage = msg.usage || msg.turn_usage
+    if (!usage || (usage.routing_source && usage.routing_source !== 'none')) return null
+    const model = String(usage.routed_model || usage.model || msg.model || '').trim()
+    if (!model) return null
+
+    const tier = options.routerSlots.value.find((slot) => {
+      const configured = String(
+        options.routerModels.value[slot]
+        || options.routerTierConfigs.value[slot]?.model
+        || '',
+      ).trim()
+      return configured === model
+    })
+    if (!tier) return null
+    return normalizeRouterDecision({
+      tier,
+      model,
+      source: 'session_model',
+      routing_applied: true,
+      rollout_phase: usage.rollout_phase || 'full',
+    })
   }
 
   function renderedEnsembleRouterStrip(
@@ -1143,9 +1245,13 @@ export function normalizeRouterDecision(raw: unknown): NormalizedRouterDecision 
   }
 }
 
-function routerDecisionFromUsage(msg: ChatMessage): NormalizedRouterDecision | null {
+function routerDecisionFromUsage(
+  msg: ChatMessage,
+  inheritedRoute: NormalizedRouterDecision | null = null,
+): NormalizedRouterDecision | null {
   const usage = msg.usage || msg.turn_usage
-  if (!usage || usage.routing_source === 'none') return null
+  if (!usage) return inheritedRoute
+  if (usage.routing_source === 'none') return inheritedRoute
   const routePlan = usage.route_plan
   const immutablePlan = (
     routePlan
@@ -1157,7 +1263,7 @@ function routerDecisionFromUsage(msg: ChatMessage): NormalizedRouterDecision | n
   const tier = typeof immutablePlan?.tier === 'string'
     ? immutablePlan.tier
     : typeof usage.routed_tier === 'string' ? usage.routed_tier : ''
-  if (!tier) return null
+  if (!tier) return inheritedRoute
   const source = typeof immutablePlan?.source === 'string'
     ? immutablePlan.source
     : usage.routing_source || 'none'

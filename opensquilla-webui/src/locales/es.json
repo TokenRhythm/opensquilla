@@ -3174,6 +3174,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Chat creado",
+      "open": "Abrir chat"
+    },
     "promptCacheKeepalive": {
       "action": "Mantener caché del prompt",
       "title": "Mantener caché del prompt",

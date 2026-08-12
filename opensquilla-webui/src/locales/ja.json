@@ -3174,6 +3174,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "チャットを作成しました",
+      "open": "チャットを開く"
+    },
     "promptCacheKeepalive": {
       "action": "プロンプトキャッシュの維持",
       "title": "プロンプトキャッシュの維持",

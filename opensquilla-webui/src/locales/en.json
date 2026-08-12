@@ -3225,6 +3225,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Chat created",
+      "open": "Open chat"
+    },
     "promptCacheKeepalive": {
       "action": "Prompt cache keepalive",
       "title": "Prompt cache keepalive",

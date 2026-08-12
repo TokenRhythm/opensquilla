@@ -201,6 +201,253 @@ describe('useChatRenderedMessages internal control turns', () => {
     expect(api.renderedMessages.value).toHaveLength(1)
     expect(api.renderedMessages.value[0]?.hasAttachments).toBe(true)
   })
+
+  it('keeps subagent completion control rows out while retaining the parent creation route', () => {
+    const messages: ChatMessage[] = [
+      { role: 'user', text: 'Create a child chat', ts: 1, turnId: 'parent-turn' },
+      {
+        role: 'router',
+        text: '',
+        ts: 2,
+        turnId: 'parent-turn',
+        provenanceKind: 'router_decision',
+        routerDecision: {
+          tier: 'c0',
+          model: 'deepseek-v4-flash',
+          source: 'heuristic',
+        },
+      },
+      {
+        role: 'system',
+        text: '{"type":"subagent_completion","child_session_key":"agent:main:subagent:child1"}',
+        ts: 3,
+        provenanceKind: 'internal_system',
+        provenanceSourceTool: 'subagent_completion',
+        provenanceSourceSessionKey: 'agent:main:subagent:child1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: 4,
+        turnId: 'parent-turn',
+        usage: {
+          routed_tier: 'c0',
+          routed_model: 'deepseek-v4-flash',
+          routing_source: 'heuristic',
+        },
+        tool_calls: [
+          {
+            type: 'tool_use',
+            tool_use_id: 'spawn-1',
+            name: 'sessions_spawn',
+            input: { task: 'Do the work' },
+          },
+          {
+            type: 'tool_result',
+            tool_use_id: 'spawn-1',
+            name: 'sessions_spawn',
+            result: '{"session_key":"agent:main:subagent:child1"}',
+            is_error: false,
+          },
+        ],
+      },
+      { role: 'assistant', text: 'Child completed', ts: 5, turnId: 'parent-resume' },
+    ]
+    const api = useChatRenderedMessages({
+      messages: ref(messages),
+      sessionKey: ref('agent:main:webchat:parent'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({ c0: 'deepseek-v4-flash', c1: 'deepseek-v4-pro' }),
+      routerTierConfigs: ref({
+        c0: { model: 'deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek-v4-pro', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: (role, text, message) => (
+        role === 'system'
+        && (
+          message?.provenanceSourceTool === 'subagent_completion'
+          || text.includes('"type":"subagent_completion"')
+        )
+      ),
+    })
+
+    expect(api.renderedMessages.value.find(message => message.isRouterStrip)?.gridCells)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ model: 'deepseek-v4-flash' })]))
+    expect(api.renderedMessages.value.some(message => message.displayRole === 'subagent')).toBe(false)
+    expect(api.renderedMessages.value.some(message => message.text.includes('subagent_completion'))).toBe(false)
+    expect(api.renderedMessages.value.find(message => (
+      message.sourceIndex === 3 && message.displayRole === 'assistant'
+    ))?.toolCalls)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ name: 'sessions_spawn' })]))
+    expect(api.renderedMessages.value.find(message => (
+      message.sourceIndex === 3 && message.displayRole === 'assistant'
+    ))?.createdSessionLinks)
+      .toEqual([])
+    const parentReply = api.renderedMessages.value[api.renderedMessages.value.length - 1]
+    expect(parentReply?.text).toBe('Child completed')
+    expect(parentReply?.createdSessionLinks).toEqual([{
+      callId: 'spawn-1',
+      sessionKey: 'agent:main:subagent:child1',
+    }])
+  })
+
+  it('shows the actual inherited model route on the child session', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Do the work', ts: 1 },
+        {
+          role: 'assistant',
+          text: 'Done',
+          ts: 2,
+          restoredFromHistory: true,
+          usage: {
+            model: 'deepseek-v4-pro',
+            routed_model: 'deepseek-v4-pro',
+            routing_source: 'none',
+            routing_applied: true,
+          },
+        },
+      ]),
+      sessionKey: ref('agent:main:subagent:child1'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({ c0: 'deepseek-v4-flash', c1: 'deepseek-v4-pro' }),
+      routerTierConfigs: ref({
+        c0: { model: 'deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek-v4-pro', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.routerSource).toBe('session_model')
+    expect(strip?.gridCells?.[strip.winnerIdx ?? -1]?.model).toBe('deepseek-v4-pro')
+    expect(api.renderedMessages.value[api.renderedMessages.value.length - 1]?.text).toBe('Done')
+  })
+
+  it('keeps the card at its source when completion identity is missing', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        {
+          role: 'assistant',
+          text: '',
+          ts: 1,
+          tool_calls: [{
+            type: 'tool_result',
+            tool_use_id: 'spawn-1',
+            name: 'sessions_spawn',
+            result: '{"session_key":"agent:main:subagent:child1"}',
+            is_error: false,
+          }],
+        },
+        {
+          role: 'system',
+          text: '{"type":"subagent_completion"}',
+          ts: 2,
+          provenanceSourceTool: 'subagent_completion',
+        },
+        { role: 'assistant', text: 'Unrelated parent reply', ts: 3 },
+      ]),
+      sessionKey: ref('agent:main:webchat:parent'),
+      routerSlots: ref([]),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(false),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: (role, text, message) => (
+        role === 'system'
+        && (message?.provenanceSourceTool === 'subagent_completion'
+          || text.includes('"type":"subagent_completion"'))
+      ),
+    })
+
+    expect(api.renderedMessages.value.find(message => message.sourceIndex === 0)?.createdSessionLinks)
+      .toEqual([{ callId: 'spawn-1', sessionKey: 'agent:main:subagent:child1' }])
+    expect(api.renderedMessages.value.find(message => message.sourceIndex === 2)?.createdSessionLinks)
+      .toEqual([])
+  })
+
+  it('does not infer a fixed-model route for a regular parent session', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([{
+        role: 'assistant',
+        text: 'Done',
+        ts: 1,
+        usage: {
+          routed_model: 'deepseek-v4-pro',
+          routing_source: 'none',
+        },
+      }]),
+      sessionKey: ref('agent:main:webchat:parent'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({ c0: 'deepseek-v4-flash', c1: 'deepseek-v4-pro' }),
+      routerTierConfigs: ref({
+        c0: { model: 'deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek-v4-pro', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    expect(api.renderedMessages.value.some(message => message.isRouterStrip)).toBe(false)
+  })
+
+  it('keeps parent routing visible when session creation fails or returns no child key', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'Create a child chat', ts: 1 },
+        {
+          role: 'assistant',
+          text: '',
+          ts: 2,
+          usage: {
+            routed_tier: 'c0',
+            routed_model: 'deepseek-v4-flash',
+            routing_source: 'heuristic',
+          },
+          tool_calls: [{
+            type: 'tool_result',
+            tool_use_id: 'spawn-failed',
+            name: 'sessions_spawn',
+            result: '{"status":"error"}',
+            is_error: true,
+          }],
+        },
+      ]),
+      sessionKey: ref('agent:main:webchat:parent'),
+      routerSlots: ref(['c0', 'c1']),
+      routerModels: ref({ c0: 'deepseek-v4-flash', c1: 'deepseek-v4-pro' }),
+      routerTierConfigs: ref({
+        c0: { model: 'deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek-v4-pro', supportsImage: false, imageOnly: false },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    expect(api.renderedMessages.value.find(message => message.isRouterStrip)?.routerSource)
+      .toBe('heuristic')
+  })
 })
 
 describe('useChatRenderedMessages silent sentinel compatibility', () => {
