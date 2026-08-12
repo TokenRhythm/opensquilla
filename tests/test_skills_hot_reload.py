@@ -9,7 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.skills import file_hash
 from opensquilla.skills import loader as skill_loader_module
+from opensquilla.skills.file_hash import _TreeChangedDuringHashError
 from opensquilla.skills.loader import MAX_SKILL_FILE_BYTES, SkillLoader
 
 
@@ -28,6 +30,24 @@ def _write_skill(root: Path, name: str, description: str = "description") -> Pat
 
 def _loader(root: Path, tmp_path: Path) -> SkillLoader:
     return SkillLoader(workspace_dir=root, snapshot_path=tmp_path / "snapshot.json")
+
+
+def _inject_transient_tree_hash_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[int]:
+    original_compute_tree_sha256 = skill_loader_module.compute_tree_sha256
+    calls = [0]
+
+    def fail_first_tree_hash(path: Path) -> str:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise _TreeChangedDuringHashError(
+                f"Skill tree entry changed while hashing {path}: metadata changed"
+            )
+        return original_compute_tree_sha256(path)
+
+    monkeypatch.setattr(skill_loader_module, "compute_tree_sha256", fail_first_tree_hash)
+    return calls
 
 
 def test_loader_normalizes_crlf_before_parsing_yaml_block_scalars(tmp_path: Path) -> None:
@@ -303,6 +323,45 @@ def test_invalid_new_is_ignored_and_invalid_existing_keeps_last_good(tmp_path: P
     repaired = loader.refresh_if_changed("test")
     assert repaired.partial is True  # the unrelated broken source remains
     assert loader.get_by_name("alpha").description == "repaired"  # type: ignore[union-attr]
+
+
+def test_unreadable_payload_is_a_per_skill_partial_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    blocked_skill = _write_skill(root, "blocked").parent
+    blocked_payload = blocked_skill / "payload.bin"
+    blocked_payload.write_bytes(b"unreadable payload")
+    _write_skill(root, "valid")
+    original_open = file_hash.os.open
+    original_read_chunk = file_hash._read_chunk
+    denied_descriptors: set[int] = set()
+
+    def track_payload_descriptor(path: Path, flags: int) -> int:
+        descriptor = original_open(path, flags)
+        if Path(path) == blocked_payload:
+            denied_descriptors.add(descriptor)
+        return descriptor
+
+    def deny_payload_read(descriptor: int, size: int) -> bytes:
+        if descriptor in denied_descriptors:
+            denied_descriptors.remove(descriptor)
+            raise PermissionError("stable payload denial")
+        return original_read_chunk(descriptor, size)
+
+    monkeypatch.setattr(file_hash.os, "open", track_payload_descriptor)
+    monkeypatch.setattr(file_hash, "_read_chunk", deny_payload_read)
+    loader = _loader(root, tmp_path)
+
+    result = loader.refresh_if_changed("cold start")
+
+    assert result.success is True
+    assert result.partial is True
+    assert [skill.name for skill in loader.snapshot().skills] == ["valid"]
+    assert len(result.errors) == 1
+    assert result.errors[0].name == "blocked"
+    assert result.errors[0].kept_previous is False
 
 
 @pytest.mark.parametrize("invalid_name", ["[bad]", "{bad: value}", "null", "123", "''"])
@@ -661,6 +720,69 @@ def test_global_scan_failure_keeps_last_known_good(tmp_path: Path, monkeypatch) 
     assert result.success is False
     assert result.generation == generation
     assert [skill.name for skill in loader.snapshot().skills] == ["alpha"]
+
+
+def test_cold_start_tree_hash_race_retries_without_manifest_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha")
+    snapshot_path = tmp_path / "snapshot.json"
+    loader = SkillLoader(workspace_dir=root, snapshot_path=snapshot_path)
+    calls = _inject_transient_tree_hash_race(monkeypatch)
+
+    failed = loader.refresh_if_changed("metadata-only race")
+
+    assert failed.success is False
+    assert failed.generation == 0
+    assert failed.errors[0].kept_previous is False
+    assert loader.snapshot().generation == 0
+    assert loader.snapshot().skills == ()
+    assert loader._initialized is False
+    assert not snapshot_path.exists()
+
+    recovered = loader.refresh_if_changed("next ordinary access")
+
+    assert recovered.success is True
+    assert recovered.added == ("alpha",)
+    assert loader.snapshot().generation == 1
+    assert loader.get_by_name("alpha") is not None
+    assert loader._initialized is True
+    assert calls == [2]
+
+
+def test_warm_tree_hash_race_keeps_lkg_until_next_refresh(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "skills"
+    _write_skill(root, "alpha", "last known good")
+    loader = _loader(root, tmp_path)
+    loader.load_all()
+    old = loader.snapshot()
+    _write_skill(root, "alpha", "new candidate")
+    calls = _inject_transient_tree_hash_race(monkeypatch)
+
+    failed = loader.refresh_if_changed("metadata-only race")
+
+    assert failed.success is False
+    assert failed.generation == old.generation
+    assert failed.errors[0].kept_previous is True
+    assert loader.snapshot() is old
+    old_skill = loader.snapshot().get_by_name("alpha")
+    assert old_skill is not None
+    assert old_skill.description == "last known good"
+
+    recovered = loader.refresh_if_changed("next ordinary access")
+
+    assert recovered.success is True
+    assert recovered.modified == ("alpha",)
+    assert loader.snapshot().generation == old.generation + 1
+    recovered_skill = loader.snapshot().get_by_name("alpha")
+    assert recovered_skill is not None
+    assert recovered_skill.description == "new candidate"
+    assert calls == [2]
 
 
 def test_publish_writes_snapshot_without_reentering_loader(

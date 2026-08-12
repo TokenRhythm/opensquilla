@@ -537,6 +537,11 @@ export interface ChatMessageMeta {
   decisionId?: string
 }
 
+export interface ChatCreatedSessionLink {
+  callId: string
+  sessionKey: string
+}
+
 export interface ChatRenderedMessage {
   id?: string
   clientId?: string
@@ -567,6 +572,9 @@ export interface ChatRenderedMessage {
   turnOutcome?: ChatTurnOutcome
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
+  /** Explicit placement for successful sessions_spawn cards. An empty array
+   *  suppresses the source card after it is rehomed below the parent reply. */
+  createdSessionLinks?: ChatCreatedSessionLink[]
   toolCalls?: ChatToolCall[]
   planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timelineItems?: ChatStreamTimelineItem[]

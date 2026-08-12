@@ -17,6 +17,7 @@ from typing import Any
 import structlog
 
 from opensquilla.paths import default_opensquilla_home
+from opensquilla.skills.file_hash import _TreeChangedDuringHashError
 from opensquilla.skills.manifest import (
     MAX_SKILL_FILE_BYTES,
     SkillCompileProfile,
@@ -1551,6 +1552,14 @@ class SkillLoader:
             )
             skill.tree_digest = compute_tree_sha256(skill_dir)
             return skill
+        except _TreeChangedDuringHashError:
+            # A tree digest is an integrity boundary, not a per-Skill parse
+            # concern.  Publishing a catalog that silently omits this Skill
+            # could make a metadata-only race permanent because the cheap
+            # manifest probe may see no subsequent change.  Let the catalog
+            # refresh fail atomically so cold starts retry and warm loaders
+            # retain their complete last-known-good snapshot.
+            raise
         except Exception as exc:
             log.debug("skill.load_failed", dir=str(skill_dir), error=str(exc))
             return None

@@ -3174,6 +3174,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "チャットを作成しました",
+      "open": "チャットを開く"
+    },
     "promptCacheKeepalive": {
       "action": "プロンプトキャッシュの維持",
       "title": "プロンプトキャッシュの維持",
@@ -4009,6 +4013,7 @@
     "sidebar": {
       "recentConversations": "最近のタスク",
       "recents": "最近",
+      "pinned": "ピン留め",
       "refresh": "タスクを再読み込み",
       "clearAgentFilter": "エージェントフィルターをクリア: {name}",
       "loadError": "タスクを読み込めません",

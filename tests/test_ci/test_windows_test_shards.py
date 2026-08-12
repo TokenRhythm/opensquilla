@@ -59,6 +59,9 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    "tests/test_scripts/test_bench_skill_integrity.py",
+    "tests/test_skills_hash_consumers.py",
+    "tests/test_skills_tree.py",
     "tests/test_recovery/test_config_recovery.py",
     "tests/unit/cli/tui/test_keys_cheatsheet.py",
     "tests/unit/cli/tui/test_opentui_prefs.py",
@@ -239,6 +242,9 @@ def test_windows_shard_responsibilities_cover_high_risk_surfaces() -> None:
         ),
         "tests/test_uninstall/test_safety.py": "desktop-installer-contracts",
         "tests/test_install_scripts.py": "desktop-installer-contracts",
+        "tests/test_scripts/test_bench_skill_integrity.py": "recovery-migration",
+        "tests/test_skills_hash_consumers.py": "recovery-migration",
+        "tests/test_skills_tree.py": "recovery-migration",
     }
 
     assert {path: shard_for_test(path) for path in expected} == expected

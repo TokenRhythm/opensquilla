@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import stat
 import tempfile
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from opensquilla.skills.file_hash import _stream_file_into_digest
 from opensquilla.skills.hub.archive import normalize_relative_path
 from opensquilla.skills.hub.contracts import (
     DiagnosticPhase,
@@ -20,6 +23,11 @@ from opensquilla.skills.hub.contracts import (
 from opensquilla.skills.tree import compute_tree_sha256
 
 LOCKFILE_SCHEMA_VERSION = 2
+
+_IGNORED_FILE_PREDICATE_ERRNOS = frozenset(
+    {errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP}
+)
+_IGNORED_FILE_PREDICATE_WINERRORS = frozenset({21, 123, 1921})
 
 _STRING_ENTRY_FIELDS = (
     "source",
@@ -953,9 +961,33 @@ def compute_sha256(directory: Path) -> str:
     hasher = hashlib.sha256()
     for path in sorted(directory.rglob("*")):
         relative = path.relative_to(directory)
-        if path.is_file() and not any(part.startswith(".") for part in relative.parts):
+        try:
+            path_info = path.lstat()
+            info = path.stat() if stat.S_ISLNK(path_info.st_mode) else path_info
+        except OSError as exc:
+            # Match Python 3.12 ``Path.is_file()``: missing, broken, or invalid
+            # paths are skipped, while permission and I/O failures propagate.
+            if (
+                exc.errno not in _IGNORED_FILE_PREDICATE_ERRNOS
+                and getattr(exc, "winerror", None)
+                not in _IGNORED_FILE_PREDICATE_WINERRORS
+            ):
+                raise
+            continue
+        except ValueError:
+            # ``Path.is_file()`` also treats non-encodable paths as non-files.
+            continue
+        if stat.S_ISREG(info.st_mode) and not any(
+            part.startswith(".") for part in relative.parts
+        ):
             hasher.update(str(relative).encode())
-            hasher.update(path.read_bytes())
+            _stream_file_into_digest(
+                path,
+                hasher,
+                follow_symlinks=True,
+                expected_stat=info,
+                expected_path_stat=path_info,
+            )
     return hasher.hexdigest()
 
 

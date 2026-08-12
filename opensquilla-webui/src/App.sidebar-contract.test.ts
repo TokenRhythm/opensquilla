@@ -40,6 +40,15 @@ describe('App sidebar chrome contract', () => {
     expect(singleDelete).toContain('appStore.removePendingApprovalsForSessions(deleted)')
   })
 
+  it('uses the write-scoped rename RPC for sidebar session titles', () => {
+    const renameStart = appSource.indexOf('async function onRenameSession')
+    const renameEnd = appSource.indexOf('function removeLocalSessions', renameStart)
+    const renameHandler = appSource.slice(renameStart, renameEnd)
+
+    expect(renameHandler).toContain("rpcStore.call('sessions.rename'")
+    expect(renameHandler).not.toContain("rpcStore.call('sessions.patch'")
+  })
+
   it('bounds automatic sidebar RPCs after chat bootstrap admission', () => {
     expect(appSource).toContain('useSessions(\n  optionalSessionRpcCallOptions,\n)')
     expect(appSource).toContain('useAgentOptions(optionalSessionRpcCallOptions)')

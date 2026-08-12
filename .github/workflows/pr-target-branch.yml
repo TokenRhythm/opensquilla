@@ -3,6 +3,8 @@ name: PR target branch
 "on":
   pull_request:
     types: [opened, edited, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -20,7 +22,7 @@ jobs:
           persist-credentials: false
 
       - name: Check out bootstrap validator before first merge
-        if: ${{ hashFiles('.github/scripts/validate-pr-target-branch.sh') == '' }}
+        if: ${{ github.event_name == 'pull_request' && hashFiles('.github/scripts/validate-pr-target-branch.sh') == '' }}
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
@@ -28,8 +30,8 @@ jobs:
 
       - name: Validate target branch
         env:
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_BASE_REF: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_ref || github.event.pull_request.base.ref }}
+          PR_HEAD_REF: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_ref || github.event.pull_request.head.ref }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
