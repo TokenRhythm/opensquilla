@@ -884,6 +884,169 @@ async def test_publish_artifact_requires_completed_attached_plan_run(
 
 
 @pytest.mark.asyncio
+async def test_publish_artifact_checkpoints_the_only_unfinished_final_step(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ready", encoding="utf-8")
+
+    class PlanStorage:
+        def __init__(self) -> None:
+            self.run = SimpleNamespace(
+                status="running",
+                current_step_id="publish",
+                active_task_id="task-1",
+                state_revision=7,
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "publish", "status": "in_progress"},
+                ],
+            )
+            self.checkpoints: list[dict[str, object]] = []
+
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return self.run
+
+        async def checkpoint_plan_run(self, run_id: str, **kwargs: object) -> SimpleNamespace:
+            assert run_id == "run-1"
+            self.checkpoints.append(kwargs)
+            self.run = SimpleNamespace(
+                status="running",
+                current_step_id=None,
+                active_task_id="task-1",
+                state_revision=8,
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "publish", "status": "completed"},
+                ],
+            )
+            return self.run
+
+    storage = PlanStorage()
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=storage,
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        payload = json.loads(await publish_artifact(path="report.txt"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["status"] == "published"
+    assert storage.checkpoints == [
+        {
+            "expected_state_revision": 7,
+            "step_id": "publish",
+            "step_status": "completed",
+            "next_step_id": None,
+            "expected_active_task_id": "task-1",
+        }
+    ]
+    assert len(ctx.published_artifacts) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_does_not_checkpoint_before_the_final_step(
+    tmp_path: Path,
+) -> None:
+    class PlanStorage:
+        def __init__(self) -> None:
+            self.checkpointed = False
+
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="running",
+                current_step_id="build",
+                active_task_id="task-1",
+                state_revision=3,
+                step_states=[
+                    {"step_id": "build", "status": "in_progress"},
+                    {"step_id": "publish", "status": "pending"},
+                ],
+            )
+
+        async def checkpoint_plan_run(self, run_id: str, **kwargs: object) -> None:
+            self.checkpointed = True
+
+    storage = PlanStorage()
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=storage,
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(RetryableToolInputError):
+            await publish_artifact(path="report.txt")
+    finally:
+        current_tool_context.reset(token)
+
+    assert storage.checkpointed is False
+    assert ctx.published_artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_does_not_checkpoint_an_invalid_final_artifact(
+    tmp_path: Path,
+) -> None:
+    class PlanStorage:
+        def __init__(self) -> None:
+            self.checkpointed = False
+
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="running",
+                current_step_id="publish",
+                active_task_id="task-1",
+                state_revision=4,
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "publish", "status": "in_progress"},
+                ],
+            )
+
+        async def checkpoint_plan_run(self, run_id: str, **kwargs: object) -> None:
+            self.checkpointed = True
+
+    storage = PlanStorage()
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=storage,
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(ToolError, match="artifact file not found"):
+            await publish_artifact(path="missing.txt")
+    finally:
+        current_tool_context.reset(token)
+
+    assert storage.checkpointed is False
+    assert ctx.published_artifacts == []
+
+
+@pytest.mark.asyncio
 async def test_publish_artifact_allows_completed_attached_plan_run(
     tmp_path: Path,
 ) -> None:
