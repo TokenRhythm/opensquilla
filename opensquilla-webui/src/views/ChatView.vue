@@ -2986,7 +2986,15 @@ const liveActivityPhaseLabel = computed(() => {
   if (runStatus.value.status === 'queued' || streamActivityStale.value) {
     return streamPhaseLabel.value
   }
-  if (!streamHasVisibleOutput.value) return streamPhaseLabel.value
+  // Keep the slot-acquired boundary explicit until a real provider/router
+  // signal replaces it. Once that activity exists, use the established
+  // timeline projection (for example Working during a tool turn).
+  if (
+    !streamHasVisibleOutput.value
+    && streamPhaseLabel.value === String(t('chat.status.running'))
+  ) {
+    return streamPhaseLabel.value
+  }
   const currentStatus = [...liveActivityProjection.value.statusSteps]
     .reverse()
     .find(step => step.isCurrent)

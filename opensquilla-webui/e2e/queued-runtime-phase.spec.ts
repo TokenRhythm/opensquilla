@@ -147,7 +147,7 @@ test('durable queued stays queued until running and an authoritative router deci
 
   lifecycle.markProviderActive()
   await expect(activity.locator('.assistant-activity__live-label')).toHaveText(
-    'Planning next step',
+    'Working',
   )
   await expect(activity).not.toContainText('Waiting for model')
   await expect(page.locator('.router-fx')).toHaveCount(0)
