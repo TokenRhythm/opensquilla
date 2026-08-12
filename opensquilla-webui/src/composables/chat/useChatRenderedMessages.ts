@@ -228,10 +228,16 @@ function rehomeCompletedSessionCards(
     const boundaries = links.map(link => completionIndices.get(link.sessionKey))
     if (boundaries.some(index => index === undefined)) continue
     const completionBoundary = Math.max(source.sourceIndex, ...boundaries as number[])
+    const nextVisibleUserIndex = rawMessages.findIndex((message, index) => (
+      index > source.sourceIndex!
+      && message.role === 'user'
+      && (message.text.trim().length > 0 || (message.attachments?.length ?? 0) > 0)
+    ))
     const target = renderedMessages.find(message => (
       message.displayRole === 'assistant'
       && message.sourceIndex !== undefined
       && message.sourceIndex > completionBoundary
+      && (nextVisibleUserIndex < 0 || message.sourceIndex < nextVisibleUserIndex)
       && message.text.trim().length > 0
     ))
     if (!target) continue
@@ -545,7 +551,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       )
     }
     const cells = routerDecisionCellsForRequest(decision, requestKind)
-    if (cells.length <= 1) return null
+    const fixedSessionRoute = decision.source === 'session_model'
+    if (cells.length === 0 || (cells.length === 1 && !fixedSessionRoute)) return null
     return {
       id: `router-turn-${turnIdx}`,
       role: 'router',
@@ -573,13 +580,20 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
   }
 
   function inheritedSubagentRoute(msg: ChatMessage): NormalizedRouterDecision | null {
-    if (!options.sessionKey.value.includes(':subagent:')) return null
+    const currentSessionKey = options.sessionKey.value.trim().toLowerCase()
+    if (!(
+      currentSessionKey.startsWith('subagent:')
+      || /^agent:[^:]+:subagent:[^:]+$/.test(currentSessionKey)
+    )) return null
     const usage = msg.usage || msg.turn_usage
-    if (!usage || (usage.routing_source && usage.routing_source !== 'none')) return null
+    const routingSource = String(usage?.routing_source || '').trim().toLowerCase()
+    if (!usage || !['', 'none', 'session_model'].includes(routingSource)) {
+      return null
+    }
     const model = String(usage.routed_model || usage.model || msg.model || '').trim()
     if (!model) return null
 
-    const tier = options.routerSlots.value.find((slot) => {
+    const configuredTier = options.routerSlots.value.find((slot) => {
       const configured = String(
         options.routerModels.value[slot]
         || options.routerTierConfigs.value[slot]?.model
@@ -587,7 +601,10 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       ).trim()
       return configured === model
     })
-    if (!tier) return null
+    // Explicit sessions_spawn models and older session histories need not match
+    // the current router configuration. A synthetic fixed tier preserves the
+    // durable model identity without pretending the router selected it now.
+    const tier = configuredTier || 'session_model'
     return normalizeRouterDecision({
       tier,
       model,

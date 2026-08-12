@@ -379,6 +379,86 @@ describe('useChatRenderedMessages internal control turns', () => {
       .toEqual([])
   })
 
+  it('does not rehome a completed card across the next visible user turn', () => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        {
+          role: 'assistant',
+          text: '',
+          ts: 1,
+          tool_calls: [{
+            type: 'tool_result',
+            tool_use_id: 'spawn-1',
+            name: 'sessions_spawn',
+            result: '{"session_key":"agent:main:subagent:child1"}',
+            is_error: false,
+          }],
+        },
+        {
+          role: 'system',
+          text: '{"type":"subagent_completion","child_session_key":"agent:main:subagent:child1"}',
+          ts: 2,
+          provenanceSourceTool: 'subagent_completion',
+          provenanceSourceSessionKey: 'agent:main:subagent:child1',
+        },
+        { role: 'user', text: 'A separate question', ts: 3 },
+        { role: 'assistant', text: 'A separate answer', ts: 4 },
+      ]),
+      sessionKey: ref('agent:main:webchat:parent'),
+      routerSlots: ref([]),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(false),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: (role, text, message) => (
+        role === 'system'
+        && (message?.provenanceSourceTool === 'subagent_completion'
+          || text.includes('"type":"subagent_completion"'))
+      ),
+    })
+
+    expect(api.renderedMessages.value.find(message => message.sourceIndex === 0)?.createdSessionLinks)
+      .toEqual([{ callId: 'spawn-1', sessionKey: 'agent:main:subagent:child1' }])
+    expect(api.renderedMessages.value.find(message => message.sourceIndex === 3)?.createdSessionLinks)
+      .toEqual([])
+  })
+
+  it.each([
+    ['agent:main:subagent:child1', 'none'],
+    ['subagent:agent:main:webchat:parent', 'session_model'],
+  ])('shows a fixed route for %s with a non-slot model', (childSessionKey, routingSource) => {
+    const api = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([{
+        role: 'assistant',
+        text: 'Done',
+        ts: 1,
+        usage: {
+          routed_model: 'provider/custom-child-model',
+          routing_source: routingSource,
+        },
+      }]),
+      sessionKey: ref(childSessionKey),
+      routerSlots: ref([]),
+      routerModels: ref({}),
+      routerTierConfigs: ref({}),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+    })
+
+    const strip = api.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.routerSource).toBe('session_model')
+    expect(strip?.gridCells).toHaveLength(1)
+    expect(strip?.gridCells?.[strip.winnerIdx ?? -1]?.model)
+      .toBe('provider/custom-child-model')
+  })
+
   it('does not infer a fixed-model route for a regular parent session', () => {
     const api = useChatRenderedMessages({
       messages: ref<ChatMessage[]>([{

@@ -112,6 +112,27 @@ describe('session creation router presentation', () => {
       .toEqual(['prior-route', 'current-creation-route'])
   })
 
+  it('keeps an earlier creation interaction deduplicated after a later user turn', () => {
+    const source = cardOwner('creation-source')
+    const finalReply = message('creation-final', 'assistant', {
+      text: 'Child completed.',
+      createdSessionLinks: source.createdSessionLinks,
+    })
+    source.createdSessionLinks = []
+    const projection = projectSessionCreationRouterPresentation([
+      message('creation-user', 'user'),
+      message('creation-route', 'router', { isRouterStrip: true }),
+      source,
+      message('resume-route', 'router', { isRouterStrip: true }),
+      finalReply,
+      message('later-user', 'user'),
+      message('later-reply', 'assistant', { text: 'A separate answer.' }),
+    ], false)
+
+    expect(projection.messages.filter(item => item.isRouterStrip).map(item => item.id))
+      .toEqual(['creation-route'])
+  })
+
   it('leaves settled history and rehomed cards unchanged', () => {
     const route = message('final-route', 'router', { isRouterStrip: true })
     const rehomedCard = message('final-reply', 'assistant', {

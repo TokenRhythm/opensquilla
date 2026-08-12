@@ -150,6 +150,18 @@ async function mockSessionCreatedHistory(
                 routing_source: 'heuristic',
                 routing_applied: true,
               },
+            }, {
+              role: 'user',
+              text: 'A later separate question',
+              id: 'later-user',
+              timestamp: Math.floor(Date.now() / 1000) + 2,
+              turn_context: { turn_id: 'later-turn' },
+            }, {
+              role: 'assistant',
+              text: 'A later separate answer',
+              id: 'later-assistant',
+              timestamp: Math.floor(Date.now() / 1000) + 3,
+              turn_context: { turn_id: 'later-turn' },
             }],
             has_more: false,
             canonical_available: true,
@@ -240,6 +252,7 @@ test('restores ordered created-chat cards and opens the selected child session',
   await expect(page.getByText('Sub-agent', { exact: true })).toHaveCount(0)
   await expect(page.getByText('subagent_completion')).toHaveCount(0)
   await expect(page.getByRole('group', { name: 'Router selected deepseek-v4-flash' })).toHaveCount(1)
+  await expect(page.locator('.chat-message-surface .router-fx')).toHaveCount(1)
   const finalReply = page.locator('.msg-ai').filter({ hasText: 'Parent final reply' })
   await expect(finalReply.getByTestId('session-created-card')).toHaveCount(2)
   await expect.poll(async () => {

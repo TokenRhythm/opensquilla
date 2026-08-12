@@ -25,57 +25,50 @@ export function projectSessionCreationRouterPresentation(
   messages: readonly ChatRenderedMessage[],
   isStreaming: boolean,
 ): SessionCreationRouterPresentation {
-  let latestUserIndex = -1
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.displayRole === 'user') {
-      latestUserIndex = index
-      break
-    }
-  }
+  const suppressedRouters = new Set<number>()
+  let interactionStart = 0
+  let active = false
 
-  let cardIndex = -1
-  let hasCreationSource = false
-  for (let index = messages.length - 1; index > latestUserIndex; index -= 1) {
-    const message = messages[index]!
-    if (cardIndex < 0 && (message.createdSessionLinks?.length ?? 0) > 0) cardIndex = index
-    if (createsSession(message)) hasCreationSource = true
-  }
-  // Rehoming intentionally separates these signals: the source assistant keeps
-  // the successful sessions_spawn tool while the final parent reply owns the
-  // visible card. Requiring both signals prevents unrelated cards or malformed
-  // tool results from collapsing ordinary route history.
-  if (cardIndex < 0 || !hasCreationSource) {
-    return { messages: messages as ChatRenderedMessage[], active: false }
-  }
+  function projectInteraction(start: number, end: number): void {
+    const interaction = messages.slice(start, end)
+    // Rehoming intentionally separates these signals: the source assistant
+    // keeps the successful sessions_spawn tool while the final parent reply
+    // owns the visible card. Requiring both prevents unrelated cards or
+    // malformed tool results from collapsing ordinary route history.
+    const hasCard = interaction.some(message => (
+      (message.createdSessionLinks?.length ?? 0) > 0
+    ))
+    const hasCreationSource = interaction.some(createsSession)
+    if (!hasCard || !hasCreationSource) return
 
-  if (!isStreaming) {
-    const routerIndices = messages.flatMap((message, index) => (
-      message.isRouterStrip && index > latestUserIndex ? [index] : []
+    const routerIndices = interaction.flatMap((message, offset) => (
+      message.isRouterStrip ? [start + offset] : []
     ))
     if (routerIndices.length <= 1) {
-      return { messages: messages as ChatRenderedMessage[], active: false }
+      if (isStreaming && end === messages.length) active = true
+      return
     }
-    const firstRouterIndex = routerIndices[0]
-    return {
-      messages: messages.filter((message, index) => !(
-        message.isRouterStrip
-        && index > latestUserIndex
-        && index !== firstRouterIndex
-      )),
-      active: false,
-    }
+    routerIndices.slice(1).forEach(index => suppressedRouters.add(index))
+    if (isStreaming && end === messages.length) active = true
   }
 
-  let keptRouter = false
-  const projected = messages.filter((message, index) => {
-    if (!message.isRouterStrip || index <= latestUserIndex) return true
-    if (!keptRouter) {
-      keptRouter = true
-      return true
-    }
-    return false
-  })
-  return { messages: projected, active: true }
+  // Treat each visible user row as the start of one interaction. Project every
+  // completed history interaction as well as the live tail so a later user turn
+  // cannot make a previously suppressed resumed-parent router reappear.
+  for (let index = 1; index < messages.length; index += 1) {
+    if (messages[index]?.displayRole !== 'user') continue
+    projectInteraction(interactionStart, index)
+    interactionStart = index
+  }
+  projectInteraction(interactionStart, messages.length)
+
+  if (!suppressedRouters.size) {
+    return { messages: messages as ChatRenderedMessage[], active }
+  }
+  return {
+    messages: messages.filter((_, index) => !suppressedRouters.has(index)),
+    active,
+  }
 }
 
 export function hasRouterAfterLatestUser(messages: readonly ChatRenderedMessage[]): boolean {
