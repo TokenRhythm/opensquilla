@@ -4,6 +4,7 @@ import { createApp, h, nextTick, reactive, type App } from 'vue'
 import { createPinia } from 'pinia'
 
 import i18n from '@/i18n'
+import type { GoalSnapshot } from '@/composables/chat/useChatGoals'
 import { useToolDetailPreference } from '@/composables/useToolDetailPreference'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
 import type {
@@ -205,6 +206,7 @@ function baseMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRendered
 function mountMessage(
   message: ChatRenderedMessage,
   showTurnOutcome = false,
+  extraProps: Record<string, unknown> = {},
 ): HTMLElement {
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -217,6 +219,7 @@ function mountMessage(
       shareSelected: false,
       shareMessageId: 'assistant-1',
       showTurnOutcome,
+      ...extraProps,
       renderMarkdown: (text: string) => `<p>${text}</p>`,
       fmtTok: (value: number) => String(value),
       toolCallGroups: () => [],
@@ -235,6 +238,46 @@ function mountMessage(
   return el
 }
 
+function completedGoal(): GoalSnapshot {
+  return {
+    goalId: 'goal-1',
+    sessionKey: 'session-a',
+    sessionId: 'session-a',
+    epoch: 0,
+    objective: 'Finish the visual regression fix',
+    status: 'complete',
+    stateRevision: 3,
+    objectiveRevision: 1,
+    progressRevision: 1,
+    progress: null,
+    continuationSeq: 0,
+    activeTaskId: null,
+    sourceMessageId: 'user-1',
+    terminalTurnId: 'turn-goal',
+    executionState: 'idle',
+    continuationDeferredReason: null,
+    turnsStarted: 2,
+    turnsSettled: 2,
+    windowTurnsStarted: 2,
+    activeTimeMs: 17_000,
+    windowActiveTimeMs: 17_000,
+    usage: {
+      inputTokens: 4096,
+      outputTokens: 128,
+      reasoningTokens: 64,
+      cacheReadTokens: 512,
+      cacheWriteTokens: 0,
+      totalTokens: 4288,
+    },
+    pauseReason: null,
+    blockedReason: null,
+    terminalReason: 'model_complete',
+    createdAt: 1,
+    updatedAt: 2,
+    finishedAt: 2,
+  }
+}
+
 beforeEach(() => {
   i18n.global.locale.value = 'en'
   clearAssistantActivityExpansionState()
@@ -248,7 +291,7 @@ afterEach(() => {
 })
 
 describe('AssistantMessage activity disclosure', () => {
-  it('uses one expandable completion receipt for a plain turn with usage', async () => {
+  it('keeps a plain completion status and restores usage to the compact footer', async () => {
     const el = mountMessage(baseMessage({
       timelineItems: [],
       parts: [],
@@ -264,24 +307,22 @@ describe('AssistantMessage activity disclosure', () => {
     }), true)
     await nextTick()
 
-    const receipt = el.querySelector<HTMLElement>('.assistant-activity')
-    const answer = el.querySelector<HTMLElement>('.assistant-answer')
-    const summary = receipt?.querySelector<HTMLButtonElement>('.assistant-activity__summary')
-    expect(receipt).not.toBeNull()
-    expect(summary?.textContent).toContain('Completed · 5s')
-    expect(el.querySelector('.turn-outcome')).toBeNull()
-    expect(el.querySelector('.msg-meta__more-btn')).toBeNull()
-    expect(receipt?.querySelector('.turn-usage-details')?.textContent).toContain('kimi-k2.7-code')
-    expect(receipt?.querySelector('.turn-usage-details')?.textContent).toContain('4096')
-    expect(receipt?.querySelector('.turn-usage-details')?.textContent).toContain('128')
-    expect(
-      Boolean(
-        (answer?.compareDocumentPosition(receipt!) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING,
-      ),
-    ).toBe(true)
+    expect(el.querySelector('.assistant-activity')).toBeNull()
+    expect(el.querySelector('[data-testid="turn-outcome-completed"]')?.textContent)
+      .toContain('Completed')
+    const trigger = el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')
+    expect(trigger).not.toBeNull()
+    trigger?.click()
+    await nextTick()
+    const usage = el.querySelector('.msg-meta-popover')?.textContent
+    expect(usage).toContain('kimi-k2.7-code')
+    expect(usage).toContain('4096')
+    expect(usage).toContain('128')
+    expect(usage).toContain('512')
+    expect(usage).toContain('64')
   })
 
-  it('keeps usage inside the same disclosure as tools and reasoning', async () => {
+  it('keeps tools and reasoning in activity while usage stays in the footer', async () => {
     const el = mountMessage(baseMessage({
       timelineItems: successfulTimeline(),
       meta: usageMeta(),
@@ -295,17 +336,27 @@ describe('AssistantMessage activity disclosure', () => {
 
     const receipts = el.querySelectorAll('.assistant-activity')
     expect(receipts).toHaveLength(1)
-    expect(receipts[0]?.querySelector('.turn-usage-details')).not.toBeNull()
+    expect(receipts[0]?.querySelector('.turn-usage-details')).toBeNull()
     expect(receipts[0]?.querySelector('.tool-row')).not.toBeNull()
-    expect(el.querySelector('.msg-meta__more-btn')).toBeNull()
+    expect(el.querySelector('.msg-meta__more-btn')).not.toBeNull()
   })
 
-  it('uses the unified receipt for Plan, Goal, and Cron provenance', async () => {
-    for (const overrides of [
-      { parts: [planPart()] },
-      { turnInputMode: 'system_event', turnRunKind: 'goal' },
-      { provenanceKind: 'cron', provenanceSourceTool: 'cron.run' },
-    ] satisfies Partial<ChatRenderedMessage>[]) {
+  it('keeps compact usage for Plan, Goal, and Cron without creating activity', async () => {
+    const cases = [
+      { overrides: { parts: [planPart()] }, goalOutcome: null },
+      {
+        overrides: { parts: [], turnInputMode: 'system_event', turnRunKind: 'goal' },
+        goalOutcome: completedGoal(),
+      },
+      {
+        overrides: { parts: [], provenanceKind: 'cron', provenanceSourceTool: 'cron.run' },
+        goalOutcome: null,
+      },
+    ] satisfies Array<{
+      overrides: Partial<ChatRenderedMessage>
+      goalOutcome: GoalSnapshot | null
+    }>
+    for (const { overrides, goalOutcome } of cases) {
       const el = mountMessage(baseMessage({
         timelineItems: [],
         statusHistory: [],
@@ -316,17 +367,28 @@ describe('AssistantMessage activity disclosure', () => {
           kind: 'completed',
         },
         ...overrides,
-      }), true)
+      }), true, { goalOutcome, goalElapsed: '17s' })
       await nextTick()
 
-      expect(el.querySelectorAll('.assistant-activity')).toHaveLength(1)
-      expect(el.querySelector('.turn-usage-details')).not.toBeNull()
-      expect(el.querySelector('.msg-meta__more-btn')).toBeNull()
+      expect(el.querySelectorAll('.assistant-activity')).toHaveLength(0)
+      expect(el.querySelector('.turn-usage-details')).toBeNull()
+      expect(el.querySelector('.msg-meta__more-btn')).not.toBeNull()
+      if (overrides.parts?.some(part => part.type === 'plan')) {
+        expect(el.querySelector('.plan-card')).not.toBeNull()
+        expect(el.querySelector('.msg-ai-actions')).toBeNull()
+      }
+      if (goalOutcome) {
+        expect(el.querySelector('.goal-outcome')?.textContent).toContain('2 turns')
+        expect(el.querySelector('.goal-outcome')?.textContent).toContain('4,288 tokens')
+      }
+      if (overrides.provenanceKind === 'cron') {
+        expect(el.querySelector('.msg-provenance-chip')?.textContent).toContain('Scheduled')
+      }
       el.remove()
     }
   })
 
-  it('keeps usage inspectable under failed and stopped receipts', async () => {
+  it('keeps usage inspectable beside explicit failed and stopped outcomes', async () => {
     for (const outcome of [
       { turnId: 'turn-failed', status: 'failed', kind: 'failed' },
       { turnId: 'turn-stopped', status: 'cancelled', kind: 'cancelled' },
@@ -340,9 +402,10 @@ describe('AssistantMessage activity disclosure', () => {
       }), true)
       await nextTick()
 
-      expect(el.querySelector('.assistant-activity')).not.toBeNull()
-      expect(el.querySelector('.turn-usage-details')).not.toBeNull()
-      expect(el.querySelector('.msg-meta__more-btn')).toBeNull()
+      expect(el.querySelector('.assistant-activity')).toBeNull()
+      expect(el.querySelector('.turn-outcome')).not.toBeNull()
+      expect(el.querySelector('.turn-usage-details')).toBeNull()
+      expect(el.querySelector('.msg-meta__more-btn')).not.toBeNull()
       el.remove()
     }
   })
@@ -438,7 +501,7 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.msg-meta-popover__model-cost')?.textContent?.trim()).toBe('—')
   })
 
-  it('adds one usage receipt without reordering a canonical-less legacy timeline', async () => {
+  it('adds compact usage without reordering a canonical-less legacy timeline', async () => {
     const el = mountMessage(baseMessage({
       text: '',
       parts: [],
@@ -452,9 +515,9 @@ describe('AssistantMessage activity disclosure', () => {
     }), true)
     await nextTick()
 
-    expect(el.querySelectorAll('.assistant-activity')).toHaveLength(1)
-    expect(el.querySelector('.assistant-activity .turn-usage-details')).not.toBeNull()
-    expect(el.querySelector('.msg-meta__more-btn')).toBeNull()
+    expect(el.querySelectorAll('.assistant-activity')).toHaveLength(0)
+    expect(el.querySelector('.turn-usage-details')).toBeNull()
+    expect(el.querySelector('.msg-meta__more-btn')).not.toBeNull()
     const text = el.textContent || ''
     expect(text).toContain('Draft prefix')
     expect(text).toContain('Draft suffix')
@@ -524,10 +587,10 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.tool-row')).not.toBeNull()
     const answer = el.querySelector<HTMLElement>('.assistant-answer')
     const activity = el.querySelector<HTMLElement>('.assistant-activity')
-    expect(el.querySelector('.assistant-answer--separated')).toBeNull()
+    expect(el.querySelector('.assistant-answer--separated')).not.toBeNull()
     expect(
       Boolean(
-        (answer?.compareDocumentPosition(activity!) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING,
+        (activity?.compareDocumentPosition(answer!) ?? 0) & Node.DOCUMENT_POSITION_FOLLOWING,
       ),
     ).toBe(true)
   })
@@ -568,9 +631,9 @@ describe('AssistantMessage activity disclosure', () => {
     const children = Array.from(main?.children ?? [])
 
     expect(intro?.textContent).toContain('The plan is ready.')
-    expect(children.indexOf(intro as HTMLElement))
-      .toBeLessThan(children.indexOf(activity as HTMLElement))
     expect(children.indexOf(activity as HTMLElement))
+      .toBeLessThan(children.indexOf(intro as HTMLElement))
+    expect(children.indexOf(intro as HTMLElement))
       .toBeLessThan(children.indexOf(card as HTMLElement))
     expect(activity?.querySelector('.assistant-activity__label')?.textContent)
       .toBe('Planning process · 7s')
@@ -960,9 +1023,10 @@ describe('AssistantMessage activity disclosure', () => {
       .toBe('true')
     const settledAnswer = el.querySelector<HTMLElement>('.assistant-answer')
     const settledActivity = el.querySelector<HTMLElement>('.assistant-activity')
+    expect(settledActivity).toBe(liveActivity)
     expect(
       Boolean(
-        (settledAnswer?.compareDocumentPosition(settledActivity!) ?? 0)
+        (settledActivity?.compareDocumentPosition(settledAnswer!) ?? 0)
         & Node.DOCUMENT_POSITION_FOLLOWING,
       ),
     ).toBe(true)

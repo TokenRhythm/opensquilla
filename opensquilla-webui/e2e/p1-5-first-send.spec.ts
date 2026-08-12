@@ -747,11 +747,17 @@ test.describe('durable handoff and pending order release gate', () => {
     }
     await expect.poll(() => pendingCardOrder(page)).toEqual(['local A', 'local B', 'local C'])
     const localC = page.locator('.chat-pending-card').filter({ hasText: 'local C' })
+    await expect(localC).toHaveAttribute('aria-keyshortcuts', /Alt\+ArrowUp/)
     await localC.press('Alt+ArrowUp')
     await expect.poll(() => pendingCardOrder(page)).toEqual(['local A', 'local C', 'local B'])
     await expect(localC).toHaveAttribute('tabindex', '0')
     await localC.press('Alt+ArrowUp')
     await expect.poll(() => pendingCardOrder(page)).toEqual(['local C', 'local A', 'local B'])
+    // The preview order changes synchronously, while IndexedDB commits it
+    // behind a delivery barrier. Wait for keyboard reordering to return before
+    // reloading so this test exercises the durable order, not an in-flight
+    // optimistic preview.
+    await expect(localC).toHaveAttribute('aria-keyshortcuts', /Alt\+ArrowUp/)
     expect(gateway.reorderCount).toBe(0)
 
     gateway.releaseFirstAck()

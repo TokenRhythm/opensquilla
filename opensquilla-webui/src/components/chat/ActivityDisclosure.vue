@@ -151,9 +151,15 @@ watch(() => [props.stateKey, props.continuityKey] as const, ([key, continuityKey
 watch(
   () => props.defaultOpen,
   (defaultOpen, previousDefaultOpen) => {
-    if (!manuallyToggled.value && defaultOpen !== previousDefaultOpen) {
-      open.value = defaultOpen
+    if (defaultOpen === previousDefaultOpen) return
+    if (!defaultOpen) {
+      // A terminal transition is an explicit visual handoff: always collapse
+      // live work so the canonical answer becomes the stable reading endpoint.
+      manuallyToggled.value = false
+      open.value = false
+      return
     }
+    if (!manuallyToggled.value) open.value = true
   },
 )
 

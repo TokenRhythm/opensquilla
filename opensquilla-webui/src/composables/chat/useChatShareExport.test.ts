@@ -78,6 +78,7 @@ describe('buildShareDom protocol-shaped documentation', () => {
       '<div data-share-activity-body>',
       '<div class="turn-usage-details">model-a · 321 input tokens</div>',
       '<div data-turn-usage-details>reasoning 45 · $0.0012</div>',
+      '<div class="msg-ai-meta"><button class="msg-meta__more">Usage details</button></div>',
       '<div class="tool-row-body">Kept activity output</div>',
       '</div>',
       '</div>',
@@ -90,6 +91,7 @@ describe('buildShareDom protocol-shaped documentation', () => {
 
     expect(stage.querySelector('.turn-usage-details')).toBeNull()
     expect(stage.querySelector('[data-turn-usage-details]')).toBeNull()
+    expect(stage.querySelector('.msg-ai-meta')).toBeNull()
     expect(stage.querySelector('.msg-meta__more')).toBeNull()
     expect(stage.querySelector('.msg-meta__cost')).toBeNull()
     expect(stage.textContent).toContain('Kept activity output')

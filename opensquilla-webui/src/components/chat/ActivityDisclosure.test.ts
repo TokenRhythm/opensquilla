@@ -143,14 +143,14 @@ describe('ActivityDisclosure lifecycle transitions', () => {
       .toBe('false')
   })
 
-  it('does not override a manual expansion with a late lifecycle default', async () => {
-    const state = reactive({ defaultOpen: false })
+  it('forces a terminal transition closed and allows reopening afterwards', async () => {
+    const state = reactive({ lifecycle: 'working' as 'working' | 'settled' })
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp({
       render: () => h(ActivityDisclosure, {
-        lifecycle: 'settled',
-        defaultOpen: state.defaultOpen,
+        lifecycle: state.lifecycle,
+        defaultOpen: state.lifecycle === 'working',
         stepCount: 1,
         failureCount: 0,
         stateKey: 'message-manual-expansion',
@@ -162,17 +162,23 @@ describe('ActivityDisclosure lifecycle transitions', () => {
     app.mount(host)
     await nextTick()
 
-    host.querySelector<HTMLButtonElement>('.assistant-activity__summary')?.click()
+    const liveSummary = host.querySelector<HTMLButtonElement>('.assistant-activity__live-head')
+    expect(liveSummary?.getAttribute('aria-expanded')).toBe('true')
+    liveSummary?.click()
     await nextTick()
-    expect(host.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
-      .toBe('true')
+    liveSummary?.click()
+    await nextTick()
+    expect(liveSummary?.getAttribute('aria-expanded')).toBe('true')
 
-    state.defaultOpen = true
-    await nextTick()
-    state.defaultOpen = false
+    state.lifecycle = 'settled'
     await nextTick()
 
-    expect(host.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+    const settledSummary = host.querySelector<HTMLButtonElement>('.assistant-activity__summary')
+    expect(settledSummary?.getAttribute('aria-expanded'))
+      .toBe('false')
+    settledSummary?.click()
+    await nextTick()
+    expect(settledSummary?.getAttribute('aria-expanded'))
       .toBe('true')
   })
 })

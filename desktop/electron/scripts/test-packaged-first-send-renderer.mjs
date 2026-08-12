@@ -213,6 +213,58 @@ async function syncObservedChatSends(page) {
   return snapshot
 }
 
+async function assertSettledMessageReceipt(page) {
+  const assistant = page.locator('.msg-ai').last()
+  await waitFor(
+    async () => await assistant.count() === 1
+      && await assistant.locator('.msg-ai-text').count() === 1,
+    'settled canonical assistant answer',
+    SEND_TIMEOUT_MS,
+  )
+  assert.equal(
+    await assistant.locator('.msg-ai-text').count(),
+    1,
+    'the canonical answer must render exactly once',
+  )
+  const usageTrigger = assistant.locator('.msg-meta__more-btn')
+  await usageTrigger.waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
+  const order = await assistant.evaluate((element) => {
+    const activity = element.querySelector('.assistant-activity')
+    const answer = element.querySelector('.assistant-answer, .msg-ai-text')
+    const footer = element.querySelector('.msg-ai-footer')
+    return {
+      activityBeforeAnswer: !activity || !answer
+        ? true
+        : Boolean(activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING),
+      answerBeforeFooter: !answer || !footer
+        ? false
+        : Boolean(answer.compareDocumentPosition(footer) & Node.DOCUMENT_POSITION_FOLLOWING),
+      activityExpanded: activity?.getAttribute('data-share-expanded') || null,
+    }
+  })
+  assert.equal(order.activityBeforeAnswer, true, 'settled activity must remain before the answer')
+  assert.equal(order.answerBeforeFooter, true, 'the compact receipt must remain after the answer')
+  if (order.activityExpanded !== null) {
+    assert.equal(order.activityExpanded, 'false', 'settled activity must collapse automatically')
+  }
+
+  assert.equal(await usageTrigger.count(), 1, 'a settled turn must expose one compact usage entry')
+  await usageTrigger.click()
+  const usagePopover = assistant.locator('.msg-meta-popover')
+  await usagePopover.waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
+  const usageText = await usagePopover.innerText()
+  assert.match(usageText, /opensquilla-packaged-first-send-gate/i)
+  assert.match(usageText, /8/)
+  assert.match(usageText, /3/)
+  assert.equal(
+    await assistant.locator('.turn-usage-details, [data-turn-usage-details]').count(),
+    0,
+    'usage details must not be embedded in the activity disclosure',
+  )
+  await page.keyboard.press('Escape')
+  await usagePopover.waitFor({ state: 'hidden', timeout: SEND_TIMEOUT_MS })
+}
+
 try {
   await assertIsolatedUserData(userDataDir)
   provider = await startSyntheticOllama()
@@ -336,6 +388,7 @@ try {
       `first turn terminal state ${iteration}`,
       SEND_TIMEOUT_MS,
     )
+    await assertSettledMessageReceipt(page)
 
     const followupMessage = `Synthetic follow-up ${String(iteration).padStart(2, '0')}`
     await composer.fill(followupMessage)
@@ -356,6 +409,7 @@ try {
       `follow-up terminal state ${iteration}`,
       SEND_TIMEOUT_MS,
     )
+    await assertSettledMessageReceipt(page)
     assert.equal(rpcSendCounts.get(firstMessage), 1)
     assert.equal(rpcSendCounts.get(followupMessage), 1)
     assert.equal(await page.locator('.error-boundary').count(), 0)
