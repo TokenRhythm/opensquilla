@@ -668,16 +668,31 @@ class GatewayProcess:
         # Windows can retain a just-closed SQLite or log handle for a short
         # interval after the child has exited. Re-run the complete secret scan
         # before each bounded delete retry; persistent deletion failures still
-        # fail the release row, while scan/credential failures are never retried
-        # or softened because they surface as RuntimeError rather than OSError.
-        for attempt in range(10):
+        # fail the release row. The scanner owns its separate transient-I/O
+        # retry; credential and non-I/O scan failures remain fail-closed.
+        cleanup_attempts = 30 if os.name == "nt" else 10
+        for attempt in range(cleanup_attempts):
             try:
                 scan_and_remove_temporary_tree(self.root, self.secret_values)
                 return
             except OSError:
-                if attempt == 9:
+                if attempt + 1 == cleanup_attempts:
                     raise
                 time.sleep(min(0.05 * (2**attempt), 0.5))
+
+
+def _artifact_cleanup_stage(error: Exception) -> str:
+    """Project cleanup failures to one stable, non-sensitive diagnostic code."""
+
+    if isinstance(error, OSError):
+        return "artifact_delete_failed"
+    if isinstance(error, RuntimeError):
+        message = str(error)
+        if message == "unable to scan temporary live artifacts before deletion":
+            return "artifact_scan_failed"
+        if message == "credential detected in temporary live artifacts":
+            return "artifact_secret_detected"
+    return "artifact_cleanup_failed"
 
 
 def _synthetic_marker(case: LiveCase, suffix: str = "") -> str:
@@ -1957,13 +1972,13 @@ def execute_case(case: LiveCase) -> tuple[dict[str, Any], int]:
             retry_proxy.close()
         try:
             gateway.cleanup()
-        except Exception:
+        except Exception as exc:
             if result is None:
                 raise
             result.update(
                 {
                     "status": "failed",
-                    "stage": "artifact_cleanup",
+                    "stage": _artifact_cleanup_stage(exc),
                     "failure_class": "implementation",
                 }
             )

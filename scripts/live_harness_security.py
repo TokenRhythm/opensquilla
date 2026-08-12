@@ -93,7 +93,7 @@ _CHILD_ENV_ALLOWLIST = frozenset(
 
 _OWNED_TEMP_TREE_PREFIX = "opensquilla-"
 _SECRET_SCAN_CHUNK_BYTES = 64 * 1024
-_WINDOWS_TEMP_SCAN_ATTEMPTS = 10
+_WINDOWS_TEMP_SCAN_ATTEMPTS = 30
 
 # Provider request ids can be rolling aliases while the upstream response
 # identifies the concrete model that served the call.  This is intentionally

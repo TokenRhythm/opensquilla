@@ -285,6 +285,28 @@ def test_gateway_cleanup_does_not_retry_security_failure(
     real_cleanup(gateway.root, ())
 
 
+@pytest.mark.parametrize(
+    ("error", "stage"),
+    [
+        (PermissionError("synthetic"), "artifact_delete_failed"),
+        (
+            RuntimeError("unable to scan temporary live artifacts before deletion"),
+            "artifact_scan_failed",
+        ),
+        (
+            RuntimeError("credential detected in temporary live artifacts"),
+            "artifact_secret_detected",
+        ),
+        (RuntimeError("synthetic unknown cleanup failure"), "artifact_cleanup_failed"),
+    ],
+)
+def test_artifact_cleanup_stage_is_stable_and_non_sensitive(
+    error: Exception,
+    stage: str,
+) -> None:
+    assert driver._artifact_cleanup_stage(error) == stage
+
+
 def test_turn_observation_keeps_only_bounded_marker_tail_and_numeric_evidence() -> None:
     observation = driver.TurnObservation(
         session_key="agent:main:webchat:synthetic",
