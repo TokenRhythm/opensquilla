@@ -1391,6 +1391,27 @@ class TestSessionsList:
         assert res.payload["sessions"][0]["title"] == "Agent PM面试清单"
 
     @pytest.mark.asyncio
+    async def test_list_webchat_title_skips_flattened_tool_result(self, dispatcher):
+        session = FakeSession(
+            session_key="agent:main:webchat:tool-result-title",
+            display_name="WebChat",
+        )
+        manager = FakeSessionManager([session])
+        manager._storage._transcripts[session.session_id] = [
+            SimpleNamespace(
+                role="user",
+                content="[Tool result (call-1): internal result projection]",
+            ),
+            SimpleNamespace(role="user", content="Keep the visible request as the title"),
+        ]
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        assert res.payload["sessions"][0]["title"] == "Keep the visible request as the..."
+
+    @pytest.mark.asyncio
     async def test_list_contract_cli_current_tui_compatible_row(self, dispatcher):
         session = FakeSession(session_key="agent:main:cli:a1b2c3d4")
         ctx = make_ctx(session_manager=FakeSessionManager([session]))
@@ -1547,7 +1568,12 @@ class TestSessionsList:
             session_key="agent:main:subagent:760b927a",
             parent_session_key=parent_key,
             spawned_by="task-123",
-            origin={"kind": "subagent", "spawnDepth": 1},
+            derived_title="Analyze Issue #1130 search readiness",
+            origin={
+                "kind": "subagent",
+                "spawnDepth": 1,
+                "task": "Analyze Issue #1130 search readiness",
+            },
         )
         manager = FakeSessionManager([session])
         manager._storage._agent_tasks[session.session_key] = [
@@ -1572,6 +1598,7 @@ class TestSessionsList:
         self._assert_contract_base(row)
         assert row["sessionKind"] == "task"
         assert row["surface"] == "subagent"
+        assert row["title"] == "Analyze Issue #1130 search readiness"
         assert row["conversationKind"] == "unknown"
         assert row["runStatus"] == "running"
         assert row["interactive"] is False
@@ -5217,6 +5244,94 @@ class TestSessionsPatch:
         )
         assert res.ok is False
         assert res.error.code == "NOT_FOUND"
+
+
+class TestSessionsRename:
+    @pytest.mark.asyncio
+    async def test_rename_is_available_to_operator_write(
+        self,
+        dispatcher,
+        session,
+    ):
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            scopes=["operator.read", "operator.write"],
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.rename",
+            {"key": session.session_key, "displayName": "  Renamed task  "},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload == {
+            "key": session.session_key,
+            "updated": ["displayName"],
+        }
+        assert session.display_name == "Renamed task"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("display_name", "expected_ok"),
+        [
+            pytest.param("界" * 512, True, id="unicode-512"),
+            pytest.param("界" * 513, False, id="unicode-513"),
+            pytest.param("界" * 100_000, False, id="unicode-100000"),
+        ],
+    )
+    async def test_rename_enforces_bounded_display_name(
+        self,
+        dispatcher,
+        session,
+        display_name: str,
+        expected_ok: bool,
+    ):
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            scopes=["operator.read", "operator.write"],
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.rename",
+            {"key": session.session_key, "displayName": display_name},
+            ctx,
+        )
+
+        assert res.ok is expected_ok
+        if expected_ok:
+            assert session.display_name == display_name
+        else:
+            assert res.error.code == "INVALID_PARAMS"
+            assert res.error.details == {"field": "displayName", "maxLength": 512}
+            assert session.display_name is None
+
+    @pytest.mark.asyncio
+    async def test_rename_rejects_admin_patch_fields(self, dispatcher, session):
+        session.model = "original-model"
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            scopes=["operator.read", "operator.write"],
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.rename",
+            {
+                "key": session.session_key,
+                "displayName": "Renamed task",
+                "model": "unauthorized-model",
+            },
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {"unexpected_fields": ["model"]}
+        assert session.display_name is None
+        assert session.model == "original-model"
 
 
 class TestSessionsReset:

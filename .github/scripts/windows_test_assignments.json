@@ -977,6 +977,7 @@
       "tests/test_sandbox/test_destructive_intents.py",
       "tests/test_sandbox/test_domain_grants.py",
       "tests/test_sandbox/test_governance.py",
+      "tests/test_sandbox/test_in_process_network_precondition.py",
       "tests/test_sandbox/test_inprocess_managed_network.py",
       "tests/test_sandbox/test_linux_helper.py",
       "tests/test_sandbox/test_linux_permissions.py",

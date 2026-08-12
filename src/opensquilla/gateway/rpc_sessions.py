@@ -6252,6 +6252,8 @@ _SESSION_DEPLOYMENT_PATCH_FIELDS = frozenset(
     }
 )
 
+_MAX_SESSION_DISPLAY_NAME_CHARS = 512
+
 
 @_d.method("sessions.patch", scope="operator.admin")
 async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
@@ -6289,6 +6291,52 @@ async def _handle_sessions_patch(params: dict | None, ctx: RpcContext) -> dict:
         if keepalive_service is not None:
             keepalive_service.refresh_required(key, "session_deployment_changed")
     return result
+
+
+@_d.method("sessions.rename", scope="operator.write")
+async def _handle_sessions_rename(params: dict | None, ctx: RpcContext) -> dict:
+    """Rename one session without exposing admin-only deployment fields."""
+
+    key = _require_key(params)
+    assert isinstance(params, dict)
+    unexpected = sorted(set(params) - {"key", "displayName"})
+    if unexpected:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="sessions.rename accepts only key and displayName.",
+            details={"unexpected_fields": unexpected},
+        )
+    display_name = params.get("displayName")
+    if not isinstance(display_name, str) or not display_name.strip():
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="displayName must be a non-empty string.",
+            details={"field": "displayName"},
+        )
+    normalized_display_name = display_name.strip()
+    if len(normalized_display_name) > _MAX_SESSION_DISPLAY_NAME_CHARS:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message=(
+                "displayName must be at most "
+                f"{_MAX_SESSION_DISPLAY_NAME_CHARS} characters."
+            ),
+            details={
+                "field": "displayName",
+                "maxLength": _MAX_SESSION_DISPLAY_NAME_CHARS,
+            },
+        )
+    if ctx.session_manager is None:
+        raise KeyError("No session manager available")
+    storage = get_session_storage(ctx.session_manager)
+    if storage is None:
+        raise KeyError("No session storage available")
+    return await _apply_sessions_patch(
+        {"key": key, "displayName": normalized_display_name},
+        ctx,
+        key=key,
+        storage=storage,
+    )
 
 
 @_d.method("sessions.reset", scope="operator.write")

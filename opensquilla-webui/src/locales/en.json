@@ -3225,6 +3225,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Chat created",
+      "open": "Open chat"
+    },
     "promptCacheKeepalive": {
       "action": "Prompt cache keepalive",
       "title": "Prompt cache keepalive",
@@ -4062,6 +4066,7 @@
     "sidebar": {
       "recentConversations": "Recent tasks",
       "recents": "Recents",
+      "pinned": "Pinned",
       "refresh": "Reload tasks",
       "clearAgentFilter": "Clear agent filter: {name}",
       "loadError": "Unable to load tasks",

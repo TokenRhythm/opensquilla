@@ -3174,6 +3174,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Chat erstellt",
+      "open": "Chat öffnen"
+    },
     "promptCacheKeepalive": {
       "action": "Prompt-Cache aktiv halten",
       "title": "Prompt-Cache aktiv halten",
@@ -4009,6 +4013,7 @@
     "sidebar": {
       "recentConversations": "Letzte Aufgaben",
       "recents": "Zuletzt",
+      "pinned": "Angeheftet",
       "refresh": "Aufgaben neu laden",
       "clearAgentFilter": "Agentenfilter zurücksetzen: {name}",
       "loadError": "Aufgaben konnten nicht geladen werden",

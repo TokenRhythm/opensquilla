@@ -3174,6 +3174,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Chat creado",
+      "open": "Abrir chat"
+    },
     "promptCacheKeepalive": {
       "action": "Mantener caché del prompt",
       "title": "Mantener caché del prompt",
@@ -4009,6 +4013,7 @@
     "sidebar": {
       "recentConversations": "Tareas recientes",
       "recents": "Recientes",
+      "pinned": "Fijadas",
       "refresh": "Recargar tareas",
       "clearAgentFilter": "Borrar filtro de agente: {name}",
       "loadError": "No se pueden cargar las tareas",

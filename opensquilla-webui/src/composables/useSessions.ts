@@ -298,7 +298,13 @@ export function normalizeSessionItem(item: unknown): SessionItem | null {
   const workspaceLabel = textValue(raw.workspaceLabel)
   const workspaceDisplayPath = textValue(raw.workspaceDisplayPath)
   let title = normalizeRequiredString(raw, 'title', fallbackSessionTitle(raw, key, sessionKind), gaps)
-  if (sessionKind === 'task' && /^you are a subagent\b/i.test(title)) title = i18n.global.t('sessions.fallbackTitle.task')
+  if (
+    sessionKind === 'task'
+    && (
+      /^you are a subagent\b/i.test(title)
+      || title.trim().toLowerCase() === 'subagent task'
+    )
+  ) title = i18n.global.t('sessions.fallbackTitle.task')
   const subtitle = hasOwn(raw, 'subtitle') ? textValue(raw.subtitle) : ''
   if (!hasOwn(raw, 'subtitle')) gaps.push('subtitle')
   const effectiveAgentId = normalizeEffectiveAgentId(raw, gaps, derivedAgentId)
