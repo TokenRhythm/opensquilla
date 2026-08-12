@@ -1668,6 +1668,44 @@ async def test_search_status_and_query_return_structured_payloads():
 
 
 @pytest.mark.asyncio
+async def test_search_status_reports_the_precondition_that_denies_query(tmp_path):
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime
+
+    register_provider(
+        "fake_search_ok",
+        FakeSearchProvider,
+        SearchProviderSpec(provider_id="fake_search_ok"),
+    )
+    configure_search("fake_search_ok", max_results=4, diagnostics=True)
+    configure_runtime(
+        SandboxSettings(
+            sandbox=True,
+            security_grading=True,
+            network_default="proxy_allowlist",
+        ),
+        workspace=tmp_path,
+    )
+
+    status = await get_dispatcher().dispatch("r1", "search.status", {}, _ctx())
+    query = await get_dispatcher().dispatch(
+        "r2",
+        "search.query",
+        {"query": "hello", "limit": 2},
+        _ctx(),
+    )
+
+    assert status.error is None, status.error
+    assert status.payload["networkReady"] is False
+    reason = status.payload["networkBlockedReason"]
+    assert "Run Context grants" in reason
+    assert query.error is None, query.error
+    assert query.payload["ok"] is False
+    assert query.payload["error"]["kind"] == "policy_denied"
+    assert query.payload["error"]["message"] == reason
+
+
+@pytest.mark.asyncio
 async def test_search_query_provider_failure_is_ok_false_payload():
     register_provider(
         "fake_search_fail",
