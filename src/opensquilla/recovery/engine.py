@@ -588,6 +588,14 @@ class _DatabaseSourceChangedError(Exception):
     """The source bundle did not remain stable during offline inspection."""
 
 
+def _os_error_detail(path: Path, exc: OSError) -> str:
+    reason = exc.strerror or str(exc)
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        return f"{path.name}: {reason} (errno {exc.errno}, winerror {winerror})"
+    return f"{path.name}: {reason} (errno {exc.errno})"
+
+
 def _regular_source_stat(path: Path) -> os.stat_result | None:
     try:
         value = os.lstat(_native_io_path(path))
@@ -595,7 +603,7 @@ def _regular_source_stat(path: Path) -> os.stat_result | None:
         return None
     except OSError as exc:
         raise RecoveryError(
-            "runtime database bundle cannot be inspected",
+            f"runtime database bundle cannot be inspected: {_os_error_detail(path, exc)}",
             stable_code="state_database_unreadable",
         ) from exc
     if (
@@ -643,7 +651,8 @@ def _copy_source_file_no_follow(source: Path, destination: Path) -> _DatabaseSou
         raise _DatabaseSourceChangedError from exc
     except OSError as exc:
         raise RecoveryError(
-            "runtime database bundle cannot be opened without following links",
+            "runtime database bundle cannot be opened without following links: "
+            f"{_os_error_detail(source, exc)}",
             stable_code="state_database_unreadable",
         ) from exc
     try:
@@ -734,18 +743,18 @@ def _bundle_names(path: Path) -> tuple[Path, ...]:
     return (path, path.with_name(f"{path.name}-wal"), path.with_name(f"{path.name}-journal"))
 
 
-def _database_safety_code(path: Path) -> str | None:
+def _database_safety_code(path: Path) -> tuple[str, str | None] | None:
     """Validate a stable private SQLite snapshot without opening the source."""
 
     bundle = _bundle_names(path)
     try:
         present_before = tuple(_regular_source_stat(entry) is not None for entry in bundle)
     except RecoveryError as exc:
-        return exc.stable_code
+        return exc.stable_code, str(exc)
     if not present_before[0]:
         # A durable sidecar without its database is ambiguous and must never be
         # treated as a fresh state root.
-        return "state_database_unsafe_path" if any(present_before[1:]) else None
+        return ("state_database_unsafe_path", None) if any(present_before[1:]) else None
 
     snapshots: list[_DatabaseSourceSnapshot] = []
     try:
@@ -771,7 +780,8 @@ def _database_safety_code(path: Path) -> str | None:
                 try:
                     check = connection.execute("PRAGMA quick_check").fetchone()
                     if not check or str(check[0]).lower() != "ok":
-                        return "state_database_invalid"
+                        finding = str(check[0]) if check else "no quick_check result"
+                        return "state_database_invalid", f"{path.name}: {finding}"
                     tables = connection.execute(
                         "SELECT name FROM sqlite_master WHERE type='table' "
                         "AND name LIKE '%yoyo_migration'"
@@ -793,37 +803,37 @@ def _database_safety_code(path: Path) -> str | None:
                         ).fetchall()
                 finally:
                     connection.close()
-            except sqlite3.Error:
-                return "state_database_invalid"
+            except sqlite3.Error as exc:
+                return "state_database_invalid", f"{path.name}: {exc}"
             try:
                 present_after = tuple(_regular_source_stat(entry) is not None for entry in bundle)
             except RecoveryError as exc:
-                return exc.stable_code
+                return exc.stable_code, str(exc)
             if present_after != present_before or not all(
                 _source_snapshot_is_current(snapshot) for snapshot in snapshots
             ):
                 raise _DatabaseSourceChangedError
     except _DatabaseSourceChangedError:
-        return "state_database_changed"
+        return "state_database_changed", None
     except RecoveryError as exc:
-        return exc.stable_code
+        return exc.stable_code, str(exc)
 
     applied = {str(migration_id) for (migration_id,) in rows if migration_id}
     if not applied:
         return None
     known = _known_migration_ids()
     if not known:
-        return "state_migration_set_unavailable"
+        return "state_migration_set_unavailable", None
     if applied - known:
-        return "state_schema_too_new"
+        return "state_schema_too_new", None
     return None
 
 
-def _state_safety_code(state_dir: Path) -> str | None:
+def _state_safety_code(state_dir: Path) -> tuple[str, str | None] | None:
     try:
         state_before = PathIdentity.from_stat(_native_stat(state_dir))
-    except OSError:
-        return "effective_state_unreadable"
+    except OSError as exc:
+        return "effective_state_unreadable", _os_error_detail(state_dir, exc)
     for database_name in ("sessions.db", "scheduler.db"):
         code = _database_safety_code(state_dir / database_name)
         if code is not None:
@@ -831,9 +841,9 @@ def _state_safety_code(state_dir: Path) -> str | None:
     try:
         state_after = PathIdentity.from_stat(_native_stat(state_dir))
     except OSError:
-        return "state_database_changed"
+        return "state_database_changed", None
     if state_before.metadata_tuple() != state_after.metadata_tuple():
-        return "state_database_changed"
+        return "state_database_changed", None
     return None
 
 
@@ -2130,14 +2140,16 @@ def inspect_profile(
         )
     state_code = _state_safety_code(state_candidate.path)
     if state_code is not None:
+        code, state_detail = state_code
         return _report(
             home=home_path,
             config=config,
             candidates=candidates,
             outcome="attention",
-            stable_code=state_code,
+            stable_code=code,
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
+            detail=state_detail,
         )
 
     effective_candidate = next(
