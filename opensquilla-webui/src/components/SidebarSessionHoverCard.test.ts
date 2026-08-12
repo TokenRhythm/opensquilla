@@ -48,6 +48,23 @@ describe('SidebarSessionHoverCard', () => {
       .toContain('opensquilla')
   })
 
+  it('uses ordinary text with the same typography as a session title', () => {
+    const host = mountCard({
+      title: 'Typography check',
+      updatedAt: Date.now(),
+    })
+
+    expect(host.querySelector('.sidebar-session-preview__title')?.tagName).toBe('SPAN')
+    const sharedTypographyRule = baseCss.match(
+      /\.sidebar-history-title,\s*\.sidebar-session-preview__title\s*\{([^}]*)\}/,
+    )?.[1]
+    expect(sharedTypographyRule).toBeDefined()
+    expect(sharedTypographyRule).toContain('font-family: var(--font-sans)')
+    expect(sharedTypographyRule).toContain('font-size: 0.828125rem')
+    expect(sharedTypographyRule).toContain('font-weight: 500')
+    expect(sharedTypographyRule).toContain('line-height: 1.35')
+  })
+
   it('omits only the project row for an unbound session', () => {
     const host = mountCard({
       title: 'General task',

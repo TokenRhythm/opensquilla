@@ -999,6 +999,14 @@ pre {
   50% { opacity: 0.4; }
 }
 
+.sidebar-history-title,
+.sidebar-session-preview__title {
+  font-family: var(--font-sans);
+  font-size: 0.828125rem;
+  font-weight: 500;
+  line-height: 1.35;
+}
+
 .sidebar-history-title {
   flex: 1;
   min-width: 0;
@@ -1006,9 +1014,6 @@ pre {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: inherit;
-  font-size: 0.828125rem;
-  font-weight: 500;
-  line-height: 1.35;
 }
 
 .sidebar-history-pin {
@@ -1373,9 +1378,6 @@ pre {
   min-width: 0;
   flex: 1;
   overflow-wrap: anywhere;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  line-height: 1.4;
 }
 
 .sidebar-session-preview__time {

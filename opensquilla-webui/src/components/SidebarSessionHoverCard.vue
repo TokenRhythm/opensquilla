@@ -89,7 +89,7 @@ onMounted(() => { void fitMeasuredCard() })
     :style="resolvedPosition"
   >
     <div class="sidebar-session-preview__head">
-      <strong class="sidebar-session-preview__title">{{ title }}</strong>
+      <span class="sidebar-session-preview__title">{{ title }}</span>
       <span class="sidebar-session-preview__time">{{ relativeUpdatedAt }}</span>
     </div>
     <div
