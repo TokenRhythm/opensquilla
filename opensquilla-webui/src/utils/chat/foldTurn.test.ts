@@ -300,4 +300,54 @@ describe('TurnAccumulator — incremental live projection', () => {
     expect(renderer).not.toHaveBeenCalled()
     expect(snapshot.toolCalls[0]?.inputRaw).toHaveLength(10_000)
   })
+
+  it('renders a provisional answer after a later tool moves it into activity', () => {
+    const accumulator = new TurnAccumulator()
+    accumulator.append({
+      kind: 'tool-start',
+      seq: 0,
+      toolId: 'inspect',
+      name: 'read_file',
+      input: '{}',
+      at: 1,
+    })
+    accumulator.append({
+      kind: 'text',
+      seq: 1,
+      text: 'Draft candidate.',
+      presentation: 'answer',
+    })
+    const initial = accumulator.snapshot(
+      text => `<p>${text}</p>`,
+      toolCallGroups,
+      undefined,
+      undefined,
+      false,
+    )
+    expect(initial.timelineItems[1]).toMatchObject({ html: '' })
+    accumulator.append({
+      kind: 'tool-start',
+      seq: 2,
+      toolId: 'verify',
+      name: 'bash_exec',
+      input: '{}',
+      at: 2,
+    })
+
+    const renderer = vi.fn((text: string) => `<p>${text}</p>`)
+    const snapshot = accumulator.snapshot(
+      renderer,
+      toolCallGroups,
+      undefined,
+      undefined,
+      false,
+    )
+
+    expect(renderer).toHaveBeenCalledWith('Draft candidate.')
+    expect(snapshot.timelineItems[1]).toMatchObject({
+      type: 'text',
+      rawText: 'Draft candidate.',
+      html: '<p>Draft candidate.</p>',
+    })
+  })
 })

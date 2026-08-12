@@ -664,15 +664,18 @@ test('preserves a Sessions Hub auto-send draft when live recovery terminates', a
   await expect(composer).toBeEditable()
   await expect(send).toBeDisabled()
 
-  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1)
-  for (let elapsed = 0; elapsed < 16_000; elapsed += 1000) {
+  await page.clock.pauseAt((await page.evaluate(() => Date.now())) + 1_000)
+  const liveFailure = page.locator(
+    '[data-testid="chat-session-recovery-status"][data-recovery-state="live-degraded"]',
+  )
+  // A replacement socket can begin one fresh bounded live-recovery budget
+  // after the original subscribe stalls. Advance through both budgets instead
+  // of assuming the first 16 seconds always lands on the terminal frame.
+  for (let elapsed = 0; elapsed < 40_000 && !await liveFailure.isVisible(); elapsed += 1000) {
     await page.clock.runFor(1000)
     tickSenders.forEach(sendTick => sendTick())
   }
 
-  const liveFailure = page.locator(
-    '[data-testid="chat-session-recovery-status"][data-recovery-state="live-degraded"]',
-  )
   await expect(liveFailure).toBeVisible()
   await expect(composer).toHaveValue(taskText)
   await composer.press('Enter')

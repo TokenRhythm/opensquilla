@@ -142,6 +142,39 @@ describe('ActivityDisclosure lifecycle transitions', () => {
     expect(host.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
       .toBe('false')
   })
+
+  it('does not override a manual expansion with a late lifecycle default', async () => {
+    const state = reactive({ defaultOpen: false })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({
+      render: () => h(ActivityDisclosure, {
+        lifecycle: 'settled',
+        defaultOpen: state.defaultOpen,
+        stepCount: 1,
+        failureCount: 0,
+        stateKey: 'message-manual-expansion',
+        continuityKey: 'turn-manual-expansion',
+      }, { default: () => 'Activity details' }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    host.querySelector<HTMLButtonElement>('.assistant-activity__summary')?.click()
+    await nextTick()
+    expect(host.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+      .toBe('true')
+
+    state.defaultOpen = true
+    await nextTick()
+    state.defaultOpen = false
+    await nextTick()
+
+    expect(host.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
+      .toBe('true')
+  })
 })
 
 describe('ActivityDisclosure resting affordance', () => {
@@ -245,7 +278,6 @@ describe('ActivityDisclosure live header', () => {
     const body = host.querySelector<HTMLElement>('.assistant-activity__body')
     expect(summary?.getAttribute('aria-expanded')).toBe('false')
     expect(body?.getAttribute('aria-hidden')).toBe('true')
-    expect(body?.classList.contains('is-open')).toBe(false)
     expect(host.querySelector('.assistant-activity')?.getAttribute('data-share-expanded')).toBe('false')
 
     summary?.click()
@@ -253,7 +285,7 @@ describe('ActivityDisclosure live header', () => {
 
     expect(summary?.getAttribute('aria-expanded')).toBe('true')
     expect(body?.getAttribute('aria-hidden')).toBe('false')
-    expect(body?.classList.contains('is-open')).toBe(true)
+    expect(host.querySelector('.assistant-activity')?.getAttribute('data-share-expanded')).toBe('true')
   })
 
   it('renders live step count without surfacing failures', async () => {
@@ -354,7 +386,9 @@ describe('ActivityDisclosure expanded boundary', () => {
     expect(bodyRule).toContain('grid-template-rows var(--dur-base)')
     expect(bodyRule).toContain('opacity: 0;')
 
-    const openRule = cssRule('.assistant-activity__body.is-open')
+    const openRule = cssRule(
+      '.assistant-activity[data-share-expanded="true"] > .assistant-activity__body',
+    )
     expect(openRule).toContain('grid-template-rows: 1fr;')
     expect(openRule).toContain('opacity: 1;')
 

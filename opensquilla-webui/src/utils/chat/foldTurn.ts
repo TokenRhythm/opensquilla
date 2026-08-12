@@ -243,6 +243,13 @@ export class TurnAccumulator {
       return existing
     }
 
+    const displacedText = this.segments[this.segments.length - 1]
+    if (displacedText?.type === 'text' && displacedText.presentation === 'answer') {
+      // A trailing answer is rendered by StreamingTextPart and therefore has
+      // no cached HTML. Once a later tool displaces it into the activity
+      // chronology, mark it dirty so the next published snapshot renders it.
+      displacedText.dirty = true
+    }
     const operationKey = toolOperationKey(name)
     const lastSegment = this.segments[this.segments.length - 1]
     const groupId = lastSegment?.type === 'tool-group'
@@ -352,6 +359,10 @@ export class TurnAccumulator {
             approvalId: frame.approvalId,
             data: frame.data,
           })
+          const displacedText = this.segments[this.segments.length - 1]
+          if (displacedText?.type === 'text' && displacedText.presentation === 'answer') {
+            displacedText.dirty = true
+          }
           this.segments.push({ type: 'interrupt', approvalId: frame.approvalId })
         } else {
           this.interrupts[index] = mergeInterruptData(
@@ -419,6 +430,7 @@ export class TurnAccumulator {
       }
     }
 
+    const trailingSegment = this.segments[this.segments.length - 1]
     for (const segment of this.segments) {
       if (segment.type === 'text' && segment.dirty) {
         // The production live answer is rendered by StreamingTextPart from
@@ -426,7 +438,13 @@ export class TurnAccumulator {
         // invisible full-prefix Markdown pass on every visual flush. Keep the
         // rendered HTML only for intermediate narration and for the DEV shadow
         // renderer, which still needs an exact legacy parity surface.
-        segment.html = segment.presentation === 'answer' && !renderAnswerMarkdown
+        // Only the current trailing answer is owned by StreamingTextPart. If
+        // a later tool arrives, that provisional answer moves back into the
+        // activity chronology and needs rendered HTML like any other
+        // narration segment.
+        segment.html = segment === trailingSegment
+          && segment.presentation === 'answer'
+          && !renderAnswerMarkdown
           ? ''
           : renderMarkdown(segment.raw || '')
         segment.dirty = false

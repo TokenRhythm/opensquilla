@@ -46,6 +46,8 @@ interface ActiveBootstrap {
     resolve: (ready: boolean) => void
   }>
   freshLiveOutageForHistoryRetry: boolean
+  awaitingReplacementConnection: boolean
+  lateReplacementRecoveryUsed: boolean
   history: PhaseRuntime<SessionPhaseResult>
   live: PhaseRuntime<SessionSubscriptionOutcome>
 }
@@ -452,6 +454,8 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
       liveQueueSequence: 0,
       liveQueueWaiters: new Set(),
       freshLiveOutageForHistoryRetry: false,
+      awaitingReplacementConnection: false,
+      lateReplacementRecoveryUsed: false,
       history: historyRuntime(deadlineAt),
       live: liveRuntime(deadlineAt),
     }
@@ -600,6 +604,7 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
         const liveWasReady = livePhase.value === 'ready'
         const liveWillRecover = run.live.running || liveWasReady
         if (liveWillRecover) {
+          run.awaitingReplacementConnection = true
           rearmCriticalQueue(
             run,
             run.includeHistory && run.history.running,
@@ -641,7 +646,41 @@ export function useChatSessionBootstrap(options: UseChatSessionBootstrapOptions)
     if (!run || run.key !== options.sessionKey.value || run.controller.signal.aborted) {
       return startSessionBootstrap({ includeHistory, force: true })
     }
+    const replacementConnected = run.awaitingReplacementConnection
+    run.awaitingReplacementConnection = false
+    if (replacementConnected && run.live.running) {
+      const interruptedPhase = run.live
+      const resumeOnReplacement = () => {
+        if (
+          !isCurrent(run)
+          || run.live !== interruptedPhase
+          || interruptedPhase.running
+          || (
+            livePhase.value !== 'connecting'
+            && livePhase.value !== 'degraded'
+          )
+        ) return
+        run.lateReplacementRecoveryUsed = true
+        rearmCriticalQueue(run, false)
+        // This is a continuation of the same outage, not a user-initiated
+        // retry. Preserve both the absolute deadline and attempts so repeated
+        // socket replacement cannot keep the UI in "connecting" forever.
+        run.live = {
+          ...liveRuntime(interruptedPhase.deadlineAt),
+          attempts: interruptedPhase.attempts,
+          skipSnapshot: interruptedPhase.skipSnapshot,
+        }
+        run.live.promise = runLivePhase(run)
+      }
+      // The replacement handshake can finish before the interrupted subscribe
+      // observes its cancellation. Resume exactly once after that old phase
+      // settles instead of leaving the UI indefinitely in "connecting".
+      void interruptedPhase.promise.then(resumeOnReplacement, resumeOnReplacement)
+      return publicRun(run)
+    }
     if (!run.live.running && livePhase.value === 'degraded') {
+      if (run.lateReplacementRecoveryUsed) return publicRun(run)
+      run.lateReplacementRecoveryUsed = true
       // A replacement socket is a new recovery opportunity, even when the
       // previous socket exhausted its bounded subscribe attempts. RpcClient
       // owns the process-wide 1/2/4/8/15 second connection backoff; once its

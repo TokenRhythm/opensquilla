@@ -680,7 +680,14 @@ test.describe('Live assistant activity lifecycle', () => {
     expect(await finalAnswer.evaluate(element =>
       element.closest('.assistant-activity') === null,
     )).toBe(true)
-    await settled.locator('.assistant-activity__summary').click()
+    // The fixture uses a paused browser clock. Motion has already been
+    // asserted above; disable it before the settled disclosure interaction so
+    // Chromium does not remain frozen on the transition's first frame.
+    await page.emulateMedia({ reducedMotion: 'reduce' })
+    const settledSummary = settled.locator('.assistant-activity__summary')
+    await settledSummary.click()
+    await expect(settledSummary).toHaveAttribute('aria-expanded', 'true')
+    await expect(settled).toHaveAttribute('data-share-expanded', 'true')
     await expect(settled.getByText('Draft candidate.', { exact: true })).toBeVisible()
     await expect(
       settled.getByText('Final verified answer.', { exact: true }),

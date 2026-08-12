@@ -528,6 +528,65 @@ describe('useChatSessionBootstrap', () => {
     expect(api.livePhase.value).toBe('ready')
   })
 
+  it('resumes when a replacement connects before the interrupted subscribe settles', async () => {
+    let resolveInterrupted!: (result: SessionSubscriptionOutcome) => void
+    let liveCalls = 0
+    const { api, loadHistory, subscribeSession } = createBootstrap({
+      subscribeSession: async () => {
+        liveCalls += 1
+        if (liveCalls === 1) {
+          return new Promise(resolve => {
+            resolveInterrupted = resolve
+          })
+        }
+        return LIVE_READY
+      },
+    })
+
+    const run = api.startSessionBootstrap()
+    await vi.waitFor(() => expect(resolveInterrupted).toBeTypeOf('function'))
+    api.handleConnectionState('disconnected')
+    api.handleConnectionState('connected')
+    resolveInterrupted({ ...UNAVAILABLE_FOR_TEST, cancelled: true })
+    await run.live
+
+    await vi.waitFor(() => expect(api.livePhase.value).toBe('ready'))
+    expect(loadHistory).toHaveBeenCalledOnce()
+    expect(subscribeSession).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not grant repeated replacement sockets unbounded recovery budgets', async () => {
+    let resolveInterrupted!: (result: SessionSubscriptionOutcome) => void
+    const timeout = new RpcTimeoutError('sessions.messages.subscribe', 7_000)
+    let liveCalls = 0
+    const { api, subscribeSession } = createBootstrap({
+      subscribeSession: async () => {
+        liveCalls += 1
+        if (liveCalls === 1) {
+          return new Promise(resolve => {
+            resolveInterrupted = resolve
+          })
+        }
+        return { ...UNAVAILABLE_FOR_TEST, error: timeout }
+      },
+    })
+
+    const run = api.startSessionBootstrap()
+    await vi.waitFor(() => expect(resolveInterrupted).toBeTypeOf('function'))
+    api.handleConnectionState('disconnected')
+    api.handleConnectionState('connected')
+    resolveInterrupted({ ...UNAVAILABLE_FOR_TEST, cancelled: true })
+    await run.live
+    await vi.waitFor(() => expect(api.livePhase.value).toBe('degraded'))
+
+    api.handleConnectionState('disconnected')
+    api.handleConnectionState('connected')
+    await Promise.resolve()
+
+    expect(subscribeSession).toHaveBeenCalledTimes(2)
+    expect(api.livePhase.value).toBe('degraded')
+  })
+
   it('does not grant a degraded live phase more attempts when history recycles the socket', async () => {
     let resolveHistory!: (result: SessionPhaseResult) => void
     const history = new Promise<SessionPhaseResult>(resolve => {
