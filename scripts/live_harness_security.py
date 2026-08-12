@@ -13,6 +13,7 @@ import re
 import shutil
 import stat
 import tempfile
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +93,7 @@ _CHILD_ENV_ALLOWLIST = frozenset(
 
 _OWNED_TEMP_TREE_PREFIX = "opensquilla-"
 _SECRET_SCAN_CHUNK_BYTES = 64 * 1024
+_WINDOWS_TEMP_SCAN_ATTEMPTS = 10
 
 # Provider request ids can be rolling aliases while the upstream response
 # identifies the concrete model that served the call.  This is intentionally
@@ -552,6 +554,12 @@ def _temporary_tree_contains_secret(root: Path, needles: tuple[bytes, ...]) -> b
     return False
 
 
+def _temporary_tree_scan_attempts() -> int:
+    """Allow bounded retries for transient Windows artifact-tree races."""
+
+    return _WINDOWS_TEMP_SCAN_ATTEMPTS if os.name == "nt" else 1
+
+
 def scan_and_remove_temporary_tree(
     path: Path | str,
     secrets: Mapping[str, str] | Iterable[str],
@@ -583,13 +591,20 @@ def scan_and_remove_temporary_tree(
 
     scan_error: Exception | None = None
     contains_secret = False
-    try:
-        contains_secret = _temporary_tree_contains_secret(
-            resolved,
-            _secret_needles(secrets),
-        )
-    except Exception as exc:  # noqa: BLE001 - cleanup must still run after any scan failure
-        scan_error = exc
+    needles = _secret_needles(secrets)
+    scan_attempts = _temporary_tree_scan_attempts()
+    for attempt in range(scan_attempts):
+        try:
+            contains_secret = _temporary_tree_contains_secret(resolved, needles)
+            scan_error = None
+            break
+        except OSError as exc:
+            scan_error = exc
+            if attempt + 1 < scan_attempts:
+                time.sleep(min(0.05 * (2**attempt), 0.5))
+        except Exception as exc:  # noqa: BLE001 - cleanup must still run after scan failure
+            scan_error = exc
+            break
 
     shutil.rmtree(resolved)
     if scan_error is not None:

@@ -419,6 +419,34 @@ def test_temporary_tree_cleanup_never_suppresses_scan_or_delete_failures(
     assert delete_root.is_dir()
 
 
+def test_temporary_tree_cleanup_retries_transient_scan_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "opensquilla-transient-scan-failure"
+    root.mkdir()
+    attempts = 0
+
+    def _scan(_root: Path, _needles: tuple[bytes, ...]) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OSError("synthetic transient scan failure")
+        return False
+
+    monkeypatch.setattr(security, "_temporary_tree_scan_attempts", lambda: 3)
+    monkeypatch.setattr(security, "_temporary_tree_contains_secret", _scan)
+    monkeypatch.setattr(security.time, "sleep", lambda _seconds: None)
+
+    security.scan_and_remove_temporary_tree(
+        root,
+        {"OPENAI_API_KEY": "offline-secret-not-present"},
+    )
+
+    assert attempts == 3
+    assert not root.exists()
+
+
 @pytest.mark.parametrize(
     "model",
     [
