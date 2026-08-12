@@ -213,6 +213,78 @@ def test_gateway_config_contains_env_names_but_not_credential_values(
     assert "enabled = true" in rendered
 
 
+def test_gateway_cleanup_retries_transient_windows_file_handle_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = driver.LiveCase(
+        case_id="deepseek-direct-cleanup-synthetic-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        scenario="direct",
+        repeat_index=1,
+        fallback_provider=None,
+        remaining_budget=driver.CaseBudget(
+            wall_ms=60_000,
+            billed_cost_usd=1,
+            physical_requests=1,
+            billed_tokens=1_000,
+        ),
+    )
+    gateway = driver.GatewayProcess(case, secret_values=())
+    real_cleanup = driver.scan_and_remove_temporary_tree
+    attempts = 0
+
+    def transient_cleanup(path: Path, secrets: tuple[str, ...]) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("synthetic transient Windows file handle")
+        real_cleanup(path, secrets)
+
+    monkeypatch.setattr(driver, "scan_and_remove_temporary_tree", transient_cleanup)
+    monkeypatch.setattr(driver.time, "sleep", lambda _seconds: None)
+
+    gateway.cleanup()
+
+    assert attempts == 3
+    assert not gateway.root.exists()
+
+
+def test_gateway_cleanup_does_not_retry_security_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = driver.LiveCase(
+        case_id="deepseek-direct-cleanup-security-synthetic-1",
+        provider="deepseek",
+        model="deepseek-v4-flash",
+        scenario="direct",
+        repeat_index=1,
+        fallback_provider=None,
+        remaining_budget=driver.CaseBudget(
+            wall_ms=60_000,
+            billed_cost_usd=1,
+            physical_requests=1,
+            billed_tokens=1_000,
+        ),
+    )
+    gateway = driver.GatewayProcess(case, secret_values=())
+    real_cleanup = driver.scan_and_remove_temporary_tree
+    attempts = 0
+
+    def unsafe_cleanup(_path: Path, _secrets: tuple[str, ...]) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("credential detected in temporary live artifacts")
+
+    monkeypatch.setattr(driver, "scan_and_remove_temporary_tree", unsafe_cleanup)
+
+    with pytest.raises(RuntimeError, match="credential detected"):
+        gateway.cleanup()
+
+    assert attempts == 1
+    real_cleanup(gateway.root, ())
+
+
 def test_turn_observation_keeps_only_bounded_marker_tail_and_numeric_evidence() -> None:
     observation = driver.TurnObservation(
         session_key="agent:main:webchat:synthetic",

@@ -719,7 +719,10 @@ def test_cleanup_never_deletes_canonical_profile_recreated_after_quarantine(
                 args=(str(primary), ready, release),
             )
             process.start()
-            assert ready.wait(5)
+            # Windows spawn must import the test module before acquiring the
+            # synthetic Gateway lock. Under a fully loaded high-risk shard that
+            # can legitimately exceed five seconds without indicating failure.
+            assert ready.wait(15)
         original_remove(path)
 
     monkeypatch.setattr(

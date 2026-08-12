@@ -665,7 +665,19 @@ class GatewayProcess:
 
     def cleanup(self) -> None:
         self.stop(force=True)
-        scan_and_remove_temporary_tree(self.root, self.secret_values)
+        # Windows can retain a just-closed SQLite or log handle for a short
+        # interval after the child has exited. Re-run the complete secret scan
+        # before each bounded delete retry; persistent deletion failures still
+        # fail the release row, while scan/credential failures are never retried
+        # or softened because they surface as RuntimeError rather than OSError.
+        for attempt in range(10):
+            try:
+                scan_and_remove_temporary_tree(self.root, self.secret_values)
+                return
+            except OSError:
+                if attempt == 9:
+                    raise
+                time.sleep(min(0.05 * (2**attempt), 0.5))
 
 
 def _synthetic_marker(case: LiveCase, suffix: str = "") -> str:
