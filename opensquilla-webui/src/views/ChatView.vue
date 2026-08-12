@@ -279,16 +279,6 @@
           @replan="beginPlanRevision"
         />
 
-        <!-- Pre-reveal router phase: shown only before the live activity owns
-             the turn. Once activity is visible, execution status becomes
-             the single primary progress surface. -->
-        <RouterFxStrip
-          v-if="routerStripReserve"
-          class="router-fx-reserve"
-          :message="routerStripReserve"
-          aria-hidden="true"
-        />
-
         <!-- MetaSkill run cards: preflight checkpoint + progress ribbon,
              grouped per run_id above the live activity area. -->
         <template v-for="runId in metaRuns.ribbonOrder.value" :key="`meta-${runId}`">
@@ -958,7 +948,6 @@ import {
 } from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
 import {
-  hasRouterAfterLatestUser,
   projectSessionCreationRouterPresentation,
 } from '@/utils/chat/sessionCreationRouterPresentation'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
@@ -1768,7 +1757,7 @@ const chatRenderedMessages = useChatRenderedMessages({
   isSubagentCompletionMessage,
   timeTranslator: t,
 })
-const { renderedMessages, routerDecisionCells } = chatRenderedMessages
+const { renderedMessages } = chatRenderedMessages
 const sessionCreationRouterPresentation = computed(() => (
   projectSessionCreationRouterPresentation(renderedMessages.value, isStreaming.value)
 ))
@@ -1779,59 +1768,6 @@ function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // surface for the synthesizing process and no longer defers to activity.
   return true
 }
-
-/**
- * Pre-decision router-strip placeholder. It holds the strip's slot for the short
- * window before the first router_decision / ensemble_progress lands, so the live
- * ensemble strip appears from the very start of the turn rather than popping in.
- */
-const routerStripReserve = computed<ChatRenderedMessage | null>(() => {
-  if (!isStreaming.value || !routerEnabled.value || !routerVisualEffectsEnabled.value) return null
-  const rendered = visibleRenderedMessages.value
-  // A subagent handoff can resume the same visible user interaction under a
-  // different engine turn id. Any router already visible after that user owns
-  // the single route slot; comparing turnKey here would append a duplicate
-  // reserve below it during the handoff/reconnect window.
-  if (hasRouterAfterLatestUser(rendered)) return null
-  if (modelRoutingMode.value === 'llm_ensemble') {
-    return {
-      id: 'router-strip-reserve',
-      role: 'router',
-      displayRole: 'router',
-      roleLabel: 'Router',
-      text: '',
-      timeStr: '',
-      showHeader: false,
-      isRouterStrip: true,
-      routerState: 'pending',
-      routerSource: 'llm_ensemble',
-      routerStatic: false,
-      routerPanel: 'llm-ensemble',
-      routerMode: 'llm_ensemble',
-      gridCells: [],
-      winnerIdx: -1,
-    }
-  }
-
-  const cells = routerDecisionCells({ tier: '', model: '' })
-  if (cells.length <= 1) return null
-  return {
-    id: 'router-strip-reserve',
-    role: 'router',
-    displayRole: 'router',
-    roleLabel: 'Router',
-    text: '',
-    timeStr: '',
-    showHeader: false,
-    isRouterStrip: true,
-    routerState: 'pending',
-    routerSource: 'none',
-    routerStatic: false,
-    routerPanel: routerVisualMode.value === 'legacy_grid' ? 'legacy-grid' : 'real-candidates',
-    gridCells: cells,
-    winnerIdx: -1,
-  }
-})
 
 const aiGeneratedLabel = computed(() => t('chat.aiGeneratedLabel'))
 
@@ -3047,7 +2983,10 @@ const liveActivityProjection = computed(() =>
   }),
 )
 const liveActivityPhaseLabel = computed(() => {
-  if (streamActivityStale.value) return streamPhaseLabel.value
+  if (runStatus.value.status === 'queued' || streamActivityStale.value) {
+    return streamPhaseLabel.value
+  }
+  if (!streamHasVisibleOutput.value) return streamPhaseLabel.value
   const currentStatus = [...liveActivityProjection.value.statusSteps]
     .reverse()
     .find(step => step.isCurrent)

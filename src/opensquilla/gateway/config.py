@@ -316,7 +316,7 @@ class PermissionsConfig(BaseModel):
 class TaskRuntimeConfig(BaseModel):
     """Server-side task-runtime queue settings."""
 
-    max_concurrency: int = Field(default=4, ge=1)
+    max_concurrency: int = Field(default=8, ge=1)
     max_pending_per_session: int = Field(default=64, ge=1)
     # Per-channel-adapter in-flight semaphore (separate from
     # task_runtime._global_sem). Configured here so OPENSQUILLA_CHANNEL_INFLIGHT_CAP

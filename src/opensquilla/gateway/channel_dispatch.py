@@ -356,7 +356,7 @@ def _compute_channel_cap(config: Any) -> int:
     """
     task_runtime_cfg = getattr(config, "task_runtime", None) if config is not None else None
     raw_cap: int = getattr(task_runtime_cfg, "channel_inflight_cap", 8)
-    max_concurrency: int = getattr(task_runtime_cfg, "max_concurrency", 4)
+    max_concurrency: int = getattr(task_runtime_cfg, "max_concurrency", 8)
     formula_cap = max(2 * max_concurrency, 1)
     return min(raw_cap, formula_cap)
 

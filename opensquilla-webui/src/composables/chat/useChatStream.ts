@@ -46,7 +46,7 @@ const THINKING_TTL_MS = 60000
 // than this (longer than any realistic provider tool run) as skew/garbage.
 const SERVER_CLOCK_TOLERANCE_MS = 5000
 const MAX_TRUSTED_TOOL_AGE_MS = 60 * 60 * 1000
-const SQUILLA_VERBS = ['Planning next step', 'Reading context', 'Waiting for model', 'Preparing output']
+const SQUILLA_VERBS = ['Planning next step', 'Reading context', 'Preparing output']
 
 // Internal phase labels stay English (they double as stable keys for dedup,
 // matching, and the appended status-frame action). Localize only at the display
@@ -54,6 +54,7 @@ const SQUILLA_VERBS = ['Planning next step', 'Reading context', 'Waiting for mod
 // back to their English text.
 const STREAM_LABEL_KEYS: Record<string, string> = {
   Sending: 'chat.stream.sending',
+  Running: 'chat.status.running',
   'Planning next step': 'chat.stream.planningNextStep',
   'Reading context': 'chat.stream.readingContext',
   'Waiting for model': 'chat.stream.waitingForModel',
@@ -150,6 +151,12 @@ export function useChatStream(options: UseChatStreamOptions) {
   // the step chip render as separate elements rather than one packed string.
   const streamPhaseLabel = computed(() => {
     streamActivityTick.value
+    // A queued task is durable but has not acquired a TaskRuntime slot. Keep
+    // that boundary authoritative: local animation timers must not relabel it
+    // as model or router work that has not started.
+    if (options.runStatus?.value.status === 'queued') {
+      return i18n.global.t('chat.status.queued')
+    }
     const now = Date.now()
     if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) {
       // Static on purpose: this feeds a polite live region, so a ticking
@@ -157,16 +164,15 @@ export function useChatStream(options: UseChatStreamOptions) {
       // stall. The aria-hidden elapsed chip carries the seconds instead.
       return i18n.global.t('chat.activity.stale')
     }
-    const startedAt = streamActivity.value.startedAt || now
-    const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
-    return seconds >= 10 && streamActivity.value.label === 'Planning next step'
-      ? i18n.global.t('chat.stream.stillWaiting')
-      : localizeStreamLabel(streamActivity.value.label)
+    return localizeStreamLabel(streamActivity.value.label)
   })
 
   // Elapsed seconds for the current phase, rendered as its own chip.
   const streamPhaseElapsed = computed(() => {
     streamActivityTick.value
+    // task.queued has no authoritative server timestamp. Do not present the
+    // optimistic browser send clock as durable queue wait time.
+    if (options.runStatus?.value.status === 'queued') return ''
     const now = Date.now()
     if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) {
       // During a stall the phase label is static for screen readers, so the

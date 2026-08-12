@@ -926,7 +926,7 @@ class TaskRuntime:
         event_emitter: EventEmitter | None = None,
         terminal_listener: TerminalListener | None = None,
         lifecycle_listener: TaskLifecycleListener | None = None,
-        max_concurrency: int = 4,
+        max_concurrency: int = 8,
         max_pending_per_session: int | None = 64,
         subagent_reserved_slots: int = 0,
         turn_hard_deadline_s: float | None = None,
@@ -1032,9 +1032,11 @@ class TaskRuntime:
         #
         # Design: true round-robin across sessions of the same agent_id.
         # ``_agent_session_rr[agent_id]`` is a deque of session_keys that have
-        # active (pending or running) tasks for that agent.  When a task needs a
-        # slot it must be at the front of its agent's deque; after acquiring the
-        # slot the deque entry rotates to the tail so the next session goes next.
+        # active (pending or running) tasks for that agent. ``_agent_slot_waiters``
+        # narrows that enrollment to sessions whose driver is genuinely waiting
+        # for a global slot; running sessions must never block idle capacity.
+        # After a waiter acquires, the RR deque rotates past that session so the
+        # next waiting session goes next.
         # When a session has no more pending/running tasks it is removed from the
         # deque in ``_mark_terminal``.
         #
@@ -1049,6 +1051,7 @@ class TaskRuntime:
         # Lazily initialised like _slot_cond.
         self._agent_session_rr: dict[str, deque[str]] = {}
         self._agent_active_sessions: dict[str, set[str]] = {}
+        self._agent_slot_waiters: dict[str, set[str]] = {}
         self._agent_in_flight: dict[str, int] = {}
         self._fair_cond: asyncio.Condition | None = None
 
@@ -4765,25 +4768,21 @@ class TaskRuntime:
         return self._fair_cond
 
     async def _acquire_fair_slot(self, task: _RuntimeTask) -> None:
-        """Acquire one global concurrency slot with per-agent_id round-robin enrollment.
+        """Acquire one global slot with round-robin among genuine slot waiters.
 
         A task must satisfy one predicate before it is granted a slot:
 
         1. A slot is available: ``_global_in_flight < _max_concurrency``.
 
-        The per-agent RR deque is rotated on each acquire so that the *next*
-        task to grab a free slot comes from the next session in enrollment
-        order.  Crucially, the deque is NOT used as a blocking gate — it only
-        controls which session goes first when multiple sessions are competing
-        for the same slot.  This means sessions of the same agent with
-        different session_keys can all run concurrently when idle slots exist,
-        preventing head-session blocking.
+        The active-session RR deque supplies stable ordering, but eligibility is
+        filtered through ``_agent_slot_waiters``. Existing running sessions and
+        sessions whose next task is still behind its execution lock therefore
+        cannot become a phantom head that leaves global capacity idle.
 
         When only one slot is left (``_global_in_flight == _max_concurrency - 1``),
-        the session at the front of the agent's RR deque is preferred: other
-        sessions of the same agent yield so the deque head gets the last slot.
-        This preserves starvation-free round-robin ordering without blocking
-        concurrent execution when multiple slots are free.
+        the first *waiting* session in RR order is preferred. Other waiters for
+        the same agent yield so the last slot remains starvation-free without
+        being blocked by a session that is already running.
 
         When a slot is released ``_fair_cond.notify_all()`` wakes all waiters
         so they re-check the predicate.
@@ -4793,29 +4792,46 @@ class TaskRuntime:
         session_key = task.envelope.session_key
 
         async with cond:
-            while True:
-                # Predicate 1: global slot available.
-                if self._global_in_flight >= self._max_concurrency:
-                    await cond.wait()
-                    continue
-                # Tie-break: when exactly one slot remains and this agent has
-                # multiple active sessions, only the deque-head session may
-                # take it.  All other sessions of this agent yield so that RR
-                # ordering is preserved without wasting the slot.
-                idle_slots = self._max_concurrency - self._global_in_flight
-                rr = self._agent_session_rr.get(agent_id)
-                if idle_slots == 1 and rr and len(rr) > 1 and rr[0] != session_key:
-                    await cond.wait()
-                    continue
-                # Predicate satisfied — rotate deque and claim the slot.
-                if rr and rr[0] == session_key:
-                    rr.rotate(-1)
-                self._global_in_flight += 1
-                if task.run_kind == "subagent":
-                    self._subagent_in_flight += 1
-                self._agent_in_flight[agent_id] = self._agent_in_flight.get(agent_id, 0) + 1
-                task.acquired_slot = True
-                break
+            waiters = self._agent_slot_waiters.setdefault(agent_id, set())
+            waiters.add(session_key)
+            try:
+                while True:
+                    # Predicate 1: global slot available.
+                    if self._global_in_flight >= self._max_concurrency:
+                        await cond.wait()
+                        continue
+                    # Tie-break only among sessions that are actually inside
+                    # this global-slot wait. Active/running RR entries are not
+                    # eligible and cannot strand the last idle slot.
+                    idle_slots = self._max_concurrency - self._global_in_flight
+                    rr = self._agent_session_rr.get(agent_id)
+                    fair_session = next(
+                        (candidate for candidate in (rr or ()) if candidate in waiters),
+                        None,
+                    )
+                    if idle_slots == 1 and fair_session != session_key:
+                        await cond.wait()
+                        continue
+                    # Predicate satisfied — rotate past the granted session and
+                    # claim the slot. Rotation works even when non-waiting RR
+                    # entries precede this session.
+                    if rr and session_key in rr:
+                        rr.rotate(-(rr.index(session_key) + 1))
+                    self._global_in_flight += 1
+                    if task.run_kind == "subagent":
+                        self._subagent_in_flight += 1
+                    self._agent_in_flight[agent_id] = (
+                        self._agent_in_flight.get(agent_id, 0) + 1
+                    )
+                    task.acquired_slot = True
+                    break
+            finally:
+                waiters.discard(session_key)
+                if not waiters:
+                    self._agent_slot_waiters.pop(agent_id, None)
+                # Cancellation or a successful grant changes the genuine RR
+                # head. Wake peers even when no global slot count changed.
+                cond.notify_all()
 
         # Update storage and emit running metric outside the condition lock. A
         # collect claim can keep this await open; if cancellation or persistence
