@@ -605,6 +605,77 @@ def test_fallback_order_uses_activity_and_durable_backup_start(tmp_path: Path) -
     )
 
 
+@pytest.mark.parametrize(
+    ("reader", "expected"),
+    [
+        (driver._durable_accounting_from_database, (2, 0)),
+        (
+            lambda gateway: driver._fallback_preceded_backup_usage_start(
+                gateway,
+                driver.TurnObservation(
+                    session_key="agent:main:webchat:synthetic",
+                    marker="OSQ_SYNTHETIC",
+                    started_monotonic=0,
+                    activity_phases=[("fallback", 1.0, 1_999, False)],
+                ),
+            ),
+            True,
+        ),
+    ],
+)
+def test_durable_usage_readers_close_sqlite_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    reader: object,
+    expected: object,
+) -> None:
+    database = tmp_path / "sessions.db"
+    database.touch()
+    closed = False
+
+    class Cursor:
+        def __init__(self, row: tuple[int, int]) -> None:
+            self.row = row
+
+        def fetchone(self) -> tuple[int, int]:
+            return self.row
+
+    class Connection:
+        def execute(self, query: str) -> Cursor:
+            return Cursor((2, 0) if "COUNT(*)" in query else (2_000, 0))
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr(driver.sqlite3, "connect", lambda *_args, **_kwargs: Connection())
+
+    assert callable(reader)
+    assert reader(SimpleNamespace(state_dir=tmp_path)) == expected
+    assert closed is True
+
+
+def test_durable_usage_reader_closes_sqlite_handle_after_query_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "sessions.db").touch()
+    closed = False
+
+    class Connection:
+        def execute(self, _query: str) -> object:
+            raise sqlite3.OperationalError("synthetic query failure")
+
+        def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    monkeypatch.setattr(driver.sqlite3, "connect", lambda *_args, **_kwargs: Connection())
+
+    assert driver._durable_accounting_from_database(SimpleNamespace(state_dir=tmp_path)) == (0, 0)
+    assert closed is True
+
+
 def test_stop_count_requires_durable_webui_stop_outcomes() -> None:
     class Client:
         async def call(self, _method: str, _params: object) -> dict[str, object]:

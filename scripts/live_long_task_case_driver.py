@@ -1107,7 +1107,12 @@ def _durable_accounting_from_database(gateway: GatewayProcess) -> tuple[int, int
     if database is None:
         return 0, 0
     try:
-        with sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True) as connection:
+        # sqlite3.Connection's context manager controls only the transaction;
+        # it does not close the database.  Keep the read handle bounded so a
+        # Windows release runner can remove the isolated state tree afterward.
+        with contextlib.closing(
+            sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+        ) as connection:
             row = connection.execute(
                 """
                 SELECT
@@ -1145,7 +1150,9 @@ def _fallback_preceded_backup_usage_start(
     if database is None:
         return False
     try:
-        with sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True) as connection:
+        with contextlib.closing(
+            sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+        ) as connection:
             row = connection.execute(
                 """
                 SELECT MAX(started_at_ms)
