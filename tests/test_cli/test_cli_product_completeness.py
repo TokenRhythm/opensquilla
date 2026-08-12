@@ -1614,6 +1614,31 @@ def test_provider_and_search_diagnostics_use_gateway_rpcs(monkeypatch):
     ) in fake.calls
 
 
+def test_search_status_text_reports_blocked_network_precondition(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    reason = (
+        "NetworkMode.PROXY_ALLOWLIST requires Run Context grants to run "
+        "in-process network tools through the managed proxy."
+    )
+    fake.rpc_payloads = {
+        "search.status": {
+            "activeProvider": "duckduckgo",
+            "provider": "duckduckgo",
+            "configured": True,
+            "buildable": True,
+            "networkReady": False,
+            "networkBlockedReason": reason,
+        }
+    }
+
+    result = runner.invoke(app, ["search", "status"])
+
+    assert result.exit_code == 0, result.stdout
+    assert "blocked" in result.stdout
+    assert reason in " ".join(result.stdout.split())
+    assert ("search.status", {}) in fake.calls
+
+
 def test_search_query_json_exits_nonzero_on_diagnostic_failure(monkeypatch):
     fake = _install_fake_gateway(monkeypatch)
     fake.rpc_payloads = {
