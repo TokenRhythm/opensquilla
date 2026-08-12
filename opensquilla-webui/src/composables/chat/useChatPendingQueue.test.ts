@@ -255,6 +255,60 @@ describe('useChatPendingQueue delivery state', () => {
     }
   })
 
+  it('pauses terminal drain while reordering and resumes with the new queue head', async () => {
+    vi.useFakeTimers()
+    const dispatchPendingItem = vi.fn(async () => 'accepted' as const)
+    const { inputText, queue } = makeQueue(dispatchPendingItem)
+    try {
+      inputText.value = 'first queued message'
+      queue.enqueuePendingInput(inputText.value)
+      inputText.value = 'second queued message'
+      queue.enqueuePendingInput(inputText.value)
+
+      expect(queue.beginPendingReorder(0)).toBe(true)
+      expect(queue.beginPendingDelivery(0)).toBeNull()
+      queue.schedulePendingDrainAfterTerminal()
+      await vi.advanceTimersByTimeAsync(50)
+      expect(dispatchPendingItem).not.toHaveBeenCalled()
+
+      expect(queue.reorderPendingItem(0, 1)).toBe(true)
+      expect(queue.pendingQueue.value.map(item => item.text)).toEqual([
+        'second queued message',
+        'first queued message',
+      ])
+      queue.endPendingReorder()
+      await vi.advanceTimersByTimeAsync(50)
+      await nextTick()
+
+      expect(dispatchPendingItem).toHaveBeenCalledWith(expect.objectContaining({
+        text: 'second queued message',
+      }), 'agent:main:webchat:test')
+      expect(queue.pendingQueue.value.map(item => item.text)).toEqual([
+        'first queued message',
+      ])
+    } finally {
+      queue.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('refuses reordering when any queued item owns delivery state', () => {
+    const { inputText, queue } = makeQueue()
+    inputText.value = 'ordinary follow-up'
+    queue.enqueuePendingInput(inputText.value)
+    inputText.value = 'retryable follow-up'
+    queue.enqueuePendingInput(inputText.value)
+    queue.pendingQueue.value[1]!.deliveryState = 'retryable'
+
+    expect(queue.beginPendingReorder(0)).toBe(false)
+    expect(queue.reorderPendingItem(0, 1)).toBe(false)
+    expect(queue.pendingQueue.value.map(item => item.text)).toEqual([
+      'ordinary follow-up',
+      'retryable follow-up',
+    ])
+    queue.cleanup()
+  })
+
   it('keeps a deferred auto-drain live until transient attachment work clears', async () => {
     vi.useFakeTimers()
     const attachmentBusy = ref(false)

@@ -1,16 +1,31 @@
 <template>
-  <section
+  <TransitionGroup
     v-if="items.length > 0"
+    name="chat-pending-list"
+    tag="section"
     class="chat-pending"
     :aria-label="t('chat.pending.label', { count: items.length, max: effectiveMaxPending })"
   >
     <article
       v-for="(item, index) in items"
-      :key="index"
+      :key="itemKey(item)"
       class="chat-pending-card"
+      :class="{
+        'is-reorderable': canReorderItem(item),
+        'is-reorder-arming': pointerReorder?.item === item && !pointerReorder.active,
+        'is-reordering': draggingItem === item,
+      }"
+      :data-queue-key="itemKey(item)"
       :data-delivery-state="pendingCardState(item)"
       :aria-busy="isSteering(item) ? 'true' : undefined"
-      :aria-describedby="attachmentBlockMessage(item) ? attachmentStatusId(index) : undefined"
+      :aria-label="canReorderItem(item)
+        ? `${displayText(item)}. ${t('chat.pending.reorderHint')}`
+        : undefined"
+      :aria-describedby="attachmentBlockMessage(item) ? attachmentStatusId(item) : undefined"
+      :aria-keyshortcuts="canReorderItem(item) ? 'Alt+ArrowUp Alt+ArrowDown' : undefined"
+      :tabindex="canReorderItem(item) ? 0 : undefined"
+      @keydown="onCardKeydown(item, $event)"
+      @pointerdown="onCardPointerDown(item, $event)"
     >
       <p class="chat-pending-text" :title="displayText(item)">
         {{ displayText(item) }}
@@ -19,7 +34,7 @@
         {{ item.attachments.length }} · 📎
         <span
           v-if="attachmentBlockMessage(item)"
-          :id="attachmentStatusId(index)"
+          :id="attachmentStatusId(item)"
           class="chat-pending-attachment-status"
           :title="attachmentBlockMessage(item)"
         >
@@ -34,7 +49,7 @@
           class="chat-pending-action chat-pending-action--steer"
           :title="steerTitle(item)"
           :disabled="isSteerDisabled(item)"
-          :aria-describedby="attachmentBlockMessage(item) ? attachmentStatusId(index) : undefined"
+          :aria-describedby="attachmentBlockMessage(item) ? attachmentStatusId(item) : undefined"
           @click="emit('steer', index)"
         >
           <span aria-hidden="true">↪</span>
@@ -47,7 +62,7 @@
           class="chat-pending-action chat-pending-action--icon"
           :aria-label="removeLabel(item, index)"
           :title="removeLabel(item, index)"
-          :disabled="isSteering(item)"
+          :disabled="isSteering(item) || isQueueReordering"
           @click="emit('remove', index)"
         >
           <Icon name="trash" :size="14" />
@@ -61,7 +76,7 @@
             :title="t('chrome.more')"
             aria-haspopup="menu"
             :aria-expanded="openMenuIndex === index && !isSteering(item) ? 'true' : 'false'"
-            :disabled="isSteering(item)"
+            :disabled="isSteering(item) || isQueueReordering"
             @click.stop="toggleMenu(index)"
           >
             <Icon name="moreHorizontal" :size="16" />
@@ -89,11 +104,14 @@
         </div>
       </div>
     </article>
-  </section>
+    <span key="reorder-announcement" class="chat-pending-announcement" aria-live="polite">
+      {{ reorderAnnouncement }}
+    </span>
+  </TransitionGroup>
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
@@ -134,10 +152,29 @@ const emit = defineEmits<{
   clear: []
   edit: [index: number]
   remove: [index: number]
+  reorder: [fromIndex: number, toIndex: number]
+  reorderEnd: []
+  reorderStart: [index: number]
   steer: [index: number]
 }>()
 
+const LONG_PRESS_MS = 1000
+const LONG_PRESS_DEADZONE_PX = 7
 const openMenuIndex = ref<number | null>(null)
+const draggingItem = shallowRef<PendingQueueItem | null>(null)
+const reorderAnnouncement = ref('')
+const itemKeys = new WeakMap<PendingQueueItem, string>()
+let nextItemKey = 0
+let longPressTimer: ReturnType<typeof setTimeout> | null = null
+const pointerReorder = shallowRef<{
+  active: boolean
+  card: HTMLElement
+  item: PendingQueueItem
+  pointerId: number
+  startX: number
+  startY: number
+} | null>(null)
+const isQueueReordering = computed(() => draggingItem.value !== null)
 const effectiveMaxPending = computed(() => (
   props.maxPending + (
     props.items.some(item => item.steerAttempt) || props.items.length > props.maxPending
@@ -148,6 +185,27 @@ const effectiveMaxPending = computed(() => (
 
 function displayText(item: PendingQueueItem): string {
   return item.displayTextOverride || item.text
+}
+
+function itemKey(item: PendingQueueItem): string {
+  const existing = itemKeys.get(item)
+  if (existing) return existing
+  nextItemKey += 1
+  const key = `pending-${nextItemKey}`
+  itemKeys.set(item, key)
+  return key
+}
+
+function queueCanReorder(): boolean {
+  return props.items.length > 1 && props.items.every(item => (
+    !item.hiddenControl
+    && !item.deliveryState
+    && !item.steerAttempt
+  ))
+}
+
+function canReorderItem(item: PendingQueueItem): boolean {
+  return queueCanReorder() && props.items.includes(item)
 }
 
 function isSteering(item: PendingQueueItem): boolean {
@@ -220,7 +278,7 @@ function pendingSteerBlocker(item: PendingQueueItem): PendingSteerBlocker | null
 }
 
 function isSteerDisabled(item: PendingQueueItem): boolean {
-  return pendingSteerBlocker(item) !== null
+  return isQueueReordering.value || pendingSteerBlocker(item) !== null
 }
 
 function steerTitle(item: PendingQueueItem): string {
@@ -246,12 +304,12 @@ function steerTitle(item: PendingQueueItem): string {
   }
 }
 
-function attachmentStatusId(index: number): string {
-  return `chat-pending-attachment-status-${index}`
+function attachmentStatusId(item: PendingQueueItem): string {
+  return `chat-pending-attachment-status-${itemKey(item)}`
 }
 
 function toggleMenu(index: number) {
-  if (props.items[index]?.deliveryState === 'steering') return
+  if (isQueueReordering.value || props.items[index]?.deliveryState === 'steering') return
   openMenuIndex.value = openMenuIndex.value === index ? null : index
 }
 
@@ -266,16 +324,158 @@ function chooseClear() {
   emit('clear')
 }
 
+function clearLongPressTimer() {
+  if (!longPressTimer) return
+  clearTimeout(longPressTimer)
+  longPressTimer = null
+}
+
+function finishPointerReorder() {
+  const reorder = pointerReorder.value
+  clearLongPressTimer()
+  pointerReorder.value = null
+  if (!reorder?.active) return
+  draggingItem.value = null
+  emit('reorderEnd')
+}
+
+function cancelPointerReorder() {
+  const reorder = pointerReorder.value
+  clearLongPressTimer()
+  pointerReorder.value = null
+  if (!reorder?.active) return
+  draggingItem.value = null
+  emit('reorderEnd')
+}
+
+function announcePosition(item: PendingQueueItem) {
+  const index = props.items.indexOf(item)
+  if (index < 0) return
+  reorderAnnouncement.value = t('chat.pending.reorderPosition', {
+    count: props.items.length,
+    label: displayText(item),
+    position: index + 1,
+  })
+}
+
+function activatePointerReorder(reorder: NonNullable<typeof pointerReorder.value>) {
+  if (pointerReorder.value !== reorder || !canReorderItem(reorder.item)) return
+  reorder.active = true
+  draggingItem.value = reorder.item
+  openMenuIndex.value = null
+  reorder.card.setPointerCapture?.(reorder.pointerId)
+  const index = props.items.indexOf(reorder.item)
+  if (index < 0) return cancelPointerReorder()
+  emit('reorderStart', index)
+  reorderAnnouncement.value = t('chat.pending.reorderStarted', {
+    label: displayText(reorder.item),
+  })
+}
+
+function onCardPointerDown(item: PendingQueueItem, event: PointerEvent) {
+  if (event.button > 0 || !canReorderItem(item)) return
+  const target = event.target as Element | null
+  if (target?.closest?.('button, a, input, textarea, select, [role="menu"]')) return
+  cancelPointerReorder()
+  const card = event.currentTarget as HTMLElement | null
+  if (!card?.classList.contains('chat-pending-card')) return
+  const reorder = {
+    active: false,
+    card,
+    item,
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+  }
+  pointerReorder.value = reorder
+  longPressTimer = setTimeout(() => activatePointerReorder(reorder), LONG_PRESS_MS)
+}
+
+function onCardKeydown(item: PendingQueueItem, event: KeyboardEvent) {
+  if (!event.altKey || !canReorderItem(item)) return
+  const fromIndex = props.items.indexOf(item)
+  const toIndex = event.key === 'ArrowUp'
+    ? fromIndex - 1
+    : event.key === 'ArrowDown'
+      ? fromIndex + 1
+      : fromIndex
+  if (toIndex === fromIndex || toIndex < 0 || toIndex >= props.items.length) return
+  event.preventDefault()
+  emit('reorderStart', fromIndex)
+  emit('reorder', fromIndex, toIndex)
+  emit('reorderEnd')
+  announcePosition(item)
+}
+
 useDocumentEvent('pointerdown', (event) => {
   const target = event.target
   if (target instanceof Element && target.closest('.chat-pending-more-wrap')) return
   openMenuIndex.value = null
 })
 
+useDocumentEvent('pointermove', (event) => {
+  const reorder = pointerReorder.value
+  if (!reorder || event.pointerId !== reorder.pointerId) return
+  if (!reorder.active) {
+    if (
+      Math.hypot(event.clientX - reorder.startX, event.clientY - reorder.startY)
+      <= LONG_PRESS_DEADZONE_PX
+    ) return
+    cancelPointerReorder()
+    return
+  }
+  event.preventDefault()
+  const target = document.elementFromPoint(event.clientX, event.clientY)
+    ?.closest<HTMLElement>('.chat-pending-card[data-queue-key]')
+  if (!target) return
+  const targetItem = props.items.find(item => itemKey(item) === target.dataset.queueKey)
+  if (!targetItem || targetItem === reorder.item || !canReorderItem(targetItem)) return
+  const fromIndex = props.items.indexOf(reorder.item)
+  const toIndex = props.items.indexOf(targetItem)
+  if (fromIndex < 0 || toIndex < 0) return
+  const rect = target.getBoundingClientRect()
+  const crossedMidpoint = fromIndex < toIndex
+    ? event.clientY > rect.top + rect.height / 2
+    : event.clientY < rect.top + rect.height / 2
+  if (!crossedMidpoint) return
+  emit('reorder', fromIndex, toIndex)
+  announcePosition(reorder.item)
+}, { passive: false })
+
+useDocumentEvent('pointerup', (event) => {
+  if (event.pointerId !== pointerReorder.value?.pointerId) return
+  finishPointerReorder()
+})
+
+useDocumentEvent('pointercancel', (event) => {
+  if (event.pointerId !== pointerReorder.value?.pointerId) return
+  cancelPointerReorder()
+})
+
 useDocumentEvent('keydown', (event) => {
+  if (event.key === 'Escape' && pointerReorder.value) {
+    event.preventDefault()
+    cancelPointerReorder()
+    return
+  }
   if (event.key !== 'Escape' || openMenuIndex.value === null) return
   event.preventDefault()
   openMenuIndex.value = null
+})
+
+watch(
+  () => !pointerReorder.value || props.items.includes(pointerReorder.value.item),
+  itemStillExists => {
+    if (!itemStillExists) cancelPointerReorder()
+  },
+)
+
+watch(queueCanReorder, (canReorder) => {
+  if (!canReorder && pointerReorder.value) cancelPointerReorder()
+})
+
+onBeforeUnmount(() => {
+  cancelPointerReorder()
 })
 </script>
 
@@ -307,6 +507,28 @@ useDocumentEvent('keydown', (event) => {
   box-shadow:
     inset 0 1px 0 var(--elev-highlight),
     0 12px 30px -25px color-mix(in srgb, var(--text) 38%, transparent);
+  transition:
+    border-color var(--dur-fast) var(--ease-standard),
+    box-shadow var(--dur-fast) var(--ease-standard),
+    opacity var(--dur-fast) var(--ease-standard);
+}
+
+.chat-pending-card.is-reorderable {
+  cursor: grab;
+  touch-action: none;
+  -webkit-touch-callout: none;
+}
+
+.chat-pending-card.is-reordering {
+  z-index: 3;
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
+  cursor: grabbing;
+  scale: 1.012;
+  box-shadow:
+    inset 0 1px 0 var(--elev-highlight),
+    0 18px 38px -22px color-mix(in srgb, var(--accent) 42%, transparent);
+  animation: chat-pending-reorder-ready var(--dur-enter) var(--ease-standard);
+  user-select: none;
 }
 
 .chat-pending-card::before {
@@ -478,10 +700,68 @@ useDocumentEvent('keydown', (event) => {
   opacity: 0.5;
 }
 
+.chat-pending-announcement {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  border: 0;
+  white-space: nowrap;
+}
+
+.chat-pending-list-move {
+  transition: transform var(--dur-base) var(--ease-standard);
+}
+
+.chat-pending-list-enter-active,
+.chat-pending-list-leave-active {
+  transition:
+    opacity var(--dur-fast) var(--ease-standard),
+    translate var(--dur-fast) var(--ease-standard),
+    scale var(--dur-fast) var(--ease-standard);
+}
+
+.chat-pending-list-enter-from,
+.chat-pending-list-leave-to {
+  opacity: 0;
+  translate: 0 6px;
+  scale: 0.985;
+}
+
+.chat-pending-list-leave-active {
+  position: absolute;
+  inset-inline: 0;
+}
+
 @keyframes chat-pending-pulse {
   50% {
     opacity: 0.45;
     transform: scale(0.82);
+  }
+}
+
+@keyframes chat-pending-reorder-ready {
+  0% {
+    translate: 0 0;
+    scale: 1;
+  }
+
+  38% {
+    translate: 0 -3px;
+    scale: 1.045;
+  }
+
+  68% {
+    translate: 0 1px;
+    scale: 0.992;
+  }
+
+  100% {
+    translate: 0 0;
+    scale: 1.012;
   }
 }
 
@@ -517,6 +797,17 @@ useDocumentEvent('keydown', (event) => {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .chat-pending-card,
+  .chat-pending-list-move,
+  .chat-pending-list-enter-active,
+  .chat-pending-list-leave-active {
+    transition: none;
+  }
+
+  .chat-pending-card.is-reordering {
+    animation: none;
+  }
+
   .chat-pending-card[data-delivery-state="busy"]::before {
     animation: none;
   }

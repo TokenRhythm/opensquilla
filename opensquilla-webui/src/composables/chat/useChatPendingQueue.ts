@@ -72,6 +72,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   const parkedQueues = new Map<string, ChatPendingItem[]>()
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
   let deferredDrainRequested = false
+  const isReordering = ref(false)
 
   // A not-yet-durable Steer owns a separate transport slot. It must not
   // consume one of the five ordinary follow-up slots, regardless of whether
@@ -244,7 +245,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function removePendingChip(index: number) {
     const item = pendingQueue.value[index]
     if (
-      !item
+      isReordering.value
+      || !item
       || item.deliveryState === 'steering'
       || item.steerAttempt?.phase === 'submitting'
     ) return false
@@ -257,6 +259,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     index: number,
     allowHiddenControl = false,
   ): ChatPendingItem | null {
+    if (isReordering.value) return null
     const item = pendingQueue.value[index]
     if (
       !item
@@ -309,6 +312,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function clearPendingQueue() {
+    cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     pendingQueue.value = pendingQueue.value.filter(
       item => (
@@ -331,6 +335,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function switchPendingQueue(targetSessionKey: string) {
+    cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
     const sourceTransportOwned = pendingQueue.value.filter(
@@ -349,6 +354,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function adoptPendingQueue(targetSessionKey: string, ownerRequestId: string) {
+    cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
     const carried: ChatPendingItem[] = []
@@ -408,6 +414,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function popAllPendingIntoComposer(): boolean {
+    cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     if (!options.hasComposer() || pendingQueue.value.length === 0) return false
     // Hidden controls and explicit/ambiguous steer deliveries stay queued;
@@ -527,20 +534,25 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return
     }
     deferredDrainRequested = true
-    if (hasDeliveryBarrier.value) return
+    if (hasDeliveryBarrier.value || isReordering.value) return
     armPendingDrainTimer()
   }
 
   function armPendingDrainTimer() {
     cancelPendingDrainTimer()
-    if (hasDeliveryBarrier.value) return
+    if (hasDeliveryBarrier.value || isReordering.value) return
     pendingDrainTimer = setTimeout(() => {
       pendingDrainTimer = null
       if (pendingQueue.value.length === 0) {
         deferredDrainRequested = false
         return
       }
-      if (options.isStreaming.value || options.isBlocked() || hasDeliveryBarrier.value) return
+      if (
+        options.isStreaming.value
+        || options.isBlocked()
+        || hasDeliveryBarrier.value
+        || isReordering.value
+      ) return
       deferredDrainRequested = false
       drainQueueHead()
     }, 50)
@@ -551,8 +563,54 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       !deferredDrainRequested
       || pendingQueue.value.length === 0
       || hasDeliveryBarrier.value
+      || isReordering.value
     ) return
     armPendingDrainTimer()
+  }
+
+  function canReorderPendingQueue(): boolean {
+    return pendingQueue.value.length > 1 && pendingQueue.value.every(item => (
+      !item.hiddenControl
+      && !item.deliveryState
+      && !item.steerAttempt
+    ))
+  }
+
+  function beginPendingReorder(index: number): boolean {
+    if (
+      isReordering.value
+      || !canReorderPendingQueue()
+      || !pendingQueue.value[index]
+    ) return false
+    cancelPendingDrainTimer()
+    isReordering.value = true
+    return true
+  }
+
+  function reorderPendingItem(fromIndex: number, toIndex: number): boolean {
+    if (
+      !isReordering.value
+      || !canReorderPendingQueue()
+      || fromIndex === toIndex
+      || fromIndex < 0
+      || toIndex < 0
+      || fromIndex >= pendingQueue.value.length
+      || toIndex >= pendingQueue.value.length
+    ) return false
+    const [item] = pendingQueue.value.splice(fromIndex, 1)
+    if (!item) return false
+    pendingQueue.value.splice(toIndex, 0, item)
+    return true
+  }
+
+  function endPendingReorder() {
+    if (!isReordering.value) return
+    isReordering.value = false
+    flushDeferredPendingDrain()
+  }
+
+  function cancelPendingReorder() {
+    isReordering.value = false
   }
 
   function cancelPendingDrainTimer() {
@@ -568,6 +626,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function cleanup() {
+    cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     parkedQueues.clear()
   }
@@ -576,6 +635,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     pendingQueue,
     canQueueMore,
     busySendMode,
+    isReordering,
     maxPending: MAX_PENDING,
     enqueuePendingPayload,
     enqueuePendingInput,
@@ -590,6 +650,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     adoptPendingQueue,
     popPendingTail,
     popAllPendingIntoComposer,
+    beginPendingReorder,
+    reorderPendingItem,
+    endPendingReorder,
     schedulePendingDrainAfterTerminal,
     flushDeferredPendingDrain,
     clearPendingDrainAfterTerminalTimer,

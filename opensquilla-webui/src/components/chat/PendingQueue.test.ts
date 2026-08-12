@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it } from 'vitest'
-import { createApp, nextTick } from 'vue'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createApp, nextTick, reactive } from 'vue'
 import i18n, { loadLocaleMessages } from '@/i18n'
 import PendingQueue from './PendingQueue.vue'
 import type { Attachment, PendingSteerAttempt } from '@/types/chat'
@@ -12,7 +12,15 @@ afterEach(() => {
 })
 
 async function mountQueue(
-  listeners: Record<string, () => void> = {},
+  listeners: Partial<{
+    onClear: () => void
+    onEdit: (index: number) => void
+    onRemove: (index: number) => void
+    onReorder: (fromIndex: number, toIndex: number) => void
+    onReorderEnd: () => void
+    onReorderStart: (index: number) => void
+    onSteer: (index: number) => void
+  }> = {},
   items: Array<{
     text: string
     deliveryState?: 'steering' | 'retryable'
@@ -352,6 +360,150 @@ describe('PendingQueue', () => {
       .find(button => button.textContent?.includes('Clear queue'))
       ?.click()
     expect(cleared).toBe(1)
+    app.unmount()
+  })
+
+  it('activates pointer sorting only after a one-second hold and reorders past a midpoint', async () => {
+    vi.useFakeTimers()
+    const starts: number[] = []
+    const moves: Array<[number, number]> = []
+    let ended = 0
+    const elementFromPoint = vi.spyOn(document, 'elementFromPoint')
+    const { app, el } = await mountQueue({
+      onReorderStart: (index: number) => starts.push(index),
+      onReorder: (fromIndex: number, toIndex: number) => moves.push([fromIndex, toIndex]),
+      onReorderEnd: () => { ended += 1 },
+    }, [
+      { text: 'First queued message' },
+      { text: 'Second queued message' },
+      { text: 'Third queued message' },
+    ])
+
+    try {
+      const cards = [...el.querySelectorAll<HTMLElement>('.chat-pending-card')]
+      expect(cards[0]?.classList.contains('is-reorderable')).toBe(true)
+      cards[0]?.dispatchEvent(new MouseEvent('pointerdown', {
+        bubbles: true,
+        button: 0,
+        clientX: 20,
+        clientY: 20,
+      }))
+      await nextTick()
+      expect(cards[0]?.classList.contains('is-reorder-arming')).toBe(true)
+      await vi.advanceTimersByTimeAsync(999)
+      expect(starts).toEqual([])
+      expect(cards[0]?.classList.contains('is-reordering')).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await nextTick()
+      expect(starts).toEqual([0])
+      expect(cards[0]?.classList.contains('is-reordering')).toBe(true)
+      expect([...cards[0]!.querySelectorAll<HTMLButtonElement>('button')]
+        .every(button => button.disabled)).toBe(true)
+
+      Object.defineProperty(cards[1], 'getBoundingClientRect', {
+        configurable: true,
+        value: () => ({ top: 50, height: 50 }),
+      })
+      elementFromPoint.mockReturnValue(cards[1]!)
+      document.dispatchEvent(new MouseEvent('pointermove', {
+        bubbles: true,
+        clientX: 20,
+        clientY: 90,
+      }))
+      expect(moves).toEqual([[0, 1]])
+
+      document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }))
+      await nextTick()
+      expect(ended).toBe(1)
+      expect(cards[0]?.classList.contains('is-reordering')).toBe(false)
+    } finally {
+      app.unmount()
+      elementFromPoint.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels a pending long press when the pointer moves before activation', async () => {
+    vi.useFakeTimers()
+    let started = 0
+    const { app, el } = await mountQueue({
+      onReorderStart: () => { started += 1 },
+    }, [
+      { text: 'First queued message' },
+      { text: 'Second queued message' },
+    ])
+
+    try {
+      el.querySelector<HTMLElement>('.chat-pending-card')?.dispatchEvent(new MouseEvent(
+        'pointerdown',
+        { bubbles: true, button: 0, clientX: 10, clientY: 10 },
+      ))
+      document.dispatchEvent(new MouseEvent('pointermove', {
+        bubbles: true,
+        clientX: 25,
+        clientY: 10,
+      }))
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(started).toBe(0)
+    } finally {
+      app.unmount()
+      vi.useRealTimers()
+    }
+  })
+
+  it('supports keyboard reordering and disables sorting around a delivery lease', async () => {
+    const moves: Array<[number, number]> = []
+    let starts = 0
+    let ends = 0
+    const { app, el } = await mountQueue({
+      onReorderStart: () => { starts += 1 },
+      onReorder: (fromIndex: number, toIndex: number) => moves.push([fromIndex, toIndex]),
+      onReorderEnd: () => { ends += 1 },
+    }, [
+      { text: 'First queued message' },
+      { text: 'Second queued message' },
+    ])
+
+    const cards = [...el.querySelectorAll<HTMLElement>('.chat-pending-card')]
+    expect(cards.every(card => card.tabIndex === 0)).toBe(true)
+    cards[1]?.dispatchEvent(new KeyboardEvent('keydown', {
+      bubbles: true,
+      altKey: true,
+      key: 'ArrowUp',
+    }))
+    expect(starts).toBe(1)
+    expect(moves).toEqual([[1, 0]])
+    expect(ends).toBe(1)
+    app.unmount()
+
+    const locked = await mountQueue({}, [
+      { text: 'In flight', deliveryState: 'steering' },
+      { text: 'Must wait' },
+    ])
+    expect([...locked.el.querySelectorAll<HTMLElement>('.chat-pending-card')]
+      .every(card => card.getAttribute('tabindex') === null)).toBe(true)
+    locked.app.unmount()
+  })
+
+  it('preserves bubble identity when a middle item is removed', async () => {
+    const items = reactive([
+      { text: 'First queued message' },
+      { text: 'Delete this middle message' },
+      { text: 'Last queued message' },
+    ])
+    const { app, el } = await mountQueue({}, items)
+    const before = [...el.querySelectorAll<HTMLElement>('.chat-pending-card')]
+
+    items.splice(1, 1)
+    await nextTick()
+
+    const after = [...el.querySelectorAll<HTMLElement>('.chat-pending-card')]
+      .filter(card => !card.classList.contains('chat-pending-list-leave-active'))
+    expect(after.map(card => card.querySelector('.chat-pending-text')?.textContent?.trim()))
+      .toEqual(['First queued message', 'Last queued message'])
+    expect(after[0]).toBe(before[0])
+    expect(after[1]).toBe(before[2])
     app.unmount()
   })
 })
