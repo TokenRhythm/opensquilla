@@ -119,7 +119,7 @@ _SIMPLE_OPTION_GRAMMARS = {
         ("--exclude", "--separator", "--files-from", "--magic-file", "--parameter"),
     ),
     "grep": _simple_grammar(
-        "EFGPUVabcdhHhIiLlmnorsvwxZz",
+        "EFGPRUVabcdhHhIiLlmnorsvwxZz",
         "ABCeefm",
         (
             "--fixed-strings",
