@@ -1002,6 +1002,7 @@ def _apply_ops(
 
 @tool(
     name="apply_patch",
+    completion_effect="action",
     description=(
         "Apply a structured patch to files. Supports adding, modifying, and deleting files "
         "using Begin Patch / End Patch markers with unified @@ or @@@ hunk headers. "

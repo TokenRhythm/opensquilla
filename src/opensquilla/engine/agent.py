@@ -31,6 +31,15 @@ import structlog
 
 from opensquilla.artifacts import artifact_payload
 from opensquilla.context_budget import ContextBudgetClass, ContextBudgetGovernor
+from opensquilla.engine.action_completion import (
+    ACTION_COMPLETION_CONTRACT_MESSAGE,
+    ACTION_COMPLETION_INCOMPLETE_CODE,
+    ACTION_COMPLETION_INCOMPLETE_MESSAGE,
+    ACTION_COMPLETION_RECOVERY_LIMIT,
+    ACTION_COMPLETION_RECOVERY_MESSAGE,
+    ACTION_COMPLETION_TOOL_NAME,
+    action_completion_tool_definition,
+)
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import (
     check_response_for_cache_break,
@@ -2167,18 +2176,31 @@ def _drop_runtime_recovery_scaffolding(messages: list[Message]) -> list[Message]
     cleaned = list(messages)
     while cleaned:
         last = cleaned[-1]
+        action_completion_recovery = False
         if (
             last.role == "user"
             and isinstance(last.content, str)
-            and last.content.startswith("[Runtime recovery]")
+            and last.content.startswith(
+                (
+                    "[Runtime recovery]",
+                    "[Action completion contract]",
+                    "[Action completion recovery]",
+                )
+            )
         ):
+            action_completion_recovery = last.content.startswith(
+                "[Action completion recovery]"
+            )
             cleaned.pop()
             if cleaned:
                 previous = cleaned[-1]
                 if (
                     previous.role == "assistant"
-                    and not _message_has_visible_text(previous)
                     and not _message_has_tool_use(previous)
+                    and (
+                        action_completion_recovery
+                        or not _message_has_visible_text(previous)
+                    )
                 ):
                     cleaned.pop()
             continue
@@ -6842,6 +6864,9 @@ class Agent:
         post_tool_empty_recovery_attempted = False
         text_only_tool_recovery_injections = 0
         text_only_tool_recovery_pending = False
+        action_completion_contract_armed = False
+        action_completion_evidence_observed = False
+        action_completion_recoveries = 0
         plan_run_reconciliation_attempts = 0
         attached_plan_run_id = str(
             getattr(self._tool_context, "plan_run_id", "") or ""
@@ -7096,6 +7121,11 @@ class Agent:
         provider_tool_definitions = self.tool_definitions or None
         if not tools_supported:
             provider_tool_definitions = None
+        action_completion_tool_names = {
+            definition.name
+            for definition in provider_tool_definitions or []
+            if definition.completion_effect == "action"
+        }
 
         def _turn_budget_error() -> ErrorEvent | None:
             max_llm_calls = self._positive_int(getattr(self.config, "max_turn_llm_calls", 0))
@@ -7841,6 +7871,19 @@ class Agent:
                         )
                         else provider_tool_definitions
                     )
+                    if (
+                        provider_tools_for_call is not None
+                        and action_completion_contract_armed
+                        and not action_completion_evidence_observed
+                        and not any(
+                            definition.name == ACTION_COMPLETION_TOOL_NAME
+                            for definition in provider_tools_for_call
+                        )
+                    ):
+                        provider_tools_for_call = [
+                            *provider_tools_for_call,
+                            action_completion_tool_definition(),
+                        ]
                     provider_tools_for_call = self._workspace_edit_gate_tool_definitions(
                         provider_tools_for_call,
                         workspace_edit_gate_details,
@@ -12051,6 +12094,82 @@ class Agent:
                         )
                         yield terminal_error
                         break
+                    if (
+                        action_completion_contract_armed
+                        and not action_completion_evidence_observed
+                        and bool(visible_text.strip())
+                        and not goal_terminal_final_response_pending
+                        and not artifact_delivery_final_response_pending
+                    ):
+                        self.config.metadata["action_completion_detections"] = (
+                            self.config.metadata.get("action_completion_detections", 0) + 1
+                        )
+                        recovery_headroom = (
+                            action_completion_recoveries
+                            < ACTION_COMPLETION_RECOVERY_LIMIT
+                            and _turn_llm_call_budget_error(turn_llm_calls + 1) is None
+                            and (_total_deadline is None or _loop.time() < _total_deadline)
+                            and not max_iterations_finalization_pending
+                            and not post_write_convergence_finalization_pending
+                        )
+                        decision = RuntimeRecoveryDecision(
+                            action="nudge" if recovery_headroom else "observe",
+                            mechanism="action_completion_contract",
+                            reason="text_only_without_completion_evidence",
+                            mode="enforce",
+                            injected_to_model=recovery_headroom,
+                            message=(
+                                ACTION_COMPLETION_RECOVERY_MESSAGE
+                                if recovery_headroom
+                                else None
+                            ),
+                            details={
+                                "visible_text_chars": len(visible_text),
+                                "recoveries": action_completion_recoveries,
+                                "limit": ACTION_COMPLETION_RECOVERY_LIMIT,
+                                "provider_call_count": turn_llm_calls,
+                            },
+                        )
+                        self._record_runtime_recovery_event(
+                            decision,
+                            iteration=iterations,
+                            provider_call_count=turn_llm_calls,
+                        )
+                        self._write_turn_call_log(
+                            "action_completion_contract",
+                            action=decision.action,
+                            reason=decision.reason,
+                            details=decision.details,
+                        )
+                        if recovery_headroom:
+                            if final_text_parts:
+                                final_text_parts.pop()
+                            turn_messages.append(
+                                Message(role="user", content=ACTION_COMPLETION_RECOVERY_MESSAGE)
+                            )
+                            runtime_recovery_scaffolding_pending = True
+                            action_completion_recoveries += 1
+                            self.config.metadata["action_completion_recoveries"] = (
+                                self.config.metadata.get("action_completion_recoveries", 0) + 1
+                            )
+                            yield WarningEvent(
+                                code="action_completion_recovery",
+                                message=(
+                                    "The action task returned text without completion "
+                                    "evidence; asking for one final decision."
+                                ),
+                            )
+                            continue
+                        self.config.metadata["action_completion_incomplete"] = (
+                            self.config.metadata.get("action_completion_incomplete", 0) + 1
+                        )
+                        yield self._transition(AgentState.ERROR)
+                        terminal_error = ErrorEvent(
+                            message=ACTION_COMPLETION_INCOMPLETE_MESSAGE,
+                            code=ACTION_COMPLETION_INCOMPLETE_CODE,
+                        )
+                        yield terminal_error
+                        break
                     text_only_mode = getattr(
                         self.config,
                         "text_only_tool_recovery_mode",
@@ -12704,6 +12823,7 @@ class Agent:
                 tool_result_blocks: list[ContentBlockToolResult] = []
                 executed_results: list[ToolResult] = []
                 turn_yielded = False
+                action_tool_executed = False
 
                 # Map tool_use_id -> ToolResult built up below.
                 results_by_id: dict[str, ToolResult] = {}
@@ -13141,6 +13261,57 @@ class Agent:
                                 reason="plan_run_checkpoint_required",
                             ),
                         )
+                        continue
+                    if (
+                        action_completion_contract_armed
+                        and tc.tool_name == ACTION_COMPLETION_TOOL_NAME
+                    ):
+                        async for event in _flush_parallel_batch(parallel_batch):
+                            yield event
+                        parallel_batch = []
+                        summary = str(tc.arguments.get("summary") or "").strip()
+                        if not summary:
+                            results_by_id[tc.tool_use_id] = ToolResult(
+                                tool_use_id=tc.tool_use_id,
+                                tool_name=tc.tool_name,
+                                content=(
+                                    "Completion evidence was not accepted: provide a "
+                                    "non-empty user-visible summary."
+                                ),
+                                is_error=True,
+                                execution_status=runtime_execution_status(
+                                    "error",
+                                    reason="missing_completion_summary",
+                                ),
+                            )
+                            continue
+                        action_completion_evidence_observed = True
+                        self.config.metadata["action_completion_evidence"] = (
+                            self.config.metadata.get("action_completion_evidence", 0) + 1
+                        )
+                        completion_result = ToolResult(
+                            tool_use_id=tc.tool_use_id,
+                            tool_name=tc.tool_name,
+                            content=json.dumps(
+                                {
+                                    "status": "completed",
+                                    "summary": summary,
+                                    "final_answer_required": not bool(
+                                        visible_text.strip()
+                                    ),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            is_error=False,
+                            terminates_turn=bool(visible_text.strip()),
+                            execution_status=runtime_execution_status(
+                                "success",
+                                reason="action_completion_evidence",
+                            ),
+                        )
+                        results_by_id[tc.tool_use_id] = completion_result
+                        if completion_result.terminates_turn:
+                            dispatch_boundary = completion_result
                         continue
                     if (
                         submit_review_enabled
@@ -13584,6 +13755,22 @@ class Agent:
                     if result.is_error
                     and not self._is_not_executed_after_dispatch_boundary(result)
                 ]
+                action_tool_executed = any(
+                    tc.tool_name in action_completion_tool_names
+                    and not self._is_not_executed_after_dispatch_boundary(result)
+                    for tc, result in zip(tool_calls, executed_results, strict=False)
+                )
+                if action_tool_executed:
+                    action_completion_evidence_observed = False
+                    if not action_completion_contract_armed:
+                        action_completion_contract_armed = True
+                        self.config.metadata["action_completion_contracts_armed"] = (
+                            self.config.metadata.get(
+                                "action_completion_contracts_armed",
+                                0,
+                            )
+                            + 1
+                        )
                 turn_tool_errors += len(actual_tool_errors)
                 first_tool_error = next(
                     iter(actual_tool_errors),
@@ -14072,6 +14259,15 @@ class Agent:
                 turn_messages.append(
                     Message(role="user", content=tool_result_blocks)  # type: ignore[arg-type]
                 )
+                if (
+                    action_tool_executed
+                    and not turn_yielded
+                    and not terminal_artifacts
+                ):
+                    turn_messages.append(
+                        Message(role="user", content=ACTION_COMPLETION_CONTRACT_MESSAGE)
+                    )
+                    runtime_recovery_scaffolding_pending = True
                 if accepted_goal_terminal_status is not None:
                     last_executed_results = list(executed_results)
                     if turn_yielded:

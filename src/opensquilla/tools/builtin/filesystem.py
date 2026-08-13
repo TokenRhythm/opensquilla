@@ -1989,6 +1989,7 @@ def _format_spreadsheet(
 
 @tool(
     name="write_file",
+    completion_effect="action",
     description=(
         "Write full file content, creating directories as needed. Best for new "
         "files and scratch files. For existing workspace source files, first use "
@@ -2479,6 +2480,7 @@ def _edit_file_retry_guidance(*, duplicate_match: bool = False) -> str:
 
 @tool(
     name="edit_file",
+    completion_effect="action",
     description=(
         "Edit one existing workspace file using exact text replacement after reading "
         "the current file with read_file without offset or limit. For one change, "

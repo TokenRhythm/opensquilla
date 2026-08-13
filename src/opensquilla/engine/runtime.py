@@ -99,6 +99,10 @@ from opensquilla.contracts.attachments import (
 from opensquilla.contracts.attachments import (
     normalize_attachment_mime as _normalize_attachment_mime,
 )
+from opensquilla.engine.action_completion import (
+    ACTION_COMPLETION_INCOMPLETE_CODE,
+    ActionCompletionIncompleteError,
+)
 from opensquilla.engine.agent import Agent, ToolHandler
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import notify_compaction
@@ -5595,6 +5599,12 @@ class TurnRunner:
             )
             if pending_error_event is not None:
                 yield pending_error_event
+                if pending_error_event.code == ACTION_COMPLETION_INCOMPLETE_CODE:
+                    # Finalization above has already persisted the assistant text,
+                    # error record, and usage-bearing Done snapshot. Raising only
+                    # now lets TaskRuntime durably classify the accepted task as
+                    # incomplete instead of upgrading a semantic failure to success.
+                    raise ActionCompletionIncompleteError(pending_error_event.message)
 
         except asyncio.CancelledError:
             # Preserve whatever assistant text has already streamed back. The

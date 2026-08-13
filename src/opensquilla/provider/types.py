@@ -350,6 +350,12 @@ class ToolDefinition(BaseModel):
     execution_timeout_seconds: float | None = None
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
+    # Runtime-only completion semantics. Excluded from every provider/API dump:
+    # it is trusted registry metadata, not part of the model-facing schema.
+    completion_effect: Literal["unknown", "read_only", "action", "control"] = Field(
+        default="unknown",
+        exclude=True,
+    )
 
 
 # ---------------------------------------------------------------------------

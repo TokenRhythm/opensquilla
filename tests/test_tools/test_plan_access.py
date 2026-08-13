@@ -43,6 +43,25 @@ def test_plan_access_defaults_to_deny_and_decorator_preserves_metadata() -> None
     assert registered is not None
     assert registered.spec.plan_access is PlanAccess.READ_ONLY
     assert registered.spec.terminates_turn is True
+    assert registered.spec.completion_effect == "read_only"
+
+
+def test_completion_effect_is_runtime_only_registry_metadata() -> None:
+    registry = ToolRegistry()
+
+    @tool(
+        name="act",
+        description="act",
+        registry=registry,
+        completion_effect="action",
+    )
+    async def act() -> str:
+        return "ok"
+
+    definition = registry.to_tool_definitions(ToolContext())[0]
+
+    assert definition.completion_effect == "action"
+    assert "completion_effect" not in definition.model_dump()
 
 
 def test_plan_visibility_is_fail_closed_but_default_visibility_is_unchanged() -> None:

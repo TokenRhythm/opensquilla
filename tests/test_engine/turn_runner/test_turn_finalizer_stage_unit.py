@@ -399,6 +399,39 @@ async def test_simple_text_with_done_event_fires_rollup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_action_incomplete_persists_visible_text_error_and_usage() -> None:
+    stage, recs = _make_stage()
+    error = ErrorEvent(
+        message="Action completion evidence was missing.",
+        code="action_completion_incomplete",
+    )
+    done = DoneEvent(
+        text="I will start it now.",
+        text_snapshot="I will start it now.",
+        input_tokens=10,
+        output_tokens=3,
+        model="synthetic-action-model",
+    )
+
+    outcome = await stage.run(
+        _make_input(
+            final_text_parts=["I will start it now."],
+            error_message=error.message,
+            pending_error_event=error,
+            done_event=done,
+        )
+    )
+
+    assert outcome.output.final_text == "I will start it now."
+    assert outcome.output.transcript_appended is True
+    assert recs["transcript_append"].calls[0]["content"] == "I will start it now."
+    assert recs["transcript_append"].calls[0]["turn_usage"]["input_tokens"] == 10
+    assert recs["transcript_append"].calls[0]["turn_usage"]["output_tokens"] == 3
+    assert recs["turn_error_persist"].calls[0]["event"] is error
+    assert recs["session_totals"].calls[0]["done_event"] is done
+
+
+@pytest.mark.asyncio
 async def test_aggregated_usage_keeps_parent_message_token_count() -> None:
     stage, recs = _make_stage()
     done = DoneEvent(

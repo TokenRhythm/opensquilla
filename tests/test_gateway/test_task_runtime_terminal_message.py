@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from opensquilla.engine.action_completion import ActionCompletionIncompleteError
 from opensquilla.engine.types import ErrorEvent
 from opensquilla.gateway.boot import (
     TaskRuntimeStreamError,
@@ -74,6 +75,28 @@ def _make_runtime(
         event_emitter=event_emitter,
         terminal_listener=terminal_listener,
     )
+
+
+@pytest.mark.asyncio
+async def test_action_completion_incomplete_persists_partial_failed_terminal() -> None:
+    async def _incomplete_handler(_run: Any) -> None:
+        raise ActionCompletionIncompleteError()
+
+    storage = _make_storage()
+    runtime = _make_runtime(_incomplete_handler, storage=storage)
+    handle = await runtime.enqueue(_make_envelope(), "start the service")
+
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.terminal_reason == "action_completion_incomplete"
+    assert record.error_class == "action_completion_incomplete"
+    assert record.details is not None
+    assert record.details["turn_outcome"]["kind"] == "partial"
+    assert record.details["turn_outcome"]["reason"] == "action_completion_incomplete"
+    persisted = await storage.get_agent_task(handle.task_id)
+    assert persisted is not None
+    assert persisted.status == AgentTaskStatus.FAILED
 
 
 @pytest.mark.asyncio
@@ -379,6 +402,33 @@ async def test_task_runtime_stream_error_emits_sanitized_terminal_message() -> N
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_action_completion_stream_error_preserves_incomplete_terminal_reason() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield ErrorEvent(
+            message="Action completion evidence was missing.",
+            code="action_completion_incomplete",
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    with pytest.raises(TaskRuntimeStreamError) as exc_info:
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            "agent:main:test",
+            _emitter,
+            stream_event_sink=None,
+            idle_timeout=1.0,
+            heartbeat_interval=0.0,
+        )
+
+    assert exc_info.value.terminal_reason == "action_completion_incomplete"
+    assert emitted[-1][2]["terminal_reason"] == "action_completion_incomplete"
 
 
 @pytest.mark.asyncio

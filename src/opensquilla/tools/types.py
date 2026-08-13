@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 
@@ -322,6 +322,9 @@ class ToolSpec:
     # persisted. The dispatcher owns this behavior; handlers must not emulate
     # it with tool-name branches.
     terminates_turn: bool = False
+    # Trusted runtime classification used by the action completion contract.
+    # Appended for positional compatibility with embedded ToolSpec callers.
+    completion_effect: Literal["unknown", "read_only", "action", "control"] = "unknown"
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

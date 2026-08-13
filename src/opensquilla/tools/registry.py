@@ -11,7 +11,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import structlog
 
@@ -403,6 +403,7 @@ class ToolRegistry:
                 execution_timeout_seconds=rt.spec.execution_timeout_seconds,
                 execution_timeout_argument=rt.spec.execution_timeout_argument,
                 execution_timeout_padding=rt.spec.execution_timeout_padding,
+                completion_effect=rt.spec.completion_effect,
             )
             for rt in visible_tools
         ]
@@ -594,6 +595,9 @@ def tool(
     *,
     plan_access: PlanAccess = PlanAccess.DENY,
     terminates_turn: bool = False,
+    completion_effect: (
+        Literal["unknown", "read_only", "action", "control"] | None
+    ) = None,
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
 ) -> Any:
     """Decorator to register an async function as a tool.
@@ -620,6 +624,15 @@ def tool(
             sandbox=sandbox or SandboxToolDescriptor.custom(kind=name),
             plan_access=plan_access,
             terminates_turn=terminates_turn,
+            completion_effect=(
+                completion_effect
+                if completion_effect is not None
+                else "read_only"
+                if plan_access is PlanAccess.READ_ONLY
+                else "control"
+                if plan_access is PlanAccess.CONTROL
+                else "unknown"
+            ),
         )
         target = registry if registry is not None else _default_registry
         target.register(spec, fn)
