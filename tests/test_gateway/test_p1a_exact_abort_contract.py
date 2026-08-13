@@ -9,6 +9,10 @@ id to its session.
 from __future__ import annotations
 
 import asyncio
+import os
+import shlex
+import sys
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -18,6 +22,7 @@ from opensquilla.gateway import rpc_sessions
 from opensquilla.gateway.rpc import get_dispatcher
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.session.models import AgentTaskStatus
+from opensquilla.tools.builtin import shell
 from tests.test_gateway.test_rpc_sessions import FakeSession, FakeSessionManager, make_ctx
 from tests.test_gateway.test_task_runtime_terminal_cleanup import (
     _make_envelope,
@@ -328,3 +333,96 @@ async def test_exact_abort_timeout_is_unknown_then_same_identity_retry_cancels(
     assert second.payload["aborted"] is True
     assert record.status is AgentTaskStatus.CANCELLED
     assert handler_calls == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="real process-group check is POSIX-specific")
+@pytest.mark.asyncio
+async def test_exact_stop_cancels_child_tool_process_and_runtime_stays_usable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise RPC -> task lineage -> real tool process cancellation end to end."""
+
+    root_key = "agent:main:webchat:process-tree-e2e"
+    child_key = "agent:worker:subagent:process-tree-e2e"
+    storage = _make_storage()
+    child_started = asyncio.Event()
+    child_task_id: str | None = None
+    created_processes: list[asyncio.subprocess.Process] = []
+    original_create = shell._create_host_shell_subprocess
+
+    async def capture_process(*args, **kwargs):
+        process = await original_create(*args, **kwargs)
+        created_processes.append(process)
+        child_started.set()
+        return process
+
+    monkeypatch.setattr(shell, "_create_host_shell_subprocess", capture_process)
+
+    async def handler(run: Any) -> None:
+        nonlocal child_task_id
+        if run.message == "after-stop":
+            return
+        if run.envelope.metadata.get("parent_task_id"):
+            await shell._run_host_shell_command(
+                " ".join(
+                    shlex.quote(part)
+                    for part in (sys.executable, "-c", "import time; time.sleep(30)")
+                ),
+                cwd=None,
+                env=dict(os.environ),
+                stdin_bytes=None,
+                effective_timeout=30.0,
+            )
+            return
+        child_envelope = replace(
+            _make_envelope(child_key),
+            metadata={
+                "parent_task_id": run.task_id,
+                "parent_session_key": root_key,
+            },
+        )
+        child = await runtime.enqueue(
+            child_envelope,
+            "run child tool",
+            mode="followup",
+            run_kind="subagent",
+        )
+        child_task_id = child.task_id
+        await asyncio.Event().wait()
+
+    runtime = TaskRuntime(storage=storage, turn_handler=handler)
+    root = await runtime.enqueue(_make_envelope(root_key), "spawn child")
+    await asyncio.wait_for(child_started.wait(), timeout=3.0)
+    assert child_task_id is not None
+
+    context = make_ctx(
+        session_manager=FakeSessionManager([FakeSession(session_key=root_key)]),
+        task_runtime=runtime,
+    )
+    response = await get_dispatcher().dispatch(
+        "process-tree-stop",
+        "chat.abort",
+        {
+            "sessionKey": root_key,
+            "taskId": root.task_id,
+            "scope": "task",
+            "source": "webui_stop",
+        },
+        context,
+    )
+
+    root_record = await runtime.wait(root.task_id, timeout=3.0)
+    child_record = await runtime.wait(child_task_id, timeout=3.0)
+    assert response.ok is True
+    assert response.payload["aborted"] is True
+    assert root_record.status is AgentTaskStatus.CANCELLED
+    assert child_record.status is AgentTaskStatus.CANCELLED
+    assert created_processes and created_processes[0].returncode is not None
+
+    # The same runtime/event loop accepts and completes another turn after Stop.
+    next_task = await runtime.enqueue(_make_envelope(root_key), "after-stop")
+    try:
+        next_record = await runtime.wait(next_task.task_id, timeout=3.0)
+    finally:
+        await runtime.shutdown()
+    assert next_record.status is AgentTaskStatus.SUCCEEDED

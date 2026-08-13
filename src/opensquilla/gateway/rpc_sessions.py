@@ -846,6 +846,169 @@ async def _active_task_runtime_ids(task_runtime: Any, session_key: str) -> tuple
     return tuple(task_ids)
 
 
+def _task_record_session_key(row: Any) -> str | None:
+    session_key = getattr(row, "session_key", None)
+    if isinstance(session_key, str) and session_key:
+        return session_key
+    return None
+
+
+def _task_record_parent_identity(row: Any) -> tuple[str, str] | None:
+    """Return the exact parent task/session for one durable subagent task row."""
+
+    if str(getattr(row, "run_kind", "") or "") != "subagent":
+        return None
+    details = getattr(row, "details", None)
+    metadata = details.get("metadata") if isinstance(details, dict) else None
+    if not isinstance(metadata, dict):
+        return None
+    parent_task_id = metadata.get("parent_task_id")
+    parent_session_key = metadata.get("parent_session_key")
+    if not isinstance(parent_task_id, str) or not parent_task_id:
+        return None
+    if not isinstance(parent_session_key, str) or not parent_session_key:
+        return None
+    return parent_task_id, parent_session_key
+
+
+async def _task_runtime_rows(task_runtime: Any) -> tuple[Any, ...]:
+    """Read active/background-owner rows plus their bounded durable ancestry."""
+
+    list_tasks = getattr(task_runtime, "list", None)
+    if not callable(list_tasks):
+        return ()
+    try:
+        rows: list[Any] = []
+        for status_value in _ACTIVE_TASK_STATUSES:
+            rows.extend(await list_tasks(status=status_value))
+    except TypeError:
+        try:
+            rows = list(await list_tasks())
+        except (TypeError, NotImplementedError):
+            return ()
+        except Exception:
+            log.warning("sessions.abort.task_runtime_tree_list_failed")
+            return ()
+    except NotImplementedError:
+        return ()
+    except Exception:
+        log.warning("sessions.abort.task_runtime_tree_list_failed")
+        return ()
+
+    # A child may have already yielded after spawning a still-running
+    # grandchild. Hydrate only the parent chain of active rows instead of
+    # scanning the unbounded task ledger.
+    status = getattr(task_runtime, "status", None)
+    rows_by_id = {
+        str(task_id): row
+        for row in rows
+        if isinstance((task_id := getattr(row, "task_id", None)), str) and task_id
+    }
+    from opensquilla.tools.builtin.shell import active_background_process_task_owners
+
+    if callable(status):
+        for owner_session_key, owner_task_id in active_background_process_task_owners():
+            if owner_task_id in rows_by_id:
+                continue
+            try:
+                owner = await status(owner_task_id)
+            except (KeyError, NotImplementedError):
+                continue
+            except Exception:
+                log.warning(
+                    "sessions.abort.background_owner_status_failed",
+                    task_id=owner_task_id,
+                )
+                continue
+            if _task_record_session_key(owner) == owner_session_key:
+                rows_by_id[owner_task_id] = owner
+    pending_parent_ids = [
+        parent_task_id
+        for row in tuple(rows_by_id.values())
+        if (identity := _task_record_parent_identity(row)) is not None
+        for parent_task_id in (identity[0],)
+        if parent_task_id not in rows_by_id
+    ]
+    while callable(status) and pending_parent_ids:
+        parent_task_id = pending_parent_ids.pop()
+        if parent_task_id in rows_by_id:
+            continue
+        try:
+            parent = await status(parent_task_id)
+        except (KeyError, NotImplementedError):
+            continue
+        except Exception:
+            log.warning(
+                "sessions.abort.task_runtime_ancestor_status_failed",
+                task_id=parent_task_id,
+            )
+            continue
+        rows_by_id[parent_task_id] = parent
+        identity = _task_record_parent_identity(parent)
+        if identity is not None and identity[0] not in rows_by_id:
+            pending_parent_ids.append(identity[0])
+    return tuple(rows_by_id.values())
+
+
+async def _task_runtime_owns_session(
+    task_runtime: Any,
+    *,
+    task_id: str,
+    session_key: str,
+) -> bool:
+    """Verify a durable root identity before following child-supplied lineage."""
+
+    status = getattr(task_runtime, "status", None)
+    if not callable(status):
+        return False
+    try:
+        record = await status(task_id)
+    except (KeyError, NotImplementedError):
+        return False
+    except Exception:
+        log.warning(
+            "sessions.abort.task_runtime_status_failed",
+            session_key=session_key,
+            task_id=task_id,
+        )
+        return False
+    return _task_record_session_key(record) == session_key
+
+
+def _task_owned_descendant_rows(
+    rows: tuple[Any, ...],
+    *,
+    owned_tasks: dict[str, str],
+) -> tuple[Any, ...]:
+    """Expand exact task ancestry without widening to sibling session work."""
+
+    discovered: list[Any] = []
+    discovered_ids: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            task_id = getattr(row, "task_id", None)
+            session_key = _task_record_session_key(row)
+            parent_identity = _task_record_parent_identity(row)
+            if (
+                not isinstance(task_id, str)
+                or not task_id
+                or session_key is None
+                or parent_identity is None
+                or task_id in owned_tasks
+            ):
+                continue
+            parent_task_id, parent_session_key = parent_identity
+            if owned_tasks.get(parent_task_id) != parent_session_key:
+                continue
+            owned_tasks[task_id] = session_key
+            discovered_ids.add(task_id)
+            discovered.append(row)
+            changed = True
+    return tuple(row for row in discovered if getattr(row, "task_id", None) in discovered_ids)
+
+
 def _session_row_value(row: Any, name: str) -> Any:
     if isinstance(row, dict):
         return row.get(name)
@@ -954,6 +1117,113 @@ async def _drain_cancelled_task_runtime(
         # Give cooperative waiters one loop turn to observe cancellation, but
         # never synchronously join a waiter that delays or suppresses it.
         await asyncio.sleep(0)
+
+
+async def _cancel_task_owned_auxiliary_work(
+    *,
+    session_key: str,
+    task_id: str,
+    deadline_at_monotonic: float,
+) -> int:
+    """Stop task-owned completion delivery and registered background processes."""
+
+    from opensquilla.gateway.subagent_announce import (
+        cancel_background_completion_for_task,
+    )
+    from opensquilla.tools.builtin.shell import cancel_background_processes_for_task
+
+    cancelled_completions = await _await_abort_operation(
+        cancel_background_completion_for_task(session_key, task_id),
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_background_completion",
+        default=0,
+    )
+    cancelled_processes = await _await_abort_operation(
+        cancel_background_processes_for_task(session_key, task_id),
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_background_processes",
+        default=0,
+    )
+    return int(cancelled_completions) + int(cancelled_processes)
+
+
+async def _cancel_task_owned_descendants(
+    task_runtime: Any,
+    *,
+    root_session_key: str,
+    root_task_id: str,
+    source: str,
+    reason: str,
+    deadline_at_monotonic: float,
+) -> int:
+    """Cancel active subagent descendants proven to belong to one exact task."""
+
+    owned_tasks = {root_task_id: root_session_key}
+    processed_task_ids = {root_task_id}
+    cancelled_task_ids: list[str] = []
+    stable_passes = 0
+
+    for _pass_index in range(_ABORT_TREE_STABILIZATION_PASSES):
+        if time.monotonic() >= deadline_at_monotonic:
+            break
+        rows = await _await_abort_operation(
+            _task_runtime_rows(task_runtime),
+            deadline_at_monotonic=deadline_at_monotonic,
+            operation="list_task_owned_descendants",
+            default=(),
+        )
+        descendants = _task_owned_descendant_rows(rows, owned_tasks=owned_tasks)
+        new_rows = [
+            row
+            for row in descendants
+            if isinstance(getattr(row, "task_id", None), str)
+            and getattr(row, "task_id") not in processed_task_ids
+        ]
+        if not new_rows:
+            stable_passes += 1
+            if stable_passes >= 2:
+                break
+            await asyncio.sleep(0)
+            continue
+
+        stable_passes = 0
+        for row in new_rows:
+            task_id = str(getattr(row, "task_id"))
+            session_key = _task_record_session_key(row)
+            if session_key is None:
+                continue
+            processed_task_ids.add(task_id)
+            await _cancel_task_owned_auxiliary_work(
+                session_key=session_key,
+                task_id=task_id,
+                deadline_at_monotonic=deadline_at_monotonic,
+            )
+            if _task_status_value(getattr(row, "status", None)) not in _ACTIVE_TASK_STATUSES:
+                continue
+            cancelled = await _await_abort_operation(
+                _cancel_task_runtime(
+                    task_runtime,
+                    session_key=session_key,
+                    task_id=task_id,
+                    source=source,
+                    reason=reason,
+                ),
+                deadline_at_monotonic=deadline_at_monotonic,
+                operation="cancel_task_owned_descendant",
+                default=0,
+            )
+            if int(cancelled) > 0:
+                cancelled_task_ids.append(task_id)
+
+        if cancelled_task_ids:
+            await _drain_cancelled_task_runtime(
+                task_runtime,
+                session_key=root_session_key,
+                task_ids=tuple(cancelled_task_ids),
+                deadline_at_monotonic=deadline_at_monotonic,
+            )
+
+    return len(set(cancelled_task_ids))
 
 
 async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> None:
@@ -6989,10 +7259,10 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         from opensquilla.gateway.approval_queue import get_approval_queue
         from opensquilla.gateway.subagent_announce import (
             cancel_background_completion_for_session,
-            cancel_background_completion_for_task,
         )
 
         if requested_task_id is not None:
+            cancel_source = _cancel_source_from_params(params, "sessions_abort")
             cancel_unknown = object()
             try:
                 cancelled_result = await _await_abort_operation(
@@ -7000,7 +7270,7 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                         task_runtime,
                         session_key=key,
                         task_id=requested_task_id,
-                        source=_cancel_source_from_params(params, "sessions_abort"),
+                        source=cancel_source,
                         reason="user_abort",
                     ),
                     deadline_at_monotonic=abort_deadline,
@@ -7024,18 +7294,39 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     "reason": "task_cancel_unknown",
                 }
             cancelled_count = int(cancelled_result)
-            if cancelled_count > 0:
-                # Background completion groups have exact task identity. Do
-                # not clear every group or every approval in the session: a
-                # queued task may be cancelled while another task is running.
-                # TaskRuntime terminalization expires approvals only when this
-                # exact task owns the running lane.
-                await _await_abort_operation(
-                    cancel_background_completion_for_task(key, requested_task_id),
-                    deadline_at_monotonic=abort_deadline,
-                    operation="cancel_task_background_completion",
-                    default=0,
+            root_owned = cancelled_count > 0
+            if not root_owned:
+                root_owned = bool(
+                    await _await_abort_operation(
+                        _task_runtime_owns_session(
+                            task_runtime,
+                            task_id=requested_task_id,
+                            session_key=key,
+                        ),
+                        deadline_at_monotonic=abort_deadline,
+                        operation="verify_requested_runtime_task",
+                        default=False,
+                    )
                 )
+            if root_owned:
+                # Every auxiliary owner is keyed by the exact task identity.
+                # This stops registered background shell processes and blocks
+                # child completion delivery without touching sibling tasks in
+                # the same session.
+                cancelled_count += await _cancel_task_owned_auxiliary_work(
+                    session_key=key,
+                    task_id=requested_task_id,
+                    deadline_at_monotonic=abort_deadline,
+                )
+                cancelled_count += await _cancel_task_owned_descendants(
+                    task_runtime,
+                    root_session_key=key,
+                    root_task_id=requested_task_id,
+                    source=cancel_source,
+                    reason="user_abort",
+                    deadline_at_monotonic=abort_deadline,
+                )
+            if int(cancelled_result) > 0:
                 await _drain_cancelled_task_runtime(
                     task_runtime,
                     session_key=key,

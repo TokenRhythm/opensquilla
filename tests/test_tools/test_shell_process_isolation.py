@@ -70,12 +70,14 @@ def _ctx(
     is_owner: bool = False,
     agent_id: str = "agent",
     caller_kind: CallerKind = CallerKind.AGENT,
+    task_id: str | None = None,
 ) -> ToolContext:
     return ToolContext(
         is_owner=is_owner,
         caller_kind=caller_kind,
         session_key=session_key,
         agent_id=agent_id,
+        task_id=task_id,
     )
 
 
@@ -261,6 +263,115 @@ async def test_exec_command_timeout_still_stops_foreground_process() -> None:
 
     assert "[timeout after 0.1s]" in result
     assert elapsed < 1.0
+
+
+@pytest.mark.skipif(os.name != "posix", reason="process group behavior is POSIX-specific")
+@pytest.mark.asyncio
+async def test_caller_cancel_stops_foreground_process_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    marker = tmp_path / "cancelled-descendant-ran"
+    child_script = (
+        "import pathlib, time; "
+        f"time.sleep(0.6); pathlib.Path({str(marker)!r}).write_text('ran')"
+    )
+    parent_script = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
+        "time.sleep(30)"
+    )
+    command = _python_shell_command(parent_script)
+    created: list[asyncio.subprocess.Process] = []
+    original_create = shell._create_host_shell_subprocess
+
+    async def capture_process(*args, **kwargs):
+        proc = await original_create(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(shell, "_create_host_shell_subprocess", capture_process)
+    running = asyncio.create_task(
+        shell._run_host_shell_command(
+            command,
+            cwd=None,
+            env=dict(os.environ),
+            stdin_bytes=None,
+            effective_timeout=30.0,
+        )
+    )
+    for _attempt in range(100):
+        if created:
+            break
+        await asyncio.sleep(0.01)
+    assert created
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert created[0].returncode is not None
+    await asyncio.sleep(0.8)
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_stops_only_owned_background_process() -> None:
+    token = current_tool_context.set(
+        _ctx("agent:main:background-owner", task_id="task-owned")
+    )
+    try:
+        result = await shell._start_host_background_process(
+            _python_shell_command("import time; time.sleep(30)"),
+            cwd=None,
+            effective_timeout=30.0,
+            runtime=None,
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    session_id = result.splitlines()[0].split("=", 1)[1]
+    session = shell._bg_sessions[session_id]
+    assert session.task_id == "task-owned"
+    assert session.process.returncode is None
+    assert (
+        "agent:main:background-owner",
+        "task-owned",
+    ) in shell.active_background_process_task_owners()
+
+    cancelled = await shell.cancel_background_processes_for_task(
+        "agent:main:background-owner",
+        "task-owned",
+    )
+
+    assert cancelled == 1
+    assert session.killed is True
+    if session.collector_task is not None:
+        await asyncio.wait_for(session.collector_task, timeout=2.0)
+    assert session.process.returncode is not None
+    assert (
+        "agent:main:background-owner",
+        "task-owned",
+    ) not in shell.active_background_process_task_owners()
+
+
+def test_windows_process_tree_kill_targets_only_owned_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(argv: list[str], **kwargs: object) -> None:
+        calls.append((argv, kwargs))
+
+    monkeypatch.setattr(shell.subprocess, "run", fake_run)
+
+    shell._force_kill_windows_process_tree(4242)
+
+    assert calls[0][0] == ["taskkill", "/PID", "4242", "/T", "/F"]
+    assert calls[0][1]["check"] is False
+    assert calls[0][1]["timeout"] == (
+        shell._EXEC_TERMINATE_TIMEOUT + shell._EXEC_KILL_TIMEOUT
+    )
 
 
 @pytest.mark.asyncio

@@ -1269,6 +1269,7 @@ class _BgSession:
     command: str
     process: asyncio.subprocess.Process
     session_key: str | None = None
+    task_id: str | None = None
     agent_id: str | None = None
     is_owner_run: bool = False
     local_urls: list[str] = field(default_factory=list)
@@ -5946,6 +5947,10 @@ async def _wait_bg_process(session: _BgSession, timeout: float) -> bool:
 async def _terminate_bg_session(session: _BgSession) -> None:
     if session.process.returncode is not None:
         return
+    if os.name == "nt":
+        await asyncio.to_thread(_force_kill_windows_process_tree, session.process.pid)
+        if await _wait_bg_process(session, _BACKGROUND_KILL_TIMEOUT):
+            return
     _signal_bg_process(session, signal.SIGTERM)
     if await _wait_bg_process(session, _BACKGROUND_TERMINATE_TIMEOUT):
         return
@@ -5953,6 +5958,56 @@ async def _terminate_bg_session(session: _BgSession) -> None:
     _signal_bg_process(session, kill_signal)
     if not await _wait_bg_process(session, _BACKGROUND_KILL_TIMEOUT):
         log.warning("background_process_termination_timeout", session_id=session.session_id)
+
+
+async def cancel_background_processes_for_task(session_key: str, task_id: str) -> int:
+    """Terminate registered background process trees owned by one exact task."""
+
+    sessions = [
+        session
+        for session in tuple(_bg_sessions.values())
+        if session.session_key == session_key
+        and session.task_id == task_id
+        and not session.done
+        and session.process.returncode is None
+    ]
+    if not sessions:
+        return 0
+
+    async def terminate_one(session: _BgSession) -> None:
+        session.killed = True
+        try:
+            await _terminate_bg_session(session)
+        except Exception:
+            log.warning(
+                "background_process_task_cancel_failed",
+                session_id=session.session_id,
+                task_id=task_id,
+                exc_info=True,
+            )
+
+    cleanup = asyncio.gather(*(terminate_one(session) for session in sessions))
+    # An abort RPC has a shorter shared deadline than process-tree escalation.
+    # Keep owned cleanup alive if that deadline cancels this waiter.
+    await asyncio.shield(cleanup)
+    return len(sessions)
+
+
+def active_background_process_task_owners() -> tuple[tuple[str, str], ...]:
+    """Snapshot exact durable identities for live registered background processes."""
+
+    return tuple(
+        dict.fromkeys(
+            (session.session_key, session.task_id)
+            for session in tuple(_bg_sessions.values())
+            if isinstance(session.session_key, str)
+            and session.session_key
+            and isinstance(session.task_id, str)
+            and session.task_id
+            and not session.done
+            and session.process.returncode is None
+        )
+    )
 
 
 async def _wait_exec_process(proc: Any, timeout: float) -> bool:
@@ -5985,6 +6040,10 @@ def _signal_exec_process_tree(proc: Any, sig: signal.Signals) -> bool:
 
 
 async def _terminate_exec_process_tree(proc: Any) -> None:
+    if os.name == "nt":
+        await asyncio.to_thread(_force_kill_windows_process_tree, proc.pid)
+        if await _wait_exec_process(proc, _EXEC_KILL_TIMEOUT):
+            return
     _signal_exec_process_tree(proc, signal.SIGTERM)
     if await _wait_exec_process(proc, _EXEC_TERMINATE_TIMEOUT):
         return
@@ -6071,9 +6130,29 @@ def _create_windows_host_shell_process(command: str, **kwargs: Any) -> Any:
     return subprocess.Popen(_windows_direct_powershell_argv(command), **kwargs)
 
 
+def _force_kill_windows_process_tree(pid: int) -> None:
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.run(  # noqa: S603 - fixed OS command and an owned child PID.
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_EXEC_TERMINATE_TIMEOUT + _EXEC_KILL_TIMEOUT,
+            creationflags=creationflags,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _terminate_windows_host_shell_process(proc: Any) -> None:
     if proc.poll() is not None:
         return
+    if os.name == "nt":
+        _force_kill_windows_process_tree(proc.pid)
+        if proc.poll() is not None:
+            return
     proc.terminate()
     try:
         proc.wait(timeout=_EXEC_TERMINATE_TIMEOUT)
@@ -6095,10 +6174,23 @@ async def _communicate_windows_host_shell_process(
     """Write finite Windows stdin outside Proactor and bound the worker wait."""
 
     communicate_task = asyncio.create_task(asyncio.to_thread(proc.communicate, input=stdin_bytes))
-    done, _pending = await asyncio.wait(
-        {communicate_task},
-        timeout=max(0.0, timeout),
-    )
+    try:
+        done, _pending = await asyncio.wait(
+            {communicate_task},
+            timeout=max(0.0, timeout),
+        )
+    except asyncio.CancelledError:
+        await asyncio.shield(
+            asyncio.to_thread(_terminate_windows_host_shell_process, proc)
+        )
+        done, _pending = await asyncio.wait(
+            {communicate_task},
+            timeout=_EXEC_TERMINATE_TIMEOUT + _EXEC_KILL_TIMEOUT,
+        )
+        if communicate_task in done:
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                await communicate_task
+        raise
     if communicate_task in done:
         await communicate_task
         return True
@@ -6225,12 +6317,21 @@ async def _run_host_shell_command(
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
                 await _terminate_exec_process_tree(proc)
                 return timeout_result()
-
-            remaining = deadline - loop.time()
-            if remaining <= 0 or not await _wait_exec_process(proc, remaining):
+            except asyncio.CancelledError:
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
-                await _terminate_exec_process_tree(proc)
-                return timeout_result()
+                await asyncio.shield(_terminate_exec_process_tree(proc))
+                raise
+
+            try:
+                remaining = deadline - loop.time()
+                if remaining <= 0 or not await _wait_exec_process(proc, remaining):
+                    await _cancel_exec_stdin_writer(proc, stdin_writer)
+                    await _terminate_exec_process_tree(proc)
+                    return timeout_result()
+            except asyncio.CancelledError:
+                await _cancel_exec_stdin_writer(proc, stdin_writer)
+                await asyncio.shield(_terminate_exec_process_tree(proc))
+                raise
             await _cancel_exec_stdin_writer(proc, stdin_writer)
             if os.name == "posix":
                 _signal_exec_process_tree(proc, signal.SIGTERM)
@@ -6782,6 +6883,7 @@ async def _start_host_background_process(
         command=command,
         process=proc,
         session_key=ctx.session_key if ctx is not None else None,
+        task_id=ctx.task_id if ctx is not None else None,
         agent_id=ctx.agent_id if ctx is not None else None,
         is_owner_run=bool(ctx.is_owner) if ctx is not None else False,
         local_urls=_local_server_urls_from_command(command),
@@ -7131,6 +7233,7 @@ async def background_process(
                 command=command,
                 process=spawned.process,
                 session_key=ctx.session_key if ctx is not None else None,
+                task_id=ctx.task_id if ctx is not None else None,
                 agent_id=ctx.agent_id if ctx is not None else None,
                 is_owner_run=bool(ctx.is_owner) if ctx is not None else False,
                 local_urls=_local_server_urls_from_command(command),

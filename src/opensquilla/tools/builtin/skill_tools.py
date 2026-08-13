@@ -6,9 +6,10 @@ Registered at boot time when a SkillLoader is available.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
+import os
 import re
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -328,11 +329,19 @@ def _community_result_to_dict(row: Any, installed: Any) -> dict[str, Any]:
 
 
 async def _run_install_argv(argv: list[str]) -> tuple[int, str, str, bool]:
+    process_group_kwargs: dict[str, Any] = {}
+    if os.name == "posix":
+        process_group_kwargs["start_new_session"] = True
+    else:
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if creationflags:
+            process_group_kwargs["creationflags"] = creationflags
     try:
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **process_group_kwargs,
         )
     except FileNotFoundError as exc:
         raise ToolError(f"Install command not found: {argv[0]}") from exc
@@ -341,11 +350,15 @@ async def _run_install_argv(argv: list[str]) -> tuple[int, str, str, bool]:
             proc.communicate(),
             timeout=_INSTALL_TIMEOUT_SECONDS,
         )
+    except asyncio.CancelledError:
+        from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
+
+        await asyncio.shield(_terminate_exec_process_tree(proc))
+        raise
     except TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
+        from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
+
+        await _terminate_exec_process_tree(proc)
         return -1, "", "Timed out", True
     return proc.returncode or 0, _cap_output(stdout), _cap_output(stderr), False
 

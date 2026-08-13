@@ -776,6 +776,51 @@ async def test_linux_helper_payload_times_out_outer_helper(
     assert terminated == [12345]
 
 
+@pytest.mark.asyncio
+async def test_linux_helper_payload_caller_cancel_terminates_outer_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = bubblewrap_mod.build_process_helper_payload(
+        _request(_policy(tmp_path, network=NetworkMode.NONE, network_proxy=None), tmp_path)
+    )
+    started = asyncio.Event()
+    terminated: list[int] = []
+
+    class _Proc:
+        pid = 12346
+        returncode = None
+        stdout = None
+        stderr = None
+
+        async def communicate(self):
+            started.set()
+            await asyncio.Event().wait()
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        assert kwargs["start_new_session"] is True
+        return _Proc()
+
+    async def fake_terminate(proc):
+        terminated.append(proc.pid)
+        return b"", b""
+
+    monkeypatch.setattr(
+        bubblewrap_mod.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(bubblewrap_mod, "_terminate_process_group", fake_terminate)
+
+    running = asyncio.create_task(bubblewrap_mod._run_linux_helper_payload(payload))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+
+    assert terminated == [12346]
+
+
 @_BWRAP_PROXY_BRIDGE_LINUX_ONLY
 @pytest.mark.asyncio
 async def test_linux_proxy_bridge_host_writes_and_removes_inner_script(

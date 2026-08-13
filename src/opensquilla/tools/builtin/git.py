@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from opensquilla.sandbox.integration import (
     get_runtime,
@@ -105,14 +107,28 @@ async def _run_git(*args: str, cwd: str | None = None) -> str:
         if result.returncode != 0:
             raise RuntimeError(f"git {' '.join(args)} failed (exit {result.returncode}):\n{output}")
         return output
+    process_group_kwargs: dict[str, Any] = {}
+    if os.name == "posix":
+        process_group_kwargs["start_new_session"] = True
+    else:
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if creationflags:
+            process_group_kwargs["creationflags"] = creationflags
     proc = await asyncio.create_subprocess_exec(
         "git",
         *args,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=cwd,
+        **process_group_kwargs,
     )
-    stdout, _ = await proc.communicate()
+    try:
+        stdout, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
+
+        await asyncio.shield(_terminate_exec_process_tree(proc))
+        raise
     from opensquilla.subprocess_encoding import decode_subprocess_output
 
     output = decode_subprocess_output(stdout)
