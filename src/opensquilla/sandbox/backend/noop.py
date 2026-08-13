@@ -1,8 +1,9 @@
 """Noop backend used when the sandbox feature switch is off.
 
 Runs the request with :mod:`asyncio` subprocess APIs and no namespace
-isolation. Resource caps from the policy are still honoured with the safety
-layer's rlimit helpers. The subprocess is owned directly by the caller task,
+isolation. Resource caps from the policy are honoured where the platform
+provides the safety layer's rlimit helpers. The subprocess is owned directly
+by the caller task,
 so cancellation can synchronously stop its process tree instead of merely
 cancelling a ``run_in_executor`` waiter while a worker keeps running.
 """
@@ -73,28 +74,21 @@ class NoopBackend(Backend):
         )
         limits = _limits_from_policy(request)
         started = time.monotonic()
-        if not HAS_RESOURCE:
-            return SandboxResult(
-                returncode=-1,
-                stdout="",
-                stderr="resource module unavailable",
-                wall_time_s=time.monotonic() - started,
-                backend_used=self.name,
-                policy_used=request.policy.summary(),
-                timed_out=False,
-            )
-
         child_env = _filtered_env(limits.env_whitelist, _filtered_request_env(request))
+        spawn_kwargs: dict[str, object] = {
+            "stdin": asyncio.subprocess.PIPE if request.stdin is not None else None,
+            "stdout": asyncio.subprocess.PIPE,
+            "stderr": asyncio.subprocess.PIPE,
+            "cwd": str(request.cwd),
+            "env": child_env,
+            "start_new_session": True,
+        }
+        if HAS_RESOURCE:
+            spawn_kwargs["preexec_fn"] = _preexec(limits)
         try:
             proc = await create_owned_subprocess_exec(
                 *request.argv,
-                stdin=asyncio.subprocess.PIPE if request.stdin is not None else None,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(request.cwd),
-                env=child_env,
-                start_new_session=True,
-                preexec_fn=_preexec(limits),
+                **spawn_kwargs,
             )
         except (OSError, ValueError) as exc:
             return SandboxResult(

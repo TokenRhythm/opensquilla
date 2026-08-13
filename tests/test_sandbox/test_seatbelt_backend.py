@@ -1345,8 +1345,8 @@ async def test_run_caller_cancel_terminates_process_group(
     )
     await asyncio.wait_for(started.wait(), timeout=1.0)
     running.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await running
+    cancelled = await asyncio.gather(running, return_exceptions=True)
+    assert isinstance(cancelled[0], asyncio.CancelledError)
 
     assert terminated == [12346]
 

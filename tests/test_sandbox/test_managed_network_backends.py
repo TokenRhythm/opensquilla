@@ -800,8 +800,8 @@ async def test_linux_helper_payload_caller_cancel_terminates_outer_process_group
     running = asyncio.create_task(bubblewrap_mod._run_linux_helper_payload(payload))
     await asyncio.wait_for(started.wait(), timeout=1.0)
     running.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await running
+    cancelled = await asyncio.gather(running, return_exceptions=True)
+    assert isinstance(cancelled[0], asyncio.CancelledError)
 
     assert terminated == [12346]
 

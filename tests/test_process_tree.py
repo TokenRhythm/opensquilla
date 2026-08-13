@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import os
 import shutil
 import signal
@@ -246,6 +247,22 @@ def test_posix_proc_skipped_read_never_reports_group_empty(
     assert process_tree._posix_group_members(123) is None
 
 
+def test_posix_proc_ignores_unrelated_pid_disappearing_during_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(process_tree.os.path, "isdir", lambda _path: True)
+    monkeypatch.setattr(process_tree.os, "listdir", lambda _path: ["123", "999"])
+
+    def selective_open(path: str, **_kwargs: object):
+        if path.endswith(os.path.join("123", "stat")):
+            return io.StringIO("123 (anchor) S 1 123")
+        raise FileNotFoundError
+
+    monkeypatch.setattr("builtins.open", selective_open)
+
+    assert process_tree._posix_group_members(123) == (123,)
+
+
 @pytest.mark.skipif(
     os.name != "posix" or os.path.isdir("/proc"),
     reason="requires the POSIX ps fallback",
@@ -319,6 +336,7 @@ async def test_non_durable_owner_never_widens_cleanup_to_a_process_group(
         process_tree.os,
         "killpg",
         lambda pgid, sig: group_signals.append((pgid, sig)),
+        raising=False,
     )
 
     class DirectProcess:
@@ -340,29 +358,21 @@ async def test_non_durable_owner_never_widens_cleanup_to_a_process_group(
     assert group_signals == []
 
 
-def test_windows_job_assignment_failure_is_a_fail_closed_platform_gate(
+def test_windows_unowned_process_never_attempts_racy_post_spawn_job_assignment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class Process:
         pid = 6262
         returncode = None
-        terminated = False
-
-        def terminate(self) -> None:
-            self.terminated = True
-
     proc = Process()
     monkeypatch.setattr(process_tree.os, "name", "nt")
-    monkeypatch.setattr(
-        process_tree._WindowsJob,
-        "assign",
-        classmethod(lambda _cls, _pid: (_ for _ in ()).throw(OSError("denied"))),
-    )
 
-    with pytest.raises(process_tree.ProcessTreeOwnershipError, match="Job Object"):
-        process_tree.capture_process_tree_owner(proc, isolated=True)
+    owner = process_tree.capture_process_tree_owner(proc, isolated=True)
 
-    assert proc.terminated is True
+    assert not hasattr(process_tree._WindowsJob, "assign")
+    assert owner.durable is False
+    assert owner.ownership_error is not None
+    assert "controlled Job Object" in owner.ownership_error
 
 
 @pytest.mark.asyncio
@@ -461,8 +471,11 @@ async def test_windows_controlled_launcher_waits_for_helper_ready_before_release
         pid = 7474
         returncode = None
 
-    async def fake_spawn(*_argv: str, **_kwargs: object) -> Process:
+    spawn_kwargs: dict[str, object] = {}
+
+    async def fake_spawn(*_argv: str, **kwargs: object) -> Process:
         events.append("spawned-helper")
+        spawn_kwargs.update(kwargs)
         return Process()
 
     monkeypatch.setattr(process_tree.os, "name", "nt")
@@ -478,9 +491,14 @@ async def test_windows_controlled_launcher_waits_for_helper_ready_before_release
     )
     monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", fake_spawn)
 
-    process = await process_tree.create_owned_subprocess_exec("command.exe")
+    process = await process_tree.create_owned_subprocess_exec(
+        "command.exe",
+        creationflags=0x20,
+    )
 
     assert process_tree.capture_process_tree_owner(process, isolated=True).durable
+    assert int(spawn_kwargs["creationflags"]) & 0x01000000
+    assert int(spawn_kwargs["creationflags"]) & 0x20
     assert events == [
         "spawned-helper",
         "assigned",
@@ -585,8 +603,11 @@ def test_windows_sync_launcher_waits_for_helper_ready_before_release(
         def poll(self) -> None:
             return None
 
-    def fake_popen(_argv: list[str], **_kwargs: object) -> Process:
+    spawn_kwargs: dict[str, object] = {}
+
+    def fake_popen(_argv: list[str], **kwargs: object) -> Process:
         events.append("spawned-helper")
+        spawn_kwargs.update(kwargs)
         return Process()
 
     monkeypatch.setattr(process_tree.os, "name", "nt")
@@ -602,9 +623,11 @@ def test_windows_sync_launcher_waits_for_helper_ready_before_release(
     )
     monkeypatch.setattr(process_tree.subprocess, "Popen", fake_popen)
 
-    process = process_tree.create_owned_popen(("command.exe",))
+    process = process_tree.create_owned_popen(("command.exe",), creationflags=0x20)
 
     assert process_tree.capture_process_tree_owner(process, isolated=True).durable
+    assert int(spawn_kwargs["creationflags"]) & 0x01000000
+    assert int(spawn_kwargs["creationflags"]) & 0x20
     assert events == [
         "spawned-helper",
         "assigned",

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ctypes
+import ctypes.wintypes as wintypes
 import logging
 import os
 import signal
@@ -32,6 +33,7 @@ _POSIX_ANCHOR_ARM = b"A"
 _POSIX_ANCHOR_EMPTY = b"E"
 _POSIX_ANCHOR_RELEASE = b"R"
 _WINDOWS_LAUNCH_GATE_PREFIX = "Local\\OpenSquillaTaskLaunch-"
+_WINDOWS_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 
 class ProcessTreeOwnershipError(RuntimeError):
@@ -57,8 +59,6 @@ class _WindowsJob:
     def create(cls) -> _WindowsJob:
         if os.name != "nt":
             raise OSError("Windows Job Objects are unavailable on this platform")
-
-        from ctypes import wintypes
 
         handle_type = wintypes.HANDLE
         dword = wintypes.DWORD
@@ -148,16 +148,6 @@ class _WindowsJob:
             kernel32.CloseHandle(job)
             raise
 
-    @classmethod
-    def assign(cls, pid: int) -> _WindowsJob:
-        job = cls.create()
-        try:
-            job.assign_pid(pid)
-            return job
-        except BaseException:
-            job.close()
-            raise
-
     def assign_pid(self, pid: int) -> None:
         process_rights = 0x0001 | 0x0100 | 0x1000
         process_handle = self._kernel32.OpenProcess(process_rights, False, pid)
@@ -181,8 +171,6 @@ class _WindowsJob:
                     raise _windows_error(error)
 
     def active_process_count(self) -> int:
-        from ctypes import wintypes
-
         class BasicAccountingInformation(ctypes.Structure):
             _fields_ = [
                 ("TotalUserTime", ctypes.c_int64),
@@ -249,8 +237,6 @@ class _WindowsLaunchGate:
     def create(cls) -> _WindowsLaunchGate:
         if os.name != "nt":
             raise OSError("Windows launch gates are unavailable on this platform")
-        from ctypes import wintypes
-
         kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
         kernel32.CreateEventW.argtypes = [
             ctypes.c_void_p,
@@ -520,21 +506,14 @@ def capture_process_tree_owner(process: Any, *, isolated: bool) -> ProcessTreeOw
             ownership_error="POSIX process was not spawned with a durable group anchor",
         )
     if os.name == "nt":
-        try:
-            return ProcessTreeOwner(process=process, pid=pid, windows_job=_WindowsJob.assign(pid))
-        except OSError as exc:
-            log.warning(
-                "process_tree_job_assignment_failed",
-                extra={"pid": pid, "error": str(exc)},
-            )
-            # Job ownership is the Windows tree-safety boundary. Do not run a
-            # task under the fiction that taskkill/direct-parent cleanup will
-            # still cover descendants when assignment is unavailable.
-            with contextlib.suppress(ProcessLookupError, OSError):
-                process.terminate()
-            raise ProcessTreeOwnershipError(
-                f"Windows Job Object assignment failed for task-owned pid {pid}: {exc}"
-            ) from exc
+        # Assigning an already-running process is both racy and invalid when
+        # the host itself belongs to a restrictive Job Object. Only the
+        # controlled breakaway launcher can provide durable Windows ownership.
+        return ProcessTreeOwner(
+            process=process,
+            pid=pid,
+            ownership_error="Windows process was not spawned with a controlled Job Object",
+        )
     return ProcessTreeOwner(
         process=process,
         pid=pid,
@@ -623,6 +602,10 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
         job = _WindowsJob.create()
         child_kwargs = dict(kwargs)
         child_kwargs.pop("start_new_session", None)
+        child_kwargs["creationflags"] = (
+            int(child_kwargs.get("creationflags", 0))
+            | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
+        )
         helper_argv = (
             sys.executable,
             "-m",
@@ -708,6 +691,10 @@ def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
     job = _WindowsJob.create()
     child_kwargs = dict(kwargs)
     child_kwargs.pop("start_new_session", None)
+    child_kwargs["creationflags"] = (
+        int(child_kwargs.get("creationflags", 0))
+        | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
+    )
     helper_argv = [
         sys.executable,
         "-m",
@@ -771,7 +758,13 @@ def _posix_group_members(pgid: int) -> tuple[int, ...] | None:
                 if len(rest) > 2 and int(rest[2]) == pgid:
                     members.append(int(name))
             except (OSError, ValueError):
-                return None
+                # Numeric /proc entries routinely disappear between listdir
+                # and open as unrelated processes exit. The anchor's own stat
+                # is mandatory; other vanished or malformed entries cannot be
+                # members of the final live snapshot.
+                if int(name) == pgid:
+                    return None
+                continue
         if not members or pgid not in members:
             return None
         return tuple(members)
@@ -832,8 +825,6 @@ def _run_windows_owned_launch(
     ready_name: str,
     argv: list[str],
 ) -> int:
-    from ctypes import wintypes
-
     kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
     kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.OpenEventW.restype = wintypes.HANDLE

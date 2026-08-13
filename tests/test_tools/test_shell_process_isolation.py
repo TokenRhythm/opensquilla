@@ -307,8 +307,8 @@ async def test_caller_cancel_stops_foreground_process_tree(
     assert created
 
     running.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await running
+    cancelled = await asyncio.gather(running, return_exceptions=True)
+    assert isinstance(cancelled[0], asyncio.CancelledError)
 
     assert created[0].returncode is not None
     await asyncio.sleep(0.8)

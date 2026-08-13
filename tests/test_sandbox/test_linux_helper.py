@@ -234,8 +234,8 @@ async def test_run_process_payload_caller_cancel_terminates_process_group(tmp_pa
             await asyncio.sleep(0.01)
         assert created
         running.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await running
+        cancelled = await asyncio.gather(running, return_exceptions=True)
+        assert isinstance(cancelled[0], asyncio.CancelledError)
 
     assert created[0].returncode is not None
 

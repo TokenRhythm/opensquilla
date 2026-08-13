@@ -86,8 +86,8 @@ async def test_code_exec_caller_cancel_stops_child_process_tree(tmp_path: Path) 
     try:
         await asyncio.sleep(0.1)
         running.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await running
+        cancelled = await asyncio.gather(running, return_exceptions=True)
+        assert isinstance(cancelled[0], asyncio.CancelledError)
         await asyncio.sleep(0.8)
         assert not marker.exists()
     finally:

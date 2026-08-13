@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from opensquilla.safety.sandbox import HAS_RESOURCE
+from opensquilla.sandbox.backend import noop as noop_mod
 from opensquilla.sandbox.backend.noop import NoopBackend
 from opensquilla.sandbox.types import (
     MountSpec,
@@ -47,7 +47,6 @@ def _policy_with_env(workspace: Path) -> SandboxPolicy:
     )
 
 
-@pytest.mark.skipif(not HAS_RESOURCE, reason="noop backend safety runner is POSIX-only")
 @pytest.mark.asyncio
 async def test_noop_backend_preserves_request_stdin(tmp_path: Path) -> None:
     request = SandboxRequest(
@@ -68,7 +67,6 @@ async def test_noop_backend_preserves_request_stdin(tmp_path: Path) -> None:
     assert result.stdout.splitlines() == ["STDIN:payload"]
 
 
-@pytest.mark.skipif(not HAS_RESOURCE, reason="noop backend safety runner is POSIX-only")
 @pytest.mark.asyncio
 async def test_noop_backend_preserves_binary_request_stdin(tmp_path: Path) -> None:
     request = SandboxRequest(
@@ -89,7 +87,6 @@ async def test_noop_backend_preserves_binary_request_stdin(tmp_path: Path) -> No
     assert result.stdout.splitlines() == ["ff00616263"]
 
 
-@pytest.mark.skipif(not HAS_RESOURCE, reason="noop backend safety runner is POSIX-only")
 @pytest.mark.asyncio
 async def test_noop_backend_forwards_allowlisted_request_env(tmp_path: Path) -> None:
     request = SandboxRequest(
@@ -117,7 +114,6 @@ async def test_noop_backend_forwards_allowlisted_request_env(tmp_path: Path) -> 
     assert result.stdout.splitlines() == ["visible", "missing"]
 
 
-@pytest.mark.skipif(not HAS_RESOURCE, reason="noop backend safety runner is POSIX-only")
 @pytest.mark.asyncio
 async def test_noop_backend_caller_cancel_stops_process_tree(tmp_path: Path) -> None:
     marker = tmp_path / "noop-descendant-ran"
@@ -141,8 +137,45 @@ async def test_noop_backend_caller_cancel_stops_process_tree(tmp_path: Path) -> 
     running = asyncio.create_task(NoopBackend().run(request))
     await asyncio.sleep(0.2)
     running.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await running
+    cancelled = await asyncio.gather(running, return_exceptions=True)
+    assert isinstance(cancelled[0], asyncio.CancelledError)
     await asyncio.sleep(1.0)
 
     assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_noop_backend_without_resource_module_omits_posix_preexec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class Process:
+        pid = 8181
+        returncode: int | None = None
+
+        async def communicate(self, *, input: bytes | None = None):
+            assert input is None
+            self.returncode = 0
+            return b"ok\n", b""
+
+    async def fake_spawn(*_argv: str, **kwargs: object) -> Process:
+        captured.update(kwargs)
+        return Process()
+
+    monkeypatch.setattr(noop_mod, "HAS_RESOURCE", False)
+    monkeypatch.setattr(noop_mod, "create_owned_subprocess_exec", fake_spawn)
+
+    result = await NoopBackend().run(
+        SandboxRequest(
+            argv=(sys.executable, "-c", "print('ok')"),
+            cwd=tmp_path,
+            action_kind="shell.exec",
+            policy=_policy(tmp_path),
+        )
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == "ok\n"
+    assert "preexec_fn" not in captured

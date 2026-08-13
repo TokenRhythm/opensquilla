@@ -6154,7 +6154,7 @@ async def _communicate_windows_host_shell_process(
         )
         if communicate_task in done:
             with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                await communicate_task
+                communicate_task.result()
         raise
     if communicate_task in done:
         await communicate_task
