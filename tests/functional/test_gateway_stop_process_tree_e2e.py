@@ -9,9 +9,12 @@ the public task-scoped Stop RPC cancels the turn.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import ctypes
 import json
 import os
 import re
+import select
 import socket
 import subprocess
 import sys
@@ -92,7 +95,7 @@ class _StopProvider:
                 "import pathlib\n"
                 "import time\n"
                 f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
-                "time.sleep(3)\n"
+                "time.sleep(30)\n"
                 f"pathlib.Path({str(survived)!r}).write_text('survived')\n"
                 "time.sleep(30)\n",
                 encoding="utf-8",
@@ -297,6 +300,70 @@ async def _wait_for_file(path: Path, *, timeout: float = 10.0) -> None:
     raise AssertionError(f"timed out waiting for process evidence: {path}")
 
 
+def _open_process_liveness(pid: int) -> tuple[str, int]:
+    """Retain a non-reusable identity for the descendant observed before Stop."""
+
+    if os.name == "nt":
+        from ctypes import wintypes
+
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if not handle:
+            raise OSError(int(getattr(ctypes, "get_last_error")()))
+        return "windows", int(handle)
+
+    pidfd_open = getattr(os, "pidfd_open", None)
+    if callable(pidfd_open):
+        return "pidfd", int(pidfd_open(pid))
+    return "pid", pid
+
+
+async def _wait_process_exit(identity: tuple[str, int], *, timeout: float) -> None:
+    kind, value = identity
+    if kind == "windows":
+        from ctypes import wintypes
+
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        result = await asyncio.to_thread(
+            kernel32.WaitForSingleObject,
+            wintypes.HANDLE(value),
+            max(0, int(timeout * 1000)),
+        )
+        assert result == 0, "task-owned Windows descendant remained alive after Stop"
+        return
+    if kind == "pidfd":
+        readable, _, _ = await asyncio.to_thread(select.select, [value], [], [], timeout)
+        assert readable, "task-owned Linux descendant remained alive after Stop"
+        return
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            os.kill(value, 0)
+        except ProcessLookupError:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError("task-owned POSIX descendant remained alive after Stop")
+
+
+def _close_process_liveness(identity: tuple[str, int]) -> None:
+    kind, value = identity
+    if kind == "windows":
+        from ctypes import wintypes
+
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(wintypes.HANDLE(value))
+    elif kind == "pidfd":
+        with contextlib.suppress(OSError):
+            os.close(value)
+
+
 def _isolated_env(tmp_path: Path, port: int, state: Path, evidence: Path) -> dict[str, str]:
     inherited = ("PATH", "LANG", "LC_ALL", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT")
     env = {key: os.environ[key] for key in inherited if key in os.environ}
@@ -364,6 +431,7 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
     )
     client = GatewayClient()
     first_frames: list[dict[str, Any]] = []
+    descendant_identity: tuple[str, int] | None = None
     try:
         await _wait_for_health(port, process, gateway_log)
         await client.connect(f"ws://127.0.0.1:{port}/ws")
@@ -375,6 +443,9 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
 
         first_turn = asyncio.create_task(consume_first())
         await _wait_for_file(evidence / "child.pid")
+        descendant_identity = _open_process_liveness(
+            int((evidence / "child.pid").read_text(encoding="utf-8"))
+        )
         await _wait_for_file(evidence / "leader-terminal")
         await _wait_for_file(evidence / "provider-blocked")
         task_id = client._active_turn_ids[session_key]
@@ -389,7 +460,7 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
         )
         assert stopped["aborted"] is True
         await asyncio.wait_for(first_turn, timeout=10.0)
-        await asyncio.sleep(3.2)
+        await _wait_process_exit(descendant_identity, timeout=10.0)
         assert not (evidence / "descendant-survived").exists()
 
         await _wait_for_health(port, process, gateway_log)
@@ -401,6 +472,8 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
         await _wait_for_health(port, process, gateway_log)
         assert process.poll() is None
     finally:
+        if descendant_identity is not None:
+            _close_process_liveness(descendant_identity)
         await client.close()
         _stop_process(process)
         stream.close()

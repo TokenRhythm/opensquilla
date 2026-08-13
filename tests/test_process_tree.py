@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import io
 import os
 import shutil
@@ -801,3 +802,59 @@ def test_windows_owned_popen_boots_helper_with_restricted_target_env() -> None:
 
     assert process.returncode == 0, stderr.decode(errors="replace")
     assert stdout.decode().splitlines() == ["yes", "missing", "missing"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows events and Job Objects")
+@pytest.mark.asyncio
+async def test_windows_job_kills_descendant_after_direct_leader_exits(tmp_path) -> None:
+    from ctypes import wintypes
+
+    child_pid = tmp_path / "child.pid"
+    child_script = tmp_path / "child.py"
+    leader_script = tmp_path / "leader.py"
+    child_script.write_text(
+        "import os\n"
+        "import pathlib\n"
+        "import time\n"
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    leader_script.write_text(
+        "import subprocess\n"
+        "import sys\n"
+        f"subprocess.Popen([sys.executable, {str(child_script)!r}])\n",
+        encoding="utf-8",
+    )
+
+    leader = await process_tree.create_owned_subprocess_exec(
+        sys.executable,
+        str(leader_script),
+    )
+    owner = process_tree.capture_process_tree_owner(leader, isolated=True)
+    await asyncio.wait_for(leader.wait(), timeout=10.0)
+    for _attempt in range(200):
+        if child_pid.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert child_pid.exists()
+    assert owner.is_active()
+
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    child_handle = kernel32.OpenProcess(
+        0x00100000,  # SYNCHRONIZE
+        False,
+        int(child_pid.read_text(encoding="utf-8")),
+    )
+    assert child_handle
+    try:
+        assert await owner.terminate(graceful_timeout=0.1, kill_timeout=5.0)
+        assert kernel32.WaitForSingleObject(child_handle, 5000) == 0
+    finally:
+        kernel32.CloseHandle(child_handle)
