@@ -71,6 +71,12 @@ from opensquilla.engine.post_write_convergence import (
 )
 from opensquilla.engine.progress_watchdog import ProgressObservation, ProgressWatchdog
 from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
+from opensquilla.engine.repetition_guard import (
+    MODEL_REPETITION_LOOP_CODE,
+    MODEL_REPETITION_LOOP_MESSAGE,
+    ModelRepetitionLoopError,
+    guard_provider_text_stream,
+)
 from opensquilla.engine.runtime_diagnostics import RuntimeDiagnosticsObserver
 from opensquilla.engine.runtime_events import append_runtime_event
 from opensquilla.engine.runtime_recovery import (
@@ -8369,6 +8375,7 @@ class Agent:
                             # exception is deliberately not chained because SDK
                             # messages may contain response bodies or secrets.
                             raise _RaisedProviderBoundaryError from None
+                        raw_stream = guard_provider_text_stream(raw_stream)
                         pending_install_deadline: float | None = (
                             self._pending_durable_compaction_event
                             .compaction_deadline_at_monotonic
@@ -9371,6 +9378,26 @@ class Agent:
                             yield TextDeltaEvent(text=response_text)
                             break
                         raise
+                    except ModelRepetitionLoopError as exc:
+                        usage_unknown_reason = MODEL_REPETITION_LOOP_CODE
+                        _notify_call_outcome(
+                            ok=False,
+                            failure_kind=MODEL_REPETITION_LOOP_CODE,
+                        )
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="stop",
+                            reason=MODEL_REPETITION_LOOP_CODE,
+                            code=MODEL_REPETITION_LOOP_CODE,
+                            **exc.detection.log_fields(),
+                        )
+                        yield self._transition(AgentState.ERROR)
+                        terminal_error = ErrorEvent(
+                            message=MODEL_REPETITION_LOOP_MESSAGE,
+                            code=MODEL_REPETITION_LOOP_CODE,
+                        )
+                        yield terminal_error
+                        break
                     except UsageAccountingUnavailableError as exc:
                         # Usage-ledger admission is an engine control-plane
                         # failure, not an upstream provider exception. Preserve
@@ -16946,7 +16973,11 @@ class Agent:
                 event = next_event.result()
             except StopAsyncIteration:
                 return
-            except (asyncio.CancelledError, UsageAccountingUnavailableError):
+            except (
+                asyncio.CancelledError,
+                UsageAccountingUnavailableError,
+                ModelRepetitionLoopError,
+            ):
                 raise
             except Exception:  # noqa: BLE001 - provider boundary
                 # TimeoutError raised *by the provider* is different from the

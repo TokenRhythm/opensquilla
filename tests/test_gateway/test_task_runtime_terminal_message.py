@@ -547,6 +547,64 @@ async def test_task_runtime_stream_output_truncation_is_terminal_state() -> None
 
 
 @pytest.mark.asyncio
+async def test_task_runtime_stream_repetition_is_stable_failed_terminal() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield ErrorEvent(
+            message="The model began repeating the same output.",
+            code="model_repetition_loop_detected",
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    with pytest.raises(TaskRuntimeStreamError) as exc_info:
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            "agent:main:test",
+            _emitter,
+            stream_event_sink=None,
+            idle_timeout=1.0,
+            heartbeat_interval=0.0,
+        )
+
+    assert exc_info.value.code == "model_repetition_loop_detected"
+    assert exc_info.value.terminal_reason == "model_repetition_loop_detected"
+    payload = emitted[-1][2]
+    assert payload["code"] == "model_repetition_loop_detected"
+    assert payload["terminal_reason"] == "model_repetition_loop_detected"
+    assert "repeating" in payload["terminal_message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_records_repetition_as_failed_not_succeeded() -> None:
+    async def _repetition_handler(_run: Any) -> None:
+        raise TaskRuntimeStreamError(
+            "The model began repeating the same output.",
+            code="model_repetition_loop_detected",
+            terminal_reason="model_repetition_loop_detected",
+        )
+
+    runtime = _make_runtime(_repetition_handler)
+    handle = await runtime.enqueue(_make_envelope(), "read a file")
+
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.terminal_reason == "model_repetition_loop_detected"
+    assert record.error_class == "model_repetition_loop_detected"
+    assert "repeating" in str(record.error_message).lower()
+    assert record.details["turn_outcome"] == {
+        "kind": "failed",
+        "reason": "model_repetition_loop_detected",
+        "error_class": "model_repetition_loop_detected",
+        "error_message": "The model began repeating the same output.",
+        "retryable": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_task_runtime_records_output_truncation_as_failed_not_succeeded() -> None:
     async def _truncated_handler(_run: Any) -> None:
         raise TaskRuntimeStreamError(

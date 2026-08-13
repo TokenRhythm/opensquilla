@@ -1796,9 +1796,14 @@ async def _emit_task_runtime_stream_events(
             code_text = str(code or "").lower()
             is_timeout = "timeout" in code_text or "stream idle" in error_message.lower()
             is_output_truncated = code_text == "provider_output_truncated"
-            terminal_reason = (
-                "timeout" if is_timeout else "output_truncated" if is_output_truncated else "error"
-            )
+            if is_timeout:
+                terminal_reason = "timeout"
+            elif is_output_truncated:
+                terminal_reason = "output_truncated"
+            elif code_text == "model_repetition_loop_detected":
+                terminal_reason = "model_repetition_loop_detected"
+            else:
+                terminal_reason = "error"
             terminal_payload = {
                 "status": "timeout" if is_timeout else "failed",
                 "terminal_reason": terminal_reason,
