@@ -40,6 +40,18 @@ _CONTAINER_LOG_LINE_RE = re.compile(
     r"(?:trace|debug|info|warn(?:ing)?|error|fatal)\b)",
     re.IGNORECASE,
 )
+_CRI_LOG_LINE_RE = re.compile(
+    r"^(?:[A-Za-z0-9_.-]{1,128}\s+)?(?:stdout|stderr)\s+[FP]\s+"
+    r"(?:\[?\d{4}-\d{2}-\d{2}[T ]|\d{2}:\d{2}:\d{2}|"
+    r"(?:trace|debug|info|warn(?:ing)?|error|fatal)\b)",
+    re.IGNORECASE,
+)
+_KUBECTL_PREFIX_LOG_LINE_RE = re.compile(
+    r"^\[pod/[A-Za-z0-9_.-]{1,253}(?:/container)?/[A-Za-z0-9_.-]{1,253}\]\s+"
+    r"(?:\[?\d{4}-\d{2}-\d{2}[T ]|\d{2}:\d{2}:\d{2}|"
+    r"(?:trace|debug|info|warn(?:ing)?|error|fatal)\b)",
+    re.IGNORECASE,
+)
 _QUERY_BORDER_RE = re.compile(r"^(?:\+-{2,}(?:\+-{2,})+\+?|[-=]{2,}(?:\+[-=]{2,})+)$")
 _QUERY_FOOTER_RE = re.compile(r"^\(\d+\s+rows?\)$", re.IGNORECASE)
 _CODE_PREFIX_RE = re.compile(
@@ -300,7 +312,12 @@ def _looks_structured(text: str, period: int) -> bool:
     structured_lines = 0
     for line in lines:
         is_table = line.count("|") >= 2
-        is_log = bool(_LOG_LINE_RE.match(line) or _CONTAINER_LOG_LINE_RE.match(line))
+        is_log = bool(
+            _LOG_LINE_RE.match(line)
+            or _CONTAINER_LOG_LINE_RE.match(line)
+            or _CRI_LOG_LINE_RE.match(line)
+            or _KUBECTL_PREFIX_LOG_LINE_RE.match(line)
+        )
         is_code = bool(
             _CODE_PREFIX_RE.match(line)
             or _CODE_CALL_RE.match(line)
@@ -363,6 +380,8 @@ async def close_async_iterator_bounded(
     timeout: float,
     event_prefix: str = "provider_stream",
 ) -> None:
+    caller = asyncio.current_task()
+    caller_cancelling_before = caller.cancelling() if caller is not None else 0
     aclose = getattr(stream_iter, "aclose", None)
     if not callable(aclose):
         return
@@ -388,9 +407,22 @@ async def close_async_iterator_bounded(
         )
         return
     except asyncio.CancelledError:
-        close_task.cancel()
-        close_task.add_done_callback(_consume_close_result)
-        raise
+        caller_cancelling_now = caller.cancelling() if caller is not None else 0
+        caller_is_cancelling = caller_cancelling_now > caller_cancelling_before or (
+            caller_cancelling_now > 0 and not close_task.cancelled()
+        )
+        if caller_is_cancelling:
+            close_task.cancel()
+            close_task.add_done_callback(_consume_close_result)
+            raise
+        # The provider's aclose() may cancel itself.  That is a cleanup
+        # failure, not evidence that the task driving the provider stream was
+        # cancelled, so it must not replace the stream's terminal outcome.
+        _consume_close_result(close_task)
+        log.warning(
+            f"{event_prefix}.close_failed",
+            error_type=asyncio.CancelledError.__name__,
+        )
     except Exception as exc:  # noqa: BLE001 - cleanup must not mask terminal outcome
         log.warning(
             f"{event_prefix}.close_failed",

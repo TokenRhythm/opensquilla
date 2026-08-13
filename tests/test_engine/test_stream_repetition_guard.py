@@ -15,6 +15,7 @@ from opensquilla.engine.repetition_guard import (
     RepetitionDetection,
     RepetitionGuardPolicy,
     StreamingRepetitionGuard,
+    close_async_iterator_bounded,
     guard_provider_text_stream,
 )
 from opensquilla.engine.usage_accounting import (
@@ -136,6 +137,14 @@ def test_large_aperiodic_loops_are_detected_chunk_invariant(period: int) -> None
             "api-1 | 2026-08-13T12:00:00 INFO request completed\n",
             id="container-log",
         ),
+        pytest.param(
+            "pod-a stdout F 2026-08-13T12:00:00Z request completed\n",
+            id="cri-log",
+        ),
+        pytest.param(
+            "[pod/api-1/container/app] 2026-08-13T12:00:00Z request completed\n",
+            id="kubectl-prefix-log",
+        ),
         pytest.param("region,status,count\nus-east,ready,10\n", id="csv"),
         pytest.param("region\tstatus\tcount\nus-east\tready\t10\n", id="tsv"),
         pytest.param(
@@ -163,6 +172,85 @@ def test_long_structured_loop_is_not_permanently_exempt() -> None:
     assert detection.structured is True
     assert detection.repeated_chars >= 57_344
     assert detection.repetitions >= 7
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        pytest.param(
+            "pod-a stdout F 2026-08-13T12:00:00Z request completed\n",
+            id="cri-log",
+        ),
+        pytest.param(
+            "[pod/api-1/container/app] 2026-08-13T12:00:00Z request completed\n",
+            id="kubectl-prefix-log",
+        ),
+    ],
+)
+def test_prefixed_log_loop_uses_structured_threshold_chunk_invariant(unit: str) -> None:
+    payload = (unit * (80_000 // len(unit) + 1))[:80_000]
+
+    results = [_feed_in_chunks(payload, chunk_size) for chunk_size in (1, 257, 4_093)]
+
+    assert len({len(emitted) for emitted, _, _ in results}) == 1
+    assert len({detection for _, detection, _ in results}) == 1
+    [detection] = list({detection for _, detection, _ in results})
+    assert detection is not None
+    assert detection.structured is True
+    assert detection.repeated_chars >= 57_344
+    assert all(guard.buffered_chars <= 65_536 for _, _, guard in results)
+
+
+@pytest.mark.parametrize(
+    "row_factory",
+    [
+        pytest.param(
+            lambda index: (
+                f"pod-{index % 7} stdout F 2026-08-13T12:{index // 60:02d}:"
+                f"{index % 60:02d}Z request={index} latency_ms={index * 17}\n"
+            ),
+            id="cri-log",
+        ),
+        pytest.param(
+            lambda index: (
+                f"[pod/api-{index % 7}/container/app] 2026-08-13T12:{index // 60:02d}:"
+                f"{index % 60:02d}Z request={index} latency_ms={index * 17}\n"
+            ),
+            id="kubectl-prefix-log",
+        ),
+    ],
+)
+def test_progressing_prefixed_logs_are_not_flagged_chunk_invariant(row_factory: Any) -> None:
+    # Stay well beyond the historical ~4.8 KiB false-positive point without
+    # multiplying a full 64 KiB scan by every chunk partition in this matrix.
+    payload = "".join(row_factory(index) for index in range(320))
+
+    for chunk_size in (1, 257, 4_093):
+        emitted, detection, guard = _feed_in_chunks(payload, chunk_size)
+        assert detection is None
+        assert emitted == payload
+        assert guard.buffered_chars <= 65_536
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        pytest.param(
+            "A report says pod-a stdout F 2026-08-13 is prose, not a runtime record. ",
+            id="cri-words-in-prose",
+        ),
+        pytest.param(
+            "A report quotes [pod/api-1/container/app] 2026-08-13 in ordinary prose. ",
+            id="kubectl-prefix-in-prose",
+        ),
+    ],
+)
+def test_prefixed_log_words_do_not_exempt_prose(unit: str) -> None:
+    _, detection, _ = _feed_in_chunks(unit * 300, 173)
+
+    assert detection is not None
+    assert detection.structured is False
+    assert detection.repeated_chars < 16_000
 
 
 @pytest.mark.parametrize(
@@ -207,13 +295,16 @@ def test_large_structured_loop_requires_full_conservative_budget() -> None:
     assert len(unit) == period
     payload = unit * 10
 
-    _, detection, guard = _feed_in_chunks(payload, 251)
+    results = [_feed_in_chunks(payload, chunk_size) for chunk_size in (1, 251, 4_093)]
 
+    assert len({len(emitted) for emitted, _, _ in results}) == 1
+    assert len({detection for _, detection, _ in results}) == 1
+    [detection] = list({detection for _, detection, _ in results})
     assert detection is not None
     assert detection.period_chars == period
     assert detection.structured is True
     assert detection.repeated_chars >= 57_344
-    assert guard.buffered_chars <= 65_536
+    assert all(guard.buffered_chars <= 65_536 for _, _, guard in results)
 
 
 def test_nonperiodic_code_table_and_log_output_does_not_trigger() -> None:
@@ -231,10 +322,19 @@ def test_nonperiodic_code_table_and_log_output_does_not_trigger() -> None:
 
 
 class _RepeatingIterator:
-    def __init__(self, *, block_close: bool = False, fail_close: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        block_close: bool = False,
+        cancel_close: bool = False,
+        fail_close: bool = False,
+        fail_iteration: bool = False,
+    ) -> None:
         self.close_calls = 0
         self.block_close = block_close
+        self.cancel_close = cancel_close
         self.fail_close = fail_close
+        self.fail_iteration = fail_iteration
         self.close_started = asyncio.Event()
 
     def __aiter__(self) -> _RepeatingIterator:
@@ -242,6 +342,8 @@ class _RepeatingIterator:
 
     async def __anext__(self) -> ProviderText:
         await asyncio.sleep(0)
+        if self.fail_iteration:
+            raise RuntimeError("synthetic provider failure")
         return ProviderText(
             text="I am reading the file while checking the next section carefully. "
         )
@@ -249,6 +351,8 @@ class _RepeatingIterator:
     async def aclose(self) -> None:
         self.close_calls += 1
         self.close_started.set()
+        if self.cancel_close:
+            raise asyncio.CancelledError
         if self.fail_close:
             raise RuntimeError("synthetic close failure")
         if self.block_close:
@@ -324,6 +428,61 @@ async def test_guard_close_failure_does_not_mask_repetition_outcome() -> None:
             pass
 
     assert exc_info.value.code == MODEL_REPETITION_LOOP_CODE
+    assert upstream.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_guard_close_cancelled_error_does_not_mask_repetition_outcome() -> None:
+    upstream = _RepeatingIterator(cancel_close=True)
+
+    with pytest.raises(ModelRepetitionLoopError) as exc_info:
+        async for _ in guard_provider_text_stream(upstream):
+            pass
+
+    assert exc_info.value.code == MODEL_REPETITION_LOOP_CODE
+    assert upstream.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_guard_close_cancelled_error_does_not_mask_provider_failure() -> None:
+    upstream = _RepeatingIterator(cancel_close=True, fail_iteration=True)
+
+    with pytest.raises(RuntimeError, match="synthetic provider failure"):
+        async for _ in guard_provider_text_stream(upstream):
+            pass
+
+    assert upstream.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_close_propagates_real_caller_cancellation() -> None:
+    upstream = _RepeatingIterator(block_close=True)
+    close = asyncio.create_task(close_async_iterator_bounded(upstream, timeout=1.0))
+    await upstream.close_started.wait()
+
+    close.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close
+
+    assert close.cancelled()
+    assert upstream.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_provider_close_cancellation_ignores_stale_caller_cancel_count() -> None:
+    upstream = _RepeatingIterator(cancel_close=True)
+    caller = asyncio.current_task()
+    assert caller is not None
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.sleep(0)
+    assert caller.cancelling() > 0
+
+    try:
+        await close_async_iterator_bounded(upstream, timeout=1.0)
+    finally:
+        caller.uncancel()
+
     assert upstream.close_calls == 1
 
 
