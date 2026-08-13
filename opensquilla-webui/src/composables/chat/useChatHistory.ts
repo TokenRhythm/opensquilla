@@ -153,7 +153,10 @@ function historyContextInteger(value: unknown, key: string): number | undefined 
   return Number.isInteger(number) && number >= 0 ? number : undefined
 }
 
-function historyActivityMarkers(value: unknown): StatusPart[] {
+function historyActivityMarkers(
+  value: unknown,
+  suppressedCompactionIds: ReadonlySet<string> = new Set(),
+): StatusPart[] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return []
   const markers = (value as Record<string, unknown>).activity_markers
   if (!Array.isArray(markers)) return []
@@ -162,7 +165,7 @@ function historyActivityMarkers(value: unknown): StatusPart[] {
     const data = marker as Record<string, unknown>
     if (data.kind !== 'context_compaction') return []
     const id = String(data.id || '').trim()
-    if (!id) return []
+    if (!id || suppressedCompactionIds.has(id)) return []
     const rawStatus = String(data.status || 'completed').toLowerCase()
     const state = rawStatus === 'completed'
       ? 'completed'
@@ -193,9 +196,10 @@ function summaryCount(value: unknown): number | undefined {
   return Number.isInteger(count) && count >= 0 ? count : undefined
 }
 
-function manualCompactionMessage(summary: ChatCompactionSummary): ChatMessage | null {
-  if (String(summary.trigger_reason || '').trim().toLowerCase() !== 'manual') return null
-
+function compactionSummaryMessage(
+  summary: ChatCompactionSummary,
+  canonicalComplete: boolean | null,
+): ChatMessage | null {
   const summaryId = summaryStableValue(summary.id)
   const compactionId = summaryStableValue(summary.compaction_id)
   const compactionIndex = summaryStableValue(summary.compaction_index)
@@ -217,21 +221,33 @@ function manualCompactionMessage(summary: ChatCompactionSummary): ChatMessage | 
     maintenance: {
       kind: 'context_compaction',
       compactionId: compactionId || identity,
-      source: 'manual',
+      source: String(summary.trigger_reason || '').trim().toLowerCase() === 'manual'
+        ? 'manual'
+        : 'automatic',
       state: 'completed',
       durability: 'durable',
       removedCount: summaryCount(summary.removed_count),
       keptCount: summaryCount(summary.kept_count),
+      historyArchived: true,
+      canonicalComplete,
     },
   }
 }
 
-function manualCompactionMessages(data: ChatHistoryResponse): ChatMessage[] {
+function compactionSummaryMessages(data: ChatHistoryResponse): ChatMessage[] {
   const summaries = data.compaction_summaries ?? data.compactionSummaries ?? []
+  const completeness = data.canonical_complete ?? data.canonicalComplete
+  const canonicalComplete = typeof completeness === 'boolean' ? completeness : null
   return summaries.flatMap((summary) => {
-    const message = manualCompactionMessage(summary)
+    const message = compactionSummaryMessage(summary, canonicalComplete)
     return message ? [message] : []
   })
+}
+
+function summaryCompactionIds(data: ChatHistoryResponse): Set<string> {
+  return new Set(
+    compactionSummaryMessages(data).map(message => message.maintenance!.compactionId),
+  )
 }
 
 function isHistoryMaintenance(message: ChatMessage): boolean {
@@ -268,7 +284,29 @@ function mergeHistoryMaintenance(
   messages: ChatMessage[],
   maintenance: ChatMessage[],
 ): ChatMessage[] {
-  const canonical = messages.filter(message => !isHistoryMaintenance(message))
+  const candidates = [
+    ...messages.filter(isHistoryMaintenance),
+    ...maintenance,
+  ]
+  const archivedCompactionIds = new Set(
+    candidates.flatMap(message =>
+      message.maintenance?.historyArchived
+        ? [message.maintenance.compactionId.trim()]
+        : [],
+    ),
+  )
+  const canonical = messages
+    .filter(message => !isHistoryMaintenance(message))
+    .map((message) => {
+      const statusHistory = message.statusHistory?.filter(entry =>
+        !(entry.category === 'maintenance'
+          && entry.id
+          && archivedCompactionIds.has(entry.id)),
+      )
+      return statusHistory?.length === message.statusHistory?.length
+        ? message
+        : { ...message, statusHistory }
+    })
   const embeddedCompactionIds = new Set(
     canonical.flatMap(message =>
       (message.statusHistory ?? []).flatMap(entry =>
@@ -277,10 +315,6 @@ function mergeHistoryMaintenance(
     ),
   )
   const maintenanceByCompactionId = new Map<string, ChatMessage>()
-  const candidates = [
-    ...messages.filter(isHistoryMaintenance),
-    ...maintenance,
-  ]
   for (const message of candidates) {
     if (!isHistoryMaintenance(message)) continue
     const compactionId = message.maintenance!.compactionId.trim()
@@ -450,7 +484,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     scheduleHistorySync()
   }
 
-  function mapHistoryMessage(msg: ChatHistoryMessage): ChatMessage {
+  function mapHistoryMessage(
+    msg: ChatHistoryMessage,
+    suppressedCompactionIds: ReadonlySet<string> = new Set(),
+  ): ChatMessage {
     // History rows carry the turn's reasoning text but not the measured
     // thinking duration; live turn records re-fill seconds after sync.
     const reasoningText = typeof msg.reasoning_content === 'string' ? msg.reasoning_content.trim() : ''
@@ -496,7 +533,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       input: msg.input || msg.input_tokens || undefined,
       output: msg.output || msg.output_tokens || undefined,
       statusHistory: msg.role === 'assistant'
-        ? historyActivityMarkers(msg.turn_context)
+        ? historyActivityMarkers(msg.turn_context, suppressedCompactionIds)
         : undefined,
       messageId,
       restoredFromHistory: true,
@@ -684,11 +721,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
       }
 
-      let mapped = attachHistoryTurnOutcomes(msgs.map(mapHistoryMessage), data)
+      const summaryIds = summaryCompactionIds(data)
+      let mapped = attachHistoryTurnOutcomes(
+        msgs.map(message => mapHistoryMessage(message, summaryIds)),
+        data,
+      )
       const previousMessages = crossedSession ? [] : options.messages.value
       const previousMaintenance = previousMessages.filter(isHistoryMaintenance)
       const previousTranscript = previousMessages.filter(message => !isHistoryMaintenance(message))
-      const maintenanceMessages = manualCompactionMessages(data)
+      const maintenanceMessages = compactionSummaryMessages(data)
       let historyData = data
       let bridgeContinuationNeeded = false
       const needsForwardBridge = canonicalAvailable !== false
@@ -756,10 +797,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           }
 
           const page = attachHistoryTurnOutcomes(
-            (bridgeData.messages || []).map(mapHistoryMessage),
+            (bridgeData.messages || []).map(message =>
+              mapHistoryMessage(message, summaryCompactionIds(bridgeData)),
+            ),
             bridgeData,
           )
-          maintenanceMessages.push(...manualCompactionMessages(bridgeData))
+          maintenanceMessages.push(...compactionSummaryMessages(bridgeData))
           for (const message of page) {
             const keyValue = messageKey(message)
             if (bridgedKeys.has(keyValue)) continue

@@ -104,6 +104,66 @@ async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -
 
 
 @pytest.mark.asyncio
+async def test_chat_history_projects_legacy_tool_pair_split_by_page_boundary(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-legacy-boundary.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:legacy-boundary"
+    await manager.create(session_key)
+    try:
+        await manager.append_message(session_key, "user", "earlier request")
+        await manager.append_message(
+            session_key,
+            "assistant",
+            "[Used tool: read_file]",
+        )
+        await manager.append_message(
+            session_key,
+            "user",
+            "[Tool result (call-boundary): private payload]",
+        )
+        await manager.append_message(session_key, "user", "continue")
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 2},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+    finally:
+        await storage.close()
+
+    assert result["loaded_count"] == 2
+    assert result["has_more"] is True
+    assert [message["role"] for message in result["messages"]] == [
+        "assistant",
+        "user",
+    ]
+    assert [message["text"] for message in result["messages"]] == ["", "continue"]
+    assert result["messages"][0]["tool_calls"] == [
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-boundary",
+            "name": "read_file",
+            "input": {},
+            "legacy_projection": True,
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-boundary",
+            "name": "read_file",
+            "result": "private payload",
+            "legacy_projection": True,
+        },
+    ]
+    assert "[Tool result" not in str(result["messages"])
+
+
+@pytest.mark.asyncio
 async def test_chat_history_batch_projects_missing_turn_usage_from_ledger(tmp_path) -> None:
     storage = SessionStorage(str(tmp_path / "history-usage-projection.db"))
     await storage.connect()

@@ -8,8 +8,10 @@ from typing import Any
 
 from opensquilla.artifacts import artifact_payload, strip_artifact_markers_from_text
 from opensquilla.chat.flattened_tool_markers import (
+    flattened_used_tool_names,
     has_flattened_used_tool_line,
     is_flattened_tool_result_dump,
+    parse_flattened_tool_result_dump,
     strip_confirmed_flattened_tool_result,
     strip_flattened_used_tool_lines,
 )
@@ -61,8 +63,8 @@ def _is_legacy_generated_plan_implementation(
     return _LEGACY_PLAN_IMPLEMENTATION_PROMPT.fullmatch(visible) is not None
 
 
-def _legacy_flattened_tool_result_indexes(entries: list[object]) -> set[int]:
-    """Identify metadata-poor result rows from an adjacent flattened tool call.
+def _legacy_flattened_tool_result_pairs(entries: list[object]) -> dict[int, int]:
+    """Map legacy result rows to their adjacent flattened assistant call row.
 
     Modern rows carry ``tool_call_id`` or role ``tool``. Older compaction
     projections sometimes persisted Anthropic-style tool results as role
@@ -71,7 +73,7 @@ def _legacy_flattened_tool_result_indexes(entries: list[object]) -> set[int]:
     the legacy syntax must remain ordinary conversation text.
     """
 
-    indexes: set[int] = set()
+    pairs: dict[int, int] = {}
     previous_was_flattened_call = False
     for index, entry in enumerate(entries):
         role = str(getattr(entry, "role", "unknown") or "unknown").lower()
@@ -81,22 +83,82 @@ def _legacy_flattened_tool_result_indexes(entries: list[object]) -> set[int]:
             and role in {"tool", "user"}
             and is_flattened_tool_result_dump(content)
         ):
-            indexes.add(index)
+            pairs[index] = index - 1
         previous_was_flattened_call = (
             role == "assistant" and has_flattened_used_tool_line(content)
         )
-    return indexes
+    return pairs
+
+
+def _legacy_tool_activity_segments(
+    tool_entry: object,
+    result_entry: object | None = None,
+) -> list[dict[str, Any]]:
+    """Project confirmed legacy text into the existing auditable tool timeline."""
+
+    names = flattened_used_tool_names(str(getattr(tool_entry, "content", "") or ""))
+    if not names:
+        return []
+    result = (
+        parse_flattened_tool_result_dump(str(getattr(result_entry, "content", "") or ""))
+        if result_entry is not None
+        else None
+    )
+    stable_entry_id = str(
+        getattr(result_entry or tool_entry, "message_id", None)
+        or getattr(result_entry or tool_entry, "id", None)
+        or "history"
+    )
+    segments: list[dict[str, Any]] = []
+    for index, name in enumerate(names):
+        is_result_owner = result is not None and index == len(names) - 1
+        tool_use_id = f"legacy:{stable_entry_id}:{index + 1}"
+        if result is not None and is_result_owner:
+            tool_use_id = result.tool_use_id
+        segments.append(
+            {
+                "type": "tool_use",
+                "tool_use_id": tool_use_id,
+                "name": name,
+                "input": {},
+                "legacy_projection": True,
+            }
+        )
+        if result is not None and is_result_owner:
+            segments.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "name": name,
+                    "result": result.content,
+                    "legacy_projection": True,
+                }
+            )
+    return segments
 
 
 def transcript_entries_to_chat_messages(
     entries: list[object],
     *,
     limit: int | None = None,
+    previous_entry: object | None = None,
+    next_entry: object | None = None,
 ) -> list[dict[str, Any]]:
     selected = entries[-limit:] if limit is not None else entries
-    legacy_tool_result_indexes = _legacy_flattened_tool_result_indexes(selected)
+    context_entries = [
+        *([previous_entry] if previous_entry is not None else []),
+        *selected,
+        *([next_entry] if next_entry is not None else []),
+    ]
+    selected_offset = 1 if previous_entry is not None else 0
+    legacy_tool_result_pairs = _legacy_flattened_tool_result_pairs(context_entries)
+    legacy_tool_call_pairs = {
+        tool_index: result_index
+        for result_index, tool_index in legacy_tool_result_pairs.items()
+    }
     messages: list[dict[str, Any]] = []
     for entry_index, entry in enumerate(selected):
+        context_index = selected_offset + entry_index
         role = getattr(entry, "role", "unknown")
         turn_context = getattr(entry, "turn_context", None)
         silent_reply = sanitize_historical_silent_reply(
@@ -106,6 +168,26 @@ def transcript_entries_to_chat_messages(
             turn_context=turn_context if isinstance(turn_context, dict) else None,
         )
         content = silent_reply.content or ""
+        legacy_segments: list[dict[str, Any]] = []
+        projected_role = role
+        paired_tool_index = legacy_tool_result_pairs.get(context_index)
+        if paired_tool_index is not None:
+            tool_entry = context_entries[paired_tool_index]
+            # Structured persisted segments already retain the complete audit
+            # trail. Synthesize only for metadata-poor legacy projections.
+            if not getattr(tool_entry, "tool_calls", None):
+                legacy_segments = _legacy_tool_activity_segments(tool_entry, entry)
+                if legacy_segments:
+                    projected_role = "assistant"
+        elif (
+            role == "assistant"
+            and has_flattened_used_tool_line(content)
+            and context_index not in legacy_tool_call_pairs
+            and not silent_reply.segments
+        ):
+            # Preserve an orphaned legacy call as an expandable activity rather
+            # than discarding the only surviving tool identity.
+            legacy_segments = _legacy_tool_activity_segments(entry)
         attachments = None
         artifacts = None
         if content and content.startswith("{"):
@@ -141,7 +223,7 @@ def transcript_entries_to_chat_messages(
             confirmed_tool_result = (
                 role == "tool"
                 or bool(getattr(entry, "tool_call_id", None))
-                or entry_index in legacy_tool_result_indexes
+                or paired_tool_index is not None
             )
             if confirmed_tool_result:
                 cleaned = strip_confirmed_flattened_tool_result(cleaned)
@@ -150,10 +232,10 @@ def transcript_entries_to_chat_messages(
                 # Drop it when nothing but internal tool transcript remains and
                 # there is no structured tool timeline to render instead;
                 # otherwise keep the narration that surrounded the markers.
-                if not cleaned.strip() and not silent_reply.segments:
+                if not cleaned.strip() and not silent_reply.segments and not legacy_segments:
                     continue
                 content = cleaned
-        if role == "user":
+        if projected_role == "user":
             display_text = display_text_from_preflight_confirmation(content)
             if display_text is not None:
                 content = display_text
@@ -165,7 +247,7 @@ def transcript_entries_to_chat_messages(
         msg: dict[str, Any] = {
             "id": getattr(entry, "message_id", None),
             "message_id": getattr(entry, "message_id", None),
-            "role": role,
+            "role": projected_role,
             "text": content,
             "timestamp": getattr(entry, "created_at", None),
             "provenance_kind": getattr(entry, "provenance_kind", None),
@@ -199,7 +281,7 @@ def transcript_entries_to_chat_messages(
             msg["output_tokens"] = output_tokens
             if usage.get("cost_usd") is not None:
                 msg["cost_usd"] = float(usage.get("cost_usd") or 0.0)
-        tool_calls = silent_reply.segments
+        tool_calls = [*(silent_reply.segments or []), *legacy_segments]
         if tool_calls:
             msg["tool_calls"] = _sanitize_display_protocol_payload(tool_calls)
         if (

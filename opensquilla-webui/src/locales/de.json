@@ -3858,6 +3858,9 @@
     "compact": {
       "compacting": "Kontext wird verdichtet",
       "compacted": "Kontext verdichtet",
+      "historyPreserved": "Früherer Kontext zusammengefasst; Originalnachrichten bleiben im Verlauf verfügbar",
+      "historyIncomplete": "Früherer Kontext zusammengefasst; einige Originalnachrichten sind nicht verfügbar",
+      "historySummarized": "Früherer Kontext zusammengefasst",
       "failed": "Verdichtung fehlgeschlagen",
       "withinBudget": "Kontext innerhalb des Budgets.",
       "skipped": "Die Kontextverdichtung wurde nicht angewendet.",

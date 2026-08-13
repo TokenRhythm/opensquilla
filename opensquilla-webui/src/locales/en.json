@@ -3911,6 +3911,9 @@
     "compact": {
       "compacting": "Organizing context…",
       "compacted": "Context organized",
+      "historyPreserved": "Earlier context summarized; original messages remain available in history",
+      "historyIncomplete": "Earlier context summarized; some original messages are unavailable",
+      "historySummarized": "Earlier context summarized",
       "failed": "Context organization failed",
       "withinBudget": "No organization needed; context has enough space",
       "skipped": "Context organization was not applied",

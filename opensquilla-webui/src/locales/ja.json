@@ -3858,6 +3858,9 @@
     "compact": {
       "compacting": "コンテキストを圧縮中",
       "compacted": "コンテキストを圧縮しました",
+      "historyPreserved": "以前のコンテキストを要約しました。元のメッセージは履歴で引き続き確認できます",
+      "historyIncomplete": "以前のコンテキストを要約しました。一部の元のメッセージは利用できません",
+      "historySummarized": "以前のコンテキストを要約しました",
       "failed": "圧縮に失敗しました",
       "withinBudget": "コンテキストは予算内です。",
       "skipped": "コンテキストの圧縮は適用されませんでした。",

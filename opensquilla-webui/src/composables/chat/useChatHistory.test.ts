@@ -347,6 +347,7 @@ describe('useChatHistory canonical pagination', () => {
           timestamp: baseTime + 3_000,
         },
       ],
+      canonical_complete: true,
       compaction_summaries: [
         {
           id: 9,
@@ -399,6 +400,7 @@ describe('useChatHistory canonical pagination', () => {
       'assistant-1',
       'maintenance:context-compaction:summary:7',
       'maintenance:context-compaction:summary:9',
+      'maintenance:context-compaction:summary:8',
       'user-2',
     ]
     expect(messages.value.map(message => message.messageId)).toEqual(expectedIds)
@@ -415,6 +417,16 @@ describe('useChatHistory canonical pagination', () => {
         durability: 'durable',
         removedCount: 5,
         keptCount: 1,
+        historyArchived: true,
+        canonicalComplete: true,
+      },
+    })
+    expect(messages.value[4]).toMatchObject({
+      maintenance: {
+        compactionId: 'cmp-auto',
+        source: 'automatic',
+        historyArchived: true,
+        canonicalComplete: true,
       },
     })
     expect(messages.value.filter(message =>
@@ -737,7 +749,7 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value[0]?.turnId).toBe('turn-1')
   })
 
-  it('restores durable compaction activity from canonical history', async () => {
+  it('prefers a durable summary boundary over duplicate activity metadata', async () => {
     const { api, messages } = makeHistory(false, {
       response: {
         messages: [{
@@ -756,6 +768,7 @@ describe('useChatHistory canonical pagination', () => {
             }],
           },
         }],
+        canonical_complete: true,
         compaction_summaries: [{
           id: 12,
           compaction_id: 'cmp-history',
@@ -768,21 +781,19 @@ describe('useChatHistory canonical pagination', () => {
 
     await api.loadHistory()
 
-    expect(messages.value[0]).toMatchObject({
+    const assistant = messages.value.find(message => message.role === 'assistant')
+    expect(assistant).toMatchObject({
       restoredFromHistory: true,
-      statusHistory: [{
-        action: 'context_compaction',
-        label: '',
-        at: 1_720_000_000_000,
-        id: 'cmp-history',
-        category: 'maintenance',
-        state: 'completed',
-        source: 'automatic',
-        durability: 'durable',
-      }],
+      statusHistory: [],
     })
-    expect(messages.value).toHaveLength(1)
-    expect(messages.value.some(message => message.role === 'maintenance')).toBe(false)
+    expect(messages.value).toHaveLength(2)
+    expect(messages.value.find(message => message.role === 'maintenance')).toMatchObject({
+      maintenance: {
+        compactionId: 'cmp-history',
+        historyArchived: true,
+        canonicalComplete: true,
+      },
+    })
   })
 
   it('interleaves cold same-turn output when the steer crosses a page boundary', async () => {

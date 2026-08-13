@@ -333,8 +333,8 @@ def test_transcript_entries_to_chat_messages_hides_exact_assistant_sentinel() ->
 
 
 def test_transcript_entries_to_chat_messages_strips_flattened_used_tool_markers() -> None:
-    # A compacted assistant turn keeps its narration but drops the flattened
-    # "[Used tool: ...]" markers that engine.agent._flatten_content_blocks emits.
+    # A compacted assistant turn keeps narration and restores legacy markers
+    # as auditable structured activity instead of exposing the raw protocol.
     entry = _assistant_entry(
         message_id="m-flat-narration",
         content=(
@@ -351,11 +351,20 @@ def test_transcript_entries_to_chat_messages_strips_flattened_used_tool_markers(
         "继续补齐上下文: 章节重新生成接口、前端 API client 与测试结构。"
     )
     assert "[Used tool:" not in messages[0]["text"]
+    assert [segment["name"] for segment in messages[0]["tool_calls"]] == [
+        "read_file",
+        "read_file",
+        "list_dir",
+    ]
+    assert all(
+        segment["type"] == "tool_use" and segment["legacy_projection"] is True
+        for segment in messages[0]["tool_calls"]
+    )
 
 
-def test_transcript_entries_to_chat_messages_drops_flattened_tool_result_dump() -> None:
-    # A "[Tool result (...)]" dump is pure internal transcript; with no
-    # structured segments to render it is dropped rather than shown as a bubble.
+def test_transcript_entries_to_chat_messages_folds_flattened_tool_result_dump() -> None:
+    # The raw wrapper is hidden, while the tool identity and payload remain
+    # available through the existing expandable tool timeline.
     entries = [
         _assistant_entry(
             message_id="m-flat-tooluse",
@@ -371,7 +380,29 @@ def test_transcript_entries_to_chat_messages_drops_flattened_tool_result_dump() 
         ),
     ]
 
-    assert transcript_entries_to_chat_messages(entries) == []
+    messages = transcript_entries_to_chat_messages(entries)
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["text"] == ""
+    assert messages[0]["tool_calls"] == [
+        {
+            "type": "tool_use",
+            "tool_use_id": "call_00_TUIq7hPsIGaww7lcUiuc8669",
+            "name": "read_file",
+            "input": {},
+            "legacy_projection": True,
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "call_00_TUIq7hPsIGaww7lcUiuc8669",
+            "name": "read_file",
+            "result": (
+                '1  """Proposal generation and management API routes."""\n2  \n3  import json'
+            ),
+            "legacy_projection": True,
+        },
+    ]
 
 
 def test_transcript_entries_to_chat_messages_keeps_unattributed_tool_result_text() -> None:
@@ -399,15 +430,67 @@ def test_transcript_entries_to_chat_messages_keeps_text_after_confirmed_tool_res
     assert messages[0]["text"] == "Please also update README.md"
 
 
-def test_transcript_entries_to_chat_messages_drops_tool_only_flattened_turn() -> None:
-    # An assistant turn whose entire content is "[Used tool: ...]" markers (no
-    # narration) collapses to nothing, matching a fully collapsed activity fold.
+def test_transcript_entries_to_chat_messages_folds_tool_only_flattened_turn() -> None:
+    # A marker-only turn remains as one collapsed, auditable activity row.
     entry = _assistant_entry(
         message_id="m-flat-toolonly",
         content="[Used tool: read_file]\n[Used tool: list_dir]",
     )
 
-    assert transcript_entries_to_chat_messages([entry]) == []
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert len(messages) == 1
+    assert messages[0]["text"] == ""
+    assert [segment["name"] for segment in messages[0]["tool_calls"]] == [
+        "read_file",
+        "list_dir",
+    ]
+
+
+def test_transcript_entries_to_chat_messages_recognizes_legacy_pair_across_page() -> None:
+    previous = _assistant_entry(
+        id=10,
+        message_id="m-boundary-tool",
+        content="[Used tool: read_file]",
+    )
+    result = _assistant_entry(
+        id=11,
+        message_id="m-boundary-result",
+        role="user",
+        content="[Tool result (call-boundary): private payload]",
+    )
+
+    messages = transcript_entries_to_chat_messages(
+        [result],
+        previous_entry=previous,
+    )
+
+    assert len(messages) == 1
+    assert messages[0]["role"] == "assistant"
+    assert messages[0]["text"] == ""
+    assert messages[0]["tool_calls"][1] == {
+        "type": "tool_result",
+        "tool_use_id": "call-boundary",
+        "name": "read_file",
+        "result": "private payload",
+        "legacy_projection": True,
+    }
+
+
+def test_transcript_entries_to_chat_messages_uses_lookahead_without_duplicate_fold() -> None:
+    tool = _assistant_entry(
+        id=12,
+        message_id="m-boundary-tool",
+        content="[Used tool: read_file]",
+    )
+    following = _assistant_entry(
+        id=13,
+        message_id="m-boundary-result",
+        role="user",
+        content="[Tool result (call-boundary): private payload]",
+    )
+
+    assert transcript_entries_to_chat_messages([tool], next_entry=following) == []
 
 
 def test_transcript_entries_to_chat_messages_keeps_ordinary_bracketed_text() -> None:

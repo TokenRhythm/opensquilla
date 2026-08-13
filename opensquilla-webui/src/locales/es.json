@@ -3858,6 +3858,9 @@
     "compact": {
       "compacting": "Compactando el contexto",
       "compacted": "Contexto compactado",
+      "historyPreserved": "Contexto anterior resumido; los mensajes originales siguen disponibles en el historial",
+      "historyIncomplete": "Contexto anterior resumido; algunos mensajes originales no están disponibles",
+      "historySummarized": "Contexto anterior resumido",
       "failed": "Error al compactar",
       "withinBudget": "Contexto dentro del presupuesto.",
       "skipped": "No se aplicó la compactación del contexto.",
