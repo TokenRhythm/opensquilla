@@ -62,6 +62,34 @@ afterEach(() => {
 })
 
 describe('ActivityDisclosure lifecycle transitions', () => {
+  it('renders queued then running as explicit live lifecycle phases', async () => {
+    const state = reactive({ phase: 'Queued' })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({
+      render: () => h(ActivityDisclosure, {
+        lifecycle: 'working',
+        defaultOpen: true,
+        stepCount: 0,
+        failureCount: 0,
+        phaseLabel: state.phase,
+        elapsedLabel: '0s',
+      }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    const label = host.querySelector('.assistant-activity__live-label')
+    expect(label?.textContent).toBe('Queued')
+    expect(host.textContent).not.toContain('Waiting for model')
+
+    state.phase = 'Running'
+    await nextTick()
+    expect(label?.textContent).toBe('Running')
+  })
+
   it('uses AA text tokens and no text shimmer for the live header', () => {
     const rule = cssRule('.assistant-activity__summary')
     expect(rule).toContain('color: var(--text-muted);')

@@ -147,6 +147,23 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('keeps a durable queued task in the queue phase without model narration', () => {
+    const { api, runStatus } = makeStream()
+    api.startStreaming()
+    runStatus.value = {
+      status: 'queued',
+      label: 'Queued',
+      task: { task_id: 'queued-task', status: 'queued' },
+    }
+
+    expect(api.streamPhaseLabel.value).toBe('Queued')
+    expect(api.streamPhaseElapsed.value).toBe('')
+    vi.advanceTimersByTime(15_000)
+    expect(api.streamPhaseLabel.value).toBe('Queued')
+    expect(api.streamPhaseLabel.value).not.toContain('model')
+    api.cleanup()
+  })
+
   it('preserves the authoritative active-task steer capability when streaming starts late', () => {
     const { api, runStatus, applySessionRunState } = makeStream()
     runStatus.value = {

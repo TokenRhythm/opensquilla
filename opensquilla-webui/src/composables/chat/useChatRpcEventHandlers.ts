@@ -1508,6 +1508,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       pendingSuccessorRenderTaskId = taskId
     }
     options.applySessionRunState({ run_status: 'running', active_task: { ...(payload || {}), status: 'running' } })
+    if (stream.isStreaming.value && !stream.streamHasVisibleOutput.value) {
+      stream.setStreamActivity('Running')
+    }
   }
 
   function handleRpcTaskGroupWaiting(payload: SessionEventPayload) {
