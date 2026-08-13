@@ -325,7 +325,13 @@ class ToolSpec:
     # Trusted runtime classification used by the action completion contract.
     # Appended for positional compatibility with embedded ToolSpec callers.
     completion_effect: Literal["unknown", "read_only", "action", "control"] = "unknown"
-    completion_effect_resolver: Literal["exec_command", "process"] | None = None
+    completion_effect_resolver: (
+        Literal["exec_command", "process", "http_request", "cron", "subagents"]
+        | None
+    ) = None
+    # A normal handler return proves execution only for explicitly audited
+    # built-ins. Dynamic/plugin tools must provide their own execution_status.
+    completion_receipt_on_return: bool = False
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

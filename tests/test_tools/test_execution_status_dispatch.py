@@ -12,13 +12,28 @@ from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import ToolContext, ToolSpec
 
 
-def _registry(name: str, result: str) -> ToolRegistry:
+def _registry(
+    name: str,
+    result: str,
+    *,
+    completion_effect: str = "unknown",
+    completion_receipt_on_return: bool = False,
+) -> ToolRegistry:
     registry = ToolRegistry()
 
     async def handler() -> str:
         return result
 
-    registry.register(ToolSpec(name=name, description=name, parameters={}), handler)
+    registry.register(
+        ToolSpec(
+            name=name,
+            description=name,
+            parameters={},
+            completion_effect=completion_effect,  # type: ignore[arg-type]
+            completion_receipt_on_return=completion_receipt_on_return,
+        ),
+        handler,
+    )
     return registry
 
 
@@ -182,6 +197,128 @@ async def test_process_kill_reports_success_for_management_call() -> None:
     assert result.execution_status is not None
     assert result.execution_status["status"] == "success"
     assert result.execution_status["reason"] == "process_killed"
+
+
+@pytest.mark.asyncio
+async def test_process_kill_already_exited_is_not_a_success_receipt() -> None:
+    handler = build_tool_handler(
+        _registry(
+            "process",
+            json.dumps(
+                {
+                    "status": "done",
+                    "action": "kill",
+                    "session": {
+                        "status": "done",
+                        "returncode": 0,
+                        "timed_out": False,
+                        "killed": False,
+                    },
+                }
+            ),
+        )
+    )
+
+    result = await handler(ToolCall("call_bg_already_done", "process", {}))
+
+    assert result.is_error is False
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == "unknown"
+    assert result.execution_status["reason"] == "process_already_exited"
+
+
+@pytest.mark.asyncio
+async def test_audited_builtin_normal_return_gets_success_receipt() -> None:
+    handler = build_tool_handler(
+        _registry(
+            "write_file",
+            "Wrote README.md",
+            completion_effect="action",
+            completion_receipt_on_return=True,
+        )
+    )
+
+    result = await handler(ToolCall("call_write", "write_file", {}))
+
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == "success"
+    assert result.execution_status["source"] == "tool_runtime"
+
+
+@pytest.mark.asyncio
+async def test_audited_builtin_soft_failure_is_not_a_success_receipt() -> None:
+    handler = build_tool_handler(
+        _registry(
+            "tts",
+            json.dumps({"status": "not_available", "provider": "elevenlabs"}),
+            completion_effect="action",
+            completion_receipt_on_return=True,
+        )
+    )
+
+    result = await handler(ToolCall("call_tts", "tts", {}))
+
+    assert result.is_error is False
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == "unknown"
+    assert result.execution_status["reason"] == "not_available"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload, expected_status, expected_reason",
+    [
+        (
+            {"status": "elevation_required"},
+            "unknown",
+            "elevation_required",
+        ),
+        ({"status": "invalid_request"}, "unknown", "invalid_request"),
+        ({"status": "preview"}, "unknown", "preview"),
+        (
+            {"status": "accepted", "success": False},
+            "error",
+            "handler_reported_failure",
+        ),
+    ],
+)
+async def test_audited_builtin_non_execution_envelopes_do_not_mint_success(
+    payload: dict[str, object],
+    expected_status: str,
+    expected_reason: str,
+) -> None:
+    handler = build_tool_handler(
+        _registry(
+            "write_file",
+            json.dumps(payload),
+            completion_effect="action",
+            completion_receipt_on_return=True,
+        )
+    )
+
+    result = await handler(ToolCall("call_write_soft_failure", "write_file", {}))
+
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == expected_status
+    assert result.execution_status["reason"] == expected_reason
+
+
+@pytest.mark.asyncio
+async def test_audited_builtin_text_error_does_not_mint_success() -> None:
+    handler = build_tool_handler(
+        _registry(
+            "http_request",
+            "[error] httpx not installed",
+            completion_effect="action",
+            completion_receipt_on_return=True,
+        )
+    )
+
+    result = await handler(ToolCall("call_http_missing_adapter", "http_request", {}))
+
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == "error"
+    assert result.execution_status["reason"] == "handler_reported_error"
 
 
 @pytest.mark.asyncio

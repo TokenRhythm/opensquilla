@@ -356,7 +356,10 @@ class ToolDefinition(BaseModel):
         default="unknown",
         exclude=True,
     )
-    completion_effect_resolver: Literal["exec_command", "process"] | None = Field(
+    completion_effect_resolver: (
+        Literal["exec_command", "process", "http_request", "cron", "subagents"]
+        | None
+    ) = Field(
         default=None,
         exclude=True,
     )

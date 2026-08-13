@@ -24,6 +24,7 @@ from opensquilla.execution_status import (
     execution_status_for_tool_result,
     mark_execution_status_truncated,
     normalize_execution_status,
+    trusted_handler_return_execution_status,
 )
 from opensquilla.result_budget import (
     ToolResultBudgetTracker,
@@ -377,6 +378,12 @@ async def finalize(
             "source": "tool_runtime",
             "preservation_class": "diagnostic",
         }
+    if (
+        execution_status is None
+        and not denial
+        and bool(getattr(registered.spec, "completion_receipt_on_return", False))
+    ):
+        execution_status = trusted_handler_return_execution_status(result)
     if execution_status is not None:
         execution_status = normalize_execution_status(execution_status)
         log.debug(

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shlex
 from collections.abc import Mapping
+from pathlib import PurePosixPath
 from typing import Any, Literal
 
 from opensquilla.execution_status import normalize_execution_status
@@ -80,13 +82,109 @@ _READ_ONLY_GIT_SUBCOMMANDS = frozenset(
         "verify-tag",
     }
 )
-def _command_name(token: str) -> str:
-    return token.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+
+_POSIX_TRUSTED_EXECUTABLE_DIRS = frozenset(
+    {"/bin", "/sbin", "/usr/bin", "/usr/sbin"}
+)
+_WINDOWS_TRUSTED_EXECUTABLE_DIRS = frozenset(
+    {"c:/windows", "c:/windows/system32"}
+)
+
+
+def _trusted_command_name(token: str) -> str | None:
+    """Return a command identity only when the shell lookup is trustworthy."""
+
+    normalized = token.replace("\\", "/")
+    if "/" not in normalized:
+        return normalized.casefold()
+    if normalized.startswith("/"):
+        path = PurePosixPath(normalized)
+        return path.name.casefold() if str(path.parent) in _POSIX_TRUSTED_EXECUTABLE_DIRS else None
+    folded = normalized.casefold()
+    if len(folded) >= 3 and folded[1:3] == ":/":
+        path = PurePosixPath(folded)
+        return (
+            path.name.casefold()
+            if str(path.parent) in _WINDOWS_TRUSTED_EXECUTABLE_DIRS
+            else None
+        )
+    return None
+
+
+def _has_active_shell_syntax(source: str) -> bool:
+    """Detect executable shell syntax while ignoring quoted literal operators."""
+
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and quote != "'":
+            escaped = True
+            index += 1
+            continue
+        if quote == "'":
+            if char == "'":
+                quote = None
+            index += 1
+            continue
+        if quote == '"':
+            if char == '"':
+                quote = None
+            elif char == "`" or source.startswith("$(", index):
+                return True
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if (
+            char == "`"
+            or source.startswith("$(", index)
+            or source.startswith("<(", index)
+            or source.startswith(">(", index)
+            or char in {"<", ">", "(", ")"}
+        ):
+            return True
+        index += 1
+    return False
+
+
+def _outer_shell_argv(source: str) -> tuple[str, ...]:
+    try:
+        return tuple(shlex.split(source, posix=os.name != "nt"))
+    except ValueError:
+        return ()
+
+
+def _nested_shell_command(argv: tuple[str, ...]) -> str | None:
+    if not argv:
+        return None
+    command = _trusted_command_name(argv[0])
+    if command in {"bash", "sh", "zsh", "fish"}:
+        for index, token in enumerate(argv[1:], start=1):
+            if token in {"-c", "-lc"} and index + 1 < len(argv):
+                return argv[index + 1]
+        return None
+    if command == "cmd":
+        if len(argv) >= 3 and argv[1].casefold() in {"/c", "/k"}:
+            return argv[2]
+        return None
+    if command in {"powershell", "pwsh"}:
+        for index, token in enumerate(argv[1:], start=1):
+            if token.casefold() in {"-c", "-command"} and index + 1 < len(argv):
+                return argv[index + 1]
+    return None
 
 
 def _git_subcommand(argv: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
     index = 1
-    value_options = {"-C", "-c", "--git-dir", "--work-tree", "--namespace"}
+    value_options = {"-C", "--git-dir", "--work-tree", "--namespace"}
     while index < len(argv):
         token = argv[index]
         if token in value_options:
@@ -103,6 +201,8 @@ def _git_subcommand(argv: tuple[str, ...]) -> tuple[str, tuple[str, ...]]:
 
 
 def _git_call_is_read_only(argv: tuple[str, ...]) -> bool:
+    if "-c" in argv[1:] or any(arg.startswith("-c=") for arg in argv[1:]):
+        return False
     subcommand, args = _git_subcommand(argv)
     unsafe_flags = {"--ext-diff", "--output", "--textconv"}
     if any(
@@ -149,11 +249,55 @@ def _git_call_is_read_only(argv: tuple[str, ...]) -> bool:
     return False
 
 
-def _shell_segment_is_read_only(source: str, argv: tuple[str, ...]) -> bool:
-    # Parsing alone does not make redirection or nested commands read-only.
-    if any(marker in source for marker in (">", "`", "$(")) or not argv:
+def _date_call_is_read_only(args: tuple[str, ...]) -> bool:
+    safe_exact = {
+        "-u",
+        "--utc",
+        "--universal",
+        "-R",
+        "--rfc-email",
+        "--resolution",
+        "--help",
+        "--version",
+    }
+    safe_value_options = {"-d", "--date", "-r", "--reference", "-I", "--iso-8601"}
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if token.startswith("+") or token in safe_exact:
+            index += 1
+            continue
+        if token in safe_value_options:
+            if index + 1 >= len(args):
+                return False
+            index += 2
+            continue
+        if token.startswith(("--date=", "--reference=", "--iso-8601=")):
+            index += 1
+            continue
         return False
-    command = _command_name(argv[0])
+    return True
+
+
+def _shell_segment_is_read_only(source: str, argv: tuple[str, ...], *, depth: int) -> bool:
+    # Parsing alone does not make redirection or nested commands read-only.
+    if depth > 4 or _has_active_shell_syntax(source) or not argv:
+        return False
+    outer_argv = _outer_shell_argv(source)
+    if not outer_argv:
+        return False
+    outer_command = _trusted_command_name(outer_argv[0])
+    if outer_command is None:
+        return False
+    nested = _nested_shell_command(outer_argv)
+    if outer_command in {"bash", "sh", "zsh", "fish", "cmd", "powershell", "pwsh"}:
+        return nested is not None and _exec_command_is_read_only(nested, depth=depth + 1)
+    # Environment/privilege wrappers can change executable lookup and behavior.
+    if outer_command in {"env", "sudo", "command", "nohup", "time"}:
+        return False
+    command = _trusted_command_name(argv[0])
+    if command is None:
+        return False
     if command == "git":
         return _git_call_is_read_only(argv)
     if command == "find":
@@ -173,6 +317,13 @@ def _shell_segment_is_read_only(source: str, argv: tuple[str, ...]) -> bool:
         arg == "--pre" or arg.startswith("--pre=") for arg in argv[1:]
     ):
         return False
+    if command == "date":
+        return _date_call_is_read_only(argv[1:])
+    if command == "tree" and any(
+        arg in {"-o", "--output"} or arg.startswith("--output=")
+        for arg in argv[1:]
+    ):
+        return False
     if os.name == "nt" and command in _WINDOWS_READ_COMMANDS:
         return True
     if command in _READ_ONLY_SIMPLE_COMMANDS:
@@ -189,25 +340,32 @@ def _shell_segment_is_read_only(source: str, argv: tuple[str, ...]) -> bool:
     )
 
 
-def resolve_exec_command_effect(arguments: Mapping[str, Any]) -> CompletionEffect:
-    """Classify an executed shell call; uncertainty remains action-capable."""
-
-    command = arguments.get("command")
-    if not isinstance(command, str) or not command.strip():
-        return "action"
+def _exec_command_is_read_only(command: str, *, depth: int = 0) -> bool:
     try:
         segments = parse_shell_segments(
             command,
             platform="windows" if os.name == "nt" else None,
         )
     except ValueError:
-        return "action"
-    if all(
-        _shell_segment_is_read_only(segment.source, segment.argv)
+        return False
+    return all(
+        _shell_segment_is_read_only(segment.source, segment.argv, depth=depth)
         for segment in segments
+    )
+
+
+def resolve_exec_command_effect(arguments: Mapping[str, Any]) -> CompletionEffect:
+    """Classify an executed shell call; uncertainty remains action-capable."""
+
+    command = arguments.get("command")
+    env = arguments.get("env")
+    if (
+        not isinstance(command, str)
+        or not command.strip()
+        or (isinstance(env, Mapping) and bool(env))
     ):
-        return "read_only"
-    return "action"
+        return "action"
+    return "read_only" if _exec_command_is_read_only(command) else "action"
 
 
 def resolve_tool_completion_effect(
@@ -222,6 +380,20 @@ def resolve_tool_completion_effect(
     if resolver == "process":
         action = str(arguments.get("action") or "").strip().casefold()
         return "read_only" if action in _READ_ONLY_PROCESS_ACTIONS else "action"
+    if resolver == "http_request":
+        method = str(arguments.get("method") or "GET").strip().upper()
+        output_path = arguments.get("output_path")
+        return (
+            "read_only"
+            if method in {"GET", "HEAD", "OPTIONS"} and not output_path
+            else "action"
+        )
+    if resolver == "cron":
+        action = str(arguments.get("action") or "").strip().casefold()
+        return "read_only" if action == "list" else "action"
+    if resolver == "subagents":
+        action = str(arguments.get("action") or "").strip().casefold()
+        return "read_only" if action == "list" else "action"
     effect: CompletionEffect = (
         definition.completion_effect if definition else "unknown"
     )
@@ -235,12 +407,10 @@ def tool_result_confirms_success(result: Any) -> bool:
         return False
     raw_status = getattr(result, "execution_status", None)
     if raw_status is None:
-        # Legacy/custom handlers only return after dispatch, so a non-error
-        # result with no sidecar is still an executed success receipt.
-        return True
+        return False
     status = normalize_execution_status(raw_status)
     if status["status"] == "success":
-        return True
+        return status["source"] in {"tool_runtime", "adapter"}
     if status["status"] != "unknown":
         return False
     reason = str(status.get("reason") or "")

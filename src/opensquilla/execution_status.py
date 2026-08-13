@@ -36,6 +36,30 @@ _VALID_PRESERVATION = {"normal", "diagnostic", "retain_summary", "retain_full", 
 _ERROR_STATUSES = {"error", "timeout", "cancelled"}
 _EXEC_EXIT_RE = re.compile(r"^exit_code=(-?\d+)\n", re.DOTALL)
 _MASKED_PIPELINE_FAILURE_MARKER = "[shell_warning:masked_pipeline_failure]"
+_NON_EXECUTED_RESULT_STATUSES = {
+    "already_published",
+    "approval_pending",
+    "approval_required",
+    "backing_off",
+    "busy",
+    "consent_required",
+    "denied",
+    "disabled",
+    "elevation_required",
+    "invalid_request",
+    "no_handler",
+    "not_available",
+    "not_due",
+    "not_found",
+    "path_access_required",
+    "preview",
+    "rejected",
+    "skipped",
+    "status_conflict",
+    "unavailable",
+    "unsupported",
+}
+_FAILED_RESULT_STATUSES = {"cancelled", "canceled", "error", "failed", "timeout"}
 
 
 def _as_bool(value: Any, *, default: bool = False) -> bool:
@@ -258,14 +282,37 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
             return None
         if not isinstance(payload, dict):
             return None
+        action = str(payload.get("action") or "").strip().casefold()
+        if action == "remove" and str(payload.get("status") or "").strip().casefold() == "removed":
+            return {
+                "version": 1,
+                "status": "success",
+                "exit_code": None,
+                "timed_out": False,
+                "truncated": False,
+                "reason": "process_removed",
+                "source": "adapter",
+                "preservation_class": "normal",
+            }
         session = payload.get("session")
         if not isinstance(session, dict):
             return None
-        action = str(payload.get("action") or "").strip().casefold()
         if action == "kill":
+            session_status = str(session.get("status") or "").strip().casefold()
+            killed = _as_bool(session.get("killed")) or session_status == "killed"
+            if not killed:
+                return {
+                    "version": 1,
+                    "status": "unknown",
+                    "exit_code": _as_exit_code(session.get("returncode")),
+                    "timed_out": False,
+                    "truncated": False,
+                    "reason": "process_already_exited",
+                    "source": "adapter",
+                    "preservation_class": "ephemeral",
+                }
             # This sidecar describes the management call, not the child it
-            # successfully terminated. A killed child is the expected receipt,
-            # not cancellation of the tool call itself.
+            # successfully terminated. A killed child is the expected receipt.
             return {
                 "version": 1,
                 "status": "success",
@@ -276,11 +323,29 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
                 "source": "adapter",
                 "preservation_class": "normal",
             }
-        session_status = session.get("status")
+        if action in {"write", "submit", "eof"}:
+            expected_status = {
+                "write": "written",
+                "submit": "submitted",
+                "eof": "eof",
+            }[action]
+            if str(payload.get("status") or "").strip().casefold() == expected_status:
+                return {
+                    "version": 1,
+                    "status": "success",
+                    "exit_code": None,
+                    "timed_out": False,
+                    "truncated": False,
+                    "reason": f"process_{expected_status}",
+                    "source": "adapter",
+                    "preservation_class": "normal",
+                }
+            return None
+        terminal_session_status = session.get("status")
         returncode = _as_exit_code(session.get("returncode"))
         timed_out = _as_bool(session.get("timed_out"))
         killed = _as_bool(session.get("killed"))
-        if session_status == "running":
+        if terminal_session_status == "running":
             return {
                 "version": 1,
                 "status": "unknown",
@@ -291,7 +356,7 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
                 "source": "adapter",
                 "preservation_class": "ephemeral",
             }
-        if timed_out or session_status == "timed_out":
+        if timed_out or terminal_session_status == "timed_out":
             return {
                 "version": 1,
                 "status": "timeout",
@@ -302,7 +367,7 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
                 "source": "adapter",
                 "preservation_class": "diagnostic",
             }
-        if killed or session_status == "killed":
+        if killed or terminal_session_status == "killed":
             return {
                 "version": 1,
                 "status": "cancelled",
@@ -328,6 +393,91 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
         }
 
     return None
+
+
+def trusted_handler_return_execution_status(content: Any) -> ExecutionStatus:
+    """Classify a normal return from an explicitly audited built-in handler."""
+
+    payload: Any = None
+    if isinstance(content, str):
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            payload = None
+    elif isinstance(content, dict):
+        payload = content
+
+    if isinstance(content, str) and content.lstrip().casefold().startswith("[error]"):
+        return {
+            "version": 1,
+            "status": "error",
+            "exit_code": None,
+            "timed_out": False,
+            "truncated": False,
+            "reason": "handler_reported_error",
+            "source": "tool_runtime",
+            "preservation_class": "diagnostic",
+        }
+
+    raw_status = payload.get("status") if isinstance(payload, dict) else None
+    if isinstance(raw_status, bool):
+        raw_status = None
+    if isinstance(raw_status, int):
+        failed = raw_status >= 400
+        return {
+            "version": 1,
+            "status": "error" if failed else "success",
+            "exit_code": None,
+            "timed_out": False,
+            "truncated": False,
+            "reason": "http_error" if failed else "handler_returned",
+            "source": "tool_runtime",
+            "preservation_class": "diagnostic" if failed else "normal",
+        }
+    status_text = str(raw_status or "").strip().casefold()
+    if status_text in _NON_EXECUTED_RESULT_STATUSES:
+        return {
+            "version": 1,
+            "status": "unknown",
+            "exit_code": None,
+            "timed_out": False,
+            "truncated": False,
+            "reason": status_text,
+            "source": "tool_runtime",
+            "preservation_class": "ephemeral",
+        }
+    if status_text in _FAILED_RESULT_STATUSES:
+        return {
+            "version": 1,
+            "status": "error",
+            "exit_code": None,
+            "timed_out": status_text == "timeout",
+            "truncated": False,
+            "reason": status_text,
+            "source": "tool_runtime",
+            "preservation_class": "diagnostic",
+        }
+    if isinstance(payload, dict) and payload.get("success") is False:
+        return {
+            "version": 1,
+            "status": "error",
+            "exit_code": None,
+            "timed_out": False,
+            "truncated": False,
+            "reason": "handler_reported_failure",
+            "source": "tool_runtime",
+            "preservation_class": "diagnostic",
+        }
+    return {
+        "version": 1,
+        "status": "success",
+        "exit_code": None,
+        "timed_out": False,
+        "truncated": False,
+        "reason": "handler_returned",
+        "source": "tool_runtime",
+        "preservation_class": "normal",
+    }
 
 
 def mark_execution_status_truncated(status: Any) -> ExecutionStatus:

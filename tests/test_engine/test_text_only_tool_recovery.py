@@ -10,6 +10,7 @@ from opensquilla.engine import Agent, AgentConfig, ToolResult
 from opensquilla.engine.action_completion import (
     ACTION_COMPLETION_TOOL_NAME,
     resolve_tool_completion_effect,
+    tool_result_confirms_success,
 )
 from opensquilla.execution_status import runtime_execution_status
 from opensquilla.provider import DoneEvent as ProviderDone
@@ -160,7 +161,10 @@ def _tool_definition(
     name: str,
     *,
     completion_effect: Literal["unknown", "read_only", "action", "control"],
-    completion_effect_resolver: Literal["exec_command", "process"] | None = None,
+    completion_effect_resolver: (
+        Literal["exec_command", "process", "http_request", "cron", "subagents"]
+        | None
+    ) = None,
 ) -> ToolDefinition:
     return ToolDefinition(
         name=name,
@@ -228,6 +232,21 @@ def test_mixed_tool_effect_resolvers_classify_each_call() -> None:
         completion_effect="unknown",
         completion_effect_resolver="process",
     )
+    http_definition = _tool_definition(
+        "http_request",
+        completion_effect="action",
+        completion_effect_resolver="http_request",
+    )
+    cron_definition = _tool_definition(
+        "cron",
+        completion_effect="action",
+        completion_effect_resolver="cron",
+    )
+    subagents_definition = _tool_definition(
+        "subagents",
+        completion_effect="action",
+        completion_effect_resolver="subagents",
+    )
 
     assert resolve_tool_completion_effect(
         exec_definition,
@@ -242,12 +261,78 @@ def test_mixed_tool_effect_resolvers_classify_each_call() -> None:
         {"command": "rg --pre 'touch marker' TODO src"},
     ) == "action"
     assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "/tmp/git status --short"},
+    ) == "action"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "/tmp/cat README.md"},
+    ) == "action"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "./git status --short"},
+    ) == "action"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "/usr/bin/git status --short"},
+    ) == "read_only"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "git status", "env": {"PATH": "/tmp/shadow-bin"}},
+    ) == "action"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "sh -c 'cat README.md; touch marker'"},
+    ) == "action"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "sh -c 'cat README.md'"},
+    ) == "read_only"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "cat <(touch marker)"},
+    ) == "action"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "date -s 2030-01-01"},
+    ) == "action"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "date --utc +%FT%TZ"},
+    ) == "read_only"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "rg 'left > right' src"},
+    ) == "read_only"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "rg left src > matches.txt"},
+    ) == "action"
+    assert resolve_tool_completion_effect(
         process_definition,
         {"action": "log", "session_id": "p1"},
     ) == "read_only"
     assert resolve_tool_completion_effect(
         process_definition,
         {"action": "write", "session_id": "p1", "data": "yes"},
+    ) == "action"
+    assert resolve_tool_completion_effect(
+        http_definition,
+        {"method": "GET", "url": "https://example.test"},
+    ) == "read_only"
+    assert resolve_tool_completion_effect(
+        http_definition,
+        {"method": "GET", "url": "https://example.test", "output_path": "out"},
+    ) == "action"
+    assert resolve_tool_completion_effect(cron_definition, {"action": "list"}) == "read_only"
+    assert resolve_tool_completion_effect(cron_definition, {"action": "run"}) == "action"
+    assert resolve_tool_completion_effect(
+        subagents_definition,
+        {"action": "list"},
+    ) == "read_only"
+    assert resolve_tool_completion_effect(
+        subagents_definition,
+        {"action": "steer"},
     ) == "action"
 
 
@@ -284,6 +369,7 @@ async def test_action_tool_text_only_recovers_once_then_accepts_completion_evide
             tool_use_id=call.tool_use_id,
             tool_name=call.tool_name,
             content="command ok",
+            execution_status=runtime_execution_status("success", reason=None),
         )
 
     agent = Agent(
@@ -335,6 +421,7 @@ async def test_summary_only_completion_evidence_requires_a_final_visible_answer(
             tool_use_id=call.tool_use_id,
             tool_name=call.tool_name,
             content="command ok",
+            execution_status=runtime_execution_status("success", reason=None),
         )
 
     agent = Agent(
@@ -371,6 +458,7 @@ async def test_action_tool_repeated_text_only_is_incomplete_without_replay() -> 
             tool_use_id=call.tool_use_id,
             tool_name=call.tool_name,
             content="inspection complete",
+            execution_status=runtime_execution_status("success", reason=None),
         )
 
     agent = Agent(
@@ -546,7 +634,7 @@ async def test_unexecuted_unknown_result_does_not_arm_completion_contract() -> N
 
 
 @pytest.mark.asyncio
-async def test_successful_unknown_tool_fails_closed_as_action() -> None:
+async def test_unknown_tool_without_success_sidecar_cannot_arm_completion() -> None:
     provider = _SequenceProvider(
         [
             _tool_call_stream("unknown-1", "dynamic_tool"),
@@ -571,6 +659,39 @@ async def test_successful_unknown_tool_fails_closed_as_action() -> None:
 
     events = [event async for event in agent.run_turn("run the dynamic action")]
 
+    assert len(provider.calls) == 2
+    assert any(event.kind == "done" for event in events)
+    assert not any(event.kind == "warning" for event in events)
+    assert agent.config.metadata.get("action_completion_contracts_armed", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_dynamic_tool_with_trusted_success_sidecar_fails_closed_as_action() -> None:
+    provider = _SequenceProvider(
+        [
+            _tool_call_stream("unknown-1", "dynamic_tool"),
+            _text_stream("The dynamic operation completed."),
+            _text_stream("The dynamic operation completed."),
+        ]
+    )
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="ok",
+            execution_status=runtime_execution_status("success", reason=None),
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=4),
+        tool_definitions=[_tool_definition("dynamic_tool", completion_effect="unknown")],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("run the dynamic action")]
+
     assert len(provider.calls) == 3
     assert sum(event.kind == "warning" for event in events) == 1
     assert any(
@@ -578,6 +699,34 @@ async def test_successful_unknown_tool_fails_closed_as_action() -> None:
         for event in events
     )
     assert agent.config.metadata["action_completion_contracts_armed"] == 1
+
+
+def test_soft_success_without_execution_sidecar_is_not_a_receipt() -> None:
+    result = ToolResult(
+        tool_use_id="media-1",
+        tool_name="tts",
+        content='{"status":"not_available"}',
+        is_error=False,
+    )
+
+    assert tool_result_confirms_success(result) is False
+
+    untrusted = ToolResult(
+        tool_use_id="plugin-1",
+        tool_name="dynamic_tool",
+        content="ok",
+        execution_status={
+            "version": 1,
+            "status": "success",
+            "exit_code": None,
+            "timed_out": False,
+            "truncated": False,
+            "reason": None,
+            "source": "unknown",
+            "preservation_class": "normal",
+        },
+    )
+    assert tool_result_confirms_success(untrusted) is False
 
 
 @pytest.mark.asyncio

@@ -1758,6 +1758,7 @@ async def _emit_task_runtime_stream_events(
     error_code: str | None = None
     failure_kind: str | None = None
     terminal_reason: str | None = None
+    pending_done_event: dict[str, Any] | None = None
     async for event in wrap_stream(
         raw_stream,
         idle_timeout=idle_timeout,
@@ -1880,6 +1881,14 @@ async def _emit_task_runtime_stream_events(
             event_dict["input_mode"] = input_mode
         if run_kind:
             event_dict["run_kind"] = run_kind
+        if event_kind == "done":
+            # Provider/TurnRunner Done carries the authoritative usage receipt,
+            # so the internal sink must observe it. Do not expose it on the wire
+            # until the stream proves that no typed semantic error follows.
+            pending_done_event = event_dict
+            continue
+        if event_kind == "error":
+            pending_done_event = None
         await event_emitter(
             session_key,
             f"session.event.{event_kind}",
@@ -1888,6 +1897,12 @@ async def _emit_task_runtime_stream_events(
         if event_kind == "error":
             message = event_dict.get("error_message")
             error_message = message if isinstance(message, str) and message else "Agent error"
+    if error_message is None and pending_done_event is not None:
+        await event_emitter(
+            session_key,
+            "session.event.done",
+            pending_done_event,
+        )
     if error_message is not None:
         raise TaskRuntimeStreamError(
             error_message,

@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from opensquilla.engine.action_completion import ActionCompletionIncompleteError
-from opensquilla.engine.types import ErrorEvent
+from opensquilla.engine.types import DoneEvent, ErrorEvent
 from opensquilla.gateway.boot import (
     TaskRuntimeStreamError,
     _emit_task_runtime_stream_events,
@@ -434,8 +434,10 @@ async def test_action_completion_stream_error_preserves_incomplete_terminal_reas
 @pytest.mark.asyncio
 async def test_typed_action_incomplete_bypasses_stream_error_downgrade() -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
+    sink_events: list[Any] = []
 
     async def _stream():
+        yield DoneEvent(input_tokens=7, output_tokens=3, model="test-model")
         yield ErrorEvent(
             message="Action completion evidence was missing.",
             code="action_completion_incomplete",
@@ -451,18 +453,27 @@ async def test_typed_action_incomplete_bypasses_stream_error_downgrade() -> None
     ) -> None:
         emitted.append((session_key, event_name, payload))
 
+    async def _sink(event: Any) -> None:
+        sink_events.append(event)
+
     with pytest.raises(ActionCompletionIncompleteError):
         await _emit_task_runtime_stream_events(
             _stream(),
             "agent:main:test",
             _emitter,
-            stream_event_sink=None,
+            stream_event_sink=_sink,
             idle_timeout=1.0,
             heartbeat_interval=0.0,
         )
 
     assert [event_name for _, event_name, _ in emitted] == ["session.event.error"]
     assert emitted[0][2]["terminal_reason"] == "action_completion_incomplete"
+    assert [
+        event.get("kind") if isinstance(event, dict) else event.kind
+        for event in sink_events
+    ] == ["done", "error"]
+    assert sink_events[0].input_tokens == 7
+    assert sink_events[0].output_tokens == 3
 
 
 @pytest.mark.asyncio
@@ -478,6 +489,7 @@ async def test_typed_action_incomplete_stream_reaches_task_runtime_once() -> Non
 
     async def _handler(run: Any) -> None:
         async def _stream():
+            yield DoneEvent(input_tokens=7, output_tokens=3, model="test-model")
             yield ErrorEvent(
                 message="Action completion evidence was missing.",
                 code="action_completion_incomplete",
@@ -504,6 +516,7 @@ async def test_typed_action_incomplete_stream_reaches_task_runtime_once() -> Non
     assert record.status == AgentTaskStatus.FAILED
     assert record.terminal_reason == "action_completion_incomplete"
     assert record.error_class == "action_completion_incomplete"
+    assert not any(event_name == "session.event.done" for _, event_name, _ in emitted)
     stream_errors = [
         payload
         for _, event_name, payload in emitted

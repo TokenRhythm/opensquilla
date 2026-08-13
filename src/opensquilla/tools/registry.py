@@ -486,6 +486,139 @@ class ToolRegistry:
 
 
 # Global default registry
+_BUILTIN_READ_ONLY_COMPLETION_TOOLS = frozenset(
+    {
+        "agents_list",
+        "audio_provider_capabilities",
+        "dubbing_status",
+        "gateway",
+        "git_diff",
+        "git_log",
+        "git_status",
+        "glob_search",
+        "grep_search",
+        "image",
+        "list_dir",
+        "memory_get",
+        "memory_search",
+        "pdf",
+        "read_file",
+        "read_source",
+        "read_spreadsheet",
+        "retrieve_tool_result",
+        "session_search",
+        "session_status",
+        "sessions_history",
+        "sessions_list",
+        "skill_list",
+        "skill_search_community",
+        "skill_view",
+        "source_symbols",
+        "voice_search",
+        "web_discover",
+        "web_fetch",
+        "web_search",
+    }
+)
+_BUILTIN_CONTROL_COMPLETION_TOOLS = frozenset(
+    {
+        "plan_run_checkpoint",
+        "request_user_input",
+        "router_control",
+        "sessions_yield",
+        "submit",
+        "submit_plan",
+        "update_goal",
+    }
+)
+_BUILTIN_ACTION_COMPLETION_TOOLS = frozenset(
+    {
+        "apply_patch",
+        "audio_config",
+        "background_process",
+        "canvas",
+        "create_csv",
+        "create_pdf_report",
+        "create_pptx",
+        "create_source",
+        "create_xlsx",
+        "cron",
+        "dubbing_download",
+        "dubbing_generate",
+        "edit_file",
+        "edit_source",
+        "exec_command",
+        "execute_code",
+        "git_commit",
+        "http_request",
+        "image_generate",
+        "install_skill_deps",
+        "memory_delete",
+        "memory_save",
+        "message",
+        "meta_invoke",
+        "music_generate",
+        "nodes",
+        "process",
+        "publish_artifact",
+        "sessions_send",
+        "sessions_spawn",
+        "skill_create",
+        "skill_delete",
+        "skill_edit",
+        "skill_install_community",
+        "song_generate",
+        "subagents",
+        "tts",
+        "update_goal_progress",
+        "voice_clone",
+        "voice_convert",
+        "write_file",
+        "write_scratch",
+    }
+)
+_BUILTIN_COMPLETION_RESOLVERS = {
+    "cron": "cron",
+    "exec_command": "exec_command",
+    "http_request": "http_request",
+    "process": "process",
+    "subagents": "subagents",
+}
+_BUILTIN_STATUS_REQUIRED_TOOLS = frozenset(
+    {"background_process", "exec_command", "execute_code", "process"}
+)
+_BUILTIN_COMPLETION_POLICIES: dict[
+    str,
+    tuple[
+        Literal["unknown", "read_only", "action", "control"],
+        Literal["exec_command", "process", "http_request", "cron", "subagents"]
+        | None,
+        bool,
+    ],
+] = {
+    **{
+        name: ("read_only", None, False)
+        for name in _BUILTIN_READ_ONLY_COMPLETION_TOOLS
+    },
+    **{
+        name: ("control", None, False)
+        for name in _BUILTIN_CONTROL_COMPLETION_TOOLS
+    },
+    **{
+        name: (
+            "action",
+            cast(
+                Literal["exec_command", "process", "http_request", "cron", "subagents"]
+                | None,
+                _BUILTIN_COMPLETION_RESOLVERS.get(name),
+            ),
+            name not in _BUILTIN_STATUS_REQUIRED_TOOLS,
+        )
+        for name in _BUILTIN_ACTION_COMPLETION_TOOLS
+    },
+}
+
+
 _default_registry = ToolRegistry()
 
 
@@ -599,7 +732,11 @@ def tool(
     completion_effect: (
         Literal["unknown", "read_only", "action", "control"] | None
     ) = None,
-    completion_effect_resolver: Literal["exec_command", "process"] | None = None,
+    completion_effect_resolver: (
+        Literal["exec_command", "process", "http_request", "cron", "subagents"]
+        | None
+    ) = None,
+    completion_receipt_on_return: bool | None = None,
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
 ) -> Any:
     """Decorator to register an async function as a tool.
@@ -611,6 +748,9 @@ def tool(
     """
 
     def decorator(fn: ToolHandler) -> ToolHandler:
+        builtin_policy = (
+            _BUILTIN_COMPLETION_POLICIES.get(name) if registry is None else None
+        )
         spec = ToolSpec(
             name=name,
             description=description,
@@ -629,13 +769,28 @@ def tool(
             completion_effect=(
                 completion_effect
                 if completion_effect is not None
+                else builtin_policy[0]
+                if builtin_policy is not None
                 else "read_only"
                 if plan_access is PlanAccess.READ_ONLY
                 else "control"
                 if plan_access is PlanAccess.CONTROL
                 else "unknown"
             ),
-            completion_effect_resolver=completion_effect_resolver,
+            completion_effect_resolver=(
+                completion_effect_resolver
+                if completion_effect_resolver is not None
+                else builtin_policy[1]
+                if builtin_policy is not None
+                else None
+            ),
+            completion_receipt_on_return=(
+                completion_receipt_on_return
+                if completion_receipt_on_return is not None
+                else builtin_policy[2]
+                if builtin_policy is not None
+                else False
+            ),
         )
         target = registry if registry is not None else _default_registry
         target.register(spec, fn)

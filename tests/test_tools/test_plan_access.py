@@ -82,6 +82,48 @@ def test_completion_effect_resolver_is_runtime_only_registry_metadata() -> None:
     assert "completion_effect_resolver" not in definition.model_dump()
 
 
+def test_builtin_completion_effect_inventory_has_no_unknown_entries() -> None:
+    registry = get_default_registry()
+    specs = {registered.spec.name: registered.spec for registered in registry.all_tools()}
+
+    assert {name for name, spec in specs.items() if spec.completion_effect == "unknown"} == set()
+    for name in {
+        "git_status",
+        "git_diff",
+        "git_log",
+        "audio_provider_capabilities",
+        "dubbing_status",
+        "voice_search",
+    }:
+        assert specs[name].completion_effect == "read_only"
+    for name in {
+        "execute_code",
+        "image_generate",
+        "message",
+        "publish_artifact",
+        "sessions_spawn",
+    }:
+        assert specs[name].completion_effect == "action"
+    assert specs["router_control"].completion_effect == "control"
+    assert specs["exec_command"].completion_effect_resolver == "exec_command"
+    assert specs["process"].completion_effect_resolver == "process"
+    assert specs["write_file"].completion_receipt_on_return is True
+    assert specs["execute_code"].completion_receipt_on_return is False
+
+
+def test_dynamic_registry_tool_stays_unknown_without_trusted_metadata() -> None:
+    registry = ToolRegistry()
+
+    @tool(name="plugin_tool", description="plugin", registry=registry)
+    async def plugin_tool() -> str:
+        return "ok"
+
+    registered = registry.get("plugin_tool")
+    assert registered is not None
+    assert registered.spec.completion_effect == "unknown"
+    assert registered.spec.completion_receipt_on_return is False
+
+
 def test_plan_visibility_is_fail_closed_but_default_visibility_is_unchanged() -> None:
     registry = ToolRegistry()
     registry.register(
