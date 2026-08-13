@@ -82,6 +82,12 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "--executable $candidate.Path `" in workflow
     assert "npm run test:packaged-first-send-renderer -- `" not in workflow
 
+    first_send_gate = Path(
+        "desktop/electron/scripts/test-packaged-first-send-renderer.mjs"
+    ).read_text(encoding="utf-8")
+    assert "const alreadyOnEmptyDraft" in first_send_gate
+    assert "if (!alreadyOnEmptyDraft)" in first_send_gate
+
 
 def test_release_workflow_runs_legacy_windows_upgrade_checks_on_server_2022() -> None:
     workflow = yaml.safe_load(

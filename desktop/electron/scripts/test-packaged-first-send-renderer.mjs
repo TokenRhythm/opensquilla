@@ -336,10 +336,19 @@ try {
   for (let iteration = 1; iteration <= iterations; iteration += 1) {
     await page.setViewportSize(iteration % 2 === 1 ? WIDE_VIEWPORT : TIGHT_VIEWPORT)
     const draftUrl = new URL(page.url())
+    const alreadyOnEmptyDraft = draftUrl.pathname === '/control/chat/new'
+      && draftUrl.search === ''
+      && draftUrl.hash === ''
     draftUrl.pathname = '/control/chat/new'
     draftUrl.search = ''
     draftUrl.hash = ''
-    await page.goto(draftUrl.toString(), { waitUntil: 'domcontentloaded' })
+    // Packaged macOS Electron can report ERR_ABORTED for a redundant
+    // same-document navigation immediately after launch. The first iteration
+    // already starts on the empty draft; later iterations still exercise the
+    // real transition back from a materialized session.
+    if (!alreadyOnEmptyDraft) {
+      await page.goto(draftUrl.toString(), { waitUntil: 'domcontentloaded' })
+    }
 
     const composer = page.locator('.chat-textarea')
     const header = page.locator('#app-route-header [data-testid="chat-header-actions"]')
