@@ -174,6 +174,96 @@ async def test_exact_abort_starts_process_cleanup_before_slow_completion_deadlin
 
 
 @pytest.mark.asyncio
+async def test_slow_exact_runtime_cancel_cannot_delay_starting_any_safety_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = FakeSession(session_key="agent:main:webchat:slow-runtime-cleanup")
+    release = asyncio.Event()
+    started = {
+        name: asyncio.Event()
+        for name in ("runtime", "completion", "process", "descendants")
+    }
+    finished = {name: asyncio.Event() for name in started}
+
+    class Runtime:
+        async def cancel(self, **_kwargs: Any) -> int:
+            started["runtime"].set()
+            try:
+                await release.wait()
+                return 1
+            finally:
+                finished["runtime"].set()
+
+        async def list(self, session_key: str | None = None):
+            assert session_key in {None, session.session_key}
+            started["descendants"].set()
+            try:
+                await release.wait()
+                return []
+            finally:
+                finished["descendants"].set()
+
+        async def wait(self, _task_id: str):
+            return SimpleNamespace(status="cancelled")
+
+    async def slow_completion(_session_key: str, _task_id: str) -> int:
+        started["completion"].set()
+        try:
+            await release.wait()
+            return 1
+        finally:
+            finished["completion"].set()
+
+    async def slow_process_cleanup(_session_key: str, _task_id: str) -> int:
+        started["process"].set()
+        try:
+            await release.wait()
+            return 1
+        finally:
+            finished["process"].set()
+
+    monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.02)
+    monkeypatch.setattr(rpc_sessions, "_ABORT_OWNED_CLEANUP_SECONDS", 0.5)
+    monkeypatch.setattr(
+        "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
+        slow_completion,
+    )
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.shell.cancel_background_processes_for_task",
+        slow_process_cleanup,
+    )
+
+    response = await asyncio.wait_for(
+        get_dispatcher().dispatch(
+            "abort-slow-runtime-cleanup",
+            "chat.abort",
+            {
+                "sessionKey": session.session_key,
+                "taskId": "task-A",
+                "scope": "task",
+                "source": "webui_stop",
+            },
+            make_ctx(
+                session_manager=FakeSessionManager([session]),
+                task_runtime=Runtime(),
+            ),
+        ),
+        timeout=0.15,
+    )
+
+    assert response.ok is True
+    assert response.payload["aborted"] is False
+    assert response.payload["reason"] == "task_cancel_unknown"
+    assert all(event.is_set() for event in started.values())
+    assert not any(event.is_set() for event in finished.values())
+
+    release.set()
+    await asyncio.gather(
+        *(asyncio.wait_for(event.wait(), timeout=0.2) for event in finished.values())
+    )
+
+
+@pytest.mark.asyncio
 async def test_task_scoped_abort_never_falls_back_to_legacy_session_cancel() -> None:
     session = FakeSession(session_key="agent:main:webchat:legacy-runtime")
 
@@ -386,8 +476,8 @@ async def test_exact_abort_timeout_is_unknown_then_same_identity_retry_cancels(
             )
             assert handle.task_id == task_id
 
-        # Release the admission fence so the exact retry can acquire it, but
-        # retain the execution fence until cancellation is durably requested.
+        # Releasing admission lets the first, still-live exact cancel finish.
+        # A same-identity retry remains safe and may observe it as inactive.
         second = await get_dispatcher().dispatch(
             "abort-admission-retry",
             "chat.abort",
@@ -405,7 +495,8 @@ async def test_exact_abort_timeout_is_unknown_then_same_identity_retry_cancels(
         await runtime.shutdown()
 
     assert second.ok is True
-    assert second.payload["aborted"] is True
+    assert second.payload["aborted"] is False
+    assert second.payload["reason"] == "task_not_active"
     assert record.status is AgentTaskStatus.CANCELLED
     assert handler_calls == []
 

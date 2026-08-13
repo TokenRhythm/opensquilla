@@ -26,6 +26,8 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 0.01
+_CONTROL_READY_TIMEOUT_SECONDS = 2.0
+_POSIX_ANCHOR_READY = b"Y"
 _POSIX_ANCHOR_ARM = b"A"
 _POSIX_ANCHOR_EMPTY = b"E"
 _POSIX_ANCHOR_RELEASE = b"R"
@@ -227,12 +229,21 @@ class _WindowsJob:
 
 
 class _WindowsLaunchGate:
-    """Named manual-reset event used by the controlled Windows helper."""
+    """Two-event handshake used by the controlled Windows helper."""
 
-    def __init__(self, kernel32: Any, handle: Any, name: str) -> None:
+    def __init__(
+        self,
+        kernel32: Any,
+        gate_handle: Any,
+        gate_name: str,
+        ready_handle: Any,
+        ready_name: str,
+    ) -> None:
         self._kernel32 = kernel32
-        self._handle = handle
-        self.name = name
+        self._gate_handle = gate_handle
+        self._ready_handle = ready_handle
+        self.gate_name = gate_name
+        self.ready_name = ready_name
 
     @classmethod
     def create(cls) -> _WindowsLaunchGate:
@@ -250,22 +261,46 @@ class _WindowsLaunchGate:
         kernel32.CreateEventW.restype = wintypes.HANDLE
         kernel32.SetEvent.argtypes = [wintypes.HANDLE]
         kernel32.SetEvent.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
-        name = f"{_WINDOWS_LAUNCH_GATE_PREFIX}{uuid.uuid4()}"
-        handle = kernel32.CreateEventW(None, True, False, name)
-        if not handle:
+        token = uuid.uuid4()
+        gate_name = f"{_WINDOWS_LAUNCH_GATE_PREFIX}{token}-gate"
+        ready_name = f"{_WINDOWS_LAUNCH_GATE_PREFIX}{token}-ready"
+        gate_handle = kernel32.CreateEventW(None, True, False, gate_name)
+        if not gate_handle:
             raise _windows_error()
-        return cls(kernel32, handle, name)
+        ready_handle = kernel32.CreateEventW(None, True, False, ready_name)
+        if not ready_handle:
+            kernel32.CloseHandle(gate_handle)
+            raise _windows_error()
+        return cls(kernel32, gate_handle, gate_name, ready_handle, ready_name)
+
+    def wait_ready(self, timeout: float) -> None:
+        wait_object_0 = 0
+        wait_timeout = 258
+        result = self._kernel32.WaitForSingleObject(
+            self._ready_handle,
+            max(0, int(timeout * 1000)),
+        )
+        if result == wait_object_0:
+            return
+        if result == wait_timeout:
+            raise TimeoutError("Windows controlled launch helper readiness timed out")
+        raise _windows_error()
 
     def release(self) -> None:
-        if not self._handle or not self._kernel32.SetEvent(self._handle):
+        if not self._gate_handle or not self._kernel32.SetEvent(self._gate_handle):
             raise _windows_error()
 
     def close(self) -> None:
-        if self._handle:
-            self._kernel32.CloseHandle(self._handle)
-            self._handle = None
+        if self._gate_handle:
+            self._kernel32.CloseHandle(self._gate_handle)
+            self._gate_handle = None
+        if self._ready_handle:
+            self._kernel32.CloseHandle(self._ready_handle)
+            self._ready_handle = None
 
 
 @dataclass
@@ -279,6 +314,22 @@ class _PosixGroupAnchor:
     @property
     def alive(self) -> bool:
         return getattr(self.process, "returncode", None) is None
+
+    async def wait_ready(self) -> None:
+        stdout = getattr(self.process, "stdout", None)
+        if stdout is None:
+            raise ProcessTreeOwnershipError("POSIX ownership anchor has no status pipe")
+        try:
+            marker = await asyncio.wait_for(
+                stdout.readexactly(1),
+                timeout=_CONTROL_READY_TIMEOUT_SECONDS,
+            )
+        except (TimeoutError, asyncio.IncompleteReadError) as exc:
+            raise ProcessTreeOwnershipError(
+                "POSIX ownership anchor did not become ready"
+            ) from exc
+        if marker != _POSIX_ANCHOR_READY:
+            raise ProcessTreeOwnershipError("POSIX ownership anchor sent invalid readiness")
 
     async def arm(self) -> None:
         stdin = getattr(self.process, "stdin", None)
@@ -522,7 +573,13 @@ async def _create_posix_anchor() -> _PosixGroupAnchor:
         stderr=asyncio.subprocess.DEVNULL,
         process_group=0,
     )
-    return _PosixGroupAnchor(process=process, pgid=int(process.pid))
+    anchor = _PosixGroupAnchor(process=process, pgid=int(process.pid))
+    try:
+        await anchor.wait_ready()
+    except BaseException:
+        await _stop_unarmed_posix_anchor(anchor)
+        raise
+    return anchor
 
 
 def _attach_owner(process: Any, owner: ProcessTreeOwner) -> Any:
@@ -571,7 +628,8 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
             "-m",
             "opensquilla.process_tree",
             "--windows-owned-launch",
-            gate.name,
+            gate.gate_name,
+            gate.ready_name,
             "--",
             *argv,
         )
@@ -582,6 +640,10 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
                 **child_kwargs,
             )
             job.assign_pid(int(windows_process.pid))
+            await asyncio.to_thread(
+                gate.wait_ready,
+                _CONTROL_READY_TIMEOUT_SECONDS,
+            )
             owner = ProcessTreeOwner(
                 process=windows_process,
                 pid=int(windows_process.pid),
@@ -651,7 +713,8 @@ def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
         "-m",
         "opensquilla.process_tree",
         "--windows-owned-launch",
-        gate.name,
+        gate.gate_name,
+        gate.ready_name,
         "--",
         *argv,
     ]
@@ -659,6 +722,7 @@ def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
     try:
         process = subprocess.Popen(helper_argv, **child_kwargs)
         job.assign_pid(int(process.pid))
+        gate.wait_ready(_CONTROL_READY_TIMEOUT_SECONDS)
         owner = ProcessTreeOwner(
             process=process,
             pid=int(process.pid),
@@ -707,7 +771,9 @@ def _posix_group_members(pgid: int) -> tuple[int, ...] | None:
                 if len(rest) > 2 and int(rest[2]) == pgid:
                     members.append(int(name))
             except (OSError, ValueError):
-                continue
+                return None
+        if not members or pgid not in members:
+            return None
         return tuple(members)
     try:
         result = subprocess.run(
@@ -720,58 +786,81 @@ def _posix_group_members(pgid: int) -> tuple[int, ...] | None:
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
     members = []
     for line in result.stdout.splitlines():
         fields = line.split()
         if len(fields) != 2:
-            continue
+            return None
         try:
             pid, candidate_pgid = (int(field) for field in fields)
         except ValueError:
-            continue
+            return None
         if candidate_pgid == pgid:
             members.append(pid)
+    if not members or pgid not in members:
+        return None
     return tuple(members)
 
 
 def _run_posix_group_anchor() -> int:
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, signal.SIG_IGN)
-    if sys.stdin.buffer.read(1) != _POSIX_ANCHOR_ARM:
-        return 125
     own_pid = os.getpid()
     pgid = os.getpgrp()
+    if pgid != own_pid:
+        return 125
+    sys.stdout.buffer.write(_POSIX_ANCHOR_READY)
+    sys.stdout.buffer.flush()
+    if sys.stdin.buffer.read(1) != _POSIX_ANCHOR_ARM:
+        return 125
     poll_delay = _POLL_INTERVAL_SECONDS
+    poll_cap = 0.25 if os.path.isdir("/proc") else 1.0
     while True:
         members = _posix_group_members(pgid)
-        if members is not None and all(pid == own_pid for pid in members):
+        if members is not None and len(members) == 1 and members[0] == own_pid:
             sys.stdout.buffer.write(_POSIX_ANCHOR_EMPTY)
             sys.stdout.buffer.flush()
             return 0 if sys.stdin.buffer.read(1) == _POSIX_ANCHOR_RELEASE else 125
         time.sleep(poll_delay)
-        poll_delay = min(0.25, poll_delay * 1.5)
+        poll_delay = min(poll_cap, poll_delay * 1.5)
 
 
-def _run_windows_owned_launch(gate_name: str, argv: list[str]) -> int:
+def _run_windows_owned_launch(
+    gate_name: str,
+    ready_name: str,
+    argv: list[str],
+) -> int:
     from ctypes import wintypes
 
     kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
     kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
     kernel32.OpenEventW.restype = wintypes.HANDLE
+    kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+    kernel32.SetEvent.restype = wintypes.BOOL
     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
     synchronize = 0x00100000
+    event_modify_state = 0x0002
     infinite = 0xFFFFFFFF
     wait_failed = 0xFFFFFFFF
     gate = kernel32.OpenEventW(synchronize, False, gate_name)
     if not gate:
         raise _windows_error()
+    ready = kernel32.OpenEventW(event_modify_state, False, ready_name)
+    if not ready:
+        kernel32.CloseHandle(gate)
+        raise _windows_error()
     try:
+        if not kernel32.SetEvent(ready):
+            raise _windows_error()
         if kernel32.WaitForSingleObject(gate, infinite) == wait_failed:
             raise _windows_error()
     finally:
+        kernel32.CloseHandle(ready)
         kernel32.CloseHandle(gate)
     if not argv:
         return 127
@@ -787,8 +876,8 @@ def _main() -> int:
     args = sys.argv[1:]
     if args == ["--posix-group-anchor"]:
         return _run_posix_group_anchor()
-    if len(args) >= 3 and args[0] == "--windows-owned-launch" and args[2] == "--":
-        return _run_windows_owned_launch(args[1], args[3:])
+    if len(args) >= 4 and args[0] == "--windows-owned-launch" and args[3] == "--":
+        return _run_windows_owned_launch(args[1], args[2], args[4:])
     return 2
 
 

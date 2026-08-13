@@ -33,6 +33,17 @@ class _FakeProcess:
     stderr = None
 
 
+def _owned_fake_process() -> _FakeProcess:
+    process = _FakeProcess()
+    owner = shell.ProcessTreeOwner(
+        process=process,
+        pid=process.pid,
+        ownership_error="synthetic test process",
+    )
+    setattr(process, "_opensquilla_process_tree_owner", owner)
+    return process
+
+
 def _request(workspace: Path) -> SandboxRequest:
     policy = SandboxPolicy(
         level=SecurityLevel.STANDARD,
@@ -110,7 +121,7 @@ async def test_spawn_sandboxed_background_supports_seatbelt_and_cleans_files(
     async def fake_create_subprocess_exec(*argv: str, **kwargs: object) -> _FakeProcess:
         captured["argv"] = argv
         captured["kwargs"] = kwargs
-        return _FakeProcess()
+        return _owned_fake_process()
 
     monkeypatch.setattr(
         seatbelt_mod,
@@ -118,8 +129,8 @@ async def test_spawn_sandboxed_background_supports_seatbelt_and_cleans_files(
         lambda binary=None: "/usr/bin/sandbox-exec",
     )
     monkeypatch.setattr(
-        shell.asyncio,
-        "create_subprocess_exec",
+        shell,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
 
@@ -163,7 +174,7 @@ async def test_spawn_sandboxed_background_seatbelt_uses_managed_proxy_env(
     async def fake_create_subprocess_exec(*argv: str, **kwargs: object) -> _FakeProcess:
         captured["argv"] = argv
         captured["kwargs"] = kwargs
-        return _FakeProcess()
+        return _owned_fake_process()
 
     monkeypatch.setattr(
         seatbelt_mod,
@@ -171,8 +182,8 @@ async def test_spawn_sandboxed_background_seatbelt_uses_managed_proxy_env(
         lambda binary=None: "/usr/bin/sandbox-exec",
     )
     monkeypatch.setattr(
-        shell.asyncio,
-        "create_subprocess_exec",
+        shell,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
 
@@ -230,12 +241,12 @@ async def test_spawn_sandboxed_background_starts_linux_proxy_bridge_for_bubblewr
         events.append("spawn")
         captured["argv"] = argv
         captured["kwargs"] = kwargs
-        return _FakeProcess()
+        return _owned_fake_process()
 
     monkeypatch.setattr(shell, "LinuxProxyBridgeHost", FakeBridge, raising=False)
     monkeypatch.setattr(
-        shell.asyncio,
-        "create_subprocess_exec",
+        shell,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
 
@@ -270,15 +281,15 @@ async def test_spawn_sandboxed_background_applies_bubblewrap_resource_limits(
     async def fake_create_subprocess_exec(*argv: str, **kwargs: object) -> _FakeProcess:
         captured["argv"] = argv
         captured["kwargs"] = kwargs
-        return _FakeProcess()
+        return _owned_fake_process()
 
     def fake_resource_preexec_from_limits(limits: ResourceLimits) -> object:
         captured["limits"] = limits
         return sentinel
 
     monkeypatch.setattr(
-        shell.asyncio,
-        "create_subprocess_exec",
+        shell,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
     monkeypatch.setattr(
@@ -309,11 +320,11 @@ async def test_spawn_sandboxed_background_wraps_bubblewrap_command_for_inner_sec
     async def fake_create_subprocess_exec(*argv: str, **kwargs: object) -> _FakeProcess:
         captured["argv"] = argv
         captured["kwargs"] = kwargs
-        return _FakeProcess()
+        return _owned_fake_process()
 
     monkeypatch.setattr(
-        shell.asyncio,
-        "create_subprocess_exec",
+        shell,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
 
@@ -354,11 +365,11 @@ async def test_spawn_sandboxed_background_skips_proc_when_bwrap_probe_disables_i
     async def fake_create_subprocess_exec(*argv: str, **kwargs: object) -> _FakeProcess:
         captured["argv"] = argv
         captured["kwargs"] = kwargs
-        return _FakeProcess()
+        return _owned_fake_process()
 
     monkeypatch.setattr(
-        shell.asyncio,
-        "create_subprocess_exec",
+        shell,
+        "create_owned_subprocess_exec",
         fake_create_subprocess_exec,
     )
     monkeypatch.setattr(

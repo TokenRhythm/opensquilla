@@ -4470,7 +4470,7 @@ class TestSessionsAbort:
         ]
 
     @pytest.mark.asyncio
-    async def test_chat_user_stop_with_stale_task_id_is_a_side_effect_free_mismatch(
+    async def test_chat_user_stop_with_stale_task_id_cleans_only_exact_auxiliary_owner(
         self, dispatcher, session, monkeypatch
     ):
         class Runtime:
@@ -4537,11 +4537,10 @@ class TestSessionsAbort:
         )
 
         assert res.ok is True
-        assert res.payload["aborted"] is False
-        assert res.payload["reason"] == "task_mismatch"
-        # The exact cancel is the in-memory authority.  The advisory task list
-        # is consulted only after its side-effect-free no-op to classify the
-        # stale identity for the client.
+        assert res.payload["aborted"] is True
+        # Runtime cancellation remains a no-op for the stale identity, while
+        # exact task-keyed auxiliary cleanup is safe and prevents already
+        # detached work from surviving a Stop retry.
         assert runtime.cancel_calls == [
             {
                 "task_id": "task-old",
@@ -4550,7 +4549,9 @@ class TestSessionsAbort:
                 "reason": "user_abort",
             }
         ]
-        assert task_background_cancel_calls == []
+        assert task_background_cancel_calls == [
+            (session.session_key, "task-old"),
+        ]
         assert approval_cancel_calls == []
 
     @pytest.mark.asyncio
