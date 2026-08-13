@@ -38,6 +38,8 @@ const BASE_PROPS = {
   sendButtonTitle: 'Send',
   runMode: 'trusted',
   allowedRunModes: ['standard', 'trusted', 'full'],
+  runModeLocked: false,
+  runModeLockMessage: '',
   modelRoutingMode: 'llm_ensemble',
   modelRoutingSettingsBusy: false,
   routerVisualEffectsEnabled: true,
@@ -84,6 +86,8 @@ const ComposerWrapper = defineComponent({
       send-button-title="Send"
       :run-mode="'trusted'"
       :allowed-run-modes="['standard', 'trusted', 'full']"
+      :run-mode-locked="false"
+      run-mode-lock-message=""
       :model-routing-mode="'llm_ensemble'"
       :model-routing-settings-busy="false"
       :router-visual-effects-enabled="true"
@@ -92,11 +96,14 @@ const ComposerWrapper = defineComponent({
       :voice-busy="false"
       :voice-recording="false"
       :voice-ready="true"
-      @send="() => {}"
+      @input="observedAtInput.push(text)"
+      @send="sent.push(text)"
     />`,
   setup() {
     const text = ref('')
-    return { text }
+    const observedAtInput = ref<string[]>([])
+    const sent = ref<string[]>([])
+    return { observedAtInput, sent, text }
   },
 })
 
@@ -105,7 +112,11 @@ function mountWrapper() {
   document.body.appendChild(el)
   const app = createApp(ComposerWrapper)
   app.use(i18n)
-  const instance = app.mount(el) as unknown as { text: string }
+  const instance = app.mount(el) as unknown as {
+    observedAtInput: string[]
+    sent: string[]
+    text: string
+  }
   const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')
   if (!textarea) throw new Error('textarea not rendered')
   return { textarea, el, instance }
@@ -126,6 +137,12 @@ function sendButtonReady(el: HTMLElement): boolean {
   const button = el.querySelector<HTMLButtonElement>('.chat-send-btn')
   if (!button) throw new Error('send button not rendered')
   return button.classList.contains('is-ready')
+}
+
+function clickSend(el: HTMLElement) {
+  const button = el.querySelector<HTMLButtonElement>('.chat-send-btn')
+  if (!button) throw new Error('send button not rendered')
+  button.click()
 }
 
 afterEach(() => {
@@ -152,7 +169,26 @@ describe('ChatComposer paste → model sync', () => {
 
     // User-visible contract: the pasted text reached the parent model…
     expect(instance.text).toBe('pasted during stale composition')
+    // …parent input consumers observed the reconciled value…
+    expect(instance.observedAtInput).toEqual(['pasted during stale composition'])
     // …and the send button is ready.
     expect(sendButtonReady(el)).toBe(true)
+
+    clickSend(el)
+    expect(instance.sent).toEqual(['pasted during stale composition'])
+  })
+
+  it('preserves the normal IME composition lifecycle', async () => {
+    const { textarea, instance } = mountWrapper()
+
+    textarea.dispatchEvent(new Event('compositionstart'))
+    textarea.value = '输入'
+    textarea.dispatchEvent(new InputEvent('input', { inputType: 'insertCompositionText' }))
+    await nextTick()
+    expect(instance.text).toBe('')
+
+    textarea.dispatchEvent(new Event('compositionend'))
+    await nextTick()
+    expect(instance.text).toBe('输入')
   })
 })

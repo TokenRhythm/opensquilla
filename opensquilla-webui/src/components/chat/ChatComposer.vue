@@ -476,7 +476,6 @@ const composerEl = ref<HTMLElement | null>(null)
 const textareaEl = ref<HTMLTextAreaElement | null>(null)
 
 function onTextareaInput(event: Event) {
-  emit('input', event)
   // vModelText skips model updates while the element's internal IME
   // composition flag is set (`if (e.target.composing) return` in
   // @vue/runtime-dom). On Windows a paste can land while that flag is
@@ -492,11 +491,16 @@ function onTextareaInput(event: Event) {
   // update. This is a no-op whenever v-model already picked up the
   // change.
   if (event instanceof InputEvent && event.inputType === 'insertFromPaste') {
-    const field = event.target as HTMLTextAreaElement | null
-    if (field && inputText.value !== field.value) {
+    const field = event.currentTarget
+    if (field instanceof HTMLTextAreaElement
+      && field === textareaEl.value
+      && inputText.value !== field.value) {
       inputText.value = field.value
     }
   }
+  // Keep parent input consumers (auto-resize, slash commands, draft state)
+  // downstream of the reconciliation so they observe the pasted model.
+  emit('input', event)
 }
 
 const fileInputEl = ref<HTMLInputElement | null>(null)
