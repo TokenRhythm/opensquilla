@@ -4381,6 +4381,175 @@ describe('useChatSend attachment payloads', () => {
     },
   )
 
+  it.each(['network_error', 'unknown_result'] as const)(
+    'keeps retrying an exact hidden-control Stop after its first %s',
+    async (firstFailure) => {
+      let resolveSend!: (value: unknown) => void
+      const abortCalls: Record<string, unknown>[] = []
+      let exactAbortAttempts = 0
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.send') {
+            return new Promise<T>((resolve) => {
+              resolveSend = resolve as (value: unknown) => void
+            })
+          }
+          if (method === 'chat.abort') {
+            abortCalls.push(params || {})
+            if (!params?.taskId) {
+              return Promise.resolve({ aborted: false, reason: 'task_id_required' }) as Promise<T>
+            }
+            exactAbortAttempts += 1
+            if (exactAbortAttempts === 1) {
+              if (firstFailure === 'network_error') {
+                return Promise.reject(new Error('response lost')) as Promise<T>
+              }
+              return Promise.resolve({
+                aborted: false,
+                reason: 'task_cancel_unknown',
+              }) as Promise<T>
+            }
+            return Promise.resolve({ aborted: true }) as Promise<T>
+          }
+          return Promise.resolve({}) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const acceptanceStopPending = ref(false)
+      const taskOwnership = useChatTaskOwnership()
+      const harness = makeOptions({ rpc, acceptanceStopPending, taskOwnership })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+
+      const hiddenSend = harness.api.dispatchHiddenSend(
+        'synthetic hidden control',
+        'visible confirmation',
+        `hidden-stop-${firstFailure}`,
+      )
+      await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+        'chat.send',
+        expect.any(Object),
+      ))
+
+      harness.api.onStop()
+      expect(acceptanceStopPending.value).toBe(true)
+      resolveSend({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-hidden-stopped',
+        task_status: 'queued',
+        user_message_id: 'message-hidden-stopped',
+      })
+      await hiddenSend
+
+      await vi.waitFor(() => expect(exactAbortAttempts).toBeGreaterThanOrEqual(2), {
+        timeout: 2_000,
+      })
+      const exactCalls = abortCalls.filter(call => call.taskId)
+      expect(exactCalls).toEqual([
+        {
+          sessionKey: 'agent:main:webchat:test',
+          taskId: 'task-hidden-stopped',
+          source: 'webui_stop',
+          scope: 'task',
+        },
+        {
+          sessionKey: 'agent:main:webchat:test',
+          taskId: 'task-hidden-stopped',
+          source: 'webui_stop',
+          scope: 'task',
+        },
+      ])
+    },
+  )
+
+  it('replays an unknown stopped hidden acceptance with the identical request and exact-aborts its receipt task', async () => {
+    vi.useFakeTimers()
+    try {
+      let rejectFirstSend!: (reason: unknown) => void
+      const sendParams: Record<string, unknown>[] = []
+      const abortCalls: Record<string, unknown>[] = []
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.abort') {
+            abortCalls.push(params || {})
+            return Promise.resolve({
+              aborted: Boolean(params?.taskId),
+              ...(!params?.taskId ? { reason: 'task_id_required' } : {}),
+            }) as Promise<T>
+          }
+          sendParams.push({ ...(params || {}) })
+          if (sendParams.length === 1) {
+            return new Promise<T>((_resolve, reject) => {
+              rejectFirstSend = reject
+            })
+          }
+          return Promise.resolve({
+            sessionKey: 'agent:main:webchat:test',
+            task_id: 'task-hidden-replayed-receipt',
+            task_status: 'queued',
+            user_message_id: 'message-hidden-replayed-receipt',
+          }) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const acceptanceStopPending = ref(false)
+      const taskOwnership = useChatTaskOwnership()
+      const harness = makeOptions({ rpc, acceptanceStopPending, taskOwnership })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+
+      const first = harness.api.dispatchHiddenSend(
+        'synthetic hidden control',
+        'visible confirmation',
+        'hidden-unknown-stop',
+      )
+      await Promise.resolve()
+      expect(sendParams).toHaveLength(1)
+      harness.api.onStop()
+      rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
+      await expect(first).resolves.toMatchObject({
+        status: 'unknown',
+        reason: 'response_unknown',
+      })
+      expect(acceptanceStopPending.value).toBe(true)
+
+      await vi.runAllTimersAsync()
+      await Promise.resolve()
+
+      expect(sendParams).toHaveLength(2)
+      expect(sendParams[1]).toEqual(sendParams[0])
+      expect(sendParams[1]?.clientRequestId).toBe('hidden-unknown-stop')
+      expect(abortCalls).toContainEqual({
+        sessionKey: 'agent:main:webchat:test',
+        taskId: 'task-hidden-replayed-receipt',
+        source: 'webui_stop',
+        scope: 'task',
+      })
+      expect(acceptanceStopPending.value).toBe(false)
+
+      // The exact abort response is only an acknowledgement; the normal task
+      // terminal/hydrate boundary releases the accepted queued owner.
+      taskOwnership.noteTerminal('task-hidden-replayed-receipt')
+      harness.stream.isStreaming.value = false
+      harness.options.activeStreamTaskId.value = ''
+
+      await expect(harness.api.dispatchHiddenSend(
+        'next synthetic hidden control',
+        'next visible confirmation',
+        'hidden-after-recovery',
+      )).resolves.toMatchObject({ status: 'accepted' })
+      expect(sendParams[2]?.clientRequestId).toBe('hidden-after-recovery')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('releases the pre-ACK Stop latch when chat.send is durably rejected', async () => {
     let rejectSend!: (reason: unknown) => void
     const acceptanceStopPending = ref(false)

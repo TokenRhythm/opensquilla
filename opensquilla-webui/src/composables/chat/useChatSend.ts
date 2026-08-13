@@ -93,6 +93,8 @@ interface SendAttempt {
   acceptedSessionKey?: string
   stopAbortPromise?: Promise<boolean> | null
   autoRecoverAcceptance?: boolean
+  hiddenControl?: boolean
+  stopOwner?: symbol
 }
 
 export type ChatSendOutcome = 'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'
@@ -661,6 +663,7 @@ export function useChatSend(options: UseChatSendOptions) {
       acceptanceStopOwner = transaction.id
       acceptanceStopPending.value = true
       if (attempt?.stopRequested) {
+        attempt.stopOwner = transaction.id
         stoppedAcceptanceAttempts.set(acceptanceAttemptKey(attempt), attempt)
       }
       if (freshSendToken) freshSendToken.stoppedByUser = true
@@ -687,6 +690,7 @@ export function useChatSend(options: UseChatSendOptions) {
     // A background recovery must not clear a newer visible request's Stop.
     if (
       activeAcceptanceTransaction?.attempt === attempt
+      || (attempt.stopOwner != null && acceptanceStopOwner === attempt.stopOwner)
       || (
         options.sessionKey.value === attempt.requestSessionKey
         && recoveredAttempt?.clientRequestId === attempt.clientRequestId
@@ -695,6 +699,7 @@ export function useChatSend(options: UseChatSendOptions) {
       acceptanceStopOwner = null
       acceptanceStopPending.value = false
     }
+    attempt.stopOwner = undefined
   }
 
   const acceptanceRecoveryDelaysMs = [250, 1_000, 4_000, 15_000] as const
@@ -758,6 +763,13 @@ export function useChatSend(options: UseChatSendOptions) {
     attempt.acceptedTaskId = acceptedTaskId(response)
     attempt.acceptedSessionKey = response.sessionKey || attempt.requestSessionKey
     const ownsRecoveredAttempt = recoveredAttempt?.clientRequestId === attempt.clientRequestId
+    if (attempt.hiddenControl) {
+      removeHiddenControl(
+        attempt.requestSessionKey,
+        attempt.clientRequestId,
+        options.hiddenControlStorage,
+      )
+    }
 
     const isCurrentRequest = options.sessionKey.value === attempt.requestSessionKey
     const accepted = noteAcceptedTask(response, attempt.requestSessionKey)
@@ -823,6 +835,19 @@ export function useChatSend(options: UseChatSendOptions) {
           if (rpcError?.accepted === false || accepted?.terminalWithoutTask) {
             attempt.acceptanceResolved = true
             if (attempt.stopRequested) clearAttemptStop(attempt)
+            if (
+              attempt.hiddenControl
+              && (
+                accepted?.terminalWithoutTask
+                || (rpcError?.accepted === false && rpcError.retryable === false)
+              )
+            ) {
+              removeHiddenControl(
+                attempt.requestSessionKey,
+                attempt.clientRequestId,
+                options.hiddenControlStorage,
+              )
+            }
             if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
               recoveredAttempt = null
             }
@@ -2451,6 +2476,7 @@ export function useChatSend(options: UseChatSendOptions) {
       acceptance.stoppedByUser = true
       if (acceptance.attempt) {
         acceptance.attempt.stopRequested = true
+        acceptance.attempt.stopOwner = acceptance.id
         stoppedAcceptanceAttempts.set(
           acceptanceAttemptKey(acceptance.attempt),
           acceptance.attempt,
@@ -2688,15 +2714,46 @@ export function useChatSend(options: UseChatSendOptions) {
     if (displayText && displayText !== providerText) params.displayText = displayText
     params._source = chatSourceMetadata(options)
 
+    // Hidden controls preserve the composer and render their own outbox-backed
+    // bubble, but their acceptance/Stop identity is otherwise the same as an
+    // ordinary send. Keep a request-owned attempt so a Stop racing this ACK can
+    // retry an exact task-scoped abort without widening to the whole session.
+    const attempt: SendAttempt = {
+      clientRequestId: stableClientRequestId,
+      clientMessageId,
+      composerText: displayText,
+      requestSessionKey,
+      text: providerText,
+      attachments: [],
+      intent: hiddenSessionIntent,
+      initialCollaborationMode: null,
+      forkBeforeMessageId: null,
+      workspaceId: null,
+      params,
+      hiddenControl: true,
+      acceptanceRpc: {
+        method: 'chat.send',
+        params: params as unknown as Record<string, unknown>,
+      },
+    }
+
     const wasStreaming = options.stream.isStreaming.value
     const freshSendToken = wasStreaming
       ? null
-      : beginFreshStream(requestSessionKey)
+      : beginFreshStream(requestSessionKey, attempt)
     let responseHandoff: ResponseHandoffGate | null = null
-    const acceptanceTransaction = beginAcceptanceTransaction(requestSessionKey, freshSendToken)
+    const acceptanceTransaction = beginAcceptanceTransaction(
+      requestSessionKey,
+      freshSendToken,
+      attempt,
+    )
 
     try {
+      attempt.acceptanceInFlight = true
       const res = await options.rpc.call<ChatSendResponse>('chat.send', params)
+      attempt.acceptanceResolved = true
+      attempt.acceptedTaskId = acceptedTaskId(res)
+      attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
       if (
         hiddenSessionIntent
         && requestSessionKey === options.sessionKey.value
@@ -2752,7 +2809,16 @@ export function useChatSend(options: UseChatSendOptions) {
         ) {
           bindAcceptedUserMessage(clientMessageId, res)
         }
-        abortStaleAcceptedTask(res, requestSessionKey, stoppedByUser)
+        if (stoppedByUser && taskId && attempt.stopRequested) {
+          // Share the ordinary-send single-flight worker. If the first exact
+          // abort response is lost or explicitly unknown, the same task id is
+          // retried without replaying the hidden control or touching composer.
+          void abortRecoveredAcceptedTask(attempt).then((resolved) => {
+            if (!resolved && attempt.stopRequested) scheduleAcceptanceRecovery(attempt)
+          })
+        } else {
+          abortStaleAcceptedTask(res, requestSessionKey, stoppedByUser)
+        }
         if (
           stoppedByUser
           && options.sessionKey.value === requestSessionKey
@@ -2845,10 +2911,22 @@ export function useChatSend(options: UseChatSendOptions) {
       const stoppedByUser = acceptanceTransaction.stoppedByUser
       if (stoppedByUser) {
         if (acceptedError?.terminalWithoutTask || accepted === false) {
+          attempt.acceptanceResolved = true
+          if (attempt.stopRequested) clearAttemptStop(attempt)
           clearAcceptanceStop(acceptanceTransaction)
-        } else if (hasUnknownAcceptance(err)) {
-          void options.reconcileTaskOwnership?.()
         }
+      }
+      if (hasUnknownAcceptance(err)) {
+        attempt.requiresIdempotentReplay = true
+        // Stop can target an already-running A while this hidden B acceptance
+        // remains unknown. Resolve B's receipt too, but only a request-owned
+        // Stop may exact-abort B when its task id becomes known.
+        if (attempt.stopRequested || attempt.autoRecoverAcceptance) {
+          scheduleAcceptanceRecovery(attempt)
+        }
+        if (stoppedByUser) void options.reconcileTaskOwnership?.()
+      } else if (accepted === false || acceptedError?.terminalWithoutTask) {
+        attempt.acceptanceResolved = true
       }
       if (
         acceptedError
@@ -2961,6 +3039,7 @@ export function useChatSend(options: UseChatSendOptions) {
         requestSessionKey,
       )
     } finally {
+      attempt.acceptanceInFlight = false
       finishAcceptanceTransaction(acceptanceTransaction)
       finishResponseHandoff(responseHandoff)
     }
