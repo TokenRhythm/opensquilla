@@ -181,6 +181,77 @@ describe('ActivityDisclosure lifecycle transitions', () => {
     expect(settledSummary?.getAttribute('aria-expanded'))
       .toBe('true')
   })
+
+  it('preserves a terminal manual reopen across same-turn canonical identity reconcile', async () => {
+    const state = reactive({
+      lifecycle: 'working' as 'working' | 'settled',
+      stateKey: 'message-live',
+      continuityKey: 'turn-stable',
+    })
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const app = createApp({
+      render: () => h(ActivityDisclosure, {
+        lifecycle: state.lifecycle,
+        defaultOpen: state.lifecycle === 'working',
+        stepCount: 1,
+        failureCount: 0,
+        stateKey: state.stateKey,
+        continuityKey: state.continuityKey,
+      }, { default: () => 'Activity details' }),
+    })
+    mountedApps.push(app)
+    app.use(i18n)
+    app.mount(host)
+    await nextTick()
+
+    state.lifecycle = 'settled'
+    await nextTick()
+    const summary = host.querySelector<HTMLButtonElement>('.assistant-activity__summary')
+    expect(summary?.getAttribute('aria-expanded')).toBe('false')
+
+    state.stateKey = 'message-canonical'
+    await nextTick()
+    // Canonical history may replace the optimistic message identity before the
+    // user reopens the finished turn.
+    summary?.click()
+    await nextTick()
+    expect(summary?.getAttribute('aria-expanded')).toBe('true')
+
+    // A canonical-history reconciliation can replace the entire message
+    // component with the earlier optimistic identity. That identity still has
+    // its terminal auto-collapse persisted, so a new component must choose the
+    // newer same-turn continuity write made by the user's explicit reopen.
+    mountedApps.pop()
+    app.unmount()
+    const reconciled = reactive({
+      stateKey: 'message-live',
+      continuityKey: 'turn-stable',
+    })
+    const reconciledApp = createApp({
+      render: () => h(ActivityDisclosure, {
+        lifecycle: 'settled',
+        defaultOpen: false,
+        stepCount: 1,
+        failureCount: 0,
+        stateKey: reconciled.stateKey,
+        continuityKey: reconciled.continuityKey,
+      }, { default: () => 'Activity details' }),
+    })
+    mountedApps.push(reconciledApp)
+    reconciledApp.use(i18n)
+    reconciledApp.mount(host)
+    await nextTick()
+    const reconciledSummary = host.querySelector<HTMLButtonElement>(
+      '.assistant-activity__summary',
+    )
+    expect(reconciledSummary?.getAttribute('aria-expanded')).toBe('true')
+
+    reconciled.stateKey = 'message-next-turn'
+    reconciled.continuityKey = 'turn-next'
+    await nextTick()
+    expect(reconciledSummary?.getAttribute('aria-expanded')).toBe('false')
+  })
 })
 
 describe('ActivityDisclosure resting affordance', () => {
