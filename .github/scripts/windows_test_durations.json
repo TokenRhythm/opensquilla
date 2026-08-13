@@ -295,6 +295,7 @@
     "tests/test_engine/test_session_sanitize.py": 0.239,
     "tests/test_engine/test_slash_command_registry.py": 0.011,
     "tests/test_engine/test_spawn_depth_unified.py": 0.01,
+    "tests/test_engine/test_stream_repetition_guard.py": 0.01,
     "tests/test_engine/test_stream_wrappers.py": 0.357,
     "tests/test_engine/test_subagent_run_mode_inheritance.py": 0.01,
     "tests/test_engine/test_subagent_usage_rollup.py": 0.03,
