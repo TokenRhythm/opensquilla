@@ -85,16 +85,23 @@ class _StopProvider:
         if call == 1:
             child_pid = self.evidence_dir / "child.pid"
             survived = self.evidence_dir / "descendant-survived"
-            child_script = (
-                "import os, pathlib, time; "
-                f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid())); "
-                "time.sleep(3); "
-                f"pathlib.Path({str(survived)!r}).write_text('survived'); "
-                "time.sleep(30)"
+            child_script = self.evidence_dir / "owned-child.py"
+            parent_script = self.evidence_dir / "exited-parent.py"
+            child_script.write_text(
+                "import os\n"
+                "import pathlib\n"
+                "import time\n"
+                f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
+                "time.sleep(3)\n"
+                f"pathlib.Path({str(survived)!r}).write_text('survived')\n"
+                "time.sleep(30)\n",
+                encoding="utf-8",
             )
-            parent_script = (
-                "import subprocess, sys; "
-                f"subprocess.Popen([sys.executable, '-c', {child_script!r}])"
+            parent_script.write_text(
+                "import subprocess\n"
+                "import sys\n"
+                f"subprocess.Popen([sys.executable, {str(child_script)!r}])\n",
+                encoding="utf-8",
             )
             yield ToolUseStartEvent(
                 tool_use_id="stop-background-1",
@@ -104,7 +111,7 @@ class _StopProvider:
                 tool_use_id="stop-background-1",
                 tool_name="background_process",
                 arguments={
-                    "command": _shell_command([sys.executable, "-c", parent_script]),
+                    "command": _shell_command([sys.executable, str(parent_script)]),
                     "timeout": 30,
                     "sandbox_permissions": "use_default",
                 },
