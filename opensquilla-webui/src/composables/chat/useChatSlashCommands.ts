@@ -840,7 +840,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     if (!cmd) {
       closeSlashMenu()
       options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmdText }))
-      return true
+      // Unknown slash input is NOT a command: report unhandled so the caller
+      // (useChatSend.onSend) falls through and sends it as ordinary chat text.
+      // The notify above still surfaces a visible hint to the user.
+      return false
     }
     selectSlashCmd(cmd, args)
     return true
