@@ -501,9 +501,12 @@ jobs:
           }
           $userData = Join-Path $env:RUNNER_TEMP "p1-5-first-send-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
           New-Item -ItemType Directory -Path $userData | Out-Null
-          npm run test:packaged-first-send-renderer -- `
-            --executable $candidate `
+          & node scripts/test-packaged-first-send-renderer.mjs `
+            --executable $candidate.Path `
             --user-data-dir $userData
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged first-send renderer gate failed with exit code $LASTEXITCODE"
+          }
 
       - name: Verify RC3-to-candidate Windows upgrade and uninstall preserve profile data
         shell: pwsh

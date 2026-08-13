@@ -78,6 +78,9 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert 'NOTES_FILE="docs/releases/${TAG#v}.md"' in workflow
     assert '--notes-file "${NOTES_FILE}"' in workflow
     assert 'gh release upload "${TAG}" dist/* --clobber' in workflow
+    assert "& node scripts/test-packaged-first-send-renderer.mjs `" in workflow
+    assert "--executable $candidate.Path `" in workflow
+    assert "npm run test:packaged-first-send-renderer -- `" not in workflow
 
 
 def test_release_workflow_runs_legacy_windows_upgrade_checks_on_server_2022() -> None:
