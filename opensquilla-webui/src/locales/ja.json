@@ -1043,7 +1043,7 @@
       "capacityWarn": "1 ターンあたり {calls} 回のモデル呼び出し — コストは線形に増え、候補 4 つを超えると集約の効果は逓減します。",
       "capacityFull": "候補の上限 {max} に達しました — これ以上追加しても集約は改善しません。先に 1 つ削除してください。",
       "diversityHint": "複数の候補が同じモデルファミリーです — 別ベンダーのモデルを追加すると集約が改善されることが多いです。",
-      "effectiveFacts": "1 ターンあたり {calls} 回のモデル呼び出し · {quorum}/{proposers} 件の成功で集約開始 · 候補タイムアウト {proposerTimeout} 秒 · 集約タイムアウト {aggregatorTimeout} 秒 · 充足後 {grace} 秒の猶予",
+      "effectiveFacts": "1 ターンあたり {calls} 回のモデル呼び出し · {quorum}/{proposers} 件の成功で集約開始 · 候補の合計タイムアウト {proposerTimeout} 秒 · 集約のアイドルタイムアウト {aggregatorTimeout} 秒 · 充足後 {grace} 秒の猶予",
       "effectiveSummary": "{proposers} 個の提案モデルを並列実行 + 1 個の集約モデル · 1 ターン約 {calls} 回呼び出し",
       "runtimeStrategyTitle": "実行戦略",
       "runtimeStrategyDesc": "成功条件、失敗時の動作、制限時間",
@@ -1052,7 +1052,7 @@
       "successThresholdExact": "{quorum}/{proposers}",
       "failurePolicyLabel": "集約を完了できない場合",
       "runtimeLimitsLabel": "制限時間",
-      "runtimeLimits": "提案モデル {proposerTimeout} 秒 · 集約モデル {aggregatorTimeout} 秒 · 条件達成後の猶予 {grace} 秒",
+      "runtimeLimits": "提案モデルは合計 {proposerTimeout} 秒 · 集約モデルはプロバイダーイベント間のアイドル {aggregatorTimeout} 秒（設定値 {configuredAggregatorTimeout} 秒）· ターン全体の期限は別管理 · 条件達成後の猶予 {grace} 秒",
       "quorumFailureLabel": "成功した候補が {quorum} 件未満の場合"
     },
     "behavior": {
@@ -3858,6 +3858,9 @@
     "compact": {
       "compacting": "コンテキストを圧縮中",
       "compacted": "コンテキストを圧縮しました",
+      "historyPreserved": "以前のコンテキストを要約しました。元のメッセージは履歴で引き続き確認できます",
+      "historyIncomplete": "以前のコンテキストを要約しました。一部の元のメッセージは利用できません",
+      "historySummarized": "以前のコンテキストを要約しました",
       "failed": "圧縮に失敗しました",
       "withinBudget": "コンテキストは予算内です。",
       "skipped": "コンテキストの圧縮は適用されませんでした。",

@@ -1043,7 +1043,7 @@
       "capacityWarn": "{calls} Modellaufrufe pro Runde — Kosten wachsen linear, der Fusionsgewinn nimmt ab 4 Entwürfen deutlich ab.",
       "capacityFull": "Limit von {max} Entwurfsmodellen erreicht — mehr Entwürfe verbessern die Fusion nicht; erst eines entfernen.",
       "diversityHint": "Mehrere Entwurfsmodelle stammen aus derselben Modellfamilie — ein anderer Anbieter verbessert die Fusion meist.",
-      "effectiveFacts": "Pro Runde: {calls} Modellaufrufe · Fusion ab {quorum}/{proposers} erfolgreichen Entwürfen · Entwurfs-Timeout {proposerTimeout}s · Aggregator-Timeout {aggregatorTimeout}s · {grace}s Nachfrist",
+      "effectiveFacts": "Pro Runde: {calls} Modellaufrufe · Fusion ab {quorum}/{proposers} erfolgreichen Entwürfen · Gesamt-Timeout je Entwurf {proposerTimeout}s · Aggregator-Leerlauf-Timeout {aggregatorTimeout}s · {grace}s Nachfrist",
       "effectiveSummary": "{proposers} Entwürfe parallel + 1 Aggregator · etwa {calls} Modellaufrufe pro Runde",
       "runtimeStrategyTitle": "Laufzeitstrategie",
       "runtimeStrategyDesc": "Erfolgsschwelle, Ausweichverhalten und Zeitlimits",
@@ -1052,7 +1052,7 @@
       "successThresholdExact": "{quorum} von {proposers}",
       "failurePolicyLabel": "Wenn die Aggregation nicht abgeschlossen werden kann",
       "runtimeLimitsLabel": "Zeitlimits",
-      "runtimeLimits": "Entwürfe {proposerTimeout}s · Aggregator {aggregatorTimeout}s · {grace}s Nachfrist nach Erreichen der Schwelle",
+      "runtimeLimits": "Entwürfe insgesamt {proposerTimeout}s · Aggregator-Leerlauf zwischen Anbieterereignissen {aggregatorTimeout}s (konfiguriert {configuredAggregatorTimeout}s) · separates Gesamtlimit der Runde · {grace}s Nachfrist",
       "quorumFailureLabel": "Wenn weniger als {quorum} Entwürfe gelingen"
     },
     "behavior": {
@@ -3858,6 +3858,9 @@
     "compact": {
       "compacting": "Kontext wird verdichtet",
       "compacted": "Kontext verdichtet",
+      "historyPreserved": "Früherer Kontext zusammengefasst; Originalnachrichten bleiben im Verlauf verfügbar",
+      "historyIncomplete": "Früherer Kontext zusammengefasst; einige Originalnachrichten sind nicht verfügbar",
+      "historySummarized": "Früherer Kontext zusammengefasst",
       "failed": "Verdichtung fehlgeschlagen",
       "withinBudget": "Kontext innerhalb des Budgets.",
       "skipped": "Die Kontextverdichtung wurde nicht angewendet.",

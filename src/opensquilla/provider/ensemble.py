@@ -207,10 +207,13 @@ async def _stream_with_heartbeats(
                         event = pending.result()
                     except StopAsyncIteration:
                         return
+                    yield event
                     pending = asyncio.ensure_future(stream_iter.__anext__())
                     if reset_deadline_on_event and timeout_budget is not None:
+                        # Consumer-side processing is not provider idle time.
+                        # Start the next idle budget only once the next provider
+                        # read is actually pending.
                         deadline = time.monotonic() + timeout_budget
-                    yield event
                     continue
                 wait_seconds = min(wait_seconds, remaining)
             done, _ = await asyncio.wait({pending}, timeout=wait_seconds)
@@ -221,12 +224,13 @@ async def _stream_with_heartbeats(
                 event = pending.result()
             except StopAsyncIteration:
                 return
-            if reset_deadline_on_event and timeout_budget is not None:
-                # Idle budget: a healthy stream that keeps producing events may
-                # run arbitrarily long; only a silent stall expires the wait.
-                deadline = time.monotonic() + timeout_budget
             yield event
             pending = asyncio.ensure_future(stream_iter.__anext__())
+            if reset_deadline_on_event and timeout_budget is not None:
+                # Idle budget: a healthy stream that keeps producing events may
+                # run arbitrarily long; only a silent provider read expires it.
+                # Exclude time spent by downstream consumers handling ``event``.
+                deadline = time.monotonic() + timeout_budget
     finally:
         cleanup_deadline = time.monotonic() + max(
             0.0,
@@ -1800,6 +1804,9 @@ class EnsembleProvider:
             prior_rows=proposer_rows,
             prior_missing_count=_candidate_missing_usage_count(candidates),
             trace=trace,
+            original_messages=messages,
+            original_config=config,
+            candidates=candidates,
         ):
             yield event
 
@@ -2363,6 +2370,8 @@ class EnsembleProvider:
             "proposer_max_retries": self.proposer_max_retries,
             "proposer_timeout_seconds": self.proposer_timeout_seconds,
             "aggregator_timeout_seconds": self.aggregator_timeout_seconds,
+            "aggregator_timeout_mode": "idle",
+            "aggregator_total_deadline_source": "outer_turn_runtime",
             "quorum_grace_seconds": self.quorum_grace_seconds,
             "content_max_chars": TRACE_CONTENT_MAX_CHARS,
             "final_request_role": final_request_role,
@@ -2421,6 +2430,9 @@ class EnsembleProvider:
         prior_rows: list[dict[str, Any]],
         prior_missing_count: int,
         trace: dict[str, Any],
+        original_messages: list[Message],
+        original_config: ChatConfig | None,
+        candidates: Sequence[_CandidateResult],
     ) -> AsyncIterator[StreamEvent]:
         final_text_parts: list[str] = []
         aggregator_started = time.monotonic()
@@ -2557,6 +2569,10 @@ class EnsembleProvider:
                     phase="ensemble_aggregator_wait",
                     message="Still waiting for ensemble aggregator response",
                     timeout_seconds=timeout_seconds,
+                    # Match provider read-timeout semantics: healthy aggregator
+                    # streams may run past this budget, but a silent stream may
+                    # not stall the turn indefinitely.
+                    reset_deadline_on_event=True,
                 )
                 async for event in heartbeat_stream:
                     if isinstance(event, DoneEvent):
@@ -2683,20 +2699,41 @@ class EnsembleProvider:
             except TimeoutError:
                 error = ErrorEvent(
                     message=(
-                        "ensemble aggregator timed out after "
+                        "ensemble aggregator stalled: no stream events for "
                         f"{self.aggregator_timeout_seconds:g}s"
                     ),
                     code="ensemble_aggregator_timeout",
                 )
+                # A completed idle budget is not a cheap transient failure:
+                # replaying the aggregator can repeat the same billed stall for
+                # another full budget. Preserve any earlier retry receipts, but
+                # do not retry this timed-out attempt. A fallback is safe only
+                # before any text, reasoning, or tool delta reached consumers.
+                yield aggregator_progress("aggregator_finish", error=error.message)
                 if (
                     not content_streamed
-                    and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                    and self.all_failed_policy == "fallback_single"
+                    and self.fallback_provider is not None
                 ):
-                    retry_error = error
-                else:
-                    yield aggregator_progress("aggregator_finish", error=error.message)
-                    yield partial_error(error)
+                    # Reuse the original conversation, not the synthetic
+                    # candidate bundle sent to the aggregator. Preserve
+                    # billed retry rows and count only attempts that ended
+                    # without a usage receipt as missing.
+                    async for fallback_event in self._fallback_or_error(
+                        original_messages,
+                        tools=tools,
+                        config=original_config,
+                        reason=error.message,
+                        code=error.code,
+                        candidates=candidates,
+                        prior_trace=trace,
+                        prior_usage_rows=retry_rows,
+                        extra_usage_missing_count=retry_missing_count + 1,
+                    ):
+                        yield fallback_event
                     return
+                yield partial_error(error)
+                return
             except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
                 safe_message = redact_upstream_error_text(
                     f"ensemble aggregator failed: {exc}",
@@ -2776,15 +2813,26 @@ class EnsembleProvider:
         reason: str,
         code: str,
         candidates: Sequence[_CandidateResult],
+        prior_trace: Mapping[str, Any] | None = None,
+        prior_usage_rows: Sequence[Mapping[str, Any]] = (),
+        extra_usage_missing_count: int = 0,
     ) -> AsyncIterator[StreamEvent]:
         proposer_rows = _candidate_usage_rows(candidates, profile=self.profile_name)
+        final_path_rows = [
+            *proposer_rows,
+            *(dict(row) for row in prior_usage_rows),
+        ]
         proposer_missing_count = _candidate_missing_usage_count(candidates)
+        usage_missing_count = proposer_missing_count + max(
+            0,
+            int(extra_usage_missing_count),
+        )
 
         def proposer_error(event: ErrorEvent) -> ErrorEvent:
             return replace(
                 event,
-                model_usage_breakdown=list(proposer_rows),
-                usage_missing_count=proposer_missing_count,
+                model_usage_breakdown=list(final_path_rows),
+                usage_missing_count=usage_missing_count,
             )
 
         request_budget_error = _uniform_request_budget_error(candidates)
@@ -2857,17 +2905,31 @@ class EnsembleProvider:
             if request_budget_error is not None
             else code
         )
+        if prior_trace is not None:
+            trace["llm_request_count"] = max(
+                int(trace.get("llm_request_count") or 0),
+                int(prior_trace.get("llm_request_count") or 0),
+            )
+            prior_final_request = prior_trace.get("final_request")
+            if isinstance(prior_final_request, Mapping):
+                archived_request = _json_safe(dict(prior_final_request))
+                if isinstance(archived_request, dict):
+                    archived_request["terminal_code"] = code
+                    archived_request["terminal_reason"] = reason
+                    trace["prior_final_request"] = archived_request
+
         def partial_error(event: ErrorEvent) -> ErrorEvent:
             return replace(
                 event,
-                model_usage_breakdown=list(proposer_rows),
-                usage_missing_count=proposer_missing_count + 1,
+                model_usage_breakdown=list(final_path_rows),
+                usage_missing_count=usage_missing_count + 1,
             )
+
         final_text_parts: list[str] = []
         _mark_final_request_started(trace)
         yield ProviderHeartbeatEvent(
             phase="ensemble_fallback",
-            message="Ensemble quorum unavailable; waiting for fallback model",
+            message="Ensemble final path unavailable; waiting for fallback model",
         )
         try:
             async for event in _stream_with_heartbeats(
@@ -2910,7 +2972,7 @@ class EnsembleProvider:
                         provider=executed_provider,
                         model=executed_model,
                     )
-                    rows = [*proposer_rows, fallback_row]
+                    rows = [*final_path_rows, fallback_row]
                     yield replace(
                         event,
                         input_tokens=_summed_int(rows, "input_tokens"),
@@ -2923,7 +2985,7 @@ class EnsembleProvider:
                         cost_source=_rollup_cost_source(rows),
                         model_usage_breakdown=rows,
                         ensemble_trace=trace,
-                        usage_missing_count=proposer_missing_count,
+                        usage_missing_count=usage_missing_count,
                         billing_receipt=None,
                     )
                     return
