@@ -261,6 +261,21 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
         session = payload.get("session")
         if not isinstance(session, dict):
             return None
+        action = str(payload.get("action") or "").strip().casefold()
+        if action == "kill":
+            # This sidecar describes the management call, not the child it
+            # successfully terminated. A killed child is the expected receipt,
+            # not cancellation of the tool call itself.
+            return {
+                "version": 1,
+                "status": "success",
+                "exit_code": None,
+                "timed_out": False,
+                "truncated": False,
+                "reason": "process_killed",
+                "source": "adapter",
+                "preservation_class": "normal",
+            }
         session_status = session.get("status")
         returncode = _as_exit_code(session.get("returncode"))
         timed_out = _as_bool(session.get("timed_out"))

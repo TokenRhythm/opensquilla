@@ -1265,6 +1265,7 @@ async def test_real_subagent_rollup_preserves_three_physical_ledger_calls() -> N
                 name="spawn_helper",
                 description="spawn a helper",
                 input_schema=ToolInputSchema(properties={}, required=[]),
+                completion_effect="control",
             )
         ],
         tool_handler=tool_handler,

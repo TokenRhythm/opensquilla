@@ -7,7 +7,11 @@ from typing import Any, Literal
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig, ToolResult
-from opensquilla.engine.action_completion import ACTION_COMPLETION_TOOL_NAME
+from opensquilla.engine.action_completion import (
+    ACTION_COMPLETION_TOOL_NAME,
+    resolve_tool_completion_effect,
+)
+from opensquilla.execution_status import runtime_execution_status
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolDefinition, ToolInputSchema
@@ -85,6 +89,7 @@ async def test_text_only_recovery_warns_then_records_next_tool_action(tmp_path) 
                     properties={"value": {"type": "string"}},
                     required=["value"],
                 ),
+                completion_effect="read_only",
             )
         ],
         tool_handler=tool_handler,
@@ -155,12 +160,14 @@ def _tool_definition(
     name: str,
     *,
     completion_effect: Literal["unknown", "read_only", "action", "control"],
+    completion_effect_resolver: Literal["exec_command", "process"] | None = None,
 ) -> ToolDefinition:
     return ToolDefinition(
         name=name,
         description=f"{name} test tool.",
         input_schema=ToolInputSchema(properties={}, required=[]),
         completion_effect=completion_effect,
+        completion_effect_resolver=completion_effect_resolver,
     )
 
 
@@ -208,6 +215,40 @@ def _text_stream(
             output_tokens=output_tokens,
         ),
     ]
+
+
+def test_mixed_tool_effect_resolvers_classify_each_call() -> None:
+    exec_definition = _tool_definition(
+        "exec_command",
+        completion_effect="unknown",
+        completion_effect_resolver="exec_command",
+    )
+    process_definition = _tool_definition(
+        "process",
+        completion_effect="unknown",
+        completion_effect_resolver="process",
+    )
+
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "git status --short && rg -n TODO src"},
+    ) == "read_only"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "printf done > result.txt"},
+    ) == "action"
+    assert resolve_tool_completion_effect(
+        exec_definition,
+        {"command": "rg --pre 'touch marker' TODO src"},
+    ) == "action"
+    assert resolve_tool_completion_effect(
+        process_definition,
+        {"action": "log", "session_id": "p1"},
+    ) == "read_only"
+    assert resolve_tool_completion_effect(
+        process_definition,
+        {"action": "write", "session_id": "p1", "data": "yes"},
+    ) == "action"
 
 
 @pytest.mark.asyncio
@@ -430,3 +471,193 @@ async def test_terminating_action_with_visible_output_needs_no_completion_retry(
     assert len(provider.calls) == 1
     assert any(event.kind == "done" and event.text == "Started service." for event in events)
     assert not any(event.kind == "warning" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_failed_action_result_does_not_arm_completion_contract() -> None:
+    provider = _SequenceProvider(
+        [
+            _tool_call_stream("action-1", "write_file"),
+            _text_stream("The write failed; no file was changed."),
+        ]
+    )
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="permission denied",
+            is_error=True,
+            execution_status=runtime_execution_status("error", reason="denied"),
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[_tool_definition("write_file", completion_effect="action")],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("write the file")]
+
+    assert len(provider.calls) == 2
+    assert any(event.kind == "done" for event in events)
+    assert not any(event.kind == "warning" for event in events)
+    assert all(
+        tool.name != ACTION_COMPLETION_TOOL_NAME
+        for tool in provider.calls[1]["tools"]
+    )
+    assert agent.config.metadata.get("action_completion_contracts_armed", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_unexecuted_unknown_result_does_not_arm_completion_contract() -> None:
+    provider = _SequenceProvider(
+        [
+            _tool_call_stream("unknown-1", "dynamic_tool"),
+            _text_stream("Approval is still required."),
+        ]
+    )
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="approval pending",
+            execution_status=runtime_execution_status(
+                "unknown",
+                reason="approval_pending",
+            ),
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[_tool_definition("dynamic_tool", completion_effect="unknown")],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("run the dynamic action")]
+
+    assert len(provider.calls) == 2
+    assert any(event.kind == "done" for event in events)
+    assert not any(event.kind == "warning" for event in events)
+    assert agent.config.metadata.get("action_completion_contracts_armed", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_successful_unknown_tool_fails_closed_as_action() -> None:
+    provider = _SequenceProvider(
+        [
+            _tool_call_stream("unknown-1", "dynamic_tool"),
+            _text_stream("The dynamic operation completed."),
+            _text_stream("The dynamic operation completed."),
+        ]
+    )
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="ok",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=4),
+        tool_definitions=[_tool_definition("dynamic_tool", completion_effect="unknown")],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("run the dynamic action")]
+
+    assert len(provider.calls) == 3
+    assert sum(event.kind == "warning" for event in events) == 1
+    assert any(
+        event.kind == "error" and event.code == "action_completion_incomplete"
+        for event in events
+    )
+    assert agent.config.metadata["action_completion_contracts_armed"] == 1
+
+
+@pytest.mark.asyncio
+async def test_read_only_exec_command_call_does_not_arm_completion_contract() -> None:
+    provider = _SequenceProvider(
+        [
+            _tool_call_stream(
+                "read-1",
+                "exec_command",
+                arguments={"command": "git status --short && rg -n TODO src"},
+            ),
+            _text_stream("There are no pending changes."),
+        ]
+    )
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="exit_code=0",
+            execution_status=runtime_execution_status("success", reason=None),
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[
+            _tool_definition(
+                "exec_command",
+                completion_effect="unknown",
+                completion_effect_resolver="exec_command",
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("inspect the repository")]
+
+    assert len(provider.calls) == 2
+    assert any(event.kind == "done" for event in events)
+    assert not any(event.kind == "warning" for event in events)
+    assert agent.config.metadata.get("action_completion_contracts_armed", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_read_only_process_poll_does_not_arm_completion_contract() -> None:
+    provider = _SequenceProvider(
+        [
+            _tool_call_stream(
+                "read-1",
+                "process",
+                arguments={"action": "poll", "session_id": "p1"},
+            ),
+            _text_stream("The process is still running."),
+        ]
+    )
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="running",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=3),
+        tool_definitions=[
+            _tool_definition(
+                "process",
+                completion_effect="unknown",
+                completion_effect_resolver="process",
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("check the process")]
+
+    assert len(provider.calls) == 2
+    assert any(event.kind == "done" for event in events)
+    assert not any(event.kind == "warning" for event in events)
+    assert agent.config.metadata.get("action_completion_contracts_armed", 0) == 0

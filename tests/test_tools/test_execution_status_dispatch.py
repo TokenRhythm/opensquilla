@@ -157,6 +157,34 @@ async def test_background_process_terminal_nonzero_is_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_process_kill_reports_success_for_management_call() -> None:
+    handler = build_tool_handler(
+        _registry(
+            "process",
+            json.dumps(
+                {
+                    "status": "killed",
+                    "action": "kill",
+                    "session": {
+                        "status": "killed",
+                        "returncode": -15,
+                        "timed_out": False,
+                        "killed": True,
+                    },
+                }
+            ),
+        )
+    )
+
+    result = await handler(ToolCall("call_bg_kill", "process", {}))
+
+    assert result.is_error is False
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == "success"
+    assert result.execution_status["reason"] == "process_killed"
+
+
+@pytest.mark.asyncio
 async def test_approval_denial_preserves_approval_denied_reason() -> None:
     handler = build_tool_handler(
         _registry(

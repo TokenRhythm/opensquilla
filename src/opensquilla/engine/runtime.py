@@ -5807,6 +5807,11 @@ class TurnRunner:
                 )
             raise
 
+        except ActionCompletionIncompleteError:
+            # Finalization already persisted the sole error, transcript, and
+            # usage receipt. Preserve the typed terminal for TaskRuntime.
+            raise
+
         except Exception as exc:
             provider_boundary_failure_kind = str(
                 getattr(exc, "failure_kind", "") or ""

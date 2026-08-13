@@ -64,6 +64,24 @@ def test_completion_effect_is_runtime_only_registry_metadata() -> None:
     assert "completion_effect" not in definition.model_dump()
 
 
+def test_completion_effect_resolver_is_runtime_only_registry_metadata() -> None:
+    registry = ToolRegistry()
+
+    @tool(
+        name="mixed",
+        description="mixed",
+        registry=registry,
+        completion_effect_resolver="process",
+    )
+    async def mixed() -> str:
+        return "ok"
+
+    definition = registry.to_tool_definitions(ToolContext())[0]
+
+    assert definition.completion_effect_resolver == "process"
+    assert "completion_effect_resolver" not in definition.model_dump()
+
+
 def test_plan_visibility_is_fail_closed_but_default_visibility_is_unchanged() -> None:
     registry = ToolRegistry()
     registry.register(

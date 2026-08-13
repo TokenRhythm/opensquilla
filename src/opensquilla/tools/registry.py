@@ -404,6 +404,7 @@ class ToolRegistry:
                 execution_timeout_argument=rt.spec.execution_timeout_argument,
                 execution_timeout_padding=rt.spec.execution_timeout_padding,
                 completion_effect=rt.spec.completion_effect,
+                completion_effect_resolver=rt.spec.completion_effect_resolver,
             )
             for rt in visible_tools
         ]
@@ -598,6 +599,7 @@ def tool(
     completion_effect: (
         Literal["unknown", "read_only", "action", "control"] | None
     ) = None,
+    completion_effect_resolver: Literal["exec_command", "process"] | None = None,
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
 ) -> Any:
     """Decorator to register an async function as a tool.
@@ -633,6 +635,7 @@ def tool(
                 if plan_access is PlanAccess.CONTROL
                 else "unknown"
             ),
+            completion_effect_resolver=completion_effect_resolver,
         )
         target = registry if registry is not None else _default_registry
         target.register(spec, fn)

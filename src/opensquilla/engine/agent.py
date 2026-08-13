@@ -39,6 +39,8 @@ from opensquilla.engine.action_completion import (
     ACTION_COMPLETION_RECOVERY_MESSAGE,
     ACTION_COMPLETION_TOOL_NAME,
     action_completion_tool_definition,
+    resolve_tool_completion_effect,
+    tool_result_confirms_success,
 )
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import (
@@ -7121,10 +7123,9 @@ class Agent:
         provider_tool_definitions = self.tool_definitions or None
         if not tools_supported:
             provider_tool_definitions = None
-        action_completion_tool_names = {
-            definition.name
+        action_completion_definitions = {
+            definition.name: definition
             for definition in provider_tool_definitions or []
-            if definition.completion_effect == "action"
         }
 
         def _turn_budget_error() -> ErrorEvent | None:
@@ -13756,8 +13757,13 @@ class Agent:
                     and not self._is_not_executed_after_dispatch_boundary(result)
                 ]
                 action_tool_executed = any(
-                    tc.tool_name in action_completion_tool_names
-                    and not self._is_not_executed_after_dispatch_boundary(result)
+                    tc.tool_name != ACTION_COMPLETION_TOOL_NAME
+                    and tool_result_confirms_success(result)
+                    and resolve_tool_completion_effect(
+                        action_completion_definitions.get(tc.tool_name),
+                        tc.arguments,
+                    )
+                    == "action"
                     for tc, result in zip(tool_calls, executed_results, strict=False)
                 )
                 if action_tool_executed:

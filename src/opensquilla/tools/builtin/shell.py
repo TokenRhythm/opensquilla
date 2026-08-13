@@ -6286,7 +6286,7 @@ async def _create_host_shell_subprocess(
 
 @tool(
     name="exec_command",
-    completion_effect="action",
+    completion_effect_resolver="exec_command",
     description=(
         "Execute a shell command and return stdout/stderr with exit code. Use for "
         "repository inspection, builds, tests, and command-line tools. For workspace "
@@ -7369,7 +7369,7 @@ def get_bg_session(session_id: str) -> _BgSession | None:
 
 @tool(
     name="process",
-    completion_effect="action",
+    completion_effect_resolver="process",
     description=(
         "Manage background_process sessions created by OpenSquilla. To await a "
         "long-running background command, call action='wait' (blocks until it "

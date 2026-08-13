@@ -325,6 +325,7 @@ class ToolSpec:
     # Trusted runtime classification used by the action completion contract.
     # Appended for positional compatibility with embedded ToolSpec callers.
     completion_effect: Literal["unknown", "read_only", "action", "control"] = "unknown"
+    completion_effect_resolver: Literal["exec_command", "process"] | None = None
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

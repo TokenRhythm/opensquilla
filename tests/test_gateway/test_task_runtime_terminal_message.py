@@ -432,6 +432,88 @@ async def test_action_completion_stream_error_preserves_incomplete_terminal_reas
 
 
 @pytest.mark.asyncio
+async def test_typed_action_incomplete_bypasses_stream_error_downgrade() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield ErrorEvent(
+            message="Action completion evidence was missing.",
+            code="action_completion_incomplete",
+        )
+        raise ActionCompletionIncompleteError(
+            "Action completion evidence was missing."
+        )
+
+    async def _emitter(
+        session_key: str,
+        event_name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    with pytest.raises(ActionCompletionIncompleteError):
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            "agent:main:test",
+            _emitter,
+            stream_event_sink=None,
+            idle_timeout=1.0,
+            heartbeat_interval=0.0,
+        )
+
+    assert [event_name for _, event_name, _ in emitted] == ["session.event.error"]
+    assert emitted[0][2]["terminal_reason"] == "action_completion_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_typed_action_incomplete_stream_reaches_task_runtime_once() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emitter(
+        session_key: str,
+        event_name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    async def _handler(run: Any) -> None:
+        async def _stream():
+            yield ErrorEvent(
+                message="Action completion evidence was missing.",
+                code="action_completion_incomplete",
+            )
+            raise ActionCompletionIncompleteError(
+                "Action completion evidence was missing."
+            )
+
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            run.session_key,
+            _emitter,
+            stream_event_sink=None,
+            idle_timeout=1.0,
+            heartbeat_interval=0.0,
+        )
+
+    storage = _make_storage()
+    runtime = _make_runtime(_handler, event_emitter=_emitter, storage=storage)
+    handle = await runtime.enqueue(_make_envelope(), "start the service")
+
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.terminal_reason == "action_completion_incomplete"
+    assert record.error_class == "action_completion_incomplete"
+    stream_errors = [
+        payload
+        for _, event_name, payload in emitted
+        if event_name == "session.event.error" and "kind" not in payload
+    ]
+    assert len(stream_errors) == 1
+    assert stream_errors[0]["terminal_reason"] == "action_completion_incomplete"
+
+
+@pytest.mark.asyncio
 async def test_task_runtime_stream_error_terminal_message_carries_error_ref() -> None:
     # Additive: when the turn loop stamped an error_id, the stream emitter
     # suffixes the user-facing text with the durable turn_errors reference.
