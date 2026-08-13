@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
+
+_JS_MAX_SAFE_INTEGER = (1 << 53) - 1
 
 
 def _epoch_time_ms() -> int:
@@ -21,6 +24,7 @@ class BufferedSessionEvent:
 
 @dataclass(frozen=True)
 class ReplayResult:
+    stream_generation: str
     current_stream_seq: int
     replay_complete: bool
     events: list[BufferedSessionEvent]
@@ -29,6 +33,7 @@ class ReplayResult:
 
 @dataclass(frozen=True)
 class LiveTurnSnapshot:
+    stream_generation: str
     current_stream_seq: int
     task_id: str | None
     events: list[BufferedSessionEvent]
@@ -41,12 +46,24 @@ class SessionStreamRegistry:
     session and survives reconnects long enough to replay recent run events.
     """
 
-    def __init__(self, *, max_events_per_session: int = 500) -> None:
+    def __init__(
+        self,
+        *,
+        max_events_per_session: int = 500,
+        stream_generation: str | None = None,
+    ) -> None:
         self._max_events_per_session = max_events_per_session
+        self._stream_generation = stream_generation or uuid.uuid4().hex
         self._seq_by_session: dict[str, int] = {}
         self._events_by_session: dict[str, deque[BufferedSessionEvent]] = {}
         self._live_events_by_session: dict[str, list[BufferedSessionEvent]] = {}
         self._live_task_by_session: dict[str, str | None] = {}
+
+    @property
+    def stream_generation(self) -> str:
+        """Return the process-local generation for every session stream."""
+
+        return self._stream_generation
 
     @staticmethod
     def _is_replay_lossy(
@@ -60,9 +77,13 @@ class SessionStreamRegistry:
         }:
             return True
         return bool(
-            event_name == "session.event.compaction"
-            and isinstance(payload, dict)
+            isinstance(payload, dict)
             and payload.get("heartbeat") is True
+            and event_name
+            in {
+                "session.event.compaction",
+                "session.event.provider_activity",
+            }
         )
 
     def _trim_session_events(self, events: deque[BufferedSessionEvent]) -> None:
@@ -77,6 +98,26 @@ class SessionStreamRegistry:
     def current_seq(self, session_key: str) -> int:
         return self._seq_by_session.get(session_key, 0)
 
+    def promote_legacy_cursor(self, session_key: str, since_stream_seq: int | None) -> bool:
+        """Keep pre-generation clients receiving events after a Gateway restart.
+
+        Older clients compare only ``stream_seq`` and therefore discard a new
+        Gateway's low sequence numbers after reconnecting.  A subscribe request
+        without ``since_stream_generation`` is the compatibility signal: raise
+        the process-local counter to the client's safe-integer cursor before the
+        next event is recorded.  Generation-aware clients never use this path.
+        """
+
+        if since_stream_seq is None:
+            return False
+        if not 0 <= since_stream_seq < _JS_MAX_SAFE_INTEGER:
+            return False
+        current = self.current_seq(session_key)
+        if since_stream_seq <= current:
+            return False
+        self._seq_by_session[session_key] = since_stream_seq
+        return True
+
     def record(
         self,
         session_key: str,
@@ -88,6 +129,7 @@ class SessionStreamRegistry:
 
         enriched = dict(payload or {})
         enriched["session_key"] = session_key
+        enriched["stream_generation"] = self.stream_generation
         enriched["stream_seq"] = stream_seq
         enriched["emitted_at"] = _epoch_time_ms()
 
@@ -200,6 +242,22 @@ class SessionStreamRegistry:
                 if events[index].event_name == event.event_name:
                     events[index] = event
                     return
+        elif (
+            event.event_name == "session.event.provider_activity"
+            and event.payload.get("heartbeat") is True
+        ):
+            activity_id = str(event.payload.get("activity_id") or "")
+            phase = str(event.payload.get("phase") or "")
+            for index in range(len(events) - 1, -1, -1):
+                existing = events[index]
+                if existing.event_name != event.event_name:
+                    continue
+                if str(existing.payload.get("activity_id") or "") != activity_id:
+                    continue
+                if str(existing.payload.get("phase") or "") != phase:
+                    continue
+                events[index] = event
+                return
         events.append(event)
 
     def live_snapshot(self, session_key: str) -> LiveTurnSnapshot:
@@ -214,19 +272,42 @@ class SessionStreamRegistry:
             for event in self._live_events_by_session.get(session_key, ())
         ]
         return LiveTurnSnapshot(
+            stream_generation=self.stream_generation,
             current_stream_seq=self.current_seq(session_key),
             task_id=self._live_task_by_session.get(session_key),
             events=events,
         )
 
-    def replay(self, session_key: str, since_stream_seq: int | None) -> ReplayResult:
+    def replay(
+        self,
+        session_key: str,
+        since_stream_seq: int | None,
+        since_stream_generation: str | None = None,
+    ) -> ReplayResult:
         current = self.current_seq(session_key)
+        if (
+            since_stream_generation is not None
+            and since_stream_generation != self.stream_generation
+        ):
+            return ReplayResult(
+                stream_generation=self.stream_generation,
+                current_stream_seq=current,
+                replay_complete=False,
+                events=[],
+                gap_reason="stream_generation_changed",
+            )
         if since_stream_seq is None:
-            return ReplayResult(current_stream_seq=current, replay_complete=True, events=[])
+            return ReplayResult(
+                stream_generation=self.stream_generation,
+                current_stream_seq=current,
+                replay_complete=True,
+                events=[],
+            )
 
         events = list(self._events_by_session.get(session_key, ()))
         if current == 0:
             return ReplayResult(
+                stream_generation=self.stream_generation,
                 current_stream_seq=0,
                 replay_complete=since_stream_seq == 0,
                 events=[],
@@ -235,6 +316,7 @@ class SessionStreamRegistry:
 
         if since_stream_seq > current:
             return ReplayResult(
+                stream_generation=self.stream_generation,
                 current_stream_seq=current,
                 replay_complete=False,
                 events=[],
@@ -242,10 +324,16 @@ class SessionStreamRegistry:
             )
 
         if since_stream_seq == current:
-            return ReplayResult(current_stream_seq=current, replay_complete=True, events=[])
+            return ReplayResult(
+                stream_generation=self.stream_generation,
+                current_stream_seq=current,
+                replay_complete=True,
+                events=[],
+            )
 
         if not events:
             return ReplayResult(
+                stream_generation=self.stream_generation,
                 current_stream_seq=current,
                 replay_complete=False,
                 events=[],
@@ -256,6 +344,7 @@ class SessionStreamRegistry:
         replay_complete = since_stream_seq >= first_seq - 1
         replay_events = [event for event in events if event.stream_seq > since_stream_seq]
         return ReplayResult(
+            stream_generation=self.stream_generation,
             current_stream_seq=current,
             replay_complete=replay_complete,
             events=replay_events,
@@ -267,4 +356,26 @@ _session_streams = SessionStreamRegistry()
 
 
 def get_session_streams() -> SessionStreamRegistry:
+    return _session_streams
+
+
+def reset_session_streams(
+    *,
+    max_events_per_session: int = 500,
+    stream_generation: str | None = None,
+) -> SessionStreamRegistry:
+    """Begin a fresh stream generation for one Gateway lifecycle.
+
+    The Gateway can be stopped and started again inside one Python process
+    (Desktop and embedded deployments do this). Module import lifetime is
+    therefore not a valid stream-generation lifetime. Replacing the registry
+    atomically also clears replay/live snapshots before the new listener can
+    accept subscriptions.
+    """
+
+    global _session_streams
+    _session_streams = SessionStreamRegistry(
+        max_events_per_session=max_events_per_session,
+        stream_generation=stream_generation,
+    )
     return _session_streams

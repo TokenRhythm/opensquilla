@@ -1262,7 +1262,14 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "desktop_changed == 'true'" in jobs["desktop-check"]["if"]
     assert "python_changed == 'true'" in jobs["ubuntu-quality"]["if"]
     assert "full_required == 'true'" in jobs["ubuntu-full"]["if"]
-    assert "platform_sensitive_changed == 'true'" in jobs["windows-compat"]["if"]
+    assert jobs["windows-compat"]["if"] == (
+        "${{ (needs.classify-changes.outputs.python_changed == 'true' || "
+        "needs.classify-changes.outputs.platform_sensitive_changed == 'true' || "
+        "needs.classify-changes.outputs.dependency_changed == 'true' || "
+        "needs.classify-changes.outputs.release_changed == 'true') && "
+        "needs.classify-changes.outputs.windows_full_required != 'true' && "
+        "needs.classify-changes.outputs.full_required != 'true' }}"
+    )
     assert "windows_full_required == 'true'" in jobs["windows-full"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["macos-recovery"]["if"]
     assert "desktop_changed == 'true'" in jobs["macos-recovery"]["if"]
@@ -1396,6 +1403,10 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "test-desktop-gateway-ownership.mjs" in run["run"]
     assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
     assert 'case "${{ matrix.shard }}" in' in run["run"]
+    assert 'local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"' in run["run"]
+    assert '[[ "${RUNNER_OS}" == "Windows" ]]' in run["run"]
+    assert "grep -Fq 'Gateway did not become healthy'" in run["run"]
+    assert 'run_case "${name}" "${script}" 2' in run["run"]
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"
     assert upload["with"]["name"] == (

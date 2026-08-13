@@ -1,9 +1,21 @@
+import fs from 'node:fs'
+import path from 'node:path'
 import { expect, test, type Page } from '@playwright/test'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-assistant-activity'
 const LIFECYCLE_SESSION_KEY = 'agent:main:webchat:e2e-assistant-activity-lifecycle'
 const LIFECYCLE_TASK_ID = 'task-e2e-assistant-activity-lifecycle'
+const ACTIVITY_SCREENSHOT_DIR = process.env.OPENSQUILLA_ACTIVITY_SCREENSHOT_DIR || ''
+
+async function captureActivityScreenshot(page: Page, name: string) {
+  if (!ACTIVITY_SCREENSHOT_DIR) return
+  fs.mkdirSync(ACTIVITY_SCREENSHOT_DIR, { recursive: true, mode: 0o700 })
+  await page.screenshot({
+    path: path.join(ACTIVITY_SCREENSHOT_DIR, `${name}.png`),
+    fullPage: true,
+  })
+}
 
 interface ActivityFixture {
   failed?: boolean
@@ -279,6 +291,14 @@ async function mockControlledActivityLifecycle(
         id: 'activity-lifecycle-assistant',
         message_id: 'activity-lifecycle-assistant',
         timestamp: Math.floor(Date.now() / 1000),
+        usage: {
+          model: 'test/activity',
+          input_tokens: 12,
+          output_tokens: 4,
+          cached_tokens: 3,
+          reasoning_tokens: 2,
+          cost_usd: 0.0012,
+        },
         tool_calls: [{
           tool_use_id: 'activity-inspect',
           name: 'read_file',
@@ -346,7 +366,7 @@ async function mockControlledActivityLifecycle(
 }
 
 test.describe('Completed assistant activity disclosure', () => {
-  test('uses one completion receipt for Default, Plan, Goal, and Cron turns', async ({
+  test('uses compact footer usage for Default, Plan, Goal, and Cron turns', async ({
     page,
   }) => {
     await mockUnifiedTurnReceiptHistory(page)
@@ -356,30 +376,33 @@ test.describe('Completed assistant activity disclosure', () => {
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
 
     const kinds = ['default', 'plan', 'goal', 'cron'] as const
-    await expect(page.locator('.msg-ai .assistant-activity')).toHaveCount(kinds.length)
-    await expect(page.locator('.msg-ai .msg-meta__more-btn')).toHaveCount(0)
+    await expect(page.locator('.msg-ai .assistant-activity')).toHaveCount(0)
+    await expect(page.locator('.msg-ai .msg-meta__more-btn')).toHaveCount(kinds.length)
 
     for (const kind of kinds) {
       const message = page.locator(
         `.msg-ai[data-message-id="assistant-unified-receipt-${kind}"]`,
       )
       await expect(message).toBeVisible()
-      const receipt = message.getByTestId('assistant-activity')
-      await expect(receipt).toHaveCount(1)
-      const trigger = receipt.locator('.assistant-activity__summary')
-      await expect(trigger).toContainText(kind === 'plan' ? 'Planning process' : 'Completed')
-      await expect(trigger).toHaveAttribute('aria-expanded', 'false')
+      const trigger = message.getByRole('button', { name: 'Usage details' })
+      await expect(trigger).toHaveCount(1)
       await trigger.click()
       await expect(trigger).toHaveAttribute('aria-expanded', 'true')
-      const usage = receipt.locator('[data-turn-usage-details]')
+      const usage = message.locator('.msg-meta-popover')
       await expect(usage).toBeVisible()
       await expect(usage).toContainText(`${kind}-e2e`)
-      await expect(usage).toContainText(/tokens/i)
+      await expect(usage).toContainText(`↑${100 + kinds.indexOf(kind)}`)
+      await page.keyboard.press('Escape')
+      await expect(usage).toHaveCount(0)
+      await expect(trigger).toBeFocused()
     }
 
     await expect(
       page.locator('.msg-ai[data-message-id="assistant-unified-receipt-plan"] .plan-card'),
     ).toBeVisible()
+    await expect(
+      page.locator('.msg-ai[data-message-id="assistant-unified-receipt-plan"] .msg-ai-actions'),
+    ).toHaveCount(0)
     await expect(
       page.locator('.msg-ai[data-message-id="assistant-unified-receipt-cron"] .msg-provenance-chip'),
     ).toContainText('Scheduled')
@@ -563,6 +586,53 @@ test.describe('Completed assistant activity disclosure', () => {
     )
     expect(pageOverflow).toBeLessThanOrEqual(1)
   })
+
+  for (const width of [1440, 390] as const) {
+    for (const theme of ['light', 'dark'] as const) {
+      for (const reducedMotion of ['no-preference', 'reduce'] as const) {
+        test(`keeps compact receipts inside ${width}px ${theme} ${reducedMotion}`, async ({
+          page,
+        }) => {
+          const runtimeErrors: string[] = []
+          page.on('pageerror', error => runtimeErrors.push(error.message))
+          page.on('console', message => {
+            if (
+              message.type() === 'error'
+              && !message.text().startsWith('Failed to load resource:')
+            ) runtimeErrors.push(message.text())
+          })
+          await page.setViewportSize({ width, height: width === 390 ? 844 : 900 })
+          await page.emulateMedia({ reducedMotion })
+          await page.addInitScript(selectedTheme => {
+            window.localStorage.setItem('opensquilla-theme', selectedTheme)
+          }, theme)
+          await mockUnifiedTurnReceiptHistory(page)
+          await page.goto(
+            CONTROL_URL
+            + 'chat?session='
+            + encodeURIComponent(`${SESSION_KEY}-${width}-${theme}-${reducedMotion}`),
+          )
+          await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+          await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
+          await expect(page.locator('.msg-ai .msg-meta__more-btn')).toHaveCount(4)
+          await expect(page.locator('.msg-ai .assistant-activity')).toHaveCount(0)
+
+          const cronMessage = page.locator(
+            '.msg-ai[data-message-id="assistant-unified-receipt-cron"]',
+          )
+          const trigger = cronMessage.getByRole('button', { name: 'Usage details' })
+          await trigger.click()
+          const popover = cronMessage.locator('.msg-meta-popover')
+          await expect(popover).toBeVisible()
+          const box = await popover.boundingBox()
+          expect(box).not.toBeNull()
+          expect(box!.x).toBeGreaterThanOrEqual(0)
+          expect(box!.x + box!.width).toBeLessThanOrEqual(width)
+          expect(runtimeErrors).toEqual([])
+        })
+      }
+    }
+  }
 })
 
 test.describe('Live assistant activity lifecycle', () => {
@@ -667,6 +737,7 @@ test.describe('Live assistant activity lifecycle', () => {
       element.closest('.assistant-activity') === null,
     )).toBe(true)
     await expect(liveActivity).toBeVisible()
+    await captureActivityScreenshot(page, '01-running-expanded')
 
     lifecycle.finish()
     await expect(liveActivity).toHaveCount(0)
@@ -680,12 +751,31 @@ test.describe('Live assistant activity lifecycle', () => {
     expect(await finalAnswer.evaluate(element =>
       element.closest('.assistant-activity') === null,
     )).toBe(true)
-    await settled.locator('.assistant-activity__summary').click()
-    await expect(settled.getByText('Draft candidate.', { exact: true })).toBeVisible()
+    expect(await settled.evaluate((activity) => {
+      const answer = activity.parentElement?.querySelector('.assistant-answer')
+      return !!answer && !!(activity.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING)
+    })).toBe(true)
+    await captureActivityScreenshot(page, '02-completed-collapsed')
+    // The fixture uses a paused browser clock. Motion has already been
+    // asserted above; disable it before the settled disclosure interaction so
+    // Chromium does not remain frozen on the transition's first frame.
+    await page.emulateMedia({ reducedMotion: 'reduce' })
+    const settledSummary = settled.locator('.assistant-activity__summary')
+    await settledSummary.click()
+    await expect(settledSummary).toHaveAttribute('aria-expanded', 'true')
+    await expect(settled).toHaveAttribute('data-share-expanded', 'true')
+    await expect(settled.locator('.assistant-activity__body')).toBeVisible()
+    const settledDraft = settled.getByText('Draft candidate.', { exact: true })
+    await expect(settledDraft).toBeVisible()
+    await captureActivityScreenshot(page, '03-completed-expanded')
     await expect(
       settled.getByText('Final verified answer.', { exact: true }),
     ).toHaveCount(0)
     await expect(page.getByText('Final verified answer.', { exact: true })).toHaveCount(1)
+    const usageTrigger = page.locator('.msg-ai .msg-meta__more-btn')
+    await usageTrigger.click()
+    await expect(page.locator('.msg-ai .msg-meta-popover')).toBeVisible()
+    await captureActivityScreenshot(page, '04-usage-popover')
   })
 
   test('disables live activity motion when reduced motion is requested', async ({ page }) => {

@@ -717,8 +717,10 @@ try {
   }, null, 2))
 } catch (error) {
   const desktopLog = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8').catch(() => '')
+  const gatewayLog = await readFile(join(userData, 'logs', 'gateway.log'), 'utf8').catch(() => '')
   console.error(JSON.stringify({
     desktopLogTail: desktopLog.slice(-8_000),
+    gatewayLogTail: gatewayLog.slice(-8_000),
     rendererDiagnostics: rendererDiagnostics.slice(-30),
   }, null, 2))
   throw error

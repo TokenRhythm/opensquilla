@@ -3224,6 +3224,7 @@ def test_consolidation_e2e_waits_for_primary_route_and_emits_renderer_diagnostic
     assert "page.on('console'" in source
     assert "page.on('pageerror'" in source
     assert "windows=${JSON.stringify(windows)}" in control
+    assert "gatewayLogTail: gatewayLog.slice(-8_000)" in source
 
 
 def test_consolidation_e2e_covers_receipt_replay_and_inactive_state_archival() -> None:

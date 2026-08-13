@@ -92,7 +92,11 @@ def _store_dispatch_truncated_snapshot(
     content: str,
 ) -> dict[str, Any] | None:
     """Persist raw output that dispatch-level result budgets truncated."""
-    if ctx is None or not ctx.tool_result_store_dir:
+    if (
+        ctx is None
+        or not ctx.tool_result_store_dir
+        or not ctx.tool_result_retrieval_available
+    ):
         return None
 
     session_id = (
@@ -404,16 +408,27 @@ async def finalize(
             is_error=is_error,
             arguments=call.arguments,
         )
-        content = budgeted.content
-        if budgeted.changed:
-            content = _attach_dispatch_truncated_snapshot(
-                content=content,
-                snapshot=_store_dispatch_truncated_snapshot(
-                    ctx=ctx,
-                    call=call,
-                    content=raw_budget_content,
-                ),
+        snapshot = (
+            _store_dispatch_truncated_snapshot(
+                ctx=ctx,
+                call=call,
+                content=raw_budget_content,
             )
+            if budgeted.changed
+            else None
+        )
+        content = (
+            _attach_dispatch_truncated_snapshot(
+                content=budgeted.content,
+                snapshot=snapshot,
+            )
+            if snapshot is not None
+            else budgeted.content
+        )
+        # Dispatch limits are hard safety budgets. When retrieval is visible,
+        # attach a Store handle to make the bounded result recoverable. When it
+        # is unavailable, keep the bounded result's explicit truncation marker
+        # rather than inventing a handle the model cannot use.
         if budgeted.changed and execution_status is not None:
             execution_status = mark_execution_status_truncated(execution_status)
     return ToolResult(

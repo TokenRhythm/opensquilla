@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from 'vitest'
-import { nextTick, ref, watch } from 'vue'
+import { effectScope, nextTick, ref, watch } from 'vue'
 
 import { useChatSend, type UseChatSendOptions } from './useChatSend'
+import { useChatRpcEventHandlers } from './useChatRpcEventHandlers'
 import {
   snapshotSteerRequest,
   useChatSteerDelivery,
 } from './useChatSteerDelivery'
+import { useChatTaskOwnership } from './useChatTaskOwnership'
 import { useChatMessageActions } from './useChatMessageActions'
 import type { FoldLiveTurnMode } from './useChatTurnLog'
 import type {
@@ -19,7 +21,10 @@ import {
   useChatPendingQueue,
   type BusySendMode,
 } from '@/composables/chat/useChatPendingQueue'
-import { FINISHED_STREAM_TASK_ID, STOPPED_STREAM_TASK_ID } from '@/utils/chat/streamEvents'
+import {
+  FINISHED_STREAM_TASK_ID,
+  PENDING_STREAM_TASK_ID,
+} from '@/utils/chat/streamEvents'
 import {
   listHiddenControls,
   persistHiddenControl,
@@ -29,6 +34,10 @@ import {
   listPendingMetaDiscards,
   persistPendingMetaDiscard,
 } from '@/utils/chat/metaDiscardOutbox'
+import type {
+  PendingInputWal,
+  ResponseHandoffWalRecord,
+} from '@/utils/chat/pendingInputWal'
 
 const pushToast = vi.hoisted(() => vi.fn())
 
@@ -42,6 +51,31 @@ function memoryStorage(): HiddenControlStorage {
     getItem: key => values.get(key) ?? null,
     setItem: (key, value) => { values.set(key, value) },
     removeItem: key => { values.delete(key) },
+  }
+}
+
+function memoryHandoffWal(): PendingInputWal {
+  const handoffs = new Map<string, ResponseHandoffWalRecord>()
+  return {
+    put: async () => {},
+    list: async () => [],
+    delete: async () => {},
+    putHandoff: async record => { handoffs.set(record.ownerRequestId, structuredClone(record)) },
+    listHandoffs: async () => [...handoffs.values()].map(record => structuredClone(record)),
+    acceptHandoff: async (ownerRequestId, acceptedSessionKey) => {
+      const record = handoffs.get(ownerRequestId)
+      if (!record) throw new Error('missing handoff')
+      const handoff = {
+        ...record,
+        state: 'accepted' as const,
+        acceptedSessionKey,
+        updatedAt: Date.now(),
+      }
+      handoffs.set(ownerRequestId, handoff)
+      return { handoff, records: [] }
+    },
+    deleteHandoff: async ownerRequestId => { handoffs.delete(ownerRequestId) },
+    close: () => {},
   }
 }
 
@@ -84,6 +118,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
   const enqueuePendingSteerAttempt = overrides.enqueuePendingSteerAttempt
     ?? ((payload) => {
       const item: ChatPendingItem = {
+        pendingUiId: `pending-ui-${pendingQueue.value.length}`,
         text: payload.request.message,
         attachments: [],
         intent: null,
@@ -102,6 +137,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     messages,
     sessionKey: ref('agent:main:webchat:test'),
     pendingQueueOwnerContext: ref(null),
+    pendingInputWal: memoryHandoffWal(),
     busySendMode: ref<BusySendMode>('queue'),
     modelRoutingMode: ref<'off'>('off'),
     modelRoutingSettingsBusy: ref(false),
@@ -152,6 +188,249 @@ function sameTurnSteerOptions(
 }
 
 describe('useChatSend attachment payloads', () => {
+  it('replays a persisted handoff identity after refresh and repairs its owner queue', async () => {
+    const parent = 'agent:main:webchat:parent'
+    const child = 'agent:main:webchat:child'
+    const other = 'agent:main:webchat:other'
+    const params = {
+      sessionKey: parent,
+      clientRequestId: 'fork-refresh-request',
+      clientMessageId: 'fork-refresh-message',
+      message: 'fork request',
+      forkBeforeMessageId: 'fork-before',
+      _source: { runMode: 'safe' as const },
+    }
+    const handoffs = new Map<string, ResponseHandoffWalRecord>([[
+      params.clientRequestId,
+      {
+        schemaVersion: 1,
+        ownerRequestId: params.clientRequestId,
+        requestSessionKey: parent,
+        clientRequestId: params.clientRequestId,
+        clientMessageId: params.clientMessageId,
+        composerText: 'fork request',
+        recoveryAttachments: [],
+        params,
+        state: 'submitting',
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ]])
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { handoffs.set(record.ownerRequestId, structuredClone(record)) },
+      listHandoffs: async () => [...handoffs.values()].map(record => structuredClone(record)),
+      deleteHandoff: async ownerRequestId => { handoffs.delete(ownerRequestId) },
+      close: () => {},
+    }
+    const recoverPendingQueueHandoff = vi.fn(async () => {})
+    const adoptResponseSession = vi.fn()
+    const rpc = {
+      call: vi.fn(async () => ({ sessionKey: child, replayed: true })),
+    } as unknown as UseChatSendOptions['rpc']
+    const { api } = makeOptions({
+      rpc,
+      sessionKey: ref(other),
+      pendingInputWal,
+      recoverPendingQueueHandoff,
+      adoptResponseSession,
+    })
+
+    await api.recoverResponseHandoffs()
+
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', params)
+    expect(recoverPendingQueueHandoff).toHaveBeenCalledWith(
+      parent,
+      child,
+      params.clientRequestId,
+    )
+    expect(adoptResponseSession).not.toHaveBeenCalled()
+    expect(handoffs.size).toBe(0)
+  })
+
+  it('restores a failed handoff draft from durable attachment recovery material', async () => {
+    const sessionKey = 'agent:main:webchat:failed-fork'
+    const attachment = {
+      kind: 'staged' as const,
+      local_id: 84,
+      name: 'recover.txt',
+      mime: 'text/plain',
+      file_uuid: 'expired-upload',
+    }
+    const record: ResponseHandoffWalRecord = {
+      schemaVersion: 1,
+      ownerRequestId: 'failed-fork-request',
+      requestSessionKey: sessionKey,
+      clientRequestId: 'failed-fork-request',
+      clientMessageId: 'failed-fork-message',
+      composerText: 'restore the fork draft',
+      recoveryAttachments: [attachment],
+      params: {
+        sessionKey,
+        clientRequestId: 'failed-fork-request',
+        clientMessageId: 'failed-fork-message',
+        message: 'restore the fork draft',
+        forkBeforeMessageId: 'fork-source-message',
+      },
+      state: 'failed',
+      errorCode: 'ATTACHMENT_EXPIRED',
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    let retained: ResponseHandoffWalRecord | null = record
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const inputText = ref('')
+    const pendingAttachments = ref<Attachment[]>([])
+    const pendingForkBeforeMessageId = ref<string | null>(null)
+    const { api, rpc } = makeOptions({
+      sessionKey: ref(sessionKey),
+      inputText,
+      pendingAttachments,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+    })
+
+    await api.recoverResponseHandoffs()
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('restore the fork draft')
+    expect(pendingAttachments.value).toEqual([attachment])
+    expect(pendingForkBeforeMessageId.value).toBe('fork-source-message')
+    expect(retained).toBeNull()
+  })
+
+  it('refreshes expired handoff attachments only after a definite rejection', async () => {
+    const parent = 'agent:main:webchat:expired-fork-parent'
+    const child = 'agent:main:webchat:expired-fork-child'
+    const file = new File(['durable'], 'durable.txt', { type: 'text/plain' })
+    const attachment: Attachment = {
+      kind: 'staged',
+      local_id: 85,
+      name: 'durable.txt',
+      mime: 'text/plain',
+      size: file.size,
+      file_uuid: 'expired-upload',
+      expires_at: 1,
+      file,
+    }
+    let retained: ResponseHandoffWalRecord | null = {
+      schemaVersion: 1,
+      ownerRequestId: 'expired-fork-request',
+      requestSessionKey: parent,
+      clientRequestId: 'expired-fork-request',
+      clientMessageId: 'expired-fork-message',
+      composerText: 'retry the fork attachment',
+      recoveryAttachments: [attachment],
+      params: {
+        sessionKey: parent,
+        clientRequestId: 'expired-fork-request',
+        clientMessageId: 'expired-fork-message',
+        message: 'retry the fork attachment',
+        forkBeforeMessageId: 'fork-source-message',
+        attachments: [{
+          type: attachment.mime,
+          name: attachment.name,
+          mime: attachment.mime,
+          file_uuid: 'expired-upload',
+        }],
+      },
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 2,
+    }
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      acceptHandoff: async (_ownerRequestId, acceptedSessionKey) => ({
+        handoff: { ...retained!, state: 'accepted', acceptedSessionKey },
+        records: [],
+      }),
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const prepareAttachmentsForSend = vi.fn(async ({ attachments }) => {
+      const staged = attachments?.[0]
+      if (staged?.kind === 'staged') {
+        staged.file_uuid = 'refreshed-upload'
+        staged.expires_at = Date.now() + 60_000
+      }
+      return true
+    })
+    const recoverPendingQueueHandoff = vi.fn().mockResolvedValue(undefined)
+    const { api, rpc } = makeOptions({
+      sessionKey: ref('agent:main:webchat:another-session'),
+      pendingInputWal,
+      prepareAttachmentsForSend,
+      recoverPendingQueueHandoff,
+    })
+    rpc.call
+      .mockRejectedValueOnce(Object.assign(new Error('expired'), {
+        accepted: false,
+        retryable: true,
+        code: 'ATTACHMENT_EXPIRED',
+      }))
+      .mockResolvedValueOnce({ sessionKey: child, task_id: 'task-refreshed' })
+
+    await api.recoverResponseHandoffs()
+
+    expect(prepareAttachmentsForSend).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledTimes(2)
+    const replay = rpc.call.mock.calls[1]?.[1] as { attachments?: Array<{ file_uuid?: string }> }
+    expect(replay.attachments?.[0]?.file_uuid).toBe('refreshed-upload')
+    expect(replay).toMatchObject({
+      clientRequestId: 'expired-fork-request',
+      clientMessageId: 'expired-fork-message',
+      sessionKey: parent,
+    })
+    expect(recoverPendingQueueHandoff).toHaveBeenCalledWith(
+      parent,
+      child,
+      'expired-fork-request',
+    )
+    expect(retained).toBeNull()
+  })
+
+  it('keeps a follow-up in the composer when fork handoff WAL is unavailable', async () => {
+    let resolveSend!: (value: unknown) => void
+    const rpc = {
+      call: vi.fn(<T = unknown>() => new Promise<T>(resolve => {
+        resolveSend = resolve as (value: unknown) => void
+      })) as UseChatSendOptions['rpc']['call'],
+    }
+    const inputText = ref('fork without browser WAL')
+    const enqueuePendingInput = vi.fn(() => true)
+    const harness = makeOptions({
+      rpc,
+      inputText,
+      pendingInputWal: null,
+      pendingForkBeforeMessageId: ref('fork-before-message'),
+      enqueuePendingInput,
+    })
+
+    const forkSend = harness.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    inputText.value = 'must remain editable'
+    await harness.api.onSend()
+
+    expect(enqueuePendingInput).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('must remain editable')
+    resolveSend({ sessionKey: 'agent:main:webchat:fork-child' })
+    await forkSend
+  })
+
   it('uses a supplied stable ingress id for a resumed hidden control', async () => {
     const { api, rpc } = makeOptions()
 
@@ -649,13 +928,14 @@ describe('useChatSend attachment payloads', () => {
   })
 
   it.each(['/status', '!pwd'])(
-    'queues busy control input %s without sending it as same-turn steer',
+    'keeps busy control input %s in the composer without delayed delivery',
     async input => {
       const enqueuePendingInput = vi.fn(() => true)
       const executeSlashCommand = vi.fn(async () => true)
+      const inputText = ref(input)
       const { api, rpc, stream } = makeOptions({
         ...sameTurnSteerOptions(),
-        inputText: ref(input),
+        inputText,
         busySendMode: ref<BusySendMode>('steer'),
         enqueuePendingInput,
         executeSlashCommand,
@@ -664,9 +944,10 @@ describe('useChatSend attachment payloads', () => {
 
       await api.onSend()
 
-      expect(enqueuePendingInput).toHaveBeenCalledWith(input, undefined)
+      expect(enqueuePendingInput).not.toHaveBeenCalled()
       expect(executeSlashCommand).not.toHaveBeenCalled()
       expect(rpc.call).not.toHaveBeenCalled()
+      expect(inputText.value).toBe(input)
     },
   )
 
@@ -680,6 +961,7 @@ describe('useChatSend attachment payloads', () => {
       stream.isStreaming.value = true
 
       await expect(api.sendQueuedSteer({
+        pendingUiId: `pending-ui-control-${input}`,
         text: input,
         attachments: [],
         intent: null,
@@ -744,6 +1026,7 @@ describe('useChatSend attachment payloads', () => {
   it('preserves queued and hidden sends while live delivery is blocked', async () => {
     const blocker = ref<string | null>('Live updates are unavailable')
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-live-blocked',
       text: 'keep this queued',
       attachments: [],
       intent: null,
@@ -756,6 +1039,7 @@ describe('useChatSend attachment payloads', () => {
 
     expect(rpc.call).not.toHaveBeenCalled()
     expect(queued).toEqual({
+      pendingUiId: 'pending-ui-live-blocked',
       text: 'keep this queued',
       attachments: [],
       intent: null,
@@ -800,6 +1084,7 @@ describe('useChatSend attachment payloads', () => {
         }),
     }
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-hidden-retry',
       text: 'provider confirmation',
       displayTextOverride: 'Confirmed',
       attachments: [],
@@ -1037,6 +1322,7 @@ describe('useChatSend attachment payloads', () => {
   it('keeps queued delivery owned when project validation blocks it', async () => {
     const validateActiveProjectBeforeSend = vi.fn(async () => 'removed')
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-project-blocked',
       text: 'keep queued',
       attachments: [],
       intent: null,
@@ -1070,6 +1356,7 @@ describe('useChatSend attachment payloads', () => {
       },
     ))
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-project-race',
       text: 'queued follow-up',
       attachments: [],
       intent: null,
@@ -1155,6 +1442,104 @@ describe('useChatSend attachment payloads', () => {
       workspaceId: 'project-a',
     }))
     expect(pendingWorkspaceId.value).toBeNull()
+  })
+
+  it('dispatches a server-staged follow-up by its durable identity', async () => {
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-pending-dispatch',
+        message_id: 'message-pending-dispatch',
+      }),
+    }
+    const { api } = makeOptions({ rpc })
+    const item: ChatPendingItem = {
+      pendingUiId: 'pending-stable-id',
+      text: 'dispatch this staged input',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+      pendingInputId: 'pending-stable-id',
+      pendingClientRequestId: 'request-stable-id',
+      pendingClientMessageId: 'message-stable-id',
+      pendingRequestFingerprint: 'fingerprint-stable-id',
+      pendingPersistenceState: 'staged',
+    }
+
+    await expect(api.sendQueuedFollowup(item)).resolves.toBe('accepted')
+    expect(rpc.call).toHaveBeenCalledWith('sessions.pending_inputs.dispatch', {
+      key: 'agent:main:webchat:test',
+      pendingInputId: 'pending-stable-id',
+      clientRequestId: 'request-stable-id',
+      requestFingerprint: 'fingerprint-stable-id',
+    })
+  })
+
+  it('reuses IndexedDB-only identities when an older Gateway lacks staged dispatch', async () => {
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-local-only-dispatch',
+        message_id: 'message-local-only-dispatch',
+      }),
+    }
+    const { api } = makeOptions({ rpc })
+    const item: ChatPendingItem = {
+      pendingUiId: 'pending-local-only-id',
+      text: 'dispatch this browser-only input',
+      attachments: [],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+      pendingInputId: 'pending-local-only-id',
+      pendingClientRequestId: 'request-local-only-id',
+      pendingClientMessageId: 'message-local-only-id',
+      pendingPersistenceState: 'local_only',
+    }
+
+    await expect(api.sendQueuedFollowup(item)).resolves.toBe('accepted')
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId: 'request-local-only-id',
+      clientMessageId: 'message-local-only-id',
+      message: 'dispatch this browser-only input',
+    }))
+  })
+
+  it('dispatches server-restored attachment material without an upload UUID', async () => {
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-pending-material',
+        message_id: 'message-pending-material',
+      }),
+    }
+    const { api } = makeOptions({ rpc })
+    const item: ChatPendingItem = {
+      pendingUiId: 'pending-material-id',
+      text: '',
+      attachments: [{
+        kind: 'staged',
+        local_id: -1,
+        name: 'restored.txt',
+        mime: 'text/plain',
+        size: 12,
+        durable_material: true,
+      }],
+      intent: null,
+      ownerSessionKey: 'agent:main:webchat:test',
+      pendingInputId: 'pending-material-id',
+      pendingClientRequestId: 'request-material-id',
+      pendingClientMessageId: 'message-material-id',
+      pendingRequestFingerprint: 'fingerprint-material-id',
+      pendingPersistenceState: 'staged',
+    }
+
+    await expect(api.sendQueuedFollowup(item)).resolves.toBe('accepted')
+    expect(rpc.call).toHaveBeenCalledWith('sessions.pending_inputs.dispatch', {
+      key: 'agent:main:webchat:test',
+      pendingInputId: 'pending-material-id',
+      clientRequestId: 'request-material-id',
+      requestFingerprint: 'fingerprint-material-id',
+    })
   })
 
   it('does not materialize a project draft before chat.send accepts it', async () => {
@@ -1685,6 +2070,7 @@ describe('useChatSend attachment payloads', () => {
       if (method === 'chat.send') {
         return { sessionKey: childSessionKey, task_id: 'task-child' }
       }
+      if (method === 'chat.abort') return { aborted: true }
       return { ok: true }
     })
     const rpc: UseChatSendOptions['rpc'] = {
@@ -1703,6 +2089,8 @@ describe('useChatSend attachment payloads', () => {
     })
 
     api.onStop()
+    // Stop remains pending until the authoritative terminal is observed.
+    stream.endStreaming({ reason: 'aborted' })
     pendingForkBeforeMessageId.value = 'msg-B'
     options.inputText.value = 'edited question'
     await api.onSend()
@@ -1779,6 +2167,9 @@ describe('useChatSend attachment payloads', () => {
     }))
 
     harness.api.onStop()
+    // The message action becomes available only after the stopped turn's
+    // terminal closes the live stream.
+    harness.stream.endStreaming({ reason: 'aborted' })
     const actions = useChatMessageActions({
       messages,
       inputText,
@@ -2035,6 +2426,7 @@ describe('useChatSend attachment payloads', () => {
       },
     ])
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-late-adjustment',
       text: 'late adjustment',
       attachments: [],
       intent: null,
@@ -2120,6 +2512,7 @@ describe('useChatSend attachment payloads', () => {
     })
     stream.isStreaming.value = true
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-composer-snapshot',
       text: 'steer with the queued snapshot',
       attachments: [],
       intent: null,
@@ -2163,10 +2556,44 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
   })
 
+  it('allows an explicit queued Steer while authoritative A is running', async () => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('turn-current')
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        accepted: true,
+        turn_id: 'turn-current',
+        disposition: 'steering',
+      }),
+    }
+    const { api, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      taskOwnership,
+      rpc,
+    })
+    stream.isStreaming.value = true
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-authoritative-running-steer',
+      text: 'apply this correction to A',
+      attachments: [],
+      intent: null,
+    }
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
+    expect(rpc.call).toHaveBeenCalledWith(
+      'sessions.steer.v2',
+      expect.objectContaining({
+        message: 'apply this correction to A',
+        expected_turn_id: 'turn-current',
+      }),
+    )
+  })
+
   it('defers an automatic queued follow-up if another run became active', async () => {
     const inputText = ref('new live draft')
     const { api, rpc, stream } = makeOptions({ inputText })
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-active-run',
       text: 'wait for the active run',
       attachments: [],
       intent: null,
@@ -2198,6 +2625,7 @@ describe('useChatSend attachment payloads', () => {
       hasPendingAttachmentWork: () => preparing,
     })
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-attachment-preparation',
       text: 'wait for composer preparation',
       attachments: [],
       intent: null,
@@ -2239,6 +2667,7 @@ describe('useChatSend attachment payloads', () => {
     })
     stream.isStreaming.value = true
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-ambiguous-steer',
       text: 'retry this queued steer',
       attachments: [],
       intent: null,
@@ -2272,6 +2701,7 @@ describe('useChatSend attachment payloads', () => {
   it('does not send a queued steer when the gateway exposes no same-turn capability', async () => {
     const { api, options, rpc, stream } = makeOptions()
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-no-capability',
       text: 'send after the prior turn',
       attachments: [],
       intent: null,
@@ -2293,6 +2723,7 @@ describe('useChatSend attachment payloads', () => {
       error: 'upload failed',
     }
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-failed-attachment',
       text: 'keep the failed attachment recoverable',
       attachments: [failed],
       intent: null,
@@ -2315,6 +2746,7 @@ describe('useChatSend attachment payloads', () => {
     }
     const inputText = ref('unrelated live draft')
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-ensemble-image',
       text: 'inspect the queued image',
       attachments: [image],
       intent: null,
@@ -2341,6 +2773,7 @@ describe('useChatSend attachment payloads', () => {
       file_uuid: 'queued-image-busy',
     }
     const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-routing-update',
       text: 'wait for the routing update',
       attachments: [image],
       intent: null,
@@ -2420,10 +2853,15 @@ describe('useChatSend attachment payloads', () => {
     const inputText = ref('edited question')
     let resolveRetry!: (value: unknown) => void
     let sendCount = 0
+    let childAbortCalls = 0
     const rpcCall = vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
       if (method === 'chat.abort') {
         if (params?.sessionKey === childSessionKey) {
-          return Promise.reject(new Error('socket closed')) as Promise<T>
+          childAbortCalls += 1
+          if (childAbortCalls === 1) {
+            return Promise.reject(new Error('socket closed')) as Promise<T>
+          }
+          return Promise.resolve({ aborted: true }) as Promise<T>
         }
         return Promise.resolve({ aborted: true }) as Promise<T>
       }
@@ -2441,12 +2879,15 @@ describe('useChatSend attachment payloads', () => {
     const adoptResponseSession = vi.fn(async (key: string) => {
       sessionKey.value = key
     })
+    const acceptanceStopPending = ref(false)
     const harness = makeOptions({
       rpc: { call: rpcCall as UseChatSendOptions['rpc']['call'] },
       sessionKey,
       inputText,
       pendingForkBeforeMessageId: ref('msg-B'),
       adoptResponseSession,
+      acceptanceStopPending,
+      reconcileTaskOwnership: vi.fn(async () => {}),
     })
     harness.stream.endStreaming = vi.fn(() => {
       harness.stream.isStreaming.value = false
@@ -2469,19 +2910,19 @@ describe('useChatSend attachment payloads', () => {
     expect(rpcCall).toHaveBeenCalledWith('chat.abort', {
       sessionKey: childSessionKey,
       taskId: 'task-child',
-      source: 'webui_stale_send',
+      source: 'webui_stop',
       scope: 'task',
     })
-    expect(harness.options.aborted.value).toBe(true)
-    expect(harness.options.activeStreamTaskId.value).toBe(STOPPED_STREAM_TASK_ID)
+    expect(harness.options.aborted.value).toBe(false)
+    expect(harness.options.activeStreamTaskId.value).toBe('task-child')
     expect(harness.options.activeStreamSessionKey.value).toBe(childSessionKey)
     expect(harness.stream.isStreaming.value).toBe(false)
-    await vi.waitFor(() => expect(harness.options.messages.value).toContainEqual(
-      expect.objectContaining({
-        role: 'system',
-        text: 'Stop could not reach the server — the run may still be finishing.',
-      }),
-    ))
+    await vi.waitFor(() => expect(childAbortCalls).toBe(2))
+    expect(acceptanceStopPending.value).toBe(false)
+    expect(harness.options.messages.value).not.toContainEqual(expect.objectContaining({
+      role: 'system',
+      text: 'Stop could not reach the server — the run may still be finishing.',
+    }))
   })
 
   it('uses a new id when the user changes a recovered attempt before resending', async () => {
@@ -3261,16 +3702,16 @@ describe('useChatSend attachment payloads', () => {
     expect(rpc.call).toHaveBeenCalledWith('chat.abort', {
       sessionKey: childSessionKey,
       taskId: 'task-child',
-      source: 'webui_stale_send',
+      source: 'webui_stop',
       scope: 'task',
     })
     expect(harness.options.messages.value.find(
       message => message.clientId === optimisticClientId,
     )?.messageId).toBeUndefined()
-    expect(harness.options.aborted.value).toBe(true)
-    expect(harness.options.activeStreamTaskId.value).toBe(STOPPED_STREAM_TASK_ID)
+    expect(harness.options.aborted.value).toBe(false)
+    expect(harness.options.activeStreamTaskId.value).toBe('task-child')
     expect(harness.options.activeStreamSessionKey.value).toBe(childSessionKey)
-    expect(harness.stream.isStreaming.value).toBe(false)
+    expect(harness.stream.isStreaming.value).toBe(true)
   })
 
   it('still aborts a stopped fork response after navigation to another session', async () => {
@@ -3280,6 +3721,7 @@ describe('useChatSend attachment payloads', () => {
     const otherSessionKey = 'agent:main:webchat:other'
     const sessionKey = ref(parentSessionKey)
     let resolveFork!: (value: unknown) => void
+    let childAbortCalls = 0
     const rpc = {
       call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
         if (method === 'chat.send') {
@@ -3288,17 +3730,24 @@ describe('useChatSend attachment payloads', () => {
           })
         }
         if (params?.sessionKey === childSessionKey) {
-          return Promise.reject(new Error('socket closed')) as Promise<T>
+          childAbortCalls += 1
+          if (childAbortCalls === 1) {
+            return Promise.reject(new Error('socket closed')) as Promise<T>
+          }
+          return Promise.resolve({ aborted: true }) as Promise<T>
         }
         return Promise.resolve({ aborted: true }) as Promise<T>
       }) as UseChatSendOptions['rpc']['call'],
     }
     const adoptResponseSession = vi.fn()
+    const acceptanceStopPending = ref(false)
     const harness = makeOptions({
       rpc,
       sessionKey,
       pendingForkBeforeMessageId: ref('msg-B'),
       adoptResponseSession,
+      acceptanceStopPending,
+      reconcileTaskOwnership: vi.fn(async () => {}),
     })
     harness.stream.startStreaming = vi.fn(() => {
       harness.stream.isStreaming.value = true
@@ -3322,9 +3771,10 @@ describe('useChatSend attachment payloads', () => {
     expect(rpc.call).toHaveBeenCalledWith('chat.abort', {
       sessionKey: childSessionKey,
       taskId: 'task-child-late',
-      source: 'webui_stale_send',
+      source: 'webui_stop',
       scope: 'task',
     })
+    await vi.waitFor(() => expect(childAbortCalls).toBe(2))
     expect(adoptResponseSession).not.toHaveBeenCalled()
     expect(sessionKey.value).toBe(otherSessionKey)
     await Promise.resolve()
@@ -3332,10 +3782,11 @@ describe('useChatSend attachment payloads', () => {
       role: 'system',
       text: 'Stop could not reach the server — the run may still be finishing.',
     }))
-    expect(pushToast).toHaveBeenCalledWith(
+    expect(pushToast).not.toHaveBeenCalledWith(
       'Stop could not reach the server — the run may still be finishing.',
-      { tone: 'warn', duration: 8000 },
+      expect.anything(),
     )
+    expect(acceptanceStopPending.value).toBe(false)
   })
 
   it('binds an orphan message id and reconciles history for an accepted queue error', async () => {
@@ -3574,7 +4025,7 @@ describe('useChatSend attachment payloads', () => {
     expect(bindActiveStreamTask).toHaveBeenCalledWith('task-new')
   })
 
-  it('shows an empty-output Stop as typed state on the user turn, never a synthetic bubble', async () => {
+  it('waits for an empty-output Stop terminal instead of synthesizing one locally', async () => {
     let resolveSend!: (value: unknown) => void
     const rpc = {
       call: vi.fn(<T = unknown>(method: string) => {
@@ -3600,15 +4051,11 @@ describe('useChatSend attachment payloads', () => {
       scope: 'task',
     })
 
-    expect(user).toMatchObject({
-      role: 'user',
-      turnOutcome: {
-        status: 'cancelled',
-        cancellationSource: 'webui_stop',
-      },
-    })
+    expect(user).toMatchObject({ role: 'user' })
+    expect(user?.turnOutcome).toBeUndefined()
     expect(options.messages.value).toHaveLength(1)
     expect(options.messages.value.some(message => message.stopNotice)).toBe(false)
+    expect(stream.endStreaming).not.toHaveBeenCalled()
 
     resolveSend({
       sessionKey: 'agent:main:webchat:test',
@@ -3620,12 +4067,1242 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value[0]).toMatchObject({
       messageId: 'user-stopped',
       turnId: 'turn-stopped',
-      turnOutcome: {
-        turnId: 'turn-stopped',
-        taskId: 'turn-stopped',
-        cancellationSource: 'webui_stop',
-      },
     })
+    expect(options.messages.value[0]?.turnOutcome).toBeUndefined()
+    expect(options.activeStreamTaskId.value).toBe('turn-stopped')
+    expect(stream.endStreaming).not.toHaveBeenCalled()
+  })
+
+  it('binds a Stop-before-ACK to the accepted task and retries one exact abort', async () => {
+    let resolveSend!: (value: unknown) => void
+    const abortCalls: Record<string, unknown>[] = []
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+        if (method === 'chat.send') {
+          return new Promise<T>((resolve) => {
+            resolveSend = resolve as (value: unknown) => void
+          })
+        }
+        if (method === 'chat.abort') {
+          abortCalls.push(params || {})
+          return Promise.resolve({ aborted: Boolean(params?.taskId) }) as Promise<T>
+        }
+        return Promise.resolve({}) as Promise<T>
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const taskOwnership = useChatTaskOwnership()
+    const bindActiveStreamTask = vi.fn()
+    const reconcileTaskOwnership = vi.fn()
+    const harness = makeOptions({
+      rpc,
+      taskOwnership,
+      bindActiveStreamTask,
+      reconcileTaskOwnership,
+    })
+    harness.stream.startStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = true
+    })
+    harness.stream.endStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = false
+    })
+
+    const send = harness.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.any(Object),
+    ))
+    harness.api.onStop()
+    await vi.waitFor(() => expect(abortCalls).toHaveLength(1))
+
+    expect(abortCalls[0]).toEqual({
+      sessionKey: 'agent:main:webchat:test',
+      source: 'webui_stop',
+      scope: 'task',
+    })
+    expect(harness.stream.endStreaming).not.toHaveBeenCalled()
+    expect(harness.options.popAllPendingIntoComposer).not.toHaveBeenCalled()
+    expect(reconcileTaskOwnership).not.toHaveBeenCalled()
+
+    resolveSend({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'task-accepted-after-stop',
+      task_status: 'queued',
+      user_message_id: 'message-accepted-after-stop',
+    })
+    await send
+    await vi.waitFor(() => expect(abortCalls).toHaveLength(2))
+
+    expect(abortCalls[1]).toEqual({
+      sessionKey: 'agent:main:webchat:test',
+      taskId: 'task-accepted-after-stop',
+      source: 'webui_stop',
+      scope: 'task',
+    })
+    expect(taskOwnership.stopRequestedTaskId.value).toBe('task-accepted-after-stop')
+    expect(bindActiveStreamTask).toHaveBeenCalledWith('task-accepted-after-stop')
+    expect(harness.stream.endStreaming).not.toHaveBeenCalled()
+    expect(harness.options.popAllPendingIntoComposer).not.toHaveBeenCalled()
+    expect(harness.options.messages.value.every(message => !message.turnOutcome)).toBe(true)
+  })
+
+  it('never widens repeated Stop clicks before ACK into an unscoped abort', async () => {
+    let resolveSend!: (value: unknown) => void
+    const abortCalls: Record<string, unknown>[] = []
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+        if (method === 'chat.send') {
+          return new Promise<T>((resolve) => {
+            resolveSend = resolve as (value: unknown) => void
+          })
+        }
+        if (method === 'chat.abort') {
+          abortCalls.push(params || {})
+          return Promise.resolve({ aborted: Boolean(params?.taskId) }) as Promise<T>
+        }
+        return Promise.resolve({}) as Promise<T>
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const taskOwnership = useChatTaskOwnership()
+    const harness = makeOptions({ rpc, taskOwnership })
+    harness.stream.startStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = true
+    })
+
+    const send = harness.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.any(Object),
+    ))
+
+    harness.api.onStop()
+    harness.api.onStop()
+    await vi.waitFor(() => expect(abortCalls.length).toBeGreaterThan(0))
+
+    expect(abortCalls.every(call => call.scope === 'task')).toBe(true)
+    expect(abortCalls.filter(call => !call.taskId)).toHaveLength(1)
+
+    resolveSend({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'task-after-double-stop',
+      task_status: 'queued',
+    })
+    await send
+    await vi.waitFor(() => expect(abortCalls.some(
+      call => call.taskId === 'task-after-double-stop',
+    )).toBe(true))
+
+    expect(abortCalls.every(call => call.scope === 'task')).toBe(true)
+  })
+
+  it('stops hydrated running A without aborting pending-acceptance B after its ACK', async () => {
+    let resolveSend!: (value: unknown) => void
+    const abortCalls: Record<string, unknown>[] = []
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+        if (method === 'chat.send') {
+          return new Promise<T>((resolve) => {
+            resolveSend = resolve as (value: unknown) => void
+          })
+        }
+        if (method === 'chat.abort') {
+          abortCalls.push(params || {})
+          return Promise.resolve({ aborted: true }) as Promise<T>
+        }
+        return Promise.resolve({}) as Promise<T>
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const taskOwnership = useChatTaskOwnership()
+    const activeStreamTaskId = ref('')
+    const harness = makeOptions({
+      rpc,
+      taskOwnership,
+      activeStreamTaskId,
+    })
+    harness.stream.startStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = true
+    })
+
+    // B crossed the network boundary while this tab still believed the
+    // session idle. Before B's ACK arrives, authoritative hydration recovers A
+    // as the durable running task.
+    const sendB = harness.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.any(Object),
+    ))
+    taskOwnership.applySnapshot({
+      run_status: 'running',
+      active_task: { task_id: 'task-A', status: 'running' },
+    }, true)
+    activeStreamTaskId.value = 'task-A'
+
+    harness.api.onStop()
+    await vi.waitFor(() => expect(abortCalls).toHaveLength(1))
+
+    expect(abortCalls[0]).toEqual({
+      sessionKey: 'agent:main:webchat:test',
+      taskId: 'task-A',
+      source: 'webui_stop',
+      scope: 'task',
+    })
+
+    resolveSend({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'task-B',
+      task_status: 'queued',
+      user_message_id: 'message-B',
+    })
+    await sendB
+    await Promise.resolve()
+
+    expect(abortCalls).toHaveLength(1)
+    expect(taskOwnership.stopRequestedTaskId.value).toBe('task-A')
+    expect(taskOwnership.runningTaskId.value).toBe('task-A')
+    expect([...taskOwnership.queuedTaskIds.value]).toEqual(['task-B'])
+  })
+
+  it.each(['regular', 'hidden'] as const)(
+    'rebinds a pending %s B send to running A and replays A output before B queued ACK',
+    async (kind) => {
+      let resolveSend!: (value: unknown) => void
+      const abortCalls: Record<string, unknown>[] = []
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.send') {
+            return new Promise<T>((resolve) => {
+              resolveSend = resolve as (value: unknown) => void
+            })
+          }
+          if (method === 'chat.abort') {
+            abortCalls.push(params || {})
+            return Promise.resolve({ aborted: true }) as Promise<T>
+          }
+          return Promise.resolve({}) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const taskOwnership = useChatTaskOwnership()
+      const activeStreamTaskId = ref('')
+      const harness = makeOptions({ rpc, taskOwnership, activeStreamTaskId })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+      const scope = effectScope()
+      const rpcEvents = scope.run(() => useChatRpcEventHandlers({
+        sessionKey: harness.options.sessionKey,
+        currentEpoch: ref(0),
+        lastStreamSeq: ref(0),
+        activeTaskGroups: ref(new Set<string>()),
+        taskOwnership,
+        activeStreamTaskId,
+        aborted: harness.options.aborted,
+        messages: harness.options.messages,
+        pendingQueue: harness.pendingQueue,
+        usageAccum: ref({
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          cost: null,
+          routedTurns: 0,
+          sessionSaved: 0,
+        }),
+        usageModel: ref(''),
+        stream: harness.stream,
+        normalizeRunStatus: status => status,
+        sessionRunStatus: () => ({ status: 'running', label: 'running', task: null }),
+        applySessionRunState: vi.fn(),
+        queueRouterDecision: vi.fn(),
+        appendEnsembleProgress: vi.fn(),
+        markEnsembleHandoff: vi.fn(),
+        flushPendingRouterDecision: vi.fn(),
+        clearPendingRouterDecision: vi.fn(),
+        handleRouterControlReplay: vi.fn(),
+        showCompactionToast: vi.fn(),
+        showWarningToast: vi.fn(),
+        scheduleHistorySync: vi.fn(),
+        schedulePendingDrainAfterTerminal: vi.fn(),
+        popAllPendingIntoComposer: vi.fn(() => false),
+        saveWidgetState: vi.fn(),
+        loadCurrentSessionUsage: vi.fn(),
+      }))!
+      harness.options.bindActiveStreamTask = rpcEvents.bindActiveStreamTask
+
+      const send = kind === 'regular'
+        ? harness.api.onSend()
+        : harness.api.dispatchHiddenSend(
+            'synthetic hidden control',
+            'visible confirmation',
+            'hidden-ack-race',
+          )
+      await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+        'chat.send',
+        expect.any(Object),
+      ))
+      expect(activeStreamTaskId.value).toBe(PENDING_STREAM_TASK_ID)
+
+      rpcEvents.handlers.onTaskRunning({
+        task_id: 'task-A',
+        session_key: 'agent:main:webchat:test',
+      })
+      rpcEvents.handlers.onTextDelta({
+        task_id: 'task-A',
+        session_key: 'agent:main:webchat:test',
+        stream_seq: 1,
+        text: 'A token before B ACK',
+      })
+      expect(activeStreamTaskId.value).toBe(PENDING_STREAM_TASK_ID)
+      expect(harness.stream.appendDelta).not.toHaveBeenCalled()
+
+      resolveSend({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-B',
+        task_status: 'queued',
+        user_message_id: 'message-B',
+      })
+      await send
+
+      expect(activeStreamTaskId.value).toBe('task-A')
+      expect(harness.stream.appendDelta).toHaveBeenCalledWith('A token before B ACK')
+      expect(taskOwnership.runningTaskId.value).toBe('task-A')
+      expect([...taskOwnership.queuedTaskIds.value]).toEqual(['task-B'])
+
+      harness.api.onStop()
+      await vi.waitFor(() => expect(abortCalls).toHaveLength(1))
+      expect(abortCalls[0]).toEqual({
+        sessionKey: 'agent:main:webchat:test',
+        taskId: 'task-A',
+        source: 'webui_stop',
+        scope: 'task',
+      })
+      scope.stop()
+    },
+  )
+
+  it.each(['network_error', 'unknown_result'] as const)(
+    'keeps retrying an exact hidden-control Stop after its first %s',
+    async (firstFailure) => {
+      let resolveSend!: (value: unknown) => void
+      const abortCalls: Record<string, unknown>[] = []
+      let exactAbortAttempts = 0
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.send') {
+            return new Promise<T>((resolve) => {
+              resolveSend = resolve as (value: unknown) => void
+            })
+          }
+          if (method === 'chat.abort') {
+            abortCalls.push(params || {})
+            if (!params?.taskId) {
+              return Promise.resolve({ aborted: false, reason: 'task_id_required' }) as Promise<T>
+            }
+            exactAbortAttempts += 1
+            if (exactAbortAttempts === 1) {
+              if (firstFailure === 'network_error') {
+                return Promise.reject(new Error('response lost')) as Promise<T>
+              }
+              return Promise.resolve({
+                aborted: false,
+                reason: 'task_cancel_unknown',
+              }) as Promise<T>
+            }
+            return Promise.resolve({ aborted: true }) as Promise<T>
+          }
+          return Promise.resolve({}) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const acceptanceStopPending = ref(false)
+      const taskOwnership = useChatTaskOwnership()
+      const harness = makeOptions({ rpc, acceptanceStopPending, taskOwnership })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+
+      const hiddenSend = harness.api.dispatchHiddenSend(
+        'synthetic hidden control',
+        'visible confirmation',
+        `hidden-stop-${firstFailure}`,
+      )
+      await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+        'chat.send',
+        expect.any(Object),
+      ))
+
+      harness.api.onStop()
+      expect(acceptanceStopPending.value).toBe(true)
+      resolveSend({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'task-hidden-stopped',
+        task_status: 'queued',
+        user_message_id: 'message-hidden-stopped',
+      })
+      await hiddenSend
+
+      await vi.waitFor(() => expect(exactAbortAttempts).toBeGreaterThanOrEqual(2), {
+        timeout: 2_000,
+      })
+      const exactCalls = abortCalls.filter(call => call.taskId)
+      expect(exactCalls).toEqual([
+        {
+          sessionKey: 'agent:main:webchat:test',
+          taskId: 'task-hidden-stopped',
+          source: 'webui_stop',
+          scope: 'task',
+        },
+        {
+          sessionKey: 'agent:main:webchat:test',
+          taskId: 'task-hidden-stopped',
+          source: 'webui_stop',
+          scope: 'task',
+        },
+      ])
+    },
+  )
+
+  it('replays an unknown stopped hidden acceptance with the identical request and exact-aborts its receipt task', async () => {
+    vi.useFakeTimers()
+    try {
+      let rejectFirstSend!: (reason: unknown) => void
+      const sendParams: Record<string, unknown>[] = []
+      const abortCalls: Record<string, unknown>[] = []
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.abort') {
+            abortCalls.push(params || {})
+            return Promise.resolve({
+              aborted: Boolean(params?.taskId),
+              ...(!params?.taskId ? { reason: 'task_id_required' } : {}),
+            }) as Promise<T>
+          }
+          sendParams.push({ ...(params || {}) })
+          if (sendParams.length === 1) {
+            return new Promise<T>((_resolve, reject) => {
+              rejectFirstSend = reject
+            })
+          }
+          return Promise.resolve({
+            sessionKey: 'agent:main:webchat:test',
+            task_id: 'task-hidden-replayed-receipt',
+            task_status: 'queued',
+            user_message_id: 'message-hidden-replayed-receipt',
+          }) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const acceptanceStopPending = ref(false)
+      const taskOwnership = useChatTaskOwnership()
+      const harness = makeOptions({ rpc, acceptanceStopPending, taskOwnership })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+
+      const first = harness.api.dispatchHiddenSend(
+        'synthetic hidden control',
+        'visible confirmation',
+        'hidden-unknown-stop',
+      )
+      await Promise.resolve()
+      expect(sendParams).toHaveLength(1)
+      harness.api.onStop()
+      rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
+      await expect(first).resolves.toMatchObject({
+        status: 'unknown',
+        reason: 'response_unknown',
+      })
+      expect(acceptanceStopPending.value).toBe(true)
+
+      await vi.runAllTimersAsync()
+      await Promise.resolve()
+
+      expect(sendParams).toHaveLength(2)
+      expect(sendParams[1]).toEqual(sendParams[0])
+      expect(sendParams[1]?.clientRequestId).toBe('hidden-unknown-stop')
+      expect(abortCalls).toContainEqual({
+        sessionKey: 'agent:main:webchat:test',
+        taskId: 'task-hidden-replayed-receipt',
+        source: 'webui_stop',
+        scope: 'task',
+      })
+      expect(acceptanceStopPending.value).toBe(false)
+
+      // The exact abort response is only an acknowledgement; the normal task
+      // terminal/hydrate boundary releases the accepted queued owner.
+      taskOwnership.noteTerminal('task-hidden-replayed-receipt')
+      harness.stream.isStreaming.value = false
+      harness.options.activeStreamTaskId.value = ''
+
+      await expect(harness.api.dispatchHiddenSend(
+        'next synthetic hidden control',
+        'next visible confirmation',
+        'hidden-after-recovery',
+      )).resolves.toMatchObject({ status: 'accepted' })
+      expect(sendParams[2]?.clientRequestId).toBe('hidden-after-recovery')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('releases the pre-ACK Stop latch when chat.send is durably rejected', async () => {
+    let rejectSend!: (reason: unknown) => void
+    const acceptanceStopPending = ref(false)
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string) => {
+        if (method === 'chat.abort') {
+          return Promise.resolve({ aborted: true }) as Promise<T>
+        }
+        return new Promise<T>((_resolve, reject) => {
+          rejectSend = reject
+        })
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const harness = makeOptions({ rpc, acceptanceStopPending })
+    harness.stream.startStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = true
+    })
+    harness.stream.endStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = false
+    })
+
+    const send = harness.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.any(Object),
+    ))
+    harness.api.onStop()
+    expect(acceptanceStopPending.value).toBe(true)
+
+    rejectSend(Object.assign(new Error('not accepted'), {
+      accepted: false,
+      retryable: false,
+    }))
+    await send
+
+    expect(acceptanceStopPending.value).toBe(false)
+  })
+
+  it('releases the pre-ACK Stop latch for accepted terminal-without-task failure', async () => {
+    let rejectSend!: (reason: unknown) => void
+    const acceptanceStopPending = ref(false)
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string) => {
+        if (method === 'chat.abort') {
+          return Promise.resolve({ aborted: true }) as Promise<T>
+        }
+        return new Promise<T>((_resolve, reject) => {
+          rejectSend = reject
+        })
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const harness = makeOptions({ rpc, acceptanceStopPending })
+    harness.stream.startStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = true
+    })
+    harness.stream.endStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = false
+    })
+
+    const send = harness.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.any(Object),
+    ))
+    harness.api.onStop()
+    expect(acceptanceStopPending.value).toBe(true)
+
+    rejectSend(Object.assign(new Error('accepted without task'), {
+      code: 'QUEUE_FULL_DIRTY',
+      accepted: true,
+      retryable: false,
+      details: {
+        session_key: 'agent:main:webchat:test',
+        orphan_message_id: 'orphan-message',
+      },
+    }))
+    await send
+
+    expect(acceptanceStopPending.value).toBe(false)
+  })
+
+  it('keeps and reconciles a pre-ACK Stop when chat.send acceptance is unknown', async () => {
+    let rejectSend!: (reason: unknown) => void
+    const acceptanceStopPending = ref(false)
+    const reconcileTaskOwnership = vi.fn()
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string) => {
+        if (method === 'chat.abort') {
+          return Promise.resolve({ aborted: false, reason: 'task_id_required' }) as Promise<T>
+        }
+        return new Promise<T>((_resolve, reject) => {
+          rejectSend = reject
+        })
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const harness = makeOptions({
+      rpc,
+      acceptanceStopPending,
+      reconcileTaskOwnership,
+    })
+    harness.stream.startStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = true
+    })
+    harness.stream.endStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = false
+    })
+
+    const send = harness.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.any(Object),
+    ))
+    harness.api.onStop()
+    rejectSend(Object.assign(new Error('response lost'), { retryable: true }))
+    await send
+
+    expect(acceptanceStopPending.value).toBe(true)
+    expect(reconcileTaskOwnership).toHaveBeenCalled()
+    expect(harness.options.messages.value.every(message => !message.turnOutcome)).toBe(true)
+  })
+
+  it('carries a pre-ACK Stop through idempotent acceptance replay to the exact task', async () => {
+    let rejectFirstSend!: (reason: unknown) => void
+    let sendCalls = 0
+    const abortCalls: Record<string, unknown>[] = []
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+        if (method === 'chat.abort') {
+          abortCalls.push(params || {})
+          return Promise.resolve({ aborted: Boolean(params?.taskId) }) as Promise<T>
+        }
+        sendCalls += 1
+        if (sendCalls === 1) {
+          return new Promise<T>((_resolve, reject) => {
+            rejectFirstSend = reject
+          })
+        }
+        return Promise.resolve({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-from-replayed-receipt',
+          task_status: 'queued',
+          user_message_id: 'message-from-replayed-receipt',
+        }) as Promise<T>
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const acceptanceStopPending = ref(false)
+    const taskOwnership = useChatTaskOwnership()
+    const harness = makeOptions({ rpc, acceptanceStopPending, taskOwnership })
+    harness.stream.startStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = true
+    })
+    harness.stream.endStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = false
+    })
+
+    const firstSend = harness.api.onSend()
+    await vi.waitFor(() => expect(sendCalls).toBe(1))
+    harness.api.onStop()
+    rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
+    await firstSend
+    expect(acceptanceStopPending.value).toBe(true)
+
+    await harness.api.onSend()
+
+    expect(abortCalls).toContainEqual({
+      sessionKey: 'agent:main:webchat:test',
+      taskId: 'task-from-replayed-receipt',
+      source: 'webui_stop',
+      scope: 'task',
+    })
+    expect(taskOwnership.stopRequestedTaskId.value).toBe('task-from-replayed-receipt')
+  })
+
+  it('carries an unknown-acceptance Stop across session navigation and receipt replay', async () => {
+    const sessionA = 'agent:main:webchat:unknown-A'
+    const sessionB = 'agent:main:webchat:other-B'
+    const sessionKey = ref(sessionA)
+    const acceptanceStopPending = ref(false)
+    let rejectFirstSend!: (reason: unknown) => void
+    let sendCalls = 0
+    const abortCalls: Record<string, unknown>[] = []
+    const requestIds: string[] = []
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+        if (method === 'chat.abort') {
+          abortCalls.push(params || {})
+          return Promise.resolve({ aborted: Boolean(params?.taskId) }) as Promise<T>
+        }
+        sendCalls += 1
+        requestIds.push(String(params?.clientRequestId || ''))
+        if (sendCalls === 1) {
+          return new Promise<T>((_resolve, reject) => {
+            rejectFirstSend = reject
+          })
+        }
+        return Promise.resolve({
+          sessionKey: sessionA,
+          task_id: 'task-receipt-after-navigation',
+          task_status: 'running',
+          user_message_id: 'message-receipt-after-navigation',
+        }) as Promise<T>
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const taskOwnership = useChatTaskOwnership()
+    const harness = makeOptions({
+      rpc,
+      sessionKey,
+      acceptanceStopPending,
+      taskOwnership,
+    })
+    harness.stream.startStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = true
+    })
+    harness.stream.endStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = false
+    })
+
+    const firstSend = harness.api.onSend()
+    await vi.waitFor(() => expect(sendCalls).toBe(1))
+    harness.api.onStop()
+    rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
+    await firstSend
+    expect(acceptanceStopPending.value).toBe(true)
+
+    // The session runtime resets its visible per-session latch while showing B.
+    // The durable/recovered A attempt must still remember that its user asked to
+    // Stop, rather than relying only on this currently displayed ref.
+    sessionKey.value = sessionB
+    acceptanceStopPending.value = false
+    taskOwnership.reset(false)
+    sessionKey.value = sessionA
+    taskOwnership.reset(true)
+
+    await harness.api.onSend()
+
+    expect(requestIds).toHaveLength(2)
+    expect(requestIds[1]).toBe(requestIds[0])
+    expect(abortCalls).toContainEqual({
+      sessionKey: sessionA,
+      taskId: 'task-receipt-after-navigation',
+      source: 'webui_stop',
+      scope: 'task',
+    })
+  })
+
+  it('automatically replays an unknown stopped acceptance and exactly aborts its receipt task', async () => {
+    vi.useFakeTimers()
+    try {
+      let rejectFirstSend!: (reason: unknown) => void
+      let sendCalls = 0
+      const requestIds: string[] = []
+      const abortCalls: Record<string, unknown>[] = []
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.abort') {
+            abortCalls.push(params || {})
+            return Promise.resolve({ aborted: Boolean(params?.taskId) }) as Promise<T>
+          }
+          sendCalls += 1
+          requestIds.push(String(params?.clientRequestId || ''))
+          if (sendCalls === 1) {
+            return new Promise<T>((_resolve, reject) => {
+              rejectFirstSend = reject
+            })
+          }
+          return Promise.resolve({
+            sessionKey: 'agent:main:webchat:test',
+            task_id: 'task-auto-replayed-receipt',
+            task_status: 'running',
+          }) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const acceptanceStopPending = ref(false)
+      const taskOwnership = useChatTaskOwnership()
+      const harness = makeOptions({
+        rpc,
+        acceptanceStopPending,
+        taskOwnership,
+        reconcileTaskOwnership: vi.fn(async () => {}),
+      })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+
+      const firstSend = harness.api.onSend()
+      await Promise.resolve()
+      expect(sendCalls).toBe(1)
+      harness.api.onStop()
+      rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
+      await firstSend
+
+      await vi.runAllTimersAsync()
+      await Promise.resolve()
+
+      expect(sendCalls).toBe(2)
+      expect(requestIds[1]).toBe(requestIds[0])
+      expect(abortCalls).toContainEqual({
+        sessionKey: 'agent:main:webchat:test',
+        taskId: 'task-auto-replayed-receipt',
+        source: 'webui_stop',
+        scope: 'task',
+      })
+      expect(acceptanceStopPending.value).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries the exact recovered task Stop when its first abort is not acknowledged', async () => {
+    vi.useFakeTimers()
+    try {
+      let rejectFirstSend!: (reason: unknown) => void
+      let sendCalls = 0
+      let exactAbortCalls = 0
+      const requestIds: string[] = []
+      const abortCalls: Record<string, unknown>[] = []
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.abort') {
+            abortCalls.push(params || {})
+            if (!params?.taskId) return Promise.resolve({ aborted: false }) as Promise<T>
+            exactAbortCalls += 1
+            return Promise.resolve({ aborted: exactAbortCalls > 1 }) as Promise<T>
+          }
+          sendCalls += 1
+          requestIds.push(String(params?.clientRequestId || ''))
+          if (sendCalls === 1) {
+            return new Promise<T>((_resolve, reject) => {
+              rejectFirstSend = reject
+            })
+          }
+          return Promise.resolve({
+            sessionKey: 'agent:main:webchat:test',
+            task_id: 'task-recovered-abort-retry',
+            task_status: 'running',
+          }) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const acceptanceStopPending = ref(false)
+      const taskOwnership = useChatTaskOwnership()
+      const harness = makeOptions({
+        rpc,
+        acceptanceStopPending,
+        taskOwnership,
+        reconcileTaskOwnership: vi.fn(async () => {}),
+      })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+
+      const firstSend = harness.api.onSend()
+      await Promise.resolve()
+      expect(sendCalls).toBe(1)
+      harness.api.onStop()
+      rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
+      await firstSend
+
+      await vi.advanceTimersByTimeAsync(250)
+      expect(sendCalls).toBe(2)
+      expect(requestIds[1]).toBe(requestIds[0])
+      expect(exactAbortCalls).toBe(1)
+      expect(acceptanceStopPending.value).toBe(true)
+
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(sendCalls).toBe(2)
+      expect(exactAbortCalls).toBe(2)
+      expect(abortCalls.filter(call => call.taskId)).toEqual([
+        {
+          sessionKey: 'agent:main:webchat:test',
+          taskId: 'task-recovered-abort-retry',
+          source: 'webui_stop',
+          scope: 'task',
+        },
+        {
+          sessionKey: 'agent:main:webchat:test',
+          taskId: 'task-recovered-abort-retry',
+          source: 'webui_stop',
+          scope: 'task',
+        },
+      ])
+      expect(acceptanceStopPending.value).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['task_not_active', 'task_mismatch'])(
+    'settles recovered Stop when exact abort reports %s',
+    async (abortReason) => {
+    vi.useFakeTimers()
+    try {
+      let rejectFirstSend!: (reason: unknown) => void
+      let sendCalls = 0
+      let exactAbortCalls = 0
+      const requestIds: string[] = []
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.abort') {
+            if (!params?.taskId) return Promise.resolve({ aborted: false }) as Promise<T>
+            exactAbortCalls += 1
+            return Promise.resolve({
+              aborted: false,
+              reason: abortReason,
+            }) as Promise<T>
+          }
+          sendCalls += 1
+          requestIds.push(String(params?.clientRequestId || ''))
+          if (sendCalls === 1) {
+            return new Promise<T>((_resolve, reject) => {
+              rejectFirstSend = reject
+            })
+          }
+          return Promise.resolve({
+            sessionKey: 'agent:main:webchat:test',
+            task_id: sendCalls === 2 ? 'task-already-terminal' : 'task-new',
+            task_status: 'running',
+          }) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const acceptanceStopPending = ref(false)
+      const taskOwnership = useChatTaskOwnership()
+      const reconcileTaskOwnership = vi.fn(async () => {
+        taskOwnership.noteTerminal('task-already-terminal')
+      })
+      const harness = makeOptions({
+        rpc,
+        acceptanceStopPending,
+        taskOwnership,
+        reconcileTaskOwnership,
+      })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+
+      const firstSend = harness.api.onSend()
+      await Promise.resolve()
+      harness.api.onStop()
+      rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
+      await firstSend
+
+      await vi.advanceTimersByTimeAsync(30_250)
+
+      expect(sendCalls).toBe(2)
+      expect(exactAbortCalls).toBe(1)
+      expect(reconcileTaskOwnership).toHaveBeenCalled()
+      expect(acceptanceStopPending.value).toBe(false)
+      expect(harness.options.messages.value.every(message => !message.turnOutcome)).toBe(true)
+
+      harness.options.inputText.value = 'new question after the settled Stop'
+      await harness.api.onSend()
+
+      expect(sendCalls).toBe(3)
+      expect(requestIds[1]).toBe(requestIds[0])
+      expect(requestIds[2]).not.toBe(requestIds[0])
+    } finally {
+      vi.useRealTimers()
+    }
+    },
+  )
+
+  it('keeps automatically replaying the stopped request beyond a 30 second disconnect', async () => {
+    vi.useFakeTimers()
+    try {
+      let rejectFirstSend!: (reason: unknown) => void
+      let sendCalls = 0
+      const requestIds: string[] = []
+      const abortCalls: Record<string, unknown>[] = []
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.abort') {
+            abortCalls.push(params || {})
+            return Promise.resolve({ aborted: Boolean(params?.taskId) }) as Promise<T>
+          }
+          sendCalls += 1
+          requestIds.push(String(params?.clientRequestId || ''))
+          if (sendCalls === 1) {
+            return new Promise<T>((_resolve, reject) => {
+              rejectFirstSend = reject
+            })
+          }
+          if (sendCalls < 6) {
+            return Promise.reject(Object.assign(new Error('still disconnected'), {
+              retryable: true,
+            })) as Promise<T>
+          }
+          return Promise.resolve({
+            sessionKey: 'agent:main:webchat:test',
+            task_id: 'task-recovered-after-long-disconnect',
+            task_status: 'running',
+          }) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const acceptanceStopPending = ref(false)
+      const harness = makeOptions({
+        rpc,
+        acceptanceStopPending,
+        taskOwnership: useChatTaskOwnership(),
+        reconcileTaskOwnership: vi.fn(async () => {}),
+      })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+
+      const firstSend = harness.api.onSend()
+      await Promise.resolve()
+      harness.api.onStop()
+      rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
+      await firstSend
+
+      // 250 + 1,000 + 4,000 + 15,000 + 15,000 ms. Recovery must not
+      // silently stop after exhausting the first pass through the backoff.
+      await vi.advanceTimersByTimeAsync(35_250)
+
+      expect(sendCalls).toBe(6)
+      expect(new Set(requestIds)).toEqual(new Set([requestIds[0]]))
+      expect(abortCalls).toContainEqual({
+        sessionKey: 'agent:main:webchat:test',
+        taskId: 'task-recovered-after-long-disconnect',
+        source: 'webui_stop',
+        scope: 'task',
+      })
+      expect(acceptanceStopPending.value).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('automatically replays unknown B without aborting it when Stop targeted hydrated A', async () => {
+    vi.useFakeTimers()
+    try {
+      let rejectFirstSend!: (reason: unknown) => void
+      let sendCalls = 0
+      const requestIds: string[] = []
+      const abortCalls: Record<string, unknown>[] = []
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.abort') {
+            abortCalls.push(params || {})
+            return Promise.resolve({ aborted: true }) as Promise<T>
+          }
+          sendCalls += 1
+          requestIds.push(String(params?.clientRequestId || ''))
+          if (sendCalls === 1) {
+            return new Promise<T>((_resolve, reject) => {
+              rejectFirstSend = reject
+            })
+          }
+          return Promise.resolve({
+            sessionKey: 'agent:main:webchat:test',
+            task_id: 'task-B-replayed',
+            task_status: 'queued',
+          }) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const taskOwnership = useChatTaskOwnership()
+      const activeStreamTaskId = ref('')
+      const harness = makeOptions({
+        rpc,
+        taskOwnership,
+        activeStreamTaskId,
+        reconcileTaskOwnership: vi.fn(async () => {}),
+      })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+
+      const firstSendB = harness.api.onSend()
+      await Promise.resolve()
+      expect(sendCalls).toBe(1)
+      taskOwnership.applySnapshot({
+        run_status: 'running',
+        active_task: { task_id: 'task-A', status: 'running' },
+      }, true)
+      activeStreamTaskId.value = 'task-A'
+      harness.api.onStop()
+      rejectFirstSend(Object.assign(new Error('B response lost'), { retryable: true }))
+      await firstSendB
+
+      await vi.runAllTimersAsync()
+      await Promise.resolve()
+
+      expect(sendCalls).toBe(2)
+      expect(requestIds[1]).toBe(requestIds[0])
+      expect(abortCalls).toEqual([{
+        sessionKey: 'agent:main:webchat:test',
+        taskId: 'task-A',
+        source: 'webui_stop',
+        scope: 'task',
+      }])
+      expect(taskOwnership.runningTaskId.value).toBe('task-A')
+      expect(taskOwnership.queuedTaskIds.value.has('task-B-replayed')).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('scopes unknown Stop recovery admission to A while allowing B to send', async () => {
+    vi.useFakeTimers()
+    try {
+      const sessionA = 'agent:main:webchat:recovering-A'
+      const sessionB = 'agent:main:webchat:independent-B'
+      const sessionKey = ref(sessionA)
+      const inputText = ref('question A')
+      const acceptanceStopPending = ref(false)
+      const acceptanceRecoveryPending = ref(false)
+      let rejectFirstA!: (reason: unknown) => void
+      let aSendCalls = 0
+      let bSendCalls = 0
+      let settleARecovery = false
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+          if (method === 'chat.abort') {
+            return Promise.resolve({ aborted: false }) as Promise<T>
+          }
+          const key = String(params?.sessionKey || '')
+          if (key === sessionA) {
+            aSendCalls += 1
+            if (aSendCalls === 1) {
+              return new Promise<T>((_resolve, reject) => {
+                rejectFirstA = reject
+              })
+            }
+            if (!settleARecovery) {
+              return Promise.reject(Object.assign(new Error('A still disconnected'), {
+                retryable: true,
+              })) as Promise<T>
+            }
+            return Promise.resolve({
+              sessionKey: sessionA,
+              task_id: 'task-A',
+              task_status: 'cancelled',
+            }) as Promise<T>
+          }
+          bSendCalls += 1
+          return Promise.resolve({
+            sessionKey: sessionB,
+            task_id: 'task-B',
+            task_status: 'succeeded',
+          }) as Promise<T>
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const enqueuePendingInput = vi.fn(() => true)
+      const harness = makeOptions({
+        rpc,
+        sessionKey,
+        inputText,
+        acceptanceStopPending,
+        acceptanceRecoveryPending,
+        enqueuePendingInput,
+        reconcileTaskOwnership: vi.fn(async () => {}),
+      })
+      harness.stream.startStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = true
+      })
+      harness.stream.endStreaming = vi.fn(() => {
+        harness.stream.isStreaming.value = false
+      })
+
+      const firstA = harness.api.onSend()
+      await Promise.resolve()
+      harness.api.onStop()
+      rejectFirstA(Object.assign(new Error('A response lost'), { retryable: true }))
+      await firstA
+      await nextTick()
+      expect(acceptanceRecoveryPending.value).toBe(true)
+
+      sessionKey.value = sessionB
+      // The real session runtime clears the visible, session-local pre-ACK
+      // latch on route switch; the request-owned recovery registry survives.
+      acceptanceStopPending.value = false
+      inputText.value = 'question B'
+      await nextTick()
+      expect(acceptanceRecoveryPending.value).toBe(false)
+      await harness.api.onSend()
+      expect(bSendCalls).toBe(1)
+
+      sessionKey.value = sessionA
+      inputText.value = 'follow-up C for A'
+      await nextTick()
+      expect(acceptanceRecoveryPending.value).toBe(true)
+      await harness.api.onSend()
+      expect(aSendCalls).toBe(1)
+      expect(enqueuePendingInput).toHaveBeenCalledWith('follow-up C for A', undefined)
+
+      settleARecovery = true
+      await vi.advanceTimersByTimeAsync(250)
+      await nextTick()
+      expect(aSendCalls).toBe(2)
+      expect(acceptanceRecoveryPending.value).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reconciles an aborted:false response without synthesizing a cancelled terminal', async () => {
+    pushToast.mockClear()
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-A')
+    taskOwnership.noteQueued('task-B')
+    const reconcileTaskOwnership = vi.fn()
+    const rpc = {
+      call: vi.fn().mockResolvedValue({ aborted: false }),
+    }
+    const harness = makeOptions({
+      rpc,
+      taskOwnership,
+      reconcileTaskOwnership,
+      activeStreamTaskId: ref('task-A'),
+      activeStreamSessionKey: ref('agent:main:webchat:test'),
+      messages: ref<ChatMessage[]>([{
+        role: 'user',
+        text: 'A',
+        ts: 1,
+        turnId: 'task-A',
+      }]),
+    })
+    harness.stream.isStreaming.value = true
+
+    harness.api.onStop()
+    await vi.waitFor(() => expect(reconcileTaskOwnership).toHaveBeenCalledOnce())
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.abort', {
+      sessionKey: 'agent:main:webchat:test',
+      taskId: 'task-A',
+      source: 'webui_stop',
+      scope: 'task',
+    })
+    expect(taskOwnership.runningTaskId.value).toBe('task-A')
+    expect([...taskOwnership.queuedTaskIds.value]).toEqual(['task-B'])
+    expect(taskOwnership.stopRequestedTaskId.value).toBe('')
+    expect(harness.stream.endStreaming).not.toHaveBeenCalled()
+    expect(harness.options.popAllPendingIntoComposer).not.toHaveBeenCalled()
+    expect(harness.options.messages.value[0]?.turnOutcome).toBeUndefined()
+    expect(pushToast).not.toHaveBeenCalled()
+    expect(harness.options.messages.value).toContainEqual(expect.objectContaining({
+      role: 'system',
+      text: 'Stop could not reach the server — the run may still be finishing.',
+    }))
   })
 
   it('does not guess pending steer dispositions or restore them before Stop is authoritative', () => {
@@ -3681,7 +5358,8 @@ describe('useChatSend attachment payloads', () => {
       source: 'webui_stop',
       scope: 'task',
     })
-    expect(activeStreamTaskId.value).not.toBe('task-old')
+    // Render ownership remains with the task until its matching terminal.
+    expect(activeStreamTaskId.value).toBe('task-old')
   })
 
   it('prefers the server steer turn when the rendered stream id is stale', () => {
@@ -3717,7 +5395,114 @@ describe('useChatSend attachment payloads', () => {
     })
   })
 
-  it('does not let a stopped send response rebind the next turn', async () => {
+  it('does not mistake a completed send acceptance for a later group-only Stop', async () => {
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string) => {
+        if (method === 'chat.send') {
+          return Promise.resolve({
+            sessionKey: 'agent:main:webchat:test',
+            task_id: 'task-parent-settled',
+            task_status: 'running',
+          }) as Promise<T>
+        }
+        return Promise.resolve({ aborted: true }) as Promise<T>
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const taskOwnership = useChatTaskOwnership()
+    const activeStreamTaskId = ref('')
+    const activeStreamSessionKey = ref('')
+    const harness = makeOptions({
+      rpc,
+      taskOwnership,
+      activeStreamTaskId,
+      activeStreamSessionKey,
+      canStop: () => true,
+    })
+
+    await harness.api.onSend()
+    taskOwnership.noteTerminal('task-parent-settled')
+    activeStreamTaskId.value = ''
+    activeStreamSessionKey.value = ''
+    harness.stream.isStreaming.value = false
+
+    harness.api.onStop()
+
+    expect(rpc.call).toHaveBeenLastCalledWith('chat.abort', {
+      sessionKey: 'agent:main:webchat:test',
+      source: 'webui_stop',
+    })
+  })
+
+  it('ignores a stale acceptance after navigation and Stops only the new running task', async () => {
+    const oldSessionKey = 'agent:main:webchat:old'
+    const newSessionKey = 'agent:main:webchat:new'
+    let resolveOldSend!: (value: unknown) => void
+    const abortCalls: Record<string, unknown>[] = []
+    const rpc = {
+      call: vi.fn(<T = unknown>(method: string, params?: Record<string, unknown>) => {
+        if (method === 'chat.send') {
+          return new Promise<T>((resolve) => {
+            resolveOldSend = resolve as (value: unknown) => void
+          })
+        }
+        if (method === 'chat.abort') {
+          abortCalls.push(params || {})
+          return Promise.resolve({ aborted: true }) as Promise<T>
+        }
+        return Promise.resolve({}) as Promise<T>
+      }) as UseChatSendOptions['rpc']['call'],
+    }
+    const sessionKey = ref(oldSessionKey)
+    const taskOwnership = useChatTaskOwnership()
+    const activeStreamTaskId = ref('')
+    const activeStreamSessionKey = ref('')
+    const harness = makeOptions({
+      rpc,
+      sessionKey,
+      taskOwnership,
+      activeStreamTaskId,
+      activeStreamSessionKey,
+    })
+    harness.stream.startStreaming = vi.fn(() => {
+      harness.stream.isStreaming.value = true
+    })
+
+    const oldSend = harness.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
+      'chat.send',
+      expect.objectContaining({ sessionKey: oldSessionKey }),
+    ))
+
+    sessionKey.value = newSessionKey
+    taskOwnership.reset(true)
+    taskOwnership.noteRunning('task-new')
+    activeStreamTaskId.value = 'task-new'
+    activeStreamSessionKey.value = newSessionKey
+
+    resolveOldSend({
+      sessionKey: oldSessionKey,
+      task_id: 'task-old-late',
+      task_status: 'running',
+    })
+    await oldSend
+
+    expect(taskOwnership.runningTaskId.value).toBe('task-new')
+    expect(taskOwnership.queuedTaskIds.value.has('task-old-late')).toBe(false)
+
+    harness.api.onStop()
+    await vi.waitFor(() => expect(abortCalls).toContainEqual({
+      sessionKey: newSessionKey,
+      taskId: 'task-new',
+      source: 'webui_stop',
+      scope: 'task',
+    }))
+    expect(abortCalls).not.toContainEqual(expect.objectContaining({
+      taskId: 'task-old-late',
+      source: 'webui_stop',
+    }))
+  })
+
+  it('queues the next turn while a pre-ACK Stop is awaiting its terminal', async () => {
     const pendingResponses: Array<(value: unknown) => void> = []
     const rpc = {
       call: vi.fn(<T = unknown>(method: string) => {
@@ -3730,7 +5515,14 @@ describe('useChatSend attachment payloads', () => {
     const inputText = ref('first')
     const messages = ref<ChatMessage[]>([])
     const activeStreamTaskId = ref('')
-    const { api, stream } = makeOptions({ rpc, inputText, messages, activeStreamTaskId })
+    const enqueuePendingInput = vi.fn(() => true)
+    const { api, stream } = makeOptions({
+      rpc,
+      inputText,
+      messages,
+      activeStreamTaskId,
+      enqueuePendingInput,
+    })
     stream.startStreaming = vi.fn(() => { stream.isStreaming.value = true })
     stream.endStreaming = vi.fn(() => { stream.isStreaming.value = false })
 
@@ -3739,18 +5531,10 @@ describe('useChatSend attachment payloads', () => {
     api.onStop()
 
     inputText.value = 'second'
-    const secondSend = api.onSend()
-    const secondClientMessageId = messages.value[1]?.clientId
+    await api.onSend()
 
-    pendingResponses[1]({
-      sessionKey: 'agent:main:webchat:test',
-      task_id: 'task-B',
-      message_id: 'message-B',
-    })
-    await secondSend
-    expect(activeStreamTaskId.value).toBe('task-B')
-    expect(messages.value.find(message => message.clientId === secondClientMessageId)?.messageId)
-      .toBe('message-B')
+    expect(pendingResponses).toHaveLength(1)
+    expect(enqueuePendingInput).toHaveBeenCalledWith('second', undefined)
 
     pendingResponses[0]({
       sessionKey: 'agent:main:webchat:test',
@@ -3759,13 +5543,13 @@ describe('useChatSend attachment payloads', () => {
     })
     await firstSend
 
-    expect(activeStreamTaskId.value).toBe('task-B')
+    expect(activeStreamTaskId.value).toBe('task-A')
     expect(messages.value.find(message => message.clientId === firstClientMessageId)?.messageId)
       .toBe('message-A')
     expect(rpc.call).toHaveBeenCalledWith('chat.abort', {
       sessionKey: 'agent:main:webchat:test',
       taskId: 'task-A',
-      source: 'webui_stale_send',
+      source: 'webui_stop',
       scope: 'task',
     })
   })
@@ -3906,6 +5690,7 @@ describe('useChatSend Ensemble image guard', () => {
       const { stream } = makeOptions()
       stream.isStreaming.value = true
       let sendCurrentInput: () => void = () => {}
+      const pendingRecords = new Map<string, import('@/utils/chat/pendingInputWal').PendingInputWalRecord>()
       const pending = useChatPendingQueue({
         sessionKey,
         inputText,
@@ -3917,6 +5702,15 @@ describe('useChatSend Ensemble image guard', () => {
         sendCurrentInput: () => sendCurrentInput(),
         resetInputHistory: vi.fn(),
         hasComposer: () => true,
+        pendingInputWal: {
+          put: async record => { pendingRecords.set(record.pendingInputId, record) },
+          list: async key => [...pendingRecords.values()].filter(record => (
+            record.sessionKey === key
+          )),
+          delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
+          close: () => {},
+        },
+        supportsMethod: () => false,
       })
       const { api, options, rpc } = makeOptions({
         inputText,

@@ -112,6 +112,7 @@ const FINE_INPUT_QUERY = '(any-hover: hover), (any-pointer: fine)'
 
 interface ConversationTurn {
   key: string
+  sourceIndex: number
   controlId: string
   preview: string
   time: string
@@ -124,6 +125,12 @@ const props = defineProps<{
   stripTimePrefix: (text: string) => string
   sessionKey?: string
   historyHasMore?: boolean
+  /** Mount a logical history row before DOM-dependent focus/highlight work. */
+  ensureMessageVisible?: (sourceIndex: number) => Promise<HTMLElement | null>
+  /** Release a row pinned only for navigation once the destination settles. */
+  releaseEnsuredMessage?: (sourceIndex?: number) => void
+  /** Absolute offset in the scroll container for an unmounted logical row. */
+  messageOffset?: (sourceIndex: number) => number | null
 }>()
 const emit = defineEmits<{
   navigate: [index: number]
@@ -162,6 +169,8 @@ let navigationContainer: HTMLElement | null = null
 let navigationEndTimer = 0
 let navigationTarget: HTMLElement | null = null
 let navigationTargetTop = 0
+let navigationTargetSourceIndex: number | null = null
+let navigationGeneration = 0
 let arrivalElement: HTMLElement | null = null
 let arrivalTimer = 0
 let lastAnchorElement: HTMLElement | null = null
@@ -181,6 +190,7 @@ const turns = computed<ConversationTurn[]>(() => {
       : t('chat.historyAttachmentOnly')
     return {
       key: chatMessageKey(message, sourceIndex),
+      sourceIndex,
       controlId: `chat-turn-${sourceIndex}`,
       preview,
       time: message.timeStr || '',
@@ -272,8 +282,15 @@ function measureLayout() {
   lastAnchorElement = anchors.get(turns.value[turns.value.length - 1]?.key || '') || null
   anchorOffsets.value = turns.value.map(turn => {
     const anchor = anchors.get(turn.key)
-    if (!anchor) return Number.POSITIVE_INFINITY
-    return anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+    if (anchor) {
+      return anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+    }
+    const logicalOffset = props.messageOffset?.(turn.sourceIndex)
+    return logicalOffset !== null
+      && logicalOffset !== undefined
+      && Number.isFinite(logicalOffset)
+      ? logicalOffset
+      : Number.POSITIVE_INFINITY
   })
   updateActiveTurn()
 }
@@ -526,14 +543,17 @@ function settleNavigation(showArrival: boolean) {
   if (!navigationPending) return
   const target = navigationTarget
   const container = navigationContainer
+  const sourceIndex = navigationTargetSourceIndex
   const arrived = showArrival
     && Boolean(container)
     && Math.abs((container?.scrollTop || 0) - navigationTargetTop) <= ARRIVAL_TOLERANCE_PX
   navigationPending = false
   navigationTarget = null
   navigationTargetTop = 0
+  navigationTargetSourceIndex = null
   clearNavigationEnd()
   if (target && arrived) showArrivalHighlight(target)
+  if (sourceIndex !== null) props.releaseEnsuredMessage?.(sourceIndex)
   scheduleActiveUpdate()
   emit('navigateEnd')
 }
@@ -543,6 +563,7 @@ function finishNavigation() {
 }
 
 function cancelNavigation() {
+  navigationGeneration += 1
   settleNavigation(false)
 }
 
@@ -555,15 +576,39 @@ function armNavigationEnd(container: HTMLElement, smooth: boolean) {
   navigationEndTimer = window.setTimeout(finishNavigation, smooth ? 2000 : 180)
 }
 
-function navigateTo(index: number, focusTarget = false) {
+async function navigateTo(index: number, focusTarget = false) {
   const container = props.scrollContainer
   const turn = turns.value[index]
   if (!container || !turn) return
+  cancelNavigation()
+  const generation = ++navigationGeneration
+  if (focusTarget) {
+    focusedIndex.value = index
+  } else {
+    // Pointer activation focuses the button before click. Clear both preview
+    // sources so the floating card does not linger over the destination; the
+    // DOM focus itself stays put for keyboard continuity.
+    closeHoverPreview()
+    focusedIndex.value = null
+  }
+  emit('navigate', index)
+  activeIndex.value = index
   const anchor = anchorElements().get(turn.key)
-  if (!anchor) return
-
+    || await props.ensureMessageVisible?.(turn.sourceIndex)
+    || null
+  if (generation !== navigationGeneration) {
+    props.releaseEnsuredMessage?.(turn.sourceIndex)
+    return
+  }
   const containerRect = container.getBoundingClientRect()
-  const anchorTop = anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+  const anchorTop = anchor
+    ? anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+    : props.messageOffset?.(turn.sourceIndex)
+  if (anchorTop === null || anchorTop === undefined || !Number.isFinite(anchorTop)) {
+    props.releaseEnsuredMessage?.(turn.sourceIndex)
+    emit('navigateEnd')
+    return
+  }
   const targetTop = Math.min(
     Math.max(0, container.scrollHeight - container.clientHeight),
     Math.max(0, anchorTop - 16),
@@ -577,26 +622,16 @@ function navigateTo(index: number, focusTarget = false) {
   // scrolling stays interruptible by wheel/touch input and avoids per-frame
   // Vue work; reduced-motion remains an immediate jump.
   const smooth = !reduceMotion
-  cancelNavigation()
-  if (focusTarget) {
-    focusedIndex.value = index
-  } else {
-    // Pointer activation focuses the button before click. Clear both preview
-    // sources so the floating card does not linger over the destination; the
-    // DOM focus itself stays put for keyboard continuity.
-    closeHoverPreview()
-    focusedIndex.value = null
-  }
-  emit('navigate', index)
-  activeIndex.value = index
-  if (focusTarget) anchor.focus({ preventScroll: true })
+  if (focusTarget) anchor?.focus({ preventScroll: true })
   if (distance <= ARRIVAL_TOLERANCE_PX) {
-    showArrivalHighlight(anchor)
+    if (anchor) showArrivalHighlight(anchor)
+    props.releaseEnsuredMessage?.(turn.sourceIndex)
     emit('navigateEnd')
     return
   }
   navigationTarget = anchor
   navigationTargetTop = targetTop
+  navigationTargetSourceIndex = turn.sourceIndex
   armNavigationEnd(container, smooth)
   container.scrollTo({ top: targetTop, behavior: smooth ? 'smooth' : 'auto' })
 }

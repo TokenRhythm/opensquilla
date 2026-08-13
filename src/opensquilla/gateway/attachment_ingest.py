@@ -10,7 +10,20 @@ from typing import Any, Literal
 
 import structlog
 
-from opensquilla.attachment_refs import make_attachment_ref, write_transcript_material
+from opensquilla.attachment_refs import (
+    TRANSCRIPT_MATERIAL_STORE,
+    PendingChatInputManifestConflictError,
+    PendingChatInputManifestCorruptError,
+    is_attachment_ref,
+    make_attachment_ref,
+    make_pending_chat_input_attachment_ref,
+    pending_chat_input_manifest_exists,
+    read_attachment_ref_bytes,
+    read_pending_chat_input_manifest,
+    write_pending_chat_input_manifest,
+    write_pending_chat_input_material,
+    write_transcript_material,
+)
 from opensquilla.contracts.attachment_sniff import sniff_mime_from_bytes
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES,
@@ -66,6 +79,7 @@ __all__ = [
     "normalize_attachments",
     "resolve_attachments",
     "sniff_mime_from_bytes",
+    "stage_pending_chat_input_attachments",
     "validate_attachments",
 ]
 
@@ -232,6 +246,9 @@ def validate_attachments(
     mark_bytes_as_staged: bool = False,
     accept_opaque: bool = True,
     opaque_limit_bytes: int | None = None,
+    allow_material_refs: bool = False,
+    material_root: Path | None = None,
+    expected_material_scope: str | None = None,
     logger: Any | None = None,
 ) -> tuple[list[dict[str, Any]], list[AttachmentFailure]]:
     normalized = normalize_attachments(raw_attachments)
@@ -261,6 +278,90 @@ def validate_attachments(
                     f"download_failed: {attachment.get('_ingest_error')}",
                 ),
             )
+            continue
+
+        if is_attachment_ref(attachment):
+            if not allow_material_refs:
+                _raise_or_mark(
+                    failure_mode=failure_mode,
+                    failures=failures,
+                    failure=_failure(
+                        index,
+                        attachment,
+                        "invalid_shape",
+                        "material references are accepted only for internal durable dispatch",
+                    ),
+                )
+                continue
+            if material_root is None or not expected_material_scope:
+                raise ValueError("material reference validation requires a scoped material root")
+            if (
+                attachment.get("store") != TRANSCRIPT_MATERIAL_STORE
+                or attachment.get("scope") != expected_material_scope
+            ):
+                _raise_or_mark(
+                    failure_mode=failure_mode,
+                    failures=failures,
+                    failure=_failure(
+                        index,
+                        attachment,
+                        "invalid_material_scope",
+                        "material reference belongs to a different session or store",
+                    ),
+                )
+                continue
+            try:
+                payload = read_attachment_ref_bytes(attachment, media_root=material_root)
+            except (OSError, ValueError) as exc:
+                _raise_or_mark(
+                    failure_mode=failure_mode,
+                    failures=failures,
+                    failure=_failure(
+                        index,
+                        attachment,
+                        "invalid_material",
+                        str(exc),
+                    ),
+                )
+                continue
+            media_type = attachment_media_type(attachment)
+            if media_type is None:
+                media_type = normalize_attachment_mime(_raw_claimed_mime(attachment))
+            if media_type is None or (
+                not accept_opaque and media_type not in ALLOWED_MEDIA_TYPES
+            ):
+                _raise_or_mark(
+                    failure_mode=failure_mode,
+                    failures=failures,
+                    failure=_failure(
+                        index,
+                        attachment,
+                        "unsupported_mime",
+                        "material reference must declare an allowed media type",
+                    ),
+                )
+                continue
+            max_bytes = attachment_size_limit_for_mime(media_type, staged=True)
+            if opaque_limit_bytes is not None and attachment_category(media_type) == "opaque":
+                max_bytes = min(max_bytes, opaque_limit_bytes)
+            if len(payload) > max_bytes:
+                _raise_or_mark(
+                    failure_mode=failure_mode,
+                    failures=failures,
+                    failure=_failure(
+                        index,
+                        attachment,
+                        "oversize",
+                        f"exceeds the {max_bytes} byte limit",
+                    ),
+                )
+                continue
+            item = dict(attachment)
+            item["type"] = media_type
+            item["mime"] = media_type
+            item["name"] = _attachment_name(item, index)
+            item["size"] = len(payload)
+            validated.append(item)
             continue
 
         data = attachment.get("data")
@@ -643,6 +744,8 @@ async def ingest_attachments(
     disk_budget_bytes: int | None = None,
     accept_opaque: bool = True,
     opaque_limit_bytes: int | None = None,
+    allow_material_refs: bool = False,
+    expected_material_scope: str | None = None,
 ) -> AttachmentIngestResult:
     validated, failures = validate_attachments(
         raw_attachments,
@@ -650,6 +753,9 @@ async def ingest_attachments(
         mark_bytes_as_staged=mark_bytes_as_staged,
         accept_opaque=accept_opaque,
         opaque_limit_bytes=opaque_limit_bytes,
+        allow_material_refs=allow_material_refs,
+        material_root=material_root,
+        expected_material_scope=expected_material_scope,
     )
     resolved, consumed = await resolve_attachments(
         validated,
@@ -667,5 +773,141 @@ async def ingest_attachments(
         text=text,
         attachments=resolved,
         failures=failures,
+        consumed_file_uuids=consumed,
+    )
+
+
+async def stage_pending_chat_input_attachments(
+    raw_attachments: Any,
+    *,
+    material_root: Path,
+    session_id: str,
+    pending_input_id: str,
+    enqueue_fingerprint: str,
+    store: Any | None = None,
+    disk_budget_bytes: int | None = None,
+    accept_opaque: bool = True,
+    opaque_limit_bytes: int | None = None,
+) -> AttachmentIngestResult:
+    """Resolve uploads into durable, queue-owned material references.
+
+    This is intentionally separate from normal turn ingestion. A queued item
+    must never retain an expiring ``file_uuid`` or inline base64 in SQLite, and
+    it cannot place bytes directly in the canonical transcript store because a
+    later cancellation must be able to delete only this queue item's material.
+    """
+
+    existing_manifest = read_pending_chat_input_manifest(
+        media_root=material_root,
+        session_id=session_id,
+        pending_input_id=pending_input_id,
+    )
+    if existing_manifest is not None:
+        if existing_manifest["enqueue_fingerprint"] != enqueue_fingerprint:
+            raise PendingChatInputManifestConflictError(
+                "pending input id was already staged for different attachment content"
+            )
+        return AttachmentIngestResult(
+            text="",
+            attachments=[dict(item) for item in existing_manifest["attachments"]],
+        )
+    if pending_chat_input_manifest_exists(
+        media_root=material_root,
+        session_id=session_id,
+        pending_input_id=pending_input_id,
+    ):
+        # Never overwrite an unreadable recovery record. Doing so could make a
+        # conflicting retry take ownership of bytes staged by the original
+        # request after a crash.
+        raise PendingChatInputManifestCorruptError(
+            "pending attachment recovery manifest is invalid"
+        )
+
+    validated, _failures = validate_attachments(
+        raw_attachments,
+        failure_mode="raise",
+        mark_bytes_as_staged=True,
+        accept_opaque=accept_opaque,
+        opaque_limit_bytes=opaque_limit_bytes,
+    )
+    from opensquilla.gateway.uploads import (
+        AttachmentLostInRestartError,
+        AttachmentNotFoundError,
+    )
+    from opensquilla.gateway.uploads import get_upload_store as _default_store
+
+    upload_store = store if store is not None else _default_store()
+    refs: list[dict[str, Any]] = []
+    consumed: list[str] = []
+    for index, attachment in enumerate(validated, start=1):
+        file_uuid = attachment.get("file_uuid")
+        source = "inline"
+        item = attachment
+        if isinstance(file_uuid, str) and file_uuid:
+            try:
+                payload, meta = await upload_store.get(file_uuid)
+            except AttachmentLostInRestartError as exc:
+                raise AttachmentResolutionError(
+                    f"attachments[{index}] uuid lost in gateway restart; please re-upload",
+                    code=ATTACHMENT_LOST_IN_RESTART_CODE,
+                    attachment_index=index,
+                    file_uuid=file_uuid,
+                ) from exc
+            except AttachmentNotFoundError as exc:
+                raise AttachmentResolutionError(
+                    f"attachments[{index}] file_uuid {file_uuid!r} is unknown or expired; "
+                    "please re-upload",
+                    code=ATTACHMENT_EXPIRED_CODE,
+                    attachment_index=index,
+                    file_uuid=file_uuid,
+                ) from exc
+            candidate = {k: v for k, v in attachment.items() if k != "file_uuid"}
+            candidate["data"] = payload
+            if not isinstance(candidate.get("type"), str):
+                candidate["type"] = meta["mime"]
+            if not isinstance(candidate.get("name"), str):
+                candidate["name"] = meta["name"]
+            materialized, _ = validate_attachments(
+                [candidate],
+                failure_mode="raise",
+                mark_bytes_as_staged=True,
+                accept_opaque=accept_opaque,
+                opaque_limit_bytes=opaque_limit_bytes,
+            )
+            item = materialized[0]
+            consumed.append(file_uuid)
+            source = "upload"
+
+        raw_bytes, _was_bytes = _raw_bytes_from_data(item.get("data"), index=index)
+        sha, _path, _wrote = write_pending_chat_input_material(
+            media_root=material_root,
+            session_id=session_id,
+            pending_input_id=pending_input_id,
+            payload=raw_bytes,
+            disk_budget_bytes=disk_budget_bytes,
+        )
+        refs.append(
+            make_pending_chat_input_attachment_ref(
+                sha256=sha,
+                name=_attachment_name(item, index),
+                mime=str(item["type"]),
+                size=len(raw_bytes),
+                session_id=session_id,
+                pending_input_id=pending_input_id,
+                source=source,
+            )
+        )
+
+    enforce_total_attachment_bytes(refs)
+    write_pending_chat_input_manifest(
+        media_root=material_root,
+        session_id=session_id,
+        pending_input_id=pending_input_id,
+        enqueue_fingerprint=enqueue_fingerprint,
+        attachments=refs,
+    )
+    return AttachmentIngestResult(
+        text="",
+        attachments=refs,
         consumed_file_uuids=consumed,
     )

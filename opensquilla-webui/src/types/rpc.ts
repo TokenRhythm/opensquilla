@@ -240,6 +240,8 @@ export interface StreamEventEnvelope {
   session_key?: string
   sessionKey?: string
   epoch?: number
+  stream_generation?: string
+  streamGeneration?: string
   stream_seq?: number
   [key: string]: unknown
 }
@@ -270,6 +272,37 @@ export interface SessionEventPayload extends StreamEventEnvelope {
 export interface WarningPayload extends SessionEventPayload {
   message?: string
   code?: string
+}
+
+export type ProviderActivityPhase =
+  | 'requesting'
+  | 'reasoning'
+  | 'retry_wait'
+  | 'retrying'
+  | 'fallback'
+
+export type ProviderActivityReason =
+  | 'initial'
+  | 'rate_limited'
+  | 'provider_overloaded'
+  | 'transport_transient'
+  | 'reasoning_only'
+  | 'empty_response'
+  | 'stream_incomplete'
+  | 'invalid_response'
+  | 'context_overflow'
+  | 'unknown'
+
+export interface ProviderActivityPayload extends SessionEventPayload {
+  schema_version?: 1
+  activity_id?: string
+  phase?: ProviderActivityPhase
+  reason?: ProviderActivityReason
+  retry_attempt?: number
+  retry_limit?: number
+  retry_after_ms?: number
+  started_at?: number
+  heartbeat?: boolean
 }
 
 export interface CronResultMessagePayload {
@@ -377,6 +410,7 @@ export interface ToolResultPayload extends ToolUsePayload {
 
 export interface SessionMessagesSubscribeParams {
   key: string
+  since_stream_generation?: string
   since_stream_seq?: number
   [key: string]: unknown
 }
@@ -389,6 +423,7 @@ export interface SessionLiveSnapshotEvent {
 export interface SessionMessagesSnapshotResponse {
   key: string
   task_id?: string | null
+  stream_generation?: string
   current_stream_seq?: number
   events?: SessionLiveSnapshotEvent[]
 }
@@ -804,6 +839,7 @@ export interface RpcEventMap {
   'session.event.router_control_replay': SessionEventPayload
   'session.event.state_change': SessionEventPayload
   'session.event.run_heartbeat': SessionEventPayload
+  'session.event.provider_activity': ProviderActivityPayload
   'session.event.compaction': CompactionPayload
   'session.event.goal': SessionEventPayload
   'session.event.warning': SessionEventPayload

@@ -116,6 +116,8 @@ export interface UseChatGoalsOptions {
   rpc: RpcClient
   sessionKey: Ref<string>
   currentEpoch?: Ref<number>
+  /** Current Gateway transport namespace, owned by the message subscription. */
+  streamGeneration?: Readonly<Ref<string | null>>
   // A Goal may only be accepted after the target session is materialized and
   // its message subscription is registered. The host owns those two steps.
   ensureSessionKey?: () => Promise<string>
@@ -425,6 +427,11 @@ function envelopeStreamSeq(value: unknown): number | undefined {
   return source ? integerField(source, 'streamSeq', 'stream_seq') : undefined
 }
 
+function envelopeStreamGeneration(value: unknown): string | undefined {
+  const source = record(value)
+  return source ? stringField(source, 'streamGeneration', 'stream_generation') : undefined
+}
+
 function goalSnapshotStreamSeq(value: unknown): number | undefined {
   const source = record(value)
   return source
@@ -442,6 +449,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   let acceptedSessionId = ''
   let acceptedEpoch = 0
   let acceptedStreamSeq = -1
+  let acceptedStreamGeneration: string | null = null
   let mutationOwner: symbol | null = null
   // Goal set owns materialization, subscription, and mutation as one UI-side
   // admission. Keep this fence separate from mutationOwner because the
@@ -468,6 +476,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     acceptedSessionId = ''
     acceptedEpoch = 0
     acceptedStreamSeq = -1
+    acceptedStreamGeneration = null
     tombstones.clear()
     automaticReattachWatermarks.clear()
     mutationOwner = null
@@ -594,6 +603,32 @@ export function useChatGoals(options: UseChatGoalsOptions) {
     return true
   }
 
+  function observeTransportGeneration(value: unknown) {
+    const generation = envelopeStreamGeneration(value)
+      ?? options.streamGeneration?.value
+      ?? undefined
+    if (generation) {
+      if (generation === acceptedStreamGeneration) return
+      acceptedStreamGeneration = generation
+      // A Gateway generation is a transport cursor namespace, not a durable
+      // Goal generation. Preserve the authoritative Goal, replacement
+      // tombstones and continuity state; only let the new stream start again
+      // from its (possibly much lower) numeric sequence.
+      acceptedStreamSeq = -1
+      return
+    }
+    // Without the subscription-owned capability signal, a generation-less
+    // metadata payload is ambiguous (modern hydrate responses intentionally
+    // omit the field). Only production's authoritative ref may identify an
+    // actual modern -> legacy downgrade.
+    if (!options.streamGeneration || acceptedStreamGeneration === null) return
+    // A subscribe/hydrate response or Goal event without a generation means a
+    // mixed-version downgrade. Reset the transport watermark once so the old
+    // Gateway's low sequence is not compared with the modern namespace.
+    acceptedStreamGeneration = null
+    acceptedStreamSeq = -1
+  }
+
   function shouldAdoptGoal(incoming: GoalSnapshot): boolean {
     const tombstoneRevision = tombstones.get(incoming.goalId)
     if (tombstoneRevision !== undefined && incoming.stateRevision <= tombstoneRevision) {
@@ -718,7 +753,9 @@ export function useChatGoals(options: UseChatGoalsOptions) {
 
   function applyHydration(value: SessionMessagesSubscribeResponse | unknown): boolean {
     const source = record(value)
-    if (!source || !('goal' in source)) return false
+    if (!source) return false
+    observeTransportGeneration(source)
+    if (!('goal' in source)) return false
     const deferred = source.deferredFields ?? source.deferred_fields
     if (Array.isArray(deferred) && deferred.some(field => (
       field === 'goal' || field === 'goalSnapshotStreamSeq' || field === 'goal_snapshot_stream_seq'
@@ -744,6 +781,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
   function onGoalEvent(payload: unknown) {
     const source = record(payload)
     if (!source) return
+    observeTransportGeneration(source)
     const eventType = stringField(source, 'eventType', 'event_type')
     const applied = applySnapshot(source, {
       allowClear: eventType === 'cleared',

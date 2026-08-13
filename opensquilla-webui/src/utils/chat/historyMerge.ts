@@ -57,13 +57,29 @@ export function rehomePromotedSteerRows(messages: ChatMessage[]): ChatMessage[] 
 // from a local Stop) and are absent from a fresh history map. Re-apply them
 // when the server snapshot lacks a richer value, keyed strictly by messageId so
 // a synthetic-key collision can never graft one turn's state onto another.
-export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): ChatMessage {
+interface LiveFieldMergeOptions {
+  preserveTurnIdentity?: boolean
+}
+
+export function mergeLiveOnlyFields(
+  prev: ChatMessage,
+  server: ChatMessage,
+  options: LiveFieldMergeOptions = {},
+): ChatMessage {
   const merged: ChatMessage = { ...server }
 
   // Keep the optimistic row identity after the backend assigns a durable
   // message id. Per-turn render keys use it to avoid remounting live surfaces
   // during the first authoritative history replacement.
   if (!server.clientId && prev.clientId) merged.clientId = prev.clientId
+
+  // Older history projections do not carry turn_context. Once the caller has
+  // proved that the canonical row is the same live row, retain its turn id so
+  // canonical reconciliation cannot split one logical turn into two frontend
+  // identities. A server-provided turn id always remains authoritative.
+  if (options.preserveTurnIdentity && !server.turnId && prev.turnId) {
+    merged.turnId = prev.turnId
+  }
 
   // reasoning: server wins if it measured seconds; else keep the live seconds.
   const serverSeconds = prev.role === 'assistant' ? server.reasoning?.seconds ?? 0 : 0
@@ -187,7 +203,9 @@ export function reconcileHistoryMessages(prev: ChatMessage[], incoming: ChatMess
   }
   return incoming.map(server => {
     const prior = server.messageId ? prevById.get(server.messageId) : undefined
-    if (prior) return mergeLiveOnlyFields(prior, server)
+    if (prior) {
+      return mergeLiveOnlyFields(prior, server, { preserveTurnIdentity: true })
+    }
 
     // The terminal stream row is optimistic and does not yet know the durable
     // message id. Graft only on a unique exact role/text match, which avoids
@@ -265,7 +283,11 @@ function reconcileOptimisticTurnFields(
     const previousAssistant = prev[previousAssistants[0]]
     const incomingAssistantIndex = incomingAssistants[0]
     const serverAssistant = merged[incomingAssistantIndex]
-    merged[incomingAssistantIndex] = mergeLiveOnlyFields(previousAssistant, serverAssistant)
+    merged[incomingAssistantIndex] = mergeLiveOnlyFields(
+      previousAssistant,
+      serverAssistant,
+      { preserveTurnIdentity: true },
+    )
     consumedOptimisticRows?.add(previousAssistant)
   })
 

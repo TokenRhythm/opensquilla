@@ -28,25 +28,6 @@
       </div>
     </div>
 
-    <!-- Chat owns the actions; App owns their stable, in-flow shell position. -->
-    <Teleport to="#app-route-header">
-      <ChatHeaderActions
-        v-if="!isNewChatLanding"
-        ref="chatHeaderActionsRef"
-        :title="currentChatTitle"
-        :copy-state="sessionCopyState"
-        :copy-icon="sessionCopyIcon"
-        :copy-live-text="sessionCopyLiveText"
-        :deliverable-count="headerDeliverableCount"
-        :context-usage="contextUsage"
-        :share-mode="shareMode"
-        :shareable-message-count="shareableMessageCount"
-        @open-deliverables="openDeliverables"
-        @start-share="startShareMode"
-        @copy-session-key="onSessionCopyClick"
-      />
-    </Teleport>
-
     <!-- Thread -->
     <div class="chat-body">
       <!-- Share-mode banner stays pinned above the scrolling thread. -->
@@ -184,8 +165,11 @@
           :data-preview-session="forkTransition?.parentKey"
         >
         <ChatMessageList
-          :messages="forkTransition?.previewMessages || renderedMessages"
+          ref="messageListRef"
+          :messages="forkTransition?.previewMessages || visibleRenderedMessages"
           :session-key="forkTransition?.parentKey || sessionKey"
+          :scroll-container="threadRef"
+          :virtualization-disabled="Boolean(forkTransition)"
           :auth-token="readAuthToken()"
           :artifact-navigation-items="sessionArtifacts"
           :workbench-enabled="workbenchEnabled"
@@ -208,6 +192,7 @@
           :plan-action-pending="planCardPendingAction"
           :plan-actions-disabled="planActionsDisabled"
           :is-streaming="isStreaming"
+          :follow-live-edge="autoScroll"
           :goal="currentGoalRun"
           :goal-elapsed="goalLastElapsed"
           @fork-conversation="forkConversation"
@@ -219,6 +204,7 @@
           @toggle-tool-group="toggleToolGroup"
           @toggle-tool-item="toggleToolItem"
           @show-tool-result="showToolResultModal"
+          @open-session="switchToSession"
           @resolve-interrupt="resolveInterrupt"
           @extend-interrupt="extendInterrupt"
           @clarify-submit="submitClarify"
@@ -277,16 +263,6 @@
           @implement-current="implementCurrentPlan"
           @implement-new="implementPlanInNewTask"
           @replan="beginPlanRevision"
-        />
-
-        <!-- Pre-reveal router phase: shown only before the live activity owns
-             the turn. Once activity is visible, execution status becomes
-             the single primary progress surface. -->
-        <RouterFxStrip
-          v-if="routerStripReserve"
-          class="router-fx-reserve"
-          :message="routerStripReserve"
-          aria-hidden="true"
         />
 
         <!-- MetaSkill run cards: preflight checkpoint + progress ribbon,
@@ -367,9 +343,9 @@
                  semantic answer span streams below the activity boundary; no
                  timeout or draft heuristic is involved. -->
             <div v-if="liveAnswerPart" class="live-answer">
-              <TextPart
-                :part="liveAnswerPart"
-                :sources="[]"
+              <StreamingTextPart
+                :raw-text="liveAnswerPart.rawText"
+                :render-markdown="renderMarkdown"
               />
             </div>
             <span
@@ -456,11 +432,15 @@
             @dismiss="dismissClarify"
           />
         </template>
+        <div ref="bottomSentinelRef" class="chat-bottom-sentinel" aria-hidden="true" />
         </div>
         <ConversationMinimap
           v-if="!isNewChatLanding && !shareMode && !forkTransition"
           :messages="renderedMessages"
           :scroll-container="threadRef"
+          :ensure-message-visible="messageListRef?.ensureMessageVisible"
+          :release-ensured-message="messageListRef?.releaseEnsuredMessage"
+          :message-offset="messageListRef?.messageOffset"
           :strip-time-prefix="stripTimePrefix"
           :session-key="sessionKey"
           :history-has-more="historyState.hasMore"
@@ -553,12 +533,17 @@
     <PendingQueue
       :items="pendingQueue"
       :max-pending="maxPending"
+      :reorder-enabled="canReorderPendingQueue"
+      :reorder-pending="pendingQueueReorderPending"
       :image-blocked-message="queuedImageSendBlockedMessage"
       :steer-available="sameTurnSteerAvailable"
       :steer-unavailable-message="sameTurnSteerUnavailableMessage"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
       @remove="removePendingChip"
+      @reorder="reorderPendingItem"
+      @reorder-end="endPendingReorder"
+      @reorder-start="beginPendingReorder"
       @steer="steerPendingMessage"
     />
 
@@ -730,7 +715,6 @@ import ApprovalCard from '@/components/chat/ApprovalCard.vue'
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
-import ChatHeaderActions from '@/components/chat/ChatHeaderActions.vue'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
@@ -743,7 +727,7 @@ import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
 import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
 import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
-import TextPart from '@/components/chat/parts/TextPart.vue'
+import StreamingTextPart from '@/components/chat/parts/StreamingTextPart.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
 import MetaSkillSetupCard from '@/components/chat/MetaSkillSetupCard.vue'
@@ -758,10 +742,12 @@ import SandboxSetupDialog from '@/components/sandbox/SandboxSetupDialog.vue'
 import ToolResultModal from '@/components/chat/ToolResultModal.vue'
 import Icon from '@/components/Icon.vue'
 import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
+import type { ChatMessageListVirtualizer } from '@/utils/chat/variableMessageWindow'
 import { useChatApprovals } from '@/composables/chat/useChatApprovals'
 import { useChatAttachments } from '@/composables/chat/useChatAttachments'
 import { useChatCompaction } from '@/composables/chat/useChatCompaction'
 import { useChatComposerShortcuts } from '@/composables/chat/useChatComposerShortcuts'
+import { useChatRouteHeaderBridge } from '@/composables/chat/useChatRouteHeaderBridge'
 import {
   goalHasRenderedTerminalAnchor,
   goalStatusIsTerminal,
@@ -800,6 +786,7 @@ import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandl
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
 import { useChatSteerDelivery } from '@/composables/chat/useChatSteerDelivery'
+import { useChatTaskOwnership } from '@/composables/chat/useChatTaskOwnership'
 import {
   composerRunModeSelectionAction,
   effectiveComposerRunMode,
@@ -930,10 +917,18 @@ import {
 import { listPendingMetaDiscards } from '@/utils/chat/metaDiscardOutbox'
 import { createHistoryNavigationScrollLock } from '@/utils/chat/historyNavigationScrollLock'
 import {
+  captureElementScrollAnchor,
+  captureVisibleTextScrollAnchor,
+  createScrollHandoffGuard,
+  restoreElementScrollAnchor,
+  restoreTextScrollAnchor,
+} from '@/utils/chat/scrollAnchor'
+import {
   createComposerRetractionController,
   type ComposerScrollIntent,
 } from '@/utils/chat/composerRetraction'
 import {
+  FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
   isCurrentSessionPayload as payloadIsCurrentSession,
@@ -954,6 +949,10 @@ import {
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
 import { isShareableChatMessage } from '@/utils/chat/messageIdentity'
+import {
+  projectSessionCreationRouterPresentation,
+} from '@/utils/chat/sessionCreationRouterPresentation'
+import { createPendingInputWal } from '@/utils/chat/pendingInputWal'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
 import { shouldDisableLandingSuggestions } from '@/utils/chat/landingSuggestions'
 import { handoffPlanQuestionnaireWheel } from '@/utils/chat/planQuestionnaireWheel'
@@ -966,6 +965,7 @@ import {
 import {
   isSemanticActivityStatusStep,
   projectAssistantActivityTimeline,
+  providerActivityRemainingSeconds,
   splitLiveAssistantTimeline,
 } from '@/utils/chat/assistantActivity'
 
@@ -1059,6 +1059,9 @@ const pendingAutoSendSessionKey = ref('')
 /* ── DOM refs ──────────────────────────────────────────────────────── */
 
 const threadRef = ref<HTMLElement | null>(null)
+const messageListRef = ref<ChatMessageListVirtualizer | null>(null)
+const bottomSentinelRef = ref<HTMLElement | null>(null)
+let bottomIntersectionObserver: IntersectionObserver | null = null
 const composerRef = ref<ChatComposerHandle | null>(null)
 /* Floating-composer retract: a pure controller accumulates slow user travel
    while ignoring scrollTop changes caused by history, minimap, and layout. */
@@ -1071,11 +1074,6 @@ let composerScrollIntentTimer: number | null = null
 // the normal layout and never retracts; on (default): it floats over the
 // transcript and collapses to a single line while scrolling up.
 const { enabled: composerFxEnabled } = useComposerFloatingPreference()
-type ChatHeaderActionsHandle = {
-  focusAction: (action: 'deliverables' | 'runs' | 'share' | 'copy-session-key') => boolean
-}
-const chatHeaderActionsRef = ref<ChatHeaderActionsHandle | null>(null)
-
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
@@ -1270,6 +1268,9 @@ const activeTaskGroups = ref<Set<string>>(new Set())
 // current turn so a prior task can't leak into it (issue 344).
 const activeStreamTaskId = ref<string>('')
 const activeStreamSessionKey = ref<string>('')
+const acceptanceStopPending = ref(false)
+const acceptanceRecoveryPending = ref(false)
+const taskOwnership = useChatTaskOwnership()
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
 let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
 
@@ -1368,6 +1369,7 @@ const {
   resetStreamForRouterReplay,
   resetLiveTurnState: resetStreamLiveTurnState,
   resetStreamIdleTimer,
+  setStreamConnectionAvailable,
   setStreamActivity,
   isToolGroupOpen,
   toggleToolGroup,
@@ -1380,6 +1382,11 @@ const {
   appendInterruptFrame,
   ensureInterruptBubble,
 } = chatStream
+watch(
+  () => rpc.state,
+  state => setStreamConnectionAvailable(state === 'connected'),
+  { immediate: true },
+)
 const chatAttachments = useChatAttachments()
 const {
   pendingAttachments,
@@ -1438,6 +1445,7 @@ let handleHiddenControlDispatchResult: (result: HiddenControlDispatchResult) => 
 let discardHiddenControlOutbox: (sessionKey: string, clientRequestId: string) => boolean = () => false
 let forgetHiddenControlOutbox: (sessionKey: string, clientRequestId: string) => void = () => {}
 let disarmGoalDraftForMetaRestore: () => void = () => {}
+const pendingInputWal = createPendingInputWal()
 const chatPendingQueue = useChatPendingQueue({
   sessionKey,
   ownerContext: pendingQueueOwnerContext,
@@ -1449,6 +1457,9 @@ const chatPendingQueue = useChatPendingQueue({
     isCompactInFlightForCurrentSession()
     || isQueuedDeliveryBlocked()
     || isLiveDeliveryBlocked()
+    || taskOwnership.hasAuthoritativeWork.value
+    || acceptanceStopPending.value
+    || acceptanceRecoveryPending.value
     || ['resolving', 'unavailable', 'removed', 'error'].includes(
       activeWorkspaceStatus.value,
     )
@@ -1459,6 +1470,23 @@ const chatPendingQueue = useChatPendingQueue({
   sendCurrentInput: () => sendCurrentInput(),
   resetInputHistory: () => resetComposerInputHistory(),
   hasComposer: () => Boolean(composerRef.value),
+  pendingInputWal,
+  rpc,
+  supportsMethod: method => rpc.supportsMethod(method),
+  connectionState: computed(() => rpc.state),
+  prepareAttachmentsForSend,
+  onPendingPersistenceError: reason => {
+    const message = reason === 'order_conflict'
+      ? 'Queue order changed in another tab. The server order was restored.'
+      : reason === 'attachments_unsupported'
+      ? 'Queued attachments are not supported yet. Your draft was kept.'
+      : reason === 'wal_failed'
+        ? 'Could not save the queued message locally. Your draft was kept.'
+        : 'The queued message is still saved locally and will retry after reconnecting.'
+    pushToast(message, {
+      tone: ['server_rejected', 'order_conflict'].includes(reason) ? 'warn' : 'danger',
+    })
+  },
   dispatchHiddenControl: (item, ownerSessionKey) =>
     dispatchQueuedHiddenControl(item, ownerSessionKey),
   onHiddenControlDispatchResult: (result) => {
@@ -1481,6 +1509,8 @@ const chatPendingQueue = useChatPendingQueue({
 const {
   pendingQueue,
   canQueueMore,
+  canReorder: canReorderPendingQueue,
+  isReordering: pendingQueueReorderPending,
   busySendMode,
   maxPending,
   enqueuePendingPayload,
@@ -1494,8 +1524,14 @@ const {
   clearPendingQueue,
   switchPendingQueue,
   adoptPendingQueue,
+  recoverPendingQueueHandoff,
+  failPendingQueueHandoff,
+  editPendingItem,
   popPendingTail,
   popAllPendingIntoComposer,
+  beginPendingReorder,
+  reorderPendingItem,
+  endPendingReorder,
   schedulePendingDrainAfterTerminal,
   flushDeferredPendingDrain,
   cleanup: cleanupPendingQueue,
@@ -1759,70 +1795,17 @@ const chatRenderedMessages = useChatRenderedMessages({
   isSubagentCompletionMessage,
   timeTranslator: t,
 })
-const { renderedMessages, routerDecisionCells } = chatRenderedMessages
+const { renderedMessages } = chatRenderedMessages
+const sessionCreationRouterPresentation = computed(() => (
+  projectSessionCreationRouterPresentation(renderedMessages.value, isStreaming.value)
+))
+const visibleRenderedMessages = computed(() => sessionCreationRouterPresentation.value.messages)
 
 function shouldRenderRouterStrip(_message: ChatRenderedMessage): boolean {
   // Always surface the router strip — the live ensemble strip is the primary
   // surface for the synthesizing process and no longer defers to activity.
   return true
 }
-
-/**
- * Pre-decision router-strip placeholder. It holds the strip's slot for the short
- * window before the first router_decision / ensemble_progress lands, so the live
- * ensemble strip appears from the very start of the turn rather than popping in.
- */
-const routerStripReserve = computed<ChatRenderedMessage | null>(() => {
-  if (!isStreaming.value || !routerEnabled.value || !routerVisualEffectsEnabled.value) return null
-  const rendered = renderedMessages.value
-  const liveTurnKey = [...rendered]
-    .reverse()
-    .find(message => message.displayRole === 'user')
-    ?.turnKey
-  for (let i = rendered.length - 1; i >= 0; i--) {
-    const msg = rendered[i]
-    if (msg.isRouterStrip && (!liveTurnKey || msg.turnKey === liveTurnKey)) return null
-    if (msg.displayRole === 'user' && msg.turnKey !== liveTurnKey) break
-  }
-  if (modelRoutingMode.value === 'llm_ensemble') {
-    return {
-      id: 'router-strip-reserve',
-      role: 'router',
-      displayRole: 'router',
-      roleLabel: 'Router',
-      text: '',
-      timeStr: '',
-      showHeader: false,
-      isRouterStrip: true,
-      routerState: 'pending',
-      routerSource: 'llm_ensemble',
-      routerStatic: false,
-      routerPanel: 'llm-ensemble',
-      routerMode: 'llm_ensemble',
-      gridCells: [],
-      winnerIdx: -1,
-    }
-  }
-
-  const cells = routerDecisionCells({ tier: '', model: '' })
-  if (cells.length <= 1) return null
-  return {
-    id: 'router-strip-reserve',
-    role: 'router',
-    displayRole: 'router',
-    roleLabel: 'Router',
-    text: '',
-    timeStr: '',
-    showHeader: false,
-    isRouterStrip: true,
-    routerState: 'pending',
-    routerSource: 'none',
-    routerStatic: false,
-    routerPanel: routerVisualMode.value === 'legacy_grid' ? 'legacy-grid' : 'real-candidates',
-    gridCells: cells,
-    winnerIdx: -1,
-  }
-})
 
 const aiGeneratedLabel = computed(() => t('chat.aiGeneratedLabel'))
 
@@ -1949,6 +1932,9 @@ const chatSessionSubscription = useChatSessionSubscription({
     Array.from(interruptState.value.values()).some(state => !state.resolution)),
   activeStreamTaskId,
   activeTaskGroups,
+  taskOwnership,
+  ownershipHydrationRequired: () => pendingSessionIntent.value !== 'new_chat',
+  acceptanceStopPending,
   sessionRunStatus,
   startStreaming,
   loadHistory,
@@ -1999,6 +1985,8 @@ const {
   retrySessionMetadata,
   unsubscribeSession,
   cancelActiveSubscription,
+  streamGeneration,
+  observeStreamGeneration,
 } = chatSessionSubscription
 applySessionRunState = chatSessionSubscription.applySessionRunState
 
@@ -2128,6 +2116,11 @@ const liveSendBlockedReason = computed<string | null>(() => {
   )
 })
 isLiveDeliveryBlocked = () => Boolean(liveSendBlockedReason.value)
+watch(
+  livePhase,
+  phase => appStore.setChatLivePhase(phase),
+  { immediate: true },
+)
 watch(livePhase, (phase, previousPhase) => {
   if (
     phase !== 'ready'
@@ -2149,6 +2142,9 @@ watch(activeWorkspaceStatus, (status, previousStatus) => {
 
 const sessionHasActiveWork = computed(() => (
   isStreaming.value
+  || taskOwnership.hasAuthoritativeWork.value
+  || acceptanceStopPending.value
+  || acceptanceRecoveryPending.value
   || activeTaskGroups.value.size > 0
   || isCompactInFlightForCurrentSession()
   || ['queued', 'running', 'approval_pending'].includes(runStatus.value.status)
@@ -2156,7 +2152,29 @@ const sessionHasActiveWork = computed(() => (
   || activePlanRun.value?.status === 'running'
   || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
 ))
-const canStop = computed(() => !isSessionHydrating.value && sessionHasActiveWork.value)
+const canStop = computed(() => (
+  !isSessionHydrating.value
+  && taskOwnership.hydrationResolved.value
+  && !taskOwnership.stopRequestedTaskId.value
+  && !acceptanceStopPending.value
+  && !acceptanceRecoveryPending.value
+  && (
+    Boolean(taskOwnership.stopTargetTaskId.value)
+    || activeStreamTaskId.value === PENDING_STREAM_TASK_ID
+    || Boolean(
+      activeStreamTaskId.value
+      && ![
+        FINISHED_STREAM_TASK_ID,
+        STOPPED_STREAM_TASK_ID,
+      ].includes(activeStreamTaskId.value),
+    )
+    || isCompactInFlightForCurrentSession()
+    || activeTaskGroups.value.size > 0
+    || activePlanRun.value?.status === 'queued'
+    || activePlanRun.value?.status === 'running'
+    || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
+  )
+))
 const runModeLocked = computed(
   () => isSessionHydrating.value
     || sessionHasActiveWork.value
@@ -2183,6 +2201,10 @@ const chatSessionRuntime = useChatSessionRuntime({
   currentEpoch,
   lastStreamSeq,
   activeTaskGroups,
+  taskOwnership,
+  activeStreamTaskId,
+  activeStreamSessionKey,
+  acceptanceStopPending,
   aborted,
   lastHeaderRole,
   lastHeaderDay,
@@ -2341,6 +2363,7 @@ const chatGoals = useChatGoals({
   rpc,
   sessionKey,
   currentEpoch,
+  streamGeneration,
   ensureSessionKey: async () => {
     // A goal needs a durable session before it can be registered. On the
     // new-chat landing the client already owns a provisional key, including
@@ -2558,6 +2581,7 @@ const chatSend = useChatSend({
   messages,
   sessionKey,
   pendingQueueOwnerContext,
+  pendingInputWal,
   busySendMode,
   modelRoutingMode,
   modelRoutingSettingsBusy,
@@ -2583,6 +2607,9 @@ const chatSend = useChatSend({
   aborted,
   activeStreamTaskId,
   activeStreamSessionKey,
+  taskOwnership,
+  acceptanceStopPending,
+  acceptanceRecoveryPending,
   autoScroll,
   stream: chatStream,
   canStop: () => canStop.value,
@@ -2597,6 +2624,8 @@ const chatSend = useChatSend({
     }
     return adoptResponseSession(key, ownerRequestId)
   },
+  recoverPendingQueueHandoff,
+  failPendingQueueHandoff,
   scheduleHistorySync,
   schedulePendingDrainAfterTerminal,
   flushDeferredPendingDrain,
@@ -2611,6 +2640,7 @@ const chatSend = useChatSend({
   steerDelivery,
   restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
+  reconcileTaskOwnership: () => retrySessionMetadata(),
   executeSlashCommand,
   closeSlashMenu,
   autoResizeTextarea,
@@ -2629,7 +2659,15 @@ const {
   flushPendingMetaDiscards,
   restoreHiddenControls,
   sendHiddenMetaPreflightConfirmation,
+  recoverResponseHandoffs,
 } = chatSend
+void recoverResponseHandoffs()
+watch(
+  [() => rpc.state, sessionKey],
+  ([state]) => {
+    if (state === 'connected') void recoverResponseHandoffs()
+  },
+)
 async function onSend(
   sendOptions?: Parameters<typeof dispatchCurrentInput>[0],
 ): Promise<void> {
@@ -2872,27 +2910,15 @@ dispatchPlanComposerPrompt = (prompt, composerText) => {
 dispatchQueuedHiddenControl = dispatchQueuedHiddenSend
 dispatchQueuedItem = sendQueuedFollowup
 
-function takeVisiblePendingItem(index: number) {
-  const item = pendingQueue.value[index]
-  if (!item || item.hiddenControl || item.deliveryState || item.steerAttempt) return null
-  pendingQueue.value.splice(index, 1)
-  return item
-}
-
-function editPendingMessage(index: number) {
-  const item = takeVisiblePendingItem(index)
-  if (!item) return
-  inputText.value = [item.text, inputText.value].filter(text => text.trim()).join('\n')
-  pendingAttachments.value = [...(item.attachments || []), ...pendingAttachments.value]
-  pendingSessionIntent.value = item.intent || pendingSessionIntent.value
-  autoResizeTextarea()
+function editPendingMessage(pendingUiId: string) {
+  if (!editPendingItem(pendingUiId)) return
   nextTick(() => composerRef.value?.focusTextarea())
 }
 
 const pendingSteerClicks = new WeakSet<ChatPendingItem>()
 
-async function steerPendingMessage(index: number) {
-  const candidate = pendingQueue.value[index]
+async function steerPendingMessage(pendingUiId: string) {
+  const candidate = pendingQueue.value.find(item => item.pendingUiId === pendingUiId)
   if (
     candidate?.steerAttempt
     && (
@@ -2902,7 +2928,7 @@ async function steerPendingMessage(index: number) {
   ) return
   const item = candidate?.steerAttempt
     ? candidate
-    : beginPendingDelivery(index, candidate?.hiddenControl === true)
+    : beginPendingDelivery(pendingUiId, candidate?.hiddenControl === true)
   if (!item) return
   if (candidate?.steerAttempt) pendingSteerClicks.add(candidate)
 
@@ -2955,7 +2981,9 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   sessionKey,
   currentEpoch,
   lastStreamSeq,
+  observeStreamGeneration,
   activeTaskGroups,
+  taskOwnership,
   activeStreamTaskId,
   aborted,
   messages,
@@ -3038,7 +3066,21 @@ const liveActivityProjection = computed(() =>
   }),
 )
 const liveActivityPhaseLabel = computed(() => {
-  if (streamActivityStale.value) return streamPhaseLabel.value
+  // The elapsed chip is backed by the shared one-second activity tick. Reading
+  // it here keeps a Retry-After countdown moving without extra provider events.
+  void streamPhaseElapsed.value
+  if (runStatus.value.status === 'queued' || streamActivityStale.value) {
+    return streamPhaseLabel.value
+  }
+  // Keep the slot-acquired boundary explicit until a real provider/router
+  // signal replaces it. Once that activity exists, use the established
+  // timeline projection (for example Working during a tool turn).
+  if (
+    !streamHasVisibleOutput.value
+    && streamPhaseLabel.value === String(t('chat.status.running'))
+  ) {
+    return streamPhaseLabel.value
+  }
   const currentStatus = [...liveActivityProjection.value.statusSteps]
     .reverse()
     .find(step => step.isCurrent)
@@ -3048,7 +3090,10 @@ const liveActivityPhaseLabel = computed(() => {
     && !currentStatus.label.code.startsWith('chat.activity.lifecycle.')
     && !liveActivityProjection.value.currentClusterKey
   ) {
-    return String(t(currentStatus.label.code, currentStatus.label.params))
+    const retrySeconds = providerActivityRemainingSeconds(currentStatus)
+    return String(t(currentStatus.label.code, retrySeconds === null
+      ? currentStatus.label.params
+      : { ...currentStatus.label.params, seconds: retrySeconds }))
   }
   return String(t(
     liveAnswerPart.value
@@ -3158,12 +3203,65 @@ watch(
 // and empties as soon as the next turn starts so that setting the same
 // "Completed" text again is a fresh mutation screen readers re-announce.
 const turnSettledAnnouncement = ref('')
+
+function preserveTerminalAnswerAnchor() {
+  const container = threadRef.value
+  if (!container || autoScroll.value) return
+  const liveAnswer = container.querySelector<HTMLElement>('.live-answer')
+  const elementAnchor = captureElementScrollAnchor(container, liveAnswer)
+  const textAnchor = captureVisibleTextScrollAnchor(container, liveAnswer)
+  if (!elementAnchor && !textAnchor) return
+
+  const ownerSessionKey = sessionKey.value
+  const guard = createScrollHandoffGuard(container)
+  const previousRows = Array.from(
+    container.querySelectorAll<HTMLElement>('.chat-message-list__row'),
+  )
+  const previousLastRow = previousRows[previousRows.length - 1] ?? null
+  let frameCount = 0
+  const finish = () => guard.dispose()
+  const restore = () => {
+    if (
+      sessionKey.value !== ownerSessionKey
+      || isStreaming.value
+      || autoScroll.value
+      || threadRef.value !== container
+      || guard.isCancelled()
+      || guard.positionChangedBeyondTolerance()
+    ) {
+      finish()
+      return
+    }
+    const rows = Array.from(
+      container.querySelectorAll<HTMLElement>('.chat-message-list__row'),
+    )
+    const lastRow = rows[rows.length - 1] ?? null
+    const replacement = lastRow && lastRow !== previousLastRow
+      ? lastRow.querySelector<HTMLElement>('.assistant-answer, .msg-ai-text')
+      : null
+    const restored = restoreTextScrollAnchor(textAnchor, replacement)
+      || restoreElementScrollAnchor(elementAnchor, replacement)
+    if (restored) guard.acceptCurrentPosition()
+    frameCount += 1
+    // The terminal row, variable-height cache, and Markdown decorators settle
+    // on adjacent frames. Re-apply the same visual offset after each phase;
+    // user intent or a new stream/session cancels the handoff above.
+    if (frameCount < 3 && (!restored || frameCount < 2)) {
+      window.requestAnimationFrame(restore)
+    } else {
+      finish()
+    }
+  }
+  void nextTick(() => window.requestAnimationFrame(restore))
+}
+
 watch(isStreaming, (streaming, wasStreaming) => {
   if (streaming) turnSettledAnnouncement.value = ''
   else if (wasStreaming) {
+    preserveTerminalAnswerAnchor()
     turnSettledAnnouncement.value = String(t('chat.activity.lifecycle.settled'))
   }
-})
+}, { flush: 'pre' })
 
 // Soft content-silence watchdog: after the high negotiated threshold, surface
 // a neutral long-running notice. Backend-deadline-owned Ensemble phases remain
@@ -3199,6 +3297,7 @@ const metaRuns = useMetaRuns({
   sessionKey,
   currentEpoch,
   lastStreamSeq,
+  observeStreamGeneration,
   sendHiddenConfirmation: sendHiddenMetaPreflightConfirmation,
   sendHiddenReplay: (providerText: string, displayText: string) => (
     dispatchHiddenForMeta(providerText, displayText)
@@ -3860,7 +3959,7 @@ const deliverablesOpen = ref(false)
 function focusHeaderAction(
   action: 'deliverables' | 'share' | 'copy-session-key',
 ) {
-  void nextTick(() => chatHeaderActionsRef.value?.focusAction(action))
+  void nextTick(() => chatRouteHeaderRegistration.focusAction(action))
 }
 
 function openDeliverables() {
@@ -4165,6 +4264,27 @@ const {
   }
 })
 
+// App owns the header component. This view registers one stable set of refs and
+// commands; draft materialization only changes those refs and never rebuilds
+// the header subtree. The owner token makes delayed teardown harmless.
+const chatRouteHeader = useChatRouteHeaderBridge()
+const chatRouteHeaderRegistration = chatRouteHeader.register({
+  visible: computed(() => !isNewChatLanding.value),
+  title: currentChatTitle,
+  copyState: sessionCopyState,
+  copyIcon: sessionCopyIcon,
+  copyLiveText: sessionCopyLiveText,
+  deliverableCount: headerDeliverableCount,
+  contextUsage,
+  shareMode,
+  shareableMessageCount,
+}, {
+  openDeliverables,
+  startShare: startShareMode,
+  copySessionKey: onSessionCopyClick,
+  restoreComposerFocus: () => composerRef.value?.focusTextarea(),
+})
+
 /* ── Share export ──────────────────────────────────────────────────── */
 
 function startShareMode() {
@@ -4290,7 +4410,7 @@ function closeSharePreview() {
   sharePreview.value = null
   nextTick(() => {
     if (shareMode.value) shareBannerRef.value?.focus()
-    else chatHeaderActionsRef.value?.focusAction('share')
+    else chatRouteHeaderRegistration.focusAction('share')
   })
 }
 
@@ -4310,7 +4430,12 @@ function scrollToBottom() {
     // A stream/event may request a follow while the reader is at the live edge,
     // then the reader can scroll up before Vue applies this next-tick callback.
     // Re-check here so that queued automatic scrolls never override that choice.
-    if (threadRef.value && autoScroll.value) {
+    if (threadRef.value && bottomSentinelRef.value && autoScroll.value) {
+      // The floating composer is represented by bottom padding after the
+      // sentinel. scrollIntoView() aligns the sentinel but leaves that padding
+      // below the viewport, so the live answer remains hidden under the dock
+      // and the geometric bottom gap equals the composer height. Scroll the
+      // container itself to its true maximum instead.
       threadRef.value.scrollTop = threadRef.value.scrollHeight
     }
   })
@@ -4320,7 +4445,12 @@ function onThreadScroll() {
   const el = threadRef.value
   if (!el) return
   const gap = el.scrollHeight - el.scrollTop - el.clientHeight
-  historyNavigationScrollLock.updateFromScroll(gap)
+  // Virtualized row measurement and other layout corrections can move the
+  // bottom sentinel without any reader gesture. Only release live-edge follow
+  // when the reader expressed scroll intent; arriving back at the bottom may
+  // always re-enable it.
+  const intent = currentThreadScrollIntent()
+  if (gap < 60 || intent !== null) historyNavigationScrollLock.updateFromScroll(gap)
   if (isNewChatLanding.value || !composerFxEnabled.value) {
     resetComposerRetraction()
     return
@@ -4731,6 +4861,21 @@ let chatViewActive = false
 onMounted(async () => {
   chatViewActive = true
   chatViewDisposed = false
+  if (
+    typeof IntersectionObserver !== 'undefined'
+    && threadRef.value
+    && bottomSentinelRef.value
+  ) {
+    bottomIntersectionObserver = new IntersectionObserver((entries) => {
+      if (entries.some(entry => entry.isIntersecting) && !historyNavigationScrollLock.locked) {
+        autoScroll.value = true
+      }
+    }, {
+      root: threadRef.value,
+      threshold: 1,
+    })
+    bottomIntersectionObserver.observe(bottomSentinelRef.value)
+  }
   const initialRouteFullPath = route.fullPath
   // Initialize session key. Without an explicit ?session= the view opens as a
   // draft instead of restoring a previous session.
@@ -4821,7 +4966,9 @@ onMounted(async () => {
         composerDockPinFrame = requestAnimationFrame(() => {
           composerDockPinFrame = null
           const thread = threadRef.value
-          if (thread && autoScroll.value) thread.scrollTop = thread.scrollHeight
+          if (thread && autoScroll.value) {
+            thread.scrollTop = thread.scrollHeight
+          }
         })
       }
     }
@@ -4883,7 +5030,9 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  chatRouteHeaderRegistration.release()
   chatViewActive = false
+  appStore.setChatLivePhase('idle')
   chatViewDisposed = true
   forkTransitionLifetime.dispose()
   forkTransition.value = null
@@ -4909,6 +5058,8 @@ onUnmounted(() => {
     composerDockResizeObserver.disconnect()
     composerDockResizeObserver = null
   }
+  bottomIntersectionObserver?.disconnect()
+  bottomIntersectionObserver = null
   if (composerDockPinFrame !== null) {
     cancelAnimationFrame(composerDockPinFrame)
     composerDockPinFrame = null
@@ -5141,5 +5292,11 @@ watch(
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+.chat-bottom-sentinel {
+  width: 100%;
+  height: 1px;
+  pointer-events: none;
 }
 </style>

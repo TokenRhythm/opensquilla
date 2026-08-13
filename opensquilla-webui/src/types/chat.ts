@@ -15,6 +15,8 @@ export interface Attachment {
   ttl_seconds?: number
   error?: string
   file?: File
+  /** Server-owned bytes restored from the durable pending-input queue. */
+  durable_material?: true
 }
 
 export interface DisplayAttachment {
@@ -56,6 +58,8 @@ export interface PendingSteerAttempt {
 }
 
 export interface ChatPendingItem {
+  /** Stable local identity for keyed rendering and UI actions across peer edits. */
+  pendingUiId: string
   text: string
   attachments: Attachment[]
   intent: string | null
@@ -83,6 +87,29 @@ export interface ChatPendingItem {
   hiddenClientMessageId?: string
   /** The visible confirmation bubble was already rendered optimistically. */
   hiddenVisibleCommitted?: boolean
+  /** Stable identity shared by IndexedDB WAL and the Gateway staged queue. */
+  pendingInputId?: string
+  pendingClientRequestId?: string
+  pendingClientMessageId?: string
+  pendingRequestFingerprint?: string
+  pendingServerRevision?: number
+  pendingPosition?: number
+  pendingWalRevision?: number
+  pendingCreatedAt?: number
+  /**
+   * The stable identity may already exist in a Gateway even when its enqueue
+   * acknowledgement was lost.  Keep this provenance across mixed-version or
+   * disconnected periods so a local cancel cannot discard the only durable
+   * delete intent.
+   */
+  pendingMayHaveServerCopy?: boolean
+  /** Browser/server staging lifecycle. Unknown enqueue results remain `saving`. */
+  pendingPersistenceState?:
+    | 'saving'
+    | 'staged'
+    | 'local_only'
+    | 'retryable'
+    | 'cancelling'
 }
 
 export type HiddenControlDispatchStatus =
@@ -537,6 +564,11 @@ export interface ChatMessageMeta {
   decisionId?: string
 }
 
+export interface ChatCreatedSessionLink {
+  callId: string
+  sessionKey: string
+}
+
 export interface ChatRenderedMessage {
   id?: string
   clientId?: string
@@ -567,6 +599,9 @@ export interface ChatRenderedMessage {
   turnOutcome?: ChatTurnOutcome
   hasAttachments?: boolean
   attachments?: DisplayAttachment[]
+  /** Explicit placement for successful sessions_spawn cards. An empty array
+   *  suppresses the source card after it is rehomed below the parent reply. */
+  createdSessionLinks?: ChatCreatedSessionLink[]
   toolCalls?: ChatToolCall[]
   planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timelineItems?: ChatStreamTimelineItem[]

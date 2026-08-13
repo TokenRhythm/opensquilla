@@ -17,6 +17,9 @@ interface MountOptions {
   historyHasMore?: boolean
   onNavigate?: ReturnType<typeof vi.fn>
   onNavigateEnd?: ReturnType<typeof vi.fn>
+  ensureMessageVisible?: (sourceIndex: number) => Promise<HTMLElement | null>
+  releaseEnsuredMessage?: (sourceIndex?: number) => void
+  messageOffset?: (sourceIndex: number) => number | null
 }
 
 interface ThreadDimensions {
@@ -154,6 +157,9 @@ async function mountMinimap(
     historyHasMore: options.historyHasMore,
     onNavigate: options.onNavigate,
     onNavigateEnd: options.onNavigateEnd,
+    ensureMessageVisible: options.ensureMessageVisible,
+    releaseEnsuredMessage: options.releaseEnsuredMessage,
+    messageOffset: options.messageOffset,
   })
   app.use(i18n)
   app.mount(host)
@@ -311,6 +317,35 @@ describe('ConversationMinimap', () => {
     thread.container.dispatchEvent(new Event('scrollend'))
     expect(onNavigateEnd).toHaveBeenCalledOnce()
     expect(thread.container.querySelector('[data-chat-turn-key="user-3"]')?.classList.contains('is-history-target')).toBe(true)
+  })
+
+  it('materializes an unmounted logical prompt before minimap navigation', async () => {
+    let threadContainer: HTMLElement | null = null
+    const releaseEnsuredMessage = vi.fn()
+    const ensureMessageVisible = vi.fn(async (sourceIndex: number) => {
+      const anchor = document.createElement('div')
+      anchor.id = `chat-turn-${sourceIndex}`
+      anchor.dataset.chatTurnKey = `user-${sourceIndex / 2}`
+      anchor.tabIndex = -1
+      anchor.getBoundingClientRect = () => rect((sourceIndex / 2) * 400 - (threadContainer?.scrollTop || 0), 80)
+      threadContainer?.appendChild(anchor)
+      return anchor
+    })
+    const mounted = await mountMinimap(8, {
+      ensureMessageVisible,
+      releaseEnsuredMessage,
+      messageOffset: sourceIndex => (sourceIndex / 2) * 400,
+    })
+    threadContainer = mounted.thread.container
+    mounted.thread.container.querySelector('[data-chat-turn-key="user-3"]')?.remove()
+
+    markers(mounted.host)[3].click()
+    await vi.waitFor(() => expect(mounted.thread.scrollTo).toHaveBeenCalled())
+
+    expect(ensureMessageVisible).toHaveBeenCalledWith(6)
+    expect(mounted.thread.scrollTo).toHaveBeenLastCalledWith({ top: 1_184, behavior: 'smooth' })
+    mounted.thread.container.dispatchEvent(new Event('scrollend'))
+    expect(releaseEnsuredMessage).toHaveBeenCalledWith(6)
   })
 
   it('completes immediately when the selected prompt is already in place', async () => {

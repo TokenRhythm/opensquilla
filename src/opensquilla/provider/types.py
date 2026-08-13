@@ -213,6 +213,40 @@ class ProviderHeartbeatEvent:
 
 
 @dataclass
+class ProviderActivityEvent:
+    """Safe, structured lifecycle signal for one upstream model activity.
+
+    This provider-domain shape intentionally contains no raw upstream error,
+    response body, prompt, or reasoning text.  The engine mirrors it onto the
+    public ``session.event.provider_activity`` contract.
+    """
+
+    kind: Literal["provider_activity"] = field(default="provider_activity", init=False)
+    schema_version: int = 1
+    activity_id: str = ""
+    phase: Literal["requesting", "reasoning", "retry_wait", "retrying", "fallback"] = (
+        "requesting"
+    )
+    reason: Literal[
+        "initial",
+        "rate_limited",
+        "provider_overloaded",
+        "transport_transient",
+        "reasoning_only",
+        "empty_response",
+        "stream_incomplete",
+        "invalid_response",
+        "context_overflow",
+        "unknown",
+    ] = "initial"
+    retry_attempt: int = 0
+    retry_limit: int = 0
+    retry_after_ms: int = 0
+    started_at: int = 0
+    heartbeat: bool = False
+
+
+@dataclass
 class EnsembleProgressEvent:
     """Mid-turn LLM-ensemble lifecycle signal — one proposer/aggregator started
     or finished. Lets the UI reveal ensemble members incrementally before the
@@ -267,6 +301,7 @@ StreamEvent = (
     | DoneEvent
     | ErrorEvent
     | ProviderHeartbeatEvent
+    | ProviderActivityEvent
     | EnsembleProgressEvent
 )
 
@@ -447,6 +482,14 @@ class ChatConfig(BaseModel):
     physical_attempt_limit: int = Field(
         default=0,
         ge=0,
+        exclude=True,
+        repr=False,
+    )
+    # Runtime-only absolute turn deadline. Provider selectors use it to avoid
+    # violating an upstream Retry-After when the same account/endpoint owns the
+    # next fallback leg. Adapters never serialize or send this value upstream.
+    turn_deadline_at_monotonic: float | None = Field(
+        default=None,
         exclude=True,
         repr=False,
     )

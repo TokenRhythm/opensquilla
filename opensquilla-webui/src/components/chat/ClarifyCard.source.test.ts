@@ -75,6 +75,9 @@ describe('ClarifyCard submit feedback', () => {
     expect(chatViewStyles).toContain(
       '.chat--plan-questionnaire-open .chat-thread :deep(.clarify-card--plan)',
     )
+    expect(chatViewStyles).toContain(
+      '.chat--plan-questionnaire-open .chat-thread :deep(.clarify-outcome--plan)',
+    )
   })
 
   it('uses restrained Plan-only presentation without changing generic outcome feedback', () => {

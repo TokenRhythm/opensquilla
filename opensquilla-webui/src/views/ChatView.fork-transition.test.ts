@@ -16,7 +16,7 @@ describe('chat fork hand-off contract', () => {
   it('uses durable inclusive turn ids for historical assistant branches', () => {
     expect(messageListSource).toContain("forkConversation: [throughTurnId?: string]")
     expect(messageListSource).toContain("turnOutcome?.turnId?.trim()")
-    expect(messageListSource).toContain("@fork=\"$emit('forkConversation', forkThroughTurnId(index))\"")
+    expect(messageListSource).toContain("@fork=\"$emit('forkConversation', forkThroughTurnId(entry.index))\"")
     expect(transitionSource).toContain("method: 'sessions.forkThroughTurn'")
     expect(transitionSource).toContain("params: { key: parentKey, throughTurnId }")
     expect(chatViewSource).toContain('rpc.call<ForkRpcResponse>(request.method, request.params)')
@@ -31,7 +31,7 @@ describe('chat fork hand-off contract', () => {
   })
 
   it('keeps a read-only parent projection visible until child history is ready', () => {
-    expect(chatViewSource).toContain(':messages="forkTransition?.previewMessages || renderedMessages"')
+    expect(chatViewSource).toContain(':messages="forkTransition?.previewMessages || visibleRenderedMessages"')
     expect(chatViewSource).toContain(':session-key="forkTransition?.parentKey || sessionKey"')
     expect(chatViewSource).toContain(':inert="forkTransition ? true : undefined"')
     expect(chatViewSource).toContain('Render-only snapshot; never becomes the child session\'s canonical messages.')

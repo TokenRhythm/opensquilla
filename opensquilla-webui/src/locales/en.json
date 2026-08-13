@@ -3225,6 +3225,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Chat created",
+      "open": "Open chat"
+    },
     "promptCacheKeepalive": {
       "action": "Prompt cache keepalive",
       "title": "Prompt cache keepalive",
@@ -3478,6 +3482,14 @@
         "settled": "Completed",
         "interrupted": "Interrupted",
         "failed": "Failed"
+      },
+      "provider": {
+        "waiting": "Waiting for model",
+        "reasoning": "Thinking deeply",
+        "rateLimited": "Rate limited · retrying in {seconds}s",
+        "retryWait": "Retrying in {seconds}s",
+        "retrying": "Retrying {attempt}/{limit}",
+        "fallback": "Switching to backup model"
       },
       "purpose": {
         "discover": "Discovered links",
@@ -3801,6 +3813,10 @@
       "steerRetryUnknownHint": "OpenSquilla could not confirm whether this guidance was accepted. Retry safely replays the exact original request.",
       "removeUnknownSteer": "Discard local retry for pending message {index}; this does not mean the server did not receive it",
       "queueHint": "Queue mode: these messages auto-send in order when the current response finishes",
+      "reorderHint": "Press and hold for 0.75 seconds, then drag to reorder. Alt+Arrow also moves this message.",
+      "reorderStarted": "Reordering {label}. Drag to a new position, then release.",
+      "reorderPosition": "{label} moved to position {position} of {count}.",
+      "reorderRecovering": "Restoring queue order…",
       "clearAll": "Clear all",
       "editMessage": "Edit message",
       "editWhileStreaming": "Wait for the current reply to finish before editing",
@@ -3979,6 +3995,7 @@
       "waitCompactionBeforeCommand": "Wait for context compaction before running {command}.",
       "waitResponseBeforeCommand": "Wait for the current response before running {command}.",
       "queueFull": "Queue is full — wait for the current response to finish.",
+      "queuePersistenceUnavailable": "Keep this message in the composer until the fork finishes; durable recovery is unavailable.",
       "messageStillSaving": "This message hasn't finished saving — try again in a moment.",
       "artifactOpenFailed": "Artifact open failed. Use Download instead."
     },
@@ -4063,6 +4080,7 @@
     "sidebar": {
       "recentConversations": "Recent tasks",
       "recents": "Recents",
+      "pinned": "Pinned",
       "refresh": "Reload tasks",
       "clearAgentFilter": "Clear agent filter: {name}",
       "loadError": "Unable to load tasks",

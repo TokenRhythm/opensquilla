@@ -121,6 +121,39 @@ describe('SidebarConversations bulk actions', () => {
     expect(menuText).toContain('Delete')
   })
 
+  it('offers rename and delete without pinning for subagent task records', async () => {
+    await mountSidebar({
+      sections: [{
+        family: 'chats',
+        label: 'Tasks',
+        rows: [{
+          rowKind: 'session',
+          key: 'agent:main:subagent:child',
+          title: 'Analyze checkout failures',
+          effectiveAgentId: 'main',
+          agentName: 'Main',
+          sessionKind: 'task',
+          depth: 1,
+          runStatus: 'idle',
+          runLabel: 'Idle',
+          taskAttention: 'none',
+          updatedAt: Date.now(),
+          hasContractGaps: false,
+        }],
+      }],
+    })
+
+    document.body.querySelector<HTMLButtonElement>(
+      '[aria-label="Actions for Analyze checkout failures"]',
+    )?.click()
+    await nextTick()
+
+    const menuItems = Array.from(
+      document.body.querySelectorAll<HTMLElement>('.sidebar-row-menu__item'),
+    ).map(item => item.textContent?.trim())
+    expect(menuItems).toEqual(['Rename', 'Delete'])
+  })
+
   it('does not render the conversations region until a session exists', async () => {
     const root = await mountSidebar({ sections: [] })
 

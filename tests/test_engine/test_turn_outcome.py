@@ -36,6 +36,24 @@ def test_provider_failure_kind_is_preserved_in_durable_outcome() -> None:
     assert outcome.to_dict()["failure_kind"] == "insufficient_credits"
 
 
+def test_transient_provider_failure_kind_is_retryable() -> None:
+    outcome = outcome_from_error(
+        code="429",
+        message="The model provider is temporarily rate limited.",
+        failure_kind="rate_limited",
+    )
+
+    assert outcome.kind == "failed"
+    assert outcome.retryable is True
+
+
+def test_pretext_buffer_exhaustion_is_retryable() -> None:
+    outcome = outcome_from_error(code="provider_pretext_buffer_exhausted")
+
+    assert outcome.kind == "failed"
+    assert outcome.retryable is True
+
+
 def test_ensemble_multimodal_rejection_is_failed_and_not_retryable() -> None:
     outcome = outcome_from_error(
         code="ensemble_multimodal_unsupported",

@@ -18,6 +18,33 @@ describe('useChatTextRendering math', () => {
   })
 })
 
+describe('useChatTextRendering cache bounds', () => {
+  it('never retains growing live prefixes', () => {
+    const { renderMarkdown, markdownCacheStats } = useChatTextRendering()
+    for (let index = 1; index <= 200; index += 1) {
+      renderMarkdown('x'.repeat(index), {
+        highlight: false,
+        cache: 'none',
+        math: 'defer',
+      })
+    }
+    expect(markdownCacheStats()).toEqual({ entries: 0, bytes: 0 })
+  })
+
+  it('bounds settled entries by retained bytes and skips oversized items', () => {
+    const { renderMarkdown, markdownCacheStats } = useChatTextRendering()
+    for (let index = 0; index < 60; index += 1) {
+      renderMarkdown(`${index}\n${'x'.repeat(40 * 1024)}`)
+    }
+    expect(markdownCacheStats().bytes).toBeLessThanOrEqual(8 * 1024 * 1024)
+    expect(markdownCacheStats().entries).toBeGreaterThan(0)
+
+    const before = markdownCacheStats()
+    renderMarkdown('y'.repeat(300 * 1024))
+    expect(markdownCacheStats()).toEqual(before)
+  })
+})
+
 describe('useChatTextRendering protocol-shaped literals', () => {
   const cases = [
     {

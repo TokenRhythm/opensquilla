@@ -109,6 +109,44 @@ async def test_mark_terminal_emits_additive_terminal_message_for_timeout_payload
 
 
 @pytest.mark.asyncio
+async def test_typed_provider_exception_is_sanitized_in_task_record_and_wire_event() -> None:
+    raw_marker = "RAW_PROVIDER_BODY_FROM_STREAM_EXCEPTION"
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _emitter(
+        session_key: str,
+        event_name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    async def _provider_failure_handler(_run: Any) -> None:
+        raise TaskRuntimeStreamError(
+            raw_marker,
+            code="PRIVATE_UPSTREAM_CODE",
+            terminal_reason="error",
+            failure_kind="transport_transient",
+        )
+
+    runtime = _make_runtime(_provider_failure_handler, event_emitter=_emitter)
+    handle = await runtime.enqueue(_make_envelope(), "hello")
+
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.error_class == "provider_transport_transient"
+    assert record.error_message == (
+        "The connection to the model provider was interrupted. Try again."
+    )
+    assert raw_marker not in repr(record)
+    terminal_event = next(event for event in emitted if event[1] == "task.failed")
+    assert raw_marker not in repr(terminal_event)
+    assert terminal_event[2]["terminal_message"] == "The task failed before it could finish."
+    assert record.details is not None
+    assert record.details["turn_outcome"]["retryable"] is True
+
+
+@pytest.mark.asyncio
 async def test_terminal_event_still_emits_when_terminal_persistence_is_locked() -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
     storage = _make_storage()
@@ -398,6 +436,79 @@ async def test_task_runtime_stream_error_keeps_failure_kind_internal() -> None:
 
     assert exc_info.value.failure_kind == "insufficient_credits"
     assert "failure_kind" not in emitted[-1][2]
+    assert emitted[-1][2]["turn_outcome"]["failure_kind"] == "insufficient_credits"
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_transient_provider_error_is_retryable_on_wire() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield ErrorEvent(
+            message="Synthetic rate limit",
+            code="PRIVATE_PROVIDER_CODE_BODY",
+            failure_kind="rate_limited",
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    with pytest.raises(TaskRuntimeStreamError):
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            "agent:main:test",
+            _emitter,
+            stream_event_sink=None,
+            idle_timeout=1.0,
+            heartbeat_interval=0.0,
+        )
+
+    assert emitted[-1][2]["turn_outcome"] == {
+        "kind": "failed",
+        "reason": "provider_rate_limited",
+        "error_class": "provider_rate_limited",
+        "error_message": "The model provider is rate-limiting requests. Try again later.",
+        "failure_kind": "rate_limited",
+        "retryable": True,
+    }
+    assert "Synthetic rate limit" not in repr(emitted[-1][2])
+    assert "PRIVATE_PROVIDER_CODE_BODY" not in repr(emitted[-1][2])
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_error_is_sanitized_before_internal_stream_sink() -> None:
+    raw_marker = "RAW_PROVIDER_BODY_FOR_STREAM_SINK"
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+    sunk: list[Any] = []
+
+    async def _stream():
+        yield ErrorEvent(
+            message=raw_marker,
+            code="PRIVATE_PROVIDER_CODE_BODY",
+            failure_kind="transport_transient",
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    async def _sink(event: Any) -> None:
+        sunk.append(event)
+
+    with pytest.raises(TaskRuntimeStreamError):
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            "agent:main:test",
+            _emitter,
+            stream_event_sink=_sink,
+            idle_timeout=1.0,
+            heartbeat_interval=0.0,
+        )
+
+    assert len(sunk) == 1
+    assert sunk[0]["kind"] == "error"
+    assert sunk[0]["code"] == "provider_transport_transient"
+    assert raw_marker not in repr(sunk)
+    assert "PRIVATE_PROVIDER_CODE_BODY" not in repr(sunk)
 
 
 @pytest.mark.asyncio

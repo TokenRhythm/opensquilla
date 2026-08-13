@@ -182,6 +182,15 @@ async function mockStreamingEnsembleRun(page: Page) {
             stream_seq: 2,
             to_state: 'thinking',
           }))
+          ws.send(wsEvent('session.event.ensemble_progress', {
+            key: STREAM_SESSION_KEY,
+            task_id: 'ensemble-stream-task',
+            stream_seq: 3,
+            event_type: 'proposer_start',
+            proposer_label: 'anchor',
+            proposer_provider: 'openrouter',
+            proposer_model: 'qwen/qwen3.7-plus',
+          }))
           return
         }
         const payloads: Record<string, unknown> = {
@@ -819,8 +828,8 @@ test('live ensemble routing shows the strip alongside flat activity', async ({ p
 
   // The flat activity surface runs its normal execution phase...
   await expect(page.locator('.assistant-activity--live')).toBeVisible({ timeout: 10000 })
-  // ...and the ensemble strip is surfaced independently — here as the pre-decision
-  // reserve, before any member arrives — instead of being hidden behind it.
+  // ...and the ensemble strip is surfaced independently after authoritative
+  // proposer activity arrives, instead of being inferred before Router work.
   await expect(page.locator('.router-fx[data-panel="llm-ensemble"]')).toHaveCount(1)
   // It is live, not settled.
   await expect(page.locator('.router-fx[data-panel="llm-ensemble"][data-settled="true"]')).toHaveCount(0)

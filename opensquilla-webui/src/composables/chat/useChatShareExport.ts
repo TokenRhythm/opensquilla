@@ -54,6 +54,7 @@ const SHARE_CLONE_STRIP_SELECTORS = [
   '[data-share-control]',
   '.turn-usage-details',
   '[data-turn-usage-details]',
+  '.msg-ai-meta',
   '.msg-meta__more',
   '.msg-meta__cost',
   '.step-view-btn',

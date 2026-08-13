@@ -79,6 +79,8 @@ export type RpcEventHandler = {
   bivarianceHack(...args: unknown[]): void;
 }['bivarianceHack'];
 
+const RECONNECT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000] as const;
+
 interface PendingRequest {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
@@ -136,9 +138,7 @@ export class RpcClient {
   private _token: string | null = null;
   private _guestSessionKey: string | null = null;
   private _reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private _reconnectDelay = 800;
-  private _maxReconnectDelay = 15000;
-  private _reconnectFactor = 1.7;
+  private _reconnectAttempt = 0;
   private _autoReconnect = true;
   private _pingTimer: ReturnType<typeof setInterval> | null = null;
   private _pingInterval = 55000;
@@ -367,7 +367,6 @@ export class RpcClient {
 
     socket.onopen = () => {
       if (!this._isCurrentSocket(socket, generation)) return;
-      this._reconnectDelay = 800;
       // Don't send connect yet — wait for connect.challenge from server
     };
 
@@ -441,6 +440,10 @@ export class RpcClient {
           this._resolvePending(handshakeRequestId, data, generation);
           handshakeRequestId = null;
         }
+        // Only a completed protocol handshake proves recovery. Merely opening
+        // a socket must not reset backoff when a Gateway is repeatedly dying
+        // before connect completes.
+        this._reconnectAttempt = 0;
         this._setState('connected');
         const helloHandlers = this._listeners.get('_hello');
         if (helloHandlers) helloHandlers.forEach((h) => h(data));
@@ -637,17 +640,18 @@ export class RpcClient {
   private _scheduleReconnect(immediate: boolean = false): void {
     if (!this._autoReconnect) return;
     this._clearReconnectTimer();
-    const delay = immediate ? 0 : this._reconnectDelay;
+    const delay = immediate
+      ? 0
+      : RECONNECT_BACKOFF_MS[
+          Math.min(this._reconnectAttempt, RECONNECT_BACKOFF_MS.length - 1)
+        ];
     this._reconnectTimer = setTimeout(() => {
       this._reconnectTimer = null;
       if (!this._autoReconnect || this._ws) return;
       this._doConnect();
     }, delay);
     if (immediate) return;
-    this._reconnectDelay = Math.min(
-      this._reconnectDelay * this._reconnectFactor,
-      this._maxReconnectDelay
-    );
+    this._reconnectAttempt += 1;
   }
 
   private _setState(s: ConnectionState): void {

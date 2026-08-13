@@ -6,6 +6,7 @@ import type {
 import type { PersistSessionOptions } from '@/composables/chat/useChatSessionRoute'
 import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
 import type { SessionSubscriptionResult } from '@/composables/chat/useChatSessionSubscription'
+import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 
 export interface ChatUsageAccumulator {
   input: number
@@ -31,6 +32,10 @@ export interface UseChatSessionRuntimeOptions {
   currentEpoch: Ref<number>
   lastStreamSeq: Ref<number>
   activeTaskGroups: Ref<Set<string>>
+  taskOwnership?: ChatTaskOwnershipApi
+  activeStreamTaskId?: Ref<string>
+  activeStreamSessionKey?: Ref<string>
+  acceptanceStopPending?: Ref<boolean>
   aborted: Ref<boolean>
   lastHeaderRole: Ref<string>
   lastHeaderDay: Ref<string>
@@ -48,8 +53,11 @@ export interface UseChatSessionRuntimeOptions {
   setCompactInFlight: (active: boolean, key?: string) => void
   hideCompactStatus: () => void
   clearPendingQueue: () => void
-  switchPendingQueue: (targetSessionKey: string) => void
-  adoptPendingQueue: (targetSessionKey: string, ownerRequestId: string) => void
+  switchPendingQueue: (targetSessionKey: string) => void | Promise<void>
+  adoptPendingQueue: (
+    targetSessionKey: string,
+    ownerRequestId: string,
+  ) => void | Promise<void>
   resetSavingsPopupCooldown: () => void
   restoreWidgetState: () => void
   resetStreamLiveTurnState: () => void
@@ -81,6 +89,13 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.currentEpoch.value = 0
     options.lastStreamSeq.value = 0
     options.activeTaskGroups.value.clear()
+    options.taskOwnership?.reset(false)
+    // Stream identity is session-local control state. Keeping A's owner while
+    // switching to an idle B can make Stop target A or let B's idle hydrate
+    // release B's pending queue based on stale evidence.
+    if (options.activeStreamTaskId) options.activeStreamTaskId.value = ''
+    if (options.activeStreamSessionKey) options.activeStreamSessionKey.value = ''
+    if (options.acceptanceStopPending) options.acceptanceStopPending.value = false
     resetLiveTurnState()
   }
 
@@ -116,9 +131,10 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     options.cancelSessionBootstrap()
     resetCompactState()
     if (pendingQueuePolicy.kind === 'response_handoff') {
-      options.adoptPendingQueue(key, pendingQueuePolicy.ownerRequestId)
+      await options.adoptPendingQueue(key, pendingQueuePolicy.ownerRequestId)
     } else {
-      options.switchPendingQueue(key)
+      const pendingQueueSwitch = options.switchPendingQueue(key)
+      if (pendingQueueSwitch) await pendingQueueSwitch
     }
     options.persistSession(key, { source: 'runtime.switchToSession' })
     resetSessionRuntimeState()
@@ -167,7 +183,8 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
     }
 
     resetCompactState()
-    options.switchPendingQueue(key)
+    const pendingQueueSwitch = options.switchPendingQueue(key)
+    if (pendingQueueSwitch) await pendingQueueSwitch
     // A recovered provisional draft remains a draft: do not write it to the URL
     // or active-session storage before the first accepted send.
     options.sessionKey.value = key
@@ -181,13 +198,17 @@ export function useChatSessionRuntime(options: UseChatSessionRuntimeOptions) {
 
   // Drafts keep their provisional key out of the URL and local storage; it
   // only persists once the first message actually goes out.
-  function startDraftSession(agentId?: string) {
+  async function startDraftSession(agentId?: string) {
     options.cancelSessionBootstrap()
     const key = options.createSessionKey(agentId)
     resetCompactState()
-    options.switchPendingQueue(key)
+    const pendingQueueSwitch = options.switchPendingQueue(key)
+    if (pendingQueueSwitch) await pendingQueueSwitch
     options.sessionKey.value = key
     resetSessionRuntimeState()
+    // A brand-new provisional key cannot own a durable Gateway task yet. Its
+    // first send must not wait for optional draft bootstrap metadata.
+    options.taskOwnership?.reset(true)
     options.pendingSessionIntent.value = 'new_chat'
     options.resetDraftComposer?.()
     resetSessionViewState()

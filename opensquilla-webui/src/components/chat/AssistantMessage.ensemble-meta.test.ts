@@ -105,6 +105,55 @@ describe('AssistantMessage ensemble footer metadata', () => {
     app.unmount()
   })
 
+  it('supports hover, pinning, Escape, focus exit, and outside dismissal', async () => {
+    const { app, el } = await mountMessage(assistantMessage({
+      meta: {
+        model: 'test/model',
+        modelShort: 'model',
+        input: 120,
+        output: 40,
+        hasTokens: true,
+        cachedTokens: 12,
+        reasoningTokens: 8,
+        costUsd: 0.001,
+        hasSaved: false,
+        savedLabel: '',
+      },
+    }))
+    const root = el.querySelector<HTMLElement>('.msg-meta__more')!
+    const trigger = el.querySelector<HTMLButtonElement>('.msg-meta__more-btn')!
+
+    root.dispatchEvent(new MouseEvent('mouseenter'))
+    await nextTick()
+    expect(el.querySelector('.msg-meta-popover')).not.toBeNull()
+    root.dispatchEvent(new MouseEvent('mouseleave'))
+    await nextTick()
+    expect(el.querySelector('.msg-meta-popover')).toBeNull()
+
+    trigger.click()
+    await nextTick()
+    expect(trigger.getAttribute('aria-expanded')).toBe('true')
+    root.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    expect(el.querySelector('.msg-meta-popover')).toBeNull()
+    expect(document.activeElement).toBe(trigger)
+
+    trigger.click()
+    await nextTick()
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+    await nextTick()
+    expect(el.querySelector('.msg-meta-popover')).toBeNull()
+
+    trigger.click()
+    await nextTick()
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    root.dispatchEvent(new FocusEvent('focusout', { relatedTarget: outside, bubbles: true }))
+    await nextTick()
+    expect(el.querySelector('.msg-meta-popover')).toBeNull()
+    app.unmount()
+  })
+
   it('keeps ensemble metadata behind the same single info control', async () => {
     const { app, el } = await mountMessage(
       assistantMessage({

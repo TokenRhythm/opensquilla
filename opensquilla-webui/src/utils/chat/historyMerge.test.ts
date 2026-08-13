@@ -246,6 +246,142 @@ describe('reconcileHistoryMessages', () => {
 })
 
 describe('reconcileHistoryWindow', () => {
+  it('preserves a live turn id when durable user ownership uniquely matches old history', () => {
+    const previous = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        messageId: 'user-1',
+        turnId: 'live-turn-1',
+      }),
+      msg({
+        role: 'assistant',
+        text: 'done',
+        turnId: 'live-turn-1',
+      }),
+    ]
+    const latestWindow = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        messageId: 'user-1',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'done',
+        messageId: 'assistant-1',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const merged = reconcileHistoryWindow(previous, latestWindow)
+
+    expect(merged.map(message => message.turnId)).toEqual([
+      'live-turn-1',
+      'live-turn-1',
+    ])
+  })
+
+  it('keeps an explicit server turn id authoritative over the live identity', () => {
+    const previous = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        messageId: 'user-1',
+        turnId: 'live-turn-1',
+      }),
+      msg({
+        role: 'assistant',
+        text: 'done',
+        turnId: 'live-turn-1',
+      }),
+    ]
+    const latestWindow = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        messageId: 'user-1',
+        turnId: 'server-turn-1',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'done',
+        messageId: 'assistant-1',
+        turnId: 'server-turn-1',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const merged = reconcileHistoryWindow(previous, latestWindow)
+
+    expect(merged.map(message => message.turnId)).toEqual([
+      'server-turn-1',
+      'server-turn-1',
+    ])
+  })
+
+  it.each([
+    {
+      name: 'different durable user ownership',
+      previous: [
+        msg({
+          role: 'user',
+          text: 'first turn',
+          messageId: 'user-1',
+          turnId: 'live-turn-1',
+        }),
+        msg({ role: 'assistant', text: 'done', turnId: 'live-turn-1' }),
+      ],
+      latestWindow: [
+        msg({
+          role: 'user',
+          text: 'different turn',
+          messageId: 'user-2',
+          restoredFromHistory: true,
+        }),
+        msg({
+          role: 'assistant',
+          text: 'done',
+          messageId: 'assistant-2',
+          restoredFromHistory: true,
+        }),
+      ],
+    },
+    {
+      name: 'ambiguous optimistic assistants',
+      previous: [
+        msg({
+          role: 'user',
+          text: 'build it',
+          messageId: 'user-1',
+          turnId: 'live-turn-1',
+        }),
+        msg({ role: 'assistant', text: 'first', turnId: 'live-turn-1' }),
+        msg({ role: 'assistant', text: 'second', turnId: 'live-turn-1' }),
+      ],
+      latestWindow: [
+        msg({
+          role: 'user',
+          text: 'build it',
+          messageId: 'user-1',
+          restoredFromHistory: true,
+        }),
+        msg({
+          role: 'assistant',
+          text: 'done',
+          messageId: 'assistant-1',
+          restoredFromHistory: true,
+        }),
+      ],
+    },
+  ])('does not infer an assistant turn id from $name', ({ previous, latestWindow }) => {
+    const merged = reconcileHistoryWindow(previous, latestWindow)
+
+    expect(merged[merged.length - 1]?.turnId).toBeUndefined()
+  })
+
   it('keeps optimistic turn identity and assistant activity on the first authoritative refresh', () => {
     const statusHistory = [
       { action: 'inspect', label: 'Inspecting', at: 1_000 },

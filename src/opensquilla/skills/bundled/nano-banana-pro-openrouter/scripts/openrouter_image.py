@@ -531,7 +531,7 @@ def _validated_image_mime(payload: bytes) -> str:
             decoded.load()
     except RuntimeError:
         raise
-    except (OSError, SyntaxError, ValueError, Image.DecompressionBombError):
+    except (IndexError, OSError, SyntaxError, ValueError, Image.DecompressionBombError):
         raise RuntimeError("invalid_image_payload") from None
     return detected_mime
 

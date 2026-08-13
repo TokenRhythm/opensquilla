@@ -43,6 +43,7 @@ def _full_env() -> dict[str, str]:
     for key in tuple(env):
         if key.startswith("RESULT_"):
             env[key] = "success"
+    env["RESULT_WINDOWS_SMOKE"] = "skipped"
     return env
 
 
@@ -52,6 +53,15 @@ def test_ci_result_gate_accepts_intentional_docs_only_skips() -> None:
 
 def test_ci_result_gate_accepts_complete_full_matrix() -> None:
     assert check_ci_results(_full_env()) == []
+
+
+def test_ci_result_gate_rejects_failed_smoke_even_when_full_matrix_is_required() -> None:
+    env = _full_env()
+    env["RESULT_WINDOWS_SMOKE"] = "failure"
+
+    errors = check_ci_results(env)
+
+    assert any("Windows compatibility smoke tests" in error for error in errors)
 
 
 def test_ci_result_gate_rejects_missing_or_invalid_classifier_outputs() -> None:
@@ -78,6 +88,37 @@ def test_ci_result_gate_rejects_required_windows_matrix_skip() -> None:
     errors = check_ci_results(env)
 
     assert any("Windows high-risk matrix" in error and "skipped" in error for error in errors)
+
+
+def test_ci_result_gate_accepts_windows_full_in_place_of_duplicate_smoke() -> None:
+    env = _base_env()
+    env[_flag_env("docs_only")] = "false"
+    env[_flag_env("runtime_changed")] = "true"
+    env[_flag_env("python_changed")] = "true"
+    env[_flag_env("platform_sensitive_changed")] = "true"
+    env[_flag_env("windows_full_required")] = "true"
+    env[_flag_env("build_wheel_required")] = "true"
+    env["RESULT_FRONTEND"] = "success"
+    env["RESULT_UBUNTU"] = "success"
+    env["RESULT_WINDOWS_FULL"] = "success"
+    env["RESULT_MACOS_RECOVERY"] = "success"
+    env["RESULT_DESKTOP_RECOVERY_E2E"] = "success"
+
+    assert check_ci_results(env) == []
+
+
+def test_ci_result_gate_requires_smoke_for_targeted_python_without_full_matrix() -> None:
+    env = _base_env()
+    env[_flag_env("docs_only")] = "false"
+    env[_flag_env("runtime_changed")] = "true"
+    env[_flag_env("python_changed")] = "true"
+    env[_flag_env("build_wheel_required")] = "true"
+    env["RESULT_FRONTEND"] = "success"
+    env["RESULT_UBUNTU"] = "success"
+
+    errors = check_ci_results(env)
+
+    assert any("Windows compatibility smoke tests" in error for error in errors)
 
 
 def test_ci_result_gate_requires_ubuntu_full_matrix_only_for_full_ci() -> None:

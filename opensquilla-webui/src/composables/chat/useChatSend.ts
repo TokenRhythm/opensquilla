@@ -1,4 +1,4 @@
-import type { Ref } from 'vue'
+import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { RpcClientError } from '@/lib/rpc'
@@ -20,6 +20,7 @@ import type {
   SessionSteerV2Response,
 } from '@/types/rpc'
 import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandlers'
+import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import type {
   BusySendMode,
   PendingQueueOwner,
@@ -50,6 +51,10 @@ import {
   persistPendingMetaDiscard,
   removePendingMetaDiscard,
 } from '@/utils/chat/metaDiscardOutbox'
+import type {
+  PendingInputWal,
+  ResponseHandoffWalRecord,
+} from '@/utils/chat/pendingInputWal'
 import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
@@ -75,6 +80,21 @@ interface SendAttempt {
   workspaceId: string | null
   params: ChatSendParams
   requiresIdempotentReplay?: boolean
+  // A Stop issued before durable acceptance is known belongs to this exact
+  // idempotent request, not to whichever session happens to be visible later.
+  stopRequested?: boolean
+  acceptanceRpc?: {
+    method: 'chat.send' | 'sessions.pending_inputs.dispatch'
+    params: Record<string, unknown>
+  }
+  acceptanceResolved?: boolean
+  acceptanceInFlight?: boolean
+  acceptedTaskId?: string
+  acceptedSessionKey?: string
+  stopAbortPromise?: Promise<boolean> | null
+  autoRecoverAcceptance?: boolean
+  hiddenControl?: boolean
+  stopOwner?: symbol
 }
 
 export type ChatSendOutcome = 'accepted' | 'deferred' | 'not_sent' | 'retryable_failure'
@@ -107,6 +127,7 @@ interface DispatchSendOptions {
   cancelIfComposerChanged?: boolean
   retryAttempt?: SendAttempt | null
   rememberRetryableAttempt?: (attempt: SendAttempt) => void
+  durablePendingItem?: ChatPendingItem
 }
 
 interface ResponseHandoffGate {
@@ -118,10 +139,19 @@ interface ResponseHandoffGate {
   terminalResponse: boolean
   authoritativeIdle: boolean
   backgroundOnly: boolean
+  durableRecord: ResponseHandoffWalRecord | null
 }
 
 interface FreshSendToken {
   stoppedByUser: boolean
+}
+
+interface AcceptanceTransaction {
+  id: symbol
+  requestSessionKey: string
+  stoppedByUser: boolean
+  freshSendToken: FreshSendToken | null
+  attempt: SendAttempt | null
 }
 
 export type SendResponseSessionDecision =
@@ -286,6 +316,7 @@ export interface UseChatSendOptions {
   messages: Ref<ChatMessage[]>
   sessionKey: Ref<string>
   pendingQueueOwnerContext: Ref<PendingQueueOwnerContext | null>
+  pendingInputWal?: PendingInputWal | null
   busySendMode: Ref<BusySendMode>
   modelRoutingMode: Readonly<Ref<ModelRoutingMode>>
   modelRoutingSettingsBusy: Readonly<Ref<boolean>>
@@ -306,6 +337,9 @@ export interface UseChatSendOptions {
   // chat.send response so a prior task's late events can't leak in (issue #344).
   activeStreamTaskId: Ref<string>
   activeStreamSessionKey: Ref<string>
+  taskOwnership?: ChatTaskOwnershipApi
+  acceptanceStopPending?: Ref<boolean>
+  acceptanceRecoveryPending?: Ref<boolean>
   autoScroll: Ref<boolean>
   stream: ChatRpcStreamApi
   canStop?: () => boolean
@@ -316,6 +350,12 @@ export interface UseChatSendOptions {
   ) => void
     | { authoritativeIdle: boolean; backgroundOnly?: boolean }
     | Promise<void | { authoritativeIdle: boolean; backgroundOnly?: boolean }>
+  recoverPendingQueueHandoff?: (
+    sourceSessionKey: string,
+    targetSessionKey: string,
+    ownerRequestId: string,
+  ) => Promise<void>
+  failPendingQueueHandoff?: (ownerRequestId: string) => Promise<void> | void
   scheduleHistorySync: () => void
   schedulePendingDrainAfterTerminal: () => void
   flushDeferredPendingDrain: () => void
@@ -328,7 +368,10 @@ export interface UseChatSendOptions {
     isCurrent?: () => boolean
     attachments?: Attachment[]
   }) => Promise<boolean>
-  enqueuePendingInput: (text: string, owner?: PendingQueueOwner) => boolean
+  enqueuePendingInput: (
+    text: string,
+    owner?: PendingQueueOwner,
+  ) => boolean | Promise<boolean>
   enqueuePendingPayload?: (
     payload: {
       text: string
@@ -336,7 +379,7 @@ export interface UseChatSendOptions {
       intent?: string | null
     },
     owner?: PendingQueueOwner,
-  ) => boolean
+  ) => boolean | Promise<boolean>
   enqueueHiddenControl?: (
     item: {
       text: string
@@ -355,6 +398,7 @@ export interface UseChatSendOptions {
   steerDelivery: ChatSteerDeliveryApi
   restoreSteerIntoComposer?: (text: string) => void
   popAllPendingIntoComposer: () => boolean
+  reconcileTaskOwnership?: () => void | Promise<unknown>
   hiddenControlStorage?: HiddenControlStorage | null
   metaDiscardStorage?: MetaDiscardStorage | null
   executeSlashCommand: (text: string) => Promise<boolean>
@@ -365,12 +409,43 @@ export interface UseChatSendOptions {
 
 export function useChatSend(options: UseChatSendOptions) {
   const { pushToast } = useToasts()
+  const acceptanceStopPending = options.acceptanceStopPending || ref(false)
   let activeFreshSendToken: FreshSendToken | null = null
+  let activeAcceptanceTransaction: AcceptanceTransaction | null = null
+  let acceptanceStopOwner: symbol | null = null
   let activeResponseHandoff: ResponseHandoffGate | null = null
   let activeProjectPreflightToken: symbol | null = null
   let recoveredAttempt: SendAttempt | null = null
+  let handoffRecoveryPromise: Promise<void> | null = null
+  const acceptanceRecoveryWorkers = new Map<string, Promise<void>>()
+  const stoppedAcceptanceAttempts = new Map<string, SendAttempt>()
   const hiddenDispatchInFlight = new Map<string, Promise<HiddenControlDispatchResult>>()
   const renderedHiddenControls = new Set<string>()
+  const acceptanceRecoveryVersion = ref(0)
+
+  function noteAcceptanceRecoveryChanged() {
+    acceptanceRecoveryVersion.value += 1
+  }
+
+  const acceptanceRecoveryPendingForCurrentSession: ComputedRef<boolean> = computed(() => {
+    // Depend on an explicit version because the attempt registry is purposely
+    // non-reactive and must remain request-owned across route switches.
+    acceptanceRecoveryVersion.value
+    const key = options.sessionKey.value
+    if (!key) return false
+    for (const attempt of stoppedAcceptanceAttempts.values()) {
+      if (attempt.requestSessionKey === key && attempt.stopRequested) return true
+    }
+    for (const workerKey of acceptanceRecoveryWorkers.keys()) {
+      if (workerKey.startsWith(`${key}\u0000`)) return true
+    }
+    return false
+  })
+  watch(acceptanceRecoveryPendingForCurrentSession, (pending) => {
+    if (options.acceptanceRecoveryPending) {
+      options.acceptanceRecoveryPending.value = pending
+    }
+  }, { immediate: true })
 
   function metaDiscardStorage(): MetaDiscardStorage | null | undefined {
     return options.metaDiscardStorage
@@ -443,9 +518,47 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function currentExpectedTurnId(): string {
     return String(
-      capabilityExpectedTurnId()
+      options.taskOwnership?.runningTaskId.value
+      || capabilityExpectedTurnId()
       || options.activeStreamTaskId.value,
     ).trim()
+  }
+
+  function taskAcceptanceStatus(response: ChatSendResponse | null | undefined): string {
+    return String(response?.task_status || response?.taskStatus || '').trim().toLowerCase()
+  }
+
+  function hasAuthoritativeWork(): boolean {
+    return options.taskOwnership?.hasAuthoritativeWork.value === true
+      || acceptanceStopPending.value
+      || acceptanceRecoveryPendingForCurrentSession.value
+  }
+
+  function noteAcceptedTask(
+    response: ChatSendResponse | null | undefined,
+    requestSessionKey: string,
+  ): {
+    taskId: string
+    claimRender: boolean
+    renderTaskId: string
+  } {
+    const taskId = acceptedTaskId(response)
+    if (!taskId || !options.taskOwnership) {
+      return { taskId, claimRender: Boolean(taskId), renderTaskId: taskId }
+    }
+    const acceptedSessionKey = response?.sessionKey || requestSessionKey
+    if (
+      options.sessionKey.value !== requestSessionKey
+      && options.sessionKey.value !== acceptedSessionKey
+    ) {
+      return { taskId, claimRender: false, renderTaskId: '' }
+    }
+    const ownership = options.taskOwnership.noteAccepted(taskId, taskAcceptanceStatus(response))
+    return {
+      taskId,
+      claimRender: ownership.claimRender,
+      renderTaskId: ownership.renderTaskId,
+    }
   }
 
   function supportsSameTurnSteer(): boolean {
@@ -512,14 +625,252 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
-  function beginFreshStream(requestSessionKey: string): FreshSendToken {
-    const token: FreshSendToken = { stoppedByUser: false }
+  function acceptanceAttemptKey(attempt: Pick<SendAttempt, 'requestSessionKey' | 'clientRequestId'>) {
+    return `${attempt.requestSessionKey}\u0000${attempt.clientRequestId}`
+  }
+
+  function beginFreshStream(
+    requestSessionKey: string,
+    attempt: SendAttempt | null = null,
+  ): FreshSendToken {
+    // An unknown-acceptance retry keeps the original Stop intent. The stable
+    // request id will hit the ingress receipt; once its task id is known the
+    // normal stopped-response path issues the exact scoped abort.
+    const token: FreshSendToken = {
+      stoppedByUser: attempt?.stopRequested === true || acceptanceStopPending.value,
+    }
     activeFreshSendToken = token
     options.activeStreamTaskId.value = PENDING_STREAM_TASK_ID
     options.activeStreamSessionKey.value = requestSessionKey
     options.stream.startStreaming()
     options.stream.showThinkingIndicator()
     return token
+  }
+
+  function beginAcceptanceTransaction(
+    requestSessionKey: string,
+    freshSendToken: FreshSendToken | null,
+    attempt: SendAttempt | null = null,
+  ): AcceptanceTransaction {
+    const transaction = {
+      id: Symbol('chat-acceptance'),
+      requestSessionKey,
+      stoppedByUser: attempt?.stopRequested === true || acceptanceStopPending.value,
+      freshSendToken,
+      attempt,
+    }
+    if (transaction.stoppedByUser) {
+      acceptanceStopOwner = transaction.id
+      acceptanceStopPending.value = true
+      if (attempt?.stopRequested) {
+        attempt.stopOwner = transaction.id
+        stoppedAcceptanceAttempts.set(acceptanceAttemptKey(attempt), attempt)
+      }
+      if (freshSendToken) freshSendToken.stoppedByUser = true
+      noteAcceptanceRecoveryChanged()
+    }
+    activeAcceptanceTransaction = transaction
+    return transaction
+  }
+
+  function finishAcceptanceTransaction(transaction: AcceptanceTransaction) {
+    if (activeAcceptanceTransaction === transaction) activeAcceptanceTransaction = null
+  }
+
+  function clearAcceptanceStop(transaction: AcceptanceTransaction | null) {
+    if (!transaction || acceptanceStopOwner !== transaction.id) return
+    acceptanceStopOwner = null
+    acceptanceStopPending.value = false
+  }
+
+  function clearAttemptStop(attempt: SendAttempt) {
+    attempt.stopRequested = false
+    stoppedAcceptanceAttempts.delete(acceptanceAttemptKey(attempt))
+    noteAcceptanceRecoveryChanged()
+    // A background recovery must not clear a newer visible request's Stop.
+    if (
+      activeAcceptanceTransaction?.attempt === attempt
+      || (attempt.stopOwner != null && acceptanceStopOwner === attempt.stopOwner)
+      || (
+        options.sessionKey.value === attempt.requestSessionKey
+        && recoveredAttempt?.clientRequestId === attempt.clientRequestId
+      )
+    ) {
+      acceptanceStopOwner = null
+      acceptanceStopPending.value = false
+    }
+    attempt.stopOwner = undefined
+  }
+
+  const acceptanceRecoveryDelaysMs = [250, 1_000, 4_000, 15_000] as const
+
+  async function abortRecoveredAcceptedTask(attempt: SendAttempt): Promise<boolean> {
+    const taskId = attempt.acceptedTaskId || ''
+    if (!attempt.stopRequested || !taskId) return !attempt.stopRequested
+    if (attempt.stopAbortPromise) return attempt.stopAbortPromise
+    const operation = (async () => {
+      const isCurrentRequest = options.sessionKey.value === attempt.requestSessionKey
+      if (isCurrentRequest) options.taskOwnership?.requestStop(taskId)
+      try {
+        const abort = await options.rpc.call<{ aborted?: boolean, reason?: string }>('chat.abort', {
+          sessionKey: attempt.acceptedSessionKey || attempt.requestSessionKey,
+          taskId,
+          source: 'webui_stop',
+          scope: 'task',
+        })
+        if (abort?.aborted !== true) {
+          if (isCurrentRequest) {
+            await options.reconcileTaskOwnership?.()
+            options.scheduleHistorySync()
+          }
+          // An exact task_not_active answer proves there is nothing left for
+          // this Stop worker to cancel. Reconcile/history owns the real
+          // terminal disposition; do not synthesize a local cancellation or
+          // retry forever.
+          if (['task_not_active', 'task_mismatch'].includes(
+            String(abort?.reason || '').toLowerCase(),
+          )) {
+            clearAttemptStop(attempt)
+            if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
+              recoveredAttempt = null
+            }
+            return true
+          }
+          return false
+        }
+        clearAttemptStop(attempt)
+        if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
+          recoveredAttempt = null
+        }
+        if (isCurrentRequest) options.scheduleHistorySync()
+        return true
+      } catch {
+        if (isCurrentRequest) await options.reconcileTaskOwnership?.()
+        return false
+      }
+    })().finally(() => {
+      if (attempt.stopAbortPromise === operation) attempt.stopAbortPromise = null
+    })
+    attempt.stopAbortPromise = operation
+    return operation
+  }
+
+  async function settleRecoveredAcceptance(
+    attempt: SendAttempt,
+    response: ChatSendResponse,
+  ): Promise<boolean> {
+    attempt.acceptanceResolved = true
+    attempt.acceptedTaskId = acceptedTaskId(response)
+    attempt.acceptedSessionKey = response.sessionKey || attempt.requestSessionKey
+    const ownsRecoveredAttempt = recoveredAttempt?.clientRequestId === attempt.clientRequestId
+    if (attempt.hiddenControl) {
+      removeHiddenControl(
+        attempt.requestSessionKey,
+        attempt.clientRequestId,
+        options.hiddenControlStorage,
+      )
+    }
+
+    const isCurrentRequest = options.sessionKey.value === attempt.requestSessionKey
+    const accepted = noteAcceptedTask(response, attempt.requestSessionKey)
+    const terminalStatus = terminalResponseStatus(response)
+    if (isCurrentRequest) {
+      consumeAcceptedSessionIntent(attempt)
+      bindAcceptedUserMessage(attempt.clientMessageId, response)
+      options.scheduleHistorySync()
+    }
+
+    if (!attempt.stopRequested) {
+      if (ownsRecoveredAttempt) recoveredAttempt = null
+      return true
+    }
+    if (terminalStatus) {
+      if (isCurrentRequest) {
+        handleTerminalResponse(response, null, { finishFreshStream: false })
+      }
+      clearAttemptStop(attempt)
+      if (ownsRecoveredAttempt) recoveredAttempt = null
+      return true
+    }
+
+    const taskId = accepted.taskId
+    if (!taskId) {
+      // A response without a task identity is not enough to widen Stop to the
+      // session. Keep replaying the same receipt until the task is identified
+      // or the bounded worker yields to later reconnect recovery.
+      attempt.acceptanceResolved = false
+      return false
+    }
+    return abortRecoveredAcceptedTask(attempt)
+  }
+
+  function scheduleAcceptanceRecovery(attempt: SendAttempt) {
+    if ((attempt.acceptanceResolved && !attempt.stopRequested) || !attempt.acceptanceRpc) return
+    const key = acceptanceAttemptKey(attempt)
+    if (acceptanceRecoveryWorkers.has(key)) return
+
+    const operation = (async () => {
+      let recoveryAttempt = 0
+      while (!attempt.acceptanceResolved || attempt.stopRequested) {
+        const delayMs = acceptanceRecoveryDelaysMs[
+          Math.min(recoveryAttempt, acceptanceRecoveryDelaysMs.length - 1)
+        ]!
+        recoveryAttempt += 1
+        await new Promise<void>(resolve => globalThis.setTimeout(resolve, delayMs))
+        if (attempt.acceptanceResolved) {
+          if (await abortRecoveredAcceptedTask(attempt)) return
+          continue
+        }
+        if (attempt.acceptanceInFlight) continue
+        attempt.acceptanceInFlight = true
+        try {
+          const response = await options.rpc.call<ChatSendResponse>(
+            attempt.acceptanceRpc!.method,
+            attempt.acceptanceRpc!.params,
+          )
+          if (await settleRecoveredAcceptance(attempt, response)) return
+        } catch (error: unknown) {
+          const rpcError = error as RpcClientError | null | undefined
+          const accepted = acceptedErrorInfo(error)
+          if (rpcError?.accepted === false || accepted?.terminalWithoutTask) {
+            attempt.acceptanceResolved = true
+            if (attempt.stopRequested) clearAttemptStop(attempt)
+            if (
+              attempt.hiddenControl
+              && (
+                accepted?.terminalWithoutTask
+                || (rpcError?.accepted === false && rpcError.retryable === false)
+              )
+            ) {
+              removeHiddenControl(
+                attempt.requestSessionKey,
+                attempt.clientRequestId,
+                options.hiddenControlStorage,
+              )
+            }
+            if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
+              recoveredAttempt = null
+            }
+            return
+          }
+          // Unknown acceptance stays attached to this exact request. A
+          // reconnect/hydrate may improve the projection while the next
+          // bounded idempotent receipt replay is waiting.
+          if (options.sessionKey.value === attempt.requestSessionKey) {
+            void options.reconcileTaskOwnership?.()
+          }
+        } finally {
+          attempt.acceptanceInFlight = false
+        }
+      }
+    })().finally(() => {
+      if (acceptanceRecoveryWorkers.get(key) === operation) {
+        acceptanceRecoveryWorkers.delete(key)
+        noteAcceptanceRecoveryChanged()
+      }
+    })
+    acceptanceRecoveryWorkers.set(key, operation)
+    noteAcceptanceRecoveryChanged()
   }
 
   function pendingQueueOwner(): PendingQueueOwner | undefined {
@@ -553,6 +904,7 @@ export function useChatSend(options: UseChatSendOptions) {
   function beginResponseHandoff(
     requestSessionKey: string,
     ownerRequestId: string,
+    durableRecord: ResponseHandoffWalRecord | null = null,
   ): ResponseHandoffGate {
     const gate: ResponseHandoffGate = {
       requestSessionKey,
@@ -563,10 +915,68 @@ export function useChatSend(options: UseChatSendOptions) {
       terminalResponse: false,
       authoritativeIdle: false,
       backgroundOnly: false,
+      durableRecord,
     }
     activeResponseHandoff = gate
-    options.pendingQueueOwnerContext.value = { sessionKey: requestSessionKey, ownerRequestId }
+    if (durableRecord) {
+      options.pendingQueueOwnerContext.value = { sessionKey: requestSessionKey, ownerRequestId }
+    }
     return gate
+  }
+
+  async function persistResponseHandoff(
+    attempt: SendAttempt,
+  ): Promise<ResponseHandoffWalRecord | null> {
+    if (!options.pendingInputWal?.putHandoff) return null
+    const now = Date.now()
+    const record: ResponseHandoffWalRecord = {
+      schemaVersion: 1,
+      ownerRequestId: attempt.clientRequestId,
+      requestSessionKey: attempt.requestSessionKey,
+      clientRequestId: attempt.clientRequestId,
+      clientMessageId: attempt.clientMessageId,
+      params: structuredClone(attempt.params),
+      composerText: attempt.composerText,
+      recoveryAttachments: attempt.attachments.map(attachment => ({ ...attachment })),
+      state: 'submitting',
+      createdAt: now,
+      updatedAt: now,
+    }
+    try {
+      await options.pendingInputWal.putHandoff(record)
+      return record
+    } catch {
+      return null
+    }
+  }
+
+  async function markResponseHandoffAccepted(
+    gate: ResponseHandoffGate,
+    acceptedSessionKey: string,
+  ): Promise<void> {
+    if (!gate.durableRecord || !options.pendingInputWal?.putHandoff) return
+    gate.durableRecord = {
+      ...gate.durableRecord,
+      state: 'accepted',
+      acceptedSessionKey,
+      updatedAt: Date.now(),
+    }
+    await options.pendingInputWal.putHandoff(gate.durableRecord).catch(() => {})
+  }
+
+  async function markResponseHandoffFailed(
+    gate: ResponseHandoffGate,
+    error: unknown,
+  ): Promise<void> {
+    if (!gate.durableRecord || !options.pendingInputWal?.putHandoff) return
+    gate.durableRecord = {
+      ...gate.durableRecord,
+      state: 'failed',
+      errorCode: errorCode(error),
+      updatedAt: Date.now(),
+    }
+    await options.pendingInputWal.putHandoff(gate.durableRecord).catch(() => {})
+    await options.failPendingQueueHandoff?.(gate.ownerRequestId)
   }
 
   function responseHandoffBlocksCurrentSession(): boolean {
@@ -587,17 +997,26 @@ export function useChatSend(options: UseChatSendOptions) {
         ownerRequestId: gate.ownerRequestId,
       }
     }
-    const adoption = await options.adoptResponseSession(key, gate.ownerRequestId)
+    await markResponseHandoffAccepted(gate, key)
+    const adoption = key === gate.requestSessionKey && options.sessionKey.value === key
+      ? await options.recoverPendingQueueHandoff?.(
+          gate.requestSessionKey,
+          key,
+          gate.ownerRequestId,
+        )
+      : await options.adoptResponseSession(key, gate.ownerRequestId)
+    if (gate.durableRecord && options.pendingInputWal?.deleteHandoff) {
+      await options.pendingInputWal.deleteHandoff(gate.ownerRequestId).catch(() => {})
+      gate.durableRecord = null
+    }
     gate.authoritativeIdle = adoption?.authoritativeIdle === true
     gate.backgroundOnly = adoption?.backgroundOnly === true
     if (gate.stoppedByUser && options.sessionKey.value === key) {
-      options.aborted.value = true
-      options.activeStreamTaskId.value = STOPPED_STREAM_TASK_ID
       options.activeStreamSessionKey.value = key
-      if (options.stream.isStreaming.value) {
-        options.stream.endStreaming({ reason: 'aborted' })
+      if (gate.acceptedTaskId) {
+        options.taskOwnership?.requestStop(gate.acceptedTaskId)
+        bindAcceptedTask(gate.acceptedTaskId)
       }
-      options.popAllPendingIntoComposer()
       return
     }
     const terminalReplayFinished = (
@@ -658,6 +1077,173 @@ export function useChatSend(options: UseChatSendOptions) {
         options.schedulePendingDrainAfterTerminal()
       }
     }
+  }
+
+  async function finalizeRecoveredHandoff(
+    record: ResponseHandoffWalRecord,
+    targetSessionKey: string,
+  ): Promise<void> {
+    if (options.sessionKey.value === record.requestSessionKey) {
+      const gate = beginResponseHandoff(
+        record.requestSessionKey,
+        record.ownerRequestId,
+        record,
+      )
+      try {
+        await handoffResponseSession(targetSessionKey, gate)
+      } finally {
+        finishResponseHandoff(gate)
+      }
+      return
+    }
+    await options.pendingInputWal?.putHandoff?.({
+      ...record,
+      state: 'accepted',
+      acceptedSessionKey: targetSessionKey,
+      updatedAt: Date.now(),
+    }).catch(() => {})
+    await options.recoverPendingQueueHandoff?.(
+      record.requestSessionKey,
+      targetSessionKey,
+      record.ownerRequestId,
+    )
+    await options.pendingInputWal?.deleteHandoff?.(record.ownerRequestId).catch(() => {})
+  }
+
+  function restoreResponseHandoffDraft(record: ResponseHandoffWalRecord): boolean {
+    if (options.sessionKey.value !== record.requestSessionKey) return false
+    const restoredText = record.composerText.trim()
+    if (restoredText && options.inputText.value !== restoredText) {
+      options.inputText.value = [restoredText, options.inputText.value]
+        .filter(Boolean)
+        .join('\n')
+    }
+    const existingAttachmentIds = new Set(
+      options.pendingAttachments.value.map(attachment => attachment.local_id),
+    )
+    const missingAttachments = record.recoveryAttachments.filter(attachment => (
+      !existingAttachmentIds.has(attachment.local_id)
+    ))
+    if (missingAttachments.length > 0) {
+      options.pendingAttachments.value = [
+        ...missingAttachments.map(attachment => ({ ...attachment })),
+        ...options.pendingAttachments.value,
+      ]
+    }
+    const forkBeforeMessageId = typeof record.params.forkBeforeMessageId === 'string'
+      ? record.params.forkBeforeMessageId
+      : null
+    if (!options.pendingForkBeforeMessageId.value && forkBeforeMessageId) {
+      options.pendingForkBeforeMessageId.value = forkBeforeMessageId
+    }
+    if (!options.pendingSessionIntent.value && typeof record.params.intent === 'string') {
+      options.pendingSessionIntent.value = record.params.intent
+    }
+    options.autoResizeTextarea()
+    return true
+  }
+
+  function recoverResponseHandoffs(): Promise<void> {
+    if (handoffRecoveryPromise) return handoffRecoveryPromise
+    const operation = (async () => {
+      const wal = options.pendingInputWal
+      if (!wal?.listHandoffs || activeResponseHandoff) return
+      let records: ResponseHandoffWalRecord[]
+      try {
+        records = await wal.listHandoffs()
+      } catch {
+        return
+      }
+      for (const record of records) {
+        if (record.state === 'failed') {
+          if (restoreResponseHandoffDraft(record)) {
+            await wal.deleteHandoff?.(record.ownerRequestId).catch(() => {})
+          }
+          continue
+        }
+        if (record.state === 'accepted' && record.acceptedSessionKey) {
+          await finalizeRecoveredHandoff(record, record.acceptedSessionKey)
+          continue
+        }
+        let replayRecord = record
+        let refreshedExpiredAttachments = false
+        while (true) {
+          try {
+            const response = await options.rpc.call<ChatSendResponse>(
+              'chat.send',
+              replayRecord.params,
+            )
+            const targetSessionKey = response.sessionKey || replayRecord.requestSessionKey
+            await finalizeRecoveredHandoff(replayRecord, targetSessionKey)
+            break
+          } catch (error) {
+            const accepted = acceptedErrorInfo(error)
+            if (accepted?.sessionKey) {
+              await finalizeRecoveredHandoff(replayRecord, accepted.sessionKey)
+              break
+            }
+            const rpcError = error as RpcClientError | null | undefined
+            const code = errorCode(error)
+            const definitelyRejected = rpcError?.accepted === false
+            const canRefreshExpiredAttachments = (
+              definitelyRejected
+              && !refreshedExpiredAttachments
+              && options.prepareAttachmentsForSend
+              && (code === 'ATTACHMENT_EXPIRED' || code === 'ATTACHMENT_LOST_IN_RESTART')
+              && replayRecord.recoveryAttachments.some(attachment => (
+                attachment.kind === 'staged' && Boolean(attachment.file)
+              ))
+            )
+            if (canRefreshExpiredAttachments) {
+              refreshedExpiredAttachments = true
+              const refreshed = replayRecord.recoveryAttachments.map(attachment => ({
+                ...attachment,
+                ...(attachment.kind === 'staged' && attachment.file
+                  ? { expires_at: 0 }
+                  : {}),
+              }))
+              const ready = await options.prepareAttachmentsForSend!({
+                attachments: refreshed,
+                isCurrent: () => true,
+              })
+              const sendable = refreshed.filter(isSendableAttachment)
+              if (ready && sendable.length === refreshed.length) {
+                replayRecord = {
+                  ...replayRecord,
+                  params: {
+                    ...replayRecord.params,
+                    attachments: sendable.map(serializeSendableAttachment),
+                  },
+                  recoveryAttachments: refreshed,
+                  updatedAt: Date.now(),
+                }
+                await wal.putHandoff?.(replayRecord)
+                // The Gateway explicitly rejected the old attachment tokens,
+                // so changing only those tokens cannot conflict with a receipt.
+                continue
+              }
+            }
+            if (definitelyRejected && rpcError?.retryable === false) {
+              await wal.putHandoff?.({
+                ...replayRecord,
+                state: 'failed',
+                errorCode: code,
+                updatedAt: Date.now(),
+              }).catch(() => {})
+              await options.failPendingQueueHandoff?.(replayRecord.ownerRequestId)
+              pushToast(sendFailureMessage(error), { tone: 'danger' })
+            }
+            // Unknown/retryable acceptance deliberately remains submitting
+            // and is replayed byte-for-byte after the next reconnect.
+            break
+          }
+        }
+      }
+    })().finally(() => {
+      handoffRecoveryPromise = null
+    })
+    handoffRecoveryPromise = operation
+    return operation
   }
 
   function freshSendStillOwnsStream(
@@ -737,7 +1323,7 @@ export function useChatSend(options: UseChatSendOptions) {
   function handleTerminalResponse(
     response: ChatSendResponse,
     freshSendToken: FreshSendToken | null,
-    optionsForResponse: { finishFreshStream: boolean },
+    optionsForResponse: { finishFreshStream: boolean; forceFreshStream?: boolean },
   ): boolean {
     const status = terminalResponseStatus(response)
     if (!status) return false
@@ -745,7 +1331,10 @@ export function useChatSend(options: UseChatSendOptions) {
     if (
       optionsForResponse.finishFreshStream
       && freshSendToken !== null
-      && activeFreshSendToken === freshSendToken
+      && (
+        activeFreshSendToken === freshSendToken
+        || optionsForResponse.forceFreshStream === true
+      )
     ) {
       activeFreshSendToken = null
       options.activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
@@ -765,8 +1354,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     options.scheduleHistorySync()
     if (finalizedFreshStream) {
-      if (status === 'cancelled') options.popAllPendingIntoComposer()
-      else options.schedulePendingDrainAfterTerminal()
+      if (!hasAuthoritativeWork()) options.schedulePendingDrainAfterTerminal()
     }
     return true
   }
@@ -782,16 +1370,30 @@ export function useChatSend(options: UseChatSendOptions) {
     const acceptedSessionKey = response?.sessionKey || requestSessionKey
     const params: Record<string, string> = {
       sessionKey: acceptedSessionKey,
-      source: 'webui_stale_send',
+      source: force ? 'webui_stop' : 'webui_stale_send',
     }
     // A user Stop that raced durable ingress is still task-scoped. If an
     // older/partial response has no task id, tell the gateway to fail closed
     // instead of falling back to the legacy whole-session abort surface.
     if (force) params.scope = 'task'
     if (taskId) params.taskId = taskId
-    options.rpc.call('chat.abort', params).catch(() => {
-      if (force) reportAbortFailure([requestSessionKey, acceptedSessionKey])
-    })
+    options.rpc.call<{ aborted?: boolean }>('chat.abort', params)
+      .then((response) => {
+        if (force && !taskId) {
+          void options.reconcileTaskOwnership?.()
+          return
+        }
+        if (!force || response?.aborted === true) return
+        options.taskOwnership?.clearStop(taskId)
+        void options.reconcileTaskOwnership?.()
+        reportAbortFailure([requestSessionKey, acceptedSessionKey])
+      })
+      .catch(() => {
+        if (!force) return
+        options.taskOwnership?.clearStop(taskId)
+        void options.reconcileTaskOwnership?.()
+        reportAbortFailure([requestSessionKey, acceptedSessionKey])
+      })
   }
 
   async function dispatchSteerV2(
@@ -1025,6 +1627,7 @@ export function useChatSend(options: UseChatSendOptions) {
       // and attachment refs untouched so manual, keyboard, and automatic sends
       // all preserve the exact draft until live subscription recovery succeeds.
       if (options.sendBlockedReason?.value) return
+      if (options.taskOwnership && !options.taskOwnership.hydrationResolved.value) return
       if (options.validateActiveProjectBeforeSend) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
@@ -1080,13 +1683,26 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     const compactInFlight = options.isCompactInFlightForCurrentSession()
-    if (options.stream.isStreaming.value || compactInFlight || handoffInFlight) {
+    if (
+      options.stream.isStreaming.value
+      || hasAuthoritativeWork()
+      || compactInFlight
+      || handoffInFlight
+    ) {
       if (!bypassSlashCommand && !isLiteralSlash && isControlInput(text)) {
-        const queued = options.enqueuePendingInput(text, pendingQueueOwner())
-        if (!queued) pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
+        // Slash and bang inputs are client control-plane commands. Running
+        // them later can target a different task/session, so keep the exact
+        // command editable in the composer while the current turn is busy.
         return
       }
       if (!hasPayload) return
+      if (handoffInFlight && !activeResponseHandoff?.durableRecord) {
+        // The fork itself may proceed without IndexedDB, but a follow-up must
+        // stay editable until the target session is known. Otherwise refresh
+        // can strand an ownerless message on the parent session.
+        pushToast(i18n.global.t('chat.toast.queuePersistenceUnavailable'), { tone: 'info' })
+        return
+      }
       if (
         options.busySendMode.value === 'steer'
         && canSteerPayload(
@@ -1103,13 +1719,15 @@ export function useChatSend(options: UseChatSendOptions) {
       // preserved (enqueue returns false before clearing the composer).
       const composerChanged = !composerMatchesSnapshot(composerSnapshot)
       if (invocation.cancelIfComposerChanged && composerChanged) return
-      const queued = composerChanged || invocation.textOverride !== undefined
-        ? options.enqueuePendingPayload?.({
+      const queued = await Promise.resolve(
+        composerChanged || invocation.textOverride !== undefined
+          ? options.enqueuePendingPayload?.({
             text,
             attachments: composerSnapshot.payloadAttachments,
             intent: composerSnapshot.intent,
           }, pendingQueueOwner()) ?? false
-        : options.enqueuePendingInput(text, pendingQueueOwner())
+          : options.enqueuePendingInput(text, pendingQueueOwner()),
+      )
       if (!queued) {
         pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
       }
@@ -1187,7 +1805,12 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       return preserveRetryState(delivery === 'followup' ? 'deferred' : 'not_sent')
     }
-    if (item.attachments.some(attachment => !isSendableAttachment(attachment))) {
+    const serverStagedItem = item.pendingPersistenceState === 'staged'
+      && Boolean(item.pendingInputId)
+    if (
+      !serverStagedItem
+      && item.attachments.some(attachment => !isSendableAttachment(attachment))
+    ) {
       return preserveRetryState('not_sent')
     }
     if (
@@ -1197,7 +1820,11 @@ export function useChatSend(options: UseChatSendOptions) {
       && item.text.trim().startsWith('/')
       && !item.text.trim().startsWith('//')
     ) {
-      if (options.stream.isStreaming.value || options.isCompactInFlightForCurrentSession()) {
+      if (
+        options.stream.isStreaming.value
+        || hasAuthoritativeWork()
+        || options.isCompactInFlightForCurrentSession()
+      ) {
         return preserveRetryState('deferred')
       }
       return await options.executeSlashCommand(item.text.trim())
@@ -1215,7 +1842,10 @@ export function useChatSend(options: UseChatSendOptions) {
     if (
       options.isCompactInFlightForCurrentSession()
       || responseHandoffBlocksCurrentSession()
-      || (delivery === 'followup' && options.stream.isStreaming.value)
+      || (
+        delivery === 'followup'
+        && (hasAuthoritativeWork() || options.stream.isStreaming.value)
+      )
     ) {
       return preserveRetryState(delivery === 'followup' ? 'deferred' : 'not_sent')
     }
@@ -1237,6 +1867,11 @@ export function useChatSend(options: UseChatSendOptions) {
       rememberRetryableAttempt: attempt => {
         recoveredQueuedAttempts.set(item, attempt)
       },
+      ...(item.pendingInputId
+        && item.pendingClientRequestId
+        && item.pendingClientMessageId
+        ? { durablePendingItem: item }
+        : {}),
     })
     if (outcome === 'accepted') {
       recoveredQueuedAttempts.delete(item)
@@ -1312,13 +1947,21 @@ export function useChatSend(options: UseChatSendOptions) {
       ),
     )
     const retryAttempt = isRecoveredRetry ? retryCandidate : null
+    // The automatic receipt recovery and a user-triggered retry share the
+    // immutable SendAttempt. Never put the same idempotency key on the wire
+    // twice concurrently; the later caller can observe/retry after the active
+    // single-flight settles without mutating the optimistic UI again.
+    if (retryAttempt?.acceptanceInFlight) return 'retryable_failure'
     const sendAttachmentIds = new Set(
       (retryAttempt?.attachments || initialSendableAttachments)
         .map(attachment => attachment.local_id),
     )
     // A recovered attempt must keep the exact serialized attachment tokens and
     // metadata that were fingerprinted with its idempotency key.
-    if (!retryAttempt && options.prepareAttachmentsForSend) {
+    const serverStagedPendingItem = sendOpts.durablePendingItem?.pendingPersistenceState === 'staged'
+      ? sendOpts.durablePendingItem
+      : undefined
+    if (!retryAttempt && !serverStagedPendingItem && options.prepareAttachmentsForSend) {
       const ready = await options.prepareAttachmentsForSend({
         isCurrent: () => options.sessionKey.value === requestSessionKey,
         ...(sendOpts.payload ? { attachments: sourceAttachments } : {}),
@@ -1335,6 +1978,7 @@ export function useChatSend(options: UseChatSendOptions) {
       ?? options.pendingAttachments.value
     if (
       preserveComposer
+      && !serverStagedPendingItem
       && sendOpts.payload
       && currentSourceAttachments.some(attachment => !isSendableAttachment(attachment))
     ) {
@@ -1351,7 +1995,9 @@ export function useChatSend(options: UseChatSendOptions) {
     const attachmentsToKeep = currentSourceAttachments.filter(
       attachment => !sendAttachmentIds.has(attachment.local_id) || !isSendableAttachment(attachment),
     )
-    if (!text && attachmentsToSend.length === 0) return 'not_sent'
+    if (!text && attachmentsToSend.length === 0 && !serverStagedPendingItem) {
+      return 'not_sent'
+    }
 
     options.aborted.value = false
     if (!preserveComposer) options.closeSlashMenu()
@@ -1362,10 +2008,14 @@ export function useChatSend(options: UseChatSendOptions) {
 
     const userText = text
     let attempt = retryAttempt
+    let durableHandoffRecord: ResponseHandoffWalRecord | null = null
     if (!attempt) {
-      const clientMessageId = createClientMessageId()
+      const durablePendingItem = sendOpts.durablePendingItem
+      const clientMessageId = durablePendingItem?.pendingClientMessageId
+        || createClientMessageId()
       const params: ChatSendParams = {
-        clientRequestId: createClientRequestId(),
+        clientRequestId: durablePendingItem?.pendingClientRequestId
+          || createClientRequestId(),
         clientMessageId,
         message: text || 'Describe these attachments',
         // The Vue client never uses the legacy cancel-style steer path. Make
@@ -1399,6 +2049,9 @@ export function useChatSend(options: UseChatSendOptions) {
         workspaceId,
         params,
       }
+      if (attempt.forkBeforeMessageId) {
+        durableHandoffRecord = await persistResponseHandoff(attempt)
+      }
       const now = new Date().toISOString()
       const displayAttachments = attachmentsToSend.map(serializeDisplayAttachment)
       options.messages.value.push({
@@ -1410,6 +2063,9 @@ export function useChatSend(options: UseChatSendOptions) {
       })
       options.autoScroll.value = true
       options.scrollToBottom()
+    }
+    if (attempt.forkBeforeMessageId && !durableHandoffRecord) {
+      durableHandoffRecord = await persistResponseHandoff(attempt)
     }
     if (!preserveComposer) {
       recoveredAttempt = null
@@ -1436,15 +2092,46 @@ export function useChatSend(options: UseChatSendOptions) {
     const wasStreaming = options.stream.isStreaming.value
     const freshSendToken = wasStreaming
       ? null
-      : beginFreshStream(requestSessionKey)
+      : beginFreshStream(requestSessionKey, attempt)
     let responseHandoff = (
       attempt.forkBeforeMessageId
-        ? beginResponseHandoff(requestSessionKey, attempt.clientRequestId)
+        ? beginResponseHandoff(
+            requestSessionKey,
+            attempt.clientRequestId,
+            durableHandoffRecord,
+          )
         : null
+    )
+    const acceptanceTransaction = beginAcceptanceTransaction(
+      requestSessionKey,
+      freshSendToken,
+      attempt,
     )
 
     try {
-      const res = await options.rpc.call<ChatSendResponse>('chat.send', attempt.params)
+      const stagedPendingItem = serverStagedPendingItem
+      const acceptanceRpc = attempt.acceptanceRpc || {
+        method: stagedPendingItem
+          ? 'sessions.pending_inputs.dispatch' as const
+          : 'chat.send' as const,
+        params: stagedPendingItem
+          ? {
+              key: requestSessionKey,
+              pendingInputId: stagedPendingItem.pendingInputId,
+              clientRequestId: stagedPendingItem.pendingClientRequestId,
+              requestFingerprint: stagedPendingItem.pendingRequestFingerprint,
+            }
+          : attempt.params as unknown as Record<string, unknown>,
+      }
+      attempt.acceptanceRpc = acceptanceRpc
+      attempt.acceptanceInFlight = true
+      const res = await options.rpc.call<ChatSendResponse>(
+        acceptanceRpc.method,
+        acceptanceRpc.params,
+      )
+      attempt.acceptanceResolved = true
+      attempt.acceptedTaskId = acceptedTaskId(res)
+      attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
       if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
         recoveredAttempt = null
       }
@@ -1452,18 +2139,40 @@ export function useChatSend(options: UseChatSendOptions) {
       // accepted its first turn. Keeping the intent until this point avoids
       // remounting onto an empty history when acceptance fails or is unknown.
       consumeAcceptedSessionIntent(attempt)
-      const taskId = acceptedTaskId(res)
+      const accepted = noteAcceptedTask(res, requestSessionKey)
+      const taskId = accepted.taskId
       const terminalStatus = terminalResponseStatus(res)
       if (responseHandoff) {
         responseHandoff.acceptedTaskId = taskId
         responseHandoff.terminalResponse = Boolean(terminalStatus)
       }
-      const stoppedByUser = freshSendToken?.stoppedByUser === true
+      const stoppedByUser = acceptanceTransaction.stoppedByUser
         || responseHandoff?.stoppedByUser === true
       const lostFreshStream = !wasStreaming
         && !freshSendStillOwnsStream(freshSendToken, requestSessionKey)
       if (stoppedByUser || lostFreshStream) {
         const acceptedSessionKey = res?.sessionKey || requestSessionKey
+        const stoppedTerminalIsCurrent = Boolean(
+          stoppedByUser
+          && terminalStatus
+          && options.sessionKey.value === requestSessionKey
+          && acceptedSessionKey === requestSessionKey,
+        )
+        if (stoppedByUser && (taskId || terminalStatus)) {
+          clearAcceptanceStop(acceptanceTransaction)
+        }
+        if (stoppedTerminalIsCurrent) {
+          bindAcceptedUserMessage(attempt.clientMessageId, res)
+          handleTerminalResponse(res, freshSendToken, {
+            finishFreshStream: !wasStreaming,
+            forceFreshStream: true,
+          })
+          return 'accepted'
+        }
+        if (stoppedByUser && taskId && options.sessionKey.value === requestSessionKey) {
+          options.taskOwnership?.requestStop(taskId)
+          bindAcceptedTask(taskId)
+        }
         // A same-session accepted row remains part of the visible parent even
         // after Stop or a newer send. A child identity must never be written
         // onto that parent row; the child history owns it after handoff.
@@ -1473,20 +2182,33 @@ export function useChatSend(options: UseChatSendOptions) {
         ) {
           bindAcceptedUserMessage(attempt.clientMessageId, res)
         }
-        abortStaleAcceptedTask(res, requestSessionKey, stoppedByUser)
+        if (stoppedByUser && taskId && attempt.stopRequested) {
+          // A manual receipt replay can win the race with the sleeping
+          // automatic worker. Share the same attempt-owned resolution so the
+          // worker observes completion instead of issuing a duplicate abort.
+          void abortRecoveredAcceptedTask(attempt).then((resolved) => {
+            if (!resolved && attempt.stopRequested) scheduleAcceptanceRecovery(attempt)
+          })
+        } else {
+          abortStaleAcceptedTask(res, requestSessionKey, stoppedByUser)
+        }
         if (
           stoppedByUser
           && options.sessionKey.value === requestSessionKey
           && acceptedSessionKey !== requestSessionKey
         ) {
+          durableHandoffRecord ||= await persistResponseHandoff(attempt)
           responseHandoff ||= beginResponseHandoff(
             requestSessionKey,
             attempt.clientRequestId,
+            durableHandoffRecord,
           )
           responseHandoff.stoppedByUser = true
           responseHandoff.acceptedTaskId = taskId
           responseHandoff.terminalResponse = Boolean(terminalStatus)
           await handoffResponseSession(acceptedSessionKey, responseHandoff)
+        } else if (responseHandoff && acceptedSessionKey === requestSessionKey) {
+          await handoffResponseSession(requestSessionKey, responseHandoff)
         }
         return 'accepted'
       }
@@ -1500,7 +2222,11 @@ export function useChatSend(options: UseChatSendOptions) {
       const responseIsCurrent = options.sessionKey.value === requestSessionKey
       if (!terminalStatus && !wasStreaming && responseIsCurrent) {
         options.activeStreamSessionKey.value = res?.sessionKey || requestSessionKey
-        if (taskId) bindAcceptedTask(taskId)
+        // A different same-session task can start while this chat.send ACK is
+        // pending. The queued B ACK must release the PENDING render gate to
+        // authoritative A (and replay A's early frames), never bind B merely
+        // because B is the request whose response arrived.
+        if (accepted.renderTaskId) bindAcceptedTask(accepted.renderTaskId)
       }
       const decision = decideSendResponseSession({
         requestSessionKey,
@@ -1516,10 +2242,17 @@ export function useChatSend(options: UseChatSendOptions) {
           responseSession: decision.responseSessionKey,
           current: options.sessionKey.value,
         })
-        responseHandoff ||= beginResponseHandoff(requestSessionKey, attempt.clientRequestId)
+        durableHandoffRecord ||= await persistResponseHandoff(attempt)
+        responseHandoff ||= beginResponseHandoff(
+          requestSessionKey,
+          attempt.clientRequestId,
+          durableHandoffRecord,
+        )
         responseHandoff.acceptedTaskId = taskId
         responseHandoff.terminalResponse = Boolean(terminalStatus)
         await handoffResponseSession(decision.responseSessionKey, responseHandoff)
+      } else if (responseHandoff && decision.reason === 'same_session') {
+        await handoffResponseSession(requestSessionKey, responseHandoff)
       } else if (decision.reason === 'current_session_changed') {
         recordSessionNavigationDiag('send.response.stale', {
           requestSession: requestSessionKey,
@@ -1542,6 +2275,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       return 'accepted'
     } catch (err: unknown) {
+      const rpcError = err as RpcClientError | null | undefined
       const acceptedError = acceptedErrorInfo(err)
       if (
         acceptedError
@@ -1553,15 +2287,12 @@ export function useChatSend(options: UseChatSendOptions) {
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
       const rememberRetryableAttempt = (restoreComposer: boolean) => {
         if (!shouldRestoreSendAttempt(err)) return
+        attempt.requiresIdempotentReplay = hasUnknownAcceptance(err)
         if (preserveComposer) {
-          const remembered = {
-            ...attempt,
-            requiresIdempotentReplay: hasUnknownAcceptance(err),
-          }
           if (sendOpts.rememberRetryableAttempt) {
-            sendOpts.rememberRetryableAttempt(remembered)
+            sendOpts.rememberRetryableAttempt(attempt)
           } else {
-            recoveredAttempt = remembered
+            recoveredAttempt = attempt
           }
         } else if (restoreComposer) {
           restoreSendAttempt(attempt, {
@@ -1569,8 +2300,23 @@ export function useChatSend(options: UseChatSendOptions) {
           })
         }
       }
-      const stoppedByUser = freshSendToken?.stoppedByUser === true
+      const stoppedByUser = acceptanceTransaction.stoppedByUser
         || responseHandoff?.stoppedByUser === true
+      if (stoppedByUser) {
+        if (acceptedError?.terminalWithoutTask || rpcError?.accepted === false) {
+          clearAcceptanceStop(acceptanceTransaction)
+        } else if (hasUnknownAcceptance(err)) {
+          void options.reconcileTaskOwnership?.()
+        }
+      }
+      if (hasUnknownAcceptance(err)) {
+        attempt.requiresIdempotentReplay = true
+        if (attempt.stopRequested || attempt.autoRecoverAcceptance) {
+          scheduleAcceptanceRecovery(attempt)
+        }
+      } else if (rpcError?.accepted === false || acceptedError?.terminalWithoutTask) {
+        attempt.acceptanceResolved = true
+      }
       if (
         acceptedError
         && stoppedByUser
@@ -1594,7 +2340,12 @@ export function useChatSend(options: UseChatSendOptions) {
           options.activeStreamSessionKey.value = ''
           options.stream.endStreaming()
         }
-        responseHandoff ||= beginResponseHandoff(requestSessionKey, attempt.clientRequestId)
+        durableHandoffRecord ||= await persistResponseHandoff(attempt)
+        responseHandoff ||= beginResponseHandoff(
+          requestSessionKey,
+          attempt.clientRequestId,
+          durableHandoffRecord,
+        )
         responseHandoff.stoppedByUser = stoppedByUser
         responseHandoff.terminalResponse = acceptedError.terminalWithoutTask
         await handoffResponseSession(acceptedSessionKey, responseHandoff)
@@ -1611,6 +2362,9 @@ export function useChatSend(options: UseChatSendOptions) {
         return 'accepted'
       }
       if (acceptedError && options.sessionKey.value === requestSessionKey) {
+        if (responseHandoff && acceptedSessionKey === requestSessionKey) {
+          await handoffResponseSession(requestSessionKey, responseHandoff)
+        }
         bindUserMessageId(attempt.clientMessageId, acceptedError.messageId)
         options.scheduleHistorySync()
       }
@@ -1635,6 +2389,9 @@ export function useChatSend(options: UseChatSendOptions) {
         options.activeStreamSessionKey.value = ''
         options.stream.endStreaming()
       }
+      if (responseHandoff && rpcError?.accepted === false && rpcError.retryable === false) {
+        await markResponseHandoffFailed(responseHandoff, err)
+      }
       rememberRetryableAttempt(true)
       options.messages.value.push({
         role: 'error',
@@ -1644,6 +2401,8 @@ export function useChatSend(options: UseChatSendOptions) {
       })
       return acceptedError ? 'accepted' : 'retryable_failure'
     } finally {
+      attempt.acceptanceInFlight = false
+      finishAcceptanceTransaction(acceptanceTransaction)
       finishResponseHandoff(responseHandoff)
     }
   }
@@ -1669,10 +2428,8 @@ export function useChatSend(options: UseChatSendOptions) {
     if (options.pendingWorkspaceId && !options.pendingWorkspaceId.value) {
       options.pendingWorkspaceId.value = attempt.workspaceId
     }
-    recoveredAttempt = {
-      ...attempt,
-      requiresIdempotentReplay: recovery.requiresIdempotentReplay,
-    }
+    attempt.requiresIdempotentReplay = recovery.requiresIdempotentReplay
+    recoveredAttempt = attempt
     options.autoResizeTextarea()
   }
 
@@ -1686,18 +2443,18 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function onStop() {
+    // A first Stop can race durable ingress before chat.send returns a task id.
+    // Keep that transaction latched until its ACK/reconcile so a double click
+    // cannot widen the second request into legacy whole-session cancellation.
+    if (acceptanceStopPending.value) return
     const handoffCanStop = responseHandoffBlocksCurrentSession()
     if (!(handoffCanStop || (options.canStop?.() ?? options.stream.isStreaming.value))) return
-    options.aborted.value = true
     const handoff = handoffCanStop ? activeResponseHandoff : null
-    if (handoff) handoff.stoppedByUser = true
-    const taskAcceptancePending = Boolean(handoff || activeFreshSendToken !== null)
-    const abortSessionKey = handoff?.targetSessionKey
-      || options.activeStreamSessionKey.value
-      || options.sessionKey.value
-    if (activeFreshSendToken !== null) activeFreshSendToken.stoppedByUser = true
-    activeFreshSendToken = null
-    const rawStoppedTurnId = currentExpectedTurnId()
+    const acceptance = activeAcceptanceTransaction?.requestSessionKey === options.sessionKey.value
+      ? activeAcceptanceTransaction
+      : null
+    const ownershipStopTarget = options.taskOwnership?.beginStop() || ''
+    const rawStoppedTurnId = ownershipStopTarget || currentExpectedTurnId()
     const stoppedTurnId = rawStoppedTurnId
       && ![
         PENDING_STREAM_TASK_ID,
@@ -1706,26 +2463,42 @@ export function useChatSend(options: UseChatSendOptions) {
       ].includes(rawStoppedTurnId)
       ? rawStoppedTurnId
       : ''
+    const taskAcceptancePending = Boolean(handoff || acceptance)
+    const acceptanceOwnsStop = taskAcceptancePending && !stoppedTurnId
+    if (!acceptanceOwnsStop && acceptance?.attempt) {
+      // B's acceptance is still unknown while Stop precisely targets hydrated
+      // A. Resolve B's idempotent receipt in the background, but do not copy
+      // A's Stop intent onto it.
+      acceptance.attempt.autoRecoverAcceptance = true
+    }
+    if (acceptanceOwnsStop && handoff) handoff.stoppedByUser = true
+    if (acceptanceOwnsStop && acceptance) {
+      acceptance.stoppedByUser = true
+      if (acceptance.attempt) {
+        acceptance.attempt.stopRequested = true
+        acceptance.attempt.stopOwner = acceptance.id
+        stoppedAcceptanceAttempts.set(
+          acceptanceAttemptKey(acceptance.attempt),
+          acceptance.attempt,
+        )
+        noteAcceptanceRecoveryChanged()
+      }
+      acceptanceStopOwner = acceptance.id
+      if (acceptance.freshSendToken) acceptance.freshSendToken.stoppedByUser = true
+    }
+    const abortSessionKey = acceptanceOwnsStop
+      ? handoff?.targetSessionKey
+        || acceptance?.requestSessionKey
+        || options.activeStreamSessionKey.value
+        || options.sessionKey.value
+      : options.activeStreamSessionKey.value || options.sessionKey.value
+    if (acceptanceOwnsStop) {
+      acceptanceStopPending.value = true
+    }
     options.steerDelivery.markStopRequested(stoppedTurnId)
     const latestUserMessage = [...options.messages.value]
       .reverse()
       .find(message => message.role === 'user')
-    const outcomeTurnId = stoppedTurnId
-      || latestUserMessage?.turnId
-      || latestUserMessage?.clientId
-      || latestUserMessage?.messageId
-      || ''
-    const stoppedAt = Date.now()
-    const stoppedOutcome = outcomeTurnId
-      ? {
-          turnId: outcomeTurnId,
-          ...(stoppedTurnId ? { taskId: stoppedTurnId } : {}),
-          status: 'cancelled',
-          kind: 'cancelled',
-          cancellationSource: 'webui_stop',
-          finishedAt: stoppedAt,
-        }
-      : undefined
     for (const message of options.messages.value) {
       if (
         message.role === 'user'
@@ -1741,20 +2514,7 @@ export function useChatSend(options: UseChatSendOptions) {
         // cancelled-input restoration.
         message.steerStopRequested = true
       }
-      if (
-        stoppedOutcome
-        && (
-          (stoppedTurnId && message.turnId === stoppedTurnId)
-          || (!stoppedTurnId && message === latestUserMessage)
-        )
-      ) {
-        message.turnOutcome = stoppedOutcome
-      }
     }
-    options.activeStreamTaskId.value = STOPPED_STREAM_TASK_ID
-    // Be honest if the abort can't reach the gateway (e.g. the socket dropped):
-    // we still tear the local stream down for responsiveness, but the user must
-    // know the server-side run may keep going rather than trust a false "stopped".
     const abortParams: Record<string, string> = {
       sessionKey: abortSessionKey,
       source: 'webui_stop',
@@ -1764,19 +2524,27 @@ export function useChatSend(options: UseChatSendOptions) {
     // intentionally retains legacy session-tree cancellation semantics.
     if (stoppedTurnId || taskAcceptancePending) abortParams.scope = 'task'
     if (stoppedTurnId) abortParams.taskId = stoppedTurnId
-    options.rpc.call('chat.abort', abortParams)
-      .then(() => options.scheduleHistorySync())
-      .catch(() => {
+    options.rpc.call<{ aborted?: boolean }>('chat.abort', abortParams)
+      .then((response) => {
+        if (response?.aborted === true) {
+          options.scheduleHistorySync()
+          return
+        }
+        if (acceptanceOwnsStop) return
+        options.taskOwnership?.clearStop(stoppedTurnId)
+        if (handoff) handoff.stoppedByUser = false
+        if (activeFreshSendToken !== null) activeFreshSendToken.stoppedByUser = false
+        void options.reconcileTaskOwnership?.()
         reportAbortFailure([abortSessionKey])
       })
-    const messageCountBeforeStop = options.messages.value.length
-    options.stream.endStreaming({ reason: 'aborted' })
-    const stoppedAssistant = options.messages.value[messageCountBeforeStop]
-    if (stoppedOutcome && stoppedAssistant?.role === 'assistant') {
-      if (stoppedTurnId) stoppedAssistant.turnId = stoppedTurnId
-      stoppedAssistant.turnOutcome = stoppedOutcome
-    }
-    options.popAllPendingIntoComposer()
+      .catch(() => {
+        if (acceptanceOwnsStop) return
+        options.taskOwnership?.clearStop(stoppedTurnId)
+        if (handoff) handoff.stoppedByUser = false
+        if (activeFreshSendToken !== null) activeFreshSendToken.stoppedByUser = false
+        void options.reconcileTaskOwnership?.()
+        reportAbortFailure([abortSessionKey])
+      })
   }
 
   /**
@@ -1890,6 +2658,7 @@ export function useChatSend(options: UseChatSendOptions) {
       projectBlocked
       || options.sendBlockedReason?.value
       || options.stream.isStreaming.value
+      || hasAuthoritativeWork()
       || compactInFlight
       || handoffInFlight
     ) {
@@ -1945,14 +2714,46 @@ export function useChatSend(options: UseChatSendOptions) {
     if (displayText && displayText !== providerText) params.displayText = displayText
     params._source = chatSourceMetadata(options)
 
+    // Hidden controls preserve the composer and render their own outbox-backed
+    // bubble, but their acceptance/Stop identity is otherwise the same as an
+    // ordinary send. Keep a request-owned attempt so a Stop racing this ACK can
+    // retry an exact task-scoped abort without widening to the whole session.
+    const attempt: SendAttempt = {
+      clientRequestId: stableClientRequestId,
+      clientMessageId,
+      composerText: displayText,
+      requestSessionKey,
+      text: providerText,
+      attachments: [],
+      intent: hiddenSessionIntent,
+      initialCollaborationMode: null,
+      forkBeforeMessageId: null,
+      workspaceId: null,
+      params,
+      hiddenControl: true,
+      acceptanceRpc: {
+        method: 'chat.send',
+        params: params as unknown as Record<string, unknown>,
+      },
+    }
+
     const wasStreaming = options.stream.isStreaming.value
     const freshSendToken = wasStreaming
       ? null
-      : beginFreshStream(requestSessionKey)
+      : beginFreshStream(requestSessionKey, attempt)
     let responseHandoff: ResponseHandoffGate | null = null
+    const acceptanceTransaction = beginAcceptanceTransaction(
+      requestSessionKey,
+      freshSendToken,
+      attempt,
+    )
 
     try {
+      attempt.acceptanceInFlight = true
       const res = await options.rpc.call<ChatSendResponse>('chat.send', params)
+      attempt.acceptanceResolved = true
+      attempt.acceptedTaskId = acceptedTaskId(res)
+      attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
       if (
         hiddenSessionIntent
         && requestSessionKey === options.sessionKey.value
@@ -1968,20 +2769,56 @@ export function useChatSend(options: UseChatSendOptions) {
         stableClientRequestId,
         options.hiddenControlStorage,
       )
-      const taskId = acceptedTaskId(res)
+      const accepted = noteAcceptedTask(res, requestSessionKey)
+      const taskId = accepted.taskId
       const terminalStatus = terminalResponseStatus(res)
-      const stoppedByUser = freshSendToken?.stoppedByUser === true
+      const stoppedByUser = acceptanceTransaction.stoppedByUser
       const lostFreshStream = !wasStreaming
         && !freshSendStillOwnsStream(freshSendToken, requestSessionKey)
       if (stoppedByUser || lostFreshStream) {
         const acceptedSessionKey = res?.sessionKey || requestSessionKey
+        const stoppedTerminalIsCurrent = Boolean(
+          stoppedByUser
+          && terminalStatus
+          && options.sessionKey.value === requestSessionKey
+          && acceptedSessionKey === requestSessionKey,
+        )
+        if (stoppedByUser && (taskId || terminalStatus)) {
+          clearAcceptanceStop(acceptanceTransaction)
+        }
+        if (stoppedTerminalIsCurrent) {
+          bindAcceptedUserMessage(clientMessageId, res)
+          handleTerminalResponse(res, freshSendToken, {
+            finishFreshStream: !wasStreaming,
+            forceFreshStream: true,
+          })
+          return hiddenDispatchResult(
+            'accepted',
+            'accepted',
+            stableClientRequestId,
+            requestSessionKey,
+          )
+        }
+        if (stoppedByUser && taskId && options.sessionKey.value === requestSessionKey) {
+          options.taskOwnership?.requestStop(taskId)
+          bindAcceptedTask(taskId)
+        }
         if (
           options.sessionKey.value === requestSessionKey
           && acceptedSessionKey === requestSessionKey
         ) {
           bindAcceptedUserMessage(clientMessageId, res)
         }
-        abortStaleAcceptedTask(res, requestSessionKey, stoppedByUser)
+        if (stoppedByUser && taskId && attempt.stopRequested) {
+          // Share the ordinary-send single-flight worker. If the first exact
+          // abort response is lost or explicitly unknown, the same task id is
+          // retried without replaying the hidden control or touching composer.
+          void abortRecoveredAcceptedTask(attempt).then((resolved) => {
+            if (!resolved && attempt.stopRequested) scheduleAcceptanceRecovery(attempt)
+          })
+        } else {
+          abortStaleAcceptedTask(res, requestSessionKey, stoppedByUser)
+        }
         if (
           stoppedByUser
           && options.sessionKey.value === requestSessionKey
@@ -2010,7 +2847,7 @@ export function useChatSend(options: UseChatSendOptions) {
       const responseIsCurrent = options.sessionKey.value === requestSessionKey
       if (!terminalStatus && !wasStreaming && responseIsCurrent) {
         options.activeStreamSessionKey.value = res?.sessionKey || requestSessionKey
-        if (taskId) bindAcceptedTask(taskId)
+        if (accepted.renderTaskId) bindAcceptedTask(accepted.renderTaskId)
       }
       const decision = decideSendResponseSession({
         requestSessionKey,
@@ -2071,7 +2908,26 @@ export function useChatSend(options: UseChatSendOptions) {
         )
       }
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
-      const stoppedByUser = freshSendToken?.stoppedByUser === true
+      const stoppedByUser = acceptanceTransaction.stoppedByUser
+      if (stoppedByUser) {
+        if (acceptedError?.terminalWithoutTask || accepted === false) {
+          attempt.acceptanceResolved = true
+          if (attempt.stopRequested) clearAttemptStop(attempt)
+          clearAcceptanceStop(acceptanceTransaction)
+        }
+      }
+      if (hasUnknownAcceptance(err)) {
+        attempt.requiresIdempotentReplay = true
+        // Stop can target an already-running A while this hidden B acceptance
+        // remains unknown. Resolve B's receipt too, but only a request-owned
+        // Stop may exact-abort B when its task id becomes known.
+        if (attempt.stopRequested || attempt.autoRecoverAcceptance) {
+          scheduleAcceptanceRecovery(attempt)
+        }
+        if (stoppedByUser) void options.reconcileTaskOwnership?.()
+      } else if (accepted === false || acceptedError?.terminalWithoutTask) {
+        attempt.acceptanceResolved = true
+      }
       if (
         acceptedError
         && stoppedByUser
@@ -2183,6 +3039,8 @@ export function useChatSend(options: UseChatSendOptions) {
         requestSessionKey,
       )
     } finally {
+      attempt.acceptanceInFlight = false
+      finishAcceptanceTransaction(acceptanceTransaction)
       finishResponseHandoff(responseHandoff)
     }
     return hiddenDispatchResult('accepted', 'accepted', stableClientRequestId, requestSessionKey)
@@ -2320,6 +3178,8 @@ export function useChatSend(options: UseChatSendOptions) {
     forgetHiddenControl,
     flushPendingMetaDiscards,
     restoreHiddenControls,
+    recoverResponseHandoffs,
     sendHiddenMetaPreflightConfirmation,
+    acceptanceRecoveryPendingForCurrentSession,
   }
 }

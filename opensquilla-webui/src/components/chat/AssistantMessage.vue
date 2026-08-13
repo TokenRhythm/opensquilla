@@ -28,21 +28,10 @@
         v-if="
           showTurnOutcome
           && message.turnOutcome
-          && !showAnyTurnDisclosure
+          && !showActivityDisclosure
           && !hasPlan
         "
         :outcome="message.turnOutcome"
-      />
-      <TextPart
-        v-if="
-          hasPlan
-          && activityProjection.canSeparateActivity
-          && activityProjection.answerPart
-        "
-        class="plan-message-intro"
-        :part="activityProjection.answerPart"
-        :sources="message.sources ?? []"
-        @citation="onCitation"
       />
       <template v-if="activityProjection.canSeparateActivity">
         <ActivityDisclosure
@@ -59,11 +48,6 @@
           :state-key="activityStateKey"
           :continuity-key="activityContinuityKey"
         >
-          <TurnUsageDetails
-            v-if="showReceiptUsage && message.meta"
-            :meta="message.meta"
-            :fmt-tok="fmtTok"
-          />
           <ReasoningPart
             v-if="reasoningPart"
             :part="reasoningPart"
@@ -119,26 +103,6 @@
            but no canonical message.text. Preserve their original order and
            visibility instead of guessing which fragment was the answer. -->
       <template v-else>
-        <ActivityDisclosure
-          v-if="showUsageOnlyReceipt"
-          :lifecycle="activityLifecycle"
-          :step-count="1"
-          :failure-count="0"
-          :duration-seconds="activityDurationSeconds"
-          :summary-label="displayActivitySummaryLabel"
-          :detail-label="displayActivityDetailLabel"
-          :phase-label="hasPlan ? t('chat.plan.process') : ''"
-          :completion-confirmed="activityCompletionConfirmed"
-          :default-open="activityDefaultOpen"
-          :state-key="activityStateKey"
-          :continuity-key="activityContinuityKey"
-        >
-          <TurnUsageDetails
-            v-if="message.meta"
-            :meta="message.meta"
-            :fmt-tok="fmtTok"
-          />
-        </ActivityDisclosure>
         <ReasoningPart v-if="reasoningPart" :part="reasoningPart" />
         <ToolCallTimeline
           :items="visibleLegacyTimelineItems"
@@ -170,6 +134,18 @@
         />
       </template>
 
+      <TextPart
+        v-if="
+          hasPlan
+          && activityProjection.canSeparateActivity
+          && activityProjection.answerPart
+        "
+        class="plan-message-intro"
+        :part="activityProjection.answerPart"
+        :sources="message.sources ?? []"
+        @citation="onCitation"
+      />
+
       <PlanCard
         v-for="part in planParts"
         :key="part.key"
@@ -180,6 +156,13 @@
         @implement-current="$emit('planImplementCurrent', $event)"
         @implement-new="$emit('planImplementNew', $event)"
         @replan="$emit('planReplan', $event)"
+      />
+
+      <SessionCreatedCard
+        v-for="createdSession in createdSessions"
+        :key="createdSession.callId"
+        :session-key="createdSession.sessionKey"
+        @open="$emit('openSession', $event)"
       />
 
       <div
@@ -217,7 +200,7 @@
           <Icon name="cron" :size="11" />
           {{ t('chat.provenance.scheduled') }}
         </span>
-        <div v-if="showLegacyUsageFallback && message.meta" class="msg-ai-meta">
+        <div v-if="message.meta" class="msg-ai-meta">
           <span
             v-if="hasMetaDetails"
             ref="metaMoreRef"
@@ -247,7 +230,7 @@
             >
               <div v-if="message.meta.model && !message.meta.ensemble" class="msg-meta-popover__row">
                 <span class="msg-meta-popover__label">{{ t('chat.msgMeta.model') }}</span>
-                <span class="msg-meta-popover__value">{{ message.meta.modelShort }}</span>
+                <span class="msg-meta-popover__value">{{ message.meta.modelShort || message.meta.model }}</span>
               </div>
               <div v-if="message.meta.costUsd && !message.meta.ensemble" class="msg-meta-popover__row">
                 <span class="msg-meta-popover__label">{{ t('chat.msgMeta.cost') }}</span>
@@ -307,7 +290,7 @@
             </div>
           </span>
         </div>
-        <div v-if="!shareMode && !message.stopNotice" class="msg-ai-actions">
+        <div v-if="!hasPlan && !shareMode && !message.stopNotice" class="msg-ai-actions">
           <button
             type="button"
             class="msg-action"
@@ -396,13 +379,14 @@ import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
 import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
+import SessionCreatedCard from '@/components/chat/SessionCreatedCard.vue'
 import StatusHistoryPart from '@/components/chat/parts/StatusHistoryPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
-import TurnUsageDetails from '@/components/chat/TurnUsageDetails.vue'
 import { useChatRouteFeedback } from '@/composables/chat/useChatRouteFeedback'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
+import { createdSessionsFromMessage } from '@/utils/chat/createdSessions'
 import {
   hasIncompleteUsageCoverage,
   usageCoverageText,
@@ -481,6 +465,7 @@ const emit = defineEmits<{
   planImplementCurrent: [target: PlanCardActionTarget]
   planImplementNew: [target: PlanCardActionTarget]
   planReplan: [target: PlanCardActionTarget]
+  openSession: [sessionKey: string]
 }>()
 
 // Absolute label is static; only the relative label subscribes to the shared
@@ -537,9 +522,6 @@ const timelineResolvedInterruptKeys = computed(() => new Set(
     )
     .map(item => item.part.key) ?? [],
 ))
-const standaloneInterruptParts = computed(() =>
-  interruptParts.value.filter(part => !timelineResolvedInterruptKeys.value.has(part.key)),
-)
 const planParts = computed(
   () =>
     props.message.parts?.filter(
@@ -547,6 +529,17 @@ const planParts = computed(
     ) ?? [],
 )
 const hasPlan = computed(() => planParts.value.length > 0)
+const standaloneInterruptParts = computed(() =>
+  interruptParts.value.filter(part => (
+    !timelineResolvedInterruptKeys.value.has(part.key)
+    && !(
+      hasPlan.value
+      && part.interruptKind === 'clarify'
+      && part.clarify?.presentation === 'plan_questionnaire_v1'
+      && part.resolution === 'replied'
+    )
+  )),
+)
 // The persisted activity timeline for this finished turn. Empty (fold hidden)
 // for OFF-mode turns and reloaded threads, which carry no snapshot.
 const statusHistory = computed(() => props.message.statusHistory ?? [])
@@ -582,12 +575,14 @@ const cronBadgeTitle = computed(() => safeCronSourceTool.value
   ? t('chat.provenance.cronSource', { tool: safeCronSourceTool.value })
   : t('chat.provenance.cron'))
 const showFooter = computed(() =>
-  planParts.value.length === 0
-  && (
-    !!props.goalOutcome
-    || isCronMessage.value
-    || showLegacyUsageFallback.value
-    || (!props.shareMode && !props.message.stopNotice)
+  hasMetaDetails.value
+  || (
+    planParts.value.length === 0
+    && (
+      !!props.goalOutcome
+      || isCronMessage.value
+      || (!props.shareMode && !props.message.stopNotice)
+    )
   ),
 )
 
@@ -709,6 +704,14 @@ const legacyTimelineItems = computed<ChatStreamTimelineItem[]>(() => {
   }))
 })
 
+const semanticCreatedSessions = computed(() => createdSessionsFromMessage(props.message))
+const createdSessions = computed(() => (
+  props.message.createdSessionLinks ?? semanticCreatedSessions.value
+))
+const createdSessionCallIds = computed(() => new Set(
+  semanticCreatedSessions.value.map(createdSession => createdSession.callId),
+))
+
 const activityLifecycle = computed<AssistantActivityLifecycle>(() => {
   if (outcomePresentation.value === 'stopped') return 'interrupted'
   if (outcomePresentation.value === 'interrupted') return 'interrupted'
@@ -758,7 +761,9 @@ function withoutFailedActivity(
       return []
     }
     const calls = item.group.calls.filter(
-      call => !call.isError && call.status !== 'error',
+      call => !call.isError
+        && call.status !== 'error'
+        && !createdSessionCallIds.value.has(call.toolId),
     )
     if (calls.length === 0) return []
     const isRunning = calls.some(call => call.isRunning)
@@ -808,29 +813,9 @@ const hasActivity = computed(() =>
   || hasVisibleActivityItem.value
   || statusHistory.value.length > 0,
 )
-const hasAuthoritativeTurnReceipt = computed(() =>
-  props.showTurnOutcome === true && !!props.message.turnOutcome,
-)
 const showActivityDisclosure = computed(() =>
   activityProjection.value.canSeparateActivity
-  && (
-    hasActivity.value
-    || (hasMetaDetails.value && hasAuthoritativeTurnReceipt.value)
-  ),
-)
-const showReceiptUsage = computed(() =>
-  hasMetaDetails.value && showActivityDisclosure.value,
-)
-const showUsageOnlyReceipt = computed(() =>
-  !activityProjection.value.canSeparateActivity
-  && hasMetaDetails.value
-  && hasAuthoritativeTurnReceipt.value,
-)
-const showAnyTurnDisclosure = computed(() =>
-  showActivityDisclosure.value || showUsageOnlyReceipt.value,
-)
-const showLegacyUsageFallback = computed(() =>
-  hasMetaDetails.value && !showAnyTurnDisclosure.value,
+  && hasActivity.value,
 )
 
 const activityStepCount = computed(() => Math.max(

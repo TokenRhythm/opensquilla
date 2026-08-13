@@ -3174,6 +3174,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Discussion créée",
+      "open": "Ouvrir la discussion"
+    },
     "promptCacheKeepalive": {
       "action": "Maintien du cache de prompt",
       "title": "Maintien du cache de prompt",
@@ -3425,6 +3429,14 @@
         "settled": "Terminé",
         "interrupted": "Interrompu",
         "failed": "Échec"
+      },
+      "provider": {
+        "waiting": "En attente du modèle",
+        "reasoning": "Réflexion approfondie",
+        "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
+        "retryWait": "Nouvel essai dans {seconds}s",
+        "retrying": "Nouvel essai {attempt}/{limit}",
+        "fallback": "Passage au modèle de secours"
       },
       "purpose": {
         "discover": "Liens découverts",
@@ -3748,6 +3760,10 @@
       "steerRetryUnknownHint": "OpenSquilla n’a pas pu confirmer l’acceptation de cette instruction. Réessayer rejoue de façon sûre la demande d’origine inchangée.",
       "removeUnknownSteer": "Abandonner la nouvelle tentative locale du message en attente {index} ; cela ne signifie pas que le serveur ne l’a pas reçu",
       "queueHint": "Mode file d'attente : ces messages s'envoient automatiquement dans l'ordre à la fin de la réponse actuelle",
+      "reorderHint": "Maintenez pendant 0,75 seconde puis faites glisser pour réorganiser. Alt+Flèche déplace aussi ce message.",
+      "reorderStarted": "Réorganisation de {label}. Faites glisser vers la nouvelle position puis relâchez.",
+      "reorderPosition": "{label} a été déplacé en position {position} sur {count}.",
+      "reorderRecovering": "Restauration de l’ordre de la file…",
       "clearAll": "Tout effacer",
       "editMessage": "Modifier le message",
       "editWhileStreaming": "Attendez la fin de la réponse en cours avant de modifier",
@@ -3926,6 +3942,7 @@
       "waitCompactionBeforeCommand": "Attendez le compactage du contexte avant d'exécuter {command}.",
       "waitResponseBeforeCommand": "Attendez la réponse actuelle avant d'exécuter {command}.",
       "queueFull": "La file d'attente est pleine — attendez la fin de la réponse actuelle.",
+      "queuePersistenceUnavailable": "Conservez ce message dans l’éditeur jusqu’à la fin de la bifurcation ; la récupération durable est indisponible.",
       "messageStillSaving": "Ce message n'est pas encore enregistré — réessayez dans un instant.",
       "artifactOpenFailed": "Échec de l'ouverture de l'artefact. Utilisez Télécharger à la place."
     },
@@ -4010,6 +4027,7 @@
     "sidebar": {
       "recentConversations": "Tâches récentes",
       "recents": "Récentes",
+      "pinned": "Épinglées",
       "refresh": "Recharger les tâches",
       "clearAgentFilter": "Effacer le filtre d'agent : {name}",
       "loadError": "Impossible de charger les tâches",

@@ -7,6 +7,12 @@ import re
 from typing import Any
 
 from opensquilla.artifacts import artifact_payload, strip_artifact_markers_from_text
+from opensquilla.chat.flattened_tool_markers import (
+    has_flattened_used_tool_line,
+    is_flattened_tool_result_dump,
+    strip_confirmed_flattened_tool_result,
+    strip_flattened_used_tool_lines,
+)
 from opensquilla.meta_preflight_protocol import (
     display_text_from_preflight_confirmation,
     strip_preflight_confirmation_protocol_text,
@@ -55,14 +61,42 @@ def _is_legacy_generated_plan_implementation(
     return _LEGACY_PLAN_IMPLEMENTATION_PROMPT.fullmatch(visible) is not None
 
 
+def _legacy_flattened_tool_result_indexes(entries: list[object]) -> set[int]:
+    """Identify metadata-poor result rows from an adjacent flattened tool call.
+
+    Modern rows carry ``tool_call_id`` or role ``tool``. Older compaction
+    projections sometimes persisted Anthropic-style tool results as role
+    ``user`` with no structured identity, so recognize only the adjacent
+    assistant-marker/result pair. An isolated user message that merely quotes
+    the legacy syntax must remain ordinary conversation text.
+    """
+
+    indexes: set[int] = set()
+    previous_was_flattened_call = False
+    for index, entry in enumerate(entries):
+        role = str(getattr(entry, "role", "unknown") or "unknown").lower()
+        content = str(getattr(entry, "content", "") or "")
+        if (
+            previous_was_flattened_call
+            and role in {"tool", "user"}
+            and is_flattened_tool_result_dump(content)
+        ):
+            indexes.add(index)
+        previous_was_flattened_call = (
+            role == "assistant" and has_flattened_used_tool_line(content)
+        )
+    return indexes
+
+
 def transcript_entries_to_chat_messages(
     entries: list[object],
     *,
     limit: int | None = None,
 ) -> list[dict[str, Any]]:
     selected = entries[-limit:] if limit is not None else entries
+    legacy_tool_result_indexes = _legacy_flattened_tool_result_indexes(selected)
     messages: list[dict[str, Any]] = []
-    for entry in selected:
+    for entry_index, entry in enumerate(selected):
         role = getattr(entry, "role", "unknown")
         turn_context = getattr(entry, "turn_context", None)
         silent_reply = sanitize_historical_silent_reply(
@@ -100,6 +134,25 @@ def transcript_entries_to_chat_messages(
             content = "\n".join(t.replace("\\n", "\n") for t in texts) if texts else ""
             if not content.strip():
                 continue
+        if content:
+            cleaned = content
+            if role == "assistant" and has_flattened_used_tool_line(cleaned):
+                cleaned = strip_flattened_used_tool_lines(cleaned)
+            confirmed_tool_result = (
+                role == "tool"
+                or bool(getattr(entry, "tool_call_id", None))
+                or entry_index in legacy_tool_result_indexes
+            )
+            if confirmed_tool_result:
+                cleaned = strip_confirmed_flattened_tool_result(cleaned)
+            if cleaned != content:
+                # The entry carried OpenSquilla's flattened tool serialization.
+                # Drop it when nothing but internal tool transcript remains and
+                # there is no structured tool timeline to render instead;
+                # otherwise keep the narration that surrounded the markers.
+                if not cleaned.strip() and not silent_reply.segments:
+                    continue
+                content = cleaned
         if role == "user":
             display_text = display_text_from_preflight_confirmation(content)
             if display_text is not None:

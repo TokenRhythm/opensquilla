@@ -201,8 +201,23 @@ try {
     followsSystem: true,
   })
 
-  const settingsUrl = new URL('/control/settings/appearance', page.url()).href
-  await page.goto(settingsUrl)
+  // Exercise the same SPA navigation path as an operator. A hard page.goto()
+  // can race a still-settling draft ChatView canonicalization on slower
+  // Windows runners and be replaced by /chat/new even though the renderer is
+  // healthy; clicking the permanent settings control also proves the shell is
+  // still interactive before testing the theme panel.
+  const settingsButton = page.locator('button.sidebar-fn-item[data-icon="settings"]')
+  await settingsButton.waitFor({ state: 'visible', timeout: 20_000 })
+  await settingsButton.click()
+  await page.waitForURL(url => url.pathname.includes('/control/settings'), {
+    timeout: 20_000,
+  })
+  const appearanceTab = page.locator('#settings-rail-appearance')
+  await appearanceTab.waitFor({ state: 'visible', timeout: 20_000 })
+  await appearanceTab.click()
+  await page.waitForURL(url => url.pathname.endsWith('/control/settings/appearance'), {
+    timeout: 20_000,
+  })
   await page.waitForSelector('input[name="appearance-theme"][value="system"]', {
     timeout: 20_000,
   })

@@ -329,7 +329,8 @@ async def test_artifact_rpc_offloads_store_reads_to_threads(
     calls: list[str] = []
 
     async def _record_to_thread(func, /, *args, **kwargs):
-        calls.append(func.__name__)
+        if isinstance(getattr(func, "__self__", None), ArtifactStore):
+            calls.append(func.__name__)
         return await original_to_thread(func, *args, **kwargs)
 
     monkeypatch.setattr(rpc_artifacts.asyncio, "to_thread", _record_to_thread)
