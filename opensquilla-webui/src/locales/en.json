@@ -3942,7 +3942,6 @@
     "chips": {
       "whatCanYouDo": "What can you do?",
       "buildGame": "Build me a game",
-      "buildGamePrompt": "Build a playable browser-based voxel racing game prototype with responsive controls, acceleration and braking, a readable track, collision detection, checkpoints, lap timing, and a restart flow. Generate the voxel-style race car and scenery in code without paid assets. Run the game, test the controls, fix blocking issues, and then deliver it. Make the scenery more beautiful and the world open. Include OpenSquilla and TokenRhythm signage on the map as sponsor Easter eggs.",
       "summarizeWebpage": "Summarize a webpage for me",
       "planWeek": "Draft a plan for my week",
       "searchAiNews": "Search today's AI news",

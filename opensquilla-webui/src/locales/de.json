@@ -3889,7 +3889,6 @@
     "chips": {
       "whatCanYouDo": "Was kannst du?",
       "buildGame": "Baue mir ein Spiel",
-      "buildGamePrompt": "Erstelle einen spielbaren, browserbasierten Prototyp eines Voxel-Rennspiels mit reaktionsschneller Steuerung, Beschleunigen und Bremsen, einer gut lesbaren Strecke, Kollisionserkennung, Kontrollpunkten, Rundenzeitmessung und einem Neustart-Ablauf. Generiere Rennwagen und Landschaft im Voxel-Stil per Code und verwende keine kostenpflichtigen Assets. Starte das Spiel, teste die Steuerung, behebe blockierende Probleme und liefere es anschließend aus. Die Landschaft soll schöner und die Welt offen sein. Platziere OpenSquilla- und TokenRhythm-Schilder als Sponsor-Easter-Eggs auf der Karte.",
       "summarizeWebpage": "Fasse eine Webseite für mich zusammen",
       "planWeek": "Entwirf einen Plan für meine Woche",
       "searchAiNews": "Suche die heutigen AI-News",

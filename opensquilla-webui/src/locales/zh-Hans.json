@@ -3942,7 +3942,6 @@
     "chips": {
       "whatCanYouDo": "你能做什么？",
       "buildGame": "帮我做个游戏",
-      "buildGamePrompt": "构建一个可玩的浏览器端体素竞速游戏原型，包含响应式操控、加速/刹车、可读赛道、碰撞检测、检查点、圈速计时和重启流程。用代码生成体素风格的赛车和场景，不使用付费素材。运行游戏、测试控制、修复阻塞性问题后交付。我希望风景更好,开放世界。且地图在有opensquilla和 tokenrhythm这两个标识 是赞助商彩蛋",
       "summarizeWebpage": "帮我总结一个网页",
       "planWeek": "为我这一周拟定计划",
       "searchAiNews": "搜索今天的 AI 新闻",

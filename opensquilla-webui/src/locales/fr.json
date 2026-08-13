@@ -3889,7 +3889,6 @@
     "chips": {
       "whatCanYouDo": "Que peux-tu faire ?",
       "buildGame": "Crée-moi un jeu",
-      "buildGamePrompt": "Construis un prototype jouable dans le navigateur d’un jeu de course en voxels, avec des commandes réactives, accélération et freinage, une piste lisible, la détection des collisions, des points de contrôle, le chronométrage des tours et un parcours de redémarrage. Génère en code la voiture et les décors en style voxel, sans ressources payantes. Lance le jeu, teste les commandes, corrige les problèmes bloquants, puis livre-le. Je veux de plus beaux paysages et un monde ouvert. Ajoute sur la carte des enseignes OpenSquilla et TokenRhythm comme clins d’œil de sponsors.",
       "summarizeWebpage": "Résume une page web pour moi",
       "planWeek": "Ébauche un plan pour ma semaine",
       "searchAiNews": "Recherche les actualités IA du jour",
