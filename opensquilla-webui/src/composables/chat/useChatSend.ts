@@ -1827,9 +1827,12 @@ export function useChatSend(options: UseChatSendOptions) {
       ) {
         return preserveRetryState('deferred')
       }
-      return await options.executeSlashCommand(item.text.trim())
-        ? 'accepted'
-        : preserveRetryState('not_sent')
+      if (await options.executeSlashCommand(item.text.trim())) {
+        return 'accepted'
+      }
+      // executeSlashCommand reports "unhandled" (false) for unknown slash
+      // input. Fall through to the normal send path below so the queued item
+      // is sent as plain chat text, mirroring the primary onSend contract.
     }
     if (hasSendableModelInputImageAttachment(item.attachments)) {
       if (options.modelRoutingSettingsBusy.value) {
