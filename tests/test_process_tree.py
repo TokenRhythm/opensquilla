@@ -5,6 +5,7 @@ import io
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from types import SimpleNamespace
 
@@ -494,11 +495,15 @@ async def test_windows_controlled_launcher_waits_for_helper_ready_before_release
     process = await process_tree.create_owned_subprocess_exec(
         "command.exe",
         creationflags=0x20,
+        env={"TARGET_ONLY": "yes"},
     )
 
     assert process_tree.capture_process_tree_owner(process, isolated=True).durable
     assert int(spawn_kwargs["creationflags"]) & 0x01000000
     assert int(spawn_kwargs["creationflags"]) & 0x20
+    assert process_tree._windows_target_env_from_helper(spawn_kwargs["env"]) == {
+        "TARGET_ONLY": "yes"
+    }
     assert events == [
         "spawned-helper",
         "assigned",
@@ -623,11 +628,18 @@ def test_windows_sync_launcher_waits_for_helper_ready_before_release(
     )
     monkeypatch.setattr(process_tree.subprocess, "Popen", fake_popen)
 
-    process = process_tree.create_owned_popen(("command.exe",), creationflags=0x20)
+    process = process_tree.create_owned_popen(
+        ("command.exe",),
+        creationflags=0x20,
+        env={"TARGET_ONLY": "yes"},
+    )
 
     assert process_tree.capture_process_tree_owner(process, isolated=True).durable
     assert int(spawn_kwargs["creationflags"]) & 0x01000000
     assert int(spawn_kwargs["creationflags"]) & 0x20
+    assert process_tree._windows_target_env_from_helper(spawn_kwargs["env"]) == {
+        "TARGET_ONLY": "yes"
+    }
     assert events == [
         "spawned-helper",
         "assigned",
@@ -704,3 +716,88 @@ def test_windows_sync_helper_ready_timeout_fails_closed(
         "job-closed",
         "gate-closed",
     ]
+
+
+def test_windows_helper_runtime_env_is_removed_before_target_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SystemRoot", r"C:\\Windows")
+    monkeypatch.setenv("WINDIR", r"C:\\Windows")
+    monkeypatch.setenv("ComSpec", r"C:\\Windows\\System32\\cmd.exe")
+
+    helper_env = process_tree._windows_helper_env({"TARGET_ONLY": "yes"})
+
+    assert helper_env["SystemRoot"] == r"C:\\Windows"
+    assert helper_env["WINDIR"] == r"C:\\Windows"
+    assert helper_env["ComSpec"] == r"C:\\Windows\\System32\\cmd.exe"
+    assert helper_env[process_tree._WINDOWS_HELPER_STRIP_ENV] == (
+        "SystemRoot;WINDIR;ComSpec"
+    )
+    assert process_tree._windows_target_env_from_helper(helper_env) == {
+        "TARGET_ONLY": "yes"
+    }
+    assert process_tree._windows_target_env_from_helper(
+        {key.upper(): value for key, value in helper_env.items()}
+    ) == {"TARGET_ONLY": "yes"}
+
+
+def test_windows_helper_preserves_allowlisted_runtime_env_for_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SystemRoot", r"C:\\HostWindows")
+
+    helper_env = process_tree._windows_helper_env(
+        {"SystemRoot": r"D:\\AllowedWindows", "TARGET_ONLY": "yes"}
+    )
+
+    assert process_tree._windows_target_env_from_helper(helper_env) == {
+        "SystemRoot": r"D:\\AllowedWindows",
+        "TARGET_ONLY": "yes",
+    }
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows events and Job Objects")
+@pytest.mark.asyncio
+async def test_windows_owned_launch_boots_helper_with_restricted_target_env() -> None:
+    process = await process_tree.create_owned_subprocess_exec(
+        sys.executable,
+        "-c",
+        (
+            "import os; "
+            "print(os.environ.get('TARGET_ONLY')); "
+            "print(os.environ.get('SystemRoot', 'missing')); "
+            f"print(os.environ.get({process_tree._WINDOWS_HELPER_STRIP_ENV!r}, 'missing'))"
+        ),
+        env={"PATH": os.environ.get("PATH", ""), "TARGET_ONLY": "yes"},
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10.0)
+
+    assert process.returncode == 0, stderr.decode(errors="replace")
+    assert stdout.decode().splitlines() == ["yes", "missing", "missing"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows events and Job Objects")
+def test_windows_owned_popen_boots_helper_with_restricted_target_env() -> None:
+    process = process_tree.create_owned_popen(
+        (
+            sys.executable,
+            "-c",
+            (
+                "import os; "
+                "print(os.environ.get('TARGET_ONLY')); "
+                "print(os.environ.get('SystemRoot', 'missing')); "
+                f"print(os.environ.get({process_tree._WINDOWS_HELPER_STRIP_ENV!r}, 'missing'))"
+            ),
+        ),
+        env={"PATH": os.environ.get("PATH", ""), "TARGET_ONLY": "yes"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+    stdout, stderr = process.communicate(timeout=10.0)
+
+    assert process.returncode == 0, stderr.decode(errors="replace")
+    assert stdout.decode().splitlines() == ["yes", "missing", "missing"]

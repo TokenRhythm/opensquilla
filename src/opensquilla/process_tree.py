@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -34,6 +35,8 @@ _POSIX_ANCHOR_EMPTY = b"E"
 _POSIX_ANCHOR_RELEASE = b"R"
 _WINDOWS_LAUNCH_GATE_PREFIX = "Local\\OpenSquillaTaskLaunch-"
 _WINDOWS_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+_WINDOWS_HELPER_STRIP_ENV = "OPENSQUILLA_INTERNAL_PROCESS_TREE_STRIP_ENV"
+_WINDOWS_HELPER_RUNTIME_ENV_KEYS = ("SystemRoot", "WINDIR", "ComSpec")
 
 
 class ProcessTreeOwnershipError(RuntimeError):
@@ -566,6 +569,49 @@ def _attach_owner(process: Any, owner: ProcessTreeOwner) -> Any:
     return process
 
 
+def _windows_helper_env(target_env: Mapping[str, str] | None) -> dict[str, str]:
+    """Build a bootable helper environment without widening the target env."""
+
+    if target_env is None:
+        helper_env = dict(os.environ)
+    else:
+        helper_env = {str(key): str(value) for key, value in dict(target_env).items()}
+
+    present = {key.casefold() for key in helper_env}
+    injected: list[str] = []
+    for key in _WINDOWS_HELPER_RUNTIME_ENV_KEYS:
+        if key.casefold() in present:
+            continue
+        value = os.environ.get(key)
+        if value is None:
+            continue
+        helper_env[key] = value
+        present.add(key.casefold())
+        injected.append(key)
+    _pop_windows_env(helper_env, _WINDOWS_HELPER_STRIP_ENV)
+    helper_env[_WINDOWS_HELPER_STRIP_ENV] = ";".join(injected)
+    return helper_env
+
+
+def _pop_windows_env(env: dict[str, str], key: str) -> str | None:
+    folded = key.casefold()
+    for candidate in tuple(env):
+        if candidate.casefold() == folded:
+            return env.pop(candidate)
+    return None
+
+
+def _windows_target_env_from_helper(helper_env: Mapping[str, str]) -> dict[str, str]:
+    """Recover the caller-requested env after the helper has booted."""
+
+    target_env = {str(key): str(value) for key, value in dict(helper_env).items()}
+    injected = _pop_windows_env(target_env, _WINDOWS_HELPER_STRIP_ENV) or ""
+    for key in injected.split(";"):
+        if key:
+            _pop_windows_env(target_env, key)
+    return target_env
+
+
 async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
     """Spawn an argv under durable task-owned tree containment."""
 
@@ -606,6 +652,7 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
             int(child_kwargs.get("creationflags", 0))
             | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
         )
+        child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
         helper_argv = (
             sys.executable,
             "-m",
@@ -695,6 +742,7 @@ def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
         int(child_kwargs.get("creationflags", 0))
         | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
     )
+    child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
     helper_argv = [
         sys.executable,
         "-m",
@@ -856,7 +904,10 @@ def _run_windows_owned_launch(
     if not argv:
         return 127
     try:
-        process = subprocess.Popen(argv)
+        process = subprocess.Popen(
+            argv,
+            env=_windows_target_env_from_helper(os.environ),
+        )
     except OSError as exc:
         print(f"OpenSquilla controlled launch failed: {exc}", file=sys.stderr)
         return 127
