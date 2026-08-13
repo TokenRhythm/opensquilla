@@ -261,6 +261,9 @@ async function assertSettledMessageReceipt(page) {
     0,
     'usage details must not be embedded in the activity disclosure',
   )
+  // Keep the pointer outside the hover target so Escape exercises the pinned
+  // popover state consistently across Electron's Windows and macOS builds.
+  await page.mouse.move(1, 1)
   await page.keyboard.press('Escape')
   await usagePopover.waitFor({ state: 'hidden', timeout: SEND_TIMEOUT_MS })
 }
@@ -357,6 +360,10 @@ try {
       timeout: SEND_TIMEOUT_MS,
     })
     await composer.waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
+    // The packaged app can expose its initial draft URL before Vue has mounted
+    // the permanent route header. Establish the landing-route baseline before
+    // asserting that session materialization preserves the same DOM node.
+    await header.waitFor({ state: 'attached', timeout: SEND_TIMEOUT_MS })
     assert.equal(
       await header.count(),
       1,
