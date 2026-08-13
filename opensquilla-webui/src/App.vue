@@ -514,6 +514,7 @@ import {
   LOCAL_SESSIONS_DELETED_EVENT,
 } from './utils/sessionSync'
 import { activeTaskWasDeletedWithProjectHistory } from './utils/projectHistory'
+import { createCoalescedRefresh } from './utils/coalescedRefresh'
 import {
   optionalSessionRpcAllowed,
   optionalSessionRpcCallOptions,
@@ -1138,9 +1139,6 @@ function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
   writeStoredSessionKeys(SIDEBAR_SESSION_ORDER_KEY, currentOrder)
 }
 
-let sessionRefreshTimer: ReturnType<typeof setTimeout> | null = null
-let sidebarRefreshPending = false
-let sidebarLoadPromise: Promise<void> | null = null
 let appAutomaticRpcMounted = false
 let appAutomaticRpcStarted = false
 
@@ -1658,30 +1656,14 @@ function openDesktopRuntimeSettings() {
 }
 
 function scheduleSessionRefresh() {
-  sidebarRefreshPending = true
-  if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
-  sessionRefreshTimer = setTimeout(() => {
-    sessionRefreshTimer = null
-    flushScheduledSidebarRefresh()
-  }, 150)
+  sidebarRefresh.schedule()
 }
 
 function flushScheduledSidebarRefresh() {
-  if (
-    !sidebarRefreshPending
-    || !appAutomaticRpcMounted
-    || !optionalSessionRpcAllowed.value
-  ) return
-  sidebarRefreshPending = false
-  if (sessionRefreshTimer) {
-    clearTimeout(sessionRefreshTimer)
-    sessionRefreshTimer = null
-  }
-  void loadSidebarData()
+  sidebarRefresh.flush()
 }
 
-function loadSidebarData(): Promise<void> {
-  if (sidebarLoadPromise) return sidebarLoadPromise
+async function performSidebarLoad(): Promise<void> {
   const requests: Promise<unknown>[] = [loadSessions()]
   if (
     rpcStore.canManageProjectWorkspaces
@@ -1691,17 +1673,22 @@ function loadSidebarData(): Promise<void> {
       projectWorkspaces.loadWorkspaces(optionalSessionRpcCallOptions),
     )
   }
-  const request = Promise.allSettled(requests).then(() => undefined)
-  const tracked = request.finally(() => {
-    if (sidebarLoadPromise === tracked) sidebarLoadPromise = null
-  })
-  sidebarLoadPromise = tracked
-  return tracked
+  await Promise.allSettled(requests)
+}
+
+const sidebarRefresh = createCoalescedRefresh({
+  run: performSidebarLoad,
+  allowed: () => appAutomaticRpcMounted && optionalSessionRpcAllowed.value,
+  delayMs: 150,
+})
+
+function loadSidebarData(): Promise<void> {
+  return sidebarRefresh.load()
 }
 
 function refreshSidebarDataWhenAdmitted(): void | Promise<void> {
   if (!optionalSessionRpcAllowed.value) {
-    sidebarRefreshPending = true
+    sidebarRefresh.defer()
     return
   }
   return loadSidebarData()
@@ -1984,11 +1971,10 @@ onMounted(() => {
 
 onUnmounted(() => {
   appAutomaticRpcMounted = false
-  sidebarRefreshPending = false
+  sidebarRefresh.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.removeEventListener('focus', markCurrentSessionReadIfVisible)
   document.removeEventListener('visibilitychange', markCurrentSessionReadIfVisible)
-  if (sessionRefreshTimer) clearTimeout(sessionRefreshTimer)
   sessionListSubscription.cleanup()
   unsubscribeApprovals()
   unsubscribeCronFinished?.()

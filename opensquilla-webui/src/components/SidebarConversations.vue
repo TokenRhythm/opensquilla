@@ -899,7 +899,10 @@ function onSelectRow(row: SidebarConversationItem) {
     </div>
 
     <!-- Filtered to nothing within the Chats agent filter -->
-    <div v-else-if="agentFilter && !hasFilterMatches" class="sidebar-history-empty">
+    <div
+      v-else-if="agentFilter && !hasFilterMatches && !hasMore"
+      class="sidebar-history-empty"
+    >
       {{ t('shared.sidebar.noMatches') }}
     </div>
 
