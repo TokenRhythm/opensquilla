@@ -460,13 +460,23 @@ async def _load_legacy_tool_projection_context(
     oldest_cursor = _chat_history_cursor_key(_chat_history_cursor(entries[0]))
     newest_cursor = _chat_history_cursor_key(_chat_history_cursor(entries[-1]))
     if _needs_legacy_tool_lookbehind(entries[0]) and oldest_cursor is not None:
-        page = await page_getter(
-            session_key,
-            limit=1,
-            before=oldest_cursor,
-            after=None,
-        )
-        candidates, _has_more, _complete = _canonical_page_parts(page)
+        try:
+            page = await page_getter(
+                session_key,
+                limit=1,
+                before=oldest_cursor,
+                after=None,
+            )
+            candidates, _has_more, _complete = _canonical_page_parts(page)
+        except StorageBusyError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - optional read-time projection
+            log.warning(
+                "chat_history_legacy_projection_context_unavailable",
+                edge="before",
+                error_type=type(exc).__name__,
+            )
+            return None, None
         if candidates:
             candidate = candidates[-1]
             candidate_cursor = _chat_history_cursor_key(_chat_history_cursor(candidate))
@@ -474,13 +484,23 @@ async def _load_legacy_tool_projection_context(
                 previous_entry = candidate
 
     if _needs_legacy_tool_lookahead(entries[-1]) and newest_cursor is not None:
-        page = await page_getter(
-            session_key,
-            limit=1,
-            before=None,
-            after=newest_cursor,
-        )
-        candidates, _has_more, _complete = _canonical_page_parts(page)
+        try:
+            page = await page_getter(
+                session_key,
+                limit=1,
+                before=None,
+                after=newest_cursor,
+            )
+            candidates, _has_more, _complete = _canonical_page_parts(page)
+        except StorageBusyError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - optional read-time projection
+            log.warning(
+                "chat_history_legacy_projection_context_unavailable",
+                edge="after",
+                error_type=type(exc).__name__,
+            )
+            return None, None
         if candidates:
             candidate = candidates[0]
             candidate_cursor = _chat_history_cursor_key(_chat_history_cursor(candidate))

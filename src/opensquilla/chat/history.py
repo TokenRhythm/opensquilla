@@ -161,8 +161,6 @@ def _legacy_tool_activity_segments(
                 "legacy_projection": True,
             }
         )
-    if parsed_results.trailing_text:
-        segments.append({"type": "text", "text": parsed_results.trailing_text})
     return segments
 
 

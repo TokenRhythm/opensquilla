@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from opensquilla.chat.history import transcript_entries_to_chat_messages
 
 
@@ -523,7 +525,7 @@ def test_transcript_entries_to_chat_messages_keeps_unattributed_tool_result_text
     assert messages[0]["text"] == entry.content
 
 
-def test_transcript_entries_to_chat_messages_keeps_text_after_confirmed_tool_result() -> None:
+def test_transcript_entries_to_chat_messages_preserves_ambiguous_result_suffix() -> None:
     entry = _assistant_entry(
         message_id="m-toolresult-with-request",
         role="user",
@@ -533,7 +535,59 @@ def test_transcript_entries_to_chat_messages_keeps_text_after_confirmed_tool_res
 
     messages = transcript_entries_to_chat_messages([entry])
 
-    assert messages[0]["text"] == "Please also update README.md"
+    assert messages[0]["text"] == entry.content
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '["a"]\nsecond payload line',
+        '{"items": []}\nJSON diagnostic detail',
+        "values = [1, 2]\nprint(values)",
+        "ordinary output ]\ncontinuation from the tool",
+    ],
+)
+def test_transcript_entries_to_chat_messages_keeps_ambiguous_multiline_remainder_in_result(
+    payload: str,
+) -> None:
+    entries = [
+        _assistant_entry(content="[Used tool: read_file]"),
+        _assistant_entry(
+            role="user",
+            content=f"[Tool result (call-1): {payload}]",
+        ),
+    ]
+
+    messages = transcript_entries_to_chat_messages(entries)
+
+    assert len(messages) == 1
+    assert messages[0]["tool_calls"][1]["result"] == payload
+    assert all(segment.get("type") != "text" for segment in messages[0]["tool_calls"])
+
+
+def test_transcript_entries_to_chat_messages_keeps_trusted_call_narration_ordered() -> None:
+    entries = [
+        _assistant_entry(
+            content=(
+                "Before the tool.\n"
+                "[Used tool: read_file]\n"
+                "After the tool was requested."
+            ),
+        ),
+        _assistant_entry(
+            role="user",
+            content="[Tool result (call-1): source payload]",
+        ),
+    ]
+
+    messages = transcript_entries_to_chat_messages(entries)
+
+    assert [segment.get("text") for segment in messages[0]["tool_calls"]] == [
+        "Before the tool.",
+        None,
+        "After the tool was requested.",
+        None,
+    ]
 
 
 def test_transcript_entries_to_chat_messages_keeps_isolated_tool_only_turn() -> None:

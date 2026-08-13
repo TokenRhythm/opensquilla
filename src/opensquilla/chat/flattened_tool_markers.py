@@ -10,9 +10,6 @@ _TOOL_RESULT_PREFIX = re.compile(r"^\[Tool result \([^\)\r\n]+\): ")
 _TOOL_RESULT_START = re.compile(
     r"(?m)^\[Tool result \((?P<tool_use_id>[^\)\r\n]+)\): "
 )
-_SINGLE_LINE_TOOL_RESULT = re.compile(
-    r"^\[Tool result \([^\)\r\n]+\): [^\r\n]*\](?:\r?\n|$)"
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,7 +25,6 @@ class FlattenedToolResults:
     """Ordered results recovered from one confirmed legacy transcript row."""
 
     results: tuple[FlattenedToolResult, ...]
-    trailing_text: str = ""
 
 
 def has_flattened_used_tool_line(content: str) -> bool:
@@ -65,8 +61,7 @@ def strip_flattened_used_tool_lines(content: str) -> str:
 def is_flattened_tool_result_dump(content: str) -> bool:
     """Recognize a complete legacy ``[Tool result (...): ...]`` projection."""
 
-    parsed = parse_flattened_tool_result_dumps(content)
-    return parsed is not None and not parsed.trailing_text
+    return parse_flattened_tool_result_dumps(content) is not None
 
 
 def parse_flattened_tool_result_dumps(
@@ -76,9 +71,12 @@ def parse_flattened_tool_result_dumps(
 
     The historical serializer joined content blocks with newlines and did not
     escape newlines inside a result payload. Marker starts are therefore the
-    only reliable internal boundary. A final single-line marker may have
-    ordinary narration after it; that suffix is returned verbatim for the
-    caller to keep in the activity timeline.
+    only reliable internal boundary. In particular, a closing bracket on the
+    first payload line cannot distinguish a single-line result followed by
+    narration from a multiline payload whose first line happens to end in
+    ``]``. The final marker therefore owns the complete remainder through its
+    last closing bracket as auditable tool output. If the complete row has no
+    final closer, parsing fails and callers preserve the original text.
     """
 
     visible = content.lstrip()
@@ -89,19 +87,9 @@ def parse_flattened_tool_result_dumps(
         return None
 
     results: list[FlattenedToolResult] = []
-    trailing_text = ""
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(visible)
-        payload_with_closer = visible[match.end() : end]
-        if index + 1 == len(matches):
-            first_line, separator, suffix = payload_with_closer.partition("\n")
-            if first_line.rstrip("\r").rstrip().endswith("]"):
-                payload_with_closer = first_line.rstrip("\r").rstrip()
-                trailing_text = suffix.strip() if separator else ""
-            else:
-                payload_with_closer = payload_with_closer.rstrip()
-        else:
-            payload_with_closer = payload_with_closer.rstrip()
+        payload_with_closer = visible[match.end() : end].rstrip()
         if not payload_with_closer.endswith("]"):
             return None
         tool_use_id = match.group("tool_use_id").strip()
@@ -113,7 +101,7 @@ def parse_flattened_tool_result_dumps(
                 content=payload_with_closer[:-1],
             )
         )
-    return FlattenedToolResults(tuple(results), trailing_text)
+    return FlattenedToolResults(tuple(results))
 
 
 def parse_flattened_tool_result_dump(content: str) -> FlattenedToolResult | None:
@@ -125,29 +113,23 @@ def parse_flattened_tool_result_dump(content: str) -> FlattenedToolResult | None
     """
 
     parsed = parse_flattened_tool_result_dumps(content)
-    if parsed is None or len(parsed.results) != 1 or parsed.trailing_text:
+    if parsed is None or len(parsed.results) != 1:
         return None
     return parsed.results[0]
 
 
 def strip_confirmed_flattened_tool_result(content: str) -> str:
-    """Hide a confirmed result projection without discarding visible suffix text.
+    """Hide a complete confirmed legacy result projection.
 
     The historical serializer did not escape newlines or brackets inside result
     snippets, so a multiline projection cannot be split safely from arbitrary
-    suffix prose. Pure result dumps are removable as a whole; the unambiguous
-    single-line form may also be removed while retaining the following text.
+    suffix prose. A parsed row is hidden only when its complete remainder is
+    retained as tool output; otherwise the original row remains verbatim.
     """
 
     leading = len(content) - len(content.lstrip())
     visible = content[leading:]
     parsed = parse_flattened_tool_result_dumps(visible)
     if parsed is not None:
-        return parsed.trailing_text
-    single_line = _SINGLE_LINE_TOOL_RESULT.match(visible)
-    if single_line is not None:
-        suffix = visible[single_line.end() :]
-        return suffix.strip()
-    if is_flattened_tool_result_dump(visible):
         return ""
     return content
