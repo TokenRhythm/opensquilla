@@ -68,6 +68,9 @@ const props = withDefaults(defineProps<{
   sections: SidebarSection[]
   error: boolean
   loading: boolean
+  loadingMore?: boolean
+  loadMoreError?: boolean
+  hasMore?: boolean
   currentKey: string
   contractDebugEnabled: boolean
   /** Command-palette chord, shown in the search button's tooltip. */
@@ -77,6 +80,9 @@ const props = withDefaults(defineProps<{
   canCreateProjects?: boolean
 }>(), {
   sessionOrder: () => [],
+  loadingMore: false,
+  loadMoreError: false,
+  hasMore: false,
   canManageProjects: false,
   canCreateProjects: false,
 })
@@ -84,6 +90,7 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   (e: 'select', key: string): void
   (e: 'refresh'): void
+  (e: 'load-more'): void
   (e: 'rename', payload: { key: string; title: string }): void
   (e: 'delete', key: string): void
   (e: 'bulk-delete', keys: string[]): void
@@ -101,6 +108,24 @@ const emit = defineEmits<{
 
 const { confirm } = useConfirm()
 const { t } = useI18n()
+const historyList = ref<HTMLElement | null>(null)
+
+function maybeLoadMore() {
+  const element = historyList.value
+  if (
+    !element
+    || !props.hasMore
+    || props.loading
+    || props.loadingMore
+    || props.loadMoreError
+  ) return
+  const remaining = element.scrollHeight - element.scrollTop - element.clientHeight
+  if (remaining <= 160) emit('load-more')
+}
+
+function onHistoryScroll() {
+  maybeLoadMore()
+}
 
 const TASK_ATTENTION_LABEL_KEYS: Record<Exclude<SessionTaskAttention, 'none'>, string> = {
   running: 'shared.sidebar.taskRunning',
@@ -613,6 +638,11 @@ watch([selectionMode, openMenuKey], closeSessionPreview)
 useDocumentEvent('scroll', closeSessionPreview, true)
 onMounted(() => window.addEventListener('resize', closeSessionPreview))
 onUnmounted(() => window.removeEventListener('resize', closeSessionPreview))
+watch(
+  [displayBlocks, () => props.hasMore, () => props.loadingMore],
+  () => nextTick(maybeLoadMore),
+  { flush: 'post' },
+)
 
 // Escape closes and returns focus to the row's ⋯ trigger; arrows rove between
 // the menu items, wrapping at the ends.
@@ -873,7 +903,12 @@ function onSelectRow(row: SidebarConversationItem) {
       {{ t('shared.sidebar.noMatches') }}
     </div>
 
-    <div v-else class="sidebar-history-list">
+    <div
+      v-else
+      ref="historyList"
+      class="sidebar-history-list"
+      @scroll.passive="onHistoryScroll"
+    >
       <div
         v-for="block in displayBlocks"
         :key="block.key"
@@ -1264,6 +1299,22 @@ function onSelectRow(row: SidebarConversationItem) {
         >
           <div class="sidebar-zone-empty__body">{{ t('shared.sidebar.noConversations') }}</div>
         </div>
+      </div>
+      <div
+        v-if="loadingMore || loadMoreError || (!hasMore && totalRows > 0)"
+        class="sidebar-history-page-state"
+        role="status"
+      >
+        <span v-if="loadingMore">{{ t('sessions.loading') }}</span>
+        <button
+          v-else-if="loadMoreError"
+          type="button"
+          class="sidebar-history-retry"
+          @click="emit('load-more')"
+        >
+          {{ t('shared.errorState.retry') }}
+        </button>
+        <span v-else>{{ t('shared.sidebar.allLoaded') }}</span>
       </div>
     </div>
     <Teleport to="body">

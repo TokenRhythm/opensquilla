@@ -27,7 +27,7 @@ class _FakeDispatcher:
         return _FakeDispatchResult()
 
 
-def test_api_sessions_forwards_limit_and_view_query_params() -> None:
+def test_api_sessions_forwards_pagination_query_params() -> None:
     dispatcher = _FakeDispatcher()
     import opensquilla.gateway.app as gateway_app
 
@@ -39,13 +39,19 @@ def test_api_sessions_forwards_limit_and_view_query_params() -> None:
         gateway_app.get_dispatcher = original
 
     with TestClient(app) as client:
-        response = client.get("/api/sessions?limit=200&view=session-list-v1")
+        response = client.get(
+            "/api/sessions?limit=200&view=session-list-v1&cursor=opaque-cursor"
+        )
 
     assert response.status_code == 200
     assert dispatcher.calls
     _request_id, method, params, _ctx = dispatcher.calls[-1]
     assert method == "sessions.list"
-    assert params == {"limit": 200, "view": "session-list-v1"}
+    assert params == {
+        "limit": 200,
+        "view": "session-list-v1",
+        "cursor": "opaque-cursor",
+    }
 
 
 def test_api_sessions_without_query_params_keeps_default_rpc_params() -> None:

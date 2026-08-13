@@ -1190,6 +1190,96 @@ class TestSessionsList:
         assert res.payload["totalCount"] == 201
 
     @pytest.mark.asyncio
+    async def test_session_list_view_pages_beyond_200_without_gaps(
+        self, dispatcher, tmp_path
+    ):
+        storage = SessionStorage(str(tmp_path / "sessions-page.db"))
+        await storage.connect()
+        try:
+            for index in range(201):
+                await storage.upsert_session(
+                    SessionNode(
+                        session_key=f"agent:main:webchat:session-{index:03d}",
+                        session_id=f"session-{index:03d}",
+                        agent_id="main",
+                        status="idle",
+                        created_at=1000,
+                        updated_at=1000,
+                    )
+                )
+            ctx = make_ctx(session_manager=SimpleNamespace(storage=storage))
+
+            first = await dispatcher.dispatch(
+                "page-1",
+                "sessions.list",
+                {"limit": 200, "view": "session-list-v1"},
+                ctx,
+            )
+            assert first.ok is True
+            assert first.payload["count"] == 200
+            assert first.payload["has_more"] is True
+            assert first.payload["hasMore"] is True
+            assert first.payload["next_cursor"] == first.payload["nextCursor"]
+
+            second = await dispatcher.dispatch(
+                "page-2",
+                "sessions.list",
+                {
+                    "limit": 200,
+                    "view": "session-list-v1",
+                    "cursor": first.payload["next_cursor"],
+                },
+                ctx,
+            )
+            assert second.ok is True
+            assert second.payload["count"] == 1
+            assert second.payload["has_more"] is False
+            assert second.payload["next_cursor"] is None
+
+            keys = [
+                row["key"]
+                for row in [*first.payload["sessions"], *second.payload["sessions"]]
+            ]
+            assert len(keys) == len(set(keys)) == 201
+            assert keys == sorted(keys, reverse=True)
+        finally:
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_session_list_view_rejects_malformed_cursor(self, dispatcher):
+        ctx = make_ctx(session_manager=FakeSessionManager())
+
+        res = await dispatcher.dispatch(
+            "bad-cursor",
+            "sessions.list",
+            {"limit": 200, "view": "session-list-v1", "cursor": "not-a-cursor"},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+
+    @pytest.mark.asyncio
+    async def test_session_list_view_marks_legacy_storage_page_terminal(self, dispatcher):
+        ctx = make_ctx(
+            session_manager=FakeSessionManager(
+                [FakeSession(session_key="agent:main:webchat:legacy")]
+            )
+        )
+
+        res = await dispatcher.dispatch(
+            "legacy-page",
+            "sessions.list",
+            {"limit": 200, "view": "session-list-v1"},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert len(res.payload["sessions"]) == 1
+        assert res.payload["has_more"] is False
+        assert res.payload["next_cursor"] is None
+
+    @pytest.mark.asyncio
     async def test_count_view_is_scoped_to_the_guest_owner(self, dispatcher):
         owner_id = "a" * 64
         other_owner_id = "b" * 64

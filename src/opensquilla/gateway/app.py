@@ -195,6 +195,9 @@ def create_gateway_app(
         view = request.query_params.get("view")
         if view:
             params["view"] = view
+        cursor = request.query_params.get("cursor")
+        if cursor:
+            params["cursor"] = cursor
         result = await dispatcher.dispatch("_http", "sessions.list", params or None, ctx)
         if result.ok:
             return _with_http_guest_cookie(

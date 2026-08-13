@@ -83,6 +83,9 @@
       :session-order="sidebarSessionOrder"
       :error="sessionListError"
       :loading="isLoading"
+      :loading-more="isLoadingMore"
+      :load-more-error="loadMoreError"
+      :has-more="hasMore"
       :current-key="sidebarCurrentKey"
       :contract-debug-enabled="contractDebugEnabled"
       :search-hint="commandPaletteHint"
@@ -90,6 +93,7 @@
       :can-create-projects="rpcStore.canChooseProject"
       @select="switchToSession"
       @refresh="loadSidebarData"
+      @load-more="loadMoreSessions"
       @rename="onRenameSession"
       @delete="onDeleteSession"
       @bulk-delete="onBulkDeleteSessions"
@@ -603,7 +607,16 @@ const router = useRouter()
 watch(() => appStore.locale, () => {
   document.title = `${routeTitle($route)} — OpenSquilla`
 })
-const { allSessions, sessionListError, isLoading, loadSessions } = useSessions(
+const {
+  allSessions,
+  sessionListError,
+  isLoading,
+  isLoadingMore,
+  loadMoreError,
+  hasMore,
+  loadSessions,
+  loadMoreSessions,
+} = useSessions(
   optionalSessionRpcCallOptions,
 )
 const { bottomRoutes, workNav } = useNavigation()
