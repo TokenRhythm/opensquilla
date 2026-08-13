@@ -2371,6 +2371,7 @@ class EnsembleProvider:
             "proposer_timeout_seconds": self.proposer_timeout_seconds,
             "aggregator_timeout_seconds": self.aggregator_timeout_seconds,
             "aggregator_timeout_mode": "idle",
+            "aggregator_total_deadline_source": "outer_turn_runtime",
             "quorum_grace_seconds": self.quorum_grace_seconds,
             "content_max_chars": TRACE_CONTENT_MAX_CHARS,
             "final_request_role": final_request_role,
@@ -2703,37 +2704,36 @@ class EnsembleProvider:
                     ),
                     code="ensemble_aggregator_timeout",
                 )
+                # A completed idle budget is not a cheap transient failure:
+                # replaying the aggregator can repeat the same billed stall for
+                # another full budget. Preserve any earlier retry receipts, but
+                # do not retry this timed-out attempt. A fallback is safe only
+                # before any text, reasoning, or tool delta reached consumers.
+                yield aggregator_progress("aggregator_finish", error=error.message)
                 if (
                     not content_streamed
-                    and attempt < _ENSEMBLE_AGGREGATOR_MAX_RETRIES
+                    and self.all_failed_policy == "fallback_single"
+                    and self.fallback_provider is not None
                 ):
-                    retry_error = error
-                else:
-                    yield aggregator_progress("aggregator_finish", error=error.message)
-                    if (
-                        not content_streamed
-                        and self.all_failed_policy == "fallback_single"
-                        and self.fallback_provider is not None
+                    # Reuse the original conversation, not the synthetic
+                    # candidate bundle sent to the aggregator. Preserve
+                    # billed retry rows and count only attempts that ended
+                    # without a usage receipt as missing.
+                    async for fallback_event in self._fallback_or_error(
+                        original_messages,
+                        tools=tools,
+                        config=original_config,
+                        reason=error.message,
+                        code=error.code,
+                        candidates=candidates,
+                        prior_trace=trace,
+                        prior_usage_rows=retry_rows,
+                        extra_usage_missing_count=retry_missing_count + 1,
                     ):
-                        # Reuse the original conversation, not the synthetic
-                        # candidate bundle sent to the aggregator. Preserve
-                        # billed retry rows and count only attempts that ended
-                        # without a usage receipt as missing.
-                        async for fallback_event in self._fallback_or_error(
-                            original_messages,
-                            tools=tools,
-                            config=original_config,
-                            reason=error.message,
-                            code=error.code,
-                            candidates=candidates,
-                            prior_trace=trace,
-                            prior_usage_rows=retry_rows,
-                            extra_usage_missing_count=retry_missing_count + 1,
-                        ):
-                            yield fallback_event
-                        return
-                    yield partial_error(error)
+                        yield fallback_event
                     return
+                yield partial_error(error)
+                return
             except Exception as exc:  # noqa: BLE001 - provider boundary returns ErrorEvent
                 safe_message = redact_upstream_error_text(
                     f"ensemble aggregator failed: {exc}",

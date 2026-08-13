@@ -3756,7 +3756,7 @@ async def test_aggregator_empty_incomplete_stream_is_retried_in_place(
 
 
 @pytest.mark.asyncio
-async def test_aggregator_timeout_before_content_is_retried_in_place(
+async def test_aggregator_timeout_before_content_is_terminal_without_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry(
@@ -3800,12 +3800,11 @@ async def test_aggregator_timeout_before_content_is_retried_in_place(
 
     events = await _collect(provider)
 
-    assert call_count[0] == 2
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.usage_missing_count == 1
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["final_request"]["retry_count"] == 1
+    assert call_count[0] == 1
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_aggregator_timeout"
+    assert error.usage_missing_count == 1
+    assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 @pytest.mark.asyncio
@@ -4287,7 +4286,9 @@ async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_u
     events = await _collect(provider)
 
     assert [call["model"] for call in registry.calls] == ["p1"]
-    assert len(aggregator.calls) == 3
+    # A completed idle budget immediately selects the safe fallback path;
+    # retrying the aggregator would repeat a full, potentially billed stall.
+    assert len(aggregator.calls) == 1
     assert fallback is not None and len(fallback.calls) == 1
     fallback_messages = fallback.calls[0]["messages"]
     assert [(message.role, message.content) for message in fallback_messages] == [
@@ -4310,7 +4311,7 @@ async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_u
         fallback_receipt,
     ]
     assert done.billing_receipt is None
-    assert done.usage_missing_count == 3
+    assert done.usage_missing_count == 1
 
     trace = done.ensemble_trace
     assert trace is not None
@@ -4318,14 +4319,15 @@ async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_u
     assert trace["fallback_code"] == "ensemble_aggregator_timeout"
     assert "no stream events" in trace["fallback_reason"]
     assert trace["aggregator_timeout_mode"] == "idle"
+    assert trace["aggregator_total_deadline_source"] == "outer_turn_runtime"
     assert trace["selection_plan"] == selection_plan
-    assert trace["llm_request_count"] == 5
+    assert trace["llm_request_count"] == 3
     assert trace["final_request"]["role"] == "fallback_single"
     assert trace["final_request"]["output"]["text"] == "fallback"
     prior_request = trace["prior_final_request"]
     assert prior_request["request_started"] is True
     assert prior_request["execution"]["model"] == "agg"
-    assert prior_request["retry_count"] == 2
+    assert prior_request.get("retry_count", 0) == 0
     assert prior_request["terminal_code"] == "ensemble_aggregator_timeout"
 
     aggregator_finish = next(
@@ -4356,7 +4358,7 @@ async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_u
         completed_at_ms=1234,
     )
     assert len(usage.items) == 2
-    assert usage.missing_usage_entries == 3
+    assert usage.missing_usage_entries == 1
 
 
 @pytest.mark.asyncio
@@ -4472,7 +4474,7 @@ async def test_aggregator_timeout_respects_error_policy(
     assert fallback is not None and fallback.calls == []
     error = next(event for event in events if isinstance(event, ErrorEvent))
     assert error.code == "ensemble_aggregator_timeout"
-    assert error.usage_missing_count == 3
+    assert error.usage_missing_count == 1
 
 
 @pytest.mark.asyncio
@@ -4500,7 +4502,7 @@ async def test_aggregator_timeout_then_fallback_error_counts_both_missing_reques
     assert len(errors) == 1
     assert errors[0].code == "fallback_failed"
     assert [row["model"] for row in errors[0].model_usage_breakdown] == ["p1"]
-    assert errors[0].usage_missing_count == 4
+    assert errors[0].usage_missing_count == 2
 
 
 @pytest.mark.asyncio
@@ -4596,8 +4598,8 @@ async def test_aggregator_timeout_fallback_retains_reported_retry_usage(
 
     events = await _collect(provider)
 
-    assert aggregator_attempts == 3
-    assert len(aggregator.calls) == 3
+    assert aggregator_attempts == 2
+    assert len(aggregator.calls) == 2
     assert fallback is not None and len(fallback.calls) == 1
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert (done.input_tokens, done.output_tokens) == (31, 9)
@@ -4610,10 +4612,10 @@ async def test_aggregator_timeout_fallback_retains_reported_retry_usage(
     assert retry_row["attempt_index"] == 1
     assert retry_row["attempt_ok"] is False
     assert retry_row["usage_reported"] is True
-    assert done.usage_missing_count == 2
+    assert done.usage_missing_count == 1
     assert done.ensemble_trace is not None
-    assert done.ensemble_trace["llm_request_count"] == 5
-    assert done.ensemble_trace["prior_final_request"]["retry_count"] == 2
+    assert done.ensemble_trace["llm_request_count"] == 4
+    assert done.ensemble_trace["prior_final_request"]["retry_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -4729,8 +4731,7 @@ async def test_ensemble_emits_aggregator_finish_before_terminal_error(
     assert expected_error in aggregator_progress[-1].error
     assert terminal_error.code == expected_code
     assert [row["model"] for row in terminal_error.model_usage_breakdown] == ["p1"]
-    expected_missing_count = 3 if mode == "timeout" else 1
-    assert terminal_error.usage_missing_count == expected_missing_count
+    assert terminal_error.usage_missing_count == 1
     assert events.index(aggregator_progress[-1]) < events.index(terminal_error)
 
 

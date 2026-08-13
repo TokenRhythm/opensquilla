@@ -159,6 +159,7 @@ export interface EnsembleEffectiveFacts {
   quorum: number
   proposerCount: number
   proposerTimeoutSeconds: number
+  configuredAggregatorTimeoutSeconds: number
   aggregatorTimeoutSeconds: number
   quorumGraceSeconds: number
 }
@@ -899,6 +900,7 @@ export function useSetupEnsembleForm() {
         storedProposerTimeoutSeconds.value,
         STATIC_B5_PROPOSER_TIMEOUT_SECONDS,
       ),
+      configuredAggregatorTimeoutSeconds: storedAggregatorTimeoutSeconds.value,
       aggregatorTimeoutSeconds: substituteLegacy(
         storedAggregatorTimeoutSeconds.value,
         STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS,

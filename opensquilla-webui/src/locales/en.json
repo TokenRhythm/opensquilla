@@ -1094,7 +1094,7 @@
       "capacityWarn": "{calls} model calls per turn — cost grows linearly and fusion gains taper past 4 proposers.",
       "capacityFull": "Limit of {max} proposers reached — more drafts stop improving fusion; remove one before adding another.",
       "diversityHint": "Several proposers share a model family — adding a different vendor usually improves fusion.",
-      "effectiveFacts": "Per turn: {calls} model calls · fuses once {quorum}/{proposers} proposers succeed · proposer timeout {proposerTimeout}s · aggregator timeout {aggregatorTimeout}s · {grace}s grace after quorum",
+      "effectiveFacts": "Per turn: {calls} model calls · fuses once {quorum}/{proposers} proposers succeed · proposer total timeout {proposerTimeout}s · aggregator idle timeout {aggregatorTimeout}s · {grace}s grace after quorum",
       "effectiveSummary": "{proposers} proposers in parallel + 1 aggregator · about {calls} model calls per turn",
       "runtimeStrategyTitle": "Runtime strategy",
       "runtimeStrategyDesc": "Success threshold, fallback, and time limits",
@@ -1103,7 +1103,7 @@
       "successThresholdExact": "At least {quorum} of {proposers} return normally",
       "failurePolicyLabel": "If aggregation cannot complete",
       "runtimeLimitsLabel": "Time limits",
-      "runtimeLimits": "Proposers {proposerTimeout}s · aggregator {aggregatorTimeout}s · {grace}s grace after the threshold",
+      "runtimeLimits": "Proposers {proposerTimeout}s total · aggregator {aggregatorTimeout}s idle between provider events (configured {configuredAggregatorTimeout}s) · outer turn deadline separate · {grace}s grace after the threshold",
       "quorumFailureLabel": "If fewer than {quorum} proposers succeed"
     },
     "behavior": {

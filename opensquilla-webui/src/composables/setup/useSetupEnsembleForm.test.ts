@@ -930,6 +930,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
       quorum: 3,
       proposerCount: 4,
       proposerTimeoutSeconds: 300,
+      configuredAggregatorTimeoutSeconds: 3600,
       aggregatorTimeoutSeconds: 480,
       quorumGraceSeconds: 10,
     })
@@ -988,6 +989,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     })
     const facts = makePanel(f, 'openrouter').value.presetFacts
     expect(facts.proposerTimeoutSeconds).toBe(600)
+    expect(facts.configuredAggregatorTimeoutSeconds).toBe(900)
     expect(facts.aggregatorTimeoutSeconds).toBe(900)
     expect(facts.quorumGraceSeconds).toBe(10)
     // The stored timeouts are read-only facts, never a pending edit.
@@ -1005,6 +1007,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     })
     const legacyFacts = makePanel(explicitLegacy, 'openrouter').value.presetFacts
     expect(legacyFacts.proposerTimeoutSeconds).toBe(300)
+    expect(legacyFacts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(legacyFacts.aggregatorTimeoutSeconds).toBe(480)
 
     // Older gateways may omit the keys from the config slice entirely.
@@ -1012,6 +1015,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     absent.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
     const absentFacts = makePanel(absent, 'openrouter').value.presetFacts
     expect(absentFacts.proposerTimeoutSeconds).toBe(300)
+    expect(absentFacts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(absentFacts.aggregatorTimeoutSeconds).toBe(480)
   })
 
@@ -1028,6 +1032,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     })
     const facts = makePanel(f, 'deepseek').value.custom.facts
     expect(facts.proposerTimeoutSeconds).toBe(720)
+    expect(facts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(facts.aggregatorTimeoutSeconds).toBe(480)
     expect(facts.quorumGraceSeconds).toBe(10)
   })
@@ -1041,6 +1046,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     })
     const facts = makePanel(f, 'deepseek').value.custom.facts
     expect(facts.proposerTimeoutSeconds).toBe(3600)
+    expect(facts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(facts.aggregatorTimeoutSeconds).toBe(3600)
     expect(facts.quorumGraceSeconds).toBe(0)
   })

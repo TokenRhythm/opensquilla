@@ -200,7 +200,10 @@ The two timeout fields have intentionally different streaming semantics.
 `aggregator_timeout_seconds` is an idle/stall budget between upstream stream
 events, so an active aggregation may run longer than that value while a silent
 provider is still bounded. Host-generated keep-alive heartbeats do not reset
-the aggregator budget.
+the aggregator budget. This field is not the turn's total wall-clock deadline:
+the outer Agent/TaskRuntime deadline remains authoritative for the complete
+turn. A completed aggregator idle budget is terminal for that attempt and is
+never retried as another full-budget aggregator request.
 
 `min_successful_proposers` is additionally clamped down to the actual proposer
 count. Both the configured and effective values (min-success, timeouts, shuffle)
@@ -228,13 +231,14 @@ usage accounting retain every started attempt, including zero-usage rows marked
 `usage_receipt_missing = true`.
 
 The aggregator already retries bounded transient upstream failures in place.
-It also retries a timeout or a stream that ends before `DoneEvent` when that
-attempt has emitted no text, reasoning, or tool delta, reusing the completed
-proposer drafts. Once any user-visible delta has been emitted, the attempt is
-terminal so a retry cannot duplicate text or tool activity downstream.
-After the retry budget is exhausted without user-visible output,
+It also retries a stream that ends before `DoneEvent` when that attempt has
+emitted no text, reasoning, or tool delta, reusing the completed proposer
+drafts. Once any user-visible delta has been emitted, the attempt is terminal
+so a retry cannot duplicate text or tool activity downstream.
+When an aggregator exhausts its idle budget without user-visible output,
 `fallback_single` makes exactly one request with the original conversation;
-the `error` policy remains terminal.
+it does not retry the timed-out aggregator or rerun proposers. The `error`
+policy remains terminal.
 
 Proposers never own an executable tool boundary. By default they receive no
 current tool schemas. Setting `proposer_tools = true` exposes those schemas only

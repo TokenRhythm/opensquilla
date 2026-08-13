@@ -476,6 +476,83 @@ async def test_turn_usage_persists_ensemble_breakdown_and_trace() -> None:
 
 
 @pytest.mark.asyncio
+async def test_timeout_fallback_persists_one_completed_turn_without_error_record() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(
+        text="fallback answer",
+        input_tokens=18,
+        output_tokens=8,
+        model="fallback-model",
+        model_usage_breakdown=[
+            {
+                "role": "proposer",
+                "provider": "openrouter",
+                "model": "draft-model",
+                "input_tokens": 7,
+                "output_tokens": 3,
+            },
+            {
+                "role": "fallback_single",
+                "provider": "openrouter",
+                "model": "fallback-model",
+                "input_tokens": 11,
+                "output_tokens": 5,
+            },
+        ],
+        ensemble_trace={
+            "profile": "static_openrouter_b5",
+            "fallback_used": True,
+            "fallback_code": "ensemble_aggregator_timeout",
+            "aggregator_timeout_mode": "idle",
+            "aggregator_total_deadline_source": "outer_turn_runtime",
+            "llm_request_count": 3,
+            "prior_final_request": {
+                "role": "aggregator",
+                "terminal_code": "ensemble_aggregator_timeout",
+            },
+        },
+    )
+
+    await stage.run(
+        _make_input(final_text_parts=["fallback answer"], done_event=done)
+    )
+
+    assert len(recs["transcript_append"].calls) == 1
+    assert len(recs["session_totals"].calls) == 1
+    assert recs["turn_error_persist"].calls == []
+    usage = recs["transcript_append"].calls[0]["turn_usage"]
+    assert [row["role"] for row in usage["model_usage_breakdown"]] == [
+        "proposer",
+        "fallback_single",
+    ]
+    assert usage["ensemble_trace"]["fallback_code"] == "ensemble_aggregator_timeout"
+    assert usage["ensemble_trace"]["llm_request_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_partial_aggregator_timeout_persists_output_and_error_once() -> None:
+    stage, recs = _make_stage()
+    error = ErrorEvent(
+        message="ensemble aggregator stalled: no stream events for 480s",
+        code="ensemble_aggregator_timeout",
+    )
+
+    await stage.run(
+        _make_input(
+            final_text_parts=["partial answer"],
+            error_message=error.message,
+            pending_error_event=error,
+        )
+    )
+
+    assert len(recs["transcript_append"].calls) == 1
+    assert recs["transcript_append"].calls[0]["content"] == "partial answer"
+    assert len(recs["turn_error_persist"].calls) == 1
+    assert recs["turn_error_persist"].calls[0]["event"] is error
+    assert recs["session_totals"].calls == []
+
+
+@pytest.mark.asyncio
 async def test_turn_usage_persists_vision_followup_metadata() -> None:
     stage, recs = _make_stage()
     done = DoneEvent(text="ok", input_tokens=5, output_tokens=3)
