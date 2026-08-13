@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CI_OPTIMIZATION_MODE: ${{ vars.CI_OPTIMIZATION_MODE || 'shadow' }}
+  CI_OPTIMIZATION_MODE: ${{ vars.CI_OPTIMIZATION_MODE || 'enforce' }}
   OPENSQUILLA_TESTING: "true"
 
 jobs:
@@ -101,10 +101,10 @@ jobs:
     if: >-
       ${{ always()
           && (github.event_name != 'merge_group'
-              || (vars.CI_OPTIMIZATION_MODE || 'shadow') != 'enforce'
+              || (vars.CI_OPTIMIZATION_MODE || 'enforce') != 'enforce'
               || needs.queue-attestation.outputs.reusable != 'true')
           && (github.event_name != 'push'
-              || (vars.CI_OPTIMIZATION_MODE || 'shadow') != 'enforce') }}
+              || (vars.CI_OPTIMIZATION_MODE || 'enforce') != 'enforce') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -1335,7 +1335,7 @@ jobs:
 
   main-canary:
     name: Main installation and offline gateway canary
-    if: ${{ github.event_name == 'push' && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce' }}
+    if: ${{ github.event_name == 'push' && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
@@ -1431,10 +1431,10 @@ jobs:
       - name: Accept verified queue or main fast path
         if: >-
           ${{ (github.event_name == 'merge_group'
-               && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce'
+               && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
                && needs.queue-attestation.outputs.reusable == 'true')
               || (github.event_name == 'push'
-                  && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce') }}
+                  && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce') }}
         env:
           QUEUE_RESULT: ${{ needs.queue-attestation.result }}
           QUEUE_REUSABLE: ${{ needs.queue-attestation.outputs.reusable }}
@@ -1459,10 +1459,10 @@ jobs:
       - name: Check out repository
         if: >-
           ${{ !((github.event_name == 'merge_group'
-                 && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce'
+                 && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
                  && needs.queue-attestation.outputs.reusable == 'true')
                 || (github.event_name == 'push'
-                    && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce')) }}
+                    && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
         uses: actions/checkout@v4
         with:
           fetch-depth: 2
@@ -1471,10 +1471,10 @@ jobs:
       - name: Set up Python
         if: >-
           ${{ !((github.event_name == 'merge_group'
-                 && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce'
+                 && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
                  && needs.queue-attestation.outputs.reusable == 'true')
                 || (github.event_name == 'push'
-                    && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce')) }}
+                    && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -1482,10 +1482,10 @@ jobs:
       - name: Check WebUI chat recovery result
         if: >-
           ${{ !((github.event_name == 'merge_group'
-                 && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce'
+                 && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
                  && needs.queue-attestation.outputs.reusable == 'true')
                 || (github.event_name == 'push'
-                    && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce')) }}
+                    && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
         env:
           RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
           FLAG_FRONTEND_CHANGED: ${{ needs.classify-changes.outputs.frontend_changed }}
@@ -1506,10 +1506,10 @@ jobs:
       - name: Check required CI results
         if: >-
           ${{ !((github.event_name == 'merge_group'
-                 && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce'
+                 && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce'
                  && needs.queue-attestation.outputs.reusable == 'true')
                 || (github.event_name == 'push'
-                    && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce')) }}
+                    && (vars.CI_OPTIMIZATION_MODE || 'enforce') == 'enforce')) }}
         env:
           RESULT_CLASSIFY: ${{ needs.classify-changes.result }}
           RESULT_WORKFLOW_LINT: ${{ needs.workflow-lint.result }}

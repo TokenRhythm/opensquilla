@@ -242,7 +242,7 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
     jobs = workflow["jobs"]
 
     assert workflow["env"]["CI_OPTIMIZATION_MODE"] == (
-        "${{ vars.CI_OPTIMIZATION_MODE || 'shadow' }}"
+        "${{ vars.CI_OPTIMIZATION_MODE || 'enforce' }}"
     )
     assert jobs["queue-attestation"]["name"] == "Verify reusable PR CI evidence"
     assert "if" not in jobs["queue-attestation"]

@@ -19,16 +19,16 @@ CI and retain their existing live markers.
 
 Set the Actions repository variable `CI_OPTIMIZATION_MODE` to one of:
 
-- `shadow` (default): compute and report whether merge-queue evidence is reusable, but run
+- `shadow`: compute and report whether merge-queue evidence is reusable, but run
   the normal queue matrix. Change-based PR selection is active so its coverage and duration
   are observable before queue reuse is enabled.
-- `enforce`: reuse an exact trusted PR result in the merge queue; otherwise fail closed to
+- `enforce` (default): reuse an exact trusted PR result in the merge queue; otherwise fail closed to
   the full queue matrix. Replace the normal `main` push matrix with the installation and
   offline gateway canary.
 - `legacy`: emergency rollback mode. It deliberately runs full PR and queue CI and keeps
   the pre-enforcement `main` behavior.
 
-An unset or empty variable resolves to `shadow`. Any non-empty unsupported value fails CI.
+An unset or empty variable resolves to `enforce`. Any non-empty unsupported value fails CI.
 Changing modes does not modify code or persisted OpenSquilla configuration.
 
 ## Trust boundary
@@ -45,11 +45,11 @@ Reusable evidence is accepted only when all of these facts match authoritative G
 Missing, expired, malformed, stale, or unverifiable evidence never bypasses tests; it causes
 the queue to run the full matrix. The required branch-protection context remains `CI result`.
 
-Before switching to `enforce`, confirm that the main ruleset requires `CI result` and
+Before merging this rollout, confirm that the main ruleset requires `CI result` and
 `Validate target branch`, requires conversation resolution, and enforces code-owner review
 for `.github/workflows/`, `.github/scripts/`, and `.github/CODEOWNERS`. Keep `enforce` as a
-separate post-merge operator action so a CI-policy pull request cannot enable its own fast
-path.
+reviewed repository default; a CI-policy pull request still cannot reuse its own evidence
+because its policy digest differs from the target branch.
 
 ## Shadow validation and rollback
 
