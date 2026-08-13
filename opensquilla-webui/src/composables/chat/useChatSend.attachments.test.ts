@@ -5928,3 +5928,88 @@ describe('useChatSend Ensemble image guard', () => {
     expect(params).not.toHaveProperty('collaborationMode')
   })
 })
+
+describe('useChatSend slash-prefixed input fall-through', () => {
+  it('sends an unknown slash-prefixed input as a normal message exactly once', async () => {
+    const inputText = ref('/gamemode creative')
+    const executeSlashCommand = vi.fn(async () => false)
+    const { api, rpc } = makeOptions({ inputText, executeSlashCommand })
+
+    await api.onSend()
+
+    // executeSlashCommand reports "unhandled" for unknown slash inputs, so
+    // onSend must fall through to the normal chat.send path — and only once.
+    expect(executeSlashCommand).toHaveBeenCalledWith('/gamemode creative')
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/gamemode creative',
+    }))
+  })
+
+  it('does not send when a registered slash command handles the input', async () => {
+    const inputText = ref('/coding')
+    const executeSlashCommand = vi.fn(async () => true)
+    const { api, rpc } = makeOptions({ inputText, executeSlashCommand })
+
+    await api.onSend()
+
+    // A registered command is handled by the command path: no chat.send.
+    expect(executeSlashCommand).toHaveBeenCalledWith('/coding')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('sends // escaped input as literal text with one slash stripped', async () => {
+    const inputText = ref('//usr/bin/env')
+    const executeSlashCommand = vi.fn(async () => true)
+    const { api, rpc } = makeOptions({ inputText, executeSlashCommand })
+
+    await api.onSend()
+
+    // "//" is a literal-slash escape: the command path is skipped entirely and
+    // the message is sent with exactly one leading slash removed.
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/usr/bin/env',
+    }))
+  })
+
+  it('sends an unknown slash-prefixed queued follow-up as a normal message exactly once', async () => {
+    const executeSlashCommand = vi.fn(async () => false)
+    const { api, rpc } = makeOptions({ executeSlashCommand })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-unknown-slash-followup',
+      text: '/gamemode creative',
+      attachments: [],
+      intent: null,
+    }
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
+
+    // The command path reports "unhandled" for unknown slash inputs, so the
+    // queued follow-up must fall through to the normal chat.send path — and
+    // only once, mirroring the primary onSend contract.
+    expect(executeSlashCommand).toHaveBeenCalledWith('/gamemode creative')
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/gamemode creative',
+    }))
+  })
+
+  it('does not send a queued follow-up when a registered slash command handles it', async () => {
+    const executeSlashCommand = vi.fn(async () => true)
+    const { api, rpc } = makeOptions({ executeSlashCommand })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-registered-slash-followup',
+      text: '/coding',
+      attachments: [],
+      intent: null,
+    }
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
+
+    // A registered command is handled by the command path: no chat.send.
+    expect(executeSlashCommand).toHaveBeenCalledWith('/coding')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+})
