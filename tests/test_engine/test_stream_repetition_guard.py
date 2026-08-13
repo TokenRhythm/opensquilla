@@ -462,7 +462,7 @@ async def test_bounded_close_propagates_real_caller_cancellation() -> None:
 
     close.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await close
+        _ = await close
 
     assert close.cancelled()
     assert upstream.close_calls == 1
@@ -519,7 +519,7 @@ async def test_outer_wrapper_cancellation_propagates_once_to_provider() -> None:
     await upstream.blocked.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        _ = await task
 
     assert upstream.close_calls == 1
 

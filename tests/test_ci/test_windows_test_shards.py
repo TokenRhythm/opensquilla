@@ -98,6 +98,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_provider_activity.py",
     "tests/test_engine/test_long_task_backend_boundaries.py",
     "tests/test_engine/test_route_plan.py",
+    "tests/test_engine/test_stream_repetition_guard.py",
     "tests/test_engine/turn_runner/test_canonical_text_contract.py",
     "tests/test_gateway/test_api_chat.py",
     "tests/test_gateway/test_channel_turn_ingress.py",

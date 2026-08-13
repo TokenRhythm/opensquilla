@@ -1134,6 +1134,7 @@
       "tests/test_engine/test_runtime_meta_invoke_surfacing.py",
       "tests/test_engine/test_runtime_tool_run_budget.py",
       "tests/test_engine/test_spawn_depth_unified.py",
+      "tests/test_engine/test_stream_repetition_guard.py",
       "tests/test_engine/test_stream_wrappers.py",
       "tests/test_engine/test_tokenjuice_tool_result_projection.py",
       "tests/test_engine/test_tool_concurrency.py",
