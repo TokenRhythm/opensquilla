@@ -27,15 +27,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   separately, dangerous scanner confirmations are bound to the reviewed
   artifact, and GitHub batches are serial, capped at 10 references, and pause
   remaining work when the source reports a rate limit.
-- Official TokenRhythm HTTPS API requests can now include the optional
-  `X-OpenSquilla-Install-Id` header by default. It carries the existing
-  pseudonymous, cross-session installation identifier without exposing raw
-  MAC/IP values, is restricted to the two exact official hosts on port 443,
-  fails open when unavailable, and is suppressed by the unified privacy
-  control, the legacy telemetry opt-out, and CI/test detection. The update-check
-  opt-out alone does not suppress it. TokenRhythm must treat the value as
-  optional and untrusted, never as an authentication, authorization, billing,
-  rate-limiting, or anti-abuse signal.
+- Official TokenRhythm HTTPS requests can include an optional pseudonymous
+  installation identifier. It is limited to official service endpoints and
+  respects the unified privacy and telemetry opt-outs.
 - TokenRhythm model discovery now combines the official published catalog with
   the current credential's declared model entitlements, exposes versioned
   `metadata.published` / `metadata.declared` fields, and reports stale catalog
