@@ -382,6 +382,10 @@ function handleApprovalPush() {
   void refreshApprovals()
 }
 
+function handleConnectionState(state: unknown) {
+  if (state === 'connected') scheduleSessionRefresh()
+}
+
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
@@ -485,6 +489,7 @@ onActivated(() => {
     rpc.on('exec.approval.resolved', handleApprovalPush),
     rpc.on('plugin.approval.requested', handleApprovalPush),
     rpc.on('plugin.approval.resolved', handleApprovalPush),
+    rpc.on('_state', handleConnectionState),
   ]
   pollTimer = setInterval(loadAll, FALLBACK_POLL_MS)
 })

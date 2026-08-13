@@ -196,7 +196,7 @@ def create_gateway_app(
         if view:
             params["view"] = view
         cursor = request.query_params.get("cursor")
-        if cursor:
+        if cursor is not None:
             params["cursor"] = cursor
         result = await dispatcher.dispatch("_http", "sessions.list", params or None, ctx)
         if result.ok:

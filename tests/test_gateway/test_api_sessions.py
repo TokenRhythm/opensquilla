@@ -77,7 +77,7 @@ def test_api_sessions_without_query_params_keeps_default_rpc_params() -> None:
     assert params is None
 
 
-def test_api_sessions_maps_invalid_cursor_params_to_bad_request() -> None:
+def test_api_sessions_maps_empty_cursor_param_to_bad_request() -> None:
     dispatcher = _FakeDispatcher(
         SimpleNamespace(
             ok=False,
@@ -95,7 +95,8 @@ def test_api_sessions_maps_invalid_cursor_params_to_bad_request() -> None:
         gateway_app.get_dispatcher = original
 
     with TestClient(app) as client:
-        response = client.get("/api/sessions?view=session-list-v1&cursor=bad")
+        response = client.get("/api/sessions?view=session-list-v1&cursor=")
 
     assert response.status_code == 400
     assert response.json() == {"error": "invalid cursor"}
+    assert dispatcher.calls[-1][2] == {"view": "session-list-v1", "cursor": ""}
