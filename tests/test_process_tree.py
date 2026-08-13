@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import ctypes.wintypes as wintypes
 import io
 import os
 import shutil
@@ -807,8 +808,6 @@ def test_windows_owned_popen_boots_helper_with_restricted_target_env() -> None:
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows events and Job Objects")
 @pytest.mark.asyncio
 async def test_windows_job_kills_descendant_after_direct_leader_exits(tmp_path) -> None:
-    from ctypes import wintypes
-
     child_pid = tmp_path / "child.pid"
     child_script = tmp_path / "child.py"
     leader_script = tmp_path / "leader.py"

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import ctypes
+import ctypes.wintypes as wintypes
 import json
 import os
 import re
@@ -304,8 +305,6 @@ def _open_process_liveness(pid: int) -> tuple[str, int]:
     """Retain a non-reusable identity for the descendant observed before Stop."""
 
     if os.name == "nt":
-        from ctypes import wintypes
-
         kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         kernel32.OpenProcess.restype = wintypes.HANDLE
@@ -323,8 +322,6 @@ def _open_process_liveness(pid: int) -> tuple[str, int]:
 async def _wait_process_exit(identity: tuple[str, int], *, timeout: float) -> None:
     kind, value = identity
     if kind == "windows":
-        from ctypes import wintypes
-
         kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
         kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
         kernel32.WaitForSingleObject.restype = wintypes.DWORD
@@ -353,8 +350,6 @@ async def _wait_process_exit(identity: tuple[str, int], *, timeout: float) -> No
 def _close_process_liveness(identity: tuple[str, int]) -> None:
     kind, value = identity
     if kind == "windows":
-        from ctypes import wintypes
-
         kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
