@@ -579,6 +579,41 @@ describe('useChatRenderedMessages silent sentinel compatibility', () => {
     expect(source.tool_calls?.[0]?.text).toBe('HEARTBEAT_OK')
   })
 
+  it('projects narration and parallel legacy calls into one ordered activity timeline', () => {
+    const source: ChatMessage = {
+      role: 'assistant',
+      text: '',
+      ts: 1,
+      tool_calls: [
+        { type: 'text', text: 'Inspect the source.' },
+        { type: 'tool_use', tool_use_id: 'call-read', name: 'read_file', input: {} },
+        { type: 'text', text: 'Compare the directory.' },
+        { type: 'tool_use', tool_use_id: 'call-list', name: 'list_dir', input: {} },
+        { type: 'tool_result', tool_use_id: 'call-read', name: 'read_file', result: 'source payload' },
+        { type: 'tool_result', tool_use_id: 'call-list', name: 'list_dir', result: 'directory payload' },
+      ],
+    }
+
+    const message = renderedMessagesFor([source]).renderedMessages.value[0]!
+
+    expect(message.timelineItems?.map(item => item.type === 'text' ? item.rawText : item.type))
+      .toEqual(['Inspect the source.', 'tool-group', 'Compare the directory.', 'tool-group'])
+    const calls = message.timelineItems?.flatMap(item =>
+      item.type === 'tool-group' ? item.group.calls : [],
+    ) ?? []
+    expect(calls.map(call => ({ id: call.toolId, result: call.result }))).toEqual([
+      { id: 'call-read', result: 'source payload' },
+      { id: 'call-list', result: 'directory payload' },
+    ])
+    expect(message.parts?.map(part => part.type)).toEqual([
+      'text',
+      'tool',
+      'text',
+      'tool',
+    ])
+    expect(source.tool_calls?.[0]?.text).toBe('Inspect the source.')
+  })
+
   it('preserves mixed sentinel-looking text on an ordinary direct-user turn', () => {
     const source: ChatMessage = {
       role: 'assistant',

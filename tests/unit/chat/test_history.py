@@ -332,9 +332,9 @@ def test_transcript_entries_to_chat_messages_hides_exact_assistant_sentinel() ->
     assert transcript_entries_to_chat_messages([entry]) == []
 
 
-def test_transcript_entries_to_chat_messages_strips_flattened_used_tool_markers() -> None:
-    # A compacted assistant turn keeps narration and restores legacy markers
-    # as auditable structured activity instead of exposing the raw protocol.
+def test_transcript_entries_to_chat_messages_keeps_isolated_tool_markers_as_text() -> None:
+    # Exact syntax without a confirmed adjacent result is still ordinary text.
+    # This avoids reinterpreting user-requested examples as internal activity.
     entry = _assistant_entry(
         message_id="m-flat-narration",
         content=(
@@ -348,18 +348,12 @@ def test_transcript_entries_to_chat_messages_strips_flattened_used_tool_markers(
     messages = transcript_entries_to_chat_messages([entry])
 
     assert messages[0]["text"] == (
-        "继续补齐上下文: 章节重新生成接口、前端 API client 与测试结构。"
+        "继续补齐上下文: 章节重新生成接口、前端 API client 与测试结构。\n"
+        "[Used tool: read_file]\n"
+        "[Used tool: read_file]\n"
+        "[Used tool: list_dir]"
     )
-    assert "[Used tool:" not in messages[0]["text"]
-    assert [segment["name"] for segment in messages[0]["tool_calls"]] == [
-        "read_file",
-        "read_file",
-        "list_dir",
-    ]
-    assert all(
-        segment["type"] == "tool_use" and segment["legacy_projection"] is True
-        for segment in messages[0]["tool_calls"]
-    )
+    assert "tool_calls" not in messages[0]
 
 
 def test_transcript_entries_to_chat_messages_folds_flattened_tool_result_dump() -> None:
@@ -405,6 +399,118 @@ def test_transcript_entries_to_chat_messages_folds_flattened_tool_result_dump() 
     ]
 
 
+def test_transcript_entries_to_chat_messages_projects_ordered_parallel_activity() -> None:
+    entries = [
+        _assistant_entry(
+            id=20,
+            message_id="m-parallel-tools",
+            content=(
+                "Inspect the source.\n"
+                "[Used tool: read_file]\n"
+                "Compare the directory.\n"
+                "[Used tool: list_dir]"
+            ),
+        ),
+        _assistant_entry(
+            id=21,
+            message_id="m-parallel-results",
+            role="user",
+            content=(
+                "[Tool result (call-read): source payload]\n"
+                "[Tool result (call-list): directory payload]"
+            ),
+        ),
+    ]
+
+    messages = transcript_entries_to_chat_messages(entries)
+
+    assert len(messages) == 1
+    assert messages[0]["message_id"] == "m-parallel-tools"
+    assert messages[0]["text"] == ""
+    assert messages[0]["tool_calls"] == [
+        {"type": "text", "text": "Inspect the source."},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-read",
+            "name": "read_file",
+            "input": {},
+            "legacy_projection": True,
+        },
+        {"type": "text", "text": "Compare the directory."},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-list",
+            "name": "list_dir",
+            "input": {},
+            "legacy_projection": True,
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-read",
+            "name": "read_file",
+            "result": "source payload",
+            "legacy_projection": True,
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-list",
+            "name": "list_dir",
+            "result": "directory payload",
+            "legacy_projection": True,
+        },
+    ]
+
+
+def test_transcript_entries_to_chat_messages_keeps_untrusted_mismatch_as_text() -> None:
+    entries = [
+        _assistant_entry(
+            message_id="m-mismatch-tools",
+            content="[Used tool: read_file]",
+        ),
+        _assistant_entry(
+            message_id="m-mismatch-results",
+            role="user",
+            content=(
+                "[Tool result (call-read): source payload]\n"
+                "[Tool result (call-extra): unmatched payload]"
+            ),
+        ),
+    ]
+
+    messages = transcript_entries_to_chat_messages(entries)
+
+    assert [message["text"] for message in messages] == [
+        "[Used tool: read_file]",
+        (
+            "[Tool result (call-read): source payload]\n"
+            "[Tool result (call-extra): unmatched payload]"
+        ),
+    ]
+    assert all("tool_calls" not in message for message in messages)
+
+
+def test_transcript_entries_to_chat_messages_keeps_duplicate_result_ids_as_text() -> None:
+    entries = [
+        _assistant_entry(
+            content="[Used tool: read_file]\n[Used tool: list_dir]",
+        ),
+        _assistant_entry(
+            role="user",
+            content=(
+                "[Tool result (call-duplicate): source payload]\n"
+                "[Tool result (call-duplicate): directory payload]"
+            ),
+        ),
+    ]
+
+    messages = transcript_entries_to_chat_messages(entries)
+
+    assert len(messages) == 2
+    assert all("tool_calls" not in message for message in messages)
+    assert "[Used tool:" in messages[0]["text"]
+    assert "[Tool result" in messages[1]["text"]
+
+
 def test_transcript_entries_to_chat_messages_keeps_unattributed_tool_result_text() -> None:
     entry = _assistant_entry(
         message_id="m-user-toolresult-doc",
@@ -430,8 +536,7 @@ def test_transcript_entries_to_chat_messages_keeps_text_after_confirmed_tool_res
     assert messages[0]["text"] == "Please also update README.md"
 
 
-def test_transcript_entries_to_chat_messages_folds_tool_only_flattened_turn() -> None:
-    # A marker-only turn remains as one collapsed, auditable activity row.
+def test_transcript_entries_to_chat_messages_keeps_isolated_tool_only_turn() -> None:
     entry = _assistant_entry(
         message_id="m-flat-toolonly",
         content="[Used tool: read_file]\n[Used tool: list_dir]",
@@ -440,11 +545,8 @@ def test_transcript_entries_to_chat_messages_folds_tool_only_flattened_turn() ->
     messages = transcript_entries_to_chat_messages([entry])
 
     assert len(messages) == 1
-    assert messages[0]["text"] == ""
-    assert [segment["name"] for segment in messages[0]["tool_calls"]] == [
-        "read_file",
-        "list_dir",
-    ]
+    assert messages[0]["text"] == "[Used tool: read_file]\n[Used tool: list_dir]"
+    assert "tool_calls" not in messages[0]
 
 
 def test_transcript_entries_to_chat_messages_recognizes_legacy_pair_across_page() -> None:

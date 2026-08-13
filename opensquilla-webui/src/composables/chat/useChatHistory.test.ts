@@ -321,6 +321,90 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('keeps one legacy activity row across prepend and canonical refresh', async () => {
+    const activity = {
+      id: 'legacy-tools',
+      message_id: 'legacy-tools',
+      role: 'assistant',
+      text: '',
+      timestamp: '2026-07-06T00:00:01Z',
+      tool_calls: [
+        { type: 'text', text: 'Inspect the source.' },
+        { type: 'tool_use', tool_use_id: 'call-read', name: 'read_file', input: {} },
+        { type: 'text', text: 'Compare the directory.' },
+        { type: 'tool_use', tool_use_id: 'call-list', name: 'list_dir', input: {} },
+        { type: 'tool_result', tool_use_id: 'call-read', name: 'read_file', result: 'source' },
+        { type: 'tool_result', tool_use_id: 'call-list', name: 'list_dir', result: 'directory' },
+      ],
+    }
+    const { api, rpc, messages } = makeHistory(false, {
+      response: {
+        messages: [activity],
+        canonical_complete: false,
+        has_more: true,
+        oldest_cursor: 'cursor-tools',
+        newest_cursor: 'cursor-tools',
+      },
+    })
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [activity],
+        canonical_complete: false,
+        has_more: true,
+        oldest_cursor: 'cursor-tools',
+        newest_cursor: 'cursor-tools',
+      })
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'older-user',
+          message_id: 'older-user',
+          role: 'user',
+          text: 'Earlier request',
+          timestamp: '2026-07-06T00:00:00Z',
+        }],
+        canonical_complete: false,
+        has_more: false,
+        oldest_cursor: 'cursor-older',
+        newest_cursor: 'cursor-older',
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          activity,
+          {
+            id: 'later-user',
+            message_id: 'later-user',
+            role: 'user',
+            text: 'Continue',
+            timestamp: '2026-07-06T00:00:02Z',
+          },
+        ],
+        canonical_complete: true,
+        has_more: false,
+        oldest_cursor: 'cursor-tools',
+        newest_cursor: 'cursor-later',
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'older-user',
+      'legacy-tools',
+      'later-user',
+    ])
+    expect(messages.value.filter(message => message.messageId === 'legacy-tools')).toHaveLength(1)
+    expect(messages.value[1]?.tool_calls?.map(segment => segment.tool_use_id)).toEqual([
+      undefined,
+      'call-read',
+      undefined,
+      'call-list',
+      'call-read',
+      'call-list',
+    ])
+    expect(api.historyState.value.canonicalComplete).toBe(true)
+  })
+
   it('restores manual compaction summaries in stable transcript chronology', async () => {
     const baseTime = 1_720_000_000_000
     const response: ChatHistoryResponse = {

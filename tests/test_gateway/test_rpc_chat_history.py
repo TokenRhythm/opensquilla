@@ -104,6 +104,68 @@ async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -
 
 
 @pytest.mark.asyncio
+async def test_chat_history_projects_parallel_legacy_activity_on_incomplete_page() -> None:
+    tool_entry = TranscriptEntry(
+        id=10,
+        session_id="parent",
+        session_key="agent:main:webchat:test",
+        role="assistant",
+        content=(
+            "Inspect the source.\n"
+            "[Used tool: read_file]\n"
+            "Compare the directory.\n"
+            "[Used tool: list_dir]"
+        ),
+        created_at=10,
+        message_id="legacy-tools",
+    )
+    result_entry = TranscriptEntry(
+        id=11,
+        session_id="parent",
+        session_key="agent:main:webchat:test",
+        role="user",
+        content=(
+            "[Tool result (call-read): source payload]\n"
+            "[Tool result (call-list): directory payload]"
+        ),
+        created_at=11,
+        message_id="legacy-results",
+    )
+    manager = _FakePagedSessionManager(
+        [tool_entry, result_entry],
+        page={
+            "entries": [tool_entry, result_entry],
+            "has_more": False,
+            "canonical_complete": False,
+        },
+    )
+
+    result = await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test", "limit": 2},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=manager,
+        ),
+    )
+
+    assert result["loaded_count"] == 2
+    assert result["canonical_complete"] is False
+    assert len(result["messages"]) == 1
+    assert result["messages"][0]["message_id"] == "legacy-tools"
+    assert [segment.get("tool_use_id") for segment in result["messages"][0]["tool_calls"]] == [
+        None,
+        "call-read",
+        None,
+        "call-list",
+        "call-read",
+        "call-list",
+    ]
+    assert "[Used tool:" not in str(result["messages"])
+    assert "[Tool result" not in str(result["messages"])
+
+
+@pytest.mark.asyncio
 async def test_chat_history_projects_legacy_tool_pair_split_by_page_boundary(
     tmp_path,
 ) -> None:
