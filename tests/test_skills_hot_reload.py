@@ -217,9 +217,20 @@ def test_local_non_utf8_supporting_filename_does_not_break_catalog(tmp_path: Pat
     assert loader.snapshot().errors == ()
 
 
-def test_rejected_verified_reload_never_replaces_visible_catalog(tmp_path: Path) -> None:
+def test_rejected_verified_reload_never_replaces_visible_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monotonic_now = [10.0]
+    monkeypatch.setattr(
+        skill_loader_module,
+        "time",
+        SimpleNamespace(monotonic=lambda: monotonic_now[0]),
+    )
     root = tmp_path / "skills"
-    _write_skill(root, "alpha", "old")
+    skill_file = _write_skill(root, "alpha", "old")
+    original_bytes = skill_file.read_bytes()
+    original_stat = skill_file.stat()
     loader = _loader(root, tmp_path)
     loader.load_all()
     old = loader.snapshot()
@@ -234,9 +245,24 @@ def test_rejected_verified_reload_never_replaces_visible_catalog(tmp_path: Path)
         assert result.success is False
         assert result.generation == old.generation
         assert loader.snapshot() is old
+        monotonic_now[0] += skill_loader_module._COMPAT_PROBE_INTERVAL_SECONDS
+        assert loader.get_by_name("alpha").description == "old"  # type: ignore[union-attr]
 
+        # A rejected management transaction restores the prior files before
+        # its publication barrier closes. Model that rollback exactly: leaving
+        # the rejected bytes in place would make a later ordinary hot-reload a
+        # legitimate external edit, which is a different contract.
+        skill_file.write_bytes(original_bytes)
+        os.utime(
+            skill_file,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+
+    post_rollback = loader.refresh_if_changed("post-rollback probe")
+    assert post_rollback.changed is False
+    assert post_rollback.generation == old.generation
     assert loader.snapshot() is old
-    assert loader.get_by_name("alpha").description == "old"  # type: ignore[union-attr]
+    assert loader.snapshot().get_by_name("alpha").description == "old"  # type: ignore[union-attr]
 
 
 def test_concurrent_reload_cannot_report_provisional_generation(tmp_path: Path) -> None:
