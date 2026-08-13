@@ -446,6 +446,10 @@ export class RpcClient {
 
       // Handshake: HelloOk frame
       if (data.protocol !== undefined && this._state === 'connecting') {
+        // The authenticated Hello is a liveness proof for this exact socket.
+        // onmessage is generation/socket fenced above, and _clearWakeProbe
+        // refuses to clear a deadline owned by any replacement generation.
+        this._clearWakeProbe(generation);
         this._policy = data.policy || null;
         const serverGuestSessionKey = data.auth?.guestSessionKey;
         if (
