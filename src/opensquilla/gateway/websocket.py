@@ -36,6 +36,11 @@ from opensquilla.gateway.protocol import (
     make_event,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcDispatcher
+from opensquilla.gateway.rpc.ingress import (
+    RpcIngressValidationError,
+    is_utf8_encodable,
+    validate_rpc_ingress,
+)
 from opensquilla.sandbox.legacy_codec import encode_payload_for_protocol
 
 log = structlog.get_logger(__name__)
@@ -853,11 +858,7 @@ def _is_wire_text(value: str) -> bool:
     into a response frame makes ``model_dump_json`` raise at send time, long
     after the handler ran.
     """
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
+    return is_utf8_encodable(value)
 
 
 def _wire_frame_id(raw_id: Any, fallback: str = "") -> str:
@@ -952,6 +953,20 @@ async def handle_ws_connection(
     if not isinstance(data, dict):
         await conn.send_res(
             make_error_res("handshake", "INVALID_REQUEST", "Connect frame must be a JSON object")
+        )
+        await conn.close()
+        return
+
+    try:
+        validate_rpc_ingress(data)
+    except RpcIngressValidationError as exc:
+        await conn.send_res(
+            make_error_res(
+                _wire_frame_id(data.get("id"), "handshake"),
+                "INVALID_REQUEST",
+                str(exc),
+                details={"reason": exc.reason},
+            )
         )
         await conn.close()
         return
@@ -1242,6 +1257,19 @@ async def _message_loop(
         if not isinstance(data, dict):
             await conn.send_res(
                 make_error_res("", "INVALID_REQUEST", "Frame must be a JSON object")
+            )
+            continue
+
+        try:
+            validate_rpc_ingress(data)
+        except RpcIngressValidationError as exc:
+            await conn.send_res(
+                make_error_res(
+                    _wire_frame_id(data.get("id")),
+                    "INVALID_REQUEST",
+                    str(exc),
+                    details={"reason": exc.reason},
+                )
             )
             continue
 
