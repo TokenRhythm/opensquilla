@@ -245,6 +245,8 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
         "${{ vars.CI_OPTIMIZATION_MODE || 'shadow' }}"
     )
     assert jobs["queue-attestation"]["name"] == "Verify reusable PR CI evidence"
+    assert "if" not in jobs["queue-attestation"]
+    assert "not a merge-group event" in str(jobs["queue-attestation"])
     assert "fetch-depth" in str(jobs["queue-attestation"])
     assert "verify-queue" in str(jobs["queue-attestation"])
     assert "full fail-closed matrix" in str(jobs["classify-changes"])

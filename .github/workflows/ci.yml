@@ -26,12 +26,11 @@ env:
 jobs:
   queue-attestation:
     name: Verify reusable PR CI evidence
-    if: ${{ github.event_name == 'merge_group' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       reusable: ${{ steps.verify.outputs.reusable || 'false' }}
-      reason: ${{ steps.verify.outputs.reason || steps.mode.outputs.reason }}
+      reason: ${{ steps.verify.outputs.reason || steps.context.outputs.reason || steps.mode.outputs.reason }}
       source_run_id: ${{ steps.verify.outputs.source_run_id }}
     steps:
       - name: Validate optimization mode
@@ -49,8 +48,13 @@ jobs:
             echo "reason=legacy mode always runs queue CI" >> "${GITHUB_OUTPUT}"
           fi
 
+      - name: Record non-queue context
+        id: context
+        if: ${{ github.event_name != 'merge_group' }}
+        run: echo "reason=not a merge-group event" >> "${GITHUB_OUTPUT}"
+
       - name: Check out merge-group commit
-        if: ${{ env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        if: ${{ github.event_name == 'merge_group' && env.CI_OPTIMIZATION_MODE != 'legacy' }}
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -58,7 +62,7 @@ jobs:
 
       - name: Verify matching trusted PR CI attestation
         id: verify
-        if: ${{ env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        if: ${{ github.event_name == 'merge_group' && env.CI_OPTIMIZATION_MODE != 'legacy' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
@@ -70,6 +74,7 @@ jobs:
           --github-output "${GITHUB_OUTPUT}"
 
       - name: Summarize queue decision
+        if: ${{ github.event_name == 'merge_group' }}
         env:
           REUSABLE: ${{ steps.verify.outputs.reusable || 'false' }}
           REASON: ${{ steps.verify.outputs.reason || steps.mode.outputs.reason }}
