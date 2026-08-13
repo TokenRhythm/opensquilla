@@ -6,21 +6,100 @@ name: CI
     types: [checks_requested]
   push:
     branches: [main]
+  schedule:
+    - cron: "23 18 * * *"
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
+  pull-requests: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
+  CI_OPTIMIZATION_MODE: ${{ vars.CI_OPTIMIZATION_MODE || 'shadow' }}
   OPENSQUILLA_TESTING: "true"
 
 jobs:
+  queue-attestation:
+    name: Verify reusable PR CI evidence
+    if: ${{ github.event_name == 'merge_group' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      reusable: ${{ steps.verify.outputs.reusable || 'false' }}
+      reason: ${{ steps.verify.outputs.reason || steps.mode.outputs.reason }}
+      source_run_id: ${{ steps.verify.outputs.source_run_id }}
+    steps:
+      - name: Validate optimization mode
+        id: mode
+        shell: bash
+        run: |
+          case "${CI_OPTIMIZATION_MODE}" in
+            legacy | shadow | enforce) ;;
+            *)
+              echo "ERROR: CI_OPTIMIZATION_MODE must be legacy, shadow, or enforce." >&2
+              exit 2
+              ;;
+          esac
+          if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
+            echo "reason=legacy mode always runs queue CI" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Check out merge-group commit
+        if: ${{ env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify matching trusted PR CI attestation
+        id: verify
+        if: ${{ env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 .github/scripts/ci_attestation.py verify-queue
+          --repository "${GITHUB_REPOSITORY}"
+          --event-path "${GITHUB_EVENT_PATH}"
+          --run-id "${GITHUB_RUN_ID}"
+          --api-url "${GITHUB_API_URL}"
+          --github-output "${GITHUB_OUTPUT}"
+
+      - name: Summarize queue decision
+        env:
+          REUSABLE: ${{ steps.verify.outputs.reusable || 'false' }}
+          REASON: ${{ steps.verify.outputs.reason || steps.mode.outputs.reason }}
+          SOURCE_RUN_ID: ${{ steps.verify.outputs.source_run_id }}
+        shell: bash
+        run: |
+          {
+            echo "## Merge queue CI evidence"
+            echo
+            echo "- Mode: \`${CI_OPTIMIZATION_MODE}\`"
+            echo "- Reusable: \`${REUSABLE}\`"
+            echo "- Reason: ${REASON}"
+            if [[ -n "${SOURCE_RUN_ID}" ]]; then
+              echo "- Source run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${SOURCE_RUN_ID}"
+            fi
+            if [[ "${CI_OPTIMIZATION_MODE}" == "shadow" && "${REUSABLE}" == "true" ]]; then
+              echo "- Shadow decision: evidence matched, but the normal queue matrix still runs."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
   classify-changes:
     name: Classify changed files
+    needs: queue-attestation
+    if: >-
+      ${{ always()
+          && (github.event_name != 'merge_group'
+              || (vars.CI_OPTIMIZATION_MODE || 'shadow') != 'enforce'
+              || needs.queue-attestation.outputs.reusable != 'true')
+          && (github.event_name != 'push'
+              || (vars.CI_OPTIMIZATION_MODE || 'shadow') != 'enforce') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -39,6 +118,7 @@ jobs:
       build_wheel_required: ${{ steps.classify.outputs.build_wheel_required }}
       toolchain_artifact_changed: ${{ steps.classify.outputs.toolchain_artifact_changed }}
       full_required: ${{ steps.classify.outputs.full_required }}
+      pytest_targets: ${{ steps.classify.outputs.pytest_targets }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -51,16 +131,32 @@ jobs:
           set -euo pipefail
           changed_files="${RUNNER_TEMP}/changed-files.txt"
 
+          case "${CI_OPTIMIZATION_MODE}" in
+            legacy | shadow | enforce) ;;
+            *)
+              echo "ERROR: CI_OPTIMIZATION_MODE must be legacy, shadow, or enforce." >&2
+              exit 2
+              ;;
+          esac
+
           case "${{ github.event_name }}" in
             pull_request)
-              git diff --name-only \
-                "${{ github.event.pull_request.base.sha }}" \
-                "${{ github.event.pull_request.head.sha }}" > "${changed_files}"
+              if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" ]]; then
+                printf '.ci/run-all\n' > "${changed_files}"
+              else
+                git diff --name-only \
+                  "${{ github.event.pull_request.base.sha }}" \
+                  "${{ github.event.pull_request.head.sha }}" > "${changed_files}"
+              fi
               ;;
             merge_group)
               base="${{ github.event.merge_group.base_sha }}"
               head="${{ github.event.merge_group.head_sha }}"
-              if [[ -n "${base}" && -n "${head}" ]] \
+              if [[ "${CI_OPTIMIZATION_MODE}" == "legacy" \
+                || "${CI_OPTIMIZATION_MODE}" == "enforce" ]]; then
+                echo "Queue evidence was unavailable; running the full fail-closed matrix." >&2
+                printf '.ci/run-all\n' > "${changed_files}"
+              elif [[ -n "${base}" && -n "${head}" ]] \
                 && git cat-file -e "${base}^{commit}" \
                 && git cat-file -e "${head}^{commit}" \
                 && git diff --name-only "${base}" "${head}" > "${changed_files}"; then
@@ -95,6 +191,7 @@ jobs:
 
   workflow-lint:
     name: Validate GitHub Actions workflows
+    needs: classify-changes
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -440,29 +537,53 @@ jobs:
       - name: Test targeted PR suite
         if: ${{ needs.classify-changes.outputs.full_required != 'true' }}
         shell: bash
+        env:
+          TARGETED_PYTEST_TARGETS: ${{ needs.classify-changes.outputs.pytest_targets }}
         run: |
           set -euo pipefail
           markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
+          pytest_targets=(
+            tests/unit
+            tests/test_ci
+            tests/test_desktop/test_electron_startup_contract.py
+            tests/test_recovery
+            tests/test_migration/test_opensquilla_home_migration.py
+            tests/test_engine/test_coding_mode.py
+            tests/test_engine/test_cancelled_turn_segments.py
+            tests/test_engine/test_history_silent_reply.py
+            tests/test_engine/test_silent_reply.py
+            tests/test_engine/test_silent_reply_runtime.py
+            tests/test_engine/test_stream_wrappers.py
+            tests/test_engine/turn_runner/test_stream_consumer_stage_unit.py
+            tests/test_engine/turn_runner/test_turn_finalizer_stage_unit.py
+            tests/test_gateway/test_rpc_chat_history.py
+            tests/test_persistence/test_usage_ledger.py
+            tests/functional/test_gateway_silent_reply_process_e2e.py
+            tests/test_tools/test_shell_process_isolation.py
+          )
+          if [[ -n "${TARGETED_PYTEST_TARGETS}" ]]; then
+            IFS=',' read -r -a affected_targets <<< "${TARGETED_PYTEST_TARGETS}"
+            for target in "${affected_targets[@]}"; do
+              if [[ "${target}" == *'*'* || "${target}" == *'?'* || "${target}" == *'['* ]]; then
+                mapfile -t matched_targets < <(compgen -G "${target}" || true)
+                if [[ "${#matched_targets[@]}" -eq 0 ]]; then
+                  echo "ERROR: classifier pattern matched no pytest targets: ${target}" >&2
+                  exit 2
+                fi
+                pytest_targets+=("${matched_targets[@]}")
+              elif [[ ! -e "${target}" ]]; then
+                echo "ERROR: classifier selected a missing pytest target: ${target}" >&2
+                exit 2
+              else
+                pytest_targets+=("${target}")
+              fi
+            done
+          fi
+
           uv run pytest \
-            tests/unit \
-            tests/test_ci \
             --ignore=tests/test_ci/test_router_artifact_manifest.py \
-            tests/test_desktop/test_electron_startup_contract.py \
-            tests/test_recovery \
-            tests/test_migration/test_opensquilla_home_migration.py \
-            tests/test_engine/test_coding_mode.py \
-            tests/test_engine/test_cancelled_turn_segments.py \
-            tests/test_engine/test_history_silent_reply.py \
-            tests/test_engine/test_silent_reply.py \
-            tests/test_engine/test_silent_reply_runtime.py \
-            tests/test_engine/test_stream_wrappers.py \
-            tests/test_engine/turn_runner/test_stream_consumer_stage_unit.py \
-            tests/test_engine/turn_runner/test_turn_finalizer_stage_unit.py \
-            tests/test_gateway/test_rpc_chat_history.py \
-            tests/test_persistence/test_usage_ledger.py \
-            tests/functional/test_gateway_silent_reply_process_e2e.py \
-            tests/test_tools/test_shell_process_isolation.py \
+            "${pytest_targets[@]}" \
             -q -m "${markers}" --durations=50
 
       - name: Test Docker build-context exclusions in full CI
@@ -914,7 +1035,7 @@ jobs:
     # contract, which is useful for their native recovery coverage.
     name: Desktop recovery E2E (${{ matrix.os }}, ${{ matrix.shard }})
     needs: [classify-changes, frontend-check]
-    if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
     strategy:
       fail-fast: false
       matrix:
@@ -1185,6 +1306,7 @@ jobs:
 
   readme-locale-check:
     name: README locale parity
+    needs: classify-changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1206,9 +1328,81 @@ jobs:
     if: ${{ needs.classify-changes.outputs.toolchain_artifact_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
     uses: ./.github/workflows/managed-toolchain-artifacts.yml
 
+  main-canary:
+    name: Main installation and offline gateway canary
+    if: ${{ github.event_name == 'push' && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      UV_PYTHON: "3.12"
+      PYTHONPATH: ${{ github.workspace }}
+      OPENSQUILLA_TURN_CALL_LOG: "0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure isolated runtime directories
+        shell: bash
+        run: |
+          printf 'OPENSQUILLA_STATE_DIR=%s/opensquilla-state\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+          printf 'OPENSQUILLA_LOG_DIR=%s/opensquilla-logs\n' "${RUNNER_TEMP}" >> "${GITHUB_ENV}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: npm
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install locked development dependencies
+        run: uv sync --extra dev --extra recommended --extra mcp --frozen
+
+      - name: Build production WebUI artifact
+        working-directory: opensquilla-webui
+        run: |
+          npm ci
+          npm run build:artifact
+          npm run verify:release-dist
+
+      - name: Build and install wheel in a clean environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          wheel_dir="${RUNNER_TEMP}/canary-wheel"
+          venv_dir="${RUNNER_TEMP}/canary-venv"
+          uv build --wheel --out-dir "${wheel_dir}"
+          wheels=("${wheel_dir}"/opensquilla-*.whl)
+          if [[ "${#wheels[@]}" -ne 1 || ! -f "${wheels[0]}" ]]; then
+            echo "ERROR: expected exactly one canary wheel" >&2
+            exit 1
+          fi
+          uv venv "${venv_dir}" --python 3.12
+          uv pip install --python "${venv_dir}/bin/python" "${wheels[0]}"
+          "${venv_dir}/bin/python" -c "import opensquilla; import opensquilla.gateway.app"
+          "${venv_dir}/bin/opensquilla" --help >/dev/null
+
+      - name: Run offline gateway and provider canary
+        run: >-
+          uv run pytest
+          tests/functional/test_gateway_silent_reply_process_e2e.py
+          -q --durations=10
+
   ci-result:
     name: CI result
     needs:
+      - queue-attestation
       - classify-changes
       - workflow-lint
       - readme-locale-check
@@ -1224,19 +1418,69 @@ jobs:
       - desktop-recovery-e2e
       - release-packaging
       - managed-toolchain-artifacts
+      - main-canary
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Accept verified queue or main fast path
+        if: >-
+          ${{ (github.event_name == 'merge_group'
+               && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce'
+               && needs.queue-attestation.outputs.reusable == 'true')
+              || (github.event_name == 'push'
+                  && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce') }}
+        env:
+          QUEUE_RESULT: ${{ needs.queue-attestation.result }}
+          QUEUE_REUSABLE: ${{ needs.queue-attestation.outputs.reusable }}
+          QUEUE_REASON: ${{ needs.queue-attestation.outputs.reason }}
+          MAIN_CANARY_RESULT: ${{ needs.main-canary.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "merge_group" ]]; then
+            if [[ "${QUEUE_RESULT}" != "success" || "${QUEUE_REUSABLE}" != "true" ]]; then
+              echo "ERROR: merge queue fast path lacks trusted green evidence: ${QUEUE_REASON}" >&2
+              exit 1
+            fi
+            echo "Merge queue reused trusted PR CI evidence: ${QUEUE_REASON}"
+          elif [[ "${MAIN_CANARY_RESULT}" != "success" ]]; then
+            echo "ERROR: main canary must succeed; got ${MAIN_CANARY_RESULT:-missing}." >&2
+            exit 1
+          else
+            echo "Main installation and offline gateway canary succeeded."
+          fi
+
       - name: Check out repository
+        if: >-
+          ${{ !((github.event_name == 'merge_group'
+                 && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce'
+                 && needs.queue-attestation.outputs.reusable == 'true')
+                || (github.event_name == 'push'
+                    && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce')) }}
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          persist-credentials: false
 
       - name: Set up Python
+        if: >-
+          ${{ !((github.event_name == 'merge_group'
+                 && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce'
+                 && needs.queue-attestation.outputs.reusable == 'true')
+                || (github.event_name == 'push'
+                    && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce')) }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Check WebUI chat recovery result
+        if: >-
+          ${{ !((github.event_name == 'merge_group'
+                 && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce'
+                 && needs.queue-attestation.outputs.reusable == 'true')
+                || (github.event_name == 'push'
+                    && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce')) }}
         env:
           RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
           FLAG_FRONTEND_CHANGED: ${{ needs.classify-changes.outputs.frontend_changed }}
@@ -1255,6 +1499,12 @@ jobs:
           fi
 
       - name: Check required CI results
+        if: >-
+          ${{ !((github.event_name == 'merge_group'
+                 && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce'
+                 && needs.queue-attestation.outputs.reusable == 'true')
+                || (github.event_name == 'push'
+                    && (vars.CI_OPTIMIZATION_MODE || 'shadow') == 'enforce')) }}
         env:
           RESULT_CLASSIFY: ${{ needs.classify-changes.result }}
           RESULT_WORKFLOW_LINT: ${{ needs.workflow-lint.result }}
@@ -1286,3 +1536,26 @@ jobs:
           FLAG_TOOLCHAIN_ARTIFACT_CHANGED: ${{ needs.classify-changes.outputs.toolchain_artifact_changed }}
           FLAG_FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
         run: python .github/scripts/check_ci_results.py
+
+      - name: Create trusted PR CI attestation
+        id: attestation
+        if: ${{ github.event_name == 'pull_request' && env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        run: >-
+          python .github/scripts/ci_attestation.py create
+          --repository "${GITHUB_REPOSITORY}"
+          --event-path "${GITHUB_EVENT_PATH}"
+          --run-id "${GITHUB_RUN_ID}"
+          --run-attempt "${GITHUB_RUN_ATTEMPT}"
+          --workflow-ref "${GITHUB_WORKFLOW_REF}"
+          --optimization-mode "${CI_OPTIMIZATION_MODE}"
+          --output "${RUNNER_TEMP}/ci-attestation.json"
+          --github-output "${GITHUB_OUTPUT}"
+
+      - name: Upload trusted PR CI attestation
+        if: ${{ github.event_name == 'pull_request' && env.CI_OPTIMIZATION_MODE != 'legacy' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-attestation-${{ steps.attestation.outputs.tree_sha }}
+          path: ${{ runner.temp }}/ci-attestation.json
+          if-no-files-found: error
+          retention-days: 31

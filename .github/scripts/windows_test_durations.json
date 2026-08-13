@@ -82,6 +82,7 @@
     "tests/test_channels/test_wecom_websocket.py": 0.127,
     "tests/test_ci/test_architecture_import_contracts.py": 11.504,
     "tests/test_ci/test_bgm_asset_hygiene.py": 0.515,
+    "tests/test_ci/test_ci_attestation.py": 1.5,
     "tests/test_ci/test_ci_result_gate.py": 0.01,
     "tests/test_ci/test_decision_log_aggregate.py": 0.01,
     "tests/test_ci/test_dockerignore_context.py": 0.01,

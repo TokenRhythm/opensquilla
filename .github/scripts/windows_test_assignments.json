@@ -25,6 +25,7 @@
       "tests/test_channels/test_send_error_classification.py",
       "tests/test_channels/test_telegram_send_chunking.py",
       "tests/test_channels/test_wecom_websocket.py",
+      "tests/test_ci/test_ci_attestation.py",
       "tests/test_ci/test_dockerignore_context.py",
       "tests/test_ci/test_migrations_packaged.py",
       "tests/test_ci/test_pr_body_lint.py",

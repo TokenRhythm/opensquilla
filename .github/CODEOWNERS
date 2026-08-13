@@ -1,0 +1,5 @@
+# CI policy is a merge-safety boundary. Changes require an accountable maintainer.
+/.github/CODEOWNERS @Open-Squilla
+/.github/CI_OPTIMIZATION.md @Open-Squilla
+/.github/workflows/ @Open-Squilla
+/.github/scripts/ @Open-Squilla

@@ -121,7 +121,10 @@ def _expected_classifier_outputs(**overrides: str) -> dict[str, str]:
         "build_wheel_required": "false",
         "toolchain_artifact_changed": "false",
         "full_required": "false",
+        "pytest_targets": "",
     }
+    if overrides.get("full_required") == "true" and "pytest_targets" not in overrides:
+        outputs["pytest_targets"] = "tests"
     outputs.update(overrides)
     return outputs
 
@@ -183,7 +186,13 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     data = _workflow("ci.yml")
     text = ci_path.read_text(encoding="utf-8")
 
-    assert {"pull_request", "merge_group", "push", "workflow_dispatch"} <= _trigger_keys(data)
+    assert {
+        "pull_request",
+        "merge_group",
+        "push",
+        "schedule",
+        "workflow_dispatch",
+    } <= _trigger_keys(data)
     assert data["on"]["merge_group"]["types"] == ["checks_requested"]
     assert "branches: [main]" in text
     assert "PYTHONPATH: ${{ github.workspace }}" in text
@@ -227,6 +236,83 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
         '"${{ github.event_name }}" == "merge_group"'
     ) == 3
 
+
+def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
+    workflow = _workflow("ci.yml")
+    jobs = workflow["jobs"]
+
+    assert workflow["env"]["CI_OPTIMIZATION_MODE"] == (
+        "${{ vars.CI_OPTIMIZATION_MODE || 'shadow' }}"
+    )
+    assert jobs["queue-attestation"]["name"] == "Verify reusable PR CI evidence"
+    assert "fetch-depth" in str(jobs["queue-attestation"])
+    assert "verify-queue" in str(jobs["queue-attestation"])
+    assert "full fail-closed matrix" in str(jobs["classify-changes"])
+    assert 'CI_OPTIMIZATION_MODE}" == "legacy"' in str(jobs["classify-changes"])
+    assert jobs["main-canary"]["name"] == "Main installation and offline gateway canary"
+    assert "test_gateway_silent_reply_process_e2e.py" in str(jobs["main-canary"])
+    assert jobs["ci-result"]["name"] == "CI result"
+    assert "ci-attestation-${{ steps.attestation.outputs.tree_sha }}" in str(
+        jobs["ci-result"]
+    )
+
+
+def test_ci_change_classifier_routes_platform_neutral_gateway_changes(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(
+        tmp_path,
+        [
+            "src/opensquilla/gateway/task_runtime.py",
+            "tests/test_gateway/test_task_runtime.py",
+        ],
+    )
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        test_changed="true",
+        python_changed="true",
+        build_wheel_required="true",
+        pytest_targets=(
+            "tests/test_gateway,tests/test_gateway*.py,tests/functional/test_gateway_*_e2e.py"
+        ),
+    )
+
+
+def test_ci_change_classifier_routes_platform_neutral_provider_changes(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(
+        tmp_path,
+        ["src/opensquilla/provider/registry.py"],
+    )
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        python_changed="true",
+        build_wheel_required="true",
+        pytest_targets=(
+            "tests/test_provider,tests/test_provider*.py,tests/test_*router*.py,"
+            "tests/test_cross_provider_tiers.py"
+        ),
+    )
+
+
+def test_ci_change_classifier_keeps_native_router_changes_platform_sensitive(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(
+        tmp_path,
+        ["src/opensquilla/squilla_router/inference.py"],
+    )
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        windows_full_required="true",
+        python_changed="true",
+        platform_sensitive_changed="true",
+        build_wheel_required="true",
+    )
 
 def test_default_ci_keeps_main_pushes_targeted_and_manual_runs_full() -> None:
     ci_path = WORKFLOW_DIR / "ci.yml"
@@ -1273,7 +1359,8 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "windows_full_required == 'true'" in jobs["windows-full"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["macos-recovery"]["if"]
     assert "desktop_changed == 'true'" in jobs["macos-recovery"]["if"]
-    assert "frontend_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
+    assert "frontend_changed == 'true'" not in jobs["desktop-recovery-e2e"]["if"]
+    assert "frontend_changed == 'true'" in jobs["webui-chat-recovery"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
     assert "desktop_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["webui-chat-recovery"]["if"]
@@ -1317,6 +1404,8 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "desktop-recovery-e2e",
         "release-packaging",
         "managed-toolchain-artifacts",
+        "queue-attestation",
+        "main-canary",
     }
     assert gate_step["run"] == "python .github/scripts/check_ci_results.py"
     assert gate_step["env"]["RESULT_UBUNTU_FULL"] == "${{ needs.ubuntu-full.result }}"

@@ -115,8 +115,7 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         (
             "RESULT_DESKTOP_RECOVERY_E2E",
             "Desktop recovery E2E matrix",
-            flags["frontend_changed"]
-            or flags["platform_sensitive_changed"]
+            flags["platform_sensitive_changed"]
             or flags["desktop_changed"]
             or full,
         ),

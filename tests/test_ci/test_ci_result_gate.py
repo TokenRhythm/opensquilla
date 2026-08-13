@@ -253,7 +253,7 @@ def test_ci_result_gate_requires_desktop_recovery_e2e_for_desktop_changes() -> N
     assert any("Desktop recovery E2E matrix" in error and "skipped" in error for error in errors)
 
 
-def test_ci_result_gate_requires_desktop_recovery_e2e_for_frontend_changes() -> None:
+def test_ci_result_gate_uses_focused_browser_checks_for_frontend_changes() -> None:
     env = _base_env()
     env[_flag_env("docs_only")] = "false"
     env[_flag_env("runtime_changed")] = "true"
@@ -264,9 +264,7 @@ def test_ci_result_gate_requires_desktop_recovery_e2e_for_frontend_changes() -> 
     env["RESULT_UBUNTU"] = "success"
     env["RESULT_WINDOWS_SMOKE"] = "success"
 
-    errors = check_ci_results(env)
-
-    assert any("Desktop recovery E2E matrix" in error and "skipped" in error for error in errors)
+    assert check_ci_results(env) == []
 
 
 def test_ci_result_gate_rejects_failed_or_missing_desktop_recovery_e2e() -> None:
