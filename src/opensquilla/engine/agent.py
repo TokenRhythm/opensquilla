@@ -87,10 +87,14 @@ from opensquilla.engine.runtime_state_capsule import (
     runtime_state_capsule_message,
 )
 from opensquilla.engine.session_sanitize import (
+    PrefixProjectionCache,
+    PrefixSanitizeCache,
     SessionSanitizeResult,
     project_historical_tool_payloads,
+    project_historical_tool_payloads_cached,
     recoverable_tool_result_reference,
     sanitize_session_messages,
+    sanitize_session_messages_cached,
     session_payload_chars,
 )
 from opensquilla.engine.submit_review import (
@@ -2926,6 +2930,11 @@ class Agent:
 
         self._state: AgentState = AgentState.IDLE
         self._history: list[Message] = []
+        # Incremental caches for per-turn history sanitize/project.
+        # History is append-only across turns; leading messages keep their
+        # object identity, so only the tail is reprocessed each turn.
+        self._sanitize_prefix_cache: PrefixSanitizeCache | None = None
+        self._project_prefix_cache: PrefixProjectionCache | None = None
         self._context: ContextAssembly | None = None
         # Typed dependency surface. Either constructor injection or legacy
         # attribute assignment from the runtime is accepted; both reach the same
@@ -6596,7 +6605,10 @@ class Agent:
         )
         loaded_history = list(self._history)
         self._write_context_stage("session:loaded", loaded_history)
-        sanitized_history, sanitize_result = sanitize_session_messages(loaded_history)
+        sanitized_history, sanitize_result, self._sanitize_prefix_cache = sanitize_session_messages_cached(
+            loaded_history,
+            self._sanitize_prefix_cache,
+        )
         verification_history = limit_turns(
             sanitized_history,
             self.config.max_history_turns,
@@ -6605,10 +6617,13 @@ class Agent:
             self._verified_tool_result_references,
             verification_history,
         )
-        sanitized_history, historical_projection_result = project_historical_tool_payloads(
-            sanitized_history,
-            preserve_reasoning_content=preserve_reasoning_content,
-            recoverable_references=recoverable_references,
+        sanitized_history, historical_projection_result, self._project_prefix_cache = (
+            project_historical_tool_payloads_cached(
+                sanitized_history,
+                preserve_reasoning_content=preserve_reasoning_content,
+                recoverable_references=recoverable_references,
+                cache=self._project_prefix_cache,
+            )
         )
         sanitized_history = repair_tool_pairing(sanitized_history)
         sanitized_history = drop_reasoning(
