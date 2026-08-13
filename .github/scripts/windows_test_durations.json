@@ -956,6 +956,7 @@
     "tests/test_session/test_session_delete_purges_meta_runs.py": 1.912,
     "tests/test_session/test_spawn_lock_eviction.py": 0.01,
     "tests/test_session/test_storage_count_batch.py": 1.093,
+    "tests/test_session/test_storage_session_list_pagination.py": 0.01,
     "tests/test_session/test_storage_transactions.py": 0.01,
     "tests/test_session/test_turn_acceptance_storage.py": 0.01,
     "tests/test_session/test_turn_usage_storage.py": 0.015,
