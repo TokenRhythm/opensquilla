@@ -161,6 +161,34 @@ function planPart(): Extract<ChatPart, { type: 'plan' }> {
   }
 }
 
+function clarifyPart(
+  presentation?: string,
+): Extract<ChatPart, { type: 'interrupt' }> {
+  return {
+    type: 'interrupt',
+    key: presentation ? 'plan-clarify-1' : 'generic-clarify-1',
+    interruptKind: 'clarify',
+    clarify: {
+      intro: 'Confirm the scope.',
+      fields: [{
+        name: 'scope',
+        prompt: 'Which scope?',
+        type: 'enum',
+        required: true,
+        defaultValue: '',
+        choices: ['focused', 'complete'],
+      }],
+      ...(presentation ? { presentation } : {}),
+      requestId: presentation ? 'plan-input-1' : 'generic-input-1',
+      runId: 'plan-run-1',
+      step: 'confirm_scope',
+    },
+    resolution: 'replied',
+    busy: false,
+    error: '',
+  }
+}
+
 function usageMeta(overrides: Partial<ChatMessageMeta> = {}): ChatMessageMeta {
   return {
     model: 'tokenrhythm/kimi-k2.7-code',
@@ -660,6 +688,33 @@ describe('AssistantMessage activity disclosure', () => {
 
     expect(el.querySelector('.plan-card')).not.toBeNull()
     expect(el.querySelector('[data-testid="turn-outcome-completed"]')).toBeNull()
+  })
+
+  it('removes the standalone Plan questionnaire receipt once the Plan card exists', async () => {
+    const el = mountMessage(baseMessage({
+      text: '',
+      timelineItems: [],
+      parts: [clarifyPart('plan_questionnaire_v1'), planPart()],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    expect(el.querySelector('.plan-card')).not.toBeNull()
+    expect(el.querySelector('.clarify-outcome--plan')).toBeNull()
+  })
+
+  it('does not suppress a generic clarify receipt when a Plan card exists', async () => {
+    const el = mountMessage(baseMessage({
+      text: '',
+      timelineItems: [],
+      parts: [clarifyPart(), planPart()],
+      statusHistory: [],
+    }))
+    await nextTick()
+
+    expect(el.querySelector('.plan-card')).not.toBeNull()
+    expect(el.querySelector('.clarify-outcome')).not.toBeNull()
+    expect(el.querySelector('.clarify-outcome--plan')).toBeNull()
   })
 
   it('keeps intermediate candidate narration inside activity and the final answer outside once', async () => {
