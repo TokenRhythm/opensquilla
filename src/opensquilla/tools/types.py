@@ -188,6 +188,10 @@ class ToolContext:
     # Process-local Goal coordinator used only by Goal-owned main-agent turns.
     # The service is never serialized into task details or route metadata.
     goal_service: Any | None = field(default=None, repr=False)
+    # Frozen after the final provider-visible tool schema is built. Dispatch
+    # and projection code use this bit to avoid replacing raw tool output with
+    # a handle that the current model is not authorized to retrieve.
+    tool_result_retrieval_available: bool = False
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

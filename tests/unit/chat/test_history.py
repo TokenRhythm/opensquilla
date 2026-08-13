@@ -266,3 +266,189 @@ def test_transcript_entries_to_chat_messages_keeps_plain_confirmed_fields_text()
     assert messages[0]["tool_calls"][0]["text"] == (
         "Confirmed request fields:\n- this is a visible note"
     )
+
+
+def test_transcript_entries_to_chat_messages_cleans_goal_sentinels_without_mutation() -> None:
+    raw_content = (
+        '{"text": "HEARTBEAT_OK\\nraw status", '
+        '"display_text": "NO_REPLY\\nvisible status\\nHEARTBEAT_OK", '
+        '"artifacts": [{"id": "art-status"}]}'
+    )
+    raw_tool_calls = [
+        {"type": "text", "text": "NO_REPLY\nchecking the external state"},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-status",
+            "name": "read_status",
+            "input": {},
+        },
+        {"type": "text", "text": "HEARTBEAT_OK"},
+    ]
+    entry = _assistant_entry(
+        content=raw_content,
+        tool_calls=raw_tool_calls,
+        turn_context={"intent": "goal_continuation"},
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == "visible status"
+    assert messages[0]["artifacts"][0]["id"] == "art-status"
+    assert messages[0]["tool_calls"] == [
+        {"type": "text", "text": "checking the external state"},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-status",
+            "name": "read_status",
+            "input": {},
+        },
+    ]
+    assert entry.content == raw_content
+    assert entry.tool_calls == raw_tool_calls
+
+
+def test_transcript_entries_to_chat_messages_keeps_unattributed_mixed_sentinel_text() -> None:
+    entry = _assistant_entry(
+        content="NO_REPLY\nThis is quoted historical prose.",
+        tool_calls=[
+            {
+                "type": "text",
+                "text": "HEARTBEAT_OK\nThis segment has no system-event provenance.",
+            }
+        ],
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == "NO_REPLY\nThis is quoted historical prose."
+    assert messages[0]["tool_calls"][0]["text"] == (
+        "HEARTBEAT_OK\nThis segment has no system-event provenance."
+    )
+
+
+def test_transcript_entries_to_chat_messages_hides_exact_assistant_sentinel() -> None:
+    entry = _assistant_entry(content="  NO_REPLY\n", tool_calls=None)
+
+    assert transcript_entries_to_chat_messages([entry]) == []
+
+
+def test_transcript_entries_to_chat_messages_strips_flattened_used_tool_markers() -> None:
+    # A compacted assistant turn keeps its narration but drops the flattened
+    # "[Used tool: ...]" markers that engine.agent._flatten_content_blocks emits.
+    entry = _assistant_entry(
+        message_id="m-flat-narration",
+        content=(
+            "继续补齐上下文: 章节重新生成接口、前端 API client 与测试结构。\n"
+            "[Used tool: read_file]\n"
+            "[Used tool: read_file]\n"
+            "[Used tool: list_dir]"
+        ),
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == (
+        "继续补齐上下文: 章节重新生成接口、前端 API client 与测试结构。"
+    )
+    assert "[Used tool:" not in messages[0]["text"]
+
+
+def test_transcript_entries_to_chat_messages_drops_flattened_tool_result_dump() -> None:
+    # A "[Tool result (...)]" dump is pure internal transcript; with no
+    # structured segments to render it is dropped rather than shown as a bubble.
+    entries = [
+        _assistant_entry(
+            message_id="m-flat-tooluse",
+            content="[Used tool: read_file]",
+        ),
+        _assistant_entry(
+            message_id="m-flat-toolresult",
+            role="user",
+            content=(
+                '[Tool result (call_00_TUIq7hPsIGaww7lcUiuc8669): 1  """Proposal '
+                'generation and management API routes."""\n2  \n3  import json]'
+            ),
+        ),
+    ]
+
+    assert transcript_entries_to_chat_messages(entries) == []
+
+
+def test_transcript_entries_to_chat_messages_keeps_unattributed_tool_result_text() -> None:
+    entry = _assistant_entry(
+        message_id="m-user-toolresult-doc",
+        role="user",
+        content="[Tool result (example): this is documentation, not a tool event]",
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == entry.content
+
+
+def test_transcript_entries_to_chat_messages_keeps_text_after_confirmed_tool_result() -> None:
+    entry = _assistant_entry(
+        message_id="m-toolresult-with-request",
+        role="user",
+        tool_call_id="call-1",
+        content="[Tool result (call-1): ok]\nPlease also update README.md",
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == "Please also update README.md"
+
+
+def test_transcript_entries_to_chat_messages_drops_tool_only_flattened_turn() -> None:
+    # An assistant turn whose entire content is "[Used tool: ...]" markers (no
+    # narration) collapses to nothing, matching a fully collapsed activity fold.
+    entry = _assistant_entry(
+        message_id="m-flat-toolonly",
+        content="[Used tool: read_file]\n[Used tool: list_dir]",
+    )
+
+    assert transcript_entries_to_chat_messages([entry]) == []
+
+
+def test_transcript_entries_to_chat_messages_keeps_ordinary_bracketed_text() -> None:
+    # Regression guard: bracketed prose that is not a tool marker is untouched.
+    entry = _assistant_entry(
+        message_id="m-brackets",
+        content="Here is the plan.\n[step 1] read the config\n[step 2] apply it",
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == (
+        "Here is the plan.\n[step 1] read the config\n[step 2] apply it"
+    )
+
+
+def test_transcript_entries_to_chat_messages_keeps_narration_when_segments_present() -> None:
+    # When structured tool segments exist, the folded timeline renders them, so
+    # the turn is kept even after its "[Used tool: ...]" narration marker is
+    # stripped from the display text.
+    entry = _assistant_entry(
+        message_id="m-flat-with-segments",
+        content="Reading the files now.\n[Used tool: read_file]",
+        tool_calls=[
+            {
+                "type": "tool_use",
+                "tool_use_id": "call-1",
+                "name": "read_file",
+                "input": {},
+            }
+        ],
+    )
+
+    messages = transcript_entries_to_chat_messages([entry])
+
+    assert messages[0]["text"] == "Reading the files now."
+    assert messages[0]["tool_calls"] == [
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-1",
+            "name": "read_file",
+            "input": {},
+        }
+    ]

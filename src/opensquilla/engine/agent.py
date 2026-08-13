@@ -89,6 +89,7 @@ from opensquilla.engine.runtime_state_capsule import (
 from opensquilla.engine.session_sanitize import (
     SessionSanitizeResult,
     project_historical_tool_payloads,
+    recoverable_tool_result_reference,
     sanitize_session_messages,
     session_payload_chars,
 )
@@ -128,6 +129,7 @@ from opensquilla.engine.tool_token_estimate import estimate_tokens as get_approx
 from opensquilla.engine.usage import model_usage_cost_fields
 from opensquilla.engine.usage_accounting import (
     UsageAccountingScope,
+    UsageAccountingUnavailableError,
     UsageCallResult,
     UsageCallStart,
     UsageEventSink,
@@ -163,6 +165,9 @@ from opensquilla.provider import (
 )
 from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
+)
+from opensquilla.provider import (
+    ProviderActivityEvent as ProviderDomainActivityEvent,
 )
 from opensquilla.provider import (
     ReasoningDeltaEvent as ProviderReasoningDelta,
@@ -242,7 +247,7 @@ from opensquilla.session.compaction_lifecycle import (
     pre_compaction_flush_requires_safe_receipt,
 )
 from opensquilla.session.context_view import format_compaction_summary_context
-from opensquilla.session.terminal_reply import build_terminal_reply
+from opensquilla.session.terminal_reply import build_terminal_reply, safe_provider_failure_code
 from opensquilla.tool_boundary import AgentToolHandler as ToolHandler
 from opensquilla.tools.patch_classification import is_instrumentation_only_patch
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
@@ -281,6 +286,7 @@ from .types import (
     DoneEvent,
     EnsembleProgressEvent,
     ErrorEvent,
+    ProviderActivityEvent,
     RunHeartbeatEvent,
     StateChangeEvent,
     TextDeltaEvent,
@@ -1208,6 +1214,11 @@ _TOOL_RESULT_HINT_LINE_MAX_CHARS = 180
 _TOOL_RESULT_HINT_MAX_LINES = 8
 _TOOL_RESULT_HINT_MAX_CHARS = 900
 _TOOL_RESULT_HINT_SCAN_MAX_CHARS = 2048
+# Historical verification reads and hashes raw Store payloads so that a lossy
+# projection is only compacted when recovery is genuinely available. Bound the
+# number of unique handles per turn; references beyond this limit stay visible
+# in their original envelope (fail open) instead of causing unbounded Store I/O.
+_MAX_HISTORICAL_TOOL_RESULT_REFERENCE_PROBES = 256
 _TOOL_PROJECTION_EVENT_ARGUMENT_KEYS = frozenset(
     {"command", "cmd", "workdir", "cwd", "path", "paths"}
 )
@@ -2207,8 +2218,175 @@ class _ProviderAttemptKind(StrEnum):
     LENGTH_CAPPED = "length_capped"
 
 
+_PROVIDER_REASONING_PULSE_INTERVAL_SECONDS = 5.0
+_MAX_PROVIDER_RETRY_WAIT_SECONDS = 900.0
+
+_ProviderActivityPhase = Literal[
+    "requesting",
+    "reasoning",
+    "retry_wait",
+    "retrying",
+    "fallback",
+]
+_ProviderActivityReason = Literal[
+    "initial",
+    "rate_limited",
+    "provider_overloaded",
+    "transport_transient",
+    "reasoning_only",
+    "empty_response",
+    "stream_incomplete",
+    "invalid_response",
+    "context_overflow",
+    "unknown",
+]
+
+_PROVIDER_ACTIVITY_PHASES: dict[str, _ProviderActivityPhase] = {
+    "requesting": "requesting",
+    "reasoning": "reasoning",
+    "retry_wait": "retry_wait",
+    "retrying": "retrying",
+    "fallback": "fallback",
+}
+_PROVIDER_ACTIVITY_REASONS: dict[str, _ProviderActivityReason] = {
+    "initial": "initial",
+    "rate_limited": "rate_limited",
+    "provider_overloaded": "provider_overloaded",
+    "transport_transient": "transport_transient",
+    "reasoning_only": "reasoning_only",
+    "empty_response": "empty_response",
+    "stream_incomplete": "stream_incomplete",
+    "invalid_response": "invalid_response",
+    "context_overflow": "context_overflow",
+    "unknown": "unknown",
+}
+
+
+def _normalize_provider_activity_phase(value: object) -> _ProviderActivityPhase:
+    if not isinstance(value, str):
+        return "requesting"
+    return _PROVIDER_ACTIVITY_PHASES.get(value, "requesting")
+
+
+def _normalize_provider_activity_reason(value: object) -> _ProviderActivityReason:
+    if not isinstance(value, str):
+        return "unknown"
+    return _PROVIDER_ACTIVITY_REASONS.get(value, "unknown")
+
+
+def _provider_activity_reason_for_failure(
+    kind: ProviderFailureKind,
+) -> _ProviderActivityReason:
+    if kind is ProviderFailureKind.RATE_LIMITED:
+        return "rate_limited"
+    if kind is ProviderFailureKind.PROVIDER_OVERLOADED:
+        return "provider_overloaded"
+    if kind is ProviderFailureKind.TRANSPORT_TRANSIENT:
+        return "transport_transient"
+    if kind is ProviderFailureKind.EMPTY_RESPONSE:
+        return "empty_response"
+    if kind is ProviderFailureKind.CONTEXT_OVERFLOW:
+        return "context_overflow"
+    if kind is ProviderFailureKind.MALFORMED_RESPONSE:
+        return "invalid_response"
+    return "unknown"
+
+
+def _safe_provider_terminal_message(
+    kind: ProviderFailureKind,
+    raw_code: str | None = None,
+) -> str:
+    """Return an actionable terminal message without upstream error prose."""
+
+    stable_code = safe_provider_failure_code(raw_code, kind.value)
+    if stable_code == "incomplete_tool_stream":
+        return "Provider stream ended with an incomplete tool call"
+    if stable_code == "provider_protocol_error":
+        return "The model provider returned an invalid tool stream."
+
+    messages = {
+        ProviderFailureKind.RATE_LIMITED: (
+            "The model provider is rate-limiting requests. Try again later."
+        ),
+        ProviderFailureKind.PROVIDER_OVERLOADED: (
+            "The model provider is temporarily overloaded. Try again later."
+        ),
+        ProviderFailureKind.AUTH_INVALID: (
+            "The model provider rejected the configured credentials."
+        ),
+        ProviderFailureKind.CONTEXT_OVERFLOW: (
+            "The request exceeds the model provider's context window."
+        ),
+        ProviderFailureKind.UNSUPPORTED_FEATURE: (
+            "The model provider does not support this request."
+        ),
+        ProviderFailureKind.INSUFFICIENT_CREDITS: (
+            "The model provider account has insufficient credits."
+        ),
+        ProviderFailureKind.MODEL_NOT_FOUND: (
+            "The configured model is unavailable from the provider."
+        ),
+        ProviderFailureKind.TRANSPORT_TRANSIENT: (
+            "The connection to the model provider was interrupted. Try again."
+        ),
+        ProviderFailureKind.POLICY_REFUSAL: (
+            "The model provider refused this request under its policy."
+        ),
+        ProviderFailureKind.EMPTY_RESPONSE: (
+            "The model provider returned an empty response."
+        ),
+        ProviderFailureKind.MALFORMED_RESPONSE: (
+            "The model provider returned an invalid response."
+        ),
+        ProviderFailureKind.BAD_REQUEST: "The model provider rejected the request.",
+    }
+    return messages.get(kind, "The model provider request failed.")
+
+
+def _provider_activity_reason_for_attempt(
+    kind: _ProviderAttemptKind,
+) -> _ProviderActivityReason:
+    if kind is _ProviderAttemptKind.REASONING_ONLY:
+        return "reasoning_only"
+    if kind is _ProviderAttemptKind.STREAM_INCOMPLETE:
+        return "stream_incomplete"
+    if kind is _ProviderAttemptKind.MALFORMED_EMPTY:
+        return "invalid_response"
+    return "unknown"
+
+
+def _provider_retry_delay_seconds(
+    *,
+    local_delay_s: float,
+    provider_retry_after_s: float | None,
+) -> float | None:
+    """Resolve a policy-safe wait, or ``None`` when the hint is too long.
+
+    A provider hint over the 15-minute automatic wait ceiling must not be
+    clamped and retried early.  The caller may select a fallback; otherwise it
+    surfaces a retryable terminal outcome.
+    """
+
+    local = max(0.0, float(local_delay_s))
+    hint = 0.0
+    if provider_retry_after_s is not None:
+        try:
+            parsed_hint = float(provider_retry_after_s)
+        except (TypeError, ValueError):
+            parsed_hint = 0.0
+        if math.isfinite(parsed_hint) and parsed_hint > 0:
+            hint = parsed_hint
+    if hint > _MAX_PROVIDER_RETRY_WAIT_SECONDS:
+        return None
+    return min(max(local, hint), _MAX_PROVIDER_RETRY_WAIT_SECONDS)
+
+
 class _IterationStreamTimeoutError(TimeoutError):
     """Raised when provider streaming exceeds the active Agent iteration budget."""
+
+
+class _RaisedProviderBoundaryError(RuntimeError):
+    """Content-free marker for an exception raised by provider call/iteration."""
 
 
 _STREAM_DEADLINE_ATTRIBUTE = "_opensquilla_stream_deadline_at_monotonic"
@@ -2671,6 +2849,7 @@ class Agent:
         self.tool_definitions = tool_definitions or []
         self._tool_definition_by_name = {tool.name: tool for tool in self.tool_definitions}
         self._raw_tool_handler = tool_handler
+        self._provider_call_tool_result_retrieval_available: bool | None = None
         self.tool_handler = tool_handler
         self.subagent_manager = subagent_manager or SubagentManager()
         self._usage_tracker = usage_tracker
@@ -2710,6 +2889,10 @@ class Agent:
             )
         if tool_context is not None:
             tool_context = self._apply_configured_tool_result_budget(tool_context)
+            tool_context.tool_result_retrieval_available = bool(
+                tool_context.tool_result_store_dir
+                and self._tool_result_recovery_available()
+            )
             tool_context.validate_path_roots()
         self._tool_context: ToolContext | None = tool_context
         # Test-only offline failure seam. ``None`` on every production path,
@@ -3003,6 +3186,11 @@ class Agent:
                 finally:
                     current_tool_context.reset(token)
 
+        setattr(
+            _handler,
+            "_opensquilla_available_tools",
+            getattr(tool_handler, "_opensquilla_available_tools", frozenset()),
+        )
         return _handler
 
     def _provider_request_proof_max_chars(self) -> int:
@@ -3262,6 +3450,11 @@ class Agent:
                     entry.get("content") or "",
                     entry.get("tool_calls"),
                     entry.get("reasoning_content"),
+                    turn_context=(
+                        entry.get("turn_context")
+                        if isinstance(entry.get("turn_context"), dict)
+                        else None
+                    ),
                 )
             )
 
@@ -3912,6 +4105,220 @@ class Agent:
             return max(1, int(fallback))
         return max(1, int(self.config.tool_result_projection_max_inline_chars))
 
+    def _tool_result_recovery_available(self) -> bool:
+        """Return whether a lossy projection can be recovered by this model."""
+
+        if self._provider_call_tool_result_retrieval_available is False:
+            return False
+        capabilities = self.config.model_capabilities
+        supports_tools = (
+            getattr(capabilities, "supports_tools", None)
+            if capabilities is not None
+            else None
+        )
+        handler_tools: frozenset[str] = getattr(
+            self._raw_tool_handler,
+            "_opensquilla_available_tools",
+            frozenset(),
+        )
+        return bool(
+            self.config.tool_result_store_dir
+            and "retrieve_tool_result" in self._tool_definition_by_name
+            and "retrieve_tool_result" in handler_tools
+            and supports_tools is not False
+        )
+
+    def _tool_result_store_session_id(self) -> str | None:
+        """Resolve the session bucket used by Store reads and retrieval."""
+
+        ctx = getattr(self, "_tool_context", None)
+        session_id = (
+            self.config.tool_result_store_session_id
+            or getattr(ctx, "tool_result_store_session_id", None)
+            or getattr(ctx, "artifact_session_id", None)
+            or self._session_key
+        )
+        return str(session_id) if session_id else None
+
+    def _tool_result_store_scope(self) -> tuple[str, str, str] | None:
+        """Resolve the Store session bucket and write provenance."""
+
+        ctx = getattr(self, "_tool_context", None)
+        session_id = self._tool_result_store_session_id()
+        session_key = (
+            self.config.tool_result_store_session_key
+            or getattr(ctx, "session_key", None)
+            or self._session_key
+        )
+        agent_id = (
+            self.config.tool_result_store_agent_id
+            or getattr(ctx, "agent_id", None)
+            or self.config.metadata.get("agent_id")
+        )
+        if not agent_id and session_key:
+            from opensquilla.session.keys import parse_agent_id
+
+            agent_id = parse_agent_id(session_key)
+        if not session_id or not session_key or not agent_id:
+            return None
+        return str(session_id), str(session_key), str(agent_id)
+
+    @staticmethod
+    def _tool_result_record_matches_reference(
+        record: ToolResultRecord,
+        *,
+        session_id: str,
+        sha256: str,
+    ) -> bool:
+        """Verify a projection reference inside the active session bucket.
+
+        ``session_key`` and ``agent_id`` on a Store record describe the writer;
+        they are not a second authorization boundary. Direct children share the
+        parent's session bucket intentionally while using a distinct session key,
+        and ``retrieve_tool_result`` addresses the same bucket by ``session_id``.
+        """
+
+        return bool(
+            record.session_id == session_id
+            and record.sha256 == sha256
+        )
+
+    @staticmethod
+    def _provider_schema_has_tool_result_retrieval(
+        tools: list[ToolDefinition] | None,
+    ) -> bool:
+        return bool(
+            tools
+            and any(tool.name == "retrieve_tool_result" for tool in tools)
+        )
+
+    def _verified_tool_result_references(
+        self,
+        messages: list[Message],
+    ) -> frozenset[tuple[str, str]]:
+        """Return references readable in this Agent's session with the claimed SHA."""
+
+        session_id = self._tool_result_store_session_id()
+        if not self._tool_result_recovery_available() or session_id is None:
+            return frozenset()
+        store_dir = self.config.tool_result_store_dir
+        if not store_dir:
+            return frozenset()
+        store = ToolResultStore(store_dir)
+        verified: set[tuple[str, str]] = set()
+        records_by_handle: dict[str, ToolResultRecord | None] = {}
+        for message in reversed(messages):
+            if not isinstance(message.content, list):
+                continue
+            for block in reversed(message.content):
+                if not isinstance(block, ContentBlockToolResult):
+                    continue
+                if not isinstance(block.content, str):
+                    continue
+                reference = recoverable_tool_result_reference(block.content)
+                if reference is None or reference in verified:
+                    continue
+                handle, sha256 = reference
+                if handle in records_by_handle:
+                    record = records_by_handle[handle]
+                else:
+                    if (
+                        len(records_by_handle)
+                        >= _MAX_HISTORICAL_TOOL_RESULT_REFERENCE_PROBES
+                    ):
+                        return frozenset(verified)
+                    try:
+                        record = store.read(handle, session_id=session_id)
+                    except Exception:  # noqa: BLE001 - stale references remain visible
+                        record = None
+                    records_by_handle[handle] = record
+                if record is None:
+                    continue
+                if self._tool_result_record_matches_reference(
+                    record,
+                    session_id=session_id,
+                    sha256=sha256,
+                ):
+                    verified.add(reference)
+        return frozenset(verified)
+
+    def _restore_tool_results_without_retrieval_schema(
+        self,
+        messages: list[Message],
+    ) -> list[Message]:
+        """Restore session-scoped raw content when this call hides retrieval."""
+
+        store_dir = self.config.tool_result_store_dir
+        session_id = self._tool_result_store_session_id()
+        if not store_dir or session_id is None:
+            return messages
+        store = ToolResultStore(store_dir)
+        restored: list[Message] = []
+        changed = False
+        for message in messages:
+            if not isinstance(message.content, list):
+                restored.append(message)
+                continue
+            next_content: list[Any] = []
+            message_changed = False
+            for block in message.content:
+                if not isinstance(block, ContentBlockToolResult):
+                    next_content.append(block)
+                    continue
+                content = (
+                    block.content
+                    if isinstance(block.content, str)
+                    else str(block.content)
+                )
+                reference = recoverable_tool_result_reference(content)
+                if reference is None:
+                    next_content.append(block)
+                    continue
+                handle, sha256 = reference
+                try:
+                    record = store.read(handle, session_id=session_id)
+                except Exception as exc:  # noqa: BLE001 - stale handles fail open
+                    logger.warning(
+                        "tool_result_projection.restore_failed",
+                        tool_use_id=block.tool_use_id,
+                        handle=handle,
+                        error_type=type(exc).__name__,
+                    )
+                    next_content.append(block)
+                    continue
+                if not self._tool_result_record_matches_reference(
+                    record,
+                    session_id=session_id,
+                    sha256=sha256,
+                ):
+                    logger.warning(
+                        "tool_result_projection.restore_reference_mismatch",
+                        tool_use_id=block.tool_use_id,
+                        handle=handle,
+                    )
+                    next_content.append(block)
+                    continue
+                next_content.append(
+                    ContentBlockToolResult(
+                        tool_use_id=block.tool_use_id,
+                        content=record.content,
+                        is_error=block.is_error,
+                        execution_status=block.execution_status,
+                    )
+                )
+                message_changed = True
+                changed = True
+            restored.append(
+                Message(
+                    role=message.role,
+                    content=next_content,
+                    reasoning_content=getattr(message, "reasoning_content", None),
+                )
+                if message_changed
+                else message
+            )
+        return restored if changed else messages
+
     def _fresh_diagnostic_policy_enabled(self) -> bool:
         return bool(
             getattr(
@@ -4487,6 +4894,9 @@ class Agent:
         exceeds the provider request cap.
         """
 
+        if not self._tool_result_recovery_available():
+            return messages
+
         tool_name_by_use_id: dict[str, str] = {}
         tool_input_by_use_id: dict[str, dict[str, Any]] = {}
         tool_result_refs: list[tuple[int, int, ContentBlockToolResult]] = []
@@ -4781,12 +5191,12 @@ class Agent:
             single_over_budget = result_cap > 0 and len(content) > result_cap
             replacement_content: str | None = None
             if budget_class is ToolResultBudgetClass.CONTROL:
-                replacement_content = compact_tool_result_content(
-                    tool_name=tool_name,
-                    content=content,
+                replacement_content = self._tool_result_projection_for_provider(
+                    content,
+                    tool_use_id=block.tool_use_id,
+                    tool_name=tool_name or "tool",
+                    reason="control tool result compacted for provider request context",
                     max_preview_chars=160,
-                    budget_class=budget_class,
-                    is_error=block.is_error,
                 )
             elif (
                 budget_class is ToolResultBudgetClass.EXTERNAL
@@ -4928,6 +5338,8 @@ class Agent:
         reason: str,
         max_preview_chars: int,
     ) -> str | None:
+        if not self._tool_result_recovery_available():
+            return None
         max_preview_chars = max(0, int(max_preview_chars))
         if max_preview_chars > 0:
             max_preview_chars = max(1, min(max_preview_chars, 4_000))
@@ -4937,11 +5349,11 @@ class Agent:
             tool_use_id=tool_use_id,
             tool_name=tool_name,
         )
-        if stored is None and self.config.tool_result_store_dir:
+        if stored is None:
             return None
-        handle_line = f"tool_result_handle: {stored.handle}\n" if stored is not None else ""
-        retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT if stored is not None else ""
-        search_hints = _tool_result_search_hints(content) if stored is not None else ""
+        handle_line = f"tool_result_handle: {stored.handle}\n"
+        retrieve_hint = _TOOL_RESULT_RETRIEVE_HINT
+        search_hints = _tool_result_search_hints(content)
         if max_preview_chars <= 0:
             head = ""
             tail = ""
@@ -4955,7 +5367,7 @@ class Agent:
             tail = content[-tail_chars:] if tail_chars else ""
         omitted = max(0, len(content) - len(head) - len(tail))
         signal_lines = ""
-        if stored is not None and self._projection_signal_hints_active():
+        if self._projection_signal_hints_active():
             signal_lines, signal_matches, signal_first_line = _tool_result_signal_scan(
                 content,
                 handle=stored.handle,
@@ -5092,18 +5504,13 @@ class Agent:
     ) -> ToolResultRecord | None:
         if not self.config.tool_result_store_dir:
             return None
-        session_id = self.config.tool_result_store_session_id or self._session_key
-        session_key = self.config.tool_result_store_session_key or self._session_key
-        agent_id = self.config.tool_result_store_agent_id
-        if not agent_id and session_key:
-            from opensquilla.session.keys import parse_agent_id
-
-            agent_id = parse_agent_id(session_key)
-        if not session_id or not session_key or not agent_id:
+        scope = self._tool_result_store_scope()
+        if scope is None:
             self.config.metadata["tool_result_store_skips"] = (
                 self.config.metadata.get("tool_result_store_skips", 0) + 1
             )
             return None
+        session_id, session_key, agent_id = scope
         sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
         cache_key = (session_id, session_key, agent_id, tool_use_id, tool_name, sha)
         store = ToolResultStore(self.config.tool_result_store_dir)
@@ -5331,9 +5738,21 @@ class Agent:
                 tool_use_id=result.tool_use_id,
                 tool_name=result.tool_name,
             )
+        self.config.metadata["tool_projection_attempts"] = (
+            self.config.metadata.get("tool_projection_attempts", 0) + 1
+        )
+        recovery_available = self._tool_result_recovery_available()
         json_guard_record: ToolResultRecord | None = None
         guarded_content, guarded = _omit_large_json_tool_fields(result.content)
         if guarded:
+            if not recovery_available:
+                return self._tool_result_projection_store_unavailable_noop(
+                    original_result,
+                    reason="tool_result_retrieval_unavailable",
+                    arguments=projection_arguments,
+                    projected_chars=len(guarded_content),
+                    json_guard_applied=True,
+                )
             if self.config.tool_result_store_dir:
                 json_guard_record = raw_snapshot_record
                 if json_guard_record is None and not raw_snapshot_store_attempted:
@@ -5370,9 +5789,6 @@ class Agent:
             )
         json_guard_applied = guarded
 
-        self.config.metadata["tool_projection_attempts"] = (
-            self.config.metadata.get("tool_projection_attempts", 0) + 1
-        )
         diagnostic_reason = self._tool_result_diagnostic_reason(result, raw_snapshot_content)
         if diagnostic_reason is not None:
             self._record_fresh_diagnostic_result(
@@ -5508,6 +5924,15 @@ class Agent:
                 json_guard_applied=json_guard_applied,
             )
             return result
+        if not recovery_available:
+            return self._tool_result_projection_store_unavailable_noop(
+                original_result,
+                reason="tool_result_retrieval_unavailable",
+                arguments=projection_arguments,
+                projected_chars=len(reduction.inline_text),
+                reducer=reduction.reducer,
+                json_guard_applied=json_guard_applied,
+            )
         self.config.metadata["tool_projection_backend"] = "tokenjuice"
         if reduction.reducer:
             self.config.metadata["tool_projection_tokenjuice_reducer"] = reduction.reducer
@@ -6172,9 +6597,18 @@ class Agent:
         loaded_history = list(self._history)
         self._write_context_stage("session:loaded", loaded_history)
         sanitized_history, sanitize_result = sanitize_session_messages(loaded_history)
+        verification_history = limit_turns(
+            sanitized_history,
+            self.config.max_history_turns,
+        )
+        recoverable_references = await asyncio.to_thread(
+            self._verified_tool_result_references,
+            verification_history,
+        )
         sanitized_history, historical_projection_result = project_historical_tool_payloads(
             sanitized_history,
             preserve_reasoning_content=preserve_reasoning_content,
+            recoverable_references=recoverable_references,
         )
         sanitized_history = repair_tool_pairing(sanitized_history)
         sanitized_history = drop_reasoning(
@@ -7370,6 +7804,8 @@ class Agent:
                 _attempt_retries_used = _retry_policy.used_attempts()
                 _invalid_response_fallback_done = False
                 _message_limit_recovery_done = False
+                provider_activity_id = uuid.uuid4().hex
+                next_provider_activity_reason: _ProviderActivityReason = "initial"
                 while _retry_attempt <= _fallback.max_retries:
                     provider_error = None
                     assistant_text_parts = []
@@ -7484,6 +7920,38 @@ class Agent:
                         *base_request_turn_messages,
                         *request_suffix_messages,
                     ]
+                    base_recovery_available = self._tool_result_recovery_available()
+                    call_retrieval_available = bool(
+                        self._provider_schema_has_tool_result_retrieval(
+                            provider_tools_for_call
+                        )
+                        and base_recovery_available
+                    )
+                    call_recovery_downgraded = False
+                    if not call_retrieval_available:
+                        # Restore before provider-view assembly.  The physical
+                        # call's admission/sanitization must see the true byte
+                        # pressure; restoring after those passes can turn an
+                        # admitted bounded request into an unbounded one.
+                        restored_request_turn_messages = (
+                            self._restore_tool_results_without_retrieval_schema(
+                                request_turn_messages
+                            )
+                        )
+                        # A tool-less/finalization call may hide retrieval even
+                        # when history contains no projected Store references.
+                        # Only the actual raw restoration expands the request and
+                        # therefore needs the custom-provider admission gate.
+                        call_recovery_downgraded = (
+                            restored_request_turn_messages is not request_turn_messages
+                        )
+                        request_turn_messages = restored_request_turn_messages
+                    previous_call_retrieval = (
+                        self._provider_call_tool_result_retrieval_available
+                    )
+                    self._provider_call_tool_result_retrieval_available = (
+                        call_retrieval_available
+                    )
                     try:
                         (
                             request_messages,
@@ -7491,9 +7959,13 @@ class Agent:
                         ) = await self._provider_request_messages_with_sanitize_async(
                             request_turn_messages,
                             request_context_message=request_context_message,
-                            request_context_insert_index=active_request_context_insert_index,
+                            request_context_insert_index=(
+                                active_request_context_insert_index
+                            ),
                             runtime_context_message=runtime_context_message,
-                            runtime_context_insert_index=active_runtime_context_insert_index,
+                            runtime_context_insert_index=(
+                                active_runtime_context_insert_index
+                            ),
                             turn_objective_message=turn_objective_message,
                         )
                     except Exception as exc:
@@ -7513,6 +7985,10 @@ class Agent:
                         terminal_error = None
                         yield TextDeltaEvent(text=response_text)
                         break
+                    finally:
+                        self._provider_call_tool_result_retrieval_available = (
+                            previous_call_retrieval
+                        )
                     validation_error = validate_provider_chat_request(
                         self.provider,
                         request_messages,
@@ -7692,6 +8168,12 @@ class Agent:
                     if deadline_thinking_off_armed:
                         call_chat_cfg = _chat_config_with_thinking_disabled(call_chat_cfg)
                         _attempt_thinking_disabled = True
+                    if _total_deadline is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "turn_deadline_at_monotonic": _total_deadline,
+                            }
+                        )
                     if self._provider_request_correlation is not None:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={
@@ -7712,6 +8194,85 @@ class Agent:
                                 )
                             }
                         )
+
+                    if call_recovery_downgraded and not bool(
+                        getattr(
+                            self.provider,
+                            "final_request_admission_guaranteed",
+                            False,
+                        )
+                    ):
+                        # Built-in adapters perform exact admission before
+                        # network I/O. A custom/plugin provider may not. When
+                        # this physical call hid retrieval and therefore
+                        # restored raw tool results, require either its exact
+                        # projector or conservative local token+character
+                        # bounds before handing it the expanded envelope.
+                        exact_projection = project_provider_final_request(
+                            self.provider,
+                            request_messages,
+                            provider_tools_for_call,
+                            call_chat_cfg,
+                        )
+                        if exact_projection is not None:
+                            restored_request_fits = exact_projection.fits
+                            admission_source = "provider_exact_projection"
+                        else:
+                            estimated_tokens = self._estimate_live_request_tokens(
+                                request_messages,
+                                tools=provider_tools_for_call,
+                                config=call_chat_cfg,
+                            )
+                            estimated_chars = self._estimate_live_request_chars(
+                                request_messages,
+                                tools=provider_tools_for_call,
+                                config=call_chat_cfg,
+                            )
+                            budget = self._context_budget_governor().snapshot()
+                            token_limit = max(
+                                1,
+                                int(budget.usable_tokens * budget.threshold),
+                            )
+                            char_limit = budget.provider_request_max_chars
+                            restored_request_fits = bool(
+                                estimated_tokens <= token_limit
+                                and estimated_chars <= char_limit
+                            )
+                            admission_source = "conservative_local_projection"
+                        if not restored_request_fits:
+                            terminal_error = ErrorEvent(
+                                message=(
+                                    "The provider request cannot safely include raw "
+                                    "tool results while retrieval is unavailable."
+                                ),
+                                code="provider_request_budget_exhausted",
+                            )
+                            if goal_terminal_final_response_pending:
+                                response_text = _record_goal_terminal_synthesized_response(
+                                    reason=terminal_error.message,
+                                    code=terminal_error.code,
+                                )
+                                assistant_text_parts.append(response_text)
+                                provider_done_for_log = ProviderDoneEvent(
+                                    stop_reason="stop"
+                                )
+                                _got_done_event = True
+                                _got_error = False
+                                terminal_error = None
+                                yield TextDeltaEvent(text=response_text)
+                            else:
+                                self._write_turn_call_log(
+                                    "turn_policy_decision",
+                                    action="stop",
+                                    reason=terminal_error.message,
+                                    code=terminal_error.code,
+                                    admission_source=admission_source,
+                                    iteration=iterations,
+                                    attempt=_call_attempt,
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                yield terminal_error
+                            break
 
                     self._write_turn_call_log(
                         "llm_request",
@@ -7741,6 +8302,9 @@ class Agent:
 
                     _got_done_event = False
                     attempt_user_visible_emitted = False
+                    attempt_irreversible_output_emitted = False
+                    reasoning_activity_started_at_ms = 0
+                    last_reasoning_activity_pulse_at = 0.0
                     # Time-to-first-event for this provider call, stamped once
                     # at the first streamed event (diagnostics only).
                     first_event_at: float | None = None
@@ -7770,23 +8334,41 @@ class Agent:
                     ):
                         usage_call = await self._usage_call_start(usage_scope)
 
+                    yield ProviderActivityEvent(
+                        activity_id=provider_activity_id,
+                        phase="requesting",
+                        reason=next_provider_activity_reason,
+                        retry_attempt=_retry_attempt,
+                        retry_limit=_fallback.max_retries,
+                        started_at=time.time_ns() // 1_000_000,
+                    )
+
                     try:
-                        if self._failure_injector is None:
-                            raw_stream = self.provider.chat(
-                                request_messages,
-                                tools=provider_tools_for_call,
-                                config=call_chat_cfg,
-                            )
-                        else:
-                            # Test-only seam: the injector either delegates this
-                            # exact call to self.provider or replaces it with one
-                            # scripted synthetic failure (see provider/types.py).
-                            raw_stream = self._failure_injector.chat(
-                                self.provider,
-                                request_messages,
-                                tools=provider_tools_for_call,
-                                config=call_chat_cfg,
-                            )
+                        try:
+                            if self._failure_injector is None:
+                                raw_stream = self.provider.chat(
+                                    request_messages,
+                                    tools=provider_tools_for_call,
+                                    config=call_chat_cfg,
+                                )
+                            else:
+                                # Test-only seam: the injector either delegates this
+                                # exact call to self.provider or replaces it with one
+                                # scripted synthetic failure (see provider/types.py).
+                                raw_stream = self._failure_injector.chat(
+                                    self.provider,
+                                    request_messages,
+                                    tools=provider_tools_for_call,
+                                    config=call_chat_cfg,
+                                )
+                        except (asyncio.CancelledError, UsageAccountingUnavailableError):
+                            raise
+                        except Exception:  # noqa: BLE001 - provider boundary
+                            # Never retain upstream prose on the exception that
+                            # crosses into the agent loop.  The original
+                            # exception is deliberately not chained because SDK
+                            # messages may contain response bodies or secrets.
+                            raise _RaisedProviderBoundaryError from None
                         pending_install_deadline: float | None = (
                             self._pending_durable_compaction_event
                             .compaction_deadline_at_monotonic
@@ -7827,10 +8409,34 @@ class Agent:
                                     yield pending_event
                             if first_event_at is None:
                                 first_event_at = time.monotonic()
-                            if isinstance(raw_ev, ProviderTextDelta):
+                            if isinstance(raw_ev, ProviderDomainActivityEvent):
+                                activity_phase = _normalize_provider_activity_phase(
+                                    raw_ev.phase
+                                )
+                                if activity_phase == "reasoning":
+                                    if reasoning_activity_started_at_ms == 0:
+                                        reasoning_activity_started_at_ms = (
+                                            max(0, raw_ev.started_at)
+                                            or time.time_ns() // 1_000_000
+                                        )
+                                    last_reasoning_activity_pulse_at = time.monotonic()
+                                yield ProviderActivityEvent(
+                                    schema_version=1,
+                                    activity_id=provider_activity_id,
+                                    phase=activity_phase,
+                                    reason=_normalize_provider_activity_reason(raw_ev.reason),
+                                    retry_attempt=max(0, raw_ev.retry_attempt),
+                                    retry_limit=max(0, raw_ev.retry_limit),
+                                    retry_after_ms=max(0, raw_ev.retry_after_ms),
+                                    started_at=max(0, raw_ev.started_at),
+                                    heartbeat=bool(raw_ev.heartbeat),
+                                )
+
+                            elif isinstance(raw_ev, ProviderTextDelta):
                                 assistant_text_parts.append(raw_ev.text)
                                 if raw_ev.text:
                                     attempt_user_visible_emitted = True
+                                    attempt_irreversible_output_emitted = True
                                 if text_presentation_decided:
                                     # A tool already appeared this call, so all
                                     # text here is intermediate narration.
@@ -7859,6 +8465,37 @@ class Agent:
                                 # still arrives via DoneEvent.reasoning_content.
                                 if raw_ev.text and reasoning_started_at_ms == 0:
                                     reasoning_started_at_ms = time.time_ns() // 1_000_000
+                                if raw_ev.text:
+                                    # Bare providers reach Agent without the
+                                    # selector's pre-text buffer. This thinking
+                                    # delta therefore crosses the live-client
+                                    # boundary immediately and cannot later be
+                                    # discarded in favour of another attempt.
+                                    attempt_irreversible_output_emitted = True
+                                    now_monotonic = time.monotonic()
+                                    first_reasoning_activity = (
+                                        reasoning_activity_started_at_ms == 0
+                                    )
+                                    if first_reasoning_activity:
+                                        reasoning_activity_started_at_ms = (
+                                            time.time_ns() // 1_000_000
+                                        )
+                                    if (
+                                        first_reasoning_activity
+                                        or now_monotonic
+                                        - last_reasoning_activity_pulse_at
+                                        >= _PROVIDER_REASONING_PULSE_INTERVAL_SECONDS
+                                    ):
+                                        yield ProviderActivityEvent(
+                                            activity_id=provider_activity_id,
+                                            phase="reasoning",
+                                            reason="initial",
+                                            retry_attempt=_retry_attempt,
+                                            retry_limit=_fallback.max_retries,
+                                            started_at=reasoning_activity_started_at_ms,
+                                            heartbeat=not first_reasoning_activity,
+                                        )
+                                        last_reasoning_activity_pulse_at = now_monotonic
                                 yield ThinkingEvent(
                                     text=raw_ev.text,
                                     started_at=reasoning_started_at_ms,
@@ -8103,6 +8740,7 @@ class Agent:
                                 )
                                 tool_argument_heartbeat_chars[raw_ev.tool_use_id] = 0
                                 attempt_user_visible_emitted = True
+                                attempt_irreversible_output_emitted = True
                                 yield ToolUseStartEvent(
                                     tool_use_id=raw_ev.tool_use_id,
                                     tool_name=raw_ev.tool_name,
@@ -8733,12 +9371,30 @@ class Agent:
                             yield TextDeltaEvent(text=response_text)
                             break
                         raise
-                    except Exception:
-                        # A provider stream that raises (instead of yielding a
-                        # ProviderErrorEvent) must still enter the stats before
-                        # the exception propagates unchanged.
+                    except UsageAccountingUnavailableError as exc:
+                        # Usage-ledger admission is an engine control-plane
+                        # failure, not an upstream provider exception. Preserve
+                        # its stable retryable code for TurnRunner/Gateway.
+                        usage_unknown_reason = str(
+                            getattr(exc, "code", "usage_accounting_unavailable")
+                        )
+                        _notify_call_outcome(
+                            ok=False,
+                            failure_kind=usage_unknown_reason,
+                        )
+                        raise
+                    except _RaisedProviderBoundaryError:
+                        # Some SDKs raise from call creation or async iteration
+                        # instead of yielding a ProviderErrorEvent.  Only those
+                        # two provider-boundary operations are wrapped in this
+                        # content-free marker.  Exceptions raised while the
+                        # engine applies pending input or processes events stay
+                        # internal and propagate unchanged.
                         usage_unknown_reason = "provider_exception"
-                        _notify_call_outcome(ok=False, failure_kind="raised")
+                        _notify_call_outcome(
+                            ok=False,
+                            failure_kind=ProviderFailureKind.TRANSPORT_TRANSIENT.value,
+                        )
                         if goal_terminal_final_response_pending:
                             response_text = _goal_terminal_final_response_text()
                             assistant_text_parts.append(response_text)
@@ -8753,7 +9409,24 @@ class Agent:
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
-                        raise
+                        provider_error = ProviderErrorEvent(
+                            message=(
+                                "The connection to the model provider ended before "
+                                "the response completed."
+                                if attempt_irreversible_output_emitted
+                                else (
+                                    "The connection to the model provider was "
+                                    "interrupted."
+                                )
+                            ),
+                            code=(
+                                "response_incomplete"
+                                if attempt_irreversible_output_emitted
+                                else "request_error"
+                            ),
+                        )
+                        provider_error_for_log = provider_error
+                        _got_error = True
                     finally:
                         if usage_call is not None and not usage_call_terminal:
                             await self._usage_call_unknown(
@@ -8819,8 +9492,12 @@ class Agent:
                             response_payload["ensemble_trace"] = ensemble_trace
                     if provider_error_for_log is not None:
                         response_payload["error"] = {
-                            "message": provider_error_for_log.message,
-                            "code": provider_error_for_log.code,
+                            "code": safe_provider_failure_code(
+                                provider_error_for_log.code,
+                                None,
+                            ),
+                            "code_chars": len(provider_error_for_log.code),
+                            "message_chars": len(provider_error_for_log.message),
                         }
                         self._write_turn_call_log("llm_error", **response_payload)
                     else:
@@ -8875,6 +9552,7 @@ class Agent:
                         if response_text:
                             assistant_text_parts.append(response_text)
                             attempt_user_visible_emitted = True
+                            attempt_irreversible_output_emitted = True
                             yield TextDeltaEvent(text=response_text)
                     post_tool_turn = _tail_has_tool_result(request_messages)
                     if (
@@ -9214,6 +9892,18 @@ class Agent:
                                 )
                             ):
                                 _invalid_response_fallback_done = True
+                                fallback_reason = _provider_activity_reason_for_attempt(
+                                    attempt_classification.kind
+                                )
+                                next_provider_activity_reason = fallback_reason
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    phase="fallback",
+                                    reason=fallback_reason,
+                                    retry_attempt=_call_attempt + 1,
+                                    retry_limit=_fallback.max_retries,
+                                    started_at=time.time_ns() // 1_000_000,
+                                )
                                 yield WarningEvent(
                                     code="provider_large_context_fallback",
                                     message=(
@@ -9274,6 +9964,19 @@ class Agent:
                                             else "retrying once to request visible content."
                                         )
                                     ),
+                                )
+                                next_provider_activity_reason = "reasoning_only"
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    phase="retrying",
+                                    reason="reasoning_only",
+                                    retry_attempt=_attempt_retries_used[
+                                        _ProviderAttemptKind.REASONING_ONLY
+                                    ],
+                                    retry_limit=_retry_policy.attempt_budgets[
+                                        _ProviderAttemptKind.REASONING_ONLY
+                                    ],
+                                    started_at=time.time_ns() // 1_000_000,
                                 )
                                 _call_attempt += 1
                                 continue
@@ -9355,6 +10058,19 @@ class Agent:
                                         "retrying once to request visible content."
                                     ),
                                 )
+                            next_provider_activity_reason = "reasoning_only"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retrying",
+                                reason="reasoning_only",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.REASONING_ONLY
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.REASONING_ONLY
+                                ],
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
 
@@ -9376,7 +10092,33 @@ class Agent:
                                 code="provider_empty_retry",
                                 message="The provider returned an empty response; retrying once.",
                             )
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retry_wait",
+                                reason="invalid_response",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             await asyncio.sleep(delay)
+                            next_provider_activity_reason = "invalid_response"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retrying",
+                                reason="invalid_response",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.MALFORMED_EMPTY
+                                ],
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
 
@@ -9401,7 +10143,33 @@ class Agent:
                                     "The provider stream ended before completion; retrying once."
                                 ),
                             )
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retry_wait",
+                                reason="stream_incomplete",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             await asyncio.sleep(delay)
+                            next_provider_activity_reason = "stream_incomplete"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retrying",
+                                reason="stream_incomplete",
+                                retry_attempt=_attempt_retries_used[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                retry_limit=_retry_policy.attempt_budgets[
+                                    _ProviderAttemptKind.STREAM_INCOMPLETE
+                                ],
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
 
@@ -9461,6 +10229,18 @@ class Agent:
                             )
                         ):
                             _invalid_response_fallback_done = True
+                            fallback_reason = _provider_activity_reason_for_attempt(
+                                attempt_classification.kind
+                            )
+                            next_provider_activity_reason = fallback_reason
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="fallback",
+                                reason=fallback_reason,
+                                retry_attempt=_call_attempt + 1,
+                                retry_limit=_fallback.max_retries,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             yield WarningEvent(
                                 code="provider_empty_retry",
                                 message=(
@@ -9598,12 +10378,41 @@ class Agent:
                             raw_code=provider_error.code,
                             message=provider_error.message,
                         )
+                        safe_provider_error_code = safe_provider_failure_code(
+                            provider_error.code,
+                            failure_kind.value,
+                        )
                         kind = _fallback.classify_error(
                             provider_error.message,
                             provider_name=getattr(self.provider, "provider_name", ""),
                             status_code=provider_error_status_code,
                             raw_code=provider_error.code,
                         )
+                        if attempt_irreversible_output_emitted:
+                            # Text, reasoning, and tool lifecycle frames are
+                            # streamed to the client immediately and cannot be
+                            # rolled back. A retry or fallback after that commit
+                            # would replay or mix attempts, while the terminal
+                            # transcript would retain only the later attempt.
+                            # Selector-buffered failed-leg reasoning remains
+                            # retryable because it never reaches this boundary.
+                            _log.warning(
+                                "provider.retry_suppressed",
+                                reason="user_visible_output_committed",
+                                kind=kind.value,
+                                provider=getattr(self.provider, "provider_name", ""),
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_error_code,
+                                failure_kind=failure_kind.value,
+                            )
+                            yield terminal_error
+                            break
                         if goal_terminal_final_response_pending:
                             response_text = _goal_terminal_final_response_text()
                             assistant_text_parts.append(response_text)
@@ -9615,7 +10424,7 @@ class Agent:
                                 action="terminal_after_summary_provider_error",
                                 reason="goal_terminal",
                                 code=goal_terminal_final_status or "goal_terminal",
-                                provider_error_code=provider_error.code,
+                                provider_error_code=safe_provider_error_code,
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
@@ -9759,8 +10568,11 @@ class Agent:
                             continue
                         if artifact_delivery_final_response_pending:
                             yield _finish_artifact_delivery_degraded(
-                                reason=provider_error.message,
-                                code=provider_error.code,
+                                reason=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_error_code,
                             )
                             break
                         if max_iterations_finalization_pending:
@@ -9779,7 +10591,7 @@ class Agent:
                                 action="partial_after_finalization_provider_error",
                                 reason="max_iterations",
                                 code="max_iterations",
-                                provider_error_code=provider_error.code,
+                                provider_error_code=safe_provider_error_code,
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
@@ -9799,7 +10611,7 @@ class Agent:
                                 action="partial_after_finalization_provider_error",
                                 reason="post_write_convergence",
                                 code="post_write_convergence",
-                                provider_error_code=provider_error.code,
+                                provider_error_code=safe_provider_error_code,
                             )
                             yield TextDeltaEvent(text=response_text)
                             break
@@ -9818,7 +10630,7 @@ class Agent:
                                 call_attempt=_call_attempt,
                                 provider_retry_attempt=_retry_attempt,
                                 post_tool_turn=post_tool_turn,
-                                provider_error_code=provider_error.code,
+                                provider_error_code=safe_provider_error_code,
                                 retrying=True,
                             )
                             delay = backoff_sleep(
@@ -9840,8 +10652,26 @@ class Agent:
                                     "execution; retrying once."
                                 ),
                             )
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retry_wait",
+                                reason="empty_response",
+                                retry_attempt=_retry_attempt + 1,
+                                retry_limit=_fallback.max_retries,
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             await asyncio.sleep(delay)
                             _retry_attempt += 1
+                            next_provider_activity_reason = "empty_response"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                phase="retrying",
+                                reason="empty_response",
+                                retry_attempt=_retry_attempt,
+                                retry_limit=_fallback.max_retries,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
                             _call_attempt += 1
                             continue
                         if failure_kind == ProviderFailureKind.CONTEXT_OVERFLOW:
@@ -10692,7 +11522,17 @@ class Agent:
                                 message_count_request_view = None
                             _call_attempt += 1
                             continue
-                        should_retry = _fallback.should_retry(kind, _retry_attempt)
+                        # The selector has already proved that honoring this
+                        # authority's Retry-After would cross the absolute turn
+                        # deadline (or the bounded 15-minute wait ceiling).
+                        # Retrying through Agent's outer loop could advance the
+                        # same selector again and accidentally call another
+                        # same-authority leg early, so this typed outcome is
+                        # terminal for the current turn.
+                        should_retry = (
+                            provider_error.code != "provider_retry_after_deadline"
+                            and _fallback.should_retry(kind, _retry_attempt)
+                        )
                         retry_failed_call_safe = (
                             getattr(
                                 self.provider,
@@ -10712,26 +11552,98 @@ class Agent:
                         if not should_retry:
                             yield self._transition(AgentState.ERROR)
                             terminal_error = ErrorEvent(
-                                message=provider_error.message,
-                                code=provider_error.code,
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_failure_code(
+                                    provider_error.code,
+                                    failure_kind.value,
+                                ),
                                 failure_kind=failure_kind.value,
                             )
                             yield terminal_error
                             break
-                        delay = backoff_sleep(
+                        local_delay = backoff_sleep(
                             _retry_attempt,
                             _fallback.base_backoff_ms,
                             _fallback.max_backoff_ms,
                             _fake=True,
                         )
+                        resolved_retry_delay = _provider_retry_delay_seconds(
+                            local_delay_s=local_delay,
+                            provider_retry_after_s=provider_error.retry_after_s,
+                        )
+                        reason = _provider_activity_reason_for_failure(failure_kind)
+                        retry_exceeds_deadline = bool(
+                            resolved_retry_delay is not None
+                            and _total_deadline is not None
+                            and _loop.time() + resolved_retry_delay >= _total_deadline
+                        )
+                        if resolved_retry_delay is None or retry_exceeds_deadline:
+                            if self._switch_to_invalid_response_fallback(
+                                failure_kind.value
+                            ):
+                                next_provider_activity_reason = reason
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    phase="fallback",
+                                    reason=reason,
+                                    retry_attempt=_retry_attempt + 1,
+                                    retry_limit=_fallback.max_retries,
+                                    retry_after_ms=(
+                                        math.ceil(
+                                            max(
+                                                0.0,
+                                                float(provider_error.retry_after_s or 0.0),
+                                            )
+                                            * 1000
+                                        )
+                                    ),
+                                    started_at=time.time_ns() // 1_000_000,
+                                )
+                                _call_attempt += 1
+                                continue
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=_safe_provider_terminal_message(
+                                    failure_kind,
+                                    provider_error.code,
+                                ),
+                                code=safe_provider_failure_code(
+                                    provider_error.code,
+                                    failure_kind.value,
+                                ),
+                                failure_kind=failure_kind.value,
+                            )
+                            yield terminal_error
+                            break
                         _log.warning(
                             "provider.retry",
                             attempt=_retry_attempt + 1,
                             kind=kind.value,
-                            delay_s=round(delay, 2),
+                            delay_s=round(resolved_retry_delay, 2),
                         )
-                        await asyncio.sleep(delay)
+                        yield ProviderActivityEvent(
+                            activity_id=provider_activity_id,
+                            phase="retry_wait",
+                            reason=reason,
+                            retry_attempt=_retry_attempt + 1,
+                            retry_limit=_fallback.max_retries,
+                            retry_after_ms=math.ceil(resolved_retry_delay * 1000),
+                            started_at=time.time_ns() // 1_000_000,
+                        )
+                        await asyncio.sleep(resolved_retry_delay)
                         _retry_attempt += 1
+                        next_provider_activity_reason = reason
+                        yield ProviderActivityEvent(
+                            activity_id=provider_activity_id,
+                            phase="retrying",
+                            reason=reason,
+                            retry_attempt=_retry_attempt,
+                            retry_limit=_fallback.max_retries,
+                            started_at=time.time_ns() // 1_000_000,
+                        )
                         _call_attempt += 1
 
                 if terminal_error is not None:
@@ -15975,7 +16887,12 @@ class Agent:
         total_deadline: float | None,
         deadline_provider: Callable[[], float | None] | None = None,
     ) -> AsyncIterator[Any]:
-        stream_iter = stream.__aiter__()
+        try:
+            stream_iter = stream.__aiter__()
+        except (asyncio.CancelledError, UsageAccountingUnavailableError):
+            raise
+        except Exception:  # noqa: BLE001 - provider boundary
+            raise _RaisedProviderBoundaryError from None
         while True:
             dynamic_deadline = (
                 deadline_provider()
@@ -16026,9 +16943,17 @@ class Agent:
                     )
                 raise _IterationStreamTimeoutError
             try:
-                yield next_event.result()
+                event = next_event.result()
             except StopAsyncIteration:
                 return
+            except (asyncio.CancelledError, UsageAccountingUnavailableError):
+                raise
+            except Exception:  # noqa: BLE001 - provider boundary
+                # TimeoutError raised *by the provider* is different from the
+                # deadline timeouts raised above by this wrapper.  Project it
+                # through the same content-free provider failure path.
+                raise _RaisedProviderBoundaryError from None
+            yield event
 
     @staticmethod
     async def _close_provider_stream(stream_iter: AsyncIterator[Any]) -> None:
@@ -16038,7 +16963,10 @@ class Agent:
         try:
             await aclose()
         except Exception as exc:  # noqa: BLE001 - cleanup must not mask timeout
-            logger.debug("provider_stream.close_failed", error=str(exc))
+            logger.debug(
+                "provider_stream.close_failed",
+                error_type=type(exc).__name__,
+            )
 
     def _provider_request_messages(
         self,
@@ -16887,6 +17815,8 @@ class Agent:
         )
 
     def _apply_provider_tool_result_overrides(self, messages: list[Message]) -> list[Message]:
+        if not self._tool_result_recovery_available():
+            return messages
         if (
             not self._provider_tool_result_overrides
             and not self._provider_tool_result_frozen_overrides
@@ -17261,6 +18191,25 @@ class Agent:
     ) -> int:
         """Estimate the current provider request size without lifetime usage."""
 
+        return max(
+            1,
+            self._estimate_live_request_chars(
+                messages,
+                tools=tools,
+                config=config,
+            )
+            // 4,
+        )
+
+    def _estimate_live_request_chars(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> int:
+        """Measure the complete conservative request envelope in JSON chars."""
+
         payload: dict[str, Any] = {
             "messages": [self._live_request_jsonable(message) for message in messages],
         }
@@ -17276,8 +18225,7 @@ class Agent:
             )
             payload.update(config_payload)
 
-        estimated_chars = len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
-        return max(1, estimated_chars // 4)
+        return len(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str))
 
     async def _check_context_overflow(
         self,
@@ -20295,6 +21243,11 @@ class Agent:
                 finally:
                     current_tool_context.reset(token)
 
+        setattr(
+            _subagent_tool_handler,
+            "_opensquilla_available_tools",
+            getattr(self._raw_tool_handler, "_opensquilla_available_tools", frozenset()),
+        )
         child_cfg = AgentConfig(
             max_iterations=spec.max_iterations,
             timeout=spec.timeout,
@@ -20431,9 +21384,12 @@ class Agent:
             max_safe_tool_concurrency=self.config.max_safe_tool_concurrency,
             tool_result_external_keep_recent=self.config.tool_result_external_keep_recent,
             tool_result_store_dir=self.config.tool_result_store_dir,
-            tool_result_store_session_id=self.config.tool_result_store_session_id,
-            tool_result_store_session_key=self.config.tool_result_store_session_key,
-            tool_result_store_agent_id=self.config.tool_result_store_agent_id,
+            # Rebind Store identity to the child's live ToolContext. Dispatch
+            # snapshots, Agent projections, verifier scope, and retrieval must
+            # all address the same session bucket and principal.
+            tool_result_store_session_id=subagent_ctx.tool_result_store_session_id,
+            tool_result_store_session_key=subagent_ctx.session_key,
+            tool_result_store_agent_id=subagent_ctx.agent_id,
             tool_result_store_full_trace=self.config.tool_result_store_full_trace,
             tool_result_store_max_bytes=self.config.tool_result_store_max_bytes,
             tool_result_store_disk_budget_bytes=(self.config.tool_result_store_disk_budget_bytes),

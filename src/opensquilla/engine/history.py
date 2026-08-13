@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from opensquilla.execution_status import (
@@ -15,6 +16,7 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     Message,
 )
+from opensquilla.silent_reply import sanitize_historical_silent_reply
 
 _SYNTHETIC_USER_PREFIXES = (
     "[Available skills for this turn]",
@@ -217,6 +219,8 @@ def reconstruct_messages_from_entry(
     content: Any,
     tool_calls: list[dict[str, Any]] | None,
     reasoning_content: str | None = None,
+    *,
+    turn_context: Mapping[str, Any] | None = None,
 ) -> list[Message]:
     """Rebuild provider Messages from one persisted transcript entry.
 
@@ -238,6 +242,15 @@ def reconstruct_messages_from_entry(
     """
     if role not in ("user", "assistant"):
         return []
+
+    silent_reply = sanitize_historical_silent_reply(
+        content,
+        tool_calls,
+        role=role,
+        turn_context=turn_context,
+    )
+    content = silent_reply.content
+    tool_calls = silent_reply.segments
 
     if role == "user":
         if content:

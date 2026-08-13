@@ -15,7 +15,7 @@ import pytest
 import pytest_asyncio
 
 from opensquilla.session import manager as session_manager_module
-from opensquilla.session.compaction import CompactionConfig
+from opensquilla.session.compaction import CompactionConfig, CompactionResult
 from opensquilla.session.context_view import (
     build_compaction_context_records,
     format_compaction_summary_context,
@@ -2404,6 +2404,149 @@ async def test_compact_no_op_small_context(manager):
     await manager.append_message("agent:main:main", "user", "hi", token_count=5)
     summary = await manager.compact("agent:main:main", context_window_tokens=100_000)
     assert summary == ""
+
+
+def test_compaction_payload_suppresses_split_goal_marker_around_tool_pair() -> None:
+    raw_segments = [
+        {"type": "text", "text": "NO_"},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-split",
+            "name": "read_status",
+            "input": {"id": "job-split"},
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-split",
+            "name": "read_status",
+            "result": "pending",
+            "is_error": False,
+        },
+        {"type": "text", "text": "REPLY"},
+    ]
+    entry = TranscriptEntry(
+        session_id="session-split",
+        session_key="agent:main:split",
+        role="assistant",
+        content="NO_REPLY",
+        tool_calls=raw_segments,
+        turn_context={"intent": "goal_continuation"},
+    )
+
+    payload = session_manager_module._compaction_entry_payloads([entry])[0]
+
+    assert payload["content"] == ""
+    assert payload["tool_calls"] == [raw_segments[1], raw_segments[2]]
+    assert payload["turn_context"] == {"intent": "goal_continuation"}
+    assert "NO_" not in str(payload["tool_calls"])
+    assert "REPLY" not in str(payload["tool_calls"])
+    assert entry.content == "NO_REPLY"
+    assert entry.tool_calls == raw_segments
+
+
+@pytest.mark.asyncio
+async def test_compaction_payload_sanitizes_silent_replies_without_rewriting_storage(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:main")
+    raw_segments = [
+        {"type": "text", "text": "NO_REPLY\nWaiting for an external update."},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-status",
+            "name": "read_status",
+            "input": {},
+        },
+        {"type": "text", "text": "HEARTBEAT_OK"},
+    ]
+    goal_entry, expected_epoch = await manager.prepare_message(
+        node.session_key,
+        "assistant",
+        "HEARTBEAT_OK\nWaiting for an external update.\nNO_REPLY",
+        tool_calls=raw_segments,
+        turn_context={"intent": "goal_continuation"},
+    )
+    await manager._storage.append_transcript_entry(
+        goal_entry,
+        expected_epoch=expected_epoch,
+    )
+    unattributed_entry, expected_epoch = await manager.prepare_message(
+        node.session_key,
+        "assistant",
+        "NO_REPLY\nQuoted protocol example.",
+        tool_calls=[
+            {"type": "text", "text": "HEARTBEAT_OK\nQuoted segment example."}
+        ],
+        turn_context={},
+    )
+    await manager._storage.append_transcript_entry(
+        unattributed_entry,
+        expected_epoch=expected_epoch,
+    )
+    exact_entry, expected_epoch = await manager.prepare_message(
+        node.session_key,
+        "assistant",
+        "NO_REPLY",
+        turn_context={},
+    )
+    await manager._storage.append_transcript_entry(
+        exact_entry,
+        expected_epoch=expected_epoch,
+    )
+
+    captured_payloads: list[dict[str, Any]] = []
+
+    async def capture_compaction_request(request):
+        captured_payloads.extend(request.entries)
+        return CompactionResult(
+            summary="",
+            kept_entries=request.entries,
+            removed_count=0,
+            chunks_processed=0,
+            summary_source="skipped",
+            skip_reason="within_compaction_budget",
+        )
+
+    monkeypatch.setattr(
+        session_manager_module,
+        "compact_context",
+        capture_compaction_request,
+    )
+    stored_before = await manager._storage.get_transcript(node.session_id)
+
+    await manager.compact_with_result(
+        node.session_key,
+        context_window_tokens=100_000,
+    )
+
+    payloads = captured_payloads
+
+    assert len(payloads) == len(stored_before) == 3
+    assert payloads[0]["content"] == "Waiting for an external update."
+    assert payloads[0]["tool_calls"] == [
+        {"type": "text", "text": "Waiting for an external update."},
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-status",
+            "name": "read_status",
+            "input": {},
+        },
+    ]
+    assert payloads[1]["content"] == "NO_REPLY\nQuoted protocol example."
+    assert payloads[1]["tool_calls"][0]["text"] == (
+        "HEARTBEAT_OK\nQuoted segment example."
+    )
+    assert payloads[2]["content"] == ""
+    assert payloads[2]["tool_calls"] is None
+
+    stored_after = await manager._storage.get_transcript(node.session_id)
+    assert [entry.content for entry in stored_after] == [
+        "HEARTBEAT_OK\nWaiting for an external update.\nNO_REPLY",
+        "NO_REPLY\nQuoted protocol example.",
+        "NO_REPLY",
+    ]
+    assert stored_after[0].tool_calls == raw_segments
 
 
 def test_durable_summary_replay_matches_runtime_formatter() -> None:

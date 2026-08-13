@@ -286,6 +286,110 @@ def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
     asyncio.run(run_case())
 
 
+def test_failed_second_start_does_not_reset_active_stream_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import boot
+    from opensquilla.gateway.session_streams import (
+        get_session_streams,
+        reset_session_streams,
+    )
+
+    active = reset_session_streams(stream_generation="active-generation")
+    active.record(
+        "agent:main:webchat:active",
+        "session.event.text_delta",
+        {"text": "still live"},
+    )
+    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
+
+    def reject_second_owner(_self: Any) -> None:
+        raise RuntimeError("gateway already owns pid lock")
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
+        reject_second_owner,
+    )
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+    )
+
+    async def run_case() -> None:
+        with pytest.raises(RuntimeError, match="already owns pid lock"):
+            await boot.start_gateway_server(config=config, run=False)
+
+        assert get_session_streams() is active
+        assert get_session_streams().stream_generation == "active-generation"
+        assert get_session_streams().current_seq("agent:main:webchat:active") == 1
+
+    try:
+        asyncio.run(run_case())
+    finally:
+        reset_session_streams()
+
+
+def test_failed_desktop_ownership_does_not_reset_active_stream_generation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway import boot
+    from opensquilla.gateway.session_streams import (
+        get_session_streams,
+        reset_session_streams,
+    )
+
+    events: list[str] = []
+    active = reset_session_streams(stream_generation="active-generation")
+    active.record(
+        "agent:main:webchat:active",
+        "session.event.text_delta",
+        {"text": "still live"},
+    )
+    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
+    monkeypatch.setattr(boot, "emit_skill_filter_banner", lambda config: None)
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.acquire",
+        lambda self: events.append("acquire"),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.pidlock.GatewayPidLock.release",
+        lambda self: events.append("release"),
+    )
+
+    def reject_desktop_owner(**_kwargs: Any) -> None:
+        raise RuntimeError("desktop lifecycle already owned")
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.desktop_ownership.activate_desktop_gateway_ownership",
+        reject_desktop_owner,
+    )
+    config = GatewayConfig(
+        state_dir=str(tmp_path / "state"),
+        workspace_dir=str(tmp_path / "workspace"),
+        control_ui={"enabled": False},
+        channels={"channels": []},
+    )
+
+    async def run_case() -> None:
+        with pytest.raises(RuntimeError, match="desktop lifecycle already owned"):
+            await boot.start_gateway_server(config=config, run=True)
+
+        assert events == ["acquire", "release"]
+        assert get_session_streams() is active
+        assert get_session_streams().stream_generation == "active-generation"
+        assert get_session_streams().current_seq("agent:main:webchat:active") == 1
+
+    try:
+        asyncio.run(run_case())
+    finally:
+        reset_session_streams()
+
+
 def test_start_gateway_server_starts_telemetry_after_listener_and_runtime_are_ready(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -345,6 +345,11 @@ sentinel tokens so the runtime can suppress the reply:
 - `NO_REPLY` — for routine status / heartbeat messages not addressed to you.
 - `HEARTBEAT_OK` — specifically for heartbeat polls.
 
+When choosing a sentinel, output that single bare token and nothing else.
+Do not wrap it in Markdown or add explanation or status text.
+When a Goal continuation has user-visible information, output that information
+directly and do not combine it with either sentinel.
+
 IMPORTANT: Never use `NO_REPLY` for messages from a human user, even simple
 greetings like "hi". Always respond to direct user messages.
 

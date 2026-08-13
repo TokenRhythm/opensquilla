@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "Einklappen der Seitenleiste abgebrochen",
     "openBlockedSession": "Blockierte Sitzung öffnen",
     "approvalRequired": "Genehmigung erforderlich",
+    "approvalRequiredCount": "Genehmigungen erforderlich: {count}",
+    "systemStatus": "Systemstatus",
+    "systemStatusSummary": "Systemstatus: {state}; {count} Hinweise",
     "manageConnection": "Gateway-Verbindung verwalten",
     "connectionTitle": "Verbindung: {state} — in den Einstellungen verwalten",
     "connectionState": {
@@ -3189,6 +3192,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Chat erstellt",
+      "open": "Chat öffnen"
+    },
     "promptCacheKeepalive": {
       "action": "Prompt-Cache aktiv halten",
       "title": "Prompt-Cache aktiv halten",
@@ -3440,6 +3447,14 @@
         "interrupted": "Unterbrochen",
         "failed": "Fehlgeschlagen"
       },
+      "provider": {
+        "waiting": "Warten auf das Modell",
+        "reasoning": "Tiefes Nachdenken",
+        "rateLimited": "Ratenlimit · neuer Versuch in {seconds}s",
+        "retryWait": "Neuer Versuch in {seconds}s",
+        "retrying": "Neuer Versuch {attempt}/{limit}",
+        "fallback": "Wechsel zum Ersatzmodell"
+      },
       "purpose": {
         "discover": "Links gefunden",
         "search": "Web durchsucht",
@@ -3655,6 +3670,7 @@
       "pausedTitle": "Ziel angehalten",
       "completeTitle": "Ziel abgeschlossen",
       "sentAsGoal": "Als Ziel gesendet",
+      "achieved": "Ziel erreicht",
       "achievedIn": "Ziel erreicht · {duration} aktiv",
       "blockedTitle": "Ziel blockiert",
       "usageLimitedTitle": "Zielnutzung begrenzt",
@@ -3754,7 +3770,17 @@
       "label": "Ausstehend {count}/{max}",
       "hint": "Alt+↑ holt die neueste zurück in die Eingabe · ESC stellt alle in die Eingabe zurück · sendet FIFO, wenn die aktuelle Antwort abgeschlossen ist",
       "steerHint": "Lenkmodus: Neuer Text wird an der nächsten sicheren Grenze angewendet, ohne die aktuelle Aufgabe zu stoppen; Nachrichten in der Warteschlange werden nach dem Durchlauf gesendet",
+      "steerSubmitting": "Anleitung wird übermittelt…",
+      "steerRetryRejected": "Nicht gesendet · Erneut versuchen",
+      "steerRetryUnknown": "Übermittlungsstatus unbekannt · Erneut bestätigen",
+      "steerRetryRejectedHint": "Das Gateway hat diese Anleitung nicht angenommen. Ein erneuter Versuch wiederholt exakt die ursprüngliche Anfrage.",
+      "steerRetryUnknownHint": "OpenSquilla konnte nicht bestätigen, ob diese Anleitung angenommen wurde. Ein erneuter Versuch wiederholt die ursprüngliche Anfrage sicher und unverändert.",
+      "removeUnknownSteer": "Lokalen Wiederholungsversuch für ausstehende Nachricht {index} verwerfen; dies bedeutet nicht, dass der Server sie nicht empfangen hat",
       "queueHint": "Warteschlangenmodus: Diese Nachrichten werden der Reihe nach automatisch gesendet, wenn die aktuelle Antwort abgeschlossen ist",
+      "reorderHint": "0,75 Sekunden gedrückt halten und dann ziehen, um die Reihenfolge zu ändern. Alt+Pfeiltaste verschiebt die Nachricht ebenfalls.",
+      "reorderStarted": "{label} wird neu angeordnet. An die neue Position ziehen und loslassen.",
+      "reorderPosition": "{label} wurde an Position {position} von {count} verschoben.",
+      "reorderRecovering": "Warteschlangenreihenfolge wird wiederhergestellt…",
       "clearAll": "Alle löschen",
       "editMessage": "Nachricht bearbeiten",
       "editWhileStreaming": "Warten Sie, bis die aktuelle Antwort fertig ist, bevor Sie bearbeiten",
@@ -3933,6 +3959,7 @@
       "waitCompactionBeforeCommand": "Warten Sie auf die Kontextverdichtung, bevor Sie {command} ausführen.",
       "waitResponseBeforeCommand": "Warten Sie auf die aktuelle Antwort, bevor Sie {command} ausführen.",
       "queueFull": "Warteschlange ist voll — warten Sie, bis die aktuelle Antwort abgeschlossen ist.",
+      "queuePersistenceUnavailable": "Behalten Sie diese Nachricht im Eingabefeld, bis die Verzweigung abgeschlossen ist; dauerhafte Wiederherstellung ist nicht verfügbar.",
       "messageStillSaving": "Diese Nachricht ist noch nicht gespeichert — versuchen Sie es gleich erneut.",
       "artifactOpenFailed": "Öffnen des Artefakts fehlgeschlagen. Verwenden Sie stattdessen Herunterladen."
     },
@@ -3963,7 +3990,12 @@
       "saved": "gespart",
       "fallback": "Fallback",
       "fallbackUsed": "genutzt",
-      "ensembleModelsAria": "Ensemble-Modelle"
+      "ensembleRequests": "{count} Anfragen",
+      "ensembleModelsAria": "Ensemble-Modelle",
+      "coverage": "Abdeckung",
+      "usageIncompleteSubtotal": "Unvollständig · angezeigte Werte sind eine bekannte Zwischensumme",
+      "usageIncompleteUnknown": "Unvollständig · exakte Nutzungssumme nicht verfügbar",
+      "unknownProviderCalls": "{count} Provider-Aufruf mit unbekannter Nutzung | {count} Provider-Aufrufe mit unbekannter Nutzung"
     },
     "modelRouting": {
       "updateFailed": "Modell-Routing konnte nicht umgeschaltet werden – zurückgesetzt. Prüfen Sie die Gateway-Verbindung und versuchen Sie es erneut."
@@ -4012,6 +4044,7 @@
     "sidebar": {
       "recentConversations": "Letzte Aufgaben",
       "recents": "Zuletzt",
+      "pinned": "Angeheftet",
       "refresh": "Aufgaben neu laden",
       "clearAgentFilter": "Agentenfilter zurücksetzen: {name}",
       "loadError": "Aufgaben konnten nicht geladen werden",

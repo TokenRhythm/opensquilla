@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "Se canceló la contracción de la barra lateral",
     "openBlockedSession": "Abrir la sesión bloqueada",
     "approvalRequired": "Aprobación requerida",
+    "approvalRequiredCount": "Aprobaciones requeridas: {count}",
+    "systemStatus": "Estado del sistema",
+    "systemStatusSummary": "Estado del sistema: {state}; {count} avisos",
     "manageConnection": "Gestionar conexión de la puerta de enlace",
     "connectionTitle": "Conexión: {state} — gestionar en Ajustes",
     "connectionState": {
@@ -3189,6 +3192,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Chat creado",
+      "open": "Abrir chat"
+    },
     "promptCacheKeepalive": {
       "action": "Mantener caché del prompt",
       "title": "Mantener caché del prompt",
@@ -3440,6 +3447,14 @@
         "interrupted": "Interrumpido",
         "failed": "Fallido"
       },
+      "provider": {
+        "waiting": "Esperando al modelo",
+        "reasoning": "Razonamiento profundo",
+        "rateLimited": "Límite de solicitudes · reintento en {seconds}s",
+        "retryWait": "Reintento en {seconds}s",
+        "retrying": "Reintentando {attempt}/{limit}",
+        "fallback": "Cambiando al modelo alternativo"
+      },
       "purpose": {
         "discover": "Enlaces descubiertos",
         "search": "Búsqueda en la web",
@@ -3655,6 +3670,7 @@
       "pausedTitle": "Objetivo en pausa",
       "completeTitle": "Objetivo completado",
       "sentAsGoal": "Enviado como objetivo",
+      "achieved": "Objetivo alcanzado",
       "achievedIn": "Objetivo alcanzado · {duration} activo",
       "blockedTitle": "Objetivo bloqueado",
       "usageLimitedTitle": "Uso del objetivo limitado",
@@ -3754,7 +3770,17 @@
       "label": "Pendientes {count}/{max}",
       "hint": "Alt+↑ devuelve el más reciente a la entrada · ESC recupera todos a la entrada · se envían en orden FIFO cuando termina la respuesta actual",
       "steerHint": "Modo redirigir: el texto nuevo se aplica en el siguiente límite seguro sin detener la tarea actual; los mensajes en cola se envían tras el turno",
+      "steerSubmitting": "Enviando indicación…",
+      "steerRetryRejected": "No enviado · Reintentar",
+      "steerRetryUnknown": "Estado de entrega desconocido · Confirmar reintento",
+      "steerRetryRejectedHint": "El gateway no aceptó esta indicación. Al reintentar se repite exactamente la solicitud original.",
+      "steerRetryUnknownHint": "OpenSquilla no pudo confirmar si se aceptó esta indicación. Al reintentar se repite de forma segura la solicitud original sin cambios.",
+      "removeUnknownSteer": "Descartar el reintento local del mensaje pendiente {index}; esto no significa que el servidor no lo haya recibido",
       "queueHint": "Modo cola: estos mensajes se envían automáticamente en orden cuando termina la respuesta actual",
+      "reorderHint": "Mantén pulsado durante 0,75 segundos y arrastra para cambiar el orden. Alt+Flecha también mueve el mensaje.",
+      "reorderStarted": "Reordenando {label}. Arrastra a la nueva posición y suelta.",
+      "reorderPosition": "{label} se movió a la posición {position} de {count}.",
+      "reorderRecovering": "Restaurando el orden de la cola…",
       "clearAll": "Borrar todo",
       "editMessage": "Editar mensaje",
       "editWhileStreaming": "Espera a que termine la respuesta actual antes de editar",
@@ -3933,6 +3959,7 @@
       "waitCompactionBeforeCommand": "Espera a que termine la compactación del contexto antes de ejecutar {command}.",
       "waitResponseBeforeCommand": "Espera a la respuesta actual antes de ejecutar {command}.",
       "queueFull": "La cola está llena — espera a que termine la respuesta actual.",
+      "queuePersistenceUnavailable": "Conserva este mensaje en el editor hasta que termine la bifurcación; la recuperación duradera no está disponible.",
       "messageStillSaving": "Este mensaje aún no se ha guardado — inténtalo de nuevo en un momento.",
       "artifactOpenFailed": "No se pudo abrir el artefacto. Usa Descargar en su lugar."
     },
@@ -3963,7 +3990,12 @@
       "saved": "ahorro",
       "fallback": "reserva",
       "fallbackUsed": "usado",
-      "ensembleModelsAria": "Modelos del conjunto"
+      "ensembleRequests": "{count} solicitudes",
+      "ensembleModelsAria": "Modelos del conjunto",
+      "coverage": "cobertura",
+      "usageIncompleteSubtotal": "Incompleto · los valores mostrados son un subtotal conocido",
+      "usageIncompleteUnknown": "Incompleto · total exacto de uso no disponible",
+      "unknownProviderCalls": "{count} llamada al proveedor tiene uso desconocido | {count} llamadas al proveedor tienen uso desconocido"
     },
     "modelRouting": {
       "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. Comprueba la conexión con la pasarela e inténtalo de nuevo."
@@ -4012,6 +4044,7 @@
     "sidebar": {
       "recentConversations": "Tareas recientes",
       "recents": "Recientes",
+      "pinned": "Fijadas",
       "refresh": "Recargar tareas",
       "clearAgentFilter": "Borrar filtro de agente: {name}",
       "loadError": "No se pueden cargar las tareas",

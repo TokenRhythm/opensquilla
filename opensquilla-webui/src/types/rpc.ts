@@ -125,6 +125,11 @@ export type RawSessionListEntry = RawSessionItem | string
 export interface SessionsListResponse {
   sessions?: RawSessionListEntry[]
   keys?: RawSessionListEntry[]
+  /** Number of rows returned in this page. */
+  count?: number
+  /** Exact number of sessions visible to the caller, independent of page size. */
+  totalCount?: number
+  total_count?: number
 }
 
 export interface ProjectWorkspaceItem {
@@ -235,6 +240,8 @@ export interface StreamEventEnvelope {
   session_key?: string
   sessionKey?: string
   epoch?: number
+  stream_generation?: string
+  streamGeneration?: string
   stream_seq?: number
   [key: string]: unknown
 }
@@ -265,6 +272,37 @@ export interface SessionEventPayload extends StreamEventEnvelope {
 export interface WarningPayload extends SessionEventPayload {
   message?: string
   code?: string
+}
+
+export type ProviderActivityPhase =
+  | 'requesting'
+  | 'reasoning'
+  | 'retry_wait'
+  | 'retrying'
+  | 'fallback'
+
+export type ProviderActivityReason =
+  | 'initial'
+  | 'rate_limited'
+  | 'provider_overloaded'
+  | 'transport_transient'
+  | 'reasoning_only'
+  | 'empty_response'
+  | 'stream_incomplete'
+  | 'invalid_response'
+  | 'context_overflow'
+  | 'unknown'
+
+export interface ProviderActivityPayload extends SessionEventPayload {
+  schema_version?: 1
+  activity_id?: string
+  phase?: ProviderActivityPhase
+  reason?: ProviderActivityReason
+  retry_attempt?: number
+  retry_limit?: number
+  retry_after_ms?: number
+  started_at?: number
+  heartbeat?: boolean
 }
 
 export interface CronResultMessagePayload {
@@ -312,6 +350,27 @@ export interface TextDeltaPayload extends SessionEventPayload {
   presentation?: 'intermediate' | 'answer'
 }
 
+export type AssistantDelivery = 'visible' | 'suppressed'
+export type AssistantSuppressionReason = 'no_reply' | 'heartbeat_ack'
+
+/**
+ * Additive terminal-delivery contract. Older gateways omit these fields; the
+ * client then retains the conservative presentation-only sentinel fallback.
+ */
+export interface SessionDonePayload extends SessionEventPayload {
+  text?: string
+  text_snapshot?: string | null
+  textSnapshot?: string | null
+  delivery?: AssistantDelivery
+  suppression_reason?: AssistantSuppressionReason | null
+  suppressionReason?: AssistantSuppressionReason | null
+  /** Additive turn provenance; snake_case is the canonical gateway spelling. */
+  input_mode?: string
+  inputMode?: string
+  run_kind?: string
+  runKind?: string
+}
+
 export interface ToolUsePayload extends SessionEventPayload {
   id?: string
   toolId?: string
@@ -351,6 +410,7 @@ export interface ToolResultPayload extends ToolUsePayload {
 
 export interface SessionMessagesSubscribeParams {
   key: string
+  since_stream_generation?: string
   since_stream_seq?: number
   [key: string]: unknown
 }
@@ -363,6 +423,7 @@ export interface SessionLiveSnapshotEvent {
 export interface SessionMessagesSnapshotResponse {
   key: string
   task_id?: string | null
+  stream_generation?: string
   current_stream_seq?: number
   events?: SessionLiveSnapshotEvent[]
 }
@@ -778,6 +839,7 @@ export interface RpcEventMap {
   'session.event.router_control_replay': SessionEventPayload
   'session.event.state_change': SessionEventPayload
   'session.event.run_heartbeat': SessionEventPayload
+  'session.event.provider_activity': ProviderActivityPayload
   'session.event.compaction': CompactionPayload
   'session.event.goal': SessionEventPayload
   'session.event.warning': SessionEventPayload
@@ -794,4 +856,5 @@ export interface RpcEventMap {
   'session.event.meta_run_announced': MetaRunAnnouncedPayload
   'session.event.meta_step_state': MetaStepStatePayload
   'session.event.meta_run_completed': MetaRunCompletedPayload
+  'session.event.done': SessionDonePayload
 }

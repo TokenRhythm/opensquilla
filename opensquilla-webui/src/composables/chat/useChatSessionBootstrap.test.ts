@@ -476,7 +476,7 @@ describe('useChatSessionBootstrap', () => {
     expect(api.livePhase.value).toBe('ready')
   })
 
-  it('does not restart a terminal bootstrap when its final timeout reconnects', async () => {
+  it('automatically subscribes on a late replacement socket after a recovery budget expires', async () => {
     let resolveHistory!: (result: SessionPhaseResult) => void
     let resolveLive!: (result: SessionSubscriptionOutcome) => void
     let historyCalls = 0
@@ -490,7 +490,9 @@ describe('useChatSessionBootstrap', () => {
             resolveHistory = resolve
           })
         }
-        return { ok: false, error: timeout }
+        return historyCalls === 2
+          ? { ok: false, error: timeout }
+          : { ok: true }
       },
       subscribeSession: async () => {
         liveCalls += 1
@@ -499,7 +501,9 @@ describe('useChatSessionBootstrap', () => {
             resolveLive = resolve
           })
         }
-        return { ...UNAVAILABLE_FOR_TEST, error: timeout }
+        return liveCalls === 2
+          ? { ...UNAVAILABLE_FOR_TEST, error: timeout }
+          : LIVE_READY
       },
     })
 
@@ -515,12 +519,71 @@ describe('useChatSessionBootstrap', () => {
 
     api.handleConnectionState('disconnected')
     expect(api.livePhase.value).toBe('degraded')
+    const lateRecovery = api.handleConnectionState('connected')
+    await Promise.all([lateRecovery!.history, lateRecovery!.live])
+
+    expect(loadHistory).toHaveBeenCalledTimes(2)
+    expect(subscribeSession).toHaveBeenCalledTimes(3)
+    expect(api.historyPhase.value).toBe('error')
+    expect(api.livePhase.value).toBe('ready')
+  })
+
+  it('resumes when a replacement connects before the interrupted subscribe settles', async () => {
+    let resolveInterrupted!: (result: SessionSubscriptionOutcome) => void
+    let liveCalls = 0
+    const { api, loadHistory, subscribeSession } = createBootstrap({
+      subscribeSession: async () => {
+        liveCalls += 1
+        if (liveCalls === 1) {
+          return new Promise(resolve => {
+            resolveInterrupted = resolve
+          })
+        }
+        return LIVE_READY
+      },
+    })
+
+    const run = api.startSessionBootstrap()
+    await vi.waitFor(() => expect(resolveInterrupted).toBeTypeOf('function'))
+    api.handleConnectionState('disconnected')
+    api.handleConnectionState('connected')
+    resolveInterrupted({ ...UNAVAILABLE_FOR_TEST, cancelled: true })
+    await run.live
+
+    await vi.waitFor(() => expect(api.livePhase.value).toBe('ready'))
+    expect(loadHistory).toHaveBeenCalledOnce()
+    expect(subscribeSession).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not grant repeated replacement sockets unbounded recovery budgets', async () => {
+    let resolveInterrupted!: (result: SessionSubscriptionOutcome) => void
+    const timeout = new RpcTimeoutError('sessions.messages.subscribe', 7_000)
+    let liveCalls = 0
+    const { api, subscribeSession } = createBootstrap({
+      subscribeSession: async () => {
+        liveCalls += 1
+        if (liveCalls === 1) {
+          return new Promise(resolve => {
+            resolveInterrupted = resolve
+          })
+        }
+        return { ...UNAVAILABLE_FOR_TEST, error: timeout }
+      },
+    })
+
+    const run = api.startSessionBootstrap()
+    await vi.waitFor(() => expect(resolveInterrupted).toBeTypeOf('function'))
+    api.handleConnectionState('disconnected')
+    api.handleConnectionState('connected')
+    resolveInterrupted({ ...UNAVAILABLE_FOR_TEST, cancelled: true })
+    await run.live
+    await vi.waitFor(() => expect(api.livePhase.value).toBe('degraded'))
+
+    api.handleConnectionState('disconnected')
     api.handleConnectionState('connected')
     await Promise.resolve()
 
-    expect(loadHistory).toHaveBeenCalledTimes(2)
     expect(subscribeSession).toHaveBeenCalledTimes(2)
-    expect(api.historyPhase.value).toBe('error')
     expect(api.livePhase.value).toBe('degraded')
   })
 

@@ -1,15 +1,24 @@
 from opensquilla.gateway import session_streams
-from opensquilla.gateway.session_streams import SessionStreamRegistry
+from opensquilla.gateway.session_streams import (
+    SessionStreamRegistry,
+    get_session_streams,
+    reset_session_streams,
+)
 
 
 def test_session_stream_registry_records_monotonic_stream_seq() -> None:
-    registry = SessionStreamRegistry(max_events_per_session=5)
+    registry = SessionStreamRegistry(
+        max_events_per_session=5,
+        stream_generation="gateway-generation-a",
+    )
 
     first = registry.record("agent:main:test", "session.event.text_delta", {"text": "a"})
     second = registry.record("agent:main:test", "session.event.done", {"reason": "stop"})
 
     assert first["stream_seq"] == 1
     assert second["stream_seq"] == 2
+    assert first["stream_generation"] == "gateway-generation-a"
+    assert second["stream_generation"] == "gateway-generation-a"
     assert second["session_key"] == "agent:main:test"
     assert registry.current_seq("agent:main:test") == 2
 
@@ -101,6 +110,56 @@ def test_session_stream_registry_reports_reset_when_client_cursor_is_ahead() -> 
     assert replay.replay_complete is False
     assert replay.gap_reason == "stream_buffer_reset"
     assert replay.events == []
+
+
+def test_session_stream_registry_reports_generation_change_without_replaying_old_cursor() -> None:
+    registry = SessionStreamRegistry(
+        max_events_per_session=5,
+        stream_generation="gateway-generation-new",
+    )
+    registry.record("agent:main:after-restart", "session.event.text_delta", {"text": "new"})
+
+    replay = registry.replay(
+        "agent:main:after-restart",
+        5_000,
+        "gateway-generation-old",
+    )
+
+    assert replay.stream_generation == "gateway-generation-new"
+    assert replay.current_stream_seq == 1
+    assert replay.replay_complete is False
+    assert replay.gap_reason == "stream_generation_changed"
+    assert replay.events == []
+
+
+def test_session_stream_registry_promotes_legacy_safe_integer_cursor() -> None:
+    registry = SessionStreamRegistry(
+        max_events_per_session=5,
+        stream_generation="gateway-generation-new",
+    )
+    session_key = "agent:main:legacy-after-restart"
+
+    assert registry.promote_legacy_cursor(session_key, 4_200) is True
+    event = registry.record(
+        session_key,
+        "session.event.text_delta",
+        {"text": "visible"},
+    )
+
+    assert event["stream_seq"] == 4_201
+    assert event["stream_generation"] == "gateway-generation-new"
+
+
+def test_session_stream_registry_rejects_unsafe_legacy_cursor_promotion() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=5)
+    session_key = "agent:main:unsafe-legacy-cursor"
+
+    assert registry.promote_legacy_cursor(session_key, 1 << 53) is False
+    assert registry.record(
+        session_key,
+        "session.event.text_delta",
+        {"text": "first"},
+    )["stream_seq"] == 1
 
 
 def test_live_turn_snapshot_compacts_high_frequency_deltas_without_losing_state() -> None:
@@ -292,3 +351,66 @@ def test_live_turn_snapshot_preserves_active_compaction_state() -> None:
         event.payload["compaction_id"] == compaction_id
         for event in snapshot.events
     )
+
+
+def test_provider_activity_pulses_are_lossy_in_replay_but_keep_phase_boundaries() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=2)
+    session_key = "agent:main:provider-activity"
+    common = {"task_id": "task-live", "activity_id": "activity-1"}
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {**common, "phase": "requesting", "heartbeat": False},
+    )
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {**common, "phase": "reasoning", "heartbeat": False},
+    )
+    registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {**common, "phase": "reasoning", "heartbeat": True, "pulse": 1},
+    )
+    latest = registry.record(
+        session_key,
+        "session.event.provider_activity",
+        {**common, "phase": "reasoning", "heartbeat": True, "pulse": 2},
+    )
+
+    replay = registry.replay(session_key, 0)
+    assert [event.payload["phase"] for event in replay.events] == [
+        "requesting",
+        "reasoning",
+    ]
+    assert all(event.payload.get("heartbeat") is not True for event in replay.events)
+
+    snapshot = registry.live_snapshot(session_key)
+    activity = [
+        event
+        for event in snapshot.events
+        if event.event_name == "session.event.provider_activity"
+    ]
+    assert [event.payload["phase"] for event in activity] == [
+        "requesting",
+        "reasoning",
+    ]
+    assert activity[-1].payload["pulse"] == 2
+    assert activity[-1].stream_seq == latest["stream_seq"]
+
+
+def test_reset_session_streams_starts_a_fresh_embedded_gateway_generation() -> None:
+    try:
+        first = reset_session_streams(stream_generation="embedded-generation-a")
+        first.record("agent:main:test", "session.event.text_delta", {"text": "old"})
+
+        second = reset_session_streams(stream_generation="embedded-generation-b")
+
+        assert get_session_streams() is second
+        assert second.stream_generation == "embedded-generation-b"
+        assert second.current_seq("agent:main:test") == 0
+        assert second.live_snapshot("agent:main:test").events == []
+        assert first.stream_generation == "embedded-generation-a"
+        assert first.current_seq("agent:main:test") == 1
+    finally:
+        reset_session_streams()

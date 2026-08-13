@@ -57,13 +57,29 @@ export function rehomePromotedSteerRows(messages: ChatMessage[]): ChatMessage[] 
 // from a local Stop) and are absent from a fresh history map. Re-apply them
 // when the server snapshot lacks a richer value, keyed strictly by messageId so
 // a synthetic-key collision can never graft one turn's state onto another.
-export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): ChatMessage {
+interface LiveFieldMergeOptions {
+  preserveTurnIdentity?: boolean
+}
+
+export function mergeLiveOnlyFields(
+  prev: ChatMessage,
+  server: ChatMessage,
+  options: LiveFieldMergeOptions = {},
+): ChatMessage {
   const merged: ChatMessage = { ...server }
 
   // Keep the optimistic row identity after the backend assigns a durable
   // message id. Per-turn render keys use it to avoid remounting live surfaces
   // during the first authoritative history replacement.
   if (!server.clientId && prev.clientId) merged.clientId = prev.clientId
+
+  // Older history projections do not carry turn_context. Once the caller has
+  // proved that the canonical row is the same live row, retain its turn id so
+  // canonical reconciliation cannot split one logical turn into two frontend
+  // identities. A server-provided turn id always remains authoritative.
+  if (options.preserveTurnIdentity && !server.turnId && prev.turnId) {
+    merged.turnId = prev.turnId
+  }
 
   // reasoning: server wins if it measured seconds; else keep the live seconds.
   const serverSeconds = prev.role === 'assistant' ? server.reasoning?.seconds ?? 0 : 0
@@ -135,6 +151,12 @@ export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): Cha
     if (prev.turnId) merged.turnId = prev.turnId
   }
   if (!server.turnOutcome && prev.turnOutcome) merged.turnOutcome = prev.turnOutcome
+  if (!server.turnInputMode && prev.turnInputMode) {
+    merged.turnInputMode = prev.turnInputMode
+  }
+  if (!server.turnRunKind && prev.turnRunKind) {
+    merged.turnRunKind = prev.turnRunKind
+  }
   if (!server.steerClientRequestId && prev.steerClientRequestId) {
     merged.steerClientRequestId = prev.steerClientRequestId
   }
@@ -181,7 +203,9 @@ export function reconcileHistoryMessages(prev: ChatMessage[], incoming: ChatMess
   }
   return incoming.map(server => {
     const prior = server.messageId ? prevById.get(server.messageId) : undefined
-    if (prior) return mergeLiveOnlyFields(prior, server)
+    if (prior) {
+      return mergeLiveOnlyFields(prior, server, { preserveTurnIdentity: true })
+    }
 
     // The terminal stream row is optimistic and does not yet know the durable
     // message id. Graft only on a unique exact role/text match, which avoids
@@ -259,8 +283,58 @@ function reconcileOptimisticTurnFields(
     const previousAssistant = prev[previousAssistants[0]]
     const incomingAssistantIndex = incomingAssistants[0]
     const serverAssistant = merged[incomingAssistantIndex]
-    merged[incomingAssistantIndex] = mergeLiveOnlyFields(previousAssistant, serverAssistant)
+    merged[incomingAssistantIndex] = mergeLiveOnlyFields(
+      previousAssistant,
+      serverAssistant,
+      { preserveTurnIdentity: true },
+    )
     consumedOptimisticRows?.add(previousAssistant)
+  })
+
+  // Automatic Goal/heartbeat turns have no durable user row of their own, so
+  // the user-owned turn heuristic above cannot associate their completed live
+  // assistant with the canonical history row. Done and history both carry the
+  // same server-issued turn id: use that identity plus exact role/text, but
+  // only for a unique one-to-one match. The uniqueness fence deliberately
+  // keeps repeated same-text rows within one turn rather than guessing, while
+  // distinct turn ids remain independent even when their text is identical.
+  const optimisticBySignature = new Map<string, ChatMessage[]>()
+  const incomingSignatureCounts = new Map<string, number>()
+  const assistantSignature = (message: ChatMessage): string | null => {
+    if (message.role !== 'assistant' || !message.turnId) return null
+    return `${message.turnId}\u0000${message.role}\u0000${message.text}`
+  }
+
+  for (const message of prev) {
+    if (
+      message.messageId
+      || message.restoredFromHistory === true
+      || consumedOptimisticRows?.has(message)
+    ) continue
+    const signature = assistantSignature(message)
+    if (!signature) continue
+    const candidates = optimisticBySignature.get(signature) ?? []
+    candidates.push(message)
+    optimisticBySignature.set(signature, candidates)
+  }
+  for (const message of incoming) {
+    if (!message.messageId || message.restoredFromHistory !== true) continue
+    const signature = assistantSignature(message)
+    if (!signature) continue
+    incomingSignatureCounts.set(
+      signature,
+      (incomingSignatureCounts.get(signature) ?? 0) + 1,
+    )
+  }
+  incoming.forEach((message, index) => {
+    if (!message.messageId || message.restoredFromHistory !== true) return
+    const signature = assistantSignature(message)
+    if (!signature || incomingSignatureCounts.get(signature) !== 1) return
+    const candidates = optimisticBySignature.get(signature) ?? []
+    if (candidates.length !== 1) return
+    const optimistic = candidates[0]
+    merged[index] = mergeLiveOnlyFields(optimistic, merged[index])
+    consumedOptimisticRows?.add(optimistic)
   })
 
   return merged

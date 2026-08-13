@@ -2113,9 +2113,16 @@ async def test_agent_records_final_diff_contract_on_finish_error_with_diff(tmp_p
 
     assert len(provider.calls) == 1
     assert any(
-        isinstance(event, ErrorEvent) and event.code == "agent_runtime_timeout"
+        isinstance(event, ErrorEvent)
+        and event.code == "request_error"
+        and event.failure_kind == "transport_transient"
         for event in events
     )
+    assert not any(
+        isinstance(event, ErrorEvent) and event.code == "iteration_timeout"
+        for event in events
+    )
+    assert "provider transport timeout" not in repr(events)
     assert not [
         event
         for event in events
@@ -5085,11 +5092,15 @@ async def test_provider_timeout_error_is_not_reclassified_as_iteration_timeout()
 
     assert len(provider.calls) == 1
     assert any(
-        isinstance(event, ErrorEvent) and event.code == "agent_runtime_timeout" for event in events
+        isinstance(event, ErrorEvent)
+        and event.code == "request_error"
+        and event.failure_kind == "transport_transient"
+        for event in events
     )
     assert not any(
         isinstance(event, ErrorEvent) and event.code == "iteration_timeout" for event in events
     )
+    assert "provider transport timeout" not in repr(events)
 
 
 @pytest.mark.asyncio

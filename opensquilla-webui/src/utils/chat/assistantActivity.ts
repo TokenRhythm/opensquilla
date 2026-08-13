@@ -109,6 +109,12 @@ export interface AssistantActivityCluster {
 export type AssistantActivityStatusCode =
   | AssistantActivityLifecycleCode
   | AssistantActivityPurposeCode
+  | 'chat.activity.provider.waiting'
+  | 'chat.activity.provider.reasoning'
+  | 'chat.activity.provider.rateLimited'
+  | 'chat.activity.provider.retryWait'
+  | 'chat.activity.provider.retrying'
+  | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
   | 'chat.compact.withinBudget'
@@ -375,28 +381,55 @@ function activityToolName(name: string): string {
   return namespaced[namespaced.length - 1] || ''
 }
 
-function isSuccessfulAnswerTransparentControlGroup(
+function isSettledSuccessfulToolGroup(
   item: ChatStreamTimelineItem,
 ): item is Extract<ChatStreamTimelineItem, { type: 'tool-group' }> {
   return item.type === 'tool-group'
     && item.group.calls.length > 0
+    && !item.group.isRunning
+    && !item.group.isError
+    && item.group.status === 'success'
     && item.group.calls.every(call =>
-      ANSWER_TRANSPARENT_CONTROL_TOOLS.has(activityToolName(call.name))
-      && !call.isRunning
+      !call.isRunning
       && !call.isError
       && call.status === 'success',
     )
 }
 
+function isSuccessfulAnswerTransparentControlGroup(
+  item: ChatStreamTimelineItem,
+): item is Extract<ChatStreamTimelineItem, { type: 'tool-group' }> {
+  return isSettledSuccessfulToolGroup(item)
+    && item.group.calls.every(call =>
+      ANSWER_TRANSPARENT_CONTROL_TOOLS.has(activityToolName(call.name))
+    )
+}
+
 function normalizedComparableText(value: string): string {
-  // Preserve Markdown-significant interior whitespace. Only normalize the
-  // transport-level line-ending difference and outer padding.
-  return String(value || '').replace(/\r\n?/g, '\n').trim()
+  // Line-ending spelling is transport noise. Every other byte can carry
+  // Markdown meaning (indentation, hard breaks, trailing blank lines), so any
+  // such difference must fail open to canonical text.
+  return String(value || '').replace(/\r\n?/g, '\n')
+}
+
+interface TimelineTextAggregates {
+  compact: string
+  readable: string
+}
+
+function readableTextAggregate(chunks: string[]): string {
+  let readable = chunks[0] || ''
+  for (const chunk of chunks.slice(1)) {
+    readable += /\s$/u.test(readable) || /^\s/u.test(chunk)
+      ? chunk
+      : `\n\n${chunk}`
+  }
+  return readable
 }
 
 function timelineTextAggregates(
   timeline: ChatStreamTimelineItem[],
-): string[] | null {
+): TimelineTextAggregates | null {
   const textItems = timeline.filter(
     (item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> =>
       item.type === 'text',
@@ -411,40 +444,17 @@ function timelineTextAggregates(
     chunks.push(item.rawText)
   }
   const compact = chunks.join('')
-  if (chunks.length < 2) return [compact]
-
-  // Mirrors the gateway's persisted `_readable_tool_boundary_text`: separate
-  // narration segments receive a paragraph break only when neither adjacent
-  // segment already supplies whitespace.
-  let readable = chunks[0] || ''
-  for (const chunk of chunks.slice(1)) {
-    readable += readable.slice(-1).trim() && chunk.slice(0, 1).trim()
-      ? `\n\n${chunk}`
-      : chunk
-  }
-  return readable === compact ? [compact] : [compact, readable]
+  return { compact, readable: readableTextAggregate(chunks) }
 }
 
 interface TerminalAnswerCandidate {
-  text: string
+  compact: string
+  readable: string
   indexes: Set<number>
-  activityPrefix?: Extract<ChatStreamTimelineItem, { type: 'text' }>
-}
-
-function splitTerminalMarkdownAnswer(
-  text: string,
-): { activityText: string, answerText: string } | null {
-  const normalized = text.replace(/\r\n?/g, '\n')
-  const thematicBreak = /^[ \t]{0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,}|(?:-[ \t]*){3,})[ \t]*$/gm
-
-  for (const match of normalized.matchAll(thematicBreak)) {
-    const index = match.index
-    if (index === undefined) continue
-    const activityText = normalized.slice(0, index).trim()
-    const answerText = normalized.slice(index + match[0].length).trim()
-    if (activityText && answerText) return { activityText, answerText }
-  }
-  return null
+  source: Extract<
+    AssistantAnswerSource,
+    'terminal-timeline-boundary' | 'terminal-control-boundary'
+  >
 }
 
 /**
@@ -460,62 +470,18 @@ function splitTerminalMarkdownAnswer(
 function terminalTimelineAnswerCandidate(
   timeline: ChatStreamTimelineItem[],
 ): TerminalAnswerCandidate | null {
-  let ordinaryToolGroups = 0
-  let lastOrdinaryToolIndex = -1
-  for (let index = 0; index < timeline.length; index += 1) {
-    const item = timeline[index]
-    if (item?.type !== 'tool-group' || isSuccessfulAnswerTransparentControlGroup(item)) {
-      continue
-    }
-    ordinaryToolGroups += 1
-    lastOrdinaryToolIndex = index
-  }
-  if (ordinaryToolGroups < 1 || lastOrdinaryToolIndex < 0) return null
+  // A failed, pending, or interrupted chronology is not a safe place to hide
+  // canonical text. Keep the full answer visible in every uncertain case.
+  if (timeline.some(item =>
+    item.type === 'interrupt'
+    || (item.type === 'tool-group' && !isSettledSuccessfulToolGroup(item)),
+  )) return null
 
-  const indexes = new Set<number>()
-  const chunks: string[] = []
-  for (let index = lastOrdinaryToolIndex + 1; index < timeline.length; index += 1) {
-    const item = timeline[index]
-    if (!item) continue
-    if (item.type === 'tool-group') {
-      if (isSuccessfulAnswerTransparentControlGroup(item)) continue
-      return null
-    }
-    if (item.type !== 'text' || typeof item.rawText !== 'string') return null
-    indexes.add(index)
-    chunks.push(item.rawText)
-  }
-  const text = chunks.join('')
-  if (!text.trim()) return null
-
-  // Some providers finish the last tool call with a short transition and the
-  // final answer in the same text item, separated by a Markdown thematic
-  // break. Preserve that transition in the activity chronology and expose
-  // only the content after the explicit boundary as the answer.
-  const markdownSplit = splitTerminalMarkdownAnswer(text)
-  if (markdownSplit) {
-    const firstIndex = Math.min(...indexes)
-    const firstItem = timeline[firstIndex]
-    return {
-      text: markdownSplit.answerText,
-      indexes,
-      activityPrefix: {
-        type: 'text',
-        key: `${firstItem?.key || 'terminal'}:activity-prefix`,
-        rawText: markdownSplit.activityText,
-        html: '',
-      },
-    }
-  }
-  return { text, indexes }
-}
-
-function terminalControlAnswerCandidate(
-  timeline: ChatStreamTimelineItem[],
-): TerminalAnswerCandidate | null {
   let index = timeline.length - 1
   let crossedControlBoundary = false
 
+  // Successful control calls may transparently end the turn, but the answer
+  // candidate itself must remain the absolute terminal contiguous text run.
   while (index >= 0) {
     const item = timeline[index]
     if (!item) {
@@ -523,22 +489,16 @@ function terminalControlAnswerCandidate(
       continue
     }
     if (item.type === 'tool-group') {
-      if (!isSuccessfulAnswerTransparentControlGroup(item)) return null
+      if (!isSuccessfulAnswerTransparentControlGroup(item)) break
       crossedControlBoundary = true
       index -= 1
       continue
     }
     if (item.type !== 'text') return null
-    if (!String(item.rawText || '').trim() && !String(item.html || '').trim()) {
-      index -= 1
-      continue
-    }
     break
   }
 
-  if (!crossedControlBoundary || index < 0 || timeline[index]?.type !== 'text') {
-    return null
-  }
+  if (index < 0 || timeline[index]?.type !== 'text') return null
 
   const indexes = new Set<number>()
   const chunks: string[] = []
@@ -550,8 +510,21 @@ function terminalControlAnswerCandidate(
     chunks.unshift(item.rawText)
     index -= 1
   }
-  const text = chunks.join('')
-  return text.trim() ? { text, indexes } : null
+  const crossedOrdinaryToolBoundary = index >= 0
+    && timeline[index]?.type === 'tool-group'
+    && !isSuccessfulAnswerTransparentControlGroup(timeline[index])
+  if (!crossedControlBoundary && !crossedOrdinaryToolBoundary) return null
+
+  const compact = chunks.join('')
+  if (!compact.trim()) return null
+  return {
+    compact,
+    readable: readableTextAggregate(chunks),
+    indexes,
+    source: crossedControlBoundary
+      ? 'terminal-control-boundary'
+      : 'terminal-timeline-boundary',
+  }
 }
 
 function completedAnswerLifecycle(
@@ -570,10 +543,11 @@ function completedAnswerLifecycle(
  * Newer runtimes should eventually persist an explicit answer phase. For old
  * PlanRun rows, `message.text` is the concatenation of every narration segment.
  * We may recover the terminal answer only when all of these structural facts
- * agree: the turn settled successfully, the canonical text exactly matches a
- * supported persisted timeline aggregate, and the last text run is followed
- * only by successful answer-transparent control calls. Every uncertain case
- * fails open to the canonical text.
+ * agree: the turn settled successfully, every tool settled successfully, the
+ * canonical text exactly matches the raw timeline aggregate, and the last text
+ * run is structurally bounded by the final tool or followed only by successful
+ * answer-transparent control calls. Every uncertain case fails open to the
+ * canonical text. Markdown content never participates in this decision.
  */
 export function resolveAssistantAnswer(
   message: ChatRenderedMessage,
@@ -585,44 +559,27 @@ export function resolveAssistantAnswer(
   )
   const canonical = String(message.text || '')
   const aggregates = timelineTextAggregates(timeline)
-  const completed = completedAnswerLifecycle(message, lifecycle)
-  const aggregateMatchesCanonical = aggregates !== null
-    && aggregates.some(aggregate =>
-      normalizedComparableText(canonical) === normalizedComparableText(aggregate),
-    )
-  const controlCandidate = terminalControlAnswerCandidate(timeline)
-  const canUseControlBoundary = completed
-    && aggregateMatchesCanonical
-    && controlCandidate !== null
-  if (canUseControlBoundary && controlCandidate) {
+  const candidate = terminalTimelineAnswerCandidate(timeline)
+  const matchedAggregate = aggregates
+    ? normalizedComparableText(canonical) === normalizedComparableText(aggregates.compact)
+      ? 'compact'
+      : normalizedComparableText(canonical) === normalizedComparableText(aggregates.readable)
+        ? 'readable'
+        : null
+    : null
+  const canUseTerminalBoundary = completedAnswerLifecycle(message, lifecycle)
+    && matchedAggregate !== null
+    && candidate !== null
+
+  if (canUseTerminalBoundary && candidate) {
     return {
-      text: controlCandidate.text,
-      source: 'terminal-control-boundary',
+      text: matchedAggregate === 'readable' ? candidate.readable : candidate.compact,
+      source: candidate.source,
       activityItems: timeline.filter(
         (item, index) =>
-          !controlCandidate.indexes.has(index)
+          !candidate.indexes.has(index)
           && !isSuccessfulAnswerTransparentControlGroup(item),
       ),
-    }
-  }
-
-  const timelineCandidate = terminalTimelineAnswerCandidate(timeline)
-  const canUseTimelineBoundary = completed
-    && aggregateMatchesCanonical
-    && timelineCandidate !== null
-  if (canUseTimelineBoundary && timelineCandidate) {
-    const activityItems = timeline.filter(
-      (item, index) =>
-        !timelineCandidate.indexes.has(index)
-        && !isSuccessfulAnswerTransparentControlGroup(item),
-    )
-    if (timelineCandidate.activityPrefix) {
-      activityItems.push(timelineCandidate.activityPrefix)
-    }
-    return {
-      text: timelineCandidate.text,
-      source: 'terminal-timeline-boundary',
-      activityItems,
     }
   }
 
@@ -819,6 +776,29 @@ function statusLabelFor(
   }
   const action = String(entry.action || '').trim()
   const normalized = action.toLowerCase()
+  if (normalized.startsWith('provider:')) {
+    const [, phase = '', first = '0', second = '0'] = normalized.split(':')
+    if (phase === 'requesting') return codeDescriptor('chat.activity.provider.waiting')
+    if (phase === 'reasoning') return codeDescriptor('chat.activity.provider.reasoning')
+    if (phase === 'rate_limited') {
+      return codeDescriptor('chat.activity.provider.rateLimited', {
+        seconds: Math.max(0, Number.parseInt(first, 10) || 0),
+      })
+    }
+    if (phase === 'retry_wait') {
+      return codeDescriptor('chat.activity.provider.retryWait', {
+        seconds: Math.max(0, Number.parseInt(first, 10) || 0),
+      })
+    }
+    if (phase === 'retrying') {
+      return codeDescriptor('chat.activity.provider.retrying', {
+        attempt: Math.max(0, Number.parseInt(first, 10) || 0),
+        limit: Math.max(0, Number.parseInt(second, 10) || 0),
+      })
+    }
+    if (phase === 'fallback') return codeDescriptor('chat.activity.provider.fallback')
+    return codeDescriptor('chat.activity.lifecycle.working')
+  }
   if (normalized.startsWith('tool:')) {
     const toolId = action.slice(action.indexOf(':') + 1)
     const cluster = clusters.find(candidate =>
@@ -847,6 +827,29 @@ export function isSemanticActivityStatusStep(step: AssistantActivityStatusStep):
   return step.category !== 'maintenance'
     && !step.isCurrent
     && !step.label.code.startsWith('chat.activity.lifecycle.')
+}
+
+/**
+ * Return the client-side retry countdown for a current provider wait step.
+ *
+ * Provider activity events deliberately carry only a safe, bounded initial
+ * delay.  Keeping the one-second ticking local avoids turning countdown UI
+ * into wire traffic while still making a long Retry-After visibly progress.
+ */
+export function providerActivityRemainingSeconds(
+  step: AssistantActivityStatusStep,
+  nowMs: number = Date.now(),
+): number | null {
+  if (
+    step.label.code !== 'chat.activity.provider.rateLimited'
+    && step.label.code !== 'chat.activity.provider.retryWait'
+  ) {
+    return null
+  }
+  const initialSeconds = Number(step.label.params.seconds ?? 0)
+  if (!Number.isFinite(initialSeconds)) return 0
+  const elapsedSeconds = Math.floor(Math.max(0, nowMs - step.at) / 1000)
+  return Math.max(0, Math.floor(initialSeconds) - elapsedSeconds)
 }
 
 function isAutomaticCompletedMaintenance(step: AssistantActivityStatusStep): boolean {

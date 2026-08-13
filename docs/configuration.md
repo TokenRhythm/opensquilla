@@ -16,6 +16,28 @@ OpenSquilla reads configuration in this order:
 Use `--config ./opensquilla.toml` when you want to write or inspect a
 project-local config file.
 
+## Task Runtime Concurrency
+
+Fresh installations allow up to eight cross-session turns to run at once:
+
+```toml
+[task_runtime]
+max_concurrency = 8
+max_pending_per_session = 64
+```
+
+Eight is the desktop default because it matches the built-in channel in-flight
+budget and leaves enough capacity for interactive tasks, Goal continuations,
+Cron runs, and subagents without bypassing TaskRuntime's global queue. Turns in
+the same session remain serialized. Provider pressure is still handled by the
+configured credential pool, provider health/fallback policy, and `Retry-After`
+cooldowns; this setting does not manufacture extra credentials or disable
+provider rate limiting.
+
+This is a default change, not a migration. An existing TOML value such as
+`max_concurrency = 4`, or an explicit
+`OPENSQUILLA_TASK_MAX_CONCURRENCY=4`, remains authoritative after upgrade.
+
 ## Secret Handling
 
 Prefer environment-variable references for secrets:

@@ -41,6 +41,8 @@ from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
+from opensquilla.tools import ToolRegistry, tool
+from opensquilla.tools.dispatch import build_tool_handler
 
 
 class _SequenceProvider:
@@ -238,6 +240,18 @@ def _fake_reduce(**kwargs: Any) -> Any:
 
 
 def _projection_agent(tmp_path, **config_kwargs: Any) -> Agent:
+    registry = ToolRegistry()
+
+    @tool(
+        name="retrieve_tool_result",
+        description="Retrieve a stored tool result.",
+        params={"handle": {"type": "string"}},
+        required=["handle"],
+        registry=registry,
+    )
+    async def retrieve_tool_result(handle: str) -> str:
+        return handle
+
     return Agent(
         provider=_TextProvider(),
         config=AgentConfig(
@@ -248,6 +262,8 @@ def _projection_agent(tmp_path, **config_kwargs: Any) -> Agent:
             tool_result_fresh_diagnostic_inline_max_chars=1,
             **config_kwargs,
         ),
+        tool_definitions=registry.to_tool_definitions(),
+        tool_handler=build_tool_handler(registry),
     )
 
 

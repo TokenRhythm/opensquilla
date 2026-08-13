@@ -1,10 +1,10 @@
 // @vitest-environment happy-dom
 
-import { afterEach, describe, expect, it } from 'vitest'
-import { createApp, nextTick } from 'vue'
-import i18n from '@/i18n'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createApp, defineComponent, h, nextTick, reactive, ref } from 'vue'
+import i18n, { loadLocaleMessages } from '@/i18n'
 import PendingQueue from './PendingQueue.vue'
-import type { Attachment } from '@/types/chat'
+import type { Attachment, PendingSteerAttempt } from '@/types/chat'
 
 afterEach(() => {
   document.body.innerHTML = ''
@@ -12,10 +12,20 @@ afterEach(() => {
 })
 
 async function mountQueue(
-  listeners: Record<string, () => void> = {},
+  listeners: Partial<{
+    onClear: () => void
+    onEdit: (pendingUiId: string) => void
+    onRemove: (pendingUiId: string) => void
+    onReorder: (fromIndex: number, toIndex: number) => void
+    onReorderEnd: () => void
+    onReorderStart: (index: number) => void
+    onSteer: (pendingUiId: string) => void
+  }> = {},
   items: Array<{
+    pendingUiId?: string
     text: string
     deliveryState?: 'steering' | 'retryable'
+    steerAttempt?: PendingSteerAttempt
     attachments?: Attachment[]
     hiddenControl?: boolean
     displayTextOverride?: string
@@ -30,6 +40,9 @@ async function mountQueue(
 ) {
   const el = document.createElement('div')
   document.body.appendChild(el)
+  items.forEach((item, index) => {
+    item.pendingUiId ||= `pending-ui-${index}`
+  })
   const app = createApp(PendingQueue, {
     items,
     maxPending: 5,
@@ -44,6 +57,16 @@ async function mountQueue(
 }
 
 describe('PendingQueue', () => {
+  const steerRequest = {
+    key: 'agent:main:webchat:test',
+    message: 'Make it longer',
+    expected_turn_id: 'turn-current',
+    client_request_id: 'request-steer',
+    client_message_id: 'client-steer',
+    surface_id: 'webui',
+    _source: { runMode: 'safe' as const },
+  }
+
   it('keeps the original steer affordance visible but disabled when capability is unavailable', async () => {
     const reason = 'Steer unavailable: the active task identity has not synchronized yet.'
     const { app, el } = await mountQueue({}, undefined, {
@@ -76,11 +99,11 @@ describe('PendingQueue', () => {
   })
 
   it('offers steer, remove, and quiet overflow actions on each queued message', async () => {
-    let steered = 0
-    let removed = 0
+    const steered: string[] = []
+    const removed: string[] = []
     const { app, el } = await mountQueue({
-      onSteer: () => { steered += 1 },
-      onRemove: () => { removed += 1 },
+      onSteer: (pendingUiId: string) => { steered.push(pendingUiId) },
+      onRemove: (pendingUiId: string) => { removed.push(pendingUiId) },
     })
 
     const steer = [...el.querySelectorAll<HTMLButtonElement>('button')]
@@ -88,8 +111,8 @@ describe('PendingQueue', () => {
     steer?.click()
     el.querySelector<HTMLButtonElement>('[aria-label="Remove pending message 1"]')?.click()
 
-    expect(steered).toBe(1)
-    expect(removed).toBe(1)
+    expect(steered).toEqual(['pending-ui-0'])
+    expect(removed).toEqual(['pending-ui-0'])
     expect(el.querySelector('.chat-pending-card')).not.toBeNull()
     app.unmount()
   })
@@ -103,6 +126,7 @@ describe('PendingQueue', () => {
     }, [{ text: 'Already steering', deliveryState: 'steering' }])
 
     expect(el.querySelector('.chat-pending-card')?.getAttribute('aria-busy')).toBe('true')
+    expect(el.querySelector('.chat-pending-card')?.getAttribute('data-delivery-state')).toBe('busy')
     const actions = [...el.querySelectorAll<HTMLButtonElement>('.chat-pending-actions button')]
     expect(actions).toHaveLength(3)
     expect(actions.every(button => button.disabled)).toBe(true)
@@ -112,6 +136,53 @@ describe('PendingQueue', () => {
     expect(steered).toBe(0)
     expect(removed).toBe(0)
     expect(el.querySelector('[role="menu"]')).toBeNull()
+    app.unmount()
+  })
+
+  it('derives submitting UI only from the canonical steer attempt phase', async () => {
+    const { app, el } = await mountQueue({}, [{
+      text: steerRequest.message,
+      steerAttempt: { phase: 'submitting', request: steerRequest },
+    }])
+
+    expect(el.querySelector('.chat-pending-card')?.getAttribute('aria-busy')).toBe('true')
+    expect(el.querySelector('.chat-pending')?.getAttribute('aria-label')).toBe('Pending 1/6')
+    expect(el.querySelector('.chat-pending-action--steer')?.textContent)
+      .toContain('Submitting guidance…')
+    const actions = [...el.querySelectorAll<HTMLButtonElement>('.chat-pending-actions button')]
+    expect(actions.every(button => button.disabled)).toBe(true)
+    app.unmount()
+  })
+
+  it.each([
+    {
+      locale: 'en' as const,
+      action: 'Delivery status unknown · Retry confirmation',
+      remove: 'Discard local retry for pending message 1; this does not mean the server did not receive it',
+    },
+    {
+      locale: 'zh-Hans' as const,
+      action: '发送状态未知 · 重试确认',
+      remove: '放弃待发送消息 1 在本设备上的重试；这不代表服务端未接收',
+    },
+  ])('explains acceptance-unknown retry and local discard in $locale', async ({
+    locale,
+    action,
+    remove,
+  }) => {
+    await loadLocaleMessages(locale)
+    i18n.global.locale.value = locale
+    const { app, el } = await mountQueue({}, [{
+      text: steerRequest.message,
+      steerAttempt: { phase: 'acceptance_unknown', request: steerRequest },
+    }], { steerAvailable: false })
+
+    const retry = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+    expect(el.querySelector('.chat-pending-card')?.getAttribute('data-delivery-state'))
+      .toBe('attention')
+    expect(retry?.textContent).toContain(action)
+    expect(retry?.disabled).toBe(false)
+    expect(el.querySelector<HTMLButtonElement>(`[aria-label="${remove}"]`)).not.toBeNull()
     app.unmount()
   })
 
@@ -293,6 +364,188 @@ describe('PendingQueue', () => {
       .find(button => button.textContent?.includes('Clear queue'))
       ?.click()
     expect(cleared).toBe(1)
+    app.unmount()
+  })
+
+  it('activates pointer sorting only after a 750 ms hold and reorders past a midpoint', async () => {
+    vi.useFakeTimers()
+    const starts: number[] = []
+    const moves: Array<[number, number]> = []
+    let ended = 0
+    const elementFromPoint = vi.spyOn(document, 'elementFromPoint')
+    const { app, el } = await mountQueue({
+      onReorderStart: (index: number) => starts.push(index),
+      onReorder: (fromIndex: number, toIndex: number) => moves.push([fromIndex, toIndex]),
+      onReorderEnd: () => { ended += 1 },
+    }, [
+      { text: 'First queued message' },
+      { text: 'Second queued message' },
+      { text: 'Third queued message' },
+    ])
+
+    try {
+      const cards = [...el.querySelectorAll<HTMLElement>('.chat-pending-card')]
+      expect(cards[0]?.classList.contains('is-reorderable')).toBe(true)
+      cards[0]?.dispatchEvent(new MouseEvent('pointerdown', {
+        bubbles: true,
+        button: 0,
+        clientX: 20,
+        clientY: 20,
+      }))
+      await nextTick()
+      expect(cards[0]?.classList.contains('is-reorder-arming')).toBe(true)
+      await vi.advanceTimersByTimeAsync(749)
+      expect(starts).toEqual([])
+      expect(cards[0]?.classList.contains('is-reordering')).toBe(false)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await nextTick()
+      expect(starts).toEqual([0])
+      expect(cards[0]?.classList.contains('is-reordering')).toBe(true)
+      expect([...cards[0]!.querySelectorAll<HTMLButtonElement>('button')]
+        .every(button => button.disabled)).toBe(true)
+
+      Object.defineProperty(cards[1], 'getBoundingClientRect', {
+        configurable: true,
+        value: () => ({ top: 50, height: 50 }),
+      })
+      elementFromPoint.mockReturnValue(cards[1]!)
+      document.dispatchEvent(new MouseEvent('pointermove', {
+        bubbles: true,
+        clientX: 20,
+        clientY: 90,
+      }))
+      expect(moves).toEqual([[0, 1]])
+
+      document.dispatchEvent(new MouseEvent('pointerup', { bubbles: true }))
+      await nextTick()
+      expect(ended).toBe(1)
+      expect(cards[0]?.classList.contains('is-reordering')).toBe(false)
+    } finally {
+      app.unmount()
+      elementFromPoint.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels a pending long press when the pointer moves before activation', async () => {
+    vi.useFakeTimers()
+    let started = 0
+    const { app, el } = await mountQueue({
+      onReorderStart: () => { started += 1 },
+    }, [
+      { text: 'First queued message' },
+      { text: 'Second queued message' },
+    ])
+
+    try {
+      el.querySelector<HTMLElement>('.chat-pending-card')?.dispatchEvent(new MouseEvent(
+        'pointerdown',
+        { bubbles: true, button: 0, clientX: 10, clientY: 10 },
+      ))
+      document.dispatchEvent(new MouseEvent('pointermove', {
+        bubbles: true,
+        clientX: 25,
+        clientY: 10,
+      }))
+      await vi.advanceTimersByTimeAsync(750)
+      expect(started).toBe(0)
+    } finally {
+      app.unmount()
+      vi.useRealTimers()
+    }
+  })
+
+  it('supports keyboard reordering and disables sorting around a delivery lease', async () => {
+    const moves: Array<[number, number]> = []
+    let starts = 0
+    let ends = 0
+    const { app, el } = await mountQueue({
+      onReorderStart: () => { starts += 1 },
+      onReorder: (fromIndex: number, toIndex: number) => moves.push([fromIndex, toIndex]),
+      onReorderEnd: () => { ends += 1 },
+    }, [
+      { text: 'First queued message' },
+      { text: 'Second queued message' },
+    ])
+
+    const cards = [...el.querySelectorAll<HTMLElement>('.chat-pending-card')]
+    expect(cards.every(card => card.tabIndex === 0)).toBe(true)
+    cards[1]?.dispatchEvent(new KeyboardEvent('keydown', {
+      bubbles: true,
+      altKey: true,
+      key: 'ArrowUp',
+    }))
+    expect(starts).toBe(1)
+    expect(moves).toEqual([[1, 0]])
+    expect(ends).toBe(1)
+    app.unmount()
+
+    const locked = await mountQueue({}, [
+      { text: 'In flight', deliveryState: 'steering' },
+      { text: 'Must wait' },
+    ])
+    expect([...locked.el.querySelectorAll<HTMLElement>('.chat-pending-card')]
+      .every(card => card.getAttribute('tabindex') === null)).toBe(true)
+    locked.app.unmount()
+  })
+
+  it('preserves bubble identity when a middle item is removed', async () => {
+    const items = reactive([
+      { text: 'First queued message' },
+      { text: 'Delete this middle message' },
+      { text: 'Last queued message' },
+    ])
+    const { app, el } = await mountQueue({}, items)
+    const before = [...el.querySelectorAll<HTMLElement>('.chat-pending-card')]
+
+    items.splice(1, 1)
+    await nextTick()
+
+    const after = [...el.querySelectorAll<HTMLElement>('.chat-pending-card')]
+      .filter(card => !card.classList.contains('chat-pending-list-leave-active'))
+    expect(after.map(card => card.querySelector('.chat-pending-text')?.textContent?.trim()))
+      .toEqual(['First queued message', 'Last queued message'])
+    expect(after[0]).toBe(before[0])
+    expect(after[1]).toBe(before[2])
+    app.unmount()
+  })
+
+  it('keeps menu focus and action identity when a peer removes an earlier item', async () => {
+    const items = ref([
+      { pendingUiId: 'pending-peer-a', text: 'Peer A' },
+      { pendingUiId: 'pending-peer-b', text: 'Peer B' },
+    ])
+    const edited: string[] = []
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const Host = defineComponent(() => () => h(PendingQueue, {
+      items: items.value,
+      maxPending: 5,
+      steerAvailable: true,
+      onEdit: (pendingUiId: string) => edited.push(pendingUiId),
+    }))
+    const app = createApp(Host)
+    app.use(i18n)
+    app.mount(el)
+    await nextTick()
+
+    const secondMore = el.querySelectorAll<HTMLButtonElement>('[aria-label="More"]')[1]
+    secondMore?.click()
+    await nextTick()
+    const edit = [...el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find(button => button.textContent?.includes('Edit message'))
+    edit?.focus()
+    expect(document.activeElement).toBe(edit)
+
+    items.value.splice(0, 1)
+    await nextTick()
+
+    const survivingCard = el.querySelector<HTMLElement>('[data-pending-ui-id="pending-peer-b"]')
+    expect(survivingCard?.querySelector('[role="menu"]')).not.toBeNull()
+    expect(document.activeElement).toBe(edit)
+    edit?.click()
+    expect(edited).toEqual(['pending-peer-b'])
     app.unmount()
   })
 })

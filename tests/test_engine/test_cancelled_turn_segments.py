@@ -13,6 +13,7 @@ import pytest
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import TextDeltaEvent
 from opensquilla.gateway.config import AttachmentsConfig, GatewayConfig, SquillaRouterConfig
+from opensquilla.gateway.usage_ledger_runtime import SessionUsageEventSink
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import Message, ModelInfo
 from opensquilla.provider import TextDeltaEvent as ProviderText
@@ -65,6 +66,69 @@ class _ToolThenCompletedTextProvider(_ToolThenHangingTextProvider):
         yield ProviderDone(stop_reason="end_turn", input_tokens=1, output_tokens=1)
 
 
+class _HangingSystemEventProvider:
+    """Emit one internal text chunk, then wait so the turn can be stopped."""
+
+    provider_name = "test"
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.model = "test/model"
+        self.text_consumed = asyncio.Event()
+
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        return self._stream()
+
+    async def _stream(self) -> AsyncIterator[Any]:
+        yield ProviderText(text=self.text)
+        # Set only when the consumer requests the next provider event, proving
+        # the shared stream stage has already accumulated the held delta.
+        self.text_consumed.set()
+        await asyncio.Event().wait()
+
+    async def list_models(self) -> list[ModelInfo]:
+        return []
+
+
+class _ToolThenHangingSilentProvider(_ToolThenHangingTextProvider):
+    """Complete a tool round, then emit a sentinel and wait for Stop."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.text_consumed = asyncio.Event()
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="lookup")
+            yield ProviderToolUseEnd(tool_use_id="tool-1", tool_name="lookup", arguments={})
+            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        yield ProviderText(text="NO_REPLY")
+        self.text_consumed.set()
+        await asyncio.Event().wait()
+
+
+class _TextToolTextHangingProvider(_ToolThenHangingTextProvider):
+    """Put caller-provided text on both sides of a completed tool boundary."""
+
+    def __init__(self, before_tool: str, after_tool: str) -> None:
+        super().__init__()
+        self.before_tool = before_tool
+        self.after_tool = after_tool
+        self.text_consumed = asyncio.Event()
+
+    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
+        if call_number == 1:
+            yield ProviderText(text=self.before_tool)
+            yield ProviderToolUseStart(tool_use_id="tool-1", tool_name="lookup")
+            yield ProviderToolUseEnd(tool_use_id="tool-1", tool_name="lookup", arguments={})
+            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+            return
+        yield ProviderText(text=self.after_tool)
+        self.text_consumed.set()
+        await asyncio.Event().wait()
+
+
 class _SelectorClone:
     current_config = SimpleNamespace(model="test/model")
 
@@ -106,11 +170,14 @@ async def test_cancelled_turn_persists_trailing_text_segment(tmp_path) -> None:
     await storage.connect()
     manager = SessionManager(storage)
     session_key = "agent:main:webchat:cancel-trailing-text"
+    await storage.initialize_usage_ledger(1)
     await manager.create(session_key)
+    usage_sink = SessionUsageEventSink(storage, start_retry_delays=(), retry_delays=())
     runner = TurnRunner(
         provider_selector=_ProviderSelector(_ToolThenHangingTextProvider()),
         tool_registry=_registry(),
         session_manager=manager,
+        usage_event_sink=usage_sink,
         config=GatewayConfig(
             attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
             squilla_router=SquillaRouterConfig(enabled=False),
@@ -159,6 +226,18 @@ async def test_cancelled_turn_persists_trailing_text_segment(tmp_path) -> None:
             seg for seg in segments if isinstance(seg, dict) and seg.get("type") == "text"
         ]
         assert any(PARTIAL_ANSWER in str(seg.get("text", "")) for seg in text_segments)
+
+        assert assistant.turn_usage is not None
+        assert assistant.turn_usage["input_tokens"] == 1
+        assert assistant.turn_usage["output_tokens"] == 1
+        assert assistant.turn_usage["coverage_status"] == "usage_unknown"
+        assert assistant.turn_usage["unknown_usage_events"] == 1
+        session = await manager.get_session(session_key)
+        assert session is not None
+        assert session.input_tokens == 1
+        assert session.output_tokens == 1
+        assert session.total_tokens == 2
+        assert session.missing_cost_entries == 1
     finally:
         if not task.done():
             task.cancel()
@@ -225,6 +304,258 @@ async def test_cancel_during_finalizer_does_not_duplicate_text_segment(
             and PARTIAL_ANSWER in str(segment.get("text", ""))
         ]
         assert len(text_segments) == 1
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial_marker", ["NO", "NO_REP", "HEARTBEAT_O"])
+async def test_cancelled_system_event_does_not_persist_partial_sentinel(
+    tmp_path,
+    partial_marker: str,
+) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = f"agent:main:webchat:cancel-sentinel-{partial_marker}"
+    await storage.initialize_usage_ledger(1)
+    await manager.create(session_key)
+    provider = _HangingSystemEventProvider(partial_marker)
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=_registry(),
+        session_manager=manager,
+        usage_event_sink=SessionUsageEventSink(
+            storage,
+            start_retry_delays=(),
+            retry_delays=(),
+        ),
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+
+    async def _consume() -> None:
+        async for _event in runner.run(
+            "internal continuation",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            input_mode="system_event",
+            run_kind="goal",
+            no_memory_capture=True,
+        ):
+            pass
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(provider.text_consumed.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        transcript = await manager.get_transcript(session_key)
+        assert [entry for entry in transcript if entry.role == "assistant"] == []
+        session = await manager.get_session(session_key)
+        assert session is not None
+        assert session.total_tokens == 0
+        assert session.missing_cost_entries == 1
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_system_event_persists_body_without_sentinel(tmp_path) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:webchat:cancel-mixed-sentinel"
+    await manager.create(session_key)
+    body = "The external check still needs confirmation."
+    provider = _HangingSystemEventProvider(f"NO_REPLY\n{body}")
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+
+    async def _consume() -> None:
+        async for _event in runner.run(
+            "internal continuation",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            input_mode="system_event",
+            run_kind="goal",
+            no_memory_capture=True,
+        ):
+            pass
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(provider.text_consumed.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        transcript = await manager.get_transcript(session_key)
+        assistants = [entry for entry in transcript if entry.role == "assistant"]
+        assert len(assistants) == 1
+        assert assistants[0].content == body
+        assert "NO_REPLY" not in str(assistants[0].tool_calls)
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_silent_system_event_keeps_completed_tool_audit(tmp_path) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:webchat:cancel-sentinel-with-tool"
+    await manager.create(session_key)
+    provider = _ToolThenHangingSilentProvider()
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+
+    async def _consume() -> None:
+        async for _event in runner.run(
+            "internal continuation",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            input_mode="system_event",
+            run_kind="goal",
+            no_memory_capture=True,
+        ):
+            pass
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(provider.text_consumed.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        transcript = await manager.get_transcript(session_key)
+        assistants = [entry for entry in transcript if entry.role == "assistant"]
+        assert len(assistants) == 1
+        assert assistants[0].content == ""
+        segments = assistants[0].tool_calls or []
+        assert [segment.get("type") for segment in segments] == [
+            "tool_use",
+            "tool_result",
+        ]
+        assert "NO_REPLY" not in str(segments)
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("before_tool", "after_tool"),
+    [
+        ("NO_REPLY", "Visible body."),
+        ("Visible body.", "NO_REPLY"),
+    ],
+)
+async def test_cancelled_system_event_removes_marker_at_tool_boundary(
+    tmp_path,
+    before_tool: str,
+    after_tool: str,
+) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = f"agent:main:webchat:cancel-tool-boundary-{before_tool}"
+    await manager.create(session_key)
+    provider = _TextToolTextHangingProvider(before_tool, after_tool)
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+
+    async def _consume() -> None:
+        async for _event in runner.run(
+            "internal continuation",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            input_mode="system_event",
+            run_kind="goal",
+            no_memory_capture=True,
+        ):
+            pass
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(provider.text_consumed.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        transcript = await manager.get_transcript(session_key)
+        assistant = [entry for entry in transcript if entry.role == "assistant"][-1]
+        assert assistant.content == "Visible body."
+        assert "NO_REPLY" not in str(assistant.tool_calls)
+        assert [segment.get("type") for segment in assistant.tool_calls or []] == (
+            ["tool_use", "tool_result", "text"]
+            if before_tool == "NO_REPLY"
+            else ["text", "tool_use", "tool_result"]
+        )
     finally:
         if not task.done():
             task.cancel()

@@ -2262,7 +2262,7 @@ async def test_agent_turn_finally_clears_only_its_execution_approval_deltas(
         provider = _LifecycleProvider(outcome)
         agent = Agent(
             provider=provider,
-            config=AgentConfig(max_iterations=1),
+            config=AgentConfig(max_iterations=1, max_provider_retries=0),
             session_key=node.session_key,
             tool_context=_fresh_tool_context(
                 latest_node,
@@ -2277,11 +2277,11 @@ async def test_agent_turn_finally_clears_only_its_execution_approval_deltas(
         if outcome == "success":
             await _run()
         elif outcome == "error":
-            with pytest.raises(
-                RuntimeError,
-                match="provider lifecycle failure",
-            ):
-                await _run()
+            events = await _run()
+            terminal = next(event for event in events if event.kind == "error")
+            assert terminal.code == "request_error"
+            assert terminal.failure_kind == "transport_transient"
+            assert "provider lifecycle failure" not in repr(events)
         else:
             task = asyncio.create_task(_run())
             await provider.started.wait()

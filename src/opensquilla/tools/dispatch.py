@@ -1699,4 +1699,13 @@ def build_tool_handler(
             finally:
                 current_tool_context.reset(token)
 
+    # Agent-side lossy projection is only safe when the callable can actually
+    # dispatch the provider-visible recovery tool.  Keep this capability on
+    # the handler itself so embedded Agents and wrapped Meta children do not
+    # mistake an arbitrary non-null callback for a retrieval implementation.
+    setattr(
+        _handler,
+        "_opensquilla_available_tools",
+        frozenset(registry.list_names()),
+    )
     return _handler

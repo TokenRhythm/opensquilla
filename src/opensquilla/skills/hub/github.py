@@ -389,6 +389,17 @@ class GitHubSource(SkillSource):
     async def search(self, query: str, limit: int = 20) -> list[SkillMeta]:
         import httpx
 
+        # GitHub rejects unauthenticated code search outright, so without a token
+        # this request cannot succeed — every Community search would spend a round
+        # trip earning a 401 and then warn about it, while the results the user sees
+        # come from the other sources regardless. Skip the call instead of crying
+        # wolf. Only search needs the token: fetch and inspect read the tree and raw
+        # endpoints, which do serve anonymous callers, so installing a GitHub skill
+        # by identifier keeps working.
+        if not self._token:
+            log.debug("github.search_skipped_unauthenticated", query=query)
+            return []
+
         search_query = f"{query} filename:SKILL.md"
         url = "https://api.github.com/search/code"
         try:

@@ -258,14 +258,16 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   background: var(--sidebar-item-active);
 }
 
-.sidebar-recents-header {
+.sidebar-recents-header,
+.sidebar-zone-heading {
   align-items: center;
   gap: var(--sp-1);
   min-height: 40px;
   padding: 4px 10px;
 }
 
-.sidebar-recents-eyebrow {
+.sidebar-recents-eyebrow,
+.sidebar-zone-heading__label {
   font-size: var(--fs-sm);
   font-weight: 400;
   line-height: 20px;
@@ -273,7 +275,8 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   text-transform: none;
 }
 
-.sidebar-recents-count {
+.sidebar-recents-count,
+.sidebar-zone-heading__count {
   align-self: center;
   color: var(--sidebar-text-soft);
   font-size: var(--fs-xs);
@@ -283,7 +286,9 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .sidebar-recents-header .sidebar-cmd-btn,
-.sidebar-recents-header .sidebar-bulk-mode-btn {
+.sidebar-recents-header .sidebar-bulk-mode-btn,
+.sidebar-zone-heading .sidebar-cmd-btn,
+.sidebar-zone-heading .sidebar-bulk-mode-btn {
   align-items: center;
   display: inline-flex;
   height: 32px;
@@ -938,12 +943,23 @@ body > .settings-overlay .settings-modal .setup-provider-editor-head {
   border: 0;
 }
 
-body > .settings-overlay .settings-modal .setup-provider-card {
+body > .settings-overlay .settings-modal .setup-provider-list {
   background: var(--bg-surface-2);
-  border: 0;
+  border: 1px solid color-mix(in srgb, var(--text) 8%, transparent);
   border-radius: var(--radius-card);
-  min-height: 64px;
-  padding: var(--sp-3) var(--sp-4);
+}
+
+body > .settings-overlay .settings-modal .setup-provider-card {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  border-top: 1px solid color-mix(in srgb, var(--text) 7%, transparent);
+  min-height: 58px;
+  padding: var(--sp-2) var(--sp-3);
+}
+
+body > .settings-overlay .settings-modal .setup-provider-card:first-child {
+  border-top: 0;
 }
 
 body > .settings-overlay .settings-modal .setup-provider-card.is-selected {

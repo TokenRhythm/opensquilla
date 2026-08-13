@@ -80,6 +80,7 @@
     <!-- Recent conversations -->
     <SidebarConversations
       :sections="sidebarSections"
+      :session-order="sidebarSessionOrder"
       :error="sessionListError"
       :loading="isLoading"
       :current-key="sidebarCurrentKey"
@@ -168,7 +169,7 @@
       'main--tabbar-hidden': mobileKeyboardOpen,
     }"
   >
-    <header class="topbar" :class="{ 'topbar--chat': isChatRoute }">
+    <header ref="topbarRef" class="topbar" :class="{ 'topbar--chat': isChatRoute }">
       <div class="topbar-left">
         <!-- Sidebar toggle — visible when sidebar is collapsed -->
         <button
@@ -190,39 +191,71 @@
           </span>
         </button>
       </div>
-      <!-- Permanent target: Chat teleports its route-owned actions into the
-           same in-flow header as the app controls without duplicating state. -->
+      <!-- App owns the route header and its component tree. Chat only publishes
+           reactive state and commands through the typed route-header bridge. -->
       <div
         id="app-route-header"
         class="topbar-route-header"
         data-testid="route-header-host"
-      ></div>
+      >
+        <ChatHeaderActions
+          v-if="isChatRoute"
+          v-show="chatRouteHeaderVisible"
+          ref="chatHeaderActionsRef"
+          :title="chatRouteHeaderTitle"
+          :copy-state="chatRouteHeaderCopyState"
+          :copy-icon="chatRouteHeaderCopyIcon"
+          :copy-live-text="chatRouteHeaderCopyLiveText"
+          :deliverable-count="chatRouteHeaderDeliverableCount"
+          :share-mode="chatRouteHeaderShareMode"
+          :shareable-message-count="chatRouteHeaderShareableMessageCount"
+          @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
+          @start-share="chatRouteHeader.invoke('startShare')"
+          @copy-session-key="chatRouteHeader.invoke('copySessionKey')"
+        />
+      </div>
       <div
         class="topbar-right"
         :class="{ 'topbar-right--attention': appStore.approvalCount > 0 }"
       >
-        <button
-          v-if="appStore.approvalCount > 0"
-          class="approval-inline"
-          @click="openBlockedApprovalSession"
-          :title="t('chrome.openBlockedSession')"
-        >
-          {{ t('chrome.approvalRequired') }}
-        </button>
-        <button
-          v-if="webConfigEnabled"
-          type="button"
-          class="conn-pill conn-pill--link"
-          :class="rpcStore.state"
-          :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
-          :aria-label="t('chrome.manageConnection')"
-          @click="openConnectionSettings"
-        >{{ connectionStateLabel }}</button>
-        <span v-else class="conn-pill" :class="rpcStore.state">{{ connectionStateLabel }}</span>
-        <DesktopUpdateIndicator />
+        <ChatSystemStatus
+          v-if="isChatRoute"
+          :layout="systemHeaderLayout"
+          :connection-state="effectiveConnectionState"
+          :connection-label="connectionStateLabel"
+          :approval-count="appStore.approvalCount"
+          :can-manage-connection="webConfigEnabled"
+          @open-connection="openConnectionSettings"
+          @open-approval="openBlockedApprovalSession"
+          @open-update="openDesktopRuntimeSettings"
+        />
+        <template v-else>
+          <button
+            v-if="appStore.approvalCount > 0"
+            class="approval-inline"
+            @click="openBlockedApprovalSession"
+            :title="t('chrome.openBlockedSession')"
+          >
+            {{ t('chrome.approvalRequired') }}
+          </button>
+          <button
+            v-if="webConfigEnabled"
+            type="button"
+            class="conn-pill conn-pill--link"
+            :class="rpcStore.state"
+            :title="t('chrome.connectionTitle', { state: connectionStateLabel })"
+            :aria-label="t('chrome.manageConnection')"
+            @click="openConnectionSettings"
+          >{{ connectionStateLabel }}</button>
+          <span v-else class="conn-pill" :class="rpcStore.state">{{ connectionStateLabel }}</span>
+          <DesktopUpdateIndicator />
+        </template>
         <!-- Opt-in (Settings → Appearance or the command palette); off by
              default so the topbar stays music-free until asked for. -->
-        <BgmControl v-if="bgmEnabled" />
+        <BgmControl
+          v-if="bgmEnabled"
+          :presentation="isChatRoute && systemHeaderLayout !== 'wide' ? 'pause-only' : 'full'"
+        />
         <LanguageSwitcher />
         <div class="theme-menu-wrap">
           <button
@@ -236,7 +269,13 @@
           >
             <Icon :name="themeIconName" :size="16" />
           </button>
-          <div v-if="themeMenuOpen" class="theme-menu" role="menu" :aria-label="t('chrome.theme')">
+          <div
+            v-if="themeMenuOpen"
+            class="theme-menu"
+            role="menu"
+            :aria-label="t('chrome.theme')"
+            data-chat-topbar-popover="theme"
+          >
             <button
               v-for="opt in themeOptions"
               :key="opt.mode"
@@ -273,7 +312,7 @@
         :data-skin-variant="variants || undefined"
         id="content"
       >
-        <ErrorBoundary>
+        <ErrorBoundary @error-captured="clearChatRouteHeaderAfterError">
           <router-view v-slot="{ Component, route }">
             <!-- out-in: one view in the DOM at a time, so pages never overlap (no
                  double-exposure, and never two composers/textareas mid-swap).
@@ -420,6 +459,8 @@ import ProjectWorkspaceEditDialog from './components/ProjectWorkspaceEditDialog.
 import ProjectWorkspacePickerDialog from './components/ProjectWorkspacePickerDialog.vue'
 import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
+import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
+import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarSetupBanner from './components/SidebarSetupBanner.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
@@ -429,10 +470,20 @@ import BgmControl from './components/BgmControl.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import { useBgm } from './composables/useBgm'
+import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
+import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
 import { useDocumentEvent } from './composables/useDocumentEvent'
-import { useDialogLayer } from './composables/useDialogA11y'
+import { hasOpenDialogLayer, useDialogLayer } from './composables/useDialogA11y'
+import {
+  provideChatTopbarPopoverCoordinator,
+  useChatTopbarPopoverCoordination,
+} from './composables/useChatTopbarPopoverCoordinator'
 import { provideArtifactImageLightbox } from './composables/chat/useArtifactImageLightbox'
+import {
+  provideChatRouteHeaderBridge,
+  type ChatRouteHeaderHostHandle,
+} from './composables/chat/useChatRouteHeaderBridge'
 import { useAgentOptions } from './composables/useAgentOptions'
 import { useSessionListSubscription } from './composables/useSessionListSubscription'
 import { useSessionTaskAttention } from './composables/useSessionTaskAttention'
@@ -444,6 +495,7 @@ import { useNavigation } from './app/useNavigation'
 import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
+import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
 import { reminderToastPreview } from './utils/cron/notifications'
 import { installSessionNavigationDiagConsole, recordSessionNavigationDiag } from './utils/chat/sessionNavigationDiag'
 import type { RpcEventHandler } from '@/lib/rpc'
@@ -451,6 +503,7 @@ import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
 import { bindingMatches, formatBinding } from './utils/keychord'
 import { SIDEBAR_MIN_WIDTH, type SidebarWidthPreference } from './utils/sidebarLayout'
+import { sidebarSessionOrderKeys } from './utils/sidebarDisplayProjection'
 import {
   dispatchLocalSessionsDeleted,
   localSessionsDeletedDetail,
@@ -474,9 +527,34 @@ const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
+// Chat-only transient chrome is coordinated independently from every modal and
+// from the non-chat topbar. The local menu refs remain authoritative elsewhere.
+const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const chatTopbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(isChatRoute)
+const chatRouteHeader = provideChatRouteHeaderBridge()
+const {
+  visible: chatRouteHeaderVisible,
+  title: chatRouteHeaderTitle,
+  copyState: chatRouteHeaderCopyState,
+  copyIcon: chatRouteHeaderCopyIcon,
+  copyLiveText: chatRouteHeaderCopyLiveText,
+  deliverableCount: chatRouteHeaderDeliverableCount,
+  shareMode: chatRouteHeaderShareMode,
+  shareableMessageCount: chatRouteHeaderShareableMessageCount,
+} = chatRouteHeader.model
+const chatHeaderActionsRef = ref<ChatRouteHeaderHostHandle | null>(null)
+watch(chatHeaderActionsRef, host => chatRouteHeader.setHost(host), { flush: 'sync' })
+watch(isChatRoute, active => {
+  if (!active) chatRouteHeader.clear()
+}, { flush: 'sync' })
+
+function clearChatRouteHeaderAfterError() {
+  chatRouteHeader.clear()
+}
 const sidebarRef = ref<HTMLElement | null>(null)
 const sidebarDockToggleRef = ref<HTMLButtonElement | null>(null)
 const topbarSidebarToggleRef = ref<HTMLButtonElement | null>(null)
+const topbarRef = ref<HTMLElement | null>(null)
 type SidebarResizerHandle = { cancel: () => boolean }
 const sidebarResizerRef = ref<SidebarResizerHandle | null>(null)
 
@@ -510,7 +588,14 @@ const APP_SESSION_SYNC_SOURCE = 'app-sidebar'
 // Localized connection-state label for the topbar pill and its tooltip. The
 // store state ('connected' | 'connecting' | 'disconnected') is a stable key, not
 // display text; CSS uppercases the result (a no-op for CJK scripts).
-const connectionStateLabel = computed(() => t(`chrome.connectionState.${rpcStore.state}`))
+const effectiveConnectionState = computed(() => effectiveChatConnectionState(
+  rpcStore.state,
+  appStore.chatLivePhase,
+  isChatRoute.value,
+))
+const connectionStateLabel = computed(() => t(
+  `chrome.connectionState.${effectiveConnectionState.value}`,
+))
 const router = useRouter()
 
 // afterEach only fires on navigation, so a same-route language switch needs an
@@ -561,6 +646,7 @@ watch(
 // Feature-gated topbar music control; the singleton `enabled` ref is written by
 // Settings → Appearance and the command palette.
 const { enabled: bgmEnabled } = useBgm()
+const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
 interface AppCronRunFinishedPayload {
@@ -664,7 +750,12 @@ const themeIconName = computed(() => {
 })
 
 const themeMenuOpen = ref(false)
-useDialogLayer(themeMenuOpen)
+useChatTopbarPopoverCoordination(
+  'theme',
+  themeMenuOpen,
+  chatTopbarPopoverCoordinator,
+)
+const themeMenuIsTopmost = useDialogLayer(themeMenuOpen)
 const themeButtonRef = ref<HTMLButtonElement | null>(null)
 
 // The compact topbar menu deliberately lists only the basic modes (Light / Dark
@@ -727,7 +818,17 @@ watch(currentSessionKey, markCurrentSessionReadIfVisible, {
 })
 
 // Chat layout applies to both the session view and the draft route.
-const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const systemHeaderPressureCount = computed(() => (
+  Number(effectiveConnectionState.value !== 'connected')
+  + Number(appStore.approvalCount > 0)
+  + Number(desktopUpdate.visible.value)
+  + Number(bgmEnabled.value)
+))
+const systemHeaderLayout = useSystemHeaderLayout({
+  target: topbarRef,
+  active: isChatRoute,
+  pressureCount: systemHeaderPressureCount,
+})
 const activeProjectDraftId = computed(() =>
   $route.path === '/chat/new' ? String($route.query.project || '') : '',
 )
@@ -992,10 +1093,10 @@ function onReorderSidebarSession(payload: {
   targetKey: string
   position: 'before' | 'after'
 }) {
-  const orderedKeys = sidebarSections.value
-    .flatMap(section => section.rows)
-    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
-    .map(row => row.key)
+  const orderedKeys = sidebarSessionOrderKeys(
+    sidebarSections.value,
+    sidebarSessionOrder.value,
+  )
   const from = orderedKeys.indexOf(payload.draggedKey)
   if (from < 0 || !orderedKeys.includes(payload.targetKey) || payload.draggedKey === payload.targetKey) return
 
@@ -1014,10 +1115,10 @@ function onPinSidebarSession(payload: { key: string; pinned: boolean }) {
   writeStoredSessionKeys(SIDEBAR_PINNED_SESSIONS_KEY, sidebarPinnedSessionKeys.value)
 
   if (!payload.pinned) return
-  const currentOrder = sidebarSections.value
-    .flatMap(section => section.rows)
-    .filter(row => row.rowKind === 'session' && row.sessionKind === 'chat' && !row.provisional)
-    .map(row => row.key)
+  const currentOrder = sidebarSessionOrderKeys(
+    sidebarSections.value,
+    sidebarSessionOrder.value,
+  )
     .filter(key => key !== payload.key)
   currentOrder.unshift(payload.key)
   sidebarSessionOrder.value = currentOrder
@@ -1400,7 +1501,7 @@ function switchToSession(key: string, source = 'app.switchToSession') {
 }
 
 // Optimistic rename: show the new title immediately, then persist via
-// sessions.patch (display_name is the top-precedence title) and reload so the
+// sessions.rename (display_name is the top-precedence title) and reload so the
 // backend's canonical title wins. The override clears once the reload lands.
 async function onRenameSession({ key, title }: { key: string; title: string }) {
   const next = title.trim()
@@ -1409,10 +1510,10 @@ async function onRenameSession({ key, title }: { key: string; title: string }) {
   const local = localChatSessions.value[key]
   if (local) localChatSessions.value[key] = { ...local, title: next }
   try {
-    await rpcStore.call('sessions.patch', { key, displayName: next })
+    await rpcStore.call('sessions.rename', { key, displayName: next })
     pushToast('Session renamed', { tone: 'ok' })
   } catch (err: unknown) {
-    console.warn('[App] sessions.patch error:', errorMessage(err))
+    console.warn('[App] sessions.rename error:', errorMessage(err))
     pushToast('Failed to rename session', { tone: 'danger' })
   } finally {
     await loadSessions()
@@ -1535,6 +1636,12 @@ function openSettings() {
 // gateway link can be inspected or re-pointed.
 function openConnectionSettings() {
   router.push('/settings/connection')
+}
+
+// Compact chat headers hand off to the complete Desktop update workflow rather
+// than recreating update actions inside the status summary.
+function openDesktopRuntimeSettings() {
+  router.push('/settings/runtime')
 }
 
 function scheduleSessionRefresh() {
@@ -1678,21 +1785,24 @@ function handleKeydown(e: KeyboardEvent) {
   // consumed the key: the composer textarea (@keydown, target phase) and any
   // earlier-registered document listener (e.g. ChatView). Overlays (drawers,
   // modals) attach their document listeners on open — AFTER this one — so they
-  // run later and are NOT covered by this guard; their collision with the
-  // sidebar-Escape branch is ruled out by the mobile-only gate below instead.
+  // run later and are covered separately by the shared dialog-layer guard.
   if (e.defaultPrevented) return
 
-  if (e.key === 'Escape' && themeMenuOpen.value) {
+  if (e.key === 'Escape' && themeMenuOpen.value && themeMenuIsTopmost.value) {
+    e.preventDefault()
     themeMenuOpen.value = false
     themeButtonRef.value?.focus()
     return
   }
+  // Child topbar controls and routed dialogs install their Escape handlers
+  // after App's listener. Let the current dialog-stack owner handle the key
+  // instead of pre-emptively collapsing the mobile sidebar beneath it.
+  if (e.key === 'Escape' && hasOpenDialogLayer()) return
   // Escape dismisses the sidebar only as the mobile slide-over. On desktop the
   // sidebar is a persistent dock toggled by its own button, so it must never
   // collapse as a side effect of an Escape meant for an overlay opened on top of
-  // it. Because those overlays run after this handler (see above), this
-  // mobile-only gate — not the defaultPrevented check — is what prevents that
-  // collision; keep it. The settings overlay owns Escape while open and is excluded.
+  // it. The shared dialog-layer guard above handles that ordering collision;
+  // this branch remains mobile-only because desktop uses a persistent dock.
   if (e.key === 'Escape' && appStore.sidebarOpen && !settingsOverlayOpen.value && isSidebarDrawer.value) {
     closeSidebarDrawer()
   }

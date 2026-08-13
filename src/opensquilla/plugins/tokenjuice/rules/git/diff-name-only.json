@@ -4,6 +4,8 @@
   "description": "Compact git diff --name-only output.",
   "match": {
     "argv0": ["git"],
+    "gitSubcommands": ["diff"],
+    "argvIncludesBeforeDoubleDash": [["--name-only"]],
     "argvIncludes": [["diff"], ["--name-only"]]
   },
   "transforms": {

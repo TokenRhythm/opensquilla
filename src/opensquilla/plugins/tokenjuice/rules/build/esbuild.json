@@ -4,6 +4,7 @@
   "description": "Compact esbuild and tsdown-like output while preserving actual errors.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["esbuild"],
     "commandIncludes": ["esbuild"]
   },
   "transforms": {

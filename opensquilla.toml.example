@@ -381,8 +381,9 @@ max_skills_prompt_chars = 8000
 
 [task_runtime]
 # Server-side agent turn queue. Same-session tasks are serialized;
-# different sessions can run concurrently up to this limit.
-max_concurrency = 4
+# different sessions can run concurrently up to this limit. Eight matches the
+# desktop channel budget while keeping provider pressure behind one global queue.
+max_concurrency = 8
 # Waiting tasks per session before new follow-up work is rejected.
 max_pending_per_session = 64
 

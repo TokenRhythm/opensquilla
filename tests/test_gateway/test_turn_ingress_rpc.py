@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -13,6 +15,11 @@ from typing import Any
 
 import pytest
 
+from opensquilla.attachment_refs import (
+    PENDING_CHAT_INPUT_MATERIAL_STORE,
+    pending_chat_input_material_path,
+    transcript_material_path,
+)
 from opensquilla.engine.steps.meta_command import (
     format_meta_replay_sentinel,
     meta_command_launch,
@@ -27,6 +34,7 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.task_runtime import TaskRuntime
+from opensquilla.gateway.uploads import UploadStore, get_upload_store, set_upload_store
 from opensquilla.session.goals import GoalCommandRequest, StartGoalMutation, new_goal
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, TranscriptEntry
@@ -91,6 +99,7 @@ async def _open_real_stack(
         principal=_PRINCIPAL,
         config=GatewayConfig(
             workspace_dir=str(db_path.parent / "workspace"),
+            attachments={"media_root": str(db_path.parent / "media")},
             memory={"flush_enabled": False},
             naming={"enabled": False},
         ),
@@ -208,6 +217,724 @@ async def _seed_idle_active_goal(stack: _RealIngressStack) -> Any:
     assert settled.status == "active"
     assert settled.active_task_id is None
     return settled
+
+
+@pytest.mark.asyncio
+async def test_pending_input_rpc_dispatch_is_exactly_once_across_response_replay(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-input-dispatch.db") as stack:
+        enqueue_params = {
+            "key": SESSION_KEY,
+            "pendingInputId": "pending-rpc-exactly-once",
+            "clientRequestId": "pending-rpc-request",
+            "clientMessageId": "pending-rpc-message",
+            "message": "Run this queued follow-up exactly once.",
+        }
+        staged = await get_dispatcher().dispatch(
+            "pending-enqueue",
+            "sessions.pending_inputs.enqueue",
+            enqueue_params,
+            stack.context,
+        )
+        assert staged.ok is True
+        assert staged.payload["status"] == "staged"
+        staged_row = await stack.storage.get_pending_chat_input(
+            "pending-rpc-exactly-once"
+        )
+        assert staged_row is not None
+
+        listed = await get_dispatcher().dispatch(
+            "pending-list",
+            "sessions.pending_inputs.list",
+            {"key": SESSION_KEY},
+            stack.context,
+        )
+        assert listed.ok is True
+        assert [item["pendingInputId"] for item in listed.payload["items"]] == [
+            "pending-rpc-exactly-once"
+        ]
+
+        dispatch_params = {
+            "key": SESSION_KEY,
+            "pendingInputId": "pending-rpc-exactly-once",
+            "clientRequestId": "pending-rpc-request",
+            "requestFingerprint": staged.payload["requestFingerprint"],
+        }
+        missing_fingerprint = await get_dispatcher().dispatch(
+            "pending-dispatch-missing-fingerprint",
+            "sessions.pending_inputs.dispatch",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-rpc-exactly-once",
+                "clientRequestId": "pending-rpc-request",
+            },
+            stack.context,
+        )
+        assert missing_fingerprint.ok is False
+        assert missing_fingerprint.error is not None
+        assert missing_fingerprint.error.code == "PENDING_INPUT_FINGERPRINT_REQUIRED"
+        accepted = await get_dispatcher().dispatch(
+            "pending-dispatch",
+            "sessions.pending_inputs.dispatch",
+            dispatch_params,
+            stack.context,
+        )
+        late_enqueue = await get_dispatcher().dispatch(
+            "pending-enqueue-after-dispatch",
+            "sessions.pending_inputs.enqueue",
+            enqueue_params,
+            stack.context,
+        )
+        assert late_enqueue.ok is False
+        assert late_enqueue.error is not None
+        assert late_enqueue.error.code == "PENDING_INPUT_ALREADY_DISPATCHED"
+        changed_message_identity = await get_dispatcher().dispatch(
+            "pending-changed-message-enqueue-after-dispatch",
+            "sessions.pending_inputs.enqueue",
+            {
+                **enqueue_params,
+                "clientMessageId": "pending-rpc-message-changed",
+            },
+            stack.context,
+        )
+        assert changed_message_identity.ok is False
+        assert changed_message_identity.error is not None
+        assert changed_message_identity.error.code == "PENDING_INPUT_CONFLICT"
+        conflicting_late_enqueue = await get_dispatcher().dispatch(
+            "pending-conflicting-enqueue-after-dispatch",
+            "sessions.pending_inputs.enqueue",
+            {
+                **enqueue_params,
+                "pendingInputId": "pending-rpc-late-arbitrary-id",
+            },
+            stack.context,
+        )
+        assert conflicting_late_enqueue.ok is False
+        assert conflicting_late_enqueue.error is not None
+        assert conflicting_late_enqueue.error.code == "PENDING_INPUT_CONFLICT"
+        reused_message_identity = await get_dispatcher().dispatch(
+            "pending-reused-message-enqueue-after-dispatch",
+            "sessions.pending_inputs.enqueue",
+            {
+                **enqueue_params,
+                "pendingInputId": "pending-rpc-late-new-request",
+                "clientRequestId": "pending-rpc-request-new",
+            },
+            stack.context,
+        )
+        assert reused_message_identity.ok is False
+        assert reused_message_identity.error is not None
+        assert reused_message_identity.error.code == "PENDING_INPUT_CONFLICT"
+
+        # Reproduce a queue ghost left by a pre-fix racing tab. Dispatch replay
+        # must bind it to the original request/message receipt and consume it
+        # without creating a second transcript or task.
+        ghost_id = "pending-rpc-legacy-ghost"
+        async with stack.storage._write_transaction(
+            "test_insert_legacy_pending_ghost"
+        ) as conn:
+            await conn.execute(
+                """
+                INSERT INTO pending_chat_inputs (
+                    pending_input_id, session_key, source_scope,
+                    client_request_id, client_message_id, request_fingerprint,
+                    payload_json, position, state_revision, created_at, updated_at,
+                    schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1, ?, ?, 1)
+                """,
+                (
+                    ghost_id,
+                    staged_row.session_key,
+                    staged_row.source_scope,
+                    staged_row.client_request_id,
+                    staged_row.client_message_id,
+                    staged_row.request_fingerprint,
+                    json.dumps(
+                        staged_row.payload,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                    staged_row.updated_at + 1,
+                    staged_row.updated_at + 1,
+                ),
+            )
+        ghost_replayed = await get_dispatcher().dispatch(
+            "pending-dispatch-legacy-ghost",
+            "sessions.pending_inputs.dispatch",
+            {**dispatch_params, "pendingInputId": ghost_id},
+            stack.context,
+        )
+        assert ghost_replayed.ok is True
+        assert ghost_replayed.payload["replayed"] is True
+        assert await stack.storage.list_pending_chat_inputs(SESSION_KEY) == []
+
+        replayed = await get_dispatcher().dispatch(
+            "pending-dispatch-replay",
+            "sessions.pending_inputs.dispatch",
+            dispatch_params,
+            stack.context,
+        )
+
+        assert accepted.ok is True
+        assert replayed.ok is True
+        assert replayed.payload["task_id"] == accepted.payload["task_id"]
+        assert replayed.payload["message_id"] == accepted.payload["message_id"]
+        arbitrary_pending = await get_dispatcher().dispatch(
+            "pending-dispatch-arbitrary-id",
+            "sessions.pending_inputs.dispatch",
+            {
+                **dispatch_params,
+                "pendingInputId": "pending-rpc-arbitrary-id",
+            },
+            stack.context,
+        )
+        assert arbitrary_pending.ok is False
+        assert arbitrary_pending.error is not None
+        assert arbitrary_pending.error.code == "PENDING_INPUT_NOT_FOUND"
+        assert await stack.storage.list_pending_chat_inputs(SESSION_KEY) == []
+        counts = _table_counts(stack.db_path)
+        assert counts == {
+            "transcript_entries": 1,
+            "agent_tasks": 1,
+            "turn_ingress_receipts": 1,
+        }
+
+
+@pytest.mark.asyncio
+async def test_pending_input_cancel_tombstone_blocks_delayed_enqueue(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "cancel-first-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(
+            tmp_path / "pending-input-cancel-first.db"
+        ) as stack:
+            identity = {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-rpc-cancel-first",
+            }
+            cancelled = await get_dispatcher().dispatch(
+                "pending-cancel-before-enqueue",
+                "sessions.pending_inputs.cancel",
+                identity,
+                stack.context,
+            )
+            assert cancelled.ok is True
+            assert cancelled.payload["alreadyMissing"] is True
+
+            payload = b"cancelled delayed attachment\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("cancelled.txt", "text/plain", payload)
+            delayed = await get_dispatcher().dispatch(
+                "pending-delayed-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    **identity,
+                    "clientRequestId": "pending-rpc-cancel-first-request",
+                    "clientMessageId": "pending-rpc-cancel-first-message",
+                    "message": "This delayed enqueue must stay cancelled.",
+                    "attachments": [
+                        {
+                            "type": "text/plain",
+                            "name": "cancelled.txt",
+                            "file_uuid": file_uuid,
+                        }
+                    ],
+                },
+                stack.context,
+            )
+            assert delayed.ok is False
+            assert delayed.error is not None
+            assert delayed.error.code == "PENDING_INPUT_CANCELLED"
+            assert await stack.storage.list_pending_chat_inputs(SESSION_KEY) == []
+            assert not pending_chat_input_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                stack.session_id,
+                "pending-rpc-cancel-first",
+                digest,
+            ).exists()
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_pending_input_rpc_rejects_conflicts_and_expired_attachments(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-input-conflict.db") as stack:
+        base = {
+            "key": SESSION_KEY,
+            "pendingInputId": "pending-rpc-conflict",
+            "clientRequestId": "pending-rpc-conflict-request",
+            "clientMessageId": "pending-rpc-conflict-message",
+            "message": "original payload",
+        }
+        first = await get_dispatcher().dispatch(
+            "pending-conflict-first",
+            "sessions.pending_inputs.enqueue",
+            base,
+            stack.context,
+        )
+        assert first.ok is True
+
+        conflict = await get_dispatcher().dispatch(
+            "pending-conflict-second",
+            "sessions.pending_inputs.enqueue",
+            {**base, "message": "different payload"},
+            stack.context,
+        )
+        assert conflict.ok is False
+        assert conflict.error is not None
+        assert conflict.error.code == "PENDING_INPUT_CONFLICT"
+
+        attachment = await get_dispatcher().dispatch(
+            "pending-attachment",
+            "sessions.pending_inputs.enqueue",
+            {
+                **base,
+                "pendingInputId": "pending-rpc-attachment",
+                "clientRequestId": "pending-rpc-attachment-request",
+                "clientMessageId": "pending-rpc-attachment-message",
+                "attachments": [{"kind": "staged", "file_uuid": "expiring-token"}],
+            },
+            stack.context,
+        )
+        assert attachment.ok is False
+        assert attachment.error is not None
+        assert attachment.error.code == "ATTACHMENT_EXPIRED"
+        assert len(await stack.storage.list_pending_chat_inputs(SESSION_KEY)) == 1
+
+
+@pytest.mark.asyncio
+async def test_pending_attachment_survives_restart_dispatches_once_and_cleans_owner(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(tmp_path / "pending-attachment.db") as stack:
+            payload = b"durable queued attachment\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("queued.txt", "text/plain", payload)
+            enqueue_params = {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-rpc-durable-attachment",
+                "clientRequestId": "pending-rpc-durable-attachment-request",
+                "clientMessageId": "pending-rpc-durable-attachment-message",
+                "message": "Use the durable attachment.",
+                "attachments": [
+                    {
+                        "type": "text/plain",
+                        "mime": "text/plain",
+                        "name": "queued.txt",
+                        "file_uuid": file_uuid,
+                    }
+                ],
+            }
+            staged = await get_dispatcher().dispatch(
+                "pending-attachment-enqueue",
+                "sessions.pending_inputs.enqueue",
+                enqueue_params,
+                stack.context,
+            )
+            assert staged.ok is True
+            assert staged.payload["attachments"] == [
+                {
+                    "name": "queued.txt",
+                    "mime": "text/plain",
+                    "type": "text/plain",
+                    "size": len(payload),
+                }
+            ]
+
+            row = await stack.storage.get_pending_chat_input(
+                "pending-rpc-durable-attachment"
+            )
+            assert row is not None
+            assert row.payload["attachments"] == [
+                {
+                    "kind": "attachment_ref",
+                    "type": "text/plain",
+                    "mime": "text/plain",
+                    "name": "queued.txt",
+                    "size": len(payload),
+                    "sha256": digest,
+                    "material_id": digest,
+                    "store": PENDING_CHAT_INPUT_MATERIAL_STORE,
+                    "scope": stack.session_id,
+                    "pending_input_id": "pending-rpc-durable-attachment",
+                    "source": "upload",
+                    "_was_staged": True,
+                }
+            ]
+            owner_path = pending_chat_input_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                stack.session_id,
+                "pending-rpc-durable-attachment",
+                digest,
+            )
+            assert owner_path.read_bytes() == payload
+
+            # The expiring upload is gone and the process-local upload store is
+            # replaced, matching a Gateway restart. Dispatch must use only the
+            # durable material reference retained by SQLite.
+            assert file_uuid not in upload_store._entries
+            set_upload_store(UploadStore(tmp_path / "upload-markers"))
+            enqueue_replay = await get_dispatcher().dispatch(
+                "pending-attachment-enqueue-replay",
+                "sessions.pending_inputs.enqueue",
+                enqueue_params,
+                stack.context,
+            )
+            assert enqueue_replay.ok is True
+            assert enqueue_replay.payload["replayed"] is True
+            assert (
+                enqueue_replay.payload["requestFingerprint"]
+                == staged.payload["requestFingerprint"]
+            )
+            dispatch_params = {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-rpc-durable-attachment",
+                "clientRequestId": "pending-rpc-durable-attachment-request",
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            }
+            accepted = await get_dispatcher().dispatch(
+                "pending-attachment-dispatch",
+                "sessions.pending_inputs.dispatch",
+                dispatch_params,
+                stack.context,
+            )
+            replayed = await get_dispatcher().dispatch(
+                "pending-attachment-dispatch-replay",
+                "sessions.pending_inputs.dispatch",
+                dispatch_params,
+                stack.context,
+            )
+            assert accepted.ok is True
+            assert replayed.ok is True
+            assert replayed.payload["message_id"] == accepted.payload["message_id"]
+            assert not owner_path.exists()
+            assert transcript_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                stack.session_id,
+                digest,
+            ).read_bytes() == payload
+            assert _table_counts(stack.db_path) == {
+                "transcript_entries": 1,
+                "agent_tasks": 1,
+                "turn_ingress_receipts": 1,
+            }
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_pending_attachment_cancel_removes_only_its_private_owner(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "cancel-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(tmp_path / "pending-attachment-cancel.db") as stack:
+            payload = b"cancel this queued attachment\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("cancel.txt", "text/plain", payload)
+            staged = await get_dispatcher().dispatch(
+                "pending-attachment-cancel-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-cancel-attachment",
+                    "clientRequestId": "pending-rpc-cancel-attachment-request",
+                    "clientMessageId": "pending-rpc-cancel-attachment-message",
+                    "message": "Queue then cancel this attachment.",
+                    "attachments": [
+                        {
+                            "type": "text/plain",
+                            "name": "cancel.txt",
+                            "file_uuid": file_uuid,
+                        }
+                    ],
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            media_root = Path(stack.context.config.attachments.media_root or "")
+            owner_path = pending_chat_input_material_path(
+                media_root,
+                stack.session_id,
+                "pending-rpc-cancel-attachment",
+                digest,
+            )
+            canonical_path = transcript_material_path(
+                media_root,
+                stack.session_id,
+                digest,
+            )
+            assert owner_path.read_bytes() == payload
+            assert not canonical_path.exists()
+
+            cancelled = await get_dispatcher().dispatch(
+                "pending-attachment-cancel",
+                "sessions.pending_inputs.cancel",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-cancel-attachment",
+                    "expectedRevision": staged.payload["revision"],
+                },
+                stack.context,
+            )
+            assert cancelled.ok is True
+            assert not owner_path.exists()
+            assert not canonical_path.exists()
+            assert await stack.storage.list_pending_chat_inputs(SESSION_KEY) == []
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_session_delete_reclaims_pending_attachment_owner(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "delete-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(tmp_path / "pending-attachment-delete.db") as stack:
+            payload = b"delete this session-owned pending attachment\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("delete.txt", "text/plain", payload)
+            staged = await get_dispatcher().dispatch(
+                "pending-attachment-delete-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-delete-attachment",
+                    "clientRequestId": "pending-rpc-delete-attachment-request",
+                    "clientMessageId": "pending-rpc-delete-attachment-message",
+                    "message": "Delete this queued attachment with the session.",
+                    "attachments": [
+                        {
+                            "type": "text/plain",
+                            "name": "delete.txt",
+                            "file_uuid": file_uuid,
+                        }
+                    ],
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            owner_path = pending_chat_input_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                stack.session_id,
+                "pending-rpc-delete-attachment",
+                digest,
+            )
+            assert owner_path.read_bytes() == payload
+
+            deleted = await get_dispatcher().dispatch(
+                "pending-attachment-session-delete",
+                "sessions.delete",
+                {"key": SESSION_KEY},
+                stack.context,
+            )
+            assert deleted.ok is True
+            assert deleted.payload == {"deleted": [SESSION_KEY], "errors": []}
+            assert not owner_path.exists()
+            assert await stack.storage.get_pending_chat_input(
+                "pending-rpc-delete-attachment"
+            ) is None
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_cancel_cleans_unreferenced_canonical_copy_after_failed_dispatch(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "failed-dispatch-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(
+            tmp_path / "pending-attachment-failed-dispatch.db",
+            max_pending_per_session=1,
+        ) as stack:
+            payload = b"failed dispatch must not leak canonical bytes\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            file_uuid = await upload_store.put("failed.txt", "text/plain", payload)
+            staged = await get_dispatcher().dispatch(
+                "pending-attachment-failed-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-failed-attachment",
+                    "clientRequestId": "pending-rpc-failed-attachment-request",
+                    "clientMessageId": "pending-rpc-failed-attachment-message",
+                    "message": "This dispatch will hit queue capacity.",
+                    "attachments": [
+                        {
+                            "type": "text/plain",
+                            "name": "failed.txt",
+                            "file_uuid": file_uuid,
+                        }
+                    ],
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            blocker = await stack.runtime.reserve(
+                RouteEnvelope(
+                    source_kind=SourceKind.WEB,
+                    source_name="pending-attachment-capacity-test",
+                    agent_id="main",
+                    session_key=SESSION_KEY,
+                    input_provenance={"kind": "synthetic-test"},
+                ),
+                "reserve the only queue slot",
+            )
+            dispatch = await get_dispatcher().dispatch(
+                "pending-attachment-failed-dispatch",
+                "sessions.pending_inputs.dispatch",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-failed-attachment",
+                    "clientRequestId": "pending-rpc-failed-attachment-request",
+                    "requestFingerprint": staged.payload["requestFingerprint"],
+                },
+                stack.context,
+            )
+            assert dispatch.ok is False
+            assert dispatch.error is not None
+            assert dispatch.error.code == "QUEUE_FULL"
+            canonical_path = transcript_material_path(
+                Path(stack.context.config.attachments.media_root or ""),
+                stack.session_id,
+                digest,
+            )
+            assert canonical_path.read_bytes() == payload
+
+            cancelled = await get_dispatcher().dispatch(
+                "pending-attachment-failed-cancel",
+                "sessions.pending_inputs.cancel",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-failed-attachment",
+                    "expectedRevision": staged.payload["revision"],
+                },
+                stack.context,
+            )
+            assert cancelled.ok is True
+            assert not canonical_path.exists()
+            await stack.runtime.abort_reservation(blocker)
+    finally:
+        set_upload_store(original_store)
+
+
+@pytest.mark.asyncio
+async def test_cancel_preserves_canonical_material_referenced_by_transcript(
+    tmp_path: Path,
+) -> None:
+    original_store = get_upload_store()
+    upload_store = UploadStore(tmp_path / "shared-material-upload-markers")
+    set_upload_store(upload_store)
+    try:
+        async with _open_real_stack(
+            tmp_path / "pending-attachment-shared-material.db",
+            max_pending_per_session=1,
+        ) as stack:
+            payload = b"shared transcript attachment bytes\n"
+            digest = hashlib.sha256(payload).hexdigest()
+            media_root = Path(stack.context.config.attachments.media_root or "")
+            canonical_path = transcript_material_path(
+                media_root,
+                stack.session_id,
+                digest,
+            )
+            canonical_path.parent.mkdir(parents=True, exist_ok=True)
+            canonical_path.write_bytes(payload)
+            await stack.manager.append_message(
+                SESSION_KEY,
+                role="user",
+                content=json.dumps(
+                    {
+                        "text": "existing transcript reference",
+                        "attachments": [
+                            {
+                                "sha256_ref": digest,
+                                "name": "existing.txt",
+                                "mime": "text/plain",
+                                "size": len(payload),
+                            }
+                        ],
+                    }
+                ),
+            )
+            file_uuid = await upload_store.put("shared.txt", "text/plain", payload)
+            staged = await get_dispatcher().dispatch(
+                "pending-shared-material-enqueue",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-shared-material",
+                    "clientRequestId": "pending-rpc-shared-material-request",
+                    "clientMessageId": "pending-rpc-shared-material-message",
+                    "message": "Do not delete the shared canonical material.",
+                    "attachments": [
+                        {
+                            "type": "text/plain",
+                            "name": "shared.txt",
+                            "file_uuid": file_uuid,
+                        }
+                    ],
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            blocker = await stack.runtime.reserve(
+                RouteEnvelope(
+                    source_kind=SourceKind.WEB,
+                    source_name="pending-shared-material-capacity-test",
+                    agent_id="main",
+                    session_key=SESSION_KEY,
+                    input_provenance={"kind": "synthetic-test"},
+                ),
+                "reserve the only queue slot",
+            )
+            dispatch = await get_dispatcher().dispatch(
+                "pending-shared-material-dispatch",
+                "sessions.pending_inputs.dispatch",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-shared-material",
+                    "clientRequestId": "pending-rpc-shared-material-request",
+                    "requestFingerprint": staged.payload["requestFingerprint"],
+                },
+                stack.context,
+            )
+            assert dispatch.ok is False
+            assert dispatch.error is not None
+            assert dispatch.error.code == "QUEUE_FULL"
+            cancelled = await get_dispatcher().dispatch(
+                "pending-shared-material-cancel",
+                "sessions.pending_inputs.cancel",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": "pending-rpc-shared-material",
+                    "expectedRevision": staged.payload["revision"],
+                },
+                stack.context,
+            )
+            assert cancelled.ok is True
+            assert canonical_path.read_bytes() == payload
+            await stack.runtime.abort_reservation(blocker)
+    finally:
+        set_upload_store(original_store)
 
 
 @pytest.mark.asyncio
@@ -1080,6 +1807,82 @@ async def test_sessions_send_atomically_accepts_message_task_and_receipt(tmp_pat
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
         }
+
+
+@pytest.mark.asyncio
+async def test_pending_input_rpc_reorders_complete_queue_atomically(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-input-reorder.db") as stack:
+        staged_items: list[dict[str, object]] = []
+        for index in range(3):
+            staged = await get_dispatcher().dispatch(
+                f"pending-reorder-enqueue-{index}",
+                "sessions.pending_inputs.enqueue",
+                {
+                    "key": SESSION_KEY,
+                    "pendingInputId": f"pending-reorder-{index}",
+                    "clientRequestId": f"pending-reorder-request-{index}",
+                    "clientMessageId": f"pending-reorder-message-{index}",
+                    "message": f"queued reorder {index}",
+                    "position": 10 - index,
+                },
+                stack.context,
+            )
+            assert staged.ok is True
+            staged_items.append(staged.payload)
+
+        reordered = await get_dispatcher().dispatch(
+            "pending-reorder",
+            "sessions.pending_inputs.reorder",
+            {
+                "key": SESSION_KEY,
+                "items": [
+                    {
+                        "pendingInputId": staged_items[index]["pendingInputId"],
+                        "expectedRevision": staged_items[index]["revision"],
+                    }
+                    for index in (2, 0, 1)
+                ],
+            },
+            stack.context,
+        )
+        assert reordered.ok is True
+        assert [item["pendingInputId"] for item in reordered.payload["items"]] == [
+            "pending-reorder-2",
+            "pending-reorder-0",
+            "pending-reorder-1",
+        ]
+        assert [item["position"] for item in reordered.payload["items"]] == [0, 1, 2]
+        assert [item["revision"] for item in reordered.payload["items"]] == [2, 2, 2]
+
+        stale = await get_dispatcher().dispatch(
+            "pending-reorder-stale",
+            "sessions.pending_inputs.reorder",
+            {
+                "key": SESSION_KEY,
+                "items": [
+                    {"pendingInputId": "pending-reorder-1", "expectedRevision": 2},
+                    {"pendingInputId": "pending-reorder-2", "expectedRevision": 1},
+                    {"pendingInputId": "pending-reorder-0", "expectedRevision": 2},
+                ],
+            },
+            stack.context,
+        )
+        assert stale.ok is False
+        assert stale.error is not None
+        assert stale.error.code == "PENDING_INPUT_CONFLICT"
+        listed = await get_dispatcher().dispatch(
+            "pending-reorder-list",
+            "sessions.pending_inputs.list",
+            {"key": SESSION_KEY},
+            stack.context,
+        )
+        assert [item["pendingInputId"] for item in listed.payload["items"]] == [
+            "pending-reorder-2",
+            "pending-reorder-0",
+            "pending-reorder-1",
+        ]
 
 
 @pytest.mark.asyncio

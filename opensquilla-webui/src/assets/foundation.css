@@ -222,6 +222,12 @@
   --msg-bubble: color-mix(in srgb, var(--text) 7%, var(--bg-surface));
   --msg-obj-border: color-mix(in srgb, var(--text) 12%, transparent);
 
+  /* Code stays close to the user-bubble surface, with only a quiet accent tint
+     to make the recessed work area feel warm rather than like a grey panel. */
+  --code-block-bg: color-mix(in srgb, var(--accent) 2%, var(--msg-bubble));
+  --code-block-header-bg: color-mix(in srgb, var(--accent) 3%, var(--msg-bubble));
+  --code-block-border: color-mix(in srgb, var(--accent) 5%, var(--msg-obj-border));
+
   /* Machined elevation + atmosphere — the dark-ground recipe (the default
      ground); light grounds (light, miami) override with paper shadows. */
   --elev-highlight: rgba(255,255,255,0.06);

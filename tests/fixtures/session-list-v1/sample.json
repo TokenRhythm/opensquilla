@@ -110,7 +110,7 @@
       "surface": "subagent",
       "conversationKind": "unknown",
       "thread": null,
-      "title": "Subagent task",
+      "title": "Analyze checkout failures",
       "subtitle": "Spawned from Web chat",
       "groupLabel": "Subagents",
       "updatedAt": 1760000000000,

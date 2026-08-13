@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import stat
 from pathlib import Path
+
+from opensquilla.skills.file_hash import (
+    _read_stable_symlink,
+    _stream_file_into_digest,
+)
 
 
 def _tree_entries(directory: Path) -> list[Path]:
@@ -56,18 +60,25 @@ def compute_tree_sha256(directory: Path) -> str:
     hasher = hashlib.sha256()
     for path in _tree_entries(directory):
         relative = path.relative_to(directory).as_posix()
-        mode = path.lstat().st_mode
+        info = path.lstat()
+        mode = info.st_mode
         if stat.S_ISDIR(mode):
             continue
         hasher.update(relative.encode("utf-8", errors="surrogateescape"))
         hasher.update(b"\0")
         if stat.S_ISREG(mode):
-            content = path.read_bytes()
             hasher.update(b"file\0")
-            hasher.update(len(content).to_bytes(8, "big"))
-            hasher.update(content)
+            hasher.update(info.st_size.to_bytes(8, "big"))
+            _stream_file_into_digest(
+                path,
+                hasher,
+                follow_symlinks=False,
+                expected_stat=info,
+            )
         elif stat.S_ISLNK(mode):
-            target = os.readlink(path).encode("utf-8", errors="surrogateescape")
+            target = _read_stable_symlink(path, expected_stat=info).encode(
+                "utf-8", errors="surrogateescape"
+            )
             hasher.update(b"symlink\0")
             hasher.update(len(target).to_bytes(8, "big"))
             hasher.update(target)

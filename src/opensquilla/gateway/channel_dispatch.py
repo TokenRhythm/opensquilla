@@ -356,7 +356,7 @@ def _compute_channel_cap(config: Any) -> int:
     """
     task_runtime_cfg = getattr(config, "task_runtime", None) if config is not None else None
     raw_cap: int = getattr(task_runtime_cfg, "channel_inflight_cap", 8)
-    max_concurrency: int = getattr(task_runtime_cfg, "max_concurrency", 4)
+    max_concurrency: int = getattr(task_runtime_cfg, "max_concurrency", 8)
     formula_cap = max(2 * max_concurrency, 1)
     return min(raw_cap, formula_cap)
 
@@ -4001,8 +4001,8 @@ async def _run_turn_batch_path(
                 log.error(
                     "channel_dispatch.agent_error",
                     session_key=session_key,
-                    code=event.code,
-                    message=event.message,
+                    failure_kind=event.failure_kind or None,
+                    error_id=event.error_id or None,
                 )
                 await channel.send(
                     _build_reply_message(
@@ -4192,8 +4192,8 @@ async def _run_turn_streaming_path(
                 log.error(
                     "channel_dispatch.agent_error",
                     session_key=session_key,
-                    code=event.code,
-                    message=event.message,
+                    failure_kind=event.failure_kind or None,
+                    error_id=event.error_id or None,
                 )
                 stream_error = append_error_ref(
                     build_terminal_reply(_terminal_payload_from_error_event(event)),

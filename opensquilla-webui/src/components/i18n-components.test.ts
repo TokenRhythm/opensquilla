@@ -119,4 +119,42 @@ describe('LanguageSwitcher — topbar dropdown', () => {
     await vi.waitFor(() => expect(trigger.textContent).toContain('中文'))
     expect(trigger.getAttribute('aria-expanded')).toBe('false')
   })
+
+  it('closes on Escape and restores focus to the language trigger', async () => {
+    const { el } = await mount(LanguageSwitcher)
+    const trigger = el.querySelector('[data-testid="language-switcher-trigger"]') as HTMLButtonElement
+    trigger.focus()
+    trigger.click()
+    await nextTick()
+    const option = el.querySelector('[data-testid="language-option-en"]') as HTMLButtonElement
+    option.focus()
+    expect(el.querySelector('[data-chat-topbar-popover="language"]')).toBeTruthy()
+
+    const escape = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+    })
+    document.dispatchEvent(escape)
+    await nextTick()
+
+    expect(escape.defaultPrevented).toBe(true)
+    expect(el.querySelector('[data-chat-topbar-popover="language"]')).toBeNull()
+    expect(document.activeElement).toBe(trigger)
+  })
+
+  it('closes on outside click without taking focus back from the outside target', async () => {
+    const { el } = await mount(LanguageSwitcher)
+    const trigger = el.querySelector('[data-testid="language-switcher-trigger"]') as HTMLButtonElement
+    trigger.click()
+    await nextTick()
+    const outside = document.createElement('button')
+    document.body.appendChild(outside)
+    outside.focus()
+    outside.click()
+    await nextTick()
+
+    expect(el.querySelector('[data-chat-topbar-popover="language"]')).toBeNull()
+    expect(document.activeElement).toBe(outside)
+  })
 })

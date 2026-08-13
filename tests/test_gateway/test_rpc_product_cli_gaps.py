@@ -204,6 +204,32 @@ def test_sessions_delete_is_write_scope_and_allows_remote_operator():
     assert missing_admin == ADMIN_SCOPE
 
 
+def test_sessions_rename_is_write_scope_without_weakening_patch():
+    dispatcher = get_dispatcher()
+    rename_entry = dispatcher.get_entry("sessions.rename")
+    patch_entry = dispatcher.get_entry("sessions.patch")
+
+    assert METHOD_SCOPES["sessions.rename"] == WRITE_SCOPE
+    assert rename_entry is not None
+    assert rename_entry.required_scope == WRITE_SCOPE
+    assert authorize_call(
+        "sessions.rename",
+        rename_entry.required_scope,
+        "operator",
+        REMOTE_OPERATOR_SCOPES,
+    ) == (True, None)
+
+    assert METHOD_SCOPES["sessions.patch"] == ADMIN_SCOPE
+    assert patch_entry is not None
+    assert patch_entry.required_scope == ADMIN_SCOPE
+    assert authorize_call(
+        "sessions.patch",
+        patch_entry.required_scope,
+        "operator",
+        REMOTE_OPERATOR_SCOPES,
+    ) == (False, ADMIN_SCOPE)
+
+
 @pytest.mark.asyncio
 async def test_memory_search_uses_admin_intent_and_returns_wire_rows(tmp_path):
     manager = FakeMemoryManager(workspace_dir=tmp_path)
@@ -1665,6 +1691,44 @@ async def test_search_status_and_query_return_structured_payloads():
     assert query.error is None, query.error
     assert query.payload["ok"] is True
     assert query.payload["results"][0]["snippet"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_search_status_reports_the_precondition_that_denies_query(tmp_path):
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime
+
+    register_provider(
+        "fake_search_ok",
+        FakeSearchProvider,
+        SearchProviderSpec(provider_id="fake_search_ok"),
+    )
+    configure_search("fake_search_ok", max_results=4, diagnostics=True)
+    configure_runtime(
+        SandboxSettings(
+            sandbox=True,
+            security_grading=True,
+            network_default="proxy_allowlist",
+        ),
+        workspace=tmp_path,
+    )
+
+    status = await get_dispatcher().dispatch("r1", "search.status", {}, _ctx())
+    query = await get_dispatcher().dispatch(
+        "r2",
+        "search.query",
+        {"query": "hello", "limit": 2},
+        _ctx(),
+    )
+
+    assert status.error is None, status.error
+    assert status.payload["networkReady"] is False
+    reason = status.payload["networkBlockedReason"]
+    assert "Run Context grants" in reason
+    assert query.error is None, query.error
+    assert query.payload["ok"] is False
+    assert query.payload["error"]["kind"] == "policy_denied"
+    assert query.payload["error"]["message"] == reason
 
 
 @pytest.mark.asyncio

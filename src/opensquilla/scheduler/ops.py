@@ -160,6 +160,7 @@ class SchedulerOps:
         schedule_kind: ScheduleKind | str,
         schedule_value: str,
         schedule_tz: str = "",
+        enabled: bool = True,
         handler_key: str = "",
         payload: dict | None = None,
         session_target: SessionTarget = SessionTarget.ISOLATED,
@@ -241,6 +242,8 @@ class SchedulerOps:
 
         job = CronJob(
             name=name,
+            status=JobStatus.PENDING if enabled else JobStatus.PAUSED,
+            enabled=enabled,
             schedule_raw=schedule_raw,
             schedule_kind=kind,
             cron_expr=cron_expr,

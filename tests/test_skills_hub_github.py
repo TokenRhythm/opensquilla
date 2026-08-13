@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import structlog.testing
 
 from opensquilla.skills.hub.archive import DEFAULT_ARCHIVE_LIMITS
 from opensquilla.skills.hub.github import GitHubSource
@@ -104,7 +105,7 @@ async def test_search_returns_exact_github_skill_references(monkeypatch) -> None
     monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
     monkeypatch.setattr(_AsyncClient, "get", search_get)
 
-    results = await GitHubSource().search("demo")
+    results = await GitHubSource(token="t0ken").search("demo")
 
     assert [(row.name, row.canonical_identifier) for row in results] == [
         ("demo", "acme/skillpack:skills/demo/SKILL.md")
@@ -146,7 +147,7 @@ async def test_search_failures_surface_stable_diagnostics(
     monkeypatch.setattr(_AsyncClient, "get", search_get)
 
     with pytest.raises(SkillSourceFetchError) as raised:
-        await GitHubSource().search("demo")
+        await GitHubSource(token="t0ken").search("demo")
 
     assert [item.code for item in raised.value.diagnostics] == [expected_code]
 
@@ -280,6 +281,108 @@ async def test_fetch_legacy_identifier_keeps_support_and_downloads_directory(mon
     assert set(bundle.files) == {"SKILL.md", "scripts/run.py", "assets/logo.bin"}
 
 
+class _ExplodingClient(_AsyncClient):
+    """Any HTTP call at all is the failure this guards against."""
+
+    async def get(self, url: str, **kwargs: Any) -> _Response:
+        raise AssertionError(f"unauthenticated search must not reach the network: {url}")
+
+
+@pytest.mark.asyncio
+async def test_search_without_a_token_stays_silent_and_off_the_network(monkeypatch) -> None:
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _ExplodingClient)
+
+    with structlog.testing.capture_logs() as captured:
+        results = await GitHubSource().search("pdf")
+
+    # No request, no warning, and — since the source now reports failures as
+    # diagnostics the user sees rather than log noise — no raised error either.
+    assert results == []
+    assert [entry for entry in captured if entry["log_level"] == "warning"] == []
+    assert [entry["event"] for entry in captured] == ["github.search_skipped_unauthenticated"]
+
+
+@pytest.mark.asyncio
+async def test_unauthenticated_search_contributes_no_diagnostics_to_the_router(
+    monkeypatch,
+) -> None:
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _ExplodingClient)
+
+    report = await SourceRouter([GitHubSource()]).search_with_diagnostics("pdf")
+
+    assert report.diagnostics == ()
+    assert report.results == ()
+
+
+@pytest.mark.asyncio
+async def test_search_with_a_token_still_queries_code_search(monkeypatch) -> None:
+    import httpx
+
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    class _SearchClient(_AsyncClient):
+        async def get(self, url: str, **kwargs: Any) -> _Response:
+            seen.append((url, kwargs))
+            return _Response(
+                json_data={
+                    "items": [
+                        {
+                            "path": "skills/demo/SKILL.md",
+                            "repository": {
+                                "full_name": "acme/skillpack",
+                                "description": "Demo skill.",
+                                "html_url": "https://github.com/acme/skillpack",
+                            },
+                        }
+                    ]
+                }
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", _SearchClient)
+
+    results = await GitHubSource(token="t0ken").search("pdf")
+
+    assert [meta.name for meta in results] == ["demo"]
+    assert len(seen) == 1
+    url, kwargs = seen[0]
+    assert url == "https://api.github.com/search/code"
+    assert kwargs["headers"]["Authorization"] == "token t0ken"
+
+
+@pytest.mark.asyncio
+async def test_search_with_a_token_still_reports_a_rejected_request(monkeypatch) -> None:
+    import httpx
+
+    class _UnauthorizedClient(_AsyncClient):
+        async def get(self, url: str, **kwargs: Any) -> _Response:
+            return _Response(status_code=401)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _UnauthorizedClient)
+
+    # A configured token that GitHub refuses is a real problem and still surfaces
+    # as a diagnostic. Only the no-token case — which could never have worked —
+    # goes quiet.
+    with pytest.raises(SkillSourceFetchError) as raised:
+        await GitHubSource(token="expired").search("pdf")
+
+    assert [item.code for item in raised.value.diagnostics] == ["SOURCE_AUTH_FAILED"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_stays_available_without_a_token(monkeypatch) -> None:
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AsyncClient)
+    _AsyncClient.requests = []
+
+    bundle = await GitHubSource().fetch("https://github.com/acme/skillpack/tree/main/skills/demo")
+
+    assert bundle is not None
+    assert bundle.name == "demo"
 @pytest.mark.asyncio
 async def test_full_commit_identifier_does_not_resolve_a_mutable_ref(monkeypatch) -> None:
     import httpx

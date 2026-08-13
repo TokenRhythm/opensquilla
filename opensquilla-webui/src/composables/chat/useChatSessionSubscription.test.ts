@@ -1,7 +1,10 @@
 import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
-import { useChatSessionSubscription } from './useChatSessionSubscription'
+import {
+  useChatSessionSubscription,
+  type UseChatSessionSubscriptionOptions,
+} from './useChatSessionSubscription'
 import { SESSION_PHASE_ATTEMPT_BUDGET_MS } from './sessionBootstrapContract'
 import { RpcTimeoutError, type RpcCallOptions } from '@/lib/rpc'
 import type { ChatRunStatus, ChatRunStatusState } from '@/types/chat'
@@ -107,7 +110,7 @@ describe('useChatSessionSubscription', () => {
         current_stream_seq: 9,
       }
     })
-    const rpc = {
+    const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
       waitForConnection: vi.fn(async () => {}),
       call: call as unknown as <T = unknown>(
         method: string,
@@ -149,6 +152,53 @@ describe('useChatSessionSubscription', () => {
       'sessions.messages.snapshot',
       { key: 'agent:main:webchat:old-gateway' },
     )
+  })
+
+  it('does not clear an unknown-acceptance Stop merely because hydrate is idle', async () => {
+    const acceptanceStopPending = ref(true)
+    const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
+      waitForConnection: vi.fn(async () => {}),
+      call: vi.fn(async (method: string) => {
+        if (method === 'sessions.messages.snapshot') {
+          return {
+            key: 'agent:main:webchat:unknown-acceptance',
+            task_id: null,
+            events: [],
+            current_stream_seq: 0,
+          }
+        }
+        return {
+          subscribed: true,
+          hydration_complete: true,
+          run_status: 'idle',
+          replay_complete: true,
+          current_stream_seq: 0,
+        }
+      }) as UseChatSessionSubscriptionOptions['rpc']['call'],
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:unknown-acceptance'),
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      acceptanceStopPending,
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+    })
+
+    await subscription.subscribeSession()
+
+    // An idle snapshot does not prove that the original chat.send was rejected:
+    // its stable request may still commit after the reconnect. The retry must
+    // retain Stop intent until receipt replay or an explicit rejection resolves it.
+    expect(acceptanceStopPending.value).toBe(true)
   })
 
   it('skips snapshot on the second bounded bootstrap attempt', async () => {
@@ -1155,5 +1205,223 @@ describe('useChatSessionSubscription', () => {
       12,
       expect.objectContaining({ workspaceId: 'project-recovered' }),
     )
+  })
+
+  it('resets the numeric cursor and restores history when the Gateway generation changes', async () => {
+    const key = 'agent:main:webchat:generation-recovery'
+    const lastStreamSeq = ref(900)
+    const loadHistory = vi.fn()
+    const resetStreamLiveTurnState = vi.fn()
+    const onLiveSnapshot = vi.fn()
+    let subscribeCount = 0
+    const call = vi.fn(async <T = unknown>(
+      method: string,
+      params?: Record<string, unknown>,
+    ) => {
+      if (method === 'sessions.messages.subscribe') {
+        subscribeCount += 1
+        return (subscribeCount === 1
+          ? {
+              subscribed: true,
+              hydration_complete: true,
+              run_status: 'idle',
+              stream_generation: 'gateway-generation-old',
+              current_stream_seq: 900,
+              replay_complete: true,
+            }
+          : {
+              subscribed: true,
+              hydration_complete: true,
+              run_status: 'idle',
+              stream_generation: 'gateway-generation-new',
+              current_stream_seq: 2,
+              replay_complete: false,
+              replay_gap_reason: 'stream_generation_changed',
+            }) as T
+      }
+      if (method === 'sessions.messages.snapshot') {
+        const generation = subscribeCount === 1
+          ? 'gateway-generation-old'
+          : 'gateway-generation-new'
+        return {
+          key,
+          task_id: subscribeCount === 1 ? null : 'task-after-restart',
+          stream_generation: generation,
+          current_stream_seq: subscribeCount === 1 ? 900 : 2,
+          events: subscribeCount === 1
+            ? []
+            : [{
+                event: 'session.event.text_delta',
+                payload: {
+                  session_key: key,
+                  stream_generation: generation,
+                  stream_seq: 2,
+                  text: 'new token',
+                },
+              }],
+        } as T
+      }
+      throw new Error(`Unexpected method: ${method} ${JSON.stringify(params)}`)
+    })
+    const subscription = useChatSessionSubscription({
+      rpc: {
+        waitForConnection: vi.fn(async () => {}),
+        call: call as unknown as <T = unknown>(
+          method: string,
+          params?: Record<string, unknown>,
+          options?: RpcCallOptions,
+        ) => Promise<T>,
+      },
+      sessionKey: ref(key),
+      lastStreamSeq,
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory,
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState,
+      onLiveSnapshot,
+    })
+
+    await subscription.subscribeSession()
+    expect(subscription.streamGeneration.value).toBe('gateway-generation-old')
+    expect(lastStreamSeq.value).toBe(900)
+
+    await subscription.subscribeSession()
+
+    const subscribeCalls = call.mock.calls.filter(([method]) => (
+      method === 'sessions.messages.subscribe'
+    ))
+    expect(subscribeCalls[1]?.[1]).toEqual({
+      key,
+      since_stream_generation: 'gateway-generation-old',
+      since_stream_seq: 900,
+      fast_ack: true,
+    })
+    expect(subscription.streamGeneration.value).toBe('gateway-generation-new')
+    expect(lastStreamSeq.value).toBe(2)
+    expect(resetStreamLiveTurnState).toHaveBeenCalledOnce()
+    expect(loadHistory).toHaveBeenCalledOnce()
+    expect(onLiveSnapshot).toHaveBeenLastCalledWith(expect.objectContaining({
+      stream_generation: 'gateway-generation-new',
+      current_stream_seq: 2,
+      task_id: 'task-after-restart',
+    }))
+  })
+
+  it('exposes generation observation so live events can accept a restarted low cursor', async () => {
+    const lastStreamSeq = ref(7_500)
+    const resetStreamLiveTurnState = vi.fn()
+    const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
+      waitForConnection: vi.fn(async () => {}),
+      call: vi.fn(async () => ({
+        subscribed: true,
+        hydration_complete: true,
+        run_status: 'idle',
+        stream_generation: 'gateway-generation-old',
+        current_stream_seq: 7_500,
+        replay_complete: true,
+      })) as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:generation-event'),
+      lastStreamSeq,
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState,
+    })
+    await subscription.subscribeSession()
+
+    expect(subscription.observeStreamGeneration({
+      stream_generation: 'gateway-generation-new',
+      stream_seq: 1,
+    })).toBe(true)
+    expect(lastStreamSeq.value).toBe(0)
+    expect(resetStreamLiveTurnState).toHaveBeenCalledOnce()
+    expect(subscription.observeStreamGeneration({
+      stream_generation: 'gateway-generation-new',
+      stream_seq: 2,
+    })).toBe(false)
+    expect(resetStreamLiveTurnState).toHaveBeenCalledOnce()
+  })
+
+  it('resets a legacy generation-less cursor when the first modern event is behind it', () => {
+    const lastStreamSeq = ref(420)
+    const resetStreamLiveTurnState = vi.fn()
+    const subscription = useChatSessionSubscription({
+      rpc: {
+        waitForConnection: vi.fn(async () => {}),
+        call: vi.fn(async () => ({})) as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
+      },
+      sessionKey: ref('agent:main:webchat:legacy-generation-upgrade'),
+      lastStreamSeq,
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState,
+    })
+
+    expect(subscription.observeStreamGeneration({
+      stream_generation: 'gateway-generation-after-upgrade',
+      stream_seq: 1,
+    })).toBe(true)
+    expect(lastStreamSeq.value).toBe(0)
+    expect(resetStreamLiveTurnState).toHaveBeenCalledOnce()
+  })
+
+  it('uses the complete subscribe ACK to reset a legacy cursor before low modern events', async () => {
+    const lastStreamSeq = ref(420)
+    const loadHistory = vi.fn()
+    const resetStreamLiveTurnState = vi.fn()
+    const subscription = useChatSessionSubscription({
+      rpc: {
+        waitForConnection: vi.fn(async () => {}),
+        call: vi.fn(async () => ({
+          subscribed: true,
+          hydration_complete: true,
+          run_status: 'idle',
+          stream_generation: 'gateway-generation-after-upgrade',
+          current_stream_seq: 2,
+          replay_complete: true,
+        })) as unknown as UseChatSessionSubscriptionOptions['rpc']['call'],
+      },
+      sessionKey: ref('agent:main:webchat:legacy-ack-upgrade'),
+      lastStreamSeq,
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory,
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState,
+    })
+
+    await subscription.subscribeSession()
+
+    expect(subscription.streamGeneration.value).toBe('gateway-generation-after-upgrade')
+    expect(lastStreamSeq.value).toBe(2)
+    expect(resetStreamLiveTurnState).toHaveBeenCalledOnce()
+    expect(loadHistory).toHaveBeenCalledOnce()
   })
 })

@@ -617,6 +617,8 @@ def evaluate_search(payload: dict[str, Any]) -> list[HealthFinding]:
     requires_api_key = bool(payload.get("requiresApiKey"))
     api_key_configured = bool(payload.get("apiKeyConfigured"))
     api_key_env = str(payload.get("apiKeyEnv") or "")
+    network_ready = payload.get("networkReady")
+    network_blocked_reason = str(payload.get("networkBlockedReason") or "")
     evidence = {
         "provider": provider,
         "activeProvider": payload.get("activeProvider"),
@@ -630,6 +632,10 @@ def evaluate_search(payload: dict[str, Any]) -> list[HealthFinding]:
         "useEnvProxy": payload.get("useEnvProxy"),
         "diagnostics": payload.get("diagnostics"),
     }
+    if "networkReady" in payload:
+        evidence["networkReady"] = network_ready
+    if "networkBlockedReason" in payload:
+        evidence["networkBlockedReason"] = network_blocked_reason or None
     configure_command = f"opensquilla configure search --search-provider {provider}"
     if requires_api_key:
         configure_command = f"{configure_command} --api-key {_API_KEY_PLACEHOLDER}"
@@ -765,6 +771,30 @@ def evaluate_search(payload: dict[str, Any]) -> list[HealthFinding]:
                     FixStep(label="Restart gateway", command="opensquilla gateway restart"),
                 ],
                 restart_required=True,
+            )
+        ]
+    if network_ready is False or network_blocked_reason:
+        reason = network_blocked_reason or (
+            "The current sandbox network posture blocks in-process search queries."
+        )
+        return [
+            HealthFinding(
+                id="search.provider.network_blocked",
+                severity="warn",
+                surface="search",
+                title="Search queries are blocked by the network posture",
+                detail=f"{provider} is configured and buildable, but {reason}",
+                evidence=evidence,
+                fix_steps=[
+                    FixStep(
+                        label="Inspect search status",
+                        command=f"opensquilla search status {provider} --json",
+                    ),
+                    FixStep(
+                        label="Inspect sandbox status",
+                        command="opensquilla sandbox status --json",
+                    ),
+                ],
             )
         ]
     return [

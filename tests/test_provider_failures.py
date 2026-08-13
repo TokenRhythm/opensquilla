@@ -105,9 +105,15 @@ def test_unknown_classification_emits_redacted_fingerprint_event() -> None:
     assert event["provider"] == "openrouter"
     assert event["failure_family"] == "openai_compat"
     assert event["status_code"] is None
-    assert event["raw_code"] == "strange_code"
-    assert "novel backend exploded" in event["message_head"]
-    assert "abc123def456" not in event["message_head"]
+    assert event["raw_code_chars"] == len("strange_code")
+    assert event["message_chars"] == len(
+        "novel backend exploded: Bearer abc123def456"
+    )
+    assert "raw_code" not in event
+    assert "message_head" not in event
+    assert "strange_code" not in repr(event)
+    assert "novel backend exploded" not in repr(event)
+    assert "abc123def456" not in repr(event)
 
 
 def test_classified_errors_do_not_emit_the_unclassified_event() -> None:

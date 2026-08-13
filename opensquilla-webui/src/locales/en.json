@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "Sidebar collapse canceled",
     "openBlockedSession": "Open the blocked session",
     "approvalRequired": "Approval required",
+    "approvalRequiredCount": "Approval required: {count}",
+    "systemStatus": "System status",
+    "systemStatusSummary": "System status: {state}; {count} notices",
     "manageConnection": "Manage gateway connection",
     "connectionTitle": "Connection: {state} — manage in Settings",
     "connectionState": {
@@ -3240,6 +3243,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Chat created",
+      "open": "Open chat"
+    },
     "promptCacheKeepalive": {
       "action": "Prompt cache keepalive",
       "title": "Prompt cache keepalive",
@@ -3493,6 +3500,14 @@
         "interrupted": "Interrupted",
         "failed": "Failed"
       },
+      "provider": {
+        "waiting": "Waiting for model",
+        "reasoning": "Thinking deeply",
+        "rateLimited": "Rate limited · retrying in {seconds}s",
+        "retryWait": "Retrying in {seconds}s",
+        "retrying": "Retrying {attempt}/{limit}",
+        "fallback": "Switching to backup model"
+      },
       "purpose": {
         "discover": "Discovered links",
         "search": "Searched the web",
@@ -3708,6 +3723,7 @@
       "pausedTitle": "Goal paused",
       "completeTitle": "Goal complete",
       "sentAsGoal": "Sent as goal",
+      "achieved": "Goal achieved",
       "achievedIn": "Goal achieved · {duration} active",
       "blockedTitle": "Goal blocked",
       "usageLimitedTitle": "Goal usage limited",
@@ -3807,7 +3823,17 @@
       "label": "Pending {count}/{max}",
       "hint": "Alt+↑ pulls the most recent back into the input · ESC recovers all to input · sends FIFO when the current response finishes",
       "steerHint": "Steer mode: new text is applied at the next safe boundary without stopping the current task; queued messages still send after the turn",
+      "steerSubmitting": "Submitting guidance…",
+      "steerRetryRejected": "Not sent · Retry",
+      "steerRetryUnknown": "Delivery status unknown · Retry confirmation",
+      "steerRetryRejectedHint": "The gateway did not accept this guidance. Retry replays the exact original request.",
+      "steerRetryUnknownHint": "OpenSquilla could not confirm whether this guidance was accepted. Retry safely replays the exact original request.",
+      "removeUnknownSteer": "Discard local retry for pending message {index}; this does not mean the server did not receive it",
       "queueHint": "Queue mode: these messages auto-send in order when the current response finishes",
+      "reorderHint": "Press and hold for 0.75 seconds, then drag to reorder. Alt+Arrow also moves this message.",
+      "reorderStarted": "Reordering {label}. Drag to a new position, then release.",
+      "reorderPosition": "{label} moved to position {position} of {count}.",
+      "reorderRecovering": "Restoring queue order…",
       "clearAll": "Clear all",
       "editMessage": "Edit message",
       "editWhileStreaming": "Wait for the current reply to finish before editing",
@@ -3986,6 +4012,7 @@
       "waitCompactionBeforeCommand": "Wait for context compaction before running {command}.",
       "waitResponseBeforeCommand": "Wait for the current response before running {command}.",
       "queueFull": "Queue is full — wait for the current response to finish.",
+      "queuePersistenceUnavailable": "Keep this message in the composer until the fork finishes; durable recovery is unavailable.",
       "messageStillSaving": "This message hasn't finished saving — try again in a moment.",
       "artifactOpenFailed": "Artifact open failed. Use Download instead."
     },
@@ -4016,7 +4043,12 @@
       "saved": "saved",
       "fallback": "fallback",
       "fallbackUsed": "used",
-      "ensembleModelsAria": "Ensemble models"
+      "ensembleRequests": "{count} requests",
+      "ensembleModelsAria": "Ensemble models",
+      "coverage": "coverage",
+      "usageIncompleteSubtotal": "Incomplete · shown values are a known subtotal",
+      "usageIncompleteUnknown": "Incomplete · exact usage total unavailable",
+      "unknownProviderCalls": "{count} provider call has unknown usage | {count} provider calls have unknown usage"
     },
     "modelRouting": {
       "updateFailed": "Couldn't switch model routing — reverted. Check the gateway connection and try again."
@@ -4065,6 +4097,7 @@
     "sidebar": {
       "recentConversations": "Recent tasks",
       "recents": "Recents",
+      "pinned": "Pinned",
       "refresh": "Reload tasks",
       "clearAgentFilter": "Clear agent filter: {name}",
       "loadError": "Unable to load tasks",

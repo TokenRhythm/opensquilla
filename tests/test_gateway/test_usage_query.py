@@ -849,6 +849,69 @@ async def test_all_uses_baseline_plus_live_without_double_counting_backfill() ->
 
 
 @pytest.mark.asyncio
+async def test_all_excludes_cumulative_generation_checkpoints_from_legacy_totals() -> None:
+    cutover = _ms("2026-07-20T00:00:00")
+    cutover_baseline = SimpleNamespace(
+        session_id="s1",
+        session_epoch=0,
+        captured_at_ms=cutover,
+        input_tokens=50,
+        output_tokens=5,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        cost_nanos=5_000_000,
+        billed_cost_nanos=0,
+        estimated_cost_nanos=5_000_000,
+        cost_source="opensquilla_estimate",
+        missing_cost_entries=0,
+    )
+    generation_checkpoint = SimpleNamespace(
+        session_id="s1",
+        session_epoch=1,
+        captured_at_ms=cutover + 1,
+        input_tokens=100,
+        output_tokens=10,
+        cache_read_tokens=0,
+        cache_write_tokens=0,
+        cost_nanos=10_000_000,
+        billed_cost_nanos=0,
+        estimated_cost_nanos=10_000_000,
+        cost_source="opensquilla_estimate",
+        missing_cost_entries=0,
+    )
+    live = _event(
+        "live-after-cutover",
+        cutover + 1_000,
+        cost_nanos=2_000_000,
+        session_id="s1",
+        session_epoch=0,
+        input_tokens=20,
+        output_tokens=2,
+        cache_read_tokens=0,
+    )
+    storage = _FakeStorage(
+        state=SimpleNamespace(
+            ledger_started_at_ms=cutover,
+            backfill_status="complete",
+            anomaly_count=0,
+        ),
+        events=[live],
+        items=[_item(live.event_id, live.cost_nanos)],
+        baselines=[cutover_baseline, generation_checkpoint],
+    )
+
+    payload = await query_usage_ledger(
+        storage,
+        {"range": {"preset": "all"}, "timezone": "UTC"},
+        now_ms=_ms("2026-07-21T00:00:00"),
+    )
+
+    assert payload["attributedTotals"]["costNanos"] == 2_000_000
+    assert payload["legacyUnattributed"]["totals"]["costNanos"] == 5_000_000
+    assert payload["totals"]["costNanos"] == 7_000_000
+
+
+@pytest.mark.asyncio
 async def test_all_counts_residual_and_attributed_session_epochs_as_a_union() -> None:
     cutover = _ms("2026-07-20T00:00:00")
     baselines = [
@@ -1269,6 +1332,68 @@ async def test_usage_query_reconciles_real_storage_baseline_backfill_and_live(
         assert sum(row["totals"]["costNanos"] for row in payload["days"]) == 6_000_000
         assert sum(row["totals"]["costNanos"] for row in payload["models"]) == 6_000_000
         assert sum(row["totals"]["costNanos"] for row in payload["sessions"]) == 6_000_000
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_usage_query_real_storage_does_not_add_epoch_checkpoint_twice(
+    tmp_path,
+) -> None:
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    session_key = "agent:main:webchat:epoch-checkpoint"
+    session_id = "session-epoch-checkpoint"
+    try:
+        await storage.upsert_session(
+            SessionNode(session_key=session_key, session_id=session_id)
+        )
+        await storage.initialize_usage_ledger(100)
+        await storage.start_usage_event(
+            UsageEventStart(
+                event_id="live-before-epoch",
+                execution_id="live-before-epoch",
+                call_index=0,
+                session_id=session_id,
+                started_at_ms=110,
+            )
+        )
+        await storage.finalize_usage_event(
+            "live-before-epoch",
+            UsageEventCompletion(
+                completed_at_ms=120,
+                input_tokens=100,
+                output_tokens=20,
+                total_tokens=120,
+                cost_nanos=9_200_000,
+                estimated_cost_nanos=9_200_000,
+                cost_source="opensquilla_estimate",
+            ),
+        )
+        reconciled = await storage.reconcile_session_usage_totals_from_ledger(
+            session_key=session_key,
+            expected_epoch=0,
+        )
+        assert reconciled is not None
+        assert reconciled.total_tokens == 120
+        assert await storage.advance_reset_epoch(session_key) == 1
+
+        baselines = await storage.list_usage_legacy_baselines()
+        assert [(row.session_epoch, row.total_tokens) for row in baselines] == [
+            (0, 0),
+            (1, 120),
+        ]
+        assert baselines[0].captured_at_ms == 100
+        assert baselines[1].captured_at_ms > 100
+
+        payload = await query_usage_ledger(
+            storage,
+            {"range": {"preset": "all"}, "timezone": "UTC"},
+            now_ms=2_000,
+        )
+        assert payload["attributedTotals"]["totalTokens"] == 120
+        assert payload["legacyUnattributed"]["totals"]["totalTokens"] == 0
+        assert payload["totals"]["totalTokens"] == 120
+        assert payload["totals"]["costNanos"] == 9_200_000
     finally:
         await storage.close()
 

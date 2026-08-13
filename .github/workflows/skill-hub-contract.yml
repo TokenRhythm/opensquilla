@@ -54,6 +54,7 @@ jobs:
             tests/test_skills_hot_reload.py \
             tests/test_skills_default_prompt_contract.py \
             tests/test_skills_loader_namespaces.py \
+            tests/test_skills_tree.py \
             tests/test_skills_hub_archive.py \
             tests/test_skills_hub_clawhub.py \
             tests/test_skills_hub_github.py \
@@ -62,6 +63,7 @@ jobs:
             tests/test_skills_hub_installer_security.py \
             tests/test_skills_hub_lockfile_contract.py \
             tests/test_skills_hub_doctor.py \
+            tests/test_skills_hash_consumers.py \
             tests/test_skills/test_hub_management_service.py \
             tests/test_skills/test_hub_scanner.py \
             tests/test_skills/test_hub_transaction_recovery.py \
@@ -72,6 +74,7 @@ jobs:
             tests/test_gateway/test_rpc_skills_reload.py \
             tests/test_gateway/test_skill_management_service_injection.py \
             tests/test_tools/test_skill_view_resources.py \
+            tests/test_scripts/test_bench_skill_integrity.py \
             tests/test_cli/test_cli_product_completeness.py \
             tests/test_cli/test_skills_doctor_cmd.py \
             tests/test_cli/test_skills_gateway_fallback.py \

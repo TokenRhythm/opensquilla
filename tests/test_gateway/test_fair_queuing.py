@@ -413,3 +413,97 @@ async def test_no_underutilization() -> None:
     await asyncio.gather(*(runtime.wait(h.task_id, timeout=60.0) for h in handles))
 
     assert peak_in_flight == max_concurrency
+
+
+@pytest.mark.asyncio
+async def test_max_eight_staggered_waiters_preserve_capacity_fairness_and_cancel() -> None:
+    """Ten staggered sessions keep eight slots full around a cancelled waiter."""
+
+    max_concurrency = 8
+    agent_id = "agent-max-eight-stress"
+    release_by_label = {
+        label: asyncio.Event()
+        for label in [*(f"base-{index}" for index in range(max_concurrency)), "W1", "W3"]
+    }
+    started_by_label = {
+        label: asyncio.Event()
+        for label in [*(f"base-{index}" for index in range(max_concurrency)), "W1", "W2", "W3"]
+    }
+    start_order: list[str] = []
+    current_in_flight = 0
+    peak_in_flight = 0
+    counter_lock = asyncio.Lock()
+
+    async def turn_handler(run: Any) -> None:
+        nonlocal current_in_flight, peak_in_flight
+        label = run.message
+        async with counter_lock:
+            current_in_flight += 1
+            peak_in_flight = max(peak_in_flight, current_in_flight)
+            start_order.append(label)
+            started_by_label[label].set()
+        try:
+            await release_by_label[label].wait()
+        finally:
+            async with counter_lock:
+                current_in_flight -= 1
+
+    runtime = TaskRuntime(
+        storage=_make_storage(),
+        turn_handler=turn_handler,
+        max_concurrency=max_concurrency,
+        max_pending_per_session=None,
+    )
+    handles = []
+    try:
+        for index in range(max_concurrency):
+            label = f"base-{index}"
+            env = _make_envelope(agent_id, f"{agent_id}::session-{label}")
+            handles.append(await runtime.enqueue(env, label))
+            await asyncio.wait_for(started_by_label[label].wait(), timeout=1.0)
+
+        assert current_in_flight == max_concurrency
+
+        waiter_handles = {}
+        for label in ("W1", "W2", "W3"):
+            env = _make_envelope(agent_id, f"{agent_id}::session-{label}")
+            handle = await runtime.enqueue(env, label)
+            handles.append(handle)
+            waiter_handles[label] = handle
+
+        waiter_sessions = {
+            label: f"{agent_id}::session-{label}"
+            for label in ("W1", "W2", "W3")
+        }
+        async with asyncio.timeout(1.0):
+            while runtime._agent_slot_waiters.get(agent_id) != set(waiter_sessions.values()):
+                await asyncio.sleep(0)
+        assert not any(started_by_label[label].is_set() for label in ("W1", "W2", "W3"))
+
+        assert await runtime.cancel(task_id=waiter_handles["W2"].task_id) == 1
+        await runtime.wait(waiter_handles["W2"].task_id, timeout=2.0)
+        assert runtime._agent_slot_waiters.get(agent_id) == {
+            waiter_sessions["W1"],
+            waiter_sessions["W3"],
+        }
+
+        release_by_label["base-0"].set()
+        await asyncio.wait_for(started_by_label["W1"].wait(), timeout=1.0)
+        assert not started_by_label["W3"].is_set()
+        assert runtime._global_in_flight == max_concurrency
+
+        release_by_label["base-1"].set()
+        await asyncio.wait_for(started_by_label["W3"].wait(), timeout=1.0)
+        assert runtime._global_in_flight == max_concurrency
+        assert start_order[-2:] == ["W1", "W3"]
+    finally:
+        for event in release_by_label.values():
+            event.set()
+        await asyncio.gather(
+            *(runtime.wait(handle.task_id, timeout=10.0) for handle in handles),
+            return_exceptions=True,
+        )
+
+    assert peak_in_flight == max_concurrency
+    assert runtime._global_in_flight == 0
+    assert runtime._agent_slot_waiters == {}

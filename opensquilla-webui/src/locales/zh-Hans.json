@@ -249,6 +249,9 @@
     "sidebarCollapseCanceled": "已取消收起侧边栏",
     "openBlockedSession": "打开被阻塞的会话",
     "approvalRequired": "需要审批",
+    "approvalRequiredCount": "需要审批：{count}",
+    "systemStatus": "系统状态",
+    "systemStatusSummary": "系统状态：{state}；{count} 项提醒",
     "manageConnection": "管理网关连接",
     "connectionTitle": "连接：{state} — 在设置中管理",
     "connectionState": {
@@ -3240,6 +3243,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "聊天已创建",
+      "open": "打开聊天"
+    },
     "promptCacheKeepalive": {
       "action": "提示词缓存保活",
       "title": "提示词缓存保活",
@@ -3493,6 +3500,14 @@
         "interrupted": "已中断",
         "failed": "已失败"
       },
+      "provider": {
+        "waiting": "等待模型",
+        "reasoning": "深度思考",
+        "rateLimited": "受到限流 · {seconds} 秒后重试",
+        "retryWait": "{seconds} 秒后重试",
+        "retrying": "正在重试 {attempt}/{limit}",
+        "fallback": "正在切换备用模型"
+      },
       "purpose": {
         "discover": "发现链接",
         "search": "搜索网页",
@@ -3708,6 +3723,7 @@
       "pausedTitle": "目标已暂停",
       "completeTitle": "目标已完成",
       "sentAsGoal": "已作为目标发送",
+      "achieved": "目标已完成",
       "achievedIn": "目标已完成 · 活跃用时 {duration}",
       "blockedTitle": "目标受阻",
       "usageLimitedTitle": "目标受用量限制",
@@ -3807,7 +3823,17 @@
       "label": "待发送 {count}/{max}",
       "hint": "Alt+↑ 将最近一条拉回输入框 · ESC 将全部恢复到输入框 · 当前回复结束后按先进先出顺序发送",
       "steerHint": "引导模式：新文本会在下一个安全边界应用，不会停止当前任务；排队消息仍会在本轮结束后发送",
+      "steerSubmitting": "正在提交引导…",
+      "steerRetryRejected": "未发送 · 重试",
+      "steerRetryUnknown": "发送状态未知 · 重试确认",
+      "steerRetryRejectedHint": "网关未接受这条引导。重试会原样重放首次请求。",
+      "steerRetryUnknownHint": "OpenSquilla 无法确认这条引导是否已被接受。重试会安全地原样重放首次请求。",
+      "removeUnknownSteer": "放弃待发送消息 {index} 在本设备上的重试；这不代表服务端未接收",
       "queueHint": "排队模式：这些消息会在当前回复结束后按顺序自动发送",
+      "reorderHint": "长按 0.75 秒后拖动可调整发送顺序，也可使用 Alt+方向键移动。",
+      "reorderStarted": "正在调整“{label}”的位置，拖动到新位置后松开。",
+      "reorderPosition": "“{label}”已移动到第 {position} 位，共 {count} 条。",
+      "reorderRecovering": "正在恢复队列顺序…",
       "clearAll": "全部清除",
       "editMessage": "编辑消息",
       "editWhileStreaming": "等待当前回复完成后再编辑",
@@ -3986,6 +4012,7 @@
       "waitCompactionBeforeCommand": "请等待上下文压缩完成后再运行 {command}。",
       "waitResponseBeforeCommand": "请等待当前回复结束后再运行 {command}。",
       "queueFull": "队列已满 — 请等待当前回复结束。",
+      "queuePersistenceUnavailable": "请将此消息保留在输入框，等待分支完成；当前无法进行持久恢复。",
       "messageStillSaving": "这条消息尚未保存完成 — 请稍后再试。",
       "artifactOpenFailed": "产物打开失败。请改为下载。"
     },
@@ -4016,7 +4043,12 @@
       "saved": "节省",
       "fallback": "降级",
       "fallbackUsed": "已使用",
-      "ensembleModelsAria": "参与融合的模型"
+      "ensembleRequests": "{count} 次请求",
+      "ensembleModelsAria": "参与融合的模型",
+      "coverage": "统计完整性",
+      "usageIncompleteSubtotal": "不完整 · 显示值为已知小计",
+      "usageIncompleteUnknown": "不完整 · 无法获得准确用量总计",
+      "unknownProviderCalls": "{count} 次服务商调用的用量未知"
     },
     "modelRouting": {
       "updateFailed": "切换模型路由失败，已恢复原设置。请检查网关连接后重试。"
@@ -4065,6 +4097,7 @@
     "sidebar": {
       "recentConversations": "最近任务",
       "recents": "最近",
+      "pinned": "置顶",
       "refresh": "重新加载任务",
       "clearAgentFilter": "清除智能体筛选：{name}",
       "loadError": "无法加载任务",
