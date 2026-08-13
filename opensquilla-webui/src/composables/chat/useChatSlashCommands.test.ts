@@ -377,20 +377,41 @@ describe('useChatSlashCommands Coding mode', () => {
 })
 
 describe('useChatSlashCommands recovery', () => {
-  it('keeps an unknown slash command in the composer and shows a visible hint', async () => {
+  it('falls through to a normal send for an unknown slash input while still showing a hint', async () => {
     const {
       api,
       inputText,
       notify,
     } = harness(false)
-    inputText.value = '/codng'
+    inputText.value = '/gamemode creative'
 
     const handled = await api.executeSlashCommand(inputText.value)
 
-    expect(handled).toBe(true)
-    expect(inputText.value).toBe('/codng')
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/codng'))
+    // Unknown slash input is NOT a command: report unhandled so the caller
+    // (useChatSend.onSend) sends it as ordinary chat text.
+    expect(handled).toBe(false)
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/gamemode'))
     expect(notify).toHaveBeenCalledWith(expect.stringContaining('//'))
+  })
+
+  it('still executes a registered slash command as a command', async () => {
+    const goalCommand = {
+      name: '/goal',
+      cmd: '/goal',
+      label: '/goal',
+      desc: 'Set a long-running goal for the agent to pursue.',
+      aliases: [],
+      execution: { action: 'goal.set' },
+    }
+    const { api, inputText, armGoal } = harness(false, [goalCommand])
+    inputText.value = '/goal'
+
+    const handled = await api.executeSlashCommand(inputText.value)
+    await Promise.resolve()
+
+    // Registered commands stay handled: they run as commands, not messages.
+    expect(handled).toBe(true)
+    expect(armGoal).toHaveBeenCalledTimes(1)
   })
 })
 
