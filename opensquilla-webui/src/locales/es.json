@@ -1043,7 +1043,7 @@
       "capacityWarn": "{calls} llamadas de modelo por turno — el coste crece linealmente y la mejora de fusión decae pasados 4 proponentes.",
       "capacityFull": "Límite de {max} proponentes alcanzado — más borradores no mejoran la fusión; quita uno antes de añadir otro.",
       "diversityHint": "Varios proponentes comparten familia de modelos — añadir otro proveedor suele mejorar la fusión.",
-      "effectiveFacts": "Por turno: {calls} llamadas de modelo · fusiona al lograr {quorum}/{proposers} proponentes · timeout de proponente {proposerTimeout}s · timeout de agregador {aggregatorTimeout}s · {grace}s de gracia tras el quórum",
+      "effectiveFacts": "Por turno: {calls} llamadas de modelo · fusiona al lograr {quorum}/{proposers} proponentes · timeout total de proponente {proposerTimeout}s · timeout de inactividad del agregador {aggregatorTimeout}s · {grace}s de gracia tras el quórum",
       "effectiveSummary": "{proposers} proponentes en paralelo + 1 agregador · unas {calls} llamadas por turno",
       "runtimeStrategyTitle": "Estrategia de ejecución",
       "runtimeStrategyDesc": "Umbral de éxito, alternativa y límites de tiempo",
@@ -1052,7 +1052,7 @@
       "successThresholdExact": "{quorum} de {proposers}",
       "failurePolicyLabel": "Si no se puede completar la agregación",
       "runtimeLimitsLabel": "Límites de tiempo",
-      "runtimeLimits": "Proponentes {proposerTimeout}s · agregador {aggregatorTimeout}s · {grace}s de gracia tras alcanzar el umbral",
+      "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado · {grace}s de gracia tras el umbral",
       "quorumFailureLabel": "Si menos de {quorum} proponentes tienen éxito"
     },
     "behavior": {
@@ -3858,6 +3858,9 @@
     "compact": {
       "compacting": "Compactando el contexto",
       "compacted": "Contexto compactado",
+      "historyPreserved": "Contexto anterior resumido; los mensajes originales siguen disponibles en el historial",
+      "historyIncomplete": "Contexto anterior resumido; algunos mensajes originales no están disponibles",
+      "historySummarized": "Contexto anterior resumido",
       "failed": "Error al compactar",
       "withinBudget": "Contexto dentro del presupuesto.",
       "skipped": "No se aplicó la compactación del contexto.",

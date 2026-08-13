@@ -1374,6 +1374,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
               <span>
                 {{ t('setup.modelStrategy.runtimeLimits', {
                   proposerTimeout: activeFacts.proposerTimeoutSeconds,
+                  configuredAggregatorTimeout: activeFacts.configuredAggregatorTimeoutSeconds,
                   aggregatorTimeout: activeFacts.aggregatorTimeoutSeconds,
                   grace: activeFacts.quorumGraceSeconds,
                 }) }}

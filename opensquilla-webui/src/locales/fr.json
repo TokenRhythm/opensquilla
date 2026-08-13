@@ -1043,7 +1043,7 @@
       "capacityWarn": "{calls} appels de modèle par tour — le coût croît linéairement et le gain de fusion s'estompe au-delà de 4 proposants.",
       "capacityFull": "Limite de {max} proposants atteinte — davantage de brouillons n'améliore plus la fusion ; retirez-en un d'abord.",
       "diversityHint": "Plusieurs proposants partagent la même famille de modèles — ajouter un autre fournisseur améliore généralement la fusion.",
-      "effectiveFacts": "Par tour : {calls} appels de modèle · fusion dès {quorum}/{proposers} proposants réussis · timeout proposant {proposerTimeout}s · timeout agrégateur {aggregatorTimeout}s · {grace}s de grâce après quorum",
+      "effectiveFacts": "Par tour : {calls} appels de modèle · fusion dès {quorum}/{proposers} proposants réussis · délai total proposant {proposerTimeout}s · délai d'inactivité agrégateur {aggregatorTimeout}s · {grace}s de grâce après quorum",
       "effectiveSummary": "{proposers} proposants en parallèle + 1 agrégateur · environ {calls} appels par tour",
       "runtimeStrategyTitle": "Stratégie d'exécution",
       "runtimeStrategyDesc": "Seuil de réussite, repli et limites de temps",
@@ -1052,7 +1052,7 @@
       "successThresholdExact": "{quorum} sur {proposers}",
       "failurePolicyLabel": "Si l'agrégation ne peut pas aboutir",
       "runtimeLimitsLabel": "Limites de temps",
-      "runtimeLimits": "Proposants {proposerTimeout}s · agrégateur {aggregatorTimeout}s · {grace}s de grâce après le seuil",
+      "runtimeLimits": "Proposants {proposerTimeout}s au total · inactivité de l'agrégateur entre événements {aggregatorTimeout}s (configurée {configuredAggregatorTimeout}s) · délai total du tour séparé · {grace}s de grâce après le seuil",
       "quorumFailureLabel": "Si moins de {quorum} proposants réussissent"
     },
     "behavior": {
@@ -3858,6 +3858,9 @@
     "compact": {
       "compacting": "Compactage du contexte",
       "compacted": "Contexte compacté",
+      "historyPreserved": "Contexte antérieur résumé ; les messages d’origine restent disponibles dans l’historique",
+      "historyIncomplete": "Contexte antérieur résumé ; certains messages d’origine ne sont pas disponibles",
+      "historySummarized": "Contexte antérieur résumé",
       "failed": "Échec du compactage",
       "withinBudget": "Contexte dans les limites du budget.",
       "skipped": "Le compactage du contexte n’a pas été appliqué.",
