@@ -471,7 +471,47 @@ async def test_typed_action_incomplete_bypasses_stream_error_downgrade() -> None
     assert [
         event.get("kind") if isinstance(event, dict) else event.kind
         for event in sink_events
-    ] == ["done", "error"]
+    ] == ["error"]
+
+
+@pytest.mark.asyncio
+async def test_successful_done_reaches_wire_and_presentation_sink_once_with_usage() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+    sink_events: list[Any] = []
+
+    async def _stream():
+        yield DoneEvent(
+            text="finished",
+            text_snapshot="finished",
+            input_tokens=7,
+            output_tokens=3,
+            model="test-model",
+        )
+
+    async def _emitter(
+        session_key: str,
+        event_name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    async def _sink(event: Any) -> None:
+        sink_events.append(event)
+
+    await _emit_task_runtime_stream_events(
+        _stream(),
+        "agent:main:test",
+        _emitter,
+        stream_event_sink=_sink,
+        idle_timeout=1.0,
+        heartbeat_interval=0.0,
+    )
+
+    assert [name for _, name, _ in emitted] == ["session.event.done"]
+    assert emitted[0][2]["input_tokens"] == 7
+    assert emitted[0][2]["output_tokens"] == 3
+    assert len(sink_events) == 1
+    assert sink_events[0].kind == "done"
     assert sink_events[0].input_tokens == 7
     assert sink_events[0].output_tokens == 3
 

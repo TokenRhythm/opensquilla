@@ -336,6 +336,42 @@ def test_mixed_tool_effect_resolvers_classify_each_call() -> None:
     ) == "action"
 
 
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("file README.md", "read_only"),
+        ("file --mime-type README.md", "read_only"),
+        ("file -C -m custom.magic", "action"),
+        ("file --compile --magic-file custom.magic", "action"),
+        ("file --unknown-mode README.md", "action"),
+        ("arch", "read_only"),
+        ("arch --version", "read_only"),
+        ("arch touch marker", "action"),
+        ("cat -n README.md", "read_only"),
+        ("cat --unknown-mode README.md", "action"),
+        ("rg -n TODO src", "read_only"),
+        ("rg -z TODO archive.gz", "action"),
+        ("rg --unknown-mode TODO src", "action"),
+        ("tree -L 2 src", "read_only"),
+        ("tree -o report.txt src", "action"),
+        ("head -20 README.md", "read_only"),
+        ("echo left -x", "read_only"),
+        ("printf '%s' -x", "read_only"),
+    ],
+)
+def test_exec_simple_command_option_grammars_fail_closed(
+    command: str,
+    expected: Literal["read_only", "action"],
+) -> None:
+    definition = _tool_definition(
+        "exec_command",
+        completion_effect="unknown",
+        completion_effect_resolver="exec_command",
+    )
+
+    assert resolve_tool_completion_effect(definition, {"command": command}) == expected
+
+
 @pytest.mark.asyncio
 async def test_action_tool_text_only_recovers_once_then_accepts_completion_evidence() -> None:
     provider = _SequenceProvider(

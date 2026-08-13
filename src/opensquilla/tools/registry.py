@@ -737,6 +737,7 @@ def tool(
         | None
     ) = None,
     completion_receipt_on_return: bool | None = None,
+    builtin_completion_policy: bool = False,
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
 ) -> Any:
     """Decorator to register an async function as a tool.
@@ -749,7 +750,9 @@ def tool(
 
     def decorator(fn: ToolHandler) -> ToolHandler:
         builtin_policy = (
-            _BUILTIN_COMPLETION_POLICIES.get(name) if registry is None else None
+            _BUILTIN_COMPLETION_POLICIES.get(name)
+            if registry is None or builtin_completion_policy
+            else None
         )
         spec = ToolSpec(
             name=name,

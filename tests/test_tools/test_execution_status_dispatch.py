@@ -322,6 +322,27 @@ async def test_audited_builtin_text_error_does_not_mint_success() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["memory_save", "memory_delete"])
+async def test_memory_text_soft_failure_does_not_mint_success(tool_name: str) -> None:
+    handler = build_tool_handler(
+        _registry(
+            tool_name,
+            "Error: memory operation was not executed.",
+            completion_effect="action",
+            completion_receipt_on_return=True,
+        )
+    )
+
+    result = await handler(ToolCall(f"call_{tool_name}_failed", tool_name, {}))
+
+    assert result.is_error is True
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == "error"
+    assert result.execution_status["source"] == "adapter"
+    assert result.execution_status["reason"] == "memory_operation_failed"
+
+
+@pytest.mark.asyncio
 async def test_approval_denial_preserves_approval_denied_reason() -> None:
     handler = build_tool_handler(
         _registry(

@@ -192,6 +192,20 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
     if not isinstance(content, str):
         return None
 
+    if tool_name in {"memory_save", "memory_delete"} and content.lstrip().casefold().startswith(
+        "error:"
+    ):
+        return {
+            "version": 1,
+            "status": "error",
+            "exit_code": None,
+            "timed_out": False,
+            "truncated": False,
+            "reason": "memory_operation_failed",
+            "source": "adapter",
+            "preservation_class": "diagnostic",
+        }
+
     if tool_name == "exec_command":
         if content.startswith("[timeout after "):
             return {

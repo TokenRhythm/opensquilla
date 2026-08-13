@@ -2244,6 +2244,8 @@ class _RuntimeChannelStreamRelay:
         self._text_deltas: list[str] = []
         self._done_snapshot_present = False
         self._done_snapshot_text = ""
+        self._error_snapshot_present = False
+        self._error_snapshot_text = ""
         self._stream_handle: _StreamedMessageHandle | None = None
         self.text_emitted = False
         self.stream_error: BaseException | None = None
@@ -2381,6 +2383,14 @@ class _RuntimeChannelStreamRelay:
         if artifact is not None:
             self._artifacts.append(artifact)
             return
+        if isinstance(event, dict) and event.get("kind") == "error":
+            terminal_text = event.get("terminal_message") or event.get("message")
+            if isinstance(terminal_text, str) and terminal_text:
+                self._error_snapshot_present = True
+                self._error_snapshot_text = terminal_text
+                self._done_snapshot_present = False
+                self._done_snapshot_text = ""
+            return
         snapshot_present, snapshot_text = done_text_snapshot(event)
         if snapshot_present and (
             isinstance(event, DoneEvent)
@@ -2424,6 +2434,10 @@ class _RuntimeChannelStreamRelay:
     def has_terminal_snapshot(self) -> bool:
         return self._done_snapshot_present
 
+    @property
+    def has_terminal_error_snapshot(self) -> bool:
+        return self._error_snapshot_present
+
     async def close(self, timeout: float = 10.0) -> None:
         if self._closed:
             return
@@ -2434,7 +2448,11 @@ class _RuntimeChannelStreamRelay:
             else _artifact_fallback_lines(self._artifacts)
         )
         terminal_text = (
-            self._done_snapshot_text if self._done_snapshot_present else "".join(self._text_deltas)
+            self._error_snapshot_text
+            if self._error_snapshot_present
+            else self._done_snapshot_text
+            if self._done_snapshot_present
+            else "".join(self._text_deltas)
         )
         if not self._live_preview and terminal_text:
             await self._queue.put(terminal_text)
@@ -2459,7 +2477,9 @@ class _RuntimeChannelStreamRelay:
         except Exception as exc:  # noqa: BLE001 - error already becomes batch fallback.
             self.stream_error = exc
 
-        if self.stream_error is None and self._done_snapshot_present:
+        if self.stream_error is None and (
+            self._done_snapshot_present or self._error_snapshot_present
+        ):
             canonical_with_artifacts = _sanitize_streamed_channel_text(terminal_text)
             if artifact_lines:
                 artifact_text = "\n".join(artifact_lines)
@@ -3813,6 +3833,13 @@ async def _deliver_runtime_channel_reply(
             return
     else:
         content = build_terminal_reply(record)
+        if (
+            stream_relay is not None
+            and stream_relay.has_terminal_error_snapshot
+            and stream_relay.text_emitted
+            and stream_relay.stream_error is None
+        ):
+            return
         if (
             stream_relay is not None
             and stream_relay.text_emitted

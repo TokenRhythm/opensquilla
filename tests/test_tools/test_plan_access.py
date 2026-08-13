@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from opensquilla.engine.action_completion import tool_result_confirms_success
 from opensquilla.engine.types import ToolCall
 from opensquilla.session.plans import PlanRunConflictError
+from opensquilla.tools.builtin.memory_tools import create_memory_tools
 from opensquilla.tools.dispatch import build_tool_handler, preflight_tool_call
 from opensquilla.tools.registry import ToolRegistry, get_default_registry, tool
 from opensquilla.tools.types import (
@@ -109,6 +112,58 @@ def test_builtin_completion_effect_inventory_has_no_unknown_entries() -> None:
     assert specs["process"].completion_effect_resolver == "process"
     assert specs["write_file"].completion_receipt_on_return is True
     assert specs["execute_code"].completion_receipt_on_return is False
+
+
+def test_production_style_explicit_memory_registry_inherits_builtin_policy() -> None:
+    registry = ToolRegistry()
+
+    create_memory_tools(
+        MagicMock(),
+        MagicMock(),
+        memory_dir="/tmp/opensquilla-memory-policy-test",
+        registry=registry,
+    )
+
+    specs = {registered.spec.name: registered.spec for registered in registry.all_tools()}
+    assert specs["memory_search"].completion_effect == "read_only"
+    assert specs["memory_get"].completion_effect == "read_only"
+    for name in {"memory_save", "memory_delete"}:
+        assert specs[name].completion_effect == "action"
+        assert specs[name].completion_receipt_on_return is True
+
+
+@pytest.mark.asyncio
+async def test_explicit_memory_registry_success_arms_but_soft_failure_does_not(
+    tmp_path,
+) -> None:
+    registry = ToolRegistry()
+    store = MagicMock()
+    store.remove_file = AsyncMock()
+    create_memory_tools(
+        store,
+        MagicMock(),
+        memory_dir=str(tmp_path),
+        registry=registry,
+    )
+    memory_dir = tmp_path / "memory"
+    memory_dir.mkdir()
+    (memory_dir / "fact.md").write_text("fact", encoding="utf-8")
+    handler = build_tool_handler(registry)
+
+    success = await handler(
+        ToolCall("memory-delete-ok", "memory_delete", {"path": "memory/fact.md"})
+    )
+    soft_failure = await handler(
+        ToolCall("memory-delete-missing", "memory_delete", {"path": "memory/fact.md"})
+    )
+
+    assert tool_result_confirms_success(success) is True
+    assert success.execution_status is not None
+    assert success.execution_status["status"] == "success"
+    assert tool_result_confirms_success(soft_failure) is False
+    assert soft_failure.is_error is True
+    assert soft_failure.execution_status is not None
+    assert soft_failure.execution_status["reason"] == "memory_operation_failed"
 
 
 def test_dynamic_registry_tool_stays_unknown_without_trusted_metadata() -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shlex
 from collections.abc import Mapping
 from pathlib import PurePosixPath
@@ -58,6 +59,171 @@ _READ_ONLY_SIMPLE_COMMANDS = frozenset(
         "which",
     }
 )
+
+_COMMON_QUERY_FLAGS = frozenset({"--help", "--version"})
+
+
+def _simple_grammar(
+    short_flags: str = "",
+    short_values: str = "",
+    long_flags: tuple[str, ...] = (),
+    long_values: tuple[str, ...] = (),
+) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
+    return (
+        frozenset(short_flags),
+        frozenset(short_values),
+        _COMMON_QUERY_FLAGS.union(long_flags),
+        frozenset(long_values),
+    )
+
+
+# Every allowlisted query command that accepts options has an explicit grammar.
+# The table intentionally covers common portable query forms; unlisted options
+# fail closed as action-capable instead of inheriting trust from the basename.
+_SIMPLE_OPTION_GRAMMARS = {
+    "basename": _simple_grammar("az", "s", ("--multiple", "--zero"), ("--suffix",)),
+    "cat": _simple_grammar(
+        "AbEenstTuv",
+        long_flags=(
+            "--show-all",
+            "--number-nonblank",
+            "--show-ends",
+            "--number",
+            "--squeeze-blank",
+            "--show-tabs",
+            "--show-nonprinting",
+        ),
+    ),
+    "dirname": _simple_grammar("z", long_flags=("--zero",)),
+    "du": _simple_grammar(
+        "0abcdhHkLlmsx",
+        "Btd",
+        (
+            "--all",
+            "--apparent-size",
+            "--bytes",
+            "--count-links",
+            "--dereference",
+            "--human-readable",
+            "--inodes",
+            "--one-file-system",
+            "--summarize",
+            "--total",
+        ),
+        ("--block-size", "--max-depth", "--exclude", "--files0-from"),
+    ),
+    "file": _simple_grammar(
+        "0bcdEiklNnprsSvzZ",
+        "eFfmP",
+        ("--brief", "--mime", "--mime-type", "--mime-encoding", "--raw"),
+        ("--exclude", "--separator", "--files-from", "--magic-file", "--parameter"),
+    ),
+    "grep": _simple_grammar(
+        "EFGPUVabcdhHhIiLlmnorsvwxZz",
+        "ABCeefm",
+        (
+            "--fixed-strings",
+            "--ignore-case",
+            "--line-number",
+            "--no-filename",
+            "--only-matching",
+            "--quiet",
+            "--recursive",
+            "--text",
+            "--with-filename",
+            "--word-regexp",
+        ),
+        ("--regexp", "--file", "--max-count", "--context", "--color"),
+    ),
+    "head": _simple_grammar("qvz#", "cn", ("--quiet", "--verbose"), ("--bytes", "--lines")),
+    "id": _simple_grammar("Ggnruz", long_flags=("--group", "--groups", "--name", "--user")),
+    "ls": _simple_grammar(
+        "ABCDFGHLOPRSTUWabcdefghiklmnopqrstuwx1",
+        "I",
+        ("--all", "--almost-all", "--human-readable", "--recursive", "--size"),
+        ("--block-size", "--color", "--format", "--ignore", "--sort", "--time"),
+    ),
+    "md5": _simple_grammar("pqrstx", "s"),
+    "md5sum": _simple_grammar("bctwz", long_flags=("--check", "--quiet", "--status")),
+    "ps": _simple_grammar(
+        "AaCcdefgGhjLlMmnNoprsSTuvwxX",
+        "OqUpt",
+        ("--all", "--forest", "--no-headers"),
+        ("--format", "--pid", "--ppid", "--sort", "--user"),
+    ),
+    "readlink": _simple_grammar("efmnqsvz", long_flags=("--canonicalize", "--zero")),
+    "realpath": _simple_grammar(
+        "eLmqsz",
+        long_flags=("--canonicalize-existing", "--canonicalize-missing", "--zero"),
+        long_values=("--relative-to", "--relative-base"),
+    ),
+    "rg": _simple_grammar(
+        "aFhHiIlLnNoPqsSuvUwx0",
+        "ABCdefgjMmrtT",
+        (
+            "--files",
+            "--fixed-strings",
+            "--heading",
+            "--hidden",
+            "--ignore-case",
+            "--json",
+            "--line-number",
+            "--no-heading",
+            "--no-ignore",
+            "--no-messages",
+            "--only-matching",
+            "--pcre2",
+            "--quiet",
+            "--smart-case",
+            "--stats",
+            "--text",
+            "--type-list",
+            "--vimgrep",
+            "--with-filename",
+        ),
+        (
+            "--context",
+            "--encoding",
+            "--engine",
+            "--glob",
+            "--ignore-file",
+            "--max-count",
+            "--max-depth",
+            "--regexp",
+            "--replace",
+            "--sort",
+            "--type",
+            "--type-add",
+            "--type-not",
+        ),
+    ),
+    "sha1sum": _simple_grammar("bctwz", long_flags=("--check", "--quiet", "--status")),
+    "sha256sum": _simple_grammar("bctwz", long_flags=("--check", "--quiet", "--status")),
+    "stat": _simple_grammar(
+        "Lfct",
+        long_flags=("--dereference", "--file-system", "--terse"),
+        long_values=("--format", "--printf"),
+    ),
+    "tail": _simple_grammar(
+        "qvzf#",
+        "cn",
+        ("--quiet", "--verbose"),
+        ("--bytes", "--lines", "--pid", "--sleep-interval"),
+    ),
+    "tree": _simple_grammar(
+        "aCdDfFghilnpqrstuvx",
+        "L",
+        ("--dirsfirst", "--filesfirst", "--noreport"),
+        ("--charset", "--filelimit", "--sort", "--timefmt"),
+    ),
+    "uname": _simple_grammar(
+        "amnoprsv",
+        long_flags=("--all", "--kernel-name", "--kernel-release", "--machine"),
+    ),
+    "wc": _simple_grammar("clLmw", long_values=("--files0-from",)),
+    "whereis": _simple_grammar("bBfLlmMsSu", "BMS"),
+    "which": _simple_grammar("as", long_flags=("--all",)),
+}
 _READ_ONLY_GIT_SUBCOMMANDS = frozenset(
     {
         "blame",
@@ -279,6 +445,123 @@ def _date_call_is_read_only(args: tuple[str, ...]) -> bool:
     return True
 
 
+def _args_match_simple_option_grammar(
+    args: tuple[str, ...],
+    grammar: tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str]],
+    *,
+    stop_options_at_first_operand: bool = False,
+) -> bool:
+    """Accept only audited options; operands themselves remain read-only inputs."""
+
+    short_flags, short_value_options, long_flags, long_value_options = grammar
+    index = 0
+    options = True
+    while index < len(args):
+        token = args[index]
+        if options and token == "--":
+            options = False
+            index += 1
+            continue
+        if not options or token == "-" or not token.startswith("-"):
+            if stop_options_at_first_operand:
+                options = False
+            index += 1
+            continue
+        if token.startswith("--"):
+            name, separator, _value = token.partition("=")
+            if name in long_flags and not separator:
+                index += 1
+                continue
+            if name not in long_value_options:
+                return False
+            if separator:
+                index += 1
+                continue
+            if index + 1 >= len(args):
+                return False
+            index += 2
+            continue
+        if re.fullmatch(r"-\d+", token):
+            # Historical count shorthand is valid only for head/tail; callers
+            # admit it by including the synthetic '#' short flag.
+            if "#" not in short_flags:
+                return False
+            index += 1
+            continue
+        cluster = token[1:]
+        cluster_index = 0
+        while cluster_index < len(cluster):
+            option = cluster[cluster_index]
+            if option in short_flags:
+                cluster_index += 1
+                continue
+            if option not in short_value_options:
+                return False
+            if cluster_index + 1 < len(cluster):
+                cluster_index = len(cluster)
+                continue
+            if index + 1 >= len(args):
+                return False
+            index += 1
+            cluster_index += 1
+        index += 1
+    return True
+
+
+def _simple_call_is_read_only(command: str, args: tuple[str, ...]) -> bool:
+    """Resolve an allowlisted query command by its own option/operand grammar."""
+
+    if command in {"[", "test"}:
+        return command != "[" or bool(args) and args[-1] == "]"
+    if command == "arch":
+        # macOS arch executes an optional program. Only identity/help queries
+        # are portable enough to classify as read-only.
+        return not args or args in {("--help",), ("--version",)}
+    if command == "date":
+        return _date_call_is_read_only(args)
+    if command in {"true", "false"}:
+        return not args or args in {("--help",), ("--version",)}
+    if command == "pwd":
+        return all(
+            arg in {"-L", "-P", "--logical", "--physical", "--help", "--version"} for arg in args
+        )
+    if command == "echo":
+        return _args_match_simple_option_grammar(
+            args,
+            (frozenset("neE"), frozenset(), frozenset({"--help", "--version"}), frozenset()),
+            stop_options_at_first_operand=True,
+        )
+    if command == "printf":
+        return _args_match_simple_option_grammar(
+            args,
+            (frozenset(), frozenset(), frozenset({"--help", "--version"}), frozenset()),
+            stop_options_at_first_operand=True,
+        )
+    if command == "type":
+        return _args_match_simple_option_grammar(
+            args,
+            (frozenset("afptP"), frozenset(), frozenset(), frozenset()),
+            stop_options_at_first_operand=True,
+        )
+    if command == "where":
+        # Windows where /R executes no program but requires a directory value.
+        index = 0
+        while index < len(args):
+            token = args[index].casefold()
+            if token == "/r":
+                if index + 1 >= len(args):
+                    return False
+                index += 2
+                continue
+            if token in {"/q", "/f", "/t", "/?"} or not token.startswith("/"):
+                index += 1
+                continue
+            return False
+        return True
+    grammar = _SIMPLE_OPTION_GRAMMARS.get(command)
+    return grammar is not None and _args_match_simple_option_grammar(args, grammar)
+
+
 def _shell_segment_is_read_only(source: str, argv: tuple[str, ...], *, depth: int) -> bool:
     # Parsing alone does not make redirection or nested commands read-only.
     if depth > 4 or _has_active_shell_syntax(source) or not argv:
@@ -313,21 +596,10 @@ def _shell_segment_is_read_only(source: str, argv: tuple[str, ...], *, depth: in
             "-okdir",
         }
         return not any(arg.casefold() in mutating_flags for arg in argv[1:])
-    if command == "rg" and any(
-        arg == "--pre" or arg.startswith("--pre=") for arg in argv[1:]
-    ):
-        return False
-    if command == "date":
-        return _date_call_is_read_only(argv[1:])
-    if command == "tree" and any(
-        arg in {"-o", "--output"} or arg.startswith("--output=")
-        for arg in argv[1:]
-    ):
-        return False
     if os.name == "nt" and command in _WINDOWS_READ_COMMANDS:
         return True
     if command in _READ_ONLY_SIMPLE_COMMANDS:
-        return True
+        return _simple_call_is_read_only(command, argv[1:])
     profile = classify_command(argv)
     return (
         (
