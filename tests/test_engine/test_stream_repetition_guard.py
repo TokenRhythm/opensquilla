@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine.agent import _IterationStreamTimeoutError
 from opensquilla.engine.repetition_guard import (
     MODEL_REPETITION_LOOP_CODE,
     ModelRepetitionLoopError,
@@ -45,6 +47,20 @@ def _feed_in_chunks(
         if detection is not None:
             break
     return "".join(emitted), detection, guard
+
+
+def _aperiodic_unit(length: int) -> str:
+    """Return deterministic text with no exact proper period."""
+
+    state = 0x12345678
+    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    chars: list[str] = []
+    for _ in range(length):
+        state = (1_664_525 * state + 1_013_904_223) & 0xFFFFFFFF
+        chars.append(alphabet[state % len(alphabet)])
+    unit = "".join(chars)
+    assert all(unit[period:] != unit[:-period] for period in range(1, min(length, 2_049)))
+    return unit
 
 
 def test_repetition_detection_is_chunk_invariant() -> None:
@@ -89,6 +105,23 @@ def test_short_repeated_unit_is_detected_via_a_larger_period() -> None:
     assert detection.period_chars >= 48
 
 
+@pytest.mark.parametrize("period", [3_000, 4_096, 8_192])
+def test_large_aperiodic_loops_are_detected_chunk_invariant(period: int) -> None:
+    payload = _aperiodic_unit(period) * 12
+
+    results = [
+        _feed_in_chunks(payload, chunk_size)[:2] for chunk_size in (1, 257, 4_093, len(payload))
+    ]
+
+    assert len({len(emitted) for emitted, _ in results}) == 1
+    assert len({detection for _, detection in results}) == 1
+    [detection] = list({detection for _, detection in results})
+    assert detection is not None
+    assert detection.period_chars == period
+    assert detection.repeated_chars >= max(16_384, period * 4)
+    assert detection.structured is False
+
+
 @pytest.mark.parametrize(
     "unit",
     [
@@ -98,6 +131,16 @@ def test_short_repeated_unit_is_detected_via_a_larger_period() -> None:
         pytest.param(
             "2026-08-13T12:00:00 INFO provider stream remains active\n",
             id="log",
+        ),
+        pytest.param(
+            "api-1 | 2026-08-13T12:00:00 INFO request completed\n",
+            id="container-log",
+        ),
+        pytest.param("region,status,count\nus-east,ready,10\n", id="csv"),
+        pytest.param("region\tstatus\tcount\nus-east\tready\t10\n", id="tsv"),
+        pytest.param(
+            " id | status\n----+--------\n 1  | ready\n(1 row)\n",
+            id="query-result",
         ),
     ],
 )
@@ -112,14 +155,65 @@ def test_structured_repetition_uses_slow_threshold(unit: str) -> None:
 
 def test_long_structured_loop_is_not_permanently_exempt() -> None:
     unit = "for item in items:\n    print(item)\n"
-    payload = (unit * (50_000 // len(unit) + 1))[:50_000]
+    payload = (unit * (80_000 // len(unit) + 1))[:80_000]
 
     _, detection, _ = _feed_in_chunks(payload, 211)
 
     assert detection is not None
     assert detection.structured is True
-    assert detection.repeated_chars >= 32_768
-    assert detection.repetitions >= 32
+    assert detection.repeated_chars >= 57_344
+    assert detection.repetitions >= 7
+
+
+@pytest.mark.parametrize(
+    "row_factory",
+    [
+        pytest.param(
+            lambda index: (
+                f"api-{index % 7} | 2026-08-13T12:{index // 60:02d}:"
+                f"{index % 60:02d} INFO request={index} latency_ms={index * 17}\n"
+            ),
+            id="container-log",
+        ),
+        pytest.param(
+            lambda index: f"region-{index % 11},ready,{index},{index * 17}\n",
+            id="csv",
+        ),
+        pytest.param(
+            lambda index: f"region-{index % 11}\tready\t{index}\t{index * 17}\n",
+            id="tsv",
+        ),
+        pytest.param(
+            lambda index: f" {index:05d} | ready | value_{index * 17}\n",
+            id="query-result",
+        ),
+    ],
+)
+def test_long_progressing_structured_output_is_not_flagged(row_factory: Any) -> None:
+    payload = "".join(row_factory(index) for index in range(4_000))
+
+    emitted, detection, guard = _feed_in_chunks(payload, 173)
+
+    assert detection is None
+    assert emitted == payload
+    assert guard.buffered_chars <= 65_536
+
+
+def test_large_structured_loop_requires_full_conservative_budget() -> None:
+    period = 8_192
+    rows = [f"{index:04d},value_{_aperiodic_unit(32)}_{index:04d}\n" for index in range(160)]
+    unit = "column,value,index\n" + "".join(rows)
+    unit = (unit + _aperiodic_unit(period))[:period]
+    assert len(unit) == period
+    payload = unit * 10
+
+    _, detection, guard = _feed_in_chunks(payload, 251)
+
+    assert detection is not None
+    assert detection.period_chars == period
+    assert detection.structured is True
+    assert detection.repeated_chars >= 57_344
+    assert guard.buffered_chars <= 65_536
 
 
 def test_nonperiodic_code_table_and_log_output_does_not_trigger() -> None:
@@ -137,9 +231,10 @@ def test_nonperiodic_code_table_and_log_output_does_not_trigger() -> None:
 
 
 class _RepeatingIterator:
-    def __init__(self, *, block_close: bool = False) -> None:
+    def __init__(self, *, block_close: bool = False, fail_close: bool = False) -> None:
         self.close_calls = 0
         self.block_close = block_close
+        self.fail_close = fail_close
         self.close_started = asyncio.Event()
 
     def __aiter__(self) -> _RepeatingIterator:
@@ -154,8 +249,41 @@ class _RepeatingIterator:
     async def aclose(self) -> None:
         self.close_calls += 1
         self.close_started.set()
+        if self.fail_close:
+            raise RuntimeError("synthetic close failure")
         if self.block_close:
             await asyncio.Event().wait()
+
+
+class _LifecycleIterator:
+    def __init__(self, *, emit_first: bool = True) -> None:
+        self.close_calls = 0
+        self.emit_first = emit_first
+        self.emitted = False
+        self.blocked = asyncio.Event()
+
+    def __aiter__(self) -> _LifecycleIterator:
+        return self
+
+    async def __anext__(self) -> ProviderText:
+        if self.emit_first and not self.emitted:
+            self.emitted = True
+            return ProviderText(text="first event")
+        self.blocked.set()
+        await asyncio.Event().wait()
+        raise StopAsyncIteration
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
+def _deadline_agent(iteration_timeout: float = 1.0) -> Agent:
+    agent = Agent.__new__(Agent)
+    agent.config = SimpleNamespace(
+        iteration_timeout=iteration_timeout,
+        timeout=iteration_timeout,
+    )
+    return agent
 
 
 @pytest.mark.asyncio
@@ -184,6 +312,73 @@ async def test_guard_close_is_bounded_when_upstream_ignores_close() -> None:
         await asyncio.wait_for(consume(), timeout=0.25)
 
     assert upstream.close_started.is_set()
+    assert upstream.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_guard_close_failure_does_not_mask_repetition_outcome() -> None:
+    upstream = _RepeatingIterator(fail_close=True)
+
+    with pytest.raises(ModelRepetitionLoopError) as exc_info:
+        async for _ in guard_provider_text_stream(upstream):
+            pass
+
+    assert exc_info.value.code == MODEL_REPETITION_LOOP_CODE
+    assert upstream.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_outer_wrapper_aclose_propagates_once_to_provider() -> None:
+    upstream = _LifecycleIterator()
+    guarded = guard_provider_text_stream(upstream)
+    wrapped = _deadline_agent()._stream_provider_events_with_deadline(
+        guarded,
+        loop=asyncio.get_running_loop(),
+        total_deadline=None,
+    )
+
+    assert (await anext(wrapped)).text == "first event"
+    await wrapped.aclose()
+
+    assert upstream.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_outer_wrapper_cancellation_propagates_once_to_provider() -> None:
+    upstream = _LifecycleIterator()
+    guarded = guard_provider_text_stream(upstream)
+
+    async def consume() -> None:
+        async for _ in _deadline_agent()._stream_provider_events_with_deadline(
+            guarded,
+            loop=asyncio.get_running_loop(),
+            total_deadline=None,
+        ):
+            pass
+
+    task = asyncio.create_task(consume())
+    await upstream.blocked.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert upstream.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_outer_wrapper_iteration_timeout_propagates_once_to_provider() -> None:
+    upstream = _LifecycleIterator(emit_first=False)
+    guarded = guard_provider_text_stream(upstream)
+    agent = _deadline_agent(iteration_timeout=0.01)
+
+    with pytest.raises(_IterationStreamTimeoutError):
+        async for _ in agent._stream_provider_events_with_deadline(
+            guarded,
+            loop=asyncio.get_running_loop(),
+            total_deadline=None,
+        ):
+            pass
+
     assert upstream.close_calls == 1
 
 

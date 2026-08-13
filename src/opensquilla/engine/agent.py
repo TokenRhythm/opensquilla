@@ -75,6 +75,7 @@ from opensquilla.engine.repetition_guard import (
     MODEL_REPETITION_LOOP_CODE,
     MODEL_REPETITION_LOOP_MESSAGE,
     ModelRepetitionLoopError,
+    close_async_iterator_bounded,
     guard_provider_text_stream,
 )
 from opensquilla.engine.runtime_diagnostics import RuntimeDiagnosticsObserver
@@ -16920,6 +16921,25 @@ class Agent:
             raise
         except Exception:  # noqa: BLE001 - provider boundary
             raise _RaisedProviderBoundaryError from None
+        try:
+            async for event in self._stream_provider_events_with_deadline_unclosed(
+                stream_iter,
+                loop=loop,
+                total_deadline=total_deadline,
+                deadline_provider=deadline_provider,
+            ):
+                yield event
+        finally:
+            await self._close_provider_stream(stream_iter)
+
+    async def _stream_provider_events_with_deadline_unclosed(
+        self,
+        stream_iter: AsyncIterator[Any],
+        *,
+        loop: asyncio.AbstractEventLoop,
+        total_deadline: float | None,
+        deadline_provider: Callable[[], float | None] | None = None,
+    ) -> AsyncIterator[Any]:
         while True:
             dynamic_deadline = (
                 deadline_provider()
@@ -16938,7 +16958,6 @@ class Agent:
             if active_deadline is not None:
                 remaining_total = active_deadline - loop.time()
                 if remaining_total <= 0:
-                    await self._close_provider_stream(stream_iter)
                     raise _provider_stream_deadline_timeout(
                         timeout_seconds=self.config.timeout,
                         deadline_at_monotonic=active_deadline,
@@ -16988,16 +17007,11 @@ class Agent:
 
     @staticmethod
     async def _close_provider_stream(stream_iter: AsyncIterator[Any]) -> None:
-        aclose = getattr(stream_iter, "aclose", None)
-        if not callable(aclose):
-            return
-        try:
-            await aclose()
-        except Exception as exc:  # noqa: BLE001 - cleanup must not mask timeout
-            logger.debug(
-                "provider_stream.close_failed",
-                error_type=type(exc).__name__,
-            )
+        await close_async_iterator_bounded(
+            stream_iter,
+            timeout=0.25,
+            event_prefix="provider_stream",
+        )
 
     def _provider_request_messages(
         self,

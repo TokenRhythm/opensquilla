@@ -33,6 +33,15 @@ _LOG_LINE_RE = re.compile(
     r"(?:trace|debug|info|warn(?:ing)?|error|fatal)\b)",
     re.IGNORECASE,
 )
+_CONTAINER_LOG_LINE_RE = re.compile(
+    r"^(?:\[[^\]\n]{1,80}\]\s*)?"
+    r"(?:[A-Za-z0-9_.-]{1,80}(?:/[A-Za-z0-9_.-]{1,80})?\s+\|\s+)"
+    r"(?:\[?\d{4}-\d{2}-\d{2}[T ]|\d{2}:\d{2}:\d{2}|"
+    r"(?:trace|debug|info|warn(?:ing)?|error|fatal)\b)",
+    re.IGNORECASE,
+)
+_QUERY_BORDER_RE = re.compile(r"^(?:\+-{2,}(?:\+-{2,})+\+?|[-=]{2,}(?:\+[-=]{2,})+)$")
+_QUERY_FOOTER_RE = re.compile(r"^\(\d+\s+rows?\)$", re.IGNORECASE)
 _CODE_PREFIX_RE = re.compile(
     r"^(?:async\s+def|def|class|function|const|let|var|if|else|elif|for|while|"
     r"try|except|catch|return|import|from|package|public|private|protected|"
@@ -50,13 +59,17 @@ class RepetitionGuardPolicy:
     check_stride_chars: int = 256
     required_consecutive_checks: int = 3
     min_period_chars: int = 48
-    max_period_chars: int = 2_048
+    max_period_chars: int = 8_192
     min_repeated_chars: int = 4_096
     min_repetitions: int = 8
     min_similarity: float = 0.985
-    structured_min_repeated_chars: int = 32_768
-    structured_min_repetitions: int = 32
-    structured_min_similarity: float = 0.995
+    large_period_threshold_chars: int = 2_048
+    large_period_min_repeated_chars: int = 16_384
+    large_period_min_repetitions: int = 4
+    structured_min_repeated_chars: int = 57_344
+    structured_min_repetitions: int = 7
+    structured_min_similarity: float = 0.9995
+    max_candidate_periods: int = 64
     close_timeout_seconds: float = 0.25
 
 
@@ -129,7 +142,7 @@ class StreamingRepetitionGuard:
         pending: list[str] = []
         for raw_index, char in enumerate(text):
             if char.isspace():
-                normalized = "\n" if char in "\r\n" else " "
+                normalized = "\n" if char in "\r\n" else "\t" if char == "\t" else " "
                 if self._last_whitespace == "\n":
                     continue
                 if self._last_whitespace == normalized:
@@ -206,6 +219,12 @@ class StreamingRepetitionGuard:
             min_similarity = (
                 policy.structured_min_similarity if structured else policy.min_similarity
             )
+            if not structured and period > policy.large_period_threshold_chars:
+                min_repeated = max(min_repeated, policy.large_period_min_repeated_chars)
+                min_repetitions = min(
+                    min_repetitions,
+                    policy.large_period_min_repetitions,
+                )
             repeated_chars = max(min_repeated, period * min_repetitions)
             if repeated_chars + period > len(text):
                 continue
@@ -236,27 +255,32 @@ class StreamingRepetitionGuard:
         """
 
         policy = self.policy
-        candidates: set[int] = set()
-        anchor_chars = 24
-        for end_offset in (0, 61, 137, 251):
-            anchor_end = len(text) - end_offset
-            anchor_start = anchor_end - anchor_chars
-            if anchor_start <= 0:
-                continue
-            anchor = text[anchor_start:anchor_end]
-            search_start = max(0, anchor_start - policy.max_period_chars)
-            search_end = anchor_start
-            occurrences = 0
-            while search_end > search_start and occurrences < policy.min_period_chars + 16:
-                previous = text.rfind(anchor, search_start, search_end)
-                if previous < 0:
-                    break
-                period = anchor_start - previous
-                if policy.min_period_chars <= period <= policy.max_period_chars:
-                    candidates.add(period)
-                search_end = previous
-                occurrences += 1
-        return sorted(candidates)
+        votes: dict[int, int] = {}
+        # Multiple anchor widths make the discovery resilient to a changing
+        # field landing inside one anchor, while the phase offsets keep the
+        # result independent of provider chunk boundaries.  Each rfind scans
+        # at most max_period_chars and both anchors and candidates are capped.
+        for anchor_chars in (24, 48, 96):
+            for end_offset in (0, 61, 137, 251, 509):
+                anchor_end = len(text) - end_offset
+                anchor_start = anchor_end - anchor_chars
+                if anchor_start <= 0:
+                    continue
+                anchor = text[anchor_start:anchor_end]
+                search_start = max(0, anchor_start - policy.max_period_chars)
+                search_end = anchor_start
+                occurrences = 0
+                while search_end > search_start and occurrences < 16:
+                    previous = text.rfind(anchor, search_start, search_end)
+                    if previous < 0:
+                        break
+                    period = anchor_start - previous
+                    if policy.min_period_chars <= period <= policy.max_period_chars:
+                        votes[period] = votes.get(period, 0) + 1
+                    search_end = previous
+                    occurrences += 1
+        ranked = sorted(votes, key=lambda period: (-votes[period], period))
+        return sorted(ranked[: policy.max_candidate_periods])
 
 
 def _looks_structured(text: str, period: int) -> bool:
@@ -270,11 +294,13 @@ def _looks_structured(text: str, period: int) -> bool:
         lines = [unit.strip()] if unit.strip() else []
     if not lines:
         return False
+    if _looks_delimited_rows(lines) or _looks_query_result(lines):
+        return True
 
     structured_lines = 0
     for line in lines:
         is_table = line.count("|") >= 2
-        is_log = _LOG_LINE_RE.match(line) is not None
+        is_log = bool(_LOG_LINE_RE.match(line) or _CONTAINER_LOG_LINE_RE.match(line))
         is_code = bool(
             _CODE_PREFIX_RE.match(line)
             or _CODE_CALL_RE.match(line)
@@ -289,6 +315,41 @@ def _looks_structured(text: str, period: int) -> bool:
     return structured_lines / len(lines) >= 0.4
 
 
+def _looks_delimited_rows(lines: list[str]) -> bool:
+    """Recognize CSV/TSV-shaped output without parsing or retaining fields."""
+
+    if len(lines) < 4:
+        return False
+    for delimiter in ("\t", ","):
+        counts = [line.count(delimiter) for line in lines]
+        eligible = [count for count in counts if count >= 1]
+        if len(eligible) < max(4, int(len(lines) * 0.75)):
+            continue
+        frequencies: dict[int, int] = {}
+        for count in eligible:
+            frequencies[count] = frequencies.get(count, 0) + 1
+        if max(frequencies.values(), default=0) >= max(3, int(len(lines) * 0.5)):
+            return True
+    return False
+
+
+def _looks_query_result(lines: list[str]) -> bool:
+    """Recognize common psql/sqlite/MySQL-style tabular query output."""
+
+    if len(lines) < 3:
+        return False
+    table_rows = sum(
+        1
+        for line in lines
+        if (
+            line.count("|") >= 1
+            or _QUERY_BORDER_RE.match(line) is not None
+            or _QUERY_FOOTER_RE.match(line) is not None
+        )
+    )
+    return table_rows >= max(3, int(len(lines) * 0.5))
+
+
 def _consume_close_result(task: asyncio.Future[Any]) -> None:
     if task.cancelled():
         return
@@ -296,10 +357,11 @@ def _consume_close_result(task: asyncio.Future[Any]) -> None:
         task.result()
 
 
-async def _close_stream_bounded(
+async def close_async_iterator_bounded(
     stream_iter: AsyncIterator[Any],
     *,
     timeout: float,
+    event_prefix: str = "provider_stream",
 ) -> None:
     aclose = getattr(stream_iter, "aclose", None)
     if not callable(aclose):
@@ -308,20 +370,54 @@ async def _close_stream_bounded(
         close_task = asyncio.ensure_future(aclose())
     except Exception as exc:  # noqa: BLE001 - cleanup must not mask detection
         log.warning(
-            "provider_repetition_guard.close_failed",
+            f"{event_prefix}.close_failed",
             error_type=type(exc).__name__,
         )
         return
-    done, _ = await asyncio.wait({close_task}, timeout=max(0.001, timeout))
-    if close_task in done:
-        _consume_close_result(close_task)
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(close_task),
+            timeout=max(0.001, timeout),
+        )
+    except TimeoutError:
+        close_task.cancel()
+        close_task.add_done_callback(_consume_close_result)
+        log.warning(
+            f"{event_prefix}.close_timeout",
+            timeout_seconds=timeout,
+        )
         return
-    close_task.cancel()
-    close_task.add_done_callback(_consume_close_result)
-    log.warning(
-        "provider_repetition_guard.close_timeout",
-        timeout_seconds=timeout,
-    )
+    except asyncio.CancelledError:
+        close_task.cancel()
+        close_task.add_done_callback(_consume_close_result)
+        raise
+    except Exception as exc:  # noqa: BLE001 - cleanup must not mask terminal outcome
+        log.warning(
+            f"{event_prefix}.close_failed",
+            error_type=type(exc).__name__,
+        )
+    else:
+        _consume_close_result(close_task)
+
+
+class _IdempotentStreamCloser:
+    """Start at most one bounded close even when exit paths converge."""
+
+    def __init__(self, stream_iter: AsyncIterator[Any], *, timeout: float) -> None:
+        self._stream_iter = stream_iter
+        self._timeout = timeout
+        self._close_task: asyncio.Task[None] | None = None
+
+    async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                close_async_iterator_bounded(
+                    self._stream_iter,
+                    timeout=self._timeout,
+                    event_prefix="provider_repetition_guard",
+                )
+            )
+        await asyncio.shield(self._close_task)
 
 
 async def guard_provider_text_stream(
@@ -334,30 +430,34 @@ async def guard_provider_text_stream(
     active_policy = policy or RepetitionGuardPolicy()
     guard = StreamingRepetitionGuard(active_policy)
     stream_iter = stream.__aiter__()
-    async for event in stream_iter:
-        kind = str(getattr(event, "kind", "") or "")
-        if kind in {"tool_use_start", "tool_use_end"}:
-            guard.reset()
-            yield event
-            continue
-        if not isinstance(event, ProviderTextDelta):
-            yield event
-            continue
+    closer = _IdempotentStreamCloser(
+        stream_iter,
+        timeout=active_policy.close_timeout_seconds,
+    )
+    try:
+        async for event in stream_iter:
+            kind = str(getattr(event, "kind", "") or "")
+            if kind in {"tool_use_start", "tool_use_end"}:
+                guard.reset()
+                yield event
+                continue
+            if not isinstance(event, ProviderTextDelta):
+                yield event
+                continue
 
-        accepted_text, detection = guard.feed(event.text)
-        if accepted_text:
-            yield replace(event, text=accepted_text)
-        elif detection is None:
-            # Preserve existing empty-delta behavior.
-            yield event
-        if detection is None:
-            continue
+            accepted_text, detection = guard.feed(event.text)
+            if accepted_text:
+                yield replace(event, text=accepted_text)
+            elif detection is None:
+                # Preserve existing empty-delta behavior.
+                yield event
+            if detection is None:
+                continue
 
-        await _close_stream_bounded(
-            stream_iter,
-            timeout=active_policy.close_timeout_seconds,
-        )
-        raise ModelRepetitionLoopError(detection)
+            await closer.close()
+            raise ModelRepetitionLoopError(detection)
+    finally:
+        await closer.close()
 
 
 __all__ = [
@@ -367,5 +467,6 @@ __all__ = [
     "RepetitionDetection",
     "RepetitionGuardPolicy",
     "StreamingRepetitionGuard",
+    "close_async_iterator_bounded",
     "guard_provider_text_stream",
 ]
