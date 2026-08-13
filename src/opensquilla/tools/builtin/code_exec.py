@@ -1222,17 +1222,20 @@ async def execute_code(
             env=safe_env,
             **process_group_kwargs,
         )
+        from opensquilla.process_tree import capture_process_tree_owner
+
+        process_tree = capture_process_tree_owner(proc, isolated=True)
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.CancelledError:
             from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
 
-            await asyncio.shield(_terminate_exec_process_tree(proc))
+            await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
             raise
         except TimeoutError:
             from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
 
-            await _terminate_exec_process_tree(proc)
+            await _terminate_exec_process_tree(proc, process_tree)
             elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
             return finish(
                 _execution_result_json(
@@ -1244,6 +1247,9 @@ async def execute_code(
                 )
             )
 
+        from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
+
+        await _terminate_exec_process_tree(proc, process_tree)
         elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
         stdout = decode_subprocess_output(stdout_bytes)
         stderr = decode_subprocess_output(stderr_bytes)

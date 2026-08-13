@@ -345,6 +345,9 @@ async def _run_install_argv(argv: list[str]) -> tuple[int, str, str, bool]:
         )
     except FileNotFoundError as exc:
         raise ToolError(f"Install command not found: {argv[0]}") from exc
+    from opensquilla.process_tree import capture_process_tree_owner
+
+    process_tree = capture_process_tree_owner(proc, isolated=True)
     try:
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(),
@@ -353,13 +356,16 @@ async def _run_install_argv(argv: list[str]) -> tuple[int, str, str, bool]:
     except asyncio.CancelledError:
         from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
 
-        await asyncio.shield(_terminate_exec_process_tree(proc))
+        await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
         raise
     except TimeoutError:
         from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
 
-        await _terminate_exec_process_tree(proc)
+        await _terminate_exec_process_tree(proc, process_tree)
         return -1, "", "Timed out", True
+    from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
+
+    await _terminate_exec_process_tree(proc, process_tree)
     return proc.returncode or 0, _cap_output(stdout), _cap_output(stderr), False
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -113,3 +115,34 @@ async def test_noop_backend_forwards_allowlisted_request_env(tmp_path: Path) -> 
 
     assert result.returncode == 0
     assert result.stdout.splitlines() == ["visible", "missing"]
+
+
+@pytest.mark.skipif(not HAS_RESOURCE, reason="noop backend safety runner is POSIX-only")
+@pytest.mark.asyncio
+async def test_noop_backend_caller_cancel_stops_process_tree(tmp_path: Path) -> None:
+    marker = tmp_path / "noop-descendant-ran"
+    child_script = (
+        "import pathlib, time; "
+        f"time.sleep(0.8); pathlib.Path({str(marker)!r}).write_text('ran')"
+    )
+    parent_script = (
+        "import subprocess, sys, time; "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}]); "
+        "time.sleep(30)"
+    )
+    request = SandboxRequest(
+        argv=(sys.executable, "-c", parent_script),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=_policy(tmp_path),
+        env={"PATH": os.environ.get("PATH", "")},
+    )
+
+    running = asyncio.create_task(NoopBackend().run(request))
+    await asyncio.sleep(0.2)
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    await asyncio.sleep(1.0)
+
+    assert not marker.exists()

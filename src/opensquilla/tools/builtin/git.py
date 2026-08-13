@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+from opensquilla.process_tree import capture_process_tree_owner
 from opensquilla.sandbox.integration import (
     get_runtime,
     reject_windows_guest_process,
@@ -122,13 +123,17 @@ async def _run_git(*args: str, cwd: str | None = None) -> str:
         cwd=cwd,
         **process_group_kwargs,
     )
+    process_tree = capture_process_tree_owner(proc, isolated=True)
     try:
         stdout, _ = await proc.communicate()
     except asyncio.CancelledError:
         from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
 
-        await asyncio.shield(_terminate_exec_process_tree(proc))
+        await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
         raise
+    from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
+
+    await _terminate_exec_process_tree(proc, process_tree)
     from opensquilla.subprocess_encoding import decode_subprocess_output
 
     output = decode_subprocess_output(stdout)

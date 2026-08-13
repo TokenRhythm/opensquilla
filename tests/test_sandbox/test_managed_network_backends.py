@@ -120,24 +120,13 @@ def test_bubblewrap_proxy_allowlist_without_proxy_fails_closed(
 @pytest.mark.asyncio
 async def test_noop_backend_passes_request_proxy_env_to_child(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from opensquilla.safety.sandbox import SandboxResult as SafetySandboxResult
     from opensquilla.sandbox.backend import noop as noop_mod
 
     policy = dataclasses.replace(
         _policy(tmp_path, network_proxy=_proxy_spec()),
         env_allowlist=("PATH", "HTTP_PROXY"),
     )
-    seen: dict[str, object] = {}
-
-    def _fake_run_sandboxed(cmd, limits=None, *, stdin=None, env=None):
-        seen["cmd"] = tuple(cmd)
-        seen["stdin"] = stdin
-        seen["env"] = dict(env or {})
-        return SafetySandboxResult(returncode=0, stdout="ok\n", stderr="")
-
-    monkeypatch.setattr(noop_mod, "run_sandboxed", _fake_run_sandboxed)
     request = SandboxRequest(
         argv=(
             sys.executable,
@@ -156,11 +145,7 @@ async def test_noop_backend_passes_request_proxy_env_to_child(
     result = await noop_mod.NoopBackend().run(request)
 
     assert result.returncode == 0
-    assert seen["stdin"] is None
-    assert seen["env"] == {
-        "PATH": "/bin",
-        "HTTP_PROXY": "http://127.0.0.1:18080",
-    }
+    assert result.stdout.strip() == "http://127.0.0.1:18080"
 
 
 def test_seatbelt_proxy_allowlist_without_proxy_fails_closed(

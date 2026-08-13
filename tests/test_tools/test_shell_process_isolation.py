@@ -355,23 +355,143 @@ async def test_task_cancel_stops_only_owned_background_process() -> None:
     ) not in shell.active_background_process_task_owners()
 
 
-def test_windows_process_tree_kill_targets_only_owned_pid(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[list[str], dict[str, object]]] = []
-
-    def fake_run(argv: list[str], **kwargs: object) -> None:
-        calls.append((argv, kwargs))
-
-    monkeypatch.setattr(shell.subprocess, "run", fake_run)
-
-    shell._force_kill_windows_process_tree(4242)
-
-    assert calls[0][0] == ["taskkill", "/PID", "4242", "/T", "/F"]
-    assert calls[0][1]["check"] is False
-    assert calls[0][1]["timeout"] == (
-        shell._EXEC_TERMINATE_TIMEOUT + shell._EXEC_KILL_TIMEOUT
+@pytest.mark.skipif(os.name != "posix", reason="process group behavior is POSIX-specific")
+@pytest.mark.asyncio
+async def test_task_cancel_stops_descendant_after_background_leader_exits(tmp_path) -> None:
+    marker = tmp_path / "leader-exit-descendant-ran"
+    child_script = (
+        "import pathlib, time; "
+        f"time.sleep(1.0); pathlib.Path({str(marker)!r}).write_text('ran'); "
+        "time.sleep(30)"
     )
+    parent_script = (
+        "import subprocess, sys; "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}])"
+    )
+    token = current_tool_context.set(
+        _ctx("agent:main:leader-exit", task_id="task-leader-exit")
+    )
+    try:
+        result = await shell._start_host_background_process(
+            _python_shell_command(parent_script),
+            cwd=None,
+            effective_timeout=30.0,
+            runtime=None,
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    session_id = result.splitlines()[0].split("=", 1)[1]
+    session = shell._bg_sessions[session_id]
+    for _attempt in range(200):
+        if session.process.returncode is not None:
+            break
+        await asyncio.sleep(0.01)
+    assert session.process.returncode == 0
+    assert session.process_tree is not None
+    assert session.process_tree.is_active() is True
+    assert (
+        "agent:main:leader-exit",
+        "task-leader-exit",
+    ) in shell.active_background_process_task_owners()
+
+    assert await shell.cancel_background_processes_for_task(
+        "agent:main:leader-exit",
+        "task-leader-exit",
+    ) == 1
+    await asyncio.sleep(1.2)
+
+    assert session.process_tree.is_active() is False
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_is_exact_across_siblings_sessions_and_repeats() -> None:
+    sessions: list[shell._BgSession] = []
+    identities = (
+        ("agent:main:shared", "task-target"),
+        ("agent:main:shared", "task-sibling"),
+        ("agent:main:other", "task-target"),
+    )
+    for session_key, task_id in identities:
+        token = current_tool_context.set(_ctx(session_key, task_id=task_id))
+        try:
+            result = await shell._start_host_background_process(
+                _python_shell_command("import time; time.sleep(30)"),
+                cwd=None,
+                effective_timeout=30.0,
+                runtime=None,
+            )
+        finally:
+            current_tool_context.reset(token)
+        session_id = result.splitlines()[0].split("=", 1)[1]
+        sessions.append(shell._bg_sessions[session_id])
+
+    try:
+        assert await shell.cancel_background_processes_for_task(
+            "agent:main:shared",
+            "task-target",
+        ) == 1
+        assert await shell.cancel_background_processes_for_task(
+            "agent:main:shared",
+            "task-target",
+        ) == 0
+        assert sessions[0].process_tree is not None
+        assert sessions[0].process_tree.is_active() is False
+        assert sessions[1].process_tree is not None
+        assert sessions[1].process_tree.is_active() is True
+        assert sessions[2].process_tree is not None
+        assert sessions[2].process_tree.is_active() is True
+    finally:
+        await shell.cancel_background_processes_for_task(
+            "agent:main:shared",
+            "task-sibling",
+        )
+        await shell.cancel_background_processes_for_task(
+            "agent:main:other",
+            "task-target",
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
+@pytest.mark.asyncio
+async def test_windows_job_owns_descendant_after_leader_exit(tmp_path) -> None:
+    from opensquilla.process_tree import capture_process_tree_owner
+
+    pid_file = tmp_path / "windows-descendant.pid"
+    survived = tmp_path / "windows-descendant-survived"
+    child_script = (
+        "import os, pathlib, time; "
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+        "time.sleep(1); "
+        f"pathlib.Path({str(survived)!r}).write_text('survived'); "
+        "time.sleep(30)"
+    )
+    parent_script = (
+        "import subprocess, sys, time; time.sleep(0.5); "
+        f"subprocess.Popen([sys.executable, '-c', {child_script!r}])"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        parent_script,
+        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+    )
+    process_tree = capture_process_tree_owner(proc, isolated=True)
+
+    assert process_tree.durable is True
+    await asyncio.wait_for(proc.wait(), timeout=5.0)
+    for _attempt in range(200):
+        if pid_file.exists():
+            break
+        await asyncio.sleep(0.01)
+    assert pid_file.exists()
+    assert process_tree.is_active() is True
+
+    assert await process_tree.terminate(graceful_timeout=0.2, kill_timeout=2.0)
+    assert process_tree.is_active() is False
+    await asyncio.sleep(1.2)
+    assert not survived.exists()
 
 
 @pytest.mark.asyncio

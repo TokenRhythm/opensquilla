@@ -17,6 +17,7 @@ from opensquilla.tools.types import ToolContext, current_tool_context
 
 class _FakeProcess:
     returncode = 0
+    pid = os.getpid()
 
     async def communicate(self) -> tuple[bytes, None]:
         return b"## main\n", None
@@ -141,6 +142,7 @@ class _GbkProcess:
     """Emits GBK/CP936-encoded Chinese bytes (e.g. a filename in git status)."""
 
     returncode = 0
+    pid = os.getpid()
 
     async def communicate(self) -> tuple[bytes, None]:
         # "新建文件" (new file) encoded in GBK — invalid UTF-8, so a naive
