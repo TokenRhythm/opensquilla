@@ -474,6 +474,10 @@ export interface ChatMaintenanceEvent {
   reason?: string
   removedCount?: number
   keptCount?: number
+  /** This event marks a durable summary/archive boundary in canonical history. */
+  historyArchived?: boolean
+  /** Whether every original row remains available across that boundary. */
+  canonicalComplete?: boolean | null
 }
 
 export interface ChatMessage {
