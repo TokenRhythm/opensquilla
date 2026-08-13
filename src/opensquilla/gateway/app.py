@@ -105,7 +105,7 @@ def create_gateway_app(
         if result.error is None:
             return default
         code = result.error.code
-        if code == "INVALID_REQUEST":
+        if code in {"INVALID_PARAMS", "INVALID_REQUEST"}:
             return 400
         if code == "UNAUTHORIZED":
             return 403

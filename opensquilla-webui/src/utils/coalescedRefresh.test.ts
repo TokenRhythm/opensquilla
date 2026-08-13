@@ -35,6 +35,44 @@ describe('createCoalescedRefresh', () => {
     await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2))
   })
 
+  it('reruns when an authoritative load is requested during an older load', async () => {
+    const first = deferred()
+    const run = vi.fn()
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce(undefined)
+    const refresh = createCoalescedRefresh({
+      run,
+      allowed: () => true,
+      delayMs: 150,
+    })
+
+    const initial = refresh.load()
+    expect(refresh.load()).toBe(initial)
+    first.resolve()
+    await initial
+
+    await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(2))
+  })
+
+  it('does not rerun a pending authoritative load after disposal', async () => {
+    const first = deferred()
+    const run = vi.fn().mockReturnValue(first.promise)
+    const refresh = createCoalescedRefresh({
+      run,
+      allowed: () => true,
+      delayMs: 150,
+    })
+
+    const initial = refresh.load()
+    void refresh.load()
+    refresh.dispose()
+    first.resolve()
+    await initial
+    await Promise.resolve()
+
+    expect(run).toHaveBeenCalledOnce()
+  })
+
   it('keeps a deferred refresh until admission resumes', async () => {
     let admitted = false
     const run = vi.fn().mockResolvedValue(undefined)

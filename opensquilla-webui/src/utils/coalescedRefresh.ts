@@ -33,7 +33,10 @@ export function createCoalescedRefresh(options: CoalescedRefreshOptions): Coales
   }
 
   function load(): Promise<void> {
-    if (inFlight) return inFlight
+    if (inFlight) {
+      pending = true
+      return inFlight
+    }
     let tracked: Promise<void>
     tracked = options.run().finally(() => {
       if (inFlight !== tracked) return
