@@ -6,8 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-08-13
+
 ### Added
 
+- Durable Goals can continue across turns with explicit progress, pause,
+  resume, edit, clear, and Plan-mode deferral controls. Queued follow-ups,
+  attachments, project handoffs, and session forks now survive reconnects and
+  preserve their intended ordering during long-running work.
+- MetaSkills, Cron workspace management, inline `/meta` requests, and richer
+  Skills lifecycle diagnostics are available through the shared runtime and
+  management surfaces.
 - Community Skills from ClawHub and GitHub now support immutable source
   resolution and transactional management through one shared service. Gateway
   RPC and CLI add read-only Doctor diagnostics, agent installs return lifecycle
@@ -39,6 +48,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Long-running chat streams recover more reliably from renderer reconnects and
+  provider activity gaps, while bounded history rendering keeps large sessions
+  responsive. Assistant answers, tool markers, pending input, session counts,
+  and created-chat cards now keep their correct UI boundaries and state.
+- Desktop startup, profile recovery, update checks, Windows packaging, provider
+  reasoning replay, prompt-cache continuity, compaction, schedules, and usage
+  receipts are more reliable across supported platforms.
 - TokenRhythm maximum-output limits now prefer the authenticated top-level
   declaration, preserve the published value separately from the runtime-safe
   value, and clamp fallback requests to each physical model's known limit.
@@ -48,6 +64,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- The landing-page game suggestion now submits only its visible localized
+  label. The previously hidden, detailed game request is no longer bundled in
+  the client or sent when the suggestion is selected.
+- The responsive chat header, floating composer, sidebar peer sections, and
+  artifact presentation have been refined without changing existing gateway
+  configuration or persisted chat data.
 - `onboarding.models.discover`, profile model discovery, and `models.list` add
   optional catalog metadata and maximum-output fields. Existing clients may
   ignore them; external decoders using `additionalProperties: false` must allow
