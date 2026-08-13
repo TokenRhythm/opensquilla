@@ -8,6 +8,7 @@ import {
   type InjectionKey,
   type Ref,
 } from 'vue'
+import type { ContextUsage } from '@/composables/chat/useChatUsageWidget'
 import type { IconName } from '@/utils/icons'
 
 export type ChatRouteHeaderAction =
@@ -22,6 +23,7 @@ export interface ChatRouteHeaderModel {
   copyIcon: Readonly<Ref<IconName>>
   copyLiveText: Readonly<Ref<string>>
   deliverableCount: Readonly<Ref<number>>
+  contextUsage: Readonly<Ref<ContextUsage | null>>
   shareMode: Readonly<Ref<boolean>>
   shareableMessageCount: Readonly<Ref<number>>
 }
@@ -52,6 +54,7 @@ export interface ChatRouteHeaderBridge {
     copyIcon: ComputedRef<IconName>
     copyLiveText: ComputedRef<string>
     deliverableCount: ComputedRef<number>
+    contextUsage: ComputedRef<ContextUsage | null>
     shareMode: ComputedRef<boolean>
     shareableMessageCount: ComputedRef<number>
   }
@@ -127,6 +130,7 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
       copyIcon: computed(() => ownerValue('copyIcon', DEFAULT_COPY_ICON)),
       copyLiveText: computed(() => ownerValue('copyLiveText', '')),
       deliverableCount: computed(() => ownerValue('deliverableCount', 0)),
+      contextUsage: computed(() => ownerValue('contextUsage', null)),
       shareMode: computed(() => ownerValue('shareMode', false)),
       shareableMessageCount: computed(() => ownerValue('shareableMessageCount', 0)),
     },

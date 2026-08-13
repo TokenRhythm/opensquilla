@@ -7,6 +7,7 @@ import {
   type ChatRouteHeaderCommands,
   type ChatRouteHeaderModel,
 } from './useChatRouteHeaderBridge'
+import type { ContextUsage } from './useChatUsageWidget'
 
 let mountedRoot: HTMLElement | null = null
 let mountedApp: App<Element> | null = null
@@ -33,7 +34,10 @@ function createBridge(): ChatRouteHeaderBridge {
   return bridge
 }
 
-function owner(title: string): {
+function owner(
+  title: string,
+  contextUsage: ContextUsage | null = null,
+): {
   model: ChatRouteHeaderModel
   commands: ChatRouteHeaderCommands
 } {
@@ -45,6 +49,7 @@ function owner(title: string): {
       copyIcon: ref('copy'),
       copyLiveText: ref(''),
       deliverableCount: ref(0),
+      contextUsage: ref(contextUsage),
       shareMode: ref(false),
       shareableMessageCount: ref(1),
     },
@@ -88,6 +93,23 @@ describe('chat route header bridge', () => {
     expect(closeMenu).toHaveBeenCalled()
     expect(bridge.model.visible.value).toBe(false)
     expect(bridge.model.title.value).toBe('')
+  })
+
+  it('publishes the context reading and drops it with its owner', () => {
+    // The reading is the one header field App cannot recompute on its own: it
+    // lives in the chat session, so it has to survive the bridge hop, and it
+    // has to disappear the moment no session owns the header — a stale
+    // percentage beside a new title reads as that session's usage.
+    const bridge = createBridge()
+    const usage: ContextUsage = { pct: 87, usedK: 87, windowK: 100, warning: true }
+    const current = owner('current', usage)
+    const registration = bridge.register(current.model, current.commands)
+
+    expect(bridge.model.contextUsage.value).toEqual(usage)
+
+    registration.release()
+
+    expect(bridge.model.contextUsage.value).toBeNull()
   })
 
   it('closes the mounted menu when the registered view returns to landing', () => {
