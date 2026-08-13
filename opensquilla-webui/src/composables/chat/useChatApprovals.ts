@@ -504,6 +504,11 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   const clarifySubmitted = ref(false)
   const clarifyBusy = ref(false)
   const clarifyError = ref('')
+  // A request-scoped submit can cross the Gateway boundary even when its RPC
+  // acknowledgement is lost. Keep that uncertainty until either the submit
+  // response/tool outcome settles it or an authoritative reconnect snapshot
+  // confirms that the request is no longer pending.
+  const clarifySubmitAttempts = new Set<string>()
 
   // Resolution view-state for inline interrupt parts is the shared `interruptState`
   // ref (keyed by approval id, or the clarify composite key). The fold reads it to
@@ -863,6 +868,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     if (!isCurrentSessionPayload(payload, sessionKey.value)) return
     const outcome = userInputOutcomeFromValue(payload.result)
     if (outcome) {
+      clarifySubmitAttempts.delete(outcome.requestId)
       setInterruptState(outcome.requestId, {
         resolution: 'replied',
         busy: false,
@@ -999,12 +1005,14 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       clarifySubmitted.value = true
       clarifyError.value = ''
     }
+    if (request.requestId) clarifySubmitAttempts.add(key)
     setInterruptState(key, { resolution: 'replied', busy: true, error: '' })
     const params: Record<string, unknown> = { sessionKey: sessionKey.value, fields }
     if (request.requestId) params.request_id = request.requestId
     if (request.runId) params.run_id = request.runId
     try {
       await rpc.call('chat.clarify_submit', params)
+      clarifySubmitAttempts.delete(key)
       setInterruptState(key, { resolution: 'replied', busy: false })
       // request_id submissions resolve the exact paused tool call in the same
       // turn. A successful RPC is therefore authoritative and can release the
@@ -1013,11 +1021,21 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       if (request.requestId) clearPendingClarify(key)
     } catch (err) {
       const message = 'Send failed — ' + (err instanceof Error ? err.message : String(err))
-      if (pendingClarifyMatches(key)) {
+      const stillPending = pendingClarifyMatches(key)
+      // A terminal tool result or authoritative empty snapshot can win the
+      // race with a rejected/lost RPC acknowledgement. Never reopen that
+      // already-settled request from the late rejection.
+      const terminalConfirmed = !stillPending
+        && interruptState.value.get(key)?.resolution === 'replied'
+      if (stillPending) {
         clarifySubmitted.value = false
         clarifyError.value = message
       }
-      setInterruptState(key, { resolution: null, busy: false, error: message })
+      if (terminalConfirmed) {
+        clarifySubmitAttempts.delete(key)
+      } else {
+        setInterruptState(key, { resolution: null, busy: false, error: message })
+      }
     } finally {
       if (pendingClarifyMatches(key)) clarifyBusy.value = false
     }
@@ -1032,13 +1050,35 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     pendingUserInputs?: unknown[]
     pending_user_inputs?: unknown[]
   }) {
+    const hasAuthoritativePendingList = Object.prototype.hasOwnProperty.call(
+      snapshot,
+      'pendingUserInputs',
+    ) || Object.prototype.hasOwnProperty.call(snapshot, 'pending_user_inputs')
+    if (!hasAuthoritativePendingList) return
+
     const pending = snapshot.pendingUserInputs || snapshot.pending_user_inputs || []
-    for (const value of pending) {
-      const request = clarifyRequestFromValue(value)
-      if (!request) continue
-      pendingClarify.value = request
-      resetClarifyPresentation()
+    const requests = pending
+      .map(value => clarifyRequestFromValue(value))
+      .filter((request): request is ChatClarifyRequest => request != null)
+    const pendingKeys = new Set(requests.map(request => clarifyFrameKey(request)))
+    const current = pendingClarify.value
+    if (current?.requestId) {
+      const currentKey = clarifyFrameKey(current)
+      if (clarifySubmitAttempts.has(currentKey) && !pendingKeys.has(currentKey)) {
+        clarifySubmitAttempts.delete(currentKey)
+        setInterruptState(currentKey, { resolution: 'replied', busy: false, error: '' })
+        clearPendingClarify(currentKey)
+      }
+    }
+
+    for (const request of requests) {
       const key = clarifyFrameKey(request)
+      if (interruptState.value.get(key)?.resolution === 'replied') continue
+      const sameRequest = pendingClarifyMatches(key)
+      pendingClarify.value = request
+      // Do not make an in-flight submission actionable again just because a
+      // racing snapshot still contains its pre-submit pending record.
+      if (!sameRequest || !clarifyBusy.value) resetClarifyPresentation()
       if (!interruptState.value.has(key)) setInterruptState(key, {})
       if (!stream.isStreaming.value) stream.ensureInterruptBubble()
       stream.appendInterruptFrame({
@@ -1061,6 +1101,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     interruptState.value = new Map()
     interruptNamespaces.clear()
     interruptApprovals.clear()
+    clarifySubmitAttempts.clear()
     legacyPushBackfills.clear()
     dismissClarify()
     if (key) hydrateApprovals()

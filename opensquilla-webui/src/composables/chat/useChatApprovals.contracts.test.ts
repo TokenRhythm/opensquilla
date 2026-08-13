@@ -425,6 +425,63 @@ describe('clarify tool-result recovery', () => {
     }
   })
 
+  it('releases a failed submit when reconnect says that request is no longer pending', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      runtime.rpcCall.mockRejectedValueOnce(new Error('connection lost after send'))
+      await runtime.approvals.submitClarify({ scope: 'focused' })
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-1')
+      expect(runtime.approvals.clarifyError.value).toContain('connection lost after send')
+
+      runtime.approvals.applyUserInputBootstrap({ pendingUserInputs: [] })
+
+      expect(runtime.approvals.pendingClarify.value).toBeNull()
+      expect(runtime.approvals.clarifySubmitted.value).toBe(false)
+      expect(runtime.approvals.clarifyBusy.value).toBe(false)
+      expect(runtime.approvals.clarifyError.value).toBe('')
+      expect(runtime.interruptState.value.get('input-request-1')).toEqual({
+        resolution: 'replied',
+        busy: false,
+        error: '',
+      })
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
+  it('does not settle a failed submit from a partial snapshot without pending-input state', async () => {
+    installSnapshot()
+    const runtime = await harness()
+    try {
+      runtime.handlers.get('session.event.tool_result')?.({
+        session_key: 'agent:main:web',
+        tool_use_id: 'request-input-1',
+        name: 'request_user_input',
+        result: planClarifyResult,
+      })
+      runtime.rpcCall.mockRejectedValueOnce(new Error('gateway unavailable'))
+      await runtime.approvals.submitClarify({ scope: 'focused' })
+
+      runtime.approvals.applyUserInputBootstrap({})
+
+      expect(runtime.approvals.pendingClarify.value?.requestId).toBe('input-request-1')
+      expect(runtime.approvals.clarifyError.value).toContain('gateway unavailable')
+      expect(runtime.interruptState.value.get('input-request-1')?.resolution).toBeNull()
+    } finally {
+      runtime.unsubscribe()
+      runtime.scope.stop()
+    }
+  })
+
   it('settles the matching card when the same tool id returns answered', async () => {
     installSnapshot()
     const runtime = await harness()
