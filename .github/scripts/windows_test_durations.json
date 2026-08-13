@@ -1293,6 +1293,7 @@
     "tests/test_engine/test_silent_reply.py": 0.01,
     "tests/test_engine/test_silent_reply_runtime.py": 0.01,
     "tests/test_skills_hash_consumers.py": 0.02,
-    "tests/test_skills_tree.py": 0.02
+    "tests/test_skills_tree.py": 0.02,
+    "tests/test_gateway/test_p1a_exact_abort_contract.py": 0.01
   }
 }

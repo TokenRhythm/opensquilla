@@ -37,7 +37,11 @@ from opensquilla.engine.agent_injection import PendingInputClaim, PendingInputPr
 from opensquilla.engine.outcome import completed_outcome, outcome_from_error
 from opensquilla.engine.steps.inject_time_prefix import TIME_PREFIX_RE
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
-from opensquilla.gateway.session_lifecycle import TaskLifecycleEvent, TaskLifecycleListener
+from opensquilla.gateway.session_lifecycle import (
+    SessionTaskSnapshot,
+    TaskLifecycleEvent,
+    TaskLifecycleListener,
+)
 from opensquilla.safety.injection_guard import xml_escape
 from opensquilla.session.goals import (
     GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
@@ -2293,6 +2297,40 @@ class TaskRuntime:
                 return None
             return task.task_id
 
+    async def session_task_snapshot(
+        self,
+        session_key: str,
+        *,
+        excluding_task_id: str | None = None,
+    ) -> SessionTaskSnapshot:
+        """Return the running-first in-memory task projection for a session.
+
+        The snapshot is captured under the runtime state lock and never reads
+        SQLite. A running task remains the foreground owner while cancellation
+        is requested; it leaves the projection only at its terminal boundary.
+        """
+
+        key = canonicalize_session_key(session_key)
+        async with self._state_lock:
+            running = self._running_by_session.get(key)
+            running_task_id = (
+                running.task_id
+                if running is not None
+                and running.task_id != excluding_task_id
+                and running.status is AgentTaskStatus.RUNNING
+                else None
+            )
+            queued_task_ids = tuple(
+                task.task_id
+                for task in self._pending_by_session.get(key, ())
+                if task.task_id != excluding_task_id
+                and task.status is AgentTaskStatus.QUEUED
+            )
+        return SessionTaskSnapshot(
+            running_task_id=running_task_id,
+            queued_task_ids=queued_task_ids,
+        )
+
     @staticmethod
     def _steer_capability_for_task(task: _RuntimeTask) -> dict[str, Any]:
         """Describe whether the active task accepts first-phase same-turn input."""
@@ -2665,6 +2703,32 @@ class TaskRuntime:
             source=source,
             reason=reason,
         )
+
+    async def cancel_exact(
+        self,
+        *,
+        task_id: str,
+        session_key: str,
+        source: str | None = None,
+        reason: str | None = None,
+    ) -> int:
+        """Cancel one task after fencing durable admission for its session.
+
+        A turn receipt becomes visible in SQLite immediately before its
+        reservation is activated in memory.  Serializing exact cancellation
+        on the same admission gate closes that commit-to-activate window: once
+        this method owns the gate, the task is either cancellable in memory or
+        definitively never became active.
+        """
+
+        key = canonicalize_session_key(session_key)
+        async with self.collect_admission(key):
+            return await self.cancel(
+                task_id=task_id,
+                session_key=key,
+                source=source,
+                reason=reason,
+            )
 
     async def _cancel_runtime_tasks(
         self,
@@ -5100,9 +5164,13 @@ class TaskRuntime:
     ) -> None:
         record_primary_terminal_disposition = False
         collected_terminal_inputs: list[_CollectedPrimaryInput] = []
+        was_running_owner = False
         async with self._state_lock:
             if task.terminal_closing:
                 return
+            was_running_owner = (
+                self._running_by_session.get(task.envelope.session_key) is task
+            )
             task.terminal_settling = True
             if task.primary_input_pending:
                 task.primary_input_pending = False
@@ -5117,22 +5185,26 @@ class TaskRuntime:
                 status=status,
                 terminal_reason=terminal_reason,
             )
-        # The per-session execution lock makes this task the only possible live
-        # continuation for approvals owned by its session. At terminal state,
-        # any remaining request is orphaned and must fail closed.
-        try:
-            from opensquilla.application.approval_queue import get_approval_queue
+        # ApprovalQueue is session-addressed. A queued task that is cancelled
+        # before execution cannot own an approval, and expiring the session
+        # here would reject the actual running owner's request. Capture
+        # ownership atomically with the terminal transition; if this task won
+        # the execution lane immediately before cancellation, it is the owner
+        # and must still fail its own orphaned approval closed.
+        if was_running_owner:
+            try:
+                from opensquilla.application.approval_queue import get_approval_queue
 
-            get_approval_queue().expire_pending_for_session(
-                task.envelope.session_key,
-            )
-        except Exception as exc:  # noqa: BLE001 - terminalization must continue.
-            log.warning(
-                "task_runtime.approval_cleanup_failed",
-                task_id=task.task_id,
-                session_key=task.envelope.session_key,
-                error=str(exc),
-            )
+                get_approval_queue().expire_pending_for_session(
+                    task.envelope.session_key,
+                )
+            except Exception as exc:  # noqa: BLE001 - terminalization must continue.
+                log.warning(
+                    "task_runtime.approval_cleanup_failed",
+                    task_id=task.task_id,
+                    session_key=task.envelope.session_key,
+                    error=str(exc),
+                )
         for collected_input in collected_terminal_inputs:
             await self._record_collected_primary_input_disposition(
                 task,
@@ -5537,6 +5609,23 @@ class TaskRuntime:
     async def _notify_task_lifecycle(self, event: TaskLifecycleEvent) -> None:
         if self._lifecycle_listener is None:
             return
+        try:
+            snapshot = await self.session_task_snapshot(
+                event.session_key,
+                excluding_task_id=(event.task_id if event.phase == "terminal" else None),
+            )
+        except Exception:
+            # The changed task remains useful evidence, but listeners must not
+            # infer a foreground owner from the callback that happened to fire.
+            log.warning(
+                "task_runtime.session_task_snapshot_failed",
+                session_key=event.session_key,
+                task_id=event.task_id,
+                phase=event.phase,
+                exc_info=True,
+            )
+        else:
+            event = replace(event, task_snapshot=snapshot)
         try:
             await self._lifecycle_listener(event)
         except Exception:

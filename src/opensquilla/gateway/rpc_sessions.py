@@ -580,15 +580,20 @@ async def _cancel_task_runtime(
     source: str,
     reason: str,
 ) -> int:
-    cancel = getattr(task_runtime, "cancel")
+    exact_cancel = getattr(task_runtime, "cancel_exact", None) if task_id else None
+    cancel = exact_cancel if callable(exact_cancel) else getattr(task_runtime, "cancel")
     kwargs: dict[str, Any] = {}
-    if task_id and _accepts_keyword_arg(cancel, "task_id"):
+    if task_id:
+        # An exact Stop must never widen into a session-wide cancellation for
+        # an older/custom runtime.  Both identities are required so a stale or
+        # forged task id cannot cancel work owned by another session.
+        if not (
+            _accepts_keyword_arg(cancel, "task_id")
+            and _accepts_keyword_arg(cancel, "session_key")
+        ):
+            raise _TaskScopedCancelUnsupportedError
         kwargs["task_id"] = task_id
-        # Task ids are process-global in TaskRuntime, but the RPC contract is
-        # session-owned. Passing both fences a stale/forged id atomically and
-        # keeps custom runtimes that support the same contract equally safe.
-        if _accepts_keyword_arg(cancel, "session_key"):
-            kwargs["session_key"] = session_key
+        kwargs["session_key"] = session_key
     else:
         kwargs["session_key"] = session_key
     if _accepts_keyword_arg(cancel, "source"):
@@ -596,6 +601,10 @@ async def _cancel_task_runtime(
     if _accepts_keyword_arg(cancel, "reason"):
         kwargs["reason"] = reason
     return int(await cancel(**kwargs))
+
+
+class _TaskScopedCancelUnsupportedError(RuntimeError):
+    """The runtime cannot atomically cancel a task owned by one session."""
 
 
 async def _durable_receipt_allows_covered_destructive_compaction(
@@ -1613,7 +1622,17 @@ def _active_task_summary(rows: list[Any]) -> dict[str, Any] | None:
     running = [row for row in active if _enum_value(getattr(row, "status", None)) == "running"]
     if running:
         return _task_summary(_sorted_task_rows(running)[0])
-    return _task_summary(_sorted_task_rows(active)[0])
+    # TaskRuntime executes a session's pending lane FIFO. Hydration must expose
+    # that same oldest queued owner; choosing the newest accepted row would make
+    # reconnecting clients target Stop/steer at a later task that is not next.
+    queued = sorted(
+        active,
+        key=lambda row: (
+            getattr(row, "created_at", 0) or 0,
+            str(getattr(row, "task_id", "")),
+        ),
+    )
+    return _task_summary(queued[0])
 
 
 def _last_task_summary(rows: list[Any]) -> dict[str, Any] | None:
@@ -1645,6 +1664,110 @@ def _task_state_summary(rows: list[Any]) -> dict[str, Any]:
         "last_task": last_task,
         "run_status": _task_run_status(active_task, last_task),
     }
+
+
+async def _overlay_runtime_task_snapshot(
+    ctx: RpcContext,
+    session_key: str,
+    task_state: dict[str, Any],
+) -> None:
+    """Overlay live FIFO ownership onto a durable task-ledger snapshot.
+
+    SQLite timestamps cannot encode the exact ordering of two same-millisecond
+    admissions. While this process owns the runtime, its state-locked pending
+    lane is authoritative for both foreground selection and ordered queued ids.
+    A non-empty durable projection is retained when the live snapshot is empty
+    during the short acceptance-commit-to-runtime-activation window; startup
+    recovery abandons stale unfinished rows before requests can reach here.
+    """
+
+    getter = getattr(getattr(ctx, "task_runtime", None), "session_task_snapshot", None)
+    if not callable(getter):
+        return
+    try:
+        candidate = getter(session_key)
+        snapshot = await candidate if inspect.isawaitable(candidate) else candidate
+    except Exception:  # noqa: BLE001 - durable hydration remains a safe fallback.
+        log.warning(
+            "sessions.runtime_task_snapshot_failed",
+            session_key=session_key,
+            exc_info=True,
+        )
+        return
+
+    running_value = getattr(snapshot, "running_task_id", None)
+    running_task_id = (
+        running_value.strip()
+        if isinstance(running_value, str) and running_value.strip()
+        else None
+    )
+    raw_queued_ids = getattr(snapshot, "queued_task_ids", ())
+    queued_task_ids: list[str] = []
+    if isinstance(raw_queued_ids, (list, tuple)):
+        for value in raw_queued_ids:
+            task_id = value.strip() if isinstance(value, str) else ""
+            if (
+                task_id
+                and task_id != running_task_id
+                and task_id not in queued_task_ids
+            ):
+                queued_task_ids.append(task_id)
+
+    active_task_id = running_task_id or (queued_task_ids[0] if queued_task_ids else None)
+    durable_active = task_state.get("active_task")
+    if active_task_id is None and isinstance(durable_active, dict):
+        durable_status = str(durable_active.get("status") or "").strip().lower()
+        durable_task_id = str(durable_active.get("task_id") or "").strip()
+        if durable_task_id and durable_status in {"queued", "running"}:
+            # accept_turn persists the QUEUED ledger row before activating it
+            # into TaskRuntime. A hydrate in that commit-to-activation window
+            # therefore sees durable work and an empty runtime snapshot. Keep
+            # the durable fail-closed projection; process-start recovery has
+            # already abandoned stale rows before requests can reach here.
+            if durable_status == "queued":
+                queued_task_ids = [
+                    str(task.get("task_id") or "").strip()
+                    for task in sorted(
+                        (
+                            task
+                            for task in task_state.get("tasks", [])
+                            if isinstance(task, dict)
+                            and str(task.get("status") or "").strip().lower()
+                            == "queued"
+                        ),
+                        key=lambda task: (
+                            int(task.get("created_at") or 0),
+                            str(task.get("task_id") or ""),
+                        ),
+                    )
+                    if isinstance(task, dict)
+                    and str(task.get("task_id") or "").strip()
+                ]
+                if durable_task_id not in queued_task_ids:
+                    queued_task_ids.insert(0, durable_task_id)
+            task_state["queued_task_ids"] = queued_task_ids
+            return
+    active_status = "running" if running_task_id is not None else "queued"
+    active_task: dict[str, Any] | None = None
+    if active_task_id is not None:
+        active_task = next(
+            (
+                dict(task)
+                for task in task_state.get("tasks", [])
+                if isinstance(task, dict) and task.get("task_id") == active_task_id
+            ),
+            None,
+        )
+        if active_task is None:
+            active_task = {"task_id": active_task_id}
+        active_task["status"] = active_status
+
+    task_state["active_task"] = active_task
+    task_state["queued_task_ids"] = queued_task_ids
+    task_state["run_status"] = _task_run_status(
+        active_task,
+        task_state.get("last_task"),
+    )
 
 
 async def _attach_active_steer_capability(
@@ -6866,62 +6989,76 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         from opensquilla.gateway.approval_queue import get_approval_queue
         from opensquilla.gateway.subagent_announce import (
             cancel_background_completion_for_session,
+            cancel_background_completion_for_task,
         )
 
         if requested_task_id is not None:
-            active_task_ids = await _await_abort_operation(
-                _active_task_runtime_ids(task_runtime, key),
-                deadline_at_monotonic=abort_deadline,
-                operation="list_requested_runtime_task",
-                default=(),
-            )
-            if active_task_ids and requested_task_id not in active_task_ids:
-                return {
-                    "aborted": False,
-                    "key": key,
-                    "reason": "task_mismatch",
-                }
-            if task_scoped and requested_task_id not in active_task_ids:
-                return {
-                    "aborted": False,
-                    "key": key,
-                    "reason": "task_not_active",
-                }
-            active_task_ids = (requested_task_id,)
-            cancelled_count = await _await_abort_operation(
-                _cancel_task_runtime(
-                    task_runtime,
-                    session_key=key,
-                    task_id=requested_task_id,
-                    source=_cancel_source_from_params(params, "sessions_abort"),
-                    reason="user_abort",
-                ),
-                deadline_at_monotonic=abort_deadline,
-                operation="cancel_requested_runtime_task",
-                default=0,
-            )
-            if cancelled_count > 0:
-                # These registries are session-addressed rather than
-                # task-addressed. Only touch them after the exact task/session
-                # match has been accepted, so stale Stop requests are strict
-                # no-ops and cannot disturb the newer task.
-                await _await_abort_operation(
-                    cancel_background_completion_for_session(key),
+            cancel_unknown = object()
+            try:
+                cancelled_result = await _await_abort_operation(
+                    _cancel_task_runtime(
+                        task_runtime,
+                        session_key=key,
+                        task_id=requested_task_id,
+                        source=_cancel_source_from_params(params, "sessions_abort"),
+                        reason="user_abort",
+                    ),
                     deadline_at_monotonic=abort_deadline,
-                    operation="cancel_background_completion",
+                    operation="cancel_requested_runtime_task",
+                    default=cancel_unknown,
+                )
+            except _TaskScopedCancelUnsupportedError:
+                return {
+                    "aborted": False,
+                    "key": key,
+                    "reason": "task_scope_unsupported",
+                }
+            if cancelled_result is cancel_unknown:
+                return {
+                    "aborted": False,
+                    "key": key,
+                    # The request may already have crossed TaskRuntime's
+                    # cancellation boundary.  Do not claim the task is
+                    # terminal; the client must reconcile and retry the same
+                    # exact identity.
+                    "reason": "task_cancel_unknown",
+                }
+            cancelled_count = int(cancelled_result)
+            if cancelled_count > 0:
+                # Background completion groups have exact task identity. Do
+                # not clear every group or every approval in the session: a
+                # queued task may be cancelled while another task is running.
+                # TaskRuntime terminalization expires approvals only when this
+                # exact task owns the running lane.
+                await _await_abort_operation(
+                    cancel_background_completion_for_task(key, requested_task_id),
+                    deadline_at_monotonic=abort_deadline,
+                    operation="cancel_task_background_completion",
                     default=0,
                 )
-                get_approval_queue().resolve_pending_for_session(key, approved=False)
                 await _drain_cancelled_task_runtime(
                     task_runtime,
                     session_key=key,
-                    task_ids=active_task_ids,
+                    task_ids=(requested_task_id,),
                     deadline_at_monotonic=abort_deadline,
                 )
+            reason = "task_not_active"
+            if cancelled_count <= 0:
+                # Classification is diagnostic only.  The exact cancel above
+                # is the authority; a storage-backed list failure can never
+                # prevent cancellation of a live in-memory task.
+                active_task_ids = await _await_abort_operation(
+                    _active_task_runtime_ids(task_runtime, key),
+                    deadline_at_monotonic=abort_deadline,
+                    operation="classify_inactive_runtime_task",
+                    default=(),
+                )
+                if active_task_ids and requested_task_id not in active_task_ids:
+                    reason = "task_mismatch"
             return {
                 "aborted": cancelled_count > 0,
                 "key": key,
-                **({} if cancelled_count > 0 else {"reason": "task_not_active"}),
+                **({} if cancelled_count > 0 else {"reason": reason}),
             }
 
         cancel_source = _cancel_source_from_params(params, "sessions_abort")
@@ -7057,6 +7194,15 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
             "cancelled_tasks": cancelled_tasks,
             "cancelled_sessions": len(cancelled_session_keys),
             "cancelled_compactions": len(active_compaction_tasks),
+        }
+
+    # The legacy registry is keyed only by session and cannot prove task
+    # ownership.  Never widen a modern exact Stop into its session-wide cancel.
+    if requested_task_id is not None or task_scoped:
+        return {
+            "aborted": False,
+            "key": key,
+            "reason": "task_scope_unsupported",
         }
 
     # Cancel running agent task via registry
@@ -8965,6 +9111,7 @@ async def _hydrate_sessions_messages_metadata(
     storage = get_session_storage(getattr(ctx, "session_manager", None))
     task_rows = await _list_task_rows(ctx, storage, key)
     task_state = _task_state_summary(task_rows)
+    await _overlay_runtime_task_snapshot(ctx, key, task_state)
     await _attach_active_steer_capability(ctx, key, task_state)
     from opensquilla.gateway.subagent_announce import (
         active_background_completion_group_ids,
@@ -9943,14 +10090,27 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
     history = await _handle_chat_history(history_params, ctx)
     task_rows = await _list_task_rows(ctx, storage, session_key)
     task_state = _task_state_summary(task_rows)
+    await _overlay_runtime_task_snapshot(ctx, session_key, task_state)
     await _attach_active_steer_capability(ctx, session_key, task_state)
     epoch = await _bootstrap_epoch(ctx.session_manager, storage, session, session_key)
-    queued_count = sum(
-        1 for row in task_rows if _enum_value(getattr(row, "status", None)) == "queued"
-    )
-    running_count = sum(
-        1 for row in task_rows if _enum_value(getattr(row, "status", None)) == "running"
-    )
+    live_queued_ids = task_state.get("queued_task_ids")
+    if isinstance(live_queued_ids, list):
+        queued_count = len(live_queued_ids)
+        active_task = task_state.get("active_task")
+        running_count = int(
+            isinstance(active_task, dict) and active_task.get("status") == "running"
+        )
+    else:
+        queued_count = sum(
+            1
+            for row in task_rows
+            if _enum_value(getattr(row, "status", None)) == "queued"
+        )
+        running_count = sum(
+            1
+            for row in task_rows
+            if _enum_value(getattr(row, "status", None)) == "running"
+        )
     agent_id = _effective_agent_id_for_session(session, session_key)
     agent_identity = await _bootstrap_agent_identity(ctx, agent_id)
     effective_model = _session_turn_model(ctx, session, agent_id)

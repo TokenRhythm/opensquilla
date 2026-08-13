@@ -19,6 +19,7 @@ import {
   type ChatRpcStreamApi,
   type UseChatRpcEventHandlersOptions,
 } from './useChatRpcEventHandlers'
+import { useChatTaskOwnership } from './useChatTaskOwnership'
 import { FINISHED_STREAM_TASK_ID, PENDING_STREAM_TASK_ID } from '@/utils/chat/streamEvents'
 
 const SESSION = 'agent:main:webchat:issue344'
@@ -412,8 +413,12 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(newest.messages.value[newest.messages.value.length - 1]?.text).toBe('Task 8 failed.')
   })
 
-  it("accepts the stopped task's cancelled terminal event after Stop poisoned the active id", () => {
-    const { api, options, stream } = makeHarness('__opensquilla_stopped_stream_task__')
+  it("accepts the exact Stop target's cancelled terminal without poisoning the render id", () => {
+    const { api, options, stream } = makeHarness('task-B')
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-B')
+    taskOwnership.beginStop()
+    options.taskOwnership = taskOwnership
     stream.isStreaming.value = false
 
     api.handlers.onAny('task.cancelled', {
@@ -431,8 +436,12 @@ describe('issue #344 — live stream is bound to a single task', () => {
     }))
   })
 
-  it("accepts the stopped task's terminal sessions.changed payload", () => {
-    const { api, options, stream } = makeHarness('__opensquilla_stopped_stream_task__')
+  it("accepts the exact Stop target's terminal sessions.changed payload", () => {
+    const { api, options, stream } = makeHarness('task-B')
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-B')
+    taskOwnership.beginStop()
+    options.taskOwnership = taskOwnership
     stream.isStreaming.value = false
     const cancelledPayload = {
       session_key: SESSION,

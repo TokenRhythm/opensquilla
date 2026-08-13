@@ -1578,7 +1578,15 @@ def build_cron_result_payload(
     }
 
 
-def _task_run_status_for_session_change(event: TaskLifecycleEvent) -> str:
+def _task_run_status_for_session_change(event: TaskLifecycleEvent) -> str | None:
+    if event.task_snapshot is not None:
+        active_task = event.task_snapshot.active_task
+        if active_task is not None:
+            return active_task["status"]
+        if event.phase in {"queued", "running"}:
+            # This is a delayed lifecycle callback for work that has already
+            # left the runtime ledger. Do not regress the current run status.
+            return None
     status = getattr(event.task_status, "value", str(event.task_status))
     if event.phase == "queued":
         return "queued"
@@ -1623,11 +1631,33 @@ def _make_task_session_lifecycle_listener(
     async def _listener(event: TaskLifecycleEvent) -> None:
         if event.run_kind == "subagent":
             return
+        task_state = _task_state_for_session_change(event)
         changed = await apply_task_lifecycle_to_session(
             event,
             session_manager=session_manager,
         )
         if not changed:
+            return
+        if event.task_snapshot is None:
+            # A callback identifies only the task that changed, not the
+            # session's foreground owner. When the authoritative runtime
+            # snapshot is unavailable, publish that limited fact and leave the
+            # active/run projection untouched.
+            await event_emitter(
+                event.session_key,
+                "sessions.changed",
+                build_sessions_changed_payload(
+                    event.session_key,
+                    (
+                        "task_queued"
+                        if event.phase == "queued"
+                        else "task_running"
+                        if event.phase == "running"
+                        else "task_terminal"
+                    ),
+                    changed_task=task_state,
+                ),
+            )
             return
         reason = (
             "task_queued"
@@ -1637,21 +1667,38 @@ def _make_task_session_lifecycle_listener(
             else "task_terminal"
         )
         session_status = session_status_for_task_status(event.task_status)
-        task_state = _task_state_for_session_change(event)
-        if event.phase == "terminal" and event.continuation_task_id:
+        active_task = event.task_snapshot.active_task
+        if active_task is None and event.continuation_task_id:
+            # Shutdown recovery can durably promote a successor without
+            # activating it into this process. The continuation id is then the
+            # only authoritative queued owner and preserves the established
+            # handoff contract.
+            active_task = {
+                "task_id": event.continuation_task_id,
+                "status": "queued",
+            }
+        if event.phase == "terminal" and active_task is not None:
             session_status = SessionStatus.RUNNING
             task_projection = {
                 "last_task": task_state,
-                "active_task": {
-                    "task_id": event.continuation_task_id,
-                    "status": "queued",
-                },
+                "active_task": active_task,
             }
+        elif event.phase == "terminal":
+            task_projection = {"last_task": task_state}
+        elif active_task is not None:
+            task_projection = {"active_task": active_task}
         else:
-            state_field = (
-                "active_task" if event.phase in {"queued", "running"} else "last_task"
+            task_projection = {}
+        if (
+            event.phase == "queued"
+            and event.task_id in event.task_snapshot.queued_task_ids
+            and (
+                active_task is None
+                or active_task.get("task_id") != event.task_id
+                or active_task.get("status") != "queued"
             )
-            task_projection = {state_field: task_state}
+        ):
+            task_projection["changed_task"] = task_state
         await event_emitter(
             event.session_key,
             "sessions.changed",
@@ -1659,7 +1706,11 @@ def _make_task_session_lifecycle_listener(
                 event.session_key,
                 reason,
                 status=getattr(session_status, "value", session_status),
-                run_status=_task_run_status_for_session_change(event),
+                run_status=(
+                    active_task["status"]
+                    if active_task is not None
+                    else _task_run_status_for_session_change(event)
+                ),
                 **task_projection,
             ),
         )

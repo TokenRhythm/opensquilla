@@ -154,6 +154,53 @@ describe('useChatSessionSubscription', () => {
     )
   })
 
+  it('does not clear an unknown-acceptance Stop merely because hydrate is idle', async () => {
+    const acceptanceStopPending = ref(true)
+    const rpc: UseChatSessionSubscriptionOptions['rpc'] = {
+      waitForConnection: vi.fn(async () => {}),
+      call: vi.fn(async (method: string) => {
+        if (method === 'sessions.messages.snapshot') {
+          return {
+            key: 'agent:main:webchat:unknown-acceptance',
+            task_id: null,
+            events: [],
+            current_stream_seq: 0,
+          }
+        }
+        return {
+          subscribed: true,
+          hydration_complete: true,
+          run_status: 'idle',
+          replay_complete: true,
+          current_stream_seq: 0,
+        }
+      }) as UseChatSessionSubscriptionOptions['rpc']['call'],
+    }
+    const subscription = useChatSessionSubscription({
+      rpc,
+      sessionKey: ref('agent:main:webchat:unknown-acceptance'),
+      lastStreamSeq: ref(0),
+      runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+      isStreaming: ref(false),
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId: ref(''),
+      activeTaskGroups: ref(new Set<string>()),
+      acceptanceStopPending,
+      sessionRunStatus: () => ({ status: 'idle', label: '', task: null }),
+      startStreaming: vi.fn(),
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+    })
+
+    await subscription.subscribeSession()
+
+    // An idle snapshot does not prove that the original chat.send was rejected:
+    // its stable request may still commit after the reconnect. The retry must
+    // retain Stop intent until receipt replay or an explicit rejection resolves it.
+    expect(acceptanceStopPending.value).toBe(true)
+  })
+
   it('skips snapshot on the second bounded bootstrap attempt', async () => {
     const now = Date.now()
     const rpc = {

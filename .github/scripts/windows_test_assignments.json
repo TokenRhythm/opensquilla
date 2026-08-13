@@ -459,6 +459,7 @@
       "tests/test_gateway/test_no_head_blocking.py",
       "tests/test_gateway/test_no_split_brain_lock.py",
       "tests/test_gateway/test_origin_guard.py",
+      "tests/test_gateway/test_p1a_exact_abort_contract.py",
       "tests/test_gateway/test_pidfile_lock.py",
       "tests/test_gateway/test_plan_rpc.py",
       "tests/test_gateway/test_project_workspace_execution.py",

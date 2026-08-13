@@ -35,6 +35,7 @@ from opensquilla.gateway.routing import tool_context_from_envelope
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
+from opensquilla.gateway.session_lifecycle import SessionTaskSnapshot
 from opensquilla.gateway.session_streams import SessionStreamRegistry, get_session_streams
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
@@ -1861,6 +1862,43 @@ class TestSessionsList:
         row = res.payload["sessions"][0]
         assert row["active_task"]["task_id"] == "task-running"
         assert row["run_status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_list_prefers_oldest_queued_task_as_fifo_foreground(self, dispatcher):
+        session = FakeSession(session_key="agent:main:webchat:queued-fifo")
+        manager = FakeSessionManager([session])
+        manager._storage._agent_tasks[session.session_key] = [
+            SimpleNamespace(
+                task_id="task-first",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+            ),
+            SimpleNamespace(
+                task_id="task-second",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=200,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+            ),
+        ]
+        ctx = make_ctx(session_manager=manager, task_runtime=None)
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        row = res.payload["sessions"][0]
+        assert row["active_task"]["task_id"] == "task-first"
+        assert row["run_status"] == "queued"
 
     @pytest.mark.asyncio
     async def test_list_batches_persisted_task_state_for_visible_sessions(self, dispatcher):
@@ -4458,18 +4496,18 @@ class TestSessionsAbort:
                         "reason": reason,
                     }
                 )
-                return 1
+                return int(task_id == "task-new" and session_key == session.session_key)
 
             async def wait(self, task_id: str):
                 return SimpleNamespace(task_id=task_id, status="cancelled")
 
         runtime = Runtime()
         ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=runtime)
-        background_cancel_calls: list[str] = []
+        task_background_cancel_calls: list[tuple[str, str]] = []
         approval_cancel_calls: list[str] = []
 
-        async def cancel_background(session_key: str) -> int:
-            background_cancel_calls.append(session_key)
+        async def cancel_task_background(session_key: str, task_id: str) -> int:
+            task_background_cancel_calls.append((session_key, task_id))
             return 1
 
         class ApprovalQueue:
@@ -4478,8 +4516,8 @@ class TestSessionsAbort:
                 return 1
 
         monkeypatch.setattr(
-            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
-            cancel_background,
+            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
+            cancel_task_background,
         )
         monkeypatch.setattr(
             "opensquilla.gateway.approval_queue.get_approval_queue",
@@ -4501,8 +4539,18 @@ class TestSessionsAbort:
         assert res.ok is True
         assert res.payload["aborted"] is False
         assert res.payload["reason"] == "task_mismatch"
-        assert runtime.cancel_calls == []
-        assert background_cancel_calls == []
+        # The exact cancel is the in-memory authority.  The advisory task list
+        # is consulted only after its side-effect-free no-op to classify the
+        # stale identity for the client.
+        assert runtime.cancel_calls == [
+            {
+                "task_id": "task-old",
+                "session_key": session.session_key,
+                "source": "webui_stop",
+                "reason": "user_abort",
+            }
+        ]
+        assert task_background_cancel_calls == []
         assert approval_cancel_calls == []
 
     @pytest.mark.asyncio
@@ -4563,6 +4611,80 @@ class TestSessionsAbort:
             }
         ]
         assert runtime.wait_calls == ["task-current"]
+
+    @pytest.mark.asyncio
+    async def test_cancel_queued_task_preserves_running_task_session_registries(
+        self, dispatcher, session, monkeypatch
+    ):
+        class Runtime:
+            def __init__(self) -> None:
+                self.cancel_calls: list[dict[str, Any]] = []
+                self.wait_calls: list[str] = []
+
+            async def list(self, session_key: str | None = None):
+                assert session_key == session.session_key
+                return [
+                    SimpleNamespace(task_id="task-running", status="running"),
+                    SimpleNamespace(task_id="task-queued", status="queued"),
+                ]
+
+            async def cancel(self, **kwargs: Any) -> int:
+                self.cancel_calls.append(kwargs)
+                return int(kwargs.get("task_id") == "task-queued")
+
+            async def wait(self, task_id: str):
+                self.wait_calls.append(task_id)
+                return SimpleNamespace(task_id=task_id, status="cancelled")
+
+        task_background_cancel_calls: list[tuple[str, str]] = []
+        approval_cancel_calls: list[str] = []
+
+        async def cancel_task_background(session_key: str, task_id: str) -> int:
+            task_background_cancel_calls.append((session_key, task_id))
+            return 1
+
+        class ApprovalQueue:
+            def resolve_pending_for_session(self, session_key: str, *, approved: bool) -> int:
+                assert approved is False
+                approval_cancel_calls.append(session_key)
+                return 1
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
+            cancel_task_background,
+        )
+        monkeypatch.setattr(
+            "opensquilla.gateway.approval_queue.get_approval_queue",
+            lambda: ApprovalQueue(),
+        )
+        runtime = Runtime()
+        ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=runtime)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "chat.abort",
+            {
+                "sessionKey": session.session_key,
+                "taskId": "task-queued",
+                "source": "webui_stop",
+                "scope": "task",
+            },
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["aborted"] is True
+        assert runtime.cancel_calls == [
+            {
+                "task_id": "task-queued",
+                "session_key": session.session_key,
+                "source": "webui_stop",
+                "reason": "user_abort",
+            }
+        ]
+        assert runtime.wait_calls == ["task-queued"]
+        assert task_background_cancel_calls == [(session.session_key, "task-queued")]
+        assert approval_cancel_calls == []
 
     @pytest.mark.asyncio
     async def test_chat_task_scoped_stop_without_valid_task_id_never_widens_to_session_abort(
@@ -8095,6 +8217,134 @@ class TestSessionsMessagesSubscribe:
         assert response.payload["hydration_complete"] is True
         assert response.payload["deferred_fields"] == ["projectWorkspace"]
         assert subscriptions.get_message_subscribers(key) == set()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method",
+        ["sessions.messages.hydrate", "sessions.bootstrap"],
+    )
+    async def test_hydration_uses_runtime_fifo_for_same_timestamp_queued_tasks(
+        self,
+        dispatcher,
+        method: str,
+    ) -> None:
+        key = "agent:main:webchat:runtime-fifo-hydration"
+        session = FakeSession(session_key=key, session_id="runtime-fifo-hydration")
+        manager = FakeSessionManager([session])
+        manager._storage._agent_tasks[key] = [
+            SimpleNamespace(
+                task_id="task-z-first",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+                details={},
+            ),
+            SimpleNamespace(
+                task_id="task-a-second",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+                details={},
+            ),
+        ]
+        runtime = SimpleNamespace(
+            session_task_snapshot=lambda candidate: (
+                SessionTaskSnapshot(
+                    running_task_id=None,
+                    queued_task_ids=("task-z-first", "task-a-second"),
+                )
+                if candidate == key
+                else SessionTaskSnapshot(None, ())
+            ),
+            pending_user_inputs=lambda _candidate: [],
+            steer_capability=lambda _candidate: None,
+        )
+        context = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        response = await dispatcher.dispatch("hydrate-fifo", method, {"key": key}, context)
+
+        assert response.ok is True
+        assert response.payload["active_task"]["task_id"] == "task-z-first"
+        assert response.payload["active_task"]["status"] == "queued"
+        assert response.payload["queued_task_ids"] == [
+            "task-z-first",
+            "task-a-second",
+        ]
+        assert response.payload["run_status"] == "queued"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method",
+        ["sessions.messages.hydrate", "sessions.bootstrap"],
+    )
+    async def test_hydration_keeps_durable_queue_during_runtime_activation_window(
+        self,
+        dispatcher,
+        method: str,
+    ) -> None:
+        key = "agent:main:webchat:runtime-activation-window"
+        session = FakeSession(session_key=key, session_id="runtime-activation-window")
+        manager = FakeSessionManager([session])
+        manager._storage._agent_tasks[key] = [
+            SimpleNamespace(
+                task_id="task-durable-before-activation",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+                details={},
+            ),
+            SimpleNamespace(
+                task_id="task-second-before-activation",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=200,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+                details={},
+            ),
+        ]
+        runtime = SimpleNamespace(
+            # The SQLite acceptance transaction committed, but activate() has
+            # not yet inserted the task into TaskRuntime's in-memory lane.
+            session_task_snapshot=lambda _candidate: SessionTaskSnapshot(None, ()),
+            pending_user_inputs=lambda _candidate: [],
+            steer_capability=lambda _candidate: None,
+        )
+        context = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        response = await dispatcher.dispatch(
+            "hydrate-activation-window",
+            method,
+            {"key": key},
+            context,
+        )
+
+        assert response.ok is True
+        assert response.payload["active_task"]["task_id"] == "task-durable-before-activation"
+        assert response.payload["active_task"]["status"] == "queued"
+        assert response.payload["queued_task_ids"] == [
+            "task-durable-before-activation",
+            "task-second-before-activation",
+        ]
+        assert response.payload["run_status"] == "queued"
 
     @pytest.mark.asyncio
     async def test_messages_subscribe_reports_persisted_task_run_mode_lock(

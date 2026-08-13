@@ -10,6 +10,8 @@ import type {
   SessionMessagesSubscribeResponse,
 } from '@/types/rpc'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
+import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
+import { chatTaskId } from '@/composables/chat/useChatTaskOwnership'
 import {
   SESSION_PHASE_ATTEMPT_BUDGET_MS,
   SESSION_SNAPSHOT_BUDGET_MS,
@@ -45,6 +47,9 @@ export interface UseChatSessionSubscriptionOptions {
   hasActiveInterrupt: Ref<boolean>
   activeStreamTaskId: Ref<string>
   activeTaskGroups: Ref<Set<string>>
+  taskOwnership?: ChatTaskOwnershipApi
+  ownershipHydrationRequired?: () => boolean
+  acceptanceStopPending?: Ref<boolean>
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   startStreaming: () => void
   loadHistory: () => void | Promise<unknown>
@@ -116,6 +121,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     bootstrap?: SessionBootstrapPhaseContext,
   ): Promise<SessionSubscriptionOutcome> {
     if (!options.sessionKey.value) return Promise.resolve(UNAVAILABLE_SUBSCRIPTION)
+    if (options.ownershipHydrationRequired?.() !== false) {
+      options.taskOwnership?.beginHydration()
+    }
     const key = options.sessionKey.value
     const sinceStreamGeneration = streamGeneration.value
     const sinceStreamSeq = options.lastStreamSeq.value
@@ -268,6 +276,12 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       options.onRunModeLock?.(runModeLock)
     }
     options.onSnapshot?.(res)
+    options.taskOwnership?.applySnapshot(res, true)
+    // Do not clear an acceptance-result-unknown Stop from an idle snapshot.
+    // The subscription can race ahead of the original ingress commit, so only
+    // the matching send transaction (receipt/rejection) or an explicit session
+    // reset may release that latch.  Its idempotent replay must still inherit
+    // the Stop intent and abort the exact accepted task once the receipt exists.
     applySessionRunState(res)
     // A pending inline interrupt is newer, stronger evidence than an idle
     // subscription snapshot that raced with the approval request.
@@ -552,6 +566,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (hydrationComplete) {
         return applyHydratedSubscriptionState(key, metadataGeneration, res)
       }
+      if (options.ownershipHydrationRequired?.() !== false) {
+        options.taskOwnership?.applySnapshot(res, false)
+      }
       if (bootstrap) {
         scheduleDeferredHydration(
           key,
@@ -727,22 +744,32 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
   function applySessionRunState(source: ChatRunStatusSource | null | undefined) {
     const next = options.sessionRunStatus(source)
     const current = options.runStatus.value
+    const currentTaskId = chatTaskId(current.task)
+    const nextTaskId = chatTaskId(next.task)
+    if (next.status === 'queued' && nextTaskId) {
+      options.taskOwnership?.noteQueued(next.task || nextTaskId)
+      const runningTaskId = options.taskOwnership?.runningTaskId.value || ''
+      // A compact task.queued or an older sessions.changed payload can name
+      // the task that changed rather than the session foreground. Never let it
+      // demote a different task that is already known to be running.
+      if (runningTaskId && runningTaskId !== nextTaskId) return
+    } else if (next.status === 'running' && nextTaskId) {
+      options.taskOwnership?.noteRunning(next.task || nextTaskId)
+    } else if (
+      ['cancelled', 'failed', 'timeout', 'interrupted', 'idle'].includes(next.status)
+      && nextTaskId
+    ) {
+      const settled = options.taskOwnership?.noteTerminal(nextTaskId)
+      if (settled?.wasQueued && !settled.wasRunning && currentTaskId !== nextTaskId) return
+      const runningTaskId = options.taskOwnership?.runningTaskId.value || ''
+      if (runningTaskId && runningTaskId !== nextTaskId) return
+    }
     if (
       LIVE_RUN_STATES.includes(current.status)
       && LIVE_RUN_STATES.includes(next.status)
       && current.task
       && next.task
     ) {
-      const currentTaskId = current.task.task_id
-        || current.task.taskId
-        || current.task.turn_id
-        || current.task.turnId
-        || ''
-      const nextTaskId = next.task.task_id
-        || next.task.taskId
-        || next.task.turn_id
-        || next.task.turnId
-        || ''
       if (currentTaskId && (!nextTaskId || nextTaskId === currentTaskId)) {
         // Lifecycle broadcasts are intentionally compact and can follow the
         // richer task.running frame for the same task. Preserve authoritative

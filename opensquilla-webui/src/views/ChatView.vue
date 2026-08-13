@@ -796,6 +796,7 @@ import { useChatRpcEventHandlers } from '@/composables/chat/useChatRpcEventHandl
 import { useChatRpcSubscriptions } from '@/composables/chat/useChatRpcSubscriptions'
 import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSend'
 import { useChatSteerDelivery } from '@/composables/chat/useChatSteerDelivery'
+import { useChatTaskOwnership } from '@/composables/chat/useChatTaskOwnership'
 import {
   composerRunModeSelectionAction,
   effectiveComposerRunMode,
@@ -937,6 +938,7 @@ import {
   type ComposerScrollIntent,
 } from '@/utils/chat/composerRetraction'
 import {
+  FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
   isCurrentSessionPayload as payloadIsCurrentSession,
@@ -1277,6 +1279,9 @@ const activeTaskGroups = ref<Set<string>>(new Set())
 // current turn so a prior task can't leak into it (issue 344).
 const activeStreamTaskId = ref<string>('')
 const activeStreamSessionKey = ref<string>('')
+const acceptanceStopPending = ref(false)
+const acceptanceRecoveryPending = ref(false)
+const taskOwnership = useChatTaskOwnership()
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
 let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
 
@@ -1463,6 +1468,9 @@ const chatPendingQueue = useChatPendingQueue({
     isCompactInFlightForCurrentSession()
     || isQueuedDeliveryBlocked()
     || isLiveDeliveryBlocked()
+    || taskOwnership.hasAuthoritativeWork.value
+    || acceptanceStopPending.value
+    || acceptanceRecoveryPending.value
     || ['resolving', 'unavailable', 'removed', 'error'].includes(
       activeWorkspaceStatus.value,
     )
@@ -1987,6 +1995,9 @@ const chatSessionSubscription = useChatSessionSubscription({
     Array.from(interruptState.value.values()).some(state => !state.resolution)),
   activeStreamTaskId,
   activeTaskGroups,
+  taskOwnership,
+  ownershipHydrationRequired: () => pendingSessionIntent.value !== 'new_chat',
+  acceptanceStopPending,
   sessionRunStatus,
   startStreaming,
   loadHistory,
@@ -2194,6 +2205,9 @@ watch(activeWorkspaceStatus, (status, previousStatus) => {
 
 const sessionHasActiveWork = computed(() => (
   isStreaming.value
+  || taskOwnership.hasAuthoritativeWork.value
+  || acceptanceStopPending.value
+  || acceptanceRecoveryPending.value
   || activeTaskGroups.value.size > 0
   || isCompactInFlightForCurrentSession()
   || ['queued', 'running', 'approval_pending'].includes(runStatus.value.status)
@@ -2201,7 +2215,29 @@ const sessionHasActiveWork = computed(() => (
   || activePlanRun.value?.status === 'running'
   || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
 ))
-const canStop = computed(() => !isSessionHydrating.value && sessionHasActiveWork.value)
+const canStop = computed(() => (
+  !isSessionHydrating.value
+  && taskOwnership.hydrationResolved.value
+  && !taskOwnership.stopRequestedTaskId.value
+  && !acceptanceStopPending.value
+  && !acceptanceRecoveryPending.value
+  && (
+    Boolean(taskOwnership.stopTargetTaskId.value)
+    || activeStreamTaskId.value === PENDING_STREAM_TASK_ID
+    || Boolean(
+      activeStreamTaskId.value
+      && ![
+        FINISHED_STREAM_TASK_ID,
+        STOPPED_STREAM_TASK_ID,
+      ].includes(activeStreamTaskId.value),
+    )
+    || isCompactInFlightForCurrentSession()
+    || activeTaskGroups.value.size > 0
+    || activePlanRun.value?.status === 'queued'
+    || activePlanRun.value?.status === 'running'
+    || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
+  )
+))
 const runModeLocked = computed(
   () => isSessionHydrating.value
     || sessionHasActiveWork.value
@@ -2228,6 +2264,10 @@ const chatSessionRuntime = useChatSessionRuntime({
   currentEpoch,
   lastStreamSeq,
   activeTaskGroups,
+  taskOwnership,
+  activeStreamTaskId,
+  activeStreamSessionKey,
+  acceptanceStopPending,
   aborted,
   lastHeaderRole,
   lastHeaderDay,
@@ -2630,6 +2670,9 @@ const chatSend = useChatSend({
   aborted,
   activeStreamTaskId,
   activeStreamSessionKey,
+  taskOwnership,
+  acceptanceStopPending,
+  acceptanceRecoveryPending,
   autoScroll,
   stream: chatStream,
   canStop: () => canStop.value,
@@ -2660,6 +2703,7 @@ const chatSend = useChatSend({
   steerDelivery,
   restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
+  reconcileTaskOwnership: () => retrySessionMetadata(),
   executeSlashCommand,
   closeSlashMenu,
   autoResizeTextarea,
@@ -3002,6 +3046,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   lastStreamSeq,
   observeStreamGeneration,
   activeTaskGroups,
+  taskOwnership,
   activeStreamTaskId,
   aborted,
   messages,
