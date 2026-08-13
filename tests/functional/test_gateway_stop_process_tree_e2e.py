@@ -9,7 +9,9 @@ the public task-scoped Stop RPC cancels the turn.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -58,14 +60,28 @@ class _StopProvider:
 
     def chat(
         self,
-        messages: list[Message],  # noqa: ARG002
+        messages: list[Message],
         tools: list[Any] | None = None,  # noqa: ARG002
         config: ChatConfig | None = None,  # noqa: ARG002
     ) -> AsyncIterator[Any]:
         self.calls += 1
-        return self._stream(self.calls)
+        return self._stream(self.calls, messages)
 
-    async def _stream(self, call: int) -> AsyncIterator[Any]:
+    @staticmethod
+    def _tool_result_contents(messages: list[Message]) -> list[str]:
+        contents: list[str] = []
+        for message in messages:
+            if not isinstance(message.content, list):
+                continue
+            for block in message.content:
+                if getattr(block, "type", None) != "tool_result":
+                    continue
+                content = getattr(block, "content", "")
+                if isinstance(content, str):
+                    contents.append(content)
+        return contents
+
+    async def _stream(self, call: int, messages: list[Message]) -> AsyncIterator[Any]:
         if call == 1:
             child_pid = self.evidence_dir / "child.pid"
             survived = self.evidence_dir / "descendant-survived"
@@ -101,6 +117,47 @@ class _StopProvider:
             )
             return
         if call == 2:
+            session_id = ""
+            for content in reversed(self._tool_result_contents(messages)):
+                match = re.search(r"(?:^|\n)session_id=([A-Za-z0-9-]+)", content)
+                if match is not None:
+                    session_id = match.group(1)
+                    break
+            if not session_id:
+                raise AssertionError("background_process result did not expose session_id")
+            yield ToolUseStartEvent(
+                tool_use_id="wait-background-leader-1",
+                tool_name="process",
+            )
+            yield ToolUseEndEvent(
+                tool_use_id="wait-background-leader-1",
+                tool_name="process",
+                arguments={
+                    "action": "wait",
+                    "session_id": session_id,
+                    "timeout": 5,
+                },
+            )
+            yield DoneEvent(
+                stop_reason="tool_use",
+                input_tokens=3,
+                output_tokens=1,
+                model=self.model,
+            )
+            return
+        if call == 3:
+            wait_result = None
+            for content in reversed(self._tool_result_contents(messages)):
+                try:
+                    candidate = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(candidate, dict) and candidate.get("action") == "wait":
+                    wait_result = candidate
+                    break
+            if wait_result is None or wait_result.get("exited") is not True:
+                raise AssertionError("process wait did not confirm direct leader exit")
+            (self.evidence_dir / "leader-terminal").write_text("confirmed")
             (self.evidence_dir / "provider-blocked").write_text("ready")
             while True:
                 await asyncio.sleep(1)
@@ -311,6 +368,7 @@ async def test_stop_kills_leaderless_descendant_and_gateway_accepts_next_task(
 
         first_turn = asyncio.create_task(consume_first())
         await _wait_for_file(evidence / "child.pid")
+        await _wait_for_file(evidence / "leader-terminal")
         await _wait_for_file(evidence / "provider-blocked")
         task_id = client._active_turn_ids[session_key]
         stopped = await client.call(

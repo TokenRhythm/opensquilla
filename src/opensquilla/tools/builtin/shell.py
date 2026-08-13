@@ -29,7 +29,13 @@ from opensquilla.gateway.approval_queue import (
 from opensquilla.gateway.approval_queue import (
     get_approval_queue,
 )
-from opensquilla.process_tree import ProcessTreeOwner, capture_process_tree_owner
+from opensquilla.process_tree import (
+    ProcessTreeOwner,
+    capture_process_tree_owner,
+    create_owned_popen,
+    create_owned_subprocess_exec,
+    create_owned_subprocess_shell,
+)
 from opensquilla.sandbox.backend.bubblewrap import (
     BubblewrapBackend,
     LinuxProxyBridgeHost,
@@ -6099,7 +6105,7 @@ async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
 
 
 def _create_windows_host_shell_process(command: str, **kwargs: Any) -> Any:
-    return subprocess.Popen(_windows_direct_powershell_argv(command), **kwargs)
+    return create_owned_popen(_windows_direct_powershell_argv(command), **kwargs)
 
 
 def _terminate_windows_host_shell_process(
@@ -6340,11 +6346,11 @@ async def _create_host_shell_subprocess(
     **kwargs: Any,
 ) -> Any:
     if os.name == "nt" or windows_host:
-        return await asyncio.create_subprocess_exec(
+        return await create_owned_subprocess_exec(
             *_windows_direct_powershell_argv(command),
             **kwargs,
         )
-    return await asyncio.create_subprocess_shell(command, **kwargs)
+    return await create_owned_subprocess_shell(command, **kwargs)
 
 
 @tool(
@@ -7341,7 +7347,7 @@ async def _spawn_sandboxed_background_process(
                         log.warning("background_process_policy_violation", message=message)
 
                 cleanup_callbacks.append(cleanup_protected_create)
-            process = await asyncio.create_subprocess_exec(
+            process = await create_owned_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
@@ -7370,7 +7376,7 @@ async def _spawn_sandboxed_background_process(
                 wrapper_tmp.cleanup()
             raise
     if isinstance(backend, NoopBackend):
-        process = await asyncio.create_subprocess_exec(
+        process = await create_owned_subprocess_exec(
             *request.argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -7416,7 +7422,7 @@ async def _spawn_sandboxed_background_process(
                 getattr(request, "env", None) or {},
                 tmp_dir=tmp_dir,
             )
-            process = await asyncio.create_subprocess_exec(
+            process = await create_owned_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,

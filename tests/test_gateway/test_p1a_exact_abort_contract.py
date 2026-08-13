@@ -99,6 +99,81 @@ async def test_exact_abort_still_uses_atomic_cancel_when_runtime_list_fails(
 
 
 @pytest.mark.asyncio
+async def test_exact_abort_starts_process_cleanup_before_slow_completion_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = FakeSession(session_key="agent:main:webchat:parallel-cleanup")
+    completion_started = asyncio.Event()
+    completion_cancelled = asyncio.Event()
+    process_started = asyncio.Event()
+    release_process = asyncio.Event()
+    process_finished = asyncio.Event()
+
+    class Runtime:
+        async def cancel(self, **_kwargs: Any) -> int:
+            return 1
+
+        async def list(self, session_key: str | None = None):
+            assert session_key in {None, session.session_key}
+            return []
+
+        async def wait(self, _task_id: str):
+            return SimpleNamespace(status="cancelled")
+
+    async def slow_completion(_session_key: str, _task_id: str) -> int:
+        completion_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            completion_cancelled.set()
+
+    async def process_cleanup(_session_key: str, _task_id: str) -> int:
+        process_started.set()
+        await release_process.wait()
+        process_finished.set()
+        return 1
+
+    monkeypatch.setattr(rpc_sessions, "_ABORT_RUNTIME_CANCEL_DRAIN_SECONDS", 0.02)
+    monkeypatch.setattr(rpc_sessions, "_ABORT_OWNED_CLEANUP_SECONDS", 0.08)
+    monkeypatch.setattr(
+        "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
+        slow_completion,
+    )
+    monkeypatch.setattr(
+        "opensquilla.tools.builtin.shell.cancel_background_processes_for_task",
+        process_cleanup,
+    )
+
+    started_at = asyncio.get_running_loop().time()
+    response = await get_dispatcher().dispatch(
+        "abort-parallel-cleanup",
+        "chat.abort",
+        {
+            "sessionKey": session.session_key,
+            "taskId": "task-A",
+            "scope": "task",
+            "source": "webui_stop",
+        },
+        make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=Runtime(),
+        ),
+    )
+    elapsed = asyncio.get_running_loop().time() - started_at
+
+    assert response.ok is True
+    assert response.payload["aborted"] is True
+    assert elapsed < 0.12
+    assert completion_started.is_set()
+    assert process_started.is_set()
+    assert process_finished.is_set() is False
+
+    release_process.set()
+    await asyncio.wait_for(process_finished.wait(), timeout=0.2)
+    await asyncio.wait_for(completion_cancelled.wait(), timeout=0.2)
+
+
+@pytest.mark.asyncio
 async def test_task_scoped_abort_never_falls_back_to_legacy_session_cancel() -> None:
     session = FakeSession(session_key="agent:main:webchat:legacy-runtime")
 

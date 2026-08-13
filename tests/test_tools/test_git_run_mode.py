@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +48,7 @@ async def test_git_status_run_mode_full_uses_host_subprocess(
         calls.append({"args": args, "kwargs": kwargs})
         return _FakeProcess()
 
-    monkeypatch.setattr(git.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(git, "create_owned_subprocess_exec", fake_create_subprocess_exec)
     token = current_tool_context.set(
         ToolContext(
             is_owner=True,
@@ -65,13 +64,6 @@ async def test_git_status_run_mode_full_uses_host_subprocess(
         reset_runtime()
 
     assert result == "## main\n"
-    process_group_kwargs: dict[str, Any] = {}
-    if os.name == "posix":
-        process_group_kwargs["start_new_session"] = True
-    else:
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        if creationflags:
-            process_group_kwargs["creationflags"] = creationflags
     assert calls == [
         {
             "args": ("git", "status", "--short", "--branch"),
@@ -79,7 +71,6 @@ async def test_git_status_run_mode_full_uses_host_subprocess(
                 "stdout": git.asyncio.subprocess.PIPE,
                 "stderr": git.asyncio.subprocess.STDOUT,
                 "cwd": str(tmp_path),
-                **process_group_kwargs,
             },
         }
     ]
@@ -173,7 +164,7 @@ async def test_git_host_output_decodes_via_centralized_decoder(
     async def fake_create_subprocess_exec(*args: str, **kwargs: Any) -> _GbkProcess:
         return _GbkProcess()
 
-    monkeypatch.setattr(git.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(git, "create_owned_subprocess_exec", fake_create_subprocess_exec)
     token = current_tool_context.set(
         ToolContext(
             is_owner=True,

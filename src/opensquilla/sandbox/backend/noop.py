@@ -14,7 +14,10 @@ import contextlib
 import logging
 import time
 
-from opensquilla.process_tree import capture_process_tree_owner
+from opensquilla.process_tree import (
+    capture_process_tree_owner,
+    create_owned_subprocess_exec,
+)
 from opensquilla.safety.sandbox import (
     HAS_RESOURCE,
     SandboxLimits,
@@ -83,7 +86,7 @@ class NoopBackend(Backend):
 
         child_env = _filtered_env(limits.env_whitelist, _filtered_request_env(request))
         try:
-            proc = await asyncio.create_subprocess_exec(
+            proc = await create_owned_subprocess_exec(
                 *request.argv,
                 stdin=asyncio.subprocess.PIPE if request.stdin is not None else None,
                 stdout=asyncio.subprocess.PIPE,

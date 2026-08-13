@@ -456,7 +456,10 @@ async def test_task_cancel_is_exact_across_siblings_sessions_and_repeats() -> No
 @pytest.mark.skipif(os.name != "nt", reason="requires native Windows Job Objects")
 @pytest.mark.asyncio
 async def test_windows_job_owns_descendant_after_leader_exit(tmp_path) -> None:
-    from opensquilla.process_tree import capture_process_tree_owner
+    from opensquilla.process_tree import (
+        capture_process_tree_owner,
+        create_owned_subprocess_exec,
+    )
 
     pid_file = tmp_path / "windows-descendant.pid"
     survived = tmp_path / "windows-descendant-survived"
@@ -468,14 +471,13 @@ async def test_windows_job_owns_descendant_after_leader_exit(tmp_path) -> None:
         "time.sleep(30)"
     )
     parent_script = (
-        "import subprocess, sys, time; time.sleep(0.5); "
+        "import subprocess, sys; "
         f"subprocess.Popen([sys.executable, '-c', {child_script!r}])"
     )
-    proc = await asyncio.create_subprocess_exec(
+    proc = await create_owned_subprocess_exec(
         sys.executable,
         "-c",
         parent_script,
-        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
     )
     process_tree = capture_process_tree_owner(proc, isolated=True)
 

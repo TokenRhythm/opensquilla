@@ -7,15 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
+from opensquilla.process_tree import (
+    capture_process_tree_owner,
+    create_owned_subprocess_exec,
+)
 from opensquilla.skills.hub.defaults import (
     build_default_skill_installer,
     get_default_skill_router,
@@ -329,24 +331,14 @@ def _community_result_to_dict(row: Any, installed: Any) -> dict[str, Any]:
 
 
 async def _run_install_argv(argv: list[str]) -> tuple[int, str, str, bool]:
-    process_group_kwargs: dict[str, Any] = {}
-    if os.name == "posix":
-        process_group_kwargs["start_new_session"] = True
-    else:
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        if creationflags:
-            process_group_kwargs["creationflags"] = creationflags
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_owned_subprocess_exec(
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            **process_group_kwargs,
         )
     except FileNotFoundError as exc:
         raise ToolError(f"Install command not found: {argv[0]}") from exc
-    from opensquilla.process_tree import capture_process_tree_owner
-
     process_tree = capture_process_tree_owner(proc, isolated=True)
     try:
         stdout, stderr = await asyncio.wait_for(

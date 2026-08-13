@@ -15,13 +15,21 @@ import ctypes
 import logging
 import os
 import signal
+import subprocess
+import sys
 import threading
+import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 log = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 0.01
+_POSIX_ANCHOR_ARM = b"A"
+_POSIX_ANCHOR_EMPTY = b"E"
+_POSIX_ANCHOR_RELEASE = b"R"
+_WINDOWS_LAUNCH_GATE_PREFIX = "Local\\OpenSquillaTaskLaunch-"
 
 
 class ProcessTreeOwnershipError(RuntimeError):
@@ -44,7 +52,7 @@ class _WindowsJob:
         self._lock = threading.Lock()
 
     @classmethod
-    def assign(cls, pid: int) -> _WindowsJob:
+    def create(cls) -> _WindowsJob:
         if os.name != "nt":
             raise OSError("Windows Job Objects are unavailable on this platform")
 
@@ -120,12 +128,9 @@ class _WindowsJob:
 
         job_object_extended_limit_information = 9
         job_object_limit_kill_on_job_close = 0x00002000
-        process_rights = 0x0001 | 0x0100 | 0x1000
-
         job = kernel32.CreateJobObjectW(None, None)
         if not job:
             raise _windows_error()
-        process_handle = None
         try:
             limits = ExtendedLimitInformation()
             limits.BasicLimitInformation.LimitFlags = job_object_limit_kill_on_job_close
@@ -136,18 +141,31 @@ class _WindowsJob:
                 ctypes.sizeof(limits),
             ):
                 raise _windows_error()
-            process_handle = kernel32.OpenProcess(process_rights, False, pid)
-            if not process_handle:
-                raise _windows_error()
-            if not kernel32.AssignProcessToJobObject(job, process_handle):
-                raise _windows_error()
             return cls(kernel32, job)
         except BaseException:
             kernel32.CloseHandle(job)
             raise
+
+    @classmethod
+    def assign(cls, pid: int) -> _WindowsJob:
+        job = cls.create()
+        try:
+            job.assign_pid(pid)
+            return job
+        except BaseException:
+            job.close()
+            raise
+
+    def assign_pid(self, pid: int) -> None:
+        process_rights = 0x0001 | 0x0100 | 0x1000
+        process_handle = self._kernel32.OpenProcess(process_rights, False, pid)
+        if not process_handle:
+            raise _windows_error()
+        try:
+            if not self._kernel32.AssignProcessToJobObject(self._handle, process_handle):
+                raise _windows_error()
         finally:
-            if process_handle:
-                kernel32.CloseHandle(process_handle)
+            self._kernel32.CloseHandle(process_handle)
 
     def terminate(self) -> None:
         with self._lock:
@@ -201,6 +219,111 @@ class _WindowsJob:
                 self._handle = None
         return True
 
+    def close(self) -> None:
+        with self._lock:
+            if self._handle:
+                self._kernel32.CloseHandle(self._handle)
+                self._handle = None
+
+
+class _WindowsLaunchGate:
+    """Named manual-reset event used by the controlled Windows helper."""
+
+    def __init__(self, kernel32: Any, handle: Any, name: str) -> None:
+        self._kernel32 = kernel32
+        self._handle = handle
+        self.name = name
+
+    @classmethod
+    def create(cls) -> _WindowsLaunchGate:
+        if os.name != "nt":
+            raise OSError("Windows launch gates are unavailable on this platform")
+        from ctypes import wintypes
+
+        kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+        kernel32.CreateEventW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        kernel32.CreateEventW.restype = wintypes.HANDLE
+        kernel32.SetEvent.argtypes = [wintypes.HANDLE]
+        kernel32.SetEvent.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        name = f"{_WINDOWS_LAUNCH_GATE_PREFIX}{uuid.uuid4()}"
+        handle = kernel32.CreateEventW(None, True, False, name)
+        if not handle:
+            raise _windows_error()
+        return cls(kernel32, handle, name)
+
+    def release(self) -> None:
+        if not self._handle or not self._kernel32.SetEvent(self._handle):
+            raise _windows_error()
+
+    def close(self) -> None:
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+@dataclass
+class _PosixGroupAnchor:
+    process: Any
+    pgid: int
+    empty: bool = False
+    _owner: ProcessTreeOwner | None = field(default=None, repr=False)
+    _monitor_task: asyncio.Task[None] | None = field(default=None, repr=False)
+
+    @property
+    def alive(self) -> bool:
+        return getattr(self.process, "returncode", None) is None
+
+    async def arm(self) -> None:
+        stdin = getattr(self.process, "stdin", None)
+        stdout = getattr(self.process, "stdout", None)
+        if stdin is None or stdout is None:
+            raise ProcessTreeOwnershipError("POSIX ownership anchor has incomplete control pipes")
+        stdin.write(_POSIX_ANCHOR_ARM)
+        await stdin.drain()
+        self._monitor_task = asyncio.create_task(self._watch_empty(stdout))
+
+    def bind(self, owner: ProcessTreeOwner) -> None:
+        self._owner = owner
+
+    async def _watch_empty(self, stdout: Any) -> None:
+        try:
+            marker = await stdout.read(1)
+        except (BrokenPipeError, ConnectionResetError):
+            marker = b""
+        if marker == _POSIX_ANCHOR_EMPTY:
+            self.empty = True
+            owner = self._owner
+            if owner is not None:
+                # The event loop cannot interleave synchronous group signalling
+                # between closing the token and releasing the still-live anchor.
+                owner._close_empty_posix_owner()
+        with contextlib.suppress(Exception):
+            await self.process.wait()
+
+    def release(self) -> None:
+        stdin = getattr(self.process, "stdin", None)
+        if stdin is None or stdin.is_closing():
+            return
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            stdin.write(_POSIX_ANCHOR_RELEASE)
+        stdin.close()
+
+    async def settle(self, timeout: float) -> None:
+        task = self._monitor_task
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        done, _pending = await asyncio.wait({task}, timeout=max(0.0, timeout))
+        if task in done:
+            with contextlib.suppress(BaseException):
+                task.result()
+
 
 @dataclass
 class ProcessTreeOwner:
@@ -209,6 +332,7 @@ class ProcessTreeOwner:
     process: Any
     pid: int
     pgid: int | None = None
+    posix_anchor: _PosixGroupAnchor | None = None
     windows_job: _WindowsJob | None = None
     ownership_error: str | None = None
     _closed: bool = False
@@ -216,22 +340,23 @@ class ProcessTreeOwner:
 
     @property
     def durable(self) -> bool:
-        return self.pgid is not None or self.windows_job is not None
+        return (
+            (self.pgid is not None and self.posix_anchor is not None)
+            or self.windows_job is not None
+        )
 
     def is_active(self) -> bool:
         if self._closed:
             return False
         if self.pgid is not None:
-            try:
-                os.killpg(self.pgid, 0)
-            except ProcessLookupError:
+            # The anchor is the non-reusable identity boundary. It is the group
+            # leader and remains alive until it reports that no task member
+            # remains. The owner closes before releasing that anchor, so it
+            # never touches a numeric PGID after reuse becomes possible.
+            active = self.posix_anchor is not None and self.posix_anchor.alive
+            if not active:
                 self._closed = True
-                return False
-            except PermissionError:
-                return True
-            except OSError:
-                return True
-            return True
+            return active
         if self.windows_job is not None:
             try:
                 active = self.windows_job.active_process_count() > 0
@@ -247,12 +372,17 @@ class ProcessTreeOwner:
             self._closed = True
         return active
 
-    def _signal_posix_group(self, sig: signal.Signals) -> None:
-        if self.pgid is None or self._closed:
+    def _close_empty_posix_owner(self) -> None:
+        if self._closed or self.posix_anchor is None:
             return
-        # The group id was verified at spawn and is never recomputed from the
-        # leader. Once absence is observed, close permanently before a future
-        # process can reuse the numeric PGID.
+        self._closed = True
+        self.posix_anchor.release()
+
+    def _signal_posix_group(self, sig: signal.Signals) -> None:
+        if self.pgid is None or self.posix_anchor is None or self._closed:
+            return
+        # No probe-then-signal sequence: the live, parent-owned anchor itself
+        # prevents numeric PGID reuse for the duration of this synchronous call.
         if not self.is_active():
             return
         try:
@@ -274,13 +404,20 @@ class ProcessTreeOwner:
 
         async with self._terminate_lock:
             if not self.is_active():
+                if self.posix_anchor is not None:
+                    await self.posix_anchor.settle(kill_timeout)
                 return True
             if self.pgid is not None:
                 self._signal_posix_group(signal.SIGTERM)
                 if await self._wait_inactive(graceful_timeout):
+                    if self.posix_anchor is not None:
+                        await self.posix_anchor.settle(kill_timeout)
                     return True
                 self._signal_posix_group(getattr(signal, "SIGKILL", signal.SIGTERM))
-                return await self._wait_inactive(kill_timeout)
+                stopped = await self._wait_inactive(kill_timeout)
+                if stopped and self.posix_anchor is not None:
+                    await self.posix_anchor.settle(kill_timeout)
+                return stopped
             if self.windows_job is not None:
                 try:
                     await asyncio.to_thread(self.windows_job.terminate)
@@ -313,6 +450,9 @@ class ProcessTreeOwner:
 def capture_process_tree_owner(process: Any, *, isolated: bool) -> ProcessTreeOwner:
     """Capture an ownership token immediately after a task-owned spawn."""
 
+    attached = getattr(process, "_opensquilla_process_tree_owner", None)
+    if isinstance(attached, ProcessTreeOwner):
+        return attached
     pid = int(process.pid)
     if not isolated:
         return ProcessTreeOwner(
@@ -321,17 +461,13 @@ def capture_process_tree_owner(process: Any, *, isolated: bool) -> ProcessTreeOw
             ownership_error="process was not spawned in an isolated tree",
         )
     if os.name == "posix":
-        try:
-            pgid = os.getpgid(pid)
-        except OSError as exc:
-            return ProcessTreeOwner(process=process, pid=pid, ownership_error=str(exc))
-        if pgid != pid:
-            return ProcessTreeOwner(
-                process=process,
-                pid=pid,
-                ownership_error=f"unverified process group pgid={pgid} pid={pid}",
-            )
-        return ProcessTreeOwner(process=process, pid=pid, pgid=pgid)
+        # A bare numeric PGID is reusable after the leader exits. Only the
+        # unified launcher can provide the required live anchor identity.
+        return ProcessTreeOwner(
+            process=process,
+            pid=pid,
+            ownership_error="POSIX process was not spawned with a durable group anchor",
+        )
     if os.name == "nt":
         try:
             return ProcessTreeOwner(process=process, pid=pid, windows_job=_WindowsJob.assign(pid))
@@ -355,6 +491,307 @@ def capture_process_tree_owner(process: Any, *, isolated: bool) -> ProcessTreeOw
     )
 
 
+async def _stop_failed_async_process(process: Any) -> None:
+    if getattr(process, "returncode", None) is None:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            process.terminate()
+        if not await _wait_direct_process(process, 0.5):
+            with contextlib.suppress(ProcessLookupError, OSError):
+                process.kill()
+            await _wait_direct_process(process, 1.0)
+
+
+async def _stop_unarmed_posix_anchor(anchor: _PosixGroupAnchor) -> None:
+    stdin = getattr(anchor.process, "stdin", None)
+    if stdin is not None and not stdin.is_closing():
+        stdin.close()
+    if not await _wait_direct_process(anchor.process, 0.5):
+        with contextlib.suppress(ProcessLookupError):
+            anchor.process.kill()
+        await _wait_direct_process(anchor.process, 1.0)
+
+
+async def _create_posix_anchor() -> _PosixGroupAnchor:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-m",
+        "opensquilla.process_tree",
+        "--posix-group-anchor",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+        process_group=0,
+    )
+    return _PosixGroupAnchor(process=process, pgid=int(process.pid))
+
+
+def _attach_owner(process: Any, owner: ProcessTreeOwner) -> Any:
+    setattr(process, "_opensquilla_process_tree_owner", owner)
+    return process
+
+
+async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
+    """Spawn an argv under durable task-owned tree containment."""
+
+    if os.name == "posix":
+        anchor = await _create_posix_anchor()
+        child_kwargs = dict(kwargs)
+        child_kwargs.pop("start_new_session", None)
+        child_kwargs.pop("process_group", None)
+        child_kwargs["process_group"] = anchor.pgid
+        try:
+            process = await asyncio.create_subprocess_exec(*argv, **child_kwargs)
+        except BaseException:
+            await _stop_unarmed_posix_anchor(anchor)
+            raise
+        owner = ProcessTreeOwner(
+            process=process,
+            pid=int(process.pid),
+            pgid=anchor.pgid,
+            posix_anchor=anchor,
+        )
+        anchor.bind(owner)
+        _attach_owner(process, owner)
+        try:
+            await anchor.arm()
+        except BaseException as exc:
+            await owner.terminate(graceful_timeout=0.2, kill_timeout=1.0)
+            raise ProcessTreeOwnershipError(
+                f"failed to arm POSIX process-tree owner for pid {process.pid}: {exc}"
+            ) from exc
+        return process
+
+    if os.name == "nt":
+        gate = _WindowsLaunchGate.create()
+        job = _WindowsJob.create()
+        child_kwargs = dict(kwargs)
+        child_kwargs.pop("start_new_session", None)
+        helper_argv = (
+            sys.executable,
+            "-m",
+            "opensquilla.process_tree",
+            "--windows-owned-launch",
+            gate.name,
+            "--",
+            *argv,
+        )
+        windows_process: Any | None = None
+        try:
+            windows_process = await asyncio.create_subprocess_exec(
+                *helper_argv,
+                **child_kwargs,
+            )
+            job.assign_pid(int(windows_process.pid))
+            owner = ProcessTreeOwner(
+                process=windows_process,
+                pid=int(windows_process.pid),
+                windows_job=job,
+            )
+            _attach_owner(windows_process, owner)
+            gate.release()
+            return windows_process
+        except BaseException as exc:
+            if windows_process is not None:
+                await _stop_failed_async_process(windows_process)
+            job.close()
+            raise ProcessTreeOwnershipError(
+                f"Windows controlled process launch failed closed: {exc}"
+            ) from exc
+        finally:
+            gate.close()
+
+    raise ProcessTreeOwnershipError(f"unsupported process-tree platform: {os.name}")
+
+
+async def create_owned_subprocess_shell(command: str, **kwargs: Any) -> Any:
+    if os.name == "nt":
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        return await create_owned_subprocess_exec(comspec, "/d", "/s", "/c", command, **kwargs)
+    if os.name != "posix":
+        raise ProcessTreeOwnershipError(f"unsupported process-tree platform: {os.name}")
+    anchor = await _create_posix_anchor()
+    child_kwargs = dict(kwargs)
+    child_kwargs.pop("start_new_session", None)
+    child_kwargs.pop("process_group", None)
+    child_kwargs["process_group"] = anchor.pgid
+    try:
+        process = await asyncio.create_subprocess_shell(command, **child_kwargs)
+    except BaseException:
+        await _stop_unarmed_posix_anchor(anchor)
+        raise
+    owner = ProcessTreeOwner(
+        process=process,
+        pid=int(process.pid),
+        pgid=anchor.pgid,
+        posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+    _attach_owner(process, owner)
+    try:
+        await anchor.arm()
+    except BaseException as exc:
+        await owner.terminate(graceful_timeout=0.2, kill_timeout=1.0)
+        raise ProcessTreeOwnershipError(
+            f"failed to arm POSIX process-tree owner for pid {process.pid}: {exc}"
+        ) from exc
+    return process
+
+
+def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
+    """Synchronous Windows controlled-helper launcher for blocking pipe I/O."""
+
+    if os.name != "nt":
+        raise ProcessTreeOwnershipError("synchronous owned launcher is Windows-only")
+    gate = _WindowsLaunchGate.create()
+    job = _WindowsJob.create()
+    child_kwargs = dict(kwargs)
+    child_kwargs.pop("start_new_session", None)
+    helper_argv = [
+        sys.executable,
+        "-m",
+        "opensquilla.process_tree",
+        "--windows-owned-launch",
+        gate.name,
+        "--",
+        *argv,
+    ]
+    process: Any | None = None
+    try:
+        process = subprocess.Popen(helper_argv, **child_kwargs)
+        job.assign_pid(int(process.pid))
+        owner = ProcessTreeOwner(
+            process=process,
+            pid=int(process.pid),
+            windows_job=job,
+        )
+        _attach_owner(process, owner)
+        gate.release()
+        return process
+    except BaseException as exc:
+        if process is not None and process.poll() is None:
+            with contextlib.suppress(OSError):
+                process.terminate()
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    process.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=1.0)
+        job.close()
+        raise ProcessTreeOwnershipError(
+            f"Windows controlled process launch failed closed: {exc}"
+        ) from exc
+    finally:
+        gate.close()
+
+
+def _posix_group_members(pgid: int) -> tuple[int, ...] | None:
+    proc_root = "/proc"
+    if os.path.isdir(proc_root):
+        members: list[int] = []
+        try:
+            names = os.listdir(proc_root)
+        except OSError:
+            return None
+        for name in names:
+            if not name.isdigit():
+                continue
+            try:
+                with open(
+                    os.path.join(proc_root, name, "stat"),
+                    encoding="utf-8",
+                ) as stat_file:
+                    stat = stat_file.read()
+                rest = stat[stat.rfind(")") + 2 :].split()
+                if len(rest) > 2 and int(rest[2]) == pgid:
+                    members.append(int(name))
+            except (OSError, ValueError):
+                continue
+        return tuple(members)
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,pgid="],
+            check=False,
+            capture_output=True,
+            text=True,
+            start_new_session=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    members = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2:
+            continue
+        try:
+            pid, candidate_pgid = (int(field) for field in fields)
+        except ValueError:
+            continue
+        if candidate_pgid == pgid:
+            members.append(pid)
+    return tuple(members)
+
+
+def _run_posix_group_anchor() -> int:
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        signal.signal(sig, signal.SIG_IGN)
+    if sys.stdin.buffer.read(1) != _POSIX_ANCHOR_ARM:
+        return 125
+    own_pid = os.getpid()
+    pgid = os.getpgrp()
+    poll_delay = _POLL_INTERVAL_SECONDS
+    while True:
+        members = _posix_group_members(pgid)
+        if members is not None and all(pid == own_pid for pid in members):
+            sys.stdout.buffer.write(_POSIX_ANCHOR_EMPTY)
+            sys.stdout.buffer.flush()
+            return 0 if sys.stdin.buffer.read(1) == _POSIX_ANCHOR_RELEASE else 125
+        time.sleep(poll_delay)
+        poll_delay = min(0.25, poll_delay * 1.5)
+
+
+def _run_windows_owned_launch(gate_name: str, argv: list[str]) -> int:
+    from ctypes import wintypes
+
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+    kernel32.OpenEventW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.OpenEventW.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    synchronize = 0x00100000
+    infinite = 0xFFFFFFFF
+    wait_failed = 0xFFFFFFFF
+    gate = kernel32.OpenEventW(synchronize, False, gate_name)
+    if not gate:
+        raise _windows_error()
+    try:
+        if kernel32.WaitForSingleObject(gate, infinite) == wait_failed:
+            raise _windows_error()
+    finally:
+        kernel32.CloseHandle(gate)
+    if not argv:
+        return 127
+    try:
+        process = subprocess.Popen(argv)
+    except OSError as exc:
+        print(f"OpenSquilla controlled launch failed: {exc}", file=sys.stderr)
+        return 127
+    return int(process.wait())
+
+
+def _main() -> int:
+    args = sys.argv[1:]
+    if args == ["--posix-group-anchor"]:
+        return _run_posix_group_anchor()
+    if len(args) >= 3 and args[0] == "--windows-owned-launch" and args[2] == "--":
+        return _run_windows_owned_launch(args[1], args[3:])
+    return 2
+
+
 async def _wait_direct_process(process: Any, timeout: float) -> bool:
     deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
     while getattr(process, "returncode", None) is None:
@@ -369,4 +806,11 @@ __all__ = [
     "ProcessTreeOwner",
     "ProcessTreeOwnershipError",
     "capture_process_tree_owner",
+    "create_owned_popen",
+    "create_owned_subprocess_exec",
+    "create_owned_subprocess_shell",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

@@ -10,14 +10,16 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
+from opensquilla.process_tree import (
+    capture_process_tree_owner,
+    create_owned_subprocess_exec,
+)
 from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
@@ -1204,15 +1206,8 @@ async def execute_code(
                     )
                 )
 
-    process_group_kwargs: dict[str, Any] = {}
-    if os.name == "posix":
-        process_group_kwargs["start_new_session"] = True
-    else:
-        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        if creationflags:
-            process_group_kwargs["creationflags"] = creationflags
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_owned_subprocess_exec(
             python_bin,
             "-c",
             code,
@@ -1220,10 +1215,7 @@ async def execute_code(
             stderr=asyncio.subprocess.PIPE,
             cwd=str(workdir_path),
             env=safe_env,
-            **process_group_kwargs,
         )
-        from opensquilla.process_tree import capture_process_tree_owner
-
         process_tree = capture_process_tree_owner(proc, isolated=True)
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
