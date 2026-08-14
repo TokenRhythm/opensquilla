@@ -372,6 +372,7 @@ export interface UseChatSendOptions {
   enqueuePendingInput: (
     text: string,
     owner?: PendingQueueOwner,
+    enqueueOptions?: { confirmedPlainText?: boolean },
   ) => boolean | Promise<boolean>
   enqueuePendingPayload?: (
     payload: {
@@ -1703,55 +1704,67 @@ export function useChatSend(options: UseChatSendOptions) {
           || !composerMatchesSnapshot(composerSnapshot)
         )
       ) return
-      if (
-        !bypassSlashCommand
-        && !isLiteralSlash
-        && isControlInput(text)
-        && slashClassification !== 'unknown'
-      ) {
-        // Registered slash commands and bang inputs are live controls. Running
-        // them later can target a different task/session, so keep the exact
-        // command editable while busy. Confirmed unknown slash input is plain
-        // text and continues into the ordinary follow-up queue below.
-        return
-      }
-      if (!hasPayload) return
-      if (handoffInFlight && !activeResponseHandoff?.durableRecord) {
-        // The fork itself may proceed without IndexedDB, but a follow-up must
-        // stay editable until the target session is known. Otherwise refresh
-        // can strand an ownerless message on the parent session.
-        pushToast(i18n.global.t('chat.toast.queuePersistenceUnavailable'), { tone: 'info' })
-        return
-      }
-      if (
-        options.busySendMode.value === 'steer'
-        && canSteerPayload(
-          text,
-          composerSnapshot.payloadAttachments,
-          composerSnapshot.intent,
-          composerSnapshot.forkBeforeMessageId,
-        )
-      ) {
-        await dispatchSteerV2(text, { composerSnapshot })
-        return
-      }
-      // Surface a full queue instead of silently dropping the send: the draft is
-      // preserved (enqueue returns false before clearing the composer).
-      const composerChanged = !composerMatchesSnapshot(composerSnapshot)
-      if (invocation.cancelIfComposerChanged && composerChanged) return
-      const queued = await Promise.resolve(
-        composerChanged || invocation.textOverride !== undefined
-          ? options.enqueuePendingPayload?.({
+      const stillBusy = options.stream.isStreaming.value
+        || hasAuthoritativeWork()
+        || options.isCompactInFlightForCurrentSession()
+        || responseHandoffBlocksCurrentSession()
+      if (stillBusy) {
+        if (
+          !bypassSlashCommand
+          && !isLiteralSlash
+          && isControlInput(text)
+          && slashClassification !== 'unknown'
+        ) {
+          // Registered slash commands and bang inputs are live controls. Running
+          // them later can target a different task/session, so keep the exact
+          // command editable while busy. Confirmed unknown slash input is plain
+          // text and continues into the ordinary follow-up queue below.
+          return
+        }
+        if (!hasPayload) return
+        if (handoffInFlight && !activeResponseHandoff?.durableRecord) {
+          // The fork itself may proceed without IndexedDB, but a follow-up must
+          // stay editable until the target session is known. Otherwise refresh
+          // can strand an ownerless message on the parent session.
+          pushToast(i18n.global.t('chat.toast.queuePersistenceUnavailable'), { tone: 'info' })
+          return
+        }
+        if (
+          options.busySendMode.value === 'steer'
+          && canSteerPayload(
             text,
-            attachments: composerSnapshot.payloadAttachments,
-            intent: composerSnapshot.intent,
-          }, pendingQueueOwner()) ?? false
-          : options.enqueuePendingInput(text, pendingQueueOwner()),
-      )
-      if (!queued) {
-        pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
+            composerSnapshot.payloadAttachments,
+            composerSnapshot.intent,
+            composerSnapshot.forkBeforeMessageId,
+          )
+        ) {
+          await dispatchSteerV2(text, { composerSnapshot })
+          return
+        }
+        // Surface a full queue instead of silently dropping the send: the draft is
+        // preserved (enqueue returns false before clearing the composer).
+        const composerChanged = !composerMatchesSnapshot(composerSnapshot)
+        if (invocation.cancelIfComposerChanged && composerChanged) return
+        const queued = await Promise.resolve(
+          composerChanged || invocation.textOverride !== undefined
+            ? options.enqueuePendingPayload?.({
+              text,
+              attachments: composerSnapshot.payloadAttachments,
+              intent: composerSnapshot.intent,
+            }, pendingQueueOwner()) ?? false
+            : slashClassification === 'unknown'
+              ? options.enqueuePendingInput(
+                text,
+                pendingQueueOwner(),
+                { confirmedPlainText: true },
+              )
+              : options.enqueuePendingInput(text, pendingQueueOwner()),
+        )
+        if (!queued) {
+          pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
+        }
+        return
       }
-      return
     }
 
     if (!bypassSlashCommand && !isLiteralSlash && text.startsWith('/')) {
@@ -1847,12 +1860,17 @@ export function useChatSend(options: UseChatSendOptions) {
       ) {
         return preserveRetryState('deferred')
       }
-      if (await options.executeSlashCommand(item.text.trim())) {
-        return 'accepted'
+      const slashClassification = await options.classifySlashCommand(item.text.trim())
+      if (slashClassification === 'unavailable') {
+        return preserveRetryState('retryable_failure')
       }
-      // executeSlashCommand reports "unhandled" (false) for unknown slash
-      // input. Fall through to the normal send path below so the queued item
-      // is sent as plain chat text, mirroring the primary onSend contract.
+      if (slashClassification === 'registered') {
+        return await options.executeSlashCommand(item.text.trim())
+          ? 'accepted'
+          : preserveRetryState('retryable_failure')
+      }
+      // Confirmed unknown slash input falls through to the normal send path
+      // below, mirroring the primary onSend contract.
     }
     if (hasSendableModelInputImageAttachment(item.attachments)) {
       if (options.modelRoutingSettingsBusy.value) {

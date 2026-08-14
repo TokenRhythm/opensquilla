@@ -858,8 +858,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function enqueuePendingInput(
     text: string,
     owner?: PendingQueueOwner,
+    enqueueOptions?: { confirmedPlainText?: boolean },
   ): boolean | Promise<boolean> {
-    if (isControlInput(text)) return false
+    if (isControlInput(text) && !enqueueOptions?.confirmedPlainText) return false
     const composerText = options.inputText.value
     const composerAttachments = snapshotComposerAttachments(options.pendingAttachments.value)
     const composerIntent = options.pendingSessionIntent.value
