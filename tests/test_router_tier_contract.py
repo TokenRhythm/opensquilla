@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from opensquilla.engine.capacity_admission import model_has_request_capacity
 from opensquilla.engine.selector_override import apply_model_override
 from opensquilla.engine.steps.squilla_router import _flag_tier_provider_mismatch
 from opensquilla.gateway.config import GatewayConfig
@@ -187,6 +188,7 @@ def test_large_context_floor_keeps_only_definitely_capable_configured_fallbacks(
         "router_fallback_chain": [],
         "large_context_floor_min_tier": "c2",
         "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
         "routed_model": "routed-at-floor",
     }
 
@@ -226,6 +228,7 @@ def test_large_context_floor_validates_router_fallback_capacity(monkeypatch) -> 
         ],
         "large_context_floor_min_tier": "c2",
         "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
         "routed_model": "routed-at-floor",
     }
 
@@ -239,6 +242,73 @@ def test_large_context_floor_validates_router_fallback_capacity(monkeypatch) -> 
     assert [config.model for config in selector.remaining_chain()] == [
         "routed-at-floor",
         "router-safe",
+    ]
+
+
+def test_capacity_admission_reserves_actual_high_thinking_budget(monkeypatch) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/reasoning-model": {
+                "context_window": 128_000,
+                "max_output_tokens": 10_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+
+    assert model_has_request_capacity(
+        provider="openai",
+        model="reasoning-model",
+        material_tokens=60_000,
+        thinking_budget_tokens=4_096,
+    )
+    assert not model_has_request_capacity(
+        provider="openai",
+        model="reasoning-model",
+        material_tokens=60_000,
+        thinking_budget_tokens=20_000,
+    )
+
+
+def test_large_context_fallback_rejects_model_at_high_thinking_budget(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/router-borderline": {
+                "context_window": 128_000,
+                "max_output_tokens": 10_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "configured-primary", api_key="test-key")
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [
+            {"tier": "c3", "model": "router-borderline"},
+        ],
+        "large_context_floor_min_tier": "c3",
+        "large_context_material_tokens": 60_000,
+        "large_context_thinking_budget_tokens": 20_000,
+        "routed_model": "routed-at-floor",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-at-floor",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == [
+        "routed-at-floor"
     ]
 
 

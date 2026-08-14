@@ -22,10 +22,6 @@ _ROUTE_SAVINGS_KEYS = (
     "savings_max_price_per_m",
     "savings_routed_price_per_m",
 )
-_FALLBACK_NON_MATERIAL_INPUT_HEADROOM_TOKENS = 8_192
-_FALLBACK_THINKING_RESERVE_TOKENS = 4_096
-
-
 def _capacity_approved_configured_fallbacks(
     selector: Any,
     turn_metadata: dict[str, Any],
@@ -63,12 +59,17 @@ def _capacity_approved_fallback_entries(
     if material_tokens <= 0:
         return []
 
-    from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor
-    from opensquilla.provider.model_catalog import shared_catalog
+    from opensquilla.engine.capacity_admission import (
+        MAX_THINKING_BUDGET_TOKENS,
+        model_has_request_capacity,
+    )
 
     current_config = getattr(selector, "current_config", None)
     default_provider = str(getattr(current_config, "provider", "") or "").strip()
-    catalog = shared_catalog()
+    thinking_budget = turn_metadata.get("large_context_thinking_budget_tokens")
+    if not isinstance(thinking_budget, int) or isinstance(thinking_budget, bool):
+        thinking_budget = MAX_THINKING_BUDGET_TOKENS
+    thinking_budget = max(0, thinking_budget)
     approved: list[dict[str, str]] = []
     for entry in entries:
         if not isinstance(entry, dict):
@@ -77,30 +78,11 @@ def _capacity_approved_fallback_entries(
         model = str(entry.get("model") or "").strip()
         if not provider or not model:
             continue
-        try:
-            window, window_source = catalog.resolve_context_window_with_source(
-                model,
-                provider,
-            )
-            max_output, _output_source = catalog.resolve_max_tokens_with_source(
-                model,
-                user_override=0,
-                provider=provider,
-            )
-        except Exception:  # noqa: BLE001 - missing/invalid capability fails closed
-            continue
-        if window_source not in {"catalog", "override"}:
-            continue
-        budget = ContextBudgetGovernor.from_values(
-            context_window_tokens=window,
-            max_output_tokens=max_output,
-            thinking_budget_tokens=_FALLBACK_THINKING_RESERVE_TOKENS,
-            context_overflow_threshold=0.85,
-        ).snapshot()
-        safe_input_tokens = budget.provider_request_max_chars // CHARS_PER_TOKEN
-        if (
-            material_tokens + _FALLBACK_NON_MATERIAL_INPUT_HEADROOM_TOKENS
-            > safe_input_tokens
+        if not model_has_request_capacity(
+            provider=provider,
+            model=model,
+            material_tokens=material_tokens,
+            thinking_budget_tokens=thinking_budget,
         ):
             continue
         approved_entry = {"provider": provider, "model": model}

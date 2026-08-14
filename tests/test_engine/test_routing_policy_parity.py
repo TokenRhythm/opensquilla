@@ -47,6 +47,8 @@ import pytest
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.steps import squilla_router as squilla_router_step
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.provider import model_catalog as model_catalog_module
+from opensquilla.provider.model_catalog import ModelCatalog
 
 GOLDEN_PATH = Path(__file__).parent / "goldens" / "routing_policy_parity_golden.json"
 
@@ -718,6 +720,24 @@ def run_case(case: Case) -> dict:
         strategy = _UnexpectedClassifyStrategy()
 
     original_get_strategy = sr._get_strategy
+    original_catalog = model_catalog_module._shared_catalog
+    capacity_catalog = ModelCatalog()
+    capacity_catalog.set_user_overrides(
+        {
+            model: {
+                "context_window": 300_000,
+                "max_output_tokens": 10_000,
+            }
+            for model in (
+                "dummy-nano-1",
+                "dummy-mini-1",
+                "dummy-pro-1",
+                "dummy-max-1",
+                "dummy-vision-1",
+            )
+        }
+    )
+    model_catalog_module._shared_catalog = capacity_catalog
     sr._get_strategy = lambda _config: strategy  # type: ignore[assignment]
     error: str | None = None
     try:
@@ -726,6 +746,7 @@ def run_case(case: Case) -> dict:
         error = f"{type(exc).__name__}: {exc}"
     finally:
         sr._get_strategy = original_get_strategy  # type: ignore[assignment]
+        model_catalog_module._shared_catalog = original_catalog
         sr._history_store.clear()
 
     return observation(ctx, error)

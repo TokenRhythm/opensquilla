@@ -985,9 +985,20 @@ class RoutingPolicyEngine:
         # raise it. With ``budget is None`` (the default) the whole block is
         # skipped, so routing is byte-identical to the pre-gate pipeline.
         if inputs.budget is not None:
+            budget_tiers = inputs.valid_tiers
+            if minimum_context_tier in inputs.valid_tiers:
+                minimum_index = _tier_index(
+                    minimum_context_tier,
+                    inputs.valid_tiers,
+                )
+                budget_tiers = [
+                    tier
+                    for tier in inputs.valid_tiers
+                    if _tier_index(tier, inputs.valid_tiers) >= minimum_index
+                ]
             budget_result = budget_gate(
                 decision.tier,
-                valid_tiers=inputs.valid_tiers,
+                valid_tiers=budget_tiers,
                 budget=inputs.budget,
             )
             decision = apply_budget_gate(
