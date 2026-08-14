@@ -26,6 +26,7 @@ NORMALIZED_ERROR_KEYS = frozenset(
         "terminal_reason",
         "error_message",
         "turn_outcome",
+        "retry_after_ms",
     }
 )
 
