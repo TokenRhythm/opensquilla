@@ -428,7 +428,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
             'commands.list_for_surface',
             params,
           )
-      slashCmds.value = (Array.isArray(res?.commands) ? res.commands : []).map(normalizeSlashCommand)
+      if (!Array.isArray(res?.commands)) throw new Error('invalid command catalog')
+      slashCmds.value = res.commands.map(normalizeSlashCommand)
       if (
         options.activatePlanMode
         && (options.planModeAvailable?.() ?? true)
@@ -829,8 +830,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     }
   }
 
-  async function executeSlashCommand(text: string): Promise<boolean> {
-    const classification = await classifySlashCommand(text)
+  async function executeSlashCommand(
+    text: string,
+    knownClassification?: SlashCommandClassification,
+  ): Promise<boolean> {
+    const classification = knownClassification ?? await classifySlashCommand(text)
     const trimmed = text.trim()
     const firstWhitespace = trimmed.search(/\s/)
     const cmdText = firstWhitespace === -1 ? trimmed : trimmed.slice(0, firstWhitespace)

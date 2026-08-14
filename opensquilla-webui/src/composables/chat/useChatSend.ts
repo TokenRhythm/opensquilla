@@ -404,7 +404,10 @@ export interface UseChatSendOptions {
   hiddenControlStorage?: HiddenControlStorage | null
   metaDiscardStorage?: MetaDiscardStorage | null
   classifySlashCommand: (text: string) => Promise<SlashCommandClassification>
-  executeSlashCommand: (text: string) => Promise<boolean>
+  executeSlashCommand: (
+    text: string,
+    knownClassification?: SlashCommandClassification,
+  ) => Promise<boolean>
   closeSlashMenu: () => void
   autoResizeTextarea: () => void
   scrollToBottom: () => void
@@ -1861,11 +1864,23 @@ export function useChatSend(options: UseChatSendOptions) {
         return preserveRetryState('deferred')
       }
       const slashClassification = await options.classifySlashCommand(item.text.trim())
+      if (options.sessionKey.value !== ownerSessionKey) {
+        return preserveRetryState('not_sent')
+      }
+      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (
+        options.stream.isStreaming.value
+        || hasAuthoritativeWork()
+        || options.isCompactInFlightForCurrentSession()
+        || responseHandoffBlocksCurrentSession()
+      ) {
+        return preserveRetryState('deferred')
+      }
       if (slashClassification === 'unavailable') {
         return preserveRetryState('retryable_failure')
       }
       if (slashClassification === 'registered') {
-        return await options.executeSlashCommand(item.text.trim())
+        return await options.executeSlashCommand(item.text.trim(), 'registered')
           ? 'accepted'
           : preserveRetryState('retryable_failure')
       }

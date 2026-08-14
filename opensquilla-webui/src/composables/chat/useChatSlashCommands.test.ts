@@ -377,6 +377,20 @@ describe('useChatSlashCommands Coding mode', () => {
 })
 
 describe('useChatSlashCommands recovery', () => {
+  it.each([
+    {},
+    { commands: null },
+  ])('keeps a malformed command catalog unavailable', async response => {
+    const { api, armGoal, notify, rpc } = harness(false)
+    rpc.call.mockResolvedValue(response)
+
+    await expect(api.classifySlashCommand('/goal')).resolves.toBe('unavailable')
+    await expect(api.executeSlashCommand('/goal')).resolves.toBe(true)
+
+    expect(armGoal).not.toHaveBeenCalled()
+    expect(notify).toHaveBeenCalledOnce()
+  })
+
   it('falls through silently for unknown slash input', async () => {
     const {
       api,

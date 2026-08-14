@@ -6157,7 +6157,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
 
     // A registered command is handled by the command path: no chat.send.
-    expect(executeSlashCommand).toHaveBeenCalledWith('/coding')
+    expect(executeSlashCommand).toHaveBeenCalledWith('/coding', 'registered')
     expect(rpc.call).not.toHaveBeenCalled()
   })
 
@@ -6229,5 +6229,35 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('keeps a queued slash item owned by A when classification finishes after switching to B', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    const sessionKey = ref('agent:main:webchat:A')
+    const classifySlashCommand = vi.fn(() => classification)
+    const executeSlashCommand = vi.fn(async () => false)
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      classifySlashCommand,
+      executeSlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-session-switch-slash',
+      ownerSessionKey: 'agent:main:webchat:A',
+      text: '/gamemode creative',
+      attachments: [],
+      intent: null,
+    }
+
+    const sending = api.sendQueuedFollowup(queued, 'agent:main:webchat:A')
+    sessionKey.value = 'agent:main:webchat:B'
+    resolveClassification('unknown')
+
+    await expect(sending).resolves.toBe('not_sent')
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
   })
 })
