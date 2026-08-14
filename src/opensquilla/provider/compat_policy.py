@@ -21,6 +21,8 @@ from fnmatch import fnmatchcase
 from typing import Literal
 from urllib.parse import urlsplit
 
+from opensquilla.endpoint_identity import base_url_matches_official_api
+
 from .model_identity import DEEPSEEK_V4_MODEL_IDS
 from .qwen_token_plan import (
     QWEN_TOKEN_PLAN_DEEPSEEK_V4_MODEL_IDS,
@@ -338,6 +340,26 @@ class OpenAICompatPolicy:
         """
 
         return self.text_tool_profile.enabled
+
+
+def effective_reasoning_format(
+    policy: OpenAICompatPolicy,
+    reasoning_format: str,
+    base_url: str,
+) -> str:
+    """Suppress a provider-native dialect outside its exact official API root."""
+
+    restricted_dialect = policy.official_reasoning_dialect.strip().lower()
+    if (
+        restricted_dialect
+        and reasoning_format.strip().lower() == restricted_dialect
+        and not base_url_matches_official_api(
+            policy.official_reasoning_api_root,
+            base_url,
+        )
+    ):
+        return ""
+    return reasoning_format
 
 
 _ARK_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS = frozenset(

@@ -20,7 +20,6 @@ from uuid import uuid4
 import httpx
 import structlog
 
-from opensquilla.endpoint_identity import base_url_matches_official_api
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.execution_status import compact_provider_status, derive_is_error
 from opensquilla.safety.secret_redaction import redact_secret_text
@@ -41,6 +40,7 @@ from .compat_policy import (
     OpenAICompatPolicy,
     ReasoningModelRule,
     compat_policy_for_kind,
+    effective_reasoning_format,
 )
 from .context_capabilities import supports_openrouter_explicit_prompt_cache
 from .error_redaction import (
@@ -723,25 +723,6 @@ def _strip_think_tags(text: str) -> str:
 
 def _on_official_host(policy: OpenAICompatPolicy, base_url: str) -> bool:
     return bool(policy.official_host) and policy.official_host in base_url.lower()
-
-
-def _effective_reasoning_format(
-    policy: OpenAICompatPolicy,
-    reasoning_format: str,
-    base_url: str,
-) -> str:
-    """Suppress one provider-native dialect outside its exact official API root."""
-    restricted_dialect = policy.official_reasoning_dialect.strip().lower()
-    if (
-        restricted_dialect
-        and reasoning_format.strip().lower() == restricted_dialect
-        and not base_url_matches_official_api(
-            policy.official_reasoning_api_root,
-            base_url,
-        )
-    ):
-        return ""
-    return reasoning_format
 
 
 def _uses_max_completion_tokens(
@@ -3463,7 +3444,7 @@ class OpenAIProvider:
                     else self._compat.default_reasoning_format
                 )
             )
-            reasoning_format = _effective_reasoning_format(
+            reasoning_format = effective_reasoning_format(
                 self._compat,
                 resolved_reasoning_format,
                 self._base_url,
@@ -3519,7 +3500,7 @@ class OpenAIProvider:
                     "none",
                     "off",
                 }:
-                    reasoning_format = _effective_reasoning_format(
+                    reasoning_format = effective_reasoning_format(
                         self._compat,
                         reasoning_rule.reasoning_format,
                         self._base_url,
@@ -3534,7 +3515,7 @@ class OpenAIProvider:
         elif caps and caps.supports_reasoning:
             apply_reasoning_disable(
                 payload,
-                _effective_reasoning_format(
+                effective_reasoning_format(
                     self._compat, caps.reasoning_format, self._base_url
                 ),
                 ReasoningDisableArgs(
