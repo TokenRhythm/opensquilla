@@ -802,7 +802,8 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         })
         break
       }
-      case 'goal.set': {
+      case 'goal.set':
+      case '/goal': {
         const goalText = String(args || '').trim()
         const first = goalText.split(/\s+/, 1)[0]?.toLowerCase() || ''
         const remainder = first ? goalText.slice(first.length).trim() : ''

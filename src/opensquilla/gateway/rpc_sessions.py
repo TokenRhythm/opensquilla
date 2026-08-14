@@ -5335,7 +5335,7 @@ def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> 
                 "size": attachment.get("size"),
             }
         )
-    return {
+    result = {
         "pendingInputId": row.pending_input_id,
         "pending_input_id": row.pending_input_id,
         "sessionKey": row.session_key,
@@ -5356,6 +5356,10 @@ def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> 
         "replayed": replayed,
         "schemaVersion": row.schema_version,
     }
+    display_text = payload.get("displayText")
+    if isinstance(display_text, str):
+        result["displayText"] = display_text
+    return result
 
 
 def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str, Any]:
@@ -5363,8 +5367,18 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
     if not isinstance(message, str) or not message.strip():
         raise ValueError("params.message must be a non-empty string")
     control = message.strip()
+    display_text = _optional_string_param(params, "displayText", "display_text")
+    display_control = display_text.strip() if display_text is not None else ""
+    literal_slash_escape = (
+        control.startswith("/")
+        and not control.startswith("//")
+        and display_control.startswith("//")
+        and display_control[1:] == control
+    )
     if control.startswith("!") or (
-        control.startswith("/") and not control.startswith("//")
+        control.startswith("/")
+        and not control.startswith("//")
+        and not literal_slash_escape
     ):
         raise RpcHandlerError(
             "PENDING_CONTROL_COMMAND_UNSUPPORTED",
@@ -5399,11 +5413,12 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
         (("intent",), "intent"),
         (("workspaceId", "workspace_id"), "workspaceId"),
         (("collaborationMode", "collaboration_mode"), "collaborationMode"),
-        (("displayText", "display_text"), "displayText"),
     ):
         value = _optional_string_param(params, *source_names)
         if value is not None:
             payload[target] = value
+    if display_text is not None:
+        payload["displayText"] = display_text
     return payload
 
 

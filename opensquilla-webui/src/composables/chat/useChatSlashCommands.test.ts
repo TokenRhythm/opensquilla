@@ -420,6 +420,20 @@ describe('useChatSlashCommands recovery', () => {
     })
   })
 
+  it('executes a legacy Goal command without execution metadata', async () => {
+    const { api, armGoal, goalStatus } = harness(false, [{
+      name: '/goal',
+      aliases: [],
+    }])
+
+    await expect(api.classifySlashCommand('/goal')).resolves.toBe('registered')
+    await expect(api.executeSlashCommand('/goal', 'registered')).resolves.toBe(true)
+    await Promise.resolve()
+
+    expect(goalStatus).toHaveBeenCalledTimes(1)
+    expect(armGoal).toHaveBeenCalledTimes(1)
+  })
+
   it('falls through silently for unknown slash input', async () => {
     const {
       api,

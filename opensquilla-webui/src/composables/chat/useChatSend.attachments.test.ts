@@ -6047,6 +6047,24 @@ describe('useChatSend slash-prefixed input fall-through', () => {
         string,
         import('@/utils/chat/pendingInputWal').PendingInputWalRecord
       >()
+      const rpcCall = vi.fn(async (
+        method: string,
+        params: Record<string, unknown> = {},
+      ): Promise<Record<string, unknown>> => {
+        if (method === 'sessions.pending_inputs.list') return { items: [] }
+        if (method === 'sessions.pending_inputs.enqueue') {
+          return { requestFingerprint: 'sha256:literal-slash', revision: 1 }
+        }
+        if (method === 'sessions.pending_inputs.dispatch') {
+          return { sessionKey: sessionKey.value }
+        }
+        throw new Error(`unexpected method: ${method} ${JSON.stringify(params)}`)
+      })
+      const rpc: UseChatSendOptions['rpc'] = {
+        call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+          rpcCall(method, params) as Promise<T>
+        ),
+      }
       let sendApi!: ReturnType<typeof useChatSend>
       const pending = useChatPendingQueue({
         sessionKey,
@@ -6067,7 +6085,8 @@ describe('useChatSend slash-prefixed input fall-through', () => {
           delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
           close: () => {},
         },
-        supportsMethod: () => false,
+        rpc,
+        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
         dispatchPendingItem: (item, ownerSessionKey) => (
           sendApi.sendQueuedFollowup(item, ownerSessionKey)
         ),
@@ -6080,6 +6099,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
         pendingSessionIntent,
         sessionKey,
         stream,
+        rpc,
         busySendMode: pending.busySendMode,
         enqueuePendingInput: pending.enqueuePendingInput,
         enqueuePendingPayload: pending.enqueuePendingPayload,
@@ -6094,9 +6114,25 @@ describe('useChatSend slash-prefixed input fall-through', () => {
       expect(pending.pendingQueue.value).toHaveLength(1)
       expect(pending.pendingQueue.value[0]).toMatchObject({
         text: '//coding',
-        attachments: [attachment],
+        attachments: [expect.objectContaining({
+          name: attachment.name,
+          mime: attachment.mime,
+        })],
       })
       expect(pendingRecords.size).toBe(1)
+      await vi.waitFor(() => {
+        expect(pending.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
+      })
+      expect(rpcCall).toHaveBeenCalledWith(
+        'sessions.pending_inputs.enqueue',
+        expect.objectContaining({
+          message: '/coding',
+          displayText: '//coding',
+          attachments: [expect.objectContaining({
+            file_uuid: 'file-literal-slash-attachment',
+          })],
+        }),
+      )
       stream.isStreaming.value = false
       pending.schedulePendingDrainAfterTerminal()
       await vi.runAllTimersAsync()
@@ -6104,13 +6140,13 @@ describe('useChatSend slash-prefixed input fall-through', () => {
 
       expect(classifySlashCommand).not.toHaveBeenCalled()
       expect(executeSlashCommand).not.toHaveBeenCalled()
-      expect(configured.rpc.call).toHaveBeenCalledOnce()
-      expect(configured.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
-        message: '/coding',
-        attachments: [expect.objectContaining({
-          file_uuid: 'file-literal-slash-attachment',
-        })],
-      }))
+      expect(rpcCall).toHaveBeenCalledWith(
+        'sessions.pending_inputs.dispatch',
+        expect.objectContaining({
+          requestFingerprint: 'sha256:literal-slash',
+        }),
+      )
+      expect(rpcCall).not.toHaveBeenCalledWith('chat.send', expect.anything())
       expect(pending.pendingQueue.value).toHaveLength(0)
       expect(pendingRecords.size).toBe(0)
       pending.cleanup()

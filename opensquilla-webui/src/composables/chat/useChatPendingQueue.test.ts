@@ -709,6 +709,46 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('restores a server-staged literal slash escape from its display text', async () => {
+    const { wal, records } = memoryWal()
+    const rpcCall = vi.fn(async (method: string): Promise<unknown> => {
+      if (method === 'sessions.pending_inputs.list') {
+        return {
+          items: [{
+            pendingInputId: 'pending-literal-slash',
+            clientRequestId: 'request-literal-slash',
+            clientMessageId: 'message-literal-slash',
+            requestFingerprint: 'sha256:literal-slash',
+            revision: 1,
+            message: '/coding',
+            displayText: '//coding',
+            attachments: [],
+          }],
+        }
+      }
+      throw new Error(`unexpected method: ${method}`)
+    })
+    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
+        void params
+        return rpcCall(method) as Promise<T>
+      },
+    }
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      rpc,
+      supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+    })
+
+    await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+    expect(queue.pendingQueue.value[0]).toMatchObject({
+      text: '//coding',
+      pendingPersistenceState: 'staged',
+    })
+    expect(records.get('pending-literal-slash')?.text).toBe('//coding')
+    queue.cleanup()
+  })
+
   it('strips an ACK-lost upload token when server reconciliation proves ownership', async () => {
     const { wal, records } = memoryWal([{
       schemaVersion: 1,

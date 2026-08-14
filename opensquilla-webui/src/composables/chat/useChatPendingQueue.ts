@@ -491,6 +491,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
             return
           }
           try {
+            const queuedText = item.text.trim()
+            const literalSlashEscape = !item.hiddenControl && queuedText.startsWith('//')
+            const providerMessage = literalSlashEscape
+              ? queuedText.slice(1)
+              : queuedText
             // Write the cross-boundary provenance before sending.  A crash or
             // lost ACK can then distinguish this identity from a genuinely
             // IndexedDB-only draft when the next Gateway is older/offline.
@@ -503,9 +508,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
                 pendingInputId,
                 clientRequestId: item.pendingClientRequestId,
                 clientMessageId: item.pendingClientMessageId,
-                message: item.text.trim() || 'Describe these attachments',
+                message: providerMessage || 'Describe these attachments',
                 attachments: sendable.map(serializeSendableAttachment),
-                ...(sendable.length > 0 ? { displayText: item.text } : {}),
+                ...(sendable.length > 0 || literalSlashEscape
+                  ? { displayText: queuedText }
+                  : {}),
                 ...(item.intent ? { intent: item.intent } : {}),
                 ...(Number.isSafeInteger(item.pendingPosition)
                   ? { position: item.pendingPosition }
@@ -696,7 +703,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         if (!item) {
           item = {
             pendingUiId: pendingInputId,
-            text: String(serverItem.message || ''),
+            text: typeof serverItem.displayText === 'string'
+              ? serverItem.displayText
+              : String(serverItem.message || ''),
             attachments: serverAttachments,
             intent: typeof serverItem.intent === 'string' ? serverItem.intent : null,
             ownerSessionKey: sessionKey,
