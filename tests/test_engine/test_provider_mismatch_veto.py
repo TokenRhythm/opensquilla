@@ -12,8 +12,6 @@ from __future__ import annotations
 import asyncio
 import copy
 
-import pytest
-
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.routing import ProviderMismatchVeto, provider_mismatch_veto
 from opensquilla.engine.steps import squilla_router as squilla_router_step
@@ -274,9 +272,9 @@ def test_step_veto_cannot_rebind_large_context_below_floor(monkeypatch) -> None:
     )
     monkeypatch.setattr(squilla_router_step, "_get_strategy", lambda _config: strategy)
 
-    with pytest.raises(RuntimeError, match="proven capacity"):
-        asyncio.run(squilla_router_step.apply_squilla_router(ctx))
+    out = asyncio.run(squilla_router_step.apply_squilla_router(ctx))
 
-    assert ctx.metadata["provider_mismatch_veto_to_tier"] == "c2"
-    assert ctx.metadata["large_context_floor_min_tier"] == "c3"
-    assert "routed_tier" not in ctx.metadata
+    assert out.metadata["provider_mismatch_veto_to_tier"] == "c2"
+    assert out.metadata["large_context_floor_min_tier"] == "c3"
+    assert out.metadata["large_context_capacity_blocked"] is True
+    assert "routed_tier" not in out.metadata

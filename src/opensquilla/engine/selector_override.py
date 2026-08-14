@@ -36,14 +36,11 @@ def _capacity_approved_configured_fallbacks(
     except Exception:  # noqa: BLE001 - an opaque selector fails closed
         return []
 
-    entries = [
-        {
-            "provider": str(getattr(config, "provider", "") or "").strip(),
-            "model": str(getattr(config, "model", "") or "").strip(),
-        }
-        for config in configured_tail
-    ]
-    return _capacity_approved_fallback_entries(selector, entries, turn_metadata)
+    return _capacity_approved_fallback_entries(
+        selector,
+        configured_tail,
+        turn_metadata,
+    )
 
 
 def _capacity_approved_fallback_entries(
@@ -70,23 +67,57 @@ def _capacity_approved_fallback_entries(
     if not isinstance(thinking_budget, int) or isinstance(thinking_budget, bool):
         thinking_budget = MAX_THINKING_BUDGET_TOKENS
     thinking_budget = max(0, thinking_budget)
+    context_window_override = turn_metadata.get(
+        "large_context_context_window_override_tokens"
+    )
+    if not isinstance(context_window_override, int) or isinstance(
+        context_window_override, bool
+    ):
+        context_window_override = 0
+    max_output_override = turn_metadata.get("large_context_max_output_override_tokens")
+    if not isinstance(max_output_override, int) or isinstance(max_output_override, bool):
+        max_output_override = 0
+    proof_max_chars = turn_metadata.get(
+        "large_context_provider_request_proof_max_chars"
+    )
+    if not isinstance(proof_max_chars, int) or isinstance(proof_max_chars, bool):
+        proof_max_chars = 0
     approved: list[dict[str, str]] = []
     for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        provider = str(entry.get("provider") or default_provider).strip()
-        model = str(entry.get("model") or "").strip()
+        if isinstance(entry, dict):
+            provider = str(entry.get("provider") or default_provider).strip()
+            model = str(entry.get("model") or "").strip()
+            tier = str(entry.get("tier") or "").strip()
+            api_key = ""
+            base_url = ""
+            proxy = ""
+        else:
+            provider = str(getattr(entry, "provider", "") or default_provider).strip()
+            model = str(getattr(entry, "model", "") or "").strip()
+            tier = ""
+            api_key = str(getattr(entry, "api_key", "") or "")
+            base_url = str(getattr(entry, "base_url", "") or "")
+            proxy = str(getattr(entry, "proxy", "") or "")
         if not provider or not model:
             continue
+        if not api_key and not base_url and provider == default_provider:
+            api_key = str(getattr(current_config, "api_key", "") or "")
+            base_url = str(getattr(current_config, "base_url", "") or "")
+            proxy = str(getattr(current_config, "proxy", "") or "")
         if not model_has_request_capacity(
             provider=provider,
             model=model,
             material_tokens=material_tokens,
             thinking_budget_tokens=thinking_budget,
+            context_window_override_tokens=max(0, context_window_override),
+            max_output_override_tokens=max(0, max_output_override),
+            provider_request_proof_max_chars=max(0, proof_max_chars),
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
         ):
             continue
         approved_entry = {"provider": provider, "model": model}
-        tier = str(entry.get("tier") or "").strip()
         if tier:
             approved_entry["tier"] = tier
         approved.append(approved_entry)
@@ -411,6 +442,15 @@ def apply_model_override(
     full ProviderConfig; the router fallback chain is skipped in that case
     (its entries are same-provider models of the provider being left).
     """
+    if turn_metadata.get("large_context_capacity_blocked") is True:
+        from opensquilla.engine.capacity_admission import LargeContextCapacityError
+
+        reason = str(
+            turn_metadata.get("large_context_capacity_block_reason")
+            or "No deployment has proven capacity for this attachment request."
+        )
+        raise LargeContextCapacityError(reason)
+
     if tier_provider_config is not None and hasattr(selector, "override_provider_config"):
         bounded_provider_override = getattr(
             selector,

@@ -507,6 +507,24 @@ async def test_large_material_ratio_floors_low_router_tier_to_t3(
 
 
 @pytest.mark.asyncio
+async def test_large_material_head_honors_global_context_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c3", 0.91, {"route_class": "R3"})
+    ctx = make_context("Please process the attached archive.")
+    object.__setattr__(ctx.config.llm, "context_window_tokens", 80_000)
+    object.__setattr__(ctx.config.llm, "max_tokens", 10_000)
+    ctx.metadata["attachment_material_estimated_tokens"] = 50_000
+
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["large_context_capacity_blocked"] is True
+    assert routed.metadata["large_context_context_window_override_tokens"] == 80_000
+    assert routed.metadata["large_context_max_output_override_tokens"] == 10_000
+    assert "routed_tier" not in routed.metadata
+
+
+@pytest.mark.asyncio
 async def test_anti_downgrade_keeps_recent_higher_tier_despite_confidence_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -937,8 +955,8 @@ async def test_large_image_attachment_bypass_honors_capacity_floor(
     catalog = ModelCatalog()
     catalog.set_user_overrides(
         {
-            "openrouter/vision-small": {
-                "context_window": 128_000,
+            "foreign/vision-small": {
+                "context_window": 300_000,
                 "max_output_tokens": 10_000,
             },
             "openrouter/vision-large": {
@@ -954,7 +972,7 @@ async def test_large_image_attachment_bypass_honors_capacity_floor(
     )
     ctx.config.squilla_router.tiers = {
         "vision_small": {
-            "provider": "openrouter",
+            "provider": "foreign",
             "model": "vision-small",
             "supports_image": True,
             "image_only": True,
@@ -973,7 +991,8 @@ async def test_large_image_attachment_bypass_honors_capacity_floor(
             "thinking_level": "off",
         },
     }
-    ctx.metadata["attachment_material_estimated_tokens"] = 90_000
+    ctx.config.squilla_router.tier_provider_mismatch = "veto"
+    ctx.metadata["attachment_material_estimated_tokens"] = 50_000
 
     routed = await apply_squilla_router(ctx)
 
@@ -981,6 +1000,7 @@ async def test_large_image_attachment_bypass_honors_capacity_floor(
     assert routed.metadata["routed_tier"] == "vision_large"
     assert routed.model == "vision-large"
     assert routed.metadata["router_fallback_chain"] == []
+    assert "router_tier_provider_mismatch" not in routed.metadata
 
 
 @pytest.mark.asyncio
@@ -1019,14 +1039,46 @@ async def test_empty_caption_large_attachment_routes_by_proven_capacity(
             "thinking_level": "off",
         },
     }
-    ctx.metadata["attachment_material_estimated_tokens"] = 90_000
+    ctx.metadata["attachment_material_estimated_tokens"] = 50_000
 
     routed = await apply_squilla_router(ctx)
 
     assert routed.metadata["routing_source"] == "large_context_attachment_route"
+    assert routed.metadata["large_context_floor_min_tier"] == "c3"
     assert routed.metadata["routed_tier"] == "c3"
     assert routed.model == "text-large"
     assert routed.metadata["router_fallback_chain"] == []
+
+
+@pytest.mark.asyncio
+async def test_empty_large_attachment_veto_fails_closed_without_active_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "foreign/text-large": {
+                "context_window": 300_000,
+                "max_output_tokens": 10_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context("", attachments=[{"mime_type": "application/pdf"}])
+    ctx.config.squilla_router.tier_provider_mismatch = "veto"
+    ctx.config.squilla_router.tiers = {
+        "c3": {
+            "provider": "foreign",
+            "model": "text-large",
+            "thinking_level": "off",
+        }
+    }
+    ctx.metadata["attachment_material_estimated_tokens"] = 90_000
+
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["large_context_capacity_blocked"] is True
+    assert "routed_tier" not in routed.metadata
 
 
 @pytest.mark.asyncio
