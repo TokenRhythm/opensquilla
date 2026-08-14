@@ -119,7 +119,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     ?? ((payload) => {
       const item: ChatPendingItem = {
         pendingUiId: `pending-ui-${pendingQueue.value.length}`,
-        text: payload.durableText ?? payload.request.message,
+        text: payload.request.message,
         attachments: [],
         intent: null,
         ownerSessionKey: payload.request.key,
@@ -972,18 +972,9 @@ describe('useChatSend attachment payloads', () => {
     },
   )
 
-  it('sends a queued literal slash Steer with normalized provider text', async () => {
-    const rpc = {
-      call: vi.fn().mockResolvedValue({
-        accepted: true,
-        turn_id: 'turn-current',
-        user_message_id: 'user-literal-steer',
-        disposition: 'steering',
-      }),
-    }
-    const { api, options, pendingQueue, stream } = makeOptions({
+  it('keeps a queued literal slash out of the Steer RPC', async () => {
+    const { api, rpc, stream } = makeOptions({
       ...sameTurnSteerOptions(),
-      rpc,
       busySendMode: ref<BusySendMode>('steer'),
     })
     const queued: ChatPendingItem = {
@@ -992,72 +983,27 @@ describe('useChatSend attachment payloads', () => {
       attachments: [],
       intent: null,
     }
-    pendingQueue.value.push(queued)
     stream.isStreaming.value = true
 
-    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
 
-    expect(rpc.call).toHaveBeenCalledWith('sessions.steer.v2', expect.objectContaining({
-      message: '/coding',
-    }))
-    expect(options.messages.value).toContainEqual(expect.objectContaining({
-      role: 'user',
-      text: '//coding',
-      messageId: 'user-literal-steer',
-    }))
+    expect(rpc.call).not.toHaveBeenCalled()
   })
 
-  it('preserves literal slash intent when a busy Steer falls back to follow-up', async () => {
-    const rpcCall = vi.fn(async (
-      method: string,
-      params?: Record<string, unknown>,
-    ) => {
-      void params
-      if (method === 'sessions.steer.v2') {
-        return {
-          accepted: false,
-          fallback_safe: true,
-          failure_code: 'turn_mismatch',
-        }
-      }
-      if (method === 'chat.send') {
-        return { sessionKey: 'agent:main:webchat:test' }
-      }
-      throw new Error(`unexpected method: ${method}`)
-    })
-    const rpc: UseChatSendOptions['rpc'] = {
-      call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
-        rpcCall(method, params) as Promise<T>
-      ),
-    }
-    const executeSlashCommand = vi.fn(async () => true)
-    const { api, options, pendingQueue, stream } = makeOptions({
+  it('queues a busy literal slash instead of attempting Steer', async () => {
+    const enqueuePendingInput = vi.fn(() => true)
+    const { api, rpc, stream } = makeOptions({
       ...sameTurnSteerOptions(),
-      rpc,
       inputText: ref('//coding'),
       busySendMode: ref<BusySendMode>('steer'),
-      executeSlashCommand,
+      enqueuePendingInput,
     })
     stream.isStreaming.value = true
 
     await api.onSend()
 
-    expect(rpcCall).toHaveBeenCalledWith('sessions.steer.v2', expect.objectContaining({
-      message: '/coding',
-    }))
-    expect(pendingQueue.value).toMatchObject([{
-      text: '//coding',
-    }])
-    expect(pendingQueue.value[0]).not.toHaveProperty('steerAttempt')
-
-    stream.isStreaming.value = false
-    options.activeStreamTaskId.value = ''
-    await expect(api.sendQueuedFollowup(pendingQueue.value[0]!)).resolves.toBe('accepted')
-
-    expect(rpcCall).toHaveBeenCalledWith('chat.send', expect.objectContaining({
-      message: '/coding',
-    }))
-    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(enqueuePendingInput).toHaveBeenCalledWith('//coding', undefined)
+    expect(rpc.call).not.toHaveBeenCalled()
   })
 
   it('falls back safely to the visible pending queue when v2 rejects before admission', async () => {
@@ -6541,6 +6487,68 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     // A registered command is handled by the command path: no chat.send.
     expect(executeSlashCommand).toHaveBeenCalledWith('/coding', 'registered')
     expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('cancels a server-staged row before executing a newly registered command', async () => {
+    const events: string[] = []
+    const cancelDurablePendingItem = vi.fn(async () => {
+      events.push('cancel')
+      return true
+    })
+    const executeSlashCommand = vi.fn(async () => {
+      events.push('execute')
+      return true
+    })
+    const { api, rpc } = makeOptions({
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      cancelDurablePendingItem,
+      executeSlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-staged-registered-slash',
+      text: '/coding',
+      attachments: [],
+      intent: null,
+      confirmedPlainText: true,
+      pendingInputId: 'pending-staged-registered-slash',
+      pendingClientRequestId: 'request-staged-registered-slash',
+      pendingClientMessageId: 'message-staged-registered-slash',
+      pendingRequestFingerprint: 'sha256:staged-registered-slash',
+      pendingPersistenceState: 'staged',
+    }
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
+
+    expect(events).toEqual(['cancel', 'execute'])
+    expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued)
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('keeps a server-staged registered command when its tombstone is unproven', async () => {
+    const cancelDurablePendingItem = vi.fn(async () => false)
+    const executeSlashCommand = vi.fn(async () => true)
+    const { api } = makeOptions({
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      cancelDurablePendingItem,
+      executeSlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-staged-registered-retry',
+      text: '/coding',
+      attachments: [],
+      intent: null,
+      confirmedPlainText: true,
+      pendingInputId: 'pending-staged-registered-retry',
+      pendingClientRequestId: 'request-staged-registered-retry',
+      pendingClientMessageId: 'message-staged-registered-retry',
+      pendingRequestFingerprint: 'sha256:staged-registered-retry',
+      pendingPersistenceState: 'staged',
+    }
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('retryable_failure')
+
+    expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued)
+    expect(executeSlashCommand).not.toHaveBeenCalled()
   })
 
   it.each(['unavailable', 'registered'] as const)(

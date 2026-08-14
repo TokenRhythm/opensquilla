@@ -288,6 +288,35 @@ async def test_pending_input_rejects_unmarked_control_commands(
         assert rejected.error.code == "PENDING_CONTROL_COMMAND_UNSUPPORTED"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    ["/coding", "/reset now", "/clear now", "/plan draft"],
+)
+async def test_pending_input_plain_marker_rejects_registered_web_controls(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    suffix = message.split(maxsplit=1)[0].removeprefix("/")
+    async with _open_real_stack(tmp_path / f"pending-registered-{suffix}.db") as stack:
+        rejected = await get_dispatcher().dispatch(
+            "pending-registered-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-registered",
+                "clientRequestId": "pending-registered-request",
+                "clientMessageId": "pending-registered-message",
+                "message": message,
+                "confirmedPlainText": True,
+            },
+            stack.context,
+        )
+        assert rejected.ok is False
+        assert rejected.error is not None
+        assert rejected.error.code == "PENDING_CONTROL_COMMAND_UNSUPPORTED"
+
+
 async def _seed_idle_active_goal(stack: _RealIngressStack) -> Any:
     """Create a settled active Goal without installing an execution lease."""
 

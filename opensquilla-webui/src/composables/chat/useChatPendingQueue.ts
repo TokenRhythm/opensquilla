@@ -97,7 +97,6 @@ export interface PendingQueuePayload {
 
 export interface PendingSteerPayload {
   request: SessionSteerV2Params
-  durableText?: string
   phase?: PendingSteerPhase
 }
 
@@ -985,7 +984,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const ownerRequestId = resolveOwnerRequestId(owner)
     const item: ChatPendingItem = {
       pendingUiId: request.client_request_id || createClientRequestId(),
-      text: payload.durableText ?? request.message,
+      text: request.message,
       attachments: [],
       intent: null,
       ownerSessionKey: options.sessionKey.value,
@@ -1898,6 +1897,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     removePendingChip,
     beginPendingDelivery,
     settlePendingDelivery,
+    cancelDurableItem,
     clearPendingQueue,
     switchPendingQueue,
     adoptPendingQueue,

@@ -37,6 +37,7 @@ from opensquilla.engine.cache_break_monitor import (
     notify_compaction,
     register_active_compaction,
 )
+from opensquilla.engine.commands import DEFAULT_REGISTRY, Surface
 from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
 from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
@@ -5376,6 +5377,19 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
     )
     if not isinstance(confirmed_plain_text, bool):
         raise ValueError("params.confirmedPlainText must be a boolean")
+    if confirmed_plain_text:
+        command_head = control.split(maxsplit=1)[0].casefold()
+        registered_heads = {"/plan"}
+        for command in DEFAULT_REGISTRY.for_surface(Surface.WEB_CHAT):
+            registered_heads.add(command.name.casefold())
+            registered_heads.update(alias.casefold() for alias in command.aliases)
+        if command_head in registered_heads:
+            raise RpcHandlerError(
+                "PENDING_CONTROL_COMMAND_UNSUPPORTED",
+                "Registered client control commands cannot be staged for later dispatch",
+                retryable=False,
+                accepted=False,
+            )
     display_control = display_text.strip() if display_text is not None else ""
     literal_slash_escape = (
         control.startswith("/")

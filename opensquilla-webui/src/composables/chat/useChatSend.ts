@@ -384,6 +384,7 @@ export interface UseChatSendOptions {
     },
     owner?: PendingQueueOwner,
   ) => boolean | Promise<boolean>
+  cancelDurablePendingItem?: (item: ChatPendingItem) => Promise<boolean>
   enqueueHiddenControl?: (
     item: {
       text: string
@@ -607,9 +608,8 @@ export function useChatSend(options: UseChatSendOptions) {
     attachments: readonly Attachment[],
     intent: string | null,
     forkBeforeMessageId: string | null,
-    allowLiteralSlash = false,
   ): boolean {
-    return (!isControlInput(text) || allowLiteralSlash)
+    return !isControlInput(text)
       && attachments.length === 0
       && !intent
       && !forkBeforeMessageId
@@ -620,16 +620,9 @@ export function useChatSend(options: UseChatSendOptions) {
     attachments: readonly Attachment[],
     intent: string | null,
     forkBeforeMessageId: string | null,
-    allowLiteralSlash = false,
   ): boolean {
     return supportsSameTurnSteer()
-      && isPlainSteerPayload(
-        text,
-        attachments,
-        intent,
-        forkBeforeMessageId,
-        allowLiteralSlash,
-      )
+      && isPlainSteerPayload(text, attachments, intent, forkBeforeMessageId)
       && !options.isCompactInFlightForCurrentSession()
       && !responseHandoffBlocksCurrentSession()
   }
@@ -1435,7 +1428,6 @@ export function useChatSend(options: UseChatSendOptions) {
     optionsForSteer: {
       composerSnapshot?: ComposerSnapshot
       queuedItem?: ChatPendingItem
-      durableText?: string
     } = {},
   ): Promise<ChatSendOutcome> {
     const requestSessionKey = options.sessionKey.value
@@ -1443,9 +1435,6 @@ export function useChatSend(options: UseChatSendOptions) {
     const recovered = pendingItem
       ? options.steerDelivery.attemptForItem(pendingItem)
       : null
-    const durableSteerText = (optionsForSteer.durableText ?? pendingItem?.text ?? text).trim()
-    const literalSlashEscape = durableSteerText.startsWith('//')
-      && durableSteerText.slice(1) === text.trim()
     if (!requestSessionKey || !text.trim()) return 'not_sent'
     if (!options.supportsMethod?.('sessions.steer.v2')) {
       return recovered ? 'retryable_failure' : 'not_sent'
@@ -1457,7 +1446,6 @@ export function useChatSend(options: UseChatSendOptions) {
         pendingItem ? pendingItem.attachments : options.pendingAttachments.value,
         pendingItem ? pendingItem.intent : options.pendingSessionIntent.value,
         pendingItem ? null : options.pendingForkBeforeMessageId.value,
-        literalSlashEscape,
       )
     ) return 'not_sent'
     if (options.sendBlockedReason?.value || options.hasPendingAttachmentWork()) {
@@ -1488,9 +1476,6 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!pendingItem) {
       pendingItem = options.enqueuePendingSteerAttempt?.({
         request: freshParams,
-        ...(optionsForSteer.durableText
-          ? { durableText: optionsForSteer.durableText }
-          : {}),
         phase: 'submitting',
       }, pendingQueueOwner()) || undefined
       if (!pendingItem) return 'not_sent'
@@ -1793,10 +1778,9 @@ export function useChatSend(options: UseChatSendOptions) {
             composerSnapshot.payloadAttachments,
             composerSnapshot.intent,
             composerSnapshot.forkBeforeMessageId,
-            isLiteralSlash,
           )
         ) {
-          await dispatchSteerV2(text, { composerSnapshot, durableText })
+          await dispatchSteerV2(text, { composerSnapshot })
           return
         }
         // Surface a full queue instead of silently dropping the send: the draft is
@@ -1953,6 +1937,10 @@ export function useChatSend(options: UseChatSendOptions) {
         if (item.attachments.length > 0) {
           return preserveRetryState('retryable_failure')
         }
+        if (
+          serverStagedItem
+          && !await options.cancelDurablePendingItem?.(item)
+        ) return preserveRetryState('retryable_failure')
         return await options.executeSlashCommand(item.text.trim(), 'registered')
           ? 'accepted'
           : preserveRetryState('retryable_failure')
@@ -1980,10 +1968,8 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     if (delivery === 'steer') {
-      return dispatchSteerV2(dispatchText, {
-        queuedItem: item,
-        durableText: item.text,
-      })
+      if (text.startsWith('//')) return preserveRetryState('not_sent')
+      return dispatchSteerV2(text, { queuedItem: item })
     }
     const outcome = await dispatchSend(dispatchText, {
       composerText: item.text,
