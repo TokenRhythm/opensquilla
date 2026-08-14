@@ -2047,6 +2047,7 @@ async def _resolve_session_node(storage: Any, key: str) -> Any:
 _SESSION_COUNT_VIEW = "session-count-v1"
 _SESSION_LIST_VIEW = "session-list-v1"
 _SESSION_LIST_CURSOR_VERSION = 1
+_MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 
 def _encode_session_list_cursor(cursor: SessionListCursor | None) -> str | None:
@@ -2091,8 +2092,10 @@ def _decode_session_list_cursor(value: Any) -> SessionListCursor | None:
     if (
         isinstance(activity_at, bool)
         or not isinstance(activity_at, int)
+        or not 0 <= activity_at <= _MAX_SQLITE_INTEGER
         or isinstance(updated_at, bool)
         or not isinstance(updated_at, int)
+        or not 0 <= updated_at <= _MAX_SQLITE_INTEGER
         or not isinstance(session_key, str)
         or not session_key
         or len(session_key) > 512

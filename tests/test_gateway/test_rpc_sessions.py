@@ -1259,6 +1259,39 @@ class TestSessionsList:
         assert res.ok is False
         assert res.error.code == "INVALID_PARAMS"
 
+    @pytest.mark.parametrize(
+        ("timestamp_field", "timestamp_value"),
+        [("a", -1), ("a", 1 << 63), ("u", -1), ("u", 1 << 63)],
+    )
+    @pytest.mark.asyncio
+    async def test_session_list_view_rejects_cursor_timestamps_outside_sqlite_range(
+        self,
+        dispatcher,
+        timestamp_field,
+        timestamp_value,
+    ):
+        ctx = make_ctx(session_manager=FakeSessionManager())
+        payload = {
+            "v": 1,
+            "a": 1,
+            "u": 1,
+            "k": "agent:main:webchat:cursor-range",
+        }
+        payload[timestamp_field] = timestamp_value
+        cursor = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
+
+        res = await dispatcher.dispatch(
+            "out-of-range-cursor",
+            "sessions.list",
+            {"limit": 200, "view": "session-list-v1", "cursor": cursor},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+
     @pytest.mark.asyncio
     async def test_session_list_view_marks_legacy_storage_page_terminal(self, dispatcher):
         ctx = make_ctx(
