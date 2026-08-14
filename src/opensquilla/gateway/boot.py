@@ -58,6 +58,7 @@ from opensquilla.gateway.session_streams import get_session_streams, reset_sessi
 from opensquilla.gateway.terminal_activity import (
     append_activity_phase,
     is_usage_accounting_barrier,
+    safe_primary_user_message_id,
     safe_retry_after_ms,
     terminal_activity_snapshot,
     usage_barrier_replay_proof,
@@ -1782,6 +1783,7 @@ async def _emit_task_runtime_stream_events(
         "no_prior_provider_dispatch": False,
         "replay_safe": False,
     }
+    primary_user_message_id = safe_primary_user_message_id(user_message_id)
     async for event in wrap_stream(
         raw_stream,
         idle_timeout=idle_timeout,
@@ -1900,6 +1902,8 @@ async def _emit_task_runtime_stream_events(
                     event_dict["retryable"] = True
                     event_dict.update(replay_proof)
                     outcome.update(replay_proof)
+                    if primary_user_message_id is not None:
+                        outcome["user_message_id"] = primary_user_message_id
                     if task_id:
                         activity_snapshot = terminal_activity_snapshot(
                             activity_phases,
@@ -1936,8 +1940,8 @@ async def _emit_task_runtime_stream_events(
             event_dict["session_id"] = session_id
         if client_message_id:
             event_dict["client_message_id"] = client_message_id
-        if user_message_id:
-            event_dict["user_message_id"] = user_message_id
+        if primary_user_message_id is not None:
+            event_dict["user_message_id"] = primary_user_message_id
         if surface_id:
             event_dict["surface_id"] = surface_id
         if input_mode:

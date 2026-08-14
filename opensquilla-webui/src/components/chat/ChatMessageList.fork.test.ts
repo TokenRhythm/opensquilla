@@ -24,7 +24,11 @@ function user(id: string, turnKey: string, turnId?: string): ChatRenderedMessage
   }
 }
 
-function usageBarrierError(id: string, turnId: string): ChatRenderedMessage {
+function usageBarrierError(
+  id: string,
+  turnId: string,
+  userMessageId?: string,
+): ChatRenderedMessage {
   return {
     id,
     messageId: id,
@@ -42,6 +46,7 @@ function usageBarrierError(id: string, turnId: string): ChatRenderedMessage {
       usageCallIndex: 1,
       noPriorProviderDispatch: true,
       replaySafe: true,
+      ...(userMessageId ? { userMessageId } : {}),
     },
   }
 }
@@ -156,7 +161,8 @@ describe('ChatMessageList usage barrier retry anchor', () => {
   it('shows Retry when the durable same-turn user is loaded', () => {
     const { host } = mountList([
       user('user-safe', 'turn:safe', 'turn-safe'),
-      usageBarrierError('error-safe', 'turn-safe'),
+      user('user-steer', 'turn:safe-steer', 'turn-safe'),
+      usageBarrierError('error-safe', 'turn-safe', 'user-safe'),
     ])
 
     expect(host.querySelector('.msg-error-card__resume')?.textContent).toContain('Retry')
@@ -165,7 +171,19 @@ describe('ChatMessageList usage barrier retry anchor', () => {
   it('hides Retry when pagination only retained a previous-turn user', () => {
     const { host } = mountList([
       user('user-old', 'turn:old', 'turn-old'),
-      usageBarrierError('error-new', 'turn-new'),
+      usageBarrierError('error-new', 'turn-new', 'user-new'),
+    ])
+
+    expect(host.querySelector('.msg-error-card__resume')).toBeNull()
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['wrong', 'user-steer'],
+  ])('hides Retry when the primary-user identity is %s', (_label, userMessageId) => {
+    const { host } = mountList([
+      user('user-primary', 'turn:safe', 'turn-safe'),
+      usageBarrierError('error-safe', 'turn-safe', userMessageId),
     ])
 
     expect(host.querySelector('.msg-error-card__resume')).toBeNull()

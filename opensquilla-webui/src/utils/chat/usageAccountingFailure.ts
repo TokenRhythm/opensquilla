@@ -26,7 +26,7 @@ type UsageBarrierRetryMessage = {
   role?: unknown
   turnId?: unknown
   messageId?: unknown
-  turnOutcome?: { turnId?: unknown } | null
+  turnOutcome?: unknown
 }
 
 function durableText(value: unknown): string {
@@ -35,9 +35,18 @@ function durableText(value: unknown): string {
 
 export function usageBarrierRetryTurnId(message: UsageBarrierRetryMessage): string {
   const directTurnId = durableText(message.turnId)
-  const outcomeTurnId = durableText(message.turnOutcome?.turnId)
+  const outcomeTurnId = durableText(record(message.turnOutcome).turnId)
   if (directTurnId && outcomeTurnId && directTurnId !== outcomeTurnId) return ''
   return directTurnId || outcomeTurnId
+}
+
+export function hasStrictUsageBarrierReplayProof(
+  message: UsageBarrierRetryMessage,
+): boolean {
+  const outcome = record(message.turnOutcome)
+  return outcome.usageCallIndex === 1
+    && outcome.noPriorProviderDispatch === true
+    && outcome.replaySafe === true
 }
 
 export function usageBarrierRetryUserMessageIndex(
@@ -46,13 +55,21 @@ export function usageBarrierRetryUserMessageIndex(
   errorMessage: UsageBarrierRetryMessage,
 ): number {
   const turnId = usageBarrierRetryTurnId(errorMessage)
-  if (!turnId || beforeIndex <= 0 || beforeIndex > messages.length) return -1
+  const primaryUserMessageId = durableText(
+    record(errorMessage.turnOutcome).userMessageId,
+  )
+  if (
+    !turnId
+    || !primaryUserMessageId
+    || beforeIndex <= 0
+    || beforeIndex > messages.length
+  ) return -1
   for (let index = beforeIndex - 1; index >= 0; index--) {
     const candidate = messages[index]
     if (
       candidate?.role === 'user'
       && durableText(candidate.turnId) === turnId
-      && durableText(candidate.messageId)
+      && durableText(candidate.messageId) === primaryUserMessageId
     ) {
       return index
     }

@@ -266,6 +266,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
       usage_call_index: 1,
       no_prior_provider_dispatch: true,
       replay_safe: true,
+      user_message_id: 'user-primary',
       activity_snapshot: activitySnapshot,
       turn_outcome: {
         kind: 'blocked',
@@ -275,6 +276,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
         usage_call_index: 1,
         no_prior_provider_dispatch: true,
         replay_safe: true,
+        user_message_id: 'user-primary',
       },
     })
     api.handlers.onAny('task.failed', {
@@ -296,8 +298,36 @@ describe('issue #344 — live stream is bound to a single task', () => {
         kind: 'blocked',
         retryable: true,
         replaySafe: true,
+        userMessageId: 'user-primary',
       },
     })
+    scope.stop()
+  })
+
+  it('drops a conflicting live primary-user identity', () => {
+    const { api, messages, scope } = makeHarness('task-B')
+
+    api.handlers.onAny('session.event.error', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      code: 'usage_accounting_busy',
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      user_message_id: 'user-primary',
+      turn_outcome: {
+        kind: 'blocked',
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+        user_message_id: 'user-steer',
+      },
+    })
+
+    expect(messages.value[messages.value.length - 1]?.turnOutcome).toMatchObject({
+      replaySafe: true,
+    })
+    expect(messages.value[messages.value.length - 1]?.turnOutcome?.userMessageId).toBeUndefined()
     scope.stop()
   })
 

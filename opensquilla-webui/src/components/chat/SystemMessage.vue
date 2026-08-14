@@ -51,7 +51,10 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { absoluteTime, fullTime, isoTime } from '@/utils/messageTime'
-import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
+import {
+  hasStrictUsageBarrierReplayProof,
+  isUsageAccountingBarrier,
+} from '@/utils/chat/usageAccountingFailure'
 
 const { t } = useI18n()
 
@@ -83,9 +86,7 @@ const isUsageBarrier = computed(
 const showRetry = computed(
   () =>
     isUsageBarrier.value
-    && props.message.turnOutcome?.usageCallIndex === 1
-    && props.message.turnOutcome?.noPriorProviderDispatch === true
-    && props.message.turnOutcome?.replaySafe === true
+    && hasStrictUsageBarrierReplayProof(props.message)
     && props.retryAvailable === true,
 )
 const errorHeading = computed(() =>

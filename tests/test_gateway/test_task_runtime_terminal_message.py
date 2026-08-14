@@ -172,6 +172,7 @@ async def test_usage_barrier_stream_error_emits_typed_retry_and_activity_snapsho
             "agent:main:test",
             _emitter,
             task_id="task-usage-busy",
+            user_message_id="user-primary",
             idle_timeout=1.0,
             heartbeat_interval=0.0,
         )
@@ -184,6 +185,8 @@ async def test_usage_barrier_stream_error_emits_typed_retry_and_activity_snapsho
     assert payload["usage_call_index"] == 1
     assert payload["no_prior_provider_dispatch"] is True
     assert payload["replay_safe"] is True
+    assert payload["user_message_id"] == "user-primary"
+    assert payload["turn_outcome"]["user_message_id"] == "user-primary"
     assert payload["turn_outcome"]["kind"] == "blocked"
     assert payload["turn_outcome"]["retryable"] is True
     snapshot = payload["activity_snapshot"]
@@ -228,7 +231,12 @@ async def test_usage_barrier_task_failed_matches_rich_terminal_contract() -> Non
         )
 
     runtime = _make_runtime(_handler, event_emitter=_emitter)
-    handle = await runtime.enqueue(_make_envelope(), "hello")
+    handle = await runtime.enqueue(
+        _make_envelope(),
+        "hello",
+        persisted_user_message_id="user-primary",
+        persisted_user_message_ids=("user-primary", "user-steer"),
+    )
     record = await runtime.wait(handle.task_id, timeout=2.0)
 
     payload = next(event[2] for event in emitted if event[1] == "task.failed")
@@ -242,6 +250,9 @@ async def test_usage_barrier_task_failed_matches_rich_terminal_contract() -> Non
     assert payload["retryable"] is True
     assert payload["retry_after_ms"] == 125
     assert payload["replay_safe"] is True
+    assert payload["user_message_id"] == "user-primary"
+    assert payload["turn_outcome"]["user_message_id"] == "user-primary"
+    assert record.details["turn_outcome"]["user_message_id"] == "user-primary"
     assert payload["turn_outcome"] == record.details["turn_outcome"]
     assert payload["activity_snapshot"] == record.details["activity_snapshot"]
     assert "safe to retry" in payload["terminal_message"].lower()

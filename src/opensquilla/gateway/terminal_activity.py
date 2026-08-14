@@ -41,6 +41,15 @@ def safe_retry_after_ms(value: object) -> int | None:
     return min(parsed, _MAX_RETRY_AFTER_MS)
 
 
+def safe_primary_user_message_id(value: object) -> str | None:
+    """Return one non-empty authoritative transcript message id."""
+
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 def usage_barrier_replay_proof(
     *,
     usage_call_index: object,
@@ -153,6 +162,7 @@ __all__ = [
     "USAGE_ACCOUNTING_BARRIER_CODES",
     "append_activity_phase",
     "is_usage_accounting_barrier",
+    "safe_primary_user_message_id",
     "safe_retry_after_ms",
     "terminal_activity_snapshot",
     "usage_barrier_replay_proof",

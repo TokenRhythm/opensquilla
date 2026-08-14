@@ -269,6 +269,7 @@ export interface ChatTurnOutcome {
   usageCallIndex?: number
   noPriorProviderDispatch?: boolean
   replaySafe?: boolean
+  userMessageId?: string
 }
 
 export interface ChatRunTask {

@@ -29,6 +29,7 @@ from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatc
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.terminal_activity import (
     is_usage_accounting_barrier,
+    safe_primary_user_message_id,
     safe_retry_after_ms,
     terminal_activity_snapshot,
     usage_barrier_replay_proof,
@@ -265,6 +266,14 @@ async def _chat_history_turn_outcomes(
             projected["error_class"] = error_class
             projected["retryable"] = True
             projected.update(replay_proof)
+            outcome.pop("user_message_id", None)
+            outcome.pop("userMessageId", None)
+            primary_user_message_id = safe_primary_user_message_id(
+                details.get("persisted_user_message_id")
+            )
+            if primary_user_message_id is not None:
+                projected["user_message_id"] = primary_user_message_id
+                outcome["user_message_id"] = primary_user_message_id
             projected["terminal_message"] = build_terminal_reply(
                 {
                     "status": status,

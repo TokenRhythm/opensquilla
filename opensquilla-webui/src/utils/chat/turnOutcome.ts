@@ -63,6 +63,12 @@ export function normalizeTurnOutcome(
     ?? nested.replay_safe
     ?? nested.replaySafe,
   )
+  const directUserMessageId = text(record.user_message_id ?? record.userMessageId)
+  const nestedUserMessageId = text(nested.user_message_id ?? nested.userMessageId)
+  const userMessageId = directUserMessageId && nestedUserMessageId
+    && directUserMessageId !== nestedUserMessageId
+    ? ''
+    : directUserMessageId || nestedUserMessageId
   const errorClass = text(
     record.error_class
     ?? record.errorClass
@@ -111,6 +117,7 @@ export function normalizeTurnOutcome(
       ? { noPriorProviderDispatch: provedNoPriorProviderDispatch }
       : {}),
     ...(hasUsageReplayProof ? { replaySafe: provedReplaySafe } : {}),
+    ...(userMessageId ? { userMessageId } : {}),
     ...(errorClass ? { errorClass } : {}),
     ...(terminalMessage ? { terminalMessage } : {}),
     ...(Number.isFinite(retryAfter) && retryAfter > 0 ? { retryAfterMs: retryAfter } : {}),

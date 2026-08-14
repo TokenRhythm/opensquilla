@@ -44,6 +44,7 @@ from opensquilla.gateway.session_lifecycle import (
 )
 from opensquilla.gateway.terminal_activity import (
     is_usage_accounting_barrier,
+    safe_primary_user_message_id,
     safe_retry_after_ms,
     terminal_activity_snapshot,
     usage_barrier_replay_proof,
@@ -5905,6 +5906,11 @@ class TaskRuntime:
                 )
                 turn_outcome.update(replay_proof)
                 details.update(replay_proof)
+                primary_user_message_id = safe_primary_user_message_id(
+                    task.persisted_user_message_id
+                )
+                if primary_user_message_id is not None:
+                    turn_outcome["user_message_id"] = primary_user_message_id
                 safe_retry = safe_retry_after_ms(retry_after_ms)
                 if safe_retry is not None:
                     turn_outcome["retry_after_ms"] = safe_retry

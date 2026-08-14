@@ -647,7 +647,12 @@ async def test_chat_history_projects_usage_barrier_retry_and_activity_snapshot(t
     await manager.create(session_key)
     try:
         with turn_context_scope({"turn_id": "turn-usage"}):
-            await manager.append_message(session_key, "user", "retry this")
+            primary_user = await manager.append_message(
+                session_key, "user", "retry this"
+            )
+            steer_user = await manager.append_message(
+                session_key, "user", "same-turn steer"
+            )
             await manager.append_message(
                 session_key,
                 "system",
@@ -672,8 +677,16 @@ async def test_chat_history_projects_usage_barrier_retry_and_activity_snapshot(t
                         "reason": "usage_accounting_busy",
                         "error_class": "usage_accounting_busy",
                         "retryable": True,
+                        # The persisted primary id is authoritative over a
+                        # stale nested projection that points at a Steer.
+                        "user_message_id": steer_user.message_id,
                     },
                     "retry_after_ms": 100,
+                    "persisted_user_message_id": primary_user.message_id,
+                    "persisted_user_message_ids": [
+                        primary_user.message_id,
+                        steer_user.message_id,
+                    ],
                     "usage_call_index": 1,
                     "no_prior_provider_dispatch": True,
                     "replay_safe": True,
@@ -706,6 +719,8 @@ async def test_chat_history_projects_usage_barrier_retry_and_activity_snapshot(t
         assert outcome["usage_call_index"] == 1
         assert outcome["no_prior_provider_dispatch"] is True
         assert outcome["replay_safe"] is True
+        assert outcome["user_message_id"] == primary_user.message_id
+        assert outcome["outcome"]["user_message_id"] == primary_user.message_id
         assert outcome["activity_snapshot"]["phases"] == [
             {"kind": "router", "phase": "decided", "at": 1_000},
             {"kind": "state", "phase": "thinking", "at": 1_100},

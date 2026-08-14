@@ -2082,6 +2082,7 @@ describe('useChatHistory optimistic local rows', () => {
           usage_call_index: 1,
           no_prior_provider_dispatch: true,
           replay_safe: true,
+          user_message_id: 'user-usage',
           terminal_message: 'server fallback',
           activity_snapshot: {
             version: 1,
@@ -2100,6 +2101,7 @@ describe('useChatHistory optimistic local rows', () => {
             usage_call_index: 1,
             no_prior_provider_dispatch: true,
             replay_safe: true,
+            user_message_id: 'user-usage',
           },
         }],
         has_more: false,
@@ -2125,6 +2127,7 @@ describe('useChatHistory optimistic local rows', () => {
       errorCode: 'usage_accounting_busy',
       terminalNotice: true,
       text: 'The provider request was not sent and no usage was billed. You can safely retry this turn.',
+      turnOutcome: expect.objectContaining({ userMessageId: 'user-usage' }),
     })
   })
 
@@ -2149,6 +2152,7 @@ describe('useChatHistory optimistic local rows', () => {
           usage_call_index: 1,
           no_prior_provider_dispatch: true,
           replay_safe: true,
+          user_message_id: 'user-usage',
           terminal_message: 'server fallback',
           activity_snapshot: {
             version: 1,
@@ -2174,7 +2178,10 @@ describe('useChatHistory optimistic local rows', () => {
       terminalNotice: true,
       restoredFromHistory: true,
       text: 'The provider request was not sent and no usage was billed. You can safely retry this turn.',
-      turnOutcome: expect.objectContaining({ turnId: 'turn-usage' }),
+      turnOutcome: expect.objectContaining({
+        turnId: 'turn-usage',
+        userMessageId: 'user-usage',
+      }),
     })
   })
 

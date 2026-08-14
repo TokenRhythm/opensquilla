@@ -5,7 +5,7 @@ import { nextTick, ref } from 'vue'
 
 import { useChatMessageActions, type UseChatMessageActionsOptions } from './useChatMessageActions'
 import { useChatTextRendering } from './useChatTextRendering'
-import type { ChatMessage, ChatRenderedMessage } from '@/types/chat'
+import type { ChatMessage, ChatRenderedMessage, ChatTurnOutcome } from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
 
 vi.mock('@/utils/browser', () => ({
@@ -21,6 +21,21 @@ function renderedMessage(overrides: Partial<ChatRenderedMessage>): ChatRenderedM
     timeStr: '',
     showHeader: false,
     ...overrides,
+  }
+}
+
+function safeUsageOutcome(
+  turnId: string,
+  userMessageId = 'msg-user',
+): ChatTurnOutcome {
+  return {
+    turnId,
+    status: 'failed',
+    retryable: true,
+    usageCallIndex: 1,
+    noPriorProviderDispatch: true,
+    replaySafe: true,
+    userMessageId,
   }
 }
 
@@ -136,6 +151,7 @@ describe('useChatMessageActions branching edits', () => {
       messageId: 'terminal-error:task-1',
       errorCode: 'usage_accounting_busy',
       turnId: 'turn-1',
+      turnOutcome: safeUsageOutcome('turn-1'),
       text: 'Usage accounting temporarily unavailable.',
     }))
     await nextTick()
@@ -145,6 +161,51 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.inputText.value).toBe('bill this safely')
     expect(options.sendCurrentInput).toHaveBeenCalledOnce()
     expect(accepted).toBe(true)
+  })
+
+  it('retries the authoritative primary user instead of a later same-turn steer', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'error',
+        text: 'Usage accounting temporarily unavailable.',
+        ts: null,
+        messageId: 'terminal-error:task-1',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-1',
+      },
+    ])
+
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: 2,
+      messageId: 'terminal-error:task-1',
+      errorCode: 'usage_accounting_busy',
+      turnId: 'turn-1',
+      turnOutcome: safeUsageOutcome('turn-1', 'msg-primary'),
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(true)
+    expect(pendingForkBeforeMessageId.value).toBe('msg-primary')
+    expect(options.messages.value).toEqual([])
+    expect(options.inputText.value).toBe('primary request')
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
   })
 
   it.each([
@@ -227,6 +288,78 @@ describe('useChatMessageActions branching edits', () => {
       messageId: messages[messages.length - 1]?.messageId,
       errorCode: 'usage_accounting_busy',
       turnId,
+      turnOutcome: safeUsageOutcome(turnId || '', 'missing-or-pending-user'),
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['missing proof', undefined],
+    ['second call', {
+      ...safeUsageOutcome('turn-safe'),
+      usageCallIndex: 2,
+    }],
+    ['string call index', {
+      ...safeUsageOutcome('turn-safe'),
+      usageCallIndex: '1',
+    } as unknown as ChatTurnOutcome],
+    ['false no-prior proof', {
+      ...safeUsageOutcome('turn-safe'),
+      noPriorProviderDispatch: false,
+    }],
+    ['false replay-safe proof', {
+      ...safeUsageOutcome('turn-safe'),
+      replaySafe: false,
+    }],
+    ['missing primary user id', {
+      ...safeUsageOutcome('turn-safe'),
+      userMessageId: undefined,
+    }],
+    ['wrong primary user id', {
+      ...safeUsageOutcome('turn-safe'),
+      userMessageId: 'msg-steer',
+    }],
+    ['conflicting second-call proof', {
+      ...safeUsageOutcome('turn-safe'),
+      usageCallIndex: 2,
+      noPriorProviderDispatch: true,
+      replaySafe: true,
+    }],
+  ])('rejects programmatic usage retry with %s', async (_label, turnOutcome) => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'user',
+        text: 'do not resend without proof',
+        ts: null,
+        messageId: 'msg-user',
+        turnId: 'turn-safe',
+      },
+      {
+        role: 'error',
+        text: 'Usage accounting temporarily unavailable.',
+        ts: null,
+        messageId: 'terminal-error:task-safe',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-safe',
+      },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: 1,
+      messageId: 'terminal-error:task-safe',
+      errorCode: 'usage_accounting_busy',
+      turnId: 'turn-safe',
+      turnOutcome,
       text: 'Usage accounting temporarily unavailable.',
     }))
     await nextTick()

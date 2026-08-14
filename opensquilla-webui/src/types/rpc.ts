@@ -688,6 +688,7 @@ export interface ChatHistoryTurnOutcome {
   usage_call_index?: number
   no_prior_provider_dispatch?: boolean
   replay_safe?: boolean
+  user_message_id?: string
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {
