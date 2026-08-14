@@ -7,6 +7,10 @@ import type {
 import { copyTextWithFallback } from '@/utils/browser'
 import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 import { turnOutcomePresentation } from '@/utils/chat/turnOutcome'
+import {
+  isUsageAccountingBarrier,
+  usageBarrierRetryUserMessageIndex,
+} from '@/utils/chat/usageAccountingFailure'
 import { sanitizeAssistantPresentationSegments } from '@/utils/chat/silentSentinels'
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
 
@@ -139,7 +143,10 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       return false
     }
     const assistantIndex = sourceMessageIndex(message)
-    const userMsgIndex = previousUserMessageIndex(assistantIndex)
+    const usageBarrierRetry = isUsageAccountingBarrier(message.errorCode)
+    const userMsgIndex = usageBarrierRetry
+      ? usageBarrierRetryUserMessageIndex(options.messages.value, assistantIndex, message)
+      : previousUserMessageIndex(assistantIndex)
     if (userMsgIndex < 0) {
       console.warn('No previous message to regenerate')
       return false

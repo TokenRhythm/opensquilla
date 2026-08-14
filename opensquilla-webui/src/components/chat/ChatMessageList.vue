@@ -106,6 +106,7 @@
           :message="messages[entry.index]"
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
+          :retry-available="usageBarrierRetryAvailable(entry.index)"
           @resume="$emit('resumeSandbox')"
           @retry="forwardSystemRetry"
         />
@@ -149,6 +150,10 @@ import {
 } from '@/composables/chat/useChatGoals'
 import type { PlanCardAction, PlanCardActionTarget } from '@/types/plans'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
+import {
+  isUsageAccountingBarrier,
+  usageBarrierRetryUserMessageIndex,
+} from '@/utils/chat/usageAccountingFailure'
 import {
   buildVariableWindow,
   CHAT_HISTORY_VIRTUALIZATION_THRESHOLD,
@@ -225,6 +230,15 @@ function forwardSystemRetry(
   settle: (accepted: boolean) => void,
 ) {
   emit('regenerateMessage', message, settle)
+}
+
+function usageBarrierRetryAvailable(index: number): boolean {
+  const message = props.messages[index]
+  return Boolean(
+    message
+    && isUsageAccountingBarrier(message.errorCode)
+    && usageBarrierRetryUserMessageIndex(props.messages, index, message) >= 0,
+  )
 }
 
 const listRootRef = ref<HTMLElement | null>(null)

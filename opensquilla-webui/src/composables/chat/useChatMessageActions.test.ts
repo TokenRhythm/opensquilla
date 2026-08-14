@@ -105,7 +105,13 @@ describe('useChatMessageActions branching edits', () => {
 
   it('retries a usage-accounting error through the normal durable regenerate path', async () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
-      { role: 'user', text: 'bill this safely', ts: null, messageId: 'msg-user' },
+      {
+        role: 'user',
+        text: 'bill this safely',
+        ts: null,
+        messageId: 'msg-user',
+        turnId: 'turn-1',
+      },
       {
         role: 'assistant',
         text: '',
@@ -119,6 +125,7 @@ describe('useChatMessageActions branching edits', () => {
         ts: null,
         messageId: 'terminal-error:task-1',
         errorCode: 'usage_accounting_busy',
+        turnId: 'turn-1',
       },
     ])
 
@@ -128,6 +135,7 @@ describe('useChatMessageActions branching edits', () => {
       sourceIndex: 2,
       messageId: 'terminal-error:task-1',
       errorCode: 'usage_accounting_busy',
+      turnId: 'turn-1',
       text: 'Usage accounting temporarily unavailable.',
     }))
     await nextTick()
@@ -137,6 +145,97 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.inputText.value).toBe('bill this safely')
     expect(options.sendCurrentInput).toHaveBeenCalledOnce()
     expect(accepted).toBe(true)
+  })
+
+  it.each([
+    [
+      'the current page only has a previous-turn user',
+      [
+        {
+          role: 'user',
+          text: 'previous turn',
+          ts: null,
+          messageId: 'msg-old',
+          turnId: 'turn-old',
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:task-new',
+          errorCode: 'usage_accounting_busy',
+          turnId: 'turn-new',
+        },
+      ] satisfies ChatMessage[],
+      'turn-new',
+    ],
+    [
+      'the error has no durable turn id',
+      [
+        {
+          role: 'user',
+          text: 'unknown turn',
+          ts: null,
+          messageId: 'msg-user',
+          turnId: 'turn-known',
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:task-unknown',
+          errorCode: 'usage_accounting_busy',
+        },
+      ] satisfies ChatMessage[],
+      undefined,
+    ],
+    [
+      'the same-turn user is not durable',
+      [
+        {
+          role: 'user',
+          text: 'previous durable turn',
+          ts: null,
+          messageId: 'msg-old',
+          turnId: 'turn-old',
+        },
+        {
+          role: 'user',
+          text: 'same turn but pending',
+          ts: null,
+          clientId: 'client-new',
+          turnId: 'turn-new',
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:task-new',
+          errorCode: 'usage_accounting_busy',
+          turnId: 'turn-new',
+        },
+      ] satisfies ChatMessage[],
+      'turn-new',
+    ],
+  ])('fails closed when %s', async (_label, messages, turnId) => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: messages.length - 1,
+      messageId: messages[messages.length - 1]?.messageId,
+      errorCode: 'usage_accounting_busy',
+      turnId,
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
   })
 
   it('preserves history, fork state, and the current draft when live delivery is unavailable', async () => {

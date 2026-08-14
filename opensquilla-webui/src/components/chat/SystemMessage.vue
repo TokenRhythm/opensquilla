@@ -59,6 +59,7 @@ const props = defineProps<{
   message: ChatRenderedMessage
   subagentSummary: (text: string) => string
   subagentBody: (text: string) => string
+  retryAvailable?: boolean
 }>()
 
 // Owner-driven recovery: a run paused by the sandbox denial ledger surfaces as a
@@ -84,7 +85,8 @@ const showRetry = computed(
     isUsageBarrier.value
     && props.message.turnOutcome?.usageCallIndex === 1
     && props.message.turnOutcome?.noPriorProviderDispatch === true
-    && props.message.turnOutcome?.replaySafe === true,
+    && props.message.turnOutcome?.replaySafe === true
+    && props.retryAvailable === true,
 )
 const errorHeading = computed(() =>
   isUsageBarrier.value ? t('chat.usageAccountingBlockedTitle') : t('chat.turnFailed'),

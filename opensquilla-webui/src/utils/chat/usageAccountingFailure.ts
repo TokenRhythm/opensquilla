@@ -22,6 +22,44 @@ export function isUsageAccountingBarrier(code: unknown): boolean {
   return USAGE_ACCOUNTING_CODES.has(text(code))
 }
 
+type UsageBarrierRetryMessage = {
+  role?: unknown
+  turnId?: unknown
+  messageId?: unknown
+  turnOutcome?: { turnId?: unknown } | null
+}
+
+function durableText(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+export function usageBarrierRetryTurnId(message: UsageBarrierRetryMessage): string {
+  const directTurnId = durableText(message.turnId)
+  const outcomeTurnId = durableText(message.turnOutcome?.turnId)
+  if (directTurnId && outcomeTurnId && directTurnId !== outcomeTurnId) return ''
+  return directTurnId || outcomeTurnId
+}
+
+export function usageBarrierRetryUserMessageIndex(
+  messages: readonly UsageBarrierRetryMessage[],
+  beforeIndex: number,
+  errorMessage: UsageBarrierRetryMessage,
+): number {
+  const turnId = usageBarrierRetryTurnId(errorMessage)
+  if (!turnId || beforeIndex <= 0 || beforeIndex > messages.length) return -1
+  for (let index = beforeIndex - 1; index >= 0; index--) {
+    const candidate = messages[index]
+    if (
+      candidate?.role === 'user'
+      && durableText(candidate.turnId) === turnId
+      && durableText(candidate.messageId)
+    ) {
+      return index
+    }
+  }
+  return -1
+}
+
 export function usageAccountingErrorCode(value: unknown): string | undefined {
   const outer = record(value)
   const outcome = record(outer.turn_outcome ?? outer.turnOutcome ?? outer.outcome)

@@ -26,6 +26,7 @@ async function mountMsg(
     message: ChatRenderedMessage,
     settle: (accepted: boolean) => void,
   ) => void,
+  retryAvailable = false,
 ) {
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -35,6 +36,7 @@ async function mountMsg(
     subagentBody: (t: string) => t,
     onResume,
     onRetry,
+    retryAvailable,
   })
   app.use(i18n)
   app.mount(el)
@@ -106,7 +108,7 @@ describe('SystemMessage sandbox resume', () => {
         replaySafe: true,
       },
     })
-    const { app, el } = await mountMsg(message, undefined, onRetry)
+    const { app, el } = await mountMsg(message, undefined, onRetry, true)
 
     expect(el.querySelector('.msg-error-card__heading')?.textContent).toContain(
       'Usage accounting temporarily unavailable',
@@ -141,7 +143,7 @@ describe('SystemMessage sandbox resume', () => {
         noPriorProviderDispatch: false,
         replaySafe: false,
       },
-    }))
+    }), undefined, undefined, true)
 
     expect(el.querySelector('.msg-error-card__heading')?.textContent).toContain(
       'Usage accounting temporarily unavailable',
@@ -192,7 +194,23 @@ describe('SystemMessage sandbox resume', () => {
     const { app, el } = await mountMsg(errorMessage({
       errorCode: 'usage_accounting_busy',
       turnOutcome,
+    }), undefined, undefined, true)
+    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    app.unmount()
+  })
+
+  it('hides a proven-safe retry when its durable same-turn user is unavailable', async () => {
+    const { app, el } = await mountMsg(errorMessage({
+      errorCode: 'usage_accounting_busy',
+      turnOutcome: {
+        turnId: 'turn-missing-user',
+        status: 'failed',
+        usageCallIndex: 1,
+        noPriorProviderDispatch: true,
+        replaySafe: true,
+      },
     }))
+
     expect(el.querySelector('.msg-error-card__resume')).toBeNull()
     app.unmount()
   })

@@ -9,7 +9,7 @@ import ChatMessageList from './ChatMessageList.vue'
 
 const apps: App<Element>[] = []
 
-function user(id: string, turnKey: string): ChatRenderedMessage {
+function user(id: string, turnKey: string, turnId?: string): ChatRenderedMessage {
   return {
     id,
     messageId: id,
@@ -20,6 +20,29 @@ function user(id: string, turnKey: string): ChatRenderedMessage {
     text: `Question ${id}`,
     timeStr: '',
     showHeader: false,
+    turnId,
+  }
+}
+
+function usageBarrierError(id: string, turnId: string): ChatRenderedMessage {
+  return {
+    id,
+    messageId: id,
+    turnId,
+    role: 'error',
+    displayRole: 'error',
+    roleLabel: 'Error',
+    text: 'Usage accounting temporarily unavailable.',
+    timeStr: '',
+    showHeader: true,
+    errorCode: 'usage_accounting_busy',
+    turnOutcome: {
+      turnId,
+      status: 'failed',
+      usageCallIndex: 1,
+      noPriorProviderDispatch: true,
+      replaySafe: true,
+    },
   }
 }
 
@@ -126,5 +149,25 @@ describe('ChatMessageList fork targets', () => {
     ], { isStreaming: true })
 
     expect(host.querySelector('[data-testid="fork-conversation"]')).toBeNull()
+  })
+})
+
+describe('ChatMessageList usage barrier retry anchor', () => {
+  it('shows Retry when the durable same-turn user is loaded', () => {
+    const { host } = mountList([
+      user('user-safe', 'turn:safe', 'turn-safe'),
+      usageBarrierError('error-safe', 'turn-safe'),
+    ])
+
+    expect(host.querySelector('.msg-error-card__resume')?.textContent).toContain('Retry')
+  })
+
+  it('hides Retry when pagination only retained a previous-turn user', () => {
+    const { host } = mountList([
+      user('user-old', 'turn:old', 'turn-old'),
+      usageBarrierError('error-new', 'turn-new'),
+    ])
+
+    expect(host.querySelector('.msg-error-card__resume')).toBeNull()
   })
 })
