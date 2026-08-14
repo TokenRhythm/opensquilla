@@ -745,6 +745,7 @@
       "tests/test_session/test_session_delete_purges_meta_runs.py",
       "tests/test_session/test_spawn_lock_eviction.py",
       "tests/test_session/test_storage_count_batch.py",
+      "tests/test_session/test_storage_session_list_pagination.py",
       "tests/test_session/test_storage_transactions.py",
       "tests/test_session/test_tokenizer.py",
       "tests/test_session/test_turn_acceptance_storage.py",

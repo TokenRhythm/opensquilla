@@ -491,6 +491,10 @@ export interface ChatMessage {
   /** Stable client-only identity for optimistic rows before the backend assigns messageId. */
   clientId?: string
   reasoning?: ChatReasoning
+  /** Structured physical-call reasoning retained across live-to-history sync. */
+  reasoningBlocks?: import('./turnlog').ReasoningBlock[]
+  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
+  reasoningPresentationPending?: boolean
   routerDecision?: import('./rpc').RouterDecisionPayload | null
   artifacts?: ArtifactPayload[]
   tool_calls?: RawToolCallPayload[]
@@ -616,6 +620,10 @@ export interface ChatRenderedMessage {
   artifacts?: ArtifactPayload[]
   meta?: ChatMessageMeta
   reasoning?: ChatReasoning
+  /** Structured physical-call reasoning retained across live-to-history sync. */
+  reasoningBlocks?: import('./turnlog').ReasoningBlock[]
+  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
+  reasoningPresentationPending?: boolean
   interrupted?: boolean
   /** The turn ended with a terminal error after this partial assistant output. */
   terminalFailure?: boolean

@@ -1876,6 +1876,7 @@
     "refresh": "刷新",
     "refreshing": "正在刷新…",
     "loading": "正在加载任务…",
+    "loadMore": "加载更多会话",
     "unknownAgent": "未知智能体",
     "deletedAgent": "已删除的智能体 · {id}",
     "msgCount": "{count} 条消息",
@@ -3480,12 +3481,14 @@
       "lifecycle": {
         "working": "正在工作",
         "answering": "正在组织回答",
+        "answerPrepared": "组织回答",
         "settled": "已完成",
         "interrupted": "已中断",
         "failed": "已失败"
       },
       "provider": {
         "waiting": "等待模型",
+        "responded": "模型响应",
         "reasoning": "深度思考",
         "rateLimited": "受到限流 · {seconds} 秒后重试",
         "retryWait": "{seconds} 秒后重试",
@@ -4089,6 +4092,7 @@
       "loadError": "无法加载任务",
       "noMatches": "无匹配项",
       "noConversations": "暂无任务。",
+      "allLoaded": "已加载全部任务",
       "startChat": "开始任务",
       "linkSessions": "会话",
       "currentTask": "当前任务",

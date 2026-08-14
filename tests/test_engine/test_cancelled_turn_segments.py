@@ -16,6 +16,7 @@ from opensquilla.gateway.config import AttachmentsConfig, GatewayConfig, Squilla
 from opensquilla.gateway.usage_ledger_runtime import SessionUsageEventSink
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import Message, ModelInfo
+from opensquilla.provider import ReasoningDeltaEvent as ProviderReasoning
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
@@ -64,6 +65,27 @@ class _ToolThenCompletedTextProvider(_ToolThenHangingTextProvider):
             return
         yield ProviderText(text=PARTIAL_ANSWER)
         yield ProviderDone(stop_reason="end_turn", input_tokens=1, output_tokens=1)
+
+
+class _HangingReasoningProvider:
+    """Stream visible reasoning without answer text, then wait for Stop."""
+
+    provider_name = "test"
+
+    def __init__(self) -> None:
+        self.model = "test/model"
+        self.reasoning_consumed = asyncio.Event()
+
+    def chat(self, messages: list[Message], tools=None, config=None) -> AsyncIterator[Any]:
+        return self._stream()
+
+    async def _stream(self) -> AsyncIterator[Any]:
+        yield ProviderReasoning(text="partial reasoning")
+        self.reasoning_consumed.set()
+        await asyncio.Event().wait()
+
+    async def list_models(self) -> list[ModelInfo]:
+        return []
 
 
 class _HangingSystemEventProvider:
@@ -243,6 +265,67 @@ async def test_cancelled_turn_persists_trailing_text_segment(tmp_path) -> None:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reasoning_only_turn_persists_assistant_history(tmp_path) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:webchat:cancel-reasoning-only"
+    await manager.create(session_key)
+    provider = _HangingReasoningProvider()
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),  # type: ignore[arg-type]
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+
+    async def _consume() -> None:
+        async for _event in runner.run(
+            "reason before answering",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            no_memory_capture=True,
+        ):
+            pass
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(provider.reasoning_consumed.wait(), timeout=5.0)
+        await asyncio.sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            pytest.fail("Expected CancelledError when awaiting cancelled task")
+
+        transcript = await manager.get_transcript(session_key)
+        assistants = [entry for entry in transcript if entry.role == "assistant"]
+        assert len(assistants) == 1
+        assert assistants[0].content == ""
+        assert assistants[0].reasoning_content == "partial reasoning"
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                # Cancellation is the expected cleanup outcome for this task.
+                pass
         await storage.close()
 
 

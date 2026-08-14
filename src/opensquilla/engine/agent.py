@@ -297,8 +297,10 @@ from .types import (
     RunHeartbeatEvent,
     StateChangeEvent,
     TextDeltaEvent,
+    ThinkingEndEvent,
     ThinkingEvent,
     ThinkingLevel,
+    ThinkingStartEvent,
     ToolCall,
     ToolResult,
     ToolResultEvent,
@@ -6499,7 +6501,7 @@ class Agent:
         self._current_turn_message = message
         _meta_invoke_turn_count.set(0)
         usage_scope = current_usage_accounting_scope()
-        reasoning_started_at_ms = 0
+        reasoning_block_index = 0
 
         # ------ IDLE → THINKING ------
         yield self._transition(AgentState.THINKING)
@@ -7837,6 +7839,25 @@ class Agent:
                     provider_error_for_log: ProviderErrorEvent | None = None
                     cost_receipt_counted = False
                     call_id = f"{iterations}.{_call_attempt}"
+                    reasoning_block_id = ""
+                    reasoning_started_at_ms = 0
+                    active_reasoning_block_index = -1
+
+                    def _finish_reasoning_block(
+                        status: Literal["completed", "interrupted", "error"],
+                    ) -> ThinkingEndEvent | None:
+                        nonlocal reasoning_block_id
+                        if not reasoning_block_id:
+                            return None
+                        event = ThinkingEndEvent(
+                            block_id=reasoning_block_id,
+                            block_index=active_reasoning_block_index,
+                            status=status,
+                            ended_at=time.time_ns() // 1_000_000,
+                        )
+                        reasoning_block_id = ""
+                        return event
+
                     call_started_at = time.monotonic()
                     provider_tools_for_call = (
                         None
@@ -8441,6 +8462,10 @@ class Agent:
                                 )
 
                             elif isinstance(raw_ev, ProviderTextDelta):
+                                if raw_ev.text:
+                                    reasoning_end = _finish_reasoning_block("completed")
+                                    if reasoning_end is not None:
+                                        yield reasoning_end
                                 assistant_text_parts.append(raw_ev.text)
                                 if raw_ev.text:
                                     attempt_user_visible_emitted = True
@@ -8471,42 +8496,53 @@ class Agent:
                                 # answer: re-emit as ThinkingEvent and keep it
                                 # out of assistant_text_parts. The joined text
                                 # still arrives via DoneEvent.reasoning_content.
-                                if raw_ev.text and reasoning_started_at_ms == 0:
+                                if not raw_ev.text:
+                                    continue
+                                if not reasoning_block_id:
                                     reasoning_started_at_ms = time.time_ns() // 1_000_000
-                                if raw_ev.text:
-                                    # Bare providers reach Agent without the
-                                    # selector's pre-text buffer. This thinking
-                                    # delta therefore crosses the live-client
-                                    # boundary immediately and cannot later be
-                                    # discarded in favour of another attempt.
-                                    attempt_irreversible_output_emitted = True
-                                    now_monotonic = time.monotonic()
-                                    first_reasoning_activity = (
-                                        reasoning_activity_started_at_ms == 0
+                                    active_reasoning_block_index = reasoning_block_index
+                                    reasoning_block_index += 1
+                                    reasoning_block_id = (
+                                        f"reasoning-{iterations}-{_call_attempt}-"
+                                        f"{active_reasoning_block_index}"
                                     )
-                                    if first_reasoning_activity:
-                                        reasoning_activity_started_at_ms = (
-                                            time.time_ns() // 1_000_000
-                                        )
-                                    if (
-                                        first_reasoning_activity
-                                        or now_monotonic
-                                        - last_reasoning_activity_pulse_at
-                                        >= _PROVIDER_REASONING_PULSE_INTERVAL_SECONDS
-                                    ):
-                                        yield ProviderActivityEvent(
-                                            activity_id=provider_activity_id,
-                                            phase="reasoning",
-                                            reason="initial",
-                                            retry_attempt=_retry_attempt,
-                                            retry_limit=_fallback.max_retries,
-                                            started_at=reasoning_activity_started_at_ms,
-                                            heartbeat=not first_reasoning_activity,
-                                        )
-                                        last_reasoning_activity_pulse_at = now_monotonic
+                                    yield ThinkingStartEvent(
+                                        block_id=reasoning_block_id,
+                                        block_index=active_reasoning_block_index,
+                                        started_at=reasoning_started_at_ms,
+                                    )
+                                # Bare providers reach Agent without the
+                                # selector's pre-text buffer. This thinking
+                                # delta therefore crosses the live-client
+                                # boundary immediately and cannot later be
+                                # discarded in favour of another attempt.
+                                attempt_irreversible_output_emitted = True
+                                now_monotonic = time.monotonic()
+                                first_reasoning_activity = reasoning_activity_started_at_ms == 0
+                                if first_reasoning_activity:
+                                    reasoning_activity_started_at_ms = (
+                                        time.time_ns() // 1_000_000
+                                    )
+                                if (
+                                    first_reasoning_activity
+                                    or now_monotonic - last_reasoning_activity_pulse_at
+                                    >= _PROVIDER_REASONING_PULSE_INTERVAL_SECONDS
+                                ):
+                                    yield ProviderActivityEvent(
+                                        activity_id=provider_activity_id,
+                                        phase="reasoning",
+                                        reason="initial",
+                                        retry_attempt=_retry_attempt,
+                                        retry_limit=_fallback.max_retries,
+                                        started_at=reasoning_activity_started_at_ms,
+                                        heartbeat=not first_reasoning_activity,
+                                    )
+                                    last_reasoning_activity_pulse_at = now_monotonic
                                 yield ThinkingEvent(
                                     text=raw_ev.text,
                                     started_at=reasoning_started_at_ms,
+                                    block_id=reasoning_block_id,
+                                    block_index=active_reasoning_block_index,
                                 )
                                 if (
                                     wrapup_margin_seconds > 0
@@ -8708,6 +8744,9 @@ class Agent:
                                         break  # break stream, retry sans thinking
 
                             elif isinstance(raw_ev, ProviderToolUseStart):
+                                reasoning_end = _finish_reasoning_block("completed")
+                                if reasoning_end is not None:
+                                    yield reasoning_end
                                 if not tools_supported_for_call:
                                     if (
                                         artifact_delivery_final_response_pending
@@ -8757,6 +8796,9 @@ class Agent:
                                 )
 
                             elif isinstance(raw_ev, ProviderToolUseDelta):
+                                reasoning_end = _finish_reasoning_block("completed")
+                                if reasoning_end is not None:
+                                    yield reasoning_end
                                 if not tools_supported_for_call:
                                     continue
                                 delta_tool_use_id = raw_ev.tool_use_id
@@ -8808,6 +8850,9 @@ class Agent:
                                     )
 
                             elif isinstance(raw_ev, ToolUseEndEvent):
+                                reasoning_end = _finish_reasoning_block("completed")
+                                if reasoning_end is not None:
+                                    yield reasoning_end
                                 if not tools_supported_for_call:
                                     if (
                                         artifact_delivery_final_response_pending
@@ -9281,7 +9326,19 @@ class Agent:
                                     cost_usd=raw_ev.cost_usd,
                                     error=raw_ev.error,
                                 )
+                        reasoning_end = _finish_reasoning_block(
+                            "completed"
+                            if _got_done_event
+                            else "error"
+                            if provider_error is not None
+                            else "interrupted"
+                        )
+                        if reasoning_end is not None:
+                            yield reasoning_end
                     except _IterationStreamTimeoutError:
+                        reasoning_end = _finish_reasoning_block("error")
+                        if reasoning_end is not None:
+                            yield reasoning_end
                         usage_unknown_reason = "iteration_timeout"
                         _notify_call_outcome(ok=False, failure_kind="iteration_timeout")
                         if artifact_delivery_final_response_pending:
@@ -9322,6 +9379,9 @@ class Agent:
                         usage_unknown_reason = "cancelled"
                         raise
                     except TimeoutError as exc:
+                        reasoning_end = _finish_reasoning_block("error")
+                        if reasoning_end is not None:
+                            yield reasoning_end
                         enforced_stream_deadline = getattr(
                             exc,
                             _STREAM_DEADLINE_ATTRIBUTE,
@@ -9410,6 +9470,9 @@ class Agent:
                             ok=False,
                             failure_kind=usage_unknown_reason,
                         )
+                        reasoning_end = _finish_reasoning_block("error")
+                        if reasoning_end is not None:
+                            yield reasoning_end
                         raise
                     except _RaisedProviderBoundaryError:
                         # Some SDKs raise from call creation or async iteration
@@ -9418,6 +9481,9 @@ class Agent:
                         # content-free marker.  Exceptions raised while the
                         # engine applies pending input or processes events stay
                         # internal and propagate unchanged.
+                        reasoning_end = _finish_reasoning_block("error")
+                        if reasoning_end is not None:
+                            yield reasoning_end
                         usage_unknown_reason = "provider_exception"
                         _notify_call_outcome(
                             ok=False,

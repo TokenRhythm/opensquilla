@@ -1825,6 +1825,7 @@
     "refresh": "Actualiser",
     "refreshing": "Actualisation…",
     "loading": "Chargement des sessions…",
+    "loadMore": "Charger plus de sessions",
     "unknownAgent": "Agent inconnu",
     "deletedAgent": "Agent supprimé · {id}",
     "msgCount": "{count} msg",
@@ -3427,12 +3428,14 @@
       "lifecycle": {
         "working": "En cours",
         "answering": "Rédaction de la réponse",
+        "answerPrepared": "Préparation de la réponse",
         "settled": "Terminé",
         "interrupted": "Interrompu",
         "failed": "Échec"
       },
       "provider": {
         "waiting": "En attente du modèle",
+        "responded": "Réponse du modèle",
         "reasoning": "Réflexion approfondie",
         "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
         "retryWait": "Nouvel essai dans {seconds}s",
@@ -4036,6 +4039,7 @@
       "loadError": "Impossible de charger les tâches",
       "noMatches": "Aucune correspondance",
       "noConversations": "Aucune tâche pour l'instant.",
+      "allLoaded": "Toutes les tâches sont chargées",
       "startChat": "Démarrer une tâche",
       "linkSessions": "Sessions",
       "currentTask": "Tâche actuelle",

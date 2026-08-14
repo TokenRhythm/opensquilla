@@ -130,6 +130,12 @@ export interface SessionsListResponse {
   /** Exact number of sessions visible to the caller, independent of page size. */
   totalCount?: number
   total_count?: number
+  /** Whether another stable session-list page is available. */
+  hasMore?: boolean
+  has_more?: boolean
+  /** Opaque keyset cursor for the next session-list page. */
+  nextCursor?: string | null
+  next_cursor?: string | null
 }
 
 export interface ProjectWorkspaceItem {

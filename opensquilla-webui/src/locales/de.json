@@ -1825,6 +1825,7 @@
     "refresh": "Aktualisieren",
     "refreshing": "Wird aktualisiert…",
     "loading": "Sitzungen werden geladen…",
+    "loadMore": "Weitere Sitzungen laden",
     "unknownAgent": "Unbekannter Agent",
     "deletedAgent": "Gelöschter Agent · {id}",
     "msgCount": "{count} Nachr.",
@@ -3427,12 +3428,14 @@
       "lifecycle": {
         "working": "In Arbeit",
         "answering": "Antwort wird verfasst",
+        "answerPrepared": "Antwortformulierung",
         "settled": "Abgeschlossen",
         "interrupted": "Unterbrochen",
         "failed": "Fehlgeschlagen"
       },
       "provider": {
         "waiting": "Warten auf das Modell",
+        "responded": "Modellantwort",
         "reasoning": "Tiefes Nachdenken",
         "rateLimited": "Ratenlimit · neuer Versuch in {seconds}s",
         "retryWait": "Neuer Versuch in {seconds}s",
@@ -4036,6 +4039,7 @@
       "loadError": "Aufgaben konnten nicht geladen werden",
       "noMatches": "Keine Treffer",
       "noConversations": "Noch keine Aufgaben.",
+      "allLoaded": "Alle Aufgaben geladen",
       "startChat": "Aufgabe starten",
       "linkSessions": "Sitzungen",
       "currentTask": "Aktuelle Aufgabe",

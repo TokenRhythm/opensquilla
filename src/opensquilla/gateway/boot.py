@@ -1786,6 +1786,11 @@ async def _emit_task_runtime_stream_events(
                 if not key.startswith("_")
             }
         event_kind = event_dict.pop("kind", getattr(event, "kind", event.__class__.__name__))
+        if event_kind == "thinking" and not event_dict.get("block_id"):
+            # Preserve the exact legacy payload for producers that still
+            # construct an unscoped ThinkingEvent.
+            event_dict.pop("block_id", None)
+            event_dict.pop("block_index", None)
         append_activity_phase(
             activity_phases,
             event_kind=event_kind,

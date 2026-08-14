@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
 import json
@@ -168,6 +169,7 @@ from opensquilla.session.storage import (
     PendingChatInputConflictError,
     PendingChatInputNotFoundError,
     PlanImplementationSessionBusyError,
+    SessionListCursor,
     SessionStorage,
     StaleEpochError,
     StorageBusyError,
@@ -2043,6 +2045,83 @@ async def _resolve_session_node(storage: Any, key: str) -> Any:
 
 
 _SESSION_COUNT_VIEW = "session-count-v1"
+_SESSION_LIST_VIEW = "session-list-v1"
+_SESSION_LIST_CURSOR_VERSION = 1
+_SESSION_LIST_CURSOR_MAX_CHARS = 8192
+_MAX_SQLITE_INTEGER = (1 << 63) - 1
+
+
+def _encode_session_list_cursor(cursor: SessionListCursor | None) -> str | None:
+    if cursor is None:
+        return None
+    payload = json.dumps(
+        {
+            "v": _SESSION_LIST_CURSOR_VERSION,
+            "a": cursor.activity_at,
+            "u": cursor.updated_at,
+            "k": cursor.session_key,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_session_list_cursor(value: Any) -> SessionListCursor | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _SESSION_LIST_CURSOR_MAX_CHARS
+    ):
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        )
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(base64.b64decode(value + padding, altchars=b"-_", validate=True))
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("v") != _SESSION_LIST_CURSOR_VERSION:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        )
+    activity_at = payload.get("a")
+    updated_at = payload.get("u")
+    session_key = payload.get("k")
+    if (
+        isinstance(activity_at, bool)
+        or not isinstance(activity_at, int)
+        or not 0 <= activity_at <= _MAX_SQLITE_INTEGER
+        or isinstance(updated_at, bool)
+        or not isinstance(updated_at, int)
+        or not 0 <= updated_at <= _MAX_SQLITE_INTEGER
+        or not isinstance(session_key, str)
+        or not session_key
+        or len(session_key) > 512
+    ):
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        )
+    try:
+        session_key.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        ) from exc
+    return SessionListCursor(
+        activity_at=activity_at,
+        updated_at=updated_at,
+        session_key=session_key,
+    )
 
 
 @_d.method("sessions.list", scope="operator.read")
@@ -2051,11 +2130,21 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
     now_ms = int(time.time() * 1000)
     request = params or {}
     count_only = request.get("view") == _SESSION_COUNT_VIEW
+    paginated = request.get("view") == _SESSION_LIST_VIEW
 
     def empty_payload() -> dict[str, Any]:
         payload: dict[str, Any] = {"sessions": [], "count": 0, "ts": now_ms}
         if count_only:
             payload.update({"totalCount": 0, "total_count": 0})
+        if paginated:
+            payload.update(
+                {
+                    "has_more": False,
+                    "hasMore": False,
+                    "next_cursor": None,
+                    "nextCursor": None,
+                }
+            )
         return payload
 
     if ctx.session_manager is None:
@@ -2066,6 +2155,12 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         return empty_payload()
 
     limit = request.get("limit", 50)
+    cursor = _decode_session_list_cursor(request.get("cursor")) if paginated else None
+    if request.get("cursor") is not None and not paginated:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor requires view=session-list-v1",
+        )
     from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, guest_owns_session_key
 
     is_guest = GuestRpcPolicy.is_guest(ctx)
@@ -2094,20 +2189,50 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
                     "ts": now_ms,
                 }
 
-    if is_guest:
+    if paginated:
+        try:
+            page_limit = int(limit)
+        except (TypeError, ValueError):
+            page_limit = 50
+        page_limit = max(1, page_limit)
+        if is_guest:
+            page_limit = min(page_limit, 100)
+        list_page = getattr(storage, "list_sessions_page", None)
+        if callable(list_page):
+            page = await list_page(
+                limit=page_limit,
+                cursor=cursor,
+                guest_owner_id=owner_id if is_guest else None,
+            )
+            sessions = page.sessions
+            has_more = bool(page.has_more)
+            next_cursor = _encode_session_list_cursor(page.next_cursor)
+        else:
+            # Additive compatibility for older storage adapters and test
+            # doubles: return one legacy page and mark it terminal so a newer
+            # client never loops over the same first page.
+            legacy_kwargs: dict[str, Any] = {"limit": page_limit}
+            if is_guest:
+                legacy_kwargs["guest_owner_id"] = owner_id
+            sessions = await storage.list_sessions(**legacy_kwargs)
+            has_more = False
+            next_cursor = None
+    elif is_guest:
         try:
             guest_limit = int(limit)
         except (TypeError, ValueError):
             guest_limit = 50
         limit = max(1, min(guest_limit, 100))
         sessions = await storage.list_sessions(limit=limit, guest_owner_id=owner_id)
+    else:
+        sessions = await storage.list_sessions(limit=limit)
+
+    if is_guest:
         sessions = [
             session
             for session in sessions
             if guest_owns_session_key(owner_id, getattr(session, "session_key", None))
         ]
-    else:
-        sessions = await storage.list_sessions(limit=limit)
     task_rows_by_session = await _list_task_rows_by_session(
         ctx,
         storage,
@@ -2196,7 +2321,17 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         row.update(_workspace_metadata_for_session(s, ctx.config))
         result.append(row)
 
-    return {"sessions": result, "count": len(result), "ts": now_ms}
+    payload = {"sessions": result, "count": len(result), "ts": now_ms}
+    if paginated:
+        payload.update(
+            {
+                "has_more": has_more,
+                "hasMore": has_more,
+                "next_cursor": next_cursor,
+                "nextCursor": next_cursor,
+            }
+        )
+    return payload
 
 
 async def _titles_for_keys(
@@ -3893,6 +4028,9 @@ async def _handle_sessions_send_impl(
             ):
                 event_dict = asdict(event)
                 event_kind = event_dict.pop("kind", event.__class__.__name__)
+                if event_kind == "thinking" and not event_dict.get("block_id"):
+                    event_dict.pop("block_id", None)
+                    event_dict.pop("block_index", None)
                 if event_kind == "artifact":
                     event_dict = enrich_artifact_event_dict(event_dict)
                 if event_kind in ("done", "error"):

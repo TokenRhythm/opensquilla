@@ -174,7 +174,61 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
       { kind: 'text', seq: 2, text: 'answer' },
     ])
     expect(f.thinkingText).toBe('pondering')
+    expect(f.reasoningBlocks).toMatchObject([{
+      id: 'legacy-reasoning',
+      index: 0,
+      text: 'pondering',
+      status: 'streaming',
+      startedAt: 1,
+    }])
     expect(f.rawText).toBe('answer')
+  })
+
+  it('preserves multiple reasoning blocks and their terminal states', () => {
+    const f = fold([
+      { kind: 'thinking-start', seq: 0, blockId: 'r1', blockIndex: 0, at: 100 },
+      { kind: 'thinking', seq: 1, blockId: 'r1', blockIndex: 0, text: 'plan', at: 100 },
+      { kind: 'thinking-end', seq: 2, blockId: 'r1', blockIndex: 0, status: 'completed', at: 200 },
+      { kind: 'tool-start', seq: 3, toolId: 't', name: 'bash', input: '{}', at: 250 },
+      { kind: 'tool-result', seq: 4, toolId: 't', name: 'bash', result: 'ok', isError: false, input: '{}', at: 300 },
+      { kind: 'thinking-start', seq: 5, blockId: 'r2', blockIndex: 1, at: 400 },
+      { kind: 'thinking', seq: 6, blockId: 'r2', blockIndex: 1, text: 'review', at: 400 },
+      { kind: 'thinking-end', seq: 7, blockId: 'r2', blockIndex: 1, status: 'interrupted', at: 500 },
+    ])
+
+    expect(f.thinkingText).toBe('planreview')
+    expect(f.reasoningBlocks).toEqual([
+      {
+        id: 'r1',
+        index: 0,
+        text: 'plan',
+        status: 'completed',
+        startedAt: 100,
+        endedAt: 200,
+        contentKind: 'reasoning',
+      },
+      {
+        id: 'r2',
+        index: 1,
+        text: 'review',
+        status: 'interrupted',
+        startedAt: 400,
+        endedAt: 500,
+        contentKind: 'reasoning',
+      },
+    ])
+  })
+
+  it('settles a prior block when a newer boundary arrives without an end event', () => {
+    const f = fold([
+      { kind: 'thinking', seq: 0, blockId: 'r1', blockIndex: 0, text: 'first', at: 100 },
+      { kind: 'thinking', seq: 1, blockId: 'r2', blockIndex: 1, text: 'second', at: 200 },
+    ])
+
+    expect(f.reasoningBlocks.map(block => [block.id, block.status, block.endedAt])).toEqual([
+      ['r1', 'completed', 200],
+      ['r2', 'streaming', undefined],
+    ])
   })
 
   it('records status transitions in arrival order with monotonic timestamps', () => {
@@ -271,10 +325,70 @@ describe('TurnAccumulator — incremental live projection', () => {
     const replayed = fold(events)
     expect(incremental.rawText).toBe(replayed.rawText)
     expect(incremental.thinkingText).toBe(replayed.thinkingText)
+    expect(incremental.reasoningBlocks).toEqual(replayed.reasoningBlocks)
     expect(incremental.timelineSegments).toEqual(replayed.timelineSegments)
     expect(incremental.toolCalls).toEqual(replayed.toolCalls)
     expect(incremental.statusHistory).toEqual(replayed.statusHistory)
     expect(incremental.parts).toEqual(replayed.parts)
+  })
+
+  it('publishes reasoning blocks before answer text and settles the previous block', () => {
+    const accumulator = new TurnAccumulator()
+    accumulator.append({
+      kind: 'thinking-start',
+      seq: 0,
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      at: 100,
+    })
+    accumulator.append({
+      kind: 'thinking',
+      seq: 1,
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      text: 'first live delta',
+      at: 110,
+    })
+
+    const first = accumulator.snapshot(renderMarkdown, toolCallGroups)
+    expect(first.rawText).toBe('')
+    expect(first.reasoningBlocks).toEqual([expect.objectContaining({
+      id: 'reasoning-1',
+      text: 'first live delta',
+      status: 'streaming',
+    })])
+
+    accumulator.append({
+      kind: 'thinking-start',
+      seq: 2,
+      blockId: 'reasoning-2',
+      blockIndex: 1,
+      at: 200,
+    })
+    accumulator.append({
+      kind: 'thinking',
+      seq: 3,
+      blockId: 'reasoning-2',
+      blockIndex: 1,
+      text: 'second live delta',
+      at: 210,
+    })
+
+    const second = accumulator.snapshot(renderMarkdown, toolCallGroups)
+    expect(second.reasoningBlocks).toEqual([
+      expect.objectContaining({
+        id: 'reasoning-1',
+        text: 'first live delta',
+        status: 'completed',
+        endedAt: 200,
+      }),
+      expect.objectContaining({
+        id: 'reasoning-2',
+        text: 'second live delta',
+        status: 'streaming',
+      }),
+    ])
+    expect(first.reasoningBlocks[0]?.status).toBe('streaming')
   })
 
   it('does not invoke Markdown for a tool-only burst', () => {

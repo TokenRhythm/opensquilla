@@ -2637,25 +2637,43 @@ class _SelectorFallbackProvider:
                     continue
 
                 if isinstance(event, ProviderReasoningDeltaEvent) and event.text:
-                    now_monotonic = time.monotonic()
-                    first_reasoning = primary_reasoning_started_at_ms == 0
-                    if first_reasoning:
-                        primary_reasoning_started_at_ms = time.time_ns() // 1_000_000
-                    if (
-                        first_reasoning
-                        or now_monotonic - primary_reasoning_last_pulse_at
-                        >= _SELECTOR_REASONING_PULSE_INTERVAL_SECONDS
-                    ):
-                        yield ProviderActivityEvent(
-                            activity_id=primary_activity_id,
-                            phase="reasoning",
-                            reason="initial",
-                            started_at=primary_reasoning_started_at_ms,
-                            heartbeat=not first_reasoning,
-                        )
-                        primary_reasoning_last_pulse_at = now_monotonic
-                    pre_text_buffer.append(event)
-                    continue
+                    if pre_text_buffer.has_incomplete_tool_call:
+                        # Reasoning is user-visible, but it cannot commit a leg
+                        # whose provisional tool lifecycle is still open. Doing
+                        # so would release an argument prefix that a later error
+                        # should discard before selector fallback.
+                        pre_text_buffer.drain(successful_leg=False)
+                        event = _selector_invalid_stream_order_error()
+                    else:
+                        now_monotonic = time.monotonic()
+                        first_reasoning = primary_reasoning_started_at_ms == 0
+                        if first_reasoning:
+                            primary_reasoning_started_at_ms = time.time_ns() // 1_000_000
+                        if (
+                            first_reasoning
+                            or now_monotonic - primary_reasoning_last_pulse_at
+                            >= _SELECTOR_REASONING_PULSE_INTERVAL_SECONDS
+                        ):
+                            yield ProviderActivityEvent(
+                                activity_id=primary_activity_id,
+                                phase="reasoning",
+                                reason="initial",
+                                started_at=primary_reasoning_started_at_ms,
+                                heartbeat=not first_reasoning,
+                            )
+                            primary_reasoning_last_pulse_at = now_monotonic
+                        # Reasoning is a live client surface, so its first non-empty
+                        # delta commits this physical leg exactly like answer text.
+                        # Keeping it provisional until text arrived made the selector
+                        # collapse an entire reasoning stream into one late event.
+                        # Once exposed, a later failure must stay on this leg rather
+                        # than silently mixing a fallback model into the same turn.
+                        for buffered_event in pre_text_buffer.drain(successful_leg=True):
+                            yield buffered_event
+                        emitted_user_visible_content = True
+                        self._record_health_success()
+                        yield event
+                        continue
 
                 if (
                     not isinstance(event, ProviderErrorEvent)
@@ -2870,6 +2888,14 @@ class _SelectorFallbackProvider:
                                 isinstance(fallback_event, ProviderReasoningDeltaEvent)
                                 and fallback_event.text
                             ):
+                                if fallback_buffer.has_incomplete_tool_call:
+                                    fallback_buffer.drain(successful_leg=False)
+                                    invalid_order_error = (
+                                        _selector_invalid_stream_order_error()
+                                    )
+                                    self._record_health_failure(invalid_order_error)
+                                    yield invalid_order_error
+                                    return
                                 now_monotonic = time.monotonic()
                                 first_reasoning = fallback_reasoning_started_at_ms == 0
                                 if first_reasoning:
@@ -2889,7 +2915,16 @@ class _SelectorFallbackProvider:
                                         heartbeat=not first_reasoning,
                                     )
                                     fallback_reasoning_last_pulse_at = now_monotonic
-                                fallback_buffer.append(fallback_event)
+                                # The fallback leg follows the same visible commit
+                                # boundary as the primary: reasoning streams live,
+                                # and no later leg may replace it invisibly.
+                                for buffered_event in fallback_buffer.drain(
+                                    successful_leg=True
+                                ):
+                                    yield buffered_event
+                                fallback_committed = True
+                                self._record_health_success()
+                                yield fallback_event
                                 continue
                             if (
                                 not isinstance(fallback_event, ProviderErrorEvent)
@@ -4510,6 +4545,7 @@ class TurnRunner:
         # Declared up-front so the CancelledError handler below can always
         # access them, even if cancellation fires before the stream loop.
         final_text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         turn_segments: list[dict] = []
         turn_artifacts: list[dict[str, Any]] = []
         artifact_delivery_failures: list[str] = []
@@ -5332,8 +5368,8 @@ class TurnRunner:
             # 8. Stream events (final_text_parts/turn_segments are declared
             # up-front above so the CancelledError handler can read them).
             # StreamConsumerStage owns the slice. The four pre-stream
-            # accumulators (final_text_parts, turn_segments, turn_artifacts,
-            # artifact_delivery_failures) stay declared in this scope and
+            # accumulators (final_text_parts, reasoning_parts, turn_segments,
+            # turn_artifacts, artifact_delivery_failures) stay declared in this scope and
             # are PASSED BY REFERENCE into _StreamState so the
             # CancelledError handler below still sees them.
             error_message: str | None = None
@@ -5344,6 +5380,7 @@ class TurnRunner:
             stream_state = _StreamState(
                 current_text_parts=current_text_parts,
                 final_text_parts=final_text_parts,
+                reasoning_parts=reasoning_parts,
                 turn_segments=turn_segments,
                 turn_artifacts=turn_artifacts,
                 artifact_delivery_failures=artifact_delivery_failures,
@@ -5424,7 +5461,7 @@ class TurnRunner:
                     yield replayed_event
                 return
             # Read terminal state off the shared _StreamState. The
-            # four pass-by-reference lists were mutated in place, so
+            # five pass-by-reference lists were mutated in place, so
             # this preserves the harness's read-after-stream
             # contract; only the four owned fields need explicit
             # writeback.
@@ -5683,6 +5720,7 @@ class TurnRunner:
                 normalized_segments = reconciled_segments
             turn_segments[:] = normalized_segments
             final_text_parts[:] = [partial_text] if partial_text else []
+            reasoning_content = "".join(reasoning_parts).strip()
             cancelled_turn_usage: dict[str, Any] | None = None
             if self._session_manager is not None and pipeline_usage_context is not None:
                 storage = getattr(self._session_manager, "storage", None)
@@ -5704,7 +5742,7 @@ class TurnRunner:
                             exc_info=True,
                         )
             if (
-                partial_text or turn_segments or turn_artifacts
+                partial_text or turn_segments or turn_artifacts or reasoning_content
             ) and self._session_manager is not None:
                 try:
                     body = _cancelled_partial_response_text(partial_text, turn_artifacts)
@@ -5717,6 +5755,7 @@ class TurnRunner:
                         "role": "assistant",
                         "content": body,
                         "tool_calls": turn_segments if turn_segments else None,
+                        "reasoning_content": reasoning_content or None,
                     }
                     append_message = self._session_manager.append_message
                     if _accepts_keyword_arg(append_message, "turn_usage"):
@@ -5738,6 +5777,7 @@ class TurnRunner:
                         session_key=session_key,
                         text_chars=len(partial_text),
                         segment_count=len(turn_segments),
+                        reasoning_chars=len(reasoning_content),
                     )
                 except Exception:  # pragma: no cover — defensive: don't swallow the cancel
                     log.warning(

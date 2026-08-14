@@ -87,6 +87,12 @@ export function mergeLiveOnlyFields(
   if (serverSeconds <= 0 && (prev.reasoning?.seconds ?? 0) > 0) {
     merged.reasoning = prev.reasoning
   }
+  // History currently persists the canonical concatenated reasoning text but
+  // not its physical-call boundaries. Preserve the just-finished structured
+  // blocks after this function has already proved both rows are the same turn.
+  if (!server.reasoningBlocks?.length && prev.reasoningBlocks?.length) {
+    merged.reasoningBlocks = prev.reasoningBlocks.map(block => ({ ...block }))
+  }
 
   // The fold's phase snapshot supplies an exact same-session activity start.
   // History does not persist it, so retain the local snapshot across the first
