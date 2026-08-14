@@ -312,6 +312,10 @@ const resolvedSummaryLabel = computed(() => {
   font-size: 0.875rem;
 }
 
+.assistant-activity--settled > .assistant-activity__summary:hover {
+  color: var(--text);
+}
+
 .assistant-activity--settled :deep(.assistant-activity-status__row),
 .assistant-activity--settled :deep(.tool-row) {
   font-size: 0.75rem;
@@ -320,6 +324,10 @@ const resolvedSummaryLabel = computed(() => {
 .assistant-activity__summary:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
+  color: var(--text);
+}
+
+.assistant-activity--settled > .assistant-activity__summary:focus-visible {
   color: var(--text);
 }
 
