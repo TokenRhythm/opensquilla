@@ -38,7 +38,7 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     assert catalog.resolve_max_tokens("deepseek-v4-flash", provider="tokenrhythm") == 384_000
     assert catalog.resolve_context_window_with_source(
         "deepseek-v4-flash-0731", provider="tokenrhythm"
-    ) == (1_048_576, "catalog")
+    ) == (1_000_000, "catalog")
     assert (
         catalog.resolve_max_tokens(
             "deepseek-v4-flash-0731", provider="tokenrhythm"
