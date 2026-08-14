@@ -1246,6 +1246,57 @@ class TestSessionsList:
             await storage.close()
 
     @pytest.mark.asyncio
+    async def test_session_list_view_round_trips_max_length_unicode_cursor_key(
+        self, dispatcher, tmp_path
+    ):
+        storage = SessionStorage(str(tmp_path / "sessions-unicode-cursor.db"))
+        await storage.connect()
+        long_key = "agent:main:webchat:" + ("😀" * 493)
+        assert len(long_key) == 512
+        try:
+            for session_key in (long_key, "agent:main:webchat:a"):
+                await storage.upsert_session(
+                    SessionNode(
+                        session_key=session_key,
+                        session_id=session_key,
+                        agent_id="main",
+                        status="idle",
+                        created_at=1000,
+                        updated_at=1000,
+                    )
+                )
+            ctx = make_ctx(session_manager=SimpleNamespace(storage=storage))
+
+            first = await dispatcher.dispatch(
+                "unicode-page-1",
+                "sessions.list",
+                {"limit": 1, "view": "session-list-v1"},
+                ctx,
+            )
+            assert first.ok is True
+            assert first.payload["sessions"][0]["key"] == long_key
+            assert first.payload["has_more"] is True
+            assert len(first.payload["next_cursor"]) > 2048
+
+            second = await dispatcher.dispatch(
+                "unicode-page-2",
+                "sessions.list",
+                {
+                    "limit": 1,
+                    "view": "session-list-v1",
+                    "cursor": first.payload["next_cursor"],
+                },
+                ctx,
+            )
+            assert second.ok is True
+            assert [row["key"] for row in second.payload["sessions"]] == [
+                "agent:main:webchat:a"
+            ]
+            assert second.payload["has_more"] is False
+        finally:
+            await storage.close()
+
+    @pytest.mark.asyncio
     async def test_session_list_view_rejects_malformed_cursor(self, dispatcher):
         ctx = make_ctx(session_manager=FakeSessionManager())
 
@@ -1284,6 +1335,23 @@ class TestSessionsList:
 
         res = await dispatcher.dispatch(
             "out-of-range-cursor",
+            "sessions.list",
+            {"limit": 200, "view": "session-list-v1", "cursor": cursor},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+
+    @pytest.mark.asyncio
+    async def test_session_list_view_rejects_non_utf8_cursor_key(self, dispatcher):
+        ctx = make_ctx(session_manager=FakeSessionManager())
+        cursor = base64.urlsafe_b64encode(
+            b'{"v":1,"a":1,"u":1,"k":"\\ud800"}'
+        ).decode().rstrip("=")
+
+        res = await dispatcher.dispatch(
+            "non-utf8-cursor",
             "sessions.list",
             {"limit": 200, "view": "session-list-v1", "cursor": cursor},
             ctx,

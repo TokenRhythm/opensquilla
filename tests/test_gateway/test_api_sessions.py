@@ -32,6 +32,12 @@ class _FakeDispatcher:
         return self.result
 
 
+def _cursor_token(payload: dict[str, object]) -> str:
+    return base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode()
+    ).decode().rstrip("=")
+
+
 def test_api_sessions_forwards_pagination_query_params() -> None:
     dispatcher = _FakeDispatcher()
 
@@ -108,9 +114,26 @@ def test_api_sessions_maps_out_of_range_cursor_timestamp_to_bad_request() -> Non
         "u": 1,
         "k": "agent:main:webchat:cursor-range",
     }
-    cursor = base64.urlsafe_b64encode(
-        json.dumps(payload, separators=(",", ":")).encode()
-    ).decode().rstrip("=")
+    cursor = _cursor_token(payload)
+    app = gateway_app.create_gateway_app(
+        GatewayConfig(),
+        session_manager=SimpleNamespace(storage=object()),
+    )
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/api/sessions",
+            params={"view": "session-list-v1", "cursor": cursor},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "error": "params.cursor must be a valid sessions.list cursor"
+    }
+
+
+def test_api_sessions_maps_non_utf8_cursor_key_to_bad_request() -> None:
+    cursor = _cursor_token({"v": 1, "a": 1, "u": 1, "k": "\ud800"})
     app = gateway_app.create_gateway_app(
         GatewayConfig(),
         session_manager=SimpleNamespace(storage=object()),

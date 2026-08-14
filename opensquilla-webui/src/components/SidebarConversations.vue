@@ -636,7 +636,10 @@ function onSessionFocusOut(event: FocusEvent) {
 
 watch([selectionMode, openMenuKey], closeSessionPreview)
 useDocumentEvent('scroll', closeSessionPreview, true)
-onMounted(() => window.addEventListener('resize', closeSessionPreview))
+onMounted(() => {
+  window.addEventListener('resize', closeSessionPreview)
+  void nextTick(maybeLoadMore)
+})
 onUnmounted(() => window.removeEventListener('resize', closeSessionPreview))
 watch(
   [displayBlocks, () => props.hasMore, () => props.loadingMore],
@@ -780,7 +783,15 @@ function onSelectRow(row: SidebarConversationItem) {
 
 <template>
   <div
-    v-if="error || totalRows > 0 || displayProjection.projectCount > 0 || props.canManageProjects"
+    v-if="
+      error
+      || hasMore
+      || loadingMore
+      || loadMoreError
+      || totalRows > 0
+      || displayProjection.projectCount > 0
+      || props.canManageProjects
+    "
     class="sidebar-section sidebar-history"
     :class="{
       'is-selecting': selectionMode,

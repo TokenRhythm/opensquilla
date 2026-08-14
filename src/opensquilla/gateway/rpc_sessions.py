@@ -2047,6 +2047,7 @@ async def _resolve_session_node(storage: Any, key: str) -> Any:
 _SESSION_COUNT_VIEW = "session-count-v1"
 _SESSION_LIST_VIEW = "session-list-v1"
 _SESSION_LIST_CURSOR_VERSION = 1
+_SESSION_LIST_CURSOR_MAX_CHARS = 8192
 _MAX_SQLITE_INTEGER = (1 << 63) - 1
 
 
@@ -2061,14 +2062,19 @@ def _encode_session_list_cursor(cursor: SessionListCursor | None) -> str | None:
             "k": cursor.session_key,
         },
         separators=(",", ":"),
-    ).encode()
+        ensure_ascii=False,
+    ).encode("utf-8")
     return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
 
 def _decode_session_list_cursor(value: Any) -> SessionListCursor | None:
     if value is None:
         return None
-    if not isinstance(value, str) or not value or len(value) > 2048:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _SESSION_LIST_CURSOR_MAX_CHARS
+    ):
         raise RpcHandlerError(
             code="INVALID_PARAMS",
             message="params.cursor must be a valid sessions.list cursor",
@@ -2104,6 +2110,13 @@ def _decode_session_list_cursor(value: Any) -> SessionListCursor | None:
             code="INVALID_PARAMS",
             message="params.cursor must be a valid sessions.list cursor",
         )
+    try:
+        session_key.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        ) from exc
     return SessionListCursor(
         activity_at=activity_at,
         updated_at=updated_at,

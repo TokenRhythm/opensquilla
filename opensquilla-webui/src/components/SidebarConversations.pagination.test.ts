@@ -32,6 +32,34 @@ afterEach(() => {
 })
 
 describe('SidebarConversations pagination', () => {
+  it('keeps loading when the current page has no displayable rows', async () => {
+    i18n.global.locale.value = 'en'
+    const loadMore = vi.fn()
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const Root = defineComponent(() => () => h(SidebarConversations, {
+      sections: [],
+      error: false,
+      loading: false,
+      loadingMore: false,
+      loadMoreError: false,
+      hasMore: true,
+      currentKey: '',
+      contractDebugEnabled: false,
+      searchHint: 'Ctrl+K',
+      onLoadMore: loadMore,
+    }))
+    const app = createApp(Root)
+    app.use(i18n)
+    app.mount(root)
+    mounted.push(app)
+    await nextTick()
+    await nextTick()
+
+    expect(root.querySelector('.sidebar-history-list')).not.toBeNull()
+    expect(loadMore).toHaveBeenCalled()
+  })
+
   it('keeps loading when an active agent filter has no match on the current page', async () => {
     i18n.global.locale.value = 'en'
     const rows = ref([taskRow('agent:research:webchat:old', 'research')])
