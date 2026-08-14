@@ -51,6 +51,37 @@ function usageBarrierError(
   }
 }
 
+function usageBarrierAssistant(
+  id: string,
+  turnId: string,
+  userMessageId: string,
+  usageCallIndex: number,
+): ChatRenderedMessage {
+  return {
+    id,
+    messageId: id,
+    turnId,
+    turnKey: `turn:${turnId}`,
+    role: 'assistant',
+    displayRole: 'assistant',
+    roleLabel: 'Assistant',
+    text: '',
+    timeStr: '',
+    showHeader: false,
+    parts: [],
+    statusHistory: [],
+    turnOutcome: {
+      turnId,
+      status: 'failed',
+      errorClass: 'usage_accounting_busy',
+      usageCallIndex,
+      noPriorProviderDispatch: usageCallIndex === 1,
+      replaySafe: usageCallIndex === 1,
+      userMessageId,
+    },
+  }
+}
+
 function assistant(
   id: string,
   turnKey: string,
@@ -187,5 +218,27 @@ describe('ChatMessageList usage barrier retry anchor', () => {
     ])
 
     expect(host.querySelector('.msg-error-card__resume')).toBeNull()
+  })
+})
+
+describe('ChatMessageList assistant usage barrier regenerate', () => {
+  it('hides Regenerate for an unsafe status-only barrier with a same-turn steer', () => {
+    const { host } = mountList([
+      user('user-primary', 'turn:primary', 'turn-safe'),
+      user('user-steer', 'turn:steer', 'turn-safe'),
+      usageBarrierAssistant('assistant-status', 'turn-safe', 'user-primary', 2),
+    ])
+
+    expect(host.querySelector('[aria-label="Regenerate"]')).toBeNull()
+  })
+
+  it('keeps Regenerate for a safe status-only barrier anchored to the primary user', () => {
+    const { host } = mountList([
+      user('user-primary', 'turn:primary', 'turn-safe'),
+      user('user-steer', 'turn:steer', 'turn-safe'),
+      usageBarrierAssistant('assistant-status', 'turn-safe', 'user-primary', 1),
+    ])
+
+    expect(host.querySelector('[aria-label="Regenerate"]')).not.toBeNull()
   })
 })

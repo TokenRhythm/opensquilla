@@ -325,7 +325,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     })
 
     expect(messages.value[messages.value.length - 1]?.turnOutcome).toMatchObject({
-      replaySafe: true,
+      replaySafe: false,
     })
     expect(messages.value[messages.value.length - 1]?.turnOutcome?.userMessageId).toBeUndefined()
     scope.stop()

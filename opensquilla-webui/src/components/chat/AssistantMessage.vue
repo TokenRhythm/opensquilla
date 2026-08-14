@@ -330,7 +330,7 @@
             <Icon :name="copyIconName" :size="12" />
           </button>
           <span class="msg-copy-live" aria-live="polite">{{ copyLiveText }}</span>
-          <button type="button" class="msg-action" :title="t('chat.regenerate')" :aria-label="t('chat.regenerate')" @click="$emit('regenerate', message)">
+          <button v-if="regenerateAvailable !== false" type="button" class="msg-action" :title="t('chat.regenerate')" :aria-label="t('chat.regenerate')" @click="$emit('regenerate', message)">
             <Icon name="refresh" :size="12" />
           </button>
           <template v-if="feedbackDecisionId">
@@ -467,6 +467,7 @@ const props = defineProps<{
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
   copyMessage: (message: ChatRenderedMessage) => Promise<boolean>
+  regenerateAvailable?: boolean
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
   authToken?: string

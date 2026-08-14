@@ -169,11 +169,76 @@ describe('SystemMessage sandbox resume', () => {
       { usage_call_index: Number.NaN, no_prior_provider_dispatch: true, replay_safe: true },
       false,
     ],
-    ['conflicting index', {
+    ['top index 2 conflicts with nested index 1', {
       usage_call_index: 2,
       no_prior_provider_dispatch: true,
       replay_safe: true,
       outcome: {
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    }, false],
+    ['top index 1 conflicts with nested index 2', {
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      outcome: {
+        usage_call_index: 2,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    }, false],
+    ['top no-prior true conflicts with nested false', {
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      outcome: {
+        usage_call_index: 1,
+        no_prior_provider_dispatch: false,
+        replay_safe: true,
+      },
+    }, false],
+    ['top replay-safe false conflicts with nested true', {
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: false,
+      outcome: {
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    }, false],
+    ['barrier code conflicts with nested error class', {
+      error_class: 'usage_accounting_busy',
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      outcome: {
+        error_class: 'provider_error',
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    }, false],
+    ['turn id conflicts with nested turn id', {
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      outcome: {
+        turn_id: 'turn-other',
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    }, false],
+    ['primary user id conflicts with nested id', {
+      user_message_id: 'user-primary',
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      outcome: {
+        user_message_id: 'user-steer',
         usage_call_index: 1,
         no_prior_provider_dispatch: true,
         replay_safe: true,

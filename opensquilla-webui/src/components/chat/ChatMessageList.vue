@@ -77,6 +77,7 @@
           :workbench-enabled="workbenchEnabled"
           :artifact-navigation-items="artifactNavigationItems"
           :copy-message="copyMessage"
+          :regenerate-available="assistantRegenerateAvailable(entry.index)"
           :is-tip="isForkableAssistant(entry.index)"
           :fork-busy="forkBusy"
           :plan-action-pending="planActionPending"
@@ -151,8 +152,8 @@ import {
 import type { PlanCardAction, PlanCardActionTarget } from '@/types/plans'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import {
-  isUsageAccountingBarrier,
-  usageBarrierRetryUserMessageIndex,
+  isUsageAccountingBarrierMessage,
+  strictUsageBarrierRetryUserMessageIndex,
 } from '@/utils/chat/usageAccountingFailure'
 import {
   buildVariableWindow,
@@ -236,9 +237,15 @@ function usageBarrierRetryAvailable(index: number): boolean {
   const message = props.messages[index]
   return Boolean(
     message
-    && isUsageAccountingBarrier(message.errorCode)
-    && usageBarrierRetryUserMessageIndex(props.messages, index, message) >= 0,
+    && isUsageAccountingBarrierMessage(message)
+    && strictUsageBarrierRetryUserMessageIndex(props.messages, index, message) >= 0,
   )
+}
+
+function assistantRegenerateAvailable(index: number): boolean {
+  const message = props.messages[index]
+  if (!message || !isUsageAccountingBarrierMessage(message)) return true
+  return strictUsageBarrierRetryUserMessageIndex(props.messages, index, message) >= 0
 }
 
 const listRootRef = ref<HTMLElement | null>(null)

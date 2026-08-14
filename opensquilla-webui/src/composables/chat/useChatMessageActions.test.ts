@@ -7,6 +7,7 @@ import { useChatMessageActions, type UseChatMessageActionsOptions } from './useC
 import { useChatTextRendering } from './useChatTextRendering'
 import type { ChatMessage, ChatRenderedMessage, ChatTurnOutcome } from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
+import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 
 vi.mock('@/utils/browser', () => ({
   copyTextWithFallback: vi.fn().mockResolvedValue(undefined),
@@ -31,6 +32,7 @@ function safeUsageOutcome(
   return {
     turnId,
     status: 'failed',
+    errorClass: 'usage_accounting_busy',
     retryable: true,
     usageCallIndex: 1,
     noPriorProviderDispatch: true,
@@ -198,6 +200,162 @@ describe('useChatMessageActions branching edits', () => {
       turnId: 'turn-1',
       turnOutcome: safeUsageOutcome('turn-1', 'msg-primary'),
       text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(true)
+    expect(pendingForkBeforeMessageId.value).toBe('msg-primary')
+    expect(options.messages.value).toEqual([])
+    expect(options.inputText.value).toBe('primary request')
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+  })
+
+  it('blocks an unsafe usage barrier on an assistant status-only bubble', async () => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 2,
+      messageId: 'terminal-activity:task-1',
+      turnId: 'turn-1',
+      turnOutcome: {
+        ...safeUsageOutcome('turn-1', 'msg-primary'),
+        usageCallIndex: 2,
+        noPriorProviderDispatch: false,
+        replaySafe: false,
+      },
+      text: '',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('blocks an assistant bubble when normalized error classes conflict around a barrier', () => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+    const turnOutcome = normalizeTurnOutcome({
+      turn_id: 'turn-1',
+      status: 'failed',
+      error_class: 'provider_error',
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      user_message_id: 'msg-primary',
+      outcome: {
+        error_class: 'usage_accounting_busy',
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+        user_message_id: 'msg-primary',
+      },
+    })
+
+    expect(turnOutcome).toMatchObject({
+      errorClass: 'usage_accounting_busy',
+      replaySafe: false,
+    })
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 2,
+      messageId: 'terminal-activity:task-1',
+      errorCode: 'provider_error',
+      turnId: 'turn-1',
+      turnOutcome,
+      text: '',
+    }))
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('retries the exact primary from a safe assistant status-only bubble', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+    ])
+
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 2,
+      messageId: 'terminal-activity:task-1',
+      turnId: 'turn-1',
+      turnOutcome: safeUsageOutcome('turn-1', 'msg-primary'),
+      text: '',
     }))
     await nextTick()
 

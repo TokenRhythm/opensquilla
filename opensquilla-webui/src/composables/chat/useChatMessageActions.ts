@@ -8,9 +8,8 @@ import { copyTextWithFallback } from '@/utils/browser'
 import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 import { turnOutcomePresentation } from '@/utils/chat/turnOutcome'
 import {
-  hasStrictUsageBarrierReplayProof,
-  isUsageAccountingBarrier,
-  usageBarrierRetryUserMessageIndex,
+  isUsageAccountingBarrierMessage,
+  strictUsageBarrierRetryUserMessageIndex,
 } from '@/utils/chat/usageAccountingFailure'
 import { sanitizeAssistantPresentationSegments } from '@/utils/chat/silentSentinels'
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
@@ -136,9 +135,15 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       console.warn('Wait for the current response to finish')
       return false
     }
-    const usageBarrierRetry = isUsageAccountingBarrier(message.errorCode)
-    if (usageBarrierRetry && !hasStrictUsageBarrierReplayProof(message)) {
-      console.warn('Usage accounting retry is missing a safe replay proof')
+    const usageBarrierRetry = isUsageAccountingBarrierMessage(message)
+    const assistantIndex = sourceMessageIndex(message)
+    const usageBarrierUserIndex = strictUsageBarrierRetryUserMessageIndex(
+      options.messages.value,
+      assistantIndex,
+      message,
+    )
+    if (usageBarrierRetry && usageBarrierUserIndex < 0) {
+      console.warn('Usage accounting retry is missing a safe replay proof or primary user')
       return false
     }
     // Regenerate is a send action that also truncates local history and
@@ -148,9 +153,8 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       options.notifyDeliveryBlocked?.()
       return false
     }
-    const assistantIndex = sourceMessageIndex(message)
     const userMsgIndex = usageBarrierRetry
-      ? usageBarrierRetryUserMessageIndex(options.messages.value, assistantIndex, message)
+      ? usageBarrierUserIndex
       : previousUserMessageIndex(assistantIndex)
     if (userMsgIndex < 0) {
       console.warn('No previous message to regenerate')

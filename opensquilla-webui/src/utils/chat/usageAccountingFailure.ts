@@ -26,6 +26,7 @@ type UsageBarrierRetryMessage = {
   role?: unknown
   turnId?: unknown
   messageId?: unknown
+  errorCode?: unknown
   turnOutcome?: unknown
 }
 
@@ -44,9 +45,25 @@ export function hasStrictUsageBarrierReplayProof(
   message: UsageBarrierRetryMessage,
 ): boolean {
   const outcome = record(message.turnOutcome)
-  return outcome.usageCallIndex === 1
+  const directCode = text(message.errorCode)
+  const outcomeCode = text(outcome.errorClass)
+  const conflictingBarrierCode = Boolean(
+    directCode
+    && outcomeCode
+    && directCode !== outcomeCode
+    && (isUsageAccountingBarrier(directCode) || isUsageAccountingBarrier(outcomeCode)),
+  )
+  return !conflictingBarrierCode
+    && outcome.usageCallIndex === 1
     && outcome.noPriorProviderDispatch === true
     && outcome.replaySafe === true
+}
+
+export function isUsageAccountingBarrierMessage(
+  message: UsageBarrierRetryMessage,
+): boolean {
+  return isUsageAccountingBarrier(message.errorCode)
+    || isUsageAccountingBarrier(record(message.turnOutcome).errorClass)
 }
 
 export function usageBarrierRetryUserMessageIndex(
@@ -75,6 +92,18 @@ export function usageBarrierRetryUserMessageIndex(
     }
   }
   return -1
+}
+
+export function strictUsageBarrierRetryUserMessageIndex(
+  messages: readonly UsageBarrierRetryMessage[],
+  beforeIndex: number,
+  message: UsageBarrierRetryMessage,
+): number {
+  if (
+    !isUsageAccountingBarrierMessage(message)
+    || !hasStrictUsageBarrierReplayProof(message)
+  ) return -1
+  return usageBarrierRetryUserMessageIndex(messages, beforeIndex, message)
 }
 
 export function usageAccountingErrorCode(value: unknown): string | undefined {

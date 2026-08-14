@@ -53,7 +53,7 @@ import type { ChatRenderedMessage } from '@/types/chat'
 import { absoluteTime, fullTime, isoTime } from '@/utils/messageTime'
 import {
   hasStrictUsageBarrierReplayProof,
-  isUsageAccountingBarrier,
+  isUsageAccountingBarrierMessage,
 } from '@/utils/chat/usageAccountingFailure'
 
 const { t } = useI18n()
@@ -81,7 +81,8 @@ const showResume = computed(
     props.message.errorCode === 'sandbox_threshold_exceeded',
 )
 const isUsageBarrier = computed(
-  () => props.message.displayRole === 'error' && isUsageAccountingBarrier(props.message.errorCode),
+  () => props.message.displayRole === 'error'
+    && isUsageAccountingBarrierMessage(props.message),
 )
 const showRetry = computed(
   () =>
