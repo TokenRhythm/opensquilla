@@ -158,7 +158,7 @@ describe('SystemMessage sandbox resume', () => {
       { usage_call_index: '1', no_prior_provider_dispatch: true, replay_safe: true },
       false,
     ],
-    ['null index', { usage_call_index: null }, undefined],
+    ['null index', { usage_call_index: null }, false],
     [
       'zero index',
       { usage_call_index: 0, no_prior_provider_dispatch: true, replay_safe: true },
@@ -244,6 +244,63 @@ describe('SystemMessage sandbox resume', () => {
         replay_safe: true,
       },
     }, false],
+    ['safe outcome conflicts with unsafe turn_outcome', {
+      outcome: {
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+      turn_outcome: {
+        usage_call_index: 2,
+        no_prior_provider_dispatch: false,
+        replay_safe: false,
+      },
+    }, false],
+    ['unsafe outcome conflicts with safe turn_outcome', {
+      outcome: {
+        usage_call_index: 2,
+        no_prior_provider_dispatch: false,
+        replay_safe: false,
+      },
+      turn_outcome: {
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    }, false],
+    ['same-container camel null invalidates snake proof', {
+      outcome: {
+        usage_call_index: 1,
+        usageCallIndex: null,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    }, false],
+    ['same-container invalid camel boolean invalidates snake proof', {
+      outcome: {
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        noPriorProviderDispatch: 'true',
+        replay_safe: true,
+      },
+    }, false],
+    ['same-container null error alias invalidates the barrier proof', {
+      outcome: {
+        error_class: 'usage_accounting_busy',
+        errorClass: null,
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    }, false],
+    ['an explicit invalid sibling container invalidates a safe proof', {
+      outcome: {
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+      turn_outcome: null,
+    }, false],
   ])('fails closed for an invalid usage replay proof: %s', async (
     _label,
     proof,
@@ -262,6 +319,46 @@ describe('SystemMessage sandbox resume', () => {
     }), undefined, undefined, true)
     expect(el.querySelector('.msg-error-card__resume')).toBeNull()
     app.unmount()
+  })
+
+  it('drops replay identity when outcome containers conflict on identity and code', () => {
+    const turnOutcome = normalizeTurnOutcome({
+      turn_id: 'turn-usage',
+      status: 'failed',
+      outcome: {
+        error_class: 'usage_accounting_busy',
+        user_message_id: 'user-primary',
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+      turnOutcome: {
+        errorClass: 'provider_error',
+        userMessageId: 'user-other',
+        usageCallIndex: 1,
+        noPriorProviderDispatch: true,
+        replaySafe: true,
+      },
+    })
+
+    expect(turnOutcome).toMatchObject({
+      turnId: 'turn-usage',
+      status: 'failed',
+      errorClass: 'usage_accounting_busy',
+      replaySafe: false,
+    })
+    expect(turnOutcome?.userMessageId).toBeUndefined()
+  })
+
+  it('preserves ordinary outcome presentation when an unused container is null', () => {
+    expect(normalizeTurnOutcome({
+      turn_id: 'turn-complete',
+      status: 'completed',
+      outcome: null,
+    })).toEqual({
+      turnId: 'turn-complete',
+      status: 'completed',
+    })
   })
 
   it('hides a proven-safe retry when its durable same-turn user is unavailable', async () => {

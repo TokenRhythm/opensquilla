@@ -26,6 +26,7 @@ type UsageBarrierRetryMessage = {
   role?: unknown
   turnId?: unknown
   messageId?: unknown
+  attachments?: unknown
   errorCode?: unknown
   turnOutcome?: unknown
 }
@@ -88,6 +89,14 @@ export function usageBarrierRetryUserMessageIndex(
       && durableText(candidate.turnId) === turnId
       && durableText(candidate.messageId) === primaryUserMessageId
     ) {
+      // Transcript attachments are display/download projections, not reusable
+      // chat.send payloads: staged upload ids may be consumed or expired, and
+      // inline bytes are not guaranteed to survive every history surface.
+      // Whole-turn retry is safe only when the authoritative primary request
+      // had no attachments at all.
+      if (candidate.attachments !== undefined) {
+        if (!Array.isArray(candidate.attachments) || candidate.attachments.length > 0) return -1
+      }
       return index
     }
   }

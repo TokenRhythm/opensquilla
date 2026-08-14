@@ -2173,6 +2173,7 @@ describe('useChatSend attachment payloads', () => {
     const actions = useChatMessageActions({
       messages,
       inputText,
+      pendingAttachments: ref<Attachment[]>([]),
       isStreaming: harness.stream.isStreaming,
       sanitizeCopyText: text => text,
       stripTimePrefix: text => text,

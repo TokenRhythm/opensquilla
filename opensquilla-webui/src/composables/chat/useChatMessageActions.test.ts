@@ -5,7 +5,13 @@ import { nextTick, ref } from 'vue'
 
 import { useChatMessageActions, type UseChatMessageActionsOptions } from './useChatMessageActions'
 import { useChatTextRendering } from './useChatTextRendering'
-import type { ChatMessage, ChatRenderedMessage, ChatTurnOutcome } from '@/types/chat'
+import type {
+  Attachment,
+  ChatMessage,
+  ChatRenderedMessage,
+  ChatTurnOutcome,
+  DisplayAttachment,
+} from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 
@@ -41,6 +47,18 @@ function safeUsageOutcome(
   }
 }
 
+function displayAttachment(kind: DisplayAttachment['kind']): DisplayAttachment {
+  return {
+    kind,
+    displayId: `history:${kind}`,
+    renderKey: `history:${kind}`,
+    name: `${kind}.txt`,
+    mime: 'text/plain',
+    ...(kind === 'inline' ? { downloadData: 'cmVxdWVzdA==' } : {}),
+    ...(kind === 'staged' ? { sha256_ref: 'a'.repeat(64) } : {}),
+  }
+}
+
 function makeOptions(
   messages: ChatMessage[],
   sanitizeCopyText: (
@@ -53,6 +71,7 @@ function makeOptions(
   const options: UseChatMessageActionsOptions = {
     messages: ref(messages),
     inputText: ref(''),
+    pendingAttachments: ref<Attachment[]>([]),
     isStreaming: ref(false),
     sanitizeCopyText,
     stripTimePrefix: text => text,
@@ -145,6 +164,13 @@ describe('useChatMessageActions branching edits', () => {
         turnId: 'turn-1',
       },
     ])
+    options.pendingAttachments.value = [{
+      kind: 'inline',
+      local_id: 99,
+      name: 'unrelated-draft.txt',
+      mime: 'text/plain',
+      data: 'ZHJhZnQ=',
+    }]
 
     const accepted = api.regenerateMessage(renderedMessage({
       role: 'error',
@@ -161,9 +187,63 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBe('msg-user')
     expect(options.messages.value).toEqual([])
     expect(options.inputText.value).toBe('bill this safely')
+    expect(options.pendingAttachments.value).toEqual([])
     expect(options.sendCurrentInput).toHaveBeenCalledOnce()
     expect(accepted).toBe(true)
   })
+
+  it.each(['inline', 'staged', 'file'] as const)(
+    'rejects programmatic whole-turn retry when the primary request has a %s display attachment',
+    async (kind) => {
+      const messages: ChatMessage[] = [
+        {
+          role: 'user',
+          text: 'request with attachment',
+          ts: null,
+          messageId: 'msg-primary',
+          turnId: 'turn-attachment',
+          attachments: [displayAttachment(kind)],
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:attachment',
+          errorCode: 'usage_accounting_busy',
+          turnId: 'turn-attachment',
+        },
+      ]
+      const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+      const draftAttachment: Attachment = {
+        kind: 'inline',
+        local_id: 77,
+        name: 'draft.txt',
+        mime: 'text/plain',
+        data: 'ZHJhZnQ=',
+      }
+      options.inputText.value = 'unrelated draft'
+      options.pendingAttachments.value = [draftAttachment]
+
+      const accepted = api.regenerateMessage(renderedMessage({
+        role: 'error',
+        displayRole: 'error',
+        sourceIndex: 1,
+        messageId: 'terminal-error:attachment',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-attachment',
+        turnOutcome: safeUsageOutcome('turn-attachment', 'msg-primary'),
+        text: 'Usage accounting temporarily unavailable.',
+      }))
+      await nextTick()
+
+      expect(accepted).toBe(false)
+      expect(options.messages.value).toEqual(messages)
+      expect(options.inputText.value).toBe('unrelated draft')
+      expect(options.pendingAttachments.value).toEqual([draftAttachment])
+      expect(pendingForkBeforeMessageId.value).toBeNull()
+      expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    },
+  )
 
   it('retries the authoritative primary user instead of a later same-turn steer', async () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([

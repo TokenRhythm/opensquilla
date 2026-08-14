@@ -1900,6 +1900,7 @@ const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured ==
 const chatMessageActions = useChatMessageActions({
   messages,
   inputText,
+  pendingAttachments,
   isStreaming,
   sanitizeCopyText,
   stripTimePrefix,

@@ -28,7 +28,9 @@ function fieldState<T>(
   parse: (value: unknown) => T | undefined,
 ): ConsistentField<T> {
   const values = keys
-    .filter(key => Object.prototype.hasOwnProperty.call(source, key) && source[key] != null)
+    // Presence is authoritative for replay-safety fields. Explicit null (or
+    // undefined) is not the same as omission and must invalidate the proof.
+    .filter(key => Object.prototype.hasOwnProperty.call(source, key))
     .map(key => parse(source[key]))
   if (!values.length) return { present: false, valid: false }
   if (values.some(value => value === undefined)) return { present: true, valid: false }
@@ -38,16 +40,19 @@ function fieldState<T>(
     : { present: true, valid: false }
 }
 
-function mergedFieldState<T>(
-  outer: ConsistentField<T>,
-  nested: ConsistentField<T>,
-): ConsistentField<T> {
-  if (!outer.present) return nested
-  if (!nested.present) return outer
-  if (!outer.valid || !nested.valid || outer.value !== nested.value) {
-    return { present: true, valid: false }
+function mergedFieldStates<T>(states: readonly ConsistentField<T>[]): ConsistentField<T> {
+  let merged: ConsistentField<T> = { present: false, valid: false }
+  for (const state of states) {
+    if (!state.present) continue
+    if (!merged.present) {
+      merged = state
+      continue
+    }
+    if (!merged.valid || !state.valid || merged.value !== state.value) {
+      return { present: true, valid: false }
+    }
   }
-  return outer
+  return merged
 }
 
 function nonEmptyText(value: unknown): string | undefined {
@@ -61,10 +66,46 @@ function positiveInteger(value: unknown): number | undefined {
     : undefined
 }
 
-function outcomeBody(raw: unknown): RawOutcomeRecord {
-  return raw && typeof raw === 'object' && !Array.isArray(raw)
-    ? raw as RawOutcomeRecord
-    : {}
+type OutcomeContainers = {
+  records: RawOutcomeRecord[]
+  invalid: boolean
+}
+
+function outcomeContainers(record: RawOutcomeRecord): OutcomeContainers {
+  const records: RawOutcomeRecord[] = []
+  let invalid = false
+  for (const key of ['outcome', 'turn_outcome', 'turnOutcome'] as const) {
+    if (!Object.prototype.hasOwnProperty.call(record, key)) continue
+    const value = record[key]
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      invalid = true
+      continue
+    }
+    records.push(value as RawOutcomeRecord)
+  }
+  return { records, invalid }
+}
+
+function fieldStateAcross<T>(
+  sources: readonly RawOutcomeRecord[],
+  keys: readonly string[],
+  parse: (value: unknown) => T | undefined,
+): ConsistentField<T> {
+  return mergedFieldStates(sources.map(source => fieldState(source, keys, parse)))
+}
+
+function firstTextValue(
+  sources: readonly RawOutcomeRecord[],
+  keys: readonly string[],
+): string {
+  for (const source of sources) {
+    for (const key of keys) {
+      if (!Object.prototype.hasOwnProperty.call(source, key)) continue
+      const value = text(source[key])
+      if (value) return value
+    }
+  }
+  return ''
 }
 
 function timestampMilliseconds(value: number | string | undefined): number {
@@ -81,14 +122,13 @@ export function normalizeTurnOutcome(
 ): ChatTurnOutcome | undefined {
   if (!raw) return undefined
   const record = raw as RawOutcomeRecord
-  const nested = outcomeBody(record.outcome ?? record.turn_outcome ?? record.turnOutcome)
-  const turnIdState = mergedFieldState(
-    fieldState(record, ['turn_id', 'turnId'], nonEmptyText),
-    fieldState(nested, ['turn_id', 'turnId'], nonEmptyText),
-  )
+  const containers = outcomeContainers(record)
+  const nested = containers.records[0] ?? {}
+  const sources = [record, ...containers.records]
+  const turnIdState = fieldStateAcross(sources, ['turn_id', 'turnId'], nonEmptyText)
   const turnId = turnIdState.valid
     ? turnIdState.value || ''
-    : text(record.turn_id ?? record.turnId ?? nested.turn_id ?? nested.turnId)
+    : firstTextValue(sources, ['turn_id', 'turnId'])
   if (!turnId) return undefined
   const taskId = text(record.task_id ?? record.taskId ?? nested.task_id ?? nested.taskId)
   const status = text(record.status ?? nested.status ?? nested.kind)
@@ -103,39 +143,40 @@ export function normalizeTurnOutcome(
   const startedAt = record.started_at ?? record.startedAt ?? nested.started_at ?? nested.startedAt
   const finishedAt = record.finished_at ?? record.finishedAt ?? nested.finished_at ?? nested.finishedAt
   const retryable = bool(record.retryable ?? nested.retryable)
-  const noPriorState = mergedFieldState(
-    fieldState(
-      record,
-      ['no_prior_provider_dispatch', 'noPriorProviderDispatch'],
-      bool,
-    ),
-    fieldState(
-      nested,
-      ['no_prior_provider_dispatch', 'noPriorProviderDispatch'],
-      bool,
-    ),
+  const noPriorState = fieldStateAcross(
+    sources,
+    ['no_prior_provider_dispatch', 'noPriorProviderDispatch'],
+    bool,
   )
-  const replaySafeState = mergedFieldState(
-    fieldState(record, ['replay_safe', 'replaySafe'], bool),
-    fieldState(nested, ['replay_safe', 'replaySafe'], bool),
+  const replaySafeState = fieldStateAcross(
+    sources,
+    ['replay_safe', 'replaySafe'],
+    bool,
   )
-  const userMessageIdState = mergedFieldState(
-    fieldState(record, ['user_message_id', 'userMessageId'], nonEmptyText),
-    fieldState(nested, ['user_message_id', 'userMessageId'], nonEmptyText),
+  const userMessageIdState = fieldStateAcross(
+    sources,
+    ['user_message_id', 'userMessageId'],
+    nonEmptyText,
   )
-  const explicitErrorCodes = [
-    record.code,
-    record.error_class,
-    record.errorClass,
-    nested.code,
-    nested.error_class,
-    nested.errorClass,
-  ].map(text).filter(Boolean)
+  const errorCodeState = fieldStateAcross(
+    sources,
+    ['code', 'error_class', 'errorClass'],
+    nonEmptyText,
+  )
+  const explicitErrorCodes = sources.flatMap(source => [
+    source.code,
+    source.error_class,
+    source.errorClass,
+  ]).map(text).filter(Boolean)
   const errorCodes = explicitErrorCodes.length
     ? explicitErrorCodes
-    : [record.reason, nested.reason].map(text).filter(Boolean)
+    : sources.map(source => source.reason).map(text).filter(Boolean)
   const barrierCodes = errorCodes.filter(isUsageAccountingBarrier)
-  const barrierCodeConflict = barrierCodes.length > 0 && new Set(errorCodes).size > 1
+  const barrierCodeConflict = barrierCodes.length > 0
+    && (
+      (errorCodeState.present && !errorCodeState.valid)
+      || new Set(errorCodes).size > 1
+    )
   const errorClass = barrierCodes[0] || text(
     record.error_class
     ?? record.errorClass
@@ -152,9 +193,10 @@ export function normalizeTurnOutcome(
   const retryAfterRaw = record.retry_after_ms ?? record.retryAfterMs
     ?? nested.retry_after_ms ?? nested.retryAfterMs
   const retryAfter = Number(retryAfterRaw)
-  const usageCallIndexState = mergedFieldState(
-    fieldState(record, ['usage_call_index', 'usageCallIndex'], positiveInteger),
-    fieldState(nested, ['usage_call_index', 'usageCallIndex'], positiveInteger),
+  const usageCallIndexState = fieldStateAcross(
+    sources,
+    ['usage_call_index', 'usageCallIndex'],
+    positiveInteger,
   )
   const usageCallIndex = usageCallIndexState.valid
     ? usageCallIndexState.value
@@ -162,9 +204,17 @@ export function normalizeTurnOutcome(
   const hasUsageReplayProof = usageCallIndexState.present
     || noPriorState.present
     || replaySafeState.present
+  const invalidMixedEnvelope = containers.invalid
+    && (
+      containers.records.length > 0
+      || hasUsageReplayProof
+      || userMessageIdState.present
+      || barrierCodes.length > 0
+    )
   const replayConflict = !turnIdState.valid
     || (userMessageIdState.present && !userMessageIdState.valid)
     || barrierCodeConflict
+    || invalidMixedEnvelope
     || (usageCallIndexState.present && !usageCallIndexState.valid)
     || (noPriorState.present && !noPriorState.valid)
     || (replaySafeState.present && !replaySafeState.valid)
@@ -192,7 +242,7 @@ export function normalizeTurnOutcome(
       ? { noPriorProviderDispatch: provedNoPriorProviderDispatch }
       : {}),
     ...(hasUsageReplayProof ? { replaySafe: provedReplaySafe } : {}),
-    ...(userMessageIdState.valid && userMessageIdState.value
+    ...(userMessageIdState.valid && userMessageIdState.value && !replayConflict
       ? { userMessageId: userMessageIdState.value }
       : {}),
     ...(errorClass ? { errorClass } : {}),

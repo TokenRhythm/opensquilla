@@ -4,7 +4,7 @@ import { createPinia } from 'pinia'
 import { createApp, nextTick, type App } from 'vue'
 
 import i18n from '@/i18n'
-import type { ChatRenderedMessage } from '@/types/chat'
+import type { ChatRenderedMessage, DisplayAttachment } from '@/types/chat'
 import ChatMessageList from './ChatMessageList.vue'
 
 const apps: App<Element>[] = []
@@ -79,6 +79,18 @@ function usageBarrierAssistant(
       replaySafe: usageCallIndex === 1,
       userMessageId,
     },
+  }
+}
+
+function displayAttachment(kind: DisplayAttachment['kind']): DisplayAttachment {
+  return {
+    kind,
+    displayId: `history:${kind}`,
+    renderKey: `history:${kind}`,
+    name: `${kind}.txt`,
+    mime: 'text/plain',
+    ...(kind === 'inline' ? { downloadData: 'cmVxdWVzdA==' } : {}),
+    ...(kind === 'staged' ? { sha256_ref: 'a'.repeat(64) } : {}),
   }
 }
 
@@ -219,6 +231,20 @@ describe('ChatMessageList usage barrier retry anchor', () => {
 
     expect(host.querySelector('.msg-error-card__resume')).toBeNull()
   })
+
+  it.each(['inline', 'staged', 'file'] as const)(
+    'hides Retry when the primary request has a %s display attachment',
+    (kind) => {
+      const primary = user('user-primary', 'turn:safe', 'turn-safe')
+      primary.attachments = [displayAttachment(kind)]
+      const { host } = mountList([
+        primary,
+        usageBarrierError('error-safe', 'turn-safe', 'user-primary'),
+      ])
+
+      expect(host.querySelector('.msg-error-card__resume')).toBeNull()
+    },
+  )
 })
 
 describe('ChatMessageList assistant usage barrier regenerate', () => {
@@ -240,5 +266,17 @@ describe('ChatMessageList assistant usage barrier regenerate', () => {
     ])
 
     expect(host.querySelector('[aria-label="Regenerate"]')).not.toBeNull()
+  })
+
+  it('hides Regenerate when a safe status-only barrier points to a request with attachments', () => {
+    const primary = user('user-primary', 'turn:primary', 'turn-safe')
+    primary.attachments = [displayAttachment('inline')]
+    const { host } = mountList([
+      primary,
+      user('user-steer', 'turn:steer', 'turn-safe'),
+      usageBarrierAssistant('assistant-status', 'turn-safe', 'user-primary', 1),
+    ])
+
+    expect(host.querySelector('[aria-label="Regenerate"]')).toBeNull()
   })
 })

@@ -1,5 +1,6 @@
 import { nextTick, type Ref } from 'vue'
 import type {
+  Attachment,
   ChatMessage,
   ChatRenderedMessage,
   ChatStreamTimelineItem,
@@ -17,6 +18,7 @@ import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentine
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
   inputText: Ref<string>
+  pendingAttachments: Ref<Attachment[]>
   isStreaming: Ref<boolean>
   sanitizeCopyText: (text: string, opts?: {
     assistantBoundary?: boolean
@@ -172,6 +174,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = options.messages.value.slice(0, userMsgIndex)
     options.inputText.value = userText
+    if (usageBarrierRetry) options.pendingAttachments.value = []
     options.autoResizeTextarea()
     nextTick(() => options.sendCurrentInput())
     return true
