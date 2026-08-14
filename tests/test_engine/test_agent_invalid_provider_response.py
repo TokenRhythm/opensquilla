@@ -927,6 +927,64 @@ async def test_large_reasoning_only_without_fallback_keeps_thinking_by_default()
 
 
 @pytest.mark.asyncio
+async def test_large_length_capped_reasoning_only_retry_disables_thinking() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="length",
+                    input_tokens=35_858,
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal reasoning",
+                    model="deepseek-v4-flash-0731",
+                )
+            ],
+            [
+                ProviderText(text="visible answer"),
+                ProviderDone(
+                    stop_reason="stop",
+                    input_tokens=35_858,
+                    output_tokens=2,
+                    model="deepseek-v4-flash-0731",
+                ),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=ThinkingLevel.MEDIUM,
+            model_id="deepseek-v4-flash-0731",
+            max_tokens=16_384,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["config"].thinking is True
+    assert provider.calls[0]["config"].max_tokens == 16_384
+    assert provider.calls[1]["config"].thinking is False
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
+    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert provider.calls[1]["config"].max_tokens == 16_384
+    visible_retry = next(
+        event
+        for event in events
+        if event.kind == "warning"
+        and event.code == "provider_large_context_visible_retry"
+    )
+    assert "thinking disabled" in visible_retry.message
+    assert not any(event.kind == "error" for event in events)
+    done = next(event for event in events if event.kind == "done")
+    assert done.text == "visible answer"
+
+
+@pytest.mark.asyncio
 async def test_large_dashscope_reasoning_only_nudges_before_hard_fail(tmp_path) -> None:
     provider = _SequenceProvider(
         [

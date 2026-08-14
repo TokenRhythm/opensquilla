@@ -9951,11 +9951,15 @@ class Agent:
                                 )
                             ):
                                 _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
-                                disable_thinking = bool(
-                                    getattr(
-                                        self.config,
-                                        "reasoning_only_thinking_fallback",
-                                        False,
+                                disable_thinking = (
+                                    (attempt_classification.stop_reason or "").lower()
+                                    == "length"
+                                    or bool(
+                                        getattr(
+                                            self.config,
+                                            "reasoning_only_thinking_fallback",
+                                            False,
+                                        )
                                     )
                                 )
                                 if disable_thinking:
