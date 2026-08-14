@@ -247,7 +247,9 @@ def _estimated_base64_decoded_bytes(value: str) -> int:
     return max(0, (encoded_chars * 3) // 4 - padding)
 
 
-def _media_reserve_tokens(kind: str, decoded_bytes: int) -> int:
+def estimate_provider_media_tokens(kind: str, decoded_bytes: int) -> int:
+    """Return the provider-envelope reserve for one decoded media block."""
+
     if kind == "pdf":
         floor = _PDF_MEDIA_TOKEN_FLOOR
         bytes_per_token = _PDF_MEDIA_BYTES_PER_TOKEN
@@ -297,7 +299,7 @@ def _budget_projection(
         pdf_blocks += kind == "pdf"
         remote_blocks += remote
         decoded_bytes += estimated_bytes
-        reserve_tokens += _media_reserve_tokens(kind, estimated_bytes)
+        reserve_tokens += estimate_provider_media_tokens(kind, estimated_bytes)
 
     def visit(value: Any, path: tuple[str | int, ...] = ()) -> Any:
         nonlocal media_chars, media_blocks

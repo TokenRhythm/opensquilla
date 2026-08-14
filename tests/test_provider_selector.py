@@ -164,6 +164,45 @@ def test_override_model_with_router_fallback_chain_prefers_lower_tiers(monkeypat
     assert [cfg.model for cfg in built] == resolved_models
 
 
+@pytest.mark.parametrize(
+    "router_chain, expected_models",
+    [
+        ([], [HIGH_TIER_MODEL]),
+        (
+            [{"tier": "c2", "provider": "openrouter", "model": MID_TIER_MODEL}],
+            [HIGH_TIER_MODEL, MID_TIER_MODEL],
+        ),
+    ],
+)
+def test_capacity_bounded_fallback_chain_drops_configured_lower_models(
+    router_chain: list[object],
+    expected_models: list[str],
+) -> None:
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="openrouter",
+                model=BASELINE_MODEL,
+                api_key="sk-test",
+            ),
+            fallbacks=[
+                ProviderConfig(
+                    provider="openrouter",
+                    model=LOW_TIER_MODEL,
+                    api_key="sk-test",
+                )
+            ],
+        )
+    )
+
+    selector.override_model_with_bounded_fallback_chain(
+        HIGH_TIER_MODEL,
+        router_chain,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == expected_models
+
+
 # A synthetic, public-dummy credential: it only exists to prove redaction.
 FAKE_LEAKED_KEY = "sk-test-000fakefakefakefake"
 

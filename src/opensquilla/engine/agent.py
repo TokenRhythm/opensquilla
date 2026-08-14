@@ -10010,11 +10010,20 @@ class Agent:
                                 continue
 
                             yield self._transition(AgentState.ERROR)
+                            if self.config.metadata.get("had_attachments"):
+                                recovery_guidance = (
+                                    "Split, summarize, or shorten the attached material, "
+                                    "or use a stronger model."
+                                )
+                            else:
+                                recovery_guidance = (
+                                    "Send the material as an attachment, summarize or "
+                                    "shorten the prompt, or use a stronger model."
+                                )
                             terminal_error = ErrorEvent(
                                 message=(
                                     "Provider returned no visible response for a large input. "
-                                    "Send the material as an attachment, summarize or shorten "
-                                    "the prompt, or use a stronger model."
+                                    + recovery_guidance
                                 ),
                                 code="empty_response",
                             )

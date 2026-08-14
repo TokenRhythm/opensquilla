@@ -955,6 +955,16 @@ class RoutingPolicyEngine:
                 extra,
             )
 
+        minimum_context_tier = large_context_min_tier(
+            inputs.material_estimated_tokens,
+            inputs.context_window_tokens,
+        )
+        if minimum_context_tier in inputs.valid_tiers:
+            metadata_updates["large_context_floor_min_tier"] = minimum_context_tier
+            metadata_updates["large_context_material_tokens"] = (
+                inputs.material_estimated_tokens
+            )
+
         decision = large_context_floor(
             decision,
             tiers=inputs.tiers,

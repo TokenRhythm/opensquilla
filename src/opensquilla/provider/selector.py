@@ -608,6 +608,36 @@ class ModelSelector:
         self._chain = [current, *deduped_tail]
         self._index = 0
 
+    def override_model_with_bounded_fallback_chain(
+        self,
+        model: str,
+        fallback_chain: list[object],
+        approved_configured_fallbacks: list[object] | None = None,
+    ) -> None:
+        """Install only definitely capacity-safe fallbacks for a floored turn."""
+
+        self.override_model_with_fallback_chain(model, fallback_chain)
+        current = self._chain[0]
+        allowed_entries = [*fallback_chain, *(approved_configured_fallbacks or [])]
+        allowed_identities = {
+            (
+                str(entry.get("provider") or current.provider).strip()
+                or current.provider,
+                str(entry.get("model") or "").strip(),
+            )
+            for entry in allowed_entries
+            if isinstance(entry, Mapping) and str(entry.get("model") or "").strip()
+        }
+        self._chain = [
+            current,
+            *[
+                config
+                for config in self._chain[1:]
+                if (config.provider, config.model) in allowed_identities
+            ],
+        ]
+        self._index = 0
+
     def sync_primary(self, cfg: ProviderConfig) -> None:
         """Replace the primary provider config for future resolves and clones."""
         if self._provider_state_replay_disabled:

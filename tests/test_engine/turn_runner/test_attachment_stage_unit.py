@@ -8,6 +8,9 @@ exception-propagation contract without the runtime wrapper.
 
 from __future__ import annotations
 
+import asyncio
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -184,3 +187,106 @@ async def test_builder_called_exactly_once_per_run() -> None:
     )
     await stage.run(inp)
     assert len(builder.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pre_router_stage_never_starts_materialization() -> None:
+    stage, builder = _make_stage(builder=_RecordingBuilder(return_value=None))
+    task = asyncio.create_task(
+        stage.run(
+            AttachmentStageInput(
+                effective_runtime_message="hi",
+                attachments=[{"type": "text/plain", "data": "eA=="}],
+            )
+        )
+    )
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert builder.calls == []
+
+
+class _StartedCancellableBuilder:
+    def __init__(self) -> None:
+        self.started = threading.Event()
+        self.stopped = threading.Event()
+
+    def build(self, *_args: Any, **_kwargs: Any) -> list[Any] | None:
+        raise AssertionError("cancellable path was not used")
+
+    def build_cancellable(
+        self,
+        *_args: Any,
+        cancel_check: Any,
+        **_kwargs: Any,
+    ) -> list[Any] | None:
+        self.started.set()
+        try:
+            while True:
+                cancel_check()
+                time.sleep(0.002)
+        finally:
+            self.stopped.set()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_preparation_starts_stops_worker() -> None:
+    builder = _StartedCancellableBuilder()
+    task = asyncio.create_task(
+        AttachmentStage(builder=builder).run(
+            AttachmentStageInput(
+                effective_runtime_message="hi",
+                attachments=[{"type": "text/plain", "data": "eA=="}],
+            )
+        )
+    )
+    assert await asyncio.to_thread(builder.started.wait, 1.0)
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert await asyncio.to_thread(builder.stopped.wait, 1.0)
+
+
+@pytest.mark.asyncio
+async def test_attachment_preparation_does_not_block_event_loop_ticker() -> None:
+    class _SlowBuilder(_RecordingBuilder):
+        def build(self, *args: Any, **kwargs: Any) -> list[Any] | None:
+            time.sleep(0.08)
+            return super().build(*args, **kwargs)
+
+    stage_task = asyncio.create_task(
+        AttachmentStage(builder=_SlowBuilder(return_value=None)).run(
+            AttachmentStageInput(
+                effective_runtime_message="hi",
+                attachments=[{"type": "text/plain", "data": "eA=="}],
+            )
+        )
+    )
+    ticks = 0
+    while not stage_task.done():
+        ticks += 1
+        await asyncio.sleep(0.005)
+    await stage_task
+
+    assert ticks >= 5
+
+
+@pytest.mark.asyncio
+async def test_attachment_preparation_deadline_stops_started_worker() -> None:
+    builder = _StartedCancellableBuilder()
+
+    with pytest.raises(TimeoutError, match="attachment preparation"):
+        await AttachmentStage(builder=builder).run(
+            AttachmentStageInput(
+                effective_runtime_message="hi",
+                attachments=[{"type": "text/plain", "data": "eA=="}],
+                timeout_seconds=0.02,
+            )
+        )
+
+    assert builder.started.is_set()
+    assert await asyncio.to_thread(builder.stopped.wait, 1.0)

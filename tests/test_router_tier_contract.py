@@ -8,6 +8,8 @@ from opensquilla.engine.selector_override import apply_model_override
 from opensquilla.engine.steps.squilla_router import _flag_tier_provider_mismatch
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.mutations import _cross_provider_tier_warnings, upsert_router
+from opensquilla.provider.model_catalog import ModelCatalog
+from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.router_tiers import TierConfig
 
 # ---------------------------------------------------------------------------
@@ -89,6 +91,19 @@ class _StubSelector:
     def override_model_with_fallback_chain(self, model: str, chain: list) -> None:
         self.calls.append(("override_with_chain", (model, chain)))
 
+    def override_model_with_bounded_fallback_chain(
+        self,
+        model: str,
+        chain: list,
+        approved_configured_fallbacks: list | None = None,
+    ) -> None:
+        self.calls.append(
+            (
+                "override_with_bounded_chain",
+                (model, chain, approved_configured_fallbacks),
+            )
+        )
+
     def resolve(self) -> object:
         return "provider-sentinel"
 
@@ -117,6 +132,76 @@ def test_override_without_routing_uses_plain_override() -> None:
     assert selector.calls[0][0] == "override_model"
     # Observe phase: routed_model intentionally keeps the would-be choice.
     assert metadata["routed_model"] == "would-be-routed"
+
+
+def test_large_context_floor_uses_capacity_bounded_selector_chain() -> None:
+    selector = _StubSelector()
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [{"tier": "c2", "model": "capacity-safe"}],
+        "large_context_floor_min_tier": "c2",
+        "routed_model": "routed",
+    }
+
+    apply_model_override(
+        selector,
+        "routed",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert selector.calls[0][0] == "override_with_bounded_chain"
+
+
+def test_large_context_floor_keeps_only_definitely_capable_configured_fallbacks(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/configured-lower": {"context_window": 20_000},
+            "openai/configured-same": {"context_window": 50_000},
+            "openai/configured-higher": {"context_window": 100_000},
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog._shared_catalog",
+        catalog,
+    )
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                "openai",
+                "configured-lower",
+                api_key="test-key",
+            ),
+            fallbacks=[
+                ProviderConfig("openai", "configured-same", api_key="test-key"),
+                ProviderConfig("openai", "configured-higher", api_key="test-key"),
+                ProviderConfig("openai", "configured-unknown", api_key="test-key"),
+            ],
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [],
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "routed_model": "routed-at-floor",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-at-floor",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == [
+        "routed-at-floor",
+        "configured-same",
+        "configured-higher",
+    ]
 
 
 def test_explicit_override_realigns_routed_model_and_drops_savings() -> None:

@@ -1101,6 +1101,30 @@ async def test_large_empty_response_without_fallback_surfaces_clear_error() -> N
 
 
 @pytest.mark.asyncio
+async def test_large_empty_response_with_attachment_does_not_recommend_uploading_again() -> None:
+    provider = _SequenceProvider(
+        [[ProviderDone(stop_reason="stop", input_tokens=35_000, output_tokens=0)]]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+            metadata={"had_attachments": True},
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    error = next(event for event in events if event.kind == "error")
+    assert error.code == "empty_response"
+    assert "Send the material as an attachment" not in error.message
+    assert "attached material" in error.message
+    assert "split" in error.message.lower()
+
+
+@pytest.mark.asyncio
 async def test_incomplete_tool_stream_errors_without_running_tool() -> None:
     provider = _SequenceProvider(
         [

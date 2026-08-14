@@ -23,6 +23,44 @@ _ROUTE_SAVINGS_KEYS = (
 )
 
 
+def _capacity_approved_configured_fallbacks(
+    selector: Any,
+    turn_metadata: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Keep only configured fallbacks with definite floor/context capacity."""
+
+    remaining_chain = getattr(selector, "remaining_chain", None)
+    if not callable(remaining_chain):
+        return []
+    try:
+        configured_tail = list(remaining_chain())
+    except Exception:  # noqa: BLE001 - an opaque selector fails closed
+        return []
+
+    material_tokens = turn_metadata.get("large_context_material_tokens")
+    if not isinstance(material_tokens, int) or isinstance(material_tokens, bool):
+        material_tokens = 0
+
+    from opensquilla.provider.model_catalog import shared_catalog
+
+    catalog = shared_catalog()
+    approved: list[dict[str, str]] = []
+    for config in configured_tail:
+        provider = str(getattr(config, "provider", "") or "").strip()
+        model = str(getattr(config, "model", "") or "").strip()
+        if not provider or not model:
+            continue
+        if material_tokens <= 0:
+            continue
+        try:
+            window, source = catalog.resolve_context_window_with_source(model, provider)
+        except Exception:  # noqa: BLE001 - missing/invalid capability fails closed
+            continue
+        if source in {"catalog", "override"} and window >= material_tokens:
+            approved.append({"provider": provider, "model": model})
+    return approved
+
+
 def acquire_profile_credential(
     provider_id: str,
     pool_names: list[str],
@@ -404,7 +442,26 @@ def apply_model_override(
         "override_model_with_fallback_chain",
         None,
     )
-    if callable(override_with_fallback_chain) and isinstance(router_fallback_chain, list):
+    override_with_bounded_fallback_chain = getattr(
+        selector,
+        "override_model_with_bounded_fallback_chain",
+        None,
+    )
+    if (
+        turn_metadata.get("large_context_floor_min_tier")
+        and callable(override_with_bounded_fallback_chain)
+        and isinstance(router_fallback_chain, list)
+    ):
+        approved_configured_fallbacks = _capacity_approved_configured_fallbacks(
+            selector,
+            turn_metadata,
+        )
+        override_with_bounded_fallback_chain(
+            model,
+            router_fallback_chain,
+            approved_configured_fallbacks,
+        )
+    elif callable(override_with_fallback_chain) and isinstance(router_fallback_chain, list):
         override_with_fallback_chain(model, router_fallback_chain)
     else:
         selector.override_model(model)

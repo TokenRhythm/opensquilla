@@ -19,6 +19,11 @@ corpus through the current code and compares the canonical JSON
 serialization (sorted keys, ``_ts`` monotonic timestamps scrubbed) of each
 observation against that golden.
 
+The large-context cases were intentionally recaptured for Issue #976 after
+the capacity floor became a hard lower bound for physical fallback. Their
+goldens therefore include the sanitized floor tier and omit fallback models
+below it; the remaining corpus still pins the original extraction parity.
+
 Classifier outputs are injected through a fake strategy: the corpus never
 loads the LightGBM/ONNX bundle, touches the network, or needs credentials.
 All tier/model/provider names and messages are synthetic dummy data; tier

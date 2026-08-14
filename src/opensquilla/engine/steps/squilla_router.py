@@ -58,6 +58,7 @@ from opensquilla.squilla_router.controller import (
     synthetic_one_hot,
     thinking_mode_to_level,
 )
+from opensquilla.token_estimation import estimate_material_text_tokens
 
 log = structlog.get_logger(__name__)
 _log_std = logging.getLogger(__name__)
@@ -83,6 +84,7 @@ _ROUTING_HISTORY_WINDOW = 1800
 def _router_text_fallback_chain(
     selected_tier: object,
     tiers: dict,
+    minimum_tier: object = None,
 ) -> list[dict[str, str]]:
     selected = normalize_text_tier(selected_tier)
     if selected is None:
@@ -91,9 +93,11 @@ def _router_text_fallback_chain(
         selected_index = TEXT_TIERS.index(selected)
     except ValueError:
         return []
+    minimum = normalize_text_tier(minimum_tier)
+    minimum_index = TEXT_TIERS.index(minimum) if minimum in TEXT_TIERS else 0
 
     chain: list[dict[str, str]] = []
-    for tier_name in reversed(TEXT_TIERS[:selected_index]):
+    for tier_name in reversed(TEXT_TIERS[minimum_index:selected_index]):
         tier_cfg = tiers.get(tier_name)
         if not isinstance(tier_cfg, dict) or tier_cfg.get("image_only", False):
             continue
@@ -676,17 +680,27 @@ def _token_estimate(value: object) -> int | None:
 
 def _material_estimated_tokens(ctx: TurnContext, semantic_message: str) -> int:
     metadata = getattr(ctx, "metadata", {}) or {}
-    candidates: list[int] = [max(len(semantic_message) // 4, 0)]
+    prompt_tokens = estimate_material_text_tokens(semantic_message)
+    attachment_tokens = _token_estimate(
+        metadata.get("attachment_material_estimated_tokens")
+    ) or 0
+    generated_normalization_tokens = _token_estimate(
+        metadata.get("attachment_generated_normalization_estimated_tokens")
+    ) or 0
+    non_generated_attachment_tokens = max(
+        0, attachment_tokens - generated_normalization_tokens
+    )
+    candidates: list[int] = [prompt_tokens + attachment_tokens]
 
     top_level = _token_estimate(metadata.get("material_estimated_tokens"))
     if top_level is not None:
-        candidates.append(top_level)
+        candidates.append(top_level + non_generated_attachment_tokens)
 
     normalization = metadata.get("input_normalization")
     if isinstance(normalization, dict):
         nested = _token_estimate(normalization.get("material_estimated_tokens"))
         if nested is not None:
-            candidates.append(nested)
+            candidates.append(nested + non_generated_attachment_tokens)
 
     return max(candidates)
 
@@ -1396,6 +1410,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     ctx.metadata["router_fallback_chain"] = _router_text_fallback_chain(
         decision.tier,
         tiers,
+        ctx.metadata.get("large_context_floor_min_tier"),
     )
     ctx.metadata.update(_compute_savings(decision.model, tiers))
     _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=routing_applied)

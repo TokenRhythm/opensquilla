@@ -119,6 +119,7 @@ from opensquilla.engine.turn_policy import resolve_turn_policy
 from opensquilla.engine.turn_runner import (
     AgentBootstrapStage,
     AgentBootstrapStageInput,
+    AttachmentMaterializationStats,
     AttachmentStage,
     AttachmentStageInput,
     CompactionAndHistoryStage,
@@ -133,6 +134,7 @@ from opensquilla.engine.turn_runner import (
     StreamConsumerStageInput,
     TurnFinalizerStage,
     TurnFinalizerStageInput,
+    rebind_attachment_prompt,
 )
 from opensquilla.engine.turn_runner.harness import (
     _PromptReportBuilderAdapter,
@@ -3167,7 +3169,12 @@ def _render_preview_only_attachment_text(
     )
 
 
-def _extract_pdf_attachment_text(raw_bytes: bytes, filename: str) -> str:
+def _extract_pdf_attachment_text(
+    raw_bytes: bytes,
+    filename: str,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> str:
     """Extract text from a PDF attachment before it reaches any provider.
 
     PDFs are converted into plain text context so provider-specific document
@@ -3186,6 +3193,8 @@ def _extract_pdf_attachment_text(raw_bytes: bytes, filename: str) -> str:
         page_texts: list[str] = []
         with pdfplumber.open(io.BytesIO(raw_bytes)) as doc:
             for index, page in enumerate(doc.pages, start=1):
+                if cancel_check is not None:
+                    cancel_check()
                 page_text = page.extract_text() or ""
                 if page_text.strip():
                     page_texts.append(f"--- Page {index} ---\n{page_text}")
@@ -3206,7 +3215,14 @@ _XLSX_MAX_ROWS_PER_SHEET = 1000
 _XLSX_MAX_COLS = 64
 
 
-def _office_zip_guard(raw_bytes: bytes, filename: str) -> None:
+def _office_zip_guard(
+    raw_bytes: bytes,
+    filename: str,
+    *,
+    decompressed_limit: int | None = None,
+    batch_decompressed_budget: list[int] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> int:
     # Measure the *actual* inflated size by streaming each member, not the
     # central-directory ``file_size`` (which the uploader controls and can lie
     # about). Reads in bounded chunks and aborts as soon as the running total
@@ -3215,21 +3231,42 @@ def _office_zip_guard(raw_bytes: bytes, filename: str) -> None:
     import zipfile
 
     chunk_size = 1024 * 1024
+    effective_limit = (
+        decompressed_limit
+        if isinstance(decompressed_limit, int) and decompressed_limit > 0
+        else _OFFICE_DECOMPRESSED_LIMIT
+    )
     try:
         with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
             total = 0
             for info in archive.infolist():
+                if cancel_check is not None:
+                    cancel_check()
                 with archive.open(info) as member:
                     while True:
+                        if cancel_check is not None:
+                            cancel_check()
                         block = member.read(chunk_size)
                         if not block:
                             break
                         total += len(block)
-                        if total > _OFFICE_DECOMPRESSED_LIMIT:
+                        if batch_decompressed_budget is not None:
+                            batch_decompressed_budget[0] -= len(block)
+                        if total > effective_limit:
                             raise ValueError(
                                 f"office attachment {filename!r} decompresses beyond "
-                                f"the {_OFFICE_DECOMPRESSED_LIMIT} byte safety limit"
+                                f"the {effective_limit} byte remaining batch safety limit"
                             )
+                        if (
+                            batch_decompressed_budget is not None
+                            and batch_decompressed_budget[0] < 0
+                        ):
+                            raise ValueError(
+                                f"office attachment batch containing {filename!r} "
+                                f"decompresses beyond the {_OFFICE_DECOMPRESSED_LIMIT} "
+                                "byte safety limit"
+                            )
+            return total
     except ValueError:
         raise
     except Exception as exc:  # noqa: BLE001 - zipfile raises several error types
@@ -3322,7 +3359,13 @@ _OFFICE_EXTRACTORS: dict[str, Callable[[bytes], str]] = {
 
 
 def _extract_office_attachment_text(
-    raw_bytes: bytes, filename: str, media_type: str
+    raw_bytes: bytes,
+    filename: str,
+    media_type: str,
+    *,
+    decompressed_limit: int | None = None,
+    batch_decompressed_budget: list[int] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> str:
     """Extract text from an OOXML office attachment before it reaches any provider.
 
@@ -3333,7 +3376,15 @@ def _extract_office_attachment_text(
     extractor = _OFFICE_EXTRACTORS.get(media_type)
     if extractor is None:  # pragma: no cover - guarded by the allow-list
         raise ValueError(f"unsupported office media type {media_type!r}")
-    _office_zip_guard(raw_bytes, filename)
+    _office_zip_guard(
+        raw_bytes,
+        filename,
+        decompressed_limit=decompressed_limit,
+        batch_decompressed_budget=batch_decompressed_budget,
+        cancel_check=cancel_check,
+    )
+    if cancel_check is not None:
+        cancel_check()
     try:
         extracted = extractor(raw_bytes).strip()
     except ValueError:
@@ -3348,6 +3399,8 @@ def _extract_office_attachment_text(
         ) from exc
     if not extracted:
         raise ValueError(f"office attachment {filename!r} has no extractable text")
+    if cancel_check is not None:
+        cancel_check()
     return _truncate_attachment_text(extracted)
 
 
@@ -4620,6 +4673,49 @@ class TurnRunner:
             tool_metadata = pt_out.tool_metadata
             skill_catalog = pt_out.skill_catalog
 
+            # Uploaded attachments have already crossed the controlled ingress
+            # boundary, so materialize their provider-visible form once before
+            # routing. Arbitrary workspace paths remain tool-mediated and are
+            # never discovered or read here.
+            attachment_materialization_session_id = (
+                pipeline_session_id if pipeline_session_id is not None else session_key
+            )
+            generated_normalization_attachment_count = 0
+            if isinstance(normalization_metadata, dict):
+                raw_generated_count = normalization_metadata.get(
+                    "generated_attachment_count"
+                )
+                if isinstance(raw_generated_count, int) and not isinstance(
+                    raw_generated_count, bool
+                ):
+                    generated_normalization_attachment_count = max(
+                        0, raw_generated_count
+                    )
+            attachment_timeout = (
+                float(timeout)
+                if isinstance(timeout, int | float)
+                and not isinstance(timeout, bool)
+                and timeout > 0
+                else None
+            )
+            att_outcome = await self._attachment_stage.run(
+                AttachmentStageInput(
+                    effective_runtime_message=runtime_message,
+                    attachments=attachments,
+                    workspace_dir=getattr(tool_context, "workspace_dir", None),
+                    session_id=(
+                        attachment_materialization_session_id
+                        if attachments
+                        else None
+                    ),
+                    generated_normalization_attachment_count=(
+                        generated_normalization_attachment_count
+                    ),
+                    timeout_seconds=attachment_timeout,
+                )
+            )
+            att_out = att_outcome.require_output()
+
             turn_usage_scope: UsageAccountingScope | None = None
             if self._usage_event_sink is not None:
                 pipeline_usage_context = UsageExecutionContext(
@@ -4651,6 +4747,7 @@ class TurnRunner:
                         agent_id=agent_id,
                         turn_id=turn_id,
                         attachments=attachments,
+                        attachment_materialization=att_out.stats,
                         bootstrap_context_mode=bootstrap_context_mode,
                         model=model,
                         history_has_persisted_user=history_has_persisted_user,
@@ -4678,6 +4775,13 @@ class TurnRunner:
             tool_defs_for_log = turn.tool_defs
             provider_for_log = provider
             effective_runtime_message = pa_out.effective_runtime_message
+            extra_msgs = rebind_attachment_prompt(
+                att_out.extra_messages,
+                effective_runtime_message,
+            )
+            attachment_turn_input = (
+                effective_runtime_message if extra_msgs is None else ""
+            )
             final_prompt = pa_out.final_prompt
             final_prompt_str = final_prompt
             cache_breakpoints = pa_out.cache_breakpoints
@@ -4838,27 +4942,6 @@ class TurnRunner:
                         "max_iterations_source": effective_max_iterations_source,
                     },
                 )
-
-            # Materialize attachments exactly once before durable compaction
-            # admission. Their extracted text and typed media blocks are fixed
-            # current-turn input and therefore must reduce the history budget.
-            attachment_materialization_session_id = None
-            if attachments:
-                attachment_materialization_session_id = await self._resolve_session_id_for_log(
-                    session_key
-                )
-                if attachment_materialization_session_id is None:
-                    attachment_materialization_session_id = session_key
-            att_outcome = await self._attachment_stage.run(
-                AttachmentStageInput(
-                    effective_runtime_message=effective_runtime_message,
-                    attachments=attachments,
-                    workspace_dir=agent_config.workspace_dir,
-                    session_id=attachment_materialization_session_id,
-                )
-            )
-            att_out = att_outcome.require_output()
-            extra_msgs = att_out.extra_messages
 
             # 6. Compaction (t3 + preflight) + history load + request-context
             # prepend. CompactionAndHistoryStage owns the four-call sequence
@@ -5339,7 +5422,7 @@ class TurnRunner:
             error_message: str | None = None
             pending_error_event: ErrorEvent | None = None
             done_event: DoneEvent | None = None
-            turn_input = att_out.turn_input
+            turn_input = attachment_turn_input
 
             stream_state = _StreamState(
                 current_text_parts=current_text_parts,
@@ -7845,6 +7928,7 @@ class TurnRunner:
         flags_text_override: str | None = None,
         tool_context: ToolContext | None = None,
         normalization_metadata: dict[str, Any] | None = None,
+        attachment_materialization: AttachmentMaterializationStats | None = None,
         input_provenance: dict[str, Any] | None = None,
         skill_catalog: Any | None = None,
         usage_execution_context: UsageExecutionContext | None = None,
@@ -8031,6 +8115,30 @@ class TurnRunner:
             material_tokens = normalization_metadata.get("material_estimated_tokens")
             if type(material_tokens) is int and material_tokens > 0:
                 initial_metadata["material_estimated_tokens"] = material_tokens
+        if attachment_materialization is not None:
+            initial_metadata["had_attachments"] = bool(
+                attachment_materialization.attachment_count
+            )
+            initial_metadata["attachment_count"] = int(
+                attachment_materialization.attachment_count
+            )
+            initial_metadata["attachment_material_estimated_tokens"] = int(
+                attachment_materialization.estimated_tokens
+            )
+            initial_metadata[
+                "attachment_generated_normalization_estimated_tokens"
+            ] = int(
+                attachment_materialization.generated_normalization_estimated_tokens
+            )
+            initial_metadata["attachment_parse_failure_count"] = int(
+                attachment_materialization.parse_failure_count
+            )
+            initial_metadata["attachment_provider_visible_text_chars"] = int(
+                attachment_materialization.provider_visible_text_chars
+            )
+            initial_metadata["attachment_image_count"] = int(
+                attachment_materialization.image_count
+            )
         if input_provenance:
             if isinstance(input_provenance, dict):
                 normalized_provenance = dict(input_provenance)
@@ -11380,6 +11488,7 @@ class TurnRunner:
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
         workspace_attachment_budget_bytes: int | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> list | None:
         """Build a multimodal user message that carries the attachments.
 
@@ -11396,6 +11505,8 @@ class TurnRunner:
 
         if not attachments:
             return None
+        if cancel_check is not None:
+            cancel_check()
         if len(attachments) > _MAX_ATTACHMENT_COUNT:
             raise ValueError(f"attachments supports at most {_MAX_ATTACHMENT_COUNT} items")
 
@@ -11407,6 +11518,7 @@ class TurnRunner:
 
         prompt_block = ContentBlockText(text=message)
         attachment_blocks: list[Any] = []
+        office_batch_decompressed_budget = [_OFFICE_DECOMPRESSED_LIMIT]
         turn_materializer: AttachmentWorkspaceMaterializer | None = None
         if workspace_dir:
             # One instance per turn so the attachment batch shares a single
@@ -11418,6 +11530,8 @@ class TurnRunner:
                 disk_budget_bytes=workspace_attachment_budget_bytes,
             )
         for index, att in enumerate(attachments, start=1):
+            if cancel_check is not None:
+                cancel_check()
             att_type = att.get("type")
             media_type: str | None = att_type if isinstance(att_type, str) else None
             if media_type is None or media_type not in _ALLOWED_ENGINE_MEDIA_TYPES:
@@ -11485,6 +11599,8 @@ class TurnRunner:
                         mime=media_type,
                         session_id=session_id,
                     )
+                if cancel_check is not None:
+                    cancel_check()
                 prefix = (
                     "attachment available"
                     if result.available
@@ -11505,7 +11621,11 @@ class TurnRunner:
                 attachment_blocks.append(ContentBlockImage(media_type=media_type, data=data))
             elif media_type == "application/pdf":
                 try:
-                    extracted_pdf_text = _extract_pdf_attachment_text(raw_bytes, filename)
+                    extracted_pdf_text = _extract_pdf_attachment_text(
+                        raw_bytes,
+                        filename,
+                        cancel_check=cancel_check,
+                    )
                 except ValueError as exc:
                     extracted_pdf_text = (
                         f"[attachment unavailable: PDF text could not be extracted: {exc}]"
@@ -11527,7 +11647,11 @@ class TurnRunner:
             elif media_type in _OFFICE_ATTACHMENT_MIMES:
                 try:
                     extracted_office_text = _extract_office_attachment_text(
-                        raw_bytes, filename, media_type
+                        raw_bytes,
+                        filename,
+                        media_type,
+                        batch_decompressed_budget=office_batch_decompressed_budget,
+                        cancel_check=cancel_check,
                     )
                 except ValueError as exc:
                     extracted_office_text = (
@@ -11602,6 +11726,9 @@ class TurnRunner:
                     details = "\n\n".join([details, material_marker])
                 wrapped = _render_file_context_block(filename, media_type, details)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
+
+            if cancel_check is not None:
+                cancel_check()
 
         return [
             Message(
