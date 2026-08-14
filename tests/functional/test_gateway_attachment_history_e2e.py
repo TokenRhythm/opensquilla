@@ -35,7 +35,12 @@ from opensquilla.gateway.uploads import (
 )
 from opensquilla.gateway.websocket import SubscriptionManager, get_registry
 from opensquilla.provider import ChatConfig, DoneEvent, Message, ModelCapabilities
-from opensquilla.provider.types import ContentBlockImage, ModelInfo, TextDeltaEvent
+from opensquilla.provider.types import (
+    ContentBlockImage,
+    ContentBlockText,
+    ModelInfo,
+    TextDeltaEvent,
+)
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
 
@@ -418,6 +423,29 @@ async def test_gateway_upload_history_image_replays_through_squilla_router_gate_
 
     with pytest.raises(AttachmentNotFoundError):
         await store.get(file_uuid)
+
+    assert vision_provider.calls
+    first_call_messages = vision_provider.calls[-1]["messages"]
+    current_turn = next(message for message in first_call_messages if _message_has_image(message))
+    assert isinstance(current_turn.content, list)
+    current_turn_markers = [
+        block.text
+        for block in current_turn.content
+        if isinstance(block, ContentBlockText)
+        and block.text.startswith("[attachment available:")
+    ]
+    workspace_images = list(
+        (Path(config.workspace_dir) / ".opensquilla" / "attachments").glob("**/*-first.png")
+    )
+    assert len(workspace_images) == 1
+    assert workspace_images[0].read_bytes() == _PNG_BYTES
+    relative_workspace_image = workspace_images[0].relative_to(config.workspace_dir).as_posix()
+    assert current_turn_markers == [
+        (
+            f"[attachment available: first.png (image/png, {len(_PNG_BYTES)} bytes) "
+            f"at {relative_workspace_image}]"
+        )
+    ]
 
     transcript = await manager.get_transcript(key)
     first_user = transcript[0]

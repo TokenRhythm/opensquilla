@@ -11386,7 +11386,8 @@ class TurnRunner:
         The engine sees one normalised attachment shape. Provider
         conversion is deliberately narrow:
 
-          * ``image/*``           -> ``ContentBlockImage``
+          * ``image/*``           -> ``ContentBlockImage`` plus a workspace
+                                     marker when a workspace is available
           * ``application/pdf``   -> local text extraction, then ``ContentBlockText``
           * text-family / json    -> ``ContentBlockText`` wrapped in an
                                      ``<file name="…" mime="…">…</file>``
@@ -11471,10 +11472,7 @@ class TurnRunner:
             name_raw = att.get("name")
             filename = _sanitize_attachment_filename(name_raw)
             material_marker = ""
-            if (
-                turn_materializer is not None
-                and _is_materializable_attachment_mime(media_type)
-            ):
+            if turn_materializer is not None:
                 materializer = turn_materializer
                 if is_attachment_ref(att):
                     result = materializer.materialize(att, session_id=session_id)
@@ -11503,6 +11501,8 @@ class TurnRunner:
 
             if media_type in _IMAGE_ATTACHMENT_MIMES:
                 attachment_blocks.append(ContentBlockImage(media_type=media_type, data=data))
+                if material_marker:
+                    attachment_blocks.append(ContentBlockText(text=material_marker))
             elif media_type == "application/pdf":
                 try:
                     extracted_pdf_text = _extract_pdf_attachment_text(raw_bytes, filename)

@@ -108,16 +108,85 @@ def test_image_emits_image_block() -> None:
     assert image_blocks[0].media_type == "image/png"
 
 
-def test_image_ref_hydrates_for_current_provider_call(tmp_path: Path) -> None:
+def test_inline_image_materializes_to_workspace_without_losing_vision_block(
+    tmp_path: Path,
+) -> None:
+    payload = b"\x89PNG\r\n\x1a\n"
+    workspace = tmp_path / "workspace"
+
+    out = TurnRunner._build_attachment_messages(
+        "use this image",
+        [{"type": "image/png", "data": _b64(payload), "name": "pet.png"}],
+        workspace_dir=workspace,
+        session_id="s-inline-image",
+    )
+
+    assert out is not None
+    image_blocks = [b for b in out[0].content if isinstance(b, ContentBlockImage)]
+    assert len(image_blocks) == 1
+    assert image_blocks[0].data == _b64(payload)
+    material_markers = [
+        b.text
+        for b in out[0].content
+        if isinstance(b, ContentBlockText) and b.text.startswith("[attachment available:")
+    ]
+    assert len(material_markers) == 1
+    assert "pet.png (image/png" in material_markers[0]
+    assert ".opensquilla/attachments/s-inline-image/" in material_markers[0]
+    workspace_paths = list((workspace / ".opensquilla" / "attachments").glob("**/*.png"))
+    assert len(workspace_paths) == 1
+    assert workspace_paths[0].read_bytes() == payload
+
+
+def test_image_workspace_budget_failure_preserves_vision_block(tmp_path: Path) -> None:
+    payload = b"\x89PNG\r\n\x1a\n" + b"x" * 64
+    workspace = tmp_path / "workspace"
+
     out = TurnRunner._build_attachment_messages(
         "describe",
-        [_ref(tmp_path, b"\x89PNG\r\n\x1a\n", name="p.png", mime="image/png")],
+        [{"type": "image/png", "data": _b64(payload), "name": "large.png"}],
+        workspace_dir=workspace,
+        session_id="s-budget-image",
+        workspace_attachment_budget_bytes=8,
+    )
+
+    assert out is not None
+    image_blocks = [b for b in out[0].content if isinstance(b, ContentBlockImage)]
+    assert len(image_blocks) == 1
+    assert image_blocks[0].data == _b64(payload)
+    marker = next(
+        b.text
+        for b in out[0].content
+        if isinstance(b, ContentBlockText) and b.text.startswith("[attachment unavailable:")
+    )
+    assert "workspace attachment budget exceeded" in marker
+    assert list((workspace / ".opensquilla" / "attachments").rglob("*-large.png")) == []
+
+
+def test_image_ref_hydrates_for_current_provider_call(tmp_path: Path) -> None:
+    payload = b"\x89PNG\r\n\x1a\n"
+    workspace = tmp_path / "workspace"
+    out = TurnRunner._build_attachment_messages(
+        "describe",
+        [_ref(tmp_path, payload, name="p.png", mime="image/png")],
         media_root=tmp_path,
+        workspace_dir=workspace,
+        session_id="s1",
     )
     assert out is not None
     image_blocks = [b for b in out[0].content if isinstance(b, ContentBlockImage)]
     assert len(image_blocks) == 1
-    assert image_blocks[0].data == _b64(b"\x89PNG\r\n\x1a\n")
+    assert image_blocks[0].data == _b64(payload)
+    marker = next(
+        b.text
+        for b in out[0].content
+        if isinstance(b, ContentBlockText) and b.text.startswith("[attachment available:")
+    )
+    assert "p.png (image/png" in marker
+    assert ".opensquilla/attachments/s1/" in marker
+    workspace_paths = list((workspace / ".opensquilla" / "attachments").glob("**/*.png"))
+    assert len(workspace_paths) == 1
+    assert workspace_paths[0].read_bytes() == payload
 
 
 def test_historical_inline_image_envelope_can_replay_for_vision() -> None:
