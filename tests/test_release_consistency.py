@@ -100,6 +100,39 @@ def test_release_workflow_runs_legacy_windows_upgrade_checks_on_server_2022() ->
     assert workflow["jobs"]["audit-downloaded-windows-release"]["runs-on"] == "windows-2022"
 
 
+def test_signpath_test_workflow_builds_the_submitted_installer_in_the_same_run() -> None:
+    workflow_path = Path(".github/workflows/signpath-test-signing.yml")
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    job = workflow["jobs"]["sign-windows-installer"]
+    steps = job["steps"]
+    step_names = [step["name"] for step in steps]
+
+    assert job["runs-on"] == "windows-2022"
+    assert "source_run_id" not in workflow_text
+    assert "SOURCE_RUN_ID" not in workflow_text
+    assert "actions/download-artifact" not in workflow_text
+
+    checkout = next(step for step in steps if step["name"] == "Checkout")
+    assert checkout["with"] == {"lfs": True, "persist-credentials": False}
+
+    build_index = step_names.index("Build unsigned Windows installer")
+    upload_index = step_names.index("Upload the unsigned installer without an archive wrapper")
+    submit_index = step_names.index("Submit SignPath test-signing request")
+    assert build_index < upload_index < submit_index
+
+    build_step = steps[build_index]
+    assert "npx electron-builder --win --publish never" in build_step["run"]
+
+    upload_step = steps[upload_index]
+    submit_step = steps[submit_index]
+    assert upload_step["with"]["path"] == "${{ steps.installer.outputs.path }}"
+    assert upload_step["with"]["archive"] is False
+    assert submit_step["with"]["github-artifact-id"] == (
+        "${{ steps.unsigned.outputs.artifact-id }}"
+    )
+
+
 def test_tui_companion_remains_development_only() -> None:
     """A normal version tag must not publish the in-repo development host."""
 

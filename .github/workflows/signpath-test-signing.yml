@@ -5,11 +5,6 @@ on:
     branches:
       - test/signpath-test-signing
   workflow_dispatch:
-    inputs:
-      source_run_id:
-        description: Successful Release Assets run containing the unsigned Windows installer
-        required: true
-        default: "29822197447"
 
 permissions:
   actions: read
@@ -21,12 +16,10 @@ concurrency:
 
 jobs:
   sign-windows-installer:
-    name: Sign Windows installer with the SignPath test certificate
+    name: Build and sign Windows installer with the SignPath test certificate
     if: github.repository == 'opensquilla/opensquilla' && github.actor == 'Open-Squilla'
-    runs-on: windows-latest
-    timeout-minutes: 30
-    env:
-      SOURCE_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.source_run_id || '29822197447' }}
+    runs-on: windows-2022
+    timeout-minutes: 150
 
     steps:
       - name: Check SignPath credential
@@ -38,14 +31,70 @@ jobs:
             throw 'SIGNPATH_API_TOKEN is not available to this repository.'
           }
 
-      - name: Download unsigned Windows installer artifact
-        uses: actions/download-artifact@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          name: opensquilla-electron-windows
-          path: unsigned-release-artifact
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ env.SOURCE_RUN_ID }}
+          lfs: true
+          persist-credentials: false
+
+      - name: Hydrate router assets
+        shell: bash
+        run: git lfs pull --include="src/opensquilla/squilla_router/models/**"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: |
+            opensquilla-webui/package-lock.json
+            desktop/electron/package-lock.json
+
+      - name: Install Web UI dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Build and verify Web UI
+        working-directory: opensquilla-webui
+        run: |
+          npm run build
+          npm run verify:release-dist
+
+      - name: Install Electron dependencies
+        working-directory: desktop/electron
+        run: npm ci
+
+      - name: Build unsigned Windows installer
+        working-directory: desktop/electron
+        shell: bash
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          set -euo pipefail
+          npm run fetch:runtimes
+          npm run build:gateway
+          npm run build
+          npx electron-builder --win --publish never
+
+      - name: Verify Electron package
+        working-directory: desktop/electron
+        run: npm run verify:package
+
+      - name: Smoke packaged gateway
+        working-directory: desktop/electron
+        env:
+          OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: "1"
+        run: npm run verify:gateway-smoke
 
       - name: Select the unsigned installer
         id: installer
@@ -53,8 +102,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $installers = @(
-            Get-ChildItem 'unsigned-release-artifact' `
-              -Recurse `
+            Get-ChildItem 'dist/desktop-electron' `
               -File `
               -Filter 'OpenSquilla-*-win-x64.exe'
           )
@@ -75,6 +123,7 @@ jobs:
         id: unsigned
         uses: actions/upload-artifact@v7
         with:
+          name: opensquilla-windows-signpath-test-unsigned
           path: ${{ steps.installer.outputs.path }}
           archive: false
           if-no-files-found: error
