@@ -317,6 +317,40 @@ async def test_pending_input_plain_marker_rejects_registered_web_controls(
         assert rejected.error.code == "PENDING_CONTROL_COMMAND_UNSUPPORTED"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "display_text", "confirmed_plain_text"),
+    [
+        ("ordinary provider text", "/reset", False),
+        ("/gamemode creative", "/reset", True),
+    ],
+)
+async def test_pending_input_rejects_unpaired_display_text(
+    tmp_path: Path,
+    message: str,
+    display_text: str,
+    confirmed_plain_text: bool,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-display-mismatch.db") as stack:
+        rejected = await get_dispatcher().dispatch(
+            "pending-display-mismatch-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-display-mismatch",
+                "clientRequestId": "pending-display-mismatch-request",
+                "clientMessageId": "pending-display-mismatch-message",
+                "message": message,
+                "displayText": display_text,
+                "confirmedPlainText": confirmed_plain_text,
+            },
+            stack.context,
+        )
+        assert rejected.ok is False
+        assert rejected.error is not None
+        assert rejected.error.code == "PENDING_DISPLAY_TEXT_MISMATCH"
+
+
 async def _seed_idle_active_goal(stack: _RealIngressStack) -> Any:
     """Create a settled active Goal without installing an execution lease."""
 

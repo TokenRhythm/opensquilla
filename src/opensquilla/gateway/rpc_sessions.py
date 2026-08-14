@@ -5409,6 +5409,17 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
             retryable=False,
             accepted=False,
         )
+    if (
+        display_text is not None
+        and display_control != control
+        and not literal_slash_escape
+    ):
+        raise RpcHandlerError(
+            "PENDING_DISPLAY_TEXT_MISMATCH",
+            "Pending display text must match the provider message or an exact literal slash escape",
+            retryable=False,
+            accepted=False,
+        )
     attachments = params.get("attachments", [])
     if attachments is None:
         attachments = []

@@ -1773,6 +1773,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (
           options.busySendMode.value === 'steer'
+          && !isLiteralSlash
           && canSteerPayload(
             text,
             composerSnapshot.payloadAttachments,
@@ -1937,10 +1938,40 @@ export function useChatSend(options: UseChatSendOptions) {
         if (item.attachments.length > 0) {
           return preserveRetryState('retryable_failure')
         }
-        if (
-          serverStagedItem
-          && !await options.cancelDurablePendingItem?.(item)
-        ) return preserveRetryState('retryable_failure')
+        if (serverStagedItem) {
+          if (!await options.cancelDurablePendingItem?.(item)) {
+            return preserveRetryState('retryable_failure')
+          }
+          // The server row and WAL are gone. Detach their identity so a
+          // navigation or new turn that wins the await race leaves a usable
+          // in-memory draft instead of a permanently `cancelling` item.
+          delete item.pendingInputId
+          delete item.pendingClientRequestId
+          delete item.pendingClientMessageId
+          delete item.pendingRequestFingerprint
+          delete item.pendingServerRevision
+          delete item.pendingPosition
+          delete item.pendingPersistenceState
+          delete item.pendingMayHaveServerCopy
+          if (options.sessionKey.value !== ownerSessionKey) {
+            return preserveRetryState('not_sent')
+          }
+          if (options.sendBlockedReason?.value) return blockedOutcome()
+          if (
+            options.validateActiveProjectBeforeSend
+            && await refreshedActiveProjectBlocksSend()
+          ) return blockedOutcome()
+          if (options.sessionKey.value !== ownerSessionKey) {
+            return preserveRetryState('not_sent')
+          }
+          if (options.sendBlockedReason?.value) return blockedOutcome()
+          if (
+            options.stream.isStreaming.value
+            || hasAuthoritativeWork()
+            || options.isCompactInFlightForCurrentSession()
+            || responseHandoffBlocksCurrentSession()
+          ) return preserveRetryState('deferred')
+        }
         return await options.executeSlashCommand(item.text.trim(), 'registered')
           ? 'accepted'
           : preserveRetryState('retryable_failure')

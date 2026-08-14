@@ -990,21 +990,24 @@ describe('useChatSend attachment payloads', () => {
     expect(rpc.call).not.toHaveBeenCalled()
   })
 
-  it('queues a busy literal slash instead of attempting Steer', async () => {
-    const enqueuePendingInput = vi.fn(() => true)
-    const { api, rpc, stream } = makeOptions({
-      ...sameTurnSteerOptions(),
-      inputText: ref('//coding'),
-      busySendMode: ref<BusySendMode>('steer'),
-      enqueuePendingInput,
-    })
-    stream.isStreaming.value = true
+  it.each(['//coding', '///usr/bin/env'])(
+    'queues a busy literal slash %s instead of attempting Steer',
+    async literalText => {
+      const enqueuePendingInput = vi.fn(() => true)
+      const { api, rpc, stream } = makeOptions({
+        ...sameTurnSteerOptions(),
+        inputText: ref(literalText),
+        busySendMode: ref<BusySendMode>('steer'),
+        enqueuePendingInput,
+      })
+      stream.isStreaming.value = true
 
-    await api.onSend()
+      await api.onSend()
 
-    expect(enqueuePendingInput).toHaveBeenCalledWith('//coding', undefined)
-    expect(rpc.call).not.toHaveBeenCalled()
-  })
+      expect(enqueuePendingInput).toHaveBeenCalledWith(literalText, undefined)
+      expect(rpc.call).not.toHaveBeenCalled()
+    },
+  )
 
   it('falls back safely to the visible pending queue when v2 rejects before admission', async () => {
     const rpc = {
@@ -6549,6 +6552,44 @@ describe('useChatSend slash-prefixed input fall-through', () => {
 
     expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued)
     expect(executeSlashCommand).not.toHaveBeenCalled()
+  })
+
+  it('does not execute a staged command after its cancellation switches sessions', async () => {
+    let resolveCancel!: (cancelled: boolean) => void
+    const cancelDurablePendingItem = vi.fn(() => new Promise<boolean>((resolve) => {
+      resolveCancel = resolve
+    }))
+    const executeSlashCommand = vi.fn(async () => true)
+    const sessionKey = ref('session-a')
+    const { api } = makeOptions({
+      sessionKey,
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      cancelDurablePendingItem,
+      executeSlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-staged-session-fence',
+      text: '/reset',
+      attachments: [],
+      intent: null,
+      confirmedPlainText: true,
+      ownerSessionKey: 'session-a',
+      pendingInputId: 'pending-staged-session-fence',
+      pendingClientRequestId: 'request-staged-session-fence',
+      pendingClientMessageId: 'message-staged-session-fence',
+      pendingRequestFingerprint: 'sha256:staged-session-fence',
+      pendingPersistenceState: 'staged',
+    }
+
+    const send = api.sendQueuedFollowup(queued)
+    await vi.waitFor(() => expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued))
+    sessionKey.value = 'session-b'
+    resolveCancel(true)
+
+    await expect(send).resolves.toBe('not_sent')
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(queued.pendingInputId).toBeUndefined()
+    expect(queued.pendingPersistenceState).toBeUndefined()
   })
 
   it.each(['unavailable', 'registered'] as const)(
