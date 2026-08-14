@@ -164,6 +164,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     steerDelivery,
     popAllPendingIntoComposer: vi.fn(() => false),
     hiddenControlStorage: memoryStorage(),
+    classifySlashCommand: vi.fn(async () => 'registered' as const),
     executeSlashCommand: vi.fn(async () => false),
     closeSlashMenu: vi.fn(),
     autoResizeTextarea: vi.fn(),
@@ -967,6 +968,43 @@ describe('useChatSend attachment payloads', () => {
         intent: null,
       })).resolves.toBe('not_sent')
 
+      expect(rpc.call).not.toHaveBeenCalled()
+    },
+  )
+
+  it('keeps a queued literal slash out of the Steer RPC', async () => {
+    const { api, rpc, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      busySendMode: ref<BusySendMode>('steer'),
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-literal-steer',
+      text: '//coding',
+      attachments: [],
+      intent: null,
+    }
+    stream.isStreaming.value = true
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it.each(['//coding', '///usr/bin/env'])(
+    'queues a busy literal slash %s instead of attempting Steer',
+    async literalText => {
+      const enqueuePendingInput = vi.fn(() => true)
+      const { api, rpc, stream } = makeOptions({
+        ...sameTurnSteerOptions(),
+        inputText: ref(literalText),
+        busySendMode: ref<BusySendMode>('steer'),
+        enqueuePendingInput,
+      })
+      stream.isStreaming.value = true
+
+      await api.onSend()
+
+      expect(enqueuePendingInput).toHaveBeenCalledWith(literalText, undefined)
       expect(rpc.call).not.toHaveBeenCalled()
     },
   )
@@ -5763,7 +5801,7 @@ describe('useChatSend Ensemble image guard', () => {
 
     await api.onSend()
 
-    expect(executeSlashCommand).toHaveBeenCalledWith('/status')
+    expect(executeSlashCommand).toHaveBeenCalledWith('/status', 'registered')
     expect(rpc.call).not.toHaveBeenCalled()
     expect(inputText.value).toBe('/status')
     expect(pendingAttachments.value).toEqual([image])
@@ -5927,5 +5965,815 @@ describe('useChatSend Ensemble image guard', () => {
 
     const params = rpc.call.mock.calls[0]?.[1]
     expect(params).not.toHaveProperty('collaborationMode')
+  })
+})
+
+describe('useChatSend slash-prefixed input fall-through', () => {
+  it('queues unknown slash-prefixed text as a follow-up while a turn is busy', async () => {
+    const inputText = ref('/gamemode creative')
+    const enqueuePendingInput = vi.fn(() => true)
+    const classifySlashCommand = vi.fn(async () => 'unknown' as const)
+    const { api, rpc, stream } = makeOptions({
+      inputText,
+      enqueuePendingInput,
+      classifySlashCommand,
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(classifySlashCommand).toHaveBeenCalledWith('/gamemode creative')
+    expect(enqueuePendingInput).toHaveBeenCalledWith(
+      '/gamemode creative',
+      undefined,
+      { confirmedPlainText: true },
+    )
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('durably queues and drains unknown slash text through the real pending queue', async () => {
+    vi.useFakeTimers()
+    try {
+      const inputText = ref('/gamemode creative')
+      const pendingAttachments = ref<Attachment[]>([])
+      const pendingSessionIntent = ref<string | null>(null)
+      const sessionKey = ref('agent:main:webchat:test')
+      const { stream } = makeOptions()
+      stream.isStreaming.value = true
+      const pendingRecords = new Map<
+        string,
+        import('@/utils/chat/pendingInputWal').PendingInputWalRecord
+      >()
+      const rpcCall = vi.fn(async (
+        method: string,
+        params: Record<string, unknown> = {},
+      ): Promise<Record<string, unknown>> => {
+        if (method === 'sessions.pending_inputs.list') return { items: [] }
+        if (method === 'sessions.pending_inputs.enqueue') {
+          return { requestFingerprint: 'sha256:unknown-slash', revision: 1 }
+        }
+        if (method === 'sessions.pending_inputs.dispatch') {
+          return { sessionKey: sessionKey.value }
+        }
+        throw new Error(`unexpected method: ${method} ${JSON.stringify(params)}`)
+      })
+      const rpc: UseChatSendOptions['rpc'] = {
+        call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+          rpcCall(method, params) as Promise<T>
+        ),
+      }
+      let sendApi!: ReturnType<typeof useChatSend>
+      const pending = useChatPendingQueue({
+        sessionKey,
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        isStreaming: stream.isStreaming,
+        isBlocked: () => false,
+        autoResizeTextarea: vi.fn(),
+        sendCurrentInput: vi.fn(),
+        resetInputHistory: vi.fn(),
+        hasComposer: () => true,
+        pendingInputWal: {
+          put: async record => { pendingRecords.set(record.pendingInputId, record) },
+          list: async key => [...pendingRecords.values()].filter(record => (
+            record.sessionKey === key
+          )),
+          delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
+          close: () => {},
+        },
+        rpc,
+        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        dispatchPendingItem: (item, ownerSessionKey) => (
+          sendApi.sendQueuedFollowup(item, ownerSessionKey)
+        ),
+      })
+      const configured = makeOptions({
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        sessionKey,
+        stream,
+        rpc,
+        busySendMode: pending.busySendMode,
+        enqueuePendingInput: pending.enqueuePendingInput,
+        enqueuePendingPayload: pending.enqueuePendingPayload,
+        popAllPendingIntoComposer: pending.popAllPendingIntoComposer,
+        classifySlashCommand: vi.fn(async () => 'unknown' as const),
+      })
+      sendApi = configured.api
+
+      await sendApi.onSend()
+
+      expect(pending.pendingQueue.value).toHaveLength(1)
+      expect(pendingRecords.size).toBe(1)
+      await vi.waitFor(() => {
+        expect(pending.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
+      })
+      expect(pendingRecords.values().next().value).toMatchObject({
+        text: '/gamemode creative',
+        confirmedPlainText: true,
+      })
+      expect(rpcCall).toHaveBeenCalledWith(
+        'sessions.pending_inputs.enqueue',
+        expect.objectContaining({
+          message: '/gamemode creative',
+          confirmedPlainText: true,
+        }),
+      )
+      expect(inputText.value).toBe('')
+      stream.isStreaming.value = false
+      pending.schedulePendingDrainAfterTerminal()
+      await vi.runAllTimersAsync()
+      await nextTick()
+
+      expect(rpcCall).toHaveBeenCalledWith(
+        'sessions.pending_inputs.dispatch',
+        expect.objectContaining({
+          requestFingerprint: 'sha256:unknown-slash',
+        }),
+      )
+      expect(rpcCall).not.toHaveBeenCalledWith('chat.send', expect.anything())
+      expect(pending.pendingQueue.value).toHaveLength(0)
+      expect(pendingRecords.size).toBe(0)
+      pending.cleanup()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('durably queues and drains an escaped registered slash as literal text', async () => {
+    vi.useFakeTimers()
+    try {
+      const attachment: Attachment = {
+        kind: 'staged',
+        local_id: 95,
+        name: 'literal-context.txt',
+        mime: 'text/plain',
+        file_uuid: 'file-literal-slash-attachment',
+      }
+      const inputText = ref('//coding')
+      const pendingAttachments = ref<Attachment[]>([attachment])
+      const pendingSessionIntent = ref<string | null>(null)
+      const sessionKey = ref('agent:main:webchat:test')
+      const { stream } = makeOptions()
+      stream.isStreaming.value = true
+      const pendingRecords = new Map<
+        string,
+        import('@/utils/chat/pendingInputWal').PendingInputWalRecord
+      >()
+      const rpcCall = vi.fn(async (
+        method: string,
+        params: Record<string, unknown> = {},
+      ): Promise<Record<string, unknown>> => {
+        if (method === 'sessions.pending_inputs.list') return { items: [] }
+        if (method === 'sessions.pending_inputs.enqueue') {
+          return { requestFingerprint: 'sha256:literal-slash', revision: 1 }
+        }
+        if (method === 'sessions.pending_inputs.dispatch') {
+          return { sessionKey: sessionKey.value }
+        }
+        throw new Error(`unexpected method: ${method} ${JSON.stringify(params)}`)
+      })
+      const rpc: UseChatSendOptions['rpc'] = {
+        call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+          rpcCall(method, params) as Promise<T>
+        ),
+      }
+      let sendApi!: ReturnType<typeof useChatSend>
+      const pending = useChatPendingQueue({
+        sessionKey,
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        isStreaming: stream.isStreaming,
+        isBlocked: () => false,
+        autoResizeTextarea: vi.fn(),
+        sendCurrentInput: vi.fn(),
+        resetInputHistory: vi.fn(),
+        hasComposer: () => true,
+        pendingInputWal: {
+          put: async record => { pendingRecords.set(record.pendingInputId, record) },
+          list: async key => [...pendingRecords.values()].filter(record => (
+            record.sessionKey === key
+          )),
+          delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
+          close: () => {},
+        },
+        rpc,
+        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+        dispatchPendingItem: (item, ownerSessionKey) => (
+          sendApi.sendQueuedFollowup(item, ownerSessionKey)
+        ),
+      })
+      const classifySlashCommand = vi.fn(async () => 'registered' as const)
+      const executeSlashCommand = vi.fn(async () => true)
+      const configured = makeOptions({
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        sessionKey,
+        stream,
+        rpc,
+        busySendMode: pending.busySendMode,
+        enqueuePendingInput: pending.enqueuePendingInput,
+        enqueuePendingPayload: pending.enqueuePendingPayload,
+        popAllPendingIntoComposer: pending.popAllPendingIntoComposer,
+        classifySlashCommand,
+        executeSlashCommand,
+      })
+      sendApi = configured.api
+
+      await sendApi.onSend()
+
+      expect(pending.pendingQueue.value).toHaveLength(1)
+      expect(pending.pendingQueue.value[0]).toMatchObject({
+        text: '//coding',
+        attachments: [expect.objectContaining({
+          name: attachment.name,
+          mime: attachment.mime,
+        })],
+      })
+      expect(pendingRecords.size).toBe(1)
+      await vi.waitFor(() => {
+        expect(pending.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
+      })
+      expect(rpcCall).toHaveBeenCalledWith(
+        'sessions.pending_inputs.enqueue',
+        expect.objectContaining({
+          message: '/coding',
+          displayText: '//coding',
+          attachments: [expect.objectContaining({
+            file_uuid: 'file-literal-slash-attachment',
+          })],
+        }),
+      )
+      stream.isStreaming.value = false
+      pending.schedulePendingDrainAfterTerminal()
+      await vi.runAllTimersAsync()
+      await nextTick()
+
+      expect(classifySlashCommand).not.toHaveBeenCalled()
+      expect(executeSlashCommand).not.toHaveBeenCalled()
+      expect(rpcCall).toHaveBeenCalledWith(
+        'sessions.pending_inputs.dispatch',
+        expect.objectContaining({
+          requestFingerprint: 'sha256:literal-slash',
+        }),
+      )
+      expect(rpcCall).not.toHaveBeenCalledWith('chat.send', expect.anything())
+      expect(pending.pendingQueue.value).toHaveLength(0)
+      expect(pendingRecords.size).toBe(0)
+      pending.cleanup()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['registered', 'unavailable'] as const)(
+    'keeps %s slash input editable while a turn is busy',
+    async classification => {
+      const inputText = ref('/coding')
+      const enqueuePendingInput = vi.fn(() => true)
+      const { api, rpc, stream } = makeOptions({
+        inputText,
+        enqueuePendingInput,
+        classifySlashCommand: vi.fn(async () => classification),
+      })
+      stream.isStreaming.value = true
+
+      await api.onSend()
+
+      expect(enqueuePendingInput).not.toHaveBeenCalled()
+      expect(rpc.call).not.toHaveBeenCalled()
+      expect(inputText.value).toBe('/coding')
+    },
+  )
+
+  it('sends an unknown slash-prefixed input as a normal message exactly once', async () => {
+    const inputText = ref('/gamemode creative')
+    const executeSlashCommand = vi.fn(async () => false)
+    const { api, rpc } = makeOptions({
+      inputText,
+      classifySlashCommand: vi.fn(async () => 'unknown' as const),
+      executeSlashCommand,
+    })
+
+    await api.onSend()
+
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/gamemode creative',
+    }))
+  })
+
+  it('keeps attachments on an unknown slash-prefixed normal message', async () => {
+    const pendingAttachments = ref<Attachment[]>([{
+      kind: 'staged',
+      local_id: 92,
+      name: 'commands.txt',
+      mime: 'text/plain',
+      file_uuid: 'file-slash-text',
+    }])
+    const { api, rpc } = makeOptions({
+      inputText: ref('/usr/bin/env'),
+      pendingAttachments,
+      classifySlashCommand: vi.fn(async () => 'unknown' as const),
+      executeSlashCommand: vi.fn(async () => false),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/usr/bin/env',
+      attachments: [expect.objectContaining({
+        file_uuid: 'file-slash-text',
+        mime: 'text/plain',
+      })],
+    }))
+  })
+
+  it('does not send when a registered slash command handles the input', async () => {
+    const inputText = ref('/coding')
+    const executeSlashCommand = vi.fn(async () => true)
+    const { api, rpc } = makeOptions({
+      inputText,
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      executeSlashCommand,
+    })
+
+    await api.onSend()
+
+    // A registered command is handled by the command path: no chat.send.
+    expect(executeSlashCommand).toHaveBeenCalledWith('/coding', 'registered')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('keeps an idle slash draft owned by A when classification finishes in B', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    const sessionKey = ref('agent:main:webchat:A')
+    const inputText = ref('/gamemode creative')
+    const pendingAttachments = ref<Attachment[]>([{
+      kind: 'staged',
+      local_id: 93,
+      name: 'commands.txt',
+      mime: 'text/plain',
+      file_uuid: 'file-idle-slash-text',
+    }])
+    const classifySlashCommand = vi.fn(() => classification)
+    const executeSlashCommand = vi.fn(async () => false)
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      inputText,
+      pendingAttachments,
+      classifySlashCommand,
+      executeSlashCommand,
+    })
+
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(classifySlashCommand).toHaveBeenCalledOnce())
+    sessionKey.value = 'agent:main:webchat:B'
+    resolveClassification('unknown')
+    await sending
+
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('/gamemode creative')
+    expect(pendingAttachments.value).toHaveLength(1)
+  })
+
+  it('keeps an idle slash draft when sending becomes blocked during classification', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    const inputText = ref('/gamemode creative')
+    const sendBlockedReason = ref('')
+    const classifySlashCommand = vi.fn(() => classification)
+    const { api, rpc } = makeOptions({
+      inputText,
+      sendBlockedReason,
+      classifySlashCommand,
+    })
+
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(classifySlashCommand).toHaveBeenCalledOnce())
+    sendBlockedReason.value = 'Live updates are unavailable'
+    resolveClassification('unknown')
+    await sending
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('/gamemode creative')
+  })
+
+  it('keeps an idle slash draft with its original handoff owner during classification', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    const sessionKey = ref('agent:main:webchat:test')
+    const inputText = ref('/gamemode creative')
+    const pendingQueueOwnerContext = ref({
+      sessionKey: sessionKey.value,
+      ownerRequestId: 'owner-request-A',
+    })
+    const enqueuePendingInput = vi.fn(() => true)
+    const classifySlashCommand = vi.fn(() => classification)
+    const { api, rpc, stream } = makeOptions({
+      sessionKey,
+      inputText,
+      pendingQueueOwnerContext,
+      enqueuePendingInput,
+      classifySlashCommand,
+    })
+    stream.isStreaming.value = true
+
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(classifySlashCommand).toHaveBeenCalledOnce())
+    pendingQueueOwnerContext.value = {
+      sessionKey: sessionKey.value,
+      ownerRequestId: 'owner-request-B',
+    }
+    resolveClassification('unknown')
+    await sending
+
+    expect(enqueuePendingInput).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('/gamemode creative')
+  })
+
+  it('keeps an idle slash draft when its workspace becomes unavailable during classification', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    let projectBlocker: string | null = null
+    const validateActiveProjectBeforeSend = vi.fn(async () => projectBlocker)
+    const inputText = ref('/gamemode creative')
+    const classifySlashCommand = vi.fn(() => classification)
+    const { api, rpc } = makeOptions({
+      inputText,
+      validateActiveProjectBeforeSend,
+      classifySlashCommand,
+    })
+
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(classifySlashCommand).toHaveBeenCalledOnce())
+    projectBlocker = 'removed'
+    resolveClassification('unknown')
+    await sending
+
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('/gamemode creative')
+  })
+
+  it('sends // escaped input as literal text with one slash stripped', async () => {
+    const inputText = ref('//usr/bin/env')
+    const executeSlashCommand = vi.fn(async () => true)
+    const { api, rpc } = makeOptions({ inputText, executeSlashCommand })
+
+    await api.onSend()
+
+    // "//" is a literal-slash escape: the command path is skipped entirely and
+    // the message is sent with exactly one leading slash removed.
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/usr/bin/env',
+    }))
+  })
+
+  it('sends an unknown slash-prefixed queued follow-up as a normal message exactly once', async () => {
+    const executeSlashCommand = vi.fn(async () => false)
+    const { api, rpc } = makeOptions({
+      classifySlashCommand: vi.fn(async () => 'unknown' as const),
+      executeSlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-unknown-slash-followup',
+      text: '/gamemode creative',
+      attachments: [],
+      intent: null,
+    }
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
+
+    // The command path reports "unhandled" for unknown slash inputs, so the
+    // queued follow-up must fall through to the normal chat.send path — and
+    // only once, mirroring the primary onSend contract.
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/gamemode creative',
+    }))
+  })
+
+  it('keeps a queued follow-up editable when it becomes a registered command', async () => {
+    const executeSlashCommand = vi.fn(async () => true)
+    const { api, rpc } = makeOptions({
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      executeSlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-registered-slash-followup',
+      text: '/coding',
+      attachments: [],
+      intent: null,
+    }
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('not_sent')
+
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('cancels a server-staged row without auto-executing a newly registered command', async () => {
+    const events: string[] = []
+    const cancelDurablePendingItem = vi.fn(async () => {
+      events.push('cancel')
+      return true
+    })
+    const executeSlashCommand = vi.fn(async () => {
+      events.push('execute')
+      return true
+    })
+    const { api, rpc } = makeOptions({
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      cancelDurablePendingItem,
+      executeSlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-staged-registered-slash',
+      text: '/coding',
+      attachments: [],
+      intent: null,
+      confirmedPlainText: true,
+      pendingInputId: 'pending-staged-registered-slash',
+      pendingClientRequestId: 'request-staged-registered-slash',
+      pendingClientMessageId: 'message-staged-registered-slash',
+      pendingRequestFingerprint: 'sha256:staged-registered-slash',
+      pendingPersistenceState: 'staged',
+    }
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('not_sent')
+
+    expect(events).toEqual(['cancel'])
+    expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued, { retainAfterCancel: true })
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('keeps a server-staged registered command when its tombstone is unproven', async () => {
+    const cancelDurablePendingItem = vi.fn(async () => false)
+    const executeSlashCommand = vi.fn(async () => true)
+    const { api } = makeOptions({
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      cancelDurablePendingItem,
+      executeSlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-staged-registered-retry',
+      text: '/coding',
+      attachments: [],
+      intent: null,
+      confirmedPlainText: true,
+      pendingInputId: 'pending-staged-registered-retry',
+      pendingClientRequestId: 'request-staged-registered-retry',
+      pendingClientMessageId: 'message-staged-registered-retry',
+      pendingRequestFingerprint: 'sha256:staged-registered-retry',
+      pendingPersistenceState: 'staged',
+    }
+
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('retryable_failure')
+
+    expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued, { retainAfterCancel: true })
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+  })
+
+  it('does not execute a staged command after its cancellation switches sessions', async () => {
+    let resolveCancel!: (cancelled: boolean) => void
+    const cancelDurablePendingItem = vi.fn(() => new Promise<boolean>((resolve) => {
+      resolveCancel = resolve
+    }))
+    const executeSlashCommand = vi.fn(async () => true)
+    const sessionKey = ref('session-a')
+    const { api } = makeOptions({
+      sessionKey,
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      cancelDurablePendingItem,
+      executeSlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-staged-session-fence',
+      text: '/reset',
+      attachments: [],
+      intent: null,
+      confirmedPlainText: true,
+      ownerSessionKey: 'session-a',
+      pendingInputId: 'pending-staged-session-fence',
+      pendingClientRequestId: 'request-staged-session-fence',
+      pendingClientMessageId: 'message-staged-session-fence',
+      pendingRequestFingerprint: 'sha256:staged-session-fence',
+      pendingPersistenceState: 'staged',
+    }
+
+    const send = api.sendQueuedFollowup(queued)
+    await vi.waitFor(() => expect(cancelDurablePendingItem).toHaveBeenCalledWith(
+      queued,
+      { retainAfterCancel: true },
+    ))
+    sessionKey.value = 'session-b'
+    resolveCancel(true)
+
+    await expect(send).resolves.toBe('not_sent')
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+  })
+
+  it('never grants concurrent cancel winners authority to execute a staged command', async () => {
+    const firstExecute = vi.fn(async () => true)
+    const secondExecute = vi.fn(async () => true)
+    const firstCancel = vi.fn(async () => true)
+    const secondCancel = vi.fn(async () => true)
+    const first = makeOptions({
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      cancelDurablePendingItem: firstCancel,
+      executeSlashCommand: firstExecute,
+    })
+    const second = makeOptions({
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      cancelDurablePendingItem: secondCancel,
+      executeSlashCommand: secondExecute,
+    })
+    const stagedItem = (): ChatPendingItem => ({
+      pendingUiId: 'pending-ui-concurrent-registered',
+      text: '/reset',
+      attachments: [],
+      intent: null,
+      confirmedPlainText: true,
+      pendingInputId: 'pending-concurrent-registered',
+      pendingClientRequestId: 'request-concurrent-registered',
+      pendingClientMessageId: 'message-concurrent-registered',
+      pendingRequestFingerprint: 'sha256:concurrent-registered',
+      pendingPersistenceState: 'staged',
+    })
+
+    await expect(Promise.all([
+      first.api.sendQueuedFollowup(stagedItem()),
+      second.api.sendQueuedFollowup(stagedItem()),
+    ])).resolves.toEqual(['not_sent', 'not_sent'])
+
+    expect(firstCancel).toHaveBeenCalledOnce()
+    expect(secondCancel).toHaveBeenCalledOnce()
+    expect(firstExecute).not.toHaveBeenCalled()
+    expect(secondExecute).not.toHaveBeenCalled()
+  })
+
+  it.each(['unavailable', 'registered'] as const)(
+    'keeps a durable queued slash item with attachments when catalog is %s',
+    async classification => {
+      vi.useFakeTimers()
+      try {
+        const inputText = ref('')
+        const pendingAttachments = ref<Attachment[]>([])
+        const pendingSessionIntent = ref<string | null>(null)
+        const sessionKey = ref('agent:main:webchat:test')
+        const isStreaming = ref(false)
+        const pendingRecords = new Map<
+          string,
+          import('@/utils/chat/pendingInputWal').PendingInputWalRecord
+        >()
+        let sendApi!: ReturnType<typeof useChatSend>
+        const pending = useChatPendingQueue({
+          sessionKey,
+          inputText,
+          pendingAttachments,
+          pendingSessionIntent,
+          isStreaming,
+          isBlocked: () => false,
+          autoResizeTextarea: vi.fn(),
+          sendCurrentInput: vi.fn(),
+          resetInputHistory: vi.fn(),
+          hasComposer: () => true,
+          pendingInputWal: {
+            put: async record => { pendingRecords.set(record.pendingInputId, record) },
+            list: async key => [...pendingRecords.values()].filter(record => (
+              record.sessionKey === key
+            )),
+            delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
+            close: () => {},
+          },
+          supportsMethod: () => false,
+          dispatchPendingItem: (item, ownerSessionKey) => (
+            sendApi.sendQueuedFollowup(item, ownerSessionKey)
+          ),
+        })
+        const executeSlashCommand = vi.fn(async () => true)
+        const classifySlashCommand = vi.fn(async () => classification)
+        const configured = makeOptions({
+          inputText,
+          pendingAttachments,
+          pendingSessionIntent,
+          sessionKey,
+          busySendMode: pending.busySendMode,
+          enqueuePendingInput: pending.enqueuePendingInput,
+          enqueuePendingPayload: pending.enqueuePendingPayload,
+          popAllPendingIntoComposer: pending.popAllPendingIntoComposer,
+          classifySlashCommand,
+          executeSlashCommand,
+        })
+        sendApi = configured.api
+        const attachment: Attachment = {
+          kind: 'staged',
+          local_id: 94,
+          name: 'slash-context.txt',
+          mime: 'text/plain',
+          file_uuid: 'file-durable-slash-attachment',
+        }
+        await pending.enqueuePendingPayload({
+          text: '/gamemode creative',
+          attachments: [attachment],
+        })
+
+        pending.schedulePendingDrainAfterTerminal()
+        await vi.runAllTimersAsync()
+        await nextTick()
+
+        expect(classifySlashCommand).toHaveBeenCalledOnce()
+        expect(executeSlashCommand).not.toHaveBeenCalled()
+        expect(configured.rpc.call).not.toHaveBeenCalled()
+        expect(pending.pendingQueue.value).toHaveLength(1)
+        expect(pending.pendingQueue.value[0]?.deliveryState).toBe('retryable')
+        expect(pending.pendingQueue.value[0]?.attachments).toEqual([attachment])
+        expect(pendingRecords.size).toBe(1)
+        pending.cleanup()
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('keeps a queued slash item when its workspace becomes unavailable during classification', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    let projectBlocker: string | null = null
+    const validateActiveProjectBeforeSend = vi.fn(async () => projectBlocker)
+    const classifySlashCommand = vi.fn(() => classification)
+    const { api, rpc } = makeOptions({
+      validateActiveProjectBeforeSend,
+      classifySlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-workspace-blocked-slash',
+      ownerSessionKey: 'agent:main:webchat:test',
+      text: '/gamemode creative',
+      attachments: [],
+      intent: null,
+    }
+
+    const sending = api.sendQueuedFollowup(queued, 'agent:main:webchat:test')
+    await vi.waitFor(() => expect(classifySlashCommand).toHaveBeenCalledOnce())
+    projectBlocker = 'removed'
+    resolveClassification('unknown')
+
+    await expect(sending).resolves.toBe('deferred')
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2)
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('keeps a queued slash item owned by A when classification finishes after switching to B', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    const sessionKey = ref('agent:main:webchat:A')
+    const classifySlashCommand = vi.fn(() => classification)
+    const executeSlashCommand = vi.fn(async () => false)
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      classifySlashCommand,
+      executeSlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-session-switch-slash',
+      ownerSessionKey: 'agent:main:webchat:A',
+      text: '/gamemode creative',
+      attachments: [],
+      intent: null,
+    }
+
+    const sending = api.sendQueuedFollowup(queued, 'agent:main:webchat:A')
+    sessionKey.value = 'agent:main:webchat:B'
+    resolveClassification('unknown')
+
+    await expect(sending).resolves.toBe('not_sent')
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
   })
 })

@@ -23,11 +23,13 @@ import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandler
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import type {
   BusySendMode,
+  PendingCancelOptions,
   PendingQueueOwner,
   PendingQueueOwnerContext,
   PendingSteerPayload,
 } from '@/composables/chat/useChatPendingQueue'
 import type { ChatSteerDeliveryApi } from '@/composables/chat/useChatSteerDelivery'
+import type { SlashCommandClassification } from '@/composables/chat/useChatSlashCommands'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
 import {
   hasSendableModelInputImageAttachment,
@@ -116,6 +118,7 @@ interface ComposerSnapshot {
   forkBeforeMessageId: string | null
   workspaceId: string | null
   initialCollaborationMode: CollaborationMode | null
+  queueOwnerRequestId: string | null
 }
 
 interface DispatchSendOptions {
@@ -371,15 +374,21 @@ export interface UseChatSendOptions {
   enqueuePendingInput: (
     text: string,
     owner?: PendingQueueOwner,
+    enqueueOptions?: { confirmedPlainText?: boolean },
   ) => boolean | Promise<boolean>
   enqueuePendingPayload?: (
     payload: {
       text: string
       attachments?: Attachment[]
       intent?: string | null
+      confirmedPlainText?: boolean
     },
     owner?: PendingQueueOwner,
   ) => boolean | Promise<boolean>
+  cancelDurablePendingItem?: (
+    item: ChatPendingItem,
+    options?: PendingCancelOptions,
+  ) => Promise<boolean>
   enqueueHiddenControl?: (
     item: {
       text: string
@@ -401,7 +410,11 @@ export interface UseChatSendOptions {
   reconcileTaskOwnership?: () => void | Promise<unknown>
   hiddenControlStorage?: HiddenControlStorage | null
   metaDiscardStorage?: MetaDiscardStorage | null
-  executeSlashCommand: (text: string) => Promise<boolean>
+  classifySlashCommand: (text: string) => Promise<SlashCommandClassification>
+  executeSlashCommand: (
+    text: string,
+    knownClassification?: SlashCommandClassification,
+  ) => Promise<boolean>
   closeSlashMenu: () => void
   autoResizeTextarea: () => void
   scrollToBottom: () => void
@@ -462,6 +475,7 @@ export function useChatSend(options: UseChatSendOptions) {
   function captureComposerSnapshot(): ComposerSnapshot {
     const intent = options.pendingSessionIntent.value
     const attachmentRefs = [...options.pendingAttachments.value]
+    const queueOwnerContext = options.pendingQueueOwnerContext.value
     return {
       revision: options.composerRevision?.value ?? null,
       inputText: options.inputText.value,
@@ -471,7 +485,24 @@ export function useChatSend(options: UseChatSendOptions) {
       forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       workspaceId: pendingWorkspaceForIntent(intent),
       initialCollaborationMode: initialModeForIntent(intent),
+      queueOwnerRequestId: queueOwnerContext?.sessionKey === options.sessionKey.value
+        ? queueOwnerContext.ownerRequestId
+        : null,
     }
+  }
+
+  function queueOwnerMatchesSnapshot(snapshot: ComposerSnapshot): boolean {
+    const context = options.pendingQueueOwnerContext.value
+    const currentOwnerRequestId = context?.sessionKey === options.sessionKey.value
+      ? context.ownerRequestId
+      : null
+    return currentOwnerRequestId === snapshot.queueOwnerRequestId
+  }
+
+  function queueOwnerFromSnapshot(snapshot: ComposerSnapshot): PendingQueueOwner | undefined {
+    return snapshot.queueOwnerRequestId
+      ? { ownerRequestId: snapshot.queueOwnerRequestId }
+      : undefined
   }
 
   function composerMatchesSnapshot(snapshot: ComposerSnapshot): boolean {
@@ -1605,6 +1636,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const bypassSlashCommand = invocation.bypassSlashCommand === true
     const composerText = invocation.composerText ?? options.inputText.value
     let text = (invocation.textOverride ?? options.inputText.value).trim()
+    let durableText = text
     let sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
     let hasPayload = text || sendableAttachments.length > 0
     let isLiteralSlash = false
@@ -1618,6 +1650,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!bypassSlashCommand && text.startsWith('//')) {
       isLiteralSlash = true
       text = text.slice(1)
+      durableText = `/${text}`
       sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
       hasPayload = text || sendableAttachments.length > 0
     }
@@ -1632,6 +1665,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (options.sessionKey.value !== requestSessionKey) return
+      if (!queueOwnerMatchesSnapshot(composerSnapshot)) return
       if (options.sendBlockedReason?.value) return
       if (
         invocation.cancelIfComposerChanged
@@ -1682,61 +1716,112 @@ export function useChatSend(options: UseChatSendOptions) {
       return
     }
 
+    const slashClassification = !bypassSlashCommand
+      && !isLiteralSlash
+      && text.startsWith('/')
+      ? await options.classifySlashCommand(text)
+      : null
+    if (slashClassification !== null) {
+      if (
+        options.sessionKey.value !== requestSessionKey
+        || !composerMatchesSnapshot(composerSnapshot)
+        || !queueOwnerMatchesSnapshot(composerSnapshot)
+        || Boolean(options.sendBlockedReason?.value)
+        || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
+      ) return
+      if (
+        options.validateActiveProjectBeforeSend
+        && await refreshedActiveProjectBlocksSend()
+      ) return
+      if (
+        options.sessionKey.value !== requestSessionKey
+        || !composerMatchesSnapshot(composerSnapshot)
+        || !queueOwnerMatchesSnapshot(composerSnapshot)
+        || Boolean(options.sendBlockedReason?.value)
+        || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
+      ) return
+    }
+
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     if (
       options.stream.isStreaming.value
       || hasAuthoritativeWork()
       || compactInFlight
-      || handoffInFlight
+      || responseHandoffBlocksCurrentSession()
     ) {
-      if (!bypassSlashCommand && !isLiteralSlash && isControlInput(text)) {
-        // Slash and bang inputs are client control-plane commands. Running
-        // them later can target a different task/session, so keep the exact
-        // command editable in the composer while the current turn is busy.
-        return
-      }
-      if (!hasPayload) return
-      if (handoffInFlight && !activeResponseHandoff?.durableRecord) {
-        // The fork itself may proceed without IndexedDB, but a follow-up must
-        // stay editable until the target session is known. Otherwise refresh
-        // can strand an ownerless message on the parent session.
-        pushToast(i18n.global.t('chat.toast.queuePersistenceUnavailable'), { tone: 'info' })
-        return
-      }
-      if (
-        options.busySendMode.value === 'steer'
-        && canSteerPayload(
-          text,
-          composerSnapshot.payloadAttachments,
-          composerSnapshot.intent,
-          composerSnapshot.forkBeforeMessageId,
-        )
-      ) {
-        await dispatchSteerV2(text, { composerSnapshot })
-        return
-      }
-      // Surface a full queue instead of silently dropping the send: the draft is
-      // preserved (enqueue returns false before clearing the composer).
-      const composerChanged = !composerMatchesSnapshot(composerSnapshot)
-      if (invocation.cancelIfComposerChanged && composerChanged) return
-      const queued = await Promise.resolve(
-        composerChanged || invocation.textOverride !== undefined
-          ? options.enqueuePendingPayload?.({
+      const currentHandoffInFlight = responseHandoffBlocksCurrentSession()
+      const stillBusy = options.stream.isStreaming.value
+        || hasAuthoritativeWork()
+        || options.isCompactInFlightForCurrentSession()
+        || currentHandoffInFlight
+      if (stillBusy) {
+        if (
+          !bypassSlashCommand
+          && !isLiteralSlash
+          && isControlInput(text)
+          && slashClassification !== 'unknown'
+        ) {
+          // Registered slash commands and bang inputs are live controls. Running
+          // them later can target a different task/session, so keep the exact
+          // command editable while busy. Confirmed unknown slash input is plain
+          // text and continues into the ordinary follow-up queue below.
+          return
+        }
+        if (!hasPayload) return
+        if (currentHandoffInFlight && !activeResponseHandoff?.durableRecord) {
+          // The fork itself may proceed without IndexedDB, but a follow-up must
+          // stay editable until the target session is known. Otherwise refresh
+          // can strand an ownerless message on the parent session.
+          pushToast(i18n.global.t('chat.toast.queuePersistenceUnavailable'), { tone: 'info' })
+          return
+        }
+        if (
+          options.busySendMode.value === 'steer'
+          && !isLiteralSlash
+          && canSteerPayload(
             text,
-            attachments: composerSnapshot.payloadAttachments,
-            intent: composerSnapshot.intent,
-          }, pendingQueueOwner()) ?? false
-          : options.enqueuePendingInput(text, pendingQueueOwner()),
-      )
-      if (!queued) {
-        pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
+            composerSnapshot.payloadAttachments,
+            composerSnapshot.intent,
+            composerSnapshot.forkBeforeMessageId,
+          )
+        ) {
+          await dispatchSteerV2(text, { composerSnapshot })
+          return
+        }
+        // Surface a full queue instead of silently dropping the send: the draft is
+        // preserved (enqueue returns false before clearing the composer).
+        const composerChanged = !composerMatchesSnapshot(composerSnapshot)
+        if (invocation.cancelIfComposerChanged && composerChanged) return
+        const queued = await Promise.resolve(
+          composerChanged || invocation.textOverride !== undefined
+            ? options.enqueuePendingPayload?.({
+              text: durableText,
+              attachments: composerSnapshot.payloadAttachments,
+              intent: composerSnapshot.intent,
+              ...(slashClassification === 'unknown'
+                ? { confirmedPlainText: true }
+                : {}),
+            }, queueOwnerFromSnapshot(composerSnapshot)) ?? false
+            : slashClassification === 'unknown'
+              ? options.enqueuePendingInput(
+                durableText,
+                queueOwnerFromSnapshot(composerSnapshot),
+                { confirmedPlainText: true },
+              )
+              : options.enqueuePendingInput(
+                durableText,
+                queueOwnerFromSnapshot(composerSnapshot),
+              ),
+        )
+        if (!queued) {
+          pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
+        }
+        return
       }
-      return
     }
 
-    if (!bypassSlashCommand && !isLiteralSlash && text.startsWith('/')) {
-      if (!composerMatchesSnapshot(composerSnapshot)) return
-      const handled = await options.executeSlashCommand(text)
+    if (slashClassification !== null && slashClassification !== 'unknown') {
+      const handled = await options.executeSlashCommand(text, slashClassification)
       if (handled) return
     }
 
@@ -1772,6 +1857,9 @@ export function useChatSend(options: UseChatSendOptions) {
     expectedSessionKey?: string,
   ): Promise<ChatSendOutcome> {
     const text = item.text.trim()
+    const dispatchText = !item.hiddenControl && text.startsWith('//')
+      ? text.slice(1)
+      : text
     const ownerSessionKey = expectedSessionKey
       || item.ownerSessionKey
       || options.sessionKey.value
@@ -1816,7 +1904,6 @@ export function useChatSend(options: UseChatSendOptions) {
     if (
       delivery === 'followup'
       && !item.hiddenControl
-      && item.attachments.length === 0
       && item.text.trim().startsWith('/')
       && !item.text.trim().startsWith('//')
     ) {
@@ -1827,9 +1914,49 @@ export function useChatSend(options: UseChatSendOptions) {
       ) {
         return preserveRetryState('deferred')
       }
-      return await options.executeSlashCommand(item.text.trim())
-        ? 'accepted'
-        : preserveRetryState('not_sent')
+      const slashClassification = await options.classifySlashCommand(item.text.trim())
+      if (options.sessionKey.value !== ownerSessionKey) {
+        return preserveRetryState('not_sent')
+      }
+      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (
+        options.validateActiveProjectBeforeSend
+        && await refreshedActiveProjectBlocksSend()
+      ) return blockedOutcome()
+      if (options.sessionKey.value !== ownerSessionKey) {
+        return preserveRetryState('not_sent')
+      }
+      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (
+        options.stream.isStreaming.value
+        || hasAuthoritativeWork()
+        || options.isCompactInFlightForCurrentSession()
+        || responseHandoffBlocksCurrentSession()
+      ) {
+        return preserveRetryState('deferred')
+      }
+      if (slashClassification === 'unavailable') {
+        return preserveRetryState('retryable_failure')
+      }
+      if (slashClassification === 'registered') {
+        if (item.attachments.length > 0) {
+          return preserveRetryState('retryable_failure')
+        }
+        if (serverStagedItem) {
+          if (!await options.cancelDurablePendingItem?.(item, { retainAfterCancel: true })) {
+            return preserveRetryState('retryable_failure')
+          }
+        }
+        // A queued item was previously classified as ordinary text. If the
+        // catalog now recognizes it, never turn a background drain into an
+        // automatic control action. In particular, an idempotent cancel can
+        // report success in multiple tabs (or after a lost ACK), so it cannot
+        // grant exactly-once authority to execute /reset, /new, /goal, etc.
+        // Leave the detached item editable for an explicit user decision.
+        return preserveRetryState('not_sent')
+      }
+      // Confirmed unknown slash input falls through to the normal send path
+      // below, mirroring the primary onSend contract.
     }
     if (hasSendableModelInputImageAttachment(item.attachments)) {
       if (options.modelRoutingSettingsBusy.value) {
@@ -1851,9 +1978,10 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     if (delivery === 'steer') {
+      if (text.startsWith('//')) return preserveRetryState('not_sent')
       return dispatchSteerV2(text, { queuedItem: item })
     }
-    const outcome = await dispatchSend(text, {
+    const outcome = await dispatchSend(dispatchText, {
       composerText: item.text,
       payload: {
         attachments: item.attachments,

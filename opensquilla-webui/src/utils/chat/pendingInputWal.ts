@@ -22,10 +22,13 @@ export interface PendingInputWalRecord {
   text: string
   attachments: Attachment[]
   intent: string | null
+  confirmedPlainText?: boolean
   ownerRequestId?: string
   state: PendingInputWalState
   /** True once enqueue may have crossed the browser/Gateway boundary. */
   mayHaveServerCopy?: boolean
+  /** Complete an in-flight tombstone by preserving the text as a local draft. */
+  retainAfterCancel?: boolean
   requestFingerprint?: string
   serverRevision?: number
   position?: number
@@ -107,11 +110,19 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
       attachment !== null && typeof attachment === 'object'
     ))
     && (record.intent === null || typeof record.intent === 'string')
+    && (
+      record.confirmedPlainText === undefined
+      || typeof record.confirmedPlainText === 'boolean'
+    )
     && typeof record.state === 'string'
     && WAL_STATES.has(record.state as PendingInputWalState)
     && (
       record.mayHaveServerCopy === undefined
       || typeof record.mayHaveServerCopy === 'boolean'
+    )
+    && (
+      record.retainAfterCancel === undefined
+      || typeof record.retainAfterCancel === 'boolean'
     )
     && (
       record.position === undefined
