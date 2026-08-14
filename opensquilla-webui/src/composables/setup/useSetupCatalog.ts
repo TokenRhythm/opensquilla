@@ -21,16 +21,19 @@ import {
   type SetupTierRow,
 } from '@/composables/setup/useSetupRouterForm'
 import {
-  CUSTOM_B5_SELECTION_MODE,
-  LEGACY_OPENROUTER_MODEL_OPTIONS,
-  STATIC_B5_PROFILES,
-  staticB5ModeForProvider,
   useSetupEnsembleForm,
   type EnsembleCandidateConfig,
   type EnsembleCandidateRole,
   type EnsembleCandidateView,
   type EnsembleCredentialStatus,
 } from '@/composables/setup/useSetupEnsembleForm'
+import {
+  CUSTOM_B5_SELECTION_MODE,
+  LEGACY_OPENROUTER_MODEL_OPTIONS,
+  ROUTER_DYNAMIC_SELECTION_MODE,
+  STATIC_B5_PROFILES,
+  staticB5ModeForProvider,
+} from '@/types/generated/router_tier_contract'
 import { useSetupModelStrategyForm } from '@/composables/setup/useSetupModelStrategyForm'
 import { invalidateReadiness } from '@/composables/setup/useReadinessSummary'
 import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composables/setup/useSettingsPromotedForm'
@@ -1688,7 +1691,7 @@ const ensembleProviderIds = computed(() => {
   // unknown explicit modes fail closed instead of advertising a capability
   // the runtime would reject.
   const legacyDynamic = !selectionMode && (ensemble.model_options || []).length > 0
-  if (selectionMode === 'router_dynamic' || legacyDynamic) {
+  if (selectionMode === ROUTER_DYNAMIC_SELECTION_MODE || legacyDynamic) {
     for (const candidate of ensemble.candidates || []) {
       if (candidate.enabled === false) continue
       add(candidate.provider || currentProvider.value)
@@ -1697,7 +1700,7 @@ const ensembleProviderIds = computed(() => {
       add(tier.provider || currentProvider.value)
     }
     const modelOptions = ensemble.model_options || []
-    const isCurrentRuntimeLegacyDefault = selectionMode === 'router_dynamic'
+    const isCurrentRuntimeLegacyDefault = selectionMode === ROUTER_DYNAMIC_SELECTION_MODE
       && modelOptions.length === LEGACY_OPENROUTER_MODEL_OPTIONS.length
       && modelOptions.every((model, index) => model === LEGACY_OPENROUTER_MODEL_OPTIONS[index])
     for (const model of isCurrentRuntimeLegacyDefault ? [] : modelOptions) {

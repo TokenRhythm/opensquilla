@@ -781,7 +781,12 @@ describe('useChatRenderedMessages router visual mode', () => {
       routerModels: ref({}),
       routerTierConfigs: ref({
         fast: { model: 'openai/gpt-5.4-mini', supportsImage: false, imageOnly: false },
-        balanced: { model: 'anthropic/claude-sonnet-4.6', supportsImage: false, imageOnly: false },
+        balanced: {
+          model: 'anthropic/claude-sonnet-4.6',
+          supportsImage: false,
+          imageOnly: false,
+          ensembleEnabled: true,
+        },
         strong: { model: 'openai/gpt-5.5', supportsImage: false, imageOnly: false },
       }),
       routerVisualEffectsEnabled: ref(true),
@@ -836,6 +841,172 @@ describe('useChatRenderedMessages router visual mode', () => {
     const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
     expect(strip?.routerPanel).toBe('llm-ensemble')
     expect(strip?.gridCells || []).toHaveLength(0)
+  })
+
+  it('keeps the tier router and appends ensemble execution when C3 owns fusion', () => {
+    const withMessages = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'hard question', ts: 0 },
+        {
+          role: 'router',
+          text: '',
+          ts: 1,
+          provenanceKind: 'router_decision',
+          routerDecision: {
+            tier: 'c3',
+            model: 'anthropic/claude-opus-4.8',
+            source: 'squilla_router',
+          },
+        },
+      ]),
+      sessionKey: ref('router-c3-ensemble-live-test'),
+      routerSlots: ref(['c0', 'c1', 'c2', 'c3']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'qwen/qwen3.7-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek/deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c2: { model: 'z-ai/glm-5.2', supportsImage: false, imageOnly: false },
+        c3: {
+          model: 'anthropic/claude-opus-4.8',
+          supportsImage: false,
+          imageOnly: false,
+          ensembleEnabled: true,
+        },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('squilla_router'),
+    })
+
+    const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
+    const c3Index = strip?.gridCells?.findIndex(cell => cell.tiers.includes('c3')) ?? -1
+    expect(strip?.routerPanel).toBe('router-ensemble-sequence')
+    expect(strip?.routerMode).toBe('squilla_router')
+    expect(strip?.gridCells || []).toHaveLength(4)
+    expect(c3Index).toBeGreaterThanOrEqual(0)
+    expect(strip?.winnerIdx).toBe(c3Index)
+    expect(strip?.gridCells?.[c3Index]).toMatchObject({
+      executionKind: 'ensemble',
+      tiers: ['c3'],
+    })
+  })
+
+  it('keeps the original C3 route decision when live ensemble members arrive', () => {
+    const withMessages = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'hard question', ts: 0 },
+        {
+          role: 'router',
+          text: '',
+          ts: 1,
+          provenanceKind: 'router_decision',
+          routerDecision: {
+            tier: 'c3',
+            model: 'anthropic/claude-opus-4.8',
+            source: 'squilla_router',
+          },
+          ensemble: {
+            profile: 'default',
+            modelCount: 1,
+            totalCandidates: 4,
+            requestCount: 1,
+            fallbackUsed: false,
+            fallbackReason: '',
+            costUsd: 0,
+            savedUsd: 0,
+            savedPct: 0,
+            models: [{
+              role: 'anchor',
+              label: 'anchor',
+              provider: 'openrouter',
+              model: 'qwen/qwen3.7-plus',
+              modelShort: 'qwen3.7-plus',
+              input: 0,
+              output: 0,
+              costUsd: 0,
+              status: 'running',
+            }],
+          },
+        },
+      ]),
+      sessionKey: ref('router-c3-ensemble-progress-test'),
+      routerSlots: ref(['c0', 'c1', 'c2', 'c3']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'qwen/qwen3.7-flash', supportsImage: false, imageOnly: false },
+        c1: { model: 'deepseek/deepseek-v4-flash', supportsImage: false, imageOnly: false },
+        c2: { model: 'z-ai/glm-5.2', supportsImage: false, imageOnly: false },
+        c3: {
+          model: 'anthropic/claude-opus-4.8',
+          supportsImage: false,
+          imageOnly: false,
+          ensembleEnabled: true,
+        },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('squilla_router'),
+    })
+
+    const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
+    expect(strip?.routerPanel).toBe('router-ensemble-sequence')
+    expect(strip?.routerSource).toBe('squilla_router')
+    expect(strip?.gridCells || []).toHaveLength(4)
+    expect(strip?.ensemble?.models.map(model => model.modelShort)).toEqual(['qwen3.7-plus'])
+  })
+
+  it('labels an ensemble-enabled C3 as fusion inside a lower-tier routing decision', () => {
+    const withMessages = useChatRenderedMessages({
+      messages: ref<ChatMessage[]>([
+        { role: 'user', text: 'quick question', ts: 0 },
+        {
+          role: 'router',
+          text: '',
+          ts: 1,
+          provenanceKind: 'router_decision',
+          routerDecision: {
+            tier: 'c0',
+            model: 'qwen/qwen3.7-flash',
+            source: 'squilla_router',
+          },
+        },
+      ]),
+      sessionKey: ref('router-c3-logical-cell-test'),
+      routerSlots: ref(['c0', 'c3']),
+      routerModels: ref({}),
+      routerTierConfigs: ref({
+        c0: { model: 'qwen/qwen3.7-flash', supportsImage: false, imageOnly: false },
+        c3: {
+          model: 'anthropic/claude-opus-4.8',
+          supportsImage: false,
+          imageOnly: false,
+          ensembleEnabled: true,
+        },
+      }),
+      routerVisualEffectsEnabled: ref(true),
+      routerVisualMode: ref('real_candidates'),
+      renderMarkdown: text => text,
+      stripGeneratedArtifactMarkers: text => text,
+      stripTimePrefix: text => text,
+      isSubagentCompletionMessage: () => false,
+      modelRoutingMode: ref('squilla_router'),
+    })
+
+    const strip = withMessages.renderedMessages.value.find(message => message.isRouterStrip)
+    const c3Cell = strip?.gridCells?.find(cell => cell.tiers.includes('c3'))
+    expect(strip?.routerPanel).toBe('real-candidates')
+    expect(c3Cell).toMatchObject({
+      displayName: 'claude-opus-4.8',
+      executionKind: 'ensemble',
+    })
   })
 
   it('renders the ensemble strip when the decision source is ensemble (per-message)', () => {

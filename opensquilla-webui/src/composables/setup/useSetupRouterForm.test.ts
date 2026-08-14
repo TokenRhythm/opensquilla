@@ -202,6 +202,28 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
     })
   })
 
+  it('does not send the shared ensemble flag for C0 through C2', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig({
+      enabled: true,
+      tiers: {
+        c0: {
+          provider: 'tokenrhythm',
+          model: 'qwen3.7-flash',
+          ensemble_enabled: true,
+        },
+        c3: {
+          provider: 'tokenrhythm',
+          model: 'glm-5.2',
+          ensemble_enabled: true,
+        },
+      },
+    }, {}, 'tokenrhythm', 'custom')
+
+    expect(f.payload()).not.toHaveProperty('tiers.c0.ensembleEnabled')
+    expect(f.payload()).toHaveProperty('tiers.c3.ensembleEnabled', true)
+  })
+
   it('sends an explicit false when the user switches C3 back to one model', () => {
     const f = useSetupRouterForm()
     f.initFromConfig({

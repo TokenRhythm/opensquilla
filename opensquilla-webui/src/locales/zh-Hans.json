@@ -1095,17 +1095,15 @@
       "capacityWarn": "每轮 {calls} 次模型调用——费用线性增长，超过 4 个提案模型后融合收益明显递减。",
       "capacityFull": "已达上限 {max} 个提案模型——更多草稿不会带来更好的融合结果，请先移除一个再添加。",
       "diversityHint": "多个提案来自同一模型家族——添加不同厂商的模型通常能提升融合质量。",
-      "effectiveFacts": "每轮 {calls} 次模型调用 · {quorum}/{proposers} 个候选正常返回即可融合 · 候选总超时 {proposerTimeout} 秒 · 融合空闲超时 {aggregatorTimeout} 秒 · 达标后宽限 {grace} 秒",
       "effectiveSummary": "{proposers} 个提案模型并行 + 1 个融合模型 · 预计每轮 {calls} 次调用",
       "runtimeStrategyTitle": "运行策略",
       "runtimeStrategyDesc": "正常返回阈值、失败处理与时限",
-      "successThresholdLabel": "完成融合所需的正常提案",
-      "successThresholdAuto": "自动 · 至少 {quorum}/{proposers} 正常返回（允许 1 个失败）",
-      "successThresholdExact": "至少 {quorum}/{proposers} 正常返回",
+      "successThresholdLabel": "最低通过条件",
+      "successThresholdValue": "至少 1 个提案模型正常返回",
+      "successThresholdDesc": "其他提案模型仍会分别等待完成或超时。",
       "failurePolicyLabel": "无法完成融合时",
       "runtimeLimitsLabel": "运行时限",
-      "runtimeLimits": "每个提案总时限 {proposerTimeout} 秒 · 融合模型事件间空闲时限 {aggregatorTimeout} 秒（配置值 {configuredAggregatorTimeout} 秒）· 整轮总时限另行控制 · 达标后宽限 {grace} 秒",
-      "quorumFailureLabel": "正常返回的提案不足 {quorum} 个时"
+      "runtimeLimits": "每个提案总时限 {proposerTimeout} 秒 · 融合模型事件间空闲时限 {aggregatorTimeout} 秒（配置值 {configuredAggregatorTimeout} 秒）· 整轮总时限另行控制"
     },
     "behavior": {
       "title": "会话行为",
@@ -3469,6 +3467,7 @@
     "aiModelEnsembleRouter": "AI 智能融合路由",
     "routerFx": {
       "selectedModel": "路由已选择 {model}",
+      "ensembleModel": "多模型融合",
       "ensembleSelecting": "AI 智能融合路由 · 正在选择候选",
       "ensembleHandedOff": "AI 智能融合路由 · 已交给 Agent",
       "ensembleRunning": "AI 智能融合路由 · 正在融合 {count} 个候选",

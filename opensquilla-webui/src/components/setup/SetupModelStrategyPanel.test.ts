@@ -7,12 +7,10 @@ import SetupModelStrategyPanel from './SetupModelStrategyPanel.vue'
 
 const FACTS = {
   perTurnCalls: 3,
-  quorum: 1,
   proposerCount: 2,
   proposerTimeoutSeconds: 300,
   configuredAggregatorTimeoutSeconds: 3600,
   aggregatorTimeoutSeconds: 480,
-  quorumGraceSeconds: 10,
 }
 
 function customLineup(overrides: Record<string, unknown> = {}) {
@@ -126,12 +124,10 @@ function panel(overrides: Record<string, unknown> = {}) {
       fixedProfile: null,
       presetFacts: {
         perTurnCalls: 5,
-        quorum: 3,
         proposerCount: 4,
         proposerTimeoutSeconds: 300,
         configuredAggregatorTimeoutSeconds: 3600,
         aggregatorTimeoutSeconds: 480,
-        quorumGraceSeconds: 10,
       },
       minSuccessfulProposers: 1,
       allFailedPolicy: 'fallback_single',
@@ -1380,15 +1376,11 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('updates the success threshold and shows the fixed fallback as read-only', async () => {
-    const onUpdateEnsembleMinSuccessful = vi.fn()
-    const { app, el } = await mountPanel(
-      {
-        activeStrategy: 'ensemble',
-        ensemble: { enabled: true, scheme: 'custom' },
-      },
-      { onUpdateEnsembleMinSuccessful },
-    )
+  it('shows the fixed one-proposer threshold and fixed fallback as read-only', async () => {
+    const { app, el } = await mountPanel({
+      activeStrategy: 'ensemble',
+      ensemble: { enabled: true, scheme: 'custom' },
+    })
 
     const runtime = el.querySelector<HTMLDetailsElement>('[data-testid="ensemble-runtime-strategy"]')!
     expect(runtime.open).toBe(false)
@@ -1399,12 +1391,11 @@ describe('SetupModelStrategyPanel', () => {
       'aggregator 480s idle between provider events (configured 3600s)',
     )
     expect(runtime.textContent).toContain('outer turn deadline separate')
-
-    const threshold = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_min_successful"]')!
-    threshold.value = '2'
-    threshold.dispatchEvent(new Event('change', { bubbles: true }))
-    await nextTick()
-    expect(onUpdateEnsembleMinSuccessful).toHaveBeenCalledWith(2)
+    expect(runtime.textContent).toContain('At least 1 proposer returns normally')
+    expect(runtime.textContent).toContain('Other proposers still wait for their own completion or timeout')
+    expect(el.querySelector('select[name="setup_model_strategy_min_successful"]')).toBeNull()
+    expect(el.querySelector('[data-testid="ensemble-success-threshold"]')?.textContent)
+      .toContain('At least 1 proposer returns normally')
 
     expect(el.querySelector('select[name="setup_model_strategy_all_failed_policy"]')).toBeNull()
     const fallback = el.querySelector<HTMLElement>('[data-testid="ensemble-fixed-fallback"]')
@@ -1432,7 +1423,7 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('clamps an oversized stored threshold to the displayed proposer count', async () => {
+  it('does not expose an oversized legacy threshold as an editable runtime rule', async () => {
     const { app, el } = await mountPanel({
       activeStrategy: 'ensemble',
       ensemble: {
@@ -1441,16 +1432,14 @@ describe('SetupModelStrategyPanel', () => {
         minSuccessfulProposers: 5,
         custom: customLineup({
           proposerCount: 2,
-          facts: { ...FACTS, proposerCount: 2, quorum: 2 },
+          facts: { ...FACTS, proposerCount: 2 },
         }),
       },
     })
 
-    const threshold = el.querySelector<HTMLSelectElement>(
-      'select[name="setup_model_strategy_min_successful"]',
-    )!
-    expect(threshold.value).toBe('2')
-    expect(threshold.selectedOptions[0]?.textContent).toContain('2 of 2')
+    expect(el.querySelector('select[name="setup_model_strategy_min_successful"]')).toBeNull()
+    expect(el.querySelector('[data-testid="ensemble-success-threshold"]')?.textContent)
+      .toContain('At least 1 proposer returns normally')
 
     app.unmount()
   })
@@ -1467,7 +1456,7 @@ describe('SetupModelStrategyPanel', () => {
           canAddProposer: false,
           belowMinimum: false,
           diversityWarning: true,
-          facts: { ...FACTS, perTurnCalls: 7, proposerCount: 6, quorum: 5 },
+          facts: { ...FACTS, perTurnCalls: 7, proposerCount: 6 },
         }),
       },
     })

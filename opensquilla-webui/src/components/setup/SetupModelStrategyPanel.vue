@@ -70,7 +70,6 @@ interface EnsemblePanelContract {
   fixedProfile: EnsembleFixedProfileView | null
   presetProviderMismatch?: boolean
   presetFacts: EnsembleEffectiveFacts
-  minSuccessfulProposers: number
   allFailedPolicy: string
   showCandidateEditor: boolean
   statusText: string
@@ -115,7 +114,6 @@ const emit = defineEmits<{
   requestProviderModels: [provider: string]
   importEnsembleTierCandidates: []
   migrateEnsembleLegacy: []
-  updateEnsembleMinSuccessful: [value: number]
   goToSection: [value: string]
 }>()
 
@@ -483,16 +481,6 @@ const legacyProposers = computed(() => (
 const legacyAggregators = computed(() => (
   props.panel.ensemble.customCandidates.filter(candidate => candidate.role === 'aggregator')
 ))
-const quorumOptions = computed(() => Array.from(
-  { length: Math.max(0, activeFacts.value.proposerCount - 1) },
-  (_, index) => index + 2,
-))
-const displayedMinSuccessful = computed(() => {
-  const configured = Math.max(1, Math.trunc(Number(props.panel.ensemble.minSuccessfulProposers)))
-  if (configured === 1) return 1
-  return Math.min(configured, Math.max(1, activeFacts.value.proposerCount))
-})
-
 function closeLineupEditors() {
   newCandidateProvider.value = ''
   newCandidateModel.value = ''
@@ -1451,32 +1439,20 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             <Icon class="setup-model-strategy__runtime-chevron" name="chevronDown" :size="15" aria-hidden="true" />
           </summary>
           <div class="setup-model-strategy__runtime-body">
-            <label class="control-row">
+            <div class="control-row">
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.successThresholdLabel') }}</span>
+                <span class="control-row__desc">
+                  {{ t('setup.modelStrategy.successThresholdDesc') }}
+                </span>
               </div>
               <div class="control-row__control">
-                <select
-                  class="control-input"
-                  :value="displayedMinSuccessful"
-                  name="setup_model_strategy_min_successful"
-                  @change="emit('updateEnsembleMinSuccessful', Number(($event.target as HTMLSelectElement).value))"
-                >
-                  <option value="1">
-                    {{ t('setup.modelStrategy.successThresholdAuto', {
-                      quorum: activeFacts.quorum,
-                      proposers: activeFacts.proposerCount,
-                    }) }}
-                  </option>
-                  <option v-for="quorum in quorumOptions" :key="quorum" :value="quorum">
-                    {{ t('setup.modelStrategy.successThresholdExact', {
-                      quorum,
-                      proposers: activeFacts.proposerCount,
-                    }) }}
-                  </option>
-                </select>
+                <span
+                  class="setup-model-strategy__runtime-value"
+                  data-testid="ensemble-success-threshold"
+                >{{ t('setup.modelStrategy.successThresholdValue') }}</span>
               </div>
-            </label>
+            </div>
             <label class="control-row">
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.failurePolicyLabel') }}</span>
@@ -1501,7 +1477,6 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                   proposerTimeout: activeFacts.proposerTimeoutSeconds,
                   configuredAggregatorTimeout: activeFacts.configuredAggregatorTimeoutSeconds,
                   aggregatorTimeout: activeFacts.aggregatorTimeoutSeconds,
-                  grace: activeFacts.quorumGraceSeconds,
                 }) }}
               </span>
             </div>

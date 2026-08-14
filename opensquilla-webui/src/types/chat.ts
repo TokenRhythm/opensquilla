@@ -149,12 +149,14 @@ export interface ChatRouterCell {
   tiers: string[]
   displayName: string
   model?: string
+  executionKind?: 'single_model' | 'ensemble'
 }
 
 export interface ChatRouterTierConfig {
   model: string
   supportsImage: boolean
   imageOnly: boolean
+  ensembleEnabled?: boolean
 }
 
 export interface ChatToolCall {

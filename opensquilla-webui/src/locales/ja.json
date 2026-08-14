@@ -1044,17 +1044,15 @@
       "capacityWarn": "1 ターンあたり {calls} 回のモデル呼び出し — コストは線形に増え、候補 4 つを超えると集約の効果は逓減します。",
       "capacityFull": "候補の上限 {max} に達しました — これ以上追加しても集約は改善しません。先に 1 つ削除してください。",
       "diversityHint": "複数の候補が同じモデルファミリーです — 別ベンダーのモデルを追加すると集約が改善されることが多いです。",
-      "effectiveFacts": "1 ターンあたり {calls} 回のモデル呼び出し · {quorum}/{proposers} 件の成功で集約開始 · 候補の合計タイムアウト {proposerTimeout} 秒 · 集約のアイドルタイムアウト {aggregatorTimeout} 秒 · 充足後 {grace} 秒の猶予",
       "effectiveSummary": "{proposers} 個の提案モデルを並列実行 + 1 個の集約モデル · 1 ターン約 {calls} 回呼び出し",
       "runtimeStrategyTitle": "実行戦略",
       "runtimeStrategyDesc": "成功条件、失敗時の動作、制限時間",
-      "successThresholdLabel": "必要な成功数",
-      "successThresholdAuto": "自動 · {quorum}/{proposers}",
-      "successThresholdExact": "{quorum}/{proposers}",
+      "successThresholdLabel": "最小成功条件",
+      "successThresholdValue": "少なくとも 1 つの提案モデルが正常に応答",
+      "successThresholdDesc": "ほかの提案モデルも、それぞれ完了またはタイムアウトまで待機します。",
       "failurePolicyLabel": "集約を完了できない場合",
       "runtimeLimitsLabel": "制限時間",
-      "runtimeLimits": "提案モデルは合計 {proposerTimeout} 秒 · 集約モデルはプロバイダーイベント間のアイドル {aggregatorTimeout} 秒（設定値 {configuredAggregatorTimeout} 秒）· ターン全体の期限は別管理 · 条件達成後の猶予 {grace} 秒",
-      "quorumFailureLabel": "成功した候補が {quorum} 件未満の場合"
+      "runtimeLimits": "提案モデルは合計 {proposerTimeout} 秒 · 集約モデルはプロバイダーイベント間のアイドル {aggregatorTimeout} 秒（設定値 {configuredAggregatorTimeout} 秒）· ターン全体の期限は別管理"
     },
     "behavior": {
       "title": "セッションの動作",
@@ -3416,6 +3414,7 @@
     "aiModelEnsembleRouter": "AI モデル集約ルーター",
     "routerFx": {
       "selectedModel": "ルーターが {model} を選択しました",
+      "ensembleModel": "マルチモデル融合",
       "ensembleSelecting": "AI モデル集約ルーター · 候補を選択中",
       "ensembleHandedOff": "AI モデル集約ルーター · エージェントへ引き継ぎ済み",
       "ensembleRunning": "AI モデル集約ルーター · {count} 件の候補を統合中",

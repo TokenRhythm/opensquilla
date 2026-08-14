@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import ast
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from opensquilla.engine.routing import RoutingDecision
 from opensquilla.engine.selector_override import apply_model_override
@@ -17,8 +23,14 @@ from opensquilla.onboarding.mutations import (
     upsert_router,
 )
 from opensquilla.router_tiers import (
+    STATIC_B5_PROFILES,
     TierConfig,
+    router_dynamic_tier_members_active,
     router_tier_provider_roles,
+    selection_fingerprint,
+    selection_fingerprint_payload,
+    static_b5_profile,
+    tier_ensemble_active,
     tier_ensemble_execution,
     tier_provider_role,
 )
@@ -26,6 +38,67 @@ from opensquilla.router_tiers import (
 # ---------------------------------------------------------------------------
 # TierConfig
 # ---------------------------------------------------------------------------
+
+
+def test_selection_mode_metadata_has_one_canonical_profile_owner() -> None:
+    openrouter = static_b5_profile("static_openrouter_b5")
+    tokenrhythm = static_b5_profile("static_tokenrhythm_b5")
+    assert openrouter is STATIC_B5_PROFILES["static_openrouter_b5"]
+    assert tokenrhythm is STATIC_B5_PROFILES["static_tokenrhythm_b5"]
+    assert openrouter is not None and openrouter.provider_id == "openrouter"
+    assert tokenrhythm is not None and tokenrhythm.provider_id == "tokenrhythm"
+    assert openrouter.ownership_role == "static_profile"
+    assert tokenrhythm.api_key_env == "TOKENRHYTHM_API_KEY"
+
+
+def test_selection_fingerprint_is_stable_and_sensitive_to_owned_inputs() -> None:
+    base = {
+        "mode": "static_openrouter_b5",
+        "provider": "openrouter",
+        "model": "z-ai/glm-5.2",
+        "profile": "static_openrouter_b5",
+        "ownership": "static_profile",
+    }
+    assert selection_fingerprint(**base) == selection_fingerprint(**base)
+    assert selection_fingerprint_payload(**base) == {
+        "mode": "static_openrouter_b5",
+        "provider": "openrouter",
+        "model": "z-ai/glm-5.2",
+        "profile": "static_openrouter_b5",
+        "ownership": "static_profile",
+    }
+    for field in ("provider", "model", "profile", "ownership"):
+        changed = {**base, field: f"changed-{field}"}
+        assert selection_fingerprint(**changed) != selection_fingerprint(**base)
+
+
+def test_ensemble_plan_is_forwarding_only_and_generator_is_current() -> None:
+    plan_path = Path(__file__).parents[1] / "src/opensquilla/ensemble_plan.py"
+    tree = ast.parse(plan_path.read_text(encoding="utf-8"))
+    imported_modules = {
+        node.module or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+    imported_modules.update(
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+    assert all(
+        not module.startswith(("opensquilla.provider", "opensquilla.engine"))
+        for module in imported_modules
+    )
+    generator = Path(__file__).parents[1] / "scripts/generate_router_tier_contract.py"
+    result = subprocess.run(
+        [sys.executable, str(generator), "--check"],
+        cwd=generator.parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_tier_config_from_dict() -> None:
@@ -67,6 +140,18 @@ def test_shared_tier_execution_follows_the_current_plan() -> None:
         "c3",
         shared_selection_mode="custom_b5",
     ) == ("custom_b5", "shared")
+
+
+@pytest.mark.parametrize("tier", ["c0", "c1", "c2"])
+def test_shared_ensemble_flag_is_c3_only(tier: str) -> None:
+    tiers = {tier: {"ensemble_enabled": True}}
+
+    assert tier_ensemble_execution(
+        tiers,
+        tier,
+        shared_selection_mode="custom_b5",
+    ) == ("", "single")
+    assert tier_ensemble_active(tiers, tier) is False
 
 
 def test_explicit_single_model_wins_over_a_legacy_tier_mode() -> None:
@@ -256,6 +341,31 @@ def test_explicit_single_model_suppresses_retained_legacy_dynamic_membership() -
         tiers,
         shared_selection_mode="custom_b5",
     ) == {"c0": "direct", "c3": "direct"}
+
+
+def test_ignored_non_c3_shared_flag_does_not_hide_legacy_dynamic_mode() -> None:
+    tiers = {
+        "c0": {
+            "provider": "deepseek",
+            "model": "fast",
+            "ensemble_enabled": True,
+            "ensemble_selection_mode": "router_dynamic",
+        },
+        "c1": {"provider": "openrouter", "model": "balanced"},
+    }
+
+    assert tier_ensemble_execution(
+        tiers,
+        "c0",
+        shared_selection_mode="custom_b5",
+    ) == ("router_dynamic", "legacy")
+    assert (
+        router_dynamic_tier_members_active(
+            tiers,
+            shared_selection_mode="custom_b5",
+        )
+        is True
+    )
 
 
 # ---------------------------------------------------------------------------

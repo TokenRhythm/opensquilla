@@ -1,4 +1,38 @@
 import { computed, ref, type ComputedRef } from 'vue'
+import {
+  CUSTOM_B5_MAX_PROPOSERS,
+  CUSTOM_B5_MIN_PROPOSERS,
+  CUSTOM_B5_RECOMMENDED_MAX,
+  CUSTOM_B5_RECOMMENDED_MIN,
+  CUSTOM_B5_SELECTION_MODE,
+  DEFAULT_ENSEMBLE_SELECTION_MODE,
+  ENSEMBLE_PROPOSER_ROLES,
+  ENSEMBLE_SELECTION_MODES,
+  LEGACY_OPENROUTER_MODEL_OPTIONS,
+  ROUTER_DYNAMIC_SELECTION_MODE,
+  STATIC_B5_PROFILES,
+  staticB5ModeForProvider,
+  type StaticB5Profile,
+} from '@/types/generated/router_tier_contract'
+
+export {
+  CUSTOM_B5_MAX_PROPOSERS,
+  CUSTOM_B5_MIN_PROPOSERS,
+  CUSTOM_B5_RECOMMENDED_MAX,
+  CUSTOM_B5_RECOMMENDED_MIN,
+  CUSTOM_B5_SELECTION_MODE,
+  ENSEMBLE_SELECTION_MODES,
+  LEGACY_OPENROUTER_MODEL_OPTIONS,
+  OPENROUTER_FIXED_ENSEMBLE_AGGREGATOR,
+  OPENROUTER_FIXED_ENSEMBLE_PROPOSERS,
+  ROUTER_DYNAMIC_SELECTION_MODE,
+  STATIC_B5_PROFILES,
+  TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR,
+  TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS,
+  staticB5ModeForProvider,
+} from '@/types/generated/router_tier_contract'
+export { ENSEMBLE_PROPOSER_ROLES }
+export type { StaticB5Profile } from '@/types/generated/router_tier_contract'
 
 // Settings form for the [llm_ensemble] routing surface, saved through
 // onboarding.ensemble.configure. That RPC has partial-payload semantics (the
@@ -13,14 +47,6 @@ import { computed, ref, type ComputedRef } from 'vue'
 // The legacy "router_dynamic" mode is read-compatible but hidden: stored
 // configs surface a migration banner that converts them to a custom lineup.
 
-export const CUSTOM_B5_SELECTION_MODE = 'custom_b5'
-
-export const ENSEMBLE_SELECTION_MODES = [
-  'static_openrouter_b5',
-  'static_tokenrhythm_b5',
-  CUSTOM_B5_SELECTION_MODE,
-  'router_dynamic',
-] as const
 export const ENSEMBLE_ALL_FAILED_POLICIES = ['fallback_single', 'error'] as const
 
 export type EnsembleCandidateRole =
@@ -31,86 +57,15 @@ export type EnsembleCandidateRole =
   | 'critic'
   | 'aggregator'
 
-export const ENSEMBLE_PROPOSER_ROLES = ['primary', 'contrast', 'fast_check', 'critic'] as const
-
-// Custom lineup bounds. Mirrors the gateway's CUSTOM_B5_* constants: 2 is the
-// smallest lineup where fusion means anything, 3-4 is the value sweet spot
-// (the preset lineups run 4), 6 is the hard ceiling before aggregator-context
-// and cost pressure outweigh the marginal draft.
-export const CUSTOM_B5_MIN_PROPOSERS = 2
-export const CUSTOM_B5_MAX_PROPOSERS = 6
-export const CUSTOM_B5_RECOMMENDED_MIN = 3
-export const CUSTOM_B5_RECOMMENDED_MAX = 4
-
-export const OPENROUTER_FIXED_ENSEMBLE_PROPOSERS = [
-  'deepseek/deepseek-v4-pro',
-  'z-ai/glm-5.2',
-  'moonshotai/kimi-k2.7-code',
-  'qwen/qwen3.7-max',
-] as const
-export const OPENROUTER_FIXED_ENSEMBLE_AGGREGATOR = 'z-ai/glm-5.2'
-export const TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS = [
-  'deepseek-v4-pro',
-  'glm-5.2',
-  'kimi-k2.7-code',
-  'qwen3.7-max',
-] as const
-export const TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR = 'glm-5.2'
-
-// Static B5 lineups keyed by selection mode. Mirrors the gateway's
-// STATIC_B5_SELECTION_MODE_PROVIDERS + provider.ensemble.STATIC_B5_PROFILES.
-export interface StaticB5Profile {
-  provider: string
-  label: string
-  proposers: readonly string[]
-  aggregator: string
-}
-
-export const STATIC_B5_PROFILES: Record<string, StaticB5Profile> = {
-  static_openrouter_b5: {
-    provider: 'openrouter',
-    label: 'OpenRouter',
-    proposers: OPENROUTER_FIXED_ENSEMBLE_PROPOSERS,
-    aggregator: OPENROUTER_FIXED_ENSEMBLE_AGGREGATOR,
-  },
-  static_tokenrhythm_b5: {
-    provider: 'tokenrhythm',
-    label: 'TokenRhythm',
-    proposers: TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS,
-    aggregator: TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR,
-  },
-}
-
-export function staticB5ModeForProvider(provider: unknown): string | null {
-  const id = String(provider || '').trim().toLowerCase()
-  if (!id) return null
-  for (const [mode, profile] of Object.entries(STATIC_B5_PROFILES)) {
-    if (profile.provider === id) return mode
-  }
-  return null
-}
-export const LEGACY_OPENROUTER_MODEL_OPTIONS = [
-  'deepseek/deepseek-v4-pro',
-  'z-ai/glm-5.2',
-  'qwen/qwen3.7-plus',
-  'deepseek/deepseek-v4-flash',
-  'qwen/qwen3.7-max',
-  'moonshotai/kimi-k2.6',
-  'moonshotai/kimi-k2.7-code',
-  'minimax/minimax-m3',
-] as const
-
-const DEFAULT_SELECTION_MODE = 'static_openrouter_b5'
+const DEFAULT_SELECTION_MODE = DEFAULT_ENSEMBLE_SELECTION_MODE
 const DEFAULT_MIN_SUCCESSFUL_PROPOSERS = 1
 const DEFAULT_ALL_FAILED_POLICY = 'fallback_single'
 
 // Runtime default replacements applied by the ensemble builder when the
 // stored value still equals the legacy default. The panel surfaces EFFECTIVE
 // values so what the user reads matches what actually runs.
-const STATIC_B5_EFFECTIVE_QUORUM = 3
 const STATIC_B5_PROPOSER_TIMEOUT_SECONDS = 300
 const STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS = 480
-const STATIC_B5_QUORUM_GRACE_SECONDS = 10
 // The gateway builder substitutes the static-B5 timeout defaults above ONLY
 // when the stored value still equals this legacy default; an explicit
 // operator override (e.g. proposer_timeout_seconds = 600 in TOML) runs as
@@ -156,12 +111,10 @@ export interface EnsembleFixedProfileView {
 
 export interface EnsembleEffectiveFacts {
   perTurnCalls: number
-  quorum: number
   proposerCount: number
   proposerTimeoutSeconds: number
   configuredAggregatorTimeoutSeconds: number
   aggregatorTimeoutSeconds: number
-  quorumGraceSeconds: number
 }
 
 export type EnsembleCapacityState = 'ok' | 'warn' | 'full'
@@ -444,7 +397,7 @@ export function useSetupEnsembleForm() {
   // Candidate/model-option inputs only drive the lineup-based modes; static
   // preset saves must not carry stale editor state.
   const dynamicCandidateInputsActive = computed(() => (
-    selectionMode.value === 'router_dynamic' || selectionMode.value === CUSTOM_B5_SELECTION_MODE
+    selectionMode.value === ROUTER_DYNAMIC_SELECTION_MODE || selectionMode.value === CUSTOM_B5_SELECTION_MODE
   ))
   const effectiveModelOptionsDirty = computed(() => dynamicCandidateInputsActive.value && modelOptionsDirty.value)
   const effectiveCandidatesDirty = computed(() => dynamicCandidateInputsActive.value && candidatesDirty.value)
@@ -541,15 +494,15 @@ export function useSetupEnsembleForm() {
   function ensureCustomMode() {
     if (
       selectionMode.value !== CUSTOM_B5_SELECTION_MODE
-      && selectionMode.value !== 'router_dynamic'
+      && selectionMode.value !== ROUTER_DYNAMIC_SELECTION_MODE
     ) {
       selectionMode.value = CUSTOM_B5_SELECTION_MODE
     }
   }
 
-  // Keep an explicit quorum consistent with the lineup: quorum > N can never
-  // succeed and the gateway rejects it. The legacy default (1) means "auto"
-  // (the runtime derives N-1), so it is never clamped.
+  // Keep the legacy configured threshold valid for older gateways and config
+  // diagnostics. Current runtime execution always uses an effective minimum
+  // of one successful proposer.
   function clampQuorumToLineup() {
     const count = enabledProposerConfigs.value.length
     if (
@@ -899,26 +852,17 @@ export function useSetupEnsembleForm() {
   }
 
   function effectiveFacts(proposerCount: number, isPreset: boolean): EnsembleEffectiveFacts {
-    const configuredQuorum = minSuccessfulProposers.value
-    const autoQuorum = isPreset
-      ? STATIC_B5_EFFECTIVE_QUORUM
-      : Math.max(1, proposerCount - 1)
-    const quorum = Math.min(
-      configuredQuorum === DEFAULT_MIN_SUCCESSFUL_PROPOSERS ? autoQuorum : configuredQuorum,
-      Math.max(1, proposerCount),
-    )
     // Mirrors the gateway builder: static presets and custom_b5 lineups get
     // the static defaults only while the stored value still equals the legacy
     // default; an explicit override runs (and reads) as configured. The
-    // hidden legacy router_dynamic mode runs the stored values untouched and
-    // has no quorum grace.
-    const staticDefaultsApply = isPreset || selectionMode.value !== 'router_dynamic'
+    // hidden legacy router_dynamic mode runs the stored timeout values
+    // untouched.
+    const staticDefaultsApply = isPreset || selectionMode.value !== ROUTER_DYNAMIC_SELECTION_MODE
     const substituteLegacy = (stored: number, staticDefault: number): number => (
       staticDefaultsApply && stored === LEGACY_ENSEMBLE_TIMEOUT_SECONDS ? staticDefault : stored
     )
     return {
       perTurnCalls: proposerCount + 1,
-      quorum,
       proposerCount,
       proposerTimeoutSeconds: substituteLegacy(
         storedProposerTimeoutSeconds.value,
@@ -929,7 +873,6 @@ export function useSetupEnsembleForm() {
         storedAggregatorTimeoutSeconds.value,
         STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS,
       ),
-      quorumGraceSeconds: staticDefaultsApply ? STATIC_B5_QUORUM_GRACE_SECONDS : 0,
     }
   }
 
@@ -948,7 +891,7 @@ export function useSetupEnsembleForm() {
         : null
 
       const scheme: EnsembleScheme = (
-        selectionMode.value === 'router_dynamic'
+        selectionMode.value === ROUTER_DYNAMIC_SELECTION_MODE
           ? 'legacy'
           : selectionMode.value === CUSTOM_B5_SELECTION_MODE
             ? 'custom'

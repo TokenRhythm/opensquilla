@@ -156,7 +156,6 @@
               @request-provider-models="discoverModelStrategyProviderModels"
               @import-ensemble-tier-candidates="importEnsembleTierCandidates"
               @migrate-ensemble-legacy="migrateEnsembleLegacy"
-              @update-ensemble-min-successful="setEnsembleMinSuccessful"
               @go-to-section="selectSection"
             />
             <SetupCapabilitiesPanel
@@ -301,7 +300,6 @@ const {
   importEnsembleTierCandidates,
   migrateEnsembleLegacy,
   setEnsembleScheme,
-  setEnsembleMinSuccessful,
   applyProviderPreset,
   updateProviderField,
   updateLlmTimeout,

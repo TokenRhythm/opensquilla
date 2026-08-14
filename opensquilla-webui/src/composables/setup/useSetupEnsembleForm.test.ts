@@ -908,8 +908,6 @@ describe('useSetupEnsembleForm — panel contract', () => {
     expect(panel.value.custom.aggregator!.model).toBe('deepseek-v4-flash')
     expect(panel.value.custom.aggregatorInherited).toBe(false)
     expect(panel.value.custom.facts.perTurnCalls).toBe(3)
-    // quorum auto (stored default 1) -> N-1 = 1
-    expect(panel.value.custom.facts.quorum).toBe(1)
   })
 
   it('falls back to the inherited chat model when no aggregator is assigned', () => {
@@ -948,18 +946,16 @@ describe('useSetupEnsembleForm — panel contract', () => {
     expect(makePanel(f, 'volcengine').value.custom.canAddProposer).toBe(false)
   })
 
-  it('surfaces the effective preset facts (quorum 3/4, 300/480s, 10s grace)', () => {
+  it('surfaces only effective preset call and timeout facts', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
     const facts = makePanel(f, 'openrouter').value.presetFacts
     expect(facts).toEqual({
       perTurnCalls: 5,
-      quorum: 3,
       proposerCount: 4,
       proposerTimeoutSeconds: 300,
       configuredAggregatorTimeoutSeconds: 3600,
       aggregatorTimeoutSeconds: 480,
-      quorumGraceSeconds: 10,
     })
   })
 
@@ -1018,7 +1014,6 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     expect(facts.proposerTimeoutSeconds).toBe(600)
     expect(facts.configuredAggregatorTimeoutSeconds).toBe(900)
     expect(facts.aggregatorTimeoutSeconds).toBe(900)
-    expect(facts.quorumGraceSeconds).toBe(10)
     // The stored timeouts are read-only facts, never a pending edit.
     expect(f.isDirty.value).toBe(false)
     expect(f.payload()).toEqual({})
@@ -1061,10 +1056,9 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     expect(facts.proposerTimeoutSeconds).toBe(720)
     expect(facts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(facts.aggregatorTimeoutSeconds).toBe(480)
-    expect(facts.quorumGraceSeconds).toBe(10)
   })
 
-  it('reports raw stored timeouts and no grace for the legacy router_dynamic mode', () => {
+  it('reports raw stored timeouts for the legacy router_dynamic mode', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       enabled: true,
@@ -1075,7 +1069,6 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     expect(facts.proposerTimeoutSeconds).toBe(3600)
     expect(facts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(facts.aggregatorTimeoutSeconds).toBe(3600)
-    expect(facts.quorumGraceSeconds).toBe(0)
   })
 })
 

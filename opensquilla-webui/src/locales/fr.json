@@ -1044,17 +1044,15 @@
       "capacityWarn": "{calls} appels de modèle par tour — le coût croît linéairement et le gain de fusion s'estompe au-delà de 4 proposants.",
       "capacityFull": "Limite de {max} proposants atteinte — davantage de brouillons n'améliore plus la fusion ; retirez-en un d'abord.",
       "diversityHint": "Plusieurs proposants partagent la même famille de modèles — ajouter un autre fournisseur améliore généralement la fusion.",
-      "effectiveFacts": "Par tour : {calls} appels de modèle · fusion dès {quorum}/{proposers} proposants réussis · délai total proposant {proposerTimeout}s · délai d'inactivité agrégateur {aggregatorTimeout}s · {grace}s de grâce après quorum",
       "effectiveSummary": "{proposers} proposants en parallèle + 1 agrégateur · environ {calls} appels par tour",
       "runtimeStrategyTitle": "Stratégie d'exécution",
       "runtimeStrategyDesc": "Seuil de réussite, repli et limites de temps",
-      "successThresholdLabel": "Réponses réussies requises",
-      "successThresholdAuto": "Automatique · {quorum} sur {proposers}",
-      "successThresholdExact": "{quorum} sur {proposers}",
+      "successThresholdLabel": "Condition minimale de réussite",
+      "successThresholdValue": "Au moins 1 modèle proposant répond normalement",
+      "successThresholdDesc": "Les autres modèles proposants attendent toujours leur propre fin ou expiration.",
       "failurePolicyLabel": "Si l'agrégation ne peut pas aboutir",
       "runtimeLimitsLabel": "Limites de temps",
-      "runtimeLimits": "Proposants {proposerTimeout}s au total · inactivité de l'agrégateur entre événements {aggregatorTimeout}s (configurée {configuredAggregatorTimeout}s) · délai total du tour séparé · {grace}s de grâce après le seuil",
-      "quorumFailureLabel": "Si moins de {quorum} proposants réussissent"
+      "runtimeLimits": "Proposants {proposerTimeout}s au total · inactivité de l'agrégateur entre événements {aggregatorTimeout}s (configurée {configuredAggregatorTimeout}s) · délai total du tour séparé"
     },
     "behavior": {
       "title": "Comportement des sessions",
@@ -3416,6 +3414,7 @@
     "aiModelEnsembleRouter": "Routeur agrégé de modèles IA",
     "routerFx": {
       "selectedModel": "Le routeur a sélectionné {model}",
+      "ensembleModel": "Fusion multimodèle",
       "ensembleSelecting": "Routeur agrégé de modèles IA · sélection des candidats",
       "ensembleHandedOff": "Routeur agrégé de modèles IA · transmis à l'agent",
       "ensembleRunning": "Routeur agrégé de modèles IA · {count} candidats en synthèse",

@@ -1044,17 +1044,15 @@
       "capacityWarn": "{calls} Modellaufrufe pro Runde — Kosten wachsen linear, der Fusionsgewinn nimmt ab 4 Entwürfen deutlich ab.",
       "capacityFull": "Limit von {max} Entwurfsmodellen erreicht — mehr Entwürfe verbessern die Fusion nicht; erst eines entfernen.",
       "diversityHint": "Mehrere Entwurfsmodelle stammen aus derselben Modellfamilie — ein anderer Anbieter verbessert die Fusion meist.",
-      "effectiveFacts": "Pro Runde: {calls} Modellaufrufe · Fusion ab {quorum}/{proposers} erfolgreichen Entwürfen · Gesamt-Timeout je Entwurf {proposerTimeout}s · Aggregator-Leerlauf-Timeout {aggregatorTimeout}s · {grace}s Nachfrist",
       "effectiveSummary": "{proposers} Entwürfe parallel + 1 Aggregator · etwa {calls} Modellaufrufe pro Runde",
       "runtimeStrategyTitle": "Laufzeitstrategie",
       "runtimeStrategyDesc": "Erfolgsschwelle, Ausweichverhalten und Zeitlimits",
-      "successThresholdLabel": "Benötigte erfolgreiche Entwürfe",
-      "successThresholdAuto": "Automatisch · {quorum} von {proposers}",
-      "successThresholdExact": "{quorum} von {proposers}",
+      "successThresholdLabel": "Mindesterfolgsbedingung",
+      "successThresholdValue": "Mindestens 1 Entwurfsmodell antwortet erfolgreich",
+      "successThresholdDesc": "Die anderen Entwurfsmodelle warten weiter auf ihren eigenen Abschluss oder ihr Zeitlimit.",
       "failurePolicyLabel": "Wenn die Aggregation nicht abgeschlossen werden kann",
       "runtimeLimitsLabel": "Zeitlimits",
-      "runtimeLimits": "Entwürfe insgesamt {proposerTimeout}s · Aggregator-Leerlauf zwischen Anbieterereignissen {aggregatorTimeout}s (konfiguriert {configuredAggregatorTimeout}s) · separates Gesamtlimit der Runde · {grace}s Nachfrist",
-      "quorumFailureLabel": "Wenn weniger als {quorum} Entwürfe gelingen"
+      "runtimeLimits": "Entwürfe insgesamt {proposerTimeout}s · Aggregator-Leerlauf zwischen Anbieterereignissen {aggregatorTimeout}s (konfiguriert {configuredAggregatorTimeout}s) · separates Gesamtlimit der Runde"
     },
     "behavior": {
       "title": "Sitzungsverhalten",
@@ -3416,6 +3414,7 @@
     "aiModelEnsembleRouter": "AI-Modell-Ensemble-Router",
     "routerFx": {
       "selectedModel": "Router hat {model} ausgewählt",
+      "ensembleModel": "Multi-Modell-Fusion",
       "ensembleSelecting": "AI-Modell-Ensemble-Router · Kandidaten werden gewählt",
       "ensembleHandedOff": "AI-Modell-Ensemble-Router · an Agent übergeben",
       "ensembleRunning": "AI-Modell-Ensemble-Router · {count} Kandidaten werden synthetisiert",

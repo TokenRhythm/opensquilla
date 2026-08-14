@@ -1044,17 +1044,15 @@
       "capacityWarn": "{calls} llamadas de modelo por turno — el coste crece linealmente y la mejora de fusión decae pasados 4 proponentes.",
       "capacityFull": "Límite de {max} proponentes alcanzado — más borradores no mejoran la fusión; quita uno antes de añadir otro.",
       "diversityHint": "Varios proponentes comparten familia de modelos — añadir otro proveedor suele mejorar la fusión.",
-      "effectiveFacts": "Por turno: {calls} llamadas de modelo · fusiona al lograr {quorum}/{proposers} proponentes · timeout total de proponente {proposerTimeout}s · timeout de inactividad del agregador {aggregatorTimeout}s · {grace}s de gracia tras el quórum",
       "effectiveSummary": "{proposers} proponentes en paralelo + 1 agregador · unas {calls} llamadas por turno",
       "runtimeStrategyTitle": "Estrategia de ejecución",
       "runtimeStrategyDesc": "Umbral de éxito, alternativa y límites de tiempo",
-      "successThresholdLabel": "Proponentes con éxito requeridos",
-      "successThresholdAuto": "Automático · {quorum} de {proposers}",
-      "successThresholdExact": "{quorum} de {proposers}",
+      "successThresholdLabel": "Condición mínima de éxito",
+      "successThresholdValue": "Al menos 1 modelo proponente responde correctamente",
+      "successThresholdDesc": "Los demás modelos proponentes siguen esperando hasta completar o agotar su propio tiempo.",
       "failurePolicyLabel": "Si no se puede completar la agregación",
       "runtimeLimitsLabel": "Límites de tiempo",
-      "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado · {grace}s de gracia tras el umbral",
-      "quorumFailureLabel": "Si menos de {quorum} proponentes tienen éxito"
+      "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado"
     },
     "behavior": {
       "title": "Comportamiento de la sesión",
@@ -3416,6 +3414,7 @@
     "aiModelEnsembleRouter": "Enrutador agregado de modelos de IA",
     "routerFx": {
       "selectedModel": "El enrutador seleccionó {model}",
+      "ensembleModel": "Fusión multimodelo",
       "ensembleSelecting": "Enrutador agregado de modelos de IA · seleccionando candidatos",
       "ensembleHandedOff": "Enrutador agregado de modelos de IA · entregado al agente",
       "ensembleRunning": "Enrutador agregado de modelos de IA · {count} candidatos sintetizando",

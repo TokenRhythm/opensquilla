@@ -23,6 +23,7 @@ import type {
   DiscoveredModelCatalog,
   DiscoveredModelsByProvider,
 } from '@/composables/setup/useSetupProviderForm'
+import { ROUTER_DYNAMIC_SELECTION_MODE } from '@/types/generated/router_tier_contract'
 
 const { t } = useI18n()
 
@@ -202,9 +203,9 @@ function sharedTierEnsembleActive(row: SetupTierRow): boolean {
 
 function legacyDynamicTierEnsembleActive(row: SetupTierRow): boolean {
   if (row.name !== 'c3' || !tierEnsembleActive(row)) return false
-  if (legacyTierEnsembleActive(row)) return row.ensembleSelectionMode === 'router_dynamic'
+  if (legacyTierEnsembleActive(row)) return row.ensembleSelectionMode === ROUTER_DYNAMIC_SELECTION_MODE
   return row.ensembleEnabled === true
-    && String(props.effectiveEnsembleSelectionMode || '').trim() === 'router_dynamic'
+    && String(props.effectiveEnsembleSelectionMode || '').trim() === ROUTER_DYNAMIC_SELECTION_MODE
 }
 
 function compatibilityTierEnsembleActive(row: SetupTierRow): boolean {
@@ -222,7 +223,7 @@ function effectiveTierEnsembleSelectionMode(row: SetupTierRow): string {
 function thinkingManagedByEnsemble(row: SetupTierRow): boolean {
   return row.name === 'c3'
     && tierEnsembleActive(row)
-    && effectiveTierEnsembleSelectionMode(row) !== 'router_dynamic'
+    && effectiveTierEnsembleSelectionMode(row) !== ROUTER_DYNAMIC_SELECTION_MODE
 }
 
 function compactSharedTierEnsembleActive(row: SetupTierRow): boolean {

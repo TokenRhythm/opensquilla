@@ -7,6 +7,10 @@ import {
   normalizeRouterTier,
 } from '@/utils/chat/routerTiers'
 import {
+  DORMANT_SHARED_SELECTION_MODES,
+  ROUTER_DYNAMIC_SELECTION_MODE,
+} from '@/types/generated/router_tier_contract'
+import {
   DEFAULT_ROUTER_VISUAL_MODE,
   normalizeRouterVisualMode,
   type RouterVisualMode,
@@ -76,16 +80,20 @@ export function buildRouterPayload(
   const tiers: Record<string, Record<string, unknown>> = {}
   Object.entries(tierValues).forEach(([name, tier]) => {
     const tierName = normalizeRouterTier(name) || name
+    const sharedEnsembleTier = tierName === 'c3'
     const tierPayload: Record<string, unknown> = {
       provider: tier.provider,
       model: tier.model,
       thinkingLevel: tier.thinkingLevel,
       supportsImage: tier.supportsImage,
     }
-    if (typeof tier.ensembleEnabled === 'boolean') {
+    if (sharedEnsembleTier && typeof tier.ensembleEnabled === 'boolean') {
       tierPayload.ensembleEnabled = tier.ensembleEnabled
     }
-    if (tier.ensembleSelectionMode || typeof tier.ensembleEnabled === 'boolean') {
+    if (
+      tier.ensembleSelectionMode
+      || (sharedEnsembleTier && typeof tier.ensembleEnabled === 'boolean')
+    ) {
       tierPayload.ensembleSelectionMode = tier.ensembleSelectionMode || ''
     }
     tiers[tierName] = tierPayload
@@ -118,12 +126,6 @@ interface RouterConfig {
 }
 
 export type RouterBinding = 'follow_primary' | 'custom' | 'legacy'
-
-const DORMANT_SHARED_SELECTION_MODES = new Set([
-  'static_openrouter_b5',
-  'static_tokenrhythm_b5',
-  'custom_b5',
-])
 
 function normalizeRouterProviderRole(value: unknown): RouterTierProviderRole {
   const raw = String(
@@ -222,11 +224,11 @@ function deriveDraftRouterProviderRoles(
   const selectionMode = String(sharedSelectionMode || '').trim()
   const c3 = tiers.c3
   const dynamicMembersActive = (
-    selectionMode === 'router_dynamic'
+    selectionMode === ROUTER_DYNAMIC_SELECTION_MODE
     && (ensembleGloballyEnabled || c3?.ensembleEnabled === true)
   ) || Object.values(tiers).some(tier => (
     tier.ensembleEnabled === undefined
-    && tier.ensembleSelectionMode === 'router_dynamic'
+    && tier.ensembleSelectionMode === ROUTER_DYNAMIC_SELECTION_MODE
   ))
 
   const out: RouterProviderRoles = {}
@@ -243,11 +245,15 @@ function deriveDraftRouterProviderRoles(
     } else if (
       ensembleGloballyEnabled
       && (TEXT_TIERS as readonly string[]).includes(normalized)
-      && DORMANT_SHARED_SELECTION_MODES.has(selectionMode)
+      && DORMANT_SHARED_SELECTION_MODES.includes(
+        selectionMode as (typeof DORMANT_SHARED_SELECTION_MODES)[number],
+      )
     ) {
       out[normalized] = 'dormant_draft'
     } else if (normalized === 'c3' && tier.ensembleEnabled === true) {
-      out[normalized] = DORMANT_SHARED_SELECTION_MODES.has(selectionMode)
+      out[normalized] = DORMANT_SHARED_SELECTION_MODES.includes(
+        selectionMode as (typeof DORMANT_SHARED_SELECTION_MODES)[number],
+      )
         ? 'dormant_draft'
         : 'blocked'
     } else {
@@ -397,11 +403,13 @@ export function useSetupRouterForm() {
         model: tier.model || '',
         thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
         supportsImage: tier.supportsImage || tier.supports_image || false,
-        ensembleEnabled: typeof tier.ensembleEnabled === 'boolean'
-          ? tier.ensembleEnabled
-          : typeof tier.ensemble_enabled === 'boolean'
-            ? tier.ensemble_enabled
-            : undefined,
+        ensembleEnabled: tierName === 'c3'
+          ? typeof tier.ensembleEnabled === 'boolean'
+            ? tier.ensembleEnabled
+            : typeof tier.ensemble_enabled === 'boolean'
+              ? tier.ensemble_enabled
+              : undefined
+          : undefined,
         ensembleSelectionMode:
           tier.ensembleSelectionMode || tier.ensemble_selection_mode || '',
       }
@@ -414,6 +422,7 @@ export function useSetupRouterForm() {
   function updateTierField(name: string, key: keyof SetupTierValue, value: string | boolean) {
     const tier = tierValues.value[name]
     if (!tier) return
+    if (key === 'ensembleEnabled' && (normalizeRouterTier(name) || name) !== 'c3') return
     if (key === 'provider') {
       const provider = String(value || '').trim().toLowerCase()
       const currentProvider = String(tier.provider || '').trim().toLowerCase()

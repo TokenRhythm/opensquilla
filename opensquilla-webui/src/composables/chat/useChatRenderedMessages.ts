@@ -265,6 +265,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     let currentTurnHasUserAnchor = false
     let lastAssistantResultIndex = -1
     let turnRequestKind: ChatRouterRequestKind = 'text'
+    let turnRouterDecision: NormalizedRouterDecision | null = null
 
     // Index of the last user turn — anything after it belongs to the in-flight
     // turn, whose live ensemble strip must survive its own mid-turn done event.
@@ -307,6 +308,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         }
       } else if (explicitTurnChanged || legacyUserStartsTurn) {
         turnRouterIdx = -1
+        turnRouterDecision = null
         lastAssistantResultIndex = -1
         turnRequestKind = msg.role === 'user'
           ? routerRequestKindFromAttachments(msg.attachments)
@@ -359,6 +361,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
 
       const routerDecision = normalizeRouterDecision(msg.routerDecision || (msg.provenanceKind === 'router_decision' ? msg : null))
       if (routerDecision) {
+        turnRouterDecision = routerDecision
         const stripItem = renderedRouterStrip(
           msg,
           routerDecision,
@@ -375,18 +378,34 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
 
       const usageEnsemble = ensembleMetaFromMessage(msg)
       if (usageEnsemble) {
+        const usageRouterDecision = routerDecisionFromUsage(msg)
+        if (usageRouterDecision) turnRouterDecision = usageRouterDecision
         const inLiveTurn = options.isStreaming?.value === true && i > lastUserIdx
-        const stripItem = renderedEnsembleRouterStrip(
-          {
-            ...msg,
-            routerSettled: msg.routerSettled === true || !inLiveTurn,
-          },
-          usageEnsemble,
-          turnIdx,
-          i,
-          `${msg.messageId || i}-ensemble-router`,
-          turnIdentity,
-        )
+        const settledMessage = {
+          ...msg,
+          routerSettled: msg.routerSettled === true || !inLiveTurn,
+        }
+        const priorStrip = turnRouterIdx >= 0 ? result[turnRouterIdx] : undefined
+        const stripItem = turnRouterDecision
+          && shouldCombineRouterAndEnsemble(turnRouterDecision, true, msg.restoredFromHistory === true)
+          ? renderedCombinedRouterStrip(
+              settledMessage,
+              turnRouterDecision,
+              usageEnsemble,
+              turnIdx,
+              i,
+              priorStrip?.messageId || `${msg.messageId || i}-router`,
+              turnRequestKind,
+              turnIdentity,
+            )
+          : renderedEnsembleRouterStrip(
+              settledMessage,
+              usageEnsemble,
+              turnIdx,
+              i,
+              `${msg.messageId || i}-ensemble-router`,
+              turnIdentity,
+            )
         if (stripItem) {
           turnRouterIdx = upsertRouterStrip(result, stripItem, turnRouterIdx, {
             settleReplacement: false,
@@ -396,6 +415,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       } else {
         const usageRouterDecision = routerDecisionFromUsage(msg, inheritedSubagentRoute(msg))
         if (usageRouterDecision) {
+          turnRouterDecision = usageRouterDecision
           const stripItem = renderedRouterStrip(
             msg,
             usageRouterDecision,
@@ -546,7 +566,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     turnIdentity = `turn-${turnIdx}`,
   ): ChatRenderedMessage | null {
     if (!options.routerVisualEffectsEnabled.value) return null
-    if (isEnsembleRouterDecision(decision, msg.restoredFromHistory === true) || msg.ensemble) {
+    const restoredFromHistory = msg.restoredFromHistory === true
+    if (isDirectEnsembleRouterDecision(decision, restoredFromHistory)) {
       return renderedEnsembleRouterStrip(
         msg,
         msg.ensemble,
@@ -556,6 +577,38 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         turnIdentity,
       )
     }
+    if (shouldCombineRouterAndEnsemble(decision, Boolean(msg.ensemble), restoredFromHistory)) {
+      return renderedCombinedRouterStrip(
+        msg,
+        decision,
+        msg.ensemble,
+        turnIdx,
+        index,
+        messageId,
+        requestKind,
+        turnIdentity,
+      )
+    }
+    return renderedTierRouterStrip(
+      msg,
+      decision,
+      turnIdx,
+      index,
+      messageId,
+      requestKind,
+      turnIdentity,
+    )
+  }
+
+  function renderedTierRouterStrip(
+    msg: ChatMessage,
+    decision: NormalizedRouterDecision,
+    turnIdx: number,
+    index: number,
+    messageId = msg.messageId,
+    requestKind: ChatRouterRequestKind = 'text',
+    turnIdentity = `turn-${turnIdx}`,
+  ): ChatRenderedMessage | null {
     const cells = routerDecisionCellsForRequest(decision, requestKind)
     const fixedSessionRoute = decision.source === 'session_model'
     if (cells.length === 0 || (cells.length === 1 && !fixedSessionRoute)) return null
@@ -618,6 +671,43 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       routing_applied: true,
       rollout_phase: usage.rollout_phase || 'full',
     })
+  }
+
+  function renderedCombinedRouterStrip(
+    msg: ChatMessage,
+    decision: NormalizedRouterDecision,
+    ensemble: ChatEnsembleMeta | undefined,
+    turnIdx: number,
+    index: number,
+    messageId = msg.messageId,
+    requestKind: ChatRouterRequestKind = 'text',
+    turnIdentity = `turn-${turnIdx}`,
+  ): ChatRenderedMessage | null {
+    const routerStrip = renderedTierRouterStrip(
+      msg,
+      decision,
+      turnIdx,
+      index,
+      messageId,
+      requestKind,
+      turnIdentity,
+    )
+    if (!routerStrip) {
+      return renderedEnsembleRouterStrip(
+        msg,
+        ensemble,
+        turnIdx,
+        index,
+        messageId,
+        turnIdentity,
+      )
+    }
+    return {
+      ...routerStrip,
+      routerPanel: 'router-ensemble-sequence',
+      routerState: msg.routerState || routerStrip.routerState,
+      ensemble,
+    }
   }
 
   function renderedEnsembleRouterStrip(
@@ -779,17 +869,26 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     return usage ? ensembleMeta(usage) : undefined
   }
 
-  function isEnsembleRouterDecision(
+  function isDirectEnsembleRouterDecision(
     decision: NormalizedRouterDecision,
     restoredFromHistory: boolean,
   ): boolean {
     const source = String(decision.source || decision.routing_source || '').toLowerCase()
     if (source.includes('ensemble')) return true
-    // The active mode is authoritative for the LIVE turn — ensemble mode shows
-    // the ensemble panel immediately instead of the tier grid, even before the
-    // first ensemble_progress lands. It is NEVER applied to restored history, so
-    // a past single-model turn is not re-tagged while the toggle happens to be on.
     return !restoredFromHistory && options.modelRoutingMode?.value === 'llm_ensemble'
+  }
+
+  function shouldCombineRouterAndEnsemble(
+    decision: NormalizedRouterDecision,
+    hasEnsembleEvidence: boolean,
+    restoredFromHistory: boolean,
+  ): boolean {
+    if (isDirectEnsembleRouterDecision(decision, restoredFromHistory)) return false
+    if (hasEnsembleEvidence) return true
+    // Current tier configuration is only authoritative for a live decision.
+    // Restored history combines the two stages only when its own usage proves
+    // that ensemble execution actually happened.
+    return !restoredFromHistory && routerTierConfig(decision.tier).ensembleEnabled === true
   }
 
   function normalizeEnsembleUsageRows(value: unknown): ChatEnsembleUsageRow[] {
@@ -877,7 +976,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       const model = tierConfig.model || options.routerModels.value[tier] || (tier === winnerTier ? String(decision.model || '') : '')
       if (!model && tier !== winnerTier) continue
       const displayName = shortModelName(routerFxStripProvider(model)) || (tier === winnerTier ? 'selected model' : tier)
-      const key = displayName || model || `winner:${tier}`
+      const executionKind = tierConfig.ensembleEnabled === true ? 'ensemble' : 'single_model'
+      const key = `${executionKind}:${displayName || model || `winner:${tier}`}`
       const existing = realByModel.get(key)
       if (existing) {
         existing.tiers = [...(existing.tiers || []), tier]
@@ -889,6 +989,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         tiers: [tier],
         displayName,
         model,
+        executionKind,
       })
     }
 
