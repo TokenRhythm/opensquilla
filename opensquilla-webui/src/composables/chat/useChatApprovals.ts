@@ -7,6 +7,7 @@ import type {
   InterruptClarifyData,
   InterruptViewState,
 } from '@/types/parts'
+import { clarifyRequestFromValue, userInputOutcomeFromValue } from '@/utils/chat/clarify'
 import { isCurrentSessionPayload } from '@/utils/chat/streamEvents'
 
 const MAX_RESOLVED_OUTCOMES = 4
@@ -18,8 +19,8 @@ const MAX_RESOLVED_OUTCOMES = 4
 // 2s interval as a recovery fallback (resolve-from-another-client self-healing).
 const APPROVAL_POLL_INTERVAL_MS = 2000
 
-// Seconds an Extend click pushes the approval deadline out by (mirrors the
-// backend default re-arm window).
+// Legacy compatibility for explicitly timed approvals from older Gateways.
+// Current human approval cards have no deadline and expose no Extend control.
 const APPROVAL_EXTEND_SECONDS = 300
 
 /** Format a whole-second remaining count as a compact `m:ss` / `s` countdown.
@@ -48,9 +49,14 @@ export interface ChatApprovalItem {
   approvalKind: string
   args: Record<string, unknown> | null
   warning: string
+  displayKind?: string
+  displayTarget?: string
+  destructive?: boolean
+  irreversible?: boolean
+  backupState?: string
   agent: string
   sessionKey: string
-  deadline: number          // epoch seconds the request expires; 0 when unknown
+  deadline: number          // legacy/internal epoch deadline; 0 for human review
 }
 
 export type ChatApprovalResolution = 'approved' | 'denied' | 'expired' | 'unavailable'
@@ -103,11 +109,16 @@ export interface ChatClarifyField {
   required: boolean
   defaultValue: string
   choices: string[]
+  header?: string
+  options?: Array<{ label: string; description: string }>
+  allowOther?: boolean
 }
 
 export interface ChatClarifyRequest {
   intro: string
   fields: ChatClarifyField[]
+  presentation?: string
+  requestId?: string
   runId: string
   step: string
 }
@@ -127,6 +138,11 @@ interface ApprovalsSnapshotItem {
   agent?: string
   sessionKey?: string
   deadline?: number
+  displayKind?: string
+  displayTarget?: string
+  destructive?: boolean
+  irreversible?: boolean
+  backupState?: string
 }
 
 interface ApprovalsSnapshotResponse {
@@ -164,6 +180,14 @@ interface ApprovalPushPayload {
   approved?: boolean
   resolution?: string
   deadline?: number
+  display_kind?: string
+  displayKind?: string
+  display_target?: string
+  displayTarget?: string
+  destructive?: boolean
+  irreversible?: boolean
+  backup_state?: string
+  backupState?: string
 }
 
 type ApprovalsRpcClient = {
@@ -197,8 +221,6 @@ export interface UseChatApprovalsOptions {
    *  with the stream (which threads it into the turn log); this composable is its
    *  sole writer. */
   interruptState: Ref<ReadonlyMap<string, InterruptViewState>>
-  /** Deliver a deny note back to the agent through the normal send/queue path. */
-  onDenyFeedback?: (note: string) => void
   /** Mirror the gateway-wide pending count (topbar pill / nav badge). */
   onSnapshotCount?: (count: number) => void
 }
@@ -273,11 +295,50 @@ function pickDisplayArgs(source: Record<string, unknown>, keys: string[]): Recor
   return Object.keys(selected).length ? selected : null
 }
 
-function approvalDisplayName(toolName: unknown, approvalKind: string): string {
-  const explicit = String(toolName || '').trim()
-  if (explicit && !/^unknown(?: tool)?$/i.test(explicit)) return explicit
-  if (approvalKind) return approvalKind.replace(/_/g, ' ')
-  return 'Approval'
+const DISPLAY_KINDS = new Set([
+  'delete',
+  'modify',
+  'create',
+  'run_command',
+  'run_code',
+  'network_access',
+  'path_access',
+  'plugin_permission',
+  'sensitive_operation',
+])
+
+const BACKUP_STATES = new Set([
+  'not_applicable',
+  'enabled',
+  'disabled',
+  'unavailable_requires_confirmation',
+])
+
+function safeDisplayKind(value: unknown, approvalKind: string, command: string): string {
+  const explicit = String(value || '').trim()
+  if (DISPLAY_KINDS.has(explicit)) return explicit
+  if (approvalKind === 'sandbox_network') return 'network_access'
+  if (approvalKind === 'sandbox_path') return 'path_access'
+  if (command) return 'run_command'
+  return 'sensitive_operation'
+}
+
+function safeBackupState(value: unknown): string {
+  const explicit = String(value || '').trim()
+  return BACKUP_STATES.has(explicit) ? explicit : 'not_applicable'
+}
+
+function legacyDisplayTarget(
+  kind: string,
+  explicit: unknown,
+  args: Record<string, unknown> | null,
+): string {
+  const target = String(explicit || '').trim()
+  if (target) return target
+  if (!args) return ''
+  if (kind === 'network_access') return String(args.host || args.bundle_id || '')
+  if (kind === 'path_access') return String(args.path || '')
+  return ''
 }
 
 function snapshotItemToApproval(item: ApprovalsSnapshotItem): ChatApprovalItem | null {
@@ -302,14 +363,20 @@ function snapshotItemToApproval(item: ApprovalsSnapshotItem): ChatApprovalItem |
     legacySnapshotDisplayArgs(approvalKind, rawArgs, params),
   )
   if (!command && rawArgs && typeof rawArgs.command === 'string') command = rawArgs.command
+  const displayKind = safeDisplayKind(item.displayKind, approvalKind, command)
   return {
     id,
     namespace: String(item.namespace || 'exec'),
-    toolName: approvalDisplayName(item.toolName || item.pluginId || item.actionKind, approvalKind),
+    toolName: String(item.toolName || item.pluginId || item.actionKind || ''),
     command,
     approvalKind,
     args,
     warning: String(item.warning || ''),
+    displayKind,
+    displayTarget: legacyDisplayTarget(displayKind, item.displayTarget, args),
+    destructive: item.destructive === true,
+    irreversible: item.irreversible === true,
+    backupState: safeBackupState(item.backupState),
     agent: String(item.agent || ''),
     sessionKey: String(item.sessionKey || ''),
     deadline: Number(item.deadline) || 0,
@@ -328,6 +395,11 @@ function approvalItemToInterruptData(item: ChatApprovalItem): InterruptApprovalD
     approvalKind: item.approvalKind,
     args: item.args,
     warning: item.warning,
+    displayKind: item.displayKind,
+    displayTarget: item.displayTarget,
+    destructive: item.destructive,
+    irreversible: item.irreversible,
+    backupState: item.backupState,
     agent: item.agent,
     sessionKey: item.sessionKey,
     deadline: item.deadline,
@@ -341,14 +413,33 @@ function pushPayloadToInterruptData(payload: ApprovalPushPayload): InterruptAppr
   const approvalId = String(payload.approval_id || payload.approvalId || '').trim()
   if (!approvalId) return null
   const approvalKind = String(payload.approval_kind || payload.approvalKind || '')
+  const command = String(payload.command || '')
+  const args = safeApprovalDisplayArgs(
+    approvalKind,
+    payload.args && typeof payload.args === 'object' ? payload.args : null,
+  )
+  const displayKind = safeDisplayKind(
+    payload.display_kind || payload.displayKind,
+    approvalKind,
+    command,
+  )
   return {
     approvalId,
     namespace: String(payload.namespace || 'exec'),
-    toolName: approvalDisplayName(payload.tool_name || payload.toolName, approvalKind),
-    command: String(payload.command || ''),
+    toolName: String(payload.tool_name || payload.toolName || ''),
+    command,
     approvalKind,
-    args: safeApprovalDisplayArgs(approvalKind, payload.args && typeof payload.args === 'object' ? payload.args : null),
+    args,
     warning: String(payload.warning || ''),
+    displayKind,
+    displayTarget: legacyDisplayTarget(
+      displayKind,
+      payload.display_target || payload.displayTarget,
+      args,
+    ),
+    destructive: payload.destructive === true,
+    irreversible: payload.irreversible === true,
+    backupState: safeBackupState(payload.backup_state || payload.backupState),
     agent: String(payload.agent || ''),
     sessionKey: String(payload.session_key || payload.sessionKey || ''),
     deadline: Number(payload.deadline) || 0,
@@ -383,36 +474,8 @@ export function resolutionFromResolveResponse(
 }
 
 function parseClarifyRequest(payload: ToolResultPayload): ChatClarifyRequest | null {
-  const rawArgs = (payload as Record<string, unknown>).arguments
-  if (!rawArgs || typeof rawArgs !== 'object') return null
-  const args = rawArgs as Record<string, unknown>
-  if (args.kind !== 'user_input' || args.paused !== true) return null
-  const schema = args.clarify_schema
-  if (!schema || typeof schema !== 'object') return null
-  const schemaObj = schema as Record<string, unknown>
-  const rawFields = Array.isArray(schemaObj.fields) ? schemaObj.fields : []
-  const fields: ChatClarifyField[] = []
-  for (const raw of rawFields) {
-    if (!raw || typeof raw !== 'object') continue
-    const field = raw as Record<string, unknown>
-    const name = String(field.name || '').trim()
-    if (!name) continue
-    fields.push({
-      name,
-      prompt: String(field.prompt || ''),
-      type: String(field.type || 'string').toLowerCase(),
-      required: field.required === true,
-      defaultValue: field.default == null ? '' : String(field.default),
-      choices: Array.isArray(field.choices) ? field.choices.map(String) : [],
-    })
-  }
-  if (fields.length === 0) return null
-  return {
-    intro: String(schemaObj.intro || ''),
-    fields,
-    runId: typeof args.run_id === 'string' ? args.run_id : '',
-    step: typeof args.step === 'string' ? args.step : '',
-  }
+  return clarifyRequestFromValue(payload.result)
+    ?? clarifyRequestFromValue((payload as Record<string, unknown>).arguments)
 }
 
 /**
@@ -428,9 +491,9 @@ function parseClarifyRequest(payload: ToolResultPayload): ChatClarifyRequest | n
  * cards collapse into one-line outcome rows.
  *
  * Clarify: the engine surfaces a pending clarify form as a tool_result whose
- * arguments carry `kind: "user_input", paused: true, clarify_schema`; the
- * card state is derived from that stream event and submitted back through
- * the `chat.clarify_submit` RPC.
+ * result JSON (or a legacy arguments payload) carries
+ * `kind: "user_input", paused: true, clarify_schema`; the card state is
+ * derived from that stream event and submitted through `chat.clarify_submit`.
  */
 export function useChatApprovals(options: UseChatApprovalsOptions) {
   const { rpc, sessionKey, stream, interruptState } = options
@@ -441,6 +504,11 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   const clarifySubmitted = ref(false)
   const clarifyBusy = ref(false)
   const clarifyError = ref('')
+  // A request-scoped submit can cross the Gateway boundary even when its RPC
+  // acknowledgement is lost. Keep that uncertainty until either the submit
+  // response/tool outcome settles it or an authoritative reconnect snapshot
+  // confirms that the request is no longer pending.
+  const clarifySubmitAttempts = new Set<string>()
 
   // Resolution view-state for inline interrupt parts is the shared `interruptState`
   // ref (keyed by approval id, or the clarify composite key). The fold reads it to
@@ -460,16 +528,38 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // list (which the hydration-only path no longer populates).
   const interruptNamespaces = new Map<string, string>()
 
-  // Last-seen approval data per id, so extendInterrupt can re-append a frame
-  // carrying the bumped deadline (the fold merges it onto the existing part) and
-  // the countdown re-arms live without a snapshot round-trip.
+  // Last-seen approval data per id. Deadline mutation remains compatible with
+  // explicitly timed approvals from older Gateways, but current human cards use 0.
   const interruptApprovals = new Map<string, InterruptApprovalData>()
 
   // The clarify frame is keyed by a runId|step composite (a clarify has no
   // approval id); arg-less clarifies fall back to a stable per-session key.
   function clarifyFrameKey(request: ChatClarifyRequest): string {
+    if (request.requestId) return request.requestId
     const composite = `${request.runId}|${request.step}`
     return composite === '|' ? `clarify:${sessionKey.value}` : composite
+  }
+
+  function resetClarifyPresentation() {
+    clarifySubmitted.value = false
+    clarifyBusy.value = false
+    clarifyError.value = ''
+  }
+
+  function pendingClarifyMatches(key: string): boolean {
+    return pendingClarify.value != null && clarifyFrameKey(pendingClarify.value) === key
+  }
+
+  /**
+   * Remove only the request whose terminal state was just confirmed. This
+   * identity guard prevents a delayed submit response from dismissing a newer
+   * questionnaire that arrived while the earlier RPC was in flight.
+   */
+  function clearPendingClarify(key: string): boolean {
+    if (!pendingClarifyMatches(key)) return false
+    pendingClarify.value = null
+    resetClarifyPresentation()
+    return true
   }
 
   let pollTimer: ReturnType<typeof setInterval> | null = null
@@ -571,6 +661,24 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     approvalBusyIds.value = next
   }
 
+  function applyApprovalDeadline(id: string, value: unknown) {
+    const deadline = Number(value)
+    if (!id || !Number.isFinite(deadline) || deadline <= 0) return
+    if (interruptState.value.get(id)?.resolution) return
+    const known = interruptApprovals.get(id)
+    if (known) appendApprovalInterrupt({ ...known, deadline })
+    approvalEntries.value = approvalEntries.value.map(entry => {
+      if (entry.approval.id !== id || entry.resolution !== null) return entry
+      return {
+        ...entry,
+        approval: {
+          ...entry.approval,
+          deadline,
+        },
+      }
+    })
+  }
+
   function statusResolution(payload: ApprovalStatusPayload): ChatApprovalResolution | null {
     if (payload.found === false) return 'unavailable'
     if (payload.resolved !== true) return null
@@ -604,10 +712,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     if (entry && entry.resolution === null && resolution) entry.resolution = resolution
     const keepBusy = !resolution && payload.resolutionInProgress === true
     setApprovalBusy(id, keepBusy)
-    if (payload.deadline && interruptApprovals.has(id)) {
-      const known = interruptApprovals.get(id)!
-      appendApprovalInterrupt({ ...known, deadline: Number(payload.deadline) || known.deadline })
-    }
+    applyApprovalDeadline(id, payload.deadline)
   }
 
   async function fetchApprovalStatus(
@@ -643,7 +748,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       fetchApprovalStatus(item.approvalId, item.namespace, generation)))
   }
 
-  async function resolveApproval(entry: ChatApprovalEntry, decision: ChatApprovalDecision, note = '') {
+  async function resolveApproval(entry: ChatApprovalEntry, decision: ChatApprovalDecision) {
     const id = entry.approval.id
     if (approvalBusyIds.value.has(id) || entry.resolution) return
     setApprovalBusy(id, true)
@@ -660,9 +765,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       const resolution = resolutionFromResolveResponse(result)
       if (resolution !== null) entry.resolution = resolution
       else await fetchApprovalStatus(id, entry.approval.namespace)
-      if (resolution === 'denied' && decision === 'deny' && note.trim()) {
-        options.onDenyFeedback?.(note.trim())
-      }
     } catch (err) {
       entry.error = 'Could not resolve — ' + (err instanceof Error ? err.message : String(err))
     } finally {
@@ -674,10 +776,10 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
    * Resolve an inline interrupt part. Reuses the same resolve POST body and the
    * same idempotency guard as resolveApproval (busy or already-resolved is a
    * no-op), driving the optimistic, append-only `interruptState` side-map instead
-   * of a card entry. A deny note rides the normal send/queue path via
-   * onDenyFeedback, exactly as the legacy card does.
+   * of a card entry. A denial is terminal for this turn and never schedules a
+   * follow-up user message.
    */
-  async function resolveInterrupt(id: string, decision: ChatApprovalDecision, note = '') {
+  async function resolveInterrupt(id: string, decision: ChatApprovalDecision) {
     const current = interruptState.value.get(id)
     if (approvalBusyIds.value.has(id) || current?.resolution) return
     setApprovalBusy(id, true)
@@ -694,9 +796,6 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       const resolution = resolutionFromResolveResponse(result)
       if (resolution) setInterruptState(id, { resolution, busy: false })
       else await fetchApprovalStatus(id, namespaceForInterrupt(id))
-      if (resolution === 'denied' && decision === 'deny' && note.trim()) {
-        options.onDenyFeedback?.(note.trim())
-      }
     } catch (err) {
       setInterruptState(id, {
         busy: false,
@@ -707,12 +806,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     }
   }
 
-  /**
-   * Push an inline approval's deadline out (WCAG 2.2.1 extend mechanism). Calls
-   * the `<namespace>.approval.extend` RPC and re-appends the frame with the
-   * bumped deadline so the countdown re-arms live (the fold merges by id). A
-   * busy or already-resolved request is a no-op.
-   */
+  /** Compatibility path for explicitly timed approvals from older Gateways. */
   async function extendInterrupt(id: string, seconds = APPROVAL_EXTEND_SECONDS) {
     const current = interruptState.value.get(id)
     if (approvalBusyIds.value.has(id) || current?.resolution) return
@@ -724,10 +818,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
         { id, seconds },
       )
       const deadline = Number(result?.deadline) || 0
-      const known = interruptApprovals.get(id)
-      if (deadline > 0 && known) {
-        appendApprovalInterrupt({ ...known, deadline })
-      }
+      applyApprovalDeadline(id, deadline)
       setInterruptState(id, { busy: false })
     } catch (err) {
       setInterruptState(id, {
@@ -752,8 +843,8 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   // args/warning rather than duplicating the part.
   function appendApprovalInterrupt(data: InterruptApprovalData) {
     interruptNamespaces.set(data.approvalId, data.namespace)
-    // A lean push (or backfill) may omit the deadline (0); keep the latest
-    // known non-zero deadline so a countdown never regresses to "unknown".
+    // A lean push (or backfill) may omit the legacy deadline (0); keep any
+    // explicit deadline already received for compatibility.
     const prior = interruptApprovals.get(data.approvalId)
     const merged: InterruptApprovalData = {
       ...data,
@@ -775,20 +866,36 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
   function handleToolResult(payload: ToolResultPayload) {
     if (!payload || typeof payload !== 'object') return
     if (!isCurrentSessionPayload(payload, sessionKey.value)) return
+    const outcome = userInputOutcomeFromValue(payload.result)
+    if (outcome) {
+      clarifySubmitAttempts.delete(outcome.requestId)
+      setInterruptState(outcome.requestId, {
+        resolution: 'replied',
+        busy: false,
+        error: '',
+      })
+      clearPendingClarify(outcome.requestId)
+      return
+    }
     const request = parseClarifyRequest(payload)
     if (!request) return
+    const key = clarifyFrameKey(request)
+    // Tool-result replay and reconnect delivery can surface the paused half
+    // after its terminal outcome. Never resurrect an already-settled request or
+    // let a duplicate paused event undo optimistic submit feedback.
+    if (interruptState.value.get(key)?.resolution === 'replied') return
     pendingClarify.value = request
-    clarifySubmitted.value = false
-    clarifyError.value = ''
+    resetClarifyPresentation()
     // Mirror the clarify into the turn log so it folds into an inline interrupt
     // part. The clarify keeps no approval id, so the runId|step composite keys it.
     const clarifyData: InterruptClarifyData = {
       intro: request.intro,
       fields: request.fields,
+      ...(request.presentation ? { presentation: request.presentation } : {}),
+      ...(request.requestId ? { requestId: request.requestId } : {}),
       runId: request.runId,
       step: request.step,
     }
-    const key = clarifyFrameKey(request)
     if (!interruptState.value.has(key)) setInterruptState(key, {})
     if (!stream.isStreaming.value) stream.ensureInterruptBubble()
     stream.appendInterruptFrame({
@@ -820,6 +927,17 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
         void fetchSnapshot()
       }
     }
+  }
+
+  function handleApprovalUpdated(payload: ApprovalPushPayload) {
+    const id = String(payload.approval_id || payload.approvalId || '').trim()
+    if (!id || interruptState.value.get(id)?.resolution) return
+    const data = pushPayloadToInterruptData(payload)
+    if (data) {
+      if (sessionKey.value && data.sessionKey !== sessionKey.value) return
+      appendApprovalInterrupt(data)
+    }
+    applyApprovalDeadline(id, payload.deadline)
   }
 
   /**
@@ -856,8 +974,10 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     const unsubs = [
       rpc.on('session.event.tool_result', handleToolResult as RpcEventHandler),
       rpc.on('exec.approval.requested', handleApprovalRequested as RpcEventHandler),
+      rpc.on('exec.approval.updated', handleApprovalUpdated as RpcEventHandler),
       rpc.on('exec.approval.resolved', handleApprovalResolved as RpcEventHandler),
       rpc.on('plugin.approval.requested', handleApprovalRequested as RpcEventHandler),
+      rpc.on('plugin.approval.updated', handleApprovalUpdated as RpcEventHandler),
       rpc.on('plugin.approval.resolved', handleApprovalResolved as RpcEventHandler),
       rpc.on('_state', handleConnectionState as RpcEventHandler),
     ]
@@ -879,29 +999,95 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     const key = clarifyFrameKey(request)
     if (interruptState.value.get(key)?.resolution === 'replied') return
     if (!requestOverride && clarifySubmitted.value) return
-    clarifyBusy.value = true
-    clarifySubmitted.value = true
-    clarifyError.value = ''
+    const controlsPendingPresentation = pendingClarifyMatches(key)
+    if (controlsPendingPresentation) {
+      clarifyBusy.value = true
+      clarifySubmitted.value = true
+      clarifyError.value = ''
+    }
+    if (request.requestId) clarifySubmitAttempts.add(key)
     setInterruptState(key, { resolution: 'replied', busy: true, error: '' })
     const params: Record<string, unknown> = { sessionKey: sessionKey.value, fields }
+    if (request.requestId) params.request_id = request.requestId
     if (request.runId) params.run_id = request.runId
     try {
       await rpc.call('chat.clarify_submit', params)
+      clarifySubmitAttempts.delete(key)
       setInterruptState(key, { resolution: 'replied', busy: false })
+      // request_id submissions resolve the exact paused tool call in the same
+      // turn. A successful RPC is therefore authoritative and can release the
+      // dock/composer immediately. Legacy clarifications create a new chat turn
+      // and intentionally retain their existing submitted receipt.
+      if (request.requestId) clearPendingClarify(key)
     } catch (err) {
       const message = 'Send failed — ' + (err instanceof Error ? err.message : String(err))
-      clarifySubmitted.value = false
-      clarifyError.value = message
-      setInterruptState(key, { resolution: null, busy: false, error: message })
+      const stillPending = pendingClarifyMatches(key)
+      // A terminal tool result or authoritative empty snapshot can win the
+      // race with a rejected/lost RPC acknowledgement. Never reopen that
+      // already-settled request from the late rejection.
+      const terminalConfirmed = !stillPending
+        && interruptState.value.get(key)?.resolution === 'replied'
+      if (stillPending) {
+        clarifySubmitted.value = false
+        clarifyError.value = message
+      }
+      if (terminalConfirmed) {
+        clarifySubmitAttempts.delete(key)
+      } else {
+        setInterruptState(key, { resolution: null, busy: false, error: message })
+      }
     } finally {
-      clarifyBusy.value = false
+      if (pendingClarifyMatches(key)) clarifyBusy.value = false
     }
   }
 
   function dismissClarify() {
     pendingClarify.value = null
-    clarifySubmitted.value = false
-    clarifyError.value = ''
+    resetClarifyPresentation()
+  }
+
+  function applyUserInputBootstrap(snapshot: {
+    pendingUserInputs?: unknown[]
+    pending_user_inputs?: unknown[]
+  }) {
+    const hasAuthoritativePendingList = Object.prototype.hasOwnProperty.call(
+      snapshot,
+      'pendingUserInputs',
+    ) || Object.prototype.hasOwnProperty.call(snapshot, 'pending_user_inputs')
+    if (!hasAuthoritativePendingList) return
+
+    const pending = snapshot.pendingUserInputs || snapshot.pending_user_inputs || []
+    const requests = pending
+      .map(value => clarifyRequestFromValue(value))
+      .filter((request): request is ChatClarifyRequest => request != null)
+    const pendingKeys = new Set(requests.map(request => clarifyFrameKey(request)))
+    const current = pendingClarify.value
+    if (current?.requestId) {
+      const currentKey = clarifyFrameKey(current)
+      if (clarifySubmitAttempts.has(currentKey) && !pendingKeys.has(currentKey)) {
+        clarifySubmitAttempts.delete(currentKey)
+        setInterruptState(currentKey, { resolution: 'replied', busy: false, error: '' })
+        clearPendingClarify(currentKey)
+      }
+    }
+
+    for (const request of requests) {
+      const key = clarifyFrameKey(request)
+      if (interruptState.value.get(key)?.resolution === 'replied') continue
+      const sameRequest = pendingClarifyMatches(key)
+      pendingClarify.value = request
+      // Do not make an in-flight submission actionable again just because a
+      // racing snapshot still contains its pre-submit pending record.
+      if (!sameRequest || !clarifyBusy.value) resetClarifyPresentation()
+      if (!interruptState.value.has(key)) setInterruptState(key, {})
+      if (!stream.isStreaming.value) stream.ensureInterruptBubble()
+      stream.appendInterruptFrame({
+        interruptKind: 'clarify',
+        approvalId: key,
+        data: request,
+        at: Date.now(),
+      })
+    }
   }
 
   // Session switches reset all in-thread card state; a one-shot hydration
@@ -915,6 +1101,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     interruptState.value = new Map()
     interruptNamespaces.clear()
     interruptApprovals.clear()
+    clarifySubmitAttempts.clear()
     legacyPushBackfills.clear()
     dismissClarify()
     if (key) hydrateApprovals()
@@ -938,6 +1125,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     extendInterrupt,
     submitClarify,
     dismissClarify,
+    applyUserInputBootstrap,
     subscribe,
     cleanup,
   }

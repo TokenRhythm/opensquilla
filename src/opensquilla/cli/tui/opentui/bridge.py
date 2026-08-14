@@ -34,7 +34,9 @@ from opensquilla.cli.tui.opentui.messages import (
     host_message_from_json,
     python_message_to_json,
 )
+from opensquilla.cli.tui.opentui.prefs import load_theme_preference
 from opensquilla.cli.tui.opentui.terminal import create_terminal_guardian
+from opensquilla.cli.tui.opentui.themes import THEME_ENV_VAR
 from opensquilla.cli.tui.opentui.transport import HostConnection
 from opensquilla.cli.tui.renderers.selection import (
     RendererBackendAvailability,
@@ -110,6 +112,21 @@ def _host_handshake_mismatches(
             "required interactive capabilities missing=" + ",".join(missing_capabilities)
         )
     return mismatches
+
+
+def apply_theme_preference_env(env: dict[str, str]) -> None:
+    """Fill ``OPENSQUILLA_TUI_THEME`` from the persisted /theme choice.
+
+    A NON-EMPTY explicit environment value wins, preserving the documented
+    OPENSQUILLA_TUI_THEME contract. An empty exported value counts as unset —
+    the host maps it to the default theme anyway, so letting it mask the
+    preference would only make /theme appear to save and then never apply.
+    """
+    if env.get(THEME_ENV_VAR):
+        return
+    saved_theme = load_theme_preference()
+    if saved_theme:
+        env[THEME_ENV_VAR] = saved_theme
 
 
 def check_opentui_host_available(
@@ -204,6 +221,7 @@ class OpenTuiBridge:
 
         env = os.environ.copy()
         env.update(self.env)
+        apply_theme_preference_env(env)
         env.update(connection.environment)
         env["OPENSQUILLA_PRODUCT_VERSION"] = __version__
         env["OPENSQUILLA_OPENTUI_HOST_VERSION"] = artifact.host_version

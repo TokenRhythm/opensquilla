@@ -86,6 +86,33 @@ def report_profile_credential_failure(
         log.debug("credential_pool.report_failed", provider=provider_id)
 
 
+def report_profile_credential_lease_failure(
+    provider_id: str,
+    session_key: str,
+    lease_token: str,
+    failure_kind: Any,
+) -> bool:
+    """Report a paid-media failure only for its exact credential lease.
+
+    This deliberately does not fall back to the session-only compatibility
+    API: a late media subprocess must not park the key acquired by a newer
+    run of the same session.
+    """
+
+    try:
+        from opensquilla.gateway.llm_runtime import profile_credential_pools
+
+        return profile_credential_pools().report_failure_for_lease(
+            provider_id,
+            session_key,
+            lease_token,
+            failure_kind,
+        )
+    except Exception:  # noqa: BLE001 - credential bookkeeping only
+        log.debug("credential_pool.lease_report_failed", provider=provider_id)
+        return False
+
+
 def resolve_tier_provider_config(
     config: Any,
     provider_id: str,
@@ -259,6 +286,26 @@ def _resolve_and_record_execution(
     turn_metadata["executed_model"] = str(
         getattr(current_config, "model", "") or ""
     )
+    remaining_chain = getattr(selector, "remaining_chain", None)
+    if callable(remaining_chain):
+        candidates: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for candidate in remaining_chain():
+            candidate_provider = str(
+                getattr(candidate, "provider", "") or ""
+            ).strip()
+            candidate_model = str(getattr(candidate, "model", "") or "").strip()
+            identity = (candidate_provider, candidate_model)
+            if not candidate_provider or not candidate_model or identity in seen:
+                continue
+            seen.add(identity)
+            candidates.append(
+                {
+                    "provider": candidate_provider,
+                    "model": candidate_model,
+                }
+            )
+        turn_metadata["selector_execution_chain"] = candidates
     return provider
 
 

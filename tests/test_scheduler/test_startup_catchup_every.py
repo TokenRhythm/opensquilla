@@ -9,6 +9,7 @@ tick and fire in a burst.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -99,3 +100,30 @@ async def test_startup_catchup_fast_forwards_cron_jobs() -> None:
         assert reloaded is not None
         assert reloaded.next_run_at is not None
         assert reloaded.next_run_at > now
+
+
+@pytest.mark.asyncio
+async def test_startup_catchup_uses_registered_handler_for_overdue_job() -> None:
+    """An overdue boot job must run through its real handler, not fail lookup."""
+    now = datetime.now(UTC)
+    called: list[str] = []
+
+    async def handler(job: CronJob) -> str:
+        called.append(job.id)
+        return "caught up"
+
+    async with JobStore(":memory:") as store:
+        await store.save(_cron_job("overdue", "* * * * *", now - timedelta(minutes=1)))
+        timer = SchedulerTimer(store, handlers={"agent_run": handler}, max_catchup=1)
+
+        await timer.startup_catchup()
+        await asyncio.gather(*timer._running.values())
+
+        reloaded = await store.get("overdue")
+        assert called == ["overdue"]
+        assert reloaded is not None
+        assert reloaded.status == JobStatus.PENDING
+        assert reloaded.last_error is None
+        runs = await store.list_executions("overdue", limit=10)
+        assert len(runs) == 1
+        assert runs[0].success is True

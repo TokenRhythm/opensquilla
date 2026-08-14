@@ -1,16 +1,23 @@
-import type { ConnectionState, RpcEventHandler } from '@/lib/rpc'
+import type { ConnectionState, RpcCallOptions, RpcEventHandler } from '@/lib/rpc'
 
 type SessionListRpc = {
-  call(method: string, params?: Record<string, unknown>): Promise<unknown>
+  call(
+    method: string,
+    params?: Record<string, unknown>,
+    callOptions?: RpcCallOptions,
+  ): Promise<unknown>
   on(event: string, handler: RpcEventHandler): () => void
 }
 
 export interface UseSessionListSubscriptionOptions {
   rpc: SessionListRpc
   isConnected: () => boolean
+  isAdmitted?: () => boolean
   refresh: () => void | Promise<void>
   scheduleRefresh: () => void
+  onChanged?: RpcEventHandler
   warn?: (message: string, error?: unknown) => void
+  callOptions?: RpcCallOptions
 }
 
 export function useSessionListSubscription(options: UseSessionListSubscriptionOptions) {
@@ -33,7 +40,12 @@ export function useSessionListSubscription(options: UseSessionListSubscriptionOp
   }
 
   function ensureSubscribed(): Promise<void> | null {
-    if (!active || !options.isConnected() || subscribed) return null
+    if (
+      !active
+      || !options.isConnected()
+      || options.isAdmitted?.() === false
+      || subscribed
+    ) return null
     if (subscribeWork) return subscribeWork
 
     const generation = connectionGeneration
@@ -41,7 +53,15 @@ export function useSessionListSubscription(options: UseSessionListSubscriptionOp
     subscribeAttempt = attempt
     subscribeWork = (async () => {
       try {
-        await options.rpc.call('sessions.subscribe')
+        if (options.callOptions) {
+          await options.rpc.call(
+            'sessions.subscribe',
+            undefined,
+            options.callOptions,
+          )
+        } else {
+          await options.rpc.call('sessions.subscribe')
+        }
         if (!active || !options.isConnected() || generation !== connectionGeneration) return
         subscribed = true
         await options.refresh()
@@ -63,7 +83,10 @@ export function useSessionListSubscription(options: UseSessionListSubscriptionOp
     if (active) return cleanup
     active = true
     removeListeners = [
-      options.rpc.on('sessions.changed', options.scheduleRefresh),
+      options.rpc.on('sessions.changed', payload => {
+        options.scheduleRefresh()
+        options.onChanged?.(payload)
+      }),
       options.rpc.on('_state', (state: ConnectionState) => {
         if (state === 'connected') {
           void ensureSubscribed()
@@ -85,7 +108,14 @@ export function useSessionListSubscription(options: UseSessionListSubscriptionOp
     removeListeners = []
 
     if (shouldUnsubscribe && options.isConnected()) {
-      void options.rpc.call('sessions.unsubscribe').catch(error => {
+      const unsubscribe = options.callOptions
+        ? options.rpc.call(
+            'sessions.unsubscribe',
+            undefined,
+            options.callOptions,
+          )
+        : options.rpc.call('sessions.unsubscribe')
+      void unsubscribe.catch(error => {
         warn('Session list unsubscribe failed', error)
       })
     }
@@ -93,6 +123,7 @@ export function useSessionListSubscription(options: UseSessionListSubscriptionOp
 
   return {
     subscribe,
+    resume: ensureSubscribed,
     cleanup,
   }
 }

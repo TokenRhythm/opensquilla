@@ -14,6 +14,7 @@ export function useUsageChartRows(options: {
     opts?: { decimals?: number; source?: object },
   ) => string
   fmtNum: (value: number | null | undefined) => string
+  taskName: (row: SessionRow) => string
 }) {
   const chartCaption = computed(() => {
     const days = options.serverDays?.value
@@ -39,7 +40,9 @@ export function useUsageChartRows(options: {
   const chartRows = computed((): ChartRow[] => {
     const days = options.serverDays?.value
     if (days) {
-      const visibleDays = days.slice(-30)
+      const visibleDays = [...days]
+        .sort((a, b) => b.date.localeCompare(a.date))
+        .slice(0, 30)
       if (visibleDays.length === 0) return []
       let maxValue = Math.max(...visibleDays.map(day => (
         options.chartMode.value === 'cost'
@@ -97,13 +100,13 @@ export function useUsageChartRows(options: {
     if (maxVal === 0) maxVal = 1
 
     return sorted.map(row => {
-      const fullLabel = (options.rowVal(row, 'session', 'sessionKey', 'key') || '-') as string
-      const label = fullLabel.length > 26 ? fullLabel.slice(0, 24) + '...' : fullLabel
+      const sessionKey = (options.rowVal(row, 'sessionKey', 'key', 'session') || '') as string
+      const label = options.taskName(row)
       if (options.chartMode.value === 'cost') {
         const cost = Number(options.rowVal(row, 'cost_usd', 'costUsd') || 0)
         const pct = (cost / maxVal) * 100
         return {
-          sessionKey: fullLabel,
+          sessionKey,
           label,
           inputPct: pct,
           outputPct: 0,
@@ -118,7 +121,7 @@ export function useUsageChartRows(options: {
       const inputPct = (inp / maxVal) * 100
       const outputPct = (out / maxVal) * 100
       return {
-        sessionKey: fullLabel,
+        sessionKey,
         label,
         inputPct,
         outputPct,

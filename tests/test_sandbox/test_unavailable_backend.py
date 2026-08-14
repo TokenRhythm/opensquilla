@@ -85,7 +85,7 @@ async def test_unavailable_backend_background_failure_remains_escalatable(
 
 
 @pytest.mark.asyncio
-async def test_managed_mode_unavailable_backend_requests_exact_host_retry(
+async def test_legacy_trusted_unavailable_backend_does_not_replay_on_host(
     tmp_path: Path,
 ) -> None:
     from opensquilla.sandbox.backend.unavailable import UnavailableBackend
@@ -114,12 +114,8 @@ async def test_managed_mode_unavailable_backend_requests_exact_host_retry(
             request.policy,
             runtime=runtime,
         )
-        assert result is not None
-        assert result.status == "approval_required"
-        entry = queue.get(result.approval_id or "")
-        assert entry.params["backendRetry"] is True
-        assert entry.params["reviewer"] == "auto_review"
-        assert entry.params["humanActionable"] is False
+        assert result is None
+        assert queue.list_pending("exec") == []
     finally:
         current_tool_context.reset(token)
         queue.close()
@@ -240,7 +236,7 @@ async def test_managed_high_impact_gate_does_not_wait_for_legacy_human_approval(
             session_key="managed-high-impact",
             workspace_dir=str(tmp_path),
             sandbox_run_context=RunContext(
-                run_mode=RunMode.TRUSTED,
+                run_mode=RunMode.SAFE,
                 workspace=str(tmp_path),
             ),
         )

@@ -80,6 +80,7 @@ from opensquilla.sandbox.operation_runtime import (
     SandboxOperationDomain,
     SandboxOperationResult,
 )
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import (
     MountSpec,
     NetworkMode,
@@ -103,13 +104,14 @@ _BWRAP_PYTHON_CANDIDATES: tuple[Path, ...] = (
     Path("/usr/bin/python"),
     Path("/bin/python"),
 )
+
+
 def _bridge_python_path() -> Path:
     for candidate in _BWRAP_PYTHON_CANDIDATES:
         if candidate.exists():
             return candidate
     raise SandboxBackendError(
-        "NetworkMode.PROXY_ALLOWLIST requires a system Python mounted "
-        "inside the bubblewrap sandbox"
+        "NetworkMode.PROXY_ALLOWLIST requires a system Python mounted inside the bubblewrap sandbox"
     )
 
 
@@ -176,8 +178,7 @@ def build_bwrap_plan(
     if policy.network == NetworkMode.PROXY_ALLOWLIST:
         if policy.network_proxy is None:
             raise SandboxBackendError(
-                "NetworkMode.PROXY_ALLOWLIST requires a network proxy "
-                "for the bubblewrap backend"
+                "NetworkMode.PROXY_ALLOWLIST requires a network proxy for the bubblewrap backend"
             )
         bridge_uds_path = bridge_uds_path or _DEFAULT_BRIDGE_UDS_PATH
         bridge_script_path = bridge_script_path or _default_bridge_script_path(
@@ -186,8 +187,7 @@ def build_bwrap_plan(
         bridge_port = bridge_port or policy.network_proxy.port
         if bridge_port <= 0 or bridge_port > 65535:
             raise SandboxBackendError(
-                "NetworkMode.PROXY_ALLOWLIST requires a valid proxy port "
-                "for the bubblewrap backend"
+                "NetworkMode.PROXY_ALLOWLIST requires a valid proxy port for the bubblewrap backend"
             )
         if bridge_script_path.parent != bridge_uds_path.parent:
             raise SandboxBackendError(
@@ -332,6 +332,11 @@ class BubblewrapBackend(Backend):
         return SandboxOperationResult(
             message=message,
             created=bool(result.get("created", False)),
+            metadata={
+                str(key): value
+                for key, value in result.items()
+                if key not in {"message", "created"}
+            },
         )
 
     async def run(self, request: SandboxRequest) -> SandboxResult:
@@ -441,11 +446,10 @@ async def _run_linux_helper_payload(payload: HelperPayload) -> dict[str, object]
         payload_path = Path(temp_dir) / "payload.json"
         payload_path.write_text(encode_payload(payload), encoding="utf-8")
         proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "opensquilla.sandbox.backend.linux_helper",
-            "--payload",
-            str(payload_path),
+            *internal_child_argv(
+                ChildRole.LINUX_HELPER,
+                args=("--payload", str(payload_path)),
+            ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,

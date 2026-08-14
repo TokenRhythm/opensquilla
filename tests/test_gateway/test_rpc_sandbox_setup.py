@@ -80,6 +80,36 @@ async def test_sandbox_setup_status_returns_setting_up_payload(monkeypatch) -> N
 
 
 @pytest.mark.asyncio
+async def test_sandbox_capability_status_forwards_explicit_refresh(monkeypatch) -> None:
+    from opensquilla.gateway import rpc_sandbox
+    from opensquilla.sandbox.capability_service import (
+        REQUIRED_SAFE_CAPABILITIES,
+        WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+        CapabilityReport,
+    )
+
+    refresh_values: list[bool] = []
+
+    async def fake_status(config, *, force_refresh=False):
+        refresh_values.append(force_refresh)
+        return CapabilityReport.available_for(
+            backend="windows_native",
+            platform="win32",
+            capabilities=REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+        )
+
+    monkeypatch.setattr(rpc_sandbox, "current_sandbox_capability_report", fake_status)
+
+    payload = await rpc_sandbox._handle_sandbox_capability_status(
+        {"refresh": True},
+        _ctx(),
+    )
+
+    assert payload["available"] is True
+    assert refresh_values == [True]
+
+
+@pytest.mark.asyncio
 async def test_sandbox_setup_ensure_returns_platform_payload(monkeypatch) -> None:
     from opensquilla.gateway import rpc_sandbox
     from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
@@ -104,17 +134,22 @@ async def test_sandbox_setup_ensure_returns_platform_payload(monkeypatch) -> Non
 async def test_run_context_set_requires_setup_for_sandbox_modes(monkeypatch) -> None:
     from opensquilla.gateway import rpc_sandbox
     from opensquilla.gateway.rpc import RpcHandlerError
-    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+    from opensquilla.sandbox.capability_service import CapabilityReport
 
     async def fake_status(config):
-        return SetupResult(
-            state=SandboxSetupState.NOT_SETUP,
+        return CapabilityReport(
+            available=False,
+            backend="windows_native",
             platform="win32",
-            message="Sandbox setup has not been completed.",
-            requires_admin=True,
+            code="not_setup",
+            reason="Sandbox setup has not been completed.",
+            setup_supported=True,
+            restart_required=False,
+            probe_version=1,
+            capabilities=frozenset(),
         )
 
-    monkeypatch.setattr(rpc_sandbox, "current_sandbox_setup_status", fake_status)
+    monkeypatch.setattr(rpc_sandbox, "current_sandbox_capability_report", fake_status)
 
     with pytest.raises(RpcHandlerError) as excinfo:
         await rpc_sandbox._handle_sandbox_run_context_set(
@@ -122,4 +157,4 @@ async def test_run_context_set_requires_setup_for_sandbox_modes(monkeypatch) -> 
             _ctx(),
         )
 
-    assert excinfo.value.code == "SANDBOX_SETUP_REQUIRED"
+    assert excinfo.value.code == "SANDBOX_CAPABILITY_UNAVAILABLE"

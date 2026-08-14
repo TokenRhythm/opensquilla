@@ -1,6 +1,7 @@
 ---
 name: paper-section-author
 description: "Write one publication-style research-paper section as a bounded, citation-grounded LaTeX fragment from a writing plan, outline, citation plan, and optional figure/table context."
+description_zh: "根据写作计划、提纲、引用计划及可选的图表上下文，将一个出版级研究论文章节撰写为有边界、基于引用的LaTeX片段。"
 user-invocable: false
 disable-model-invocation: true
 provenance:
@@ -24,6 +25,9 @@ when concatenated with neighboring sections.
   narrative claim, per-section `target_words`, and per-section cite-key budget.
 - `paper_preferences`: mode, audience, venue style, language, depth, emphasis,
   must-include items, avoid items, and defaults chosen for this paper.
+- `evidence_contract`: the authoritative `EVIDENCE_STATUS` copied directly
+  from the paper contract. Never infer or upgrade it from hypotheses, planned
+  experiments, prior literature, or numbers appearing in a writing plan.
 - `outline`: the full 5-section outline from `paper-outline-author`.
   Use the line that matches your section as your prompt.
 - `citation_plan`: claim-to-citation assignments from `paper-citation-planner`.
@@ -132,6 +136,16 @@ thesis. Do not add side topics merely to increase length.
   transition from the writing plan.
 - Match `paper_preferences` for depth, audience, language, emphasis, and
   avoid-list constraints while preserving the fixed section contract.
+- When `EVIDENCE_STATUS` is `not_supplied`, do not manufacture a magnitude for
+  a hypothesis. Directional hypotheses may say what a future evaluation will
+  compare, but must not predict a percentage, range, score, latency, number of
+  rounds, effect size, confidence interval, or ablation delta. Write unknown
+  outcomes as `\textless TBD\textgreater` / `待实验确定`. Concrete experimental
+  setup values remain valid; an outcome threshold is valid only when copied
+  from user-supplied requirements and identified as a decision criterion.
+- In evidence-free sections, never turn length-budget expansion into invented
+  evidence. Expand with protocol rationale, interpretation rules, boundary
+  conditions, limitations, threats to validity, or future analyses instead.
 - Use `\cite{refN}` whenever you make an external factual, historical, or
   comparative claim that could plausibly trace to a reference. Across all
   non-abstract sections, follow the assigned citation budget when available.
@@ -143,6 +157,13 @@ thesis. Do not add side topics merely to increase length.
   they are supplied by the writing plan or extras. Do not hard-code
   `figure_1.pdf` unless that exact placeholder is provided.
 - LaTeX-escape literal `%`, `&`, `_`, and `#` that appear in prose.
+- Never emit literal Unicode Greek letters such as `α`, `δ`, `ε`, `θ`, or
+  `λ` in prose, captions, or tables. Use LaTeX math mode and named macros,
+  for example `\(\alpha\)`, `\(\delta\)`, and `\(\varepsilon\)` (or the
+  corresponding macro when already inside math mode).
+- Do not use Unicode en/em dashes (`–` / `—`) as LaTeX range punctuation.
+  Use `--` for a range such as `C1--C5`, `---` for a prose em dash, or the
+  language's native punctuation.
 - Do NOT escape math delimiter dollars. Prefer `\( ... \)` for inline math
   and `\[ ... \]` for display math so prose escaping cannot corrupt formulas.
   If a literal currency dollar appears in prose, write `\$`.
@@ -150,5 +171,6 @@ thesis. Do not add side topics merely to increase length.
   "It is important to note that...".
 - Before replying, silently verify: correct section opener, target_words
   respected as a lower-bound budget, cite keys all appear in `cite_keys_hint`,
-  no invented results, no Markdown fence, no commentary, no path/log text.
+  no invented results, no forecast magnitude when evidence is not supplied,
+  no Markdown fence, no commentary, no path/log text.
 - Reply with the LaTeX fragment only. No commentary, no Markdown, no code fences.

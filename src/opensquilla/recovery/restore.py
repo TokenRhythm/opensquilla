@@ -15,6 +15,7 @@ from typing import Any
 from opensquilla.recovery.atomic import (
     PathIdentity,
     _chmod_open_file,
+    is_path_redirecting_stat,
     native_move_no_replace,
     profile_no_follow_manifest,
 )
@@ -223,8 +224,7 @@ def _recorded_backup(backup: Path) -> tuple[ConfigSnapshot, dict[str, Any], dict
         value = backup.lstat()
     except OSError as exc:
         raise RestoreValidationError("recorded backup is inaccessible") from exc
-    attributes = int(getattr(value, "st_file_attributes", 0))
-    if stat.S_ISLNK(value.st_mode) or attributes & 0x400 or not stat.S_ISDIR(value.st_mode):
+    if is_path_redirecting_stat(value) or not stat.S_ISDIR(value.st_mode):
         raise RestoreValidationError("recorded backup is not a real directory")
     profile_no_follow_manifest(backup)
     return snapshot, history, record, target
@@ -357,8 +357,8 @@ def _require_existing_backup_lock_authority(
     ):
         raise RestoreValidationError(
             "recorded backup requires a pre-existing legacy gateway lock authority; "
-            "the backup was not changed—continue with a recovery profile or use the "
-            "complete profile importer to copy this backup into the stopped primary profile",
+            "the backup was not changed—repair and retry the stopped primary profile, "
+            "or use the complete profile importer to copy this backup into it",
             stable_code="restore_backup_lock_authority_missing",
         )
 

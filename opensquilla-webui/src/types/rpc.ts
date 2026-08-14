@@ -27,10 +27,18 @@ export interface RawSessionChannelContext {
 
 export interface RawSessionTask {
   status?: string
+  task_id?: string
+  taskId?: string
+  turn_id?: string
+  turnId?: string
   started_at?: number | string
   startedAt?: number | string
   finished_at?: number | string
   finishedAt?: number | string
+  turn_outcome?: Record<string, unknown>
+  turnOutcome?: Record<string, unknown>
+  steer_capability?: import('./chat').ChatSteerCapability
+  steerCapability?: import('./chat').ChatSteerCapability
 }
 
 export interface RawSessionCron {
@@ -57,6 +65,8 @@ export interface RawSessionItem {
   subtitle?: string
   groupLabel?: string
   workspace?: string
+  workspaceId?: string
+  workspace_id?: string
   workspaceLabel?: string
   workspaceDisplayPath?: string
   updatedAt?: number | string
@@ -115,6 +125,47 @@ export type RawSessionListEntry = RawSessionItem | string
 export interface SessionsListResponse {
   sessions?: RawSessionListEntry[]
   keys?: RawSessionListEntry[]
+  /** Number of rows returned in this page. */
+  count?: number
+  /** Exact number of sessions visible to the caller, independent of page size. */
+  totalCount?: number
+  total_count?: number
+}
+
+export interface ProjectWorkspaceItem {
+  id: string
+  name: string
+  path: string
+  taskCount: number
+  pinned: boolean
+  available: boolean
+  availabilityReason?: string
+}
+
+export interface ProjectWorkspacesResponse {
+  workspaces?: ProjectWorkspaceItem[]
+}
+
+export interface SandboxPathEntry {
+  name: string
+  path: string
+  kind: 'directory' | 'file'
+  selectable: boolean
+  hidden?: boolean
+}
+
+export interface SandboxPathListResponse {
+  currentPath: string
+  path: string
+  parentPath: string | null
+  systemPickerAvailable: boolean
+  entries: SandboxPathEntry[]
+}
+
+export interface ProjectWorkspaceHistoryDeleteResponse {
+  workspaceId?: string
+  deletedTaskCount?: number
+  deletedSessionKeys?: string[]
 }
 
 /** One title/subject match from `sessions.search`. */
@@ -147,6 +198,9 @@ export interface SessionsSearchResponse {
 export interface ArtifactPayload {
   id?: string
   key?: string
+  kind?: string
+  sha256?: string
+  session_id?: string
   session_key?: string
   sessionKey?: string
   epoch?: number
@@ -154,9 +208,31 @@ export interface ArtifactPayload {
   name?: string
   mime?: string
   size?: number | string
+  source?: string
+  created_at?: string
+  createdAt?: string
+  store?: string
   download_url?: string
   thumbnail_url?: string
   [key: string]: unknown
+}
+
+export interface ArtifactsListResponse {
+  artifacts?: ArtifactPayload[]
+  has_more?: boolean
+  hasMore?: boolean
+  oldest_cursor?: string | null
+  oldestCursor?: string | null
+  newest_cursor?: string | null
+  newestCursor?: string | null
+  total_count?: number
+  totalCount?: number
+  page_size?: number
+  pageSize?: number
+}
+
+export interface ArtifactsGetResponse {
+  artifact?: ArtifactPayload | null
 }
 
 export interface StreamEventEnvelope {
@@ -164,6 +240,8 @@ export interface StreamEventEnvelope {
   session_key?: string
   sessionKey?: string
   epoch?: number
+  stream_generation?: string
+  streamGeneration?: string
   stream_seq?: number
   [key: string]: unknown
 }
@@ -171,6 +249,10 @@ export interface StreamEventEnvelope {
 export interface SessionEventPayload extends StreamEventEnvelope {
   task_id?: string
   taskId?: string
+  turn_id?: string
+  turnId?: string
+  started_at?: number
+  emitted_at?: number
   reason?: string
   status?: string
   run_status?: string
@@ -190,6 +272,37 @@ export interface SessionEventPayload extends StreamEventEnvelope {
 export interface WarningPayload extends SessionEventPayload {
   message?: string
   code?: string
+}
+
+export type ProviderActivityPhase =
+  | 'requesting'
+  | 'reasoning'
+  | 'retry_wait'
+  | 'retrying'
+  | 'fallback'
+
+export type ProviderActivityReason =
+  | 'initial'
+  | 'rate_limited'
+  | 'provider_overloaded'
+  | 'transport_transient'
+  | 'reasoning_only'
+  | 'empty_response'
+  | 'stream_incomplete'
+  | 'invalid_response'
+  | 'context_overflow'
+  | 'unknown'
+
+export interface ProviderActivityPayload extends SessionEventPayload {
+  schema_version?: 1
+  activity_id?: string
+  phase?: ProviderActivityPhase
+  reason?: ProviderActivityReason
+  retry_attempt?: number
+  retry_limit?: number
+  retry_after_ms?: number
+  started_at?: number
+  heartbeat?: boolean
 }
 
 export interface CronResultMessagePayload {
@@ -233,6 +346,29 @@ export interface ApprovalStatusPayload {
 
 export interface TextDeltaPayload extends SessionEventPayload {
   text?: string
+  /** Gateway-owned semantic role for this text span. */
+  presentation?: 'intermediate' | 'answer'
+}
+
+export type AssistantDelivery = 'visible' | 'suppressed'
+export type AssistantSuppressionReason = 'no_reply' | 'heartbeat_ack'
+
+/**
+ * Additive terminal-delivery contract. Older gateways omit these fields; the
+ * client then retains the conservative presentation-only sentinel fallback.
+ */
+export interface SessionDonePayload extends SessionEventPayload {
+  text?: string
+  text_snapshot?: string | null
+  textSnapshot?: string | null
+  delivery?: AssistantDelivery
+  suppression_reason?: AssistantSuppressionReason | null
+  suppressionReason?: AssistantSuppressionReason | null
+  /** Additive turn provenance; snake_case is the canonical gateway spelling. */
+  input_mode?: string
+  inputMode?: string
+  run_kind?: string
+  runKind?: string
 }
 
 export interface ToolUsePayload extends SessionEventPayload {
@@ -274,16 +410,67 @@ export interface ToolResultPayload extends ToolUsePayload {
 
 export interface SessionMessagesSubscribeParams {
   key: string
+  since_stream_generation?: string
   since_stream_seq?: number
   [key: string]: unknown
 }
 
+export interface SessionLiveSnapshotEvent {
+  event: string
+  payload: SessionEventPayload
+}
+
+export interface SessionMessagesSnapshotResponse {
+  key: string
+  task_id?: string | null
+  stream_generation?: string
+  current_stream_seq?: number
+  events?: SessionLiveSnapshotEvent[]
+}
+
+export interface SessionProjectWorkspaceSnapshot {
+  id: string
+  name: string
+  path: string
+  available: boolean
+  removed: boolean
+  availabilityReason?: string
+}
+
 export interface SessionMessagesSubscribeResponse extends SessionEventPayload {
   subscribed?: boolean
+  hydration_complete?: boolean
+  hydrationComplete?: boolean
+  deferred_fields?: string[]
+  deferredFields?: string[]
+  projectWorkspaceDeferred?: boolean
+  project_workspace_deferred?: boolean
   replay_complete?: boolean
   current_stream_seq?: number
   active_task_group_ids?: string[]
   activeTaskGroupIds?: string[]
+  run_mode_lock?: {
+    locked?: boolean
+    runMode?: 'safe' | 'full'
+    source?: string
+  }
+  runModeLock?: {
+    locked?: boolean
+    runMode?: 'safe' | 'full'
+    source?: string
+  }
+  workspaceId?: string
+  projectWorkspace?: SessionProjectWorkspaceSnapshot | null
+  collaboration?: import('./plans').CollaborationSnapshot
+  currentPlan?: import('./plans').PlanRevisionSnapshot | null
+  current_plan?: unknown
+  activePlanRun?: import('./plans').PlanRunSnapshot | null
+  active_plan_run?: unknown
+  goal?: unknown
+  goalSnapshotStreamSeq?: number | null
+  goal_snapshot_stream_seq?: number | null
+  pendingUserInputs?: unknown[]
+  pending_user_inputs?: unknown[]
 }
 
 export interface ChatSendAttachmentPayload {
@@ -301,8 +488,10 @@ export interface ChatSendParams {
   clientRequestId?: string
   /** Stable client identity for reconciling the optimistic user row. */
   clientMessageId?: string
-  _source?: { elevated?: string; runMode?: 'standard' | 'trusted' | 'full' }
+  _source?: { elevated?: string; runMode?: 'safe' | 'full' }
   intent?: string
+  workspaceId?: string
+  collaborationMode?: import('./plans').CollaborationMode
   forkBeforeMessageId?: string
   displayText?: string
   attachments?: ChatSendAttachmentPayload[]
@@ -325,6 +514,77 @@ export interface ChatSendResponse {
   terminal_message?: string
   terminalMessage?: string
   reason?: string
+}
+
+/** Server-owned recovery record for one unaccepted manual MetaSkill launch. */
+export interface MetaLaunchDraftPayload {
+  sessionKey: string
+  clientRequestId: string
+  name: string
+  launchText: string
+  createdAt: number
+  expiresAt: number
+  sessionExists: boolean
+}
+
+export interface MetaDraftsListResponse {
+  ok: boolean
+  durable: boolean
+  drafts: MetaLaunchDraftPayload[]
+}
+
+export interface MetaDraftDiscardResponse {
+  ok: boolean
+  discarded: boolean
+  accepted?: boolean
+}
+
+export interface SessionSteerV2Params {
+  key: string
+  message: string
+  expected_turn_id: string
+  client_request_id: string
+  client_message_id: string
+  surface_id?: string
+  _source?: { elevated?: string; runMode?: 'safe' | 'full' }
+}
+
+export interface SessionSteerV2Response {
+  accepted?: boolean
+  replayed?: boolean
+  session_key?: string
+  turn_id?: string
+  user_message_id?: string
+  client_request_id?: string
+  client_message_id?: string
+  disposition?: import('./chat').ChatSteerDisposition
+  revision?: number
+  promoted_turn_id?: string
+  promoted_from_turn_id?: string
+  applied_iteration?: number
+  model_call_id?: string
+  fallback_safe?: boolean
+  failure_code?: string
+  retryable?: boolean
+  recovery?: string
+  reason?: string
+}
+
+export interface InputDispositionPayload extends SessionEventPayload {
+  target_turn_id?: string
+  client_request_id?: string
+  client_message_id?: string
+  user_message_id?: string
+  disposition?: import('./chat').ChatSteerDisposition
+  promoted_from_turn_id?: string
+  promoted_turn_id?: string
+  applied_iteration?: number
+  model_call_id?: string
+  failure_code?: string
+  retryable?: boolean
+  recovery?: string
+  fallback_safe?: boolean
+  revision?: number
 }
 
 export interface ChatHistoryAttachmentPayload {
@@ -360,6 +620,7 @@ export interface ChatHistoryMessage {
   provenance_kind?: string
   provenance_source_session_key?: string
   provenance_source_tool?: string
+  turn_context?: Record<string, unknown>
   reasoning_content?: string
   usage?: unknown
   turn_usage?: unknown
@@ -368,6 +629,20 @@ export interface ChatHistoryMessage {
   input_tokens?: number
   output?: number
   output_tokens?: number
+}
+
+export interface ChatCompactionSummary {
+  id?: string | number | null
+  compaction_id?: string | null
+  compaction_index?: number | null
+  trigger_reason?: string | null
+  summary_text?: string
+  summary_format?: string
+  coverage_status?: string
+  removed_count?: number | null
+  kept_count?: number | null
+  covered_through_id?: number | null
+  created_at?: string | number | null
 }
 
 export interface ChatHistoryResponse {
@@ -386,6 +661,18 @@ export interface ChatHistoryResponse {
   canonicalComplete?: boolean
   limit?: number
   returned?: number
+  compaction_summaries?: ChatCompactionSummary[]
+  compactionSummaries?: ChatCompactionSummary[]
+  turn_outcomes?: ChatHistoryTurnOutcome[]
+}
+
+export interface ChatHistoryTurnOutcome {
+  turn_id?: string
+  task_id?: string
+  status?: string
+  started_at?: string | number
+  finished_at?: string | number
+  outcome?: Record<string, unknown>
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {
@@ -417,8 +704,38 @@ export interface EnsembleProgressPayload extends SessionEventPayload {
 }
 
 export interface CompactionPayload extends SessionEventPayload {
+  status?:
+    | 'started'
+    | 'observed'
+    | 'completed'
+    | 'skipped'
+    | 'stale'
+    | 'failed'
+    | 'error'
+    | 'cancelled'
+    | 'timed_out'
+    | 'emergency_ephemeral'
+    | (string & {})
   compacted?: boolean
   detail?: string
+  reason?: string
+  skip_reason?: string
+  source?: string
+  phase?: string
+  compaction_id?: string
+  compactionId?: string
+  sequence?: number
+  heartbeat?: boolean
+  heartbeat_at?: number
+  elapsed_ms?: number
+  stage?: string
+  refused?: boolean
+  safe_to_send?: boolean
+  safeToSend?: boolean
+  applied?: boolean
+  durability?: 'durable' | 'request_scoped' | (string & {})
+  user_visible?: boolean
+  userVisible?: boolean
 }
 
 /* ── MetaSkill run events ──────────────────────────────────────────────
@@ -522,8 +839,11 @@ export interface RpcEventMap {
   'session.event.router_control_replay': SessionEventPayload
   'session.event.state_change': SessionEventPayload
   'session.event.run_heartbeat': SessionEventPayload
+  'session.event.provider_activity': ProviderActivityPayload
   'session.event.compaction': CompactionPayload
+  'session.event.goal': SessionEventPayload
   'session.event.warning': SessionEventPayload
+  'session.event.input_disposition': InputDispositionPayload
   'session.epoch_changed': SessionEventPayload
   'sessions.changed': SessionEventPayload
   'task.queued': SessionEventPayload
@@ -536,4 +856,5 @@ export interface RpcEventMap {
   'session.event.meta_run_announced': MetaRunAnnouncedPayload
   'session.event.meta_step_state': MetaStepStatePayload
   'session.event.meta_run_completed': MetaRunCompletedPayload
+  'session.event.done': SessionDonePayload
 }

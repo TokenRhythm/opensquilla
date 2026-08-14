@@ -7,7 +7,11 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
-from opensquilla.sandbox.integration import get_runtime, run_under_backend
+from opensquilla.sandbox.integration import (
+    get_runtime,
+    reject_windows_guest_process,
+    run_under_backend,
+)
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.sandbox.permissions import (
     FileSystemAccess,
@@ -48,6 +52,7 @@ def _reject_foreign_git_path(path: str) -> None:
 
 async def _run_git(*args: str, cwd: str | None = None) -> str:
     runtime = get_runtime()
+    reject_windows_guest_process(runtime)
     if (
         runtime is not None
         and runtime.effective.sandbox_enabled

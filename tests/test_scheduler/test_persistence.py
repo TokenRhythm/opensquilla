@@ -5,6 +5,11 @@ from datetime import datetime
 
 import pytest
 
+from opensquilla.gateway.boot import (
+    _task_runtime_envelope_host_execute,
+    _task_runtime_envelope_owner,
+)
+from opensquilla.gateway.routing import build_cron_route_envelope, tool_context_from_envelope
 from opensquilla.scheduler.persistence import JobStore
 from opensquilla.scheduler.types import CronJob, JobReservation, ScheduleKind
 
@@ -38,6 +43,144 @@ async def test_scheduler_persistence_round_trips_tool_policy(tmp_path) -> None:
         "also_allow": ["memory_search"],
         "deny": ["web_fetch"],
     }
+
+
+@pytest.mark.asyncio
+async def test_open_migrates_legacy_jobs_without_deduplicating_existing_rows(tmp_path) -> None:
+    db_path = tmp_path / "legacy-scheduler.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE scheduler_jobs (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                cron_expr TEXT NOT NULL,
+                handler_key TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_run_at TEXT,
+                next_run_at TEXT,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                jitter_seconds REAL NOT NULL DEFAULT 0.0
+            )
+            """
+        )
+        for job_id in ("legacy-a", "legacy-b"):
+            conn.execute(
+                """
+                INSERT INTO scheduler_jobs
+                    (id, name, cron_expr, handler_key, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    "duplicate",
+                    "*/5 * * * *",
+                    "agent_run",
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+
+    store = JobStore(str(db_path))
+    await store.open()
+    try:
+        jobs = await store.list_active()
+    finally:
+        await store.close()
+
+    assert {job.id for job in jobs} == {"legacy-a", "legacy-b"}
+    assert {job.idempotency_key for job in jobs} == {""}
+    assert {job.creator_host_execute for job in jobs} == {False}
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(scheduler_jobs)").fetchall()
+        }
+    assert "creator_host_execute" in columns
+
+
+@pytest.mark.asyncio
+async def test_legacy_owner_row_without_host_authority_fails_closed(tmp_path) -> None:
+    db_path = tmp_path / "legacy-owner-scheduler.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE scheduler_jobs (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL DEFAULT '',
+                cron_expr TEXT NOT NULL,
+                handler_key TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_run_at TEXT,
+                next_run_at TEXT,
+                run_count INTEGER NOT NULL DEFAULT 0,
+                error_count INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                jitter_seconds REAL NOT NULL DEFAULT 0.0,
+                creator_is_owner INTEGER NOT NULL DEFAULT 0,
+                run_mode TEXT NOT NULL DEFAULT '',
+                elevated TEXT NOT NULL DEFAULT '',
+                execution_target TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO scheduler_jobs
+                (id, name, cron_expr, handler_key, created_at, updated_at,
+                 creator_is_owner, run_mode, elevated, execution_target)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-owner",
+                "Legacy owner",
+                "*/5 * * * *",
+                "agent_run",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+                1,
+                "full",
+                "full",
+                "host",
+            ),
+        )
+
+    store = JobStore(str(db_path))
+    await store.open()
+    try:
+        job = await store.get("legacy-owner")
+    finally:
+        await store.close()
+
+    assert job is not None
+    assert job.creator_is_owner is True
+    assert job.creator_host_execute is False
+    envelope = build_cron_route_envelope(job, session_key="cron:legacy-owner")
+    assert _task_runtime_envelope_owner(envelope) is False
+    assert _task_runtime_envelope_host_execute(envelope) is False
+    assert envelope.metadata["run_mode"] == "safe"
+    assert envelope.metadata["execution_target"] == "sandbox"
+    assert "elevated" not in envelope.metadata
+
+    ctx = tool_context_from_envelope(
+        envelope,
+        is_owner=_task_runtime_envelope_owner(envelope),
+        host_execute_allowed=_task_runtime_envelope_host_execute(envelope),
+    )
+    assert ctx.is_owner is False
+    assert ctx.run_mode == "safe"
+    assert ctx.allowed_tools is not None
+    assert "exec_command" in ctx.denied_tools
 
 
 @pytest.mark.asyncio

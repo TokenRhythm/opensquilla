@@ -1,6 +1,7 @@
 ---
 name: openrouter-video-generator
-description: "Generate or declare a configured OpenRouter video asset for AwesomeWebpageMetaSkill. Use only when the meta skill needs a local webpage video and the provider, model, API key, and output directory come from config."
+description: "Generate or declare an OpenRouter video asset for AwesomeWebpageMetaSkill using a parent-leased Provider Settings connection and configured non-secret model/output values."
+description_zh: "使用父级租用的 Provider Settings 连接及已配置的非敏感模型/输出参数，为 AwesomeWebpageMetaSkill 生成或声明 OpenRouter 视频资产。"
 homepage: ""
 user-invocable: false
 disable-model-invocation: true
@@ -15,9 +16,6 @@ metadata:
     requires:
       env: []
       config:
-        - awesome_webpage.openrouter.api_key
-        - awesome_webpage.openrouter.api_key_env
-        - awesome_webpage.openrouter.base_url
         - awesome_webpage.openrouter.models.video_generation
         - awesome_webpage.output_dir
 entrypoint:
@@ -25,10 +23,6 @@ entrypoint:
   args:
     - --model
     - "{{ with.model | default('bytedance/seedance-2.0-fast') }}"
-    - --base-url
-    - "{{ with.base_url | default('https://openrouter.ai/api/v1') }}"
-    - --api-key-env
-    - "{{ with.api_key_env | default('OPENROUTER_API_KEY') }}"
     - --output-dir
     - "{{ with.output_dir }}"
     - --filename
@@ -38,7 +32,7 @@ entrypoint:
     - --aspect-ratio
     - "{{ with.aspect_ratio | default('16:9') }}"
   env:
-    "{{ with.api_key_env | default('OPENROUTER_API_KEY') }}": "{{ with.api_key | default('') }}"
+    OPENSQUILLA_META_CAPABILITY_LEASE_REQUIRED: "1"
   stdin: "{{ with.prompt | default(inputs.user_message) }}"
   parse: text
   timeout: 420
@@ -53,17 +47,17 @@ choose providers or invent model ids.
 ## Meta-Skill Entrypoint
 
 Meta-skills should run this skill as `skill_exec`. The entrypoint is a
-deterministic Python adapter around OpenRouter's async video endpoint; it uses
-an explicit `with.api_key` value by injecting it into the configured
-`with.api_key_env` child process environment variable, writes the MP4 under the supplied
-output directory, and prints either `VIDEO_READY:` or a single failure label.
-Do not spawn an LLM sub-agent just to generate video.
+deterministic Python adapter around OpenRouter's async video endpoint. During a
+MetaSkill run it receives a short-lived connection from ordinary Provider
+Settings in the child process only; the credential, endpoint, and proxy never
+enter `with`, argv, the plan, or persisted run data. It writes the MP4 under
+the supplied output directory and prints either `VIDEO_READY:` or a failure
+label. Do not spawn an LLM sub-agent just to generate video.
 
 ## Contract
 
-- Read provider settings from `config.awesome_webpage.openrouter`.
-- Resolve the API key from `awesome_webpage.openrouter.api_key`; if empty, use
-  the environment variable named by `awesome_webpage.openrouter.api_key_env`.
+- Use the code-owned OpenRouter capability candidate and the volatile provider
+  lease resolved from ordinary Provider Settings after explicit approval.
 - Use only `awesome_webpage.openrouter.models.video_generation` as the model.
 - Use only `awesome_webpage.output_dir` as the output root.
 - Save generated files under `project/assets/video/`.
@@ -107,6 +101,10 @@ Return one of these labels instead of silently skipping video:
 - `VIDEO_MODEL_UNSUPPORTED`: the configured model cannot return a local
   browser-playable asset in this environment.
 - `VIDEO_GENERATION_FAILED`: the provider call failed after a concrete attempt.
+
+A missing/invalid required MetaSkill lease emits `VIDEO_CONFIG_NEEDED` and exits
+78 before submit. Failures after a concrete submit stay an exit-0 degradation
+so downstream packaging can bind a replacement slot without automatic replay.
 
 When returning a failure label, also return a replacement slot such as
 `project/assets/video/replace-with-topic-intro.mp4` and enough prompt/context

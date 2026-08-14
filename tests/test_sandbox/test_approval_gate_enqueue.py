@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import pytest
@@ -8,10 +9,13 @@ from opensquilla.sandbox.escalation import request_sandbox_approval
 from opensquilla.sandbox.governance import (
     ALLOW,
     ApprovalGate,
+    action_fingerprint,
     gate_execution,
     on_successful_exec,
 )
 from opensquilla.sandbox.types import (
+    ApprovedHostExecution,
+    DenialResult,
     MountSpec,
     NetworkMode,
     ResourceLimits,
@@ -39,6 +43,27 @@ class _RecordingQueue:
         raise AssertionError("resolve should not be called in this test")
 
 
+class _ResolvingConsumableQueue(_RecordingQueue):
+    def __init__(
+        self,
+        *,
+        approved: bool = True,
+        consume_error: Exception | None = None,
+    ) -> None:
+        super().__init__()
+        self.approved = approved
+        self.consume_error = consume_error
+        self.consumed: list[str] = []
+
+    async def wait(self, approval_id: str, timeout: float | None = None) -> bool:
+        return self.approved
+
+    def consume(self, approval_id: str) -> None:
+        if self.consume_error is not None:
+            raise self.consume_error
+        self.consumed.append(approval_id)
+
+
 def _policy(workspace: Path) -> SandboxPolicy:
     return SandboxPolicy(
         level=SecurityLevel.STANDARD,
@@ -50,6 +75,84 @@ def _policy(workspace: Path) -> SandboxPolicy:
         env_allowlist=("PATH",),
         require_approval=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_locked_approval_returns_consumed_host_execution_grant(
+    tmp_path: Path,
+) -> None:
+    policy = dataclasses.replace(_policy(tmp_path), level=SecurityLevel.LOCKED)
+    request = SandboxRequest(
+        argv=("shell.exec", f"rm {tmp_path / 'x'}"),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=policy,
+    )
+    queue = _ResolvingConsumableQueue()
+
+    decision = await ApprovalGate(queue).gate(request, policy, session_id="s1")
+
+    assert isinstance(decision, ApprovedHostExecution)
+    assert decision.approval_id == "approval-1"
+    assert decision.action_fingerprint == action_fingerprint(request)
+    assert decision.level is SecurityLevel.LOCKED
+    assert queue.consumed == ["approval-1"]
+
+
+@pytest.mark.asyncio
+async def test_rejected_locked_approval_does_not_consume(tmp_path: Path) -> None:
+    policy = dataclasses.replace(_policy(tmp_path), level=SecurityLevel.LOCKED)
+    request = SandboxRequest(
+        argv=("shell.exec", f"rm {tmp_path / 'x'}"),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=policy,
+    )
+    queue = _ResolvingConsumableQueue(approved=False)
+
+    decision = await ApprovalGate(queue).gate(request, policy, session_id="s1")
+
+    assert isinstance(decision, DenialResult)
+    assert queue.consumed == []
+
+
+@pytest.mark.asyncio
+async def test_locked_approval_fails_closed_when_grant_cannot_be_consumed(
+    tmp_path: Path,
+) -> None:
+    policy = dataclasses.replace(_policy(tmp_path), level=SecurityLevel.LOCKED)
+    request = SandboxRequest(
+        argv=("shell.exec", f"rm {tmp_path / 'x'}"),
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=policy,
+    )
+    queue = _ResolvingConsumableQueue(consume_error=ValueError("approval already consumed"))
+
+    decision = await ApprovalGate(queue).gate(request, policy, session_id="s1")
+
+    assert isinstance(decision, DenialResult)
+    assert decision.retryable is False
+    assert queue.consumed == []
+
+
+@pytest.mark.asyncio
+async def test_locked_non_execution_approval_keeps_ordinary_allow_semantics(
+    tmp_path: Path,
+) -> None:
+    policy = dataclasses.replace(_policy(tmp_path), level=SecurityLevel.LOCKED)
+    request = SandboxRequest(
+        argv=("http_request", "https://example.com"),
+        cwd=tmp_path,
+        action_kind="network.http",
+        policy=policy,
+    )
+    queue = _ResolvingConsumableQueue()
+
+    decision = await ApprovalGate(queue).gate(request, policy, session_id="s1")
+
+    assert decision is ALLOW
+    assert queue.consumed == []
 
 
 @pytest.mark.asyncio
@@ -65,7 +168,10 @@ async def test_gate_enqueues_when_approval_required(tmp_path: Path) -> None:
     )
 
     class _ResolvingQueue(_RecordingQueue):
+        waited_timeout: float | None | object = object()
+
         async def wait(self, approval_id: str, timeout: float | None = None) -> bool:
+            self.waited_timeout = timeout
             return True
 
     queue = _ResolvingQueue()
@@ -75,6 +181,7 @@ async def test_gate_enqueues_when_approval_required(tmp_path: Path) -> None:
 
     assert decision is ALLOW
     assert queue.requested is True
+    assert queue.waited_timeout is None
 
 
 @pytest.mark.asyncio

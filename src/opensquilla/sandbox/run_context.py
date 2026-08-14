@@ -15,10 +15,16 @@ from opensquilla.sandbox.path_validation import (
     normalize_mount_access,
     normalize_path,
 )
-from opensquilla.sandbox.run_mode import RunMode, config_run_mode, normalize_run_mode
+from opensquilla.sandbox.run_mode import (
+    RunMode,
+    config_run_mode,
+    normalize_run_mode,
+    project_default_run_mode,
+)
 from opensquilla.sandbox.user_grants import load_user_grants_payload
 
 RUN_CONTEXT_ORIGIN_KEY = "sandbox_run_context"
+RUN_MODE_PREFERENCE_KEY = "sandbox.run_mode"
 DEFAULT_ROOT_WORKSPACE = "/root/.opensquilla/workspace"
 
 
@@ -66,11 +72,13 @@ class RunContext:
     bundles: tuple[PackageBundleGrant, ...] = ()
     public_network: tuple[PublicNetworkGrant, ...] = ()
     temporary_grants: tuple[TemporaryGrant, ...] = ()
+    run_mode_source: str | None = None
     source: str = "default"
 
     def to_origin_payload(self) -> dict[str, Any]:
         return {
             "run_mode": self.run_mode.value,
+            "run_mode_source": self.run_mode_source,
             "workspace": self.workspace,
             "mounts": [
                 {"path": grant.path, "access": grant.access, "scope": grant.scope}
@@ -180,6 +188,16 @@ def _workspace_from_payload(value: Any) -> str | None:
         return normalize_workspace_path(value)
     except ValueError:
         return None
+
+
+def _run_mode_source_from_payload(value: Any) -> str | None:
+    if isinstance(value, str) and value in {
+        "project_default",
+        "operator_default",
+        "user",
+    }:
+        return value
+    return None
 
 
 def _mounts_from_payload(
@@ -332,6 +350,9 @@ def _context_from_payload(payload: Any, source: str) -> RunContext | None:
             payload.get("public_network") or payload.get("publicNetwork")
         ),
         temporary_grants=_temporary_grants_from_payload(payload.get("temporary_grants")),
+        run_mode_source=_run_mode_source_from_payload(
+            payload.get("run_mode_source")
+        ),
         source=source,
     )
 
@@ -480,6 +501,7 @@ def _with_user_grants(context: RunContext) -> RunContext:
         bundles=bundles,
         public_network=public_network,
         temporary_grants=context.temporary_grants,
+        run_mode_source=context.run_mode_source,
         source=context.source,
     )
 
@@ -524,9 +546,13 @@ async def get_run_context(
     config: Any,
     workspace: str | None,
     include_user_grants: bool = True,
+    session_node: Any | None = None,
 ) -> RunContext:
-    configured_mode = config_run_mode(config)
-    node = await _get_session_node(session_manager, session_key)
+    node = (
+        session_node
+        if session_node is not None
+        else await _get_session_node(session_manager, session_key)
+    )
     if node is not None:
         origin = _origin_dict(node)
         saved = _context_from_payload(
@@ -534,15 +560,41 @@ async def get_run_context(
             "saved",
         )
         if saved is not None:
-            if configured_mode == RunMode.FULL and saved.run_mode != RunMode.FULL:
-                saved = replace(saved, run_mode=RunMode.FULL, source="global_full")
             return _with_user_grants(saved) if include_user_grants else saved
+    configured_mode, _source = await resolve_default_run_mode(session_manager, config)
     context = RunContext(
         run_mode=configured_mode,
         workspace=_workspace_from_payload(workspace),
         source="default",
     )
     return _with_user_grants(context) if include_user_grants else context
+
+
+async def resolve_default_run_mode(
+    session_manager: Any,
+    config: Any,
+) -> tuple[RunMode, str]:
+    """Resolve the durable owner default before falling back to configuration."""
+
+    storage = getattr(session_manager, "storage", None)
+    if storage is None:
+        storage = getattr(session_manager, "_storage", None)
+    get_preference = getattr(storage, "get_runtime_preference", None)
+    if callable(get_preference):
+        stored = await get_preference(RUN_MODE_PREFERENCE_KEY)
+        if stored is not None:
+            return normalize_run_mode(stored), "preference"
+
+    sandbox = getattr(config, "sandbox", None)
+    fields_set = getattr(sandbox, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(sandbox, "__fields_set__", ())
+    source = (
+        "config"
+        if fields_set is not None and "run_mode" in fields_set
+        else "default"
+    )
+    return config_run_mode(config), source
 
 
 async def persist_run_context(
@@ -586,13 +638,30 @@ async def set_run_mode(
         bundles=existing.bundles,
         public_network=existing.public_network,
         temporary_grants=existing.temporary_grants,
+        run_mode_source="user",
         source="saved",
     )
     return await persist_run_context(session_manager, session_key, updated)
 
 
+def effective_project_run_mode(context: RunContext, config: Any) -> RunContext:
+    if (
+        context.run_mode is RunMode.FULL
+        and context.run_mode_source is None
+        and config_run_mode(config) is RunMode.FULL
+        and project_default_run_mode(config) is RunMode.SAFE
+    ):
+        return replace(
+            context,
+            run_mode=RunMode.SAFE,
+            run_mode_source="project_default",
+        )
+    return context
+
+
 __all__ = [
     "RUN_CONTEXT_ORIGIN_KEY",
+    "RUN_MODE_PREFERENCE_KEY",
     "DEFAULT_ROOT_WORKSPACE",
     "DomainGrant",
     "MountGrant",
@@ -600,11 +669,13 @@ __all__ = [
     "PublicNetworkGrant",
     "RunContext",
     "TemporaryGrant",
+    "effective_project_run_mode",
     "get_run_context",
     "normalize_scope",
     "normalize_workspace_path",
     "persist_run_context",
     "run_context_from_origin_payload",
     "run_context_for_subagent",
+    "resolve_default_run_mode",
     "set_run_mode",
 ]

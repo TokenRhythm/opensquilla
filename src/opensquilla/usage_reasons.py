@@ -16,6 +16,7 @@ _INTERNAL_USAGE_UNKNOWN_REASONS = frozenset(
         "direct_request_failed",
         "iteration_timeout",
         "missing_or_invalid_usage_receipt",
+        "model_repetition_loop_detected",
         "process_restarted",
         "provider_error",
         "provider_exception",

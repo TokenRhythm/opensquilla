@@ -27,7 +27,14 @@ from opensquilla.paths import default_opensquilla_home
 # one provider 404 on another. [llm_ensemble] is deliberately NOT carried:
 # its static profiles opt back in on env-key presence alone, which would
 # re-pin the subagent to a provider the operator moved away from.
-OPERATOR_SECTIONS = ("llm", "squilla_router", "llm_profiles", "models", "model_catalog")
+OPERATOR_SECTIONS = (
+    "llm",
+    "squilla_router",
+    "llm_profiles",
+    "models",
+    "model_catalog",
+    "privacy",
+)
 
 # Field-level pydantic precedence is init (TOML) > env, and env fills fields
 # ABSENT from the TOML section — so a key stripped from the written file is
@@ -80,10 +87,32 @@ def load_agent_config_bundle() -> AgentConfigBundle:
     """Assemble and validate the subagent config for one code-task run."""
     override = agent_config_override()
     if override is not None:
-        # An explicit operator override is fully authoritative: no provider
-        # inheritance, so a hand-tuned subagent config (the documented #541
-        # escape hatch) is never partially rewritten.
-        payload = _validated(_read_payload(override), source=str(override))
+        # An explicit operator override remains authoritative for provider and
+        # run policy (the documented #541 escape hatch).  The gateway's
+        # explicitly configured privacy policy still applies to every child
+        # process, however, so it cannot be relaxed by a provider override.
+        payload = _read_payload(override)
+        try:
+            user_payload, _source = user_config_payload()
+        except AgentConfigError:
+            # The explicit override is the recovery path for a broken ordinary
+            # config. Keep it usable, but never silently enable installation
+            # metadata when the operator's privacy policy cannot be read.
+            payload["privacy"] = {"disable_network_observability": True}
+        else:
+            if "privacy" in user_payload:
+                privacy_payload = user_payload["privacy"]
+                try:
+                    from opensquilla.gateway.config import PrivacyConfig
+
+                    PrivacyConfig(**privacy_payload)
+                except Exception:
+                    payload["privacy"] = {
+                        "disable_network_observability": True
+                    }
+                else:
+                    payload["privacy"] = copy.deepcopy(privacy_payload)
+        payload = _validated(payload, source=str(override))
         return AgentConfigBundle(payload=payload, source_path=str(override))
     template_payload = _read_payload(agent_config_path())
     user_payload, source = user_config_payload()
@@ -100,8 +129,8 @@ def build_per_run_agent_config(
 
     Operator sections replace the template's wholesale (and are dropped when
     the operator has none, falling back to built-in defaults plus env), so
-    the subagent resolves provider, model, credentials, and router tiers
-    exactly like the operator's own gateway.
+    the subagent resolves provider, model, credentials, router tiers, and
+    network-observability privacy exactly like the operator's own gateway.
     """
     merged = copy.deepcopy(template_payload)
     child_env: dict[str, str] = {}

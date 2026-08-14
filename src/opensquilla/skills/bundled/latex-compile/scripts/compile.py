@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -102,7 +103,21 @@ def _cjk_preamble(title: str, body: str) -> str:
     needs_cjk = bool(_CJK_RE.search(title) or _CJK_RE.search(body))
     cjk_lines = ""
     if needs_cjk:
-        cjk_lines = r"""
+        font_dirs = [
+            Path(value)
+            for value in os.environ.get("OSFONTDIR", "").split(os.pathsep)
+            if value
+        ]
+        managed_noto = any(
+            (directory / "NotoSansCJK-Regular.ttc").is_file() for directory in font_dirs
+        )
+        if managed_noto:
+            cjk_lines = r"""
+\usepackage{fontspec}
+\setmainfont[FontIndex=2]{NotoSansCJK-Regular.ttc}
+"""
+        else:
+            cjk_lines = r"""
 \usepackage{fontspec}
 \usepackage{xeCJK}
 \IfFontExistsTF{WenQuanYi Zen Hei}{%
@@ -115,7 +130,7 @@ def _cjk_preamble(title: str, body: str) -> str:
 """
     return (
         "\\documentclass[11pt]{article}\n"
-        "% xelatex is Unicode-native; use xeCJK when CJK text is present.\n"
+        "% xelatex is Unicode-native; configure a CJK-capable font when needed.\n"
         f"{cjk_lines}"
         "\\usepackage{amsmath}\n"
         "\\usepackage{amssymb}\n"

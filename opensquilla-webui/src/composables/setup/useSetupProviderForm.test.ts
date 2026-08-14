@@ -4,6 +4,8 @@ import {
   useSetupProviderForm,
   buildProviderPayload,
   hasEffectiveProvider,
+  normalizeCatalogSyncStatus,
+  normalizeDiscoveredModels,
 } from './useSetupProviderForm'
 
 // The connection state machine talks to the gateway through the rpc store —
@@ -328,6 +330,60 @@ const DISCOVER_ROW = {
 
 const DISCOVER_OK = { ok: true, failureKind: '', detail: '', source: 'live', models: [DISCOVER_ROW] }
 
+const DISCOVER_METADATA = {
+  schemaVersion: 1,
+  published: {
+    name: 'Test Model (official)',
+    providerDisplayName: 'Test Vendor',
+    modelType: 'chat',
+    status: 'available',
+    modalities: ['text'],
+    contextWindow: 1048576,
+    maxOutputTokens: 131072,
+    reasoningMode: 'hybrid',
+    reasoningDefault: 'provider',
+    reasoningSupportedEfforts: [],
+    reasoningSupportsMaxTokens: false,
+    capabilities: {
+      tools: true,
+      reasoning: true,
+      vision: false,
+      anthropic: false,
+      responses: true,
+      streaming: true,
+    },
+    responses: {
+      modes: ['chat'],
+      capabilities: ['stream', 'background'],
+      capabilityStates: {
+        stream: true,
+        tools: false,
+        background: null,
+      },
+    },
+    pricing: {
+      currency: 'USD',
+      billingMode: 'per_1m_tokens',
+      billingUnit: 1000000,
+      hasDiscount: false,
+      pricePerImage: null,
+      standard: { input: '0.25', output: '1.25', cacheRead: null },
+      discount: { input: null, output: null, cacheRead: null },
+      effective: { input: '0.25', output: '1.25', cacheRead: null },
+    },
+  },
+  declared: {
+    displayName: 'Test Model declared',
+    modelType: 'chat',
+    status: 'testing',
+    contextWindow: 262144,
+    maxOutputTokens: 8192,
+    capabilities: { tools: true },
+    responses: null,
+    pricing: null,
+  },
+}
+
 function mockRpc(responses: { probe?: unknown; discover?: unknown } = {}) {
   callMock.mockImplementation(async (method: string) => {
     if (method === 'onboarding.provider.probe') return responses.probe ?? PROBE_OK
@@ -335,6 +391,181 @@ function mockRpc(responses: { probe?: unknown; discover?: unknown } = {}) {
     throw new Error(`unexpected rpc method: ${method}`)
   })
 }
+
+describe('model discovery wire normalization', () => {
+  it('accepts additive schema v1 metadata without changing the legacy row contract', () => {
+    const [model] = normalizeDiscoveredModels([{ ...DISCOVER_ROW, metadata: DISCOVER_METADATA }])
+
+    expect(model).toEqual(expect.objectContaining({
+      id: DISCOVER_ROW.id,
+      contextWindow: DISCOVER_ROW.contextWindow,
+      maxOutputTokens: DISCOVER_ROW.maxOutputTokens,
+    }))
+    expect(model.metadata?.published?.contextWindow).toBe(1048576)
+    expect(model.metadata?.published?.maxOutputTokens).toBe(131072)
+    expect(model.metadata?.published?.capabilities.vision).toBe(false)
+    expect(model.metadata?.published?.reasoningDefault).toBe('provider')
+    expect(model.metadata?.published?.reasoningSupportedEfforts).toEqual([])
+    expect(model.metadata?.published?.reasoningSupportsMaxTokens).toBe(false)
+    expect(model.metadata?.published?.responses?.capabilityStates).toMatchObject({
+      stream: true,
+      tools: false,
+      background: null,
+      compact: null,
+    })
+    expect(model.metadata?.published?.responses?.capabilities).toEqual(['stream', 'background'])
+    expect(model.metadata?.published?.pricing?.standard.input).toBe('0.25')
+    expect(model.metadata?.published?.pricing?.billingMode).toBe('per_1m_tokens')
+    expect(model.metadata?.published?.pricing?.pricePerImage).toBeNull()
+    expect(model.metadata?.declared?.maxOutputTokens).toBe(8192)
+    expect(model.metadata?.declared).toMatchObject({
+      displayName: 'Test Model declared',
+      modelType: 'chat',
+      status: 'testing',
+    })
+  })
+
+  it('rejects lossy numeric and malformed metadata prices', () => {
+    const [model] = normalizeDiscoveredModels([{
+      ...DISCOVER_ROW,
+      metadata: {
+        ...DISCOVER_METADATA,
+        published: {
+          ...DISCOVER_METADATA.published,
+          pricing: {
+            ...DISCOVER_METADATA.published.pricing,
+            pricePerImage: 0.25,
+            standard: { input: 0.1, output: 'not-a-decimal', cacheRead: '1.0e-3' },
+          },
+        },
+      },
+    }])
+
+    expect(model.metadata?.published?.pricing?.pricePerImage).toBeNull()
+    expect(model.metadata?.published?.pricing?.standard).toEqual({
+      input: null,
+      output: null,
+      cacheRead: '1.0e-3',
+    })
+  })
+
+  it('infers response true states for older gateways while keeping unknown states null', () => {
+    const [model] = normalizeDiscoveredModels([{
+      ...DISCOVER_ROW,
+      metadata: {
+        ...DISCOVER_METADATA,
+        published: {
+          ...DISCOVER_METADATA.published,
+          responses: { modes: [], capabilities: ['stream', 'tools'] },
+        },
+      },
+    }])
+
+    expect(model.metadata?.published?.responses).toEqual({
+      modes: [],
+      capabilities: ['stream', 'tools'],
+      capabilityStates: {
+        stream: true,
+        tools: true,
+        background: null,
+        compact: null,
+        webSearch: null,
+        mcp: null,
+        codeInterpreter: null,
+        imageGeneration: null,
+        fileSearch: null,
+        cancel: null,
+      },
+    })
+  })
+
+  it('ignores unknown metadata schema versions for old-client compatibility', () => {
+    const [model] = normalizeDiscoveredModels([{
+      ...DISCOVER_ROW,
+      metadata: { schemaVersion: 2, published: { maxOutputTokens: 999999 } },
+    }])
+
+    expect(model.metadata).toBeNull()
+    expect(model.maxOutputTokens).toBe(DISCOVER_ROW.maxOutputTokens)
+  })
+
+  it('rejects fractional token counts instead of silently rounding them down', () => {
+    const [model] = normalizeDiscoveredModels([{
+      ...DISCOVER_ROW,
+      contextWindow: 262144.5,
+      maxOutputTokens: 8192.25,
+      metadata: {
+        ...DISCOVER_METADATA,
+        published: {
+          ...DISCOVER_METADATA.published,
+          contextWindow: 1048576.5,
+          maxOutputTokens: 131072.5,
+          pricing: {
+            ...DISCOVER_METADATA.published.pricing,
+            billingUnit: 1000000.5,
+          },
+        },
+      },
+    }])
+
+    expect(model.contextWindow).toBeNull()
+    expect(model.maxOutputTokens).toBeNull()
+    expect(model.metadata?.published?.contextWindow).toBeNull()
+    expect(model.metadata?.published?.maxOutputTokens).toBeNull()
+    expect(model.metadata?.published?.pricing?.billingUnit).toBeNull()
+  })
+
+  it('accepts only complete catalog freshness objects with UTC ISO timestamps', () => {
+    expect(normalizeCatalogSyncStatus({
+      lastSyncedAt: '2026-08-03T06:00:00.123Z',
+      stale: false,
+    })).toEqual({
+      lastSyncedAt: '2026-08-03T06:00:00.123Z',
+      stale: false,
+    })
+    expect(normalizeCatalogSyncStatus({ lastSyncedAt: null, stale: true })).toEqual({
+      lastSyncedAt: null,
+      stale: true,
+    })
+
+    expect(normalizeCatalogSyncStatus({
+      lastSyncedAt: '2026-08-03T06:00:00Z',
+      stale: 'false',
+    })).toBeNull()
+    expect(normalizeCatalogSyncStatus({
+      lastSyncedAt: '2026-08-03T06:00:00+01:00',
+      stale: false,
+    })).toBeNull()
+    expect(normalizeCatalogSyncStatus({
+      lastSyncedAt: '2026-02-30T06:00:00Z',
+      stale: false,
+    })).toBeNull()
+    expect(normalizeCatalogSyncStatus({ stale: false })).toBeNull()
+  })
+
+  it('stores catalog freshness and sends forceRefresh only for an explicit refresh', async () => {
+    const response = {
+      ...DISCOVER_OK,
+      models: [{ ...DISCOVER_ROW, metadata: DISCOVER_METADATA }],
+      catalog: { lastSyncedAt: '2026-08-03T06:00:00Z', stale: false },
+    }
+    mockRpc({ discover: response })
+    const f = useSetupProviderForm()
+    f.selectProvider('openai')
+
+    await f.discoverModels({ forceRefresh: true })
+
+    expect(callMock).toHaveBeenCalledWith('onboarding.models.discover', {
+      providerId: 'openai',
+      forceRefresh: true,
+    })
+    expect(f.connection.value.catalog).toEqual({
+      lastSyncedAt: '2026-08-03T06:00:00Z',
+      stale: false,
+    })
+    expect(f.connection.value.models[0]?.metadata?.published?.status).toBe('available')
+  })
+})
 
 describe('useSetupProviderForm — connection state machine', () => {
   it('starts unconfigured and moves to unverified when a provider is selected', () => {
@@ -362,6 +593,8 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(f.connection.value.modelSource).toBe('live')
     expect(f.connection.value.models).toHaveLength(1)
     expect(f.connection.value.models[0].id).toBe('test-vendor/test-model')
+    expect(f.connection.value.models[0].metadata).toBeNull()
+    expect(f.connection.value.catalog).toBeNull()
     expect(f.connection.value.discoverError).toBe('')
     expect(callMock).toHaveBeenCalledTimes(2)
   })
@@ -383,6 +616,7 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(callMock).toHaveBeenNthCalledWith(2, 'onboarding.models.discover', {
       providerId: 'openai',
       apiKey: 'sk-unsaved',
+      forceRefresh: true,
     })
   })
 
@@ -404,6 +638,7 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(callMock).toHaveBeenNthCalledWith(2, 'onboarding.models.discover', {
       providerId: 'openai',
       model: 'canonical-fixed-model',
+      forceRefresh: true,
     })
   })
 
@@ -576,6 +811,7 @@ describe('useSetupProviderForm — connection state machine', () => {
     })
     expect(callMock).toHaveBeenNthCalledWith(2, 'onboarding.llmProfile.models.discover', {
       providerId: 'deepseek',
+      forceRefresh: true,
     })
   })
 
@@ -613,7 +849,7 @@ describe('useSetupProviderForm — connection state machine', () => {
     expect(callMock).toHaveBeenNthCalledWith(
       2,
       'onboarding.llmProfile.draft.models.discover',
-      expectedDraft,
+      { ...expectedDraft, forceRefresh: true },
     )
   })
 

@@ -3,6 +3,7 @@ import type { Part } from '@/types/parts'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
+import PlanCard from '@/components/chat/PlanCard.vue'
 import ToolCallTimeline from '@/components/chat/ToolCallTimeline.vue'
 
 /**
@@ -27,6 +28,7 @@ export const partRegistry: Record<Part['type'], Component | null> = {
   artifact: null,
   source: null,
   interrupt: InterruptPart,
+  plan: PlanCard,
 }
 
 /**

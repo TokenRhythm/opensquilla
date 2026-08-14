@@ -142,6 +142,8 @@ export function useDesktopUpdate() {
   }
 }
 
+export type DesktopUpdateController = ReturnType<typeof useDesktopUpdate>
+
 export function stopDesktopUpdateSubscriptionForTests() {
   unsubscribe?.()
   unsubscribe = null

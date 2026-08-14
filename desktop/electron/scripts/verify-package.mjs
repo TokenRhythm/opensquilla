@@ -4,11 +4,19 @@ import { readdir, readFile, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
+import {
+  assertRuntimeSetReady,
+  currentRuntimeTarget,
+  loadRuntimeManifest,
+  packagedRuntimeTarget,
+} from './fetch-bundled-runtimes.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '..', '..')
 const runtimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
+const runtimeDeveloperDir = join(packageRoot, 'runtime', 'developer')
+const runtimeManifestPath = join(packageRoot, 'runtime', 'runtime-manifest.json')
 const sourceMainPath = join(packageRoot, 'src', 'main.ts')
 const compiledMainPath = join(packageRoot, 'dist', 'main.js')
 const packageJsonPath = join(packageRoot, 'package.json')
@@ -221,10 +229,26 @@ function verifyMainProcess(source, label) {
     fail(`${label} main process does not create the desktop window before gateway startup`)
   }
 
-  if (!/app\.on\(['"]activate['"][\s\S]{0,240}openOrResumeDesktopApp/.test(source)) {
+  const activateIndex = source.indexOf('async function activateMainWindow')
+  const activateSource = activateIndex === -1 ? '' : source.slice(activateIndex, activateIndex + 2_400)
+  const activateRoutesToDesktopOpen = activateSource.includes('openOrResumeDesktopApp()')
+  const revealRoutesToDesktopOpen =
+    /function revealDesktopApp\([^)]*\)[^{]*\{[^}]{0,300}activateMainWindow\(/.test(source)
+    && activateRoutesToDesktopOpen
+  const handlerRoutesToDesktopOpen = (handlerPattern) => {
+    const directRoute = new RegExp(
+      `${handlerPattern}[\\s\\S]{0,240}openOrResumeDesktopApp`,
+    ).test(source)
+    const revealRoute = new RegExp(
+      `${handlerPattern}[\\s\\S]{0,240}revealDesktopApp`,
+    ).test(source)
+    return directRoute || (revealRoute && revealRoutesToDesktopOpen)
+  }
+
+  if (!handlerRoutesToDesktopOpen(String.raw`app\.on\(['"]activate['"]`)) {
     fail(`${label} main process activate handler does not route through openOrResumeDesktopApp`)
   }
-  if (!/second-instance[\s\S]{0,240}openOrResumeDesktopApp/.test(source)) {
+  if (!handlerRoutesToDesktopOpen('second-instance')) {
     fail(`${label} main process second-instance handler does not route through openOrResumeDesktopApp`)
   }
 
@@ -286,6 +310,17 @@ async function verifyInstallerDataPolicy() {
   const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf8'))
   if (packageJson.build?.nsis?.deleteAppDataOnUninstall !== false) {
     fail('NSIS uninstall must preserve Desktop profile data (deleteAppDataOnUninstall=false)')
+  }
+  const protocols = packageJson.build?.protocols
+  if (
+    !Array.isArray(protocols)
+    || protocols.length !== 1
+    || protocols[0]?.name !== 'OpenSquilla'
+    || !Array.isArray(protocols[0]?.schemes)
+    || protocols[0].schemes.length !== 1
+    || protocols[0].schemes[0] !== 'opensquilla'
+  ) {
+    fail('electron-builder must register only the opensquilla URL protocol')
   }
 }
 
@@ -366,6 +401,24 @@ async function verifyGeneratedBundle({ label, resourcesDir, platform }) {
     platform,
     executeCommands: platform === process.platform,
   })
+  try {
+    const manifest = await loadRuntimeManifest(
+      join(resourcesDir, 'runtime', 'runtime-manifest.json'),
+    )
+    const target = packagedRuntimeTarget(resourcesDir, platform)
+    if (!(target in manifest.assets)) {
+      fail(`${label} runtime manifest has no target for ${platform}`)
+    } else {
+      await assertRuntimeSetReady({
+        manifest,
+        runtimeRoot: join(resourcesDir, 'runtime', 'developer'),
+        target,
+        executeCommands: platform === process.platform,
+      })
+    }
+  } catch (error) {
+    fail(`${label} bundled runtimes failed verification: ${error instanceof Error ? error.message : String(error)}`)
+  }
 
   const asarPath = join(resourcesDir, 'app.asar')
   if (!existsSync(asarPath)) {
@@ -382,6 +435,16 @@ async function verifyGeneratedBundle({ label, resourcesDir, platform }) {
 }
 
 await verifyRuntime(runtimeGatewayDir, 'source', { platform: process.platform, executeCommands: true })
+try {
+  await assertRuntimeSetReady({
+    manifest: await loadRuntimeManifest(runtimeManifestPath),
+    runtimeRoot: runtimeDeveloperDir,
+    target: currentRuntimeTarget(),
+    executeCommands: true,
+  })
+} catch (error) {
+  fail(`source bundled runtimes failed verification: ${error instanceof Error ? error.message : String(error)}`)
+}
 await verifyInstallerDataPolicy()
 await verifySourceMain()
 await verifyCompiledMain()

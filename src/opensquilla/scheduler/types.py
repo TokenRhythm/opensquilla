@@ -143,6 +143,11 @@ class CronJob:
     creator_session_key: str = ""  # Session key of the caller that created the job
     creator_sender_id: str = ""  # Channel sender id (when created from a channel)
     creator_is_owner: bool = False
+    creator_host_execute: bool = False
+    run_mode: str = ""
+    elevated: str = ""
+    execution_target: str = ""
+    idempotency_key: str = ""
     session_target: SessionTarget = SessionTarget.ISOLATED
     session_key: str = ""
     origin_session_key: str = ""
@@ -159,6 +164,8 @@ class CronJob:
     reservation_source: str = ""
     scheduled_run_at: datetime | None = None
     tool_policy: dict[str, Any] = field(default_factory=dict)
+    # Response-only marker; it is intentionally not persisted.
+    deduplicated: bool = False
 
 
 @dataclass

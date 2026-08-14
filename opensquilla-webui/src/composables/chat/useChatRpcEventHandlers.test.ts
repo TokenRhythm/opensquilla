@@ -1,15 +1,42 @@
 import { describe, expect, it, vi } from 'vitest'
-import { effectScope, ref } from 'vue'
+import { effectScope, nextTick, ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
-import type { ChatMessage, ChatRunStatus, ChatRunStatusSource } from '@/types/chat'
+import type { SessionBootstrapRun } from './useChatSessionBootstrap'
+import type {
+  ChatMessage,
+  ChatPendingItem,
+  ChatRunStatus,
+  ChatRunStatusSource,
+} from '@/types/chat'
+import {
+  FINISHED_STREAM_TASK_ID,
+  PENDING_STREAM_TASK_ID,
+} from '@/utils/chat/streamEvents'
 
 function createHarness(options: {
   messages?: ChatMessage[]
   endStreaming?: (messages: ChatMessage[]) => void
   sessionRunStatus?: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
+  subscribeSession?: () =>
+    | boolean
+    | void
+    | { authoritative: boolean, live: boolean, backgroundOnly: boolean }
+    | Promise<boolean | void | { authoritative: boolean, live: boolean, backgroundOnly: boolean }>
+  onSessionSubscribed?: () => void | Promise<void>
+  handleSessionConnectionState?: (state: string) => SessionBootstrapRun | undefined
+  loadCurrentSessionUsage?: () => void
+  refreshRunModePreference?: () => void | Promise<void>
+  pendingQueue?: ChatPendingItem[]
+  restoreSteerIntoComposer?: (text: string) => void
+  getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
+  observeStreamGeneration?: (payload: unknown) => boolean
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
+  const sessionKey = ref('agent:main:test')
+  const lastStreamSeq = ref(0)
   const activeTaskGroups = ref(new Set<string>())
+  const activeStreamTaskId = ref('')
+  const pendingQueue = ref<ChatPendingItem[]>(options.pendingQueue ?? [])
   const applySessionRunState = vi.fn()
   const stream: ChatRpcStreamApi = {
     isStreaming: ref(true),
@@ -24,9 +51,11 @@ function createHarness(options: {
     appendToolResult: vi.fn(),
     appendArtifact: vi.fn(),
     reconcileFinalText: vi.fn(),
+    resetLiveTurnState: vi.fn(),
     resetStreamIdleTimer: vi.fn(),
     clearStreamIdleTimer: vi.fn(),
     setStreamActivity: vi.fn(),
+    recordCompactionActivity: vi.fn(),
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
@@ -35,17 +64,27 @@ function createHarness(options: {
   const markEnsembleHandoff = vi.fn()
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
+  const showCompactionToast = vi.fn()
   const showWarningToast = vi.fn()
+  const subscribeSession = vi.fn(options.subscribeSession || (() => undefined))
+  const onSessionSubscribed = vi.fn(options.onSessionSubscribed || (() => undefined))
+  const handleSessionConnectionState = vi.fn(
+    options.handleSessionConnectionState ?? (() => undefined),
+  )
+  const loadCurrentSessionUsage = vi.fn(options.loadCurrentSessionUsage ?? (() => {}))
+  const refreshRunModePreference = vi.fn(options.refreshRunModePreference ?? (() => {}))
+  const restoreSteerIntoComposer = vi.fn(options.restoreSteerIntoComposer ?? (() => {}))
   const scope = effectScope()
   const api = scope.run(() => useChatRpcEventHandlers({
-    sessionKey: ref('agent:main:test'),
+    sessionKey,
     currentEpoch: ref(0),
-    lastStreamSeq: ref(0),
+    lastStreamSeq,
+    observeStreamGeneration: options.observeStreamGeneration,
     activeTaskGroups,
-    activeStreamTaskId: ref(''),
+    activeStreamTaskId,
     aborted: ref(false),
     messages,
-    pendingQueue: ref([]),
+    pendingQueue,
     usageAccum: ref({
       input: 0,
       output: 0,
@@ -66,29 +105,563 @@ function createHarness(options: {
     flushPendingRouterDecision: vi.fn(),
     clearPendingRouterDecision: vi.fn(),
     handleRouterControlReplay: vi.fn(),
-    showCompactionToast: vi.fn(),
+    showCompactionToast,
+    getCompactionPlacement: options.getCompactionPlacement,
     showWarningToast,
     scheduleHistorySync,
     schedulePendingDrainAfterTerminal,
     popAllPendingIntoComposer: vi.fn(() => false),
+    restoreSteerIntoComposer,
     saveWidgetState: vi.fn(),
-    subscribeSession: vi.fn(),
+    subscribeSession,
+    onSessionSubscribed,
     loadHistory: vi.fn(),
-    loadCurrentSessionUsage: vi.fn(),
+    handleSessionConnectionState,
+    loadCurrentSessionUsage,
+    refreshRunModePreference,
   }))!
   return {
     api,
     messages,
+    sessionKey,
+    lastStreamSeq,
     stream,
     activeTaskGroups,
+    activeStreamTaskId,
+    pendingQueue,
     applySessionRunState,
     markEnsembleHandoff,
     schedulePendingDrainAfterTerminal,
     scheduleHistorySync,
+    showCompactionToast,
     showWarningToast,
+    subscribeSession,
+    onSessionSubscribed,
+    handleSessionConnectionState,
+    loadCurrentSessionUsage,
+    refreshRunModePreference,
+    restoreSteerIntoComposer,
     stop: () => scope.stop(),
   }
 }
+
+describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it('does not replace live task state for a recents-only session change', () => {
+    const {
+      api,
+      activeStreamTaskId,
+      applySessionRunState,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = 'task-live'
+
+      api.handlers.onSessionsChanged({
+        session_key: 'agent:main:test',
+        reason: 'title_changed',
+      })
+
+      expect(applySessionRunState).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it('rebuilds the unfinished turn while advancing to the authoritative cursor', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stop,
+    } = createHarness()
+    try {
+      lastStreamSeq.value = 900
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 2400,
+        events: [
+          {
+            event: 'session.event.thinking',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'Recovered reasoning',
+              stream_seq: 10,
+            },
+          },
+          {
+            event: 'session.event.tool_use_start',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              id: 'tool-1',
+              name: 'exec',
+              stream_seq: 11,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              text: 'Recovered answer',
+              presentation: 'answer',
+              stream_seq: 12,
+            },
+          },
+        ],
+      })
+
+      expect(stream.resetLiveTurnState).toHaveBeenCalledOnce()
+      expect(api.streamThinkingText.value).toBe('Recovered reasoning')
+      expect(stream.appendToolCall).toHaveBeenCalledWith(expect.objectContaining({
+        id: 'tool-1',
+      }))
+      expect(stream.appendDelta).toHaveBeenCalledWith('Recovered answer', 'answer')
+      expect(activeStreamTaskId.value).toBe('task-live')
+      expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+
+  it('restores an active compaction from the authoritative live snapshot', () => {
+    const {
+      api,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      stream.isStreaming.value = false
+      vi.mocked(stream.startStreaming).mockImplementation(() => {
+        stream.isStreaming.value = true
+      })
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 2400,
+        events: [
+          {
+            event: 'session.event.compaction',
+            payload: {
+              session_key: 'agent:main:test',
+              status: 'started',
+              phase: 'summarizing',
+              compaction_id: 'cmp-live',
+              task_id: 'task-live',
+              sequence: 1,
+              stream_seq: 2399,
+            },
+          },
+        ],
+      })
+
+      expect(showCompactionToast).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: 'started',
+          phase: 'summarizing',
+          compaction_id: 'cmp-live',
+          sequence: 1,
+        }),
+        expect.objectContaining({
+          authoritativeLive: true,
+          placement: 'activity',
+          replayed: false,
+        }),
+      )
+      expect(showCompactionToast.mock.calls[0][0]).not.toHaveProperty('stream_seq')
+      expect(stream.startStreaming).toHaveBeenCalledOnce()
+      expect(stream.recordCompactionActivity).toHaveBeenCalledWith(expect.objectContaining({
+        compaction_id: 'cmp-live',
+      }))
+      expect(lastStreamSeq.value).toBe(2400)
+    } finally {
+      stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers stream generation', () => {
+  it('observes a restarted generation before rejecting its lower sequence', () => {
+    let lastStreamSeqRef = ref(500)
+    const observeStreamGeneration = vi.fn((payload: unknown) => {
+      if ((payload as { stream_generation?: string }).stream_generation === 'new-generation') {
+        lastStreamSeqRef.value = 0
+        return true
+      }
+      return false
+    })
+    const harness = createHarness({ observeStreamGeneration })
+    lastStreamSeqRef = harness.lastStreamSeq
+    harness.lastStreamSeq.value = 500
+    try {
+      harness.api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-new',
+        stream_generation: 'new-generation',
+        stream_seq: 1,
+        text: 'first token after restart',
+      })
+
+      expect(observeStreamGeneration).toHaveBeenCalledOnce()
+      expect(harness.stream.appendDelta).toHaveBeenCalledWith('first token after restart')
+      expect(harness.lastStreamSeq.value).toBe(1)
+    } finally {
+      harness.stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers compaction ownership', () => {
+  it('buffers compaction while task identity is pending and replays only for its owner', () => {
+    const {
+      api,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-owned',
+        stream_seq: 1,
+        status: 'started',
+        source: 'automatic',
+        compaction_id: 'cmp-owned',
+      }, {})
+
+      expect(showCompactionToast).not.toHaveBeenCalled()
+      expect(lastStreamSeq.value).toBe(0)
+
+      api.bindActiveStreamTask('task-owned')
+
+      expect(showCompactionToast).toHaveBeenCalledOnce()
+      expect(stream.recordCompactionActivity).toHaveBeenCalledWith(expect.objectContaining({
+        compaction_id: 'cmp-owned',
+      }))
+      expect(lastStreamSeq.value).toBe(1)
+    } finally {
+      stop()
+    }
+  })
+
+  it('rejects a compaction tagged for another task before consuming its sequence', () => {
+    const {
+      api,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = 'task-current'
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-other',
+        stream_seq: 7,
+        status: 'completed',
+        source: 'automatic',
+        compaction_id: 'cmp-other',
+      }, {})
+
+      expect(showCompactionToast).not.toHaveBeenCalled()
+      expect(stream.recordCompactionActivity).not.toHaveBeenCalled()
+      expect(lastStreamSeq.value).toBe(0)
+    } finally {
+      stop()
+    }
+  })
+
+  it('replays done before higher-sequence maintenance without losing the terminal', () => {
+    const getCompactionPlacement = vi.fn((id: string) => (
+      id === 'cmp-late' ? 'activity' as const : undefined
+    ))
+    const {
+      api,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness({ getCompactionPlacement })
+    try {
+      vi.mocked(stream.endStreaming).mockImplementation(() => {
+        stream.isStreaming.value = false
+      })
+      activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-race',
+        stream_seq: 10,
+        text: 'Finished before late maintenance.',
+      })
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-race',
+        stream_seq: 11,
+        status: 'completed',
+        source: 'automatic',
+        compaction_id: 'cmp-late',
+      }, {})
+
+      api.bindActiveStreamTask('task-race')
+
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+      expect(activeStreamTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+      expect(lastStreamSeq.value).toBe(10)
+      expect(showCompactionToast).toHaveBeenCalledOnce()
+      expect(showCompactionToast).toHaveBeenCalledWith(
+        expect.objectContaining({ compaction_id: 'cmp-late' }),
+        expect.objectContaining({ placement: 'activity' }),
+      )
+      expect(stream.recordCompactionActivity).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it.each(['task.failed', 'task.timeout'])(
+    'schedules queued follow-up delivery after %s settles the active task',
+    (event) => {
+      const {
+        api,
+        activeStreamTaskId,
+        schedulePendingDrainAfterTerminal,
+        stop,
+      } = createHarness({
+        pendingQueue: [{
+          pendingUiId: 'pending-terminal-follow-up',
+          text: 'Follow up',
+          attachments: [],
+          intent: null,
+        }],
+      })
+      try {
+        activeStreamTaskId.value = 'task-failed'
+        api.handlers.onAny(event, {
+          session_key: 'agent:main:test',
+          task_id: 'task-failed',
+          message: 'Provider failed',
+        })
+
+        expect(schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+      } finally {
+        stop()
+      }
+    },
+  )
+
+  it('lets a terminal own a stream sequence shared with an earlier visible frame', () => {
+    const {
+      api,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = PENDING_STREAM_TASK_ID
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-shared-seq',
+        stream_seq: 10,
+        status: 'started',
+        source: 'automatic',
+        compaction_id: 'cmp-shared-seq',
+      }, {})
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-shared-seq',
+        stream_seq: 10,
+        text: 'Done on the shared sequence.',
+      })
+
+      api.bindActiveStreamTask('task-shared-seq')
+
+      expect(showCompactionToast).toHaveBeenCalledOnce()
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+      expect(activeStreamTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+      expect(lastStreamSeq.value).toBe(10)
+    } finally {
+      stop()
+    }
+  })
+
+  it('accepts only tracked terminal compaction after its task has finished', () => {
+    const getCompactionPlacement = vi.fn((id: string) => (
+      id === 'cmp-known' ? 'activity' as const : undefined
+    ))
+    const {
+      api,
+      activeStreamTaskId,
+      lastStreamSeq,
+      stream,
+      showCompactionToast,
+      stop,
+    } = createHarness({ getCompactionPlacement })
+    try {
+      activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+      stream.isStreaming.value = false
+
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-finished',
+        stream_seq: 20,
+        status: 'started',
+        source: 'automatic',
+        compaction_id: 'cmp-known',
+      }, {})
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-finished',
+        stream_seq: 21,
+        status: 'failed',
+        source: 'automatic',
+        compaction_id: 'cmp-known',
+      }, {})
+      api.handlers.onCompaction({
+        session_key: 'agent:main:test',
+        task_id: 'task-finished',
+        stream_seq: 22,
+        status: 'failed',
+        source: 'automatic',
+        compaction_id: 'cmp-unknown',
+      }, {})
+
+      expect(showCompactionToast).toHaveBeenCalledOnce()
+      expect(showCompactionToast).toHaveBeenCalledWith(
+        expect.objectContaining({ compaction_id: 'cmp-known', status: 'failed' }),
+        expect.objectContaining({ placement: 'activity' }),
+      )
+      expect(stream.recordCompactionActivity).not.toHaveBeenCalled()
+      expect(stream.startStreaming).not.toHaveBeenCalled()
+      expect(lastStreamSeq.value).toBe(21)
+      expect(getCompactionPlacement).toHaveBeenCalledWith('cmp-known')
+      expect(getCompactionPlacement).toHaveBeenCalledWith('cmp-unknown')
+    } finally {
+      stop()
+    }
+  })
+
+  it.each([
+    ['completed', 'completed'],
+    ['emergency_ephemeral', 'completed'],
+    ['skipped', 'skipped'],
+    ['stale', 'cancelled'],
+    ['cancelled', 'cancelled'],
+    ['failed', 'failed'],
+    ['error', 'failed'],
+    ['timed_out', 'failed'],
+  ] as const)(
+    'settles the latest committed activity marker for a late %s terminal',
+    (status, expectedState) => {
+      const initialMessages: ChatMessage[] = [
+        {
+          role: 'assistant',
+          text: 'Earlier turn',
+          ts: '2026-08-04T00:00:00.000Z',
+          statusHistory: [{
+            action: 'context_compaction',
+            label: '',
+            at: 1_000,
+            id: 'cmp-committed',
+            category: 'maintenance',
+            state: 'running',
+          }],
+        },
+        {
+          role: 'assistant',
+          text: 'Most recent turn',
+          ts: '2026-08-04T00:01:00.000Z',
+          statusHistory: [{
+            action: 'context_compaction',
+            label: '',
+            at: 2_000,
+            id: 'cmp-committed',
+            category: 'maintenance',
+            state: 'running',
+            detail: 'summarizing',
+          }],
+        },
+      ]
+      const {
+        api,
+        activeStreamTaskId,
+        lastStreamSeq,
+        messages,
+        stream,
+        stop,
+      } = createHarness({
+        messages: initialMessages,
+        getCompactionPlacement: id => id === 'cmp-committed' ? 'activity' : undefined,
+      })
+      try {
+        activeStreamTaskId.value = FINISHED_STREAM_TASK_ID
+        stream.isStreaming.value = false
+
+        api.handlers.onCompaction({
+          session_key: 'agent:main:test',
+          task_id: 'task-finished',
+          stream_seq: 31,
+          status,
+          source: 'automatic',
+          compaction_id: 'cmp-committed',
+        }, { authoritativeLive: true })
+
+        expect(messages.value).toHaveLength(2)
+        expect(messages.value[0]?.statusHistory?.[0]).toMatchObject({
+          at: 1_000,
+          state: 'running',
+        })
+        expect(messages.value[1]?.statusHistory?.[0]).toMatchObject({
+          at: 2_000,
+          state: expectedState,
+          detail: 'summarizing',
+        })
+        expect(stream.startStreaming).not.toHaveBeenCalled()
+        expect(stream.recordCompactionActivity).not.toHaveBeenCalled()
+        expect(lastStreamSeq.value).toBe(31)
+      } finally {
+        stop()
+      }
+    },
+  )
+
+  it('syncs history after an accepted identified manual completion only', () => {
+    const {
+      api,
+      scheduleHistorySync,
+      showCompactionToast,
+      stop,
+    } = createHarness()
+    try {
+      showCompactionToast
+        .mockReturnValueOnce('standalone')
+        .mockReturnValueOnce(false)
+      const payload = {
+        session_key: 'agent:main:test',
+        status: 'completed',
+        source: 'manual',
+        compaction_id: 'cmp-manual',
+      }
+      api.handlers.onCompaction({ ...payload, stream_seq: 1 }, {})
+      api.handlers.onCompaction({ ...payload, stream_seq: 2 }, {})
+
+      expect(scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      stop()
+    }
+  })
+})
 
 describe('useChatRpcEventHandlers durable out-of-band messages', () => {
   it('shows cron results immediately, preserves provenance, and deduplicates replay by id', () => {
@@ -185,7 +758,7 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
   })
 
   it('toasts warnings for five-second host handling while consuming silent warning sequences', () => {
-    const { api, showWarningToast, messages, stop } = createHarness()
+    const { api, showWarningToast, messages, lastStreamSeq, stop } = createHarness()
     try {
       api.handlers.onWarning({
         session_key: 'agent:main:test',
@@ -201,12 +774,316 @@ describe('useChatRpcEventHandlers durable out-of-band messages', () => {
       api.handlers.onWarning({
         session_key: 'agent:main:test',
         stream_seq: 2,
+        code: 'provider_request_message_limit_recovery_success',
+        message: 'Older history was summarized for this provider request; retrying once.',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        message: 'replayed compaction warning',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        code: 'context_auto_compaction_start',
+        message: 'Provider context limit reached; compacting older context before retrying.',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        message: 'replayed automatic compaction start warning',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 4,
+        code: 'context_auto_compaction_retry',
+        message: 'Stable context compacted; retrying the provider request.',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 4,
+        message: 'replayed automatic compaction warning',
+      })
+      api.handlers.onWarning({
+        session_key: 'agent:main:test',
+        stream_seq: 5,
         message: 'Provider is degraded',
       })
 
       expect(showWarningToast).toHaveBeenCalledOnce()
       expect(showWarningToast).toHaveBeenCalledWith('Provider is degraded')
       expect(messages.value).toHaveLength(0)
+      expect(lastStreamSeq.value).toBe(5)
+    } finally {
+      stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers steer disposition', () => {
+  it('does not paint primary send lifecycle events as same-turn steer status', () => {
+    const { api, messages, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'ordinary queued follow-up',
+        ts: 'now',
+        clientId: 'client-send',
+        turnId: 'turn-send',
+      }],
+    })
+
+    try {
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        client_message_id: 'client-send',
+        user_message_id: 'user-send',
+        turn_id: 'turn-send',
+        intent: 'send',
+        disposition: 'applied',
+        revision: 1,
+      })
+
+      expect(messages.value[0]).not.toHaveProperty('inputDisposition')
+      expect(messages.value[0]).not.toHaveProperty('inputDispositionRevision')
+    } finally {
+      stop()
+    }
+  })
+
+  it('moves a promoted adjustment to its explicit new turn and clears its retry lease', () => {
+    const steer: ChatMessage = {
+      role: 'user',
+      text: 'use the new constraint',
+      ts: 'now',
+      turnId: 'turn-old',
+      inputDisposition: 'steering',
+      steerClientRequestId: 'request-1',
+      steerClientMessageId: 'client-1',
+    }
+    const pending: ChatPendingItem = {
+      pendingUiId: 'pending-ui-promoted-adjustment',
+      text: steer.text,
+      attachments: [],
+      intent: null,
+      steerAttempt: {
+        phase: 'acceptance_unknown',
+        request: {
+          key: 'agent:main:test',
+          message: steer.text,
+          expected_turn_id: 'turn-old',
+          client_request_id: 'request-1',
+          client_message_id: 'client-1',
+          surface_id: 'webui',
+        },
+      },
+    }
+    const { api, messages, pendingQueue, scheduleHistorySync, stop } = createHarness({
+      messages: [
+        {
+          role: 'user',
+          text: 'original request',
+          ts: 'before',
+          messageId: 'user-old',
+          turnId: 'turn-old',
+        },
+        steer,
+        {
+          role: 'assistant',
+          text: 'completed old-turn output',
+          ts: 'after',
+          messageId: 'assistant-old',
+          turnId: 'turn-old',
+        },
+        {
+          role: 'router',
+          text: '',
+          ts: 'new',
+          messageId: 'router-new',
+          turnId: 'turn-new',
+        },
+      ],
+      pendingQueue: [pending],
+    })
+
+    try {
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        client_request_id: 'request-1',
+        client_message_id: 'client-1',
+        user_message_id: 'user-1',
+        turn_id: 'turn-old',
+        promoted_turn_id: 'turn-new',
+        promoted_from_turn_id: 'turn-old',
+        disposition: 'promoted',
+        revision: 2,
+      })
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        client_request_id: 'request-1',
+        turn_id: 'turn-old',
+        disposition: 'steering',
+        revision: 1,
+      })
+
+      expect(messages.value.map(message => message.messageId)).toEqual([
+        'user-old',
+        'assistant-old',
+        'user-1',
+        'router-new',
+      ])
+      expect(messages.value[2]).toMatchObject({
+        messageId: 'user-1',
+        turnId: 'turn-new',
+        promotedFromTurnId: 'turn-old',
+        inputDisposition: 'promoted',
+        inputDispositionRevision: 2,
+      })
+      expect(pendingQueue.value).toEqual([])
+      expect(scheduleHistorySync).toHaveBeenCalledOnce()
+    } finally {
+      stop()
+    }
+  })
+
+  it.each([
+    {
+      disposition: 'cancelled' as const,
+      retryable: false,
+      recovery: 'restore_to_composer',
+    },
+    {
+      disposition: 'rejected' as const,
+      retryable: true,
+      recovery: 'resend_after_queue_drains',
+    },
+  ])('restores $disposition steer text once and leaves a muted durable row', ({
+    disposition,
+    retryable,
+    recovery,
+  }) => {
+    const { api, messages, restoreSteerIntoComposer, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'preserve this adjustment',
+        ts: 'now',
+        turnId: 'turn-current',
+        inputDisposition: 'steering',
+        steerClientRequestId: 'request-restore',
+      }],
+    })
+
+    try {
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        client_request_id: 'request-restore',
+        disposition,
+        retryable,
+        recovery,
+        revision: 2,
+      })
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        client_request_id: 'request-restore',
+        disposition,
+        retryable,
+        recovery,
+        revision: 2,
+      })
+
+      expect(messages.value[0]).toMatchObject({
+        inputDisposition: disposition,
+        steerRestored: true,
+      })
+      expect(restoreSteerIntoComposer).toHaveBeenCalledOnce()
+      expect(restoreSteerIntoComposer).toHaveBeenCalledWith('preserve this adjustment')
+    } finally {
+      stop()
+    }
+  })
+
+  it('lets an authoritative applied revision win a local Stop race without restoring text', () => {
+    const { api, messages, restoreSteerIntoComposer, stop } = createHarness({
+      messages: [{
+        role: 'user',
+        text: 'already reached the model',
+        ts: 'now',
+        turnId: 'turn-current',
+        inputDisposition: 'steering',
+        steerStopRequested: true,
+        steerClientRequestId: 'request-applied',
+      }],
+    })
+
+    try {
+      api.handlers.onInputDisposition({
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        client_request_id: 'request-applied',
+        disposition: 'applied',
+        revision: 2,
+        applied_iteration: 2,
+        model_call_id: '2.0',
+      })
+
+      expect(messages.value[0]).toMatchObject({
+        inputDisposition: 'applied',
+        inputDispositionRevision: 2,
+        steerStopRequested: false,
+      })
+      expect(restoreSteerIntoComposer).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it('restores multiple authoritatively cancelled steers in event FIFO order', () => {
+    const { api, restoreSteerIntoComposer, stop } = createHarness({
+      messages: [
+        {
+          role: 'user',
+          text: 'first adjustment',
+          ts: 1,
+          turnId: 'turn-current',
+          inputDisposition: 'steering',
+          steerStopRequested: true,
+          steerClientRequestId: 'request-first',
+        },
+        {
+          role: 'user',
+          text: 'second adjustment',
+          ts: 2,
+          turnId: 'turn-current',
+          inputDisposition: 'steering',
+          steerStopRequested: true,
+          steerClientRequestId: 'request-second',
+        },
+      ],
+    })
+
+    try {
+      for (const [streamSeq, clientRequestId] of [
+        [1, 'request-first'],
+        [2, 'request-second'],
+      ] as const) {
+        api.handlers.onInputDisposition({
+          session_key: 'agent:main:test',
+          stream_seq: streamSeq,
+          client_request_id: clientRequestId,
+          disposition: 'cancelled',
+          revision: 2,
+          recovery: 'restore_to_composer',
+        })
+      }
+
+      expect(restoreSteerIntoComposer.mock.calls).toEqual([
+        ['first adjustment'],
+        ['second adjustment'],
+      ])
     } finally {
       stop()
     }
@@ -377,6 +1254,86 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
     }
   })
 
+  it('honors only the outer suppressed delivery contract and clears stale text', () => {
+    const previous: ChatMessage = { role: 'assistant', text: 'previous', ts: 'before' }
+    const { api, messages, stream, stop } = createHarness({ messages: [previous] })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text_snapshot: 'stale streamed answer',
+        delivery: 'suppressed',
+        suppression_reason: 'no_reply',
+        input_tokens: 10,
+        output_tokens: 1,
+        model: 'z-ai/glm-5.2',
+      })
+
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith('')
+      expect(stream.endStreaming).toHaveBeenLastCalledWith({ suppressed: true })
+      expect(messages.value).toEqual([previous])
+      expect(previous.usage).toBeUndefined()
+
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text_snapshot: 'visible despite diagnostic reason',
+        suppression_reason: 'heartbeat_ack',
+      })
+
+      expect(stream.reconcileFinalText).toHaveBeenLastCalledWith(
+        'visible despite diagnostic reason',
+      )
+      expect(stream.endStreaming).toHaveBeenLastCalledWith(undefined)
+    } finally {
+      stop()
+    }
+  })
+
+  it('attaches suppressed-turn usage only to the preserved tool and artifact row', () => {
+    const previous: ChatMessage = { role: 'assistant', text: 'previous', ts: 'before' }
+    const { api, messages, stream, stop } = createHarness({
+      messages: [previous],
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: '',
+          ts: 'now',
+          tool_calls: [{ type: 'tool_use', name: 'web_search', tool_use_id: 'tool-1' }],
+          artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text_snapshot: '',
+        delivery: 'suppressed',
+        suppression_reason: 'heartbeat_ack',
+        input_tokens: 10,
+        output_tokens: 1,
+        model: 'z-ai/glm-5.2',
+      })
+
+      expect(stream.endStreaming).toHaveBeenLastCalledWith({ suppressed: true })
+      expect(messages.value).toHaveLength(2)
+      expect(messages.value[0]?.usage).toBeUndefined()
+      expect(messages.value[1]).toMatchObject({
+        text: '',
+        model: 'z-ai/glm-5.2',
+        input_tokens: 10,
+        output_tokens: 1,
+        artifacts: [{ id: 'artifact-1', name: 'result.txt' }],
+      })
+      expect(messages.value[1]?.usage).toBeDefined()
+    } finally {
+      stop()
+    }
+  })
+
   it('attaches done usage to the assistant message pushed by endStreaming', () => {
     const previous: ChatMessage = { role: 'assistant', text: 'previous', ts: 'before' }
     const { api, messages, stop } = createHarness({
@@ -390,12 +1347,18 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
       api.handlers.onAny('session.event.done', {
         session_key: 'agent:main:test',
         stream_seq: 1,
+        turn_id: 'goal-turn-1',
         text: 'current',
         input_tokens: 10,
         output_tokens: 1,
         model: 'z-ai/glm-5.2',
+        input_mode: 'system_event',
+        run_kind: 'goal',
         model_usage_breakdown: [{ model: 'z-ai/glm-5.2', role: 'aggregator' }],
         ensemble_trace: { profile: 'default', llm_request_count: 5 },
+        coverage_status: 'usage_unknown',
+        usage_unknown: true,
+        unknown_usage_events: 1,
       })
 
       expect(messages.value[0].usage).toBeUndefined()
@@ -403,11 +1366,220 @@ describe('useChatRpcEventHandlers done usage attachment', () => {
         profile: 'default',
         llm_request_count: 5,
       })
+      expect(messages.value[1].usage).toMatchObject({
+        coverage_status: 'usage_unknown',
+        usage_unknown: true,
+        unknown_usage_events: 1,
+      })
       expect(messages.value[1].model).toBe('z-ai/glm-5.2')
       expect(messages.value[1].input_tokens).toBe(10)
       expect(messages.value[1].output_tokens).toBe(1)
+      expect(messages.value[1].turnId).toBe('goal-turn-1')
+      expect(messages.value[1].turnInputMode).toBe('system_event')
+      expect(messages.value[1].turnRunKind).toBe('goal')
     } finally {
       stop()
+    }
+  })
+
+  it('binds an aborted partial assistant to the terminal task identity', () => {
+    const { api, messages, stream, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'partial answer', ts: 'now' })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        task_id: 'stopped-turn-1',
+        reason: 'aborted',
+        text_snapshot: 'partial answer',
+      })
+
+      expect(stream.endStreaming).toHaveBeenLastCalledWith({ reason: 'aborted' })
+      expect(messages.value[0]).toMatchObject({
+        role: 'assistant',
+        text: 'partial answer',
+        turnId: 'stopped-turn-1',
+      })
+    } finally {
+      stop()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers reasoning timer replay', () => {
+  it('keeps production reasoning text on the shared accumulator publish clock', () => {
+    const { api, stream, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'answer', ts: 'now' })
+      },
+    })
+    stream.useReducer.value = true
+    stream.getThinkingText = vi.fn(() => 'folded reasoning')
+    try {
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'folded ',
+      })
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text: 'reasoning',
+      })
+
+      expect(api.streamThinkingText.value).toBe('')
+      expect(stream.appendFrame).toHaveBeenCalledTimes(2)
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        text: 'answer',
+      })
+      expect(messages.value[0]?.reasoning?.text).toBe('folded reasoning')
+    } finally {
+      stop()
+    }
+  })
+
+  it('keeps elapsed time across A to B to A replay without leaking into B', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(105_000)
+    const { api, sessionKey, lastStreamSeq, stop } = createHarness()
+
+    try {
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'first',
+        started_at: 100_000,
+      })
+      expect(api.streamThinkingElapsedText.value).toBe('5s')
+
+      vi.setSystemTime(108_000)
+      sessionKey.value = 'agent:main:other'
+      lastStreamSeq.value = 0
+      await nextTick()
+      expect(api.streamThinkingText.value).toBe('')
+
+      sessionKey.value = 'agent:main:test'
+      lastStreamSeq.value = 0
+      await nextTick()
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'first',
+        started_at: 100_000,
+      })
+      expect(api.streamThinkingElapsedText.value).toBe('8s')
+
+      vi.setSystemTime(110_000)
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text: ' second',
+        started_at: 109_000,
+      })
+      expect(api.streamThinkingElapsedText.value).toBe('10s')
+    } finally {
+      stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('stops replayed reasoning at the original done emission time', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(120_000)
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'answer', ts: 'now' })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'reasoning',
+        started_at: 100_000,
+      })
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text: 'answer',
+        reasoning_content: 'reasoning',
+        emitted_at: 108_000,
+      })
+
+      expect(messages.value[0].reasoning).toEqual({
+        text: 'reasoning',
+        seconds: 8,
+      })
+    } finally {
+      stop()
+      vi.useRealTimers()
+    }
+  })
+
+  it('falls back to the local clock for legacy, skewed, and invalid start times', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(5_000_000)
+
+    try {
+      for (const startedAt of [
+        undefined,
+        5_006_000,
+        5_000_000 - 60 * 60 * 1_000 - 1,
+        Number.NaN,
+      ]) {
+        const { api, stop } = createHarness()
+        try {
+          api.handlers.onAny('session.event.thinking', {
+            session_key: 'agent:main:test',
+            stream_seq: 1,
+            text: 'reasoning',
+            started_at: startedAt,
+          })
+          expect(api.streamThinkingElapsedText.value).toBe('0s')
+        } finally {
+          stop()
+        }
+      }
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('falls back to local completion time when emitted_at precedes the start', () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(108_000)
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({ role: 'assistant', text: 'answer', ts: 'now' })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        text: 'reasoning',
+        started_at: 100_000,
+      })
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        text: 'answer',
+        reasoning_content: 'reasoning',
+        emitted_at: 99_000,
+      })
+
+      expect(messages.value[0].reasoning?.seconds).toBe(8)
+    } finally {
+      stop()
+      vi.useRealTimers()
     }
   })
 })
@@ -451,6 +1623,37 @@ describe('useChatRpcEventHandlers ensemble handoff', () => {
 })
 
 describe('useChatRpcEventHandlers ensemble activity', () => {
+  it('removes the transient connection-loss row after reconnect', () => {
+    const { api, messages, stop } = createHarness()
+
+    try {
+      api.handlers.onConnectionState('disconnected')
+      expect(messages.value).toEqual([
+        expect.objectContaining({
+          role: 'system',
+          text: 'Connection lost — trying to reconnect…',
+        }),
+      ])
+
+      api.handlers.onConnectionState('connected')
+      expect(messages.value).toEqual([])
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not duplicate the transient row while disconnected', () => {
+    const { api, messages, stop } = createHarness()
+
+    try {
+      api.handlers.onConnectionState('disconnected')
+      api.handlers.onConnectionState('disconnected')
+      expect(messages.value).toHaveLength(1)
+    } finally {
+      stop()
+    }
+  })
+
   it('treats ensemble progress as a hard-idle liveness event', () => {
     const { api, stream, stop } = createHarness()
 
@@ -469,18 +1672,94 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
-  it('maps ensemble heartbeats to neutral proposer and aggregator phase copy', () => {
+  it('treats every run heartbeat as transport liveness without replacing the phase', () => {
     const { api, stream, stop } = createHarness()
 
     try {
       api.handlers.onRunHeartbeat({ stream_seq: 1, phase: 'ensemble_proposers_wait' })
-      expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Generating candidates')
+      api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'channel' })
+      api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'ensemble_aggregator_stream' })
+      api.handlers.onRunHeartbeat({ stream_seq: 4, phase: 'provider_wait' })
 
-      api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'ensemble_aggregator_stream' })
-      expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Synthesizing candidates')
+      expect(stream.setStreamActivity).not.toHaveBeenCalled()
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(4)
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledWith({ progress: false })
+    } finally {
+      stop()
+    }
+  })
 
-      api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'provider_wait' })
-      expect(stream.setStreamActivity).toHaveBeenLastCalledWith('Planning next step')
+  it('maps structured provider activity without rendering provider error text', () => {
+    const { api, stream, stop } = createHarness()
+
+    try {
+      api.handlers.onProviderActivity({
+        stream_seq: 1,
+        schema_version: 1,
+        phase: 'requesting',
+        reason: 'initial',
+        activity_id: 'activity-safe',
+      })
+      api.handlers.onProviderActivity({
+        stream_seq: 2,
+        schema_version: 1,
+        phase: 'reasoning',
+        reason: 'reasoning_only',
+        activity_id: 'activity-safe',
+      })
+      api.handlers.onProviderActivity({
+        stream_seq: 3,
+        schema_version: 1,
+        phase: 'retry_wait',
+        reason: 'rate_limited',
+        retry_after_ms: 8_000,
+        activity_id: 'activity-safe',
+        message: 'secret provider body',
+      } as never)
+      api.handlers.onProviderActivity({
+        stream_seq: 4,
+        schema_version: 1,
+        phase: 'retrying',
+        reason: 'rate_limited',
+        retry_attempt: 2,
+        retry_limit: 3,
+        activity_id: 'activity-safe',
+      })
+      api.handlers.onProviderActivity({
+        stream_seq: 5,
+        schema_version: 1,
+        phase: 'fallback',
+        reason: 'provider_overloaded',
+        activity_id: 'activity-safe',
+      })
+
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        1,
+        'Waiting for model',
+        'provider:requesting',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        2,
+        'Thinking deeply',
+        'provider:reasoning',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        3,
+        'Rate limited · 8s',
+        'provider:rate_limited:8',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        4,
+        'Retrying 2/3',
+        'provider:retrying:2:3',
+      )
+      expect(stream.setStreamActivity).toHaveBeenNthCalledWith(
+        5,
+        'Switching to backup model',
+        'provider:fallback',
+      )
+      expect(JSON.stringify(vi.mocked(stream.setStreamActivity).mock.calls))
+        .not.toContain('secret provider body')
     } finally {
       stop()
     }
@@ -493,8 +1772,118 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       vi.mocked(stream.resetStreamIdleTimer).mockClear()
       api.handlers.onConnectionState('connected')
       expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(1)
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledWith({ progress: false })
     } finally {
       stop()
+    }
+  })
+
+  it('restores durable setup work only after reconnect subscription succeeds', async () => {
+    let resolveSubscription: ((subscribed: boolean) => void) | undefined
+    const subscription = new Promise<boolean>((resolve) => { resolveSubscription = resolve })
+    const { api, subscribeSession, onSessionSubscribed, stop } = createHarness({
+      subscribeSession: () => subscription,
+    })
+
+    try {
+      api.handlers.onConnectionState('connected')
+      expect(subscribeSession).toHaveBeenCalledOnce()
+      expect(onSessionSubscribed).not.toHaveBeenCalled()
+
+      resolveSubscription?.(true)
+      await subscription
+      await Promise.resolve()
+
+      expect(onSessionSubscribed).toHaveBeenCalledOnce()
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not restore durable setup work when reconnect subscription fails', async () => {
+    const { api, onSessionSubscribed, stop } = createHarness({
+      subscribeSession: async () => false,
+    })
+
+    try {
+      api.handlers.onConnectionState('connected')
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(onSessionSubscribed).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it('does not restore durable setup work from a non-authoritative outcome object', async () => {
+    const { api, onSessionSubscribed, stop } = createHarness({
+      subscribeSession: async () => ({
+        authoritative: false,
+        live: false,
+        backgroundOnly: false,
+      }),
+    })
+
+    try {
+      api.handlers.onConnectionState('connected')
+      await Promise.resolve()
+      await Promise.resolve()
+
+      expect(onSessionSubscribed).not.toHaveBeenCalled()
+    } finally {
+      stop()
+    }
+  })
+
+  it('refreshes reconnect metadata once critical requests are queued', async () => {
+    let resolveCriticalRequestsQueued!: () => void
+    let resolveHistory!: () => void
+    let resolveLive!: () => void
+    const criticalRequestsQueued = new Promise<void>(resolve => {
+      resolveCriticalRequestsQueued = resolve
+    })
+    const history = new Promise<{ ok: boolean }>(resolve => {
+      resolveHistory = () => resolve({ ok: true })
+    })
+    const live = new Promise<{
+      authoritative: boolean
+      live: boolean
+      backgroundOnly: boolean
+    }>(resolve => {
+      resolveLive = () => resolve({
+        authoritative: true,
+        live: false,
+        backgroundOnly: false,
+      })
+    })
+    const run: SessionBootstrapRun = {
+      generation: 2,
+      criticalRequestsQueued,
+      history,
+      live,
+    }
+    const harness = createHarness({
+      handleSessionConnectionState: () => run,
+    })
+
+    try {
+      harness.api.handlers.onConnectionState('connected')
+      await Promise.resolve()
+      expect(harness.loadCurrentSessionUsage).not.toHaveBeenCalled()
+      expect(harness.refreshRunModePreference).not.toHaveBeenCalled()
+
+      resolveCriticalRequestsQueued()
+      await vi.waitFor(() => {
+        expect(harness.loadCurrentSessionUsage).toHaveBeenCalledOnce()
+        expect(harness.refreshRunModePreference).toHaveBeenCalledOnce()
+      })
+
+      resolveLive()
+      resolveHistory()
+      await Promise.all([live, history])
+    } finally {
+      harness.stop()
     }
   })
 })

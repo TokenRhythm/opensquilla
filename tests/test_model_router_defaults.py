@@ -402,8 +402,8 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
     assert squilla_router["require_router_runtime"] is True
 
     tiers = squilla_router["tiers"]
-    # TokenRhythm rejects thinking-toggle request fields, so the example
-    # ladder deliberately carries no thinking_level.
+    # The packaged mixed-family ladder preserves provider defaults; explicit
+    # turn-level V4 controls do not become tier-wide settings.
     for name in ("c0", "c1", "c2", "c3", "image_model"):
         assert tiers[name]["provider"] == "tokenrhythm"
         assert "thinking_level" not in tiers[name]

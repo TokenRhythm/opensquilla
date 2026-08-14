@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RouteLocationNormalized } from 'vue-router'
-import i18n from '@/i18n'
+import i18n, { loadLocaleMessages } from '@/i18n'
 import { LAST_ROUTE_KEY } from './lastRoute'
 import { defaultRootRedirect } from './sharedRoutes'
 import { routeTitle, routes } from './index'
@@ -51,6 +51,15 @@ describe('route hubs', () => {
     return route
   }
 
+  it('keeps the same Chat view instance while a draft materializes', () => {
+    const chat = routeAt('/chat')
+    const draft = routeAt('/chat/new')
+
+    expect(draft.component).toBe(chat.component)
+    expect(chat.meta?.viewKey).toBe('chat')
+    expect(draft.meta?.viewKey).toBe('chat')
+  })
+
   it('hosts Skills and Channels in one kept-alive destination', () => {
     const skills = routeAt('/skills')
     const channels = routeAt('/channels')
@@ -80,7 +89,8 @@ describe('route hubs', () => {
     expect(logs.meta?.viewKey).toBeUndefined()
     expect(logs.meta?.keepAlive).toBe(true)
     expect(overview.meta?.titleKey).toBe('nav.status')
-    expect(overview.meta?.navLabelKey).toBe('nav.overview')
+    expect(overview.meta?.navLabelKey).toBeUndefined()
+    expect(usage.meta?.navLabelKey).toBe('nav.viewUsage')
     expect(channels.component).not.toBe(overview.component)
     expect(channels.meta?.viewKey).not.toBe('overview-hub')
   })
@@ -92,5 +102,17 @@ describe('route hubs', () => {
     })
 
     expect(titles).toEqual(['Status', 'Usage', 'Logs'])
+  })
+
+  it('uses the localized task title for the sessions ledger', async () => {
+    await loadLocaleMessages('zh-Hans')
+    i18n.global.locale.value = 'zh-Hans'
+    const sessions = routeAt('/sessions')
+
+    expect(sessions.meta?.titleKey).toBe('sessions.title')
+    expect(routeTitle({
+      name: sessions.name,
+      meta: sessions.meta,
+    } as unknown as RouteLocationNormalized)).toBe('任务')
   })
 })

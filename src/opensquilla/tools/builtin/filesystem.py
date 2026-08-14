@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import csv
+import difflib
 import fnmatch
 import hashlib
 import json
@@ -20,8 +21,14 @@ from typing import Any
 from xml.etree import ElementTree as ET
 
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
+from opensquilla.sandbox.backup_vault import BackupReceiptSummary, summarize_backup_receipts
+from opensquilla.sandbox.destructive_backup import DestructiveBackupGate
 from opensquilla.sandbox.directory_listing import format_directory_entry
-from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
+from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
+    ElevationAction,
+    gate_elevated_action,
+)
 from opensquilla.sandbox.escalation import (
     build_path_approval_params,
     current_tool_mounts,
@@ -29,7 +36,12 @@ from opensquilla.sandbox.escalation import (
     grant_temporary_mount_for_current_tool,
     request_sandbox_approval,
 )
-from opensquilla.sandbox.integration import active_file_system_profile, get_runtime
+from opensquilla.sandbox.file_policy import authority_roots_for_state, decide_file_access
+from opensquilla.sandbox.integration import (
+    active_file_system_profile,
+    active_sandbox_policy,
+    get_runtime,
+)
 from opensquilla.sandbox.operation_runtime import (
     FilesystemOperationRequest,
     SandboxOperation,
@@ -39,9 +51,10 @@ from opensquilla.sandbox.operation_runtime import (
 from opensquilla.sandbox.path_validation import (
     MountDecision,
     decide_path_access,
+    logical_tool_path,
     trusted_write_auto_grant_allowed,
 )
-from opensquilla.sandbox.permissions import FileSystemAccess
+from opensquilla.sandbox.permissions import FileSystemAccess, FileSystemPermissionProfile
 from opensquilla.tools.mutation_receipts import (
     fingerprint_path,
     record_semantic_mutation_receipt,
@@ -61,6 +74,7 @@ from opensquilla.tools.source_edit_contract import (
     source_revision_for_path,
 )
 from opensquilla.tools.types import (
+    PlanAccess,
     RetryableToolInputError,
     SafeToolError,
     ToolError,
@@ -343,7 +357,8 @@ def _resolve_path(path: str) -> Path:
     reject_foreign_host_path(str(path), platform=os.name, workspace=root)
     alias = resolve_workspace_alias(raw, root)
     if alias is not None:
-        return alias
+        assert isinstance(alias, Path)
+        return alias.resolve(strict=False)
     if root is not None and not raw.is_absolute():
         return (root / raw).resolve(strict=False)
     return raw.resolve(strict=False) if raw.is_absolute() else raw
@@ -638,6 +653,23 @@ def _path_access_denied_message(workspace_root: Path | None) -> str:
 
 
 def _path_access_blocked_envelope(decision: MountDecision) -> dict[str, object]:
+    ctx = current_tool_context.get()
+    if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
+        reason = (
+            "GUEST_WRITE_OUTSIDE_DEFAULT_WORKSPACE"
+            if decision.access == "rw"
+            else "GUEST_SENSITIVE_PATH_DENIED"
+        )
+        return {
+            "status": "blocked",
+            "reason": reason,
+            "path": decision.normalized_path,
+            "message": (
+                "Web guest mode can modify only the configured default workspace."
+                if decision.access == "rw"
+                else "Web guest mode cannot read credential or authority data."
+            ),
+        }
     return {
         "status": "blocked",
         "reason": decision.reason,
@@ -667,8 +699,13 @@ def _sandbox_path_access_envelope(
         return None
     if decision.status == "blocked":
         return _path_access_blocked_envelope(decision)
+    ctx = current_tool_context.get()
+    if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
+        return _path_access_blocked_envelope(
+            replace(decision, status="blocked", reason="guest_boundary")
+        )
     if not write and trusted_sandbox_active():
-        # Managed Execution treats local reads as host-readable. Sensitive data
+        # Safe mode treats local reads as host-readable. Sensitive data
         # exfiltration remains blocked at the action/network review boundary.
         return None
     if trusted_sandbox_active() and trusted_write_auto_grant_allowed(
@@ -721,7 +758,7 @@ def _active_filesystem_run_mode() -> str:
     context = current_tool_run_context()
     if context is not None:
         return context.run_mode.value
-    return current_run_mode() or "standard"
+    return current_run_mode() or "safe"
 
 
 async def _run_sandbox_operation_if_required(
@@ -735,12 +772,55 @@ async def _run_sandbox_operation_if_required(
             operation = replace(operation, file_system_profile=profile)
     runtime = get_runtime()
     ctx = current_tool_context.get()
+    if operation.domain == "filesystem" and ctx is not None and ctx.workspace_strict:
+        filesystem_permissions = dict(operation.permissions.filesystem)
+        filesystem_permissions["workspaceStrict"] = True
+        workspace = operation.workspace
+        if workspace is not None and ctx.artifact_session_id:
+            from opensquilla.attachment_workspace import _safe_path_segment
+
+            attachment_base = (
+                workspace.expanduser().resolve(strict=False) / ".opensquilla" / "attachments"
+            )
+            attachment_segment = _safe_path_segment(
+                ctx.artifact_session_id,
+                fallback="session",
+            )
+            filesystem_permissions.update(
+                {
+                    "attachmentBase": str(attachment_base),
+                    "attachmentSessionRoot": str(attachment_base / attachment_segment),
+                }
+            )
+        if ctx.artifact_media_root and ctx.artifact_session_id:
+            from opensquilla.attachment_refs import transcript_material_dir
+
+            media_root = Path(ctx.artifact_media_root).expanduser().resolve(strict=False)
+            filesystem_permissions.update(
+                {
+                    "transcriptBase": str(media_root / "transcripts"),
+                    "transcriptSessionRoot": str(
+                        transcript_material_dir(
+                            media_root,
+                            ctx.artifact_session_id,
+                        ).resolve(strict=False)
+                    ),
+                }
+            )
+        operation = replace(
+            operation,
+            permissions=replace(
+                operation.permissions,
+                filesystem=filesystem_permissions,
+            ),
+        )
     if (
         trusted_sandbox_active()
         and ctx is not None
         and ctx.is_owner
         and runtime is not None
         and isinstance(runtime.backend, UnavailableBackend)
+        and operation.kind not in {"create_source", "edit_source"}
     ):
         return None
     return await SandboxOperationRuntime(
@@ -941,6 +1021,65 @@ def _cross_session_attachment_block(
     }
 
 
+def _cross_session_transcript_material_block(
+    tool_name: str,
+    candidate: Path,
+    original_path: str,
+) -> dict[str, object] | None:
+    """Block the shared transcript store except for the active session."""
+
+    ctx = current_tool_context.get()
+    if (
+        ctx is None
+        or not ctx.workspace_strict
+        or not ctx.artifact_media_root
+        or not ctx.artifact_session_id
+    ):
+        return None
+    transcript_root = (Path(ctx.artifact_media_root).expanduser() / "transcripts").resolve(
+        strict=False
+    )
+    try:
+        candidate.relative_to(transcript_root)
+    except ValueError:
+        return None
+    current_material_root = _strict_read_material_root()
+    if current_material_root is not None:
+        try:
+            candidate.relative_to(current_material_root)
+            return None
+        except ValueError:
+            pass
+    return {
+        "status": "blocked",
+        "reason": "cross_session_transcript_material",
+        "tool": tool_name,
+        "path": original_path,
+        "resolved_path": str(candidate),
+        "message": (
+            f"{tool_name} blocked: {candidate} is outside this session's "
+            "session-scoped transcript materials."
+        ),
+        "retryable": False,
+    }
+
+
+def _cross_session_read_block(
+    tool_name: str,
+    candidate: Path,
+    original_path: str,
+) -> dict[str, object] | None:
+    return _cross_session_attachment_block(
+        tool_name,
+        candidate,
+        original_path,
+    ) or _cross_session_transcript_material_block(
+        tool_name,
+        candidate,
+        original_path,
+    )
+
+
 def _workspace_strict_read_block(
     tool_name: str,
     resolved: Path,
@@ -948,10 +1087,25 @@ def _workspace_strict_read_block(
 ) -> dict[str, object] | None:
     """Return a block envelope when *resolved* escapes the strict workspace."""
 
+    candidate = resolved.expanduser().resolve(strict=False)
+    profile = active_file_system_profile(_workspace_root())
+    ctx = current_tool_context.get()
+    authenticated_safe_read = bool(
+        trusted_sandbox_active()
+        and ctx is not None
+        and not ctx.guest_safe
+    )
+    if (
+        authenticated_safe_read
+        and profile is not None
+        and not profile.is_explicitly_denied(candidate)
+    ):
+        return _cross_session_read_block(tool_name, candidate, original_path)
+    if profile is not None and profile.resolve(candidate) is not FileSystemAccess.DENY:
+        return _cross_session_read_block(tool_name, candidate, original_path)
     roots = _strict_read_roots()
     if not roots:
         return None
-    candidate = resolved.expanduser().resolve(strict=False)
     if not _is_within_any_root(candidate, roots):
         root_labels = ", ".join(str(root) for root in roots)
         return {
@@ -967,7 +1121,7 @@ def _workspace_strict_read_block(
             ),
             "retryable": False,
         }
-    return _cross_session_attachment_block(tool_name, candidate, original_path)
+    return _cross_session_read_block(tool_name, candidate, original_path)
 
 
 def _gate_workspace_strict_read(tool_name: str, resolved: Path, original_path: str) -> None:
@@ -1001,11 +1155,35 @@ def _workspace_strict_candidate_marker(
         if resolved_candidate is not None
         else candidate.expanduser().resolve(strict=False)
     )
+    profile = active_file_system_profile(_workspace_root())
+    ctx = current_tool_context.get()
+    if (
+        trusted_sandbox_active()
+        and ctx is not None
+        and not ctx.guest_safe
+        and profile is not None
+        and not profile.is_explicitly_denied(resolved)
+    ):
+        if _cross_session_read_block(
+            tool_name,
+            resolved,
+            original_path or str(candidate),
+        ):
+            return f"[blocked] {candidate}: another session's private material"
+        return None
+    if profile is not None and profile.resolve(resolved) is not FileSystemAccess.DENY:
+        if _cross_session_read_block(
+            tool_name,
+            resolved,
+            original_path or str(candidate),
+        ):
+            return f"[blocked] {candidate}: another session's private material"
+        return None
     if not _is_within_any_root(resolved, roots):
         root_labels = ", ".join(str(root) for root in roots)
         return f"[blocked] {candidate}: outside active read roots ({root_labels})"
-    if _cross_session_attachment_block(tool_name, resolved, original_path or str(candidate)):
-        return f"[blocked] {candidate}: another session's materialized attachments"
+    if _cross_session_read_block(tool_name, resolved, original_path or str(candidate)):
+        return f"[blocked] {candidate}: another session's private material"
     return None
 
 
@@ -1100,10 +1278,10 @@ async def _gate_out_of_workspace_write(
     justification: str = "",
     content_digest: str | None = None,
     prefix_rule: list[str] | None = None,
-) -> tuple[dict[str, object] | None, bool]:
-    """Return ``(block, elevated)`` after hard policy and exact-action gating."""
+) -> tuple[dict[str, object] | None, bool, tuple[BackupReceiptSummary, ...]]:
+    """Return ``(block, elevated, backups)`` after exact-action gating."""
     if full_host_access_active():
-        return None, False
+        return None, False, ()
 
     # Sensitive-path hard block — takes precedence over approval flow.
     from opensquilla.sandbox.sensitive_paths import build_block_envelope, sensitive_path_marker
@@ -1116,6 +1294,7 @@ async def _gate_out_of_workspace_write(
                     f"{tool_name} {original_path}", sensitive, tool_name=tool_name
                 ),
                 False,
+                (),
             )
 
     _gate_workspace_lockdown_write(tool_name, resolved, original_path)
@@ -1144,19 +1323,41 @@ async def _gate_out_of_workspace_write(
                 "reason": "invalid_sandbox_permissions",
             },
             False,
+            (),
         )
 
     if _sandbox_path_access_enabled():
+        safe_policy_gate = await _gate_safe_policy_file_mutation(
+            tool_name,
+            resolved,
+            original_path,
+            approval_id,
+            justification=justification,
+            content_digest=content_digest,
+            prefix_rule=prefix_rule,
+        )
+        if safe_policy_gate is not None:
+            return safe_policy_gate
         decision = decide_path_access(
             resolved,
             workspace=_workspace_root(),
             mounts=_active_sandbox_mounts(),
             write=True,
             profile=active_file_system_profile(_workspace_root()),
+            logical_path=original_path,
         )
         if decision.status == "blocked":
-            return _path_access_blocked_envelope(decision), False
+            return _path_access_blocked_envelope(decision), False, ()
         if decision.status == "request":
+            ctx = current_tool_context.get()
+            if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
+                return (
+                    _path_access_blocked_envelope(
+                        replace(decision, status="blocked", reason="guest_boundary")
+                    ),
+                    False,
+                    (),
+                )
             if sandbox_permissions == "use_default":
                 return (
                     {
@@ -1172,17 +1373,17 @@ async def _gate_out_of_workspace_write(
                         ),
                     },
                     False,
+                    (),
                 )
             if not justification.strip():
                 return (
                     {
                         "status": "elevation_required",
                         "reason": "justification_required",
-                        "message": (
-                            "A precise justification is required for elevated execution."
-                        ),
+                        "message": ("A precise justification is required for elevated execution."),
                     },
                     False,
+                    (),
                 )
             action_kinds = {
                 "write_file": "fs.write",
@@ -1199,26 +1400,191 @@ async def _gate_out_of_workspace_write(
                 target_paths=((str(resolved), "write"),),
                 content_digest=content_digest,
                 prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+                display=ApprovalDisplay(
+                    kind="modify" if resolved.exists() or resolved.is_symlink() else "create",
+                    target=str(resolved),
+                ),
             )
             ctx = current_tool_context.get()
+            if resolved.exists() or resolved.is_symlink():
+                config = getattr(ctx, "sandbox_gateway_config", None) if ctx else None
+                destructive = await DestructiveBackupGate().evaluate(
+                    action,
+                    approval_id=approval_id,
+                    targets=(resolved,),
+                    policy=active_sandbox_policy(),
+                    state_dir=str(getattr(config, "state_dir", "") or ""),
+                    session_key=ctx.session_key if ctx is not None else None,
+                )
+                if not destructive.allowed:
+                    return destructive.envelope, False, ()
+                return None, True, summarize_backup_receipts(destructive.receipts)
             gate = gate_elevated_action(
                 action,
                 approval_id=approval_id,
                 session_key=ctx.session_key if ctx is not None else None,
             )
             if not gate.allowed:
-                return gate.to_envelope(), False
-            return None, True
+                return gate.to_envelope(), False, ()
+            return None, True, ()
 
     if not _is_outside_workspace(resolved):
-        return None, False
+        return None, False, ()
     if _is_inside_scratch(resolved):
-        return None, False
+        return None, False, ()
     if _memory_source_rel_path(resolved) is not None:
-        return None, False
+        return None, False, ()
     if _active_sandbox_mount_allows(resolved, write=True):
-        return None, False
-    return _outside_workspace_write_block(tool_name, resolved, original_path), False
+        return None, False, ()
+    return _outside_workspace_write_block(tool_name, resolved, original_path), False, ()
+
+
+async def _gate_safe_policy_file_mutation(
+    tool_name: str,
+    resolved: Path,
+    original_path: str,
+    approval_id: str | None,
+    *,
+    justification: str,
+    content_digest: str | None,
+    prefix_rule: list[str] | None,
+) -> tuple[
+    dict[str, object] | None,
+    bool,
+    tuple[BackupReceiptSummary, ...],
+] | None:
+    """Gate one exact structured mutation against the pinned Safe file policy.
+
+    A protected user path can be approved because the structured filesystem
+    tool performs only the fingerprinted operation.  This does not grant an
+    arbitrary shell process unsandboxed access.  OpenSquilla authority paths
+    remain non-overridable.
+    """
+
+    ctx = current_tool_context.get()
+    config = getattr(ctx, "sandbox_gateway_config", None) if ctx is not None else None
+    state_dir = str(getattr(config, "state_dir", "") or "").strip()
+    authority_roots = authority_roots_for_state(state_dir) if state_dir else ()
+    decision = decide_file_access(
+        "write",
+        resolved,
+        active_sandbox_policy(),
+        authority_roots=authority_roots,
+    )
+    if decision.allowed:
+        return None
+    if not decision.approval_required:
+        return (
+            {
+                "status": "blocked",
+                "reason": decision.code or "sandbox_file_mutation_denied",
+                "path": str(resolved),
+                "matched_path": (
+                    str(decision.matched_path) if decision.matched_path is not None else None
+                ),
+            },
+            False,
+            (),
+        )
+    if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
+        return (
+            {
+                "status": "blocked",
+                "reason": "guest_safe_protected_mutation_forbidden",
+                "path": str(resolved),
+                "message": (
+                    "Authentication is required before a protected-path mutation "
+                    "can be submitted for approval."
+                ),
+            },
+            False,
+            (),
+        )
+
+    action_kinds = {
+        "write_file": "fs.write",
+        "edit_file": "fs.edit",
+        "edit_source": "fs.edit_source",
+        "create_source": "fs.create_source",
+    }
+    action = ElevationAction(
+        tool_name=tool_name,
+        action_kind=action_kinds.get(tool_name, "fs.write"),
+        argv=(tool_name, str(resolved)),
+        cwd=str(_workspace_root() or Path.cwd()),
+        sandbox_permissions="require_escalated",
+        justification=(
+            justification.strip()
+            or f"Modify the exact Safe-mode protected path: {original_path}"
+        ),
+        target_paths=((str(resolved), "write"),),
+        content_digest=content_digest,
+        risk_markers=("safe_policy_protected_path",),
+        prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+        display=ApprovalDisplay(
+            kind="modify" if resolved.exists() or resolved.is_symlink() else "create",
+            target=str(resolved),
+        ),
+    )
+    if resolved.exists() or resolved.is_symlink():
+        destructive = await DestructiveBackupGate().evaluate(
+            action,
+            approval_id=approval_id,
+            targets=(resolved,),
+            policy=active_sandbox_policy(),
+            state_dir=state_dir,
+            session_key=ctx.session_key if ctx is not None else None,
+        )
+        if not destructive.allowed:
+            envelope = destructive.envelope or {
+                "status": "blocked",
+                "reason": "destructive_backup_gate_failed",
+            }
+            envelope.update(
+                {
+                    "reason": decision.code
+                    or "sensitive_file_mutation_requires_approval",
+                    "path": str(resolved),
+                    "matched_path": (
+                        str(decision.matched_path)
+                        if decision.matched_path is not None
+                        else None
+                    ),
+                }
+            )
+            return envelope, False, ()
+        return None, True, summarize_backup_receipts(destructive.receipts)
+    gate = gate_elevated_action(
+        action,
+        approval_id=approval_id,
+        session_key=ctx.session_key if ctx is not None else None,
+        file_system_profile=FileSystemPermissionProfile.full_access(),
+    )
+    if not gate.allowed:
+        envelope = gate.to_envelope()
+        envelope.update(
+            {
+                "reason": decision.code or "sensitive_file_mutation_requires_approval",
+                "path": str(resolved),
+                "matched_path": (
+                    str(decision.matched_path) if decision.matched_path is not None else None
+                ),
+            }
+        )
+        return envelope, False, ()
+    return None, True, ()
+
+
+def _backup_receipt_note(
+    summaries: tuple[BackupReceiptSummary, ...],
+) -> str:
+    if not summaries:
+        return ""
+    return "\n" + json.dumps(
+        {"recoverableBackups": list(summaries)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 @tool(
@@ -1239,6 +1605,7 @@ async def _gate_out_of_workspace_write(
         "limit": {"type": "integer", "description": "Maximum number of lines to read."},
     },
     required=["path"],
+    plan_access=PlanAccess.READ_ONLY,
     sandbox=SandboxToolDescriptor.filesystem(
         kind="read_file",
         argv_factory=lambda a: ("read_file", str(a.get("path", ""))),
@@ -1340,6 +1707,7 @@ async def read_file(path: str, offset: int | None = None, limit: int | None = No
     },
     required=["path"],
     exposed_by_default=False,
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def read_source(path: str, start_line: int = 1, end_line: int | None = None) -> str:
     p = _resolve_path(path)
@@ -1354,7 +1722,6 @@ async def read_source(path: str, start_line: int = 1, end_line: int | None = Non
         raise FileNotFoundError(f"File not found: {path}")
     if not p.is_file():
         raise IsADirectoryError(f"Path is a directory: {path}")
-
     loop = asyncio.get_event_loop()
     sample: bytes = await loop.run_in_executor(None, _read_binary_sample, p)
     if sample:
@@ -1407,6 +1774,7 @@ async def read_source(path: str, start_line: int = 1, end_line: int | None = Non
         },
     },
     required=["path"],
+    plan_access=PlanAccess.READ_ONLY,
     sandbox=SandboxToolDescriptor.filesystem(
         kind="read_spreadsheet",
         argv_factory=lambda a: ("read_spreadsheet", str(a.get("path", ""))),
@@ -1685,7 +2053,7 @@ async def write_file(
         _notify_bootstrap_source_write(p)
         return f"Written {len(content)} bytes to {p}"
 
-    approval, elevated = await _gate_out_of_workspace_write(
+    approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
         "write_file",
         p,
         path,
@@ -1734,7 +2102,9 @@ async def write_file(
             record_scratch_file_write(p)
             _notify_memory_source_write(p)
             _notify_bootstrap_source_write(p)
-            return str(getattr(sandbox_result, "message"))
+            return str(getattr(sandbox_result, "message")) + _backup_receipt_note(
+                backup_summaries
+            )
 
     def _write() -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1756,7 +2126,10 @@ async def write_file(
     record_scratch_file_write(p)
     _notify_memory_source_write(p)
     _notify_bootstrap_source_write(p)
-    return f"Written {len(content)} bytes to {p}{_write_scope_suffix(p)}"
+    return (
+        f"Written {len(content)} bytes to {p}{_write_scope_suffix(p)}"
+        f"{_backup_receipt_note(backup_summaries)}"
+    )
 
 
 def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
@@ -1766,9 +2139,7 @@ def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
     scratch = Path(ctx.scratch_dir).expanduser().resolve(strict=False)
     raw = Path(path).expanduser()
     resolved = (
-        raw.resolve(strict=False)
-        if raw.is_absolute()
-        else (scratch / raw).resolve(strict=False)
+        raw.resolve(strict=False) if raw.is_absolute() else (scratch / raw).resolve(strict=False)
     )
     try:
         relative_path = resolved.relative_to(scratch).as_posix()
@@ -1778,6 +2149,25 @@ def _resolve_scratch_write_path(path: str) -> tuple[Path, str]:
         ) from exc
     if not relative_path or relative_path == ".":
         raise ToolError("write_scratch requires a file path inside the scratch directory.")
+    if ctx.workspace_dir:
+        workspace = Path(ctx.workspace_dir).expanduser().resolve(strict=False)
+        try:
+            resolved.relative_to(workspace)
+        except ValueError:
+            pass
+        else:
+            try:
+                scratch_relative = scratch.relative_to(workspace)
+            except ValueError as exc:
+                raise ToolError(
+                    "write_scratch refused a workspace target because scratch_dir "
+                    "contains the active workspace."
+                ) from exc
+            if not scratch_relative.parts:
+                raise ToolError(
+                    "write_scratch refused a workspace target because scratch_dir "
+                    "equals the active workspace."
+                )
     return resolved, relative_path
 
 
@@ -1875,28 +2265,101 @@ async def create_source(path: str, content: str, approval_id: str | None = None)
     blocked = _sensitive_access_block("create_source", p, path)
     if blocked is not None:
         return json.dumps(blocked)
+    if not full_host_access_active():
+        profile = active_file_system_profile(_workspace_root())
+        decision = (
+            decide_path_access(
+                p,
+                workspace=_workspace_root(),
+                mounts=_active_sandbox_mounts(),
+                write=True,
+                profile=profile,
+                logical_path=path,
+            )
+            if profile is not None
+            else None
+        )
+        if decision is not None and decision.status != "allowed":
+            blocked_envelope = _path_access_blocked_envelope(decision)
+            blocked_envelope["message"] = (
+                "create_source cannot write a non-writable workspace carveout. "
+                "Use Full Host Access only when the user explicitly requests "
+                "that exact protected change."
+            )
+            return json.dumps(blocked_envelope)
     _gate_workspace_lockdown_write("create_source", p, path)
     workspace = _workspace_root()
     if workspace is None:
         raise ToolError("create_source requires an active workspace_dir.")
     if _is_outside_workspace(p):
-        raise WorkspaceAccessError(
-            f"create_source only writes inside the active workspace: {path}"
-        )
+        raise WorkspaceAccessError(f"create_source only writes inside the active workspace: {path}")
     if _is_under_configured_scratch_dir(p):
         raise ToolError("create_source refused a scratch path; use write_scratch instead.")
+    sandbox_result = await _run_sandbox_operation_if_required(
+        SandboxOperation.filesystem(
+            kind="create_source",
+            workspace=workspace,
+            run_mode=_active_filesystem_run_mode(),
+            path=p,
+            logical_path=Path(logical_tool_path(path, base=workspace)),
+            paths=(p,),
+            content=content,
+        )
+    )
+    if sandbox_result is not None:
+        metadata = getattr(sandbox_result, "metadata", {})
+        after_revision = metadata.get("afterRevision")
+        before_fingerprint = metadata.get("beforeFingerprint")
+        after_fingerprint = metadata.get("afterFingerprint")
+        if (
+            not isinstance(after_revision, str)
+            or not isinstance(before_fingerprint, dict)
+            or not isinstance(after_fingerprint, dict)
+        ):
+            raise ToolError("create_source worker returned an invalid revision receipt.")
+        display_path = _workspace_display_path(p, path)
+        receipt = record_semantic_mutation_receipt(
+            tool_name="create_source",
+            path=p,
+            operation="create_source",
+            before=before_fingerprint,
+            after=after_fingerprint,
+            partial=False,
+            metadata={
+                "after_revision": after_revision,
+                "created": True,
+                "contract": "source_create_v1",
+            },
+        )
+        workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
+        record_workspace_file_write(p, operation="create_source", created=True)
+        refresh_workspace_file_read_state(p, operation="create_source")
+        _notify_memory_source_write(p)
+        _notify_bootstrap_source_write(p)
+        return json.dumps(
+            {
+                "status": "created",
+                "path": display_path,
+                "changed": True,
+                "after_revision": after_revision,
+                "workspace_epoch": workspace_epoch,
+                "diff_summary": build_diff_summary("", content, path=display_path),
+            },
+            ensure_ascii=False,
+        )
+
     if p.exists():
         raise RetryableToolInputError(
             f"create_source refused because the file already exists: {path}. "
             "Use read_source/edit_source for existing files."
         )
-
     loop = asyncio.get_event_loop()
     before_fingerprint = fingerprint_path(p)
 
     def _write() -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        with p.open("x", encoding="utf-8") as handle:
+            handle.write(content)
 
     await loop.run_in_executor(None, _write)
     after_fingerprint = fingerprint_path(p)
@@ -2001,11 +2464,7 @@ def _tool_visible_in_current_context(name: str) -> bool:
 
 
 def _existing_file_edit_alternatives() -> list[str]:
-    return [
-        name
-        for name in ("edit_file", "apply_patch")
-        if _tool_visible_in_current_context(name)
-    ]
+    return [name for name in ("edit_file", "apply_patch") if _tool_visible_in_current_context(name)]
 
 
 def _edit_file_retry_guidance(*, duplicate_match: bool = False) -> str:
@@ -2133,16 +2592,13 @@ async def edit_file(
 
     edit_digest = hashlib.sha256(
         json.dumps(
-            [
-                {"old_text": item.old_text, "new_text": item.new_text}
-                for item in replacements
-            ],
+            [{"old_text": item.old_text, "new_text": item.new_text} for item in replacements],
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    approval, elevated = await _gate_out_of_workspace_write(
+    approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
         "edit_file",
         p,
         path,
@@ -2188,7 +2644,9 @@ async def edit_file(
                 record_scratch_file_write(p)
                 _notify_memory_source_write(p)
                 _notify_bootstrap_source_write(p)
-                return str(getattr(sandbox_result, "message"))
+                return str(getattr(sandbox_result, "message")) + _backup_receipt_note(
+                    backup_summaries
+                )
         elif _sandbox_path_access_enabled() and not elevated:
             raise RetryableToolInputError(
                 "edit_file accepts only one replacement per call when edits are "
@@ -2228,8 +2686,12 @@ async def edit_file(
         return (
             f"Edited {p}: replaced {len(replacement.old_text)} chars with "
             f"{len(replacement.new_text)} chars{_write_scope_suffix(p)}"
+            f"{_backup_receipt_note(backup_summaries)}"
         )
-    return f"Edited {p}: applied {len(replacements)} replacements{_write_scope_suffix(p)}"
+    return (
+        f"Edited {p}: applied {len(replacements)} replacements{_write_scope_suffix(p)}"
+        f"{_backup_receipt_note(backup_summaries)}"
+    )
 
 
 @tool(
@@ -2323,7 +2785,7 @@ async def edit_source(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
-    approval, _elevated = await _gate_out_of_workspace_write(
+    approval, elevated, backup_summaries = await _gate_out_of_workspace_write(
         "edit_source",
         p,
         path,
@@ -2335,10 +2797,95 @@ async def edit_source(
     )
     if approval is not None:
         return json.dumps(approval)
+    display_path = _workspace_display_path(p, path)
+    workspace = _filesystem_operation_workspace()
+    if workspace is not None:
+        sandbox_result = await _run_sandbox_operation_if_required(
+            SandboxOperation.filesystem(
+                kind="edit_source",
+                workspace=workspace,
+                run_mode=_active_filesystem_run_mode(),
+                path=p,
+                logical_path=Path(logical_tool_path(path, base=workspace)),
+                paths=(p,),
+                expected_revision=expected_revision,
+                edits=tuple(edits),
+            ),
+            host_execution_active=elevated,
+        )
+        if sandbox_result is not None:
+            metadata = getattr(sandbox_result, "metadata", {})
+            status = metadata.get("status")
+            if status == "revision_conflict":
+                current_revision = metadata.get("beforeRevision")
+                raise RetryableToolInputError(
+                    "revision_conflict: edit_source expected "
+                    f"{expected_revision}, but current revision is {current_revision}. "
+                    "Call read_source for the current file range and retry with the new revision."
+                )
+            if status == "contract_error":
+                raise RetryableToolInputError(str(getattr(sandbox_result, "message", "")))
+            original_result = metadata.get("original")
+            updated_result = metadata.get("updated")
+            before_revision_result = metadata.get("beforeRevision")
+            after_revision_result = metadata.get("afterRevision")
+            before_fingerprint = metadata.get("beforeFingerprint")
+            after_fingerprint = metadata.get("afterFingerprint")
+            if (
+                status != "applied"
+                or not isinstance(original_result, str)
+                or not isinstance(updated_result, str)
+                or not isinstance(before_revision_result, str)
+                or not isinstance(after_revision_result, str)
+                or not isinstance(before_fingerprint, dict)
+                or not isinstance(after_fingerprint, dict)
+            ):
+                raise ToolError("edit_source worker returned an invalid revision receipt.")
+            original = original_result
+            updated = updated_result
+            before_revision = before_revision_result
+            after_revision = after_revision_result
+            receipt = record_semantic_mutation_receipt(
+                tool_name="edit_source",
+                path=p,
+                operation="edit_source",
+                before=before_fingerprint,
+                after=after_fingerprint,
+                partial=False,
+                metadata={
+                    "before_revision": before_revision,
+                    "after_revision": after_revision,
+                    "edit_count": len(edits),
+                    "contract": "source_revision_line_edit_v1",
+                },
+            )
+            workspace_epoch = receipt["workspace_epoch"] if receipt is not None else None
+            if updated != original:
+                record_workspace_file_write(p, operation="edit_source", created=False)
+                refresh_workspace_file_read_state(p, operation="edit_source")
+                record_scratch_file_write(p)
+                _notify_memory_source_write(p)
+                _notify_bootstrap_source_write(p)
+            return json.dumps(
+                {
+                    "status": "applied",
+                    "path": display_path,
+                    "changed": updated != original,
+                    "before_revision": before_revision,
+                    "after_revision": after_revision,
+                    "workspace_epoch": workspace_epoch,
+                    "diff_summary": build_diff_summary(original, updated, path=display_path),
+                    "recoverableBackups": list(backup_summaries),
+                },
+                ensure_ascii=False,
+            )
+
     if not p.exists():
         raise FileNotFoundError(f"File not found: {path}")
     if not p.is_file():
         raise IsADirectoryError(f"Path is a directory: {path}")
+    if _is_under_configured_scratch_dir(p):
+        raise ToolError("edit_source refused a scratch path; use edit_file instead.")
 
     loop = asyncio.get_event_loop()
     try:
@@ -2360,7 +2907,6 @@ async def edit_source(
         raise RetryableToolInputError(str(exc)) from exc
 
     before_fingerprint = fingerprint_path(p)
-    display_path = _workspace_display_path(p, path)
     if updated != original:
 
         def _write() -> None:
@@ -2401,6 +2947,7 @@ async def edit_source(
         "after_revision": after_revision,
         "workspace_epoch": workspace_epoch,
         "diff_summary": build_diff_summary(original, updated, path=display_path),
+        "recoverableBackups": list(backup_summaries),
     }
     return json.dumps(result, ensure_ascii=False)
 
@@ -2500,6 +3047,11 @@ def _normalize_edit_replacements(
                 f"edit_file {replacement.label} must not be empty. "
                 "Retry with exact non-empty text from the file."
             )
+        if replacement.old_text == replacement.new_text:
+            raise RetryableToolInputError(
+                f"edit_file {replacement.label} is unchanged: old_text and new_text are "
+                "identical, so the edit would do nothing. Retry with the intended new_text."
+            )
     return replacements
 
 
@@ -2519,11 +3071,22 @@ def _apply_edit_replacements(
                 path=path,
             )
             if recovered is None:
+                hint = _edit_file_closest_lines_hint(replacement.old_text, original)
+                if hint:
+                    _record_edit_recovery_event(
+                        name="edit_file.no_match_hint",
+                        path=path,
+                        replacement=replacement,
+                        outcome="hint",
+                        reason="closest_lines",
+                        matches=hint.count("\n---\n") + 1,
+                    )
                 raise RetryableToolInputError(
                     f"edit_file could not find {replacement.label} in {path}. "
                     "Read the current file content, then retry with exact text from that file. "
                     "Do not include read_file line-number prefixes like '12\\t', "
                     f"{_edit_file_retry_guidance()}"
+                    f"{hint}"
                 )
             start, end, replacement_text = recovered
             spans.append((start, end, replacement_text, replacement))
@@ -2557,6 +3120,31 @@ def _apply_edit_replacements(
     return "".join(chunks)
 
 
+_READ_FILE_LINE_PREFIX_RE = re.compile(r"^\s*\d+\t")
+
+
+def _strip_read_file_line_prefixes(value: str) -> str:
+    """Strip ``{lineno}\\t`` prefixes left when read_file output is pasted as old_text.
+
+    read_file renders lines as ``{lineno}\\t{line}``; models frequently copy that
+    rendered block straight into edit_file.old_text, which then fails to match the
+    real source. Only strip when *every* non-empty line carries the prefix, so
+    ordinary source that merely starts a line with a number+tab is never mangled.
+    """
+    lines = value.split("\n")
+    non_empty = 0
+    prefixed = 0
+    for line in lines:
+        if line == "":
+            continue
+        non_empty += 1
+        if _READ_FILE_LINE_PREFIX_RE.match(line):
+            prefixed += 1
+    if non_empty == 0 or prefixed != non_empty:
+        return value
+    return "\n".join(_READ_FILE_LINE_PREFIX_RE.sub("", line) for line in lines)
+
+
 def _recover_edit_replacement(
     original: str,
     replacement: _EditReplacement,
@@ -2575,21 +3163,26 @@ def _recover_edit_replacement(
         )
         return None
 
-    candidates = [replacement.old_text]
+    candidates: list[tuple[str, str]] = [("original", replacement.old_text)]
     unescaped = _unescape_edit_search_text(replacement.old_text)
     if unescaped != replacement.old_text:
-        candidates.append(unescaped)
+        candidates.append(("unescape", unescaped))
+    line_prefix_stripped = _strip_read_file_line_prefixes(replacement.old_text)
+    if line_prefix_stripped != replacement.old_text:
+        candidates.append(("line_prefix", line_prefix_stripped))
 
-    for index, candidate in enumerate(candidates):
-        if index > 0:
+    for kind, candidate in candidates:
+        transformed = kind != "original"
+        repair_event = f"edit_file.{kind}_repair_used"
+        if transformed:
             count = original.count(candidate)
             if count == 1:
                 _record_edit_recovery_event(
-                    name="edit_file.unescape_repair_used",
+                    name=repair_event,
                     path=path,
                     replacement=replacement,
                     outcome="used",
-                    reason="exact_match_after_unescape",
+                    reason=f"exact_match_after_{kind}",
                     matches=count,
                 )
                 start = original.index(candidate)
@@ -2600,7 +3193,7 @@ def _recover_edit_replacement(
                     path=path,
                     replacement=replacement,
                     outcome="rejected",
-                    reason="multiple_matches_after_unescape",
+                    reason=f"multiple_matches_after_{kind}",
                     matches=count,
                 )
                 return None
@@ -2623,13 +3216,13 @@ def _recover_edit_replacement(
             )
             return None
         _tag, start, end, replacement_text = flexible
-        if index > 0:
+        if transformed:
             _record_edit_recovery_event(
-                name="edit_file.unescape_repair_used",
+                name=repair_event,
                 path=path,
                 replacement=replacement,
                 outcome="used",
-                reason="flexible_match_after_unescape",
+                reason=f"flexible_match_after_{kind}",
                 matches=1,
             )
         _record_edit_recovery_event(
@@ -2669,7 +3262,7 @@ def _find_unique_flexible_edit_match(
     if not any(stripped_search):
         return None
 
-    source_lines = original.replace("\r\n", "\n").splitlines(keepends=True)
+    source_lines = original.splitlines(keepends=True)
     if len(search_lines) > len(source_lines):
         return None
 
@@ -2760,6 +3353,85 @@ def _unescape_edit_search_text(value: str) -> str:
     return "".join(output)
 
 
+_EDIT_HINT_MAX_CHARS = 1200
+_EDIT_HINT_MAX_LINE_CHARS = 200
+
+
+def _edit_file_closest_lines_hint(
+    old_text: str,
+    original: str,
+    *,
+    context_lines: int = 2,
+    max_results: int = 3,
+) -> str:
+    """Build a "did you mean" hint for an edit_file exact-match failure.
+
+    Scores every non-blank source line against the first non-blank line of
+    ``old_text`` (difflib similarity) and returns up to ``max_results`` numbered,
+    context-padded snippets of the closest regions, or "" when nothing is close
+    enough. Only meant for the count==0 no-match path; the returned string is
+    already formatted for appending to the retry error (leading blank line and
+    header included). Output length is bounded so it never floods the turn.
+    """
+    if not old_text or not original:
+        return ""
+    old_lines = old_text.splitlines()
+    content_lines = original.splitlines()
+    if not old_lines or not content_lines:
+        return ""
+
+    anchor = ""
+    for line in old_lines:
+        if line.strip():
+            anchor = line.strip()
+            break
+    if not anchor:
+        return ""
+
+    matcher = difflib.SequenceMatcher(autojunk=False)
+    matcher.set_seq2(anchor)
+    scored: list[tuple[float, int]] = []
+    for i, line in enumerate(content_lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        matcher.set_seq1(stripped)
+        if matcher.real_quick_ratio() <= 0.3 or matcher.quick_ratio() <= 0.3:
+            continue
+        ratio = matcher.ratio()
+        if ratio > 0.3:
+            scored.append((ratio, i))
+    if not scored:
+        return ""
+    scored.sort(key=lambda item: (-item[0], item[1]))
+
+    parts: list[str] = []
+    seen_ranges: set[tuple[int, int]] = set()
+    for _ratio, line_idx in scored:
+        if len(parts) >= max_results:
+            break
+        start = max(0, line_idx - context_lines)
+        end = min(len(content_lines), line_idx + len(old_lines) + context_lines)
+        key = (start, end)
+        if key in seen_ranges:
+            continue
+        seen_ranges.add(key)
+        snippet_lines = []
+        for j in range(start, end):
+            text = content_lines[j]
+            if len(text) > _EDIT_HINT_MAX_LINE_CHARS:
+                text = text[:_EDIT_HINT_MAX_LINE_CHARS] + "…"
+            snippet_lines.append(f"{j + 1:4d}| {text}")
+        parts.append("\n".join(snippet_lines))
+    if not parts:
+        return ""
+
+    body = "\n---\n".join(parts)
+    if len(body) > _EDIT_HINT_MAX_CHARS:
+        body = body[:_EDIT_HINT_MAX_CHARS] + "\n… (truncated)"
+    return "\n\nDid you mean one of these sections?\n" + body
+
+
 def _record_edit_recovery_event(
     *,
     name: str,
@@ -2803,6 +3475,7 @@ def _record_edit_recovery_event(
         },
     },
     required=["path"],
+    plan_access=PlanAccess.READ_ONLY,
     runtime_only_arguments=("approval_id",),
     sandbox=SandboxToolDescriptor.filesystem(
         kind="list_dir",
@@ -2897,6 +3570,7 @@ async def list_dir(path: str, approval_id: str | None = None) -> str:
         "path": {"type": "string", "description": "Base directory to search from (default: cwd)."},
     },
     required=["pattern"],
+    plan_access=PlanAccess.READ_ONLY,
     sandbox=SandboxToolDescriptor.filesystem(
         kind="glob_search",
         argv_factory=lambda a: (
@@ -3089,6 +3763,7 @@ def _source_symbol_query_matches(
     },
     required=[],
     exposed_by_default=False,
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def source_symbols(
     query: str | None = None,
@@ -3204,6 +3879,7 @@ async def source_symbols(
         },
     },
     required=["pattern"],
+    plan_access=PlanAccess.READ_ONLY,
     sandbox=SandboxToolDescriptor.filesystem(
         kind="grep_search",
         argv_factory=lambda a: (

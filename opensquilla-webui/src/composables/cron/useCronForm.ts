@@ -3,9 +3,10 @@ import { useRoute } from 'vue-router'
 import i18n from '@/i18n'
 import { useRpcStore } from '@/stores/rpc'
 import { useToasts } from '@/composables/useToasts'
+import { useProjectWorkspaces } from '@/composables/useProjectWorkspaces'
 import type { CronJob, CronJobFormModel, CronPanelTemplate } from '@/types/cron'
 import { buildDeliveryFromValues, normalizeDeliveryFields } from '@/utils/cron/delivery'
-import { explainCron, nextRuns, parseCron } from '@/utils/cron/schedule'
+import { DEFAULT_CRON_EXPRESSION, explainCron, nextRuns, parseCron } from '@/utils/cron/schedule'
 import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
 
 interface UseCronFormOptions {
@@ -16,6 +17,7 @@ export function useCronForm(options: UseCronFormOptions) {
   const rpc = useRpcStore()
   const route = useRoute()
   const { pushToast } = useToasts()
+  const projectWorkspaces = useProjectWorkspaces()
   const t = i18n.global.t
   const panelOpen = ref(false)
   const editingJob = ref<CronJob | null>(null)
@@ -26,14 +28,17 @@ export function useCronForm(options: UseCronFormOptions) {
   let previewTimer: ReturnType<typeof setTimeout> | null = null
 
   const form = reactive<CronJobFormModel>({
+    templateId: '',
     name: '',
     type: 'cron',
     cron: '',
     every: '',
     at: '',
     tz: '',
-    payloadKind: 'reminder',
+    payloadKind: 'agent_turn',
     agentId: 'main',
+    workspaceId: '',
+    workspaceRequired: false,
     sessionTarget: 'isolated',
     targetSessionKey: '',
     message: '',
@@ -84,7 +89,10 @@ export function useCronForm(options: UseCronFormOptions) {
     editingJob.value = job
     panelOpen.value = true
     const tpl = template || {}
-    const payloadKind = job ? (job.payloadKind || 'agent_turn') : (tpl.payloadKind || 'reminder')
+    form.templateId = job ? (job.templateId || '') : (tpl.id || '')
+    // A newly-authored scheduled task should execute its instruction. Static
+    // delivery remains available as an explicit no-model reminder mode.
+    const payloadKind = job ? (job.payloadKind || 'agent_turn') : (tpl.payloadKind || 'agent_turn')
     const sessionTarget = job
       ? (job.sessionTarget || job.session_target || 'isolated')
       : (tpl.sessionTarget || (payloadKind === 'system_event' ? 'main' : 'isolated'))
@@ -92,18 +100,31 @@ export function useCronForm(options: UseCronFormOptions) {
     form.name = job ? (job.name || '') : (tpl.name || '')
     form.message = job ? (job.message || job.prompt || '') : (tpl.message || '')
     form.type = job ? (job.scheduleKind || job.schedule_kind || 'cron') : (tpl.scheduleKind || tpl.schedule_kind || 'cron')
-    form.cron = job ? (job.expression || '') : (tpl.expression || '')
+    // Keep the friendly default and the submitted schedule in sync. Previously
+    // the panel rendered 09:00 from a display-only fallback while sending an
+    // empty expression on the first save. The default comes from the same
+    // constant the panel falls back to, so the two cannot drift apart, and only
+    // a cron job is seeded — an `every` or `at` job has no expression to hold.
+    form.cron = job
+      ? (job.expression || '')
+      : (tpl.expression || (form.type === 'cron' ? DEFAULT_CRON_EXPRESSION : ''))
     form.enabled = job ? !!job.enabled : true
     form.agentId = job ? (job.agentId || 'main') : (tpl.agentId || 'main')
+    form.workspaceId = job ? (job.workspaceId || '') : (tpl.workspaceId || '')
+    form.workspaceRequired = tpl.requiresWorkspace === true ||
+      ['weekly-report', 'project-risk', 'knowledge-review'].includes(form.templateId)
     form.payloadKind = payloadKind
     form.sessionTarget = sessionTarget
     form.targetSessionKey = job ? jobSessionKey(job) : (tpl.targetSessionKey || activeChatSessionKey() || '')
     form.every = form.type === 'every' ? (job ? (job.scheduleRaw || job.schedule_raw || '') : String(tpl.every_seconds || '')) : ''
     form.at = form.type === 'at' ? (job ? (job.scheduleRaw || job.schedule_raw || '') : (tpl.at || '')) : ''
-    form.tz = job ? (job.tz || '') : (tpl.tz || '')
+    form.tz = job
+      ? (job.tz || '')
+      : (tpl.tz || Intl.DateTimeFormat().resolvedOptions().timeZone || '')
     form.wakeMode = job ? (job.wakeMode || job.wake_mode || 'now') : (tpl.wakeMode || 'now')
 
     Object.assign(form, normalizeDeliveryFields(job))
+    void projectWorkspaces.loadWorkspaces().catch(() => undefined)
     onPayloadKindChange()
     renderCronExplain(form.cron)
     nextTick(() => document.getElementById('cp-name')?.focus())
@@ -184,10 +205,21 @@ export function useCronForm(options: UseCronFormOptions) {
       agentId: form.agentId.trim() || 'main',
       sessionTarget,
       text: form.message.trim(),
+      workspaceId: form.workspaceId.trim(),
+      templateId: form.templateId,
+    }
+    if (payloadKind === 'agent_turn' && form.workspaceRequired && !form.workspaceId.trim()) {
+      pushToast(t('cronSkills.form.toastWorkspaceRequired'), { tone: 'danger' })
+      return
     }
 
     if (form.type === 'cron') {
-      payload.schedule = { kind: 'cron', expr: form.cron.trim() }
+      const expr = form.cron.trim()
+      if (!expr) {
+        pushToast(t('cronSkills.form.toastCronRequired'), { tone: 'danger' })
+        return
+      }
+      payload.schedule = { kind: 'cron', expr }
     } else if (form.type === 'every') {
       const everySeconds = Number(form.every)
       if (!Number.isInteger(everySeconds) || everySeconds < 1) {
@@ -282,6 +314,10 @@ export function useCronForm(options: UseCronFormOptions) {
     targetSessionLabel,
     targetSessionHint,
     messageLabel,
+    projectWorkspaces: projectWorkspaces.workspaces,
+    projectWorkspacesLoading: projectWorkspaces.isLoading,
+    projectWorkspacesLoaded: projectWorkspaces.hasLoaded,
+    loadProjectWorkspaces: projectWorkspaces.loadWorkspaces,
     openPanel,
     closePanel,
     onPayloadKindChange,

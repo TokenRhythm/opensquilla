@@ -5,6 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from opensquilla.provider.image_generation_catalog import (
+    ImageGenerationProviderCatalogEntry,
+    list_image_generation_provider_catalog_entries,
+)
+
 FieldType = Literal["text", "password", "select", "bool"]
 
 
@@ -38,25 +43,9 @@ class ImageGenerationProviderSetupSpec:
     fields: tuple[ImageGenerationProviderSetupField, ...]
 
 
-_IMAGE_PROVIDER_DATA: dict[str, dict[str, Any]] = {
-    "openai": {
-        "label": "OpenAI Images",
-        "env_key": "OPENAI_API_KEY",
-        "default_base_url": "https://api.openai.com/v1",
-        "default_model": "openai/gpt-image-1",
-        "suggested_models": ("openai/gpt-image-1",),
-    },
-    "openrouter": {
-        "label": "OpenRouter Images",
-        "env_key": "OPENROUTER_API_KEY",
-        "default_base_url": "https://openrouter.ai/api/v1",
-        "default_model": "openrouter/google/gemini-3.1-flash-image-preview",
-        "suggested_models": ("openrouter/google/gemini-3.1-flash-image-preview",),
-    },
-}
-
-
-def _fields_for(data: dict[str, Any]) -> tuple[ImageGenerationProviderSetupField, ...]:
+def _fields_for(
+    entry: ImageGenerationProviderCatalogEntry,
+) -> tuple[ImageGenerationProviderSetupField, ...]:
     return (
         ImageGenerationProviderSetupField(
             name="enabled",
@@ -70,7 +59,7 @@ def _fields_for(data: dict[str, Any]) -> tuple[ImageGenerationProviderSetupField
             label="Primary model",
             field_type="text",
             required=True,
-            default=str(data["default_model"]),
+            default=entry.default_model,
             description="Provider/model identifier.",
         ),
         ImageGenerationProviderSetupField(
@@ -79,7 +68,7 @@ def _fields_for(data: dict[str, Any]) -> tuple[ImageGenerationProviderSetupField
             field_type="password",
             required=False,
             default="",
-            description=f"May be provided by {data['env_key']}.",
+            description=f"May be provided by {entry.env_key}.",
             secret=True,
         ),
         ImageGenerationProviderSetupField(
@@ -87,7 +76,7 @@ def _fields_for(data: dict[str, Any]) -> tuple[ImageGenerationProviderSetupField
             label="Base URL",
             field_type="text",
             required=False,
-            default=str(data["default_base_url"]),
+            default=entry.default_base_url,
             description="Override the upstream HTTP base URL.",
         ),
     )
@@ -96,25 +85,25 @@ def _fields_for(data: dict[str, Any]) -> tuple[ImageGenerationProviderSetupField
 def list_image_generation_provider_setup_specs() -> list[ImageGenerationProviderSetupSpec]:
     return [
         ImageGenerationProviderSetupSpec(
-            provider_id=provider_id,
-            label=str(data["label"]),
+            provider_id=entry.provider_id,
+            label=entry.label,
             runtime_supported=True,
             requires_api_key=True,
-            env_key=str(data["env_key"]),
-            default_base_url=str(data["default_base_url"]),
-            default_model=str(data["default_model"]),
-            suggested_models=tuple(data["suggested_models"]),
+            env_key=entry.env_key,
+            default_base_url=entry.default_base_url,
+            default_model=entry.default_model,
+            suggested_models=entry.suggested_models,
             deployment="cloud",
             blocking=False,
             can_probe=False,
             readme_scenarios=("image generation", "first-run setup"),
             what_you_need=(
-                f"API key via {data['env_key']} or a one-time paste.",
+                f"API key via {entry.env_key} or a one-time paste.",
                 "A provider/model id that supports image generation.",
             ),
-            fields=_fields_for(data),
+            fields=_fields_for(entry),
         )
-        for provider_id, data in _IMAGE_PROVIDER_DATA.items()
+        for entry in list_image_generation_provider_catalog_entries()
     ]
 
 

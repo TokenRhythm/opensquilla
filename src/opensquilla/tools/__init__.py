@@ -4,6 +4,7 @@ from opensquilla.tools import builtin as _builtin  # noqa: F401 — side-effect:
 from opensquilla.tools.registry import ToolRegistry, get_default_registry, tool
 from opensquilla.tools.types import (
     CallerKind,
+    PlanAccess,
     RegisteredTool,
     ToolContext,
     ToolError,
@@ -15,6 +16,7 @@ __all__ = [
     "get_default_registry",
     "tool",
     "CallerKind",
+    "PlanAccess",
     "ToolContext",
     "ToolSpec",
     "RegisteredTool",

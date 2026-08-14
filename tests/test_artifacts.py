@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import shutil
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,11 +20,13 @@ from opensquilla.artifacts import (
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactStore,
+    artifact_cursor,
     artifact_marker,
     artifact_payload,
     strip_artifact_markers_from_text,
 )
 from opensquilla.engine.types import ToolCall
+from opensquilla.session.plans import PlanRunConflictError
 from opensquilla.tools.builtin.artifacts import publish_artifact
 from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import ToolRegistry
@@ -69,6 +74,438 @@ def test_artifact_store_round_trips_metadata_and_bytes(tmp_path: Path) -> None:
     resolved_ref, resolved_path = store.resolve_for_download(ref.id, session_id="session-1")
     assert resolved_ref == ref
     assert resolved_path == path
+
+
+def _set_artifact_created_at(store: ArtifactStore, ref, created_at: str):
+    updated = replace(ref, created_at=created_at)
+    meta_path = store.path_for(ref).parent / "meta.json"
+    meta_path.write_text(
+        json.dumps(updated.to_dict(), ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    return updated
+
+
+def test_artifact_store_lists_stable_backwards_pages_and_gets_metadata(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    session_id = "session-1"
+    session_key = "agent:main:webchat:session-1"
+    refs = [
+        store.publish_bytes(
+            f"payload-{index}".encode(),
+            session_id=session_id,
+            session_key=session_key,
+            name=f"report-{index}.txt",
+            mime="text/plain",
+            source="publish_artifact",
+        )
+        for index in range(3)
+    ]
+    refs = [
+        _set_artifact_created_at(store, ref, f"2026-01-0{index + 1}T00:00:00Z")
+        for index, ref in enumerate(refs)
+    ]
+
+    newest = store.list_refs(session_id=session_id, limit=2)
+
+    assert newest.refs == tuple(refs[1:])
+    assert newest.has_more is True
+    assert newest.total_count == 3
+    assert store.get_ref(session_id=session_id, artifact_id=refs[2].id) == refs[2]
+
+    older = store.list_refs(
+        session_id=session_id,
+        limit=2,
+        before=artifact_cursor(newest.refs[0]),
+    )
+
+    assert older.refs == (refs[0],)
+    assert older.has_more is False
+    assert older.total_count == 3
+
+
+def test_artifact_store_metadata_listing_skips_invalid_refs_without_reading_material(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    session_id = "session-1"
+    session_key = "agent:main:webchat:session-1"
+    good = store.publish_bytes(
+        b"good",
+        session_id=session_id,
+        session_key=session_key,
+        name="good.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    corrupt = store.publish_bytes(
+        b"corrupt metadata",
+        session_id=session_id,
+        session_key=session_key,
+        name="corrupt.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    non_object = store.publish_bytes(
+        b"non-object metadata",
+        session_id=session_id,
+        session_key=session_key,
+        name="non-object.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    missing = store.publish_bytes(
+        b"missing material",
+        session_id=session_id,
+        session_key=session_key,
+        name="missing.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    wrong_session = store.publish_bytes(
+        b"wrong session metadata",
+        session_id=session_id,
+        session_key=session_key,
+        name="wrong-session.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    (store.path_for(corrupt).parent / "meta.json").write_text("{", encoding="utf-8")
+    (store.path_for(non_object).parent / "meta.json").write_text("[]", encoding="utf-8")
+    store.path_for(missing).unlink()
+    wrong_session_meta = store.path_for(wrong_session).parent / "meta.json"
+    wrong_session_meta.write_text(
+        json.dumps(
+            replace(wrong_session, session_id="session-2").to_dict(),
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    def _unexpected_material_read(_path: Path) -> bytes:
+        raise AssertionError("artifact metadata listing must not read material bytes")
+
+    monkeypatch.setattr(Path, "read_bytes", _unexpected_material_read)
+
+    page = store.list_refs(session_id=session_id, limit=20)
+
+    assert page.refs == (good,)
+    assert page.total_count == 1
+    assert store.get_ref(session_id=session_id, artifact_id=good.id) == good
+    for invalid_ref in (corrupt, non_object, missing):
+        with pytest.raises(ArtifactNotFoundError):
+            store.get_ref(session_id=session_id, artifact_id=invalid_ref.id)
+    with pytest.raises(ArtifactNotFoundError):
+        store.get_ref(session_id="session-2", artifact_id=good.id)
+
+
+@pytest.mark.parametrize("invalid_field", ["id", "session_id"])
+def test_artifact_store_validates_metadata_identity_before_material_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_field: str,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    session_id = "session-1"
+    ref = store.publish_bytes(
+        b"material",
+        session_id=session_id,
+        session_key="agent:main:webchat:session-1",
+        name="report.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    invalid_ref = replace(
+        ref,
+        **(
+            {"id": "art-other-session-artifact"}
+            if invalid_field == "id"
+            else {"session_id": "session-2"}
+        ),
+    )
+    (store.path_for(ref).parent / "meta.json").write_text(
+        json.dumps(invalid_ref.to_dict(), ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    def _unexpected_material_lookup(_ref):
+        raise PermissionError("another session must not be inspected")
+
+    monkeypatch.setattr(
+        store,
+        "_preferred_material_path_for_ref",
+        _unexpected_material_lookup,
+    )
+
+    page = store.list_refs(session_id=session_id, limit=10)
+
+    assert page.refs == ()
+    with pytest.raises(ArtifactNotFoundError):
+        store.get_ref(session_id=session_id, artifact_id=ref.id)
+
+
+def test_artifact_store_listing_propagates_directory_io_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path)
+
+    def _unreadable_directory(_session_id: str):
+        raise OSError("artifact directory is unreadable")
+
+    monkeypatch.setattr(
+        store,
+        "_iter_session_meta_paths_for_listing",
+        _unreadable_directory,
+    )
+
+    with pytest.raises(OSError, match="artifact directory is unreadable"):
+        store.list_refs(session_id="session-1", limit=20)
+
+
+def test_artifact_store_rejects_invalid_or_unknown_list_cursor(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path)
+
+    with pytest.raises(ValueError, match="artifact id is invalid"):
+        store.list_refs(session_id="session-1", limit=20, before="not-a-cursor")
+    with pytest.raises(ValueError, match="artifact cursor not found"):
+        store.list_refs(session_id="session-1", limit=20, before="art-missing")
+
+
+@pytest.mark.parametrize("layout", ["current", "legacy-short", "legacy-plain"])
+def test_artifact_store_list_reads_every_supported_layout(
+    tmp_path: Path,
+    layout: str,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    session_id = "532d5065-abce-499f-97b0-bbf2a067d5ab"
+    ref = store.publish_bytes(
+        b"layout material",
+        session_id=session_id,
+        session_key="agent:main:webchat:layout",
+        name="layout.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    current_dir = store.path_for(ref).parent
+    if layout == "legacy-short":
+        session_token = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+        artifact_token = hashlib.sha256(ref.id.encode("utf-8")).hexdigest()[:16]
+        target_dir = tmp_path / "artifacts" / "s" / session_token / artifact_token
+        target_dir.parent.mkdir(parents=True)
+        current_dir.rename(target_dir)
+    elif layout == "legacy-plain":
+        from opensquilla.artifacts import _safe_token
+
+        target_dir = tmp_path / "artifacts" / _safe_token(session_id) / ref.id
+        target_dir.mkdir(parents=True)
+        (current_dir / "data").rename(target_dir / ref.sha256)
+        (current_dir / "meta.json").rename(target_dir / "meta.json")
+
+    page = store.list_refs(session_id=session_id, limit=10)
+
+    assert page.refs == (ref,)
+    assert store.get_ref(session_id=session_id, artifact_id=ref.id) == ref
+
+
+def test_artifact_store_list_prefers_current_duplicate_and_sorts_equal_times(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    session_id = "532d5065-abce-499f-97b0-bbf2a067d5ab"
+    session_key = "agent:main:webchat:duplicates"
+    first = store.publish_bytes(
+        b"first",
+        session_id=session_id,
+        session_key=session_key,
+        name="current.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    second = store.publish_bytes(
+        b"second",
+        session_id=session_id,
+        session_key=session_key,
+        name="second.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    first_dir = store.path_for(first).parent
+    legacy_session_token = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    legacy_artifact_token = hashlib.sha256(first.id.encode("utf-8")).hexdigest()[:16]
+    legacy_dir = tmp_path / "artifacts" / "s" / legacy_session_token / legacy_artifact_token
+    shutil.copytree(first_dir, legacy_dir)
+    legacy_ref = replace(first, name="legacy-duplicate.txt")
+    (legacy_dir / "meta.json").write_text(
+        json.dumps(legacy_ref.to_dict(), ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    same_time = "2026-03-01T00:00:00Z"
+    first = _set_artifact_created_at(store, first, same_time)
+    second = _set_artifact_created_at(store, second, same_time)
+
+    page = store.list_refs(session_id=session_id, limit=10)
+
+    assert [ref.id for ref in page.refs] == sorted([first.id, second.id])
+    assert page.total_count == 2
+    selected_first = next(ref for ref in page.refs if ref.id == first.id)
+    assert selected_first.name == "current.txt"
+
+
+def test_artifact_store_list_uses_preferred_meta_with_split_material_layout(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    session_id = "532d5065-abce-499f-97b0-bbf2a067d5ab"
+    ref = store.publish_bytes(
+        b"current material",
+        session_id=session_id,
+        session_key="agent:main:webchat:mixed-layout",
+        name="current.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    current_dir = store.path_for(ref).parent
+    legacy_session_token = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    legacy_artifact_token = hashlib.sha256(ref.id.encode("utf-8")).hexdigest()[:16]
+    legacy_dir = tmp_path / "artifacts" / "s" / legacy_session_token / legacy_artifact_token
+    shutil.copytree(current_dir, legacy_dir)
+
+    legacy_bytes = b"legacy material"
+    legacy_ref = replace(
+        ref,
+        sha256=hashlib.sha256(legacy_bytes).hexdigest(),
+        name="legacy.txt",
+        size=len(legacy_bytes),
+    )
+    (legacy_dir / "data").write_bytes(legacy_bytes)
+    (legacy_dir / "meta.json").write_text(
+        json.dumps(legacy_ref.to_dict(), ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    (current_dir / "data").unlink()
+
+    page = store.list_refs(session_id=session_id, limit=10)
+
+    assert page.refs == (ref,)
+    assert store.get_ref(session_id=session_id, artifact_id=ref.id) == ref
+    with pytest.raises(ArtifactIntegrityError):
+        store.resolve_for_download(ref.id, session_id=session_id)
+
+
+def test_artifact_store_split_layout_with_matching_material_remains_downloadable(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    session_id = "532d5065-abce-499f-97b0-bbf2a067d5ab"
+    ref = store.publish_bytes(
+        b"shared material",
+        session_id=session_id,
+        session_key="agent:main:webchat:split-layout",
+        name="current.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    current_dir = store.path_for(ref).parent
+    legacy_session_token = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+    legacy_artifact_token = hashlib.sha256(ref.id.encode("utf-8")).hexdigest()[:16]
+    legacy_dir = tmp_path / "artifacts" / "s" / legacy_session_token / legacy_artifact_token
+    shutil.copytree(current_dir, legacy_dir)
+    (current_dir / "data").unlink()
+
+    page = store.list_refs(session_id=session_id, limit=10)
+    fetched = store.get_ref(session_id=session_id, artifact_id=ref.id)
+    resolved_ref, resolved_path = store.resolve_for_download(ref.id, session_id=session_id)
+
+    assert page.refs == (ref,)
+    assert fetched == ref
+    assert resolved_ref == ref
+    assert resolved_path == legacy_dir / "data"
+    assert resolved_path.read_bytes() == b"shared material"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlink regression")
+@pytest.mark.parametrize("component", ["root", "meta", "material"])
+def test_artifact_store_list_and_get_never_follow_symlink_targets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    component: str,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    session_id = "session-links"
+    ref = store.publish_bytes(
+        b"material",
+        session_id=session_id,
+        session_key="agent:main:webchat:links",
+        name="report.txt",
+        mime="text/plain",
+        source="publish_artifact",
+    )
+    artifact_dir = store.path_for(ref).parent
+    root = store._artifact_session_roots(session_id)[0]
+    selected_path = {
+        "root": root,
+        "meta": artifact_dir / "meta.json",
+        "material": artifact_dir / "data",
+    }[component]
+    target = tmp_path / f"outside-{component}"
+    selected_path.rename(target)
+    selected_path.symlink_to(target, target_is_directory=component == "root")
+
+    original_stat = Path.stat
+
+    def _reject_follow(
+        path: Path,
+        *,
+        follow_symlinks: bool = True,
+    ):
+        if path == selected_path and follow_symlinks:
+            raise AssertionError("artifact listing followed a symlink target")
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", _reject_follow)
+
+    page = store.list_refs(session_id=session_id, limit=10)
+
+    assert page.refs == ()
+    with pytest.raises(ArtifactNotFoundError):
+        store.get_ref(session_id=session_id, artifact_id=ref.id)
+
+
+def test_artifact_copy_keeps_using_the_existing_metadata_iterator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    scanned: list[str] = []
+
+    def _existing_iterator(session_id: str):
+        scanned.append(session_id)
+        return iter(())
+
+    def _listing_iterator(_session_id: str):
+        raise AssertionError("fork copy must not use the list-only iterator")
+
+    monkeypatch.setattr(store, "_iter_session_meta_paths", _existing_iterator)
+    monkeypatch.setattr(
+        store,
+        "_iter_session_meta_paths_for_listing",
+        _listing_iterator,
+    )
+
+    assert (
+        store.copy_session_artifacts(
+            source_session_id="source",
+            target_session_id="target",
+            target_session_key="agent:main:webchat:target",
+        )
+        == 0
+    )
+    assert scanned == ["source"]
 
 
 def test_artifact_store_finds_existing_session_deliverable_by_name_and_sha(
@@ -408,6 +845,445 @@ async def test_publish_artifact_tool_allows_workspace_file_only(tmp_path: Path) 
         if k not in {"workspace_path", "local_path"}
     }
     assert {k: v for k, v in full_artifact.items() if k != "download_url"} == llm_artifact
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_requires_completed_attached_plan_run(
+    tmp_path: Path,
+) -> None:
+    class PlanStorage:
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="running",
+                current_step_id="verify",
+                active_task_id="task-1",
+            )
+
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(RetryableToolInputError) as exc_info:
+            await publish_artifact(path="report.txt")
+    finally:
+        current_tool_context.reset(token)
+
+    message = exc_info.value.user_message
+    assert "was not executed" in message
+    assert "current step is verify" in message
+    assert "after the final checkpoint returns no current step" in message
+    assert ctx.published_artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_checkpoints_the_only_unfinished_final_step(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ready", encoding="utf-8")
+
+    class PlanStorage:
+        def __init__(self) -> None:
+            self.run = SimpleNamespace(
+                status="running",
+                current_step_id="publish",
+                active_task_id="task-1",
+                state_revision=7,
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "publish", "status": "in_progress"},
+                ],
+            )
+            self.checkpoints: list[dict[str, object]] = []
+
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return self.run
+
+        async def checkpoint_plan_run(self, run_id: str, **kwargs: object) -> SimpleNamespace:
+            assert run_id == "run-1"
+            self.checkpoints.append(kwargs)
+            self.run = SimpleNamespace(
+                status="running",
+                current_step_id=None,
+                active_task_id="task-1",
+                state_revision=8,
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "publish", "status": "completed"},
+                ],
+            )
+            return self.run
+
+    storage = PlanStorage()
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=storage,
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        payload = json.loads(await publish_artifact(path="report.txt"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["status"] == "published"
+    assert storage.checkpoints == [
+        {
+            "expected_state_revision": 7,
+            "step_id": "publish",
+            "step_status": "completed",
+            "next_step_id": None,
+            "expected_active_task_id": "task-1",
+        }
+    ]
+    assert len(ctx.published_artifacts) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("refreshed_status", "refreshed_active_task_id"),
+    [
+        ("cancelled", None),
+        ("running", "task-2"),
+    ],
+)
+async def test_publish_artifact_rejects_disallowed_state_after_checkpoint_conflict(
+    tmp_path: Path,
+    refreshed_status: str,
+    refreshed_active_task_id: str | None,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ready", encoding="utf-8")
+
+    class PlanStorage:
+        def __init__(self) -> None:
+            self.refreshed = False
+
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            if not self.refreshed:
+                return SimpleNamespace(
+                    status="running",
+                    current_step_id="publish",
+                    active_task_id="task-1",
+                    state_revision=7,
+                    step_states=[
+                        {"step_id": "build", "status": "completed"},
+                        {"step_id": "publish", "status": "in_progress"},
+                    ],
+                )
+            return SimpleNamespace(
+                status=refreshed_status,
+                current_step_id=None,
+                active_task_id=refreshed_active_task_id,
+                state_revision=9,
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "publish", "status": "completed"},
+                ],
+            )
+
+        async def checkpoint_plan_run(self, run_id: str, **kwargs: object) -> None:
+            assert run_id == "run-1"
+            self.refreshed = True
+            raise PlanRunConflictError("plan run changed")
+
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(RetryableToolInputError, match="changed"):
+            await publish_artifact(path="report.txt")
+    finally:
+        current_tool_context.reset(token)
+
+    assert ctx.published_artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_allows_owned_delivery_after_checkpoint_conflict(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ready", encoding="utf-8")
+
+    class PlanStorage:
+        def __init__(self) -> None:
+            self.refreshed = False
+
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            if not self.refreshed:
+                return SimpleNamespace(
+                    status="running",
+                    current_step_id="publish",
+                    active_task_id="task-1",
+                    state_revision=7,
+                    step_states=[
+                        {"step_id": "build", "status": "completed"},
+                        {"step_id": "publish", "status": "in_progress"},
+                    ],
+                )
+            return SimpleNamespace(
+                status="running",
+                current_step_id=None,
+                active_task_id="task-1",
+                state_revision=8,
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "publish", "status": "completed"},
+                ],
+            )
+
+        async def checkpoint_plan_run(self, run_id: str, **kwargs: object) -> None:
+            assert run_id == "run-1"
+            self.refreshed = True
+            raise PlanRunConflictError("plan run changed")
+
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        payload = json.loads(await publish_artifact(path="report.txt"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["status"] == "published"
+    assert len(ctx.published_artifacts) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_does_not_checkpoint_before_the_final_step(
+    tmp_path: Path,
+) -> None:
+    class PlanStorage:
+        def __init__(self) -> None:
+            self.checkpointed = False
+
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="running",
+                current_step_id="build",
+                active_task_id="task-1",
+                state_revision=3,
+                step_states=[
+                    {"step_id": "build", "status": "in_progress"},
+                    {"step_id": "publish", "status": "pending"},
+                ],
+            )
+
+        async def checkpoint_plan_run(self, run_id: str, **kwargs: object) -> None:
+            self.checkpointed = True
+
+    storage = PlanStorage()
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=storage,
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(RetryableToolInputError):
+            await publish_artifact(path="report.txt")
+    finally:
+        current_tool_context.reset(token)
+
+    assert storage.checkpointed is False
+    assert ctx.published_artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_does_not_checkpoint_an_invalid_final_artifact(
+    tmp_path: Path,
+) -> None:
+    class PlanStorage:
+        def __init__(self) -> None:
+            self.checkpointed = False
+
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="running",
+                current_step_id="publish",
+                active_task_id="task-1",
+                state_revision=4,
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "publish", "status": "in_progress"},
+                ],
+            )
+
+        async def checkpoint_plan_run(self, run_id: str, **kwargs: object) -> None:
+            self.checkpointed = True
+
+    storage = PlanStorage()
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=storage,
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(ToolError, match="artifact file not found"):
+            await publish_artifact(path="missing.txt")
+    finally:
+        current_tool_context.reset(token)
+
+    assert storage.checkpointed is False
+    assert ctx.published_artifacts == []
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_allows_completed_attached_plan_run(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ready", encoding="utf-8")
+
+    class PlanStorage:
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(status="completed", current_step_id=None)
+
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        payload = json.loads(await publish_artifact(path="report.txt"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["status"] == "published"
+    assert len(ctx.published_artifacts) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_allows_delivery_ready_running_plan_run(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "report.txt").write_text("ready", encoding="utf-8")
+
+    class PlanStorage:
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="running",
+                current_step_id=None,
+                active_task_id="task-1",
+                step_states=[
+                    {"step_id": "build", "status": "completed"},
+                    {"step_id": "verify", "status": "skipped"},
+                ],
+            )
+
+    ctx = ToolContext(
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        task_id="task-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        payload = json.loads(await publish_artifact(path="report.txt"))
+    finally:
+        current_tool_context.reset(token)
+
+    assert payload["status"] == "published"
+    assert len(ctx.published_artifacts) == 1
+
+
+@pytest.mark.asyncio
+async def test_publish_artifact_rejects_paused_plan_run_without_retry(
+    tmp_path: Path,
+) -> None:
+    class PlanStorage:
+        async def get_plan_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(
+                status="paused",
+                current_step_id=None,
+                step_states=[{"step_id": "build", "status": "completed"}],
+            )
+
+    ctx = ToolContext(
+        workspace_dir=str(tmp_path),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        plan_run_id="run-1",
+        plan_storage=PlanStorage(),
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        with pytest.raises(ToolError) as exc_info:
+            await publish_artifact(path="report.txt")
+    finally:
+        current_tool_context.reset(token)
+
+    assert not isinstance(exc_info.value, RetryableToolInputError)
+    assert "unavailable for this terminal or unowned PlanRun state" in str(
+        exc_info.value
+    )
 
 
 @pytest.mark.asyncio
@@ -1236,6 +2112,8 @@ def test_copy_session_artifacts_rebinds_to_child_and_preserves_isolation(
     assert child_ref.session_id == "child-1"
     assert child_ref.session_key == "agent:main:webchat:child-1"
     assert child_ref.sha256 == ref.sha256
+    child_page = store.list_refs(session_id="child-1", limit=10)
+    assert [listed.id for listed in child_page.refs] == [ref.id]
 
     # The parent still owns its copy and an unrelated session stays blocked.
     parent_ref, _ = store.resolve_for_download(ref.id, session_id="parent-1")

@@ -27,6 +27,15 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("display_text", ("displayText", "display_text")),
     ("attachments", ("attachments",)),
     ("intent", ("intent",)),
+    (
+        "initial_collaboration_mode",
+        (
+            "initialCollaborationMode",
+            "initial_collaboration_mode",
+            "collaborationMode",
+            "collaboration_mode",
+        ),
+    ),
     ("fork_before_message_id", ("forkBeforeMessageId", "fork_before_message_id")),
     ("queue_mode", ("queueMode", "queue_mode")),
     ("no_memory_capture", ("noMemoryCapture", "no_memory_capture")),
@@ -36,6 +45,7 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("inputProvenanceKind", "input_provenance_kind", "provenance_kind"),
     ),
     ("run_kind", ("runKind", "run_kind")),
+    ("workspace_id", ("workspaceId", "workspace_id")),
 )
 
 

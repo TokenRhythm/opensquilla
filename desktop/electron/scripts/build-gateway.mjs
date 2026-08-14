@@ -2,6 +2,11 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync,
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import {
+  assertRuntimeSetReady,
+  currentRuntimeTarget,
+  loadRuntimeManifest,
+} from './fetch-bundled-runtimes.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
@@ -9,6 +14,7 @@ const repoRoot = resolve(packageRoot, '..', '..')
 const runtimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
 const pyinstallerWorkDir = join(packageRoot, '.pyinstaller')
 const entryPath = join(scriptDir, 'gateway-entry.py')
+const caRuntimeHookPath = join(scriptDir, 'pyinstaller_runtime_hooks', 'ensure_ca_trust.py')
 const controlUiDistDir = join(repoRoot, 'src', 'opensquilla', 'gateway', 'static', 'dist')
 const controlUiVerifier = join(repoRoot, 'opensquilla-webui', 'scripts', 'verify-dist.mjs')
 const routerBundleDir = join(repoRoot, 'src', 'opensquilla', 'squilla_router', 'models', 'v4.2_phase3_inference')
@@ -227,6 +233,11 @@ function patchMacLightgbmRuntime() {
 
 assertControlUiArtifactReady()
 assertRouterAssetsReady()
+await assertRuntimeSetReady({
+  manifest: await loadRuntimeManifest(),
+  target: currentRuntimeTarget(),
+  executeCommands: true,
+})
 
 rmSync(runtimeGatewayDir, { recursive: true, force: true })
 mkdirSync(runtimeGatewayDir, { recursive: true })
@@ -270,6 +281,10 @@ const args = [
   'opensquilla',
   '--collect-all',
   'sqlite_vec',
+  '--collect-data',
+  'certifi',
+  '--hidden-import',
+  'certifi',
   '--collect-binaries',
   'sklearn',
   '--copy-metadata',
@@ -304,6 +319,8 @@ const args = [
   'mcp',
   '--hidden-import',
   'yoyo.backends.core.sqlite3',
+  '--runtime-hook',
+  caRuntimeHookPath,
   '--add-data',
   `${join(repoRoot, 'migrations')}${addDataSeparator}opensquilla/_migrations`,
   '--add-data',

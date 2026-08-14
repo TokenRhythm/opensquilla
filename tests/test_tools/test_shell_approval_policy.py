@@ -10,9 +10,10 @@ import pytest
 from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
+from opensquilla.sandbox.types import ApprovedHostExecution, SecurityLevel
 from opensquilla.tools.builtin import code_exec, filesystem, shell
 from opensquilla.tools.builtin.code_exec import execute_code
-from opensquilla.tools.builtin.shell_policy import PolicyResult
+from opensquilla.tools.builtin.shell_policy import DEFAULT_DENYLIST, PolicyResult, SafeBinPolicy
 from opensquilla.tools.types import (
     CallerKind,
     InteractionMode,
@@ -26,6 +27,32 @@ def _original_async(fn):
     while hasattr(fn, "__wrapped__"):
         fn = fn.__wrapped__  # type: ignore[attr-defined]
     return fn
+
+
+class _AutoApprovingQueue:
+    def __init__(self) -> None:
+        self.params: dict[str, object] | None = None
+        self.request_count = 0
+        self.consumed: list[str] = []
+
+    def request(self, namespace: str, params: dict[str, object]) -> str:
+        assert namespace == "exec"
+        self.request_count += 1
+        self.params = params
+        return "approval-1"
+
+    async def wait(self, approval_id: str, timeout: float | None = None) -> bool:
+        assert approval_id == "approval-1"
+        return True
+
+    def resolve(self, approval_id: str, approved: bool) -> None:
+        raise AssertionError("auto-approving queue should not be resolved explicitly")
+
+    def consume(self, approval_id: str) -> None:
+        assert approval_id == "approval-1"
+        if self.consumed:
+            raise ValueError("approval already consumed")
+        self.consumed.append(approval_id)
 
 
 @pytest.fixture(autouse=True)
@@ -84,6 +111,15 @@ def test_shell_approval_fingerprint_changes_when_script_content_changes(
     )
 
     assert before.fingerprint() != after.fingerprint()
+
+
+def test_safe_bin_halt_rule_allows_latex_flag_but_blocks_system_halt() -> None:
+    policy = SafeBinPolicy(denylist=DEFAULT_DENYLIST, allowlist=[], warnlist=[])
+
+    assert policy.check("xelatex -halt-on-error paper.tex").allowed is True
+    assert policy.check("sudo /sbin/halt").allowed is False
+    assert policy.check("halt --force").allowed is False
+    assert policy.check("echo ready; halt").allowed is False
 
 
 @pytest.mark.asyncio
@@ -160,6 +196,7 @@ async def test_full_host_access_warnlisted_exec_skips_approval_and_records_mutat
         return "exit_code=0\nhost\n"
 
     monkeypatch.setattr(shell, "_run_host_shell_command", fake_host_execution)
+
     def fail_preflight(*args: object, **kwargs: object) -> object:
         raise AssertionError("Full Host Access must skip shell safety preflight")
 
@@ -265,6 +302,7 @@ async def test_warnlisted_exec_allow_pattern_skips_prompt_when_sandbox_enabled(
     ctx = current_tool_context.get()
     assert ctx is not None
     ctx.workspace_dir = str(tmp_path)
+    ctx.run_mode = "standard"
     get_approval_queue().set_settings(
         "prompt",
         allow_patterns=["pip install requests"],
@@ -275,6 +313,7 @@ async def test_warnlisted_exec_allow_pattern_skips_prompt_when_sandbox_enabled(
             security_grading=True,
             backend="noop",
             allow_legacy_mode=True,
+            run_mode="standard",
         ),
         workspace=tmp_path,
     )
@@ -313,6 +352,114 @@ async def test_warnlisted_exec_allow_pattern_skips_prompt_when_sandbox_enabled(
     assert "sandboxed" in result
     assert [name for name, _ in calls] == ["gate", "backend"]
     assert get_approval_queue().list_pending("exec") == []
+
+
+@pytest.mark.asyncio
+async def test_exec_command_approved_locked_action_uses_host_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = current_tool_context.get()
+    assert ctx is not None
+    ctx.workspace_dir = str(tmp_path)
+    ctx.run_mode = "standard"
+    configure_runtime(
+        SandboxSettings(
+            sandbox=True,
+            security_grading=True,
+            backend="noop",
+            allow_legacy_mode=True,
+            run_mode="standard",
+        ),
+        workspace=tmp_path,
+    )
+    calls: list[tuple[str, str]] = []
+
+    async def fake_gate_action(**kwargs: object) -> tuple[object, object, object]:
+        calls.append(("gate", str(kwargs["argv"])))
+        policy = SimpleNamespace(network=None)
+        request = SimpleNamespace(cwd=tmp_path, action_kind="shell.exec", policy=policy)
+        return (
+            ApprovedHostExecution(
+                approval_id="approval-1",
+                action_fingerprint="fingerprint",
+                level=SecurityLevel.LOCKED,
+            ),
+            policy,
+            request,
+        )
+
+    async def fail_backend(*args: object, **kwargs: object) -> object:
+        raise AssertionError("approved L3 call must not run under the backend")
+
+    async def fake_host(command: str, **kwargs: object) -> str:
+        calls.append(("host", command))
+        return "exit_code=0\n"
+
+    monkeypatch.setattr(shell, "gate_action", fake_gate_action)
+    monkeypatch.setattr(shell, "_run_backend_with_managed_network", fail_backend)
+    monkeypatch.setattr(shell, "_run_host_shell_command", fake_host)
+
+    result = await shell.exec_command("rm -f exact-probe", workdir=str(tmp_path))
+
+    assert result == "exit_code=0\n"
+    assert calls == [
+        ("gate", "('exec_command', 'rm -f exact-probe')"),
+        ("host", "rm -f exact-probe"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_nonrecursive_delete_requires_exact_recoverable_approval(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = current_tool_context.get()
+    assert ctx is not None
+    ctx.workspace_dir = str(tmp_path)
+    ctx.run_mode = "standard"
+    target = tmp_path / "approved-delete.txt"
+    target.write_text("delete me", encoding="utf-8")
+    queue = _AutoApprovingQueue()
+    configure_runtime(
+        SandboxSettings(
+            sandbox=True,
+            security_grading=True,
+            backend="noop",
+            allow_legacy_mode=True,
+            run_mode="standard",
+        ),
+        approval_queue=queue,
+        workspace=tmp_path,
+    )
+
+    async def fake_backend(*args: object, **kwargs: object) -> object:
+        return SimpleNamespace(
+            returncode=0,
+            stdout="sandboxed\n",
+            stderr="",
+            timed_out=False,
+            backend_notes=(),
+        )
+
+    monkeypatch.setattr(shell, "_run_backend_with_managed_network", fake_backend)
+
+    command = (
+        f'Remove-Item -Force "{target.name}"'
+        if os.name == "nt"
+        else f"rm -f {target.name}"
+    )
+    result = await shell.exec_command(command, workdir=str(tmp_path))
+
+    payload = json.loads(result)
+    assert payload["status"] == "approval_required"
+    assert payload["target"] == str(target)
+    assert payload["backup_state"] == "enabled"
+    assert payload["irreversible"] is False
+    assert target.exists() is True
+    assert queue.params is None
+    assert queue.request_count == 0
+    assert queue.consumed == []
 
 
 @pytest.mark.asyncio
@@ -442,13 +589,14 @@ async def test_warnlisted_exec_unattended_runs_without_approval_when_no_sandbox_
 
 
 @pytest.mark.asyncio
-async def test_destructive_code_exec_uses_sandbox_gate_when_runtime_enabled(
+async def test_single_file_code_delete_uses_sandbox_without_high_impact_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     ctx = current_tool_context.get()
     assert ctx is not None
     ctx.workspace_dir = str(tmp_path)
+    ctx.run_mode = "standard"
     target = tmp_path / "target.txt"
     target.write_text("delete me", encoding="utf-8")
     configure_runtime(
@@ -457,6 +605,7 @@ async def test_destructive_code_exec_uses_sandbox_gate_when_runtime_enabled(
             security_grading=True,
             backend="noop",
             allow_legacy_mode=True,
+            run_mode="standard",
         ),
         workspace=tmp_path,
     )
@@ -488,9 +637,64 @@ async def test_destructive_code_exec_uses_sandbox_gate_when_runtime_enabled(
     assert payload["stdout"] == "sandboxed\n"
     assert [name for name, _ in calls] == ["gate", "backend"]
     hints = calls[0][1]["hints"]  # type: ignore[index]
-    assert hints.high_impact is True
+    assert hints.high_impact is False
     assert target.exists()
     assert get_approval_queue().list_pending("exec") == []
+
+
+@pytest.mark.asyncio
+async def test_execute_code_approved_locked_action_uses_host_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = current_tool_context.get()
+    assert ctx is not None
+    ctx.workspace_dir = str(tmp_path)
+    ctx.run_mode = "standard"
+    target = tmp_path / "approved-delete.txt"
+    target.write_text("delete me", encoding="utf-8")
+    configure_runtime(
+        SandboxSettings(
+            sandbox=True,
+            security_grading=True,
+            backend="noop",
+            allow_legacy_mode=True,
+            run_mode="standard",
+        ),
+        workspace=tmp_path,
+    )
+    calls: list[str] = []
+
+    async def fake_gate_action(**kwargs: object) -> tuple[object, object, object]:
+        calls.append("gate")
+        policy = SimpleNamespace(network=None)
+        request = SimpleNamespace(cwd=tmp_path, action_kind="code.exec", policy=policy)
+        return (
+            ApprovedHostExecution(
+                approval_id="approval-1",
+                action_fingerprint="fingerprint",
+                level=SecurityLevel.LOCKED,
+            ),
+            policy,
+            request,
+        )
+
+    async def fail_backend(*args: object, **kwargs: object) -> object:
+        raise AssertionError("approved L3 code must not run under the backend")
+
+    monkeypatch.setattr(code_exec, "gate_action", fake_gate_action)
+    monkeypatch.setattr(
+        code_exec,
+        "_run_backend_with_managed_network_if_needed",
+        fail_backend,
+    )
+
+    result = await execute_code(f"from pathlib import Path\nPath({str(target)!r}).unlink()")
+    payload = json.loads(result)
+
+    assert payload["exit_code"] == 0
+    assert calls == ["gate"]
+    assert target.exists() is False
 
 
 @pytest.mark.asyncio
@@ -501,12 +705,14 @@ async def test_warnlist_background_process_uses_sandbox_gate_when_runtime_enable
     ctx = current_tool_context.get()
     assert ctx is not None
     ctx.workspace_dir = str(tmp_path)
+    ctx.run_mode = "standard"
     configure_runtime(
         SandboxSettings(
             sandbox=True,
             security_grading=True,
             backend="noop",
             allow_legacy_mode=True,
+            run_mode="standard",
         ),
         workspace=tmp_path,
     )
@@ -557,6 +763,78 @@ async def test_warnlist_background_process_uses_sandbox_gate_when_runtime_enable
     hints = calls[0][1]["hints"]  # type: ignore[index]
     assert hints.high_impact is True
     assert get_approval_queue().list_pending("exec") == []
+
+
+@pytest.mark.asyncio
+async def test_background_process_approved_locked_action_uses_host_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = current_tool_context.get()
+    assert ctx is not None
+    ctx.workspace_dir = str(tmp_path)
+    ctx.run_mode = "standard"
+    configure_runtime(
+        SandboxSettings(
+            sandbox=True,
+            security_grading=True,
+            backend="noop",
+            allow_legacy_mode=True,
+            run_mode="standard",
+        ),
+        workspace=tmp_path,
+    )
+    calls: list[tuple[str, str]] = []
+    approved_paths: list[str] = []
+    monkeypatch.setenv("PATH", "/approved-path")
+
+    async def fake_gate_action(**kwargs: object) -> tuple[object, object, object]:
+        calls.append(("gate", str(kwargs["argv"])))
+        approved_env = kwargs["env"]
+        assert isinstance(approved_env, dict)
+        assert approved_env["PATH"].split(os.pathsep, 1)[0] == "/approved-path"
+        approved_paths.append(approved_env["PATH"])
+        monkeypatch.setenv("PATH", "/changed-after-approval")
+        policy = SimpleNamespace(network=None, network_proxy=None)
+        request = SimpleNamespace(
+            cwd=tmp_path,
+            action_kind="shell.background",
+            policy=policy,
+        )
+        return (
+            ApprovedHostExecution(
+                approval_id="approval-1",
+                action_fingerprint="fingerprint",
+                level=SecurityLevel.LOCKED,
+            ),
+            policy,
+            request,
+        )
+
+    async def fail_backend(*args: object, **kwargs: object) -> object:
+        raise AssertionError("approved L3 background call must not use the backend")
+
+    async def fake_host(command: str, **kwargs: object) -> str:
+        calls.append(("host", command))
+        host_env = kwargs["env"]
+        assert isinstance(host_env, dict)
+        assert host_env["PATH"] == approved_paths[0]
+        return "host-background"
+
+    monkeypatch.setattr(shell, "gate_action", fake_gate_action)
+    monkeypatch.setattr(shell, "_spawn_sandboxed_background_process", fail_backend)
+    monkeypatch.setattr(shell, "_start_host_background_process", fake_host)
+
+    result = await shell.background_process(
+        "rm -f exact-background-probe",
+        workdir=str(tmp_path),
+    )
+
+    assert result == "host-background"
+    assert calls == [
+        ("gate", "('background_process', 'rm -f exact-background-probe')"),
+        ("host", "rm -f exact-background-probe"),
+    ]
 
 
 @pytest.mark.asyncio
@@ -619,7 +897,7 @@ async def test_workspace_lockdown_allows_configured_scratch_dir_write(
     ctx.scratch_dir = str(scratch)  # type: ignore[attr-defined]
     ctx.workspace_lockdown = True  # type: ignore[attr-defined]
 
-    result, elevated = await filesystem._gate_out_of_workspace_write(
+    result, elevated, _backups = await filesystem._gate_out_of_workspace_write(
         "write_file",
         target.resolve(strict=False),
         str(target),

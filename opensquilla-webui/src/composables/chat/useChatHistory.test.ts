@@ -12,6 +12,7 @@ function makeHistory(autoScroll = true, overrides: {
   preserveLiveTail?: boolean
   sessionKey?: Ref<string>
   threadRef?: Ref<HTMLElement | null>
+  concurrentHistoryReads?: boolean
 } = {}) {
   const response: ChatHistoryResponse = overrides.response || {
     messages: [
@@ -30,6 +31,9 @@ function makeHistory(autoScroll = true, overrides: {
   }
   const messages = ref<ChatMessage[]>(overrides.messages || [])
   const rpc = {
+    policy: {
+      concurrent_history_reads: overrides.concurrentHistoryReads ?? true,
+    },
     waitForConnection: vi.fn().mockResolvedValue(undefined),
     call: vi.fn().mockResolvedValue(response),
   }
@@ -60,20 +64,1078 @@ function historyMessage(id: string): NonNullable<ChatHistoryResponse['messages']
 }
 
 describe('useChatHistory canonical pagination', () => {
-  it('requests canonical messages without compaction summaries', async () => {
+  it('does not expose an ordinary send disposition as same-turn steer status', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'user-send',
+          message_id: 'user-send',
+          role: 'user',
+          text: 'ordinary queued follow-up',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: {
+            turn_id: 'turn-send',
+            target_turn_id: 'turn-send',
+            client_request_id: 'request-send',
+            client_message_id: 'client-send',
+            intent: 'send',
+            disposition: 'applied',
+            revision: 1,
+          },
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      role: 'user',
+      text: 'ordinary queued follow-up',
+      turnId: 'turn-send',
+    })
+    expect(messages.value[0]?.inputDisposition).toBeUndefined()
+    expect(messages.value[0]?.inputDispositionRevision).toBeUndefined()
+    expect(messages.value[0]?.steerClientRequestId).toBeUndefined()
+    expect(messages.value[0]?.steerClientMessageId).toBeUndefined()
+  })
+
+  it('restores an explicit Steer intent without relying on shared transport IDs', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'current-steer',
+          message_id: 'current-steer',
+          role: 'user',
+          text: 'current same-turn correction',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: {
+            turn_id: 'turn-steer',
+            client_request_id: 'request-steer',
+            client_message_id: 'client-steer',
+            intent: 'steer',
+            disposition: 'applied',
+            revision: 2,
+          },
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      inputDisposition: 'applied',
+      inputDispositionRevision: 2,
+      steerClientRequestId: 'request-steer',
+      steerClientMessageId: 'client-steer',
+    })
+  })
+
+  it('does not infer legacy Steer UX from shared primary-input fields', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: (['applied', 'cancelled', 'rejected'] as const).map((disposition, index) => ({
+          id: `legacy-send-${disposition}`,
+          message_id: `legacy-send-${disposition}`,
+          role: 'user' as const,
+          text: `legacy primary ${disposition}`,
+          timestamp: `2026-07-06T00:00:0${index}Z`,
+          turn_context: {
+            turn_id: 'turn-send',
+            target_turn_id: 'turn-send',
+            client_request_id: `request-${disposition}`,
+            client_message_id: `client-${disposition}`,
+            disposition,
+            revision: 2,
+            applied_iteration: null,
+          },
+        })),
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    for (const message of messages.value) {
+      expect(message.inputDisposition).toBeUndefined()
+      expect(message.inputDispositionRevision).toBeUndefined()
+      expect(message.steerClientRequestId).toBeUndefined()
+      expect(message.steerClientMessageId).toBeUndefined()
+    }
+  })
+
+  it('restores an applied legacy steer from model-call evidence when intent is absent', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'legacy-steer',
+          message_id: 'legacy-steer',
+          role: 'user',
+          text: 'legacy same-turn correction',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: {
+            turn_id: 'turn-steer',
+            client_request_id: 'request-steer',
+            client_message_id: 'client-steer',
+            disposition: 'applied',
+            revision: 2,
+            model_call_id: '2.0',
+            applied_iteration: 2,
+          },
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      role: 'user',
+      text: 'legacy same-turn correction',
+      turnId: 'turn-steer',
+      inputDisposition: 'applied',
+      inputDispositionRevision: 2,
+      steerClientRequestId: 'request-steer',
+      steerClientMessageId: 'client-steer',
+      steerModelCallId: '2.0',
+      steerAppliedIteration: 2,
+    })
+  })
+
+  it('projects durable internal turn provenance without mutating history context', async () => {
+    const turnContext = {
+      turn_id: 'turn-goal',
+      input_mode: 'system_event',
+      run_kind: 'goal',
+    }
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-goal',
+          message_id: 'assistant-goal',
+          role: 'assistant',
+          text: 'NO_REPLY\nGoal progress',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: turnContext,
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      turnId: 'turn-goal',
+      turnInputMode: 'system_event',
+      turnRunKind: 'goal',
+    })
+    expect(turnContext).toEqual({
+      turn_id: 'turn-goal',
+      input_mode: 'system_event',
+      run_kind: 'goal',
+    })
+  })
+
+  it('derives internal goal provenance from a legacy goal_continuation intent', async () => {
+    const turnContext = {
+      turn_id: 'turn-legacy-goal',
+      intent: 'goal_continuation',
+    }
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-legacy-goal',
+          message_id: 'assistant-legacy-goal',
+          role: 'assistant',
+          text: 'NO_REPLY\nGoal progress',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: turnContext,
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]).toMatchObject({
+      turnId: 'turn-legacy-goal',
+      turnInputMode: 'system_event',
+      turnRunKind: 'goal',
+    })
+    expect(turnContext).toEqual({
+      turn_id: 'turn-legacy-goal',
+      intent: 'goal_continuation',
+    })
+  })
+
+  it('preserves additive cancellation usage coverage from canonical history', async () => {
+    const usage = {
+      input_tokens: 1,
+      output_tokens: 1,
+      cost_usd: 0,
+      coverage_status: 'usage_unknown',
+      usage_unknown: true,
+      unknown_usage_events: 1,
+    }
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-cancelled',
+          message_id: 'assistant-cancelled',
+          role: 'assistant',
+          text: 'Partial answer',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: { turn_id: 'turn-cancelled' },
+          usage,
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]?.usage).toEqual(usage)
+    expect(usage).toEqual({
+      input_tokens: 1,
+      output_tokens: 1,
+      cost_usd: 0,
+      coverage_status: 'usage_unknown',
+      usage_unknown: true,
+      unknown_usage_events: 1,
+    })
+  })
+
+  it('requests canonical messages with durable compaction summaries', async () => {
     const { api, rpc } = makeHistory()
 
+    expect(api.historyState.value.initialLoadStatus).toBe('pending')
     await api.loadHistory()
 
     expect(rpc.call).toHaveBeenCalledWith('chat.history', expect.objectContaining({
       includeCanonical: true,
-      includeSummaries: false,
+      includeSummaries: true,
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+    })
+  })
+
+  it('keeps one legacy activity row across prepend and canonical refresh', async () => {
+    const activity = {
+      id: 'legacy-tools',
+      message_id: 'legacy-tools',
+      role: 'assistant',
+      text: '',
+      timestamp: '2026-07-06T00:00:01Z',
+      tool_calls: [
+        { type: 'text', text: 'Inspect the source.' },
+        { type: 'tool_use', tool_use_id: 'call-read', name: 'read_file', input: {} },
+        { type: 'text', text: 'Compare the directory.' },
+        { type: 'tool_use', tool_use_id: 'call-list', name: 'list_dir', input: {} },
+        { type: 'tool_result', tool_use_id: 'call-read', name: 'read_file', result: 'source' },
+        { type: 'tool_result', tool_use_id: 'call-list', name: 'list_dir', result: 'directory' },
+      ],
+    }
+    const { api, rpc, messages } = makeHistory(false, {
+      response: {
+        messages: [activity],
+        canonical_complete: false,
+        has_more: true,
+        oldest_cursor: 'cursor-tools',
+        newest_cursor: 'cursor-tools',
+      },
+    })
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [activity],
+        canonical_complete: false,
+        has_more: true,
+        oldest_cursor: 'cursor-tools',
+        newest_cursor: 'cursor-tools',
+      })
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'older-user',
+          message_id: 'older-user',
+          role: 'user',
+          text: 'Earlier request',
+          timestamp: '2026-07-06T00:00:00Z',
+        }],
+        canonical_complete: false,
+        has_more: false,
+        oldest_cursor: 'cursor-older',
+        newest_cursor: 'cursor-older',
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          activity,
+          {
+            id: 'later-user',
+            message_id: 'later-user',
+            role: 'user',
+            text: 'Continue',
+            timestamp: '2026-07-06T00:00:02Z',
+          },
+        ],
+        canonical_complete: true,
+        has_more: false,
+        oldest_cursor: 'cursor-tools',
+        newest_cursor: 'cursor-later',
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'older-user',
+      'legacy-tools',
+      'later-user',
+    ])
+    expect(messages.value.filter(message => message.messageId === 'legacy-tools')).toHaveLength(1)
+    expect(messages.value[1]?.tool_calls?.map(segment => segment.tool_use_id)).toEqual([
+      undefined,
+      'call-read',
+      undefined,
+      'call-list',
+      'call-read',
+      'call-list',
+    ])
+    expect(api.historyState.value.canonicalComplete).toBe(true)
+  })
+
+  it('restores manual compaction summaries in stable transcript chronology', async () => {
+    const baseTime = 1_720_000_000_000
+    const response: ChatHistoryResponse = {
+      messages: [
+        {
+          id: 'user-1',
+          message_id: 'user-1',
+          role: 'user',
+          text: 'Earlier request',
+          timestamp: baseTime,
+        },
+        {
+          id: 'assistant-1',
+          message_id: 'assistant-1',
+          role: 'assistant',
+          text: 'Earlier answer',
+          timestamp: baseTime + 1_000,
+        },
+        {
+          id: 'user-2',
+          message_id: 'user-2',
+          role: 'user',
+          text: 'Continue',
+          timestamp: baseTime + 3_000,
+        },
+      ],
+      canonical_complete: true,
+      compaction_summaries: [
+        {
+          id: 9,
+          compaction_id: 'cmp-9',
+          compaction_index: 2,
+          trigger_reason: 'manual',
+          removed_count: 8,
+          kept_count: 2,
+          created_at: 1_720_000_001,
+        },
+        {
+          id: 7,
+          compaction_id: 'cmp-7',
+          compaction_index: 1,
+          trigger_reason: 'manual',
+          removed_count: 5,
+          kept_count: 1,
+          created_at: 1_720_000_001,
+        },
+        {
+          id: 8,
+          compaction_id: 'cmp-auto',
+          trigger_reason: 'auto_threshold',
+          created_at: 1_720_000_002,
+        },
+      ],
+      has_more: false,
+    }
+    const { api, messages } = makeHistory(false, {
+      response,
+      messages: [{
+        role: 'maintenance',
+        text: '',
+        ts: baseTime + 500,
+        messageId: 'maintenance:optimistic:cmp-7',
+        maintenance: {
+          kind: 'context_compaction',
+          compactionId: 'cmp-7',
+          source: 'manual',
+          state: 'completed',
+          durability: 'durable',
+        },
+      }],
+    })
+
+    await api.loadHistory()
+
+    const expectedIds = [
+      'user-1',
+      'assistant-1',
+      'maintenance:context-compaction:summary:7',
+      'maintenance:context-compaction:summary:9',
+      'maintenance:context-compaction:summary:8',
+      'user-2',
+    ]
+    expect(messages.value.map(message => message.messageId)).toEqual(expectedIds)
+    expect(messages.value[2]).toMatchObject({
+      role: 'maintenance',
+      text: '',
+      ts: baseTime + 1_000,
+      restoredFromHistory: true,
+      maintenance: {
+        kind: 'context_compaction',
+        compactionId: 'cmp-7',
+        source: 'manual',
+        state: 'completed',
+        durability: 'durable',
+        removedCount: 5,
+        keptCount: 1,
+        historyArchived: true,
+        canonicalComplete: true,
+      },
+    })
+    expect(messages.value[4]).toMatchObject({
+      maintenance: {
+        compactionId: 'cmp-auto',
+        source: 'automatic',
+        historyArchived: true,
+        canonicalComplete: true,
+      },
+    })
+    expect(messages.value.filter(message =>
+      message.maintenance?.compactionId === 'cmp-7',
+    )).toHaveLength(1)
+
+    // A background refresh receives the same metadata. Stable ids and the
+    // timestamp tie-breaker keep both membership and order unchanged.
+    await api.loadHistory()
+    expect(messages.value.map(message => message.messageId)).toEqual(expectedIds)
+  })
+
+  it('inserts maintenance without reordering promoted canonical rows', async () => {
+    const baseTime = 1_720_000_000_000
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [
+          {
+            id: 'user-old',
+            message_id: 'user-old',
+            role: 'user',
+            text: 'Original request',
+            timestamp: baseTime,
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'steer-1',
+            message_id: 'steer-1',
+            role: 'user',
+            text: 'Use the new constraint',
+            timestamp: baseTime + 1_000,
+            turn_context: {
+              turn_id: 'turn-new',
+              promoted_from_turn_id: 'turn-old',
+              disposition: 'promoted',
+              revision: 2,
+            },
+          },
+          {
+            id: 'assistant-old',
+            message_id: 'assistant-old',
+            role: 'assistant',
+            text: 'Completed old turn',
+            timestamp: baseTime + 2_000,
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'assistant-new',
+            message_id: 'assistant-new',
+            role: 'assistant',
+            text: 'Completed promoted turn',
+            timestamp: baseTime + 3_000,
+            turn_context: { turn_id: 'turn-new' },
+          },
+        ],
+        compaction_summaries: [{
+          id: 11,
+          compaction_id: 'cmp-promoted',
+          trigger_reason: 'manual',
+          created_at: baseTime + 1_500,
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value
+      .filter(message => message.role !== 'maintenance')
+      .map(message => message.messageId)).toEqual([
+      'user-old',
+      'assistant-old',
+      'steer-1',
+      'assistant-new',
+    ])
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'user-old',
+      'maintenance:context-compaction:summary:11',
+      'assistant-old',
+      'steer-1',
+      'assistant-new',
+    ])
+  })
+
+  it('applies the shared bootstrap deadline without recycling on history timeout', async () => {
+    const { api, rpc } = makeHistory()
+    const now = Date.now()
+    const controller = new AbortController()
+
+    await api.loadHistory({}, {
+      generation: 1,
+      key: 'agent:main:webchat:test',
+      attempt: 0,
+      deadlineAt: now + 15_000,
+      attemptDeadlineAt: now + 7_000,
+      signal: controller.signal,
+      skipSnapshot: false,
+    })
+
+    expect(rpc.waitForConnection).toHaveBeenCalledWith(
+      expect.any(Number),
+      expect.any(AbortSignal),
+      {
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+      },
+    )
+    expect(rpc.call).toHaveBeenCalledWith(
+      'chat.history',
+      expect.objectContaining({ includeCanonical: true }),
+      expect.objectContaining({
+        timeoutMs: expect.any(Number),
+        signal: expect.any(AbortSignal),
+        timeoutAction: 'reject',
+        abortAction: 'reject',
+        onSent: expect.any(Function),
+      }),
+    )
+  })
+
+  it('recycles a legacy serial Gateway when history is abandoned', async () => {
+    const { api, rpc } = makeHistory(true, {
+      concurrentHistoryReads: false,
+    })
+    const now = Date.now()
+
+    await api.loadHistory({}, {
+      generation: 1,
+      key: 'agent:main:webchat:test',
+      attempt: 0,
+      deadlineAt: now + 15_000,
+      attemptDeadlineAt: now + 7_000,
+      signal: new AbortController().signal,
+      skipSnapshot: false,
+    })
+
+    expect(rpc.call).toHaveBeenCalledWith(
+      'chat.history',
+      expect.any(Object),
+      expect.objectContaining({
+        timeoutAction: 'reconnect',
+        abortAction: 'reconnect',
+      }),
+    )
+  })
+
+  it('enters the initial loading state before the first RPC settles', async () => {
+    let resolveHistory!: (value: ChatHistoryResponse) => void
+    const pendingHistory = new Promise<ChatHistoryResponse>(resolve => {
+      resolveHistory = resolve
+    })
+    const { api, rpc } = makeHistory()
+    rpc.call.mockReturnValueOnce(pendingHistory)
+
+    const load = api.loadHistory()
+    expect(api.historyState.value.initialLoadStatus).toBe('loading')
+
+    resolveHistory({
+      messages: [],
+      has_more: false,
+      oldest_cursor: null,
+    })
+    await load
+    expect(api.historyState.value.initialLoadStatus).toBe('ready')
+  })
+
+  it('does not restore the full-screen loader for a settled empty-session refresh', async () => {
+    let resolveRefresh!: (value: ChatHistoryResponse) => void
+    const refreshResponse = new Promise<ChatHistoryResponse>(resolve => {
+      resolveRefresh = resolve
+    })
+    const { api, rpc } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+      },
+    })
+
+    await api.loadHistory()
+    rpc.call.mockReturnValueOnce(refreshResponse)
+    const refresh = api.loadHistory()
+
+    expect(api.historyState.value.loading).toBe(true)
+    expect(api.historyState.value.initialLoadStatus).toBe('ready')
+
+    resolveRefresh({
+      messages: [],
+      has_more: false,
+      oldest_cursor: null,
+    })
+    await refresh
+    expect(api.historyState.value.initialLoadStatus).toBe('ready')
+  })
+
+  it('keeps a settled empty-session refresh failure retryable without restoring the loader', async () => {
+    const { api, rpc } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+      },
+    })
+
+    await api.loadHistory()
+    rpc.call.mockRejectedValueOnce(new Error('offline'))
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loadEarlierError: false,
+      recoveryError: true,
+    })
+
+    let resolveRetry!: (value: ChatHistoryResponse) => void
+    rpc.call.mockReturnValueOnce(new Promise<ChatHistoryResponse>(resolve => {
+      resolveRetry = resolve
     }))
+    const retry = api.retryHistory()
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loading: true,
+      retrying: true,
+      loadEarlierError: false,
+    })
+    resolveRetry({
+      messages: [],
+      has_more: false,
+      oldest_cursor: null,
+    })
+    await retry
+    expect(rpc.call).toHaveBeenCalledTimes(3)
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      retrying: false,
+      loadEarlierError: false,
+      recoveryError: false,
+    })
+  })
+
+  it('keeps loaded messages visible and exposes an inline recovery error after refresh fails', async () => {
+    const { api, rpc, messages } = makeHistory()
+    await api.loadHistory()
+    expect(messages.value.map(message => message.text)).toEqual(['hello'])
+
+    rpc.call.mockRejectedValueOnce(new Error('refresh disconnected'))
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.text)).toEqual(['hello'])
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loading: false,
+      recoveryError: true,
+    })
+  })
+
+  it('keeps an unavailable canonical reader retryable after an empty session has settled', async () => {
+    const { api, rpc } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+      },
+    })
+
+    await api.loadHistory()
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        canonical_available: false,
+        canonical_complete: false,
+      })
+      .mockResolvedValueOnce({
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        canonical_available: true,
+        canonical_complete: true,
+      })
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: false,
+      canonicalComplete: false,
+      loadEarlierError: false,
+    })
+
+    await api.retryHistory()
+    expect(rpc.call).toHaveBeenCalledTimes(3)
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: true,
+      canonicalComplete: true,
+    })
+  })
+
+  it('restores the durable causal turn identity from canonical history', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-1',
+          message_id: 'assistant-1',
+          role: 'assistant',
+          text: 'partial answer',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: {
+            turn_id: 'turn-1',
+            intent: 'send',
+          },
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]?.turnId).toBe('turn-1')
+  })
+
+  it('prefers a durable summary boundary over duplicate activity metadata', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-1',
+          message_id: 'assistant-1',
+          role: 'assistant',
+          text: 'answer after compaction',
+          timestamp: '2026-07-06T00:00:00Z',
+          turn_context: {
+            turn_id: 'turn-1',
+            activity_markers: [{
+              kind: 'context_compaction',
+              id: 'cmp-history',
+              status: 'completed',
+              at: 1_720_000_000_000,
+            }],
+          },
+        }],
+        canonical_complete: true,
+        compaction_summaries: [{
+          id: 12,
+          compaction_id: 'cmp-history',
+          trigger_reason: 'manual',
+          created_at: 1_720_000_000_000,
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    const assistant = messages.value.find(message => message.role === 'assistant')
+    expect(assistant).toMatchObject({
+      restoredFromHistory: true,
+      statusHistory: [],
+    })
+    expect(messages.value).toHaveLength(2)
+    expect(messages.value.find(message => message.role === 'maintenance')).toMatchObject({
+      maintenance: {
+        compactionId: 'cmp-history',
+        historyArchived: true,
+        canonicalComplete: true,
+      },
+    })
+  })
+
+  it('interleaves cold same-turn output when the steer crosses a page boundary', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'assistant-1',
+          message_id: 'assistant-1',
+          role: 'assistant',
+          text: '前😀后续',
+          timestamp: '2026-07-06T00:00:02Z',
+          turn_context: { turn_id: 'turn-1' },
+          usage: {
+            model_call_segments: [{
+              model_call_id: '2.0',
+              iteration: 2,
+              start_codepoint: 2,
+              end_codepoint: 4,
+            }],
+          },
+        }],
+        has_more: true,
+        oldest_cursor: 'cursor-assistant',
+        newest_cursor: 'cursor-assistant',
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'user-1',
+            message_id: 'user-1',
+            role: 'user',
+            text: '原始问题',
+            timestamp: '2026-07-06T00:00:00Z',
+            turn_context: { turn_id: 'turn-1' },
+          },
+          {
+            id: 'steer-1',
+            message_id: 'steer-1',
+            role: 'user',
+            text: '请补充细节',
+            timestamp: '2026-07-06T00:00:01Z',
+            turn_context: {
+              turn_id: 'turn-1',
+              disposition: 'applied',
+              revision: 2,
+              model_call_id: '2.0',
+              applied_iteration: 2,
+            },
+          },
+        ],
+        has_more: false,
+        oldest_cursor: 'cursor-user',
+        newest_cursor: 'cursor-steer',
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([
+      ['user', '原始问题'],
+      ['assistant', '前😀'],
+      ['user', '请补充细节'],
+      ['assistant', '后续'],
+    ])
+    expect(messages.value[2]).toMatchObject({
+      messageId: 'steer-1',
+      inputDisposition: 'applied',
+      steerModelCallId: '2.0',
+      steerAppliedIteration: 2,
+    })
+    expect(messages.value[3]?.messageId).toBe('assistant-1')
+  })
+
+  it('restores a promoted steer under its new turn instead of the completed target turn', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        // Persistence keeps the steer row's original receive sequence. The
+        // history projection must move it behind the completed old turn and
+        // ahead of output belonging to its promoted follow-up.
+        messages: [
+          {
+            id: 'user-old',
+            message_id: 'user-old',
+            role: 'user',
+            text: 'original request',
+            timestamp: '2026-07-06T00:00:00Z',
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'steer-1',
+            message_id: 'steer-1',
+            role: 'user',
+            text: 'use the new constraint',
+            timestamp: '2026-07-06T00:00:01Z',
+            turn_context: {
+              turn_id: 'turn-new',
+              target_turn_id: 'turn-old',
+              promoted_turn_id: 'turn-new',
+              promoted_from_turn_id: 'turn-old',
+              disposition: 'promoted',
+              revision: 2,
+            },
+          },
+          {
+            id: 'assistant-old',
+            message_id: 'assistant-old',
+            role: 'assistant',
+            text: 'completed old-turn output',
+            timestamp: '2026-07-06T00:00:02Z',
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'assistant-new',
+            message_id: 'assistant-new',
+            role: 'assistant',
+            text: 'promoted follow-up output',
+            timestamp: '2026-07-06T00:00:03Z',
+            turn_context: { turn_id: 'turn-new' },
+          },
+        ],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'user-old',
+      'assistant-old',
+      'steer-1',
+      'assistant-new',
+    ])
+    expect(messages.value[2]).toMatchObject({
+      turnId: 'turn-new',
+      promotedFromTurnId: 'turn-old',
+      inputDisposition: 'promoted',
+      inputDispositionRevision: 2,
+    })
+  })
+
+  it('re-homes a promoted steer when its completed turn crosses a page boundary', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'assistant-old',
+            message_id: 'assistant-old',
+            role: 'assistant',
+            text: 'completed old-turn output',
+            timestamp: '2026-07-06T00:00:02Z',
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'assistant-new',
+            message_id: 'assistant-new',
+            role: 'assistant',
+            text: 'promoted follow-up output',
+            timestamp: '2026-07-06T00:00:03Z',
+            turn_context: { turn_id: 'turn-new' },
+          },
+        ],
+        has_more: true,
+        oldest_cursor: 'cursor-assistant-old',
+        newest_cursor: 'cursor-assistant-new',
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          {
+            id: 'user-old',
+            message_id: 'user-old',
+            role: 'user',
+            text: 'original request',
+            timestamp: '2026-07-06T00:00:00Z',
+            turn_context: { turn_id: 'turn-old' },
+          },
+          {
+            id: 'steer-1',
+            message_id: 'steer-1',
+            role: 'user',
+            text: 'use the new constraint',
+            timestamp: '2026-07-06T00:00:01Z',
+            turn_context: {
+              turn_id: 'turn-new',
+              promoted_from_turn_id: 'turn-old',
+              disposition: 'promoted',
+              revision: 2,
+            },
+          },
+        ],
+        has_more: false,
+        oldest_cursor: 'cursor-user-old',
+        newest_cursor: 'cursor-steer',
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'user-old',
+      'assistant-old',
+      'steer-1',
+      'assistant-new',
+    ])
+  })
+
+  it('restores immutable plan revisions from typed transcript segments', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-plan',
+          message_id: 'assistant-plan',
+          role: 'assistant',
+          text: 'Legacy Markdown fallback',
+          timestamp: '2026-07-06T00:00:00Z',
+          tool_calls: [{
+            type: 'plan',
+            snapshot: {
+              revisionId: 'revision-2',
+              planId: 'plan-1',
+              title: 'Ship plan mode',
+              markdown: 'A complete plan.',
+              steps: [{ stepId: 'inspect', title: 'Inspect' }],
+              current: true,
+            },
+          }],
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]?.planRevisions).toEqual([
+      expect.objectContaining({
+        revisionId: 'revision-2',
+        planId: 'plan-1',
+        title: 'Ship plan mode',
+      }),
+    ])
   })
 
   it('prepends one page per cursor and preserves the reader scroll anchor', async () => {
     const thread = document.createElement('div')
     let height = 400
+    const earlySummary = {
+      id: 21,
+      compaction_id: 'cmp-early',
+      trigger_reason: 'manual',
+      created_at: Date.parse('2026-07-06T00:00:01.500Z'),
+    }
+    const lateSummary = {
+      id: 22,
+      compaction_id: 'cmp-late',
+      trigger_reason: 'manual',
+      created_at: Date.parse('2026-07-06T00:00:03.500Z'),
+    }
     Object.defineProperties(thread, {
       scrollHeight: { configurable: true, get: () => height },
       scrollTop: { configurable: true, value: 120, writable: true },
@@ -83,6 +1145,7 @@ describe('useChatHistory canonical pagination', () => {
       threadRef,
       response: {
         messages: [historyMessage('m3'), historyMessage('m4')],
+        compaction_summaries: [lateSummary],
         has_more: true,
         oldest_cursor: 'cursor-3',
         newest_cursor: 'cursor-4',
@@ -95,11 +1158,13 @@ describe('useChatHistory canonical pagination', () => {
     document.body.append(thread)
     thread.getBoundingClientRect = () => ({ top: 0, bottom: 500 } as DOMRect)
     anchor.getBoundingClientRect = () => {
-      const top = messages.value.length > 2 ? 300 : 100
+      const canonicalCount = messages.value.filter(message => message.role !== 'maintenance').length
+      const top = canonicalCount > 2 ? 300 : 100
       return { top, bottom: top + 60 } as DOMRect
     }
     rpc.call.mockImplementationOnce(async () => ({
       messages: [historyMessage('m3'), historyMessage('m4')],
+      compaction_summaries: [lateSummary],
       has_more: true,
       oldest_cursor: 'cursor-3',
       newest_cursor: 'cursor-4',
@@ -110,6 +1175,7 @@ describe('useChatHistory canonical pagination', () => {
       height = 900
       return {
         messages: [historyMessage('m1'), historyMessage('m2')],
+        compaction_summaries: [earlySummary, lateSummary],
         has_more: false,
         oldest_cursor: 'cursor-1',
         newest_cursor: 'cursor-2',
@@ -122,7 +1188,17 @@ describe('useChatHistory canonical pagination', () => {
     await nextTick()
     await api.loadEarlierHistory()
 
-    expect(messages.value.map(message => message.messageId)).toEqual(['m1', 'm2', 'm3', 'm4'])
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'm1',
+      'maintenance:context-compaction:summary:21',
+      'm2',
+      'm3',
+      'maintenance:context-compaction:summary:22',
+      'm4',
+    ])
+    expect(messages.value
+      .filter(message => message.role !== 'maintenance')
+      .map(message => message.messageId)).toEqual(['m1', 'm2', 'm3', 'm4'])
     expect(thread.scrollTop).toBe(320)
     expect(rpc.call).toHaveBeenCalledTimes(2)
     expect(api.historyState.value.canonicalComplete).toBe(true)
@@ -176,7 +1252,7 @@ describe('useChatHistory canonical pagination', () => {
 
     expect(rpc.call).toHaveBeenNthCalledWith(4, 'chat.history', expect.objectContaining({
       before: 'cursor-3',
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
     await vi.waitFor(() => {
       expect(messages.value.map(message => message.messageId)).toEqual(['m2', 'm3', 'm4', 'm5'])
     })
@@ -226,7 +1302,7 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value.map(message => message.messageId)).toEqual(['m2', 'm3', 'm4'])
     expect(rpc.call).toHaveBeenNthCalledWith(3, 'chat.history', expect.objectContaining({
       before: 'cursor-4',
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
   })
 
   it('keeps more than 200 loaded canonical messages during a latest-window refresh', async () => {
@@ -321,12 +1397,15 @@ describe('useChatHistory canonical pagination', () => {
         text: 'still running',
         ts: '2026-07-06T01:00:00Z',
         messageId: 'live-user-server',
+        turnId: 'turn-live',
       },
       {
-        role: 'assistant',
-        text: 'Stopped locally',
+        role: 'user',
+        text: 'adjust while running',
         ts: '2026-07-06T01:00:01Z',
-        stopNotice: true,
+        clientId: 'local-steer',
+        turnId: 'turn-live',
+        inputDisposition: 'steering',
       },
     )
 
@@ -335,7 +1414,10 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value[0].messageId).toBe('m-200')
     expect(messages.value.some(message => message.messageId === 'm-300')).toBe(true)
     expect(messages.value.some(message => message.messageId === 'm-500')).toBe(true)
-    expect(messages.value[messages.value.length - 1]?.stopNotice).toBe(true)
+    expect(messages.value[messages.value.length - 1]).toMatchObject({
+      clientId: 'local-steer',
+      inputDisposition: 'steering',
+    })
     expect(api.historyState.value).toMatchObject({
       hasMore: true,
       oldestCursor: 'cursor-200',
@@ -344,16 +1426,16 @@ describe('useChatHistory canonical pagination', () => {
     expect(rpc.call).toHaveBeenNthCalledWith(4, 'chat.history', expect.objectContaining({
       after: 'cursor-299',
       limit: 200,
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
     expect(rpc.call).toHaveBeenNthCalledWith(5, 'chat.history', expect.objectContaining({
       after: 'cursor-499',
       limit: 200,
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
 
     await api.loadEarlierHistory()
     expect(rpc.call).toHaveBeenNthCalledWith(6, 'chat.history', expect.objectContaining({
       before: 'cursor-200',
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
   })
 
   it('bounds each disconnected forward bridge and resumes from the saved cursor', async () => {
@@ -422,7 +1504,7 @@ describe('useChatHistory canonical pagination', () => {
     await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(7))
     expect(rpc.call).toHaveBeenNthCalledWith(7, 'chat.history', expect.objectContaining({
       after: 'cursor-12',
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
     expect(messages.value.map(message => message.messageId)).toEqual([
       'm7', 'm8', 'm9', 'm10', 'm11', 'm12', 'm13', 'm14', 'm15', 'm16',
       'm17', 'm18', 'm19', 'm20',
@@ -501,7 +1583,7 @@ describe('useChatHistory canonical pagination', () => {
     ])
     expect(rpc.call).toHaveBeenNthCalledWith(6, 'chat.history', expect.objectContaining({
       after: 'cursor-4',
-    }))
+    }), expect.objectContaining({ timeoutAction: 'reject' }))
   })
 
   it('stops a forward bridge when its cursor does not advance', async () => {
@@ -545,7 +1627,9 @@ describe('useChatHistory canonical pagination', () => {
     expect(api.historyState.value).toMatchObject({
       oldestCursor: 'cursor-3',
       newestCursor: 'cursor-4',
-      loadEarlierError: true,
+      loadingEarlier: false,
+      loadEarlierError: false,
+      recoveryError: true,
     })
   })
 
@@ -591,11 +1675,45 @@ describe('useChatHistory canonical pagination', () => {
       })
 
     await api.loadHistory()
-    expect(api.historyState.value.loadEarlierError).toBe(true)
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'error',
+      loadEarlierError: false,
+    })
 
-    await api.retryHistory()
-    expect(api.historyState.value.loadEarlierError).toBe(false)
+    const retry = api.retryHistory()
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'loading',
+    })
+    await retry
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loadEarlierError: false,
+    })
     expect(messages.value.map(message => message.messageId)).toEqual(['m1'])
+  })
+
+  it('keeps an initial failure retryable when a live row arrives first', async () => {
+    const { api, rpc, messages } = makeHistory(false)
+    let rejectHistory!: (reason: Error) => void
+    rpc.call.mockReturnValueOnce(new Promise<ChatHistoryResponse>((_resolve, reject) => {
+      rejectHistory = reject
+    }))
+
+    const load = api.loadHistory()
+    messages.value.push({
+      role: 'assistant',
+      text: 'live row',
+      ts: 'live',
+      messageId: 'live-row',
+    })
+    rejectHistory(new Error('offline'))
+    await load
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'error',
+      loadEarlierError: false,
+    })
+    expect(messages.value.map(message => message.messageId)).toEqual(['live-row'])
   })
 
   it('retries the current canonical window when the canonical reader was unavailable', async () => {
@@ -619,11 +1737,92 @@ describe('useChatHistory canonical pagination', () => {
     await api.loadHistory()
     expect(api.historyState.value.canonicalAvailable).toBe(false)
     expect(api.historyState.value.loadingEarlier).toBe(false)
+    expect(api.historyState.value.initialLoadStatus).toBe('ready')
     expect(messages.value.map(message => message.messageId)).toEqual(['fallback'])
 
     await api.retryHistory()
     expect(api.historyState.value.canonicalAvailable).toBe(true)
     expect(rpc.call).toHaveBeenCalledTimes(2)
+  })
+
+  it('marks an empty unavailable canonical reader as an initial retriable failure', async () => {
+    const { api } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        canonical_available: false,
+        canonical_complete: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'error',
+      canonicalAvailable: false,
+      canonicalComplete: false,
+      loadEarlierError: false,
+    })
+  })
+
+  it('settles a confirmed empty session without reporting an initial failure', async () => {
+    const { api } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        canonical_available: false,
+        canonical_complete: true,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: false,
+      canonicalComplete: true,
+    })
+  })
+
+  it('keeps an old-gateway empty success without canonical fields compatible', async () => {
+    const { api } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: null,
+      canonicalComplete: null,
+      loadEarlierError: false,
+    })
+  })
+
+  it('keeps a pre-canonical-complete unavailable empty response compatible', async () => {
+    const { api } = makeHistory(false, {
+      response: {
+        messages: [],
+        has_more: false,
+        oldest_cursor: null,
+        canonical_available: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      canonicalAvailable: false,
+      canonicalComplete: null,
+      loadEarlierError: false,
+    })
   })
 
   it('discards a stale response after switching sessions', async () => {
@@ -662,6 +1861,68 @@ describe('useChatHistory canonical pagination', () => {
 
     expect(messages.value.map(message => message.messageId)).toEqual(['new-message'])
     expect(api.historyState.value.loading).toBe(false)
+    expect(api.historyState.value.initialLoadStatus).toBe('ready')
+  })
+
+  it('cancels a scheduled history sync before switching to another session or draft', async () => {
+    vi.useFakeTimers()
+    try {
+      const sessionKey = ref('agent:main:webchat:old')
+      const { api, rpc } = makeHistory(false, { sessionKey })
+
+      api.scheduleHistorySync()
+      api.cancelActiveHistory()
+      sessionKey.value = 'agent:main:webchat:new-draft'
+      await vi.advanceTimersByTimeAsync(50)
+
+      expect(rpc.waitForConnection).not.toHaveBeenCalled()
+      expect(rpc.call).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps the new session loading when a stale request fails first', async () => {
+    const sessionKey = ref('agent:main:webchat:old')
+    let rejectOld!: (reason: Error) => void
+    let resolveNew!: (value: ChatHistoryResponse) => void
+    const oldResponse = new Promise<ChatHistoryResponse>((_resolve, reject) => {
+      rejectOld = reject
+    })
+    const newResponse = new Promise<ChatHistoryResponse>(resolve => {
+      resolveNew = resolve
+    })
+    const { api, rpc, messages } = makeHistory(false, { sessionKey })
+    rpc.call
+      .mockImplementationOnce(() => oldResponse)
+      .mockImplementationOnce(() => newResponse)
+
+    const oldLoad = api.loadHistory()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(1))
+    sessionKey.value = 'agent:main:webchat:new'
+    const newLoad = api.loadHistory()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(2))
+
+    rejectOld(new Error('stale offline response'))
+    await oldLoad
+    expect(messages.value).toEqual([])
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'loading',
+      loading: true,
+      loadEarlierError: false,
+    })
+
+    resolveNew({
+      messages: [historyMessage('new-message')],
+      has_more: false,
+      oldest_cursor: null,
+    })
+    await newLoad
+    expect(messages.value.map(message => message.messageId)).toEqual(['new-message'])
+    expect(api.historyState.value).toMatchObject({
+      initialLoadStatus: 'ready',
+      loading: false,
+    })
   })
 })
 
@@ -737,7 +1998,7 @@ describe('useChatHistory optimistic local rows', () => {
     expect(messages.value).toEqual(localMessages)
   })
 
-  it('keeps a local stopped-output notice when the settled server history only has the user turn', async () => {
+  it('drops a legacy synthetic stop bubble and uses the typed turn outcome', async () => {
     const { api, messages } = makeHistory(true, {
       messages: [
         { role: 'user', text: 'stop immediately', ts: '2026-07-07T10:00:00Z', messageId: 'user-1' },
@@ -758,8 +2019,20 @@ describe('useChatHistory optimistic local rows', () => {
             role: 'user',
             text: 'stop immediately',
             timestamp: '2026-07-07T10:00:00Z',
+            turn_context: { turn_id: 'turn-1' },
           },
         ],
+        turn_outcomes: [{
+          turn_id: 'turn-1',
+          task_id: 'task-1',
+          status: 'cancelled',
+          started_at: 1_000,
+          finished_at: 2_000,
+          outcome: {
+            kind: 'cancelled',
+            cancellation_source: 'webui_stop',
+          },
+        }],
         has_more: false,
         oldest_cursor: null,
         newest_cursor: null,
@@ -771,9 +2044,12 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', 'stop immediately'],
-      ['assistant', 'Stopped after 1s'],
     ])
-    expect(messages.value[1]?.stopNotice).toBe(true)
+    expect(messages.value[0]?.turnOutcome).toMatchObject({
+      turnId: 'turn-1',
+      status: 'cancelled',
+      cancellationSource: 'webui_stop',
+    })
   })
 
   it('keeps a terminal replay error until server history contains a durable error row', async () => {
@@ -817,7 +2093,7 @@ describe('useChatHistory optimistic local rows', () => {
     })
   })
 
-  it('keeps multiple local stopped-output notices when repeated user prompts reload with server ids', async () => {
+  it('does not infer interruption bubbles from adjacent repeated user messages', async () => {
     const prompt = '调研一下上下文相关的sota论文'
     const { api, messages } = makeHistory(true, {
       messages: [
@@ -884,12 +2160,9 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', prompt],
-      ['assistant', '输出被中断'],
       ['user', prompt],
-      ['assistant', '输出被中断'],
       ['user', prompt],
-      ['assistant', '输出被中断'],
     ])
-    expect(messages.value.filter(message => message.stopNotice)).toHaveLength(3)
+    expect(messages.value.some(message => message.stopNotice)).toBe(false)
   })
 })

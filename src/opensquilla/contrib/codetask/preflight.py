@@ -22,12 +22,20 @@ workable run into a hard stop.
 from __future__ import annotations
 
 import asyncio
+from typing import TYPE_CHECKING
 
 import structlog
 
 from opensquilla.contrib.codetask.agent_config import AgentConfigBundle
 from opensquilla.onboarding.probe import ProviderProbeResult, probe_llm_provider
 from opensquilla.provider.failures import ProviderFailureKind
+from opensquilla.provider.tokenrhythm_correlation import (
+    prewarm_tokenrhythm_install_id,
+    redact_tokenrhythm_install_ids,
+)
+
+if TYPE_CHECKING:
+    from opensquilla.gateway.config import GatewayConfig
 
 log = structlog.get_logger(__name__)
 
@@ -47,8 +55,8 @@ _CREDENTIAL_BLOCK_CODES = frozenset({"no_provider", "401", "402", "403"})
 
 def _effective_provider_config(
     bundle: AgentConfigBundle, model_override: str
-) -> tuple[str, str, str, str, str] | None:
-    """Resolve (provider, model, api_key, base_url, proxy) the subagent will use.
+) -> tuple[GatewayConfig, str, str, str, str, str] | None:
+    """Resolve the config and provider settings the subagent will use.
 
     Returns ``None`` if the bundle carries no usable ``[llm]`` (nothing to
     probe). Mirrors the child's own resolution: build the config from the
@@ -78,7 +86,7 @@ def _effective_provider_config(
     # named by api_key_env / the provider spec, which resolve_llm_runtime_config
     # already applied.
     api_key = bundle.child_env.get("OPENSQUILLA_LLM_API_KEY", "") or (runtime.api_key or "")
-    return provider, model, api_key, runtime.base_url or "", runtime.proxy or ""
+    return cfg, provider, model, api_key, runtime.base_url or "", runtime.proxy or ""
 
 
 def provider_preflight(bundle: AgentConfigBundle, model_override: str = "") -> tuple[bool, str]:
@@ -92,7 +100,12 @@ def provider_preflight(bundle: AgentConfigBundle, model_override: str = "") -> t
     resolved = _effective_provider_config(bundle, model_override)
     if resolved is None:
         return True, ""
-    provider, model, api_key, base_url, proxy = resolved
+    config, provider, model, api_key, base_url, proxy = resolved
+
+    # Register the exact effective child config before the probe can issue a
+    # TokenRhythm request.  Resolution remains asynchronous/fail-open inside
+    # the prewarmer, so this does not add blocking I/O to preflight.
+    prewarm_tokenrhythm_install_id(config=config)
 
     try:
         spec = get_provider_spec(provider)
@@ -118,15 +131,19 @@ def provider_preflight(bundle: AgentConfigBundle, model_override: str = "") -> t
     except ValueError:
         return True, ""  # validation-level probe issue — fail open
     except Exception as exc:  # never let a probe bug block a run
-        log.warning("codetask.preflight.probe_error", error=str(exc))
+        log.warning(
+            "codetask.preflight.probe_error",
+            error=redact_tokenrhythm_install_ids(str(exc)),
+        )
         return True, ""
 
     if probe.ok:
         return True, ""
     if probe.failure_kind in _CREDENTIAL_BLOCK_KINDS:
+        safe_probe_message = redact_tokenrhythm_install_ids(probe.message)
         return False, (
             f"code-task's provider '{provider}' cannot authenticate for model "
-            f"'{model}': {probe.message} Configure a working provider (run "
+            f"'{model}': {safe_probe_message} Configure a working provider (run "
             "`opensquilla onboard`) or set that provider's API key, then retry."
         )
     # Non-credential failure (transport blip, model-not-found, …): fail open.
@@ -150,7 +167,9 @@ def provider_block_reason(errors: list[dict]) -> str | None:
             continue
         code = str(err.get("code") or "").strip().lower()
         if code in _CREDENTIAL_BLOCK_CODES:
-            message = str(err.get("message") or "").strip()
+            message = redact_tokenrhythm_install_ids(
+                str(err.get("message") or "").strip()
+            )
             detail = f": {message}" if message else ""
             return (
                 "code-task's provider rejected the request (the configured "

@@ -9,7 +9,7 @@ import structlog
 
 from opensquilla.tools.builtin.sessions import _get_session_manager, _get_task_runtime
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import ToolError, current_tool_context
+from opensquilla.tools.types import PlanAccess, ToolError, current_tool_context
 
 _VALID_SUBAGENT_ACTIONS = ("list", "kill", "steer")
 _TERMINAL_STATUSES = ("done", "failed", "killed", "timeout")
@@ -70,6 +70,7 @@ def _check_spawned_by_or_raise(session_or_dict: object, current_key: str | None)
     description="List available agent configurations from the agent registry.",
     params={},
     required=[],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def agents_list() -> str:
     registry = _get_agent_registry()

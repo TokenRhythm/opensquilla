@@ -87,6 +87,9 @@ class ReasoningEnableArgs:
 
     thinking_level: ThinkingLevel | None
     thinking_budget_tokens: int
+    model: str = ""
+    thinking_budget_explicit: bool = False
+    reasoning_effort_override: str | None = None
 
     @property
     def effort(self) -> str:
@@ -117,7 +120,10 @@ def _enable_reasoning_effort(payload: dict[str, Any], args: ReasoningEnableArgs)
 
 def _enable_deepseek(payload: dict[str, Any], args: ReasoningEnableArgs) -> None:
     payload["thinking"] = {"type": "enabled"}
-    payload["reasoning_effort"] = _resolve_deepseek_reasoning_effort(args.thinking_level)
+    payload["reasoning_effort"] = (
+        args.reasoning_effort_override
+        or _resolve_deepseek_reasoning_effort(args.thinking_level)
+    )
 
 
 def _enable_tencent_tokenhub(payload: dict[str, Any], args: ReasoningEnableArgs) -> None:
@@ -132,6 +138,52 @@ def _enable_thinking_object(payload: dict[str, Any], args: ReasoningEnableArgs) 
 def _enable_dashscope(payload: dict[str, Any], args: ReasoningEnableArgs) -> None:
     payload["enable_thinking"] = True
     payload["thinking_budget"] = args.thinking_budget_tokens
+
+
+def _enable_qwen_token_plan(payload: dict[str, Any], args: ReasoningEnableArgs) -> None:
+    payload["enable_thinking"] = True
+
+
+def _enable_qwen_token_plan_qwen(
+    payload: dict[str, Any], args: ReasoningEnableArgs
+) -> None:
+    payload["enable_thinking"] = True
+    if args.model.rsplit("/", 1)[-1].strip().lower() == "qwen3.8-max-preview":
+        if args.thinking_budget_explicit:
+            payload["thinking_budget"] = args.thinking_budget_tokens
+        else:
+            from opensquilla.engine.types import ThinkingLevel
+
+            if args.thinking_level in (ThinkingLevel.MINIMAL, ThinkingLevel.LOW):
+                payload["reasoning_effort"] = "low"
+            elif args.thinking_level in (ThinkingLevel.MEDIUM, ThinkingLevel.HIGH):
+                payload["reasoning_effort"] = "medium"
+            else:
+                payload["reasoning_effort"] = "xhigh"
+        return
+    payload["thinking_budget"] = args.thinking_budget_tokens
+
+
+def _enable_qwen_token_plan_deepseek(
+    payload: dict[str, Any], args: ReasoningEnableArgs
+) -> None:
+    payload["enable_thinking"] = True
+    payload["reasoning_effort"] = _resolve_deepseek_reasoning_effort(args.thinking_level)
+
+
+def _enable_qwen_token_plan_glm(
+    payload: dict[str, Any], args: ReasoningEnableArgs
+) -> None:
+    payload["enable_thinking"] = True
+    payload["reasoning_effort"] = _resolve_deepseek_reasoning_effort(
+        args.thinking_level
+    )
+
+
+def _disable_qwen_token_plan(
+    payload: dict[str, Any], args: ReasoningDisableArgs
+) -> None:
+    payload["enable_thinking"] = False
 
 
 def _disable_thinking_object(payload: dict[str, Any], args: ReasoningDisableArgs) -> None:
@@ -201,6 +253,31 @@ DIALECTS: dict[str, ReasoningDialect] = {
         name="dashscope",
         enable=_enable_dashscope,
         disable=_disable_dashscope,
+    ),
+    "qwen_token_plan": ReasoningDialect(
+        name="qwen_token_plan",
+        enable=_enable_qwen_token_plan,
+        disable=_disable_qwen_token_plan,
+    ),
+    "qwen_token_plan_qwen": ReasoningDialect(
+        name="qwen_token_plan_qwen",
+        enable=_enable_qwen_token_plan_qwen,
+        disable=_disable_qwen_token_plan,
+    ),
+    "qwen_token_plan_deepseek": ReasoningDialect(
+        name="qwen_token_plan_deepseek",
+        enable=_enable_qwen_token_plan_deepseek,
+        disable=_disable_qwen_token_plan,
+    ),
+    "qwen_token_plan_glm": ReasoningDialect(
+        name="qwen_token_plan_glm",
+        enable=_enable_qwen_token_plan_glm,
+        disable=_disable_qwen_token_plan,
+    ),
+    "qwen_token_plan_kimi": ReasoningDialect(
+        name="qwen_token_plan_kimi",
+        enable=_enable_qwen_token_plan,
+        disable=_disable_qwen_token_plan,
     ),
     "moonshot": ReasoningDialect(
         name="moonshot",

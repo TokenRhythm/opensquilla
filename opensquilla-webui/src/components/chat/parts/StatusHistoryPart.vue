@@ -21,7 +21,9 @@ import type { StatusPart } from '@/types/parts'
 
 const { t } = useI18n()
 
-const props = defineProps<{ entries: StatusPart[] }>()
+const props = defineProps<{
+  entries: StatusPart[]
+}>()
 
 // Time the agent spent in each phase = gap to the next transition. The last
 // phase has no successor, so it shows no duration (the turn ended there).

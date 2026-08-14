@@ -9,7 +9,7 @@ from typing import Any
 
 from opensquilla.engine.tool_result_store import ToolResultRecord, ToolResultStore
 from opensquilla.tools.registry import tool
-from opensquilla.tools.types import SafeToolError, current_tool_context
+from opensquilla.tools.types import PlanAccess, SafeToolError, current_tool_context
 
 _DEFAULT_MAX_CHARS = 12_000
 _ABSOLUTE_MAX_CHARS = 500_000
@@ -471,6 +471,7 @@ def _line_ref_query(
     },
     required=["handle"],
     exposed_by_default=False,
+    plan_access=PlanAccess.READ_ONLY,
     result_budget_class="code",
 )
 async def retrieve_tool_result(

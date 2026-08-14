@@ -5,7 +5,20 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any, TypeGuard
 
+import structlog
+
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
+from opensquilla.gateway.session_services import get_session_storage
+from opensquilla.project_workspaces import (
+    ProjectWorkspaceStateError,
+    resolve_validated_project_workspace,
+)
+from opensquilla.sandbox.run_context import resolve_default_run_mode
+from opensquilla.sandbox.run_mode_policy import (
+    coerce_run_mode_for_principal,
+    default_run_mode_for_principal,
+    principal_has_host_execute,
+)
 from opensquilla.scheduler.payloads import (
     REMINDER_KIND,
     SYSTEM_EVENT_KIND,
@@ -31,6 +44,8 @@ from opensquilla.scheduler.types import (
 )
 
 _d = get_dispatcher()
+log = structlog.get_logger(__name__)
+_MAX_IDEMPOTENCY_KEY_LENGTH = 256
 
 
 def _require_scheduler(ctx: RpcContext) -> Any:
@@ -73,6 +88,12 @@ def _job_to_wire(j: Any) -> dict[str, Any]:
         if hasattr(schedule_kind_value, "value")
         else str(schedule_kind_value)
     )
+    last_run = d.get("last_run_at")
+    last_status = (
+        "error"
+        if d.get("last_error")
+        else ("ok" if last_run is not None else None)
+    )
     return {  # noqa: PIE810 — wire schema favors flat literal dict
         "id": d.get("id"),
         "name": d.get("name", ""),
@@ -84,12 +105,18 @@ def _job_to_wire(j: Any) -> dict[str, Any]:
         "text": text,
         "payloadKind": kind,
         "agentId": payload_agent_id(payload, "main"),
+        "workspaceId": payload.get("_workspace_id", ""),
+        "workspaceName": payload.get("_workspace_name", ""),
+        "workspaceUnavailable": bool(payload.get("_workspace_unavailable")),
+        "templateId": payload.get("_template_id", ""),
         "status": status_str,
+        "lastStatus": last_status,
+        "last_status": last_status,
         "enabled": (
             bool(d.get("enabled", True)) and status_str not in ("paused", "disabled", "deleted")
         ),
         "next_run": _iso(d.get("next_run_at")),
-        "last_run": _iso(d.get("last_run_at")),
+        "last_run": _iso(last_run),
         "lastResult": d.get("last_error"),
         "run_count": d.get("run_count", 0),
         "error_count": d.get("error_count", 0),
@@ -108,7 +135,68 @@ def _job_to_wire(j: Any) -> dict[str, Any]:
         "consecutive_errors": d.get("consecutive_errors", 0),
         "delivery": _delivery_to_wire(delivery),
         "toolPolicy": _tool_policy_to_wire(d.get("tool_policy")),
+        "runMode": d.get("run_mode", "") or "",
+        "elevated": d.get("elevated", "") or "",
+        "executionTarget": d.get("execution_target", "") or "",
+        "deduplicated": bool(d.get("deduplicated", False)),
     }
+
+
+async def _apply_workspace_binding(
+    params: dict[str, Any],
+    payload: dict[str, Any],
+    ctx: RpcContext,
+) -> None:
+    """Validate and persist an optional project-workspace binding."""
+    if "workspaceId" not in params and "workspace_id" not in params:
+        return
+    raw = params.get("workspaceId", params.get("workspace_id"))
+    workspace_id = raw.strip() if isinstance(raw, str) else ""
+    payload.pop("_workspace_id", None)
+    payload.pop("_workspace_name", None)
+    payload.pop("_workspace_unavailable", None)
+    if not workspace_id:
+        return
+    storage = get_session_storage(getattr(ctx, "session_manager", None))
+    if storage is None:
+        raise ValueError("Project workspace storage is unavailable")
+    try:
+        validated = await resolve_validated_project_workspace(storage, workspace_id)
+    except ProjectWorkspaceStateError as exc:
+        raise ValueError(f"Project workspace is unavailable: {exc.reason}") from exc
+    payload["_workspace_id"] = workspace_id
+    payload["_workspace_name"] = validated.workspace.display_name
+
+
+_WORKSPACE_REQUIRED_TEMPLATE_IDS = frozenset(
+    {"weekly-report", "project-risk", "knowledge-review"}
+)
+
+
+def _apply_template_contract(params: dict[str, Any], payload: dict[str, Any]) -> None:
+    """Persist template identity and fail closed for project-based automations."""
+    raw_template_id = params.get("templateId", params.get("template_id"))
+    template_id = raw_template_id.strip() if isinstance(raw_template_id, str) else ""
+    if template_id:
+        payload["_template_id"] = template_id
+    if template_id in _WORKSPACE_REQUIRED_TEMPLATE_IDS and not payload.get("_workspace_id"):
+        raise ValueError("This automation template requires a project workspace")
+
+
+def _idempotency_key_from_params(params: dict[str, Any]) -> str:
+    raw = params.get("idempotencyKey", params.get("idempotency_key"))
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise ValueError("idempotencyKey must be a string")
+    key = raw.strip()
+    if not key:
+        raise ValueError("idempotencyKey must not be empty")
+    if len(key) > _MAX_IDEMPOTENCY_KEY_LENGTH:
+        raise ValueError(
+            f"idempotencyKey must be at most {_MAX_IDEMPOTENCY_KEY_LENGTH} characters"
+        )
+    return key
 
 
 def _failure_destination_to_wire(fd: Any) -> dict[str, Any] | None:
@@ -218,6 +306,7 @@ def _manual_run_to_wire(result: Any) -> dict[str, Any]:
         return {
             "success": execution.success,
             "status": status_str,
+            "runId": execution.id,
             "reply": execution.summary,
             "error": execution.error,
             "duration_ms": (
@@ -501,12 +590,28 @@ async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, An
     schedule_kind, schedule_value, schedule_tz = _schedule_from_params(params)
     session_target = _resolve_session_target(params)
     payload_kind_name, payload = _build_payload(params, session_target, require_text=True)
+    log.info(
+        "cron.workspace_contract",
+        workspace_requested=bool(params.get("workspaceId") or params.get("workspace_id")),
+        template_id=str(params.get("templateId") or params.get("template_id") or ""),
+    )
+    await _apply_workspace_binding(params, payload, ctx)
+    _apply_template_contract(params, payload)
     text = payload_text(payload, session_target)
     target_session_key = _resolve_target_session_key(params, session_target)
     origin_session_key = _resolve_origin_session_key(params, session_target)
     delivery_raw = params.get("delivery")
     _ensure_delivery_supported(session_target=session_target, delivery_raw=delivery_raw)
     scheduler = _require_scheduler(ctx)
+    default_run_mode, _source = await resolve_default_run_mode(
+        ctx.session_manager,
+        ctx.config,
+    )
+    if ctx.config is None:
+        default_run_mode = default_run_mode_for_principal(ctx.principal)
+    run_mode = coerce_run_mode_for_principal(default_run_mode, ctx.principal)
+    creator_is_owner = ctx.principal.is_owner
+    creator_host_execute = principal_has_host_execute(ctx.principal)
 
     # Webhook delivery bypasses session-based channel inference entirely.
     if _is_webhook_delivery(delivery_raw):
@@ -524,6 +629,9 @@ async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, An
             schedule_kind=schedule_kind,
             schedule_value=schedule_value,
             schedule_tz=schedule_tz,
+            run_mode=run_mode.value,
+            creator_is_owner=creator_is_owner,
+            creator_host_execute=creator_host_execute,
         )
 
     # Infer or parse delivery config
@@ -580,6 +688,9 @@ async def _handle_cron_add(params: dict | None, ctx: RpcContext) -> dict[str, An
         schedule_kind=schedule_kind,
         schedule_value=schedule_value,
         schedule_tz=schedule_tz,
+        run_mode=run_mode.value,
+        creator_is_owner=creator_is_owner,
+        creator_host_execute=creator_host_execute,
     )
 
 
@@ -597,6 +708,9 @@ async def _finalize_cron_add(
     schedule_kind: ScheduleKind,
     schedule_value: str,
     schedule_tz: str,
+    run_mode: str,
+    creator_is_owner: bool,
+    creator_host_execute: bool,
 ) -> dict[str, Any]:
     tz_value = (
         schedule_tz
@@ -613,6 +727,10 @@ async def _finalize_cron_add(
         jitter_seconds = 0.0
     job = await scheduler.add_job(
         name=params.get("name") or text,
+        # Only an explicit JSON false changes the legacy create default.  This
+        # keeps missing or malformed values backward-compatible while making
+        # the Control UI's Enabled switch effective on the initial write.
+        enabled=params.get("enabled") is not False,
         handler_key=_handler_key_for_payload_kind(payload_kind_name),
         payload=payload,
         session_target=session_target,
@@ -624,7 +742,10 @@ async def _finalize_cron_add(
         tool_policy=_tool_policy_from_params(params),
         tz=tz_value,
         jitter_seconds=jitter_seconds,
-        creator_is_owner=True,
+        creator_is_owner=creator_is_owner,
+        creator_host_execute=creator_host_execute,
+        run_mode=run_mode,
+        idempotency_key=_idempotency_key_from_params(params),
         schedule_kind=schedule_kind,
         schedule_value=schedule_value,
         schedule_tz=tz_value,
@@ -763,6 +884,17 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
             session_target,
             require_text=False,
         )
+        # Preserve trusted scheduler metadata when legacy clients rebuild only
+        # the task payload. Explicit workspace/template patches below remain
+        # authoritative and can replace or remove the inherited values.
+        for key in (
+            "_workspace_id",
+            "_workspace_name",
+            "_workspace_unavailable",
+            "_template_id",
+        ):
+            if key in current_job.payload:
+                payload[key] = current_job.payload[key]
         patch["handler_key"] = _handler_key_for_payload_kind(payload_kind_name)
         patch["payload"] = payload
         patch["session_target"] = session_target
@@ -770,6 +902,27 @@ async def _handle_cron_update(params: dict | None, ctx: RpcContext) -> dict[str,
         patch["origin_session_key"] = _resolve_origin_session_key(merged_params, session_target)
         if session_target == SessionTarget.MAIN and "delivery" not in params:
             patch["delivery"] = DeliveryConfig()
+
+    if "workspaceId" in params or "workspace_id" in params:
+        workspace_payload = dict(patch.get("payload", current_job.payload))
+        await _apply_workspace_binding(params, workspace_payload, ctx)
+        patch["payload"] = workspace_payload
+
+    if "templateId" in params or "template_id" in params:
+        template_payload = dict(patch.get("payload", current_job.payload))
+        if not template_payload.get("_template_id") and current_job.payload.get(
+            "_template_id"
+        ):
+            template_payload["_template_id"] = current_job.payload["_template_id"]
+        _apply_template_contract(params, template_payload)
+        patch["payload"] = template_payload
+
+    if "payload" in patch:
+        effective_template = patch["payload"].get("_template_id", "")
+        _apply_template_contract(
+            {"templateId": effective_template},
+            patch["payload"],
+        )
 
     if "timeout" in params:
         patch["timeout_seconds"] = float(params["timeout"])

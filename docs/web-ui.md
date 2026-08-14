@@ -99,11 +99,13 @@ The chat UI supports:
 - a deliverables drawer for generated outputs;
 - share and export actions for handoff;
 - a conversation sidebar for switching sessions;
+- durable `/goal` objectives with structured progress, usage, pause/resume,
+  edit, clear, guardrail, and Plan-mode waiting states;
 - `/meta` listing and run launch on gateway-backed chat sessions;
 - pending message queue behavior while compaction or runtime work is in flight;
 - manual `/compact`;
 - per-turn usage and savings metadata when available;
-- copyable session keys;
+- copyable session IDs;
 - mobile tabs that keep chat, sessions, and operational views reachable on
   narrow screens.
 
@@ -111,10 +113,22 @@ Use the session selector to switch between existing sessions. Copy the session
 key when reporting a bug or asking another OpenSquilla surface to inspect the
 same session.
 
+Slash command suggestions complete before they run. `Tab` always completes the
+active candidate, while `Enter` completes a partial match and runs only an
+exact command. Unknown commands remain in the composer with a recovery hint.
+
+Use `/goal <objective>` to start a multi-turn Goal. Its ribbon remains visible
+while working or waiting, and mutation results, hydration, and the Goal event
+stream keep it synchronized after reconnects. See [`goal-mode.md`](goal-mode.md)
+for the lifecycle, execution-lease, guardrail, and Plan-mode contracts.
+
 Coding mode can be enabled from chat when you want code modifications routed
 through `opensquilla code-task`. With Coding mode on, code changes use the
 guarded host workflow described in [`cli.md`](cli.md#coding-mode-and-code-task)
-instead of ordinary in-session editing.
+instead of ordinary in-session editing. Enter `/coding` to toggle the mode.
+While it is enabled, the composer shows a `Coding ON` status control that can
+also turn the mode off. The explicit `/coding on`, `/coding off`, and
+`/coding status` forms remain available for compatibility.
 
 ## Manual Compaction
 
@@ -142,6 +156,25 @@ cards for:
 Artifact cards may include thumbnails or preview metadata, and the deliverables
 drawer keeps published outputs discoverable after the originating turn has
 scrolled away.
+
+HTML artifact previews always show whether they are using full network access
+or offline mode. A local Web UI may request either mode; a remotely reached Web
+UI is forced offline and runs bundle scripts in an opaque sandbox while
+explicitly reporting that workers, persistent storage, and root-absolute paths
+are not guaranteed. Ordinary web links continue to open in a separate browser
+tab with `noopener,noreferrer`. The Desktop app additionally offers an explicit
+action to open an HTTP(S) link in its isolated side browser.
+
+The full Desktop preview is intentionally browser-like, not a privileged
+Electron view. Each open item has a separate temporary cookie/storage/cache
+partition and no Node, preload, IPC, host filesystem, OpenSquilla identity, or
+system-browser session. Closing an item clears its temporary state. Device
+permissions, user-initiated downloads, popups, and external protocols remain
+host-mediated; client certificates from the operating-system store are never
+offered to preview pages. The active OpenSquilla Gateway is also unreachable
+inside side previews, preventing network proximity from becoming an ambient
+OpenSquilla identity; users can still open an explicit link in the system
+browser.
 
 For channel delivery limits and artifact recovery, see
 [`artifacts-and-media.md`](artifacts-and-media.md).

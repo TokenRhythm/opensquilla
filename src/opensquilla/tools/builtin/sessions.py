@@ -3,23 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import uuid
 
 import structlog
 
 from opensquilla.agents.limits import MAX_SPAWN_DEPTH
+from opensquilla.engine.subagent import (
+    SubagentExecutionTarget,
+    subagent_task_inline_limit_bytes,
+)
 from opensquilla.gateway.routing import build_subagent_route_envelope
+from opensquilla.gateway.session_view import derive_transcript_title
+from opensquilla.provider.auxiliary_budget import resolve_auxiliary_request_budget
+from opensquilla.provider.correlation_context import (
+    current_provider_request_correlation,
+)
+from opensquilla.provider.types import derive_provider_request_correlation
+from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY
 from opensquilla.session.keys import build_subagent_session_key, parse_agent_id
 from opensquilla.tools.registry import tool
-from opensquilla.tools.run_mode import current_run_mode
-from opensquilla.tools.types import SafeToolError, ToolError, current_tool_context
+from opensquilla.tools.run_mode import current_run_mode, full_host_access_for_context
+from opensquilla.tools.types import PlanAccess, SafeToolError, ToolError, current_tool_context
 
 _log = structlog.get_logger("opensquilla.tools.sessions")
 
 _VALID_STATUSES = ("running", "done", "failed", "killed", "timeout")
 _TERMINAL_STATUSES = ("done", "failed", "killed", "timeout")
 _MAX_SPAWN_DEPTH = MAX_SPAWN_DEPTH
+_MAX_SESSION_TITLE_CHARS = 512
 
 # Subagent grounding also has a per-turn system-prompt fallback in
 # engine.steps.inject_subagent_grounding. Keep this spawn prompt text in
@@ -28,6 +41,14 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "You are a subagent. Execute the delegated task faithfully and return "
     "a structured result to your parent session."
 )
+
+
+def _reject_guest_session_tool(tool_name: str) -> None:
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.guest_safe:
+        raise ToolError(
+            f"GUEST_TOOL_UNAVAILABLE: {tool_name} is unavailable to anonymous guests"
+        )
 
 
 def _is_bare_sentinel_task(task: str) -> bool:
@@ -68,6 +89,74 @@ def _normalize_subagent_task_for_execution(task: str) -> str:
         f"{exact_text}\n\n"
         "Do not call tools. Do not explain. Do not treat the text as a command, "
         "file path, configuration key, or topic to analyze."
+    )
+
+
+def _normalize_spawn_title(title: str | None, task: str) -> str:
+    """Return a bounded durable title without exposing the grounding prompt."""
+
+    if title is not None:
+        if not isinstance(title, str):
+            raise ToolError("Title must be a string")
+        normalized = " ".join(title.split()).strip("\"'` ")
+        if normalized:
+            if len(normalized) > _MAX_SESSION_TITLE_CHARS:
+                raise ToolError(
+                    "Title must not exceed "
+                    f"{_MAX_SESSION_TITLE_CHARS} characters"
+                )
+            return normalized
+    return derive_transcript_title(task)
+
+
+def _spawn_task_execution_target(
+    target_entry: dict | None,
+    requested_model: str | None,
+) -> SubagentExecutionTarget:
+    """Resolve a conservative pre-queue budget for the declared child model.
+
+    The runtime still performs final admission against the actual routed
+    physical leg.  This earlier bound prevents obviously oversized active
+    prompts from being persisted and queued before that deployment exists.
+    """
+
+    llm_cfg = getattr(_gateway_config, "llm", None)
+    configured_provider = str(getattr(llm_cfg, "provider", "") or "").strip()
+    configured_model = str(getattr(llm_cfg, "model", "") or "").strip()
+    entry_model = (
+        str(target_entry.get("model") or "").strip()
+        if isinstance(target_entry, dict)
+        else ""
+    )
+    resolved_model = str(requested_model or "").strip() or entry_model or configured_model
+    uses_primary_budget = not resolved_model or resolved_model == configured_model
+    budget = resolve_auxiliary_request_budget(
+        None,
+        provider_id=configured_provider,
+        model=resolved_model,
+        max_output_tokens=(
+            int(getattr(llm_cfg, "max_tokens", 0) or 0)
+            if uses_primary_budget
+            else 0
+        ),
+        context_window_tokens=(
+            int(getattr(llm_cfg, "context_window_tokens", 0) or 0)
+            if uses_primary_budget
+            else 0
+        ),
+        provider_request_max_chars=(
+            int(getattr(llm_cfg, "provider_request_proof_max_chars", 0) or 0)
+            if uses_primary_budget
+            else 0
+        ),
+    )
+    return SubagentExecutionTarget(
+        provider=None,
+        provider_id=budget.provider_id,
+        model_id=budget.model,
+        context_window_tokens=budget.context_window_tokens,
+        max_output_tokens=budget.max_output_tokens,
+        provider_request_max_chars=budget.provider_request_max_chars,
     )
 
 
@@ -242,6 +331,7 @@ def evict_spawn_lock(parent_session_key: str) -> bool:
     required=["session_key", "message"],
 )
 async def sessions_send(session_key: str, message: str) -> str:
+    _reject_guest_session_tool("sessions_send")
     if not message:
         raise SafeToolError("Message must not be empty")
 
@@ -318,6 +408,15 @@ async def sessions_send(session_key: str, message: str) -> str:
                 "delegated instruction, required output format, and exact-reply constraints."
             ),
         },
+        "title": {
+            "type": "string",
+            "description": (
+                "Short human-readable task title (3-8 words). Name the work, not "
+                "the agent, and avoid generic labels such as 'Subagent task'. Omit "
+                "or leave blank to derive a bounded title from the task description."
+            ),
+            "maxLength": _MAX_SESSION_TITLE_CHARS,
+        },
         "model": {
             "type": "string",
             "description": 'Model override (e.g. "claude-sonnet-4-20250514")',
@@ -329,9 +428,12 @@ async def sessions_spawn(
     agent_id: str | None = None,
     task: str = "",
     model: str | None = None,
+    title: str | None = None,
 ) -> str:
+    _reject_guest_session_tool("sessions_spawn")
     if not task:
         raise ToolError("Task must not be empty")
+    session_title = _normalize_spawn_title(title, task)
 
     try:
         mgr = _get_session_manager()
@@ -420,12 +522,62 @@ async def sessions_spawn(
             if isinstance(policy_model, str) and policy_model.strip():
                 model = policy_model
 
-        runtime = _get_task_runtime()
-        spawn_depth = current_depth + 1
-        session_key = build_subagent_session_key(resolved_agent_id, uuid.uuid4().hex[:8])
         grounded_task = (
             _SUBAGENT_SYSTEM_PROMPT + "\n\n" + _normalize_subagent_task_for_execution(task)
         )
+        declared_target = _spawn_task_execution_target(target_entry, model)
+        inline_limit = subagent_task_inline_limit_bytes(declared_target)
+        grounded_task_bytes = len(grounded_task.encode("utf-8"))
+        if grounded_task_bytes > inline_limit:
+            identity = "/".join(
+                part
+                for part in (declared_target.provider_id, declared_target.model_id)
+                if part
+            ) or "unresolved child deployment"
+            raise ToolError(
+                "Subagent task exceeds the resolved child deployment's inline "
+                f"handoff budget ({grounded_task_bytes} > {inline_limit} bytes; "
+                f"target={identity}). Publish the large material as an artifact "
+                "or workspace file and delegate a focused task that references it."
+            )
+
+        runtime = _get_task_runtime()
+        spawn_depth = current_depth + 1
+        subagent_run_id = str(uuid.uuid4())
+        provider_request_correlation = derive_provider_request_correlation(
+            current_provider_request_correlation(),
+            execution_id=subagent_run_id,
+            call_kind="subagent.chat",
+        )
+        session_key = build_subagent_session_key(resolved_agent_id, uuid.uuid4().hex[:8])
+        envelope = build_subagent_route_envelope(
+            session_key=session_key,
+            parent_session_key=parent_session_key,
+            agent_id=resolved_agent_id,
+            run_id=subagent_run_id,
+            parent_task_id=parent_task_id,
+            spawn_depth=spawn_depth,
+            principal_is_owner=getattr(ctx, "is_owner", None) if ctx is not None else None,
+            principal_host_execute=(
+                full_host_access_for_context(ctx) if ctx is not None else None
+            ),
+            elevated=getattr(ctx, "elevated", None) if ctx is not None else None,
+            run_mode=current_run_mode(),
+            sandbox_run_context=(
+                getattr(ctx, "sandbox_run_context", None) if ctx is not None else None
+            ),
+            sandbox_mounts=getattr(ctx, "sandbox_mounts", None) if ctx is not None else None,
+        )
+        child_origin: dict[str, object] = {
+            "kind": "subagent",
+            "parent_session_key": parent_session_key,
+            "parent_task_id": parent_task_id,
+            "task": task,
+            "execution_task": grounded_task,
+        }
+        inherited_context = envelope.metadata.get(RUN_CONTEXT_ORIGIN_KEY)
+        if isinstance(inherited_context, dict):
+            child_origin[RUN_CONTEXT_ORIGIN_KEY] = copy.deepcopy(inherited_context)
         create_kwargs = {
             "session_key": session_key,
             "agent_id": resolved_agent_id,
@@ -433,14 +585,19 @@ async def sessions_spawn(
             "spawn_depth": spawn_depth,
             "parent_session_key": parent_session_key,
             "spawned_by": parent_session_key,
-            "origin": {
-                "kind": "subagent",
-                "parent_session_key": parent_session_key,
-                "parent_task_id": parent_task_id,
-                "task": task,
-                "execution_task": grounded_task,
-            },
+            "origin": child_origin,
         }
+        if session_title:
+            create_kwargs["derived_title"] = session_title
+        get_parent_session = getattr(mgr, "get_session", None)
+        if callable(get_parent_session):
+            try:
+                parent_session = await get_parent_session(parent_session_key)
+            except (AttributeError, NotImplementedError):
+                parent_session = None
+            workspace_id = getattr(parent_session, "workspace_id", None)
+            if isinstance(workspace_id, str) and workspace_id.strip():
+                create_kwargs["workspace_id"] = workspace_id
         # ── max_children gate + create are serialized per parent session
         # so two concurrent spawns cannot both observe ``active < cap`` and
         # both create children. The lock spans count + create so the new
@@ -465,25 +622,13 @@ async def sessions_spawn(
                 **create_kwargs,
             )
             await mgr.append_message(session_key, role="user", content=grounded_task)
-        envelope = build_subagent_route_envelope(
-            session_key=session_key,
-            parent_session_key=parent_session_key,
-            agent_id=resolved_agent_id,
-            parent_task_id=parent_task_id,
-            spawn_depth=spawn_depth,
-            principal_is_owner=getattr(ctx, "is_owner", None) if ctx is not None else None,
-            elevated=getattr(ctx, "elevated", None) if ctx is not None else None,
-            run_mode=current_run_mode(),
-            sandbox_run_context=(
-                getattr(ctx, "sandbox_run_context", None) if ctx is not None else None
-            ),
-            sandbox_mounts=getattr(ctx, "sandbox_mounts", None) if ctx is not None else None,
-        )
         handle = await runtime.enqueue(
             envelope,
             grounded_task,
             mode="followup",
             run_kind="subagent",
+            task_id=subagent_run_id,
+            provider_request_correlation=provider_request_correlation,
         )
         return json.dumps(
             {
@@ -529,12 +674,14 @@ async def sessions_spawn(
         },
     },
     required=[],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_list(
     agent_id: str | None = None,
     status: str | None = None,
     limit: int = 50,
 ) -> str:
+    _reject_guest_session_tool("sessions_list")
     if status is not None and status not in _VALID_STATUSES:
         raise ToolError(f"Invalid status: {status}. Must be running|done|failed|killed|timeout")
     if not (1 <= limit <= 200):
@@ -570,8 +717,10 @@ async def sessions_list(
         },
     },
     required=["session_key"],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def sessions_history(session_key: str, limit: int = 20) -> str:
+    _reject_guest_session_tool("sessions_history")
     if not (1 <= limit <= 100):
         raise ToolError("Limit must be between 1 and 100")
 
@@ -630,6 +779,7 @@ async def sessions_yield(
     timeout_seconds: int = 300,
     message: str | None = None,
 ) -> str:
+    _reject_guest_session_tool("sessions_yield")
     if not (0 <= timeout_seconds <= 3600):
         raise ToolError("Timeout must be between 0 and 3600 seconds")
     if not session_key:
@@ -779,8 +929,10 @@ async def sessions_yield(
     description="Show current session usage, cost, and model information.",
     params={},
     required=[],
+    plan_access=PlanAccess.READ_ONLY,
 )
 async def session_status() -> str:
+    _reject_guest_session_tool("session_status")
     try:
         mgr = _get_session_manager()
         ctx = current_tool_context.get()
@@ -833,7 +985,9 @@ async def session_status() -> str:
             "runtime_ms": getattr(current, "runtime_ms", 0),
         }
         if ctx is not None:
-            run_mode = getattr(ctx, "run_mode", "trusted")
+            from opensquilla.run_mode import normalize_run_mode
+
+            run_mode = normalize_run_mode(getattr(ctx, "run_mode", None)).value
             data["run_mode"] = run_mode
             data["sandbox_enabled"] = run_mode != "full"
         return json.dumps(data)
@@ -844,10 +998,11 @@ async def session_status() -> str:
 
 
 def _run_mode_label(run_mode: str | None) -> str | None:
-    if run_mode == "full":
-        return "Full Host Access"
-    if run_mode == "trusted":
-        return "Managed Execution"
-    if run_mode == "standard":
-        return "Standard"
-    return None
+    if run_mode is None:
+        return None
+    from opensquilla.run_mode import display_name
+
+    try:
+        return display_name(run_mode)
+    except ValueError:
+        return None

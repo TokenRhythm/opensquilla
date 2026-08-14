@@ -179,6 +179,9 @@ export function formatUsageCost(
   if (currency !== 'CNY') return '$' + canonicalUsd.toFixed(decimals)
   const native = nativeBillingDisplay(source, canonicalUsd)
   if (native.exactCny != null) return '¥' + native.exactCny.toFixed(decimals)
-  if (native.useCanonicalUsd) return '$' + canonicalUsd.toFixed(decimals)
+  // Native receipt coverage determines whether CNY can be shown as an exact
+  // provider-billed amount, but it must not override the user's display
+  // currency. Mixed, pending, and older rows still have a canonical USD total
+  // that can be converted with the snapshot's effective display rate.
   return '¥' + (canonicalUsd * cnyRate).toFixed(decimals)
 }

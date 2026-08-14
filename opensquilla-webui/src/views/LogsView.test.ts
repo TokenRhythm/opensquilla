@@ -302,6 +302,45 @@ describe('LogsView states', () => {
     expect(el.textContent).toContain('No lines match the current filter.')
     expect(el.textContent).not.toContain('No logs have been recorded yet.')
   })
+
+  it('uses bracketed log levels before error-like message text', async () => {
+    rpcMocks.call.mockImplementation(async (method: string) => {
+      if (method === 'logs.status') return normalStatus()
+      if (method === 'logs.tail') {
+        return {
+          lines: [
+            '2026-08-10 [INFO] opensquilla: migrations_applied migration=V019__turn_errors',
+            '2026-08-10 [INFO] opensquilla: skill_catalog.refreshed errors=0',
+            '2026-08-10 [WARNING] opensquilla: github.search_failed error="request failed"',
+            '2026-08-10 [ERROR] opensquilla: actual failure',
+          ],
+          cursor: 4,
+        }
+      }
+      throw new Error(`unexpected RPC method: ${method}`)
+    })
+
+    const { el } = await mountLogs()
+
+    expect(Array.from(el.querySelectorAll('.lg-line__lvl'), level => level.textContent)).toEqual([
+      'INFO',
+      'INFO',
+      'WARN',
+      'ERROR',
+    ])
+    expect(el.querySelector('.lg-level-btn--info .lg-level-btn__count')?.textContent).toBe('2')
+    expect(el.querySelector('.lg-level-btn--warn .lg-level-btn__count')?.textContent).toBe('1')
+    expect(el.querySelector('.lg-level-btn--error .lg-level-btn__count')?.textContent).toBe('1')
+
+    el.querySelector<HTMLButtonElement>('.lg-level-btn--debug')?.click()
+    el.querySelector<HTMLButtonElement>('.lg-level-btn--info')?.click()
+    el.querySelector<HTMLButtonElement>('.lg-level-btn--warn')?.click()
+    await flush()
+
+    const visibleLines = Array.from(el.querySelectorAll('.lg-line'), line => line.textContent)
+    expect(visibleLines).toHaveLength(1)
+    expect(visibleLines[0]).toContain('actual failure')
+  })
 })
 
 describe('LogsView KeepAlive lifecycle', () => {

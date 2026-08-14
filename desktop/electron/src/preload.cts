@@ -15,32 +15,59 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getDesktopSettings: () => ipcRenderer.invoke('desktop:settings:get'),
   saveDesktopSettings: (payload: unknown) => ipcRenderer.invoke('desktop:settings:save', payload),
   resetDesktopSettings: () => ipcRenderer.invoke('desktop:settings:reset'),
+  getDesktopPreferences: () => ipcRenderer.invoke('desktop:preferences:get'),
+  saveDesktopPreferences: (payload: unknown) => ipcRenderer.invoke('desktop:preferences:save', payload),
+  reportSandboxUnavailable: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:sandbox:unavailable', payload)
+  ),
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
+  chooseProjectDirectory: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workspace:choose-directory', payload)
+  ),
+  getWorkbenchCapabilities: () => ipcRenderer.invoke('desktop:workbench:capabilities'),
+  createArtifactPreviewLease: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:preview-lease:create', payload)
+  ),
+  renewArtifactPreviewLease: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:preview-lease:renew', payload)
+  ),
+  revokeArtifactPreviewLease: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:preview-lease:revoke', payload)
+  ),
+  createWorkbenchSurface: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:surface:create', payload)
+  ),
+  navigateWorkbenchSurface: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:surface:navigate', payload)
+  ),
+  respondToWorkbenchPermission: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:permission:respond', payload)
+  ),
+  setWorkbenchSurfaceRect: (payload: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:surface:set-rect', payload)
+  ),
+  activateWorkbenchSurface: (surfaceId: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:surface:activate', surfaceId)
+  ),
+  destroyWorkbenchSurface: (surfaceId: unknown) => (
+    ipcRenderer.invoke('desktop:workbench:surface:destroy', surfaceId)
+  ),
   getOnboardingDefaults: () => ipcRenderer.invoke('desktop:onboarding:defaults'),
+  probeOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:probe', payload),
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
   getBootState: () => ipcRenderer.invoke('desktop:boot:state'),
   retryStartup: () => ipcRenderer.invoke('desktop:boot:retry'),
   quitApp: () => ipcRenderer.invoke('desktop:boot:quit'),
   getRecoveryState: () => ipcRenderer.invoke('desktop:recovery:state'),
-  getDesktopProfileKind: async () => {
-    const value = await ipcRenderer.invoke('desktop:recovery:state')
-    if (!value || typeof value !== 'object') return null
-    const active = (value as Record<string, unknown>).activeProfile
-    if (!active || typeof active !== 'object') return null
-    const kind = (active as Record<string, unknown>).kind
-    return kind === 'primary' || kind === 'recovery' ? kind : null
-  },
+  retryProfileConsolidation: () => ipcRenderer.invoke('desktop:recovery:retry-consolidation'),
   chooseRecoveryWorkspace: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:choose-workspace', payload),
   chooseLegacyAgentDataLocation: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:choose-legacy-agent-data', payload),
   recoverProfileTransaction: () => ipcRenderer.invoke('desktop:recovery:recover-transaction'),
-  launchSafeProfile: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:launch-safe', payload),
-  retryPrimaryProfile: () => ipcRenderer.invoke('desktop:recovery:retry-primary'),
-  returnPrimaryProfile: () => ipcRenderer.invoke('desktop:recovery:return-primary'),
   revealRecoveryPath: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:reveal-path', payload),
   copyRecoveryDiagnostics: () => ipcRenderer.invoke('desktop:recovery:copy-diagnostics'),
-  abandonCleanupTransaction: () => ipcRenderer.invoke('desktop:recovery:abandon-cleanup'),
+  openLatestDownloadPage: () => ipcRenderer.invoke('desktop:recovery:open-download'),
   inspectDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:inspect', payload),
   discardDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:discard', payload),
   applyDesktopCleanup: (payload: unknown) => ipcRenderer.invoke('desktop:cleanup:apply', payload),
@@ -75,5 +102,15 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:migration:progress', listener)
     return () => ipcRenderer.removeListener('desktop:migration:progress', listener)
+  },
+  onWindowHidden: (callback: () => void) => {
+    const listener = () => callback()
+    ipcRenderer.on('desktop:window:hidden', listener)
+    return () => ipcRenderer.removeListener('desktop:window:hidden', listener)
+  },
+  onWorkbenchSurfaceEvent: (callback: (payload: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
+    ipcRenderer.on('desktop:workbench:surface-event', listener)
+    return () => ipcRenderer.removeListener('desktop:workbench:surface-event', listener)
   },
 })

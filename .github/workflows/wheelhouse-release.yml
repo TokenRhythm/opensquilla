@@ -360,6 +360,7 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          npm run fetch:runtimes
           npm run build:gateway
           npm run build
           npx electron-builder --mac --publish never
@@ -374,6 +375,23 @@ jobs:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: "1"
           OPENSQUILLA_GATEWAY_SMOKE_TIMEOUT_MS: "240000"
         run: npm run verify:gateway-smoke
+
+      - name: Gate packaged first-send renderer
+        working-directory: desktop/electron
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          candidates=(../../dist/desktop-electron/mac*/OpenSquilla.app/Contents/MacOS/OpenSquilla)
+          if [[ "${#candidates[@]}" -ne 1 || ! -x "${candidates[0]}" ]]; then
+            printf 'Expected exactly one unpacked macOS candidate, found %d\n' "${#candidates[@]}" >&2
+            exit 1
+          fi
+          user_data="${RUNNER_TEMP}/p1-5-first-send-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p "${user_data}"
+          npm run test:packaged-first-send-renderer -- \
+            --executable "${candidates[0]}" \
+            --user-data-dir "${user_data}"
 
       - name: Verify RC3-to-candidate macOS upgrade and uninstall preserve profile data
         env:
@@ -406,7 +424,10 @@ jobs:
   build-desktop-windows:
     name: Build unsigned Windows Electron installer
     needs: build-control-ui
-    runs-on: windows-latest
+    # Keep the v0.5.0rc3 upgrade baseline on the OS generation it shipped on.
+    # The legacy NSIS installer can crash with 0xC0000005 on Windows Server 2025
+    # before the candidate installer or profile-preservation checks run.
+    runs-on: windows-2022
     timeout-minutes: 150
     steps:
       - name: Checkout
@@ -454,6 +475,7 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           set -euo pipefail
+          npm run fetch:runtimes
           npm run build:gateway
           npm run build
           npx electron-builder --win --publish never
@@ -467,6 +489,24 @@ jobs:
         env:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: "1"
         run: npm run verify:gateway-smoke
+
+      - name: Gate packaged first-send renderer
+        working-directory: desktop/electron
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidate = Resolve-Path '../../dist/desktop-electron/win-unpacked/OpenSquilla.exe'
+          if (-not (Test-Path $candidate -PathType Leaf)) {
+            throw "Unpacked Windows candidate was not found: $candidate"
+          }
+          $userData = Join-Path $env:RUNNER_TEMP "p1-5-first-send-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $userData | Out-Null
+          & node scripts/test-packaged-first-send-renderer.mjs `
+            --executable $candidate.Path `
+            --user-data-dir $userData
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaged first-send renderer gate failed with exit code $LASTEXITCODE"
+          }
 
       - name: Verify RC3-to-candidate Windows upgrade and uninstall preserve profile data
         shell: pwsh
@@ -822,10 +862,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set up Node.js for app.asar verification
+      - name: Set up Node.js for packaged verification
         uses: actions/setup-node@v4
         with:
           node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+
+      - name: Install Electron release verification dependencies
+        working-directory: desktop/electron
+        run: npm ci
 
       - name: Download actual draft release assets
         env:
@@ -953,7 +999,8 @@ jobs:
     name: Audit downloaded Windows draft asset
     if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
     needs: publish-release
-    runs-on: windows-latest
+    # Match the build-time upgrade gate while v0.5.0rc3 is the baseline.
+    runs-on: windows-2022
     timeout-minutes: 75
     permissions:
       contents: write
@@ -969,6 +1016,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Set up Node.js for packaged verification
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+
+      - name: Install Electron release verification dependencies
+        working-directory: desktop/electron
+        run: npm ci
 
       - name: Download actual draft release assets
         shell: pwsh

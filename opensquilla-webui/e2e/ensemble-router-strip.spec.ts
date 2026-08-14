@@ -182,6 +182,15 @@ async function mockStreamingEnsembleRun(page: Page) {
             stream_seq: 2,
             to_state: 'thinking',
           }))
+          ws.send(wsEvent('session.event.ensemble_progress', {
+            key: STREAM_SESSION_KEY,
+            task_id: 'ensemble-stream-task',
+            stream_seq: 3,
+            event_type: 'proposer_start',
+            proposer_label: 'anchor',
+            proposer_provider: 'openrouter',
+            proposer_model: 'qwen/qwen3.7-plus',
+          }))
           return
         }
         const payloads: Record<string, unknown> = {
@@ -609,6 +618,8 @@ test('ensemble lifecycle replaces telemetry pending immediately and completes af
   })
   await expect(page.locator('.chat-thread')).toContainText('Lifecycle answer complete.')
   await expect(strip.locator('[data-testid="router-ensemble-toggle"]')).toContainText('3 candidates synthesized')
+  await expect(strip.locator('[data-testid="router-ensemble-toggle"]'))
+    .toHaveAttribute('aria-expanded', 'true')
   await expect(inspector).toContainText('105s')
   await expect(inspector).toContainText('118s')
   await expect(inspector).toContainText('130s')
@@ -678,7 +689,7 @@ test('ensemble mode does not render the tier candidate grid for the live turn', 
   await page.locator('.chat-textarea').fill('Synthesize an answer from several models.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
 
-  await expect(page.locator('.work-card')).toBeVisible({ timeout: 10000 })
+  await expect(page.locator('.assistant-activity--live')).toBeVisible({ timeout: 10000 })
   // The regression: a squilla_router tier decision must NOT paint the grid strip
   // while ensemble mode is active — it belongs to the ensemble surface instead.
   await expect(page.locator('.router-fx[data-panel="real-candidates"]')).toHaveCount(0)
@@ -807,7 +818,7 @@ for (const complexity of ['simple', 'medium', 'complex'] as const) {
   })
 }
 
-test('live ensemble routing shows the strip alongside the work card', async ({ page }) => {
+test('live ensemble routing shows the strip alongside flat activity', async ({ page }) => {
   await mockStreamingEnsembleRun(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(STREAM_SESSION_KEY))
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
@@ -815,10 +826,10 @@ test('live ensemble routing shows the strip alongside the work card', async ({ p
   await page.locator('.chat-textarea').fill('Build a tiny team collaboration app.')
   await page.locator('.chat-send-btn[aria-label="Send"]').click()
 
-  // The work-card runs its normal execution phase...
-  await expect(page.locator('.work-card')).toBeVisible({ timeout: 10000 })
-  // ...and the ensemble strip is surfaced independently — here as the pre-decision
-  // reserve, before any member arrives — instead of being hidden behind it.
+  // The flat activity surface runs its normal execution phase...
+  await expect(page.locator('.assistant-activity--live')).toBeVisible({ timeout: 10000 })
+  // ...and the ensemble strip is surfaced independently after authoritative
+  // proposer activity arrives, instead of being inferred before Router work.
   await expect(page.locator('.router-fx[data-panel="llm-ensemble"]')).toHaveCount(1)
   // It is live, not settled.
   await expect(page.locator('.router-fx[data-panel="llm-ensemble"][data-settled="true"]')).toHaveCount(0)

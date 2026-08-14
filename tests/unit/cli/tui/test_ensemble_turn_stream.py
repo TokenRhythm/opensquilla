@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from opensquilla.cli.chat.turn import UsageSummary
+from opensquilla.cli.chat.turn import UsageCounter, UsageSummary
 from opensquilla.cli.chat.turn_stream import (
     default_turn_stream_dependencies,
     stream_response_gateway,
@@ -251,3 +251,29 @@ def test_usage_summary_does_not_infer_ensemble_without_actual_done_trace() -> No
     assert gateway_usage.ensemble_trace == {}
     assert runner_usage.model_usage_breakdown == []
     assert runner_usage.ensemble_trace == {}
+
+
+def test_gateway_session_snapshot_drives_cli_usage_counter() -> None:
+    usage = UsageSummary.from_gateway_payload(
+        {
+            "input_tokens": 1070,
+            "output_tokens": 207,
+            "cost_usd": 0.57,
+            "session_totals": {
+                "input_tokens": 1070,
+                "output_tokens": 207,
+                "cache_read_tokens": 50,
+                "cache_write_tokens": 25,
+                "cost_usd": 0.57,
+                "billed_cost": 0.57,
+            },
+        }
+    )
+    counter = UsageCounter()
+
+    counter.apply(usage)
+
+    assert counter.input_tokens == 1070
+    assert counter.output_tokens == 207
+    assert counter.cached_tokens == 50
+    assert counter.cost_usd == pytest.approx(0.57)

@@ -40,6 +40,7 @@ from opensquilla.cli.tui.opentui.messages import (
     HostProtocolUnknown,
     HostReady,
     HostResize,
+    HostThemeSelected,
     RouterPluginState,
     ScrollbackWrite,
 )
@@ -83,6 +84,26 @@ class _OpenTuiBridgeLike(Protocol):
     async def send(self, message_type: str, payload: object | None = None) -> None: ...
 
     async def next_message(self) -> object | None: ...
+
+
+def _sanitized_approval_payload(request: dict[str, object]) -> dict[str, object]:
+    """Copy an approval.request payload with its display text made cell-safe.
+
+    This is the single choke point for every overlay payload — the canonical
+    tool-request path AND gateway-push previews — so tool/model-derived text
+    cannot smuggle control bytes into the host's raw cell renderer no matter
+    which caller built the dict.
+    """
+    from opensquilla.cli.tui.backend.render_summary import (  # noqa: PLC0415
+        sanitize_terminal_text,
+    )
+
+    payload = dict(request)
+    for key in ("summary", "message", "tool"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            payload[key] = sanitize_terminal_text(value)
+    return payload
 
 
 class OpenTuiOutputHandle:
@@ -270,7 +291,7 @@ class OpenTuiOutputHandle:
             future = asyncio.get_running_loop().create_future()
             self._approval_waiters[approval_id] = future
         assert future is not None
-        payload = dict(request)
+        payload = _sanitized_approval_payload(request)
         try:
             # A push-first overlay may be a deliberately small preview. The
             # canonical request owns the choices, so refresh only when its
@@ -332,7 +353,7 @@ class OpenTuiOutputHandle:
         # allowed to upgrade a preview with canonical details.
         if approval_id in self._approval_waiters:
             return True
-        payload = dict(request)
+        payload = _sanitized_approval_payload(request)
         future: asyncio.Future[HostApprovalResponse | ExternalApprovalResolution | None] = (
             asyncio.get_running_loop().create_future()
         )
@@ -446,6 +467,7 @@ class OpenTuiSurface:
         self._eof_emitted = False
         self._consecutive_host_errors = 0
         self._completion_task: asyncio.Task[None] | None = None
+        self._persist_tasks: set[asyncio.Task[None]] = set()
         self._last_resize: tuple[int, int] | None = None
         self._output_handle = OpenTuiOutputHandle(
             bridge,
@@ -506,6 +528,23 @@ class OpenTuiSurface:
                     "opentui.host.protocol_unknown",
                     message_type=message.message_type,
                 )
+                continue
+            if isinstance(message, HostThemeSelected):
+                # A picker confirmation happens entirely in the host; persist
+                # it here so the choice survives restarts like /theme <name>.
+                # Fire-and-forget: this loop IS the input pump — awaiting the
+                # write would queue the next input/cancel/approval frame
+                # behind prefs IO. The save is best-effort by contract, so a
+                # failure is logged by the prefs module, never raised here.
+                from opensquilla.cli.tui.opentui.prefs import (  # noqa: PLC0415
+                    save_theme_preference,
+                )
+
+                task = asyncio.get_running_loop().create_task(
+                    asyncio.to_thread(save_theme_preference, message.name)
+                )
+                self._persist_tasks.add(task)
+                task.add_done_callback(self._persist_tasks.discard)
                 continue
             if isinstance(message, HostResize):
                 self._last_resize = (message.width, message.height)

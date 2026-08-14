@@ -7,11 +7,12 @@ import base64
 import json
 import ntpath
 import os
+import secrets
 import sys
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any
 
 from opensquilla.sandbox.backend.base import Backend
@@ -34,6 +35,7 @@ from opensquilla.sandbox.backend.windows_default_roots import (
     runtime_rx_roots,
     windows_platform_rx_roots,
     windows_sensitive_marker,
+    windows_system_root,
     workspace_cache_root,
 )
 from opensquilla.sandbox.backend.windows_default_setup import (
@@ -48,19 +50,21 @@ from opensquilla.sandbox.operation_runtime import (
     SandboxOperationDomain,
     SandboxOperationResult,
 )
+from opensquilla.sandbox.path_aliases import resolve_workspace_alias
 from opensquilla.sandbox.permissions import (
     FileSystemAccess,
     FileSystemPermissionEntry,
     FileSystemPermissionProfile,
+    logical_absolute_path,
 )
 from opensquilla.sandbox.run_mode import normalize_run_mode
+from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest, SandboxResult
 from opensquilla.subprocess_encoding import decode_subprocess_output
 
-_HELPER_MODULE = "opensquilla.sandbox.backend.windows_default_runner"
-_FILESYSTEM_WORKER_MODULE = "opensquilla.sandbox.filesystem_worker"
 _OUTPUT_BYTE_CAP = 1_048_576
 _HELPER_PAYLOAD_ENV = "OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"
+_HELPER_ERROR_PREFIX = "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
 _HELPER_TIMEOUT_GRACE_S = 30.0
 _WINDOWS_PROCESS_BASE_ENV_KEYS = (
     "SystemRoot",
@@ -89,7 +93,7 @@ _WINDOWS_DOS_DEVICE_NAMES = frozenset(
 
 
 class WindowsDefaultBackend(Backend):
-    """Windows backend used by Standard-Sandbox and Managed Execution."""
+    """Windows backend used by Safe mode."""
 
     name = "windows_default"
 
@@ -162,7 +166,10 @@ class WindowsDefaultBackend(Backend):
             separators=(",", ":"),
             sort_keys=True,
         )
-        helper_argv = (sys.executable, "-m", _HELPER_MODULE, "--payload-env")
+        helper_argv = internal_child_argv(
+            ChildRole.WINDOWS_DEFAULT_RUNNER,
+            args=("--payload-env",),
+        )
         wall = request.policy.limits.wall_timeout_s
         helper_wall = _helper_supervision_timeout(wall)
         started = time.monotonic()
@@ -181,6 +188,13 @@ class WindowsDefaultBackend(Backend):
                 proc.communicate(),
                 timeout=helper_wall,
             )
+        except asyncio.CancelledError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+            raise
         except TimeoutError:
             proc.kill()
             try:
@@ -201,6 +215,14 @@ class WindowsDefaultBackend(Backend):
         elapsed = time.monotonic() - started
         stdout, trunc_out = _decode_capped(stdout_bytes)
         stderr, trunc_err = _decode_capped(stderr_bytes)
+        helper_error = _authenticated_helper_error(
+            stderr,
+            expected_nonce=str(payload["helperNonce"]),
+        )
+        if proc.returncode not in {None, 0} and helper_error is not None:
+            raise SandboxBackendError(
+                f"windows_default helper infrastructure failed: {helper_error}"
+            )
         return SandboxResult(
             returncode=proc.returncode if proc.returncode is not None else -1,
             stdout=stdout,
@@ -244,6 +266,12 @@ def _payload_for_request(
         request,
         private_mounts_are_required=private_mounts_are_required,
     )
+    if _is_capability_probe_request(request):
+        # Capability canaries use their own short-lived capability SIDs. They
+        # must not switch the shared offline account's allow journal away from
+        # the user's real Safe profile, which can trigger expensive inherited
+        # ACL churn on a large home directory.
+        policy["capabilityProbe"] = True
     network_boundary = _windows_network_boundary_payload(request)
     if network_boundary is not None:
         policy["windowsNetworkBoundary"] = network_boundary
@@ -252,6 +280,7 @@ def _payload_for_request(
     )
     return {
         "backend": "windows_default",
+        "helperNonce": _new_helper_nonce(),
         "argv": list(request.argv),
         "cwd": str(request.cwd),
         "env": env,
@@ -260,6 +289,44 @@ def _payload_for_request(
         "timeout": request.policy.limits.wall_timeout_s,
         "stdinBase64": stdin_b64,
     }
+
+
+def _new_helper_nonce() -> str:
+    return secrets.token_hex(16)
+
+
+def _is_capability_probe_request(request: SandboxRequest) -> bool:
+    return request.action_kind == "capability.probe" or request.action_kind.startswith(
+        "capability.probe.fs.worker."
+    )
+
+
+def _authenticated_helper_error(
+    stderr: str,
+    *,
+    expected_nonce: str,
+) -> str | None:
+    if not expected_nonce:
+        return None
+    for line in stderr.splitlines():
+        if not line.startswith(_HELPER_ERROR_PREFIX):
+            continue
+        try:
+            payload = json.loads(line[len(_HELPER_ERROR_PREFIX) :])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        nonce = payload.get("nonce")
+        message = payload.get("message")
+        if (
+            isinstance(nonce, str)
+            and secrets.compare_digest(nonce, expected_nonce)
+            and isinstance(message, str)
+            and message.strip()
+        ):
+            return message.strip()
+    return None
 
 
 def _windows_network_boundary_payload(request: SandboxRequest) -> dict[str, object] | None:
@@ -288,14 +355,23 @@ def _filesystem_operation_request(
     runtime_roots = _runtime_readonly_roots()
     _validate_filesystem_operation_targets(operation, request, targets, runtime_roots)
     _validate_filesystem_private_transport_roots(profile, runtime_roots)
+    worker_temp = workspace / ".opensquilla-cache" / "filesystem-worker-temp"
+    worker_temp.mkdir(parents=True, exist_ok=True)
     policy = replace(
         build_filesystem_worker_policy(
             operation,
-            private_rw_roots=(),
+            private_rw_roots=(worker_temp,),
             private_ro_roots=runtime_roots,
             env_allowlist=(
                 "PATH",
                 "PYTHONPATH",
+                "TEMP",
+                "TMP",
+                "TMPDIR",
+                "HOME",
+                "USERPROFILE",
+                "HOMEDRIVE",
+                "HOMEPATH",
                 "SystemRoot",
                 "WINDIR",
                 "ComSpec",
@@ -307,19 +383,49 @@ def _filesystem_operation_request(
     env = {
         "PATH": str(_python_executable().parent),
         "PYTHONPATH": _pythonpath_for_worker(),
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
+        "TEMP": str(worker_temp),
+        "TMP": str(worker_temp),
+        "TMPDIR": str(worker_temp),
     }
+    _preserve_windows_home_env(env, host_env=os.environ)
+    worker_payload = operation.to_payload()
+    permissions = worker_payload.get("permissions")
+    if not isinstance(permissions, dict):
+        permissions = {}
+        worker_payload["permissions"] = permissions
+    filesystem_permissions = permissions.get("filesystem")
+    if not isinstance(filesystem_permissions, dict):
+        filesystem_permissions = {}
+    permissions["filesystem"] = {
+        **filesystem_permissions,
+        "profile": {
+            "entries": [
+                {
+                    "path": str(entry.path),
+                    "access": entry.access.value,
+                    **(
+                        {"logicalPath": str(entry.logical_path)}
+                        if entry.logical_path is not None
+                        else {}
+                    ),
+                }
+                for entry in profile.entries
+            ],
+            "deniedReadGlobs": list(profile.denied_read_globs),
+            "defaultAccess": profile.default_access.value,
+        },
+    }
+    action_kind = f"fs.worker.{operation.kind}"
+    if operation.operation_id == "capability-probe":
+        action_kind = f"capability.probe.{action_kind}"
     return SandboxRequest(
-        argv=(
-            str(_python_executable()),
-            "-B",
-            "-m",
-            _FILESYSTEM_WORKER_MODULE,
-            "-",
-        ),
+        argv=internal_child_argv(ChildRole.FILESYSTEM_WORKER, args=("-",)),
         cwd=workspace,
-        action_kind=f"fs.worker.{operation.kind}",
+        action_kind=action_kind,
         policy=policy,
-        stdin=json.dumps(operation.to_payload(), ensure_ascii=False).encode("utf-8"),
+        stdin=json.dumps(worker_payload, ensure_ascii=False).encode("utf-8"),
         env=env,
         reason="sandboxed filesystem side-effect worker",
         run_mode=normalize_run_mode(operation.run_mode).value,
@@ -328,6 +434,24 @@ def _filesystem_operation_request(
 
 def _python_executable() -> Path:
     return Path(sys.executable)
+
+
+def _preserve_windows_home_env(
+    env: dict[str, str],
+    *,
+    host_env: Mapping[str, str],
+) -> None:
+    profile = str(host_env.get("USERPROFILE") or host_env.get("HOME") or "").strip()
+    if not profile:
+        try:
+            profile = str(Path.home())
+        except (OSError, RuntimeError):
+            return
+    drive, tail = ntpath.splitdrive(profile)
+    env.setdefault("USERPROFILE", profile)
+    env.setdefault("HOME", profile)
+    env.setdefault("HOMEDRIVE", str(host_env.get("HOMEDRIVE") or drive))
+    env.setdefault("HOMEPATH", str(host_env.get("HOMEPATH") or tail or profile))
 
 
 def _capability_store_path() -> Path:
@@ -370,7 +494,7 @@ def _validate_filesystem_operation_targets(
     elif operation.kind in {"glob_search", "grep_search"} and target is not None:
         if not target.exists():
             raise FileNotFoundError(f"Path not found: {target}")
-    elif operation.kind == "edit_text" and target is not None:
+    elif operation.kind in {"edit_text", "edit_source"} and target is not None:
         if not target.exists():
             raise FileNotFoundError(f"File not found: {target}")
         if not target.is_file():
@@ -389,36 +513,72 @@ def _filesystem_operation_targets(
     operation: SandboxOperation,
     request: FilesystemOperationRequest,
 ) -> tuple[Path, ...]:
+    if operation.workspace is None:
+        raise SandboxBackendError("filesystem operation is missing workspace")
+    logical_workspace = _logical_filesystem_target(
+        operation.workspace,
+        base=Path.cwd(),
+    )
     targets: tuple[Path, ...]
+    logical_targets: tuple[Path, ...]
     if operation.kind in {
         "read_file",
         "list_dir",
         "write_text",
         "edit_text",
+        "create_source",
+        "edit_source",
         "glob_search",
         "grep_search",
     }:
         if request.path is None:
             raise SandboxBackendError(f"filesystem operation {operation.kind} requires path")
-        targets = (_canonical_filesystem_target(request.path),)
+        raw_logical_target = request.logical_path or request.path
+        mapped_logical_target = (
+            resolve_workspace_alias(raw_logical_target, logical_workspace) or raw_logical_target
+        )
+        logical_targets = (
+            _logical_filesystem_target(mapped_logical_target, base=logical_workspace),
+        )
+        _validate_filesystem_operation_profile_targets(operation, logical_targets)
+        targets = (_canonical_filesystem_target(logical_targets[0]),)
     elif operation.kind == "apply_patch":
         if request.root is None:
             raise SandboxBackendError("filesystem operation apply_patch requires root")
-        root = _canonical_filesystem_target(request.root)
+        logical_root = _logical_filesystem_target(
+            request.root,
+            base=logical_workspace,
+        )
+        root = _canonical_filesystem_target(logical_root)
         try:
             from opensquilla.tools.builtin import patch as patch_tool
 
+            patch_operations = patch_tool._parse_patch(request.patch)
+        except Exception as exc:
+            raise SandboxBackendError(f"invalid apply_patch targets: {exc}") from exc
+        logical_targets = tuple(
+            dict.fromkeys(
+                _logical_filesystem_target(Path(patch_op.path), base=logical_root)
+                for patch_op in patch_operations
+            )
+        )
+        _validate_filesystem_operation_profile_targets(operation, logical_targets)
+        try:
             targets = tuple(
                 dict.fromkeys(
-                    patch_tool._validate_path(patch_op.path, root)
-                    for patch_op in patch_tool._parse_patch(request.patch)
+                    patch_tool._validate_path(patch_op.path, root) for patch_op in patch_operations
                 )
             )
         except Exception as exc:
             raise SandboxBackendError(f"invalid apply_patch targets: {exc}") from exc
     else:
         raise SandboxBackendError(f"unsupported filesystem operation: {operation.kind!r}")
-    declared = tuple(dict.fromkeys(_canonical_filesystem_target(path) for path in request.paths))
+    declared = tuple(
+        dict.fromkeys(
+            _canonical_filesystem_target(_logical_filesystem_target(path, base=logical_workspace))
+            for path in request.paths
+        )
+    )
     if set(declared) != set(targets):
         raise SandboxBackendError(
             "declared filesystem paths do not match derived operation targets: "
@@ -426,6 +586,13 @@ def _filesystem_operation_targets(
             f"derived={tuple(str(path) for path in targets)!r}"
         )
     return targets
+
+
+def _logical_filesystem_target(path: Path, *, base: Path | None = None) -> Path:
+    candidate = path.expanduser()
+    if base is not None and not candidate.is_absolute():
+        candidate = base / candidate
+    return Path(logical_absolute_path(candidate))
 
 
 def _canonical_filesystem_target(path: Path) -> Path:
@@ -466,42 +633,47 @@ def _validate_filesystem_private_transport_roots(
 
 
 def _validate_profile_is_windows_compilable(profile: FileSystemPermissionProfile) -> None:
-    if profile.default_access is not FileSystemAccess.DENY:
+    retargeted_writable_roots = profile.retargeted_writable_roots
+    if retargeted_writable_roots:
+        roots = ", ".join(str(path) for path in retargeted_writable_roots)
+        raise SandboxBackendError(f"retargeted writable filesystem root: {roots}")
+    if profile.default_access is FileSystemAccess.WRITE:
         raise SandboxBackendError(
-            "windows_default cannot compile non-deny default filesystem access; "
-            "the Windows platform profile must project explicit roots"
+            "windows_default cannot compile default filesystem access with write "
+            "authority; writable roots must be explicit"
         )
     if profile.denied_read_globs:
         raise SandboxBackendError(
             "windows_default cannot reliably enforce denied filesystem read globs"
         )
     entries = _effective_raw_profile_entries(profile)
-    writable = tuple(
-        Path(entry.path).resolve(strict=False)
+    writable = _dedupe_acl_paths(
+        path
         for entry in entries
         if entry.access is FileSystemAccess.WRITE
+        for path in _profile_entry_acl_path_variants(profile, entry)
     )
     for entry in entries:
         if entry.access is not FileSystemAccess.WRITE:
             continue
-        candidate = Path(entry.path).resolve(strict=False)
-        for restriction in entries:
-            if restriction.access is FileSystemAccess.WRITE:
-                continue
-            restricted = Path(restriction.path).resolve(strict=False)
-            if (
-                _windows_acl_path_key(candidate) != _windows_acl_path_key(restricted)
-                and _is_relative_to_casefold(candidate, restricted)
-                and any(
-                    _windows_acl_path_key(restricted) != _windows_acl_path_key(root)
-                    and _is_relative_to_casefold(restricted, root)
-                    for root in writable
-                )
-            ):
-                raise SandboxBackendError(
-                    "windows_default cannot reopen a writable descendant below a "
-                    f"READ/DENY ACL carveout: {entry.path}"
-                )
+        for candidate in _profile_entry_acl_path_variants(profile, entry):
+            for restriction in entries:
+                if restriction.access is FileSystemAccess.WRITE:
+                    continue
+                for restricted in _profile_entry_acl_path_variants(profile, restriction):
+                    if (
+                        _windows_acl_path_key(candidate) != _windows_acl_path_key(restricted)
+                        and _is_relative_to_casefold(candidate, restricted)
+                        and any(
+                            _windows_acl_path_key(restricted) != _windows_acl_path_key(root)
+                            and _is_relative_to_casefold(restricted, root)
+                            for root in writable
+                        )
+                    ):
+                        raise SandboxBackendError(
+                            "windows_default cannot reopen a writable descendant below a "
+                            f"READ/DENY ACL carveout: {entry.path}"
+                        )
 
 
 def _filesystem_request(operation: SandboxOperation) -> FilesystemOperationRequest:
@@ -612,13 +784,25 @@ def _acl_plan_payload(
     process_rx_roots = tuple(
         root for root in process_executable_rx_roots(request.argv, request.env) if root.exists()
     )
-    tool_rx_roots = tuple(
-        root
-        for root in _windows_tool_path_roots(
-            _process_base_env(request),
-            host_env=_host_tool_env(request),
+    if request.env.get("OPENSQUILLA_GUEST_SAFE") == "1":
+        system_root = windows_system_root(request.env).resolve(strict=False)
+        process_rx_roots = tuple(
+            root
+            for root in process_rx_roots
+            if _is_relative_to_casefold(root.resolve(strict=False), system_root)
+            or profile.resolve(root) is not FileSystemAccess.DENY
         )
-        if _acl_sensitive_marker(root) is None
+    tool_rx_roots = (
+        ()
+        if not _request_needs_host_tool_paths(request)
+        else tuple(
+            root
+            for root in _windows_tool_path_roots(
+                _process_base_env(request),
+                host_env=_host_tool_env(request),
+            )
+            if _acl_sensitive_marker(root) is None
+        )
     )
     tool_traversal_roots = _windows_tool_traversal_roots(
         tool_rx_roots,
@@ -677,7 +861,7 @@ def _acl_plan_payload(
         include_private_mounts=private_mounts_are_required,
     )
     deny_read_paths = _profile_denied_read_paths(profile)
-    merged_grants = _merge_acl_grants(plan.auto_grants)
+    merged_grants = _filter_filesystem_root_acl_grants(_merge_acl_grants(plan.auto_grants))
     roots = tuple(grant.path for grant in merged_grants)
     accesses = tuple(grant.access.value for grant in merged_grants)
     sids = capability_sids_for_command(
@@ -703,6 +887,7 @@ def _acl_plan_payload(
         "denyWritePaths": [str(path) for path in deny_write_paths],
         "denyReadPaths": [str(path) for path in deny_read_paths],
         "denyAclStatePath": str(_deny_acl_state_path()),
+        "revalidateDenyAcl": not _is_filesystem_worker_request(request),
         "grantCurrentUserAccess": True,
     }
 
@@ -716,8 +901,13 @@ def _profile_acl_grants(
         path = Path(entry.path)
         if entry.access is FileSystemAccess.DENY or not path.exists():
             continue
-        access = AclAccess.RWX if entry.access is FileSystemAccess.WRITE else AclAccess.RX
-        if access is AclAccess.RX and not _rx_root_needs_acl_grant(path, request.env):
+        effective_access = profile.resolve(entry.path)
+        if effective_access is FileSystemAccess.DENY:
+            continue
+        access = AclAccess.RWX if effective_access is FileSystemAccess.WRITE else AclAccess.RX
+        if access is AclAccess.RX and (
+            _is_filesystem_root(path) or not _rx_root_needs_acl_grant(path, request.env)
+        ):
             continue
         grants.append(AclGrant(path, access, AclGrantKind.POLICY))
     return tuple(grants)
@@ -729,25 +919,27 @@ def _deny_write_paths_for_request(
     *,
     include_private_mounts: bool,
 ) -> tuple[Path, ...]:
-    writable_roots = tuple(Path(path) for path in profile.writable_roots)
+    entries = _effective_raw_profile_entries(profile)
     writable_acl_roots = _dedupe_acl_paths(
         variant
-        for entry in _effective_raw_profile_entries(profile)
+        for entry in entries
         if entry.access is FileSystemAccess.WRITE
-        for variant in _acl_path_variants(Path(entry.path))
+        for variant in _profile_entry_acl_path_variants(profile, entry)
     )
     paths: list[Path] = [
         root
         for root in _runtime_readonly_roots()
         if root.exists() and not _is_filesystem_root(root) and _acl_sensitive_marker(root) is None
     ]
-    for entry in _effective_raw_profile_entries(profile):
+    for entry in entries:
         if entry.access is FileSystemAccess.WRITE:
             continue
-        entry_path = Path(entry.path)
-        if not _acl_target_is_nested_under_writable_root(entry_path, writable_acl_roots):
+        variants = _profile_entry_acl_path_variants(profile, entry)
+        if not any(
+            _acl_target_is_at_or_below_writable_root(variant, writable_acl_roots)
+            for variant in variants
+        ):
             continue
-        variants = _acl_path_variants(entry_path)
         paths.extend(variants)
         for variant in variants:
             paths.extend(_writable_reparse_ancestors(variant, writable_acl_roots))
@@ -759,7 +951,7 @@ def _deny_write_paths_for_request(
                 protected_root.resolve(strict=False),
                 writable_root.resolve(strict=False),
             )
-            for writable_root in writable_roots
+            for writable_root in writable_acl_roots
         )
     )
     paths.extend(
@@ -774,13 +966,12 @@ def _deny_write_paths_for_request(
     return _dedupe_acl_paths(paths)
 
 
-def _acl_target_is_nested_under_writable_root(
+def _acl_target_is_at_or_below_writable_root(
     path: Path,
     writable_roots: tuple[Path, ...],
 ) -> bool:
     return any(
-        _windows_acl_path_key(target) != _windows_acl_path_key(writable_root)
-        and _is_relative_to_casefold(target, writable_root)
+        _is_relative_to_casefold(target, writable_root)
         for target in _acl_path_variants(path)
         for writable_root in writable_roots
     )
@@ -814,22 +1005,49 @@ def _profile_denied_read_paths(
         path
         for entry in _effective_raw_profile_entries(profile)
         if entry.access is FileSystemAccess.DENY
-        for path in _acl_path_variants(Path(entry.path))
+        for path in _profile_entry_acl_path_variants(profile, entry)
     )
 
 
 def _effective_raw_profile_entries(
     profile: FileSystemPermissionProfile,
 ) -> tuple[FileSystemPermissionEntry, ...]:
-    latest: dict[str, tuple[int, FileSystemPermissionEntry]] = {}
+    latest: dict[tuple[str, str], tuple[int, FileSystemPermissionEntry]] = {}
     for index, entry in enumerate(profile.entries):
-        canonical = Path(entry.path).expanduser().resolve(strict=False)
-        latest[_windows_acl_path_key(canonical)] = (index, entry)
-    return tuple(entry for _index, entry in sorted(latest.values()))
+        lexical = Path(logical_absolute_path(entry.lexical_path))
+        canonical = Path(logical_absolute_path(entry.path))
+        latest[
+            (
+                _windows_acl_path_key(lexical),
+                _windows_acl_path_key(canonical),
+            )
+        ] = (index, entry)
+    return tuple(entry for _index, entry in sorted(latest.values(), key=lambda item: item[0]))
+
+
+def _profile_entry_acl_path_variants(
+    profile: FileSystemPermissionProfile,
+    entry: FileSystemPermissionEntry,
+) -> tuple[Path, ...]:
+    shared_paths: tuple[PurePath, ...]
+    if entry.access is FileSystemAccess.WRITE:
+        shared_paths = profile.writable_path_variants(entry.lexical_path)
+        return _dedupe_acl_paths(Path(path) for path in shared_paths)
+    else:
+        shared_paths = profile.protected_path_variants(entry.lexical_path)
+        if not shared_paths:
+            shared_paths = (entry.lexical_path, entry.path)
+    base_paths = tuple(Path(path) for path in shared_paths)
+    return _dedupe_acl_paths(
+        (
+            *base_paths,
+            *(variant for path in base_paths for variant in _acl_path_variants(path)),
+        )
+    )
 
 
 def _acl_path_variants(path: Path) -> tuple[Path, ...]:
-    lexical = path.expanduser().absolute()
+    lexical = Path(logical_absolute_path(path))
     variants = [lexical]
     if lexical.exists():
         variants.append(lexical.resolve(strict=False))
@@ -840,7 +1058,7 @@ def _dedupe_acl_paths(paths: Iterable[Path | str]) -> tuple[Path, ...]:
     seen: set[str] = set()
     result: list[Path] = []
     for raw in paths:
-        path = Path(raw).expanduser().absolute()
+        path = Path(logical_absolute_path(Path(raw)))
         key = _windows_acl_path_key(path)
         if key in seen:
             continue
@@ -873,6 +1091,22 @@ def _merge_acl_grants(grants: Iterable[AclGrant]) -> tuple[AclGrant, ...]:
             AclGrant(path=grant.path, access=access, kind=kind),
         )
     return tuple(grant for _index, grant in sorted(merged.values()))
+
+
+def _filter_filesystem_root_acl_grants(
+    grants: Iterable[AclGrant],
+) -> tuple[AclGrant, ...]:
+    filtered: list[AclGrant] = []
+    for grant in grants:
+        canonical_path = grant.path.resolve(strict=False)
+        if not _is_filesystem_root(canonical_path):
+            filtered.append(grant)
+            continue
+        if grant.access is AclAccess.RWX:
+            raise SandboxBackendError(
+                "windows_default cannot grant write access to a filesystem root"
+            )
+    return tuple(filtered)
 
 
 def _windows_acl_path_key(path: Path) -> str:
@@ -926,8 +1160,23 @@ def _process_base_env(request: SandboxRequest) -> dict[str, str]:
         value = request.env.get(key) or os.environ.get(key)
         if isinstance(value, str) and value:
             env[key] = value
-    _prepend_windows_tool_paths(env, host_env=_host_tool_env(request))
+    if _request_needs_host_tool_paths(request):
+        _prepend_windows_tool_paths(env, host_env=_host_tool_env(request))
     return env
+
+
+def _is_filesystem_worker_request(request: SandboxRequest) -> bool:
+    return request.action_kind.startswith(
+        ("fs.worker.", "capability.probe.fs.worker.")
+    )
+
+
+def _request_needs_host_tool_paths(request: SandboxRequest) -> bool:
+    return (
+        request.env.get("OPENSQUILLA_GUEST_SAFE") != "1"
+        and not _is_filesystem_worker_request(request)
+        and request.action_kind != "capability.probe"
+    )
 
 
 def _host_tool_env(request: SandboxRequest) -> dict[str, str]:
@@ -1115,9 +1364,14 @@ def _split_windows_path(value: str) -> list[str]:
 
 
 def _directory_has_windows_tool(path: Path) -> bool:
-    if not path.exists() or not path.is_dir():
+    try:
+        if not path.exists() or not path.is_dir():
+            return False
+        return any((path / name).exists() for name in _WINDOWS_TOOL_PATH_EXECUTABLES)
+    except OSError:
+        # Ignore malformed or oversized PATH entries instead of aborting the
+        # entire sandbox request while probing for optional Windows tools.
         return False
-    return any((path / name).exists() for name in _WINDOWS_TOOL_PATH_EXECUTABLES)
 
 
 def _windows_path_is_apps_alias_dir(path: Path) -> bool:

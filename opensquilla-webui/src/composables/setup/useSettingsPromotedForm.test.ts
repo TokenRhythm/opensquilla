@@ -31,7 +31,7 @@ describe('useSettingsPromotedForm — audio TTS fields', () => {
     expect(f.audioDirty.value).toBe(true)
     const p = f.audioPayload()
     expect(p.providerId).toBe('elevenlabs')
-    expect(p.enabled).toBe(true)
+    expect(p).not.toHaveProperty('enabled')
     expect(p.ttsVoice).toBe('rachel')
     expect(p.languageCode).toBe('zh-CN')
     expect('ttsModel' in p).toBe(false) // empty → omitted (backend keeps current)
@@ -43,6 +43,28 @@ describe('useSettingsPromotedForm — audio TTS fields', () => {
     f.initFromConfig({ audio: { enabled: true, providers: { elevenlabs: {} } } })
     f.updateAudioField('ttsModel', '   ')
     expect('ttsModel' in f.audioPayload()).toBe(false)
+  })
+
+  it('prefers a one-time pasted key over a hydrated environment reference', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({
+      audio: {
+        enabled: false,
+        providers: {
+          elevenlabs: {
+            api_key_env: 'ELEVENLABS_API_KEY',
+            base_url: 'https://api.elevenlabs.io',
+          },
+        },
+      },
+    })
+    f.updateAudioField('apiKey', 'test-inline-key')
+
+    expect(f.audioPayload()).toEqual({
+      providerId: 'elevenlabs',
+      apiKey: 'test-inline-key',
+      baseUrl: 'https://api.elevenlabs.io',
+    })
   })
 })
 

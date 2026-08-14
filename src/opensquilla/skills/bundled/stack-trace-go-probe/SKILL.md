@@ -1,6 +1,7 @@
 ---
 name: stack-trace-go-probe
 description: "Internal helper for meta-stack-trace-investigator. Use when a Go panic or stack trace needs Go-specific nil/error checks, go test reproducer guidance, and patch targets."
+description_zh: "meta-stack-trace-investigator的内部辅助工具。当Go panic或堆栈跟踪需要Go特定的nil/error检查、go test复现指引和补丁目标时使用。"
 user-invocable: false
 disable-model-invocation: true
 provenance:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,8 @@ _HISTORICAL_TOOL_ARGUMENT_TOTAL_MAX_CHARS = 4096
 _HISTORICAL_TOOL_RESULT_MAX_CHARS = 4096
 _HISTORICAL_TOOL_RESULT_PREVIEW_CHARS = 480
 _TOOL_RESULT_PROJECTION_PREFIX = "[tool_result_projection]\n"
+_AGGREGATE_TOOL_RESULT_PROJECTION_PREFIX = "[aggregate_tool_result_compacted]\n"
+_HISTORICAL_TOOL_RESULT_COMPACTED_PREFIX = "[historical_tool_result_compacted]\n"
 _TOOL_RESULT_PROJECTION_HEADER_PREFIXES = (
     "tool_result_handle:",
     "sha256:",
@@ -55,7 +58,11 @@ _TOOL_RESULT_PROJECTION_HEADER_PREFIXES = (
     "preview_complete:",
     "retrieve_hint:",
     "search_hints:",
+    "signal_scan:",
+    "signal_next_call:",
 )
+_TOOL_RESULT_HANDLE_RE = re.compile(r"^tr-[0-9a-f]{32}$")
+_TOOL_RESULT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,7 @@ def project_historical_tool_payloads(
     messages: list[Message],
     *,
     preserve_reasoning_content: bool = False,
+    recoverable_references: frozenset[tuple[str, str]] = frozenset(),
 ) -> tuple[list[Message], HistoricalReplayProjectionResult]:
     """Return a compact provider-view for persisted historical tool payloads.
 
@@ -140,7 +148,10 @@ def project_historical_tool_payloads(
                     next_blocks.append(next_tool_use)
                     continue
                 if isinstance(block, ContentBlockToolResult):
-                    next_tool_result, changed = _project_historical_tool_result(block)
+                    next_tool_result, changed = _project_historical_tool_result(
+                        block,
+                        recoverable_references=recoverable_references,
+                    )
                     if changed:
                         tool_results_projected += 1
                         content_changed = True
@@ -270,11 +281,22 @@ def _project_historical_tool_use(
 
 def _project_historical_tool_result(
     block: ContentBlockToolResult,
+    *,
+    recoverable_references: frozenset[tuple[str, str]],
 ) -> tuple[ContentBlockToolResult, bool]:
     content = block.content if isinstance(block.content, str) else _json_text(block.content)
     if len(content) <= _HISTORICAL_TOOL_RESULT_MAX_CHARS:
         return block, False
-    if content.startswith(_TOOL_RESULT_PROJECTION_PREFIX):
+    reference = recoverable_tool_result_reference(content)
+    if reference is None or reference not in recoverable_references:
+        # A head/tail-only historical projection is irreversible for the
+        # model. Keep visible evidence unless the caller has verified this
+        # exact handle+digest in the current Store/session/agent scope.
+        return block, False
+    handle, raw_sha256 = reference
+    if content.startswith(
+        (_TOOL_RESULT_PROJECTION_PREFIX, _AGGREGATE_TOOL_RESULT_PROJECTION_PREFIX)
+    ):
         compacted = _compact_historical_tool_result_projection(
             content,
             tool_use_id=block.tool_use_id,
@@ -291,7 +313,14 @@ def _project_historical_tool_result(
     compacted = _compact_historical_text(
         content,
         label="historical_tool_result",
-        metadata={"tool_use_id": block.tool_use_id},
+        metadata={
+            "retrieve_hint": (
+                "Use retrieve_tool_result with this handle to inspect the original raw output."
+            ),
+            "tool_result_handle": handle,
+            "tool_result_sha256": raw_sha256,
+            "tool_use_id": block.tool_use_id,
+        },
     )
     return (
         ContentBlockToolResult(
@@ -304,10 +333,93 @@ def _project_historical_tool_result(
     )
 
 
+def recoverable_tool_result_reference(content: str) -> tuple[str, str] | None:
+    """Parse a strict Store reference from a known projection envelope.
+
+    Parsing alone never proves recoverability.  Callers must also validate the
+    returned handle and raw-content digest against the active Store scope.
+    """
+
+    if content.startswith(
+        (_TOOL_RESULT_PROJECTION_PREFIX, _AGGREGATE_TOOL_RESULT_PROJECTION_PREFIX)
+    ):
+        fields: dict[str, str] = {}
+        for line in content.splitlines()[1:]:
+            key, separator, value = line.partition(":")
+            if separator:
+                fields.setdefault(key.strip(), value.strip())
+        handle = fields.get("tool_result_handle", "")
+        sha256 = fields.get("sha256", "")
+        if not _TOOL_RESULT_HANDLE_RE.fullmatch(handle):
+            return None
+        if not _TOOL_RESULT_SHA256_RE.fullmatch(sha256):
+            return None
+        return handle, sha256
+    if content.startswith(_HISTORICAL_TOOL_RESULT_COMPACTED_PREFIX):
+        fields = {}
+        for line in content.splitlines()[1:]:
+            key, separator, value = line.partition(":")
+            if separator:
+                fields.setdefault(key.strip(), value.strip())
+        handle = fields.get("tool_result_handle", "")
+        sha256 = fields.get("tool_result_sha256", "")
+        if not _TOOL_RESULT_HANDLE_RE.fullmatch(handle):
+            return None
+        if not _TOOL_RESULT_SHA256_RE.fullmatch(sha256):
+            return None
+        return handle, sha256
+
+    # Structured truncation envelopes are always JSON objects emitted with
+    # these literal keys.  Reject unrelated historical JSON before invoking
+    # the recursive decoder: arbitrary tool output can be deeply nested even
+    # though it cannot possibly contain a recoverable Store reference.
+    object_start = 0
+    object_end = len(content)
+    while object_start < object_end and content[object_start] in " \t\r\n":
+        object_start += 1
+    while object_end > object_start and content[object_end - 1] in " \t\r\n":
+        object_end -= 1
+    if (
+        object_start == object_end
+        or content[object_start] != "{"
+        or content[object_end - 1] != "}"
+    ):
+        return None
+    if any(
+        marker not in content
+        for marker in (
+            '"result_truncated"',
+            '"retrieve_hint"',
+            '"tool_result_handle"',
+            '"tool_result_sha256"',
+        )
+    ):
+        return None
+    try:
+        payload = json.loads(content)
+    except (json.JSONDecodeError, RecursionError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("result_truncated") is not True or not payload.get("retrieve_hint"):
+        return None
+    payload_handle = payload.get("tool_result_handle")
+    payload_sha256 = payload.get("tool_result_sha256")
+    if not isinstance(payload_handle, str) or not isinstance(payload_sha256, str):
+        return None
+    handle = payload_handle.strip()
+    sha256 = payload_sha256.strip()
+    if not _TOOL_RESULT_HANDLE_RE.fullmatch(handle):
+        return None
+    if not _TOOL_RESULT_SHA256_RE.fullmatch(sha256):
+        return None
+    return handle, sha256
+
+
 def _compact_historical_tool_result_projection(text: str, *, tool_use_id: str) -> str:
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     lines = text.splitlines()
-    preserved: list[str] = [_TOOL_RESULT_PROJECTION_PREFIX.rstrip("\n")]
+    preserved: list[str] = [text.splitlines()[0]]
     for line in lines[1:]:
         stripped = line.strip()
         if any(stripped.startswith(prefix) for prefix in _TOOL_RESULT_PROJECTION_HEADER_PREFIXES):

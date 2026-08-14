@@ -33,6 +33,8 @@ export function useSetupModelStrategyForm(
   tierCandidates?: ComputedRef<EnsembleTierCandidate[]>,
   activeModel?: ComputedRef<string>,
 ) {
+  const fixedProvider = ref('')
+  const fixedProviderBaseline = ref('')
   const fixedModel = ref('')
   const fixedModelBaseline = ref('')
 
@@ -41,17 +43,29 @@ export function useSetupModelStrategyForm(
     return routerForm.mode.value === 'disabled' ? 'single' : 'router'
   })
 
+  const fixedProviderDirty = computed(() => fixedProvider.value !== fixedProviderBaseline.value)
   const fixedModelDirty = computed(() => fixedModel.value !== fixedModelBaseline.value)
   const isDirty = computed(() => (
     routerForm.isDirty.value
     || ensembleForm.isDirty.value
+    || fixedProviderDirty.value
     || fixedModelDirty.value
   ))
 
-  function initFixedModel(value = activeModel?.value || '') {
+  function initFixedModel(
+    value = activeModel?.value || '',
+    provider = activeProvider?.value || '',
+  ) {
+    const normalizedProvider = String(provider || '').trim().toLowerCase()
     const normalized = String(value || '').trim()
+    fixedProvider.value = normalizedProvider
+    fixedProviderBaseline.value = normalizedProvider
     fixedModel.value = normalized
     fixedModelBaseline.value = normalized
+  }
+
+  function setFixedProvider(value: string) {
+    fixedProvider.value = String(value || '').trim().toLowerCase()
   }
 
   function setFixedModel(value: string) {
@@ -59,7 +73,10 @@ export function useSetupModelStrategyForm(
   }
 
   function fixedModelPatches(): Record<string, string> {
-    if (!fixedModelDirty.value) return {}
+    // Activating another stored provider persists both provider and model in
+    // one secret-safe RPC. A plain config patch is only correct while the
+    // active provider remains unchanged.
+    if (fixedProviderDirty.value || !fixedModelDirty.value) return {}
     return { 'llm.model': fixedModel.value.trim() }
   }
 
@@ -88,7 +105,12 @@ export function useSetupModelStrategyForm(
   }
 
   function createPanel(context: ModelStrategyPanelContext) {
-    return computed(() => ({
+    return computed(() => {
+      const providerId = fixedProvider.value || activeProvider?.value || ''
+      const providerOption = context.routerPanel.value.providerOptions.find(
+        option => option.providerId === providerId,
+      )
+      return {
       activeStrategy: activeStrategy.value,
       hasSavedProvider: context.hasSavedProvider.value,
       providerLabel: context.providerLabel.value,
@@ -96,13 +118,20 @@ export function useSetupModelStrategyForm(
       router: context.routerPanel.value,
       ensemble: context.ensemblePanel.value,
       single: {
-        providerId: activeProvider?.value || '',
-        providerLabel: context.providerLabel.value,
+        providerId,
+        providerLabel: providerOption?.label || context.providerLabel.value,
         model: fixedModel.value,
         models: context.fixedModelCatalog.value.models,
         modelSource: context.fixedModelCatalog.value.source,
       },
       cards: [
+        {
+          id: 'ensemble' as const,
+          enabled: activeStrategy.value === 'ensemble',
+          titleKey: 'setup.modelStrategy.cards.ensemble.title',
+          descKey: 'setup.modelStrategy.cards.ensemble.desc',
+          badgeKey: 'setup.modelStrategy.cards.ensemble.badge',
+        },
         {
           id: 'router' as const,
           enabled: activeStrategy.value === 'router',
@@ -117,23 +146,20 @@ export function useSetupModelStrategyForm(
           descKey: 'setup.modelStrategy.cards.single.desc',
           badgeKey: 'setup.modelStrategy.cards.single.badge',
         },
-        {
-          id: 'ensemble' as const,
-          enabled: activeStrategy.value === 'ensemble',
-          titleKey: 'setup.modelStrategy.cards.ensemble.title',
-          descKey: 'setup.modelStrategy.cards.ensemble.desc',
-          badgeKey: 'setup.modelStrategy.cards.ensemble.badge',
-        },
       ],
-    }))
+    }
+    })
   }
 
   return {
     activeStrategy,
+    fixedProvider,
+    fixedProviderDirty,
     fixedModel,
     fixedModelDirty,
     isDirty,
     initFixedModel,
+    setFixedProvider,
     setFixedModel,
     fixedModelPatches,
     setStrategy,

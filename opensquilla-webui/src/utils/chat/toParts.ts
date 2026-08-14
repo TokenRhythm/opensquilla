@@ -9,6 +9,7 @@ import type {
   ChatPart,
   InterruptApprovalData,
   InterruptClarifyData,
+  InterruptResolution,
   InterruptViewState,
   ToolPartState,
 } from '@/types/parts'
@@ -20,6 +21,7 @@ export interface ToPartsInterrupt {
   kind: 'approval' | 'clarify'
   approvalId: string
   data: InterruptApprovalData | InterruptClarifyData
+  resolution?: InterruptResolution
 }
 
 function assertNever(x: never): never {
@@ -69,6 +71,10 @@ function pushTimelineItem(parts: ChatPart[], item: ChatStreamTimelineItem) {
     for (const call of item.group.calls) {
       parts.push(toolPartFromCall(call, item.group.groupId, item.group.operationKey, call.renderKey))
     }
+    return
+  }
+  if (item.type === 'interrupt') {
+    parts.push(item.part)
     return
   }
   return assertNever(item)
@@ -136,17 +142,38 @@ export function toParts(
   // (2c) interrupts — after the body, before artifacts: an approval blocks the
   // run mid-stream, so it belongs after the text/tools that preceded it and
   // before the turn's final deliverables. One part per id, in arrival order.
+  const timelineInterruptIds = new Set(
+    msg.timelineItems
+      ?.filter(
+        (item): item is Extract<ChatStreamTimelineItem, { type: 'interrupt' }> =>
+          item.type === 'interrupt',
+      )
+      .map(item => item.approvalId) ?? [],
+  )
   for (const it of interrupts) {
+    if (timelineInterruptIds.has(it.approvalId)) continue
     const state = interruptState.get(it.approvalId)
     parts.push({
       type: 'interrupt',
       interruptKind: it.kind,
       approval: it.kind === 'approval' ? (it.data as InterruptApprovalData) : undefined,
       clarify: it.kind === 'clarify' ? (it.data as InterruptClarifyData) : undefined,
-      resolution: state?.resolution ?? null,
+      resolution: state?.resolution ?? it.resolution ?? null,
       busy: state?.busy ?? false,
       error: state?.error ?? '',
       key: `${ownerKey}:interrupt:${it.approvalId}`,
+    })
+  }
+
+  // (2d) immutable plan revisions are typed transcript parts. The rendered
+  // message suppresses their Markdown fallback body, so this card is the one
+  // visual representation while the raw text remains available to providers
+  // and older clients.
+  for (const plan of msg.planRevisions ?? []) {
+    parts.push({
+      type: 'plan',
+      plan,
+      key: `${ownerKey}:plan:${plan.revisionId}`,
     })
   }
 

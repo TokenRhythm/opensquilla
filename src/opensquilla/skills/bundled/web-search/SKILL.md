@@ -1,6 +1,7 @@
 ---
 name: web-search
 description: This skill should be used when users need to search the web for information, find current content, look up news articles, search for images, or find videos. It uses DuckDuckGo's search API to return results in clean, formatted output (text, markdown, or JSON). Use for research, fact-checking, finding recent information, or gathering web resources.
+description_zh: "当用户需要在网上搜索信息、查找最新内容、查阅新闻文章、搜索图片或查找视频时使用。它使用DuckDuckGo的搜索API，以清晰、格式化的输出（文本、markdown或JSON）返回结果。适用于研究、事实核查、查找近期信息或收集网络资源。"
 homepage: https://clawhub.ai/billyutw/web-search
 provenance:
   origin: clawhub-mit0

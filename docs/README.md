@@ -16,7 +16,9 @@ root release README with task-oriented guides.
 7. [`web-ui.md`](web-ui.md) - local control console and chat UI.
 8. [`sessions.md`](sessions.md) - session continuity, export, resume, abort,
    and cleanup.
-9. [`glossary.md`](glossary.md) - user-facing terminology.
+9. [`goal-mode.md`](goal-mode.md) - persistent multi-turn Goals, progress,
+   guardrails, pause/resume, and Plan-mode interaction.
+10. [`glossary.md`](glossary.md) - user-facing terminology.
 
 ## Feature Guides
 
@@ -38,9 +40,14 @@ root release README with task-oriented guides.
   authoring.
 - [`features/compaction-and-cache.md`](features/compaction-and-cache.md) -
   long-session compaction and prompt-cache continuity.
+- [`goal-mode.md`](goal-mode.md) - durable session Goals and safe automatic
+  continuation.
 
 ## Surfaces and Operations
 
+- [`releases/0.5.3.md`](releases/0.5.3.md) - OpenSquilla 0.5.3 release notes.
+- [`releases/0.5.2.md`](releases/0.5.2.md) - OpenSquilla 0.5.2 release notes.
+- [`releases/0.5.1.md`](releases/0.5.1.md) - OpenSquilla 0.5.1 release notes.
 - [`releases/0.5.0.md`](releases/0.5.0.md) - OpenSquilla 0.5.0 release notes.
 - [`releases/0.5.0rc3.md`](releases/0.5.0rc3.md) - OpenSquilla 0.5.0 Preview 3 release notes.
 - [`releases/0.5.0rc2.md`](releases/0.5.0rc2.md) - OpenSquilla 0.5.0 Preview 2 release notes.
@@ -56,6 +63,8 @@ root release README with task-oriented guides.
   files, images, PDF, and TTS.
 - [`tools-and-sandbox.md`](tools-and-sandbox.md) - built-in tools, approvals,
   sandbox posture, and write policy.
+- [`sandbox-security.md`](sandbox-security.md) - Safe and Full execution modes,
+  guest isolation, policy behavior, bundled runtimes, and upgrade compatibility.
 - [`approvals-and-permissions.md`](approvals-and-permissions.md) - permission
   profiles, approval commands, workspace containment, and sandbox posture.
 - [`agents.md`](agents.md) - durable named agents and workspace defaults.

@@ -1,6 +1,7 @@
 ---
 name: AwesomeWebpageMetaSkill
 description: "Build a local multimedia webpage project from a user topic, audience, language, style, and media preferences by framing requirements, researching, planning, acquiring media, generating files, packaging, validating, repairing, and delivering usage guidance."
+description_zh: "根据用户给定的主题、受众、语言、风格和媒体偏好，通过梳理需求、调研、规划、获取媒体、生成文件、打包、校验、修复并交付使用指引，构建一个本地多媒体网页项目。"
 kind: meta
 meta_priority: 65
 always: false
@@ -46,8 +47,6 @@ metadata:
     capabilities: [network-read, network-write, filesystem-read, filesystem-write, command-exec]
     requires:
       config:
-        - awesome_webpage.provider
-        - awesome_webpage.openrouter.api_key
         - awesome_webpage.openrouter.models.page_generation
         - awesome_webpage.openrouter.models.image_generation
         - awesome_webpage.openrouter.models.audio_generation
@@ -56,11 +55,7 @@ metadata:
         - awesome_webpage.media_strategy
 config:
   awesome_webpage:
-    provider: openrouter
     openrouter:
-      api_key: null
-      api_key_env: OPENROUTER_API_KEY
-      base_url: https://openrouter.ai/api/v1
       models:
         page_generation: moonshotai/kimi-k2.6
         image_generation: google/gemini-3-pro-image-preview
@@ -74,7 +69,7 @@ config:
       default_modalities: [text, images, audio, video]
       search_modalities: [images]
       direct_aigc_modalities: [audio, video]
-      confirmation_steps: [ask_images, ask_audio, ask_video, ask_style]
+      confirmation_steps: [ask_images, ask_audio, ask_video, ask_style, media_provider_approval]
       aigc_policy: search_images_direct_generate_audio_video
       placeholder_policy: visible_replacement_slot_when_generation_unavailable
       target_assets:
@@ -92,8 +87,8 @@ config:
         opensquilla_compatibility: deterministic-skill-exec
         notes: |
           The image_aigc step runs this deterministic skill_exec adapter.
-          It does not invoke a prompt-building skill as an agent. No
-          GEMINI_API_KEY required; only OPENROUTER_API_KEY.
+          It does not invoke a prompt-building skill as an agent. Its volatile
+          connection comes from ordinary Provider Settings after approval.
       audio_generation:
         skill: audio-cog
         url: https://clawhub.ai/skills/audio-cog
@@ -143,7 +138,6 @@ composition:
 
           Resolved awesome_webpage config for this run:
           provider: openrouter
-          openrouter.api_key_env: OPENROUTER_API_KEY
           openrouter.models.page_generation: {{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('models', {}).get('page_generation', 'moonshotai/kimi-k2.6') }}
           openrouter.models.image_generation: {{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('models', {}).get('image_generation', 'google/gemini-3-pro-image-preview') }}
           openrouter.models.audio_generation: {{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('models', {}).get('audio_generation', 'openai/gpt-audio-mini') }}
@@ -521,16 +515,64 @@ composition:
           {"media_slots": {{ outputs.media_slots_normalize | tojson }},
            "media_search": {{ outputs.media_search | tojson }}}
 
+    - id: media_provider_approval
+      kind: user_input
+      depends_on: [page_outline, media_strategy]
+      clarify:
+        mode: form
+        intro: |
+          媒体生成需要你明确授权。批准后，媒体提示词、网页大纲及生成所需的
+          相关内容会发送给下方所选的外部 Provider，并且可能产生费用。
+          修改意见（包括备注栏内容）、含糊回答或空回复都不会被视为授权，
+          也不会调用付费生成。
+
+          Selected Provider: OpenRouter (the current code-owned candidate)
+          Images: {{ inputs.get('collected', {}).get('ask_images', {}).get('include_images', 'YES') }}
+          Audio: {{ inputs.get('collected', {}).get('ask_audio', {}).get('include_audio', 'YES') }}
+          Video: {{ inputs.get('collected', {}).get('ask_video', {}).get('include_video', 'YES') }}
+        intro_zh: |
+          媒体生成需要你明确授权。批准后，媒体提示词、网页大纲及生成所需的相关内容会发送给下方所选的外部 Provider，并且可能产生费用。修改意见（包括备注栏内容）、含糊回答或空回复都不会被视为授权，也不会调用付费生成。
+
+          所选 Provider：OpenRouter（当前由代码维护的候选）
+          图片：{{ inputs.get('collected', {}).get('ask_images', {}).get('include_images', 'YES') }}
+          音频：{{ inputs.get('collected', {}).get('ask_audio', {}).get('include_audio', 'YES') }}
+          视频：{{ inputs.get('collected', {}).get('ask_video', {}).get('include_video', 'YES') }}
+        intro_en: |
+          Media generation requires your explicit approval. If you approve, media prompts, the webpage outline, and related content needed for generation will be sent to the selected external Provider below and may incur charges. Edit requests (including any additional-notes text), ambiguous answers, and empty replies do not count as approval and will not authorize paid generation.
+
+          Selected Provider: OpenRouter (the current code-owned candidate)
+          Images: {{ inputs.get('collected', {}).get('ask_images', {}).get('include_images', 'YES') }}
+          Audio: {{ inputs.get('collected', {}).get('ask_audio', {}).get('include_audio', 'YES') }}
+          Video: {{ inputs.get('collected', {}).get('ask_video', {}).get('include_video', 'YES') }}
+        # Keep extraction off and omit a default so only the user's explicit
+        # structured choice can authorize an external paid submission.
+        nl_extract: false
+        fields:
+          - name: approval
+            type: enum
+            required: true
+            choices: ["APPROVE_MEDIA_SEND_AND_COST", "DECLINE_MEDIA_GENERATION"]
+            prompt: "是否同意向所选 Provider 发送媒体提示词和相关内容，并接受可能产生的费用？"
+            prompt_zh: "是否同意向所选 Provider 发送媒体提示词和相关内容，并接受可能产生的费用？"
+            prompt_en: "Do you approve sending media prompts and related content to the selected Provider and accept that charges may apply?"
+          - name: additional_notes
+            type: string
+            required: false
+            prompt: "可选修改意见。填写任何内容都会阻止本次付费媒体调用；请先修改方案，再重新授权。"
+            prompt_zh: "可选修改意见。填写任何内容都会阻止本次付费媒体调用；请先修改方案，再重新授权。"
+            prompt_en: "Optional edit notes. Any text here blocks paid media calls for this approval; revise the plan before authorizing again."
+            max_chars: 2000
+        cancel_keywords: ["取消", "算了", "cancel", "stop", "abort"]
+        timeout_hours: 24
+
     - id: image_aigc
       kind: skill_exec
       skill: nano-banana-pro-openrouter
-      depends_on: [media_strategy, image_download, media_slots_normalize]
-      when: "inputs.get('collected', {}).get('ask_images', {}).get('include_images', 'YES') == 'YES' and (outputs.media_strategy == 'NEEDS_AIGC_IMAGE' or 'IMAGE_DOWNLOAD_INCOMPLETE:' in outputs.get('image_download', '') or (outputs.media_strategy == 'IMAGE_SEARCH_READY' and 'IMAGE_READY:' not in outputs.get('image_download', '')))"
+      side_effect: external_paid_submit
+      depends_on: [media_strategy, image_download, media_slots_normalize, media_provider_approval]
+      when: "inputs.get('collected', {}).get('media_provider_approval', {}).get('approval', '') == 'APPROVE_MEDIA_SEND_AND_COST' and not inputs.get('collected', {}).get('media_provider_approval', {}).get('additional_notes', '') and inputs.get('collected', {}).get('ask_images', {}).get('include_images', 'YES') == 'YES' and (outputs.media_strategy == 'NEEDS_AIGC_IMAGE' or 'IMAGE_DOWNLOAD_INCOMPLETE:' in outputs.get('image_download', '') or (outputs.media_strategy == 'IMAGE_SEARCH_READY' and 'IMAGE_READY:' not in outputs.get('image_download', '')))"
       with:
         model: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('models', {}).get('image_generation', 'google/gemini-3-pro-image-preview') }}"
-        base_url: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('base_url', 'https://openrouter.ai/api/v1') }}"
-        api_key: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('api_key', '') }}"
-        api_key_env: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('api_key_env', 'OPENROUTER_API_KEY') }}"
         output_dir: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('output_dir') or (inputs.workspace_dir ~ '/awesome-webpage-output') }}/{{ outputs.project_slug | slugify }}/project/assets/images"
         filename: "{{ outputs.project_slug | slugify }}.png"
         resolution: "1K"
@@ -549,13 +591,11 @@ composition:
     - id: audio_aigc
       kind: skill_exec
       skill: audio-cog
-      depends_on: [audio_script]
-      when: "inputs.get('collected', {}).get('ask_audio', {}).get('include_audio', 'YES') == 'YES'"
+      side_effect: external_paid_submit
+      depends_on: [audio_script, media_provider_approval]
+      when: "inputs.get('collected', {}).get('media_provider_approval', {}).get('approval', '') == 'APPROVE_MEDIA_SEND_AND_COST' and not inputs.get('collected', {}).get('media_provider_approval', {}).get('additional_notes', '') and inputs.get('collected', {}).get('ask_audio', {}).get('include_audio', 'YES') == 'YES'"
       with:
         model: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('models', {}).get('audio_generation', 'openai/gpt-audio-mini') }}"
-        base_url: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('base_url', 'https://openrouter.ai/api/v1') }}"
-        api_key: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('api_key', '') }}"
-        api_key_env: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('api_key_env', 'OPENROUTER_API_KEY') }}"
         output_dir: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('output_dir') or (inputs.workspace_dir ~ '/awesome-webpage-output') }}/{{ outputs.project_slug | slugify }}/project/assets/audio"
         filename: "{{ outputs.project_slug | slugify }}-narration.wav"
         voice: cedar
@@ -602,13 +642,11 @@ composition:
     - id: video_aigc
       kind: skill_exec
       skill: openrouter-video-generator
-      depends_on: [page_outline]
-      when: "inputs.get('collected', {}).get('ask_video', {}).get('include_video', 'YES') == 'YES'"
+      side_effect: external_paid_submit
+      depends_on: [page_outline, media_provider_approval]
+      when: "inputs.get('collected', {}).get('media_provider_approval', {}).get('approval', '') == 'APPROVE_MEDIA_SEND_AND_COST' and not inputs.get('collected', {}).get('media_provider_approval', {}).get('additional_notes', '') and inputs.get('collected', {}).get('ask_video', {}).get('include_video', 'YES') == 'YES'"
       with:
         model: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('models', {}).get('video_generation', 'bytedance/seedance-2.0-fast') }}"
-        base_url: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('base_url', 'https://openrouter.ai/api/v1') }}"
-        api_key: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('api_key', '') }}"
-        api_key_env: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('openrouter', {}).get('api_key_env', 'OPENROUTER_API_KEY') }}"
         output_dir: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('output_dir') or (inputs.workspace_dir ~ '/awesome-webpage-output') }}/{{ outputs.project_slug | slugify }}/project/assets/video"
         filename: "{{ outputs.project_slug | slugify }}-intro.mp4"
         duration: "10"
@@ -888,9 +926,20 @@ composition:
           Media bind/validate output:
           {{ outputs.media_bind_validate | truncate(3500) }}
 
+    - id: publish_webpage
+      kind: tool_call
+      tool: publish_artifact
+      tool_allowlist: [publish_artifact]
+      depends_on: [quick_validate]
+      tool_args:
+        path: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('output_dir') or (inputs.workspace_dir ~ '/awesome-webpage-output') }}/{{ outputs.project_slug | slugify }}/project/index.html"
+        mime: "text/html"
+        bundle: "directory"
+        bundle_root: "{{ inputs.get('config', {}).get('awesome_webpage', {}).get('output_dir') or (inputs.workspace_dir ~ '/awesome-webpage-output') }}/{{ outputs.project_slug | slugify }}/project"
+
     - id: delivery_guide
       kind: llm_chat
-      depends_on: [quick_validate]
+      depends_on: [quick_validate, publish_webpage]
       with:
         system: |
           You are the Delivery Guide stage for AwesomeWebpageMetaSkill.
@@ -904,6 +953,8 @@ composition:
           - how to replace images, audio, and video assets
           - how to edit content in index.html, style.css, and script.js
           - what was validated, including the deterministic media bind gate
+          - confirm that the complete project was published as one webpage
+            bundle; do not invent or print an artifact URL
           - any CONFIG_NEEDED items if config values were missing
           - do not claim a requested media modality is available unless the
             media bind report says it is present and referenced
@@ -913,6 +964,9 @@ composition:
 
           Media bind report:
           {{ outputs.media_bind_validate | truncate(5000) }}
+
+          Webpage bundle publication:
+          {{ outputs.publish_webpage | truncate(1500) }}
 ---
 
 # AwesomeWebpageMetaSkill
@@ -931,8 +985,11 @@ Pipeline:
 7. Deterministic Webpage Write
 8. Deterministic Media Bind + Validation
 9. Local Validation
-10. Delivery Guide
+10. Publish Complete Webpage Bundle
+11. Delivery Guide
 
-Provider, OpenRouter model, API key, output directory, and media strategy are
-configuration-owned. The meta-skill may pass the config contract through the
-DAG, but individual steps must not invent those values.
+The current code-owned media capability candidate is OpenRouter. Its volatile
+credential, endpoint, and proxy are leased from ordinary Provider Settings only
+after the explicit media-send approval gate; they never enter this plan or a
+persisted run. Non-secret media model defaults, output directory, and media
+strategy remain configuration-owned, and individual steps must not invent them.

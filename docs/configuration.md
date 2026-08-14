@@ -16,6 +16,28 @@ OpenSquilla reads configuration in this order:
 Use `--config ./opensquilla.toml` when you want to write or inspect a
 project-local config file.
 
+## Task Runtime Concurrency
+
+Fresh installations allow up to eight cross-session turns to run at once:
+
+```toml
+[task_runtime]
+max_concurrency = 8
+max_pending_per_session = 64
+```
+
+Eight is the desktop default because it matches the built-in channel in-flight
+budget and leaves enough capacity for interactive tasks, Goal continuations,
+Cron runs, and subagents without bypassing TaskRuntime's global queue. Turns in
+the same session remain serialized. Provider pressure is still handled by the
+configured credential pool, provider health/fallback policy, and `Retry-After`
+cooldowns; this setting does not manufacture extra credentials or disable
+provider rate limiting.
+
+This is a default change, not a migration. An existing TOML value such as
+`max_concurrency = 4`, or an explicit
+`OPENSQUILLA_TASK_MAX_CONCURRENCY=4`, remains authoritative after upgrade.
+
 ## Secret Handling
 
 Prefer environment-variable references for secrets:
@@ -352,6 +374,11 @@ hard-blocked ranges, fix the DNS or proxy setup instead of bypassing the guard.
 
 ## Gateway Binding
 
+The desktop application always owns a loopback-only child Gateway bound to
+`127.0.0.1`. Desktop settings do not change its listener address or expose it
+to the LAN. The settings below apply to a separately launched standalone
+Gateway.
+
 Foreground:
 
 ```sh
@@ -375,6 +402,93 @@ Bind precedence:
 4. `OPENSQUILLA_GATEWAY_HOST`
 5. config host
 6. `127.0.0.1`
+
+When listening on the LAN, OpenSquilla accepts only loopback, RFC 1918, and
+IPv6 ULA socket peers. `auth.allowed_client_cidrs` can narrow that built-in
+range but cannot add public networks:
+
+```toml
+host = "0.0.0.0"
+
+[auth]
+mode = "token"
+allowed_client_cidrs = ["192.168.50.0/24"]
+```
+
+Missing, malformed, and incorrect tokens receive guest-safe authority only.
+A valid named token with `host.execute` may select Full Access without gaining
+owner-only settings authority.
+
+For a remote Web guest, the server ignores any client-supplied workspace and
+uses the configured default workspace. All file-capable tools follow the same
+non-bypassable policy:
+
+- ordinary host files are readable;
+- the built-in credential paths and OpenSquilla authority/recovery data are
+  not readable;
+- writes are allowed only inside the configured default workspace;
+- workspace creation, selection, and other owner-only lifecycle operations are
+  unavailable.
+
+These restrictions also apply to Shell, Python, Node.js, Git Bash, and their
+child processes. Guests cannot access the global approval queue, and approvals
+cannot elevate a guest past this boundary. The Gateway refuses Guest Safe
+startup when the configured default workspace is inside a protected credential
+or authority path.
+
+## Safe Mode Policy
+
+Settings -> Sandbox persists a versioned policy snapshot for each new task.
+Ordinary host files are readable and writable in Safe mode, except OpenSquilla
+authority/recovery data and the built-in or custom deny-write paths. Mutating a
+deny-write path requires an exact user approval.
+
+Recursive directory deletion always requires a dedicated irreversible-action
+confirmation. Backups are enabled by default with a 3 GiB quota; oldest
+backups are evicted first. A target larger than the quota requires a second,
+explicit confirmation to delete without a backup.
+
+Commands run automatically unless a built-in high-risk rule or a configured
+approval prefix matches. An auto-allow prefix takes precedence over approval
+rules. Network access is public by default through the managed boundary, with
+SSRF and local metadata protections; operators can deny domains, allow
+exceptions, or block all network access.
+
+## Goal Mode (`[goal]`)
+
+Session-level `/goal` mode drives the agent toward a fixed goal turn after turn
+until it completes, blocks, pauses, reaches a provider usage limit, or hits a
+guardrail. Automatic turns use the same TaskRuntime, TurnRunner, sandbox,
+approval, provider, and usage-accounting path as ordinary turns. All fields
+below are optional; absent keys keep the defaults.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `execution_enabled` | `true` | Emergency kill switch. When false, no new Goal execution is accepted and unfinished active Goals pause. |
+| `max_turns` | `50` | Per-resume-window turn limit (`1`-`500`). The current turn finishes first; an otherwise active Goal then pauses with `turn_limit`. |
+| `runtime_budget_seconds` | `3600` | Per-resume-window active running-time limit (`60`-`86400` seconds). Queue time, pauses, and Gateway downtime do not count. An otherwise active Goal pauses with `runtime_limit`. |
+
+```toml
+[goal]
+execution_enabled = true
+max_turns = 50
+runtime_budget_seconds = 3600
+```
+
+`/goal resume` resets the current guardrail window while retaining lifetime
+turn, active-time, and token totals. Goal mode does not replay a failed or timed
+out whole turn: tools may already have produced side effects. Provider/core
+request retries remain governed by their existing policies.
+
+An execution lease belongs to the subscribed Web UI or CLI connection that
+started or resumed the Goal. Losing that client connection detaches the lease:
+the Goal stays active, its current accepted turn may finish, and no new
+automatic continuation starts until an authorized client reattaches. A Web UI
+refresh reattaches with a tab-local continuity token; an explicit takeover is
+available when that token was lost. Disabling execution or restarting the
+Gateway still pauses unattended work. Read the complete workflow, state model,
+Plan-mode interaction, upgrade notes, and recovery guidance in
+[`goal-mode.md`](goal-mode.md).
 
 ## Raw Config Editing
 

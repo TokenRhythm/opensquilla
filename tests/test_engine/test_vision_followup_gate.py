@@ -14,11 +14,13 @@ from opensquilla.engine.usage_accounting import (
     UsageExecutionContext,
 )
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.provider import auxiliary_budget
 from opensquilla.provider.types import (
     ChatConfig,
     DoneEvent,
     Message,
     ModelInfo,
+    ProviderRequestCorrelation,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -43,8 +45,9 @@ class _FailProvider:
 class _JsonProvider:
     provider_name = "json"
 
-    def __init__(self, payload: str) -> None:
+    def __init__(self, payload: str, *, model: str = "") -> None:
         self.payload = payload
+        self.model = model
         self.calls: list[dict[str, Any]] = []
 
     async def chat(
@@ -126,8 +129,36 @@ class _RecordingSelector:
 
     def resolve(self) -> _JsonProvider:
         return _JsonProvider(
-            '{"decision":"text_only","confidence":0.88,"reason":"selector gate"}'
+            '{"decision":"text_only","confidence":0.88,"reason":"selector gate"}',
+            model=self.model or "",
         )
+
+
+class _WindowCatalog:
+    def __init__(self, windows: dict[str, int]) -> None:
+        self.windows = windows
+
+    def resolve_context_window_with_source(
+        self,
+        model_id: str,
+        *,
+        provider: str = "",
+    ) -> tuple[int, str]:
+        del provider
+        return self.windows[model_id], "catalog"
+
+    def resolve_context_window(self, model_id: str, provider: str = "") -> int:
+        del provider
+        return self.windows[model_id]
+
+    def resolve_max_tokens(
+        self,
+        model_id: str,
+        user_override: int = 0,
+        provider: str = "",
+    ) -> int:
+        del model_id, provider
+        return max(1, user_override or 256)
 
 
 class _UsageSink:
@@ -203,6 +234,7 @@ async def test_gate_accepts_needs_image_json() -> None:
     assert out.metadata["router_vision_followup_gate_confidence"] == 0.91
     assert out.metadata["router_vision_followup_gate_reason"] == "spatial reference"
     assert provider.calls[0]["tools"] == []
+    assert provider.calls[0]["config"].provider_request_max_chars > 0
 
 
 @pytest.mark.asyncio
@@ -219,6 +251,12 @@ async def test_gate_prefers_dedicated_gate_chat_over_primary_provider() -> None:
             "router_vision_followup_gate_model": "deepseek/deepseek-v4-flash",
         },
     )
+    ctx.provider_request_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="root-execution",
+        call_kind="agent.chat",
+    )
 
     out = await apply_vision_followup_gate(ctx)
 
@@ -226,6 +264,11 @@ async def test_gate_prefers_dedicated_gate_chat_over_primary_provider() -> None:
     assert out.metadata["router_vision_followup_gate_source"] == "llm"
     assert out.metadata["router_vision_followup_gate_model"] == "deepseek/deepseek-v4-flash"
     assert gate_chat.calls
+    correlation = gate_chat.calls[0]["config"].provider_request_correlation
+    assert correlation.session_id == "session-1"
+    assert correlation.turn_id == "turn-1"
+    assert correlation.execution_id != "root-execution"
+    assert correlation.call_kind == "auxiliary.vision_gate"
 
 
 @pytest.mark.asyncio
@@ -248,6 +291,67 @@ async def test_runtime_gate_chat_uses_configured_lightweight_tier_model() -> Non
         )
     ]
     assert any(isinstance(event, TextDeltaEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_dedicated_gate_budget_uses_small_gate_window_not_large_primary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _WindowCatalog(
+        {
+            "base-large": 128_000,
+            "gate-small": 2_048,
+        }
+    )
+    monkeypatch.setattr(auxiliary_budget, "shared_catalog", lambda: catalog)
+    config = GatewayConfig(
+        llm={"provider": "openrouter", "model": "base-large"},
+        squilla_router={"vision_followup_gate_model": "gate-small"},
+    )
+    runner = TurnRunner(provider_selector=None, config=config)
+    selector = _RecordingSelector()
+    chat, model = runner._make_vision_followup_gate_chat(selector)
+    assert callable(chat)
+    assert model == "gate-small"
+
+    primary = _JsonProvider("unused", model="base-large")
+    ctx = _ctx(
+        "Does the right side matter?",
+        {
+            "router_history_has_recent_image": True,
+            "router_turns_since_last_image": 1,
+            "router_vision_followup_gate_chat": chat,
+            "router_vision_followup_gate_model": model,
+        },
+    )
+    ctx.config = config
+    ctx.provider = primary
+    ctx.model = "base-large"
+
+    out = await apply_vision_followup_gate(ctx)
+
+    # The closure owns the provider returned by its original resolve(), so
+    # inspect the target attached by TurnRunner rather than resolving again.
+    execution_target = getattr(
+        chat,
+        "_opensquilla_vision_gate_execution_target",
+    )
+    gate_provider = execution_target.provider
+    gate_config = gate_provider.calls[0]["config"]
+    gate_budget = auxiliary_budget.resolve_auxiliary_request_budget(
+        gate_provider,
+        max_output_tokens=config.squilla_router.vision_followup_gate_max_output_tokens,
+        model="gate-small",
+    )
+    primary_budget = auxiliary_budget.resolve_auxiliary_request_budget(
+        primary,
+        max_output_tokens=config.squilla_router.vision_followup_gate_max_output_tokens,
+        model="base-large",
+    )
+
+    assert out.metadata["router_vision_followup_gate_decision"] == "text_only"
+    assert gate_config.provider_request_max_chars == gate_budget.provider_request_max_chars
+    assert gate_config.provider_request_max_chars < primary_budget.provider_request_max_chars
 
 
 @pytest.mark.asyncio

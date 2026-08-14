@@ -22,7 +22,7 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("channels", "tools"),
     ("cli", "agents"),
     ("cli", "contracts"),
-    # opensquilla swebench CLI drives the contrib SWE-bench harness (lazy import).
+    # The code-task CLI drives its contrib host workflow through lazy imports.
     ("cli", "contrib"),
     ("cli", "dist"),
     ("cli", "engine"),
@@ -35,6 +35,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "observability"),
     ("cli", "onboarding"),
     ("cli", "persistence"),
+    # CLI maintenance commands attach the same typed provider-correlation
+    # envelope as the shared turn loop; provider remains a lower-level leaf.
+    ("cli", "provider"),
     # The root CLI exposes the offline recovery adapter and writer entrypoints
     # acquire recovery locks; recovery never imports the CLI back.
     ("cli", "recovery"),
@@ -109,12 +112,21 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # orchestrator (offline retrain; default-off, fail-open).
     ("gateway", "squilla_router"),
     ("gateway", "tools"),
+    # The reusable Python Gateway client shares the bounded WebSocket receive
+    # contract with the CLI client; contracts remains implementation-free.
+    ("gateway_client.py", "contracts"),
     ("identity", "safety"),
     ("identity", "session"),
     ("mcp", "tools"),
     ("memory", "agents"),
     ("memory", "compat"),
     ("memory", "engine"),
+    # The project-workspace aggregate owns validation across agent identity,
+    # sandbox run contexts, and persisted session bindings. It remains a
+    # top-level composition module rather than a dependency of those packages.
+    ("project_workspaces.py", "agents"),
+    ("project_workspaces.py", "sandbox"),
+    ("project_workspaces.py", "session"),
     ("memory", "gateway"),
     ("memory", "identity"),
     ("memory", "provider"),
@@ -134,12 +146,22 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # narrow top-level facade. Recovery owns the platform-specific mechanics;
     # lower-level packages must not import the recovery package directly.
     ("profile_operation_lock.py", "recovery"),
+    # Profile import uses a narrow top-level facade for no-replace publication,
+    # metadata preservation, native path handling, and the shared profile lock.
+    ("profile_import_io.py", "recovery"),
+    # The same facade reuses migration's handle-pinned Windows source reader;
+    # the lower-level memory package remains independent of migration internals.
+    ("profile_import_io.py", "migration"),
     ("permissions.py", "sandbox"),
     # turn_error_writer scrubs free-text error records through the low-level
     # observability.redact utility before insert — sound downward layering.
     ("persistence", "observability"),
     ("persistence", "skills"),
     ("provider", "engine"),
+    # Official TokenRhythm transports reuse the passive install identity and
+    # its shared privacy policy; observability remains a leaf and never imports
+    # provider back.
+    ("provider", "observability"),
     ("provider", "safety"),
     # Provider argument repair reuses the tool alias/schema helpers (lazy import).
     ("provider", "tools"),
@@ -151,6 +173,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("router_control.py", "engine"),
     ("sandbox", "application"),
     ("sandbox", "gateway"),
+    # Direct-update migration reuses the profile lock implementation owned by
+    # recovery. Recovery no longer imports sandbox back, so this stays one-way.
+    ("sandbox", "recovery"),
     ("sandbox", "safety"),
     ("sandbox", "tools"),
     ("scheduler", "agents"),
@@ -158,6 +183,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("scheduler", "compat"),
     ("scheduler", "engine"),
     ("scheduler", "gateway"),
+    # Persisted cron jobs decode legacy run-mode names through the sandbox
+    # compatibility codec; the package-neutral vocabulary avoids wider edges.
+    ("scheduler", "sandbox"),
     ("scheduler", "session"),
     ("scheduler", "skills"),
     ("scheduler", "tools"),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -329,6 +330,116 @@ async def test_windows_setup_status_reports_windows_default_not_setup(
     assert "setup=not ready" in str(result.detail)
 
 
+async def test_windows_setup_repairs_stale_offline_identity(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox import setup_state
+    from opensquilla.sandbox.backend.windows_default_network import (
+        FIREWALL_RULE_VERSION,
+        WFP_RULE_VERSION,
+        WindowsNetworkSetup,
+    )
+
+    marker = tmp_path / "setup_marker.json"
+    repaired = WindowsNetworkSetup(
+        offline_user_sid="S-1-5-21-100-200-300-400",
+        allowed_proxy_ports=(48123,),
+        allow_local_binding=False,
+        firewall_rule_version=FIREWALL_RULE_VERSION,
+        wfp_rule_version=WFP_RULE_VERSION,
+        offline_username="OpenSquillaSandbox",
+        protected_password="new-protected-password",
+    )
+    probes = iter(
+        (
+            setup_state.WindowsSetupSupport(
+                default_backend_available=False,
+                ctypes_available=True,
+                token_api_available=True,
+                acl_api_available=True,
+                setup_ready=True,
+                proxy_allowlist_enforced=True,
+                identity_ready=False,
+            ),
+            setup_state.WindowsSetupSupport(
+                default_backend_available=True,
+                ctypes_available=True,
+                token_api_available=True,
+                acl_api_available=True,
+                setup_ready=True,
+                proxy_allowlist_enforced=True,
+                identity_ready=True,
+            ),
+        )
+    )
+
+    monkeypatch.setattr(setup_state.sys, "platform", "win32")
+    monkeypatch.setattr(setup_state, "_windows_process_is_admin", lambda: True)
+    monkeypatch.setattr(setup_state, "_probe_windows_sandbox_support", lambda: next(probes))
+    monkeypatch.setattr(setup_state, "_windows_setup_marker_path", lambda: marker)
+    monkeypatch.setattr(
+        setup_state,
+        "_establish_windows_network_setup",
+        lambda _marker_path: repaired,
+    )
+
+    result = await setup_state.ensure_sandbox_setup(SimpleNamespace())
+
+    assert result.state is setup_state.SandboxSetupState.READY
+    assert result.detail == "proxy_allowlist=ready"
+    assert marker.exists()
+
+
+async def test_windows_setup_repairs_unwritable_persistent_storage(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox import setup_state
+
+    marker = tmp_path / "setup_marker.json"
+    probes = iter(
+        (
+            setup_state.WindowsSetupSupport(
+                default_backend_available=False,
+                ctypes_available=True,
+                token_api_available=True,
+                acl_api_available=True,
+                setup_ready=True,
+                proxy_allowlist_enforced=True,
+                identity_ready=True,
+                storage_ready=False,
+            ),
+            setup_state.WindowsSetupSupport(
+                default_backend_available=True,
+                ctypes_available=True,
+                token_api_available=True,
+                acl_api_available=True,
+                setup_ready=True,
+                proxy_allowlist_enforced=True,
+                identity_ready=True,
+                storage_ready=True,
+            ),
+        )
+    )
+    helper_calls: list[Path] = []
+
+    monkeypatch.setattr(setup_state.sys, "platform", "win32")
+    monkeypatch.setattr(setup_state, "_windows_process_is_admin", lambda: False)
+    monkeypatch.setattr(setup_state, "_probe_windows_sandbox_support", lambda: next(probes))
+    monkeypatch.setattr(setup_state, "_windows_setup_marker_path", lambda: marker)
+    monkeypatch.setattr(
+        setup_state,
+        "_run_windows_setup_helper_elevated",
+        lambda path: helper_calls.append(path),
+    )
+
+    result = await setup_state.ensure_sandbox_setup(SimpleNamespace())
+
+    assert result.state is setup_state.SandboxSetupState.READY
+    assert helper_calls == [marker]
+
+
 async def test_ensure_windows_setup_writes_marker_when_windows_checks_are_ready(
     monkeypatch,
     tmp_path,
@@ -427,6 +538,8 @@ def test_windows_setup_support_uses_marker_proxy_ports(monkeypatch, tmp_path) ->
     monkeypatch.setattr(support_mod, "_ctypes_available", lambda: True)
     monkeypatch.setattr(support_mod, "_token_api_available", lambda: True)
     monkeypatch.setattr(support_mod, "_acl_api_available", lambda: True)
+    monkeypatch.setattr(support_mod, "_offline_identity_ready", lambda _path: True)
+    monkeypatch.setattr(support_mod, "_persistent_storage_ready", lambda _path: True)
     monkeypatch.setattr(support_mod, "default_setup_marker_path", lambda home=None: marker)
     monkeypatch.setattr(setup_marker_mod, "default_setup_marker_path", lambda home=None: marker)
 

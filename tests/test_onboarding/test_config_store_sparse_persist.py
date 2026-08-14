@@ -20,6 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.config_store import load_config, persist_config
+from opensquilla.onboarding.mutations import upsert_llm_provider
 
 
 def _write_small_config(target) -> None:
@@ -766,6 +767,50 @@ def test_persist_never_loaded_missing_file_still_writes_sparse(tmp_path):
     data = tomllib.loads(target.read_text())
     assert data["port"] == 18795
     assert "memory" not in data  # defaults are not dumped wholesale
+
+
+def test_fresh_tokenrhythm_save_persists_explicit_provider_identity(tmp_path):
+    target = tmp_path / "config.toml"
+    before = load_config(target)
+
+    changed = upsert_llm_provider(
+        before,
+        provider_id="tokenrhythm",
+        api_key="sk_tr_abcdefghijklmnop",
+    ).config
+    persist_config(changed, path=target, backup=False)
+
+    raw = tomllib.loads(target.read_text())
+    assert raw["llm"]["provider"] == "tokenrhythm"
+    reloaded = load_config(target)
+    assert reloaded.llm.provider == changed.llm.provider == "tokenrhythm"
+    assert reloaded.llm.model == changed.llm.model
+    assert reloaded.llm.base_url == changed.llm.base_url
+    assert reloaded.squilla_router.preset_binding == "follow_primary"
+    assert reloaded.squilla_router.tiers == changed.squilla_router.tiers
+    assert {
+        tier["provider"] for tier in reloaded.squilla_router.tiers.values()
+    } == {"tokenrhythm"}
+
+
+def test_fresh_tokenrhythm_env_and_custom_endpoint_round_trip(tmp_path):
+    target = tmp_path / "config.toml"
+    changed = upsert_llm_provider(
+        load_config(target),
+        provider_id="tokenrhythm",
+        api_key_env="TOKENRHYTHM_API_KEY",
+        model="custom-tr-model",
+        base_url="https://tr-proxy.example/v1",
+    ).config
+    persist_config(changed, path=target, backup=False)
+
+    raw = tomllib.loads(target.read_text())
+    assert raw["llm"]["provider"] == "tokenrhythm"
+    assert raw["llm"]["api_key_env"] == "TOKENRHYTHM_API_KEY"
+    reloaded = load_config(target)
+    assert reloaded.llm.provider == "tokenrhythm"
+    assert reloaded.llm.model == "custom-tr-model"
+    assert reloaded.llm.base_url == "https://tr-proxy.example/v1"
 
 
 # ---------------------------------------------------------------------------

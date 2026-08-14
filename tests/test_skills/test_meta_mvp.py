@@ -13,6 +13,7 @@ from opensquilla.engine.steps.meta_resolution import _build_hint, meta_resolutio
 from opensquilla.engine.types import (
     AgentConfig,
     AgentEvent,
+    ArtifactEvent,
     DoneEvent,
     TextDeltaEvent,
 )
@@ -27,13 +28,15 @@ from opensquilla.skills.meta.orchestrator import (
     _verify_declared_artifacts,
     format_step_prompt,
     make_llm_chat_from_provider,
+    make_tool_invoker_from_handler,
     render_with_args,
     resolve_route,
 )
 from opensquilla.skills.meta.parser import MetaPlanError, parse_meta_plan
 from opensquilla.skills.meta.scheduler import _localized_request_template, _localized_step_label
 from opensquilla.skills.meta.types import MetaMatch, MetaPlan, MetaResult, MetaStep, RouteCase
-from opensquilla.skills.types import SkillLayer, SkillSpec
+from opensquilla.skills.types import SkillLayer, SkillPlatformMeta, SkillRequires, SkillSpec
+from opensquilla.tool_boundary import ToolResult
 
 # ---------------------------------------------------------------------------
 # Parser tests
@@ -337,6 +340,195 @@ async def test_confirmed_preflight_rejects_completed_run_id(tmp_path: Path) -> N
     by_id = {row.run_id: row for row in rows}
     assert by_id[paused_run_id].status == "ok"
     assert any(row.run_id != paused_run_id and row.status == "cancelled" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_failed_replay_materializes_seed_outputs_for_the_next_retry(
+    tmp_path: Path,
+) -> None:
+    async def unused_runner(_prompt: str, _config: AgentConfig) -> str:
+        raise AssertionError("llm_chat steps must not use the agent runner")
+
+    dispatches = 0
+
+    async def flaky_gate(_system: str, _user: str) -> str:
+        nonlocal dispatches
+        dispatches += 1
+        if dispatches == 1:
+            raise RuntimeError("quality gate failed")
+        return "recovered paper"
+
+    db_path = str(tmp_path / "meta-replay-runs.db")
+    migrations_dir = Path(__file__).resolve().parents[2] / "migrations"
+    apply_pending(db_path, migrations_dir)
+    writer = open_meta_run_writer(db_path)
+    plan = MetaPlan(
+        name="meta-paper-replay",
+        triggers=("paper",),
+        priority=0,
+        steps=(
+            MetaStep(id="draft", skill="draft", kind="llm_chat"),
+            MetaStep(
+                id="publication_quality_gate",
+                skill="quality-gate",
+                kind="llm_chat",
+                depends_on=("draft",),
+                with_args={"text": "validate {{ outputs.draft }}"},
+            ),
+        ),
+        final_text_mode="raw",
+    )
+    def make_orchestrator(current_writer: Any) -> MetaOrchestrator:
+        return MetaOrchestrator(
+            agent_runner=unused_runner,
+            skill_loader=SimpleNamespace(),
+            llm_chat=flaky_gate,
+            run_writer=current_writer,
+            session_key="paper-session",
+            triggered_by="manual_command",
+        )
+
+    async def replay(
+        orchestrator: MetaOrchestrator,
+        seed_outputs: dict[str, str],
+    ) -> MetaResult:
+        final = MetaResult(ok=False, error="missing result")
+        async for event in orchestrator.iter_events(
+            MetaMatch(plan=plan, inputs={"user_message": "write paper"}),
+            seed_outputs=seed_outputs,
+            trusted_preflight_replay=True,
+        ):
+            if isinstance(event, MetaResult):
+                final = event
+        return final
+
+    try:
+        first = await replay(
+            make_orchestrator(writer),
+            {"draft": "persisted ten-page draft artifact"},
+        )
+        writer.close()
+        writer = open_meta_run_writer(db_path)
+        first_record = writer.hydrate_runs(writer.list_runs(limit=1))[0]
+        first_seed = {
+            step.step_id: step.output_text or ""
+            for step in first_record.steps
+            if step.status in {"ok", "substituted"} and step.output_text is not None
+        }
+        second = await replay(make_orchestrator(writer), first_seed)
+        records = writer.hydrate_runs(writer.list_runs(limit=5))
+    finally:
+        writer.close()
+
+    assert first.ok is False
+    assert first.failed_step_id == "publication_quality_gate"
+    assert first_seed == {"draft": "persisted ten-page draft artifact"}
+    assert second.ok is True
+    assert dispatches == 2  # only the failed gate dispatched on each replay
+    assert len(records) == 2
+    for record in records:
+        persisted_steps = {step.step_id: step for step in record.steps}
+        assert persisted_steps["draft"].status == "ok"
+        assert persisted_steps["draft"].output_text == "persisted ten-page draft artifact"
+
+
+@pytest.mark.asyncio
+async def test_chained_replay_preserves_durable_failover_pair(tmp_path: Path) -> None:
+    from opensquilla.engine.agent import _trusted_meta_replay_seed_outputs
+
+    async def unused_runner(_prompt: str, _config: AgentConfig) -> str:
+        raise AssertionError("seed persistence must not dispatch an agent")
+
+    db_path = str(tmp_path / "meta-failover-replay-runs.db")
+    migrations_dir = Path(__file__).resolve().parents[2] / "migrations"
+    apply_pending(db_path, migrations_dir)
+    writer = open_meta_run_writer(db_path)
+    plan = MetaPlan(
+        name="meta-failover-replay",
+        triggers=("render",),
+        priority=0,
+        steps=(
+            MetaStep(
+                id="primary",
+                skill="paid-renderer",
+                kind="agent",
+                on_failure="fallback",
+            ),
+            MetaStep(id="fallback", skill="local-renderer", kind="agent"),
+            MetaStep(
+                id="delivery",
+                skill="delivery-audit",
+                kind="agent",
+                depends_on=("primary", "fallback"),
+            ),
+        ),
+    )
+    orchestrator = MetaOrchestrator(
+        agent_runner=unused_runner,
+        skill_loader=SimpleNamespace(),
+        run_writer=writer,
+        session_key="failover-session",
+        triggered_by="manual_command",
+    )
+
+    async def persist_failed_replay(seed_outputs: dict[str, str]) -> Any:
+        run_id = writer.begin_run_sync(
+            meta_skill_name=plan.name,
+            meta_plan=plan,
+            triggered_by="manual_command",
+            inputs={"user_message": "render a synthetic clip"},
+            session_key="failover-session",
+            turn_id=None,
+        )
+        assert run_id is not None
+        await orchestrator._persist_seed_outputs(
+            writer=writer,
+            run_id=run_id,
+            plan=plan,
+            seed_outputs=seed_outputs,
+        )
+        writer.finish_run_sync(
+            run_id=run_id,
+            status="failed",
+            result=MetaResult(
+                ok=False,
+                error="delivery audit failed",
+                failed_step_id="delivery",
+            ),
+        )
+        record = writer.get_run(run_id)
+        assert record is not None
+        return record
+
+    expected_seeds = {
+        "primary": "artifact:/workspace/fallback.mp4",
+        "fallback": "artifact:/workspace/fallback.mp4",
+    }
+    try:
+        first_record = await persist_failed_replay(expected_seeds)
+        first_chained_seeds = _trusted_meta_replay_seed_outputs(
+            plan=plan,
+            persisted_steps=first_record.steps,
+            failed_step_id="delivery",
+        )
+        second_record = await persist_failed_replay(first_chained_seeds)
+        second_chained_seeds = _trusted_meta_replay_seed_outputs(
+            plan=plan,
+            persisted_steps=second_record.steps,
+            failed_step_id="delivery",
+        )
+    finally:
+        writer.close()
+
+    assert first_chained_seeds == expected_seeds
+    assert second_chained_seeds == expected_seeds
+    for record in (first_record, second_record):
+        steps = {step.step_id: step for step in record.steps}
+        assert steps["primary"].status == "substituted"
+        assert steps["primary"].substitute_step_id == "fallback"
+        assert steps["primary"].output_text is None
+        assert steps["fallback"].status == "ok"
+        assert steps["fallback"].output_text == expected_seeds["fallback"]
 
 
 def test_parser_happy_path() -> None:
@@ -1194,6 +1386,11 @@ def _make_skill_spec(name: str, content: str = "") -> SkillSpec:
     )
 
 
+async def _unreachable_agent_runner(_s: str, _u: str) -> AsyncIterator[AgentEvent]:
+    raise AssertionError("skill_exec must not spawn a sub-Agent")
+    yield  # pragma: no cover
+
+
 @pytest.mark.asyncio
 async def test_orchestrator_runs_steps_in_topological_order() -> None:
     # Plan: a -> b -> c, sub-Agent echoes the system prompt back as final text
@@ -1931,6 +2128,135 @@ async def test_orchestrator_skill_exec_propagates_nonzero_exit(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_skill_exec_uses_sanitized_stdout_failure_detail(
+    tmp_path: Path,
+) -> None:
+    skill_dir = tmp_path / "stdout_fail_skill"
+    skill_dir.mkdir()
+    script = skill_dir / "fail.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stdout.write('\\x1b[31mQUALITY_GATE: block\\x1b[0m\\x00: citations missing\\n')\n"
+        "raise SystemExit(2)\n",
+        encoding="utf-8",
+    )
+
+    fake_spec = _make_skill_spec("stdout-fail-skill", content="x")
+    fake_spec.base_dir = str(skill_dir)
+    fake_spec.entrypoint = {"command": "python", "args": ["{baseDir}/fail.py"]}
+    plan = parse_meta_plan(
+        _make_meta_spec(
+            composition={
+                "steps": [
+                    {"id": "quality", "kind": "skill_exec", "skill": "stdout-fail-skill"},
+                ],
+            },
+        ),
+    )
+    assert plan is not None
+
+    orch = MetaOrchestrator(
+        agent_runner=_unreachable_agent_runner,
+        skill_loader=_FakeLoader([fake_spec]),
+    )
+    result = await orch.run(MetaMatch(plan=plan, inputs={}))
+
+    assert result.ok is False
+    assert result.error is not None
+    assert "QUALITY_GATE: block: citations missing" in result.error
+    assert "\x1b" not in result.error
+    assert "\x00" not in result.error
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_skill_exec_bounds_combined_failure_detail(tmp_path: Path) -> None:
+    skill_dir = tmp_path / "long_fail_skill"
+    skill_dir.mkdir()
+    script = skill_dir / "fail.py"
+    script.write_text(
+        "import sys\n"
+        "sys.stderr.write('primary diagnostic\\n')\n"
+        "sys.stdout.write('QUALITY_GATE: block\\n' + "
+        "('detail ' * 1000) + 'TAIL_MUST_NOT_LEAK\\n')\n"
+        "raise SystemExit(3)\n",
+        encoding="utf-8",
+    )
+
+    fake_spec = _make_skill_spec("long-fail-skill", content="x")
+    fake_spec.base_dir = str(skill_dir)
+    fake_spec.entrypoint = {"command": "python", "args": ["{baseDir}/fail.py"]}
+    plan = parse_meta_plan(
+        _make_meta_spec(
+            composition={
+                "steps": [
+                    {"id": "quality", "kind": "skill_exec", "skill": "long-fail-skill"},
+                ],
+            },
+        ),
+    )
+    assert plan is not None
+
+    orch = MetaOrchestrator(
+        agent_runner=_unreachable_agent_runner,
+        skill_loader=_FakeLoader([fake_spec]),
+    )
+    result = await orch.run(MetaMatch(plan=plan, inputs={}))
+
+    assert result.error is not None
+    detail = result.error.split(": ", 1)[1]
+    assert detail.startswith("stderr: primary diagnostic\nstdout: QUALITY_GATE: block")
+    assert len(detail) <= 500
+    assert detail.endswith("…")
+    assert "TAIL_MUST_NOT_LEAK" not in detail
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_skill_exec_redacts_sensitive_env_value_from_stdout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "short-sensitive-value"
+    monkeypatch.setenv("META_EXEC_TEST_API_KEY", secret)
+    skill_dir = tmp_path / "secret_fail_skill"
+    skill_dir.mkdir()
+    script = skill_dir / "fail.py"
+    script.write_text(
+        "import os\n"
+        "print('provider rejected ' + os.environ['META_EXEC_TEST_API_KEY'])\n"
+        "raise SystemExit(4)\n",
+        encoding="utf-8",
+    )
+
+    fake_spec = _make_skill_spec("secret-fail-skill", content="x")
+    fake_spec.metadata = SkillPlatformMeta(
+        requires=SkillRequires(env=["META_EXEC_TEST_API_KEY"]),
+    )
+    fake_spec.base_dir = str(skill_dir)
+    fake_spec.entrypoint = {"command": "python", "args": ["{baseDir}/fail.py"]}
+    plan = parse_meta_plan(
+        _make_meta_spec(
+            composition={
+                "steps": [
+                    {"id": "api", "kind": "skill_exec", "skill": "secret-fail-skill"},
+                ],
+            },
+        ),
+    )
+    assert plan is not None
+
+    orch = MetaOrchestrator(
+        agent_runner=_unreachable_agent_runner,
+        skill_loader=_FakeLoader([fake_spec]),
+    )
+    result = await orch.run(MetaMatch(plan=plan, inputs={}))
+
+    assert result.error is not None
+    assert "provider rejected" in result.error
+    assert secret not in result.error
+    assert "[REDACTED]" in result.error
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_skill_exec_rejects_cwd_outside_workspace(
     tmp_path: Path,
 ) -> None:
@@ -2361,23 +2687,75 @@ async def test_meta_orchestrator_repairs_chinese_leakage_in_english_final_text()
 
 @pytest.mark.asyncio
 async def test_make_llm_chat_from_provider_uses_deliverable_sized_token_budget() -> None:
-    from opensquilla.provider.types import TextDeltaEvent as ProviderTextDelta
+    from opensquilla.provider.types import (
+        ProviderRequestCorrelation,
+    )
+    from opensquilla.provider.types import (
+        TextDeltaEvent as ProviderTextDelta,
+    )
 
-    captured: dict[str, int | None] = {}
+    captured: dict[str, object] = {}
 
     class FakeProvider:
         async def chat(self, _messages, *, tools, config):
             assert tools is None
             captured["max_tokens"] = config.max_tokens
+            captured["correlation"] = config.provider_request_correlation
             yield ProviderTextDelta(text="ok")
 
+    root = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="meta-execution",
+        call_kind="auxiliary.meta",
+    )
     llm_chat = make_llm_chat_from_provider(
         provider=FakeProvider(),
         base_config=AgentConfig(model_id="fake"),
+        provider_request_correlation=root,
     )
 
     assert await llm_chat("system", "user") == "ok"
     assert captured["max_tokens"] == 16384
+    assert captured["correlation"] == root
+
+
+@pytest.mark.asyncio
+async def test_make_llm_chat_from_provider_derives_context_correlation() -> None:
+    from opensquilla.provider.correlation_context import bind_provider_request_correlation
+    from opensquilla.provider.types import (
+        ProviderRequestCorrelation,
+    )
+    from opensquilla.provider.types import (
+        TextDeltaEvent as ProviderTextDelta,
+    )
+
+    captured: dict[str, object] = {}
+
+    class FakeProvider:
+        async def chat(self, _messages, *, tools, config):
+            captured["correlation"] = config.provider_request_correlation
+            yield ProviderTextDelta(text="ok")
+
+    root = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="root-execution",
+        call_kind="agent.chat",
+    )
+    with bind_provider_request_correlation(root):
+        llm_chat = make_llm_chat_from_provider(
+            provider=FakeProvider(),
+            base_config=AgentConfig(model_id="fake"),
+        )
+        assert await llm_chat("system", "user") == "ok"
+
+    correlation = captured["correlation"]
+    assert isinstance(correlation, ProviderRequestCorrelation)
+    assert correlation.session_id == root.session_id
+    assert correlation.turn_id == root.turn_id
+    assert correlation.execution_id != root.execution_id
+    assert correlation.call_kind == "auxiliary.meta"
 
 
 @pytest.mark.asyncio
@@ -3207,6 +3585,73 @@ async def test_orchestrator_tool_call_invokes_tool_directly() -> None:
     assert tool_calls == [
         ("memory_save", {"content": "Topic: kb", "mode": "append"}),
     ]
+
+
+@pytest.mark.asyncio
+async def test_meta_tool_call_forwards_artifacts_as_canonical_events_once() -> None:
+    spec = _make_meta_spec(
+        composition={
+            "steps": [
+                {
+                    "id": "publish",
+                    "kind": "tool_call",
+                    "tool": "publish_artifact",
+                    "tool_args": {"path": "final.mp4", "mime": "video/mp4"},
+                },
+            ],
+        },
+    )
+    plan = parse_meta_plan(spec)
+    assert plan is not None
+    artifact = {
+        "id": "art-meta-video-0001",
+        "kind": "artifact_ref",
+        "sha256": "a" * 64,
+        "name": "final.mp4",
+        "mime": "video/mp4",
+        "size": 4096,
+        "session_id": "session-test",
+        "source": "publish_artifact",
+        "created_at": "2026-01-01T00:00:00Z",
+        "store": "artifacts",
+    }
+
+    async def tool_handler(call) -> ToolResult:
+        assert call.tool_name == "publish_artifact"
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content='{"status":"published"}',
+            # Defensive duplicate: one tool boundary result must not produce
+            # duplicate live/history artifacts when replayed by the scheduler.
+            artifacts=[artifact, dict(artifact)],
+        )
+
+    async def explode_runner(_system: str, _user: str) -> AsyncIterator[AgentEvent]:
+        raise AssertionError("tool-call-only plan must not spawn an agent")
+        yield  # pragma: no cover
+
+    orch = MetaOrchestrator(
+        agent_runner=explode_runner,
+        skill_loader=_FakeLoader([]),
+        tool_invoker=make_tool_invoker_from_handler(tool_handler=tool_handler),
+    )
+    events = [
+        event
+        async for event in orch.iter_events(
+            MetaMatch(plan=plan, inputs={"user_message": "render a video"}),
+        )
+    ]
+
+    artifact_events = [event for event in events if isinstance(event, ArtifactEvent)]
+    assert len(artifact_events) == 1
+    assert artifact_events[0].id == artifact["id"]
+    assert artifact_events[0].name == "final.mp4"
+    assert artifact_events[0].mime == "video/mp4"
+    assert artifact_events[0].download_url == "/api/v1/artifacts/art-meta-video-0001"
+    result = next(event for event in events if isinstance(event, MetaResult))
+    assert result.ok is True
+    assert result.step_outputs["publish"] == '{"status":"published"}'
 
 
 @pytest.mark.asyncio

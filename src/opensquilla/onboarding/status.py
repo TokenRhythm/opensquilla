@@ -24,12 +24,20 @@ from opensquilla.onboarding.config_store import default_config_path
 from opensquilla.onboarding.image_generation_specs import (
     get_image_generation_provider_setup_spec,
 )
+from opensquilla.onboarding.image_generation_state import (
+    resolve_image_generation_state,
+)
 from opensquilla.onboarding.provider_specs import get_provider_setup_spec
 from opensquilla.onboarding.search_specs import get_search_provider_setup_spec
 from opensquilla.onboarding.section_status import (
     FIRST_RUN_REQUIRED_SECTIONS,
     SectionStatus,
     _configured_image_generation_provider_ids,
+    _image_generation_effective_endpoint,
+    _image_generation_endpoint_conflict_provider,
+    _image_generation_endpoint_is_valid,
+    _image_generation_has_invalid_model_reference,
+    _image_generation_llm_key_reusable,
     audio_section_status,
     channels_section_status,
     ensemble_section_status,
@@ -44,6 +52,9 @@ from opensquilla.onboarding.section_status import (
     needs_onboarding as _needs_onboarding,
 )
 from opensquilla.provider.environment import environment_value
+from opensquilla.provider.image_generation_credentials import (
+    resolve_image_generation_credential,
+)
 from opensquilla.provider.preset_registry import get_preset
 
 
@@ -82,6 +93,9 @@ class OnboardingStatus:
     sections: dict[str, SectionStatus] = field(default_factory=dict)
     section_details: dict[str, dict[str, object]] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
+    # Additive read-side metadata stays optional so integrations that construct
+    # this public dataclass with the pre-feature positional shape keep working.
+    image_generation_state: dict[str, object] = field(default_factory=dict)
 
 
 _SECTION_LABELS: dict[str, str] = {
@@ -156,12 +170,23 @@ def _router_detail(cfg: GatewayConfig, llm_source: str) -> str:
 
 
 def _ensemble_detail(cfg: GatewayConfig) -> str:
-    ensemble = getattr(cfg, "llm_ensemble", None)
-    if ensemble is None or not bool(getattr(ensemble, "enabled", False)):
+    from opensquilla.provider.ensemble import ensemble_runtime_status
+
+    runtime = ensemble_runtime_status(cfg)
+    if not runtime["enabled"]:
         return "disabled"
-    mode = str(getattr(ensemble, "selection_mode", "") or "")
-    options = list(getattr(ensemble, "model_options", []) or [])
-    return f"selection mode: {mode} ({len(options)} models)"
+    mode = str(runtime["selectionMode"])
+    proposer_count = runtime.get("proposerCount")
+    if proposer_count is None:
+        proposer_range = runtime.get("proposerCountRange") or []
+        count_text = (
+            f"{proposer_range[0]}-{proposer_range[1]} proposers"
+            if len(proposer_range) == 2
+            else "dynamic proposers"
+        )
+    else:
+        count_text = f"{proposer_count} proposers"
+    return f"selection mode: {mode} ({count_text})"
 
 
 def _candidate_field(candidate: object, field_name: str) -> object:
@@ -810,30 +835,31 @@ def _image_generation_provider_source(
         return "", ""
 
     provider_cfg = _image_generation_provider_config(cfg, provider_id)
-    explicit_key = getattr(provider_cfg, "api_key", "") if provider_cfg else ""
-    if explicit_key:
-        return "explicit", spec.env_key
-
-    spec_env_key = (getattr(spec, "env_key", "") or "").strip()
-    cfg_env_key = (
-        (getattr(provider_cfg, "api_key_env", "") or "").strip()
-        if provider_cfg
-        else ""
+    endpoint = _image_generation_effective_endpoint(cfg, provider_id)
+    if endpoint is None:
+        return "", ""
+    resolution = resolve_image_generation_credential(
+        provider_id=provider_id,
+        provider_config=provider_cfg,
+        default_env_key=spec.env_key,
+        default_base_url=endpoint[0],
+        effective_base_url=(
+            spec.default_base_url
+            if str(getattr(cfg.image_generation, "binding", "custom") or "custom")
+            == "follow_llm"
+            else endpoint[1]
+        ),
+        gateway_config=cfg,
+        model=str(getattr(cfg.image_generation, "primary", "") or "image-generation"),
+        include_image_credentials=(
+            str(getattr(cfg.image_generation, "binding", "custom") or "custom")
+            != "follow_llm"
+        ),
     )
-    explicit_env_key = cfg_env_key if cfg_env_key and cfg_env_key != spec_env_key else ""
-    if explicit_env_key:
-        return (
-            ("env", explicit_env_key)
-            if os.environ.get(explicit_env_key)
-            else ("missing_env", explicit_env_key)
-        )
-    if spec_env_key and os.environ.get(spec_env_key):
-        return "env", spec_env_key
-
-    llm = getattr(cfg, "llm", None)
-    if getattr(llm, "provider", "").strip().lower() == provider_id and getattr(llm, "api_key", ""):
-        return "llm_fallback", spec.env_key
-    return "", spec_env_key
+    return (
+        resolution.source if resolution.source != "none" else "",
+        resolution.env_key or spec.env_key,
+    )
 
 
 def _image_generation_annotations(
@@ -848,7 +874,59 @@ def _image_generation_annotations(
         source, env_key = _image_generation_provider_source(cfg, provider_id)
         if source:
             return source, provider_id, primary, env_key
+        try:
+            get_image_generation_provider_setup_spec(provider_id)
+        except KeyError:
+            return "none", provider_id, primary, ""
+        if _image_generation_llm_key_reusable(cfg, provider_id) is False:
+            return "none", provider_id, primary, env_key
     return "none", "", primary, ""
+
+
+def _image_generation_detail(
+    cfg: GatewayConfig,
+    status: SectionStatus,
+    source: str,
+    provider: str,
+    env_key: str,
+) -> str:
+    if status is SectionStatus.UNKNOWN and _image_generation_has_invalid_model_reference(cfg):
+        return "invalid image provider/model reference"
+    if status is SectionStatus.UNKNOWN and provider:
+        try:
+            get_image_generation_provider_setup_spec(provider)
+        except KeyError:
+            return _with_provider(provider, "unknown image provider")
+    if status is SectionStatus.DEGRADED:
+        for candidate_provider in _configured_image_generation_provider_ids(cfg):
+            if _image_generation_endpoint_is_valid(cfg, candidate_provider) is False:
+                return _with_provider(
+                    candidate_provider,
+                    "invalid image endpoint; use an absolute http:// or https:// URL",
+                )
+            conflicting_provider = _image_generation_endpoint_conflict_provider(
+                cfg,
+                candidate_provider,
+            )
+            if conflicting_provider is not None:
+                return _with_provider(
+                    candidate_provider,
+                    "endpoint/provider mismatch: "
+                    f"configured {conflicting_provider} official endpoint",
+                )
+            if _image_generation_llm_key_reusable(cfg, candidate_provider) is False:
+                return _with_provider(
+                    candidate_provider,
+                    "LLM key cannot be reused across image endpoint origins",
+                )
+    return _with_provider(
+        provider,
+        (
+            "same provider key"
+            if source == "llm_fallback"
+            else _source_detail(source, env_key)
+        ),
+    )
 
 
 def _memory_embedding_annotations(
@@ -958,13 +1036,12 @@ def get_onboarding_status(
         "router": _router_detail(config, llm_source),
         "ensemble": _ensemble_detail(config),
         "search": _source_detail(search_source, search_env_key),
-        "image_generation": _with_provider(
+        "image_generation": _image_generation_detail(
+            config,
+            image_status,
+            image_source,
             image_provider,
-            (
-                "same provider key"
-                if image_source == "llm_fallback"
-                else _source_detail(image_source, image_env_key)
-            ),
+            image_env_key,
         ),
         "audio": _with_provider(
             audio_provider,
@@ -989,8 +1066,55 @@ def get_onboarding_status(
         section_details["router"]["routerProviderConflicts"] = list(
             _router_provider_conflicts(config)
         )
+    if "ensemble" in section_details:
+        from opensquilla.provider.ensemble import ensemble_runtime_status
+
+        section_details["ensemble"].update(ensemble_runtime_status(config))
+    resolution_getter = getattr(config, "provider_resolution", None)
+    provider_resolution = (
+        resolution_getter() if callable(resolution_getter) else {}
+    )
+    if "llm" in section_details and provider_resolution:
+        effective_provider = provider_resolution.get("effective_provider")
+        section_details["llm"]["providerResolution"] = {
+            "status": str(provider_resolution.get("status") or "explicit"),
+            "effectiveProvider": str(
+                getattr(config.llm, "provider", "")
+                if effective_provider is None
+                else effective_provider
+            ),
+            "source": str(provider_resolution.get("source") or "config"),
+            "reasonCode": str(
+                provider_resolution.get("reason_code") or "provider_explicit"
+            ),
+            "actionRequired": bool(
+                provider_resolution.get("action_required", False)
+            ),
+            "actionRecommended": bool(
+                provider_resolution.get("action_recommended", False)
+            ),
+        }
+
+    warnings: tuple[str, ...] = ()
+    if bool(provider_resolution.get("action_required", False)):
+        warnings = (
+            "Provider evidence conflicts; choose and save the intended provider "
+            "before sending model requests.",
+        )
+    elif bool(provider_resolution.get("action_recommended", False)):
+        warnings = (
+            "Provider was inferred for compatibility; save the intended provider "
+            "to make the identity explicit.",
+        )
 
     llm_profile_status = _llm_profile_status(config, probe_history=probe_history)
+    image_generation_state = resolve_image_generation_state(
+        config,
+        configured=image_status is SectionStatus.OK,
+        resolved_provider_id=image_provider,
+        credential_source=image_source,
+        section_status=image_status.value,
+    )
     return OnboardingStatus(
         config_path=str(path),
         has_config=has_config,
@@ -1007,6 +1131,7 @@ def get_onboarding_status(
         image_generation_provider=image_provider,
         image_generation_primary=image_primary,
         image_generation_env_key=image_env_key,
+        image_generation_state=image_generation_state,
         audio_configured=audio_status is SectionStatus.OK,
         audio_enabled=bool(getattr(config.audio, "enabled", False)),
         audio_source=audio_source,
@@ -1027,6 +1152,7 @@ def get_onboarding_status(
         ),
         sections=sections,
         section_details=section_details,
+        warnings=warnings,
     )
 
 

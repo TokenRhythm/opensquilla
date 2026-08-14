@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+import os
 import runpy
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+import pytest
 
 SHARD_SCRIPT = Path(".github/scripts/windows_test_shards.py")
 SHARD_MODULE: dict[str, Any] = runpy.run_path(
@@ -15,8 +19,12 @@ discover_test_files = SHARD_MODULE["discover_test_files"]
 files_for_shard = SHARD_MODULE["files_for_shard"]
 historical_test_weights = SHARD_MODULE["historical_test_weights"]
 matching_specialized_shards = SHARD_MODULE["matching_specialized_shards"]
+assignment_governance = SHARD_MODULE["assignment_governance"]
+assignment_governance_summary = SHARD_MODULE["assignment_governance_summary"]
+assignment_snapshot_fingerprint = SHARD_MODULE["assignment_snapshot_fingerprint"]
 shard_for_test = SHARD_MODULE["shard_for_test"]
 shard_weight_summary = SHARD_MODULE["shard_weight_summary"]
+validate_assignment_payload = SHARD_MODULE["validate_assignment_payload"]
 
 OFFLINE_MARKER_EXCLUSIONS = {
     "tests/functional/test_agent_synthetic_golden.py",
@@ -42,13 +50,23 @@ OFFLINE_MARKER_EXCLUSIONS = {
     "tests/integration/cli/tui_real_terminal/test_source_gateway_bootstrap_startup.py",
     "tests/integration/cli/tui_real_terminal/test_terminal_changes.py",
     "tests/live/test_search_api_matrix_live.py",
+    "tests/live/test_skill_hub_canary_live.py",
     "tests/live/test_multi_provider_matrix_live.py",
     "tests/live/test_search_retrieval_live.py",
+    "tests/live/test_tokenrhythm_catalog_live.py",
     "tests/live/test_web_search_agent_e2e.py",
     "tests/test_skills/test_meta_router_live.py",
     "tests/test_skills/test_meta_skill_creator_smoke_live.py",
 }
 RECENTLY_ADDED_ACTIVE_TESTS = {
+    "tests/test_scripts/test_bench_skill_integrity.py",
+    "tests/test_skills_hash_consumers.py",
+    "tests/test_skills_tree.py",
+    "tests/test_recovery/test_config_recovery.py",
+    "tests/unit/cli/tui/test_keys_cheatsheet.py",
+    "tests/unit/cli/tui/test_opentui_prefs.py",
+    "tests/test_cli/test_gateway_client_steer.py",
+    "tests/test_cli/test_skills_search_cmd.py",
     "tests/test_channels/test_admission_reason_persistence.py",
     "tests/test_channels/test_channel_admission.py",
     "tests/test_channels/test_channel_certification.py",
@@ -66,6 +84,9 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_channel_dispatch_chunking.py",
     "tests/test_gateway/test_channel_reply_delivery_guard.py",
     "tests/test_gateway/test_channel_session_and_busy_policy.py",
+    "tests/test_gateway/test_capability_runtime.py",
+    "tests/test_gateway/test_meta_setup_launch_e2e.py",
+    "tests/test_gateway/test_rpc_meta_setup.py",
     "tests/test_artifact_validation.py",
     "tests/test_ci/test_dockerignore_context.py",
     "tests/test_ci/test_migration_v022.py",
@@ -73,21 +94,32 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_channels/test_stream_terminal_routing.py",
     "tests/test_engine/test_agent_canonical_text_contract.py",
     "tests/test_engine/test_done_text_snapshot_consumers.py",
+    "tests/test_engine/test_provider_request_correlation.py",
+    "tests/test_engine/test_provider_activity.py",
+    "tests/test_engine/test_long_task_backend_boundaries.py",
+    "tests/test_engine/test_route_plan.py",
+    "tests/test_engine/test_stream_repetition_guard.py",
     "tests/test_engine/turn_runner/test_canonical_text_contract.py",
     "tests/test_gateway/test_api_chat.py",
     "tests/test_gateway/test_channel_turn_ingress.py",
+    "tests/test_gateway/test_config_persist_corruption.py",
     "tests/test_gateway/test_config_profile_paths.py",
     "tests/test_gateway/test_cron_result_payload.py",
     "tests/test_gateway/test_memory_repair_storage_gate.py",
+    "tests/test_gateway/test_p1a_exact_abort_contract.py",
     "tests/test_gateway/test_rpc_llm_profiles.py",
+    "tests/test_gateway/test_rpc_capability_reset.py",
     "tests/test_gateway/test_rpc_provider_credential_clear.py",
     "tests/test_gateway/test_rpc_migration.py",
+    "tests/test_gateway/test_rpc_memory_import.py",
     "tests/test_gateway/test_rpc_storage_busy.py",
+    "tests/test_gateway/test_steer_restart_recovery.py",
     "tests/test_gateway/test_task_runtime_reservations.py",
     "tests/test_gateway/test_turn_ingress_fork.py",
     "tests/test_gateway/test_turn_ingress_intents.py",
     "tests/test_gateway/test_turn_ingress_rpc.py",
     "tests/test_memory/test_store_vec_extension_cleanup.py",
+    "tests/test_memory/test_profile_import.py",
     "tests/test_migration/test_import_receipt_verification_cli.py",
     "tests/test_migration/test_source_snapshot_windows.py",
     "tests/test_migrations/test_migrator_diagnostics.py",
@@ -95,17 +127,26 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_observability/test_usage_telemetry.py",
     "tests/test_migrations/test_v023_router_deployment_telemetry.py",
     "tests/test_migrations/test_v024_usage_native_billing_receipts.py",
+    "tests/test_migrations/test_v030_meta_control_intents.py",
+    "tests/test_migrations/test_v031_meta_launch_drafts.py",
+    "tests/test_migrations/test_v032_meta_launch_discard_tombstones.py",
     "tests/test_live_mixed_provider_gateway.py",
+    "tests/test_live_long_task_case_driver.py",
+    "tests/test_live_long_task_release_gate.py",
     "tests/test_live_multi_provider_matrix.py",
     "tests/test_live_tokenrhythm_billing_audit.py",
     "tests/test_onboarding/test_llm_profiles.py",
+    "tests/test_onboarding/test_image_generation_model_discovery.py",
     "tests/test_packaging/test_webui_build_contract.py",
     "tests/test_provider/test_error_secret_boundary.py",
     "tests/test_provider_candidate_artifact.py",
+    "tests/test_provider_correlation_context.py",
     "tests/test_provider_native_response_guards.py",
     "tests/test_provider_terminal_evidence.py",
     "tests/test_provider_terminal_evidence_anthropic_codex.py",
     "tests/test_provider_text_tool_normalization.py",
+    "tests/test_provider_tokenrhythm_correlation.py",
+    "tests/test_long_task_fault_proxy.py",
     "tests/test_recovery/test_atomic_and_locking.py",
     "tests/test_recovery/test_cleanup.py",
     "tests/test_recovery/test_engine.py",
@@ -117,9 +158,62 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_recovery/test_transaction.py",
     "tests/test_scripts/test_release_channel_manifest.py",
     "tests/test_scripts/test_verify_webui_artifact.py",
+    "tests/test_scheduler/test_job_lifecycle.py",
     "tests/test_session/test_storage_transactions.py",
+    "tests/test_session/test_meta_launch_drafts.py",
+    "tests/test_session/test_pending_chat_inputs.py",
     "tests/test_session/test_turn_acceptance_storage.py",
     "tests/test_skills/test_hub_deps_subprocess.py",
+    "tests/test_skills/test_managed_toolchains.py",
+    "tests/test_skills/test_meta_readiness.py",
+    "tests/test_skills/test_meta_short_drama_delivery_audit.py",
+    "tests/test_skills/test_paper_citation_integrity_gate.py",
+    "tests/test_skills/test_paper_delivery_summary.py",
+    "tests/test_skills/test_paper_latex_sanitizer.py",
+    "tests/test_skills/test_paper_length_gate.py",
+    "tests/test_skills/test_paper_quality_gate.py",
+    "tests/test_skills/test_paper_refbib_metadata.py",
+    "tests/test_skills/test_paper_source_readiness_gate.py",
+    "tests/test_skills/test_short_drama_review_normalizer.py",
+    "tests/test_skills/test_subtitle_burner.py",
+    "tests/test_skills/test_title_card_image.py",
+    "tests/test_skills/test_toolchain_runtime_integration.py",
+    "tests/test_skills/test_toolchain_state_scope.py",
+    "tests/test_tools/test_shell_managed_toolchains.py",
+    "tests/test_envelope_policy_deny_cap.py",
+    "tests/test_request_proof_levers.py",
+    "tests/test_toolcomp_matcher_levers.py",
+    "tests/test_toolcomp_matcher_safety.py",
+    "tests/test_toolcomp_reducer_semantics.py",
+    "tests/test_engine/test_agent_patch_hygiene_block.py",
+    "tests/test_engine/test_agent_submit_review.py",
+    "tests/test_engine/test_agent_verify_mirror_and_variant_challenge.py",
+    "tests/test_engine/test_endgame_directive_and_cap_levers.py",
+    "tests/test_engine/test_plan_run_reconciliation.py",
+    "tests/test_engine/test_runtime_submit_surfacing.py",
+    "tests/test_engine/test_submit_review.py",
+    "tests/test_engine/test_tool_surface_levers.py",
+    "tests/test_engine/turn_runner/test_tool_surface_levers_bootstrap_unit.py",
+    "tests/test_gateway/test_plan_rpc.py",
+    "tests/test_gateway/test_user_input_broker.py",
+    "tests/test_session/test_plan_storage.py",
+    "tests/test_tools/test_description_overrides.py",
+    "tests/test_tools/test_edit_file_closest_hint.py",
+    "tests/test_tools/test_patch_classification.py",
+    "tests/test_tools/test_plan_access.py",
+    "tests/test_tools/test_repeated_call_notice.py",
+    "tests/test_tools/test_admin_audio_config.py",
+    "tests/test_tools/test_admin_gateway_contract.py",
+    "tests/test_tools/test_shell_self_kill_policy.py",
+    "tests/test_tools/test_run_mode_full_host_fallback.py",
+    "tests/test_tools/test_workspace_write_deny_effects.py",
+    "tests/test_engine/test_goal_context_prompt.py",
+    "tests/test_engine/test_goal_routing_hint.py",
+    "tests/test_gateway/test_goal_rpc.py",
+    "tests/test_migrations/test_v033_goal_runs.py",
+    "tests/test_migrations/test_v034_goal_message_anchor.py",
+    "tests/test_session/test_goal_storage.py",
+    "tests/test_session/test_goals.py",
 }
 
 
@@ -158,6 +252,9 @@ def test_windows_shard_responsibilities_cover_high_risk_surfaces() -> None:
         ),
         "tests/test_uninstall/test_safety.py": "desktop-installer-contracts",
         "tests/test_install_scripts.py": "desktop-installer-contracts",
+        "tests/test_scripts/test_bench_skill_integrity.py": "recovery-migration",
+        "tests/test_skills_hash_consumers.py": "recovery-migration",
+        "tests/test_skills_tree.py": "recovery-migration",
     }
 
     assert {path: shard_for_test(path) for path in expected} == expected
@@ -173,6 +270,118 @@ def test_windows_shards_are_balanced_by_historical_duration() -> None:
     estimated_seconds = [summary[shard][1] for shard in SHARD_NAMES]
     assert min(estimated_seconds) > 0
     assert max(estimated_seconds) / min(estimated_seconds) < 1.05
+
+
+def test_windows_assignment_snapshot_freezes_current_mapping_without_movement() -> None:
+    baseline, assignments, guardrails, overrides = assignment_governance()
+    report = assignment_governance_summary(Path.cwd())
+
+    assert baseline == assignments
+    assert set(assignments) == set(historical_test_weights())
+    assert overrides == ()
+    assert guardrails == {
+        "max_moved_files": 10,
+        "max_moved_fraction": 0.02,
+        "minimum_predicted_max_shard_improvement_seconds": 60.0,
+    }
+    assert report["predicted_max_shard_improvement_seconds"] == 0.0
+    assert report["assignment_sha256"] == assignment_snapshot_fingerprint()
+    assert len(str(report["assignment_sha256"])) == 64
+
+
+def _synthetic_assignment_payload(
+    baseline_assignments: dict[str, list[str]], overrides: list[dict[str, object]]
+) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "guardrails": {
+            "max_moved_files": 10,
+            "max_moved_fraction": 1.0,
+            "minimum_predicted_max_shard_improvement_seconds": 60.0,
+        },
+        "baseline_assignments": baseline_assignments,
+        "overrides": overrides,
+    }
+
+
+def test_windows_assignment_snapshot_rejects_hard_pin_movement() -> None:
+    baseline = {
+        "core": ["tests/test_ci/test_router_artifact_manifest.py"],
+        "gateway-sqlite": ["tests/test_gateway/test_rpc.py"],
+        "recovery-migration": ["tests/test_recovery/test_restore.py"],
+        "desktop-installer-contracts": ["tests/test_desktop/test_startup.py"],
+    }
+    weights = {path: 100.0 for paths in baseline.values() for path in paths}
+    payload = _synthetic_assignment_payload(
+        baseline,
+        [
+            {
+                "path": "tests/test_ci/test_router_artifact_manifest.py",
+                "from": "core",
+                "to": "desktop-installer-contracts",
+                "reason": "synthetic invalid movement",
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="hard-pinned"):
+        validate_assignment_payload(payload, weights)
+
+
+def test_windows_assignment_snapshot_rejects_low_value_movement() -> None:
+    baseline = {
+        "core": ["tests/test_core_big.py", "tests/test_core_small.py"],
+        "gateway-sqlite": ["tests/test_gateway_other.py"],
+        "recovery-migration": ["tests/test_recovery_other.py"],
+        "desktop-installer-contracts": ["tests/test_desktop_other.py"],
+    }
+    weights = {
+        "tests/test_core_big.py": 100.0,
+        "tests/test_core_small.py": 1.0,
+        "tests/test_gateway_other.py": 100.0,
+        "tests/test_recovery_other.py": 100.0,
+        "tests/test_desktop_other.py": 100.0,
+    }
+    payload = _synthetic_assignment_payload(
+        baseline,
+        [
+            {
+                "path": "tests/test_core_small.py",
+                "from": "core",
+                "to": "gateway-sqlite",
+                "reason": "synthetic low-value movement",
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="minimum predicted improvement"):
+        validate_assignment_payload(payload, weights)
+
+
+def test_windows_assignment_snapshot_rejects_excessive_movement() -> None:
+    core_paths = [f"tests/test_core_{index:02d}.py" for index in range(11)]
+    baseline = {
+        "core": core_paths,
+        "gateway-sqlite": ["tests/test_gateway_other.py"],
+        "recovery-migration": ["tests/test_recovery_other.py"],
+        "desktop-installer-contracts": ["tests/test_desktop_other.py"],
+    }
+    weights = {path: 100.0 for paths in baseline.values() for path in paths}
+    payload = _synthetic_assignment_payload(
+        baseline,
+        [
+            {
+                "path": path,
+                "from": "core",
+                "to": "gateway-sqlite",
+                "reason": "synthetic excessive movement",
+            }
+            for path in core_paths
+        ],
+    )
+
+    with pytest.raises(ValueError, match="movement budget"):
+        validate_assignment_payload(payload, weights)
 
 
 def test_active_unweighted_fallback_stays_within_refresh_budget() -> None:
@@ -244,6 +453,15 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
     )
     junit = tmp_path / "reports" / "junit.xml"
     summary = tmp_path / "reports" / "first-failure.txt"
+    metadata = tmp_path / "reports" / "windows-shard-metadata.json"
+    env = os.environ.copy()
+    env.update(
+        {
+            "GITHUB_RUN_ID": "1234",
+            "GITHUB_RUN_ATTEMPT": "2",
+            "GITHUB_SHA": "a" * 40,
+        }
+    )
 
     result = subprocess.run(
         [
@@ -257,6 +475,8 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
             junit.as_posix(),
             "--summary",
             summary.as_posix(),
+            "--metadata",
+            metadata.as_posix(),
             "--",
             "-q",
             "--maxfail=3",
@@ -264,11 +484,19 @@ def test_windows_shard_runner_preserves_failure_exit_and_summary(tmp_path: Path)
         check=False,
         text=True,
         capture_output=True,
+        env=env,
     )
 
     assert result.returncode == 1
     assert "CI shard core (historical weight: 0.0s; unweighted: 1)" in result.stdout
     assert junit.is_file()
+    metadata_payload = json.loads(metadata.read_text(encoding="utf-8"))
+    assert metadata_payload["run_id"] == 1234
+    assert metadata_payload["run_attempt"] == 2
+    assert metadata_payload["sha"] == "a" * 40
+    assert metadata_payload["shard"] == "core"
+    assert metadata_payload["test_files"] == ["tests/test_failure.py"]
+    assert len(metadata_payload["assignment_sha256"]) == 64
     text = summary.read_text(encoding="utf-8")
     assert "pytest_exit_code=1" in text
     assert "junit_status=failed" in text

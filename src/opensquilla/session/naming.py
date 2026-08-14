@@ -24,18 +24,32 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import structlog
 
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
+from opensquilla.provider.auxiliary_budget import (
+    AuxiliaryRequestBudget,
+    AuxiliaryRequestTooLargeError,
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.protocol import (
     configured_provider_id,
     provider_connection_config,
 )
+from opensquilla.provider.tokenrhythm_correlation import (
+    redact_tokenrhythm_install_ids,
+    tokenrhythm_correlation_headers,
+    tokenrhythm_install_id_headers,
+)
 from opensquilla.router_tiers import DEFAULT_TEXT_TIER, normalize_text_tier
+
+if TYPE_CHECKING:
+    from opensquilla.provider.types import ProviderRequestCorrelation
 
 log = structlog.get_logger(__name__)
 
@@ -262,6 +276,37 @@ def _should_disable_openrouter_reasoning(url: str, model: str) -> bool:
     return normalized_model in _OPENROUTER_REASONING_DEFAULT_MODELS
 
 
+def _fit_naming_user_content(
+    first_message: str,
+    *,
+    system_prompt: str,
+    budget: AuxiliaryRequestBudget,
+) -> str | None:
+    """Fit a deterministic prefix without sending an over-budget title request."""
+
+    prefix = "Generate a title for this message:\n\n"
+    source = (first_message or "")[:_MAX_INPUT_CHARS]
+    low = 1
+    high = len(source)
+    best: str | None = None
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = prefix + source[:midpoint]
+        try:
+            ensure_auxiliary_text_fits(
+                [{"role": "user", "content": candidate}],
+                system=system_prompt,
+                max_chars=budget.provider_request_max_chars,
+                max_tokens=budget.max_input_tokens,
+            )
+        except AuxiliaryRequestTooLargeError:
+            high = midpoint - 1
+        else:
+            best = candidate
+            low = midpoint + 1
+    return best
+
+
 async def call_naming_llm(
     first_message: str,
     *,
@@ -272,6 +317,7 @@ async def call_naming_llm(
     max_chars: int = 48,
     language: str = "auto",
     provider: str = "",
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> str | None:
     """Summarize ``first_message`` into a short title. Returns ``None`` on failure."""
 
@@ -283,16 +329,36 @@ async def call_naming_llm(
         url += "/v1"
     url += "/chat/completions"
 
-    user_content = (
-        f"Generate a title for this message:\n\n{first_message[:_MAX_INPUT_CHARS]}"
+    system_prompt = _build_system_prompt(language)
+    budget_provider = provider or (
+        "openrouter" if "openrouter.ai" in url.lower() else "openai_compat"
     )
+    request_budget = resolve_auxiliary_request_budget(
+        None,
+        provider_id=budget_provider,
+        model=model,
+        max_output_tokens=_TITLE_MAX_TOKENS,
+    )
+    user_content = _fit_naming_user_content(
+        first_message,
+        system_prompt=system_prompt,
+        budget=request_budget,
+    )
+    if user_content is None:
+        log.warning(
+            "session_naming.request_too_large",
+            provider=budget_provider,
+            model=model,
+            context_window=request_budget.context_window_tokens,
+        )
+        return None
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": _build_system_prompt(language)},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "max_tokens": _TITLE_MAX_TOKENS,
+        "max_tokens": request_budget.max_output_tokens,
         "temperature": 0,
         "stream": False,
     }
@@ -303,6 +369,13 @@ async def call_naming_llm(
         "Content-Type": "application/json",
     }
     headers.update(provider_app_headers(url))
+    headers.update(
+        tokenrhythm_correlation_headers(
+            provider,
+            url,
+            provider_request_correlation,
+        )
+    )
 
     # Keep this import local: engine types import session lifecycle helpers
     # while the session package initializes this module.
@@ -315,8 +388,18 @@ async def call_naming_llm(
         base_url=url,
     )
 
+    cancelled = False
+    client: httpx.AsyncClient | None = None
+    resp: httpx.Response | None = None
+    data: Any = None
+    raw: str | None = None
     try:
-        async with httpx.AsyncClient(timeout=timeout, trust_env=_trust_env()) as client:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            trust_env=_trust_env(),
+            follow_redirects=False,
+        ) as client:
+            headers.update(tokenrhythm_install_id_headers(provider, url))
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
@@ -326,20 +409,54 @@ async def call_naming_llm(
             )
             raw = data["choices"][0]["message"]["content"]
     except asyncio.CancelledError:
-        await usage.mark_unknown("cancelled")
-        raise
+        # A propagated cancellation retains this frame. Scrub request state before
+        # accounting and raise a fresh exception outside the handler so neither the
+        # original traceback nor its context can expose the installation header.
+        headers.clear()
+        client = None
+        resp = None
+        data = None
+        raw = None
+        cancelled = True
+        try:
+            await usage.mark_unknown("cancelled")
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
     except Exception as exc:  # noqa: BLE001 - naming is best-effort
-        await usage.mark_unknown("direct_request_failed")
-        log.warning("session_naming.llm_call_failed", model=model, error=str(exc))
-        return None
+        safe_error = redact_tokenrhythm_install_ids(str(exc))
+        headers.clear()
+        client = None
+        resp = None
+        data = None
+        raw = None
+        try:
+            await usage.mark_unknown("direct_request_failed")
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            pass
+        if not cancelled:
+            log.warning(
+                "session_naming.llm_call_failed",
+                model=model,
+                error=safe_error,
+            )
+            return None
 
-    return _sanitize_title(raw, max_chars)
+    if cancelled:
+        raise asyncio.CancelledError from None
+    safe_raw = redact_tokenrhythm_install_ids(raw) if isinstance(raw, str) else raw
+    return _sanitize_title(safe_raw, max_chars)
 
 
 async def generate_session_title(
     ctx: Any,
     session_key: str,
     first_message: str,
+    *,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> None:
     """Background entry point: generate + persist a title, then refresh the UI.
 
@@ -392,6 +509,11 @@ async def generate_session_title(
             run_kind="session_naming",
         )
         with bind_usage_accounting_scope(usage_scope):
+            correlation_kwargs: dict[str, Any] = {}
+            if provider_request_correlation is not None:
+                correlation_kwargs["provider_request_correlation"] = (
+                    provider_request_correlation
+                )
             title = await call_naming_llm(
                 first_message,
                 model=target.model,
@@ -401,6 +523,7 @@ async def generate_session_title(
                 max_chars=int(getattr(naming_cfg, "max_chars", 48)),
                 language=str(getattr(naming_cfg, "language", "auto")),
                 provider=target.provider,
+                **correlation_kwargs,
             )
         if not title:
             return
@@ -423,4 +546,8 @@ async def generate_session_title(
         )
         log.info("session_naming.titled", session_key=session_key, title=title)
     except Exception as exc:  # noqa: BLE001 - never disturb the spawning turn
-        log.warning("session_naming.failed", session_key=session_key, error=str(exc))
+        log.warning(
+            "session_naming.failed",
+            session_key=session_key,
+            error=redact_tokenrhythm_install_ids(str(exc)),
+        )

@@ -9,15 +9,37 @@ computed for the abandoned model no longer apply.
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
+from opensquilla.context_budget import ContextBudgetGovernor
+from opensquilla.engine import ToolResult
+from opensquilla.engine.agent import Agent
+from opensquilla.engine.agent_injection import ListPendingInputProvider
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
+from opensquilla.engine.selector_override import apply_model_override
+from opensquilla.engine.types import (
+    AgentConfig,
+    RouterDecisionEvent,
+)
 from opensquilla.engine.types import DoneEvent as EngineDoneEvent
-from opensquilla.engine.types import RouterDecisionEvent
-from opensquilla.provider import DoneEvent, ErrorEvent, TextDeltaEvent
+from opensquilla.provider import (
+    ChatConfig,
+    DoneEvent,
+    ErrorEvent,
+    Message,
+    ModelCapabilities,
+    ProviderRequestCorrelation,
+    TextDeltaEvent,
+    ToolDefinition,
+    ToolInputSchema,
+    ToolUseEndEvent,
+    ToolUseStartEvent,
+)
+from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.tools.types import CallerKind, ToolContext
 
 
@@ -76,6 +98,501 @@ def test_fallback_without_metadata_is_noop() -> None:
     assert wrapper.fallback_after_invalid_response("upstream 503") is True
 
 
+def test_preselected_fallback_leg_derives_call_kind_only() -> None:
+    wrapper = _SelectorFallbackProvider(object(), _StubSelector("fallback/model"))
+    correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat",
+    )
+    config = ChatConfig(provider_request_correlation=correlation)
+
+    assert wrapper._config_for_active_leg(config) is config
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+
+    fallback_config = wrapper._config_for_active_leg(config)
+    assert fallback_config is not config
+    assert fallback_config.provider_request_correlation == ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat.provider_fallback",
+    )
+
+
+def test_fallback_leg_rebinds_request_budget_and_model_capabilities(
+    monkeypatch: Any,
+) -> None:
+    class _Catalog:
+        def resolve_max_tokens(
+            self,
+            model_id: str,
+            user_override: int = 0,
+            provider: str = "",
+        ) -> int:
+            assert (model_id, user_override, provider) == (
+                "fallback/model",
+                0,
+                "fallback-provider",
+            )
+            return 2_048
+
+        def get_capabilities(
+            self,
+            model_id: str,
+            provider_name: str = "openrouter",
+            base_url: str = "",
+        ) -> ModelCapabilities:
+            assert (model_id, provider_name, base_url) == (
+                "fallback/model",
+                "fallback-provider",
+                "",
+            )
+            return ModelCapabilities(supports_tools=False, supports_vision=False)
+
+        def resolve_context_window_with_source(
+            self,
+            model_id: str,
+            provider: str = "",
+        ) -> tuple[int, str]:
+            return 8_192, "catalog"
+
+        def resolve_context_window(
+            self,
+            model_id: str,
+            provider: str = "",
+        ) -> int:
+            return 8_192
+
+    monkeypatch.setattr("opensquilla.engine.runtime.shared_catalog", lambda: _Catalog())
+    wrapper = _SelectorFallbackProvider(
+        object(),
+        _StubSelector("fallback/model"),
+    )
+    wrapper.configure_fallback_limits(
+        {("fallback-provider", "fallback/model"): (8_192, 2_048)}
+    )
+    original = ChatConfig(
+        max_tokens=64_000,
+        provider_request_max_chars=500_000,
+        model_capabilities=ModelCapabilities(
+            supports_tools=True,
+            supports_vision=True,
+        ),
+    )
+
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+    rebound = wrapper._config_for_active_leg(original)
+
+    assert rebound is not original
+    assert rebound.max_tokens == 2_048
+    assert rebound.provider_request_max_chars == 17_408
+    assert rebound.model_capabilities == ModelCapabilities(
+        supports_tools=False,
+        supports_vision=False,
+    )
+    assert original.max_tokens == 64_000
+    assert original.provider_request_max_chars == 500_000
+
+
+def test_fallback_leg_replaces_a_cap_derived_for_the_previous_leg(
+    monkeypatch: Any,
+) -> None:
+    class _Catalog:
+        def resolve_max_tokens(
+            self,
+            model_id: str,
+            user_override: int = 0,
+            provider: str = "",
+        ) -> int:
+            return 2_048
+
+        def get_capabilities(
+            self,
+            model_id: str,
+            provider_name: str = "openrouter",
+            base_url: str = "",
+        ) -> ModelCapabilities:
+            return ModelCapabilities()
+
+    monkeypatch.setattr("opensquilla.engine.runtime.shared_catalog", lambda: _Catalog())
+    wrapper = _SelectorFallbackProvider(
+        object(),
+        _StubSelector("fallback/model"),
+    )
+    wrapper.configure_fallback_limits(
+        {("fallback-provider", "fallback/model"): (32_000, 2_048)}
+    )
+    original = ChatConfig(
+        max_tokens=2_048,
+        provider_request_max_chars=17_408,
+        provider_request_max_chars_explicit_cap=0,
+    )
+
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+    rebound = wrapper._config_for_active_leg(original)
+
+    assert rebound.provider_request_max_chars > original.provider_request_max_chars
+    assert rebound.context_window_tokens_global_override == 0
+    assert rebound.provider_request_max_chars_explicit_cap == 0
+
+
+def test_fallback_leg_preserves_global_context_window_override(
+    monkeypatch: Any,
+) -> None:
+    class _Catalog:
+        def resolve_max_tokens(
+            self,
+            model_id: str,
+            user_override: int = 0,
+            provider: str = "",
+        ) -> int:
+            return 2_048
+
+        def get_capabilities(
+            self,
+            model_id: str,
+            provider_name: str = "openrouter",
+            base_url: str = "",
+        ) -> ModelCapabilities:
+            return ModelCapabilities()
+
+    monkeypatch.setattr("opensquilla.engine.runtime.shared_catalog", lambda: _Catalog())
+    wrapper = _SelectorFallbackProvider(
+        object(),
+        _StubSelector("fallback/model"),
+    )
+    wrapper.configure_fallback_limits(
+        {("fallback-provider", "fallback/model"): (8_192, 2_048)}
+    )
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            max_tokens=2_048,
+            context_window_tokens=8_192,
+            context_window_tokens_global_override=8_192,
+        ),
+    )
+    original = agent._provider_admission_chat_config(
+        "active user",
+        context_window_tokens=8_192,
+        max_output_tokens=2_048,
+    )
+
+    assert original.provider_request_max_chars == 17_408
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+    rebound = wrapper._config_for_active_leg(original)
+
+    assert rebound.provider_request_max_chars == 17_408
+    assert rebound.context_window_tokens_global_override == 8_192
+    assert rebound.provider_request_max_chars_explicit_cap == 0
+
+
+def test_global_context_window_override_prevents_catalog_only_escalation(
+    monkeypatch: Any,
+) -> None:
+    class _Selector:
+        current_config = SimpleNamespace(provider="openai", model="small-model")
+
+        def remaining_chain(self) -> list[SimpleNamespace]:
+            return [
+                self.current_config,
+                SimpleNamespace(provider="openai", model="large-model"),
+            ]
+
+    seen: list[tuple[str, int]] = []
+
+    def _resolve_context_window(
+        _catalog: Any,
+        model: str,
+        *,
+        provider: str = "",
+        global_override: int = 0,
+    ) -> tuple[int, str]:
+        assert provider == "openai"
+        seen.append((model, global_override))
+        if global_override > 0:
+            return global_override, "config"
+        return (4_000, "catalog") if model == "small-model" else (32_000, "catalog")
+
+    monkeypatch.setattr("opensquilla.engine.runtime.shared_catalog", object)
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime.resolve_effective_context_window",
+        _resolve_context_window,
+    )
+    wrapper = _SelectorFallbackProvider(object(), _Selector())
+    config = ChatConfig(context_window_tokens_global_override=8_192)
+
+    assert wrapper._can_escalate_local_admission_failure(config) is False
+    assert seen == [("small-model", 8_192), ("large-model", 8_192)]
+
+
+def test_fallback_leg_never_enlarges_an_explicit_request_cap(
+    monkeypatch: Any,
+) -> None:
+    class _Catalog:
+        def resolve_max_tokens(
+            self,
+            model_id: str,
+            user_override: int = 0,
+            provider: str = "",
+        ) -> int:
+            return 2_048
+
+        def get_capabilities(
+            self,
+            model_id: str,
+            provider_name: str = "openrouter",
+            base_url: str = "",
+        ) -> ModelCapabilities:
+            return ModelCapabilities()
+
+    monkeypatch.setattr("opensquilla.engine.runtime.shared_catalog", lambda: _Catalog())
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime.resolve_effective_context_window",
+        lambda *_args, **_kwargs: (32_000, "catalog"),
+    )
+    wrapper = _SelectorFallbackProvider(
+        object(),
+        _StubSelector("fallback/model"),
+    )
+    wrapper.configure_fallback_limits(
+        {("fallback-provider", "fallback/model"): (32_000, 2_048)}
+    )
+    original = ChatConfig(
+        max_tokens=2_048,
+        provider_request_max_chars=12_345,
+    )
+
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+    rebound = wrapper._config_for_active_leg(original)
+
+    assert rebound.provider_request_max_chars == 12_345
+    assert rebound.provider_request_max_chars_explicit_cap == 12_345
+
+
+def test_fallback_leg_clamps_output_and_proof_budget_without_correlation() -> None:
+    wrapper = _SelectorFallbackProvider(object(), _StubSelector("fallback/model"))
+    wrapper.configure_fallback_limits(
+        {("FALLBACK-PROVIDER", "fallback/model"): (32_000, 8_192)}
+    )
+    config = ChatConfig(
+        max_tokens=131_072,
+        provider_request_max_chars=500_000,
+    )
+
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+    fallback_config = wrapper._config_for_active_leg(config)
+
+    expected_proof_cap = ContextBudgetGovernor.from_values(
+        context_window_tokens=32_000,
+        max_output_tokens=8_192,
+        thinking_budget_tokens=0,
+        context_overflow_threshold=0.85,
+    ).snapshot().provider_request_max_chars
+    assert fallback_config is not config
+    assert fallback_config.max_tokens == 8_192
+    assert fallback_config.provider_request_max_chars == expected_proof_cap
+    assert fallback_config.provider_request_correlation is None
+
+
+def test_fallback_leg_never_increases_small_explicit_output_limit() -> None:
+    wrapper = _SelectorFallbackProvider(object(), _StubSelector("fallback/model"))
+    wrapper.configure_fallback_limits(
+        {("fallback-provider", "fallback/model"): (32_000, 8_192)}
+    )
+    config = ChatConfig(max_tokens=4_096)
+
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+    fallback_config = wrapper._config_for_active_leg(config)
+
+    assert fallback_config is config
+    assert fallback_config.max_tokens == 4_096
+
+
+def test_unknown_fallback_limit_does_not_apply_generic_default() -> None:
+    wrapper = _SelectorFallbackProvider(object(), _StubSelector("unknown/model"))
+    config = ChatConfig(max_tokens=131_072)
+
+    assert wrapper.fallback_after_invalid_response("upstream 503") is True
+
+    assert wrapper._config_for_active_leg(config) is config
+
+
+def test_each_hop_uses_the_active_physical_models_own_output_limit() -> None:
+    class _MultiHopSelector:
+        def __init__(self) -> None:
+            self._remaining = [
+                SimpleNamespace(provider="fallback-provider", model="middle/model"),
+                SimpleNamespace(provider="fallback-provider", model="last/model"),
+            ]
+            self.current_config = SimpleNamespace(
+                provider="primary-provider", model="primary/model"
+            )
+
+        @property
+        def active_provider_id(self) -> str:
+            return str(self.current_config.provider)
+
+        def next_fallback_after_failure(self, exc: Exception) -> object:
+            del exc
+            self.current_config = self._remaining.pop(0)
+            return object()
+
+    selector = _MultiHopSelector()
+    wrapper = _SelectorFallbackProvider(object(), selector)
+    wrapper.configure_fallback_limits(
+        {
+            ("fallback-provider", "middle/model"): (64_000, 32_768),
+            ("fallback-provider", "last/model"): (16_000, 4_096),
+        }
+    )
+    original = ChatConfig(
+        max_tokens=131_072,
+        provider_request_max_chars=500_000,
+    )
+
+    assert wrapper.fallback_after_invalid_response("first failure") is True
+    middle = wrapper._config_for_active_leg(original)
+    assert middle.max_tokens == 32_768
+
+    assert wrapper.fallback_after_invalid_response("second failure") is True
+    last = wrapper._config_for_active_leg(original)
+    assert last.max_tokens == 4_096
+    assert last.provider_request_max_chars < middle.provider_request_max_chars
+
+
+def test_tokenrhythm_same_model_fallback_uses_exact_private_config_identity() -> None:
+    primary = SimpleNamespace(
+        provider="tokenrhythm",
+        model="shared/model",
+        api_key="synthetic-key-a",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+    fallback_same_model = SimpleNamespace(
+        provider="tokenrhythm",
+        model="shared/model",
+        api_key="synthetic-key-b",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="http://127.0.0.1:8118",
+    )
+    fallback_other_model = SimpleNamespace(
+        provider="tokenrhythm",
+        model="other/model",
+        api_key="synthetic-key-c",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+
+    class _AuthoritySelector:
+        def __init__(self) -> None:
+            self._chain = [primary, fallback_same_model, fallback_other_model]
+            self._index = 0
+
+        @property
+        def current_config(self):
+            return self._chain[self._index]
+
+        @property
+        def active_provider_id(self) -> str:
+            return str(self.current_config.provider)
+
+        def remaining_chain(self):
+            return list(self._chain[self._index :])
+
+        def next_fallback_after_failure(self, _exc: Exception) -> object:
+            self._index += 1
+            return object()
+
+    metadata: dict[str, Any] = {
+        "route_plan": {
+            "fallback_chain": [
+                {
+                    "provider": "tokenrhythm",
+                    "model": "shared/model",
+                    "capabilities": {
+                        "context_window": 1_000_000,
+                        "effective_max_tokens": 131_072,
+                    },
+                }
+            ]
+        }
+    }
+    selector = _AuthoritySelector()
+    wrapper = _SelectorFallbackProvider(
+        object(),
+        selector,
+        turn_metadata=metadata,
+    )
+    wrapper.configure_fallback_deployment_limits(
+        [
+            (fallback_same_model, 64_000, 8_192),
+            (fallback_other_model, 32_000, 4_096),
+        ]
+    )
+    # A sanitized provider/model-only compatibility limit would be wrong for B.
+    wrapper.configure_fallback_limits(
+        {("tokenrhythm", "shared/model"): (1_000_000, 131_072)}
+    )
+    original = ChatConfig(max_tokens=131_072)
+
+    assert wrapper.fallback_after_invalid_response("first failure") is True
+    assert wrapper._config_for_active_leg(original).max_tokens == 8_192
+    assert wrapper.fallback_after_invalid_response("second failure") is True
+    assert wrapper._config_for_active_leg(original).max_tokens == 4_096
+
+    serialized = json.dumps(metadata, sort_keys=True)
+    assert "synthetic-key-a" not in serialized
+    assert "synthetic-key-b" not in serialized
+    assert "synthetic-key-c" not in serialized
+    assert "authority_identity" not in serialized
+    assert "transport_fingerprint" not in serialized
+
+
+def test_dynamic_tokenrhythm_fallback_without_exact_limit_is_not_cross_clamped() -> None:
+    primary = SimpleNamespace(
+        provider="tokenrhythm",
+        model="shared/model",
+        api_key="synthetic-known-key",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+    dynamically_injected = SimpleNamespace(
+        provider="tokenrhythm",
+        model="shared/model",
+        api_key="synthetic-dynamic-key",
+        base_url="https://tokenrhythm.studio/v1",
+        proxy="",
+    )
+
+    class _DynamicPluginSelector:
+        def __init__(self) -> None:
+            self.current_config = primary
+
+        @property
+        def active_provider_id(self) -> str:
+            return "tokenrhythm"
+
+        def next_fallback_after_failure(self, _exc: Exception) -> object:
+            # Models introduced by a plugin failover hook after bootstrap have
+            # no exact authority limit in the wrapper's private map.
+            self.current_config = dynamically_injected
+            return object()
+
+    selector = _DynamicPluginSelector()
+    wrapper = _SelectorFallbackProvider(object(), selector)
+    wrapper.configure_fallback_deployment_limits([(primary, 64_000, 8_192)])
+    wrapper.configure_fallback_limits(
+        {("tokenrhythm", "shared/model"): (64_000, 8_192)}
+    )
+    original = ChatConfig(max_tokens=131_072)
+
+    assert wrapper.fallback_after_invalid_response("dynamic plugin fallback") is True
+    assert wrapper._config_for_active_leg(original) is original
+
+
 PRIMARY_MODEL = "routed-primary"
 FALLBACK_MODEL = "fallback-secondary"
 
@@ -105,25 +622,376 @@ class _ChainProvider:
         return []
 
 
+class _ProjectingScriptProvider:
+    """Script one physical leg while using its real wire projection."""
+
+    def __init__(
+        self,
+        *,
+        provider_name: str,
+        wire_provider: OpenAIProvider,
+        streams: list[list[Any]],
+    ) -> None:
+        self.provider_name = provider_name
+        self._wire_provider = wire_provider
+        self._streams = streams
+        self.calls: list[dict[str, Any]] = []
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: Any = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> Any:
+        return self._wire_provider.project_final_request(
+            messages,
+            tools,
+            config,
+            message_limit=message_limit,
+        )
+
+    def project_message_count(
+        self,
+        messages: list[Message],
+        config: ChatConfig | None = None,
+        *,
+        additional_messages: int = 0,
+    ) -> Any:
+        return self._wire_provider.project_message_count(
+            messages,
+            config,
+            additional_messages=additional_messages,
+        )
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: Any = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        canonical_before = [message.model_dump(mode="json") for message in messages]
+        projection = self.project_final_request(messages, tools, config)
+        canonical_after = [message.model_dump(mode="json") for message in messages]
+        call_index = len(self.calls)
+        self.calls.append(
+            {
+                "messages": messages,
+                "canonical_before": canonical_before,
+                "canonical_after": canonical_after,
+                "payload": projection.payload,
+            }
+        )
+        events = self._streams[call_index]
+        return self._stream(events)
+
+    async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
+        for event in events:
+            yield event
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+class _ProjectingFallbackSelector:
+    def __init__(
+        self,
+        primary: _ProjectingScriptProvider,
+        fallback: _ProjectingScriptProvider,
+    ) -> None:
+        self.primary = primary
+        self.fallback = fallback
+        self.current_config = SimpleNamespace(
+            provider="tokenrhythm",
+            model="deepseek-v4-flash",
+            base_url="https://tokenrhythm.studio/v1",
+        )
+        self._remaining_chain = [
+            self.current_config,
+            SimpleNamespace(
+                provider="deepseek",
+                model="deepseek-v4-flash",
+                base_url="https://api.deepseek.com",
+            ),
+        ]
+
+    @property
+    def active_provider_id(self) -> str:
+        return str(self.current_config.provider)
+
+    def remaining_chain(self) -> list[SimpleNamespace]:
+        return list(self._remaining_chain)
+
+    def next_fallback_after_failure(
+        self,
+        _exc: Exception,
+    ) -> _ProjectingScriptProvider:
+        self.current_config = self._remaining_chain[1]
+        self._remaining_chain = self._remaining_chain[1:]
+        return self.fallback
+
+
 class _ChainSelector:
     """Two-link chain selector: primary fails, one fallback hop remains."""
 
     def __init__(self, *, primary_fails: bool) -> None:
         self._primary_fails = primary_fails
-        self.current_config = SimpleNamespace(model=PRIMARY_MODEL)
+        self.current_config = SimpleNamespace(
+            provider="openrouter",
+            model=PRIMARY_MODEL,
+        )
+        self._remaining_chain = [
+            self.current_config,
+            SimpleNamespace(provider="openrouter", model=FALLBACK_MODEL),
+        ]
 
     def clone(self) -> _ChainSelector:
         return self
 
     def override_model(self, model: str) -> None:
-        self.current_config = SimpleNamespace(model=model)
+        if model == self.current_config.model:
+            return
+        previous_chain = list(self._remaining_chain)
+        self.current_config = SimpleNamespace(provider="openrouter", model=model)
+        self._remaining_chain = [self.current_config, *previous_chain]
+
+    @property
+    def active_provider_id(self) -> str:
+        return str(self.current_config.provider)
+
+    def remaining_chain(self) -> list[SimpleNamespace]:
+        return list(self._remaining_chain)
 
     def resolve(self) -> _ChainProvider:
         return _ChainProvider(PRIMARY_MODEL, fail=self._primary_fails)
 
     def next_fallback_after_failure(self, exc: Exception) -> _ChainProvider:
-        self.current_config = SimpleNamespace(model=FALLBACK_MODEL)
+        self.current_config = self._remaining_chain[1]
+        self._remaining_chain = self._remaining_chain[1:]
         return _ChainProvider(FALLBACK_MODEL, fail=False)
+
+
+async def test_physical_attempt_limit_prevents_selector_internal_fallback() -> None:
+    selector = _ChainSelector(primary_fails=True)
+    wrapper = _SelectorFallbackProvider(selector.resolve(), selector)
+
+    events = [
+        event
+        async for event in wrapper.chat(
+            [Message(role="user", content="summarize")],
+            tools=[],
+            config=ChatConfig(physical_attempt_limit=1),
+        )
+    ]
+
+    assert any(isinstance(event, ErrorEvent) for event in events)
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert selector.current_config.model == PRIMARY_MODEL
+
+
+async def test_tokenrhythm_tool_reasoning_fallback_rebuilds_from_canonical_history() -> None:
+    long_reasoning = "r" * 50_001
+    primary = _ProjectingScriptProvider(
+        provider_name="tokenrhythm",
+        wire_provider=OpenAIProvider(
+            api_key="synthetic-tokenrhythm-key",
+            model="deepseek-v4-flash",
+            base_url="https://tokenrhythm.studio/v1",
+            provider_kind="tokenrhythm",
+            provider_id="tokenrhythm",
+        ),
+        streams=[
+            [
+                ToolUseStartEvent(tool_use_id="tool-1", tool_name="echo"),
+                ToolUseEndEvent(
+                    tool_use_id="tool-1",
+                    tool_name="echo",
+                    arguments={"value": "once"},
+                ),
+                DoneEvent(
+                    stop_reason="tool_use",
+                    input_tokens=3,
+                    output_tokens=1,
+                    reasoning_tokens=1,
+                    reasoning_content=long_reasoning,
+                ),
+            ],
+            [ErrorEvent(message="upstream unavailable", code="503")],
+        ],
+    )
+    fallback = _ProjectingScriptProvider(
+        provider_name="deepseek",
+        wire_provider=OpenAIProvider(
+            api_key="synthetic-deepseek-key",
+            model="deepseek-v4-flash",
+            base_url="https://api.deepseek.com",
+            provider_kind="deepseek",
+            provider_id="deepseek",
+        ),
+        streams=[
+            [
+                TextDeltaEvent(text="done"),
+                DoneEvent(
+                    stop_reason="stop",
+                    model="deepseek-v4-flash",
+                    input_tokens=4,
+                    output_tokens=1,
+                ),
+            ]
+        ],
+    )
+    selector = _ProjectingFallbackSelector(primary, fallback)
+    provider = _SelectorFallbackProvider(primary, selector)
+    tool_handler_calls = 0
+
+    async def tool_handler(call: Any) -> ToolResult:
+        nonlocal tool_handler_calls
+        tool_handler_calls += 1
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="tool result",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=2,
+            max_provider_retries=0,
+            model_id="deepseek-v4-flash",
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="echo",
+                description="Echo once.",
+                input_schema=ToolInputSchema(
+                    properties={"value": {"type": "string"}},
+                    required=["value"],
+                ),
+            )
+        ],
+        tool_handler=tool_handler,
+    )
+
+    events = [event async for event in agent.run_turn("run the tool once")]
+
+    assert tool_handler_calls == 1
+    assert len(primary.calls) == 2
+    assert len(fallback.calls) == 1
+    primary_post_tool = primary.calls[1]
+    fallback_post_tool = fallback.calls[0]
+    assert primary_post_tool["canonical_before"] == primary_post_tool["canonical_after"]
+    assert fallback_post_tool["canonical_before"] == fallback_post_tool["canonical_after"]
+    assert fallback_post_tool["canonical_before"] == primary_post_tool["canonical_before"]
+
+    canonical_tool_call = next(
+        message
+        for message in primary_post_tool["messages"]
+        if message.role == "assistant" and message.reasoning_content == long_reasoning
+    )
+    assert canonical_tool_call.reasoning_content == long_reasoning
+
+    primary_wire_tool_call = next(
+        message
+        for message in primary_post_tool["payload"]["messages"]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    fallback_wire_tool_call = next(
+        message
+        for message in fallback_post_tool["payload"]["messages"]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    assert primary_wire_tool_call["reasoning_content"] == ""
+    assert fallback_wire_tool_call["reasoning_content"] == long_reasoning
+    assert any(event.kind == "done" and event.text == "done" for event in events)
+
+
+async def test_local_admission_failure_escalates_to_larger_authorized_leg(
+    monkeypatch: Any,
+) -> None:
+    class _AdmissionProvider:
+        provider_name = "openai"
+
+        def __init__(self, model: str, *, fits: bool) -> None:
+            self.model = model
+            self.fits = fits
+            self.network_calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            if not self.fits:
+                yield ErrorEvent(
+                    message='{"reason":"provider_request_budget_exhausted"}',
+                    code="provider_request_budget_exhausted",
+                )
+                return
+            self.network_calls += 1
+            yield TextDeltaEvent(text="fallback answer")
+            yield DoneEvent(model=self.model)
+
+    class _AdmissionSelector:
+        def __init__(self) -> None:
+            self.current_config = SimpleNamespace(
+                provider="openai",
+                model="small-model",
+            )
+            self.primary = _AdmissionProvider("small-model", fits=False)
+            self.fallback = _AdmissionProvider("large-model", fits=True)
+
+        @property
+        def active_provider_id(self) -> str:
+            return "openai"
+
+        def remaining_chain(self) -> list[SimpleNamespace]:
+            return [
+                self.current_config,
+                SimpleNamespace(provider="openai", model="large-model"),
+            ]
+
+        def next_fallback(self) -> _AdmissionProvider:
+            self.current_config = SimpleNamespace(
+                provider="openai",
+                model="large-model",
+            )
+            return self.fallback
+
+    def _resolve_context_window(
+        _catalog: Any,
+        model: str,
+        *,
+        global_override: int = 0,
+        **_kwargs: Any,
+    ) -> tuple[int, str]:
+        assert global_override == 0
+        return (4_000, "catalog") if model == "small-model" else (32_000, "catalog")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime.resolve_effective_context_window",
+        _resolve_context_window,
+    )
+    selector = _AdmissionSelector()
+    metadata: dict[str, object] = {"routed_model": "small-model"}
+    wrapper = _SelectorFallbackProvider(
+        selector.primary,
+        selector,
+        turn_metadata=metadata,
+    )
+
+    events = [
+        event
+        async for event in wrapper.chat(
+            [Message(role="user", content="large request")],
+            tools=[],
+            config=ChatConfig(),
+        )
+    ]
+
+    assert selector.primary.network_calls == 0
+    assert selector.fallback.network_calls == 1
+    assert any(isinstance(event, TextDeltaEvent) for event in events)
+    assert metadata["executed_model"] == "large-model"
+    assert metadata["router_fallback_reason"] == "local_admission_escalation"
 
 
 def _routed_pipeline_fake(routed_model: str) -> Any:
@@ -138,6 +1006,13 @@ def _routed_pipeline_fake(routed_model: str) -> Any:
         attachments: list[dict[str, Any]],
         **_: Any,
     ) -> tuple[TurnContext, Any]:
+        selector_execution_chain = [
+            {
+                "provider": str(candidate.provider),
+                "model": str(candidate.model),
+            }
+            for candidate in cloned_selector.remaining_chain()
+        ]
         return (
             TurnContext(
                 message=message,
@@ -157,6 +1032,7 @@ def _routed_pipeline_fake(routed_model: str) -> Any:
                     "savings_pct": 41.0,
                     "savings_max_price_per_m": 3.0,
                     "savings_routed_price_per_m": 0.5,
+                    "selector_execution_chain": selector_execution_chain,
                 },
             ),
             provider,
@@ -169,6 +1045,7 @@ async def _run_turn_events(
     monkeypatch: Any,
     *,
     primary_fails: bool,
+    pending_input_provider: ListPendingInputProvider | None = None,
 ) -> list[Any]:
     monkeypatch.setattr(TurnRunner, "_run_pipeline", _routed_pipeline_fake(PRIMARY_MODEL))
     runner = TurnRunner(provider_selector=_ChainSelector(primary_fails=primary_fails))
@@ -180,33 +1057,104 @@ async def _run_turn_events(
             tool_context=ToolContext(is_owner=True, caller_kind=CallerKind.CLI),
             history_has_persisted_user=False,
             no_memory_capture=True,
+            pending_input_provider=pending_input_provider,
         )
     ]
 
 
-async def test_precontent_fallback_emits_corrective_router_decision_before_done(
+def test_model_override_snapshots_selector_execution_candidates() -> None:
+    selector = _ChainSelector(primary_fails=False)
+    metadata: dict[str, object] = {}
+
+    apply_model_override(
+        selector,
+        PRIMARY_MODEL,
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert metadata["selector_execution_chain"] == [
+        {"provider": "openrouter", "model": PRIMARY_MODEL},
+        {"provider": "openrouter", "model": FALLBACK_MODEL},
+    ]
+
+
+async def test_precontent_fallback_keeps_one_route_decision_and_appends_execution_leg(
     monkeypatch: Any,
 ) -> None:
     events = await _run_turn_events(monkeypatch, primary_fails=True)
 
     router_events = [event for event in events if isinstance(event, RouterDecisionEvent)]
-    assert len(router_events) == 2
-
-    initial, corrective = router_events
-    assert initial.model == PRIMARY_MODEL
-    assert initial.source == "router"
-    assert initial.fallback is False
-
-    assert corrective.model == FALLBACK_MODEL
-    assert corrective.source == "fallback"
-    assert corrective.fallback is True
-    assert corrective.savings_pct == 0.0
+    assert len(router_events) == 1
+    assert router_events[0].model == PRIMARY_MODEL
+    assert router_events[0].source == "router"
+    assert router_events[0].fallback is False
 
     done_events = [event for event in events if isinstance(event, EngineDoneEvent)]
     assert len(done_events) == 1
-    assert done_events[0].model == FALLBACK_MODEL
-    assert done_events[0].routed_model == FALLBACK_MODEL
-    assert events.index(corrective) < events.index(done_events[0])
+    done = done_events[0]
+    assert done.model == FALLBACK_MODEL
+    assert done.routed_model == FALLBACK_MODEL
+    assert done.route_plan is not None
+    assert done.route_plan["model"] == PRIMARY_MODEL
+    assert [leg["kind"] for leg in done.execution_legs] == [
+        "primary",
+        "provider_fallback",
+    ]
+    assert [leg["model"] for leg in done.execution_legs] == [
+        PRIMARY_MODEL,
+        FALLBACK_MODEL,
+    ]
+
+
+async def test_same_turn_pending_input_preserves_route_plan_and_model(
+    monkeypatch: Any,
+) -> None:
+    pending = ListPendingInputProvider()
+    pending.append("continue with this constraint")
+
+    events = await _run_turn_events(
+        monkeypatch,
+        primary_fails=False,
+        pending_input_provider=pending,
+    )
+
+    router_events = [event for event in events if isinstance(event, RouterDecisionEvent)]
+    assert len(router_events) == 1
+    assert router_events[0].model == PRIMARY_MODEL
+    done = next(event for event in events if isinstance(event, EngineDoneEvent))
+    assert done.route_plan is not None
+    assert done.route_plan["model"] == PRIMARY_MODEL
+    assert len(done.execution_legs) == 2
+    assert {leg["model"] for leg in done.execution_legs} == {PRIMARY_MODEL}
+    assert {leg["plan_id"] for leg in done.execution_legs} == {
+        done.route_plan["plan_id"]
+    }
+
+
+async def test_same_turn_pending_input_applies_after_precontent_selector_fallback(
+    monkeypatch: Any,
+) -> None:
+    pending = ListPendingInputProvider()
+    pending.append("replace the original constraint")
+
+    events = await _run_turn_events(
+        monkeypatch,
+        primary_fails=True,
+        pending_input_provider=pending,
+    )
+
+    assert len(pending.applications) == 1
+    assert pending.applications[0].texts == ("replace the original constraint",)
+    assert pending.applications[0].model_call_id == "2.0"
+    done = next(event for event in events if isinstance(event, EngineDoneEvent))
+    assert done.route_plan is not None
+    assert done.route_plan["model"] == PRIMARY_MODEL
+    assert {
+        (item["provider"], item["model"])
+        for item in done.route_plan["fallback_chain"]
+    } >= {("openrouter", FALLBACK_MODEL)}
+    assert done.model == FALLBACK_MODEL
 
 
 async def test_turn_without_fallback_hop_emits_exactly_one_router_decision(

@@ -159,6 +159,7 @@ export interface EnsembleEffectiveFacts {
   quorum: number
   proposerCount: number
   proposerTimeoutSeconds: number
+  configuredAggregatorTimeoutSeconds: number
   aggregatorTimeoutSeconds: number
   quorumGraceSeconds: number
 }
@@ -186,6 +187,12 @@ export interface EnsembleCustomLineupView {
 export interface EnsembleConfigSlice {
   enabled?: boolean
   selection_mode?: string
+  selection_configured?: boolean
+  activation_preview?: {
+    selection_mode?: string
+    candidates?: EnsembleCandidateConfig[]
+    blocked_reason?: string | null
+  }
   model_options?: string[]
   candidates?: EnsembleCandidateConfig[]
   min_successful_proposers?: number
@@ -464,9 +471,23 @@ export function useSetupEnsembleForm() {
 
   function initFromConfig(config: EnsembleConfigSlice) {
     enabled.value = config.enabled === true
-    selectionMode.value = normalizeSelectionMode(config.selection_mode)
+    const usePlannedActivation = (
+      config.enabled !== true && config.selection_configured === false
+    )
+    const plannedActivation = usePlannedActivation
+      ? config.activation_preview
+      : undefined
+    selectionMode.value = (
+      usePlannedActivation
+        ? normalizeSelectionMode(
+            plannedActivation?.selection_mode ?? CUSTOM_B5_SELECTION_MODE,
+          )
+        : normalizeSelectionMode(config.selection_mode)
+    )
     modelOptions.value = normalizeModelOptions(config.model_options)
-    candidates.value = normalizeCandidates(config.candidates)
+    candidates.value = normalizeCandidates(
+      plannedActivation?.candidates ?? config.candidates,
+    )
     minSuccessfulProposers.value = normalizeMinSuccessful(
       config.min_successful_proposers ?? DEFAULT_MIN_SUCCESSFUL_PROPOSERS,
     )
@@ -754,20 +775,20 @@ export function useSetupEnsembleForm() {
     }
   }
 
-  // Default activation when the ensemble strategy is switched on: providers
-  // with an official preset land on it; every other provider gets an explicit
-  // custom lineup seeded from the router tiers (the models the user already
-  // configured), never the hidden legacy dynamic mode.
+  // Default activation when the ensemble strategy is switched on: every
+  // provider lands on the single editable custom path. Providers with a
+  // curated static profile use that profile only as the initial seed; other
+  // providers seed from the router tiers the user already configured.
   function activateForProvider(provider: unknown, tierCandidates: readonly EnsembleTierCandidate[] = []) {
     const presetMode = staticB5ModeForProvider(provider)
-    if (presetMode) {
-      selectionMode.value = presetMode
+    selectionMode.value = CUSTOM_B5_SELECTION_MODE
+    if (candidates.value.some(candidate => candidate.enabled !== false)) return
+    const profile = presetMode ? STATIC_B5_PROFILES[presetMode] : null
+    if (profile) {
+      candidates.value = customSeedFromProfile(profile)
       return
     }
-    selectionMode.value = CUSTOM_B5_SELECTION_MODE
-    if (!candidates.value.some(candidate => candidate.enabled !== false)) {
-      importTierCandidates(tierCandidates)
-    }
+    importTierCandidates(tierCandidates)
   }
 
   // One-click migration off the hidden legacy router_dynamic mode: fold the
@@ -879,6 +900,7 @@ export function useSetupEnsembleForm() {
         storedProposerTimeoutSeconds.value,
         STATIC_B5_PROPOSER_TIMEOUT_SECONDS,
       ),
+      configuredAggregatorTimeoutSeconds: storedAggregatorTimeoutSeconds.value,
       aggregatorTimeoutSeconds: substituteLegacy(
         storedAggregatorTimeoutSeconds.value,
         STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS,

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import typer
@@ -102,7 +105,7 @@ class _ProbeTarget:
     api_key_env: str
     base_url: str
     proxy: str
-    source: str  # "llm" (primary) | "llm_profiles"
+    source: str  # "llm" (primary) | "llm_profiles" | "draft"
 
 
 def _tier_model_for_provider(cfg: Any, provider_id: str) -> str:
@@ -236,6 +239,76 @@ async def _run_probes(targets: list[_ProbeTarget], timeout: float) -> list[dict[
     return [await _probe_one(target, timeout) for target in targets]
 
 
+def _prewarm_draft_probe_install_id() -> None:
+    """Register the active privacy context before an unsaved live probe."""
+
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
+
+    config: Any
+    try:
+        config = load_config(None)
+    except Exception:
+        # A malformed local config must not break the desktop bridge, but it
+        # also must not fall back to an implicitly enabled privacy context.
+        config = SimpleNamespace(
+            privacy=SimpleNamespace(disable_network_observability=True)
+        )
+    prewarm_tokenrhythm_install_id(config=config)
+
+
+@app.command("probe-draft", hidden=True)
+def models_probe_draft() -> None:
+    """Probe one unsaved provider draft supplied as JSON on stdin.
+
+    Internal desktop bridge: credential material never appears in argv and the
+    command never persists the candidate configuration. Output is always one
+    redacted JSON result object.
+    """
+    try:
+        payload = json.loads(sys.stdin.read())
+    except (json.JSONDecodeError, OSError) as exc:
+        emit_error(
+            f"Invalid provider draft JSON: {exc}",
+            json_output=True,
+            code="invalid_draft",
+        )
+        raise typer.Exit(code=2) from exc
+    if not isinstance(payload, dict):
+        emit_error(
+            "Provider draft must be a JSON object.",
+            json_output=True,
+            code="invalid_draft",
+        )
+        raise typer.Exit(code=2)
+
+    provider_id = str(payload.get("providerId") or "").strip().lower()
+    model = str(payload.get("model") or "").strip()
+    if not provider_id or not model:
+        emit_error(
+            "Provider draft requires providerId and model.",
+            json_output=True,
+            code="invalid_draft",
+        )
+        raise typer.Exit(code=2)
+
+    _prewarm_draft_probe_install_id()
+    target = _ProbeTarget(
+        provider_id=provider_id,
+        model=model,
+        api_key=str(payload.get("apiKey") or ""),
+        api_key_env=str(payload.get("apiKeyEnv") or ""),
+        base_url=str(payload.get("baseUrl") or ""),
+        proxy=str(payload.get("proxy") or ""),
+        source="draft",
+    )
+    row = asyncio.run(_probe_one(target, float(payload.get("timeout") or 30.0)))
+    print_json(row)
+    if not row["ok"]:
+        raise typer.Exit(code=1)
+
+
 @app.command("probe")
 def models_probe(
     provider: str | None = typer.Option(
@@ -258,6 +331,11 @@ def models_probe(
     probe fails, 2 on invalid selection.
     """
     cfg = load_config(config_path)
+    from opensquilla.provider.tokenrhythm_correlation import (
+        prewarm_tokenrhythm_install_id,
+    )
+
+    prewarm_tokenrhythm_install_id(config=cfg)
     targets = _probe_targets(cfg)
     if provider:
         wanted = provider.strip().lower()

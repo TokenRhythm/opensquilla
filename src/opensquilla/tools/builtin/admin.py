@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any, Protocol
 
 import structlog
 
+from opensquilla.scheduler.parser import parse_cron, parse_iso_at
 from opensquilla.scheduler.payloads import (
     REMINDER_KIND,
     SYSTEM_EVENT_KIND,
@@ -31,7 +33,23 @@ log = structlog.get_logger(__name__)
 _VALID_CRON_ACTIONS = ("list", "add", "remove", "run")
 
 
-_VALID_GATEWAY_ACTIONS = ("restart", "config_get", "config_set")
+_VALID_GATEWAY_ACTIONS = ("config_get",)
+
+# Actions the tool used to advertise. They were never functional (restart
+# always raised; config_set depended on a GatewayConfig.patch() that does not
+# exist). Keep them recognized so callers receive the accurate replacement
+# contract instead of a generic "invalid action".
+_RETIRED_GATEWAY_ACTIONS = {
+    "restart": (
+        "Gateway restart is not available through this tool. Audio configuration "
+        "via audio_config applies immediately and does not require a restart."
+    ),
+    "config_set": (
+        "Configuration writes are not available through this tool. For audio "
+        "(TTS) providers use audio_config, which validates, persists atomically, "
+        "and hot-applies without a restart."
+    ),
+}
 
 
 class _SchedulerProtocol(Protocol):
@@ -59,6 +77,8 @@ class _SchedulerProtocol(Protocol):
         creator_session_key: str = "",
         creator_sender_id: str = "",
         creator_is_owner: bool = False,
+        run_mode: str = "",
+        idempotency_key: str = "",
     ) -> Any: ...
 
     async def update_job(self, job_id: str, **patch: Any) -> Any: ...
@@ -93,6 +113,56 @@ def scheduler_available() -> bool:
 
 def gateway_config_available() -> bool:
     return _gateway_config is not None
+
+
+def _cron_tool_idempotency_key(
+    *,
+    task_id: str,
+    schedule_kind: ScheduleKind,
+    schedule_value: str,
+    schedule_tz: str,
+    task: str,
+    job_kind: str,
+    session_target: str,
+    session_key: str,
+    agent_id: str,
+    wake_mode: str,
+    tool_policy: dict[str, Any] | None,
+    creator_session_key: str,
+    creator_sender_id: str,
+) -> str:
+    if schedule_kind is ScheduleKind.CRON:
+        canonical_schedule_value = " ".join(parse_cron(schedule_value).raw.split())
+    elif schedule_kind is ScheduleKind.AT:
+        canonical_schedule_value = parse_iso_at(schedule_value).isoformat()
+    else:
+        canonical_schedule_value = str(int(schedule_value))
+    canonical = {
+        "task_id": task_id,
+        "schedule": {
+            "kind": schedule_kind.value,
+            "value": canonical_schedule_value,
+            "tz": schedule_tz,
+        },
+        "task": task,
+        "job_kind": job_kind,
+        "session_target": session_target,
+        "session_key": session_key,
+        "agent_id": agent_id,
+        "wake_mode": wake_mode,
+        "tool_policy": tool_policy or {},
+        "creator_session_key": creator_session_key,
+        "creator_sender_id": creator_sender_id,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"cron-tool:{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -464,16 +534,47 @@ async def cron(
             payload = make_agent_turn_payload(task, agent_id)
             handler_key = "agent_run"
         effective_tz = (schedule_tz or tz or "").strip()
+        resolved_session_key = (
+            caller_session_key
+            if session_target == "current"
+            else (target_session_key or "")
+        )
+        task_id = str(getattr(ctx, "task_id", "") or "") if ctx is not None else ""
+        idempotency_key = (
+            _cron_tool_idempotency_key(
+                task_id=task_id,
+                schedule_kind=schedule_kind,
+                schedule_value=schedule_value,
+                schedule_tz=effective_tz,
+                task=task,
+                job_kind=job_kind,
+                session_target=session_target,
+                session_key=resolved_session_key,
+                agent_id=agent_id,
+                wake_mode=wake_mode,
+                tool_policy=tool_policy,
+                creator_session_key=caller_session_key,
+                creator_sender_id=caller_sender_id,
+            )
+            if task_id
+            else ""
+        )
+        context_run_mode = str(getattr(ctx, "run_mode", "") or "") if ctx is not None else ""
+        from opensquilla.run_mode import RunMode, normalize_run_mode
+
+        try:
+            creator_run_mode = normalize_run_mode(
+                context_run_mode,
+                default=RunMode.FULL if is_owner_caller else RunMode.SAFE,
+            ).value
+        except ValueError:
+            creator_run_mode = "full" if is_owner_caller else "safe"
         job = await sched.add_job(
             name=task or "cron-tool-job",
             handler_key=handler_key,
             payload=payload,
             session_target=SessionTarget(session_target),
-            session_key=(
-                caller_session_key
-                if session_target == "current"
-                else (target_session_key or "")
-            ),
+            session_key=resolved_session_key,
             wake_mode=wake_mode,
             delivery=delivery,
             origin_session_key=caller_session_key,
@@ -482,6 +583,8 @@ async def cron(
             creator_session_key=caller_session_key,
             creator_sender_id=caller_sender_id,
             creator_is_owner=is_owner_caller,
+            run_mode=creator_run_mode,
+            idempotency_key=idempotency_key,
             schedule_kind=schedule_kind,
             schedule_value=schedule_value,
             schedule_tz=effective_tz,
@@ -505,6 +608,7 @@ async def cron(
                 "wake_mode": wake_mode,
                 "tz": effective_tz,
                 "status": "scheduled",
+                "deduplicated": bool(getattr(job, "deduplicated", False)),
             }
         )
 
@@ -568,19 +672,24 @@ async def cron(
 
 @tool(
     name="gateway",
-    description="Gateway control: restart and configuration management.",
+    description=(
+        "Read gateway configuration values (action: config_get). "
+        "Credential-bearing values are redacted. Configuration writes and "
+        "restarts are not available here: audio providers are configured "
+        "through audio_config and apply immediately without a restart."
+    ),
     params={
         "action": {
             "type": "string",
-            "description": "Action: restart, config_get, config_set",
+            "description": "Action: config_get",
         },
         "key": {
             "type": "string",
-            "description": "Config key path (required for config_get and config_set)",
+            "description": "Config key path (required for config_get)",
         },
         "value": {
             "type": "string",
-            "description": "Config value as JSON string (required for config_set)",
+            "description": "Unused; retained for backward compatibility",
         },
     },
     required=["action"],
@@ -591,55 +700,120 @@ async def gateway(
     key: str | None = None,
     value: str | None = None,
 ) -> str:
+    retired = _RETIRED_GATEWAY_ACTIONS.get(action)
+    if retired is not None:
+        raise ToolError(retired)
     if action not in _VALID_GATEWAY_ACTIONS:
-        raise ToolError(f"Invalid action: {action}. Must be restart|config_get|config_set")
+        raise ToolError(f"Invalid action: {action}. Must be config_get")
 
-    if action in ("config_get", "config_set") and not key:
-        raise ToolError(f"'key' required for {action}")
-    if action == "config_set" and value is None:
-        raise ToolError("'value' required for config_set")
-
-    # Parse JSON value for config_set
-    parsed_value = None
-    if action == "config_set":
-        assert value is not None
-        try:
-            parsed_value = json.loads(value)
-        except (json.JSONDecodeError, TypeError):
-            raise ToolError("'value' must be valid JSON")
+    if not key:
+        raise ToolError("'key' required for config_get")
 
     if _gateway_config is None:
         raise ToolError("Gateway config not available")
 
     config = _gateway_config
 
-    if action == "restart":
-        raise ToolError("Gateway restart not supported via tool")
+    cfg_dict = config.to_toml_dict() if hasattr(config, "to_toml_dict") else {}
+    # Navigate dot-path key
+    parts = key.split(".")
+    val = cfg_dict
+    for p in parts:
+        if isinstance(val, dict):
+            val = val.get(p)
+        else:
+            val = None
+            break
+    if val is None:
+        raise ToolError(f"Config key not found: {key}")
+    # Reuse the public config contract so this tool cannot drift behind newly
+    # added credential fields such as channel encryption keys. Scalar leaf
+    # reads need their dot-path segment checked explicitly because the shared
+    # recursive redactor only sees mapping keys.
+    from opensquilla.gateway.config import is_sensitive_config_key, redact_public_config
 
-    if action == "config_get":
-        assert key is not None
-        cfg_dict = config.to_toml_dict() if hasattr(config, "to_toml_dict") else {}
-        # Navigate dot-path key
-        parts = key.split(".")
-        val = cfg_dict
-        for p in parts:
-            if isinstance(val, dict):
-                val = val.get(p)
-            else:
-                val = None
-                break
-        if val is None:
-            raise ToolError(f"Config key not found: {key}")
-        return json.dumps({"action": "config_get", "key": key, "value": val})
+    redacted = (
+        "[redacted]"
+        if is_sensitive_config_key(parts[-1]) and val
+        else redact_public_config(val)
+    )
+    return json.dumps({"action": "config_get", "key": key, "value": redacted})
 
-    # config_set
-    if hasattr(config, "patch"):
-        await config.patch({key: parsed_value})
-        return json.dumps(
-            {
-                "action": "config_set",
-                "key": key,
-                "value": parsed_value,
-            }
+
+# ---------------------------------------------------------------------------
+# audio_config
+# ---------------------------------------------------------------------------
+
+
+@tool(
+    name="audio_config",
+    description=(
+        "Configure the audio (TTS) provider safely. Validates the settings, "
+        "persists config.toml atomically (UTF-8, backup kept), and "
+        "hot-applies to the running gateway without a restart. Agent-driven "
+        "configuration uses the provider's registered endpoint and credential "
+        "environment variable. The API key is stored but never echoed back."
+    ),
+    params={
+        "provider": {
+            "type": "string",
+            "description": "Audio provider id (currently supported: elevenlabs)",
+        },
+        "api_key": {
+            "type": "string",
+            "description": "Provider API key (mutually exclusive with api_key_env)",
+        },
+        "api_key_env": {
+            "type": "string",
+            "description": "Name of an environment variable holding the API key",
+        },
+        "enabled": {
+            "type": "boolean",
+            "description": "Enable or disable audio (default: true)",
+        },
+        "tts_voice": {"type": "string", "description": "TTS voice id"},
+        "tts_model": {"type": "string", "description": "TTS model id"},
+        "language_code": {"type": "string", "description": "Language code hint for TTS"},
+    },
+    required=["provider"],
+    owner_only=True,
+)
+async def audio_config(
+    provider: str,
+    api_key: str = "",
+    api_key_env: str = "",
+    enabled: bool = True,
+    tts_voice: str = "",
+    tts_model: str = "",
+    language_code: str = "",
+) -> str:
+    if _gateway_config is None:
+        raise ToolError("Gateway config not available")
+
+    from types import SimpleNamespace
+
+    from opensquilla.gateway.rpc_onboarding import apply_agent_audio_provider_configuration
+
+    holder = SimpleNamespace(config=_gateway_config)
+    try:
+        result = apply_agent_audio_provider_configuration(
+            holder,
+            provider_id=provider,
+            api_key=api_key,
+            api_key_env=api_key_env,
+            enabled=enabled,
+            tts_voice=tts_voice,
+            tts_model=tts_model,
+            language_code=language_code,
         )
-    raise ToolError("Config modification not supported")
+    except (KeyError, ValueError) as exc:
+        # Mutation validation messages (unknown provider, key/env conflicts)
+        # are agent-actionable and never embed the credential itself.
+        raise ToolError(str(exc).strip("\"'")) from exc
+
+    payload = json.dumps(result)
+    # Defense in depth: the entry payload is pre-redacted by the mutation
+    # layer, but a returned credential would be unrecoverable — fail closed.
+    if api_key and api_key in payload:
+        raise ToolError("internal error: refusing to return a payload containing the API key")
+    return payload

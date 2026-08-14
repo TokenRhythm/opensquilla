@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
 from opensquilla.cli.memory_flush_cmd import (
     MemoryFlushSessionResult,
     _emit_text_result,
     _receipt_is_complete_flush,
     _zero_usage,
+    memory_flush_session_cmd,
+    run_memory_flush_session,
 )
+from opensquilla.gateway.config import GatewayConfig
 
 
 def test_receipt_is_complete_flush_rejects_raw_and_degraded_llm() -> None:
@@ -63,3 +72,112 @@ def test_emit_text_result_labels_raw_fallback_as_degraded(capsys) -> None:
     assert "Flush degraded to raw backup" in captured.out
     assert "Backup path: memory/.raw_fallbacks/raw.md" in captured.out
     assert "not searchable durable memory" in captured.err
+
+
+def test_memory_flush_command_holds_profile_lease_during_service_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    lease_active = False
+
+    @contextmanager
+    def guarded_profile():
+        nonlocal lease_active
+        assert lease_active is False
+        lease_active = True
+        try:
+            yield None
+        finally:
+            lease_active = False
+
+    async def run_flush(**_kwargs):
+        assert lease_active is True
+        return MemoryFlushSessionResult(
+            ok=True,
+            key="agent:main:webchat:lease",
+            agent_id="main",
+            message_window="all",
+            flush_max_chars="default",
+            segment_mode="auto",
+            segment_max_chars="default",
+            segment_overlap_messages=0,
+            flush_receipt={"mode": "llm"},
+            usage=_zero_usage(),
+            usage_path=None,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.recovery.guarded_desktop_profile",
+        guarded_profile,
+    )
+    monkeypatch.setattr(
+        "opensquilla.cli.memory_flush_cmd.run_memory_flush_session",
+        run_flush,
+    )
+
+    memory_flush_session_cmd(
+        key="agent:main:webchat:lease",
+        session_db_path=":memory:",
+        workspace="",
+        config_path="",
+        agent_id="",
+        message_window="all",
+        timeout=None,
+        flush_max_chars=None,
+        segment_mode="auto",
+        segment_max_chars=None,
+        segment_overlap_messages=0,
+        usage_path="",
+        json_output=True,
+    )
+
+    assert lease_active is False
+    assert '"ok": true' in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_flush_session_uses_durable_session_correlation(monkeypatch) -> None:
+    session_manager = SimpleNamespace(
+        get_transcript=AsyncMock(return_value=[SimpleNamespace(content="hello")]),
+        get_session=AsyncMock(
+            return_value=SimpleNamespace(session_id="durable-session-1")
+        ),
+    )
+    receipt = SimpleNamespace(
+        to_dict=lambda: {
+            "mode": "llm",
+            "indexed_chunk_count": 1,
+            "integrity_status": "ok",
+            "output_coverage_status": "ok",
+            "invalid_candidate_count": 0,
+            "candidate_missing_ids": [],
+            "obligation_status": "ok",
+            "obligation_missing_ids": [],
+        }
+    )
+    flush_service = SimpleNamespace(execute=AsyncMock(return_value=receipt))
+    services = SimpleNamespace(
+        session_manager=session_manager,
+        flush_service=flush_service,
+        memory_stores={},
+        close=AsyncMock(),
+    )
+
+    async def build_services(**_kwargs):
+        return services
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", build_services)
+
+    result = await run_memory_flush_session(
+        key="agent:main:webchat:test",
+        session_db_path="/synthetic/session.db",
+        config=GatewayConfig(memory={"flush_enabled": True}),
+    )
+
+    assert result.ok is True
+    flush_kwargs = flush_service.execute.await_args.kwargs
+    correlation = flush_kwargs["provider_request_correlation"]
+    assert correlation.session_id == "durable-session-1"
+    assert correlation.turn_id == flush_kwargs["turn_id"]
+    assert correlation.execution_id != correlation.turn_id
+    assert correlation.call_kind == "auxiliary.session_flush"

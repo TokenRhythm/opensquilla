@@ -19,7 +19,8 @@ import pytest
 import structlog
 from starlette.websockets import WebSocketState
 
-from opensquilla.gateway.protocol import make_event
+import opensquilla.gateway.websocket as websocket_module
+from opensquilla.gateway.protocol import make_event, make_ok_res
 from opensquilla.gateway.websocket import (
     _LOSSY_EVENTS,
     _SENTINEL_STOP,
@@ -291,6 +292,92 @@ async def test_kill_switch_disabled_uses_legacy_direct_send() -> None:
     assert len(fake.sent) == 1
     payload = json.loads(fake.sent[0])
     assert payload["seq"] == 1
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_direct_send_timeout_closes_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeWebSocket()
+    fake._send_event = asyncio.Event()
+    fake._send_unblock = asyncio.Event()
+    conn = WsConnection(conn_id="cx-legacy-timeout", ws=fake)  # type: ignore[arg-type]
+    conn._start_writer(maxsize=4, enabled=False)
+    monkeypatch.setattr(websocket_module, "_DIRECT_SEND_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            conn.send_event("session.event.text_delta", {"chunk": "x"}),
+            timeout=0.5,
+        )
+
+    assert conn._closing is True
+    assert fake.close_code == 1011
+    assert fake.close_reason == "direct_send_timeout"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_resistant_direct_send_is_bounded_and_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _ShieldedFakeWebSocket()
+    fake._send_event = asyncio.Event()
+    fake._send_unblock = asyncio.Event()
+    conn = WsConnection(conn_id="cx-legacy-shielded", ws=fake)  # type: ignore[arg-type]
+    conn._start_writer(maxsize=4, enabled=False)
+    monkeypatch.setattr(websocket_module, "_DIRECT_SEND_TIMEOUT_SECONDS", 0.01)
+
+    try:
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(
+                conn.send_event("session.event.text_delta", {"chunk": "x"}),
+                timeout=0.5,
+            )
+        elapsed = asyncio.get_running_loop().time() - started
+
+        assert elapsed < 0.5
+        assert conn._closing is True
+        assert fake.close_code == 1011
+
+        # The cancellation-resistant socket still owns the original low-level
+        # send, but the connection is terminal and cannot start a second one.
+        await conn.send_event("session.event.text_delta", {"chunk": "late"})
+        await conn.send_res(make_ok_res("late-response", {"ok": True}))
+        await conn.send_raw_text('{"type":"pong"}')
+        assert fake._send_event.is_set() is True
+        assert fake.sent == []
+    finally:
+        fake._send_unblock.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_raw_pong_uses_the_connection_writer_queue() -> None:
+    fake = _FakeWebSocket()
+    conn = WsConnection(conn_id="cx-raw-pong", ws=fake)  # type: ignore[arg-type]
+    conn._start_writer(maxsize=4, enabled=True)
+    try:
+        await conn.send_raw_text('{"type":"pong"}')
+        await _flush_writer(conn)
+        assert fake.sent == ['{"type":"pong"}']
+    finally:
+        await conn._stop_writer()
+
+
+@pytest.mark.asyncio
+async def test_stopped_writer_refuses_event_response_and_raw_fallback_sends() -> None:
+    fake = _FakeWebSocket()
+    conn = WsConnection(conn_id="cx-stopped", ws=fake)  # type: ignore[arg-type]
+    conn._start_writer(maxsize=4, enabled=True)
+    await conn._stop_writer()
+
+    await conn.send_event("session.event.text_delta", {"chunk": "late"})
+    await conn.send_res(make_ok_res("late-response", {"ok": True}))
+    await conn.send_raw_text('{"type":"pong"}')
+
+    assert conn._closing is True
+    assert fake.sent == []
 
 
 # ---------------------------------------------------------------------------

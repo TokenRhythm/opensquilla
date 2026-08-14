@@ -5,6 +5,7 @@
   "priority": 1,
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["vitest", "run-vitest.mjs"],
     "commandIncludesAny": ["vitest", "run-vitest.mjs"]
   },
   "transforms": {

@@ -27,6 +27,7 @@ from opensquilla.tools.envelope import build_tool_failure_envelope
 from opensquilla.tools.policy.types import DispatchInput, PolicyDecision
 from opensquilla.tools.policy_helpers import private_memory_read_tool_denied
 from opensquilla.tools.types import CallerKind, ToolContext
+from opensquilla.tools.visibility import guest_safe_tool_allowed
 
 
 def _denial_envelope(
@@ -86,6 +87,38 @@ def _block_log_event(
         "agent_id": ctx.agent_id if ctx else None,
         "session_key": ctx.session_key if ctx else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# Guest hard allow list
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GuestSafePolicy:
+    """Default-deny every guest tool outside the reviewed safe surface."""
+
+    name: str = "guest_safe_allowlist"
+
+    def evaluate(self, d: DispatchInput) -> PolicyDecision:
+        if guest_safe_tool_allowed(d.ctx, d.tool_call.tool_name):
+            return PolicyDecision(allowed=True)
+        envelope = _denial_envelope(
+            d.tool_call,
+            exc=PermissionError("guest tool blocked"),
+            error_class_override="PolicyDenied",
+            user_message_override=(
+                f"Tool '{d.tool_call.tool_name}' not available in this context."
+            ),
+        )
+        log_event = _block_log_event(
+            d.tool_call,
+            d.ctx,
+            event="dispatch.defense_in_depth_block",
+            reason="guest_safe_not_allowed",
+        )
+        return PolicyDecision(allowed=False, envelope=envelope, log_event=log_event)
+
 
 # ---------------------------------------------------------------------------
 # Owner-only
@@ -264,13 +297,13 @@ class PermissionMatrixPolicy:
     def evaluate(self, d: DispatchInput) -> PolicyDecision:
         ctx = d.ctx
         if ctx and ctx.caller_kind is CallerKind.CHANNEL:
-            # Defense-in-depth: CHANNEL callers must never reach operator role
-            # regardless of is_owner. Owner promotion happens upstream in the
-            # owner-resolver, not here, so an is_owner=True leak from a future
-            # ctx constructor must not silently widen channel permissions.
+            # Only the authenticated channel ingress boundary can set
+            # ``channel_admin_verified``. A generic ``is_owner`` context is
+            # insufficient so accidental owner propagation cannot widen an
+            # untrusted channel caller.
             principal = Principal(
-                role="user",
-                channel_id=ctx.session_key,
+                role="operator" if ctx.channel_admin_verified else "user",
+                channel_id=ctx.channel_id or ctx.session_key,
             )
             channel_kind = (
                 CHANNEL_WEBUI

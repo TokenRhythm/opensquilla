@@ -17,10 +17,13 @@ by every caller (gateway, CLI, cron, channel adapters). The pipeline is:
 from __future__ import annotations
 
 import asyncio
+import difflib
+import hashlib
 import json
 import os
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -58,6 +61,7 @@ from opensquilla.tools.argument_normalization import (
     format_alias_conflicts,
 )
 from opensquilla.tools.envelope import build_tool_failure_envelope
+from opensquilla.tools.plan_access import preflight_plan_access
 from opensquilla.tools.policy import DispatchInput, finalize, run_chain_with_emit
 from opensquilla.tools.projected_arguments import find_projected_tool_argument
 from opensquilla.tools.registry import ToolRegistry
@@ -81,11 +85,52 @@ _PROVIDER_REPLAY_ARGUMENT_PREFIX = "_opensquilla_replay_"
 _MISSING_REQUIRED_ARGUMENT_SHAPE_GUIDANCE_ENV = (
     "OPENSQUILLA_MISSING_REQUIRED_ARGUMENT_SHAPE_GUIDANCE"
 )
+_REPEATED_CALL_NOTICE_ENV = "OPENSQUILLA_REPEATED_CALL_NOTICE"
+# Repeat-tracking state per handler closure holds keys and hashes only, never
+# result content.
+_REPEATED_CALL_NOTICE_MAX_ENTRIES = 1024
+# ToolSpec carries no mutating/read-only flag, so hash-compare only tools whose
+# results are pure functions of their arguments and observed state. Execution
+# and write tools stay excluded: byte-identical output from them is no proof
+# the call had no effect.
+_REPEATED_CALL_NOTICE_SAFE_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "read_file",
+        "read_source",
+        "read_spreadsheet",
+        "list_dir",
+        "glob_search",
+        "grep_search",
+        "source_symbols",
+        "git_status",
+        "git_diff",
+        "git_log",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _plan_access_preflight(
+    tool_call: ToolCall,
+    registered: Any,
+    ctx: ToolContext | None,
+) -> ToolResult | None:
+    denial = preflight_plan_access(tool_call, registered, ctx)
+    if denial is None:
+        return None
+    log.warning(
+        "dispatch.defense_in_depth_block",
+        tool=tool_call.tool_name,
+        reason="plan_mode_denied",
+        tool_use_id=tool_call.tool_use_id,
+        agent_id=ctx.agent_id if ctx else None,
+        session_key=ctx.session_key if ctx else None,
+    )
+    return denial
 
 
 def _resolve_budget_policy(ctx: ToolContext | None) -> ToolResultBudgetPolicy:
@@ -445,6 +490,7 @@ def _record_invalid_tool_arguments_event(
     required: list[str] | None = None,
     errors: list[str] | None = None,
     shape_guidance_enabled: bool | None = None,
+    example_guidance_emitted: bool | None = None,
 ) -> None:
     if effective_ctx is None or effective_ctx.on_runtime_event is None:
         return
@@ -470,8 +516,59 @@ def _record_invalid_tool_arguments_event(
         event["errors"] = errors
     if shape_guidance_enabled is not None:
         event["shape_guidance_enabled"] = shape_guidance_enabled
+    if example_guidance_emitted is not None:
+        event["example_guidance_emitted"] = example_guidance_emitted
     try:
         effective_ctx.on_runtime_event(event)
+    except Exception:
+        return
+
+
+def _closest_tool_names(
+    target: str,
+    candidates: list[str],
+    *,
+    limit: int = 3,
+    cutoff: float = 0.6,
+) -> list[str]:
+    """Return up to ``limit`` registered tool names closest to ``target``.
+
+    Used to offer an advisory "did you mean" hint on a registry miss so the
+    model can recover a mistyped or glued tool name instead of blindly
+    retrying an unavailable one. Pure stdlib difflib; returns an empty list
+    when nothing clears the similarity ``cutoff``.
+    """
+    if not target or not candidates:
+        return []
+    return difflib.get_close_matches(target, candidates, n=limit, cutoff=cutoff)
+
+
+def _record_registry_miss_event(
+    ctx: ToolContext | None,
+    tool_call: ToolCall,
+    *,
+    is_skill: bool,
+    untrusted: bool,
+    suggestions: list[str],
+) -> None:
+    if ctx is None or ctx.on_runtime_event is None:
+        return
+    event: dict[str, Any] = {
+        "feature": "tool_dispatch",
+        "name": "dispatch.registry_miss",
+        "tool": tool_call.tool_name,
+        "tool_name": tool_call.tool_name,
+        "tool_use_id": tool_call.tool_use_id,
+        "is_skill": is_skill,
+        "untrusted_caller": untrusted,
+        "suggestions": suggestions,
+        "suggestion_emitted": bool(suggestions),
+        "executed": False,
+        "agent_id": ctx.agent_id,
+        "session_key": ctx.session_key,
+    }
+    try:
+        ctx.on_runtime_event(event)
     except Exception:
         return
 
@@ -884,6 +981,13 @@ def _check_schema_valid_arguments(
         f"schema: {'; '.join(errors[:5])}. Reissue the tool call with corrected "
         "JSON arguments."
     )
+    guidance = _invalid_argument_guidance(
+        tool_call.tool_name,
+        missing=[],
+        effective_ctx=effective_ctx,
+    )
+    if guidance:
+        user_message = f"{user_message}{guidance}"
     log.warning(
         "dispatch.invalid_tool_arguments",
         tool=tool_call.tool_name,
@@ -893,12 +997,14 @@ def _check_schema_valid_arguments(
         reason="schema_validation_failed",
         errors=errors[:5],
         argument_keys=sorted(str(name) for name in tool_call.arguments if str(name)),
+        example_guidance_emitted=bool(guidance),
     )
     _record_invalid_tool_arguments_event(
         effective_ctx,
         tool_call,
         reason="schema_validation_failed",
         errors=errors[:5],
+        example_guidance_emitted=bool(guidance),
     )
     return _build_invalid_attempt_result(
         tool_call,
@@ -981,6 +1087,128 @@ def _normalize_common_tool_argument_aliases(
     ), None
 
 
+def _repeated_call_notice_threshold() -> int:
+    raw = os.environ.get(_REPEATED_CALL_NOTICE_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def _record_repeated_call_notice_event(
+    effective_ctx: ToolContext | None,
+    tool_call: ToolCall,
+    *,
+    arguments_sha256: str,
+    result_sha256: str,
+    repeat_count: int,
+    threshold: int,
+) -> None:
+    if effective_ctx is None or effective_ctx.on_runtime_event is None:
+        return
+    event: dict[str, Any] = {
+        "feature": "repeated_call_notice",
+        "name": "dispatch.repeated_call_notice",
+        "tool": tool_call.tool_name,
+        "tool_name": tool_call.tool_name,
+        "tool_use_id": tool_call.tool_use_id,
+        "arguments_sha256": arguments_sha256,
+        "result_sha256": result_sha256,
+        "repeat_count": repeat_count,
+        "threshold": threshold,
+        "injected_to_model": True,
+        "agent_id": effective_ctx.agent_id,
+        "session_key": effective_ctx.session_key,
+    }
+    try:
+        effective_ctx.on_runtime_event(event)
+    except Exception:
+        return
+
+
+def _inject_repeated_call_notice(content: str, notice: str) -> str:
+    # Downstream consumers json.loads structured tool results (the
+    # result_truncated wrapper); those must stay parseable, so the wrapper
+    # gets the notice as a key. Anything else — including file bodies that
+    # happen to be JSON — must keep its exact bytes, so it gets a text prefix.
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict) and payload.get("result_truncated") is True:
+        payload["repeated_call_notice"] = notice
+        return json.dumps(payload, ensure_ascii=False)
+    return f"{notice}\n{content}"
+
+
+def _maybe_apply_repeated_call_notice(
+    final_result: ToolResult,
+    *,
+    tool_call: ToolCall,
+    effective_ctx: ToolContext | None,
+    raw_result: Any,
+    exception: BaseException | None,
+    seen: OrderedDict[tuple[str, str, str], tuple[int, str]],
+) -> ToolResult:
+    threshold = _repeated_call_notice_threshold()
+    if threshold <= 0:
+        return final_result
+    if (
+        exception is not None
+        or final_result.is_error
+        or tool_call.tool_name not in _REPEATED_CALL_NOTICE_SAFE_TOOL_NAMES
+        or not isinstance(raw_result, str)
+    ):
+        return final_result
+    arguments_payload = json.dumps(
+        tool_call.arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    args_sha = hashlib.sha256(arguments_payload.encode("utf-8")).hexdigest()
+    # Hash the pre-budget result: the per-turn budget tracker is stateful, so
+    # finalized content is not byte-stable across identical calls.
+    result_sha = hashlib.sha256(raw_result.encode("utf-8")).hexdigest()
+    # Subagents share the handler closure via current_tool_context; keying on
+    # session_key keeps their counters independent of the parent's. Callers
+    # with no session identity are never counted: an id()-derived fallback
+    # aliases (id reuse after GC; every None ctx shares one id) and could
+    # merge unrelated callers into one counter.
+    if effective_ctx is None or not effective_ctx.session_key:
+        return final_result
+    scope_key = effective_ctx.session_key
+    key = (scope_key, tool_call.tool_name, args_sha)
+    previous = seen.get(key)
+    if previous is not None and previous[1] == result_sha:
+        count = previous[0] + 1
+    else:
+        count = 1
+    seen[key] = (count, result_sha)
+    seen.move_to_end(key)
+    while len(seen) > _REPEATED_CALL_NOTICE_MAX_ENTRIES:
+        seen.popitem(last=False)
+    if count < threshold:
+        return final_result
+    notice = (
+        f"[repeated_call_notice] This exact {tool_call.tool_name} call has "
+        f"already been run {count} times this session and returned an "
+        "identical result each time."
+    )
+    final_result.content = _inject_repeated_call_notice(final_result.content, notice)
+    _record_repeated_call_notice_event(
+        effective_ctx,
+        tool_call,
+        arguments_sha256=args_sha,
+        result_sha256=result_sha,
+        repeat_count=count,
+        threshold=threshold,
+    )
+    return final_result
+
+
 def _is_untrusted_caller(ctx: ToolContext | None) -> bool:
     """Return True when the caller cannot be trusted with tool-name disclosure.
 
@@ -999,9 +1227,18 @@ def _resolve_registry_miss(
     tool_call: ToolCall,
     known_skill_names: frozenset[str],
     ctx: ToolContext | None,
+    registry: ToolRegistry,
 ) -> ToolResult:
     untrusted = _is_untrusted_caller(ctx)
     is_skill = tool_call.tool_name in known_skill_names
+
+    # Advisory "did you mean" recovery hint. Only computed for trusted callers
+    # on the generic path: untrusted callers receive an opaque envelope (below)
+    # and must not be able to enumerate the catalogue, skills have their own
+    # redirect, and ``bash`` has a targeted exec_command redirect.
+    suggestions: list[str] = []
+    if not untrusted and not is_skill and tool_call.tool_name != "bash":
+        suggestions = _closest_tool_names(tool_call.tool_name, registry.list_names())
 
     # Always record the actual tool name in the structured log so operators
     # retain debug visibility regardless of what the caller is allowed to see.
@@ -1013,6 +1250,13 @@ def _resolve_registry_miss(
         untrusted_caller=untrusted,
         agent_id=ctx.agent_id if ctx else None,
         session_key=ctx.session_key if ctx else None,
+    )
+    _record_registry_miss_event(
+        ctx,
+        tool_call,
+        is_skill=is_skill,
+        untrusted=untrusted,
+        suggestions=suggestions,
     )
 
     if untrusted:
@@ -1051,6 +1295,8 @@ def _resolve_registry_miss(
             f"Tool not found: {tool_call.tool_name}. Do not retry unavailable tools; "
             "use only tools listed in Available Tools."
         )
+        if suggestions:
+            user_message += " Did you mean: " + ", ".join(suggestions) + "?"
     return _build_envelope_result(
         tool_call,
         exc=KeyError(tool_call.tool_name),
@@ -1075,7 +1321,11 @@ async def preflight_tool_call(
 
     registered = registry.get(tool_call.tool_name)
     if registered is None:
-        return _resolve_registry_miss(tool_call, known, ctx)
+        return _resolve_registry_miss(tool_call, known, ctx, registry)
+
+    plan_access_denial = _plan_access_preflight(tool_call, registered, ctx)
+    if plan_access_denial is not None:
+        return plan_access_denial
 
     tool_call = _unwrap_nested_json_arguments(tool_call, registered, ctx)
     injection_envelope = _check_injection_guard(tool_call, ctx)
@@ -1154,6 +1404,8 @@ def build_tool_handler(
     ``tool_hooks`` defaults to empty so callers that do not pass hooks are
     bit-for-bit equivalent to the legacy path.
     """
+    if ctx is not None:
+        ctx.validate_path_roots()
     known = frozenset(known_skill_names or ())
     hooks: tuple[ToolHook, ...] = tuple(tool_hooks or ())
     fallback_budget_tracker = _build_budget_tracker(ctx)
@@ -1162,6 +1414,11 @@ def build_tool_handler(
         tuple[weakref.ReferenceType[ToolContext], ToolResultBudgetTracker],
     ] = {}
     keyed_run_budget_trackers: dict[str, ToolRunBudgetTracker] = {}
+    # (scope_key, tool_name, args_sha256) -> (count, last_result_sha256).
+    # One instance per built tool surface; bounded by
+    # _REPEATED_CALL_NOTICE_MAX_ENTRIES and only populated while the
+    # OPENSQUILLA_REPEATED_CALL_NOTICE gate is armed.
+    repeated_call_seen: OrderedDict[tuple[str, str, str], tuple[int, str]] = OrderedDict()
 
     def _budget_tracker_for(effective_ctx: ToolContext | None) -> ToolResultBudgetTracker:
         if effective_ctx is None or effective_ctx is ctx:
@@ -1204,7 +1461,15 @@ def build_tool_handler(
         # 2. Registry lookup.
         registered = registry.get(tool_call.tool_name)
         if registered is None:
-            return _resolve_registry_miss(tool_call, known, effective_ctx)
+            return _resolve_registry_miss(tool_call, known, effective_ctx, registry)
+
+        plan_access_denial = _plan_access_preflight(
+            tool_call,
+            registered,
+            effective_ctx,
+        )
+        if plan_access_denial is not None:
+            return plan_access_denial
 
         tool_call = _unwrap_nested_json_arguments(tool_call, registered, effective_ctx)
         injection_envelope = _check_injection_guard(tool_call, effective_ctx)
@@ -1411,7 +1676,7 @@ def build_tool_handler(
                         exception=exception,
                     )
                     # 7. Single finalisation point.
-                    return await finalize(
+                    final_result = await finalize(
                         tool_call,
                         effective_ctx,
                         raw_result,
@@ -1420,7 +1685,27 @@ def build_tool_handler(
                         _budget_tracker_for(effective_ctx),
                         registered,
                     )
+                    # Applied after finalize so the notice survives every
+                    # ToolResultBudgetPolicy cap; hooks above still observe
+                    # the unmodified raw outcome.
+                    return _maybe_apply_repeated_call_notice(
+                        final_result,
+                        tool_call=tool_call,
+                        effective_ctx=effective_ctx,
+                        raw_result=raw_result,
+                        exception=exception,
+                        seen=repeated_call_seen,
+                    )
             finally:
                 current_tool_context.reset(token)
 
+    # Agent-side lossy projection is only safe when the callable can actually
+    # dispatch the provider-visible recovery tool.  Keep this capability on
+    # the handler itself so embedded Agents and wrapped Meta children do not
+    # mistake an arbitrary non-null callback for a retrieval implementation.
+    setattr(
+        _handler,
+        "_opensquilla_available_tools",
+        frozenset(registry.list_names()),
+    )
     return _handler

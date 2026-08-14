@@ -35,7 +35,7 @@ test.describe('Console clarity', () => {
     await expect(settingsRow).toHaveAttribute('data-icon', 'settings')
     await expect(page.locator('.sidebar-nav-group-toggle')).toHaveCount(0)
     await expect(page.locator('.sidebar-core .sidebar-fn-label')).toHaveText([
-      'Sessions', 'Overview', 'Skills & Channels', 'Cron',
+      'Overview', 'Skills & Channels', 'Cron',
     ])
   })
 
@@ -104,6 +104,33 @@ test.describe('Console clarity', () => {
         expect(actions).not.toBeNull()
         expect(tabs!.x + tabs!.width).toBeLessThanOrEqual(actions!.x)
       }
+    }
+  })
+
+  test('Channels aligns its refresh action with the hub tabs only on desktop', async ({ page }) => {
+    for (const scenario of [
+      { width: 900, height: 800, inline: true },
+      { width: 390, height: 844, inline: false },
+    ]) {
+      await page.setViewportSize({ width: scenario.width, height: scenario.height })
+      await openControl(page, 'channels')
+
+      const tabs = await page.locator('.route-hub__tabs').boundingBox()
+      const actions = await page.locator('.ch-stage__actions').boundingBox()
+      expect(tabs).not.toBeNull()
+      expect(actions).not.toBeNull()
+
+      if (scenario.inline) {
+        const tabsCenter = tabs!.y + tabs!.height / 2
+        const actionsCenter = actions!.y + actions!.height / 2
+        expect(Math.abs(tabsCenter - actionsCenter)).toBeLessThanOrEqual(2)
+      } else {
+        expect(actions!.y).toBeGreaterThanOrEqual(tabs!.y + tabs!.height)
+      }
+
+      const overflow = await page.evaluate(() =>
+        document.documentElement.scrollWidth - document.documentElement.clientWidth)
+      expect(overflow).toBeLessThanOrEqual(0)
     }
   })
 

@@ -54,6 +54,33 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
     assert catalog.resolve_context_window("deepseek-v4-flash", "deepseek") == 1_000_000
 
 
+def test_tokenrhythm_v4_flash_0731_offline_metadata_is_exact_and_scoped() -> None:
+    catalog = ModelCatalog()
+
+    entry = catalog.resolve_entry("deepseek-v4-flash-0731", provider="tokenrhythm")
+    assert entry.context_window == 1_000_000
+    assert entry.max_output_tokens == 384_000
+    assert entry.supports_reasoning is True
+    assert entry.supports_tools is True
+    assert entry.supports_vision is False
+    assert entry.reasoning_format == "none"
+    assert entry.status == "testing"
+    assert entry.input_cost_per_mtok == pytest.approx(0.14336917562724014)
+    assert entry.output_cost_per_mtok == pytest.approx(0.2867383512544803)
+    assert entry.cache_read_cost_per_mtok == pytest.approx(0.002867383512544803)
+    assert catalog.resolve_context_window(
+        "deepseek-v4-flash-0731", provider="tokenrhythm"
+    ) == 1_000_000
+    assert catalog.resolve_max_tokens(
+        "deepseek-v4-flash-0731", provider="tokenrhythm"
+    ) == 384_000
+
+    direct = catalog.resolve_entry("deepseek-v4-flash-0731", provider="deepseek")
+    assert direct.input_cost_per_mtok is None
+    assert direct.output_cost_per_mtok is None
+    assert direct.cache_read_cost_per_mtok is None
+
+
 def test_direct_profile_windows_resolve_from_models_dev_snapshot() -> None:
     catalog = ModelCatalog()
 

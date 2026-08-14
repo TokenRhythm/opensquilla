@@ -20,13 +20,15 @@ future AgentConfig-validation early-yield branch.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
+from opensquilla.engine.route_plan import pin_route_plan
 from opensquilla.engine.runtime_recovery import (
     normalize_reasoning_prefill_recovery_mode,
     normalize_runtime_recovery_mode,
 )
+from opensquilla.tools.write_policy import validate_workspace_write_deny_env
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -36,7 +38,7 @@ if TYPE_CHECKING:
     from opensquilla.engine.types import AgentConfig, ThinkingLevel
     from opensquilla.observability.turn_call_log import TurnCallLogger
     from opensquilla.provider.protocol import LLMProvider
-    from opensquilla.provider.types import ModelCapabilities
+    from opensquilla.provider.types import ModelCapabilities, ProviderRequestCorrelation
     from opensquilla.tools.types import ToolContext
 
 _PROGRESS_WATCHDOG_MODES = frozenset({"off", "log", "warn_model", "block"})
@@ -178,6 +180,132 @@ def _finalize_evidence_gate_from_env(config_value: bool = False) -> bool:
     )
 
 
+_FINALIZE_EVIDENCE_STRICT_ENV = "OPENSQUILLA_FINALIZE_EVIDENCE_STRICT"
+
+
+def _finalize_evidence_strict_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in strict mode of the finalize-time evidence gate.
+
+    Default off. A non-blank ``OPENSQUILLA_FINALIZE_EVIDENCE_STRICT``
+    overrides ``config_value``. Strict implies the gate itself (the loop
+    activates the tracker when either flag is on). Unrecognized env values
+    raise instead of being silently ignored so a run manifest cannot record
+    an override the run did not actually apply.
+    """
+    raw = os.environ.get(_FINALIZE_EVIDENCE_STRICT_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _FINALIZE_EVIDENCE_GATE_ON:
+        return True
+    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
+        return False
+    raise ValueError(
+        f"{_FINALIZE_EVIDENCE_STRICT_ENV} must be one of: "
+        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
+    )
+
+
+_SCRATCH_VERIFY_MIRROR_ENV = "OPENSQUILLA_SCRATCH_VERIFY_MIRROR"
+
+
+def _scratch_verify_mirror_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in scratch verify-mirror flag.
+
+    Default off. A non-blank ``OPENSQUILLA_SCRATCH_VERIFY_MIRROR`` overrides
+    ``config_value``. Unrecognized env values raise instead of being silently
+    ignored so a run manifest cannot record an override the run did not
+    actually apply.
+    """
+    raw = os.environ.get(_SCRATCH_VERIFY_MIRROR_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _FINALIZE_EVIDENCE_GATE_ON:
+        return True
+    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
+        return False
+    raise ValueError(
+        f"{_SCRATCH_VERIFY_MIRROR_ENV} must be one of: "
+        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
+    )
+
+
+_FINALIZE_VARIANT_CHALLENGE_ENV = "OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE"
+
+
+def _finalize_variant_challenge_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in finalize-time variant-sweep challenge flag.
+
+    Default off. A non-blank ``OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE``
+    overrides ``config_value``. Unrecognized env values raise instead of
+    being silently ignored so a run manifest cannot record an override the
+    run did not actually apply.
+    """
+    raw = os.environ.get(_FINALIZE_VARIANT_CHALLENGE_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _FINALIZE_EVIDENCE_GATE_ON:
+        return True
+    if raw in _FINALIZE_EVIDENCE_GATE_OFF:
+        return False
+    raise ValueError(
+        f"{_FINALIZE_VARIANT_CHALLENGE_ENV} must be one of: "
+        + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
+    )
+
+
+_SUBMIT_REVIEW_ENV = "OPENSQUILLA_SUBMIT_REVIEW"
+_SUBMIT_REVIEW_ON = frozenset({"on", "1", "true", "yes"})
+_SUBMIT_REVIEW_OFF = frozenset({"off", "0", "false", "no"})
+
+
+def _submit_review_from_env(config_value: bool = False) -> bool:
+    """Resolve the opt-in review-on-submit checkpoint flag.
+
+    Default off. A non-blank ``OPENSQUILLA_SUBMIT_REVIEW`` overrides
+    ``config_value``. Unlike the finalize-evidence gate there is no gateway aux
+    mirror: the review has no system-prompt section that could disagree with the
+    loop behaviour. Unrecognized env values raise instead of being silently
+    ignored so an experiment manifest cannot record a lever the run did not
+    actually apply.
+    """
+    raw = os.environ.get(_SUBMIT_REVIEW_ENV, "").strip().lower()
+    if not raw:
+        return bool(config_value)
+    if raw in _SUBMIT_REVIEW_ON:
+        return True
+    if raw in _SUBMIT_REVIEW_OFF:
+        return False
+    raise ValueError(
+        f"{_SUBMIT_REVIEW_ENV} must be one of: "
+        + ", ".join(sorted(_SUBMIT_REVIEW_ON | _SUBMIT_REVIEW_OFF))
+    )
+
+
+_PATCH_HYGIENE_BLOCK_ENV = "OPENSQUILLA_PATCH_HYGIENE_BLOCK"
+_PATCH_HYGIENE_BLOCK_MODES = ("off", "test_paths", "protected_paths")
+
+
+def _patch_hygiene_block_from_env(
+    config_value: Literal["off", "test_paths", "protected_paths"] = "off",
+) -> Literal["off", "test_paths", "protected_paths"]:
+    """Resolve the finalize-time patch hygiene hard-block mode.
+
+    Default off. A non-blank ``OPENSQUILLA_PATCH_HYGIENE_BLOCK`` overrides
+    ``config_value``. Unrecognized env values raise instead of being silently
+    ignored so a run manifest cannot record an override the run did not
+    actually apply.
+    """
+    raw = os.environ.get(_PATCH_HYGIENE_BLOCK_ENV, "").strip().lower()
+    if not raw:
+        return config_value
+    if raw in _PATCH_HYGIENE_BLOCK_MODES:
+        return raw  # type: ignore[return-value]
+    raise ValueError(
+        f"{_PATCH_HYGIENE_BLOCK_ENV} must be one of: "
+        + ", ".join(_PATCH_HYGIENE_BLOCK_MODES)
+    )
+
+
 def _positive_int_from_env(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -205,9 +333,40 @@ def _bool_from_env(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in _TRUE_ENV_VALUES
 
 
+def _strict_bool_from_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in _FINALIZE_EVIDENCE_GATE_ON:
+        return True
+    if normalized in _FINALIZE_EVIDENCE_GATE_OFF:
+        return False
+    raise ValueError(
+        f"{name} must be one of: "
+        + ", ".join(
+            sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF)
+        )
+    )
+
+
 def _name_tuple_from_env(name: str) -> tuple[str, ...]:
     raw = os.environ.get(name, "")
     return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+def _projection_signal_hints_from_env() -> bool:
+    """Parse OPENSQUILLA_PROJECTION_SIGNAL_HINTS through the runtime gate.
+
+    Delegating keeps bootstrap and per-request resolution on one on/off
+    vocabulary: an unrecognized value raises here, at bootstrap, instead of
+    surviving as False and then raising mid-turn when the agent re-reads the
+    env. Local import; the engine.agent module is import-cycle-safe from
+    this stage only at call time.
+    """
+    from opensquilla.engine.agent import _projection_signal_hints_enabled
+
+    return _projection_signal_hints_enabled(False)
 
 
 # ---------------------------------------------------------------------------
@@ -236,6 +395,17 @@ class _ResolvedCatalog:
     max_tokens: int
     context_window: int
     capabilities: ModelCapabilities | None
+    # Raw positive global ``llm.context_window_tokens`` value, or zero when
+    # unset. This is deliberately distinct from ``context_window`` because a
+    # per-model override may win for the current deployment while the global
+    # value still governs a later selector fallback without its own override.
+    context_window_tokens_global_override: int = 0
+    # Provider/model ceiling resolved without the global llm.max_tokens
+    # override. Physical fallback uses it only when ``auto_max_tokens_known``
+    # is true, so unknown/self-hosted models are never capped by a generic
+    # default.
+    auto_max_tokens: int = 0
+    auto_max_tokens_known: bool = False
     temperature: float | None = None
     top_p: float | None = None
     # Explicit provider-request proof budget (chars); 0 keeps the derived path.
@@ -268,6 +438,8 @@ class _AgentConfigAuxiliaries:
     flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"]
     compaction_profile: Literal["conversation", "coding", "research", "support"]
     compaction_protected_recent_messages: int
+    compaction_total_timeout_seconds: float
+    compaction_heartbeat_interval_seconds: float
     # Agent-token-cfg-derived
     tool_result_projection_max_inline_chars: int
     tool_result_fresh_diagnostic_policy_enabled: bool
@@ -443,6 +615,7 @@ class AgentFactoryPort(Protocol):
         session_epoch: int = 0,
         agent_id: str = "",
         run_kind: str = "agent",
+        provider_request_correlation: ProviderRequestCorrelation | None = None,
     ) -> Agent: ...
 
 
@@ -491,6 +664,10 @@ class AgentBootstrapStageInput:
     turn_id: str = ""
     run_kind: str = "agent"
     session_epoch: int = 0
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -599,8 +776,40 @@ class AgentBootstrapStage:
             max_provider_retries=inp.max_provider_retries,
         )
 
-        # 2. Resolve max_tokens, context_window, capabilities from catalog
-        catalog = self._model_catalog.lookup(inp.resolved_model, inp.active_provider_id)
+        # 2. Resolve max_tokens, context_window, capabilities from catalog.
+        # Prefer the exact in-process ProviderConfig when the selector wrapper
+        # exposes it; provider/model route metadata cannot distinguish two
+        # TokenRhythm credentials serving the same model id.
+        deployment_lookup = getattr(
+            self._model_catalog,
+            "lookup_deployment",
+            None,
+        )
+        active_deployment_config = getattr(
+            inp.provider,
+            "active_deployment_config",
+            None,
+        )
+        deployment = (
+            active_deployment_config()
+            if callable(active_deployment_config)
+            else None
+        )
+        if (
+            deployment is not None
+            and callable(deployment_lookup)
+            and str(getattr(deployment, "model", "") or "").strip()
+            == inp.resolved_model
+        ):
+            catalog = deployment_lookup(
+                deployment,
+                include_global_overrides=True,
+            )
+        else:
+            catalog = self._model_catalog.lookup(
+                inp.resolved_model,
+                inp.active_provider_id,
+            )
 
         # 3. Build AgentConfig auxiliaries (thinking, projection, store, mem cfg)
         aux = self._agent_config_builder.build_auxiliaries(
@@ -610,10 +819,136 @@ class AgentBootstrapStage:
             turn=inp.turn,
         )
         agent_metadata = inp.turn.metadata
+        fallback_capabilities: dict[
+            tuple[str, str],
+            tuple[int, int, ModelCapabilities | None],
+        ] = {}
+        private_fallback_limits: list[tuple[Any, int, int]] = []
+        fallback_deployment_configs = getattr(
+            inp.provider,
+            "fallback_deployment_configs",
+            None,
+        )
+        if callable(fallback_deployment_configs):
+            for deployment in fallback_deployment_configs():
+                fallback_model = str(
+                    getattr(deployment, "model", "") or ""
+                ).strip()
+                fallback_provider = str(
+                    getattr(deployment, "provider", "") or ""
+                ).strip()
+                if not fallback_model or not fallback_provider:
+                    continue
+                fallback_catalog = (
+                    deployment_lookup(
+                        deployment,
+                        include_global_overrides=False,
+                    )
+                    if callable(deployment_lookup)
+                    else self._model_catalog.lookup(
+                        fallback_model,
+                        fallback_provider,
+                    )
+                )
+                effective_max_tokens = (
+                    fallback_catalog.auto_max_tokens
+                    if fallback_catalog.auto_max_tokens_known
+                    else 0
+                )
+                private_fallback_limits.append(
+                    (
+                        deployment,
+                        fallback_catalog.context_window,
+                        effective_max_tokens,
+                    )
+                )
+                fallback_capabilities.setdefault(
+                    (fallback_provider, fallback_model),
+                    (
+                        fallback_catalog.context_window,
+                        effective_max_tokens,
+                        fallback_catalog.capabilities,
+                    ),
+                )
+        route_provider = str(
+            agent_metadata.get("routed_provider")
+            or inp.active_provider_id
+            or ""
+        )
+        fallback_sources = (
+            agent_metadata.get("router_fallback_chain"),
+            agent_metadata.get("selector_execution_chain"),
+        )
+        for raw_fallbacks in fallback_sources:
+            if not isinstance(raw_fallbacks, list):
+                continue
+            for raw_fallback in raw_fallbacks:
+                if not isinstance(raw_fallback, dict):
+                    continue
+                fallback_model = str(raw_fallback.get("model") or "").strip()
+                if not fallback_model:
+                    continue
+                fallback_provider = str(
+                    raw_fallback.get("provider") or route_provider
+                ).strip()
+                if (fallback_provider, fallback_model) in fallback_capabilities:
+                    continue
+                fallback_catalog = self._model_catalog.lookup(
+                    fallback_model,
+                    fallback_provider,
+                )
+                fallback_capabilities[(fallback_provider, fallback_model)] = (
+                    fallback_catalog.context_window,
+                    (
+                        fallback_catalog.auto_max_tokens
+                        if fallback_catalog.auto_max_tokens_known
+                        else 0
+                    ),
+                    fallback_catalog.capabilities,
+                )
+        configure_private_fallback_limits = getattr(
+            inp.provider,
+            "configure_fallback_deployment_limits",
+            None,
+        )
+        if callable(configure_private_fallback_limits):
+            configure_private_fallback_limits(private_fallback_limits)
+        configure_fallback_limits = getattr(
+            inp.provider,
+            "configure_fallback_limits",
+            None,
+        )
+        if callable(configure_fallback_limits):
+            configure_fallback_limits(
+                {
+                    identity: (context_window, effective_max_tokens)
+                    for identity, (
+                        context_window,
+                        effective_max_tokens,
+                        _capabilities,
+                    ) in fallback_capabilities.items()
+                }
+            )
+        pin_route_plan(
+            inp.turn,
+            turn_id=inp.turn_id,
+            provider=inp.active_provider_id,
+            model=inp.resolved_model,
+            context_window=catalog.context_window,
+            capabilities=catalog.capabilities,
+            effective_thinking=aux.thinking,
+            fallback_capabilities=fallback_capabilities,
+        )
         agent_metadata["agent_max_iterations"] = budgets.max_iterations
         agent_metadata["agent_max_iterations_source"] = budgets.max_iterations_source
 
         # 4. Construct AgentConfig (declarative, single call site)
+        #
+        # Validation-only gate: the workspace write deny env levers are read
+        # at dispatch time in the tools layer (no AgentConfig fields), but a
+        # typo there must stop the run at startup, not silently disable
+        # enforcement mid-run.
+        validate_workspace_write_deny_env()
         #
         # ``workspace_dir`` is sourced from the per-turn metadata key
         # ``bootstrap_workspace_dir`` (written by ``_run_pipeline`` from
@@ -648,7 +983,13 @@ class AgentBootstrapStage:
             temperature=catalog.temperature,
             top_p=catalog.top_p,
             context_window_tokens=catalog.context_window,
+            context_window_tokens_global_override=(
+                catalog.context_window_tokens_global_override
+            ),
             provider_request_proof_max_chars=catalog.provider_request_proof_max_chars,
+            provider_request_proof_max_chars_explicit=(
+                catalog.provider_request_proof_max_chars > 0
+            ),
             max_history_turns=_route_max_history_turns(inp.turn.metadata),
             preserve_historical_images=_preserve_historical_images(inp.turn.metadata),
             materialize_historical_attachments=bool(
@@ -666,6 +1007,8 @@ class AgentBootstrapStage:
             flush_compaction_safety_mode=aux.flush_compaction_safety_mode,
             compaction_profile=aux.compaction_profile,
             compaction_protected_recent_messages=(aux.compaction_protected_recent_messages),
+            compaction_total_timeout_seconds=aux.compaction_total_timeout_seconds,
+            compaction_heartbeat_interval_seconds=aux.compaction_heartbeat_interval_seconds,
             flush_workspace_dir=aux.flush_workspace_dir,
             model_capabilities=catalog.capabilities,
             thinking=aux.thinking,
@@ -729,6 +1072,23 @@ class AgentBootstrapStage:
             finalize_evidence_gate_enabled=_finalize_evidence_gate_from_env(
                 aux.finalize_evidence_gate
             ),
+            finalize_evidence_strict=_finalize_evidence_strict_from_env(
+                AgentConfig().finalize_evidence_strict
+            ),
+            submit_review_enabled=_submit_review_from_env(),
+            submit_review_diff_max_chars=_positive_int_from_env(
+                "OPENSQUILLA_SUBMIT_REVIEW_DIFF_MAX_CHARS",
+                AgentConfig().submit_review_diff_max_chars,
+            ),
+            patch_hygiene_block_mode=_patch_hygiene_block_from_env(
+                AgentConfig().patch_hygiene_block_mode
+            ),
+            scratch_verify_mirror=_scratch_verify_mirror_from_env(
+                AgentConfig().scratch_verify_mirror
+            ),
+            finalize_variant_challenge=_finalize_variant_challenge_from_env(
+                AgentConfig().finalize_variant_challenge
+            ),
             provider_context_block_feedback=_bool_from_env(
                 "OPENSQUILLA_PROVIDER_CONTEXT_BLOCK_FEEDBACK",
                 AgentConfig().provider_context_block_feedback,
@@ -749,6 +1109,10 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK",
                 AgentConfig().reasoning_only_thinking_fallback,
             ),
+            provider_error_thinking_fallback=_strict_bool_from_env(
+                "OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK",
+                AgentConfig().provider_error_thinking_fallback,
+            ),
             deadline_thinking_off_margin_seconds=_nonnegative_int_from_env(
                 "OPENSQUILLA_DEADLINE_THINKING_OFF_MARGIN_SECONDS",
                 AgentConfig().deadline_thinking_off_margin_seconds,
@@ -764,6 +1128,30 @@ class AgentBootstrapStage:
             endgame_git_freeze_margin_seconds=_nonnegative_int_from_env(
                 "OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS",
                 AgentConfig().endgame_git_freeze_margin_seconds,
+            ),
+            max_iterations_deadline_extend_seconds=_nonnegative_int_from_env(
+                "OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS",
+                AgentConfig().max_iterations_deadline_extend_seconds,
+            ),
+            final_diff_salvage_veto=_bool_from_env(
+                "OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO",
+                AgentConfig().final_diff_salvage_veto,
+            ),
+            endgame_git_freeze_instrumentation_exempt=_bool_from_env(
+                "OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT",
+                AgentConfig().endgame_git_freeze_instrumentation_exempt,
+            ),
+            deadline_wrapup_sticky_thinking_off=_bool_from_env(
+                "OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF",
+                AgentConfig().deadline_wrapup_sticky_thinking_off,
+            ),
+            endgame_fix_directive_margin_seconds=_nonnegative_int_from_env(
+                "OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS",
+                AgentConfig().endgame_fix_directive_margin_seconds,
+            ),
+            reasoning_only_act_now=_bool_from_env(
+                "OPENSQUILLA_REASONING_ONLY_ACT_NOW",
+                AgentConfig().reasoning_only_act_now,
             ),
             mid_budget_no_diff_nudge=_bool_from_env(
                 "OPENSQUILLA_MID_BUDGET_NO_DIFF_NUDGE",
@@ -784,6 +1172,7 @@ class AgentBootstrapStage:
                 "OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS",
                 AgentConfig().provider_history_dedup_min_repeats,
             ),
+            projection_signal_hints=_projection_signal_hints_from_env(),
             tool_loop_observer_mode=_tool_loop_observer_mode_from_env(),
             runtime_recovery_mode=_runtime_recovery_mode_from_env(),
             runtime_recovery_source_loop_max_nudges=_positive_int_from_env(
@@ -831,6 +1220,7 @@ class AgentBootstrapStage:
             session_epoch=inp.session_epoch,
             agent_id=inp.agent_id,
             run_kind=inp.run_kind,
+            provider_request_correlation=inp.provider_request_correlation,
         )
 
         return StageOutcome.success(

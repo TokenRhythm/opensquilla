@@ -4,14 +4,14 @@
     ref="sentinelRef"
     class="history-load-sentinel"
     :class="{ 'history-load-sentinel--idle': idle }"
-    :role="loading || retryable || unavailable ? 'status' : undefined"
-    :aria-live="loading || retryable || unavailable ? 'polite' : undefined"
-    :aria-atomic="loading || retryable || unavailable ? 'true' : undefined"
+    :role="busy || retryable || unavailable ? 'status' : undefined"
+    :aria-live="busy || retryable || unavailable ? 'polite' : undefined"
+    :aria-atomic="busy || retryable || unavailable ? 'true' : undefined"
     data-testid="history-load-sentinel"
   >
     <Transition name="history-load-feedback">
       <span
-        v-if="loading"
+        v-if="busy"
         key="loading"
         class="history-load-sentinel__feedback history-load-sentinel__feedback--loading"
       >
@@ -66,18 +66,22 @@ const retryable = computed(() => (
   props.error
   || (props.canonicalAvailable === false && props.canonicalComplete !== true)
 ))
+const busy = computed(() => (
+  props.loading || Boolean(props.blocked && retryable.value)
+))
 const unavailable = computed(() => (
   !props.hasMore
   && props.canonicalAvailable === true
   && props.canonicalComplete === false
 ))
-const visible = computed(() => props.hasMore || props.loading || retryable.value || unavailable.value)
+const visible = computed(() => props.hasMore || busy.value || retryable.value || unavailable.value)
 const idle = computed(() => (
   props.hasMore && !props.loading && !props.blocked && !retryable.value
 ))
 
 let observer: IntersectionObserver | null = null
 let lastAutoCursor = ''
+const retryRequested = ref(false)
 
 function cursorKey(): string {
   return props.cursor == null ? '' : String(props.cursor)
@@ -103,6 +107,8 @@ function requestEarlier() {
 }
 
 function requestRetry() {
+  if (retryRequested.value || props.blocked || props.loading) return
+  retryRequested.value = true
   emit('retry')
   void nextTick(() => props.scrollContainer?.focus({ preventScroll: true }))
 }
@@ -137,6 +143,7 @@ watch(
     props.blocked,
   ],
   (next, previous) => {
+    if (next[6] !== previous?.[6]) retryRequested.value = false
     if (
       next[4] !== previous?.[4]
       || next[5] !== previous?.[5]
@@ -144,6 +151,13 @@ watch(
       || (previous?.[7] === true && next[7] !== true)
     ) lastAutoCursor = ''
     void nextTick(attach)
+  },
+)
+
+watch(
+  () => Boolean(props.blocked || props.loading),
+  (inFlight, wasInFlight) => {
+    if (!inFlight && wasInFlight) retryRequested.value = false
   },
 )
 

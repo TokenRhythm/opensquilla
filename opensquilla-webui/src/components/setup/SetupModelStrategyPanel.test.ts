@@ -1,4 +1,5 @@
 // @vitest-environment happy-dom
+import { readFileSync } from 'node:fs'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
 import i18n from '@/i18n'
@@ -9,6 +10,7 @@ const FACTS = {
   quorum: 1,
   proposerCount: 2,
   proposerTimeoutSeconds: 300,
+  configuredAggregatorTimeoutSeconds: 3600,
   aggregatorTimeoutSeconds: 480,
   quorumGraceSeconds: 10,
 }
@@ -110,6 +112,7 @@ function panel(overrides: Record<string, unknown> = {}) {
         quorum: 3,
         proposerCount: 4,
         proposerTimeoutSeconds: 300,
+        configuredAggregatorTimeoutSeconds: 3600,
         aggregatorTimeoutSeconds: 480,
         quorumGraceSeconds: 10,
       },
@@ -159,7 +162,10 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.querySelector('[role="radiogroup"]')?.getAttribute('aria-label')).toBe('Choose how models are used')
     expect(el.textContent).toContain('Intelligent model routing')
     expect(el.textContent).toContain('Fixed model')
-    expect(el.textContent).toContain('Multi-model collaboration')
+    expect(el.textContent).toContain('Model ensemble')
+    expect(el.textContent).toContain(
+      'Candidate models answer in parallel, then one aggregator model produces the final reply.',
+    )
     expect(el.querySelector('[role="radiogroup"]')).toBeTruthy()
     const choices = Array.from(el.querySelectorAll<HTMLInputElement>('input[type="radio"][name="setup_model_strategy"]'))
     expect(choices).toHaveLength(3)
@@ -169,10 +175,15 @@ describe('SetupModelStrategyPanel', () => {
     expect(strategyRowsText).toContain('Token-efficient')
     expect(strategyRowsText).toContain('Predictable')
     expect(strategyRowsText).toContain('Capability-first')
+    const strategyBadges = Array.from(el.querySelectorAll<HTMLElement>('.setup-model-strategy__card .control-pill'))
+    expect(strategyBadges).toHaveLength(3)
+    expect(strategyBadges.every(badge => badge.classList.contains('control-pill--info'))).toBe(true)
+    expect(strategyBadges.some(badge => badge.classList.contains('control-pill--ok'))).toBe(false)
+    expect(strategyBadges.some(badge => badge.classList.contains('control-pill--queued'))).toBe(false)
     expect(strategyRowsText).not.toContain('Recommended')
     expect(strategyRowsText).not.toContain('Advanced')
     expect(strategyRowsText).not.toContain('Default')
-    expect(strategyRowsText).not.toContain('Model ensemble')
+    expect(strategyRowsText).not.toContain('Multi-model collaboration')
     expect(el.textContent).not.toContain('Preset and credentials')
     expect(el.textContent).not.toContain('OpenRouter aggregated')
     expect(el.textContent).not.toContain('OpenRouter mix')
@@ -191,6 +202,23 @@ describe('SetupModelStrategyPanel', () => {
     await nextTick()
 
     expect(onUpdateStrategy).toHaveBeenCalledWith('ensemble')
+    app.unmount()
+  })
+
+  it('places model service management beside the page description', async () => {
+    const onGoToSection = vi.fn()
+    const { app, el } = await mountPanel({}, { onGoToSection })
+    const pageMeta = el.querySelector('.setup-model-strategy__page-meta')
+    const manageButton = pageMeta?.querySelector<HTMLButtonElement>('button')
+
+    expect(pageMeta?.textContent).toContain('Choose how models are picked for each request.')
+    expect(manageButton?.textContent).toContain('Manage Model Service')
+    expect(el.textContent).not.toContain('Models come from Model Service.')
+
+    manageButton?.click()
+    await nextTick()
+
+    expect(onGoToSection).toHaveBeenCalledWith('provider')
     app.unmount()
   })
 
@@ -218,22 +246,21 @@ describe('SetupModelStrategyPanel', () => {
   it('shows router details when model router is active', async () => {
     const { app, el } = await mountPanel({ activeStrategy: 'router' })
 
-    expect(el.textContent).toContain('When routing is uncertain')
     expect(el.textContent).toContain('Model roles')
-    expect(el.textContent).toContain('Choose models for each request level. One provider can supply every level.')
+    expect(el.textContent).toContain('Pick a model for each request level. One provider can supply every level.')
     expect(el.textContent).not.toContain('Preset and credentials from OpenRouter')
     expect(el.querySelector('[role="table"]')).toBeTruthy()
-    // The chat-panel visualization picker rides with the router details; losing
-    // it strands a saved legacy_grid choice with no UI path back.
-    const visualMode = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_router_visual_mode"]')
-    expect(visualMode?.value).toBe('real_candidates')
-    const advanced = visualMode?.closest<HTMLDetailsElement>('details')
+    // The fallback tier rides in the collapsed advanced fold: rarely needed,
+    // but a saved non-default tier must stay reachable from the UI.
+    const fallbackTier = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_router_default_tier"]')
+    expect(fallbackTier).toBeTruthy()
+    const advanced = fallbackTier?.closest<HTMLDetailsElement>('details')
     expect(advanced?.open).toBe(false)
-    expect(advanced?.querySelector('summary')?.textContent).toContain('Display options')
+    expect(advanced?.querySelector('summary')?.textContent).toContain('Advanced options')
     advanced?.querySelector<HTMLElement>('summary')?.click()
     await nextTick()
     expect(advanced?.open).toBe(true)
-    expect(el.textContent).toContain('Routing decision panel style')
+    expect(el.textContent).toContain('When routing is uncertain')
 
     app.unmount()
   })
@@ -282,27 +309,19 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('emits the routing panel style from the visual-mode select', async () => {
-    const onUpdateRouterVisualMode = vi.fn()
-    const { app, el } = await mountPanel(
-      {
-        router: {
-          routerVisualModeOptions: [
-            { value: 'real_candidates', label: 'Real routing candidates' },
-            { value: 'legacy_grid', label: 'Three-tier visual panel' },
-          ],
-        },
+  it('no longer renders the retired routing-panel-style select', async () => {
+    // The cosmetic visual-mode picker was cut in the mist declutter pass; the
+    // saved value keeps applying, it is just not editable from this page.
+    const { app, el } = await mountPanel({
+      router: {
+        routerVisualModeOptions: [
+          { value: 'real_candidates', label: 'Real routing candidates' },
+          { value: 'legacy_grid', label: 'Three-tier visual panel' },
+        ],
       },
-      { onUpdateRouterVisualMode },
-    )
+    })
 
-    const select = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_router_visual_mode"]')
-    expect(select).toBeTruthy()
-    select!.value = 'legacy_grid'
-    select!.dispatchEvent(new Event('change', { bubbles: true }))
-    await nextTick()
-
-    expect(onUpdateRouterVisualMode).toHaveBeenCalledWith('legacy_grid')
+    expect(el.querySelector('select[name="setup_model_strategy_router_visual_mode"]')).toBeNull()
     app.unmount()
   })
 
@@ -395,6 +414,7 @@ describe('SetupModelStrategyPanel', () => {
   })
 
   it('edits the current provider model in fixed mode without calling it a routing default', async () => {
+    const onUpdateFixedProvider = vi.fn()
     const onUpdateFixedModel = vi.fn()
     const discoveredModel = {
       id: 'deepseek/deepseek-v4-flash',
@@ -412,14 +432,48 @@ describe('SetupModelStrategyPanel', () => {
         models: [discoveredModel],
         modelSource: 'live',
       },
-    }, { onUpdateFixedModel })
+    }, { onUpdateFixedProvider, onUpdateFixedModel })
 
     const detail = el.querySelector('.setup-model-strategy__detail')?.textContent || ''
+    const provider = el.querySelector<HTMLButtonElement>('[data-testid="setup-model-strategy-fixed-provider-trigger"]')
     const input = el.querySelector<HTMLInputElement>('input[name="setup_provider_model_strategy_fixed_model"]')
     expect(detail).toContain('Current model provider')
     expect(detail).toContain('OpenRouter')
+    expect(provider?.getAttribute('role')).toBe('combobox')
+    expect(provider?.getAttribute('aria-expanded')).toBe('false')
+    expect(provider?.textContent).toContain('OpenRouter')
+    expect(provider?.closest('.setup-model-strategy__single-provider-control')).toBeTruthy()
+    expect(provider?.parentElement?.querySelector('.setup-model-strategy__single-provider-chevron')).toBeTruthy()
     expect(input?.value).toBe(discoveredModel.id)
     expect(detail).not.toContain('default tier')
+
+    if (provider) {
+      provider.click()
+      await nextTick()
+      expect(provider.getAttribute('aria-expanded')).toBe('true')
+      const options = Array.from(document.querySelectorAll<HTMLElement>('#setup-model-strategy-fixed-provider-listbox [role="option"]'))
+      expect(options.map(option => option.textContent?.trim()))
+        .toEqual(['OpenRouter', 'DeepSeek', 'TokenRhythm'])
+      expect(options.every(option => option.tabIndex === -1)).toBe(true)
+      provider.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }))
+      await nextTick()
+      expect(provider.getAttribute('aria-expanded')).toBe('false')
+      provider.click()
+      await nextTick()
+      provider.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }))
+      provider.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+      await nextTick()
+    }
+    expect(onUpdateFixedProvider).toHaveBeenCalledWith('deepseek')
+    expect(provider?.getAttribute('aria-expanded')).toBe('false')
+
+    const source = readFileSync('src/components/setup/SetupModelStrategyPanel.vue', 'utf8')
+    expect(source).toContain('rotate(180deg)')
+    expect(source).toContain('FIXED_PROVIDER_MENU_MAX_HEIGHT = 272')
+    expect(source).toContain('<Teleport to="body">')
+    expect(source).toContain('position: fixed')
+    expect(source).toContain('scrollIntoView')
+    expect(source).toContain('fixed-provider-menu-enter-from')
 
     if (input) {
       input.value = 'deepseek/deepseek-v4-pro'
@@ -427,6 +481,43 @@ describe('SetupModelStrategyPanel', () => {
       await nextTick()
     }
     expect(onUpdateFixedModel).toHaveBeenCalledWith('deepseek/deepseek-v4-pro')
+
+    app.unmount()
+  })
+
+  it('keeps a long provider menu keyboard-visible and closes when focus leaves', async () => {
+    const providerOptions = Array.from({ length: 24 }, (_, index) => ({
+      providerId: `provider-${index}`,
+      label: `Provider ${index}`,
+    }))
+    const { app, el } = await mountPanel({
+      activeStrategy: 'single',
+      router: { providerOptions },
+      single: {
+        providerId: 'provider-0',
+        providerLabel: 'Provider 0',
+      },
+    })
+    const trigger = el.querySelector<HTMLButtonElement>('[data-testid="setup-model-strategy-fixed-provider-trigger"]')!
+    trigger.click()
+    await nextTick()
+
+    const listbox = document.getElementById('setup-model-strategy-fixed-provider-listbox')!
+    const options = Array.from(listbox.querySelectorAll<HTMLElement>('[role="option"]'))
+    expect(options).toHaveLength(24)
+    const scrollIntoView = vi.fn()
+    options[23]!.scrollIntoView = scrollIntoView
+    trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }))
+    await nextTick()
+    await nextTick()
+    expect(trigger.getAttribute('aria-activedescendant'))
+      .toBe('setup-model-strategy-fixed-provider-option-23')
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: 'nearest' })
+
+    const modelInput = el.querySelector<HTMLInputElement>('input[name="setup_provider_model_strategy_fixed_model"]')!
+    trigger.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: modelInput }))
+    await nextTick()
+    expect(trigger.getAttribute('aria-expanded')).toBe('false')
 
     app.unmount()
   })
@@ -854,6 +945,10 @@ describe('SetupModelStrategyPanel', () => {
     runtime.querySelector('summary')?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await nextTick()
     expect(runtime.open).toBe(true)
+    expect(runtime.textContent).toContain(
+      'aggregator 480s idle between provider events (configured 3600s)',
+    )
+    expect(runtime.textContent).toContain('outer turn deadline separate')
 
     const threshold = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_min_successful"]')!
     threshold.value = '2'
@@ -918,7 +1013,7 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('keeps the preset lineup read-only while allowing a switch to custom', async () => {
+  it('migrates a saved preset directly into the single custom editing path', async () => {
     const onUpdateEnsembleScheme = vi.fn()
     const { app, el } = await mountPanel({
       activeStrategy: 'ensemble',
@@ -944,6 +1039,8 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.textContent).toContain('deepseek/deepseek-v4-pro')
     expect(el.textContent).toContain('moonshotai/kimi-k2.7-code')
     expect(el.textContent).toContain('Aggregator')
+    expect(el.querySelector('.setup-model-strategy__ensemble > .control-section__head')).toBeNull()
+    expect(el.textContent).not.toContain('Models draft in parallel')
     expect(el.querySelector('[data-testid="ensemble-preset-provider-mismatch"]')).toBeNull()
     const preset = el.querySelector<HTMLElement>('[data-testid="ensemble-preset-lineup"]')!
     const steps = preset.querySelectorAll<HTMLElement>('.setup-model-strategy__step')
@@ -955,10 +1052,11 @@ describe('SetupModelStrategyPanel', () => {
     expect(preset.querySelector('[data-testid="setup-model-strategy-add-candidate-trigger"]')).toBeNull()
     expect(preset.querySelector('[data-testid="ensemble-replace-aggregator"]')).toBeNull()
     expect(el.querySelector('[data-testid="ensemble-effective-summary"]')?.textContent).toContain('5 model calls')
-    expect(el.querySelector('[data-testid="ensemble-scheme-preset"]')?.getAttribute('aria-checked')).toBe('true')
-    el.querySelector<HTMLButtonElement>('[data-testid="ensemble-scheme-custom"]')?.click()
-    await nextTick()
+    expect(el.querySelector('[data-testid="ensemble-scheme-preset"]')).toBeNull()
+    expect(el.querySelector('[data-testid="ensemble-scheme-custom"]')).toBeNull()
     expect(onUpdateEnsembleScheme).toHaveBeenCalledWith('custom')
+    expect(preset.querySelector('.setup-model-strategy__step-role')).toBeNull()
+    expect(steps[1]?.querySelector('.setup-model-strategy__step-role')).toBeNull()
     expect(el.textContent).not.toContain('legacy OpenRouter candidate template')
     expect(el.querySelector('.setup-model-strategy__candidate-provider')).toBeNull()
 
@@ -1133,6 +1231,8 @@ describe('SetupModelStrategyPanel', () => {
         'input[name="setup_provider_model_strategy_fixed_model"]',
       )
       expect(fixedModelInput?.value).toBe('deepseek/deepseek-v4-pro')
+      expect(el.querySelector('[data-testid="setup-model-strategy-fixed-model"]')
+        ?.classList.contains('setup-model-strategy__fixed-model-row')).toBe(true)
       const fixedSection = el.querySelector<HTMLElement>(
         '[data-testid="setup-model-strategy-fixed-section"]',
       )!
@@ -1140,7 +1240,16 @@ describe('SetupModelStrategyPanel', () => {
         '#setup-provider-model_strategy_fixed_model-description',
       )
       expect(fixedFieldDescription?.textContent)
-        .toContain('as the fallback when routing or collaboration cannot complete')
+        .toContain('as the fallback if routing or ensemble execution cannot complete')
+      expect(fixedFieldDescription?.classList.contains('setup-model-combobox__sr-only')).toBe(true)
+      const fixedModelInfo = fixedSection.querySelector<HTMLElement>(
+        '.setup-model-combobox__info',
+      )
+      expect(fixedModelInfo?.getAttribute('title')).toBeNull()
+      expect(fixedModelInfo?.getAttribute('aria-describedby'))
+        .toBe('setup-provider-model_strategy_fixed_model-info-tooltip')
+      expect(fixedModelInfo?.querySelector('[role="tooltip"]')?.textContent)
+        .toContain('as the fallback if routing or ensemble execution cannot complete')
       expect(fixedModelInput?.getAttribute('aria-describedby'))
         .toBe('setup-provider-model_strategy_fixed_model-description')
       if (activeStrategy === 'single') {
@@ -1148,16 +1257,13 @@ describe('SetupModelStrategyPanel', () => {
         expect(fixedSection.querySelector('.control-section__head .control-section__desc')?.textContent)
           .toContain('Choose the model used for every request.')
         expect(fixedSection.textContent)
-          .toContain('without automatic routing or multi-model collaboration')
+          .toContain('without automatic routing or model ensemble')
       } else {
-        expect(fixedSection.querySelector('h4')?.textContent)
-          .toContain('Fixed and fallback model')
-        expect(fixedSection.textContent)
-          .toContain('as the fallback when routing or collaboration cannot complete')
-        expect(fixedSection.querySelector('.control-section__head .control-section__desc')).toBeNull()
+        expect(fixedSection.querySelector('.control-section__head')).toBeNull()
+        expect(fixedSection.querySelector('.control-row__desc')).toBeNull()
         expect(fixedSection.textContent).not.toContain('Choose the model used for every request.')
         expect(fixedSection.textContent)
-          .not.toContain('without automatic routing or multi-model collaboration')
+          .not.toContain('without automatic routing or model ensemble')
       }
 
       app.unmount()
@@ -1171,10 +1277,15 @@ describe('SetupModelStrategyPanel', () => {
       .toEqual(['Model routing'])
     expect(Array.from(el.querySelectorAll('h4')).map(node => node.textContent?.trim()))
       .toEqual(expect.arrayContaining([
-        'Choose how models are used',
         'Intelligent model routing',
-        'Fixed and fallback model',
       ]))
+    expect(Array.from(el.querySelectorAll('h4')).map(node => node.textContent?.trim()))
+      .not.toContain('Fixed and fallback model')
+    // The redundant "Choose how models are used" section heading was removed;
+    // the mode radiogroup is labelled for AT via aria-label instead.
+    expect(el.textContent).not.toContain('Choose how models are used')
+    expect(el.querySelector('.setup-model-strategy__cards')?.getAttribute('aria-label'))
+      .toBe('Choose how models are used')
     expect(el.querySelector('.setup-model-strategy__roles-head h5')?.textContent)
       .toContain('Model roles')
 
@@ -1205,7 +1316,7 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.textContent).toContain('Fixed model')
     expect(el.textContent).toContain('Choose the model used for every request.')
     expect(el.textContent).toContain('Fixed and fallback model')
-    expect(el.textContent).toContain('without automatic routing or multi-model collaboration')
+    expect(el.textContent).toContain('without automatic routing or model ensemble')
     expect(el.querySelector('[data-testid="setup-model-strategy-fixed-model"]')).toBeTruthy()
     expect(el.textContent).not.toContain('When routing is uncertain')
     expect(el.querySelector('[role="table"]')).toBeNull()

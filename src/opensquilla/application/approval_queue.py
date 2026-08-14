@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import ntpath
 import os
 import sqlite3
 import time
@@ -18,7 +19,21 @@ from opensquilla.paths import state_dir
 
 VALID_APPROVAL_MODES = frozenset({"auto-approve", "auto-deny", "prompt"})
 VALID_ELEVATED_MODES = frozenset({"on", "bypass", "full"})
-VALID_RUN_MODES = frozenset({"standard", "trusted", "full"})
+VALID_RUN_MODES = frozenset({"safe", "full"})
+
+
+def _native_db_path(path: str | Path) -> str:
+    """Return an internal SQLite spelling without changing the public path."""
+
+    value = os.fspath(path)
+    if value == ":memory:" or os.name != "nt":
+        return value
+    absolute = ntpath.abspath(value)
+    if absolute.startswith("\\\\?\\"):
+        return absolute
+    if absolute.startswith("\\\\"):
+        return f"\\\\?\\UNC\\{absolute[2:]}"
+    return f"\\\\?\\{absolute}"
 
 
 @dataclass
@@ -84,14 +99,18 @@ ApprovalEventListener = Callable[[str, dict], None]
 class ApprovalQueue:
     def __init__(
         self,
-        default_timeout: float = 300.0,
+        default_timeout: float | None = None,
         *,
         db_path: str | None = None,
         poll_interval: float = 0.25,
         claim_ttl_seconds: float = 60.0,
     ):
         self._pending: dict[str, PendingApproval] = {}
-        self._timeout = default_timeout
+        self._timeout = (
+            max(0.0, float(default_timeout))
+            if default_timeout is not None
+            else None
+        )
         self._poll_interval = max(0.01, float(poll_interval))
         self._claim_ttl_seconds = max(0.0, float(claim_ttl_seconds))
         self._global_settings = ApprovalSettings()
@@ -100,9 +119,10 @@ class ApprovalQueue:
         self._event_listeners: list[ApprovalEventListener] = []
 
         self._db_path = Path(db_path or os.fspath(_DEFAULT_APPROVAL_QUEUE_PATH))
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        native_db_path = _native_db_path(self._db_path)
+        os.makedirs(os.path.dirname(native_db_path) or os.curdir, exist_ok=True)
         self._conn = sqlite3.connect(
-            self._db_path,
+            native_db_path,
             timeout=30.0,
             check_same_thread=False,
         )
@@ -318,9 +338,10 @@ class ApprovalQueue:
         """Register a lifecycle listener; returns a remove callable.
 
         Listeners fire synchronously on ``requested`` (an approval was
-        created — the moment a run blocks) and ``resolved`` (a decision
-        landed, including deny-on-timeout). Listener errors are swallowed:
-        notification is best-effort and must never break queue state.
+        created — the moment a run blocks), ``updated`` (its deadline changed),
+        and ``resolved`` (a decision landed, including deny-on-timeout).
+        Listener errors are swallowed: notification is best-effort and must
+        never break queue state.
         """
         self._event_listeners.append(listener)
 
@@ -356,7 +377,7 @@ class ApprovalQueue:
         while True:
             approval_id = uuid.uuid4().hex[:12]
             now = time.time()
-            deadline = now + self._timeout
+            deadline = now + self._timeout if self._timeout else 0.0
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 self._conn.execute(
@@ -434,8 +455,8 @@ class ApprovalQueue:
             entry = self.get(approval_id)
             if entry.resolved and entry.claim_token is None:
                 return entry.approved
-            remaining = entry.deadline - time.time()
-            if remaining <= 0:
+            remaining = entry.deadline - time.time() if entry.deadline > 0 else None
+            if remaining is not None and remaining <= 0:
                 outcome = self._expire_if_unresolved(approval_id)
                 if outcome is not None:
                     return outcome
@@ -443,7 +464,11 @@ class ApprovalQueue:
             try:
                 await asyncio.wait_for(
                     entry._event.wait(),
-                    timeout=min(self._poll_interval, remaining),
+                    timeout=(
+                        self._poll_interval
+                        if remaining is None
+                        else min(self._poll_interval, remaining)
+                    ),
                 )
             except TimeoutError:
                 pass
@@ -456,7 +481,7 @@ class ApprovalQueue:
         self._release_stale_claims()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "UPDATE approval_queue SET deadline = ? "
                 "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
                 (deadline, approval_id),
@@ -465,9 +490,11 @@ class ApprovalQueue:
         except Exception:
             self._conn.rollback()
             raise
-        cached = self._pending.get(approval_id)
-        if cached is not None and not cached.resolved and cached.claim_token is None:
-            cached.deadline = deadline
+        if cursor.rowcount != 1:
+            return
+        entry = self.get(approval_id)
+        self._pending[approval_id] = entry
+        self._notify_event("updated", entry)
 
     def extend(self, approval_id: str, seconds: float) -> float:
         """Push a pending request's deadline out by ``seconds`` and return it."""
@@ -496,9 +523,15 @@ class ApprovalQueue:
         )
         self._conn.commit()
         entry = self.get(approval_id)
+        self._notify_event("updated", entry)
         return entry.deadline
 
-    def _expire_if_unresolved(self, approval_id: str) -> bool | None:
+    def _expire_if_unresolved(
+        self,
+        approval_id: str,
+        *,
+        force: bool = False,
+    ) -> bool | None:
         """Resolve a lapsed request as expired, unless it was extended."""
         self._release_stale_claims()
         self._conn.execute("BEGIN IMMEDIATE")
@@ -507,7 +540,7 @@ class ApprovalQueue:
             self._conn.rollback()
             raise KeyError(f"Approval not found: {approval_id}")
         entry = self._row_to_entry(row)
-        if entry.claim_token:
+        if entry.claim_token and not force:
             self._conn.rollback()
             self._pending[approval_id] = entry
             raise ValueError(f"Approval resolution in progress: {approval_id}")
@@ -516,14 +549,16 @@ class ApprovalQueue:
             self._pending[approval_id] = entry
             entry._event.set()
             return entry.approved
-        if entry.deadline > time.time():
+        if not force and entry.deadline > time.time():
             self._conn.rollback()
             self._pending[approval_id] = entry
             return None
+        claim_guard = "" if force else " AND claim_token IS NULL"
         self._conn.execute(
             "UPDATE approval_queue "
-            "SET resolved = 1, approved = 0, resolution = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+            "SET resolved = 1, approved = 0, resolution = ?, "
+            "claim_token = NULL, claim_started_at = NULL "
+            f"WHERE approval_id = ? AND resolved = 0{claim_guard}",
             (RESOLUTION_EXPIRED, approval_id),
         )
         self._conn.commit()
@@ -533,6 +568,84 @@ class ApprovalQueue:
         self._notify_event("resolved", entry)
         return entry.approved
 
+    def expire_pending_for_session(self, session_key: str) -> int:
+        """Expire unresolved approvals whose continuation died with a session task."""
+
+        key = session_key.strip()
+        if not key:
+            return 0
+        count = 0
+        rows = self._conn.execute(
+            "SELECT approval_id, params FROM approval_queue WHERE resolved = 0"
+        ).fetchall()
+        for row in rows:
+            params = self._deserialize_params(row["params"])
+            owner_key = str(
+                params.get("sessionKey") or params.get("session_key") or ""
+            ).strip()
+            if owner_key != key:
+                continue
+            if self._expire_if_unresolved(
+                str(row["approval_id"]),
+                force=True,
+            ) is not None:
+                count += 1
+        return count
+
+    def expire_pending(self, approval_id: str) -> bool:
+        """Expire one unresolved approval whose live continuation no longer exists."""
+
+        outcome = self._expire_if_unresolved(approval_id, force=True)
+        return outcome is not None
+
+    def expire_all_pending(self) -> int:
+        """Expire every unresolved approval left by an earlier process."""
+
+        rows = self._conn.execute(
+            "SELECT approval_id FROM approval_queue WHERE resolved = 0"
+        ).fetchall()
+        count = 0
+        for row in rows:
+            if self._expire_if_unresolved(
+                str(row["approval_id"]),
+                force=True,
+            ) is not None:
+                count += 1
+        return count
+
+    def expire_claimed_resolution(
+        self,
+        approval_id: str,
+        claim_token: str,
+    ) -> None:
+        """Fail-close an approved claim whose side effect could not be applied."""
+
+        self._conn.execute("BEGIN IMMEDIATE")
+        row = self._get_row(approval_id)
+        if row is None:
+            self._conn.rollback()
+            raise KeyError(f"Approval not found: {approval_id}")
+        entry = self._row_to_entry(row)
+        if entry.claim_token != claim_token:
+            self._conn.rollback()
+            self._pending[approval_id] = entry
+            raise ValueError(f"Approval resolution claim mismatch: {approval_id}")
+        cursor = self._conn.execute(
+            "UPDATE approval_queue "
+            "SET resolved = 1, approved = 0, consumed = 0, resolution = ?, "
+            "claim_token = NULL, claim_started_at = NULL "
+            "WHERE approval_id = ? AND claim_token = ?",
+            (RESOLUTION_EXPIRED, approval_id, claim_token),
+        )
+        if cursor.rowcount != 1:
+            self._conn.rollback()
+            raise ValueError(f"Approval could not be expired: {approval_id}")
+        self._conn.commit()
+        expired = self.get(approval_id)
+        expired._event.set()
+        self._pending[approval_id] = expired
+        self._notify_event("resolved", expired)
+
     def resolve(
         self,
         approval_id: str,
@@ -540,6 +653,7 @@ class ApprovalQueue:
         *,
         elevated_mode: str | None = None,
         allow_idempotent: bool = True,
+        resolution_metadata: dict | None = None,
     ) -> None:
         self._release_stale_claims()
         self._conn.execute("BEGIN IMMEDIATE")
@@ -560,16 +674,31 @@ class ApprovalQueue:
                 return
             raise ValueError(f"Approval already resolved: {approval_id}")
 
-        cursor = self._conn.execute(
-            "UPDATE approval_queue "
-            "SET resolved = 1, approved = ?, resolution = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-            (
-                1 if approved else 0,
-                RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
-                approval_id,
-            ),
-        )
+        if resolution_metadata:
+            merged_params = dict(entry.params)
+            merged_params.update(resolution_metadata)
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET resolved = 1, approved = ?, resolution = ?, params = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (
+                    1 if approved else 0,
+                    RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
+                    self._serialize_params(merged_params),
+                    approval_id,
+                ),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET resolved = 1, approved = ?, resolution = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (
+                    1 if approved else 0,
+                    RESOLUTION_APPROVED if approved else RESOLUTION_DENIED,
+                    approval_id,
+                ),
+            )
         if cursor.rowcount != 1:
             self._conn.rollback()
             entry = self.get(approval_id)
@@ -592,7 +721,12 @@ class ApprovalQueue:
 
         del elevated_mode
 
-    def claim_resolution(self, approval_id: str) -> str:
+    def claim_resolution(
+        self,
+        approval_id: str,
+        *,
+        resolution_metadata: dict | None = None,
+    ) -> str:
         self._release_stale_claims()
         token = uuid.uuid4().hex
         now = time.time()
@@ -611,12 +745,27 @@ class ApprovalQueue:
             self._pending[approval_id] = entry
             entry._event.set()
             raise ValueError(f"Approval already resolved: {approval_id}")
-        cursor = self._conn.execute(
-            "UPDATE approval_queue "
-            "SET claim_token = ?, claim_started_at = ? "
-            "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
-            (token, now, approval_id),
-        )
+        if resolution_metadata:
+            merged_params = dict(entry.params)
+            merged_params.update(resolution_metadata)
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET claim_token = ?, claim_started_at = ?, params = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (
+                    token,
+                    now,
+                    self._serialize_params(merged_params),
+                    approval_id,
+                ),
+            )
+        else:
+            cursor = self._conn.execute(
+                "UPDATE approval_queue "
+                "SET claim_token = ?, claim_started_at = ? "
+                "WHERE approval_id = ? AND resolved = 0 AND claim_token IS NULL",
+                (token, now, approval_id),
+            )
         if cursor.rowcount != 1:
             self._conn.rollback()
             entry = self.get(approval_id)
@@ -868,7 +1017,7 @@ class ApprovalQueue:
             return
         if mode not in VALID_ELEVATED_MODES:
             raise ValueError("mode must be one of: on, bypass, full, off")
-        self.set_run_mode(key, "full" if mode == "full" else "trusted")
+        self.set_run_mode(key, "full" if mode == "full" else "safe")
 
     def get_elevated_mode(self, session_key: str | None) -> str | None:
         """Legacy compatibility wrapper returning only full host access."""
@@ -882,9 +1031,13 @@ class ApprovalQueue:
         if mode in (None, "", "off"):
             self._session_run_modes.pop(key, None)
             return
-        if mode not in VALID_RUN_MODES:
-            raise ValueError("mode must be one of: full, standard, trusted, off")
-        self._session_run_modes[key] = mode
+        from opensquilla.run_mode import normalize_run_mode
+
+        try:
+            normalized = normalize_run_mode(mode).value
+        except ValueError as exc:
+            raise ValueError("mode must be one of: safe, full, off") from exc
+        self._session_run_modes[key] = normalized
 
     def get_run_mode(self, session_key: str | None) -> str | None:
         key = (session_key or "").strip()
@@ -976,7 +1129,9 @@ def reset_approval_queue() -> None:
         _queue = None
     else:
         path = _DEFAULT_APPROVAL_QUEUE_PATH
+    if os.fspath(path) == ":memory:":
+        return
     try:
-        path.unlink()
+        os.unlink(_native_db_path(path))
     except FileNotFoundError:
         pass

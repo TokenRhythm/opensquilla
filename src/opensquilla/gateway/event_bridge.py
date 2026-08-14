@@ -50,6 +50,8 @@ class EventBridge:
         session_key: str,
         event_name: str,
         payload: dict[str, Any] | None = None,
+        *,
+        replay_recorded: bool = False,
     ) -> None:
         """Broadcast an event to all WS connections subscribed to ``session_key``.
 
@@ -64,7 +66,7 @@ class EventBridge:
 
         try:
             send_payload = payload or {}
-            if event_name.startswith("session.event."):
+            if event_name.startswith("session.event.") and not replay_recorded:
                 send_payload = get_session_streams().record(session_key, event_name, send_payload)
 
             subscriber_ids = self._subs.get_message_subscribers(session_key)

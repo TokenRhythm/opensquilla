@@ -447,7 +447,7 @@ def test_gateway_cli_removes_record_after_profile_writer_lock_exits(
     events: list[str] = []
 
     @contextmanager
-    def guarded_profile():
+    def guarded_profile(**_kwargs):
         events.append("profile_lock_acquired")
         try:
             yield None

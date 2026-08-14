@@ -269,12 +269,14 @@ test.describe('Sidebar', () => {
     await expect(sidebar).toHaveClass(/docked/)
     await expect(expandedToggle).toHaveAttribute('aria-expanded', 'true')
     await expect(expandedToggle).toHaveAttribute('aria-keyshortcuts', /^(Meta|Control)\+B$/)
+    await expect(expandedToggle.locator('path[d="M9.5 4.5v15"]')).toHaveCount(1)
 
     await expandedToggle.click()
     await expect(sidebar).not.toHaveClass(/docked/)
     const collapsedToggle = page.getByTestId('sidebar-toggle-collapsed')
     await expect(collapsedToggle).toBeFocused()
     await expect(collapsedToggle).toHaveAttribute('aria-expanded', 'false')
+    await expect(collapsedToggle.locator('path[d="M8.5 9v6"]')).toHaveCount(1)
 
     // The former invisible edge hot zone is gone: approaching the history rail
     // can no longer reveal a 260px overlay above it.
@@ -458,10 +460,27 @@ test.describe('Sidebar', () => {
   })
 
   test('footer pins Settings; connection state shows in the topbar', async ({ page }) => {
-    await openControl(page)
+    await page.goto(CONTROL_URL)
+    await page.waitForSelector('.conn-pill', { timeout: 10000 })
+    await page.waitForSelector('.conn-pill.connected', { timeout: 10000 }).catch(() => {})
+    await page.waitForTimeout(800)
 
     const foot = page.locator('.sidebar-foot')
     await expect(foot.getByText('Settings', { exact: true })).toBeVisible()
+    // Empty profiles omit SidebarConversations entirely. Simulate that state
+    // after the shared fixture settles and verify the footer owns its bottom
+    // anchor instead of relying on the optional Recents region's flex growth.
+    await page.evaluate(() => document.querySelector('.sidebar-history')?.remove())
+    const footerGeometry = await page.evaluate(() => {
+      const sidebarElement = document.querySelector<HTMLElement>('.sidebar')!
+      const sidebar = sidebarElement.getBoundingClientRect()
+      const footer = document.querySelector('.sidebar-foot')!.getBoundingClientRect()
+      return {
+        bottomGap: sidebar.bottom - footer.bottom,
+        paddingBottom: Number.parseFloat(getComputedStyle(sidebarElement).paddingBottom),
+      }
+    })
+    expect(Math.abs(footerGeometry.bottomGap - footerGeometry.paddingBottom)).toBeLessThanOrEqual(1)
     // Connection state is shown once, in the global topbar pill — not duplicated
     // in the sidebar footer.
     await expect(foot.locator('.sidebar-conn')).toHaveCount(0)

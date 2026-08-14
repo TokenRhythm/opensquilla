@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import functools
+import json
 import time
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, TypeVar
 
 import structlog
 from starlette.applications import Starlette
@@ -26,6 +27,7 @@ from opensquilla.gateway.middleware import (
     ErrorHandlingMiddleware,
     RateLimitMiddleware,
     SecurityHeadersMiddleware,
+    UnsafeOriginGuardMiddleware,
 )
 from opensquilla.gateway.origin_guard import (
     extract_http_token,
@@ -39,6 +41,9 @@ from opensquilla.gateway.websocket import handle_ws_connection
 log = structlog.get_logger(__name__)
 
 _start_time = time.time()
+_HTTP_GUEST_COOKIE = "opensquilla_guest_session"
+_HTTP_GUEST_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
+_ResponseT = TypeVar("_ResponseT", bound=Response)
 
 
 def _human_actionable_approvals(pending: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -68,6 +73,7 @@ def create_gateway_app(
     usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
+    skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
@@ -81,6 +87,8 @@ def create_gateway_app(
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
     extra_routes: list[Route] | None = None,
+    prompt_cache_keepalive_service: Any = None,
+    skill_management_service: Any = None,
 ) -> Starlette:
     """Build and return the Starlette ASGI application."""
     if diagnostics_state is None:
@@ -115,6 +123,20 @@ def create_gateway_app(
         if code in {"UNAVAILABLE", "STORAGE_BUSY"}:
             return 503
         return default
+
+    def _with_http_guest_cookie(request: Request, response: _ResponseT) -> _ResponseT:
+        guest_session_key = getattr(request.state, "guest_session_key", None)
+        if isinstance(guest_session_key, str) and guest_session_key:
+            response.set_cookie(
+                _HTTP_GUEST_COOKIE,
+                guest_session_key,
+                max_age=_HTTP_GUEST_COOKIE_MAX_AGE,
+                path="/",
+                secure=request.url.scheme == "https",
+                httponly=True,
+                samesite="strict",
+            )
+        return response
 
     def _same_origin(
         handler: Callable[[Request], Awaitable[Response]],
@@ -175,9 +197,15 @@ def create_gateway_app(
             params["view"] = view
         result = await dispatcher.dispatch("_http", "sessions.list", params or None, ctx)
         if result.ok:
-            return JSONResponse(result.payload or {"sessions": []})
+            return _with_http_guest_cookie(
+                request,
+                JSONResponse(result.payload or {"sessions": []}),
+            )
         msg = result.error.message if result.error else "error"
-        return JSONResponse({"error": msg}, status_code=_rpc_status_code(result))
+        return _with_http_guest_cookie(
+            request,
+            JSONResponse({"error": msg}, status_code=_rpc_status_code(result)),
+        )
 
     async def api_chat(request: Request) -> JSONResponse:
         try:
@@ -187,15 +215,21 @@ def create_gateway_app(
         ctx = _make_ctx(request)
         result = await dispatcher.dispatch("_http", "chat.send", body, ctx)
         if result.ok:
-            return JSONResponse({"ok": True, **(result.payload or {})})
+            return _with_http_guest_cookie(
+                request,
+                JSONResponse({"ok": True, **(result.payload or {})}),
+            )
         error = result.error
         error_payload = error.model_dump(exclude_none=True) if error is not None else {}
-        return JSONResponse(
-            {
-                "error": error.message if error is not None else "error",
-                **error_payload,
-            },
-            status_code=_rpc_status_code(result, default=400),
+        return _with_http_guest_cookie(
+            request,
+            JSONResponse(
+                {
+                    "error": error.message if error is not None else "error",
+                    **error_payload,
+                },
+                status_code=_rpc_status_code(result, default=400),
+            ),
         )
 
     async def api_system_status(request: Request) -> JSONResponse:
@@ -359,20 +393,69 @@ def create_gateway_app(
         msg = result.error.message if result.error else "error"
         return JSONResponse({"error": msg}, status_code=_rpc_status_code(result))
 
+    async def api_sandbox_policy_get(request: Request) -> JSONResponse:
+        result = await dispatcher.dispatch(
+            "_http",
+            "sandbox.policy.get",
+            {},
+            _make_ctx(request),
+        )
+        if result.ok:
+            return JSONResponse(result.payload or {})
+        message = result.error.message if result.error else "error"
+        return JSONResponse({"error": message}, status_code=_rpc_status_code(result))
+
+    async def api_sandbox_policy_update(request: Request) -> JSONResponse:
+        try:
+            params = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+        result = await dispatcher.dispatch(
+            "_http",
+            "sandbox.policy.update",
+            params if isinstance(params, dict) else None,
+            _make_ctx(request),
+        )
+        if result.ok:
+            return JSONResponse(result.payload or {})
+        error = result.error
+        status = (
+            409
+            if error and error.code == "POLICY_VERSION_CONFLICT"
+            else _rpc_status_code(result)
+        )
+        payload: dict[str, Any] = {
+            "error": error.message if error else "error",
+            "code": error.code if error else "INTERNAL",
+        }
+        if error is not None and error.details is not None:
+            payload["details"] = error.details
+        return JSONResponse(payload, status_code=status)
+
     def _make_ctx(request: Request | None = None, role_claim: str = "operator") -> RpcContext:
         from opensquilla.gateway.auth import Principal, resolve_auth
 
-        auth_params: dict[str, str] = {}
-        token = extract_http_token(request)
-        if token:
-            auth_params["token"] = token
-        peer_ip = request.client.host if request is not None and request.client else None
-        principal = resolve_auth(
-            config,
-            auth_params=auth_params,
-            role_claim=role_claim,
-            peer_ip=peer_ip,
+        principal = (
+            getattr(request.state, "principal", None)
+            if request is not None
+            else None
         )
+        if principal is None:
+            auth_params: dict[str, str] = {}
+            token = extract_http_token(request)
+            if token:
+                auth_params["token"] = token
+            if request is not None:
+                guest_session_key = request.cookies.get(_HTTP_GUEST_COOKIE)
+                if guest_session_key:
+                    auth_params["guestSessionKey"] = guest_session_key
+            peer_ip = request.client.host if request is not None and request.client else None
+            principal = resolve_auth(
+                config,
+                auth_params=auth_params,
+                role_claim=role_claim,
+                peer_ip=peer_ip,
+            )
         if principal is None:
             principal = Principal(
                 role=role_claim,
@@ -380,6 +463,10 @@ def create_gateway_app(
                 is_owner=False,
                 authenticated=False,
             )
+        if request is not None:
+            guest_session_key = getattr(principal, "guest_session_key", None)
+            if isinstance(guest_session_key, str) and guest_session_key:
+                request.state.guest_session_key = guest_session_key
         return RpcContext(
             conn_id="http",
             principal=principal,
@@ -393,12 +480,15 @@ def create_gateway_app(
             usage_event_sink=usage_event_sink,
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
+            skill_management_service=skill_management_service,
+            skill_management_state=skill_management_state or {},
             cron_scheduler=cron_scheduler,
             turn_runner=turn_runner,
             task_runtime=task_runtime,
             flush_service=flush_service,
             heartbeat_service=heartbeat_service,
             heartbeat_loop=heartbeat_loop,
+            prompt_cache_keepalive_service=prompt_cache_keepalive_service,
             agent_registry=agent_registry,
             diagnostics_state=diagnostics_state,
             provider_stats=provider_stats,
@@ -629,10 +719,16 @@ def create_gateway_app(
             "_http", "chat.history", {"sessionKey": session_key}, ctx
         )
         if result.ok:
-            return JSONResponse(result.payload or {"messages": []})
-        return JSONResponse(
-            {"error": result.error.message if result.error else "error"},
-            status_code=_rpc_status_code(result),
+            return _with_http_guest_cookie(
+                request,
+                JSONResponse(result.payload or {"messages": []}),
+            )
+        return _with_http_guest_cookie(
+            request,
+            JSONResponse(
+                {"error": result.error.message if result.error else "error"},
+                status_code=_rpc_status_code(result),
+            ),
         )
 
     async def ws_endpoint(ws: WebSocket) -> None:
@@ -649,6 +745,7 @@ def create_gateway_app(
             usage_event_sink=usage_event_sink,
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
+            skill_management_state=skill_management_state or {},
             cron_scheduler=cron_scheduler,
             turn_runner=turn_runner,
             task_runtime=task_runtime,
@@ -661,12 +758,19 @@ def create_gateway_app(
             memory_managers=memory_managers,
             memory_stores=memory_stores,
             memory_retrievers=memory_retrievers,
+            prompt_cache_keepalive_service=prompt_cache_keepalive_service,
+            skill_management_service=skill_management_service,
         )
 
     # ── Routes ───────────────────────────────────────────────────────────────
 
+    root_routes = (
+        []
+        if config.control_ui.enabled and config.control_ui.base_path == "/"
+        else [Route("/", root, methods=["GET"])]
+    )
     routes = [
-        Route("/", root, methods=["GET"]),
+        *root_routes,
         Route("/health", health, methods=["GET"]),
         Route("/healthz", health, methods=["GET"]),
         Route("/ready", ready, methods=["GET"]),
@@ -683,6 +787,12 @@ def create_gateway_app(
         Route("/api/desktop/identity", _same_origin(api_desktop_identity), methods=["POST"]),
         Route("/api/desktop/shutdown", _same_origin(api_desktop_shutdown), methods=["POST"]),
         Route("/api/usage", api_usage, methods=["GET"]),
+        Route("/api/v2/sandbox/policy", api_sandbox_policy_get, methods=["GET"]),
+        Route(
+            "/api/v2/sandbox/policy",
+            _same_origin(api_sandbox_policy_update),
+            methods=["PUT"],
+        ),
         Route("/api/channels/status", api_channels_status, methods=["GET"]),
         Route("/api/channels/logout", _same_origin(api_channels_logout), methods=["POST"]),
         Route("/api/channels/pairings", api_channel_pairings, methods=["GET"]),
@@ -707,30 +817,28 @@ def create_gateway_app(
     if extra_routes:
         routes.extend(extra_routes)
 
-    # ── Control UI routes ────────────────────────────────────────────────
-    routes.extend(create_control_ui_routes(config))
-
     # ── Middleware ───────────────────────────────────────────────────────────
 
-    middleware = [Middleware(ErrorHandlingMiddleware)]
-    if config.cors.allowed_origins:
+    middleware = [
+        Middleware(ErrorHandlingMiddleware),
+        Middleware(UnsafeOriginGuardMiddleware, config=config),
+    ]
+    exact_cors_origins = [
+        origin for origin in config.cors.allowed_origins if origin != "*"
+    ]
+    if "*" in config.cors.allowed_origins:
+        log.warning(
+            "gateway.cors_wildcard_ignored",
+            category="cors_wildcard_not_permitted",
+        )
+    if exact_cors_origins:
         # CORS headers are opt-in: the default empty list installs no CORS
         # middleware at all, so browsers refuse cross-origin reads. The Web UI
         # is same-origin and non-browser clients never need CORS.
-        if "*" in config.cors.allowed_origins and config.cors.allow_credentials:
-            log.warning(
-                "gateway.cors_wildcard_with_credentials",
-                detail=(
-                    "cors.allowed_origins contains '*' with allow_credentials "
-                    "enabled, which lets any website the browser visits read "
-                    "authenticated gateway responses — list explicit origins "
-                    "instead."
-                ),
-            )
         middleware.append(
             Middleware(
                 CORSMiddleware,
-                allow_origins=config.cors.allowed_origins,
+                allow_origins=exact_cors_origins,
                 allow_credentials=config.cors.allow_credentials,
                 allow_methods=config.cors.allowed_methods,
                 allow_headers=config.cors.allowed_headers,
@@ -739,7 +847,11 @@ def create_gateway_app(
     middleware.extend(
         [
             Middleware(RateLimitMiddleware, config=config),
-            Middleware(SecurityHeadersMiddleware, path_prefix=config.control_ui.base_path),
+            Middleware(
+                SecurityHeadersMiddleware,
+                path_prefix=config.control_ui.base_path,
+                enabled=config.control_ui.enabled,
+            ),
             Middleware(AuthMiddleware, config=config),
         ]
     )
@@ -801,9 +913,22 @@ def create_gateway_app(
         config=config,
         session_manager=session_manager,
     )
+    from opensquilla.gateway.artifact_preview import (  # noqa: PLC0415
+        register_artifact_preview_routes,
+    )
+
+    app.state.artifact_preview_service = register_artifact_preview_routes(
+        app,
+        config=config,
+        session_manager=session_manager,
+    )
     register_audio_transcription_routes(app, config=config)
     from opensquilla.gateway.bundle_routes import register_bundle_routes  # noqa: PLC0415
 
     register_bundle_routes(app, config=config)
+
+    # Keep the SPA catch-all last.  This is required when the Control UI is
+    # mounted at "/" so dynamically registered API routes are still reachable.
+    app.router.routes.extend(create_control_ui_routes(config))
 
     return app

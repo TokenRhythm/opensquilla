@@ -134,6 +134,7 @@ EXPECTED_GATEWAY_COMMANDS = {
     "/approvals",
     "/permissions",
     "/forget",
+    "/goal",
     "/sessions",
     "/resume",
     "/delete",
@@ -145,6 +146,7 @@ EXPECTED_STANDALONE_COMMANDS = EXPECTED_GATEWAY_COMMANDS - {
     "/delete",
     "/file",
     "/forget",
+    "/goal",
     "/models",
     "/permissions",
     "/resume",
@@ -167,6 +169,7 @@ def test_gateway_registry_commands_have_gateway_handlers() -> None:
     assert "/quit" in chat_cmd.GATEWAY_SLASH_HANDLER_WORDS
     assert "/usage" in chat_cmd.GATEWAY_SLASH_HANDLER_WORDS
     assert "/file" in chat_cmd.GATEWAY_SLASH_HANDLER_WORDS
+    assert "/goal" in chat_cmd.GATEWAY_SLASH_HANDLER_WORDS
 
 
 def test_standalone_registry_commands_have_standalone_handlers() -> None:
@@ -198,6 +201,14 @@ def test_usage_is_gateway_only_and_not_standalone_help() -> None:
 def test_file_is_gateway_only() -> None:
     assert "/file" in _handler_words(Surface.CLI_GATEWAY)
     assert "/file" not in _handler_words(Surface.CLI_STANDALONE)
+
+
+def test_goal_surface_visibility() -> None:
+    assert "/goal" in _handler_words(Surface.CLI_GATEWAY)
+    assert "/goal" not in _handler_words(Surface.CLI_STANDALONE)
+    assert "/goal" in _handler_words(Surface.WEB_CHAT)
+    assert "/goal" in EXPECTED_GATEWAY_COMMANDS
+    assert "/goal" not in EXPECTED_STANDALONE_COMMANDS
 
 
 def test_interactive_chat_clear_screen_only_on_terminal(monkeypatch) -> None:
@@ -1101,7 +1112,7 @@ async def test_standalone_repl_uses_exact_slash_tokens(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_standalone_slash_compact_passes_provider_config(monkeypatch) -> None:
+async def test_standalone_slash_compact_uses_selected_physical_deployment(monkeypatch) -> None:
     services = _FakeServices()
     services.provider_selector = _FakeProviderSelector()
     services.config = SimpleNamespace(
@@ -1139,7 +1150,7 @@ async def test_standalone_slash_compact_passes_provider_config(monkeypatch) -> N
     assert context_window == 1234
     assert isinstance(config, CompactionConfig)
     assert config.api_key == "cli-provider-key"
-    assert config.model == "openrouter/test"
+    assert config.model == "provider/model"
     assert config.base_url == "https://openrouter.ai/api/v1"
     assert config.timeout_seconds == 12.5
 

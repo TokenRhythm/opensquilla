@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator
@@ -91,6 +92,11 @@ _NEW_COLUMNS: list[tuple[str, str]] = [
     ("creator_session_key", "TEXT NOT NULL DEFAULT ''"),
     ("creator_sender_id", "TEXT NOT NULL DEFAULT ''"),
     ("creator_is_owner", "INTEGER NOT NULL DEFAULT 0"),
+    ("creator_host_execute", "INTEGER NOT NULL DEFAULT 0"),
+    ("run_mode", "TEXT NOT NULL DEFAULT ''"),
+    ("elevated", "TEXT NOT NULL DEFAULT ''"),
+    ("execution_target", "TEXT NOT NULL DEFAULT ''"),
+    ("idempotency_key", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 _DATETIME_COLUMNS: tuple[str, ...] = (
@@ -171,6 +177,11 @@ def _row_to_job(row: aiosqlite.Row) -> CronJob:
         creator_session_key=_get("creator_session_key", "") or "",
         creator_sender_id=_get("creator_sender_id", "") or "",
         creator_is_owner=bool(_get("creator_is_owner", 0)),
+        creator_host_execute=bool(_get("creator_host_execute", 0)),
+        run_mode=_get("run_mode", "") or "",
+        elevated=_get("elevated", "") or "",
+        execution_target=_get("execution_target", "") or "",
+        idempotency_key=_get("idempotency_key", "") or "",
         session_target=session_target,
         session_key=session_key,
         timeout_seconds=_get("timeout_seconds", 600.0) or 600.0,
@@ -343,6 +354,7 @@ class JobStore:
     def __init__(self, db_path: str = ":memory:") -> None:
         self._db_path = db_path
         self._conn: aiosqlite.Connection | None = None
+        self._idempotent_create_lock = asyncio.Lock()
 
     async def open(self) -> None:
         if self._conn is None:
@@ -365,6 +377,14 @@ class JobStore:
         for col_name, col_def in _NEW_COLUMNS:
             if col_name not in existing:
                 await db.execute(f"ALTER TABLE scheduler_jobs ADD COLUMN {col_name} {col_def}")
+        await db.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_scheduler_jobs_idempotency_key
+            ON scheduler_jobs(idempotency_key)
+            WHERE idempotency_key <> ''
+            """
+        )
 
         # Migrate scheduler_runs — add missing columns
         async with db.execute("PRAGMA table_info(scheduler_runs)") as cur:
@@ -501,8 +521,11 @@ class JobStore:
                  consecutive_errors, delivery_json, origin_session_key,
                  reservation_token, reserved_at, reserved_by, reservation_source,
                  scheduled_run_at, tool_policy_json, tz, anchor_at,
-                 creator_session_key, creator_sender_id, creator_is_owner)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 creator_session_key, creator_sender_id, creator_is_owner,
+                 creator_host_execute,
+                 run_mode, elevated, execution_target, idempotency_key)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                    ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
                 name=excluded.name,
                 cron_expr=excluded.cron_expr,
@@ -539,7 +562,12 @@ class JobStore:
                 anchor_at=excluded.anchor_at,
                 creator_session_key=excluded.creator_session_key,
                 creator_sender_id=excluded.creator_sender_id,
-                creator_is_owner=excluded.creator_is_owner
+                creator_is_owner=excluded.creator_is_owner,
+                creator_host_execute=excluded.creator_host_execute,
+                run_mode=excluded.run_mode,
+                elevated=excluded.elevated,
+                execution_target=excluded.execution_target,
+                idempotency_key=excluded.idempotency_key
             """,
             (
                 job.id,
@@ -580,12 +608,40 @@ class JobStore:
                 job.creator_session_key or "",
                 job.creator_sender_id or "",
                 1 if job.creator_is_owner else 0,
+                1 if job.creator_host_execute else 0,
+                job.run_mode or "",
+                job.elevated or "",
+                job.execution_target or "",
+                job.idempotency_key or "",
             ),
         )
 
     async def save(self, job: CronJob) -> None:
         await self._execute_save(job)
         await self._db().commit()
+
+    async def create_or_get(self, job: CronJob) -> CronJob:
+        """Atomically create an idempotent job or return the existing row."""
+        if not job.idempotency_key:
+            await self.save(job)
+            return job
+
+        async with self._idempotent_create_lock:
+            existing = await self.get_by_idempotency_key(job.idempotency_key)
+            if existing is not None:
+                existing.deduplicated = True
+                return existing
+            try:
+                await self._execute_save(job)
+                await self._db().commit()
+            except aiosqlite.IntegrityError:
+                await self._db().rollback()
+                existing = await self.get_by_idempotency_key(job.idempotency_key)
+                if existing is None:
+                    raise
+                existing.deduplicated = True
+                return existing
+            return job
 
     async def save_no_commit(self, job: CronJob) -> None:
         """Insert/update a job without committing — use inside transaction()."""
@@ -600,6 +656,16 @@ class JobStore:
     async def get(self, job_id: str) -> CronJob | None:
         async with self._db().execute(
             "SELECT * FROM scheduler_jobs WHERE id = ?", (job_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return _row_to_job(row) if row else None
+
+    async def get_by_idempotency_key(self, idempotency_key: str) -> CronJob | None:
+        if not idempotency_key:
+            return None
+        async with self._db().execute(
+            "SELECT * FROM scheduler_jobs WHERE idempotency_key = ?",
+            (idempotency_key,),
         ) as cur:
             row = await cur.fetchone()
             return _row_to_job(row) if row else None

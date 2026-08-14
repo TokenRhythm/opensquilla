@@ -30,7 +30,10 @@ from opensquilla.gateway.scopes import ADMIN_SCOPE, METHOD_SCOPES
 # Top-level envelope. ``source`` distinguishes "the provider listed models"
 # ("live") from "provider lists nothing / does not support listing" ("none",
 # still ok=true); a classified failure is ok=false with failureKind/detail.
-DISCOVER_ENVELOPE_KEYS = frozenset({"ok", "failureKind", "detail", "source", "models"})
+DISCOVER_ENVELOPE_KEYS = frozenset(
+    {"ok", "failureKind", "detail", "source", "models", "catalog"}
+)
+DISCOVER_CATALOG_KEYS = frozenset({"lastSyncedAt", "stale"})
 
 # Per-model row. ``pricing`` is an object with the frozen keys below or null
 # when no layer knows a price; ``capabilitySource`` names the catalog layer
@@ -44,6 +47,7 @@ DISCOVER_MODEL_ROW_KEYS = frozenset(
         "capabilities",
         "pricing",
         "capabilitySource",
+        "metadata",
     }
 )
 DISCOVER_PRICING_KEYS = frozenset({"inputPer1k", "outputPer1k"})
@@ -101,6 +105,9 @@ async def test_discover_envelope_keys_are_frozen(tmp_path, monkeypatch: Any) -> 
     assert payload["ok"] is True
     assert payload["source"] == "live"
     assert payload["models"], "a live listing must produce rows"
+    # Providers outside the dual-source catalog keep the additive health
+    # envelope absent without changing their discovery behavior.
+    assert payload["catalog"] is None
 
 
 async def test_discover_model_row_keys_are_frozen(tmp_path, monkeypatch: Any) -> None:
@@ -127,6 +134,21 @@ async def test_discover_model_row_keys_are_frozen(tmp_path, monkeypatch: Any) ->
     # Metadata provenance comes from the layered catalog; an unknown model
     # resolves to the synthesized floor rather than failing.
     assert row["capabilitySource"] == "synthesized"
+    assert row["metadata"] is None
+
+
+def test_discover_tokenrhythm_catalog_health_shape_is_frozen() -> None:
+    from opensquilla.onboarding.probe import ProviderModelsDiscoverResult
+
+    payload = ProviderModelsDiscoverResult(
+        ok=True,
+        provider_id="tokenrhythm",
+        source="live",
+        catalog={"lastSyncedAt": "2026-08-03T12:00:00+00:00", "stale": False},
+    ).to_payload()
+
+    assert set(payload) == DISCOVER_ENVELOPE_KEYS
+    assert set(payload["catalog"]) == DISCOVER_CATALOG_KEYS
 
 
 async def test_discover_pricing_keys_are_frozen_when_present(tmp_path, monkeypatch: Any) -> None:
@@ -162,6 +184,96 @@ async def test_discover_pricing_keys_are_frozen_when_present(tmp_path, monkeypat
     assert row["capabilitySource"] == "user"
 
 
+def test_discover_metadata_preserves_explicit_false_capabilities() -> None:
+    """Declared/public ``False`` must outrank truthy compatibility fallbacks."""
+
+    from opensquilla.onboarding.probe import _discover_model_row
+    from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
+    from opensquilla.provider.types import ModelInfo
+
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "tokenrhythm/test-model": {
+                "supports_tools": True,
+                "supports_reasoning": True,
+                "supports_vision": True,
+            }
+        }
+    )
+    metadata = {
+        "schemaVersion": 1,
+        "published": {
+            "capabilities": {"tools": True, "reasoning": True, "vision": False}
+        },
+        "declared": {
+            "capabilities": {"tools": False, "reasoning": False, "vision": None}
+        },
+    }
+    set_shared_catalog(catalog)
+    try:
+        row = _discover_model_row(
+            ModelInfo(
+                provider="tokenrhythm",
+                model_id="test-model",
+                supports_tools=True,
+                supports_reasoning=True,
+                supports_vision=True,
+                metadata=metadata,
+            ),
+            "tokenrhythm",
+        )
+    finally:
+        set_shared_catalog(None)
+
+    assert row["capabilities"] == ["chat"]
+    assert row["metadata"] == metadata
+
+
+def test_discover_metadata_true_does_not_enable_unsupported_transport_capability() -> None:
+    """Published declarations cannot enable a capability the runtime cannot execute."""
+
+    from opensquilla.onboarding.probe import _discover_model_row
+    from opensquilla.provider.model_catalog import ModelCatalog, set_shared_catalog
+    from opensquilla.provider.types import ModelInfo
+
+    metadata = {
+        "schemaVersion": 1,
+        "published": {
+            "capabilities": {"tools": True, "reasoning": True, "vision": True}
+        },
+        "declared": None,
+    }
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "tokenrhythm/unknown-auth-only-model": {
+                "supports_tools": False,
+                "supports_reasoning": False,
+                "supports_vision": False,
+            }
+        }
+    )
+    set_shared_catalog(catalog)
+    try:
+        row = _discover_model_row(
+            ModelInfo(
+                provider="tokenrhythm",
+                model_id="unknown-auth-only-model",
+                supports_tools=False,
+                supports_reasoning=False,
+                supports_vision=False,
+                metadata=metadata,
+            ),
+            "tokenrhythm",
+        )
+    finally:
+        set_shared_catalog(None)
+
+    assert row["capabilities"] == ["chat"]
+    assert row["metadata"] == metadata
+
+
 async def test_discover_empty_listing_is_ok_with_source_none(tmp_path, monkeypatch: Any) -> None:
     # "Provider lists nothing / does not support listing" is NOT a failure:
     # ok stays true, source is "none", models is empty. Clients must be able
@@ -184,6 +296,7 @@ async def test_discover_empty_listing_is_ok_with_source_none(tmp_path, monkeypat
     assert payload["source"] == "none"
     assert payload["models"] == []
     assert payload["failureKind"] == ""
+    assert payload["catalog"] is None
 
 
 async def test_discover_classified_failure_envelope_is_frozen(tmp_path, monkeypatch: Any) -> None:
@@ -215,6 +328,7 @@ async def test_discover_classified_failure_envelope_is_frozen(tmp_path, monkeypa
     assert payload["source"] == "none"
     assert payload["models"] == []
     assert payload["failureKind"] == "auth_invalid"
+    assert payload["catalog"] is None
     # detail is redacted free text: never echo credential-shaped material.
     assert "sk-badkey000" not in payload["detail"]
 

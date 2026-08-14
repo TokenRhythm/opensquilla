@@ -34,7 +34,7 @@ class SkillRequires:
 class SkillInstallSpec:
     """How to install a skill's dependencies."""
 
-    kind: str = ""  # brew | node | go | uv | download
+    kind: str = ""  # brew | node | go | uv | download | toolchain
     id: str = ""
     label: str = ""
     bins: list[str] = field(default_factory=list)
@@ -90,6 +90,11 @@ class SkillSpec:
     provenance: SkillProvenance = field(default_factory=SkillProvenance)
     user_invocable: bool = True
     disable_model_invocation: bool = False
+    # Optional localized (Simplified Chinese) one-line description. Falls back
+    # to ``description`` (English) when absent. Sourced from the SKILL.md
+    # front-matter ``description_zh`` field, mirroring the ``_zh/_en``
+    # convention already used by meta-skill clarify prompts.
+    description_zh: str = ""
     homepage: str = ""
     file_path: str = ""
     base_dir: str = ""
@@ -132,3 +137,14 @@ class SkillSpec:
     #   timeout: float         — seconds before the subprocess is killed
     #   cwd: str               — working directory (defaults to base_dir)
     entrypoint: dict[str, Any] | None = None
+    # Stable identity of this physical skill instance. Kept last so adding the
+    # field does not shift any historical positional ``SkillSpec`` arguments.
+    # Multiple layers may contribute the same logical ``name``; ``instance_id``
+    # distinguishes the winning instance from shadowed candidates without
+    # exposing host paths.
+    instance_id: str = ""
+    # Full content/type digest of the physical Skill tree at catalog compile
+    # time. Supporting-resource reads compare this value with the live tree so
+    # a turn pinned to an older catalog cannot combine old instructions with
+    # files published by a newer install or reload.
+    tree_digest: str = ""

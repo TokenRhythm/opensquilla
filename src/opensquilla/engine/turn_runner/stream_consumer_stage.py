@@ -27,6 +27,7 @@ No ``TurnHook`` is fired from inside the stream loop today.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
@@ -34,7 +35,9 @@ from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 import structlog
 
 from opensquilla.engine.hooks.types import CompactionState
+from opensquilla.engine.route_plan import route_plan_snapshot
 from opensquilla.observability.decision_log import build_vision_followup_gate_reason_code
+from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
 
 if TYPE_CHECKING:
     from opensquilla.engine.agent import Agent
@@ -47,12 +50,12 @@ if TYPE_CHECKING:
         CompactionEvent,
         DoneEvent,
         ErrorEvent,
-        RouterDecisionEvent,
         TextDeltaEvent,
         ToolResultEvent,
         ToolUseStartEvent,
         WarningEvent,
     )
+    from opensquilla.silent_reply import SilentReplySegmentsNormalization
 
 log = structlog.get_logger(__name__)
 
@@ -60,6 +63,9 @@ log = structlog.get_logger(__name__)
 # downstream" (CompactionEvent + ErrorEvent take this path -- the
 # loop continues instead of yielding).
 _SUPPRESS: Final = object()
+_CURRENT_SILENT_REPLY_TEXT_MARKER: Final = (
+    "_opensquilla_current_silent_reply_text"
+)
 
 # ---------------------------------------------------------------------------
 # Ports -- five narrow Protocols + one callable
@@ -109,8 +115,20 @@ class CompactionPersistPort(Protocol):
         session_key: str,
         summary: str,
         kept_entries: list[Any],
+        summary_payload: dict[str, Any] | None = None,
+        summary_format: str = "text",
+        coverage_status: str = "unknown",
+        missing_obligations: list[str] | None = None,
+        critical_carry_forward: list[str] | None = None,
         compaction_id: str | None = None,
-    ) -> None: ...
+        compaction_deadline_at_monotonic: float | None = None,
+        compaction_timeout_seconds: float | None = None,
+        removed_count: int = 0,
+        source_entries: tuple[Any, ...] | None = None,
+        source_preimage: tuple[tuple[Any, ...], ...] | None = None,
+        source_boundary_message_id: str | None = None,
+        source_boundary_entry_id: int | None = None,
+    ) -> bool | None: ...
 
 @runtime_checkable
 class MemorySnapshotRefreshPort(Protocol):
@@ -214,6 +232,15 @@ class _StreamState:
     artifact_delivery_failures_by_target: dict[str, str] = field(default_factory=dict)
     completed_meta_skill_without_text: str | None = None
 
+
+@dataclass(frozen=True)
+class _SilentReplyStateProjection:
+    """Copy-on-write silent-reply projection of the live segment timeline."""
+
+    raw_text: str
+    canonical_text: str
+    normalization: SilentReplySegmentsNormalization
+
 # ---------------------------------------------------------------------------
 # Stage I/O dataclass
 # ---------------------------------------------------------------------------
@@ -264,6 +291,19 @@ class StreamConsumerStageInput:
     input_provenance: dict[str, Any] | None = None
     # In-process pending submitted-line provider for mid-turn injection.
     pending_input_provider: PendingInputProvider | None = None
+    # Live delivery-ready authorization resolved on the event loop before the
+    # blocking omitted-artifact publish enters its worker thread.
+    attached_plan_run_ready: bool | None = None
+    # Frozen durable prefix used by in-turn compaction persistence. The storage
+    # adapter compares it atomically and preserves later append-only queue rows.
+    compaction_source_entries: tuple[Any, ...] | None = None
+    compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
+    compaction_source_boundary_message_id: str | None = None
+    compaction_source_boundary_entry_id: int | None = None
+    # Original ingress mode.  Internal Goal continuations and heartbeats use
+    # ``system_event``; their text is held until the terminal snapshot can be
+    # canonicalized so silent-reply protocol markers never flash on a client.
+    input_mode: str = "user"
 
 # ---------------------------------------------------------------------------
 # Per-event handler classes
@@ -339,6 +379,37 @@ def _clear_artifact_delivery_failure(state: _StreamState, target_key: str) -> No
         pass
 
 
+def _user_input_payload(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict) or value.get("kind") != "user_input":
+        return None
+    return dict(value)
+
+
+def _pending_user_input_request(value: Any) -> dict[str, Any] | None:
+    payload = _user_input_payload(value)
+    if (
+        payload is None
+        or payload.get("status") != "input_required"
+        or payload.get("paused") is not True
+    ):
+        return None
+    return payload
+
+
+def _is_terminal_user_input_outcome(value: Any) -> bool:
+    payload = _user_input_payload(value)
+    return bool(
+        payload is not None
+        and payload.get("status") in {"answered", "cancelled", "expired"}
+        and payload.get("paused") is False
+    )
+
+
 class _ToolResultHandler:
     """Capture artifact-delivery failures and append the tool_result segment."""
 
@@ -393,6 +464,16 @@ class _ToolResultHandler:
                 segment.get("type") == "tool_result"
                 and segment.get("tool_use_id") == event.tool_use_id
             ):
+                initial_user_input_request = segment.get("user_input_request")
+                if initial_user_input_request is None:
+                    initial_user_input_request = _pending_user_input_request(
+                        segment.get("result")
+                    )
+                if (
+                    initial_user_input_request is not None
+                    and _is_terminal_user_input_outcome(result_segment.get("result"))
+                ):
+                    result_segment["user_input_request"] = initial_user_input_request
                 state.turn_segments[index] = result_segment
                 break
         else:
@@ -457,7 +538,10 @@ class _WarningHandler:
         self._transformer = transformer
 
     def handle(self, event: WarningEvent, state: _StreamState) -> WarningEvent:
-        if event.code == "workspace_diff_recovery":
+        if event.code in {
+            "workspace_diff_recovery",
+            "plan_run_reconciliation",
+        }:
             self._discard_superseded_current_text(state)
         return self._transformer(event)
 
@@ -492,9 +576,8 @@ class _DoneHandler:
     Largest single handler. Returns ``(transformed_done_event,
     extra_yields)`` where ``extra_yields`` is the (possibly empty) list
     of events the outer stage must yield BEFORE the DoneEvent itself --
-    the corrective fallback RouterDecisionEvent (when the selector
-    hopped mid-turn), the artifact-delivery-failure notice TextDelta
-    and/or the hallucination Warning yield, in the original order.
+    the artifact-delivery-failure notice TextDelta and/or the
+    hallucination Warning yield, in the original order.
 
     Split into three phases so the live stage can keep every
     ``_StreamState`` mutation on the event loop while offloading ONLY the
@@ -538,9 +621,9 @@ class _DoneHandler:
         from opensquilla.engine.runtime import (
             _compute_comprehensive_turn_savings,
             _compute_route_input_savings_usd,
-            _normalize_heartbeat_text,
             _turn_used_ensemble,
         )
+        from opensquilla.engine.silent_reply import normalize_silent_reply
         from opensquilla.engine.types import (
             done_text_snapshot,
         )
@@ -549,11 +632,87 @@ class _DoneHandler:
         metadata = turn.metadata
 
         snapshot_present, terminal_text = done_text_snapshot(event)
-        done_fallback_text = _normalize_heartbeat_text(
-            terminal_text,
+        accumulated_text = "".join(state.final_text_parts)
+        buffer_system_event_text = (
+            inp.input_mode == "system_event"
+            and inp.run_kind in {"goal", "heartbeat"}
+        )
+        # Buffered internal turns may be produced by legacy adapters that leave
+        # Done.text empty. Their accumulated deltas are still the canonical
+        # terminal candidate and must be normalized before anything is shown.
+        normalization_source = (
+            terminal_text
+            if snapshot_present
+            else accumulated_text if buffer_system_event_text else terminal_text
+        )
+        silent_reply = normalize_silent_reply(
+            normalization_source,
             run_kind=inp.run_kind,
+            input_mode=inp.input_mode,
             heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
         )
+
+        state_projection: _SilentReplyStateProjection | None = None
+        candidate = _silent_reply_state_projection(
+            state,
+            run_kind=inp.run_kind,
+            input_mode=inp.input_mode,
+            heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
+        )
+        if (
+            candidate.raw_text == accumulated_text
+            and candidate.normalization.changed
+            and (
+                candidate.canonical_text == silent_reply.text
+                or (
+                    normalization_source == accumulated_text
+                    and not silent_reply.changed
+                )
+            )
+        ):
+            # A producer may already publish the canonical terminal snapshot
+            # even though its streamed timeline still contains an outer marker.
+            # Exact canonical agreement lets us preserve text/tool chronology;
+            # any other terminal mismatch remains the retry/recovery path.
+            state_projection = candidate
+
+        if state_projection is not None:
+            segment_normalization = state_projection.normalization
+            done_fallback_text = state_projection.canonical_text
+            normalization_changed = True
+            normalization_sentinel = silent_reply.sentinel or next(
+                iter(segment_normalization.sentinels),
+                None,
+            )
+            normalization_suppressed = segment_normalization.suppressed
+            normalization_delivery = segment_normalization.delivery
+            normalization_suppression_reason = (
+                segment_normalization.suppression_reason
+            )
+        else:
+            done_fallback_text = silent_reply.text
+            normalization_changed = silent_reply.changed
+            normalization_sentinel = silent_reply.sentinel
+            normalization_suppressed = silent_reply.suppressed
+            normalization_delivery = silent_reply.delivery
+            normalization_suppression_reason = silent_reply.suppression_reason
+
+        if normalization_sentinel is not None:
+            metric = (
+                "suppressed_reply_total"
+                if normalization_suppressed
+                else "mixed_sentinel_output_total"
+            )
+            # Labels are fixed protocol enums only. Never log model-authored
+            # text from this path.
+            log.info(
+                metric,
+                metric=metric,
+                value=1,
+                run_kind=inp.run_kind,
+                sentinel=normalization_sentinel,
+            )
+        canonical_snapshot_present = snapshot_present or buffer_system_event_text
         routed_tier = metadata.get("routed_tier")
         routing_source = metadata.get("routing_source", "none")
         routing_confidence = float(metadata.get("routing_confidence") or 0.0)
@@ -600,7 +759,11 @@ class _DoneHandler:
         event = replace(
             event,
             text=done_fallback_text,
-            text_snapshot=(done_fallback_text if snapshot_present else None),
+            text_snapshot=(
+                done_fallback_text if canonical_snapshot_present else None
+            ),
+            delivery=normalization_delivery,
+            suppression_reason=normalization_suppression_reason,
             decision_id=str(decision_id) if decision_id else None,
             routed_tier=routed_tier,
             routing_source=routing_source or "none",
@@ -633,22 +796,29 @@ class _DoneHandler:
             vision_followup_gate_model=metadata.get("router_vision_followup_gate_model"),
             vision_followup_needs_image=metadata.get("router_vision_followup_needs_image"),
             vision_followup_fallback=metadata.get("router_vision_followup_fallback"),
+            route_plan=route_plan_snapshot(turn),
+            execution_legs=[
+                dict(leg)
+                for leg in metadata.get("execution_legs", [])
+                if isinstance(leg, dict)
+            ],
         )
 
-        accumulated_text = "".join(state.final_text_parts)
-        canonical_text, done_suffix_event = _reconcile_done_text_snapshot(
-            done_fallback_text,
-            state,
-            accumulated_text=accumulated_text,
-            authoritative=snapshot_present,
-        )
+        if normalization_changed and state_projection is not None:
+            _apply_silent_reply_normalization_to_state(state, state_projection)
+            canonical_text = done_fallback_text
+            done_suffix_event = None
+        else:
+            canonical_text, done_suffix_event = _reconcile_done_text_snapshot(
+                done_fallback_text,
+                state,
+                accumulated_text=accumulated_text,
+                authoritative=canonical_snapshot_present,
+            )
         accumulated_text = "".join(state.final_text_parts)
         event = replace(event, text=canonical_text)
         state.done_event = event
         extra_yields: list[AgentEvent] = []
-        corrective_router_event = _fallback_router_decision_event(turn)
-        if corrective_router_event is not None:
-            extra_yields.append(corrective_router_event)
         if done_suffix_event is not None:
             extra_yields.append(done_suffix_event)
         if not accumulated_text.strip() and state.completed_meta_skill_without_text:
@@ -691,6 +861,7 @@ class _DoneHandler:
         return auto_publish_omitted_workspace_artifacts(
             inp.tool_context,
             final_text=accumulated_text,
+            attached_plan_run_ready=inp.attached_plan_run_ready,
         )
 
     def record_publish_result(
@@ -784,6 +955,24 @@ class _DoneHandler:
             extra_yields.append(notice_event)
 
         accumulated_text = "".join(state.final_text_parts)
+        from opensquilla.engine.turn_runner.runtime_notices import (
+            unconfirmed_action_notice,
+        )
+
+        confirmation_notice = unconfirmed_action_notice(
+            accumulated_text,
+            state.turn_segments,
+        )
+        if confirmation_notice is not None:
+            event, notice_event = _append_done_notice_delta(
+                event,
+                state,
+                confirmation_notice,
+                accumulated_text=accumulated_text,
+            )
+            extra_yields.append(notice_event)
+
+        accumulated_text = "".join(state.final_text_parts)
         if _claims_image_without_tool_use(
             accumulated_text, turn.tool_defs, state.turn_segments
         ):
@@ -847,6 +1036,86 @@ def _reconcile_done_text_snapshot(
     return done_text, None
 
 
+def _silent_reply_state_projection(
+    state: _StreamState,
+    *,
+    run_kind: str,
+    input_mode: str | None,
+    heartbeat_ack_max_chars: int,
+) -> _SilentReplyStateProjection:
+    """Normalize the ordered timeline, including the unflushed text carrier."""
+
+    from opensquilla.engine.silent_reply import sanitize_silent_reply_segments
+
+    current_text = "".join(state.current_text_parts)
+    combined_segments = [dict(segment) for segment in state.turn_segments]
+    if current_text:
+        combined_segments.append(
+            {
+                "type": "text",
+                "text": current_text,
+                _CURRENT_SILENT_REPLY_TEXT_MARKER: True,
+            }
+        )
+    normalized = sanitize_silent_reply_segments(
+        combined_segments,
+        run_kind=run_kind,
+        input_mode=input_mode,
+        heartbeat_ack_max_chars=heartbeat_ack_max_chars,
+    )
+    raw_text = "".join(
+        str(segment.get("text") or "")
+        for segment in combined_segments
+        if segment.get("type") == "text"
+    )
+    normalized_text = "".join(
+        str(segment.get("text") or "")
+        for segment in normalized.segments
+        if segment.get("type") == "text"
+    )
+    return _SilentReplyStateProjection(
+        raw_text=raw_text,
+        canonical_text=normalized_text,
+        normalization=normalized,
+    )
+
+
+def _apply_silent_reply_normalization_to_state(
+    state: _StreamState,
+    projection: _SilentReplyStateProjection,
+) -> None:
+    """Commit a validated deletion-only projection without crossing tools."""
+
+    turn_segments: list[dict[str, Any]] = []
+    normalized_current = ""
+    for raw_segment in projection.normalization.segments:
+        segment = dict(raw_segment)
+        if segment.pop(_CURRENT_SILENT_REPLY_TEXT_MARKER, False):
+            normalized_current += str(segment.get("text") or "")
+            continue
+        turn_segments.append(segment)
+    state.turn_segments[:] = turn_segments
+    state.current_text_parts[:] = [normalized_current] if normalized_current else []
+    state.final_text_parts[:] = (
+        [projection.canonical_text] if projection.canonical_text else []
+    )
+
+
+def _unreleased_text_suffix(
+    canonical_text: str,
+    released_text: str | None,
+) -> str:
+    """Return only a safe append after an Error already released held text."""
+
+    if released_text is None:
+        return canonical_text
+    if canonical_text.startswith(released_text):
+        return canonical_text[len(released_text) :]
+    # A conflicting terminal snapshot is authoritative, but a delta cannot
+    # retract the already-released prefix. Let Done.text_snapshot reconcile it.
+    return ""
+
+
 def _append_done_notice_delta(
     event: DoneEvent,
     state: _StreamState,
@@ -861,52 +1130,15 @@ def _append_done_notice_delta(
     state.final_text_parts.append(notice_delta)
     state.current_text_parts.append(notice_delta)
     final_text = "".join(state.final_text_parts)
-    event = replace(event, text=final_text, text_snapshot=final_text)
+    event = replace(
+        event,
+        text=final_text,
+        text_snapshot=final_text,
+        delivery="visible",
+        suppression_reason=None,
+    )
     state.done_event = event
     return event, _TextDeltaEvent(text=notice_delta)
-
-
-def _fallback_router_decision_event(turn: Any) -> RouterDecisionEvent | None:
-    """Corrective router-decision event after a mid-turn selector failover.
-
-    The turn's one-shot RouterDecisionEvent is emitted before the first
-    provider call, so a pre-content failover leaves every router HUD
-    showing a decision for a model that never answered. When the turn
-    metadata records at least one selector fallback hop, rebuild the
-    event from the realigned metadata (``routed_model`` already names
-    the model that ran, and route savings were zeroed alongside it) and
-    mark it as a fallback so HUDs settle before the DoneEvent receipt
-    renders. Returns ``None`` when no hop occurred, keeping non-fallback
-    turns at exactly one RouterDecisionEvent.
-    """
-    # Late imports keep the module import-cycle-free.
-    from opensquilla.engine.router_decision import build_router_decision_event
-    from opensquilla.engine.steps.router_decision_record import (
-        FALLBACK_HOPS_METADATA_KEY,
-    )
-
-    metadata = turn.metadata
-    try:
-        fallback_hops = int(metadata.get(FALLBACK_HOPS_METADATA_KEY) or 0)
-    except (TypeError, ValueError):
-        fallback_hops = 0
-    if fallback_hops <= 0:
-        return None
-
-    corrective = build_router_decision_event(turn)
-    if corrective is None:
-        return None
-    # Source is passed explicitly instead of mutating turn metadata: the
-    # staged decision record and the DoneEvent keep reporting the original
-    # routing source, while the corrective HUD event reports the failover.
-    # ``savings_pct`` mirrors the realigned metadata value directly so the
-    # builder cannot resurrect stale tier savings for the abandoned model.
-    return replace(
-        corrective,
-        source="fallback",
-        fallback=True,
-        savings_pct=float(metadata.get("savings_pct") or 0.0),
-    )
 
 
 def _is_completed_meta_invoke(event: ToolResultEvent) -> bool:
@@ -1051,12 +1283,101 @@ class _CompactionHandler:
         await self._fire_before_compact(state)
         if inp.session_manager_present:
             try:
-                await self._persist.persist_and_notify(
-                    session_key=inp.session_key,
-                    summary=event.summary,
-                    kept_entries=event.kept_entries,
-                    compaction_id=event.compaction_id,
+                persist_kwargs: dict[str, Any] = {
+                    "session_key": inp.session_key,
+                    "summary": event.summary,
+                    "kept_entries": event.kept_entries,
+                    "summary_payload": event.summary_payload,
+                    "summary_format": event.summary_format,
+                    "coverage_status": event.coverage_status,
+                    "missing_obligations": event.missing_obligations,
+                    "critical_carry_forward": event.critical_carry_forward,
+                    "compaction_id": event.compaction_id,
+                    "removed_count": event.removed_count,
+                    "source_entries": inp.compaction_source_entries,
+                    "source_preimage": inp.compaction_source_preimage,
+                    "source_boundary_message_id": (
+                        inp.compaction_source_boundary_message_id
+                    ),
+                    "source_boundary_entry_id": (
+                        inp.compaction_source_boundary_entry_id
+                    ),
+                }
+                if event.compaction_deadline_at_monotonic is not None:
+                    persist_kwargs["compaction_deadline_at_monotonic"] = (
+                        event.compaction_deadline_at_monotonic
+                    )
+                if event.compaction_timeout_seconds is not None:
+                    persist_kwargs["compaction_timeout_seconds"] = (
+                        event.compaction_timeout_seconds
+                    )
+                installed = await self._persist.persist_and_notify(**persist_kwargs)
+                if installed is False:
+                    await self._fire_after_compact(
+                        state,
+                        {
+                            "status": "skipped",
+                            "reason": "stale_preimage",
+                        },
+                    )
+                    return
+            except asyncio.CancelledError:
+                from opensquilla.engine.cache_break_monitor import notify_compaction
+                from opensquilla.session.compaction_lifecycle import (
+                    COMPACTION_TRIGGERED_EVENT,
+                    compaction_effect_payload,
+                    compaction_lifecycle_payload,
+                    new_compaction_id,
                 )
+
+                compaction_id = event.compaction_id or new_compaction_id()
+                notify_compaction(
+                    inp.session_key,
+                    source="automatic",
+                    phase="agent_inline_overflow",
+                    status="cancelled",
+                    reason="cancelled",
+                    **compaction_effect_payload(status="cancelled"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                await self._fire_after_compact(
+                    state,
+                    {"status": "cancelled", "reason": "cancelled"},
+                )
+                raise
+            except CompactionTimeoutError as exc:
+                from opensquilla.engine.cache_break_monitor import notify_compaction
+                from opensquilla.session.compaction_lifecycle import (
+                    COMPACTION_TRIGGERED_EVENT,
+                    compaction_effect_payload,
+                    compaction_lifecycle_payload,
+                    new_compaction_id,
+                )
+
+                compaction_id = event.compaction_id or new_compaction_id()
+                notify_compaction(
+                    inp.session_key,
+                    source="automatic",
+                    phase=exc.phase,
+                    status="timed_out",
+                    reason="compaction_deadline_exceeded",
+                    **compaction_effect_payload(status="timed_out"),
+                    **compaction_lifecycle_payload(
+                        compaction_id,
+                        COMPACTION_TRIGGERED_EVENT,
+                    ),
+                )
+                await self._fire_after_compact(
+                    state,
+                    {
+                        "status": "timed_out",
+                        "reason": "compaction_deadline_exceeded",
+                    },
+                )
+                return
             except Exception as exc:  # noqa: BLE001 - preserve turn recoverability
                 log.warning("compaction_persist_failed", error=str(exc))
                 from opensquilla.engine.cache_break_monitor import notify_compaction
@@ -1215,12 +1536,21 @@ class StreamConsumerStage:
             ToolUseDeltaEvent,
             ToolUseStartEvent,
             WarningEvent,
+            done_text_snapshot,
         )
         from opensquilla.provider.types import (
             EnsembleProgressEvent as ProviderEnsembleProgressEvent,
         )
 
         state = inp.state
+        buffer_system_event_text = (
+            inp.input_mode == "system_event"
+            and inp.run_kind in {"goal", "heartbeat"}
+        )
+        buffered_text_observed = False
+        released_system_event_text: str | None = None
+        released_system_event_source_text: str | None = None
+        released_suppressed_source_text: str | None = None
         async for event in self._agent_run.run_turn(
             inp.agent,
             turn_input=inp.turn_input,
@@ -1232,6 +1562,16 @@ class StreamConsumerStage:
             extra_yields: list[AgentEvent] = []
             if isinstance(event, TextDeltaEvent):
                 transformed = self._text_delta_handler.handle(event, state)
+                if buffer_system_event_text:
+                    if event.text and not buffered_text_observed:
+                        log.info(
+                            "system_event_text_buffered_total",
+                            metric="system_event_text_buffered_total",
+                            value=1,
+                            run_kind=inp.run_kind,
+                        )
+                        buffered_text_observed = True
+                    transformed = _SUPPRESS
             elif isinstance(event, ToolUseStartEvent):
                 transformed = self._tool_use_start_handler.handle(event, state)
             elif isinstance(event, ToolUseDeltaEvent):
@@ -1246,9 +1586,129 @@ class StreamConsumerStage:
                 transformed = self._artifact_handler.handle(event, state)
             elif isinstance(event, ErrorEvent):
                 transformed = self._error_handler.handle(event, state)
+                if buffer_system_event_text:
+                    from opensquilla.engine.silent_reply import (
+                        is_silent_reply_prefix,
+                        normalize_silent_reply,
+                    )
+
+                    buffered_text = "".join(state.final_text_parts)
+                    normalized = normalize_silent_reply(
+                        buffered_text,
+                        run_kind=inp.run_kind,
+                        input_mode=inp.input_mode,
+                        heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
+                    )
+                    state_projection: _SilentReplyStateProjection | None = None
+                    candidate = _silent_reply_state_projection(
+                        state,
+                        run_kind=inp.run_kind,
+                        input_mode=inp.input_mode,
+                        heartbeat_ack_max_chars=inp.heartbeat_ack_max_chars,
+                    )
+                    if (
+                        candidate.raw_text == buffered_text
+                        and candidate.normalization.changed
+                        and (
+                            not normalized.changed
+                            or candidate.canonical_text == normalized.text
+                        )
+                    ):
+                        state_projection = candidate
+                    if is_silent_reply_prefix(buffered_text):
+                        canonical_partial = ""
+                        state_projection = None
+                    elif state_projection is not None:
+                        canonical_partial = state_projection.canonical_text
+                    else:
+                        canonical_partial = normalized.text
+
+                    if state_projection is not None:
+                        _apply_silent_reply_normalization_to_state(
+                            state,
+                            state_projection,
+                        )
+                    else:
+                        _reconcile_done_text_snapshot(
+                            canonical_partial,
+                            state,
+                            accumulated_text=buffered_text,
+                            authoritative=True,
+                        )
+                    # An Error has no authoritative Done snapshot. Settle the
+                    # held text once so useful partial output remains visible,
+                    # while an exact or distinctive incomplete marker never
+                    # escapes merely because the provider failed mid-token.
+                    release_delta = _unreleased_text_suffix(
+                        canonical_partial,
+                        released_system_event_text,
+                    )
+                    if release_delta:
+                        extra_yields.append(TextDeltaEvent(text=release_delta))
+                    if (
+                        released_system_event_source_text is not None
+                        and released_system_event_text is not None
+                        and buffered_text.startswith(released_system_event_text)
+                    ):
+                        released_system_event_source_text += buffered_text[
+                            len(released_system_event_text) :
+                        ]
+                    else:
+                        released_system_event_source_text = buffered_text
+                    released_system_event_text = canonical_partial
+                    released_suppressed_source_text = (
+                        buffered_text
+                        if (
+                            normalized.suppressed
+                            or (
+                                state_projection is not None
+                                and state_projection.normalization.suppressed
+                            )
+                        )
+                        else None
+                    )
             elif isinstance(event, WarningEvent):
                 transformed = self._warning_handler.handle(event, state)
             elif isinstance(event, DoneEvent):
+                if (
+                    buffer_system_event_text
+                    and released_system_event_source_text is not None
+                    and released_system_event_text is not None
+                ):
+                    snapshot_present, terminal_text = done_text_snapshot(event)
+                    accumulated_text = "".join(state.final_text_parts)
+                    if (
+                        snapshot_present
+                        and not terminal_text
+                        and released_suppressed_source_text is not None
+                    ):
+                        # A canonical-empty usage Done can follow an Error that
+                        # carried a complete silent token. Re-present that raw
+                        # token only to the shared normalizer so the terminal
+                        # delivery remains explicitly suppressed.
+                        event = replace(
+                            event,
+                            text=released_suppressed_source_text,
+                            text_snapshot=released_suppressed_source_text,
+                        )
+                        terminal_text = released_suppressed_source_text
+                    if (
+                        snapshot_present
+                        and bool(released_system_event_text)
+                        and terminal_text == released_system_event_source_text
+                        and accumulated_text.startswith(released_system_event_text)
+                    ):
+                        # Some providers emit a usage-bearing Done after Error
+                        # with the same pre-normalization aggregate. Map only
+                        # that exact raw payload back to the canonical text we
+                        # already released; a genuinely conflicting retry
+                        # snapshot remains authoritative.
+                        canonical_terminal = released_system_event_text
+                        event = replace(
+                            event,
+                            text=canonical_terminal,
+                            text_snapshot=canonical_terminal,
+                        )
                 # The done handler may auto-publish forgotten workspace
                 # deliverables, which re-reads and fully validates them
                 # (PPTX inflation plus deck parse). Keep every _StreamState
@@ -1261,10 +1721,20 @@ class StreamConsumerStage:
                 # the ArtifactStore -- yielding a torn transcript or an
                 # artifact persisted without a transcript record.
                 pre = self._done_handler.pre_publish(event, inp, state)
+                from opensquilla.engine.artifact_delivery import (
+                    attached_plan_run_ready_for_auto_publish,
+                )
+
+                publish_inp = replace(
+                    inp,
+                    attached_plan_run_ready=(
+                        await attached_plan_run_ready_for_auto_publish(inp.tool_context)
+                    ),
+                )
                 publish_task = asyncio.ensure_future(
                     asyncio.to_thread(
                         self._done_handler.run_publish,
-                        inp,
+                        publish_inp,
                         pre.accumulated_text,
                     )
                 )
@@ -1301,6 +1771,26 @@ class StreamConsumerStage:
                 transformed, extra_yields = self._done_handler.post_publish(
                     pre, publish_result, inp, state
                 )
+                if buffer_system_event_text:
+                    # Text deltas generated by reconciliation/notices are
+                    # replaced with one canonical terminal answer.  Non-text
+                    # events (artifacts, warnings, tool lifecycle) remain live
+                    # and in their original relative order.
+                    extra_yields = [
+                        extra_event
+                        for extra_event in extra_yields
+                        if not isinstance(extra_event, TextDeltaEvent)
+                    ]
+                    snapshot_present, canonical_text = done_text_snapshot(transformed)
+                    if not snapshot_present:
+                        canonical_text = transformed.text
+                    release_delta = _unreleased_text_suffix(
+                        canonical_text,
+                        released_system_event_text,
+                    )
+                    if release_delta:
+                        extra_yields.insert(0, TextDeltaEvent(text=release_delta))
+                    released_system_event_text = canonical_text
             elif isinstance(event, CompactionEvent):
                 await self._compaction_handler.handle(event, inp)
                 transformed = _SUPPRESS

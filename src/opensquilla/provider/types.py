@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from opensquilla.execution_status import ExecutionStatus
@@ -146,6 +146,26 @@ class ProviderMessageCountProjection:
 
 
 @dataclass(frozen=True)
+class ProviderFinalRequestProjection:
+    """Pure admission evidence for one adapter's exact outbound payload.
+
+    ``payload`` is retained so tests and higher-level admission coordinators
+    can prove that projection and transport use the same envelope.  It is
+    deliberately excluded from ``repr`` because provider requests may contain
+    user content.  ``fits_message_count`` is ``None`` when the adapter has no
+    authoritative message limit; the exact wire count remains available
+    without pretending that an unknown limit was proved.
+    """
+
+    payload: dict[str, Any] = field(repr=False, compare=False)
+    proof: dict[str, Any]
+    wire_message_count: int
+    message_limit: int | None
+    fits_message_count: bool | None
+    fits: bool
+
+
+@dataclass(frozen=True)
 class ProviderMessageLimitProof:
     """Structured proof of an upstream wire-message cardinality rejection."""
 
@@ -190,6 +210,40 @@ class ProviderHeartbeatEvent:
     kind: Literal["provider_heartbeat"] = field(default="provider_heartbeat", init=False)
     phase: str = "provider"
     message: str = ""
+
+
+@dataclass
+class ProviderActivityEvent:
+    """Safe, structured lifecycle signal for one upstream model activity.
+
+    This provider-domain shape intentionally contains no raw upstream error,
+    response body, prompt, or reasoning text.  The engine mirrors it onto the
+    public ``session.event.provider_activity`` contract.
+    """
+
+    kind: Literal["provider_activity"] = field(default="provider_activity", init=False)
+    schema_version: int = 1
+    activity_id: str = ""
+    phase: Literal["requesting", "reasoning", "retry_wait", "retrying", "fallback"] = (
+        "requesting"
+    )
+    reason: Literal[
+        "initial",
+        "rate_limited",
+        "provider_overloaded",
+        "transport_transient",
+        "reasoning_only",
+        "empty_response",
+        "stream_incomplete",
+        "invalid_response",
+        "context_overflow",
+        "unknown",
+    ] = "initial"
+    retry_attempt: int = 0
+    retry_limit: int = 0
+    retry_after_ms: int = 0
+    started_at: int = 0
+    heartbeat: bool = False
 
 
 @dataclass
@@ -247,6 +301,7 @@ StreamEvent = (
     | DoneEvent
     | ErrorEvent
     | ProviderHeartbeatEvent
+    | ProviderActivityEvent
     | EnsembleProgressEvent
 )
 
@@ -255,7 +310,13 @@ StreamEvent = (
 # Tool definition (Pydantic BaseModel — external API boundary)
 # ---------------------------------------------------------------------------
 
-from pydantic import BaseModel, ConfigDict, Field  # noqa: E402
+from pydantic import (  # noqa: E402
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
 
 class ToolParam(BaseModel):
@@ -310,11 +371,54 @@ class ModelInfo(BaseModel):
     supports_vision: bool = False
     input_cost_per_1k: float = 0.0
     output_cost_per_1k: float = 0.0
+    # Additive, normalized provider facts for discovery/RPC projection.
+    # Never contains an upstream raw row. Providers without a typed metadata
+    # contract leave it as None.
+    metadata: dict[str, Any] | None = None
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_absent_metadata(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ):
+        """Preserve the pre-metadata dump shape on every supported Pydantic 2.x."""
+        serialized = cast(dict[str, Any], handler(self))
+        if self.metadata is None:
+            serialized.pop("metadata", None)
+        return serialized
 
 
 # ---------------------------------------------------------------------------
 # Chat config (Pydantic BaseModel — call-time settings)
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRequestCorrelation:
+    """Opaque request identities exposed only to trusted provider transports."""
+
+    session_id: str
+    turn_id: str
+    execution_id: str
+    call_kind: str
+
+
+def derive_provider_request_correlation(
+    correlation: ProviderRequestCorrelation | None,
+    *,
+    execution_id: str | None = None,
+    call_kind: str | None = None,
+) -> ProviderRequestCorrelation | None:
+    """Derive one physical-call identity without changing its session or root turn."""
+
+    if correlation is None:
+        return None
+    updates: dict[str, str] = {}
+    if execution_id is not None:
+        updates["execution_id"] = execution_id
+    if call_kind is not None:
+        updates["call_kind"] = call_kind
+    return replace(correlation, **updates) if updates else correlation
 
 
 class ChatConfig(BaseModel):
@@ -337,9 +441,60 @@ class ChatConfig(BaseModel):
     model_capabilities: ModelCapabilities | None = None
     thinking_level: Any | None = None
     provider_request_max_chars: int = 0
+    # Runtime-only provenance for an explicit global
+    # ``llm.context_window_tokens`` override. Selector fallback must resolve the
+    # new physical model with this same operator setting; zero means the active
+    # window came from per-model/catalog/default resolution and may be rebound.
+    context_window_tokens_global_override: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        repr=False,
+    )
+    # Preserve the operator-owned portion of ``provider_request_max_chars``
+    # separately from the cap derived for one physical deployment.  Selector
+    # fallback may replace a derived cap when it rebinds to a different
+    # context window, but it must never enlarge an explicit caller limit.
+    provider_request_max_chars_explicit_cap: int | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    # Index of the real active user request in the final logical ``messages``
+    # list.  Provider wrappers may append synthetic user-role context (for
+    # example an ensemble candidate bundle); carrying the anchor separately
+    # prevents request compaction from protecting the synthetic message while
+    # rewriting the user's actual prompt.
+    active_user_message_index: int | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
     tool_choice: Any | None = None
     candidate_output_mode: Literal["normal", "inert_artifact"] = Field(
         default="normal",
+        exclude=True,
+        repr=False,
+    )
+    # Runtime-only bound for adapter-internal physical transport attempts.
+    # Zero preserves each adapter's compatibility behavior; auxiliary
+    # compaction binds this to one so its operation-level two-call cap is real.
+    physical_attempt_limit: int = Field(
+        default=0,
+        ge=0,
+        exclude=True,
+        repr=False,
+    )
+    # Runtime-only absolute turn deadline. Provider selectors use it to avoid
+    # violating an upstream Retry-After when the same account/endpoint owns the
+    # next fallback leg. Adapters never serialize or send this value upstream.
+    turn_deadline_at_monotonic: float | None = Field(
+        default=None,
+        exclude=True,
+        repr=False,
+    )
+    provider_request_correlation: ProviderRequestCorrelation | None = Field(
+        default=None,
         exclude=True,
         repr=False,
     )
@@ -348,6 +503,12 @@ class ChatConfig(BaseModel):
         if self.thinking_budget_explicit is None:
             self.thinking_budget_explicit = (
                 "thinking_budget_tokens" in self.model_fields_set
+            )
+        if self.provider_request_max_chars_explicit_cap is None:
+            self.provider_request_max_chars_explicit_cap = (
+                max(0, int(self.provider_request_max_chars or 0))
+                if "provider_request_max_chars" in self.model_fields_set
+                else 0
             )
 
 

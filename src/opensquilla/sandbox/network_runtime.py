@@ -12,18 +12,24 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
-from opensquilla.sandbox.elevation import ApprovalReviewerName
+from opensquilla.sandbox.elevation import (
+    ApprovalReviewerName,
+    effective_approval_reviewer,
+)
 from opensquilla.sandbox.escalation import (
     build_network_approval_params,
     consume_persisted_temporary_network_grant,
     consume_temporary_network_grant,
     context_with_temporary_network_grants,
+    current_tool_run_context,
+    discard_approval_run_context_authority,
     request_sandbox_approval,
 )
 from opensquilla.sandbox.governance import action_fingerprint
 from opensquilla.sandbox.network_guard import NetworkDecision, decide_network_access
+from opensquilla.sandbox.policy_models import SandboxPolicy
 from opensquilla.sandbox.run_context import RunContext
 from opensquilla.sandbox.types import SandboxRequest
 
@@ -85,6 +91,7 @@ class NetworkApprovalService:
     context: RunContext
     request: SandboxRequest
     runtime: Any
+    policy: SandboxPolicy = field(default_factory=SandboxPolicy)
     approval_timeout_seconds: float | None = None
     consume_temporary_grants: bool = True
     session_key_override: str | None = None
@@ -102,7 +109,7 @@ class NetworkApprovalService:
             self.context,
             fingerprint=self.fingerprint,
         )
-        return decide_network_access(host, effective_context)
+        return decide_network_access(host, effective_context, self.policy)
 
     async def decide(self, policy_request: NetworkPolicyRequest) -> NetworkDecision:
         key = HostApprovalKey.from_request(policy_request)
@@ -136,7 +143,11 @@ class NetworkApprovalService:
             self.context,
             fingerprint=self.fingerprint,
         )
-        decision = decide_network_access(policy_request.host, effective_context)
+        decision = decide_network_access(
+            policy_request.host,
+            effective_context,
+            self.policy,
+        )
         if decision.status == "allow":
             await self._consume_temporary_grant_if_needed(decision)
             return decision
@@ -179,17 +190,33 @@ class NetworkApprovalService:
 
         if params.get("reviewer") == "auto_review":
             await self._run_auto_review(payload, approval_id)
-        approved = await get_approval_queue().wait(
-            approval_id,
-            timeout=self.approval_timeout_seconds,
-        )
+        queue = get_approval_queue()
+        try:
+            approved = await queue.wait(
+                approval_id,
+                timeout=self.approval_timeout_seconds,
+            )
+        except asyncio.CancelledError:
+            # The originating client/proxy request is gone, so there is no
+            # continuation left for this card to resume.
+            try:
+                queue.expire_pending(approval_id)
+            except (KeyError, ValueError):
+                pass
+            discard_approval_run_context_authority(approval_id)
+            raise
         if not approved:
             try:
-                entry = get_approval_queue().get(approval_id)
+                entry = queue.get(approval_id)
                 rationale = str(entry.params.get("reviewRationale") or "").strip()
             except KeyError:
                 rationale = ""
             return self._blocked(policy_request, rationale or "denied")
+        if not self._current_execution_allows_approved_target(policy_request):
+            return self._blocked(
+                policy_request,
+                "approval_authority_unavailable",
+            )
 
         approved_decision = NetworkDecision(
             status="allow",
@@ -199,6 +226,33 @@ class NetworkApprovalService:
         )
         await self._consume_temporary_grant_if_needed(approved_decision)
         return approved_decision
+
+    def _current_execution_allows_approved_target(
+        self,
+        policy_request: NetworkPolicyRequest,
+    ) -> bool:
+        from opensquilla.tools.types import current_tool_context
+
+        ctx = current_tool_context.get()
+        if ctx is None:
+            return False
+        if (
+            str(getattr(ctx, "session_key", None) or "").strip()
+            != str(self.session_key or "").strip()
+        ):
+            return False
+        context = current_tool_run_context()
+        if context is None:
+            return False
+        effective = context_with_temporary_network_grants(
+            context,
+            fingerprint=self.fingerprint,
+        )
+        return decide_network_access(
+            policy_request.host,
+            effective,
+            self.policy,
+        ).status == "allow"
 
     async def _run_auto_review(
         self,
@@ -225,6 +279,11 @@ class NetworkApprovalService:
             except KeyError:
                 return
             if not entry.resolved:
+                if (
+                    entry.params.get("reviewer") == "user"
+                    and entry.params.get("humanActionable") is True
+                ):
+                    return
                 self._fail_auto_review_closed(
                     approval_id,
                     "Automatic network review returned without a decision and failed closed.",
@@ -307,9 +366,9 @@ class NetworkApprovalService:
     def approval_reviewer(self) -> ApprovalReviewerName:
         settings = getattr(self.runtime, "settings", None)
         reviewer = str(getattr(settings, "approvals_reviewer", "user") or "user")
-        return cast(
-            "ApprovalReviewerName",
-            reviewer if reviewer in {"user", "auto_review"} else "user",
+        return effective_approval_reviewer(
+            reviewer,
+            self.context.run_mode,
         )
 
 

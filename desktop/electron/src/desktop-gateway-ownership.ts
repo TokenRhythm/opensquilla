@@ -431,13 +431,18 @@ function windowsProcessStartIdentity(pid: number): string | null {
   // GetProcessTimes creation time, via the .NET filetime round-trip. The
   // query needs only limited-information access; a denied or missing process
   // yields null and the caller stays on the conservative path.
+  const processId = Math.trunc(pid)
+  const command = [
+    "$ErrorActionPreference='Stop'",
+    `[System.Diagnostics.Process]::GetProcessById(${processId}).StartTime.ToFileTime()`,
+  ].join('; ')
   const result = spawnSync(
     'powershell.exe',
     [
       '-NoProfile',
       '-NonInteractive',
       '-Command',
-      `$ErrorActionPreference='Stop'; (Get-Process -Id ${Math.trunc(pid)}).StartTime.ToFileTime()`,
+      command,
     ],
     { windowsHide: true, timeout: 2000, encoding: 'utf8' },
   )

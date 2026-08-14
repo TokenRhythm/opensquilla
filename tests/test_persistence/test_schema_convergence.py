@@ -31,6 +31,13 @@ TABLES = (
     "usage_billing_receipt_state",
     "usage_ledger_state",
     "usage_legacy_baselines",
+    "meta_control_intents",
+    "meta_launch_drafts",
+    "meta_launch_discard_tombstones",
+    "plan_revisions",
+    "plan_runs",
+    "session_goals",
+    "goal_command_receipts",
 )
 
 # Synthetic approximation of the oldest supported on-disk shape. It is the
@@ -42,6 +49,8 @@ TABLES = (
 #   - V009__transcript_reasoning_content: reasoning_content
 #     (transcript_entries)
 #   - V010__transcript_turn_usage: turn_usage (transcript_entries)
+#   - V025__session_collaboration_state: collaboration_mode,
+#     collaboration_revision, active_plan_revision_id (sessions)
 # session_summaries is not mutated by any yoyo migration (its later columns
 # arrive via SessionStorage connect-time shims), so its legacy DDL matches
 # the current one; it is still compared below to catch a future one-sided

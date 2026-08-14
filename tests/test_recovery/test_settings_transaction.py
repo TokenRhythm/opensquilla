@@ -11,10 +11,12 @@ from pathlib import Path
 import pytest
 
 from opensquilla.recovery import inspect_profile
+from opensquilla.recovery.atomic import _native_io_path
 from opensquilla.recovery.errors import AtomicStateUnknownError, RecoveryError
 from opensquilla.recovery.settings_transaction import (
     apply_desktop_settings,
     recover_desktop_settings,
+    settings_transaction_exists,
     settings_transaction_journal,
 )
 
@@ -341,7 +343,7 @@ def test_crash_is_detected_and_identity_proven_pair_is_recovered(
     journal_text = journal.read_text(encoding="utf-8")
     assert "synthetic-new-ciphertext" not in journal_text
     blocked = inspect_profile(home, profile_kind="desktop-primary")
-    assert blocked.outcome == "recovery_required"
+    assert blocked.outcome == "attention"
     assert blocked.stable_code == "settings_transaction_incomplete"
     assert "recover-settings" in blocked.allowed_actions
     recovered = recover_desktop_settings(home)
@@ -350,6 +352,85 @@ def test_crash_is_detected_and_identity_proven_pair_is_recovered(
     assert (home / "config.toml").read_text(encoding="utf-8") == new_config
     assert credential_path.read_text(encoding="utf-8") == new_credential
     assert not journal.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_extended_length_settings_transaction_recovers_silently(
+    tmp_path: Path,
+) -> None:
+    user_data = tmp_path / "user-data"
+    home = user_data / "opensquilla"
+    index = 0
+    while len(str(home)) < 275:
+        user_data /= f"user-data-segment-{index:02d}-0123456789"
+        home = user_data / "opensquilla"
+        index += 1
+    workspace = home / "workspace"
+    state = home / "state"
+    os.makedirs(_native_io_path(workspace))
+    os.makedirs(_native_io_path(state))
+    with open(_native_io_path(workspace / "SOUL.md"), "w", encoding="utf-8") as handle:
+        handle.write("synthetic identity\n")
+    old_config = (
+        f"state_dir = {json.dumps(str(state))}\n"
+        f"workspace_dir = {json.dumps(str(workspace))}\n"
+        'search_provider = "duckduckgo"\n\n'
+        '[llm]\nprovider = "ollama"\nmodel = "old-model"\n'
+    )
+    old_credential = json.dumps(
+        {
+            "provider": "ollama",
+            "model": "old-model",
+            "encryptedApiKey": "synthetic-old-ciphertext",
+        },
+        sort_keys=True,
+    )
+    with open(_native_io_path(home / "config.toml"), "wb") as handle:
+        handle.write(old_config.encode())
+    credential_path = user_data / "desktop-credential.json"
+    with open(_native_io_path(credential_path), "wb") as handle:
+        handle.write(old_credential.encode())
+    new_config = old_config.replace('model = "old-model"', 'model = "new-model"')
+    new_credential = json.dumps(
+        {
+            "provider": "ollama",
+            "model": "new-model",
+            "encryptedApiKey": "synthetic-new-ciphertext",
+        },
+        sort_keys=True,
+    )
+
+    before = inspect_profile(home, profile_kind="desktop-primary")
+    assert before.outcome == "ready", before
+
+    def crash(phase: str) -> None:
+        if phase == "credential_published":
+            raise SimulatedProcessCrash
+
+    with pytest.raises(SimulatedProcessCrash):
+        _apply(
+            home,
+            old_config=old_config,
+            old_credential=old_credential,
+            new_config=new_config,
+            new_credential=new_credential,
+            failpoint=crash,
+        )
+
+    journal = settings_transaction_journal(home)
+    assert settings_transaction_exists(home)
+    assert os.path.lexists(_native_io_path(journal))
+    blocked = inspect_profile(home, profile_kind="desktop-primary")
+    assert blocked.stable_code == "settings_transaction_incomplete"
+
+    recovered = recover_desktop_settings(home)
+
+    assert recovered.outcome == "ready", recovered
+    with open(_native_io_path(home / "config.toml"), encoding="utf-8") as handle:
+        assert handle.read() == new_config
+    with open(_native_io_path(credential_path), encoding="utf-8") as handle:
+        assert handle.read() == new_credential
+    assert not settings_transaction_exists(home)
 
 
 def test_enospc_during_publication_rolls_back_both_files(

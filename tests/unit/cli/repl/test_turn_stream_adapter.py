@@ -248,6 +248,7 @@ async def test_local_approval_resolver_threads_sandbox_choice(
     async def fake_apply_sandbox_approval_choice(
         params: dict[str, Any] | None,
         *,
+        approval_id: str | None = None,
         choice: str | None,
         approved: bool,
         session_manager: object,
@@ -256,6 +257,7 @@ async def test_local_approval_resolver_threads_sandbox_choice(
         captured.update(
             {
                 "params": params,
+                "approval_id": approval_id,
                 "choice": choice,
                 "approved": approved,
                 "session_manager": session_manager,
@@ -281,7 +283,8 @@ async def test_local_approval_resolver_threads_sandbox_choice(
     assert pending.claim_token is None
     assert captured["choice"] == "allow_same_type"
     assert captured["approved"] is True
-    assert captured["params"] == params
+    assert captured["params"] == {**params, "resolutionSource": "user_web"}
+    assert captured["approval_id"] == approval_id
     assert captured["session_manager"] is manager
 
     reset_approval_queue()

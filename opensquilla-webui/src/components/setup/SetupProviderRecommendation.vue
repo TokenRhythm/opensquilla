@@ -6,6 +6,7 @@ const { t } = useI18n()
 const props = defineProps<{
   tokenRhythmSelected: boolean
   credentialReplacementRequired: boolean
+  compact?: boolean
 }>()
 
 const registrationUrl = 'https://tokenrhythm.studio/register'
@@ -28,26 +29,36 @@ const stepKeys = computed(() => [
 <template>
   <div
     class="setup-provider-recommendation control-card control-card--compact control-card--accent"
+    :class="{ 'setup-provider-recommendation--compact': compact }"
     data-testid="tokenrhythm-recommendation"
   >
     <div class="setup-provider-recommendation__head">
-      <p
-        class="setup-provider-recommendation__title"
-        data-testid="tokenrhythm-recommendation-title"
-      >{{ t('setup.provider.recommendation.title') }}</p>
-      <span class="setup-provider-recommendation__scope">
-        {{ t('setup.provider.recommendationScope') }}
-      </span>
+      <div class="setup-provider-recommendation__message">
+        <div class="setup-provider-recommendation__title-row">
+          <p
+            class="setup-provider-recommendation__title"
+            data-testid="tokenrhythm-recommendation-title"
+          >{{ t('setup.provider.recommendation.title') }}</p>
+          <span class="setup-provider-recommendation__scope">
+            {{ t('setup.provider.recommendationScope') }}
+          </span>
+        </div>
+        <p
+          class="setup-provider-recommendation__copy"
+          data-testid="tokenrhythm-recommendation-value"
+        >{{ t('setup.provider.recommendation.value') }}</p>
+      </div>
+      <a
+        v-if="compact"
+        class="setup-provider-recommendation__link setup-provider-recommendation__link--compact btn btn--ghost"
+        :href="registrationUrl"
+        target="_blank"
+        rel="noopener noreferrer"
+        :aria-label="t('setup.provider.recommendation.externalLabel')"
+      >{{ t('setup.provider.recommendation.cta') }}</a>
     </div>
-    <p
-      class="setup-provider-recommendation__copy"
-      data-testid="tokenrhythm-recommendation-value"
-    >{{ t('setup.provider.recommendation.value') }}</p>
-    <p
-      class="setup-provider-recommendation__copy"
-      data-testid="tokenrhythm-recommendation-registration"
-    >{{ t('setup.provider.recommendation.registration') }}</p>
     <ol
+      v-if="!compact"
       class="setup-provider-recommendation__steps"
       :aria-label="t('setup.provider.recommendation.stepsLabel')"
     >
@@ -62,6 +73,7 @@ const stepKeys = computed(() => [
       </li>
     </ol>
     <a
+      v-if="!compact"
       class="setup-provider-recommendation__link btn btn--primary"
       :href="registrationUrl"
       target="_blank"
@@ -73,8 +85,9 @@ const stepKeys = computed(() => [
 
 <style scoped>
 .setup-provider-recommendation {
-  background: color-mix(in srgb, var(--accent) 5%, var(--bg-elevated));
-  border-left: 3px solid color-mix(in srgb, var(--accent) 72%, var(--border));
+  background: var(--bg-elevated);
+  border-radius: var(--radius-card);
+  box-shadow: var(--elev-1);
   margin: var(--sp-4) 0;
 }
 
@@ -88,7 +101,18 @@ const stepKeys = computed(() => [
   font-weight: 700;
 }
 
+.setup-provider-recommendation__message {
+  display: grid;
+  gap: var(--sp-1);
+  min-width: 0;
+}
+
 .setup-provider-recommendation__head {
+  display: grid;
+  gap: var(--sp-2);
+}
+
+.setup-provider-recommendation__title-row {
   align-items: center;
   display: flex;
   flex-wrap: wrap;
@@ -171,9 +195,49 @@ const stepKeys = computed(() => [
   outline-offset: 2px;
 }
 
+.setup-provider-recommendation--compact {
+  background: color-mix(in srgb, var(--accent) 5%, var(--bg-elevated));
+  box-shadow: none;
+  margin: 0;
+  padding: var(--sp-3);
+}
+
+.setup-provider-recommendation--compact .setup-provider-recommendation__head {
+  align-items: center;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.setup-provider-recommendation--compact .setup-provider-recommendation__scope {
+  justify-self: start;
+}
+
+.setup-provider-recommendation__link--compact {
+  align-items: center;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 28%, var(--border));
+  color: var(--accent-deep);
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.setup-provider-recommendation__link--compact:hover {
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  border-color: color-mix(in srgb, var(--accent) 42%, var(--border));
+}
+
 @media (max-width: 720px) {
   .setup-provider-recommendation__steps {
     grid-template-columns: 1fr;
+  }
+
+  .setup-provider-recommendation--compact .setup-provider-recommendation__head {
+    align-items: stretch;
+    grid-template-columns: 1fr;
+  }
+
+  .setup-provider-recommendation__link--compact {
+    justify-content: center;
+    width: 100%;
   }
 }
 </style>

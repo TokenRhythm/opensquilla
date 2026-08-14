@@ -7,7 +7,7 @@ from typing import Any, Literal
 from pydantic import BaseModel
 
 # Protocol version negotiated during handshake
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 # Payload limits
 MAX_PAYLOAD_BYTES = 26_214_400  # 25 MiB
@@ -142,6 +142,8 @@ class PolicyInfo(BaseModel):
     max_payload: int = MAX_PAYLOAD_BYTES
     max_buffered_bytes: int = MAX_BUFFERED_BYTES
     tick_interval_ms: int = TICK_INTERVAL_MS
+    concurrent_history_reads: bool = False
+    concurrent_optional_read_methods: list[str] = []
     agent_stream_heartbeat_interval_ms: int = 15_000
     agent_stream_idle_timeout_ms: int = 600_000
     webui_stream_idle_grace_ms: int = 630_000

@@ -15,6 +15,24 @@ export interface PersistSessionOptions {
   source?: string
 }
 
+export interface InitialDraftCanonicalizationState {
+  disposed: boolean
+  initialFullPath: string
+  currentFullPath: string
+  currentPathIsDraft: boolean
+  hasLegacyNewChatQuery: boolean
+}
+
+export function shouldCanonicalizeInitialDraftRoute(
+  state: InitialDraftCanonicalizationState,
+): boolean {
+  return (
+    !state.disposed
+    && state.currentFullPath === state.initialFullPath
+    && (!state.currentPathIsDraft || state.hasLegacyNewChatQuery)
+  )
+}
+
 function routeStringParam(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
@@ -65,13 +83,30 @@ export function useChatSessionRoute(sessionKey: Ref<string>) {
     return routeStringParam(route.query.agent)
   }
 
+  function readProjectFromUrl(): string {
+    return routeStringParam(route.query.project)
+  }
+
   function draftAgentId(): string {
     return readAgentFromUrl() || 'main'
   }
 
-  function goToDraft(options: { agentId?: string; replace?: boolean } = {}) {
+  function goToDraft(options: {
+    agentId?: string
+    projectId?: string | null
+    replace?: boolean
+  } = {}) {
     const agent = options.agentId || readAgentFromUrl()
-    const target = { path: DRAFT_CHAT_PATH, query: agent ? { agent } : {} }
+    const project = options.projectId === undefined
+      ? readProjectFromUrl()
+      : options.projectId || ''
+    const target = {
+      path: DRAFT_CHAT_PATH,
+      query: {
+        ...(agent ? { agent } : {}),
+        ...(project ? { project } : {}),
+      },
+    }
     const navigation = options.replace ? router.replace(target) : router.push(target)
     navigation.catch(() => {})
   }
@@ -100,6 +135,7 @@ export function useChatSessionRoute(sessionKey: Ref<string>) {
     isDraftRoute,
     persistSession,
     readAgentFromUrl,
+    readProjectFromUrl,
     readSessionFromUrl,
     resolveInitialSession,
   }

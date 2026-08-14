@@ -194,7 +194,7 @@ def test_windows_root_projects_codex_read_roots_in_stable_order() -> None:
     )
 
 
-def test_windows_workspace_profile_matches_codex_projection() -> None:
+def test_windows_workspace_profile_matches_codex_full_read_baseline() -> None:
     home = PureWindowsPath(r"C:\Users\codex")
     workspace = PureWindowsPath(r"C:\work\repo")
     context = _context(
@@ -218,10 +218,11 @@ def test_windows_workspace_profile_matches_codex_projection() -> None:
 
     assert profile.resolve(PureWindowsPath(r"C:\Windows\System32\cmd.exe")) is FileSystemAccess.READ
     assert profile.resolve(home / "Desktop" / "notes.txt") is FileSystemAccess.READ
-    assert profile.resolve(home / ".ssh" / "id_ed25519") is FileSystemAccess.DENY
+    assert profile.resolve(home / ".ssh" / "id_ed25519") is FileSystemAccess.READ
     assert not profile.is_explicitly_denied(home / ".ssh" / "id_ed25519")
+    assert profile.resolve(PureWindowsPath(r"D:\lrk\notes.txt")) is FileSystemAccess.READ
     assert profile.resolve(workspace / "src" / "app.py") is FileSystemAccess.WRITE
-    assert not profile.has_full_disk_read_baseline
+    assert profile.has_full_disk_read_baseline
 
 
 def test_supplied_windows_context_preserves_special_root_flavor(
@@ -245,12 +246,14 @@ def test_supplied_windows_context_preserves_special_root_flavor(
         platform_context=context,
     )
 
-    assert PureWindowsPath(r"C:\Windows") in profile.readable_roots
+    assert profile.default_access is FileSystemAccess.READ
+    assert profile.has_full_disk_read_baseline
     windows_root = Path(r"C:\Windows")
     expected_access = (
         FileSystemAccess.READ if windows_root.is_absolute() else FileSystemAccess.WRITE
     )
     assert profile.resolve(workspace / windows_root / "System32") is expected_access
+    assert profile.resolve(PureWindowsPath(r"D:\outside")) is FileSystemAccess.READ
     assert profile.resolve(workspace / "src" / "app.py") is FileSystemAccess.WRITE
 
 
@@ -293,7 +296,8 @@ def test_build_policy_uses_windows_context_for_host_root_projection(
         policy.file_system.resolve(PureWindowsPath(r"C:\Windows\System32\cmd.exe"))
         is FileSystemAccess.READ
     )
-    assert policy.file_system.resolve(home / ".ssh" / "id_ed25519") is FileSystemAccess.DENY
+    assert policy.file_system.resolve(home / ".ssh" / "id_ed25519") is FileSystemAccess.READ
+    assert policy.file_system.resolve(PureWindowsPath(r"D:\lrk")) is FileSystemAccess.READ
 
 
 def test_macos_root_read_is_overridden_by_explicit_denied_root() -> None:

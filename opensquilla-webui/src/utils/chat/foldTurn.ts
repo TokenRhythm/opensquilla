@@ -2,6 +2,7 @@ import type {
   ChatRenderedMessage,
   ChatStreamSegment,
   ChatStreamTimelineItem,
+  ChatTimelineSegment,
   ChatToolCall,
   ChatToolCallGroup,
 } from '@/types/chat'
@@ -40,6 +41,7 @@ export interface FoldedTurn {
   // Accepted activity-phase transitions, in arrival order, for the finished
   // turn's activity timeline. Empty when no status frames were appended.
   statusHistory: StatusPart[]
+  timelineSegments: ChatTimelineSegment[]
 }
 
 // Live ownerKey: the legacy `streamTimelineItems` computed groups with the
@@ -85,13 +87,15 @@ export function reconcileTextSnapshot(
         dirty: true,
       }
     } else {
-      next.push({ type: 'text', raw: suffix, html: '', dirty: true })
+      next.push({ type: 'text', raw: suffix, html: '', dirty: true, presentation: 'answer' })
     }
     return { rawText: snapshot, segments: next, changed: true }
   }
 
-  const next = segments.filter(segment => segment.type === 'tool-group')
-  if (snapshot) next.push({ type: 'text', raw: snapshot, html: '', dirty: true })
+  const next = segments.filter(segment => segment.type !== 'text')
+  if (snapshot) {
+    next.push({ type: 'text', raw: snapshot, html: '', dirty: true, presentation: 'answer' })
+  }
   return { rawText: snapshot, segments: next, changed: true }
 }
 
@@ -140,6 +144,402 @@ function asRenderedMessage(folded: {
 }
 
 /**
+ * Incremental live-turn accumulator.
+ *
+ * `foldTurn` below intentionally stays a pure replay oracle for history and
+ * parity tests.  The live UI, however, must not replay the entire accepted
+ * frame log for every token.  This accumulator applies each frame once and
+ * only derives the small render projection when the frame scheduler publishes
+ * a snapshot.
+ */
+export class TurnAccumulator {
+  private segments: ChatStreamSegment[] = []
+  private toolCalls: ChatToolCall[] = []
+  private toolCallsById = new Map<string, ChatToolCall>()
+  private toolInputChunks = new Map<string, string[]>()
+  private toolInputPreview = new Map<string, string>()
+  private artifacts: ArtifactPayload[] = []
+  private toolTimes = new Map<string, { startedAt: number; endedAt?: number }>()
+  private interrupts: FoldedInterrupt[] = []
+  private interruptIndex = new Map<string, number>()
+  private statusHistory: StatusPart[] = []
+  private maintenanceIndex = new Map<string, number>()
+  private rawText = ''
+  private finalText: string | null = null
+  private thinkingText = ''
+  private toolGroupSeq = 0
+
+  reset(): void {
+    this.segments = []
+    this.toolCalls = []
+    this.toolCallsById = new Map()
+    this.toolInputChunks = new Map()
+    this.toolInputPreview = new Map()
+    this.artifacts = []
+    this.toolTimes = new Map()
+    this.interrupts = []
+    this.interruptIndex = new Map()
+    this.statusHistory = []
+    this.maintenanceIndex = new Map()
+    this.rawText = ''
+    this.finalText = null
+    this.thinkingText = ''
+    this.toolGroupSeq = 0
+  }
+
+  /** Split a steered turn at its text boundary without replaying a frame log. */
+  checkpointText(): void {
+    this.segments = this.segments.filter(segment => segment.type !== 'text')
+    this.rawText = ''
+    this.finalText = null
+  }
+
+  /**
+   * Read the authoritative current answer without materializing a detached
+   * render snapshot. The stream ingress uses this for cumulative-delta
+   * de-duplication and terminal commit, keeping the production accumulator as
+   * the sole full-text owner between scheduled publications.
+   */
+  currentRawText(): string {
+    return this.finalText ?? this.rawText
+  }
+
+  private replaceToolInput(call: ChatToolCall, input: string): void {
+    call.inputRaw = input
+    call.inputPreview = truncateToolPreview(input, 200)
+    call.displayName = toolDisplayName(call.name, input)
+    this.toolInputChunks.delete(call.toolId)
+    this.toolInputPreview.set(call.toolId, input.slice(0, 200))
+  }
+
+  private materializedToolInput(call: ChatToolCall): string {
+    const chunks = this.toolInputChunks.get(call.toolId)
+    return chunks?.length ? `${call.inputRaw || ''}${chunks.join('')}` : call.inputRaw || ''
+  }
+
+  private finalizeToolInput(call: ChatToolCall): boolean {
+    const chunks = this.toolInputChunks.get(call.toolId)
+    if (!chunks?.length) return false
+    this.replaceToolInput(call, this.materializedToolInput(call))
+    return true
+  }
+
+  /** Materialize pending tool fragments once at the terminal boundary. */
+  finalizeToolInputs(): boolean {
+    let changed = false
+    for (const call of this.toolCalls) changed = this.finalizeToolInput(call) || changed
+    return changed
+  }
+
+  private ensureCall(
+    toolId: string,
+    name: string,
+    input: string,
+    running: boolean,
+  ): ChatToolCall {
+    const existing = this.toolCallsById.get(toolId)
+    if (existing) {
+      if (input) this.replaceToolInput(existing, input)
+      return existing
+    }
+
+    const displacedText = this.segments[this.segments.length - 1]
+    if (displacedText?.type === 'text' && displacedText.presentation === 'answer') {
+      // A trailing answer is rendered by StreamingTextPart and therefore has
+      // no cached HTML. Once a later tool displaces it into the activity
+      // chronology, mark it dirty so the next published snapshot renders it.
+      displacedText.dirty = true
+    }
+    const operationKey = toolOperationKey(name)
+    const lastSegment = this.segments[this.segments.length - 1]
+    const groupId = lastSegment?.type === 'tool-group'
+      && lastSegment.operationKey === operationKey
+      && lastSegment.groupId
+      ? lastSegment.groupId
+      : `stream:tool-group:${operationKey}:${this.toolGroupSeq++}`
+
+    if (lastSegment?.type !== 'tool-group' || lastSegment.groupId !== groupId) {
+      this.segments.push({ type: 'tool-group', groupId, operationKey })
+    }
+
+    const call: ChatToolCall = {
+      toolId,
+      name,
+      displayName: toolDisplayName(name, input),
+      groupId,
+      inputRaw: input,
+      inputPreview: truncateToolPreview(input, 200),
+      isRunning: running,
+      status: '',
+      isError: false,
+      result: '',
+      resultPreview: '',
+      isOpen: false,
+    }
+    this.toolCalls.push(call)
+    this.toolCallsById.set(toolId, call)
+    this.toolInputPreview.set(toolId, input.slice(0, 200))
+    return call
+  }
+
+  append(frame: Frame): void {
+    switch (frame.kind) {
+      case 'text': {
+        this.rawText += frame.text
+        const lastSegment = this.segments[this.segments.length - 1]
+        if (
+          !lastSegment
+          || lastSegment.type !== 'text'
+          || lastSegment.presentation !== frame.presentation
+        ) {
+          this.segments.push({
+            type: 'text',
+            raw: frame.text,
+            html: '',
+            dirty: true,
+            presentation: frame.presentation,
+          })
+        } else {
+          lastSegment.raw = `${lastSegment.raw || ''}${frame.text}`
+          lastSegment.dirty = true
+        }
+        break
+      }
+      case 'tool-start': {
+        if (!this.toolTimes.has(frame.toolId)) {
+          this.toolTimes.set(frame.toolId, { startedAt: frame.at })
+        }
+        this.ensureCall(frame.toolId, frame.name, frame.input, true)
+        break
+      }
+      case 'tool-delta': {
+        const call = this.toolCallsById.get(frame.toolId)
+        if (!call) break
+        const chunks = this.toolInputChunks.get(frame.toolId)
+        if (chunks) chunks.push(frame.fragment)
+        else this.toolInputChunks.set(frame.toolId, [frame.fragment])
+        const previousPreview = this.toolInputPreview.get(frame.toolId) || ''
+        if (previousPreview.length < 200) {
+          const nextPreview = `${previousPreview}${frame.fragment}`.slice(0, 200)
+          this.toolInputPreview.set(frame.toolId, nextPreview)
+          if (!isEmptyToolPreview(nextPreview)) {
+            call.inputPreview = truncateToolPreview(nextPreview, 200)
+            call.displayName = toolDisplayName(call.name, nextPreview)
+          }
+        }
+        break
+      }
+      case 'tool-result': {
+        const call = this.ensureCall(frame.toolId, frame.name, frame.input, false)
+        if (!frame.input) this.finalizeToolInput(call)
+        call.isRunning = false
+        call.status = frame.isError ? 'error' : 'success'
+        call.isError = frame.isError
+        call.result = frame.result
+        call.resultPreview = truncateToolPreview(frame.result, 200)
+        const timing = this.toolTimes.get(call.toolId)
+        if (timing && !timing.endedAt) timing.endedAt = frame.at
+        break
+      }
+      case 'artifact':
+        this.artifacts.push(frame.artifact)
+        break
+      case 'thinking':
+        this.thinkingText += frame.text
+        break
+      case 'final-text':
+        this.finalText = frame.text
+        break
+      case 'interrupt': {
+        const index = this.interruptIndex.get(frame.approvalId)
+        if (index === undefined) {
+          this.interruptIndex.set(frame.approvalId, this.interrupts.length)
+          this.interrupts.push({
+            kind: frame.interruptKind,
+            approvalId: frame.approvalId,
+            data: frame.data,
+          })
+          const displacedText = this.segments[this.segments.length - 1]
+          if (displacedText?.type === 'text' && displacedText.presentation === 'answer') {
+            displacedText.dirty = true
+          }
+          this.segments.push({ type: 'interrupt', approvalId: frame.approvalId })
+        } else {
+          this.interrupts[index] = mergeInterruptData(
+            this.interrupts[index]!,
+            frame.data,
+          )
+        }
+        break
+      }
+      case 'interrupt-resolved':
+        break
+      case 'status': {
+        const entry: StatusPart = {
+          action: frame.action,
+          label: frame.label,
+          at: frame.at,
+          ...(frame.id ? { id: frame.id } : {}),
+          ...(frame.category ? { category: frame.category } : {}),
+          ...(frame.state ? { state: frame.state } : {}),
+          ...(frame.source ? { source: frame.source } : {}),
+          ...(frame.durability ? { durability: frame.durability } : {}),
+          ...(frame.detail ? { detail: frame.detail } : {}),
+          ...(frame.reason ? { reason: frame.reason } : {}),
+        }
+        if (entry.category === 'maintenance' && entry.id) {
+          const index = this.maintenanceIndex.get(entry.id)
+          if (index === undefined) {
+            this.maintenanceIndex.set(entry.id, this.statusHistory.length)
+            this.statusHistory.push(entry)
+          } else {
+            this.statusHistory[index] = {
+              ...this.statusHistory[index],
+              ...entry,
+              at: this.statusHistory[index]!.at,
+            }
+          }
+        } else {
+          this.statusHistory.push(entry)
+        }
+        break
+      }
+    }
+  }
+
+  snapshot(
+    renderMarkdown: (text: string) => string,
+    toolCallGroups: (
+      calls: ChatToolCall[] | undefined,
+      baseKey: string,
+    ) => ChatToolCallGroup[],
+    ownerKey: string = LIVE_OWNER_KEY,
+    interruptState: ReadonlyMap<string, InterruptViewState> = new Map(),
+    renderAnswerMarkdown: boolean = true,
+    materializeRunningToolInputs: boolean = true,
+  ): FoldedTurn {
+    if (this.finalText !== null) {
+      const reconciled = reconcileTextSnapshot(
+        this.segments,
+        this.rawText,
+        this.finalText,
+      )
+      this.rawText = reconciled.rawText
+      if (reconciled.segments !== this.segments) {
+        this.segments.splice(0, this.segments.length, ...reconciled.segments)
+      }
+    }
+
+    const trailingSegment = this.segments[this.segments.length - 1]
+    for (const segment of this.segments) {
+      if (segment.type === 'text' && segment.dirty) {
+        // The production live answer is rendered by StreamingTextPart from
+        // canonical raw text. Parsing the same growing answer here produced an
+        // invisible full-prefix Markdown pass on every visual flush. Keep the
+        // rendered HTML only for intermediate narration and for the DEV shadow
+        // renderer, which still needs an exact legacy parity surface.
+        // Only the current trailing answer is owned by StreamingTextPart. If
+        // a later tool arrives, that provisional answer moves back into the
+        // activity chronology and needs rendered HTML like any other
+        // narration segment.
+        segment.html = segment === trailingSegment
+          && segment.presentation === 'answer'
+          && !renderAnswerMarkdown
+          ? ''
+          : renderMarkdown(segment.raw || '')
+        segment.dirty = false
+      }
+    }
+
+    // Publish detached collections. The accumulator continues mutating its
+    // private state between frames; already-published snapshots must stay
+    // immutable until the scheduler explicitly publishes the next one.
+    const segments = this.segments.map(segment => ({ ...segment }))
+    const toolCalls = this.toolCalls.map(call => ({
+      ...call,
+      ...(materializeRunningToolInputs
+        ? { inputRaw: this.materializedToolInput(call) }
+        : {}),
+    }))
+    const artifacts = this.artifacts.map(artifact => ({ ...artifact }))
+    const interrupts = this.interrupts.map(interrupt => ({
+      ...interrupt,
+      data: { ...interrupt.data },
+    }))
+    const statusHistory = this.statusHistory.map(entry => ({ ...entry }))
+
+    const interruptParts = new Map<
+      string,
+      Extract<ChatPart, { type: 'interrupt' }>
+    >()
+    for (const interrupt of interrupts) {
+      const state = interruptState.get(interrupt.approvalId)
+      interruptParts.set(interrupt.approvalId, {
+        type: 'interrupt',
+        interruptKind: interrupt.kind,
+        approval: interrupt.kind === 'approval'
+          ? interrupt.data as InterruptApprovalData
+          : undefined,
+        clarify: interrupt.kind === 'clarify'
+          ? interrupt.data as InterruptClarifyData
+          : undefined,
+        resolution: state?.resolution ?? interrupt.resolution ?? null,
+        busy: state?.busy ?? false,
+        error: state?.error ?? '',
+        key: `${ownerKey}:interrupt:${interrupt.approvalId}`,
+      })
+    }
+
+    const timelineItems = segmentsToTimelineItems(
+      segments,
+      toolCalls,
+      ownerKey,
+      interruptParts,
+    )
+    const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
+      if (segment.type === 'text') {
+        const raw = String(segment.raw || '')
+        return raw ? [{ type: 'text', raw }] : []
+      }
+      if (segment.type === 'interrupt') {
+        const approvalId = String(segment.approvalId || '')
+        return approvalId ? [{ type: 'interrupt', approvalId }] : []
+      }
+      return [{
+        type: 'tool-group',
+        groupId: segment.groupId,
+        operationKey: segment.operationKey,
+      }]
+    })
+    const base = {
+      timelineItems,
+      toolCalls,
+      artifacts,
+      rawText: this.rawText,
+    }
+    const rendered = asRenderedMessage(base)
+    return {
+      ...base,
+      thinkingText: this.thinkingText,
+      toolTimes: new Map(
+        [...this.toolTimes].map(([key, value]) => [key, { ...value }]),
+      ),
+      statusHistory,
+      timelineSegments,
+      parts: toParts(
+        rendered,
+        renderMarkdown,
+        toolCallGroups,
+        ownerKey,
+        interrupts,
+        interruptState,
+      ),
+      sources: toSources(rendered),
+    }
+  }
+}
+
+/**
  * Pure left-fold of an append-only frame log into the exact structures the
  * legacy live mutators build in place (text segments, tool calls, artifacts,
  * raw text, tool clocks, live thinking). The frame array is already in accept
@@ -162,6 +562,7 @@ export function foldTurn(
   const interrupts: FoldedInterrupt[] = []
   const interruptIndex = new Map<string, number>()
   const statusHistory: StatusPart[] = []
+  const maintenanceIndex = new Map<string, number>()
   let rawText = ''
   let finalText: string | null = null
   let thinkingText = ''
@@ -215,8 +616,18 @@ export function foldTurn(
       case 'text': {
         rawText += frame.text
         const lastSegment = segments[segments.length - 1]
-        if (!lastSegment || lastSegment.type !== 'text') {
-          segments.push({ type: 'text', raw: frame.text, html: '', dirty: true })
+        if (
+          !lastSegment
+          || lastSegment.type !== 'text'
+          || lastSegment.presentation !== frame.presentation
+        ) {
+          segments.push({
+            type: 'text',
+            raw: frame.text,
+            html: '',
+            dirty: true,
+            presentation: frame.presentation,
+          })
         } else {
           lastSegment.raw = (lastSegment.raw || '') + frame.text
           lastSegment.dirty = true
@@ -272,6 +683,7 @@ export function foldTurn(
         if (i === undefined) {
           interruptIndex.set(frame.approvalId, interrupts.length)
           interrupts.push({ kind: frame.interruptKind, approvalId: frame.approvalId, data: frame.data })
+          segments.push({ type: 'interrupt', approvalId: frame.approvalId })
         } else {
           // A later requested-frame for the same id (re-broadcast / hydration
           // backfill) merges richer data without reordering.
@@ -285,9 +697,37 @@ export function foldTurn(
         break
       }
       case 'status': {
-        // Append-only, already in accept order: setStreamActivity emits a frame
-        // only on a real phase change, so each entry is a distinct transition.
-        statusHistory.push({ action: frame.action, label: frame.label, at: frame.at })
+        const entry: StatusPart = {
+          action: frame.action,
+          label: frame.label,
+          at: frame.at,
+          ...(frame.id ? { id: frame.id } : {}),
+          ...(frame.category ? { category: frame.category } : {}),
+          ...(frame.state ? { state: frame.state } : {}),
+          ...(frame.source ? { source: frame.source } : {}),
+          ...(frame.durability ? { durability: frame.durability } : {}),
+          ...(frame.detail ? { detail: frame.detail } : {}),
+          ...(frame.reason ? { reason: frame.reason } : {}),
+        }
+        // Context maintenance emits started/observed/completed lifecycle
+        // frames. Keep its first chronological position and update that row in
+        // place so one compaction never looks like multiple task steps.
+        if (entry.category === 'maintenance' && entry.id) {
+          const index = maintenanceIndex.get(entry.id)
+          if (index === undefined) {
+            maintenanceIndex.set(entry.id, statusHistory.length)
+            statusHistory.push(entry)
+          } else {
+            statusHistory[index] = {
+              ...statusHistory[index],
+              ...entry,
+              at: statusHistory[index]!.at,
+            }
+          }
+        } else {
+          // Phase rows remain append-only and in accepted order.
+          statusHistory.push(entry)
+        }
         break
       }
     }
@@ -308,7 +748,48 @@ export function foldTurn(
     }
   }
 
-  const timelineItems = segmentsToTimelineItems(segments, toolCalls, ownerKey)
+  const interruptParts = new Map<
+    string,
+    Extract<ChatPart, { type: 'interrupt' }>
+  >()
+  for (const interrupt of interrupts) {
+    const state = interruptState.get(interrupt.approvalId)
+    interruptParts.set(interrupt.approvalId, {
+      type: 'interrupt',
+      interruptKind: interrupt.kind,
+      approval: interrupt.kind === 'approval'
+        ? interrupt.data as InterruptApprovalData
+        : undefined,
+      clarify: interrupt.kind === 'clarify'
+        ? interrupt.data as InterruptClarifyData
+        : undefined,
+      resolution: state?.resolution ?? interrupt.resolution ?? null,
+      busy: state?.busy ?? false,
+      error: state?.error ?? '',
+      key: `${ownerKey}:interrupt:${interrupt.approvalId}`,
+    })
+  }
+  const timelineItems = segmentsToTimelineItems(
+    segments,
+    toolCalls,
+    ownerKey,
+    interruptParts,
+  )
+  const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
+    if (segment.type === 'text') {
+      const raw = String(segment.raw || '')
+      return raw ? [{ type: 'text', raw }] : []
+    }
+    if (segment.type === 'interrupt') {
+      const approvalId = String(segment.approvalId || '')
+      return approvalId ? [{ type: 'interrupt', approvalId }] : []
+    }
+    return [{
+      type: 'tool-group',
+      groupId: segment.groupId,
+      operationKey: segment.operationKey,
+    }]
+  })
   const base = { timelineItems, toolCalls, artifacts, rawText }
   const rendered = asRenderedMessage(base)
 
@@ -317,6 +798,7 @@ export function foldTurn(
     thinkingText,
     toolTimes,
     statusHistory,
+    timelineSegments,
     parts: toParts(rendered, renderMarkdown, toolCallGroups, ownerKey, interrupts, interruptState),
     sources: toSources(rendered),
   }

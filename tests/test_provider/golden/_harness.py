@@ -26,6 +26,7 @@ import pytest
 from opensquilla.engine.types import ThinkingLevel
 from opensquilla.provider.compat_policy import known_policy_kinds
 from opensquilla.provider.model_catalog import ModelCatalog
+from opensquilla.provider.protocol import project_provider_final_request
 from opensquilla.provider.registry import get_provider_spec, list_provider_specs
 from opensquilla.provider.selector import ProviderConfig, _build_provider
 from opensquilla.provider.types import (
@@ -37,6 +38,7 @@ from opensquilla.provider.types import (
     ErrorEvent,
     Message,
     ModelCapabilities,
+    ProviderFinalRequestProjection,
     ToolDefinition,
     ToolInputSchema,
 )
@@ -56,8 +58,9 @@ _NEUTRAL_MODEL = "test-chat-model"
 # kind -> (model id, reasoning dialect resolved when thinking is requested).
 # Model ids are derived from the code paths that trigger each dialect —
 # ModelCatalog.get_capabilities prefix ladders and compat_policy model-id
-# sets — never invented. "none" kinds freeze the omission: a thinking
-# request must serialize with no reasoning field at all.
+# sets — never invented. "none" normally freezes omission; an exact
+# endpoint/model compat rule may deliberately override neutral catalog
+# metadata, which its request golden then freezes explicitly.
 COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     # api.openai.com host + gpt-5 prefix ladder (model_catalog) -> "openai";
     # gpt-5.4 is also in max_completion_tokens and omit-temperature-when-
@@ -76,6 +79,10 @@ COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     # qwen3 prefix ladder (model_catalog dashscope branch) -> "dashscope".
     "dashscope": ("qwen3-coder-plus", "dashscope"),
     "bailian_coding": (_NEUTRAL_MODEL, "none"),
+    # Qwen 3.8 is forced-thinking on Token Plan. The plain/tools/thinking
+    # matrix freezes enable_thinking, preserve_thinking, temperature floor,
+    # and the plan-specific reasoning dialect.
+    "qwen_token_plan": ("qwen3.8-max-preview", "qwen_token_plan_qwen"),
     # kimi-k2.7 ladder (model_catalog moonshot branch) -> "moonshot"; also in
     # fixed_sampling_model_prefixes so the non-default temperature is dropped.
     "moonshot": ("kimi-k2.7-code", "moonshot"),
@@ -98,11 +105,9 @@ COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     # "tencent_tokenhub" dialect; the policy also requires assistant
     # reasoning_content replay for the hy3 ids, frozen by the tools golden.
     "tencent_tokenhub": ("hy3", "tencent_tokenhub"),
-    # [tokenrhythm."deepseek-v4-flash"] corrections row pins
-    # reasoning_format="none": the relay streams reasoning_content on its
-    # own but 400s on any thinking payload, so the thinking golden freezes
-    # the omission. The id is also in require_reasoning_content_model_ids,
-    # so the tools golden freezes assistant reasoning_content replay.
+    # The mixed-family catalog remains neutral, while the exact official V4
+    # request rule supplies DeepSeek-shaped thinking control and tool-call-only
+    # bounded reasoning replay. The request goldens freeze that override.
     "tokenrhythm": ("deepseek-v4-flash", "none"),
     "lm_studio": (_NEUTRAL_MODEL, "none"),
     "ovms": (_NEUTRAL_MODEL, "none"),
@@ -266,6 +271,15 @@ def build_cases() -> list[GoldenCase]:
                 slug="tencent_token_plan_anthropic__plain",
                 provider_id="tencent_token_plan_anthropic",
                 model="hy3",
+            ),
+            # Qwen Token Plan's Anthropic-compatible service uses bearer auth,
+            # appends /v1/messages to /apps/anthropic, and applies the Qwen
+            # 3.8 temperature floor.
+            GoldenCase(
+                backend="anthropic",
+                slug="qwen_token_plan_anthropic__plain",
+                provider_id="qwen_token_plan_anthropic",
+                model="qwen3.8-max-preview",
             ),
         ]
     )
@@ -549,6 +563,22 @@ def _provider_for_case(case: GoldenCase) -> Any:
             base_url=case.base_url,
         )
     )
+
+
+def project_case_request(case: GoldenCase) -> ProviderFinalRequestProjection:
+    """Project the same exact request envelope used by ``capture_case_record``."""
+
+    provider = _provider_for_case(case)
+    messages = _tool_history_messages() if case.tool_history else _plain_messages()
+    tools = [_golden_tool()] if case.with_tools else None
+    projection = project_provider_final_request(
+        provider,
+        messages,
+        tools,
+        _chat_config(case),
+    )
+    assert projection is not None, f"{case.case_id}: final request projection unavailable"
+    return projection
 
 
 def _auth_style(request: httpx.Request) -> str:

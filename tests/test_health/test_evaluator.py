@@ -239,6 +239,58 @@ def test_provider_evaluator_reports_ready_active_provider() -> None:
     assert findings[0].severity == "ok"
 
 
+def test_provider_auth_probe_failure_blocks_readiness() -> None:
+    findings = evaluate_provider(
+        {
+            "activeProvider": "openrouter",
+            "providers": [
+                {
+                    "providerId": "openrouter",
+                    "active": True,
+                    "configured": True,
+                    "buildable": True,
+                    "modelProbe": {
+                        "attempted": True,
+                        "status": "error",
+                        "failureKind": "auth_invalid",
+                        "error": "HTTP 401 invalid credential",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert findings[0].id == "provider.active.probe.auth_invalid"
+    assert findings[0].severity == "error"
+    assert _impact(findings[0]) == "blocks_ready"
+
+
+def test_provider_temporary_probe_failure_only_degrades_readiness() -> None:
+    findings = evaluate_provider(
+        {
+            "activeProvider": "openrouter",
+            "providers": [
+                {
+                    "providerId": "openrouter",
+                    "active": True,
+                    "configured": True,
+                    "buildable": True,
+                    "modelProbe": {
+                        "attempted": True,
+                        "status": "error",
+                        "failureKind": "network",
+                        "error": "temporary network failure",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert findings[0].id == "provider.active.probe.network"
+    assert findings[0].severity == "warn"
+    assert _impact(findings[0]) == "degrades"
+
+
 def _healthy_active_row(**extra: object) -> dict[str, object]:
     row: dict[str, object] = {
         "providerId": "openrouter",
@@ -888,6 +940,40 @@ def test_search_evaluator_reports_ready_provider() -> None:
     assert findings[0].evidence["maxResults"] == 8
     assert findings[0].evidence["proxyConfigured"] is True
     assert findings[0].evidence["diagnostics"] is True
+    assert "networkReady" not in findings[0].evidence
+    assert "networkBlockedReason" not in findings[0].evidence
+
+
+def test_search_evaluator_reports_network_blocked_provider_as_degraded() -> None:
+    reason = (
+        "NetworkMode.PROXY_ALLOWLIST requires Run Context grants to run "
+        "in-process network tools through the managed proxy."
+    )
+    findings = evaluate_search(
+        {
+            "provider": "duckduckgo",
+            "activeProvider": "duckduckgo",
+            "configured": True,
+            "runtimeSupported": True,
+            "requiresApiKey": False,
+            "apiKeyConfigured": False,
+            "buildable": True,
+            "networkReady": False,
+            "networkBlockedReason": reason,
+        }
+    )
+
+    finding = findings[0]
+    assert finding.id == "search.provider.network_blocked"
+    assert finding.severity == "warn"
+    assert finding.to_dict()["readinessImpact"] == "degrades"
+    assert reason in finding.detail
+    assert finding.evidence["networkReady"] is False
+    assert finding.evidence["networkBlockedReason"] == reason
+    assert [step.command for step in finding.fix_steps] == [
+        "opensquilla search status duckduckgo --json",
+        "opensquilla sandbox status --json",
+    ]
 
 
 def test_image_generation_evaluator_treats_disabled_as_optional_info() -> None:

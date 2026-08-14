@@ -36,7 +36,12 @@ from opensquilla.search.types import (
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import full_host_access_active
-from opensquilla.tools.types import ToolError, UnsupportedURLSchemeError, current_tool_context
+from opensquilla.tools.types import (
+    PlanAccess,
+    ToolError,
+    UnsupportedURLSchemeError,
+    current_tool_context,
+)
 
 
 def _validate_http_url(url: str) -> None:
@@ -1149,6 +1154,7 @@ def _search_error_payload(
         },
     },
     required=["query"],
+    plan_access=PlanAccess.READ_ONLY,
     result_budget_class="external",
     sandbox=SandboxToolDescriptor.network(
         kind="web.fetch",
@@ -1193,6 +1199,7 @@ async def web_search(
         },
     },
     required=["query"],
+    plan_access=PlanAccess.READ_ONLY,
     result_budget_class="external",
     sandbox=SandboxToolDescriptor.network(
         kind="web.fetch",

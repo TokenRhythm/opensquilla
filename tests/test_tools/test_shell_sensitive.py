@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from opensquilla.tools.builtin import shell
+from opensquilla.sandbox.path_validation import MountDecision
+from opensquilla.tools.builtin import filesystem, shell
 from opensquilla.tools.types import ToolContext, ToolError, current_tool_context
 
 
@@ -131,6 +132,34 @@ def test_sensitive_shell_workspace_exception_keeps_leaf_secret_blocks() -> None:
 
     assert payload is not None
     assert json.loads(payload)["reason"] == "sensitive_path"
+
+
+@pytest.mark.parametrize(
+    ("access", "expected"),
+    [
+        ("ro", "GUEST_SENSITIVE_PATH_DENIED"),
+        ("rw", "GUEST_WRITE_OUTSIDE_DEFAULT_WORKSPACE"),
+    ],
+)
+def test_guest_profile_denials_use_stable_cross_tool_error_codes(
+    access: str,
+    expected: str,
+) -> None:
+    decision = MountDecision(
+        status="blocked",
+        normalized_path=r"C:\Users\alice\.ssh\id_ed25519",
+        access=access,
+        reason="permission_profile_denied",
+    )
+    token = current_tool_context.set(ToolContext(guest_safe=True))
+    try:
+        shell_payload = shell._path_access_blocked_envelope(decision)
+        filesystem_payload = filesystem._path_access_blocked_envelope(decision)
+    finally:
+        current_tool_context.reset(token)
+
+    assert shell_payload["reason"] == expected
+    assert filesystem_payload["reason"] == expected
 
 
 def test_sensitive_external_transfer_blocks_curl_upload() -> None:

@@ -3,6 +3,12 @@
 The `opensquilla` CLI is the fastest way to configure, run, inspect, and
 automate OpenSquilla.
 
+Install the current release with the recommended integrations:
+
+```sh
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/opensquilla-0.5.3-py3-none-any.whl"
+```
+
 Run:
 
 ```sh
@@ -38,7 +44,6 @@ opensquilla <command> --help
 | `opensquilla models` | Inspect available models. |
 | `opensquilla agents` | Manage durable agents. |
 | `opensquilla mcp-server` | Run the OpenSquilla MCP server bridge. |
-| `opensquilla swebench` | Run optional SWE-bench solve/eval workflows. |
 | `opensquilla dist` | Emit a reproducible workspace-state inventory. |
 | `opensquilla reset` | Reset a session and flush memory synchronously. |
 
@@ -107,7 +112,65 @@ Useful automation flags:
 | `--permissions` | Select restricted, bypass, or full permission posture. |
 | `--transcript-path` | Write a JSONL transcript for automation. |
 | `--usage-path` | Write usage JSON. |
+| `--event-stream-stderr` | Stream stable v1 progress-event JSONL on stderr. |
 | `--session-db-path` | Persist session replay across invocations. |
+
+### Agent Progress Event Stream
+
+`--event-stream-stderr` is opt-in. It does not change the final stdout payload
+or exit status. Each supported event is flushed to stderr as one compact JSON
+object with this envelope:
+
+```json
+{"_event":true,"schema_version":1,"kind":"thinking"}
+```
+
+stderr can also contain ordinary diagnostics. Subprocess consumers must drain
+it continuously, parse it line by line, and accept only objects whose `_event`
+value is `true`. A closed or unwritable stderr disables further progress events
+without failing an otherwise successful agent run.
+
+The v1 event fields are intentionally smaller and more stable than the engine's
+internal event dataclasses:
+
+| `kind` | Additional fields |
+| --- | --- |
+| `router_decision` | `tier`, `model`, `source` |
+| `thinking` | None |
+| `text_delta` | `presentation` |
+| `run_heartbeat` | `phase`, `elapsed_ms`, `idle_ms` |
+| `tool_use_start` | `tool_use_id`, `tool_name`, `started_at` |
+| `tool_result` | `tool_use_id`, `tool_name`, `is_error` |
+| `warning`, `error` | `code`, redacted and bounded `message` |
+| `artifact` | `id`, `name`, `mime`, `size` |
+| `done` | None; read the final result from stdout |
+
+The stream does not expose reasoning text, answer text, tool arguments, tool
+results, internal routing probabilities, session paths, or fields added to
+future engine events. Unsupported internal events are skipped. Consumers may
+use the stable top-level fields above and must ignore additional fields that a
+future compatible v1 producer may add.
+
+### Concurrent Agent Subprocesses
+
+Each write-capable agent holds a profile-wide writer lease. Calls that share an
+`OPENSQUILLA_STATE_DIR` therefore conflict instead of writing the same profile
+concurrently. An orchestrator that needs parallel agents must give every child
+both a distinct profile home and a distinct gateway state root:
+
+```sh
+OPENSQUILLA_STATE_DIR=/tmp/agent-a \
+OPENSQUILLA_GATEWAY_STATE_DIR=/tmp/agent-a/state \
+  opensquilla agent -m "task A" --json &
+```
+
+`OPENSQUILLA_STATE_DIR` alone does not override a `state_dir` from a
+current-directory `opensquilla.toml`, an explicit gateway config, or a copied
+profile. When copying `config.toml` or `.env`, remove or rewrite `state_dir` and
+`OPENSQUILLA_GATEWAY_STATE_DIR`. Also choose distinct `--session-db-path`,
+workspace, scratch, transcript, and usage paths when those outputs must be
+isolated. On Windows, pass both environment variables in each child process
+rather than relying on POSIX inline assignment syntax.
 
 ## Coding Mode and Code-Task
 
@@ -140,21 +203,6 @@ is updated.
 `--verification-mode build` is for app or artifact delivery checks.
 `--verification-mode scratch` creates an empty throwaway repo and must not be
 combined with `--repo`.
-
-## SWE-Bench
-
-`opensquilla swebench` is an optional evaluation surface, not part of the normal
-install path. It requires Docker plus the `swebench` extra.
-
-```sh
-uv tool install --python 3.12 "opensquilla[recommended,swebench] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl"
-opensquilla swebench pull django__django-16429 --dataset verified
-opensquilla swebench solve django__django-16429 --dataset verified --json
-opensquilla swebench eval predictions.jsonl --dataset verified
-```
-
-Use `opensquilla code-task` for trusted real-repository coding tasks when you do
-not need the Docker-based SWE-bench harness.
 
 ## Configuration Commands
 
@@ -212,10 +260,16 @@ More detail:
 ```sh
 opensquilla skills list
 opensquilla skills search pdf
+opensquilla skills search pdf --json --include-diagnostics
 opensquilla skills view pdf-toolkit
-opensquilla skills install <skill-name>
+opensquilla skills install <install-reference> --source <clawhub|github>
+opensquilla skills install <install-reference> --source <clawhub|github> \
+  --force --risk-confirmation <token>
+opensquilla skills update --install-id <install-id>
 opensquilla skills update --all
 opensquilla skills uninstall <skill-name>
+opensquilla skills uninstall --install-id <install-id>
+opensquilla skills doctor [<skill-name-or-install-id>] --json
 opensquilla skills inspect meta-skill-creator
 opensquilla skills meta proposals list
 opensquilla skills meta runs list
@@ -223,6 +277,9 @@ opensquilla skills meta runs show <run-id>
 opensquilla skills meta runs steps <run-id>
 opensquilla skills meta runs replay <run-id> --dry-run
 ```
+
+`skills search --json` keeps the legacy top-level array for existing clients.
+Add `--include-diagnostics` when a stable results-and-source-diagnostics envelope is needed.
 
 Use `skills inspect` when you want to see the compiled step plan for a
 meta-skill before invoking it.

@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import structlog
 
 from opensquilla.observability.decision_log import PipelineStepRecord, RoutingSource
 from opensquilla.provider import ToolDefinition
 from opensquilla.provider.protocol import LLMProvider
+
+if TYPE_CHECKING:
+    from opensquilla.provider.types import ProviderRequestCorrelation
 
 log = structlog.get_logger(__name__)
 
@@ -31,9 +34,22 @@ class TurnContext:
     attachments: list[dict] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
     raw_message: str | None = None
+    # Runtime-only semantic input for model routing and skill retrieval. It is
+    # intentionally excluded from metadata and repr so it cannot leak through
+    # decision snapshots or routine context logging.
+    routing_hint: str | None = field(default=None, repr=False)
     # Immutable catalog pinned at the provider/tools boundary. Selection
     # steps use this instead of probing the loader again mid-turn.
     skill_catalog: Any | None = None
+    # Opaque transport-only identity. Keep this typed field out of metadata so
+    # decision logs and persisted pipeline snapshots never serialize it.
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
+    # Pinned once after model/catalog resolution. Provider retries and
+    # same-turn pending-input continuations must not replace this value.
+    route_plan: Any | None = field(default=None, repr=False)
     # PR3 (design §14): surface origin so PR4's clarify reply parser
     # can adapt its tolerance per surface. Defaults to "unknown" so
     # the gateway/CLI/channel adapters can set it post-construction.

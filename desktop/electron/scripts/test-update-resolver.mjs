@@ -165,7 +165,7 @@ assert.throws(
 }
 
 // Windows mirror downloads are trusted only after their bytes match the exact
-// asset entry in the canonical GitHub Release SHA256SUMS file.
+// asset entry in the canonical SHA256SUMS file mirrored to OSS.
 {
   const asset = 'OpenSquilla-0.5.0-rc5-win-x64.exe'
   const bytes = Buffer.from('verified windows installer bytes')

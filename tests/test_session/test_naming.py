@@ -8,6 +8,7 @@ the first-message trigger gate.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 from types import SimpleNamespace
@@ -17,7 +18,9 @@ import pytest_asyncio
 
 from opensquilla.compat import aiosqlite
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.provider.auxiliary_budget import AuxiliaryRequestBudget
 from opensquilla.provider.protocol import ProviderConnectionConfig
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import SessionNode
 from opensquilla.session.naming import (
@@ -367,23 +370,255 @@ async def test_call_naming_llm_payload_and_sanitization(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_call_naming_llm_adds_tokenrhythm_app_attribution(monkeypatch):
+async def test_call_naming_llm_truncates_to_resolved_token_budget(monkeypatch):
     captured: dict = {}
     monkeypatch.setattr(
         "opensquilla.session.naming.httpx.AsyncClient",
         lambda **kwargs: _fake_client(captured),
     )
+    monkeypatch.setattr(
+        "opensquilla.session.naming.resolve_auxiliary_request_budget",
+        lambda *args, **kwargs: AuxiliaryRequestBudget(
+            provider_id="test",
+            model="tiny",
+            context_window_tokens=1024,
+            max_output_tokens=64,
+            max_input_tokens=160,
+            provider_request_max_chars=4096,
+            context_window_source="test",
+        ),
+    )
+    original = "中文🙂" * 1000
 
-    await call_naming_llm(
+    title = await call_naming_llm(
+        original,
+        model="tiny",
+        api_key="test-key",
+    )
+
+    assert title == "Reset my password"
+    sent = captured["json"]["messages"][1]["content"]
+    assert len(sent) < len(original)
+    assert captured["json"]["max_tokens"] == 64
+
+
+@pytest.mark.asyncio
+async def test_call_naming_llm_skips_when_request_framing_cannot_fit(monkeypatch):
+    called = False
+
+    def fake_client(**kwargs):
+        nonlocal called
+        del kwargs
+        called = True
+        return _fake_client({})
+
+    monkeypatch.setattr("opensquilla.session.naming.httpx.AsyncClient", fake_client)
+    monkeypatch.setattr(
+        "opensquilla.session.naming.resolve_auxiliary_request_budget",
+        lambda *args, **kwargs: AuxiliaryRequestBudget(
+            provider_id="test",
+            model="tiny",
+            context_window_tokens=32,
+            max_output_tokens=16,
+            max_input_tokens=1,
+            provider_request_max_chars=1,
+            context_window_source="test",
+        ),
+    )
+
+    assert await call_naming_llm("hello", model="tiny", api_key="test-key") is None
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_call_naming_llm_adds_tokenrhythm_app_attribution(monkeypatch):
+    captured: dict = {}
+    install_id = "synthetic-install-id"
+    monkeypatch.setattr(
+        "opensquilla.session.naming.httpx.AsyncClient",
+        lambda **kwargs: _fake_client(captured, content=f'"Echo {install_id}"'),
+    )
+    monkeypatch.setattr(
+        "opensquilla.session.naming.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.session.naming.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+
+    title = await call_naming_llm(
         "Help me reset my password please",
         model="deepseek-v4-flash",
         api_key="test-key",
         base_url="https://tokenrhythm.studio/v1",
+        provider="tokenrhythm",
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="naming-1",
+            call_kind="auxiliary.naming",
+        ),
     )
 
     assert captured["url"] == "https://tokenrhythm.studio/v1/chat/completions"
     assert captured["headers"]["HTTP-Referer"] == "https://opensquilla.ai"
     assert captured["headers"]["X-Title"] == "OpenSquilla"
+    assert captured["headers"]["X-OpenSquilla-Session-Id"] == "session-1"
+    assert captured["headers"]["X-OpenSquilla-Turn-Id"] == "turn-1"
+    assert captured["headers"]["X-OpenSquilla-Execution-Id"] == "naming-1"
+    assert captured["headers"]["X-OpenSquilla-Call-Kind"] == "auxiliary.naming"
+    assert captured["headers"]["X-OpenSquilla-Install-Id"] == install_id
+    assert install_id not in str(captured["json"])
+    # Title sanitization removes the trailing redaction marker as punctuation.
+    assert title == "Echo"
+
+
+@pytest.mark.asyncio
+async def test_call_naming_llm_cancellation_does_not_retain_install_id(monkeypatch):
+    install_id = "synthetic-cancelled-naming-install-id"
+    sent_headers: dict[str, str] = {}
+    usage_reasons: list[str] = []
+
+    class RetainingResponse:
+        text = ""
+
+        def __init__(self, headers: dict[str, str]) -> None:
+            self.request_headers = dict(headers)
+
+        def __repr__(self) -> str:
+            return f"RetainingResponse(headers={self.request_headers!r})"
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [{"message": {"content": "unused"}}],
+                "echo": install_id,
+            }
+
+    class RetainingClient:
+        def __init__(self) -> None:
+            self.request_headers: dict[str, str] = {}
+
+        def __repr__(self) -> str:
+            return f"RetainingClient(headers={self.request_headers!r})"
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, json, headers):
+            self.request_headers = dict(headers)
+            sent_headers.update(headers)
+            return RetainingResponse(headers)
+
+    class CancellingUsage:
+        async def finalize_openai_response(self, data, *, raw_json) -> None:
+            raise asyncio.CancelledError
+
+        async def mark_unknown(self, reason: str) -> None:
+            usage_reasons.append(reason)
+
+    async def reserve_direct_usage_call(**_kwargs):
+        return CancellingUsage()
+
+    monkeypatch.setattr(
+        "opensquilla.session.naming.httpx.AsyncClient",
+        lambda **_kwargs: RetainingClient(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.session.naming.tokenrhythm_install_id_headers",
+        lambda _provider_kind, _base_url: {
+            "X-OpenSquilla-Install-Id": install_id
+        },
+    )
+    monkeypatch.setattr(
+        "opensquilla.engine.usage_http.reserve_direct_usage_call",
+        reserve_direct_usage_call,
+    )
+
+    task = asyncio.create_task(
+        call_naming_llm(
+            "Help me reset my password please",
+            model="deepseek-v4-flash",
+            api_key="test-key",
+            base_url="https://tokenrhythm.studio/v1",
+            provider="tokenrhythm",
+        )
+    )
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+
+    assert task.cancelled()
+    assert usage_reasons == ["cancelled"]
+    assert sent_headers["X-OpenSquilla-Install-Id"] == install_id
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+    traceback = caught.value.__traceback__
+    production_locals: list[str] = []
+    while traceback is not None:
+        frame = traceback.tb_frame
+        if (
+            frame.f_globals.get("__name__") == "opensquilla.session.naming"
+            and frame.f_code.co_name == "call_naming_llm"
+        ):
+            production_locals.append(repr(frame.f_locals))
+        traceback = traceback.tb_next
+    assert len(production_locals) == 1
+    assert install_id not in production_locals[0]
+
+
+@pytest.mark.asyncio
+async def test_call_naming_llm_redacts_install_id_from_failure_log(monkeypatch):
+    install_id = "i7"
+    warnings: list[tuple[str, dict]] = []
+
+    class FailingClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            return False
+
+        async def post(self, url, *, json, headers):
+            raise RuntimeError(f"upstream echoed {install_id}")
+
+    class CapturingLog:
+        def warning(self, event: str, **kwargs) -> None:
+            warnings.append((event, kwargs))
+
+    monkeypatch.setattr(
+        "opensquilla.session.naming.httpx.AsyncClient",
+        lambda **_kwargs: FailingClient(),
+    )
+    monkeypatch.setattr("opensquilla.session.naming.log", CapturingLog())
+    monkeypatch.setattr(
+        "opensquilla.session.naming.redact_tokenrhythm_install_ids",
+        lambda text: text.replace(install_id, "***"),
+    )
+
+    title = await call_naming_llm(
+        "Help me reset my password please",
+        model="deepseek-v4-flash",
+        api_key="test-key",
+        base_url="https://tokenrhythm.studio/v1",
+        provider="tokenrhythm",
+    )
+
+    assert title is None
+    assert warnings == [
+        (
+            "session_naming.llm_call_failed",
+            {"model": "deepseek-v4-flash", "error": "upstream echoed ***"},
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -540,6 +775,7 @@ def _patch_provider_and_emit(monkeypatch, *, title: str | None):
     async def fake_llm(first_message, **kwargs):
         calls["llm"] += 1
         calls["first_message"] = first_message
+        calls["kwargs"] = kwargs
         return title
 
     monkeypatch.setattr(naming_mod, "call_naming_llm", fake_llm)
@@ -562,15 +798,78 @@ async def test_generate_session_title_writes_and_broadcasts(storage, mgr, monkey
     )
     ctx = SimpleNamespace(config=GatewayConfig(), session_manager=mgr, provider_selector=None)
 
-    await generate_session_title(ctx, key, "Please help me reset my password")
+    correlation = ProviderRequestCorrelation(
+        session_id="sid-s1",
+        turn_id="turn-1",
+        execution_id="naming-1",
+        call_kind="auxiliary.naming",
+    )
+    await generate_session_title(
+        ctx,
+        key,
+        "Please help me reset my password",
+        provider_request_correlation=correlation,
+    )
 
     assert calls["llm"] == 1
+    assert calls["kwargs"]["provider_request_correlation"] is correlation
     assert (await storage.get_session(key)).derived_title == "Reset Password"
     assert len(emits) == 1
     emit_key, event_name, payload = emits[0]
     assert emit_key == key
     assert event_name == "sessions.changed"
     assert payload["reason"] == "auto_titled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disabled", [False, True])
+async def test_auto_title_schedule_explicitly_captures_turn_correlation(
+    disabled: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.gateway.rpc_sessions as rpc_sessions_mod
+
+    observed: list[ProviderRequestCorrelation | None] = []
+    done = asyncio.Event()
+
+    async def _generate(
+        _ctx,
+        _key,
+        _message,
+        *,
+        provider_request_correlation=None,
+    ) -> None:
+        observed.append(provider_request_correlation)
+        done.set()
+
+    monkeypatch.setattr(rpc_sessions_mod, "generate_session_title", _generate)
+    monkeypatch.delenv(
+        "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY",
+        raising=False,
+    )
+    config = GatewayConfig()
+    config.privacy.disable_network_observability = disabled
+    ctx = SimpleNamespace(config=config)
+
+    rpc_sessions_mod._schedule_auto_title(
+        ctx,
+        "agent:main:webchat:s1",
+        "hello",
+        enabled=True,
+        session_id="session-1",
+        root_turn_id="turn-1",
+    )
+    await done.wait()
+
+    if disabled:
+        assert observed == [None]
+    else:
+        correlation = observed[0]
+        assert correlation is not None
+        assert correlation.session_id == "session-1"
+        assert correlation.turn_id == "turn-1"
+        assert correlation.execution_id not in {"", "turn-1"}
+        assert correlation.call_kind == "auxiliary.naming"
 
 
 @pytest.mark.asyncio

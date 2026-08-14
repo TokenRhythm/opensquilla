@@ -20,7 +20,9 @@ from typing import Any
 from opensquilla.recovery.atomic import (
     PathIdentity,
     _chmod_open_file,
+    _native_io_path,
     _windows_extended_path,
+    is_path_redirecting_stat,
     native_move_no_replace,
 )
 from opensquilla.recovery.errors import (
@@ -33,14 +35,16 @@ from opensquilla.recovery.errors import (
 
 WORKSPACE_OVERRIDE_ENV_VARS = (
     "OPENSQUILLA_GATEWAY_WORKSPACE_DIR",
-    # Kept for the standalone TUI compatibility spelling. It is not a
-    # GatewayConfig source today, but treating it as an override is safer than
-    # silently writing a setting the visible runtime may ignore.
+    # GatewayConfig keeps the standalone/TUI spelling as a public compatibility
+    # alias, with the canonical Gateway spelling taking precedence.
     "OPENSQUILLA_WORKSPACE_DIR",
 )
 STATE_OVERRIDE_ENV_VARS = ("OPENSQUILLA_GATEWAY_STATE_DIR",)
+MEDIA_OVERRIDE_ENV_VARS = (
+    "OPENSQUILLA_GATEWAY_ATTACHMENTS__MEDIA_ROOT",
+    "OPENSQUILLA_ATTACHMENTS_MEDIA_ROOT",
+)
 _DOTENV_MAX_BYTES = 1024 * 1024
-_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 _COPYFILE_ACL = 1 << 0
 _COPYFILE_XATTR = 1 << 2
 _WORKSPACE_PATCH_SCHEMA_VERSION = 1
@@ -72,7 +76,7 @@ class ConfigSnapshot:
     def capture(cls, path: str | Path) -> ConfigSnapshot:
         config_path = Path(path)
         try:
-            path_stat = config_path.lstat()
+            path_stat = os.lstat(_native_io_path(config_path))
         except FileNotFoundError:
             return cls(
                 path=config_path,
@@ -85,10 +89,8 @@ class ConfigSnapshot:
             raise UnsafePathError(
                 f"cannot inspect config without following links: {config_path}"
             ) from exc
-        path_attributes = int(getattr(path_stat, "st_file_attributes", 0))
         if (
-            stat.S_ISLNK(path_stat.st_mode)
-            or path_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+            is_path_redirecting_stat(path_stat)
             or not stat.S_ISREG(path_stat.st_mode)
             or path_stat.st_nlink != 1
         ):
@@ -100,7 +102,7 @@ class ConfigSnapshot:
             | getattr(os, "O_NOFOLLOW", 0)
         )
         try:
-            fd = os.open(config_path, flags)
+            fd = os.open(_native_io_path(config_path), flags)
         except FileNotFoundError as exc:
             raise ConfigChangedError("config disappeared while it was being opened") from exc
         except OSError as exc:
@@ -109,12 +111,11 @@ class ConfigSnapshot:
             ) from exc
         try:
             before = os.fstat(fd)
-            before_attributes = int(getattr(before, "st_file_attributes", 0))
-            if (
-                before_attributes & _FILE_ATTRIBUTE_REPARSE_POINT
-                or not stat.S_ISREG(before.st_mode)
-                or before.st_nlink != 1
-            ):
+            # fstat cannot observe reparse tags, so a data-only cloud
+            # placeholder must not be re-rejected here; the no-follow lstat
+            # above vetted the shape and the metadata comparison below pins
+            # this handle to that same entry.
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
                 raise UnsafePathError(f"config must be a regular single-link file: {config_path}")
             if (
                 PathIdentity.from_stat(path_stat).metadata_tuple()
@@ -188,7 +189,7 @@ def _parse_dotenv_value(
         if quote == '"':
             replacements = {
                 r"\\": "\\",
-                r'\"': '"',
+                r"\"": '"',
                 r"\n": "\n",
                 r"\r": "\r",
                 r"\t": "\t",
@@ -213,12 +214,12 @@ def _parse_dotenv_value(
 
 def _profile_dotenv_path(home: Path, *, include_legacy: bool) -> Path | None:
     current = home / ".env"
-    if os.path.lexists(current):
+    if os.path.lexists(_native_io_path(current)):
         return current
     if not include_legacy:
         return None
     legacy = home / "state" / ".env"
-    return legacy if os.path.lexists(legacy) else None
+    return legacy if os.path.lexists(_native_io_path(legacy)) else None
 
 
 def _profile_dotenv_override(
@@ -256,9 +257,7 @@ def _profile_dotenv_override(
         ) from exc
     parsed: dict[str, str] = {}
     key_pattern = "|".join(re.escape(name) for name in names)
-    assignment = re.compile(
-        rf"^\s*(?:export\s+)?(?P<key>{key_pattern})\s*=\s*(?P<value>.*)$"
-    )
+    assignment = re.compile(rf"^\s*(?:export\s+)?(?P<key>{key_pattern})\s*=\s*(?P<value>.*)$")
     for raw_line in text.splitlines():
         stripped = raw_line.strip()
         if not stripped or stripped.startswith("#"):
@@ -283,6 +282,8 @@ def workspace_override(
     home: str | Path | None = None,
     *,
     include_legacy_dotenv: bool = False,
+    include_process_environment: bool = True,
+    include_standalone_alias: bool = True,
 ) -> tuple[str, str] | None:
     """Resolve only workspace overrides without loading a general dotenv.
 
@@ -291,16 +292,22 @@ def workspace_override(
     proven reconciliation would publish) with a narrow, no-follow parser.
     """
 
-    for name in WORKSPACE_OVERRIDE_ENV_VARS:
-        value = os.environ.get(name, "").strip()
-        if value:
-            return name, value
+    names = (
+        WORKSPACE_OVERRIDE_ENV_VARS
+        if include_standalone_alias
+        else ("OPENSQUILLA_GATEWAY_WORKSPACE_DIR",)
+    )
+    if include_process_environment:
+        for name in names:
+            value = os.environ.get(name, "").strip()
+            if value:
+                return name, value
     if home is None:
         return None
     return _profile_dotenv_override(
         Path(home).expanduser().absolute(),
         include_legacy=include_legacy_dotenv,
-        names=WORKSPACE_OVERRIDE_ENV_VARS,
+        names=names,
         label="workspace",
         error_type=WorkspaceOverrideError,
         stable_code="workspace_env_override_unsafe",
@@ -329,6 +336,31 @@ def state_override(
         label="state",
         error_type=RecoveryError,
         stable_code="state_env_override_unsafe",
+    )
+
+
+def media_override(
+    home: str | Path | None = None,
+    *,
+    include_legacy_dotenv: bool = False,
+    include_process_environment: bool = True,
+) -> tuple[str, str] | None:
+    """Resolve the attachment media root without loading a general dotenv."""
+
+    if include_process_environment:
+        for name in MEDIA_OVERRIDE_ENV_VARS:
+            value = os.environ.get(name, "").strip()
+            if value:
+                return name, value
+    if home is None:
+        return None
+    return _profile_dotenv_override(
+        Path(home).expanduser().absolute(),
+        include_legacy=include_legacy_dotenv,
+        names=MEDIA_OVERRIDE_ENV_VARS,
+        label="media",
+        error_type=RecoveryError,
+        stable_code="media_env_override_unsafe",
     )
 
 
@@ -451,7 +483,7 @@ def workspace_patch_journal(home: str | Path) -> Path:
 
 def workspace_patch_exists(home: str | Path) -> bool:
     try:
-        return os.path.lexists(workspace_patch_journal(home))
+        return os.path.lexists(_native_io_path(workspace_patch_journal(home)))
     except OSError:
         return True
 
@@ -547,7 +579,7 @@ def _write_json_no_replace(path: Path, payload: dict[str, Any]) -> ConfigSnapsho
     )
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags, 0o600)
+        fd = os.open(_native_io_path(path), flags, 0o600)
     except FileExistsError as exc:
         raise RecoveryError(
             "an unfinished workspace config transaction already exists",
@@ -629,7 +661,7 @@ def _make_owner_only(path: Path, expected: object) -> None:
         raise AtomicStateUnknownError("workspace config backup identity is ambiguous")
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        fd = os.open(path, flags)
+        fd = os.open(_native_io_path(path), flags)
         try:
             opened = PathIdentity.from_stat(os.fstat(fd))
             assert isinstance(expected, dict)
@@ -659,14 +691,10 @@ def _park_workspace_config(
     expected_old: object,
 ) -> None:
     if not _identity_matches(config, expected_old):
-        raise AtomicStateUnknownError(
-            "workspace config changed before it could be parked"
-        )
+        raise AtomicStateUnknownError("workspace config changed before it could be parked")
     native_move_no_replace(config, backup)
     if not _identity_matches(backup, expected_old):
-        raise AtomicStateUnknownError(
-            "workspace config changed while it was being parked"
-        )
+        raise AtomicStateUnknownError("workspace config changed while it was being parked")
     _make_owner_only(backup, expected_old)
 
 
@@ -677,10 +705,8 @@ def _publish_workspace_config(
 ) -> None:
     if not _identity_matches(staged, expected_staged):
         raise AtomicStateUnknownError("workspace config candidate identity is ambiguous")
-    if os.path.lexists(config):
-        raise AtomicStateUnknownError(
-            "workspace config destination changed before publication"
-        )
+    if os.path.lexists(_native_io_path(config)):
+        raise AtomicStateUnknownError("workspace config destination changed before publication")
     native_move_no_replace(staged, config)
     if not _identity_matches(config, expected_staged):
         raise AtomicStateUnknownError("workspace config publication state is ambiguous")
@@ -691,11 +717,11 @@ def _commit_workspace_patch(home: Path) -> None:
     identities = payload["identities"]
     if not _identity_matches(paths["config"], identities["staged"]):
         raise AtomicStateUnknownError("workspace config is not safely published")
-    if os.path.lexists(paths["staged"]):
+    if os.path.lexists(_native_io_path(paths["staged"])):
         raise AtomicStateUnknownError("workspace config candidate remains after publication")
     old_identity = identities["old_config"]
     if old_identity is None:
-        if os.path.lexists(paths["backup"]):
+        if os.path.lexists(_native_io_path(paths["backup"])):
             raise AtomicStateUnknownError("unexpected workspace config backup exists")
     elif not _parked_config_matches(paths["backup"], old_identity):
         raise AtomicStateUnknownError("workspace config backup identity is ambiguous")
@@ -711,22 +737,22 @@ def _finish_workspace_patch(home: Path) -> Path | None:
     staged_identity = identities["staged"]
 
     if _identity_matches(paths["config"], staged_identity):
-        if os.path.lexists(paths["staged"]):
+        if os.path.lexists(_native_io_path(paths["staged"])):
             raise AtomicStateUnknownError("workspace config publication is duplicated")
     else:
         if old_identity is None:
-            if os.path.lexists(paths["backup"]) or os.path.lexists(paths["config"]):
+            if os.path.lexists(_native_io_path(paths["backup"])) or os.path.lexists(
+                _native_io_path(paths["config"])
+            ):
                 raise AtomicStateUnknownError(
                     "workspace config destination changed during publication"
                 )
         elif _parked_config_matches(paths["backup"], old_identity):
-            if os.path.lexists(paths["config"]):
-                raise AtomicStateUnknownError(
-                    "workspace config destination changed after parking"
-                )
+            if os.path.lexists(_native_io_path(paths["config"])):
+                raise AtomicStateUnknownError("workspace config destination changed after parking")
             _make_owner_only(paths["backup"], old_identity)
         elif _identity_matches(paths["config"], old_identity) and not os.path.lexists(
-            paths["backup"]
+            _native_io_path(paths["backup"])
         ):
             _park_workspace_config(paths["config"], paths["backup"], old_identity)
         else:
@@ -765,23 +791,22 @@ def _copy_macos_config_metadata(snapshot: ConfigSnapshot, destination_fd: int) -
     fcopyfile.restype = ctypes.c_int
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        source_fd = os.open(snapshot.path, flags)
+        source_fd = os.open(_native_io_path(snapshot.path), flags)
     except OSError as exc:
-        raise ConfigChangedError(
-            "config changed before its ACLs could be preserved"
-        ) from exc
+        raise ConfigChangedError("config changed before its ACLs could be preserved") from exc
     try:
         current = PathIdentity.from_stat(os.fstat(source_fd))
         if current.metadata_tuple() != snapshot.identity.metadata_tuple():
-            raise ConfigChangedError(
-                "config changed before its ACLs could be preserved"
+            raise ConfigChangedError("config changed before its ACLs could be preserved")
+        if (
+            fcopyfile(
+                source_fd,
+                destination_fd,
+                None,
+                _COPYFILE_ACL | _COPYFILE_XATTR,
             )
-        if fcopyfile(
-            source_fd,
-            destination_fd,
-            None,
-            _COPYFILE_ACL | _COPYFILE_XATTR,
-        ) != 0:
+            != 0
+        ):
             error_number = ctypes.get_errno()
             raise RecoveryError(
                 f"macOS ACL or extended metadata could not be preserved ({error_number})",
@@ -859,7 +884,7 @@ def _patch_workspace_dir_locked(home: str | Path, workspace: str | Path) -> Path
         raise WorkspaceOverrideError(f"remove {name} before changing the persisted workspace path")
     workspace_path = Path(workspace).expanduser().absolute()
     config_path = home_path / "config.toml"
-    home_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.makedirs(_native_io_path(home_path), mode=0o700, exist_ok=True)
     snapshot = ConfigSnapshot.capture(config_path)
     try:
         raw = snapshot.data.decode("utf-8")
@@ -893,12 +918,16 @@ def _patch_workspace_dir_locked(home: str | Path, workspace: str | Path) -> Path
             | getattr(os, "O_CLOEXEC", 0)
         )
         flags |= getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(staged_path, flags, 0o600)
+        fd = os.open(_native_io_path(staged_path), flags, 0o600)
         staged_created = True
         try:
             if snapshot.identity is not None:
                 try:
-                    shutil.copystat(config_path, staged_path, follow_symlinks=False)
+                    shutil.copystat(
+                        _native_io_path(config_path),
+                        _native_io_path(staged_path),
+                        follow_symlinks=False,
+                    )
                 except OSError as exc:
                     raise RecoveryError(
                         "config permissions, ACLs, or extended metadata could not be preserved",
@@ -933,7 +962,7 @@ def _patch_workspace_dir_locked(home: str | Path, workspace: str | Path) -> Path
         try:
             _write_json_no_replace(paths["journal"], payload)
         finally:
-            journal_created = os.path.lexists(paths["journal"])
+            journal_created = os.path.lexists(_native_io_path(paths["journal"]))
         backup = _finish_workspace_patch(home_path)
         journal_created = False
         staged_created = False
@@ -944,7 +973,7 @@ def _patch_workspace_dir_locked(home: str | Path, workspace: str | Path) -> Path
         # place for deterministic recovery; no failure path guesses or deletes.
         if staged_created and not journal_created:
             with contextlib.suppress(OSError):
-                staged_path.unlink()
+                os.unlink(_native_io_path(staged_path))
 
 
 def patch_workspace_dir(
@@ -965,9 +994,11 @@ def patch_workspace_dir(
 
 __all__ = [
     "ConfigSnapshot",
+    "MEDIA_OVERRIDE_ENV_VARS",
     "STATE_OVERRIDE_ENV_VARS",
     "WORKSPACE_OVERRIDE_ENV_VARS",
     "patch_workspace_dir",
+    "media_override",
     "recover_workspace_patch",
     "state_override",
     "workspace_override",

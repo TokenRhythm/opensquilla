@@ -90,8 +90,14 @@ const EXIT_SCROLL_RANGE_RATIO = 1
 // not mount/unmount the rail on every sub-pixel wobble around one boundary.
 // A fresh rail must reach the enter threshold; once visible it is allowed to
 // remain until the conversation pane crosses the lower exit threshold.
-const ENTER_INLINE_SIZE = 1104
-const EXIT_INLINE_SIZE = 1056
+// The rail's 30px interactive lens starts 14px from the shell edge; its focus
+// ring reaches another 4px. At the 1104px floor, the shared 980px conversation
+// column still leaves a stable gap after accounting for the thread's scrollbar
+// gutter.
+// Enter a little later than that floor so live sidebar resizing cannot flicker
+// the rail at the exact collision boundary.
+const ENTER_INLINE_SIZE = 1120
+const EXIT_INLINE_SIZE = 1104
 const ARRIVAL_HIGHLIGHT_MS = 650
 const ARRIVAL_TOLERANCE_PX = 4
 const MAX_PREVIEW_LENGTH = 220
@@ -106,6 +112,7 @@ const FINE_INPUT_QUERY = '(any-hover: hover), (any-pointer: fine)'
 
 interface ConversationTurn {
   key: string
+  sourceIndex: number
   controlId: string
   preview: string
   time: string
@@ -118,6 +125,12 @@ const props = defineProps<{
   stripTimePrefix: (text: string) => string
   sessionKey?: string
   historyHasMore?: boolean
+  /** Mount a logical history row before DOM-dependent focus/highlight work. */
+  ensureMessageVisible?: (sourceIndex: number) => Promise<HTMLElement | null>
+  /** Release a row pinned only for navigation once the destination settles. */
+  releaseEnsuredMessage?: (sourceIndex?: number) => void
+  /** Absolute offset in the scroll container for an unmounted logical row. */
+  messageOffset?: (sourceIndex: number) => number | null
 }>()
 const emit = defineEmits<{
   navigate: [index: number]
@@ -130,7 +143,6 @@ const listRef = ref<HTMLElement | null>(null)
 const tooltipRef = ref<HTMLElement | null>(null)
 const markerRefs = ref<HTMLButtonElement[]>([])
 const activeIndex = ref(0)
-const activeProgress = ref(0)
 const hoveredIndex = ref<number | null>(null)
 const focusedIndex = ref<number | null>(null)
 const pointerLensIndex = ref<number | null>(null)
@@ -157,6 +169,8 @@ let navigationContainer: HTMLElement | null = null
 let navigationEndTimer = 0
 let navigationTarget: HTMLElement | null = null
 let navigationTargetTop = 0
+let navigationTargetSourceIndex: number | null = null
+let navigationGeneration = 0
 let arrivalElement: HTMLElement | null = null
 let arrivalTimer = 0
 let lastAnchorElement: HTMLElement | null = null
@@ -176,6 +190,7 @@ const turns = computed<ConversationTurn[]>(() => {
       : t('chat.historyAttachmentOnly')
     return {
       key: chatMessageKey(message, sourceIndex),
+      sourceIndex,
       controlId: `chat-turn-${sourceIndex}`,
       preview,
       time: message.timeStr || '',
@@ -194,11 +209,10 @@ const previewTurn = computed(() => {
   const index = previewIndex.value
   return index === null ? null : turns.value[index] || null
 })
-const visualFocusIndex = computed(() => (
+const visualFocusIndex = computed<number | null>(() => (
   pointerLensIndex.value
   ?? focusedIndex.value
   ?? hoveredIndex.value
-  ?? activeProgress.value
 ))
 
 function truncatePreview(text: string): string {
@@ -211,15 +225,19 @@ function setMarkerRef(el: Element | ComponentPublicInstance | null, index: numbe
 }
 
 function markerStyle(index: number): Record<string, string> {
-  const distance = Math.abs(index - visualFocusIndex.value)
-  const influence = Math.exp(-(distance * distance) / (2 * LENS_SIGMA * LENS_SIGMA))
-  const scaleX = MIN_LINE_SCALE_X + (1 - MIN_LINE_SCALE_X) * influence
-  const scaleY = MIN_LINE_SCALE_Y + (1 - MIN_LINE_SCALE_Y) * influence
-  const opacity = MIN_LINE_OPACITY + (1 - MIN_LINE_OPACITY) * influence
+  const isActive = index === activeIndex.value
+  const focusIndex = visualFocusIndex.value
+  let scaleX = MIN_LINE_SCALE_X
+  if (focusIndex !== null) {
+    const distance = Math.abs(index - focusIndex)
+    const influence = Math.exp(-(distance * distance) / (2 * LENS_SIGMA * LENS_SIGMA))
+    scaleX += (1 - MIN_LINE_SCALE_X) * influence
+  }
+
   return {
     '--conversation-minimap-line-scale-x': scaleX.toFixed(4),
-    '--conversation-minimap-line-scale-y': scaleY.toFixed(4),
-    '--conversation-minimap-line-opacity': opacity.toFixed(4),
+    '--conversation-minimap-line-scale-y': (isActive ? 1 : MIN_LINE_SCALE_Y).toFixed(4),
+    '--conversation-minimap-line-opacity': (isActive ? 1 : MIN_LINE_OPACITY).toFixed(4),
   }
 }
 
@@ -264,8 +282,15 @@ function measureLayout() {
   lastAnchorElement = anchors.get(turns.value[turns.value.length - 1]?.key || '') || null
   anchorOffsets.value = turns.value.map(turn => {
     const anchor = anchors.get(turn.key)
-    if (!anchor) return Number.POSITIVE_INFINITY
-    return anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+    if (anchor) {
+      return anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+    }
+    const logicalOffset = props.messageOffset?.(turn.sourceIndex)
+    return logicalOffset !== null
+      && logicalOffset !== undefined
+      && Number.isFinite(logicalOffset)
+      ? logicalOffset
+      : Number.POSITIVE_INFINITY
   })
   updateActiveTurn()
 }
@@ -278,16 +303,13 @@ function updateActiveTurn() {
   const offsets = anchorOffsets.value
   if (!container || offsets.length === 0) {
     activeIndex.value = 0
-    activeProgress.value = 0
     return
   }
 
   const bottomGap = container.scrollHeight - container.scrollTop - container.clientHeight
   let nextIndex = 0
-  let nextProgress = 0
   if (bottomGap <= 2) {
     nextIndex = offsets.length - 1
-    nextProgress = nextIndex
   } else {
     const readingLine = container.scrollTop + Math.min(180, container.clientHeight * 0.3)
     let low = 0
@@ -301,16 +323,8 @@ function updateActiveTurn() {
         high = mid - 1
       }
     }
-    nextProgress = nextIndex
-    const nextOffset = offsets[nextIndex + 1]
-    const currentOffset = offsets[nextIndex]
-    if (Number.isFinite(currentOffset) && Number.isFinite(nextOffset) && nextOffset > currentOffset) {
-      const segmentProgress = Math.min(1, Math.max(0, (readingLine - currentOffset) / (nextOffset - currentOffset)))
-      nextProgress += segmentProgress
-    }
   }
 
-  activeProgress.value = nextProgress
   if (nextIndex !== activeIndex.value) {
     activeIndex.value = nextIndex
     void nextTick(keepActiveMarkerVisible)
@@ -529,14 +543,17 @@ function settleNavigation(showArrival: boolean) {
   if (!navigationPending) return
   const target = navigationTarget
   const container = navigationContainer
+  const sourceIndex = navigationTargetSourceIndex
   const arrived = showArrival
     && Boolean(container)
     && Math.abs((container?.scrollTop || 0) - navigationTargetTop) <= ARRIVAL_TOLERANCE_PX
   navigationPending = false
   navigationTarget = null
   navigationTargetTop = 0
+  navigationTargetSourceIndex = null
   clearNavigationEnd()
   if (target && arrived) showArrivalHighlight(target)
+  if (sourceIndex !== null) props.releaseEnsuredMessage?.(sourceIndex)
   scheduleActiveUpdate()
   emit('navigateEnd')
 }
@@ -546,6 +563,7 @@ function finishNavigation() {
 }
 
 function cancelNavigation() {
+  navigationGeneration += 1
   settleNavigation(false)
 }
 
@@ -558,15 +576,39 @@ function armNavigationEnd(container: HTMLElement, smooth: boolean) {
   navigationEndTimer = window.setTimeout(finishNavigation, smooth ? 2000 : 180)
 }
 
-function navigateTo(index: number, focusTarget = false) {
+async function navigateTo(index: number, focusTarget = false) {
   const container = props.scrollContainer
   const turn = turns.value[index]
   if (!container || !turn) return
+  cancelNavigation()
+  const generation = ++navigationGeneration
+  if (focusTarget) {
+    focusedIndex.value = index
+  } else {
+    // Pointer activation focuses the button before click. Clear both preview
+    // sources so the floating card does not linger over the destination; the
+    // DOM focus itself stays put for keyboard continuity.
+    closeHoverPreview()
+    focusedIndex.value = null
+  }
+  emit('navigate', index)
+  activeIndex.value = index
   const anchor = anchorElements().get(turn.key)
-  if (!anchor) return
-
+    || await props.ensureMessageVisible?.(turn.sourceIndex)
+    || null
+  if (generation !== navigationGeneration) {
+    props.releaseEnsuredMessage?.(turn.sourceIndex)
+    return
+  }
   const containerRect = container.getBoundingClientRect()
-  const anchorTop = anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+  const anchorTop = anchor
+    ? anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+    : props.messageOffset?.(turn.sourceIndex)
+  if (anchorTop === null || anchorTop === undefined || !Number.isFinite(anchorTop)) {
+    props.releaseEnsuredMessage?.(turn.sourceIndex)
+    emit('navigateEnd')
+    return
+  }
   const targetTop = Math.min(
     Math.max(0, container.scrollHeight - container.clientHeight),
     Math.max(0, anchorTop - 16),
@@ -580,27 +622,16 @@ function navigateTo(index: number, focusTarget = false) {
   // scrolling stays interruptible by wheel/touch input and avoids per-frame
   // Vue work; reduced-motion remains an immediate jump.
   const smooth = !reduceMotion
-  cancelNavigation()
-  if (focusTarget) {
-    focusedIndex.value = index
-  } else {
-    // Pointer activation focuses the button before click. Clear both preview
-    // sources so the floating card does not linger over the destination; the
-    // DOM focus itself stays put for keyboard continuity.
-    closeHoverPreview()
-    focusedIndex.value = null
-  }
-  emit('navigate', index)
-  activeIndex.value = index
-  activeProgress.value = index
-  if (focusTarget) anchor.focus({ preventScroll: true })
+  if (focusTarget) anchor?.focus({ preventScroll: true })
   if (distance <= ARRIVAL_TOLERANCE_PX) {
-    showArrivalHighlight(anchor)
+    if (anchor) showArrivalHighlight(anchor)
+    props.releaseEnsuredMessage?.(turn.sourceIndex)
     emit('navigateEnd')
     return
   }
   navigationTarget = anchor
   navigationTargetTop = targetTop
+  navigationTargetSourceIndex = turn.sourceIndex
   armNavigationEnd(container, smooth)
   container.scrollTo({ top: targetTop, behavior: smooth ? 'smooth' : 'auto' })
 }
@@ -637,7 +668,7 @@ function onListPointerMove(event: PointerEvent) {
       if (Math.abs(pitch) >= 1) {
         nextLensIndex = (pendingPointerClientY - firstCenter) / pitch
       } else {
-        nextLensIndex = hoveredIndex.value ?? activeProgress.value
+        nextLensIndex = hoveredIndex.value ?? focusedIndex.value ?? activeIndex.value
       }
     }
     pointerLensIndex.value = Math.min(turns.value.length - 1, Math.max(0, nextLensIndex))
@@ -699,7 +730,6 @@ watch(() => props.sessionKey, () => {
   clearArrivalHighlight()
   hasLongHistory.value = false
   activeIndex.value = 0
-  activeProgress.value = 0
   hoveredIndex.value = null
   focusedIndex.value = null
   pointerLensIndex.value = null
@@ -718,7 +748,6 @@ watch(turns, (nextTurns, previousTurns) => {
   hoveredIndex.value = remap(hoveredIndex.value)
   focusedIndex.value = remap(focusedIndex.value)
   activeIndex.value = remap(activeIndex.value) ?? 0
-  activeProgress.value = activeIndex.value
   pointerLensIndex.value = null
   markerRefs.value = []
   void nextTick(() => {
@@ -923,9 +952,9 @@ onBeforeUnmount(() => {
   font-size: var(--fs-xs);
 }
 
-/* This is the hard safety floor only. JavaScript owns the 1104px enter / 1056px
+/* This is the hard safety floor only. JavaScript owns the 1120px enter / 1104px
    exit hysteresis; using the enter value here would defeat that hysteresis. */
-@container chat-thread-shell (max-width: 1056px) {
+@container chat-thread-shell (max-width: 1104px) {
   .conversation-minimap {
     display: none;
   }

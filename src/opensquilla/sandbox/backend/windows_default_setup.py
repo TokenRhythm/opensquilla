@@ -24,6 +24,14 @@ SETUP_VERSION = 2
 OFFLINE_USERNAME = "OpenSquillaSandbox"
 SETUP_HELPER_REPORT = "setup_helper_report.json"
 SETUP_PROCESS_LOCK_TIMEOUT_MS = 10 * 60 * 1000
+_DESKTOP_PRIMARY_HOME_PARTS = (
+    "AppData",
+    "Roaming",
+    "@opensquilla",
+    "desktop-electron",
+    "opensquilla",
+)
+_IDENTITY_READINESS_CACHE: dict[tuple[str, int, int], bool] = {}
 
 
 @dataclass(frozen=True)
@@ -134,6 +142,64 @@ def setup_marker_proxy_allowlist_ready(path: Path, *, ports: tuple[int, ...]) ->
     return marker.network.is_current_for_ports(ports)
 
 
+def setup_marker_identity_ready(path: Path) -> bool:
+    """Return whether the marker's offline account can actually log on.
+
+    A current marker is not sufficient: the local account password can be
+    changed or recreated independently, leaving a DPAPI-readable but stale
+    credential behind.  Probe the identity before advertising Safe mode so
+    automatic setup can repair that state instead of failing on first launch.
+    """
+
+    try:
+        stat_result = path.stat()
+        cache_key = (str(path), stat_result.st_mtime_ns, stat_result.st_size)
+    except OSError:
+        return False
+    cached = _IDENTITY_READINESS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    marker = read_setup_marker(path)
+    if marker is None or marker.network is None:
+        return False
+    network = marker.network
+    if not network.offline_username or not network.protected_password:
+        return False
+    try:
+        from opensquilla.sandbox.backend.windows_default_identity import (
+            OfflineSandboxIdentity,
+            logon_offline_identity,
+        )
+
+        token = logon_offline_identity(
+            OfflineSandboxIdentity(
+                sid=network.offline_user_sid,
+                username=network.offline_username,
+                protected_password=network.protected_password,
+            )
+        )
+    except (OSError, ValueError):
+        ready = False
+    else:
+        try:
+            if not sys.platform.startswith("win"):
+                ready = False
+            else:
+                import ctypes
+                from ctypes import wintypes
+
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+                kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+                kernel32.CloseHandle.restype = wintypes.BOOL
+                ready = bool(kernel32.CloseHandle(wintypes.HANDLE(token)))
+        except Exception:
+            ready = False
+    if len(_IDENTITY_READINESS_CACHE) >= 32:
+        _IDENTITY_READINESS_CACHE.clear()
+    _IDENTITY_READINESS_CACHE[cache_key] = ready
+    return ready
+
+
 def setup_payload(path: Path) -> dict[str, Any]:
     return {
         "setupVersion": SETUP_VERSION,
@@ -216,14 +282,10 @@ def run_elevated_setup_helper(path: Path) -> None:
     except FileNotFoundError:
         pass
     payload = _encode_setup_helper_payload(path, user_sid=_current_windows_user_sid())
-    parameters = subprocess.list2cmdline(
-        [
-            "-m",
-            "opensquilla.sandbox.backend.windows_default_setup",
-            "--elevated-helper",
-            payload,
-        ]
-    )
+    helper_args = ["--elevated-helper", payload]
+    if not getattr(sys, "frozen", False):
+        helper_args = ["-m", "opensquilla.sandbox.backend.windows_default_setup", *helper_args]
+    parameters = subprocess.list2cmdline(helper_args)
     exit_code = _shell_execute_runas_and_wait(
         executable=sys.executable,
         parameters=parameters,
@@ -251,16 +313,32 @@ def elevated_setup_helper_main(argv: list[str] | None = None) -> int:
     try:
         with _windows_setup_process_lock(marker_path):
             with _secure_setup_directory_lease(marker_path, profile_path) as lease:
-                if _windows_setup_is_ready(marker_path, profile_path):
+                if _windows_setup_is_ready(marker_path):
+                    marker = read_setup_marker(marker_path)
+                    assert marker is not None and marker.network is not None
+                    lock_persistent_sandbox_dirs(
+                        marker_path,
+                        offline_sid=marker.network.offline_user_sid,
+                        real_user_sid=payload["userSid"],
+                        lease=lease,
+                    )
+                    _validate_setup_directory_lease(lease, recursive=True)
                     write_setup_helper_report(
                         marker_path,
                         state="ready",
-                        detail="already_ready",
+                        detail="existing_setup_acl_repaired",
                     )
                     return 0
                 write_setup_helper_report(marker_path, state="running")
                 try:
                     network = establish_windows_network_setup(marker_path)
+                    # Account rotation happens inside network setup. Persist
+                    # the matching DPAPI credential before ACL hardening so a
+                    # later ACL failure cannot leave the old marker pointing
+                    # at a password that no longer exists. Storage readiness
+                    # remains false until the ACL pass succeeds, so this does
+                    # not advertise a partially repaired sandbox as usable.
+                    write_setup_marker(marker_path, network=network)
                     lock_persistent_sandbox_dirs(
                         marker_path,
                         offline_sid=network.offline_user_sid,
@@ -268,7 +346,6 @@ def elevated_setup_helper_main(argv: list[str] | None = None) -> int:
                         lease=lease,
                     )
                     _validate_setup_directory_lease(lease, recursive=True)
-                    write_setup_marker(marker_path, network=network)
                     write_setup_helper_report(marker_path, state="ready", detail="setup_complete")
                     return 0
                 except Exception as exc:
@@ -341,9 +418,16 @@ def _validated_elevated_setup_target(payload: dict[str, str]) -> tuple[Path, Pat
     if not sid:
         raise OSError("windows_setup_helper_real_user_sid_missing")
     profile_path = _windows_profile_path_for_sid(sid).expanduser().absolute()
-    expected = default_setup_marker_path(profile_path).absolute()
     supplied = Path(payload["markerPath"]).expanduser().absolute()
-    if _setup_path_key(supplied) != _setup_path_key(expected):
+    expected = next(
+        (
+            candidate
+            for candidate in _allowed_setup_marker_paths(profile_path)
+            if _setup_path_key(supplied) == _setup_path_key(candidate)
+        ),
+        None,
+    )
+    if expected is None:
         raise OSError("windows_setup_helper_marker_path_mismatch")
     _validate_existing_non_reparse_components(expected)
     profile_canonical = profile_path.resolve(strict=True)
@@ -353,6 +437,18 @@ def _validated_elevated_setup_target(payload: dict[str, str]) -> tuple[Path, Pat
     except ValueError as exc:
         raise OSError("windows_setup_helper_marker_outside_profile") from exc
     return expected, profile_path
+
+
+def _allowed_setup_marker_paths(profile_path: Path) -> tuple[Path, ...]:
+    # The SID-derived profile is the trusted anchor for both supported state
+    # layouts. Never trust OPENSQUILLA_STATE_DIR in the elevated process: it is
+    # inherited from the unelevated caller and could name an arbitrary path.
+    profile = profile_path.expanduser().absolute()
+    desktop_home = profile.joinpath(*_DESKTOP_PRIMARY_HOME_PARTS)
+    return (
+        default_setup_marker_path(profile).absolute(),
+        (desktop_home / "sandbox" / "setup_marker.json").absolute(),
+    )
 
 
 def _windows_profile_path_for_sid(sid: str) -> Path:
@@ -375,20 +471,15 @@ def _setup_path_key(path: Path) -> str:
     return os.path.normcase(os.path.abspath(str(path))).replace("\\", "/").rstrip("/")
 
 
-def _windows_setup_is_ready(marker_path: Path, profile_path: Path) -> bool:
+def _windows_setup_is_ready(marker_path: Path) -> bool:
     marker = read_setup_marker(marker_path)
     if marker is None or marker.network is None:
         return False
-
-    from opensquilla.sandbox.backend.windows_default_support import (
-        probe_windows_default_support,
+    return (
+        marker.setup_version == SETUP_VERSION
+        and marker.network.is_current_for_ports(marker.network.allowed_proxy_ports)
+        and setup_marker_identity_ready(marker_path)
     )
-
-    support = probe_windows_default_support(
-        home=profile_path,
-        proxy_ports=marker.network.allowed_proxy_ports,
-    )
-    return support.default_backend_available and support.proxy_allowlist_enforced
 
 
 @contextmanager
@@ -553,7 +644,7 @@ def _secure_setup_directory_lease(
     marker_path: Path,
     profile_path: Path,
 ) -> Iterator[_SetupDirectoryLease]:
-    opensquilla_root = profile_path / ".opensquilla"
+    opensquilla_root = marker_path.parent.parent
     roots = (
         opensquilla_root / "sandbox",
         opensquilla_root / "sandbox-secrets",
@@ -834,6 +925,9 @@ def ensure_offline_sandbox_user(state_root: Path) -> dict[str, str]:
         "New-LocalUser -Name $name -Password $password "
         "-Description 'OpenSquilla offline sandbox network identity' | Out-Null "
         "} else { Set-LocalUser -Name $name -Password $password }; "
+        "$adsi = [ADSI]('WinNT://./' + $name + ',user'); "
+        "if ([bool]$adsi.IsAccountLocked) { "
+        "$adsi.IsAccountLocked = $false; $adsi.SetInfo() }; "
         "$user = Get-LocalUser -Name $name; "
         "$user.SID.Value"
     )
@@ -889,9 +983,9 @@ def lock_persistent_sandbox_dirs(
         assert active_lease is not None
         for root in roots:
             _validate_setup_directory_lease(active_lease, recursive=True)
-            commands = (
-                ["icacls", str(root), "/reset", "/t", "/c"],
-                ["icacls", str(root), "/inheritance:r", "/t", "/c"],
+            children = tuple(root.iterdir())
+            commands = [
+                ["icacls", str(root), "/inheritance:r"],
                 [
                     "icacls",
                     str(root),
@@ -900,17 +994,30 @@ def lock_persistent_sandbox_dirs(
                     "*S-1-5-18:(OI)(CI)F",
                     "*S-1-5-32-544:(OI)(CI)F",
                     "/t",
-                    "/c",
                 ],
-                ["icacls", str(root), "/remove:g", f"*{offline_sid}", "/t", "/c"],
-            )
-            for command in commands:
-                _validate_setup_directory_lease(active_lease, recursive=True)
+            ]
+            if children:
+                # icacls expands this wildcard itself, so all existing children
+                # can be reset in one process without changing the root ACL.
+                commands.append(["icacls", str(root / "*"), "/reset", "/t"])
+            commands.append(["icacls", str(root), "/remove:g", f"*{offline_sid}", "/t"])
+            skip_revalidation_indices = {1}
+            if children:
+                skip_revalidation_indices.add(2)
+            for command_index, command in enumerate(commands):
+                # Root inheritance is removed first.  The next command
+                # immediately establishes the trusted explicit ACL; reopening
+                # the tree in between would fail for legacy roots that had no
+                # explicit owner ACE.  Existing children are then reset so
+                # they inherit only that trusted root ACL.
+                if command_index not in skip_revalidation_indices:
+                    _validate_setup_directory_lease(active_lease, recursive=True)
                 command.append("/L")
                 completed = subprocess.run(command, capture_output=True, text=True, check=False)
                 if completed.returncode != 0:
                     detail = completed.stderr.strip() or completed.stdout.strip()
                     raise OSError(detail or f"persistent_sandbox_acl_failed: {root}")
+            _validate_setup_directory_lease(active_lease, recursive=True)
 
 
 def _current_windows_user_sid() -> str:
@@ -947,6 +1054,7 @@ __all__ = [
     "WindowsDefaultSetupMarker",
     "default_setup_marker_path",
     "ensure_offline_sandbox_user",
+    "setup_marker_identity_ready",
     "elevated_setup_helper_main",
     "establish_windows_network_setup",
     "read_setup_marker",

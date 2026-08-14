@@ -1,23 +1,34 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
+import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 
 import pytest
 
 from opensquilla.gateway.approval_queue import get_approval_queue, reset_approval_queue
+from opensquilla.sandbox import filesystem_worker
+from opensquilla.sandbox.backend.unavailable import UnavailableBackend
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, get_runtime, reset_runtime
 from opensquilla.sandbox.operation_runtime import SandboxOperation, SandboxOperationResult
-from opensquilla.sandbox.path_validation import decide_path_access
-from opensquilla.sandbox.permissions import FileSystemPermissionProfile
-from opensquilla.sandbox.run_context import RunContext
-from opensquilla.sandbox.run_mode import RunMode
-from opensquilla.sandbox.types import SandboxRequest
+from opensquilla.sandbox.path_aliases import resolve_workspace_alias
+from opensquilla.sandbox.path_validation import decide_path_access, logical_tool_path
+from opensquilla.sandbox.permissions import (
+    FileSystemAccess,
+    FileSystemPermissionEntry,
+    FileSystemPermissionProfile,
+)
+from opensquilla.sandbox.platform_permissions import FileSystemPlatformContext
+from opensquilla.sandbox.policy_models import FilePolicySettings, SandboxPolicy
+from opensquilla.sandbox.run_context import MountGrant, RunContext
+from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
+from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest
 from opensquilla.tools.builtin import filesystem as fs
 from opensquilla.tools.builtin import patch as patch_tool
 from opensquilla.tools.builtin import shell
@@ -86,10 +97,49 @@ class _FilesystemBackend:
                 for line_no, line in enumerate(text.splitlines(), start=1):
                     if request.pattern in line:
                         matches.append(f"{entry}:{line_no}:{line}")
-            return SandboxOperationResult(
-                message="\n".join(matches) if matches else "No matches"
-            )
+            return SandboxOperationResult(message="\n".join(matches) if matches else "No matches")
         raise AssertionError(f"unsupported filesystem operation: {operation.kind}")
+
+
+class _SourceFilesystemWorkerBackend:
+    name = "source_filesystem_worker_backend"
+
+    def __init__(self) -> None:
+        self.calls: list[SandboxOperation] = []
+        self.before_run: object | None = None
+
+    def operation_domains_supported(self) -> frozenset[str]:
+        return frozenset({"filesystem"})
+
+    async def run_operation(self, operation: SandboxOperation) -> SandboxOperationResult:
+        self.calls.append(operation)
+        if callable(self.before_run):
+            self.before_run()
+        profile = operation.file_system_profile
+        assert profile is not None
+        payload = operation.to_payload()
+        payload["permissions"]["filesystem"]["profile"] = {
+            "entries": [
+                {
+                    "path": str(entry.path),
+                    "access": entry.access.value,
+                    **(
+                        {"logicalPath": str(entry.logical_path)}
+                        if entry.logical_path is not None
+                        else {}
+                    ),
+                }
+                for entry in profile.effective_entries
+            ],
+            "deniedReadGlobs": list(profile.denied_read_globs),
+            "defaultAccess": profile.default_access.value,
+        }
+        result = filesystem_worker._run(payload)
+        return SandboxOperationResult(
+            message=str(result.get("message", "")),
+            created=bool(result.get("created", False)),
+            metadata=result,
+        )
 
 
 def _install_filesystem_read_backend() -> None:
@@ -98,14 +148,30 @@ def _install_filesystem_read_backend() -> None:
     runtime.backend = _FilesystemBackend()
 
 
+def _install_source_filesystem_worker_backend() -> _SourceFilesystemWorkerBackend:
+    runtime = get_runtime()
+    assert runtime is not None
+    backend = _SourceFilesystemWorkerBackend()
+    runtime.backend = backend
+    return backend
+
+
 @contextmanager
 def tool_context(
     workspace: Path,
     *,
-    run_mode: str | None = "standard",
+    run_mode: str | None = "safe",
     sandbox_mounts: list[dict[str, object]] | None = None,
     workspace_strict: bool = False,
 ) -> Iterator[ToolContext]:
+    mounts = tuple(
+        MountGrant(
+            path=str(item["path"]),
+            access=str(item.get("access") or "ro"),
+            scope=str(item.get("scope") or "chat"),
+        )
+        for item in (sandbox_mounts or [])
+    )
     ctx = ToolContext(
         is_owner=True,
         caller_kind=CallerKind.CLI,
@@ -114,6 +180,15 @@ def tool_context(
         run_mode=run_mode,
         session_key="s1",
         sandbox_mounts=sandbox_mounts or [],
+        sandbox_run_context=RunContext(
+            run_mode=normalize_run_mode(run_mode),
+            workspace=str(workspace),
+            mounts=mounts,
+            source="saved",
+        ),
+        artifact_session_id="session-id-s1",
+        session_epoch=0,
+        execution_id="execution-s1",
     )
     token = current_tool_context.set(ctx)
     try:
@@ -158,6 +233,449 @@ def _disable_global_root_readonly() -> None:
     runtime = get_runtime()
     assert runtime is not None
     runtime.settings.host_root_readonly = False
+
+
+def _directory_link(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) != 1314:
+            raise
+    result = subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.skip(f"directory links unavailable: {result.stderr or result.stdout}")
+
+
+def _stale_metadata_profile(
+    workspace: Path,
+    *,
+    logical: Path,
+    stale_target: Path,
+) -> FileSystemPermissionProfile:
+    """Model a profile captured before a protected symlink was retargeted."""
+
+    return FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(
+                stale_target,
+                FileSystemAccess.READ,
+                logical_path=logical,
+            ),
+        )
+    )
+
+
+def test_logical_tool_path_uses_explicit_base_without_following_symlinks(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = tmp_path / "target"
+    workspace.mkdir(exist_ok=True)
+    target.mkdir()
+    _directory_link(workspace / ".git", target)
+
+    logical = logical_tool_path("src/../.git/config", base=workspace)
+
+    assert logical == workspace / ".git" / "config"
+    assert logical != target / "config"
+
+
+def test_path_decision_uses_most_restrictive_logical_and_canonical_view(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-workspace"
+    alias_root = tmp_path / "model-alias" / "workspace"
+    workspace.mkdir()
+    alias_root.mkdir(parents=True)
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(alias_root, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(
+                workspace / ".git",
+                FileSystemAccess.READ,
+            ),
+        )
+    )
+    canonical = workspace / ".git" / "config"
+    logical = alias_root / ".git" / "config"
+
+    decision = decide_path_access(
+        canonical,
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path=logical,
+    )
+
+    assert decision.status == "request"
+    assert decision.reason == "protected_metadata"
+
+
+def test_path_decision_maps_transport_workspace_alias_to_host_lexical_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+
+    decision = decide_path_access(
+        workspace / "ordinary.py",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path="/workspace/ordinary.py",
+    )
+
+    assert decision.status == "allowed"
+
+
+def test_path_decision_maps_generalized_workspace_alias_to_host_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-project"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    raw_logical_path = str(tmp_path / "model-home" / ".opensquilla" / "workspace" / "ordinary.py")
+
+    decision = decide_path_access(
+        workspace / "ordinary.py",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path=raw_logical_path,
+    )
+
+    assert decision.status == "allowed"
+
+
+def test_path_decision_uses_last_generalized_workspace_segment(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-project"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+
+    decision = decide_path_access(
+        workspace / "ordinary.py",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path="/model/workspace/.git/workspace/ordinary.py",
+    )
+
+    assert decision.status == "allowed"
+
+
+def test_real_workspace_metadata_path_is_not_remapped_by_nested_workspace_symlink(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-project"
+    metadata = workspace / ".git"
+    external_write_root = tmp_path / "external-write-root"
+    metadata.mkdir(parents=True)
+    external_write_root.mkdir()
+    nested_workspace = metadata / "workspace"
+    _directory_link(nested_workspace, external_write_root)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        writable_roots=(external_write_root,),
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    logical = nested_workspace / "generated.py"
+    canonical = external_write_root / "generated.py"
+
+    decision = decide_path_access(
+        canonical,
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path=logical,
+    )
+
+    assert profile.resolve(logical) is FileSystemAccess.READ
+    assert profile.resolve(canonical) is FileSystemAccess.WRITE
+    assert decision.status == "request"
+    assert decision.reason == "protected_metadata"
+
+
+def test_path_decision_resolves_relative_logical_path_from_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-project"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+
+    decision = decide_path_access(
+        workspace / "src" / "ordinary.py",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path="src/ordinary.py",
+    )
+
+    assert decision.status == "allowed"
+
+
+def test_path_decision_preserves_raw_transport_alias_for_windows_profile() -> None:
+    workspace = PureWindowsPath(r"C:\repos\project")
+    context = FileSystemPlatformContext(
+        platform="windows",
+        cwd=workspace,
+        home=PureWindowsPath(r"C:\Users\test"),
+        writable_roots=(workspace,),
+    )
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+        platform_context=context,
+    )
+
+    decision = decide_path_access(
+        workspace / "ordinary.py",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path="/workspace/ordinary.py",
+    )
+
+    assert decision.status == "allowed"
+    assert decision.normalized_path == r"C:\repos\project\ordinary.py"
+
+
+def test_transport_workspace_alias_keeps_protected_metadata_read_only(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+
+    decision = decide_path_access(
+        workspace / ".git" / "config",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path="/workspace/.git/config",
+    )
+
+    assert decision.status == "request"
+    assert decision.reason == "protected_metadata"
+
+
+def test_generalized_workspace_alias_keeps_protected_metadata_read_only(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-project"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+
+    decision = decide_path_access(
+        workspace / ".git" / "config",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path="/model/home/.opensquilla/workspace/.git/config",
+    )
+
+    assert decision.status == "request"
+    assert decision.reason == "protected_metadata"
+
+
+def test_generalized_workspace_alias_preserves_metadata_symlink_logical_view(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-project"
+    stale_target = workspace / "stale-target"
+    current_target = workspace / "ordinary-target"
+    workspace.mkdir()
+    stale_target.mkdir()
+    current_target.mkdir()
+    metadata_link = workspace / ".git"
+    _directory_link(metadata_link, stale_target)
+    profile = _stale_metadata_profile(
+        workspace=workspace,
+        logical=metadata_link,
+        stale_target=stale_target,
+    )
+    try:
+        metadata_link.unlink()
+    except (IsADirectoryError, PermissionError):
+        metadata_link.rmdir()
+    _directory_link(metadata_link, current_target)
+    raw_logical_path = tmp_path / "model-home" / "workspace" / ".git" / "config"
+
+    with tool_context(workspace):
+        resolved_host_path = fs._resolve_path(str(raw_logical_path))
+    decision = decide_path_access(
+        current_target / "config",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path=raw_logical_path,
+    )
+    mapped = resolve_workspace_alias(raw_logical_path, workspace)
+
+    assert mapped == workspace / ".git" / "config"
+    assert resolved_host_path == current_target / "config"
+    assert decision.status == "request"
+    assert decision.reason == "protected_metadata"
+
+
+def test_generalized_workspace_alias_keeps_readonly_carveout(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-project"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(
+                workspace / ".opensquilla",
+                FileSystemAccess.READ,
+            ),
+        )
+    )
+
+    decision = decide_path_access(
+        workspace / ".opensquilla" / "state.json",
+        workspace=workspace,
+        write=True,
+        profile=profile,
+        logical_path="/model/home/.opensquilla/workspace/.opensquilla/state.json",
+    )
+
+    assert decision.status == "request"
+    assert decision.reason == "mount_requires_write_access"
+
+
+def test_transport_workspace_alias_does_not_follow_retargeted_host_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace_alias = tmp_path / "workspace-alias"
+    frozen_workspace = tmp_path / "frozen-workspace"
+    current_workspace = tmp_path / "current-workspace"
+    frozen_workspace.mkdir()
+    current_workspace.mkdir()
+    _directory_link(workspace_alias, frozen_workspace)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace_alias,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+
+    stable = decide_path_access(
+        frozen_workspace / "ordinary.py",
+        workspace=workspace_alias,
+        write=True,
+        profile=profile,
+        logical_path="/workspace/ordinary.py",
+    )
+
+    assert stable.status == "allowed"
+
+    try:
+        workspace_alias.unlink()
+    except (IsADirectoryError, PermissionError):
+        workspace_alias.rmdir()
+    _directory_link(workspace_alias, current_workspace)
+
+    retargeted = decide_path_access(
+        current_workspace / "ordinary.py",
+        workspace=workspace_alias,
+        write=True,
+        profile=profile,
+        logical_path="/workspace/ordinary.py",
+    )
+
+    assert retargeted.status == "request"
+    assert profile.resolve(frozen_workspace / "ordinary.py") is FileSystemAccess.WRITE
+    assert profile.resolve(current_workspace / "ordinary.py") is FileSystemAccess.DENY
+
+
+def test_generalized_workspace_alias_does_not_expand_retargeted_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace_alias = tmp_path / "workspace-alias"
+    frozen_workspace = tmp_path / "frozen-workspace"
+    current_workspace = tmp_path / "current-workspace"
+    frozen_workspace.mkdir()
+    current_workspace.mkdir()
+    _directory_link(workspace_alias, frozen_workspace)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace_alias,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    raw_logical_path = "/model/home/.opensquilla/workspace/ordinary.py"
+
+    stable = decide_path_access(
+        frozen_workspace / "ordinary.py",
+        workspace=workspace_alias,
+        write=True,
+        profile=profile,
+        logical_path=raw_logical_path,
+    )
+
+    assert stable.status == "allowed"
+
+    try:
+        workspace_alias.unlink()
+    except (IsADirectoryError, PermissionError):
+        workspace_alias.rmdir()
+    _directory_link(workspace_alias, current_workspace)
+
+    retargeted = decide_path_access(
+        current_workspace / "ordinary.py",
+        workspace=workspace_alias,
+        write=True,
+        profile=profile,
+        logical_path=raw_logical_path,
+    )
+
+    assert retargeted.status == "request"
+    assert profile.resolve(frozen_workspace / "ordinary.py") is FileSystemAccess.WRITE
+    assert profile.resolve(current_workspace / "ordinary.py") is FileSystemAccess.DENY
 
 
 def test_normal_sibling_path_requests_ro_mount(tmp_path: Path) -> None:
@@ -330,16 +848,17 @@ def test_unmounted_root_read_can_request_a_mount_grant(tmp_path: Path) -> None:
     from opensquilla.sandbox.escalation import build_path_approval_params
 
     workspace = tmp_path / "workspace"
-    decision = decide_path_access(
-        Path(tmp_path.anchor), workspace=workspace, write=False
-    )
+    decision = decide_path_access(Path(tmp_path.anchor), workspace=workspace, write=False)
 
     assert decision.status == "request"
-    assert build_path_approval_params(
-        decision,
-        session_key="agent:main:webchat:abc",
-        workspace=str(workspace),
-    ) is not None
+    assert (
+        build_path_approval_params(
+            decision,
+            session_key="agent:main:webchat:abc",
+            workspace=str(workspace),
+        )
+        is not None
+    )
 
 
 def test_most_specific_rw_mount_allows_write_under_ro_parent(tmp_path: Path) -> None:
@@ -524,118 +1043,23 @@ async def test_shell_reads_dot_credential_names_inside_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_denied_sandbox_path_request_does_not_create_repeated_prompt(
+async def test_authenticated_safe_reads_outside_workspace_without_prompt(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _disable_global_root_readonly()
-    from types import SimpleNamespace
-
-    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
 
     workspace = tmp_path / "workspace"
     workspace.mkdir(exist_ok=True)
     outside = tmp_path / "outside"
     outside.mkdir()
+    (outside / "notes.txt").write_text("readable\n", encoding="utf-8")
     monkeypatch.setattr(fs.asyncio, "get_event_loop", lambda: _InlineExecutorLoop())
 
     with tool_context(workspace):
-        first = json.loads(await fs.list_dir(str(outside)))
+        result = await fs.list_dir(str(outside))
 
-    assert first["status"] == "approval_required"
-    assert first["approvalKind"] == "sandbox_path"
-    approval_id = first["approval_id"]
-    assert len(get_approval_queue().list_pending("exec")) == 1
-
-    await _handle_exec_approval_resolve(
-        {"id": approval_id, "approved": False, "choice": "deny"},
-        SimpleNamespace(session_manager=None, config=None),
-    )
-
-    with tool_context(workspace):
-        second = json.loads(await fs.list_dir(str(outside)))
-
-    assert second["status"] == "approval_denied"
-    assert second["approval_id"] == approval_id
-    assert "user denied" in second["message"].lower()
-    assert "do not ask" in second["message"].lower()
-    assert "Add the requested path" not in second["message"]
-    assert get_approval_queue().list_pending("exec") == []
-
-
-@pytest.mark.asyncio
-async def test_denied_sandbox_path_request_can_be_requested_again_next_turn(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _disable_global_root_readonly()
-    from types import SimpleNamespace
-
-    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
-    from opensquilla.sandbox.escalation import clear_sandbox_approval_denials
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(exist_ok=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    monkeypatch.setattr(fs.asyncio, "get_event_loop", lambda: _InlineExecutorLoop())
-
-    with tool_context(workspace):
-        first = json.loads(await fs.list_dir(str(outside)))
-
-    assert first["status"] == "approval_required"
-    approval_id = first["approval_id"]
-
-    await _handle_exec_approval_resolve(
-        {"id": approval_id, "approved": False, "choice": "deny"},
-        SimpleNamespace(session_manager=None, config=None),
-    )
-
-    with tool_context(workspace):
-        same_turn = json.loads(await fs.list_dir(str(outside)))
-
-    assert same_turn["status"] == "approval_denied"
-    assert same_turn["approval_id"] == approval_id
-
-    clear_sandbox_approval_denials("s1")
-
-    with tool_context(workspace):
-        next_turn = json.loads(await fs.list_dir(str(outside)))
-
-    assert next_turn["status"] == "approval_required"
-    assert next_turn["approval_id"] != approval_id
-
-
-@pytest.mark.asyncio
-async def test_denied_sandbox_path_request_clears_duplicate_pending_prompts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _disable_global_root_readonly()
-    from types import SimpleNamespace
-
-    from opensquilla.gateway.rpc_approvals import _handle_exec_approval_resolve
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(exist_ok=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    monkeypatch.setattr(fs.asyncio, "get_event_loop", lambda: _InlineExecutorLoop())
-
-    with tool_context(workspace):
-        first = json.loads(await fs.list_dir(str(outside)))
-        second = json.loads(await fs.list_dir(str(outside)))
-
-    assert first["status"] == "approval_required"
-    assert second["status"] == "approval_pending"
-    assert second["approval_id"] == first["approval_id"]
-    assert len(get_approval_queue().list_pending("exec")) == 1
-
-    await _handle_exec_approval_resolve(
-        {"id": first["approval_id"], "approved": False, "choice": "deny"},
-        SimpleNamespace(session_manager=None, config=None),
-    )
-
+    assert "notes.txt" in result
     assert get_approval_queue().list_pending("exec") == []
 
 
@@ -654,6 +1078,63 @@ async def test_filesystem_write_outside_workspace_requires_explicit_elevation(
     assert payload["path"] == str(outside.resolve(strict=False))
     assert get_approval_queue().list_pending("exec") == []
     assert not outside.exists()
+
+
+@pytest.mark.asyncio
+async def test_safe_custom_deny_write_path_forces_exact_user_approval(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    protected = workspace / "protected"
+    protected.mkdir(parents=True)
+    target = protected / "credentials.json"
+    state_dir = tmp_path / "state"
+    policy = SandboxPolicy(
+        files=FilePolicySettings(
+            custom_deny_write_paths=[str(protected / "**")],
+        )
+    )
+
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_policy = policy
+        ctx.sandbox_gateway_config = SimpleNamespace(state_dir=str(state_dir))
+        requested = json.loads(await fs.write_file(str(target), "approved\n"))
+        assert requested["status"] == "approval_required"
+        approval_id = requested["approval_id"]
+        pending = get_approval_queue().get(approval_id)
+
+        assert pending.params["reviewer"] == "user"
+        assert pending.params["action"]["target_paths"] == [[str(target), "write"]]
+        assert not target.exists()
+
+        get_approval_queue().resolve(approval_id, True)
+        result = await fs.write_file(
+            str(target),
+            "approved\n",
+            approval_id=approval_id,
+        )
+
+    assert "Written 9 bytes" in result
+    assert target.read_text(encoding="utf-8") == "approved\n"
+    assert get_approval_queue().get(approval_id).consumed is True
+
+
+@pytest.mark.asyncio
+async def test_safe_authority_path_mutation_cannot_be_approved(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(exist_ok=True)
+    state_dir = tmp_path / "state"
+    target = state_dir / "sessions.db"
+
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_policy = SandboxPolicy()
+        ctx.sandbox_gateway_config = SimpleNamespace(state_dir=str(state_dir))
+        payload = json.loads(await fs.write_file(str(target), "blocked\n"))
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "sandbox_authority_read_denied"
+    assert get_approval_queue().list_pending("exec") == []
+    assert not target.exists()
 
 
 @pytest.mark.asyncio
@@ -814,6 +1295,829 @@ async def test_approved_direct_workspace_metadata_write_executes_once(
 
 
 @pytest.mark.asyncio
+async def test_relative_metadata_symlink_write_uses_workspace_logical_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-logical-write"
+    writable_target = workspace / "ordinary-target"
+    stale_target = tmp_path / "stale-metadata-target"
+    process_cwd = tmp_path / "process-cwd"
+    workspace.mkdir()
+    writable_target.mkdir()
+    stale_target.mkdir()
+    process_cwd.mkdir()
+    logical = workspace / ".git"
+    _directory_link(logical, writable_target)
+    profile = _stale_metadata_profile(
+        workspace,
+        logical=logical,
+        stale_target=stale_target,
+    )
+    target = writable_target / "config"
+    monkeypatch.chdir(process_cwd)
+
+    kwargs = {
+        "sandbox_permissions": "require_escalated",
+        "justification": "Write the exact protected metadata file requested by the user.",
+    }
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_file_system_profile = profile
+        default = json.loads(await fs.write_file(".git/config", "approved\n"))
+        assert default["status"] == "elevation_required"
+        assert default["reason"] == "protected_metadata"
+        assert not target.exists()
+
+        requested = json.loads(await fs.write_file(".git/config", "approved\n", **kwargs))
+        approval_id = requested["approval_id"]
+        get_approval_queue().resolve(approval_id, True)
+        result = await fs.write_file(
+            ".git/config",
+            "approved\n",
+            approval_id=approval_id,
+            **kwargs,
+        )
+
+    assert "Written 9 bytes" in result
+    assert target.read_text(encoding="utf-8") == "approved\n"
+    assert get_approval_queue().get(approval_id).consumed is True
+
+
+@pytest.mark.asyncio
+async def test_create_source_blocks_relative_retargeted_metadata_symlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-logical-source"
+    writable_target = workspace / "ordinary-target"
+    stale_target = tmp_path / "stale-source-target"
+    process_cwd = tmp_path / "process-cwd-source"
+    workspace.mkdir()
+    writable_target.mkdir()
+    stale_target.mkdir()
+    process_cwd.mkdir()
+    logical = workspace / ".git"
+    _directory_link(logical, writable_target)
+    profile = _stale_metadata_profile(
+        workspace,
+        logical=logical,
+        stale_target=stale_target,
+    )
+    target = writable_target / "new.py"
+    monkeypatch.chdir(process_cwd)
+
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_file_system_profile = profile
+        payload = json.loads(await fs.create_source(".git/new.py", "value = 1\n"))
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "protected_metadata"
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_generalized_workspace_alias_allows_ordinary_filesystem_write(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-workspace"
+    workspace.mkdir()
+    raw_path = str(tmp_path / "model-home" / ".opensquilla" / "workspace" / "ordinary.py")
+    target = workspace / "ordinary.py"
+
+    with tool_context(workspace):
+        result = await fs.write_file(raw_path, "allowed\n")
+
+    assert "Written 8 bytes" in result
+    assert target.read_text(encoding="utf-8") == "allowed\n"
+
+
+@pytest.mark.asyncio
+async def test_workspace_alias_cannot_weaken_canonical_metadata_write(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-workspace"
+    alias_root = tmp_path / "model-alias" / "workspace"
+    metadata = workspace / ".git"
+    workspace.mkdir()
+    alias_root.mkdir(parents=True)
+    metadata.mkdir()
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(alias_root, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(metadata, FileSystemAccess.READ),
+        )
+    )
+    raw_path = str(alias_root / ".git" / "config")
+    target = metadata / "config"
+
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_file_system_profile = profile
+        payload = json.loads(await fs.write_file(raw_path, "blocked\n"))
+
+    assert payload["status"] == "elevation_required"
+    assert payload["reason"] == "protected_metadata"
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_create_source_blocks_workspace_alias_to_readonly_carveout(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "real-workspace"
+    alias_root = tmp_path / "model-alias" / "workspace"
+    readonly = workspace / ".opensquilla"
+    workspace.mkdir()
+    alias_root.mkdir(parents=True)
+    readonly.mkdir()
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(alias_root, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(readonly, FileSystemAccess.READ),
+        )
+    )
+    raw_path = str(alias_root / ".opensquilla" / "created.py")
+    target = readonly / "created.py"
+
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_file_system_profile = profile
+        payload = json.loads(await fs.create_source(raw_path, "value = 1\n"))
+
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "mount_requires_write_access"
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_create_source_worker_blocks_parent_symlink_swap_to_metadata(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-source-create-race"
+    safe = workspace / "safe"
+    protected = workspace / ".git"
+    safe.mkdir(parents=True)
+    protected.mkdir()
+    backend = _install_source_filesystem_worker_backend()
+
+    def swap_parent() -> None:
+        safe.rename(workspace / "safe-original")
+        _directory_link(safe, protected)
+
+    backend.before_run = swap_parent
+
+    with tool_context(workspace):
+        with pytest.raises(PermissionError, match="filesystem profile denies access"):
+            await fs.create_source("safe/new.py", "value = 1\n")
+
+    assert len(backend.calls) == 1
+    assert not (protected / "new.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_create_source_worker_preserves_exclusive_create_during_race(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-source-create-exclusive"
+    workspace.mkdir()
+    target = workspace / "new.py"
+    backend = _install_source_filesystem_worker_backend()
+
+    def create_racing_target() -> None:
+        target.write_text("racing writer\n", encoding="utf-8")
+
+    backend.before_run = create_racing_target
+
+    with tool_context(workspace):
+        with pytest.raises(FileExistsError):
+            await fs.create_source("new.py", "model writer\n")
+
+    assert len(backend.calls) == 1
+    assert target.read_text(encoding="utf-8") == "racing writer\n"
+
+
+@pytest.mark.asyncio
+async def test_create_source_full_host_preserves_exclusive_create_during_race(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-source-create-full-exclusive"
+    workspace.mkdir()
+    target = workspace / "new.py"
+
+    class RacingExecutorLoop:
+        async def run_in_executor(
+            self,
+            executor: object,
+            callback: object,
+            *args: object,
+        ) -> object:
+            fs._resolve_path("new.py").write_text("racing writer\n", encoding="utf-8")
+            return callback(*args)  # type: ignore[operator]
+
+    async def direct_host_execution(*args: object, **kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(fs.asyncio, "get_event_loop", lambda: RacingExecutorLoop())
+    monkeypatch.setattr(
+        fs,
+        "_run_sandbox_operation_if_required",
+        direct_host_execution,
+    )
+
+    with tool_context(workspace, run_mode="full"):
+        with pytest.raises(FileExistsError):
+            await fs.create_source("new.py", "model writer\n")
+
+    assert target.read_text(encoding="utf-8") == "racing writer\n"
+
+
+@pytest.mark.asyncio
+async def test_create_source_worker_maps_execution_workspace_alias(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-source-execution-alias"
+    workspace.mkdir()
+    target = workspace / "new.py"
+    backend = _install_source_filesystem_worker_backend()
+
+    with tool_context(workspace):
+        result = json.loads(await fs.create_source("/workspace/new.py", "value = 1\n"))
+
+    assert len(backend.calls) == 1
+    assert result["status"] == "created"
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_edit_source_worker_blocks_parent_symlink_swap_to_metadata(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-source-edit-race"
+    safe = workspace / "safe"
+    protected = workspace / ".git"
+    safe.mkdir(parents=True)
+    protected.mkdir()
+    target = safe / "target.py"
+    protected_target = protected / "target.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    protected_target.write_text("protected\n", encoding="utf-8")
+    backend = _install_source_filesystem_worker_backend()
+
+    def swap_parent() -> None:
+        safe.rename(workspace / "safe-original")
+        _directory_link(safe, protected)
+
+    backend.before_run = swap_parent
+
+    with tool_context(workspace):
+        receipt = json.loads(await fs.read_source("safe/target.py"))
+        with pytest.raises(PermissionError, match="filesystem profile denies access"):
+            await fs.edit_source(
+                "safe/target.py",
+                receipt["revision"],
+                [{"start_line": 1, "end_line": 1, "replacement": "value = 2\n"}],
+            )
+
+    assert len(backend.calls) == 1
+    assert protected_target.read_text(encoding="utf-8") == "protected\n"
+
+
+@pytest.mark.asyncio
+async def test_edit_source_worker_revision_compare_covers_racing_change(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-source-edit-revision-race"
+    workspace.mkdir()
+    target = workspace / "target.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    backend = _install_source_filesystem_worker_backend()
+
+    def change_before_worker() -> None:
+        target.write_text("racing writer\n", encoding="utf-8")
+
+    backend.before_run = change_before_worker
+
+    with tool_context(workspace):
+        receipt = json.loads(await fs.read_source("target.py"))
+        with pytest.raises(fs.RetryableToolInputError, match="revision_conflict"):
+            await fs.edit_source(
+                "target.py",
+                receipt["revision"],
+                [{"start_line": 1, "end_line": 1, "replacement": "value = 2\n"}],
+            )
+
+    assert len(backend.calls) == 1
+    assert target.read_text(encoding="utf-8") == "racing writer\n"
+
+
+@pytest.mark.asyncio
+async def test_create_source_fails_closed_when_configured_backend_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-source-unavailable-create"
+    workspace.mkdir()
+    runtime = get_runtime()
+    assert runtime is not None
+    runtime.backend = UnavailableBackend("native sandbox is unavailable")
+
+    with tool_context(workspace, run_mode="trusted"):
+        with pytest.raises(SandboxBackendError, match="must sandbox filesystem operations"):
+            await fs.create_source("new.py", "value = 1\n")
+
+    assert not (workspace / "new.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_edit_source_fails_closed_when_configured_backend_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace-source-unavailable-edit"
+    workspace.mkdir()
+    target = workspace / "target.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    runtime = get_runtime()
+    assert runtime is not None
+    runtime.backend = UnavailableBackend("native sandbox is unavailable")
+
+    with tool_context(workspace, run_mode="trusted"):
+        receipt = json.loads(await fs.read_source("target.py"))
+        with pytest.raises(SandboxBackendError, match="must sandbox filesystem operations"):
+            await fs.edit_source(
+                "target.py",
+                receipt["revision"],
+                [{"start_line": 1, "end_line": 1, "replacement": "value = 2\n"}],
+            )
+
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.asyncio
+async def test_edit_source_post_gate_parent_swap_is_worker_owned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-source-post-gate-race"
+    safe = workspace / "safe"
+    protected = workspace / ".git"
+    safe.mkdir(parents=True)
+    protected.mkdir()
+    target = safe / "target.py"
+    protected_target = protected / "target.py"
+    target.write_text("value = 1\n", encoding="utf-8")
+    protected_target.write_text("protected\n", encoding="utf-8")
+    backend = _install_source_filesystem_worker_backend()
+    original_gate = fs._gate_out_of_workspace_write
+
+    async def swap_after_gate(*args: object, **kwargs: object) -> object:
+        result = await original_gate(*args, **kwargs)
+        safe.rename(workspace / "safe-original")
+        _directory_link(safe, protected)
+        return result
+
+    monkeypatch.setattr(fs, "_gate_out_of_workspace_write", swap_after_gate)
+
+    with tool_context(workspace):
+        receipt = json.loads(await fs.read_source("safe/target.py"))
+        with pytest.raises(PermissionError, match="filesystem profile denies access"):
+            await fs.edit_source(
+                "safe/target.py",
+                receipt["revision"],
+                [{"start_line": 1, "end_line": 1, "replacement": "value = 2\n"}],
+            )
+
+    assert len(backend.calls) == 1
+    assert protected_target.read_text(encoding="utf-8") == "protected\n"
+
+
+@pytest.mark.asyncio
+async def test_patch_relative_metadata_symlink_uses_explicit_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-logical-patch"
+    writable_target = workspace / "ordinary-target"
+    stale_target = tmp_path / "stale-patch-target"
+    process_cwd = tmp_path / "process-cwd-patch"
+    workspace.mkdir()
+    writable_target.mkdir()
+    stale_target.mkdir()
+    process_cwd.mkdir()
+    logical = workspace / ".git"
+    _directory_link(logical, writable_target)
+    profile = _stale_metadata_profile(
+        workspace,
+        logical=logical,
+        stale_target=stale_target,
+    )
+    target = writable_target / "patched.txt"
+    monkeypatch.chdir(process_cwd)
+    monkeypatch.setattr(patch_tool, "_default_patch_root", lambda: workspace)
+
+    async def fail_worker(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("protected patch must not reach the worker")
+
+    monkeypatch.setattr(fs, "_run_sandbox_operation_if_required", fail_worker)
+    patch_text = """*** Begin Patch
+*** Add File: .git/patched.txt
++blocked
+*** End Patch"""
+
+    with tool_context(workspace) as ctx:
+        ctx.sandbox_file_system_profile = profile
+        payload = json.loads(await patch_tool.apply_patch(patch=patch_text))
+
+    assert payload["status"] == "elevation_required"
+    assert payload["reason"] == "protected_metadata"
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_shell_relative_metadata_symlink_uses_effective_workspace_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-logical-shell"
+    writable_target = workspace / "ordinary-target"
+    stale_target = tmp_path / "stale-shell-target"
+    process_cwd = tmp_path / "process-cwd-shell"
+    workspace.mkdir()
+    writable_target.mkdir()
+    stale_target.mkdir()
+    process_cwd.mkdir()
+    logical = workspace / ".git"
+    _directory_link(logical, writable_target)
+    profile = _stale_metadata_profile(
+        workspace,
+        logical=logical,
+        stale_target=stale_target,
+    )
+    target = writable_target / "shell.txt"
+    backend_calls: list[SandboxRequest] = []
+    monkeypatch.chdir(process_cwd)
+
+    async def fake_backend(request: SandboxRequest, *, runtime: object = None) -> object:
+        backend_calls.append(request)
+        return SimpleNamespace(stdout="", stderr="", returncode=0, backend_notes=[])
+
+    monkeypatch.setattr(shell, "run_under_backend", fake_backend)
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
+    )
+
+    with tool_context(workspace, run_mode="trusted") as ctx:
+        ctx.sandbox_file_system_profile = profile
+        payload = json.loads(await shell.exec_command("printf blocked > .git/shell.txt"))
+
+    assert payload["status"] == "elevation_required"
+    assert payload["reason"] == "protected_metadata"
+    assert backend_calls == []
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    ("command", "relative_workdir"),
+    [
+        ("cd .git && printf blocked > config", ".git"),
+        ("cd -- .git; printf blocked > config", ".git"),
+        ("cd .git || exit; printf blocked > config", ".git"),
+        ("cd .git\nprintf blocked > config", ".git"),
+        ("cd safe || exit\nprintf allowed > output.log", "safe"),
+        ("cd safe; cd nested; printf allowed > output.log", "safe/nested"),
+        ("cd safe\ncd nested\nprintf allowed > output.log", "safe/nested"),
+        ("cd safe && cd nested && printf allowed > output.log", "safe/nested"),
+        (
+            "cd safe || exit; cd nested || exit; printf allowed > output.log",
+            "safe/nested",
+        ),
+    ],
+)
+def test_shell_redirection_workdir_parses_supported_leading_cd_forms(
+    tmp_path: Path,
+    command: str,
+    relative_workdir: str,
+) -> None:
+    workspace = tmp_path / "workspace-shell-cd-parser"
+    workspace.mkdir()
+
+    target_workdir = shell._shell_redirection_workdir(command, str(workspace))
+
+    assert target_workdir == str((workspace / relative_workdir).resolve(strict=False))
+
+
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        ('cd "$TARGET_DIR" && printf blocked > config', "dynamic_workdir"),
+        ('cd "$(lookup-workdir)" && printf blocked > config', "dynamic_workdir"),
+        ("cd -; printf blocked > config", "dynamic_workdir"),
+        ("cd -- -; printf blocked > config", "dynamic_workdir"),
+        ("cd; printf blocked > config", "dynamic_workdir"),
+        ("cd safe || true; printf blocked > config", "untrusted_workdir"),
+        ("printf before; cd safe; printf blocked > config", "untrusted_workdir"),
+        (
+            "printf before; command cd safe; printf blocked > config",
+            "untrusted_workdir",
+        ),
+        (
+            "printf before; builtin cd safe; printf blocked > config",
+            "untrusted_workdir",
+        ),
+        ("> pre.log cd safe; printf blocked > config", "untrusted_workdir"),
+        ("cd safe; eval 'cd ../.git'; printf blocked > config", "untrusted_workdir"),
+        ("cd safe; source script; printf blocked > config", "untrusted_workdir"),
+        ("cd safe; . script; printf blocked > config", "untrusted_workdir"),
+        ("cd safe; pushd ../.git; printf blocked > config", "untrusted_workdir"),
+        ("cd safe; popd; printf blocked > config", "untrusted_workdir"),
+        ("Set-Location .git; printf blocked > config", "untrusted_workdir"),
+        ("Push-Location .git; printf blocked > config", "untrusted_workdir"),
+        ("Pop-Location; printf blocked > config", "untrusted_workdir"),
+    ],
+)
+def test_shell_unmodelled_workdir_changes_are_marked_unsafe(
+    command: str,
+    reason: str,
+) -> None:
+    assert shell._leading_cd_prefix(command).unsafe_reason == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cd .git && printf blocked > config",
+        "cd .git || exit; printf blocked > config",
+        "cd .git\nprintf blocked > config",
+        "cd safe; cd ../.git; printf blocked > config",
+        "cd safe\ncd ../.git\nprintf blocked > config",
+        "cd safe && cd ../.git && printf blocked > config",
+        "cd safe || exit; cd ../.git || exit; printf blocked > config",
+        "sh -c 'cd .git; printf blocked > config'",
+        "bash -lc 'cd .git; printf blocked > config'",
+    ],
+)
+async def test_shell_leading_cd_uses_redirected_workdir_for_metadata_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    workspace = tmp_path / "workspace-shell-cd"
+    workspace.mkdir()
+    (workspace / "safe").mkdir()
+    (workspace / ".git").mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    backend_calls: list[SandboxRequest] = []
+
+    async def fake_backend(request: SandboxRequest, *, runtime: object = None) -> object:
+        backend_calls.append(request)
+        return SimpleNamespace(stdout="", stderr="", returncode=0, backend_notes=[])
+
+    monkeypatch.setattr(shell, "run_under_backend", fake_backend)
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
+    )
+
+    with tool_context(workspace, run_mode="trusted") as ctx:
+        ctx.sandbox_file_system_profile = profile
+        payload = json.loads(await shell.exec_command(command))
+
+    assert payload["status"] == "elevation_required"
+    assert payload["reason"] == "protected_metadata"
+    assert backend_calls == []
+    assert not (workspace / ".git" / "config").exists()
+
+
+@pytest.mark.asyncio
+async def test_shell_guarded_leading_cd_safe_path_reaches_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-shell-safe-cd"
+    nested = workspace / "safe" / "nested"
+    nested.mkdir(parents=True)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    backend_calls: list[SandboxRequest] = []
+
+    async def fake_backend(request: SandboxRequest, *, runtime: object = None) -> object:
+        backend_calls.append(request)
+        return SimpleNamespace(stdout="", stderr="", returncode=0, backend_notes=[])
+
+    monkeypatch.setattr(shell, "run_under_backend", fake_backend)
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
+    )
+
+    with tool_context(workspace, run_mode="trusted") as ctx:
+        ctx.sandbox_file_system_profile = profile
+        result = await shell.exec_command(
+            "cd safe || exit; cd nested || exit; printf allowed > output.log"
+        )
+
+    assert result == "exit_code=0\n"
+    assert len(backend_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_shell_nested_sh_workspace_write_reaches_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-shell-nested-sh"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    backend_calls: list[SandboxRequest] = []
+
+    async def fake_backend(request: SandboxRequest, *, runtime: object = None) -> object:
+        backend_calls.append(request)
+        return SimpleNamespace(
+            stdout="shell-workspace-ok\n",
+            stderr="",
+            returncode=0,
+            backend_notes=[],
+        )
+
+    monkeypatch.setattr(shell, "run_under_backend", fake_backend)
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
+    )
+
+    with tool_context(workspace, run_mode="trusted") as ctx:
+        ctx.sandbox_file_system_profile = profile
+        result = await shell.exec_command(
+            "sh -lc 'printf shell-workspace-ok > sandbox_probe_shell.txt "
+            "&& cat sandbox_probe_shell.txt'"
+        )
+
+    assert result == "exit_code=0\nshell-workspace-ok\n"
+    assert len(backend_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_shell_transport_workspace_cd_maps_to_host_workspace_before_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-shell-transport-alias"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    backend_calls: list[SandboxRequest] = []
+
+    async def fake_backend(request: SandboxRequest, *, runtime: object = None) -> object:
+        backend_calls.append(request)
+        return SimpleNamespace(stdout="", stderr="", returncode=0, backend_notes=[])
+
+    monkeypatch.setattr(shell, "run_under_backend", fake_backend)
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
+    )
+
+    with tool_context(workspace, run_mode="trusted") as ctx:
+        ctx.sandbox_file_system_profile = profile
+        assert (
+            shell._resolve_shell_write_target(
+                "output.log",
+                "/workspace",
+            )
+            == workspace / "output.log"
+        )
+        result = await shell.exec_command("cd /workspace; printf allowed > output.log")
+
+    assert result == "exit_code=0\n"
+    assert len(backend_calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("command", "reason"),
+    [
+        ('cd "$TARGET_DIR" && printf blocked > config', "dynamic_workdir"),
+        ('cd "$(lookup-workdir)" && printf blocked > config', "dynamic_workdir"),
+        ("cd -; printf blocked > config", "dynamic_workdir"),
+        ("cd -- -; printf blocked > config", "dynamic_workdir"),
+        ("cd; printf blocked > config", "dynamic_workdir"),
+        ("cd safe || true; printf blocked > config", "untrusted_workdir"),
+        ("printf before; cd safe; printf blocked > config", "untrusted_workdir"),
+        (
+            "printf before; command cd safe; printf blocked > config",
+            "untrusted_workdir",
+        ),
+        (
+            "printf before; builtin cd safe; printf blocked > config",
+            "untrusted_workdir",
+        ),
+        ("> pre.log cd safe; printf blocked > config", "untrusted_workdir"),
+        ("cd safe; eval 'cd ../.git'; printf blocked > config", "untrusted_workdir"),
+        ("cd safe; source script; printf blocked > config", "untrusted_workdir"),
+        ("cd safe; . script; printf blocked > config", "untrusted_workdir"),
+        ("cd safe; pushd ../.git; printf blocked > config", "untrusted_workdir"),
+        ("cd safe; popd; printf blocked > config", "untrusted_workdir"),
+        ("Set-Location .git; printf blocked > config", "untrusted_workdir"),
+        ("Push-Location .git; printf blocked > config", "untrusted_workdir"),
+        ("Pop-Location; printf blocked > config", "untrusted_workdir"),
+    ],
+)
+async def test_shell_unmodelled_workdir_fails_closed_before_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    reason: str,
+) -> None:
+    workspace = tmp_path / "workspace-shell-dynamic-cd"
+    workspace.mkdir()
+    (workspace / "safe").mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    backend_calls: list[SandboxRequest] = []
+
+    async def fake_backend(request: SandboxRequest, *, runtime: object = None) -> object:
+        backend_calls.append(request)
+        return SimpleNamespace(stdout="", stderr="", returncode=0, backend_notes=[])
+
+    monkeypatch.setattr(shell, "run_under_backend", fake_backend)
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
+    )
+
+    with tool_context(workspace, run_mode="trusted") as ctx:
+        ctx.sandbox_file_system_profile = profile
+        payload = json.loads(await shell.exec_command(command))
+
+    assert payload["status"] == "elevation_required"
+    assert payload["reason"] == reason
+    assert backend_calls == []
+
+
+@pytest.mark.asyncio
+async def test_shell_cd_text_in_ordinary_argument_reaches_backend(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace-shell-cd-argument"
+    workspace.mkdir()
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    backend_calls: list[SandboxRequest] = []
+
+    async def fake_backend(request: SandboxRequest, *, runtime: object = None) -> object:
+        backend_calls.append(request)
+        return SimpleNamespace(stdout="", stderr="", returncode=0, backend_notes=[])
+
+    monkeypatch.setattr(shell, "run_under_backend", fake_backend)
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
+    )
+
+    with tool_context(workspace, run_mode="trusted") as ctx:
+        ctx.sandbox_file_system_profile = profile
+        result = await shell.exec_command("printf 'cd .git' > output.log")
+
+    assert result == "exit_code=0\n"
+    assert len(backend_calls) == 1
+
+
+@pytest.mark.asyncio
 async def test_trusted_sandbox_write_outside_workspace_does_not_auto_grant_mount(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -868,7 +2172,8 @@ async def test_write_file_exact_elevation_grant_is_consumed_once(
         )
         approval_id = requested["approval_id"]
         pending = get_approval_queue().get(approval_id)
-        assert pending.params["humanActionable"] is False
+        assert pending.params["reviewer"] == "user"
+        assert pending.params["humanActionable"] is True
         assert pending.params["action"]["content_digest"]
         assert "outside body" not in json.dumps(pending.params)
 
@@ -952,16 +2257,39 @@ async def test_apply_patch_exact_elevation_uses_digest_and_bypasses_worker(
         assert "-old" not in json.dumps(pending.params)
         get_approval_queue().resolve(approval_id, True)
 
+        backup_warning = json.loads(
+            await patch_tool.apply_patch(
+                patch=patch_text,
+                sandbox_permissions="require_escalated",
+                justification="Apply the exact one-file patch requested by the user.",
+                approval_id=approval_id,
+            )
+        )
+        assert backup_warning["status"] == "approval_required"
+        second_approval_id = backup_warning["approval_id"]
+        assert second_approval_id != approval_id
+        second_pending = get_approval_queue().get(second_approval_id)
+        assert second_pending.params["action"]["action_kind"] == (
+            "patch.apply_without_backup"
+        )
+        assert second_pending.params["action"]["display"]["backup_state"] == (
+            "unavailable_requires_confirmation"
+        )
+        assert second_pending.params["action"]["content_digest"]
+        assert "-old" not in json.dumps(second_pending.params)
+        get_approval_queue().resolve(second_approval_id, True)
+
         result = await patch_tool.apply_patch(
             patch=patch_text,
             sandbox_permissions="require_escalated",
             justification="Apply the exact one-file patch requested by the user.",
-            approval_id=approval_id,
+            approval_id=second_approval_id,
         )
 
     assert "1 file(s) modified" in result
     assert outside.read_text(encoding="utf-8") == "new\n"
     assert get_approval_queue().get(approval_id).consumed is True
+    assert get_approval_queue().get(second_approval_id).consumed is True
 
 
 @pytest.mark.asyncio
@@ -989,13 +2317,27 @@ async def test_edit_file_exact_elevation_edits_one_outside_file(
         )
         approval_id = requested["approval_id"]
         get_approval_queue().resolve(approval_id, True)
+        backup_warning = json.loads(
+            await fs.edit_file(
+                str(outside),
+                "old value",
+                "new value",
+                sandbox_permissions="require_escalated",
+                justification="Edit the exact outside file requested by the user.",
+                approval_id=approval_id,
+            )
+        )
+        second_approval_id = backup_warning["approval_id"]
+        assert backup_warning["backup_state"] == "unavailable_requires_confirmation"
+        assert second_approval_id != approval_id
+        get_approval_queue().resolve(second_approval_id, True)
         result = await fs.edit_file(
             str(outside),
             "old value",
             "new value",
             sandbox_permissions="require_escalated",
             justification="Edit the exact outside file requested by the user.",
-            approval_id=approval_id,
+            approval_id=second_approval_id,
         )
 
     assert "Edited" in result
@@ -1029,7 +2371,7 @@ async def test_edit_source_exact_elevation_preserves_revision_contract(
         )
         approval_id = requested["approval_id"]
         get_approval_queue().resolve(approval_id, True)
-        result = json.loads(
+        backup_warning = json.loads(
             await fs.edit_source(
                 str(outside),
                 revision,
@@ -1037,6 +2379,20 @@ async def test_edit_source_exact_elevation_preserves_revision_contract(
                 sandbox_permissions="require_escalated",
                 justification="Apply the exact revision-gated edit requested by the user.",
                 approval_id=approval_id,
+            )
+        )
+        second_approval_id = backup_warning["approval_id"]
+        assert backup_warning["backup_state"] == "unavailable_requires_confirmation"
+        assert second_approval_id != approval_id
+        get_approval_queue().resolve(second_approval_id, True)
+        result = json.loads(
+            await fs.edit_source(
+                str(outside),
+                revision,
+                edits,
+                sandbox_permissions="require_escalated",
+                justification="Apply the exact revision-gated edit requested by the user.",
+                approval_id=second_approval_id,
             )
         )
 
@@ -1188,9 +2544,7 @@ def test_shell_windows_null_redirection_does_not_request_write_access(
 
     assert shell._shell_write_access_targets("chcp 65001 >nul && echo ok", profile) == ()
     assert shell._shell_write_access_targets("where winget 2>NUL || echo missing", profile) == ()
-    assert shell._shell_write_access_targets("echo ok > output.txt", profile) == (
-        "output.txt",
-    )
+    assert shell._shell_write_access_targets("echo ok > output.txt", profile) == ("output.txt",)
 
 
 @pytest.mark.asyncio
@@ -1263,21 +2617,17 @@ async def test_shell_ro_workdir_mount_stays_read_only_in_policy(
         sandbox_mounts=[{"path": str(outside), "access": "ro"}],
     ):
         await shell.exec_command(
-            "python -c 'open(\"x\", \"w\").write(\"1\")'",
+            'python -c \'open("x", "w").write("1")\'',
             workdir=str(outside),
         )
 
     assert len(backend_calls) == 1
     request = backend_calls[0]
     workspace_mount = next(
-        mount
-        for mount in request.policy.mounts
-        if str(mount.sandbox_path) == "/workspace"
+        mount for mount in request.policy.mounts if str(mount.sandbox_path) == "/workspace"
     )
     outside_mount = next(
-        mount
-        for mount in request.policy.mounts
-        if mount.host_path == outside.resolve(strict=False)
+        mount for mount in request.policy.mounts if mount.host_path == outside.resolve(strict=False)
     )
     assert request.cwd == outside.resolve(strict=False)
     assert workspace_mount.host_path == workspace.resolve(strict=False)
@@ -1371,7 +2721,7 @@ async def test_standard_shell_powershell_read_path_outside_workspace_requests_ro
         lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
     )
 
-    command = f'powershell -NoProfile -Command "Get-ChildItem -LiteralPath \'{outside}\'"'
+    command = f"powershell -NoProfile -Command \"Get-ChildItem -LiteralPath '{outside}'\""
     with tool_context(workspace, run_mode="standard"):
         payload = json.loads(await shell.exec_command(command))
 
@@ -1420,7 +2770,7 @@ async def test_trusted_run_context_read_path_outside_workspace_needs_no_mount(
 
     with tool_context(workspace, run_mode=None) as ctx:
         ctx.sandbox_run_context = RunContext(
-            run_mode=RunMode.TRUSTED,
+            run_mode=RunMode.SAFE,
             workspace=str(workspace),
         )
         result = await fs.read_file(str(target))
@@ -1484,7 +2834,7 @@ async def test_trusted_shell_powershell_read_path_outside_workspace_needs_no_mou
         lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
     )
 
-    command = f'powershell -NoProfile -Command "Get-ChildItem -LiteralPath \'{outside}\'"'
+    command = f"powershell -NoProfile -Command \"Get-ChildItem -LiteralPath '{outside}'\""
     with tool_context(workspace, run_mode="trusted") as ctx:
         result = await shell.exec_command(command)
 
@@ -1496,7 +2846,7 @@ async def test_trusted_shell_powershell_read_path_outside_workspace_needs_no_mou
 
 
 @pytest.mark.asyncio
-async def test_trusted_shell_delete_existing_file_requires_elevation(
+async def test_trusted_shell_delete_existing_file_requires_destructive_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1521,10 +2871,12 @@ async def test_trusted_shell_delete_existing_file_requires_elevation(
     with tool_context(workspace, run_mode="trusted") as ctx:
         payload = json.loads(await shell.exec_command(f'del "{outside}"'))
 
-    assert payload["status"] == "elevation_required"
+    assert payload["status"] == "approval_required"
     assert payload["target"] == str(outside.resolve(strict=False))
+    assert payload["backup_state"] == "enabled"
+    assert payload["irreversible"] is False
     assert backend_calls == []
-    assert get_approval_queue().list_pending("exec") == []
+    assert len(get_approval_queue().list_pending("exec")) == 1
     assert ctx.sandbox_mounts == []
 
 
@@ -1545,12 +2897,8 @@ async def test_shell_write_to_protected_metadata_requires_elevation_before_backe
         return SimpleNamespace(stdout="", stderr="", returncode=0, backend_notes=[])
 
     monkeypatch.setattr(shell, "run_under_backend", fake_backend)
-    monkeypatch.setattr(
-        shell, "_windows_sandbox_backend_active", lambda runtime=None: True
-    )
-    monkeypatch.setattr(
-        shell, "_windows_translate_posix_tmp_references", lambda command: command
-    )
+    monkeypatch.setattr(shell, "_windows_sandbox_backend_active", lambda runtime=None: True)
+    monkeypatch.setattr(shell, "_windows_translate_posix_tmp_references", lambda command: command)
     monkeypatch.setattr(shell, "_windows_translate_posix_tmp_path", lambda path: path)
     monkeypatch.setattr(
         shell,
@@ -1561,12 +2909,8 @@ async def test_shell_write_to_protected_metadata_requires_elevation_before_backe
     with tool_context(workspace, run_mode="trusted"):
         git_target = repo / ".git/_sandbox_should_not_write.txt"
         codex_target = repo / ".codex/_sandbox_should_not_write.txt"
-        git_result = await shell.exec_command(
-            f"touch {shlex.quote(str(git_target))}"
-        )
-        codex_result = await shell.exec_command(
-            f"touch {shlex.quote(str(codex_target))}"
-        )
+        git_result = await shell.exec_command(f"touch {shlex.quote(str(git_target))}")
+        codex_result = await shell.exec_command(f"touch {shlex.quote(str(codex_target))}")
 
     git_payload = json.loads(git_result)
     codex_payload = json.loads(codex_result)
@@ -1619,8 +2963,7 @@ async def test_full_host_access_shell_write_to_protected_metadata_uses_host(
     )
 
     command = (
-        "powershell -NoProfile -Command "
-        f"\"Set-Content -LiteralPath '{target}' -Value full-host\""
+        f"powershell -NoProfile -Command \"Set-Content -LiteralPath '{target}' -Value full-host\""
     )
     with tool_context(workspace, run_mode="full"):
         result = await shell.exec_command(command)
@@ -1631,7 +2974,7 @@ async def test_full_host_access_shell_write_to_protected_metadata_uses_host(
 
 
 @pytest.mark.asyncio
-async def test_trusted_shell_delete_existing_file_under_rw_mount_uses_existing_mount(
+async def test_trusted_shell_delete_under_rw_mount_still_requires_destructive_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1649,6 +2992,11 @@ async def test_trusted_shell_delete_existing_file_under_rw_mount_uses_existing_m
 
     monkeypatch.setattr(shell, "run_under_backend", fake_backend)
     monkeypatch.setattr(shell, "_windows_sandbox_backend_active", lambda runtime=None: True)
+    # This test simulates the Windows backend on a POSIX host while keeping
+    # the target as a real host fixture.  Do not remap Linux ``/tmp`` into the
+    # synthetic Windows session temp root before destructive-action parsing.
+    monkeypatch.setattr(shell, "_windows_translate_posix_tmp_references", lambda command: command)
+    monkeypatch.setattr(shell, "_windows_translate_posix_tmp_path", lambda path: path)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",
@@ -1660,16 +3008,16 @@ async def test_trusted_shell_delete_existing_file_under_rw_mount_uses_existing_m
         run_mode="trusted",
         sandbox_mounts=[{"path": str(mounted.resolve(strict=False)), "access": "rw"}],
     ) as ctx:
-        result = await shell.exec_command(f'del "{outside}"')
+        payload = json.loads(await shell.exec_command(f'del "{outside}"'))
 
-    assert "exit_code=0" in result
-    assert backend_calls
-    assert get_approval_queue().list_pending("exec") == []
+    assert payload["status"] == "approval_required"
+    assert payload["target"] == str(outside.resolve(strict=False))
+    assert payload["backup_state"] == "enabled"
+    assert backend_calls == []
+    assert len(get_approval_queue().list_pending("exec")) == 1
     assert ctx.sandbox_mounts == [
         {"path": str(mounted.resolve(strict=False)), "access": "rw"},
     ]
-    request = backend_calls[0]
-    assert any(mount.host_path == mounted for mount in request.policy.mounts)
 
 
 def test_windows_shell_policy_ignores_deleted_active_file_mount(
@@ -1882,9 +3230,7 @@ async def test_trusted_shell_external_workdir_write_requires_elevation(
     )
 
     with tool_context(workspace, run_mode="trusted") as ctx:
-        payload = json.loads(
-            await shell.exec_command("echo hi > out.txt", workdir=str(outside))
-        )
+        payload = json.loads(await shell.exec_command("echo hi > out.txt", workdir=str(outside)))
 
     assert payload["status"] == "elevation_required"
     assert payload["target"] == str(outside.resolve(strict=False))

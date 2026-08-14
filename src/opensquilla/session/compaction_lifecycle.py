@@ -99,6 +99,20 @@ class CompactionLifecycleResult:
     flush_receipt: Any = None
 
 
+class CompactionTimeoutError(TimeoutError):
+    """A compaction operation exhausted its shared absolute deadline."""
+
+    def __init__(self, phase: str, timeout_seconds: float | None = None) -> None:
+        self.phase = str(phase or "unknown")
+        self.timeout_seconds = timeout_seconds
+        detail = (
+            f" after {timeout_seconds:g}s"
+            if timeout_seconds is not None and timeout_seconds > 0
+            else ""
+        )
+        super().__init__(f"Compaction timed out during {self.phase}{detail}")
+
+
 def new_compaction_id() -> str:
     """Return an opaque id used to correlate one compaction attempt's events."""
 
@@ -264,7 +278,7 @@ def compaction_effect_payload(
             user_visible = True
         elif normalized_status in {"started", "observed", "completed", "emergency_ephemeral"}:
             user_visible = True
-        elif normalized_status in {"failed", "error", "cancelled"}:
+        elif normalized_status in {"failed", "error", "cancelled", "timed_out"}:
             user_visible = True
         elif normalized_status == "skipped":
             user_visible = (

@@ -12,6 +12,10 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 from urllib.parse import urlparse
 
+from opensquilla.contracts.gateway_transport import (
+    GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+    GATEWAY_CLIENT_MAX_QUEUE,
+)
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
 
@@ -25,11 +29,17 @@ class GatewayRPCError(Exception):
         code: str | None = None,
         message: str = "RPC failed",
         data: dict | None = None,
+        retryable: bool | None = None,
+        retry_after_ms: int | None = None,
+        accepted: bool | None = None,
     ) -> None:
         self.method = method
         self.code = code
         self.message = message
         self.data = data
+        self.retryable = retryable
+        self.retry_after_ms = retry_after_ms
+        self.accepted = accepted
         super().__init__(self.__str__())
 
     def __str__(self) -> str:
@@ -359,6 +369,17 @@ class GatewayClient:
         self._server_session_subscriptions: set[str] = set()
         self._subscription_lock = asyncio.Lock()
         self._session_event_backlog: dict[str, deque[dict[str, Any]]] = {}
+        # ``sessions.steer.v2`` deliberately targets one exact logical turn.
+        # Keep the identity returned by ``sessions.send`` while its stream is
+        # active so the TUI can prefer the versioned protocol without asking
+        # the Gateway to retarget a late steer implicitly.
+        self._active_turn_ids: dict[str, str] = {}
+        # A missing ``sessions.steer.v2`` response is ambiguous: the Gateway
+        # may already have durably accepted the request.  Preserve the exact
+        # request until a definitive response arrives so a TUI retry keeps the
+        # original turn target and idempotency identity even if the active
+        # stream has completed in the meantime.
+        self._pending_steer_v2: dict[tuple[str, str], dict[str, Any]] = {}
 
     async def connect(
         self,
@@ -382,7 +403,11 @@ class GatewayClient:
             raise SystemExit("websockets package is required: uv pip install websockets")
 
         try:
-            self._ws = await websockets.connect(url)
+            self._ws = await websockets.connect(
+                url,
+                max_size=GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
+                max_queue=GATEWAY_CLIENT_MAX_QUEUE,
+            )
         except Exception as exc:
             raise SystemExit(
                 f"Cannot connect to OpenSquilla gateway at {url}\n"
@@ -634,6 +659,9 @@ class GatewayClient:
                 code=err.get("code"),
                 message=err.get("message") or "RPC failed",
                 data=raw_details if isinstance(raw_details, dict) else None,
+                retryable=err.get("retryable"),
+                retry_after_ms=err.get("retry_after_ms"),
+                accepted=err.get("accepted"),
             )
         payload = res.get("payload")
         return {} if payload is None else payload
@@ -759,33 +787,84 @@ class GatewayClient:
     async def abort_session(self, key: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("sessions.abort", {"key": key}))
 
-    async def steer_session(self, key: str, message: str) -> dict[str, Any]:
+    async def steer_session(
+        self,
+        key: str,
+        message: str,
+        *,
+        expected_turn_id: str | None = None,
+    ) -> dict[str, Any]:
         from opensquilla.cli.tui.backend.input_identity import (
             current_tui_client_message_id,
         )
 
         client_message_id = current_tui_client_message_id() or uuid.uuid4().hex
-        return cast(
-            dict[str, Any],
-            await self._call(
-                "sessions.steer",
-                {
+        retry_key = (key, client_message_id)
+        source = {
+            "caller_kind": "cli",
+            "channel_kind": "cli",
+            "channel_id": "cli:chat",
+            "source_kind": "cli",
+            "source_name": "chat",
+            "client_message_id": client_message_id,
+            "surface_id": self.surface_id,
+        }
+        v2_params = self._pending_steer_v2.get(retry_key)
+        if v2_params is None:
+            target_turn_id = expected_turn_id or self._active_turn_ids.get(key)
+            if target_turn_id:
+                v2_params = {
                     "key": key,
                     "message": message,
+                    "expected_turn_id": target_turn_id,
+                    # The composer identity is stable for the lifetime
+                    # of one accepted input. Prefix it so its receipt
+                    # cannot collide with a normal sessions.send using
+                    # the same client_message_id.
+                    "client_request_id": f"steer:{client_message_id}",
                     "client_message_id": client_message_id,
                     "surface_id": self.surface_id,
-                    "_source": {
-                        "caller_kind": "cli",
-                        "channel_kind": "cli",
-                        "channel_id": "cli:chat",
-                        "source_kind": "cli",
-                        "source_name": "chat",
-                        "client_message_id": client_message_id,
-                        "surface_id": self.surface_id,
-                    },
-                },
-            ),
-        )
+                    "_source": source,
+                }
+                self._pending_steer_v2[retry_key] = v2_params
+        if v2_params is not None:
+            try:
+                result = cast(
+                    dict[str, Any],
+                    await self._call(
+                        "sessions.steer.v2",
+                        v2_params,
+                    ),
+                )
+                self._pending_steer_v2.pop(retry_key, None)
+                return result
+            except GatewayRPCError as exc:
+                error_code = str(exc.code or "").upper()
+                fallback_safe = bool(
+                    isinstance(exc.data, dict) and exc.data.get("fallback_safe") is True
+                )
+                should_retry = exc.retryable is True or not fallback_safe
+                if error_code != "METHOD_NOT_FOUND" and should_retry:
+                    raise
+                self._pending_steer_v2.pop(retry_key, None)
+                if error_code != "METHOD_NOT_FOUND":
+                    raise
+
+        # A new CLI must never fall back to the unversioned steer endpoint:
+        # it has no expected-turn fence, and older Gateways may implement it
+        # by cancelling/restarting the active task. Returning an explicit
+        # queue-only disposition lets the TUI retain the input visibly and
+        # submit it as the next ordinary turn.
+        return {
+            "accepted": False,
+            "replayed": False,
+            "key": key,
+            "turn_id": expected_turn_id or self._active_turn_ids.get(key),
+            "client_message_id": client_message_id,
+            "disposition": "queue_only",
+            "failure_code": "STEER_V2_UNAVAILABLE",
+            "fallback_safe": True,
+        }
 
     async def patch_session(self, key: str, **fields: Any) -> dict[str, Any]:
         params: dict[str, Any] = {"key": key, **fields}
@@ -1026,7 +1105,7 @@ class GatewayClient:
         """Send message and yield session events until done.
 
         ``elevated`` is a legacy surface kept for older clients. ``off``
-        clears the override, ``on``/``bypass`` map to Managed Execution, and
+        clears the override, ``on``/``bypass`` map to Safe mode, and
         ``full`` maps to Full Host Access.
         """
         # Register the local queue before send. Replay/live frames are broadcast
@@ -1081,6 +1160,7 @@ class GatewayClient:
             or client_message_id
         )
         if accepted_turn_id is not None:
+            self._active_turn_ids[session_key] = accepted_turn_id
             from opensquilla.cli.tui.backend.input_identity import (
                 notify_tui_turn_identity,
             )
@@ -1118,6 +1198,11 @@ class GatewayClient:
                 if terminal:
                     break
         finally:
+            if (
+                accepted_turn_id is not None
+                and self._active_turn_ids.get(session_key) == accepted_turn_id
+            ):
+                self._active_turn_ids.pop(session_key, None)
             await subscription.close()
 
     async def close(self) -> None:
@@ -1138,6 +1223,8 @@ class GatewayClient:
         self._listener_task = None
         self._server_session_subscriptions.clear()
         self._session_event_backlog.clear()
+        self._active_turn_ids.clear()
+        self._pending_steer_v2.clear()
         for subscription in tuple(self._event_subscriptions.values()):
             subscription._close_from_client()
         self._event_subscriptions.clear()

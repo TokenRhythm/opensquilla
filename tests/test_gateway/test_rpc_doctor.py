@@ -584,6 +584,45 @@ async def test_doctor_status_can_skip_deep_memory_diagnostics(monkeypatch) -> No
 
 
 @pytest.mark.asyncio
+async def test_doctor_provider_probe_is_disabled_by_default_and_opt_in(
+    monkeypatch,
+) -> None:
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    seen_probe_values: list[bool] = []
+
+    async def provider_status(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
+        seen_probe_values.append(bool(params.get("probeModels")))
+        return {
+            "activeProvider": "openrouter",
+            "providers": [
+                {
+                    "providerId": "openrouter",
+                    "active": True,
+                    "configured": True,
+                    "buildable": True,
+                }
+            ],
+        }
+
+    _patch_ready_support_surfaces(monkeypatch, rpc_doctor)
+    monkeypatch.setattr(rpc_doctor, "_handle_providers_status", provider_status)
+    ctx = RpcContext(conn_id="test", config=GatewayConfig())
+
+    first = await get_dispatcher().dispatch("req-default", "doctor.status", {}, ctx)
+    second = await get_dispatcher().dispatch(
+        "req-probe",
+        "doctor.status",
+        {"probeProviders": True},
+        ctx,
+    )
+
+    assert first.ok is True
+    assert second.ok is True
+    assert seen_probe_values == [False, True]
+
+
+@pytest.mark.asyncio
 async def test_doctor_status_explains_recovery_when_collection_fails(monkeypatch) -> None:
     import opensquilla.gateway.rpc_doctor as rpc_doctor
 

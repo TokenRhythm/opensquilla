@@ -201,6 +201,7 @@ def _build_bootstrap_context(config: GatewayConfig, request: Request) -> dict:
         "ws_url": _request_ws_url(request, config),
         "auth_mode": config.auth.mode,
         "base_path": config.control_ui.base_path,
+        "asset_base_path": config.control_ui.base_path.rstrip("/"),
         "config_path": config.config_path or "",
         "locale": _resolve_locale(config, request),
         "update": _update_payload(config),
@@ -288,6 +289,7 @@ def create_control_ui_routes(config: GatewayConfig) -> list[Route | Mount]:
         )
 
     base = config.control_ui.base_path
+    route_base = "" if base == "/" else base
     template = _get_jinja_env().get_template("index.html")
 
     async def serve_index(request: Request) -> HTMLResponse:
@@ -309,11 +311,11 @@ def create_control_ui_routes(config: GatewayConfig) -> list[Route | Mount]:
 
     routes: list[Route | Mount] = [
         Mount(
-            f"{base}/static",
+            f"{route_base}/static",
             app=_CachedStaticFiles(directory=str(_STATIC_DIR)),
             name="control_ui_static",
         ),
-        Route(f"{base}/{{path:path}}", serve_index, methods=["GET"]),
-        Route(f"{base}/", serve_index, methods=["GET"]),
+        Route(f"{route_base}/{{path:path}}", serve_index, methods=["GET"]),
+        Route(f"{route_base}/", serve_index, methods=["GET"]),
     ]
     return routes

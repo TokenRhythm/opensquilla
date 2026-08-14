@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import shutil
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -33,6 +36,150 @@ def test_approval_queue_request_persists_across_queue_restart(tmp_path) -> None:
     assert reloaded.get(approval_id).consumed is True
     assert reloaded.list_pending("exec") == []
     reloaded.close()
+
+
+def test_resolution_metadata_is_committed_with_the_winning_decision(tmp_path) -> None:
+    db_path = tmp_path / "approval_queue.sqlite"
+    first = ApprovalQueue(db_path=str(db_path))
+    second = ApprovalQueue(db_path=str(db_path))
+    approval_id = first.request("exec", {"toolName": "exec_command"})
+    try:
+        first.resolve(
+            approval_id,
+            False,
+            resolution_metadata={
+                "resolutionSource": "approval_delivery_failure",
+                "resolutionReason": "send_failed",
+            },
+        )
+        with pytest.raises(ValueError):
+            second.resolve(
+                approval_id,
+                True,
+                resolution_metadata={"resolutionSource": "user_web"},
+            )
+
+        entry = second.get(approval_id)
+        assert entry.approved is False
+        assert entry.params["resolutionSource"] == "approval_delivery_failure"
+        assert entry.params["resolutionReason"] == "send_failed"
+    finally:
+        first.close()
+        second.close()
+
+
+def test_claim_metadata_cannot_be_overwritten_by_losing_resolver(tmp_path) -> None:
+    db_path = tmp_path / "approval_queue.sqlite"
+    first = ApprovalQueue(db_path=str(db_path))
+    second = ApprovalQueue(db_path=str(db_path))
+    approval_id = first.request("exec", {"toolName": "exec_command"})
+    try:
+        first.claim_resolution(
+            approval_id,
+            resolution_metadata={"resolutionSource": "user_web"},
+        )
+        with pytest.raises(ValueError):
+            second.resolve(
+                approval_id,
+                False,
+                resolution_metadata={
+                    "resolutionSource": "approval_delivery_failure",
+                },
+            )
+
+        entry = second.get(approval_id)
+        assert entry.claim_token is not None
+        assert entry.params["resolutionSource"] == "user_web"
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.asyncio
+async def test_default_approval_wait_remains_pending_until_human_decides(tmp_path) -> None:
+    queue = ApprovalQueue(
+        db_path=str(tmp_path / "approval_queue.sqlite"),
+        poll_interval=0.01,
+    )
+    approval_id = queue.request(
+        "exec",
+        {
+            "toolName": "exec_command",
+            "command": "rm -f target.txt",
+            "sessionKey": "agent:main:webchat:indefinite",
+        },
+    )
+    waiter = asyncio.create_task(queue.wait(approval_id))
+    try:
+        await asyncio.sleep(0.03)
+
+        entry = queue.get(approval_id)
+        assert entry.deadline == 0.0
+        assert entry.resolved is False
+        assert waiter.done() is False
+
+        queue.resolve(approval_id, True)
+        assert await asyncio.wait_for(waiter, timeout=0.2) is True
+    finally:
+        if not waiter.done():
+            waiter.cancel()
+        queue.close()
+
+
+def test_expire_pending_for_session_only_terminalizes_matching_approvals(tmp_path) -> None:
+    queue = ApprovalQueue(db_path=str(tmp_path / "approval_queue.sqlite"))
+    restarted_key = "agent:main:webchat:restart"
+    matching_ids = [
+        queue.request("exec", {"sessionKey": restarted_key, "toolName": "shell"}),
+        queue.request("plugin", {"session_key": restarted_key, "pluginId": "example"}),
+    ]
+    claimed_id = queue.request(
+        "exec",
+        {"sessionKey": restarted_key, "toolName": "claimed-shell"},
+    )
+    queue.claim_resolution(claimed_id)
+    matching_ids.append(claimed_id)
+    other_id = queue.request(
+        "exec",
+        {"sessionKey": "agent:main:webchat:other", "toolName": "shell"},
+    )
+    unscoped_id = queue.request("plugin", {"pluginId": "unscoped"})
+
+    try:
+        assert queue.expire_pending_for_session(restarted_key) == 3
+        assert queue.expire_pending_for_session(restarted_key) == 0
+
+        for approval_id in matching_ids:
+            entry = queue.get(approval_id)
+            assert entry.resolved is True
+            assert entry.approved is False
+            assert entry.resolution == "expired"
+        assert queue.get(other_id).resolved is False
+        assert queue.get(unscoped_id).resolved is False
+    finally:
+        queue.close()
+
+
+def test_expire_all_pending_terminalizes_scoped_unscoped_and_claimed_approvals(
+    tmp_path,
+) -> None:
+    queue = ApprovalQueue(db_path=str(tmp_path / "approval_queue.sqlite"))
+    approval_ids = [
+        queue.request("exec", {"sessionKey": "agent:main:webchat:a"}),
+        queue.request("plugin", {"sessionKey": "agent:main:webchat:b"}),
+        queue.request("plugin", {"pluginId": "unscoped"}),
+    ]
+    queue.claim_resolution(approval_ids[-1])
+    try:
+        assert queue.expire_all_pending() == 3
+        assert queue.list_pending() == []
+        for approval_id in approval_ids:
+            entry = queue.get(approval_id)
+            assert entry.resolved is True
+            assert entry.approved is False
+            assert entry.resolution == "expired"
+    finally:
+        queue.close()
 
 
 def test_channel_approval_code_binding_persists_across_queue_restart(tmp_path) -> None:
@@ -362,3 +509,52 @@ async def test_approval_queue_keeps_stale_resolved_claim_not_ready(tmp_path) -> 
             await queue.wait(approval_id, timeout=0.02)
     finally:
         queue.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path contract")
+def test_approval_queue_persists_on_extended_length_state_path(tmp_path: Path) -> None:
+    from opensquilla.application.approval_queue import _native_db_path
+
+    long_root = tmp_path / "long-approval-state"
+    parent = long_root
+    index = 0
+    while len(str(parent / "approval_queue.sqlite")) < 280:
+        parent /= f"state-segment-{index:02d}-0123456789"
+        index += 1
+    db_path = parent / "approval_queue.sqlite"
+    queue = None
+    reloaded = None
+    try:
+        queue = ApprovalQueue(db_path=str(db_path))
+        approval_id = queue.request(
+            "exec",
+            {"toolName": "exec_command", "command": "echo long-state"},
+        )
+        assert queue._db_path == db_path
+        queue.close()
+        queue = None
+
+        reloaded = ApprovalQueue(db_path=str(db_path))
+        assert reloaded.get(approval_id).approval_id == approval_id
+        assert os.path.isfile(_native_db_path(db_path))
+    finally:
+        if queue is not None:
+            queue.close()
+        if reloaded is not None:
+            reloaded.close()
+        native_root = _native_db_path(long_root)
+        if os.path.exists(native_root):
+            shutil.rmtree(native_root)
+
+
+def test_reset_approval_queue_accepts_memory_database(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.application import approval_queue as approval_queue_module
+
+    queue = ApprovalQueue(db_path=":memory:")
+    monkeypatch.setattr(approval_queue_module, "_queue", queue)
+
+    approval_queue_module.reset_approval_queue()
+
+    assert approval_queue_module._queue is None

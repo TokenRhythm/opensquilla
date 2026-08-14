@@ -1185,6 +1185,81 @@ async def test_windows_exec_command_does_not_mount_program_files_tools_per_comma
 
 
 @pytest.mark.asyncio
+async def test_windows_exec_command_preserves_terminal_backend_failure(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.policy import build_policy
+    from opensquilla.sandbox.types import SandboxBackendError, SecurityLevel
+    from opensquilla.tools.builtin import shell
+
+    runtime = _windows_runtime()
+    policy = build_policy(
+        SecurityLevel.STANDARD,
+        "shell.exec",
+        tmp_path,
+        SandboxSettings(
+            sandbox=True,
+            security_grading=True,
+            backend="windows_default",
+            network_default="none",
+        ),
+        trusted=True,
+    )
+    request = SimpleNamespace(
+        cwd=tmp_path,
+        action_kind="shell.exec",
+        policy=policy,
+        reason="",
+        session_id="s1",
+        run_mode="trusted",
+    )
+
+    async def _fake_gate_action(**kwargs):
+        return object(), policy, request
+
+    async def _fake_preflight(*args, **kwargs):
+        return None
+
+    async def _fake_run_backend(request, *, runtime=None):
+        raise SandboxBackendError("execution lease is busy")
+
+    async def _fake_escalation(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(shell, "get_runtime", lambda: runtime)
+    monkeypatch.setattr(shell, "gate_action", _fake_gate_action)
+    monkeypatch.setattr(shell, "preflight_subprocess_managed_network", _fake_preflight)
+    monkeypatch.setattr(shell, "_run_backend_with_managed_network", _fake_run_backend)
+    monkeypatch.setattr(
+        shell,
+        "escalate_unavailable_backend_in_managed_mode",
+        _fake_escalation,
+    )
+    monkeypatch.setattr(
+        shell,
+        "check_safe_bin",
+        lambda command: SimpleNamespace(allowed=True, needs_approval=False, reason=""),
+    )
+
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            workspace_dir=str(tmp_path),
+            session_key="s1",
+            run_mode="trusted",
+        )
+    )
+    try:
+        with pytest.raises(SandboxBackendError, match="execution lease"):
+            await shell.exec_command("Write-Output ok", workdir=str(tmp_path))
+    finally:
+        current_tool_context.reset(token)
+
+
+@pytest.mark.asyncio
 async def test_windows_exec_command_uses_shared_path_envelopes(monkeypatch, tmp_path) -> None:
     from opensquilla.sandbox.config import SandboxSettings
     from opensquilla.sandbox.policy import build_policy

@@ -1,4 +1,5 @@
 import type { ArtifactPayload } from '@/types/rpc'
+import type { PlanRevisionSnapshot } from '@/types/plans'
 
 /**
  * The four-state tool machine. Maps from today's ChatToolCall.{status,isRunning,result}:
@@ -31,6 +32,11 @@ export interface InterruptApprovalData {
   approvalKind: string                    // e.g. 'sandbox_network' / 'sandbox_path'
   args: Record<string, unknown> | null    // may be null until hydrated
   warning: string                         // '' until hydrated
+  displayKind?: string
+  displayTarget?: string
+  destructive?: boolean
+  irreversible?: boolean
+  backupState?: string
   agent: string
   sessionKey: string
   deadline: number                        // epoch seconds the request expires; 0 when unknown
@@ -43,11 +49,16 @@ export interface InterruptClarifyField {
   required: boolean
   defaultValue: string
   choices: string[]
+  header?: string
+  options?: Array<{ label: string; description: string }>
+  allowOther?: boolean
 }
 
 export interface InterruptClarifyData {
   intro: string
   fields: InterruptClarifyField[]
+  presentation?: string
+  requestId?: string
   runId: string
   step: string
 }
@@ -117,6 +128,10 @@ export type Part =
       busy: boolean
       error: string
     }
+  | {
+      type: 'plan'
+      plan: PlanRevisionSnapshot
+    }
 
 export type ChatPart = Part & { key: string }
 
@@ -140,6 +155,15 @@ export interface StatusPart {
   action: string
   label: string
   at: number
+  /** Stable lifecycle id for a maintenance event; phase rows omit it. */
+  id?: string
+  /** Maintenance rows are context housekeeping, not semantic task steps. */
+  category?: 'phase' | 'maintenance'
+  state?: 'running' | 'completed' | 'skipped' | 'stale' | 'cancelled' | 'failed'
+  source?: string
+  durability?: string
+  detail?: string
+  reason?: string
 }
 
 export interface TurnMessageParts {

@@ -22,6 +22,7 @@ from .types import (
     ArtifactEvent,
     DoneEvent,
     ErrorEvent,
+    ProviderActivityEvent,
     RouterControlReplayEvent,
     RunHeartbeatEvent,
     StateChangeEvent,
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
         SubagentManager,
         SubagentRegistry,
         SubagentSpec,
+        SubagentUsage,
     )
 
 
@@ -59,6 +61,7 @@ _LAZY_MAP: dict[str, tuple[str, str]] = {
     "SubagentManager": ("opensquilla.engine.subagent", "SubagentManager"),
     "SubagentRegistry": ("opensquilla.engine.subagent", "SubagentRegistry"),
     "SubagentSpec": ("opensquilla.engine.subagent", "SubagentSpec"),
+    "SubagentUsage": ("opensquilla.engine.subagent", "SubagentUsage"),
 }
 
 
@@ -82,6 +85,7 @@ __all__ = [
     "ContextFiles",
     "DoneEvent",
     "ErrorEvent",
+    "ProviderActivityEvent",
     "RouterControlReplayEvent",
     "RunHeartbeatEvent",
     "StateChangeEvent",
@@ -89,6 +93,7 @@ __all__ = [
     "SubagentManager",
     "SubagentRegistry",
     "SubagentSpec",
+    "SubagentUsage",
     "TextDeltaEvent",
     "ThinkingEvent",
     "ThinkingLevel",

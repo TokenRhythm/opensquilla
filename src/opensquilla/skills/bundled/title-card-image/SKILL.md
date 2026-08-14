@@ -1,6 +1,7 @@
 ---
 name: title-card-image
-description: "Render a static title / ending card PNG with Pillow. Centered headline + optional subtitle on a solid-colour background. CJK-friendly font fallback (Microsoft YaHei → SimHei → Songti → Noto CJK → bitmap). Pure deterministic, no LLM, no network. Used by meta-short-drama for opening and closing cards."
+description: "Render a static title / ending card PNG with Pillow. Centered headline + optional subtitle on a solid-colour background. Uses managed or platform CJK fonts with glyph verification and fails actionably instead of rendering tofu. Pure deterministic, no LLM, no network. Used by meta-short-drama for opening and closing cards."
+description_zh: "使用 Pillow 渲染静态片头/片尾 PNG，在纯色背景上居中显示标题和可选副标题。使用托管或平台 CJK 字体并验证字形；无法正确渲染时给出可操作错误，而不是输出方框字。过程完全确定，不使用 LLM 或网络。由 meta-short-drama 生成片头片尾卡。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0
@@ -31,6 +32,8 @@ entrypoint:
     - "{{ with.width | default(720) }}"
     - --height
     - "{{ with.height | default(1280) }}"
+    - --font
+    - "{{ with.font | default('') }}"
   parse: text
   timeout: 30
 ---
@@ -53,6 +56,7 @@ animating into a clip with `video-still-animator`.
 | `subtitle_size` | no | `36` | Subtitle font size in pixels. |
 | `width` | no | `720` | Output width in pixels. Match the merge pipeline. |
 | `height` | no | `1280` | Output height. 720x1280 = 9:16. |
+| `font` | no | `""` | Optional `.ttf`, `.otf`, or `.ttc` path. Must contain the requested CJK glyphs. |
 
 ## Output
 
@@ -62,11 +66,17 @@ length.
 
 ## Font fallback
 
-Tries `--font` if explicit, else walks a CJK-aware list of platform
-defaults (Microsoft YaHei / SimHei on Windows, PingFang on macOS, Noto
-CJK / WenQuanYi on Linux). If nothing loads, falls back to Pillow's
-bundled bitmap font — CJK characters render as squares ("tofu") in that
-worst-case but the program never crashes.
+Resolution order is `--font`, the managed media directory from
+`OPENSQUILLA_MEDIA_FONTS_DIR`, user font directories, then platform defaults:
+Microsoft YaHei / SimHei / DengXian on Windows; PingFang / Hiragino Sans GB /
+STHeiti / Songti on macOS; Noto CJK / Source Han / WenQuanYi on Linux. Font
+collection files (`.ttc`/`.otc`) are supported. Before drawing, the renderer
+compares requested non-ASCII glyphs with the font's missing-glyph signature. A font
+that would produce tofu is skipped. If no compatible scalable font exists, the
+step fails with an actionable `--font` / `OPENSQUILLA_MEDIA_FONTS_DIR` message
+for CJK or other non-ASCII text; it never silently emits tiny bitmap squares.
+Pure ASCII cards remain available on minimal systems through Pillow's built-in
+font when no scalable font is installed.
 
 ## Limits
 

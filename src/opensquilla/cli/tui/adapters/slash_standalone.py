@@ -10,19 +10,21 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import uuid4
 
 import opensquilla.cli.tui.adapters.input_bridge as _input_bridge
 from opensquilla.cli.chat.session_state import ChatSessionState
 from opensquilla.cli.chat.turn import TurnResult
-from opensquilla.cli.tui.adapters.commands import render_help_table
+from opensquilla.cli.tui.adapters.commands import render_help_table, render_keys_table
 from opensquilla.cli.tui.adapters.slash_common import (
     compact_skipped_line,
     compact_success_line,
     compact_summary_stats,
     compact_token_stats,
     dispatch_theme_command,
+    output_supports_host_ui,
     record_turn,
     registry_handler_words,
     resolve_transcript_target,
@@ -35,12 +37,20 @@ from opensquilla.cli.tui.adapters.slash_common import (
 from opensquilla.cli.tui.backend.contracts import TuiOutputHandle
 from opensquilla.cli.ui import ACCENT, console, error_panel
 from opensquilla.engine.commands import Surface
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
+from opensquilla.provider.types import (
+    ProviderRequestCorrelation,
+    derive_provider_request_correlation,
+)
 from opensquilla.session.compaction import (
     build_compaction_config_from_provider,
     call_compact_with_optional_config,
 )
 from opensquilla.session.compaction_lifecycle import (
     flush_receipt_is_successful_flush,
+    new_compaction_id,
 )
 
 if TYPE_CHECKING:
@@ -111,6 +121,10 @@ class StandaloneReadTranscript(Protocol):
     def __call__(self, session_key: str) -> Awaitable[Any] | Any: ...
 
 
+class StandaloneGetSession(Protocol):
+    def __call__(self, session_key: str) -> Awaitable[Any] | Any: ...
+
+
 class StandaloneTruncateSession(Protocol):
     def __call__(self, session_key: str, *, max_messages: int = 0) -> Awaitable[None]: ...
 
@@ -136,6 +150,7 @@ class StandaloneFlushTranscript(Protocol):
 @dataclass
 class StandaloneSlashServices:
     create_session: StandaloneCreateSession | None = None
+    get_session: StandaloneGetSession | None = None
     read_transcript: StandaloneReadTranscript | None = None
     truncate_session: StandaloneTruncateSession | None = None
     compact_session: StandaloneCompactSession | None = None
@@ -305,6 +320,7 @@ async def _flush_before_standalone_rewrite(
     session_key: str,
     *,
     operation: str,
+    provider_request_correlation: ProviderRequestCorrelation | None = None,
 ) -> bool:
     """Fail closed before reset; compact can continue on flush degradation."""
     compaction_operation = operation.strip().lower() == "compact"
@@ -341,13 +357,21 @@ async def _flush_before_standalone_rewrite(
         return False
 
     try:
+        flush_kwargs: dict[str, Any] = {
+            "agent_id": "main",
+            "timeout": 30.0,
+            "message_window": 0,
+            "segment_mode": "auto",
+        }
+        if provider_request_correlation is not None:
+            flush_kwargs["provider_request_correlation"] = (
+                provider_request_correlation
+            )
+            flush_kwargs["turn_id"] = provider_request_correlation.turn_id
         receipt = await flush_transcript(
             transcript,
             session_key,
-            agent_id="main",
-            timeout=30.0,
-            message_window=0,
-            segment_mode="auto",
+            **flush_kwargs,
         )
     except Exception as exc:  # noqa: BLE001
         if compaction_operation:
@@ -371,6 +395,35 @@ async def _flush_before_standalone_rewrite(
         console.print(f"[yellow]{operation} aborted: flush failed ({error}).[/yellow]")
         return False
     return True
+
+
+async def _standalone_maintenance_correlation(
+    slash_services: StandaloneSlashServices,
+    session_key: str,
+    *,
+    call_kind: str,
+    turn_id: str | None = None,
+) -> ProviderRequestCorrelation | None:
+    get_session = slash_services.get_session
+    if get_session is None or provider_request_correlation_disabled(
+        config=slash_services.config,
+    ):
+        return None
+    try:
+        session = get_session(session_key)
+        if inspect.isawaitable(session):
+            session = await session
+    except Exception:  # noqa: BLE001 - observability must not block maintenance
+        return None
+    session_id = getattr(session, "session_id", None)
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return ProviderRequestCorrelation(
+        session_id=session_id,
+        turn_id=turn_id or f"maintenance_{uuid4().hex}",
+        execution_id=uuid4().hex,
+        call_kind=call_kind,
+    )
 
 
 def _save_state_transcript_command(cmd: str, state: ChatSessionState) -> None:
@@ -455,33 +508,144 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
         console.print("[yellow]No session manager available.[/yellow]")
         return
 
+    compaction_id = new_compaction_id()
+    compaction_correlation = await _standalone_maintenance_correlation(
+        slash_services,
+        context.session_key,
+        call_kind="auxiliary.compaction",
+        turn_id=compaction_id,
+    )
     safe_to_compact = await _flush_before_standalone_rewrite(
         slash_services,
         context.session_key,
         operation="Compact",
+        provider_request_correlation=derive_provider_request_correlation(
+            compaction_correlation,
+            execution_id=uuid4().hex,
+            call_kind="auxiliary.session_flush",
+        ),
     )
     if not safe_to_compact:
         return
 
     console.print(f"[{ACCENT}]compacting context...[/]")
     config = slash_services.config
-    context_window = (
+    configured_context_cap = (
         getattr(config, "context_budget_tokens", 100_000) if config is not None else 100_000
     )
-    compaction_config = build_compaction_config_from_provider(
-        _resolve_compaction_provider(
+    session = None
+    if slash_services.get_session is not None:
+        try:
+            session = await _maybe_await(
+                slash_services.get_session(context.session_key)
+            )
+        except Exception:  # noqa: BLE001 - target fallback remains isolated
+            session = None
+    if session is None:
+        session = SimpleNamespace(
+            session_key=context.session_key,
+            model=context.model,
+            model_override=None,
+            model_provider=None,
+            provider_override=None,
+        )
+    from opensquilla.gateway.compaction_target import (
+        build_gateway_consumer_admission,
+        limit_gateway_consumer_budget,
+        resolve_gateway_compaction_target,
+        resolve_gateway_consumer_budget,
+    )
+
+    gateway_context = SimpleNamespace(
+        config=config,
+        provider_selector=slash_services.provider_selector,
+    )
+    consumer_budget = resolve_gateway_consumer_budget(
+        gateway_context,
+        session,
+    )
+    consumer_budget = limit_gateway_consumer_budget(
+        consumer_budget,
+        max(1, int(configured_context_cap or 1)),
+    )
+    context_window = consumer_budget.context_window_tokens
+    consumer_admission, consumer_admission_fingerprint = (
+        build_gateway_consumer_admission(consumer_budget)
+    )
+    target = resolve_gateway_compaction_target(
+        gateway_context,
+        session,
+    )
+    compaction_provider = target.provider
+    if compaction_provider is None and not target.blocked_reason:
+        compaction_provider = _resolve_compaction_provider(
             slash_services.provider_selector,
             context.model,
-        ),
-        model_override=context.model,
+        )
+    compaction_config = build_compaction_config_from_provider(
+        compaction_provider,
+        model_override=target.model or context.model,
         compaction_config=getattr(config, "compaction", None),
+        compaction_plan=target.plan,
+        context_window_tokens=context_window,
     )
     try:
         if compact_with_result is not None:
+            compact_kwargs: dict[str, Any] = {}
+            try:
+                parameters = tuple(
+                    inspect.signature(compact_with_result).parameters.values()
+                )
+            except (TypeError, ValueError):
+                parameters = ()
+            if compaction_correlation is not None:
+                if any(
+                    parameter.kind is inspect.Parameter.VAR_KEYWORD
+                    or parameter.name == "provider_request_correlation"
+                    for parameter in parameters
+                ):
+                    compact_kwargs["provider_request_correlation"] = (
+                        compaction_correlation
+                    )
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "compaction_id"
+                for parameter in parameters
+            ):
+                compact_kwargs["compaction_id"] = compaction_id
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "trigger_reason"
+                for parameter in parameters
+            ):
+                compact_kwargs["trigger_reason"] = "manual"
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "context_window_chars"
+                for parameter in parameters
+            ):
+                compact_kwargs["context_window_chars"] = (
+                    consumer_budget.provider_request_max_chars
+                )
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "consumer_admission"
+                for parameter in parameters
+            ):
+                compact_kwargs["consumer_admission"] = consumer_admission
+            if any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                or parameter.name == "consumer_admission_fingerprint"
+                for parameter in parameters
+            ):
+                compact_kwargs["consumer_admission_fingerprint"] = (
+                    consumer_admission_fingerprint
+                )
             result = await compact_with_result(
                 context.session_key,
                 context_window,
                 compaction_config,
+                **compact_kwargs,
             )
             summary = getattr(result, "summary", "") or ""
             token_stats = compact_token_stats(
@@ -499,6 +663,7 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
                 context.session_key,
                 context_window,
                 compaction_config,
+                provider_request_correlation=compaction_correlation,
             )
             token_stats = compact_summary_stats(len(summary))
     except Exception as exc:  # noqa: BLE001 - keep chat command recoverable.
@@ -530,6 +695,10 @@ async def handle_standalone_slash_command(
 
     if cmd == "/help":
         console.print(render_help_table(Surface.CLI_STANDALONE))
+        return True
+
+    if cmd in {"/keys", "/shortcuts"}:
+        console.print(render_keys_table(opentui=output_supports_host_ui(context.tui_output)))
         return True
 
     if _slash_parts(cmd, "/theme"):
@@ -594,10 +763,16 @@ async def handle_standalone_slash_command(
     if cmd in {"/clear", "/reset"}:
         truncate_session = context.slash_services.truncate_session
         if truncate_session is not None:
+            flush_correlation = await _standalone_maintenance_correlation(
+                context.slash_services,
+                context.session_key,
+                call_kind="auxiliary.session_flush",
+            )
             safe_to_reset = await _flush_before_standalone_rewrite(
                 context.slash_services,
                 context.session_key,
                 operation="Reset",
+                provider_request_correlation=flush_correlation,
             )
             if not safe_to_reset:
                 return True

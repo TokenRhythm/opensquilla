@@ -462,7 +462,7 @@ become the primary UI path.
   "sessionKind": "task",
   "surface": "subagent",
   "conversationKind": "unknown",
-  "title": "Subagent task",
+  "title": "Analyze checkout failures",
   "subtitle": "Spawned from Web chat",
   "groupLabel": "Subagents",
   "updatedAt": 1760000000000,
@@ -478,6 +478,11 @@ become the primary UI path.
   "cron": null
 }
 ```
+
+New subagent sessions should persist a caller-supplied short title, or derive a
+bounded title from the original delegated task when the caller omits it. The
+generic localized `Subagent task` label remains the compatibility fallback for
+legacy or malformed rows with no usable title source.
 
 ### Cron-Owned Isolated Run
 

@@ -19,7 +19,8 @@ from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.task_runtime import TaskRuntime
 from opensquilla.session.manager import SessionManager
-from opensquilla.session.models import SessionContextState, SessionSummary
+from opensquilla.session.models import PlanRunRecord, SessionContextState, SessionSummary
+from opensquilla.session.plans import new_plan_revision
 from opensquilla.session.storage import SessionStorage
 
 SESSION_KEY = "agent:main:webchat:atomic-intents"
@@ -42,6 +43,7 @@ class _IntentStack:
     handler_started: asyncio.Event
     handler_cancelled: asyncio.Event
     release_handler: asyncio.Event
+    handler_runs: list[Any]
 
     async def wait_until_running(self) -> None:
         await asyncio.wait_for(self.handler_started.wait(), timeout=2.0)
@@ -55,7 +57,10 @@ async def _open_intent_stack(db_path: Path) -> AsyncIterator[_IntentStack]:
     handler_cancelled = asyncio.Event()
     release_handler = asyncio.Event()
 
-    async def _turn_handler(_run: Any) -> None:
+    handler_runs: list[Any] = []
+
+    async def _turn_handler(run: Any) -> None:
+        handler_runs.append(run)
         handler_started.set()
         try:
             await release_handler.wait()
@@ -89,6 +94,7 @@ async def _open_intent_stack(db_path: Path) -> AsyncIterator[_IntentStack]:
         handler_started=handler_started,
         handler_cancelled=handler_cancelled,
         release_handler=release_handler,
+        handler_runs=handler_runs,
     )
     try:
         yield stack
@@ -201,6 +207,227 @@ async def test_chat_send_new_chat_atomically_creates_webchat_turn(tmp_path: Path
 
 
 @pytest.mark.asyncio
+async def test_chat_send_atomically_creates_first_plan_turn(tmp_path: Path) -> None:
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        params = {
+            "sessionKey": SESSION_KEY,
+            "message": "inspect the repository and propose a plan",
+            "intent": "new_chat",
+            "collaborationMode": "plan",
+            "clientRequestId": "new-chat-plan-success",
+        }
+
+        response = await get_dispatcher().dispatch(
+            "rpc-new-chat-plan",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        await stack.wait_until_running()
+
+        assert response.ok is True
+        assert response.payload["accepted"] is True
+        assert response.payload["collaboration"] == {
+            "mode": "plan",
+            "revision": 1,
+            "appliesTo": "next_turn",
+        }
+        assert response.payload["acceptedCollaboration"] == {
+            "mode": "plan",
+            "revision": 1,
+        }
+        created = await stack.storage.get_session(SESSION_KEY)
+        assert created is not None
+        assert created.collaboration_mode == "plan"
+        assert created.collaboration_revision == 1
+
+        transcript = await stack.storage.get_transcript(created.session_id)
+        assert len(transcript) == 1
+        assert transcript[0].content == params["message"]
+        assert len(stack.handler_runs) == 1
+        metadata = stack.handler_runs[0].envelope.metadata
+        assert metadata["collaboration_mode"] == "plan"
+        assert metadata["collaboration_revision"] == 1
+        assert metadata["required_collaboration_mode"] == "plan"
+        assert metadata["required_collaboration_revision"] == 1
+
+        replay = await get_dispatcher().dispatch(
+            "rpc-new-chat-plan-replay",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert replay.ok is True
+        assert replay.payload["replayed"] is True
+        assert replay.payload["collaboration"] == {
+            "mode": "plan",
+            "revision": 1,
+            "appliesTo": "next_turn",
+        }
+        assert replay.payload["acceptedCollaboration"] == {
+            "mode": "plan",
+            "revision": 1,
+        }
+
+        await stack.storage.set_collaboration_mode(
+            SESSION_KEY,
+            "default",
+            expected_revision=1,
+        )
+        replay_after_toggle = await get_dispatcher().dispatch(
+            "rpc-new-chat-plan-replay-after-toggle",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert replay_after_toggle.ok is True
+        assert replay_after_toggle.payload["replayed"] is True
+        assert replay_after_toggle.payload["acceptedCollaboration"] == {
+            "mode": "plan",
+            "revision": 1,
+        }
+        assert replay_after_toggle.payload["collaboration"] == {
+            "mode": "default",
+            "revision": 2,
+            "appliesTo": "next_turn",
+        }
+
+        fingerprint_conflict = await get_dispatcher().dispatch(
+            "rpc-new-chat-plan-fingerprint-conflict",
+            "chat.send",
+            {
+                **params,
+                "collaborationMode": "default",
+            },
+            stack.context,
+        )
+        assert fingerprint_conflict.ok is False
+        assert fingerprint_conflict.error is not None
+        assert fingerprint_conflict.error.code == "IDEMPOTENCY_CONFLICT"
+        assert _table_counts(stack.db_path) == {
+            "sessions": 1,
+            "transcript_entries": 1,
+            "session_summaries": 0,
+            "session_context_states": 0,
+            "agent_tasks": 1,
+            "turn_ingress_receipts": 1,
+        }
+
+
+@pytest.mark.asyncio
+async def test_chat_send_requires_explicit_new_chat_for_initial_mode(
+    tmp_path: Path,
+) -> None:
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        response = await get_dispatcher().dispatch(
+            "rpc-implicit-new-chat-initial-plan",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "must state the creation intent",
+                "collaborationMode": "plan",
+                "clientRequestId": "implicit-new-chat-initial-plan",
+            },
+            stack.context,
+        )
+
+        assert response.ok is False
+        assert await stack.storage.get_session(SESSION_KEY) is None
+        assert _table_counts(stack.db_path) == {
+            "sessions": 0,
+            "transcript_entries": 0,
+            "session_summaries": 0,
+            "session_context_states": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        assert stack.handler_started.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_chat_send_rejects_initial_mode_without_atomic_runtime(
+    tmp_path: Path,
+) -> None:
+    context = RpcContext(
+        conn_id="initial-plan-no-runtime",
+        principal=_PRINCIPAL,
+        config=GatewayConfig(workspace_dir=str(tmp_path / "workspace")),
+    )
+
+    response = await get_dispatcher().dispatch(
+        "rpc-initial-plan-no-runtime",
+        "chat.send",
+        {
+            "sessionKey": SESSION_KEY,
+            "message": "must not report a false Plan acceptance",
+            "intent": "new_chat",
+            "collaborationMode": "plan",
+            "clientRequestId": "initial-plan-no-runtime",
+        },
+        context,
+    )
+
+    assert response.ok is False
+    assert response.error is not None
+    assert response.error.code == "UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_chat_send_rejects_non_string_initial_mode(tmp_path: Path) -> None:
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        response = await get_dispatcher().dispatch(
+            "rpc-invalid-initial-plan-mode",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "invalid mode payload",
+                "intent": "new_chat",
+                "collaborationMode": {"mode": "plan"},
+                "clientRequestId": "invalid-initial-plan-mode",
+            },
+            stack.context,
+        )
+
+        assert response.ok is False
+        assert await stack.storage.get_session(SESSION_KEY) is None
+        assert stack.handler_started.is_set() is False
+
+
+@pytest.mark.asyncio
+async def test_chat_send_rejects_initial_mode_for_existing_session(tmp_path: Path) -> None:
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        existing = await stack.manager.create(SESSION_KEY, agent_id="main")
+
+        response = await get_dispatcher().dispatch(
+            "rpc-existing-chat-initial-plan",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "must not change this session",
+                "collaborationMode": "plan",
+                "clientRequestId": "existing-chat-initial-plan",
+            },
+            stack.context,
+        )
+
+        assert response.ok is False
+        unchanged = await stack.storage.get_session(SESSION_KEY)
+        assert unchanged is not None
+        assert unchanged.session_id == existing.session_id
+        assert unchanged.collaboration_mode == "default"
+        assert unchanged.collaboration_revision == 0
+        assert _table_counts(stack.db_path) == {
+            "sessions": 1,
+            "transcript_entries": 0,
+            "session_summaries": 0,
+            "session_context_states": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        assert stack.handler_started.is_set() is False
+
+
+@pytest.mark.asyncio
 async def test_explicit_continue_first_turn_replays_with_original_fingerprint(
     tmp_path: Path,
 ) -> None:
@@ -297,6 +524,7 @@ async def test_new_chat_storage_busy_does_not_create_session(tmp_path: Path) -> 
                     "sessionKey": SESSION_KEY,
                     "message": "must not create a draft",
                     "intent": "new_chat",
+                    "collaborationMode": "plan",
                     "clientRequestId": "new-chat-busy",
                 },
                 stack.context,
@@ -389,6 +617,35 @@ async def test_reset_same_key_atomically_rotates_and_accepts_new_turn(
     monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
     async with _open_intent_stack(tmp_path / "sessions.db") as stack:
         old_session_id, old_epoch, _old_message_id = await _seed_reset_state(stack)
+        revision = await stack.storage.create_plan_revision(
+            new_plan_revision(
+                source_session_key=SESSION_KEY,
+                source_session_id=old_session_id,
+                source_epoch=old_epoch,
+                title="Plan from the old epoch",
+                markdown="## Plan from the old epoch",
+                steps=[{"step_id": "old", "title": "Old step"}],
+            ),
+            expected_parent_revision_id=None,
+        )
+        before_reset = await stack.storage.get_session(SESSION_KEY)
+        assert before_reset is not None
+        await stack.storage.set_collaboration_mode(
+            SESSION_KEY,
+            "plan",
+            expected_revision=int(before_reset.collaboration_revision or 0),
+        )
+        old_run = await stack.storage.start_plan_run(
+            PlanRunRecord(
+                run_id="atomic-reset-old-plan-run",
+                session_key=SESSION_KEY,
+                session_id=old_session_id,
+                session_epoch=old_epoch,
+                plan_revision_id=revision.revision_id,
+                driver_kind="manual",
+                status="queued",
+            )
+        )
 
         response = await get_dispatcher().dispatch(
             "rpc-reset-success",
@@ -411,6 +668,13 @@ async def test_reset_same_key_atomically_rotates_and_accepts_new_turn(
         assert reset.session_id == response.payload["session_id"]
         assert reset.epoch == old_epoch + 1
         assert reset.display_name == "Before reset"
+        assert reset.collaboration_mode == "default"
+        assert reset.collaboration_revision == 0
+        assert reset.active_plan_revision_id is None
+        superseded = await stack.storage.get_plan_run(old_run.run_id)
+        assert superseded is not None
+        assert superseded.status == "superseded"
+        assert superseded.terminal_reason == "session_reset"
 
         assert await stack.storage.get_transcript(old_session_id) == []
         transcript = await stack.storage.get_transcript(reset.session_id)
@@ -441,6 +705,53 @@ async def test_reset_same_key_atomically_rotates_and_accepts_new_turn(
             "session_context_states": 1,
             "agent_tasks": 1,
             "turn_ingress_receipts": 1,
+        }
+
+
+@pytest.mark.asyncio
+async def test_reset_archive_failure_rolls_back_atomic_acceptance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_SESSION_ARCHIVE_DIR", str(tmp_path / "archives"))
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        old_session_id, old_epoch, _old_message_id = await _seed_reset_state(stack)
+
+        async def fail_archive(*_args: Any, **_kwargs: Any) -> None:
+            raise OSError("archive unavailable")
+
+        monkeypatch.setattr(stack.manager, "write_session_archive", fail_archive)
+        response = await get_dispatcher().dispatch(
+            "rpc-reset-archive-failure",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "must not replace old history",
+                "intent": "reset_same_key",
+                "clientRequestId": "reset-archive-failure",
+            },
+            stack.context,
+        )
+
+        assert response.ok is False
+        persisted = await stack.storage.get_session(SESSION_KEY)
+        assert persisted is not None
+        assert persisted.session_id == old_session_id
+        assert persisted.epoch == old_epoch
+        transcript = await stack.storage.get_transcript(old_session_id)
+        assert [entry.content for entry in transcript] == ["old transcript"]
+        summaries = await stack.storage.get_all_summaries(old_session_id)
+        assert [summary.summary_text for summary in summaries] == ["old summary"]
+        context_states = await stack.manager.get_context_states(SESSION_KEY)
+        assert len(context_states) == 1
+        assert context_states[0].valid is True
+        assert _table_counts(stack.db_path) == {
+            "sessions": 1,
+            "transcript_entries": 1,
+            "session_summaries": 1,
+            "session_context_states": 1,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
         }
 
 

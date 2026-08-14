@@ -5,9 +5,11 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
 import yaml
 
 WORKFLOW_DIR = Path(".github/workflows")
@@ -117,6 +119,7 @@ def _expected_classifier_outputs(**overrides: str) -> dict[str, str]:
         "python_changed": "false",
         "platform_sensitive_changed": "false",
         "build_wheel_required": "false",
+        "toolchain_artifact_changed": "false",
         "full_required": "false",
     }
     outputs.update(overrides)
@@ -180,7 +183,8 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     data = _workflow("ci.yml")
     text = ci_path.read_text(encoding="utf-8")
 
-    assert {"pull_request", "push", "workflow_dispatch"} <= _trigger_keys(data)
+    assert {"pull_request", "merge_group", "push", "workflow_dispatch"} <= _trigger_keys(data)
+    assert data["on"]["merge_group"]["types"] == ["checks_requested"]
     assert "branches: [main]" in text
     assert "PYTHONPATH: ${{ github.workspace }}" in text
     assert "Configure runtime directories" in text
@@ -196,6 +200,10 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert "Release packaging contracts" in text
     assert "CI result" in text
     assert 'push)\n              before="${{ github.event.before }}"' in text
+    assert 'merge_group)\n              base="${{ github.event.merge_group.base_sha }}"' in text
+    assert 'head="${{ github.event.merge_group.head_sha }}"' in text
+    assert 'git diff --name-only "${base}" "${head}" > "${changed_files}"' in text
+    assert "Merge-group diff is unavailable; running the full CI matrix." in text
     assert 'git diff --name-only "${before}" "${after}" > "${changed_files}"' in text
     assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in text
     assert "runtime_changed" in text
@@ -214,6 +222,10 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert ".github/scripts/check_ci_results.py" in text
     assert "code_changed" not in text
     assert "workflow_changed" not in text
+    assert text.count(
+        '"${{ github.event_name }}" == "pull_request" || '
+        '"${{ github.event_name }}" == "merge_group"'
+    ) == 3
 
 
 def test_default_ci_keeps_main_pushes_targeted_and_manual_runs_full() -> None:
@@ -309,13 +321,155 @@ def test_readme_contract_check_uses_the_pinned_node_version() -> None:
     assert check["run"] == "node scripts/check-readme-locales.mjs"
 
 
-def test_desktop_ci_runs_profile_substrate_unit_tests() -> None:
+def test_managed_toolchain_artifacts_cover_native_macos_architectures_and_musl() -> None:
+    workflow = _workflow("managed-toolchain-artifacts.yml")
+    assert _trigger_keys(workflow) == {"workflow_call", "workflow_dispatch"}
+    validate = workflow["jobs"]["validate"]
+    matrix = validate["strategy"]["matrix"]["include"]
+
+    assert {entry["runner"] for entry in matrix} == {
+        "ubuntu-24.04",
+        "ubuntu-24.04-arm",
+        "macos-15",
+        "macos-15-intel",
+        "windows-2022",
+    }
+    assert {entry["platform_key"] for entry in matrix} == {
+        "linux-x64",
+        "linux-arm64",
+        "darwin-arm64",
+        "darwin-x64",
+        "windows-x64",
+    }
+    assert all(entry["paper_platform_key"] for entry in matrix)
+    macos = {entry["runner"]: entry for entry in matrix if entry["runner"].startswith("macos-")}
+    assert macos == {
+        "macos-15": {
+            "label": "macOS Apple Silicon real artifacts",
+            "runner": "macos-15",
+            "platform_key": "darwin-arm64",
+            "paper_platform_key": "darwin-universal",
+        },
+        "macos-15-intel": {
+            "label": "macOS Intel real artifacts",
+            "runner": "macos-15-intel",
+            "platform_key": "darwin-x64",
+            "paper_platform_key": "darwin-universal",
+        },
+    }
+
+    assert "OPENSQUILLA_GATEWAY_STATE_DIR" not in validate["env"]
+    assert "OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT" not in validate["env"]
+    assert validate["env"]["OPENSQUILLA_REQUIRE_MANAGED_TOOLCHAIN_E2E"] == "1"
+
+    configure_state = next(
+        step
+        for step in validate["steps"]
+        if step.get("name") == "Configure isolated managed-toolchain state"
+    )
+    assert configure_state["shell"] == "bash"
+    assert "$RUNNER_TEMP" in configure_state["run"]
+    assert "OPENSQUILLA_GATEWAY_STATE_DIR=" in configure_state["run"]
+    assert "OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT=" in configure_state["run"]
+    assert "$GITHUB_ENV" in configure_state["run"]
+
+    paper_smoke = next(
+        step
+        for step in validate["steps"]
+        if step.get("name") == "Validate real pinned paper archive and capability smoke"
+    )["run"]
+    assert "--component paper-tex" in paper_smoke
+    assert "--expect-platform-key ${{ matrix.paper_platform_key }}" in paper_smoke
+    assert (
+        "${{ matrix.platform_key == 'linux-x64' && '--check-runtime-hot-path' || '' }}"
+        in paper_smoke
+    )
+    media_smoke = next(
+        step
+        for step in validate["steps"]
+        if step.get("name") == "Validate real pinned media archives and capability smoke"
+    )["run"]
+    assert "--component media-ffmpeg" in media_smoke
+    assert "--expect-platform-key ${{ matrix.platform_key }}" in media_smoke
+    assert "--check-runtime-hot-path" not in media_smoke
+    paper_compile = next(
+        step
+        for step in validate["steps"]
+        if step.get("name") == "Compile the default four-page paper with the managed toolchain"
+    )["run"]
+    assert "test_meta_default_compact_contract_compiles_real_content_to_four_pages" in paper_compile
+
+    musl = workflow["jobs"]["validate-musl-paper"]
+    assert musl["runs-on"] == "ubuntu-24.04"
+    assert musl["container"]["image"] == "python:3.12-alpine"
+    assert musl["env"]["PYTHONPATH"] == "${{ github.workspace }}/src"
+    assert musl["steps"][0] == {
+        "name": "Prepare Alpine action runtime",
+        "run": "apk add --no-cache fontconfig git nodejs",
+    }
+    smoke = next(
+        step
+        for step in musl["steps"]
+        if step.get("name") == "Validate native musl TinyTeX archive and capability smoke"
+    )
+    command = smoke["run"]
+    assert "validate_managed_toolchain_artifacts_stdlib.py" in command
+    assert "--component paper-tex" in command
+    assert "--expect-platform-key linux-musl-x64" in command
+    assert "media-ffmpeg" not in command
+
+
+def test_musl_toolchain_validator_bootstrap_is_stdlib_only() -> None:
+    script = Path("scripts/validate_managed_toolchain_artifacts_stdlib.py")
+    result = subprocess.run(
+        [sys.executable, "-S", str(script), "--help"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "--component {paper-tex,media-ffmpeg}" in result.stdout
+    assert "--expect-platform-key" in result.stdout
+
+
+def test_toolchain_validator_platform_assertion_never_overrides_detection(
+    tmp_path: Path,
+) -> None:
+    script = Path("scripts/validate_managed_toolchain_artifacts_stdlib.py")
+    root = tmp_path / "managed-toolchains"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            str(script),
+            "--component",
+            "paper-tex",
+            "--root",
+            str(root),
+            "--expect-platform-key",
+            "not-the-native-host",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 1, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    mismatch = next(event for event in events if event["event"] == "platform_mismatch")
+    assert mismatch["expected_platform_key"] == "not-the-native-host"
+    assert mismatch["actual_platform_key"] != mismatch["expected_platform_key"]
+    assert not (root / "packages").exists()
+
+
+def test_desktop_ci_runs_primary_profile_substrate_unit_tests() -> None:
     data = _workflow("ci.yml")
     desktop_steps = data["jobs"]["desktop-check"]["steps"]
     unit_step = next(step for step in desktop_steps if step.get("name") == "Run desktop unit tests")
 
     assert "node scripts/test-desktop-profile-substrate.mjs" in unit_step["run"]
-    assert "node scripts/test-desktop-profile-context.mjs" in unit_step["run"]
+    assert "node scripts/test-desktop-profile-consolidation.mjs" in unit_step["run"]
 
 
 def test_pr_target_validator_allows_main_pull_requests(tmp_path: Path) -> None:
@@ -450,16 +604,31 @@ def test_pr_target_branch_workflow_runs_trusted_base_validator() -> None:
     data = _workflow("pr-target-branch.yml")
     text = (WORKFLOW_DIR / "pr-target-branch.yml").read_text(encoding="utf-8")
 
-    assert _trigger_keys(data) == {"pull_request"}
+    assert _trigger_keys(data) == {"pull_request", "merge_group"}
+    assert data["on"]["merge_group"]["types"] == ["checks_requested"]
     assert "pull_request_target" not in text
     assert "Validate target branch" in text
     assert "github.event.repository.default_branch" in text
     assert "hashFiles('.github/scripts/validate-pr-target-branch.sh') == ''" in text
     assert "github.event.pull_request.head.sha" in text
+    assert "github.event.merge_group.base_ref" in text
+    assert "github.event.merge_group.head_ref" in text
     assert "pull-requests: read" in text
     assert "PR_LABELS" in text
     assert "PR_NUMBER" in text
     assert ".github/scripts/validate-pr-target-branch.sh" in text
+
+
+def test_pr_target_validator_accepts_merge_group_base_ref(tmp_path: Path) -> None:
+    result = _validate_pr_target(tmp_path, base="refs/heads/main")
+
+    assert result.returncode == 0
+    assert "targets main" in result.stdout
+
+    blocked = _validate_pr_target(tmp_path, base="refs/heads/feature/private-target")
+
+    assert blocked.returncode == 1
+    assert "Ordinary pull requests should target main" in blocked.stderr
 
 
 def test_pr_body_lint_workflow_warns_from_trusted_base() -> None:
@@ -627,7 +796,119 @@ def test_ci_change_classifier_tracks_ci_dependency_and_release_changes(tmp_path:
         python_changed="true",
         platform_sensitive_changed="true",
         build_wheel_required="true",
+        toolchain_artifact_changed="true",
         full_required="true",
+    )
+
+
+def test_ci_change_classifier_requires_real_artifacts_for_toolchain_surfaces(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(
+        tmp_path,
+        [
+            "src/opensquilla/skills/toolchains/registry.py",
+            "src/opensquilla/skills/toolchains/manager.py",
+            "src/opensquilla/skills/toolchains/runtime.py",
+            "scripts/validate_managed_toolchain_artifacts.py",
+            "scripts/validate_managed_toolchain_artifacts_stdlib.py",
+        ],
+    )
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        windows_full_required="true",
+        python_changed="true",
+        platform_sensitive_changed="true",
+        build_wheel_required="true",
+        toolchain_artifact_changed="true",
+    )
+
+
+def test_ci_change_classifier_requires_real_artifacts_for_paper_contracts(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(
+        tmp_path,
+        [
+            "src/opensquilla/skills/runtime_env.py",
+            "src/opensquilla/skills/bundled/meta-paper-write/SKILL.md",
+            "src/opensquilla/skills/bundled/paper-artifact-runtime/scripts/run.py",
+            "src/opensquilla/skills/bundled/paper-citation-integrity-gate/scripts/audit.py",
+            "src/opensquilla/skills/bundled/paper-delivery-summary/SKILL.md",
+            "src/opensquilla/skills/bundled/paper-latex-sanitizer/scripts/sanitize.py",
+            "src/opensquilla/skills/bundled/paper-length-gate/scripts/audit.py",
+            "src/opensquilla/skills/bundled/paper-quality-gate/scripts/audit.py",
+            "src/opensquilla/skills/bundled/meta-short-drama/SKILL.md",
+            "src/opensquilla/skills/bundled/subtitle-burner/scripts/burn.py",
+            "src/opensquilla/skills/bundled/video-still-animator/scripts/animate.py",
+            "tests/test_skills/test_meta_paper_skills.py",
+            "tests/test_skills/test_managed_toolchains.py",
+        ],
+    )
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        test_changed="true",
+        windows_full_required="true",
+        python_changed="true",
+        platform_sensitive_changed="true",
+        build_wheel_required="true",
+        toolchain_artifact_changed="true",
+    )
+
+
+@pytest.mark.parametrize(
+    "paper_surface",
+    [
+        "src/opensquilla/skills/bundled/meta-paper-write/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-artifact-runtime/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-artifact-runtime/scripts/run.py",
+        "src/opensquilla/skills/bundled/paper-citation-integrity-gate/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-citation-integrity-gate/scripts/audit.py",
+        "src/opensquilla/skills/bundled/paper-delivery-summary/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-delivery-summary/scripts/render.py",
+        "src/opensquilla/skills/bundled/paper-latex-sanitizer/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-latex-sanitizer/scripts/sanitize.py",
+        "src/opensquilla/skills/bundled/paper-length-gate/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-length-gate/scripts/audit.py",
+        "src/opensquilla/skills/bundled/paper-quality-gate/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-quality-gate/scripts/audit.py",
+        "src/opensquilla/skills/bundled/paper-refbib-stub/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-refbib-stub/scripts/json_to_bib.py",
+        "src/opensquilla/skills/bundled/paper-source-readiness-gate/SKILL.md",
+        "src/opensquilla/skills/bundled/paper-source-readiness-gate/scripts/audit.py",
+    ],
+)
+def test_each_paper_truthfulness_surface_requires_real_artifacts(
+    tmp_path: Path,
+    paper_surface: str,
+) -> None:
+    outputs = _classify_changed_files(tmp_path, [paper_surface])
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        windows_full_required="true",
+        python_changed="true",
+        platform_sensitive_changed="true",
+        build_wheel_required="true",
+        toolchain_artifact_changed="true",
+    )
+
+
+def test_ci_change_classifier_requires_real_artifacts_for_dependency_changes(
+    tmp_path: Path,
+) -> None:
+    outputs = _classify_changed_files(tmp_path, ["uv.lock"])
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        dependency_changed="true",
+        release_changed="true",
+        windows_full_required="true",
+        python_changed="true",
+        build_wheel_required="true",
+        toolchain_artifact_changed="true",
     )
 
 
@@ -805,6 +1086,7 @@ def test_ci_change_classifier_runs_full_for_its_own_windows_gate(tmp_path: Path)
         python_changed="true",
         platform_sensitive_changed="true",
         build_wheel_required="true",
+        toolchain_artifact_changed="true",
         full_required="true",
     )
 
@@ -831,6 +1113,7 @@ def test_ci_change_classifier_fails_closed_for_future_ci_surfaces(tmp_path: Path
         python_changed="true",
         platform_sensitive_changed="true",
         build_wheel_required="true",
+        toolchain_artifact_changed="true",
         full_required="true",
     )
 
@@ -963,6 +1246,7 @@ def test_ci_change_classifier_run_all_requires_full_ci(tmp_path: Path) -> None:
         python_changed="true",
         platform_sensitive_changed="true",
         build_wheel_required="true",
+        toolchain_artifact_changed="true",
         full_required="true",
     )
 
@@ -978,19 +1262,33 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "desktop_changed == 'true'" in jobs["desktop-check"]["if"]
     assert "python_changed == 'true'" in jobs["ubuntu-quality"]["if"]
     assert "full_required == 'true'" in jobs["ubuntu-full"]["if"]
-    assert "platform_sensitive_changed == 'true'" in jobs["windows-compat"]["if"]
+    assert jobs["windows-compat"]["if"] == (
+        "${{ (needs.classify-changes.outputs.python_changed == 'true' || "
+        "needs.classify-changes.outputs.platform_sensitive_changed == 'true' || "
+        "needs.classify-changes.outputs.dependency_changed == 'true' || "
+        "needs.classify-changes.outputs.release_changed == 'true') && "
+        "needs.classify-changes.outputs.windows_full_required != 'true' && "
+        "needs.classify-changes.outputs.full_required != 'true' }}"
+    )
     assert "windows_full_required == 'true'" in jobs["windows-full"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["macos-recovery"]["if"]
     assert "desktop_changed == 'true'" in jobs["macos-recovery"]["if"]
     assert "frontend_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
     assert "desktop_changed == 'true'" in jobs["desktop-recovery-e2e"]["if"]
+    assert "platform_sensitive_changed == 'true'" in jobs["webui-chat-recovery"]["if"]
     assert "release_changed == 'true'" in jobs["release-packaging"]["if"]
     assert "tui-check" in jobs["ci-result"]["needs"]
+    assert "webui-chat-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-check" in jobs["ci-result"]["needs"]
     assert "ubuntu-full" in jobs["ci-result"]["needs"]
     assert "macos-recovery" in jobs["ci-result"]["needs"]
     assert "desktop-recovery-e2e" in jobs["ci-result"]["needs"]
+    assert "managed-toolchain-artifacts" in jobs["ci-result"]["needs"]
+    artifact_e2e = jobs["managed-toolchain-artifacts"]
+    assert artifact_e2e["uses"] == "./.github/workflows/managed-toolchain-artifacts.yml"
+    assert "toolchain_artifact_changed == 'true'" in artifact_e2e["if"]
+    assert "full_required == 'true'" in artifact_e2e["if"]
 
 
 def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> None:
@@ -1008,6 +1306,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "workflow-lint",
         "readme-locale-check",
         "frontend-check",
+        "webui-chat-recovery",
         "tui-check",
         "desktop-check",
         "ubuntu-quality",
@@ -1017,6 +1316,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "macos-recovery",
         "desktop-recovery-e2e",
         "release-packaging",
+        "managed-toolchain-artifacts",
     }
     assert gate_step["run"] == "python .github/scripts/check_ci_results.py"
     assert gate_step["env"]["RESULT_UBUNTU_FULL"] == "${{ needs.ubuntu-full.result }}"
@@ -1025,6 +1325,9 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
     )
     assert gate_step["env"]["RESULT_DESKTOP_RECOVERY_E2E"] == (
         "${{ needs.desktop-recovery-e2e.result }}"
+    )
+    assert gate_step["env"]["RESULT_MANAGED_TOOLCHAIN_ARTIFACTS"] == (
+        "${{ needs.managed-toolchain-artifacts.result }}"
     )
     assert set(key for key in gate_step["env"] if key.startswith("FLAG_")) == {
         "FLAG_DOCS_ONLY",
@@ -1040,6 +1343,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "FLAG_PYTHON_CHANGED",
         "FLAG_PLATFORM_SENSITIVE_CHANGED",
         "FLAG_BUILD_WHEEL_REQUIRED",
+        "FLAG_TOOLCHAIN_ARTIFACT_CHANGED",
         "FLAG_FULL_REQUIRED",
     }
 
@@ -1049,10 +1353,12 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     steps = job["steps"]
 
     assert job["strategy"]["fail-fast"] is False
-    assert job["strategy"]["matrix"]["os"] == [
-        "ubuntu-latest",
-        "macos-latest",
-        "windows-latest",
+    assert job["strategy"]["matrix"]["include"] == [
+        {"os": "ubuntu-latest", "shard": "all"},
+        {"os": "macos-latest", "shard": "all"},
+        {"os": "windows-latest", "shard": "profiles"},
+        {"os": "windows-latest", "shard": "ownership"},
+        {"os": "windows-latest", "shard": "workbench"},
     ]
     download = next(
         step for step in steps if step.get("name") == "Download verified frontend artifact"
@@ -1064,6 +1370,12 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         if step.get("name") == "Verify downloaded frontend artifact on consumer OS"
     )
     build = next(step for step in steps if step.get("name") == "Build Desktop TypeScript")
+    session_recovery = next(
+        step
+        for step in steps
+        if step.get("name")
+        == "Run cross-platform production-dist browser session hang contract"
+    )
     run = next(
         step for step in steps if step.get("name") == "Run compiled Desktop recovery flows"
     )
@@ -1078,14 +1390,71 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
         "src/opensquilla/gateway/static/dist"
     )
     assert build["run"] == "npm run build"
+    assert session_recovery["working-directory"] == "opensquilla-webui"
+    assert session_recovery["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
+    assert session_recovery["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
+    assert "history-hydration.spec.ts" in session_recovery["run"]
+    assert '--grep "terminates stalled"' in session_recovery["run"]
     assert "xvfb-run -a node" in run["run"]
-    assert "test-profile-recovery-flow.mjs" in run["run"]
-    assert "test-profile-recovery-accessibility.mjs" in run["run"]
+    assert "test-profile-consolidation-flow.mjs" in run["run"]
+    assert "test-primary-repair-accessibility.mjs" in run["run"]
     assert "test-profile-import-flow.mjs" in run["run"]
-    assert "test-unsafe-profile-no-write.mjs" in run["run"]
+    assert "test-desktop-cleanup-flow.mjs" in run["run"]
+    assert "test-desktop-gateway-ownership.mjs" in run["run"]
+    assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
+    assert 'case "${{ matrix.shard }}" in' in run["run"]
+    assert 'local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"' in run["run"]
+    assert '[[ "${RUNNER_OS}" == "Windows" ]]' in run["run"]
+    assert "grep -Fq 'Gateway did not become healthy'" in run["run"]
+    assert 'run_case "${name}" "${script}" 2' in run["run"]
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"
-    assert "github.run_attempt" in upload["with"]["name"]
+    assert upload["with"]["name"] == (
+        "desktop-recovery-e2e-${{ matrix.os }}-${{ matrix.shard }}"
+        "-attempt-${{ github.run_attempt }}"
+    )
+
+
+def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
+    job = _workflow("ci.yml")["jobs"]["webui-chat-recovery"]
+    steps = job["steps"]
+    download = next(
+        step for step in steps if step.get("name") == "Download verified frontend artifact"
+    )
+    install_gateway = next(
+        step for step in steps if step.get("name") == "Install Gateway dependencies"
+    )
+    run = next(
+        step
+        for step in steps
+        if step.get("name")
+        == "Run production-dist chat and Goal recovery browser contracts"
+    )
+
+    assert job["needs"] == ["classify-changes", "frontend-check"]
+    assert download["with"]["name"] == "opensquilla-webui-dist"
+    assert download["with"]["path"] == "src/opensquilla/gateway/static/dist/"
+    assert steps.index(download) < steps.index(install_gateway) < steps.index(run)
+    assert install_gateway["run"] == "uv sync --frozen"
+    assert job["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
+    assert job["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
+    selected_specs = {
+        argument
+        for argument in run["run"].split()
+        if argument.endswith(".spec.ts")
+    }
+    required_specs = {
+        "assistant-activity.spec.ts",
+        "composer-paste.spec.ts",
+        "goal-mode.spec.ts",
+        "history-hydration.spec.ts",
+        "queue-steer.spec.ts",
+        "session-created-card.spec.ts",
+        "share.spec.ts",
+    }
+    assert selected_specs == required_specs
+    for spec in required_specs:
+        assert (Path("opensquilla-webui/e2e") / spec).is_file()
 
 
 def test_windows_smoke_does_not_install_bun_by_default() -> None:
@@ -1100,6 +1469,12 @@ def test_windows_smoke_does_not_install_bun_by_default() -> None:
     tui_steps = jobs["tui-check"]["steps"]
     assert any(step.get("uses") == "oven-sh/setup-bun@v2" for step in tui_steps)
     assert any("bun run test:bun" in step.get("run", "") for step in tui_steps)
+
+    bun_test = next(step for step in tui_steps if step.get("name") == "Run OpenTUI Bun tests")
+    bun_run = bun_test["run"]
+    assert "for attempt in 1 2" in bun_run
+    assert 'status" -ne 132' in bun_run
+    assert "retrying once" in bun_run
 
 
 def test_windows_high_risk_job_runs_parallel_reported_shards() -> None:
@@ -1492,3 +1867,37 @@ def test_wheelhouse_release_hydrates_current_router_bundle() -> None:
     assert 'root / "router.runtime.yaml"' in text
     assert "intent_head.joblib" not in text
     assert "router_model.onnx" not in text
+
+
+def test_linux_desktop_recovery_e2e_scripts_preserve_x11_authority() -> None:
+    """The xvfb display needs ``DISPLAY`` and ``XAUTHORITY`` to survive scrubbing.
+
+    These harnesses strip credential-shaped variables from the Electron child
+    environment, and ``XAUTHORITY`` matches that pattern.  Dropping it makes the
+    ubuntu Desktop recovery E2E job fail with ``Missing X server or $DISPLAY``,
+    so every harness that scrubs must exempt the X11 variables.
+    """
+
+    data = _workflow("ci.yml")
+    steps = data["jobs"]["desktop-recovery-e2e"]["steps"]
+    step = next(
+        item for item in steps if item.get("name") == "Run compiled Desktop recovery flows"
+    )
+    run = step["run"]
+    assert "xvfb-run" in run, "the Linux branch must provide a virtual display"
+
+    scripts = re.findall(r"'[a-z0-9-]+:(scripts/[A-Za-z0-9_./-]+\.mjs)'", run)
+    assert scripts, "no Desktop recovery E2E scripts were found in ci.yml"
+
+    exemption = "name === 'DISPLAY' || name === 'XAUTHORITY'"
+    for relative in scripts:
+        path = Path("desktop/electron") / relative
+        assert path.is_file(), f"missing Desktop recovery E2E script: {path}"
+        source = path.read_text(encoding="utf-8")
+        if "CREDENTIAL|AUTH" not in source:
+            continue
+        assert exemption in source, (
+            f"{path} scrubs credential-shaped environment variables without exempting "
+            "DISPLAY/XAUTHORITY, so the ubuntu Desktop recovery E2E job will fail with "
+            "'Missing X server or $DISPLAY'"
+        )

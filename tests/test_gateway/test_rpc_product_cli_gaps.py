@@ -173,7 +173,7 @@ def test_sessions_delete_is_write_scope_and_allows_remote_operator():
 
     On the default Docker bind (``OPENSQUILLA_LISTEN=0.0.0.0``) the gateway is not a
     loopback bind, so even a ``127.0.0.1`` peer is not the local owner and is granted
-    only :data:`REMOTE_OPERATOR_SCOPES` (read/write/approvals, no admin). While
+    only :data:`REMOTE_OPERATOR_SCOPES` (read/write, no approvals or admin). While
     ``sessions.delete`` was admin-gated, every such delete failed with
     ``UNAUTHORIZED`` and the UI showed "Failed to delete session". It is now
     write-scoped like its sibling destructive ops (reset/truncate), so a remote
@@ -202,6 +202,32 @@ def test_sessions_delete_is_write_scope_and_allows_remote_operator():
     )
     assert denied is False
     assert missing_admin == ADMIN_SCOPE
+
+
+def test_sessions_rename_is_write_scope_without_weakening_patch():
+    dispatcher = get_dispatcher()
+    rename_entry = dispatcher.get_entry("sessions.rename")
+    patch_entry = dispatcher.get_entry("sessions.patch")
+
+    assert METHOD_SCOPES["sessions.rename"] == WRITE_SCOPE
+    assert rename_entry is not None
+    assert rename_entry.required_scope == WRITE_SCOPE
+    assert authorize_call(
+        "sessions.rename",
+        rename_entry.required_scope,
+        "operator",
+        REMOTE_OPERATOR_SCOPES,
+    ) == (True, None)
+
+    assert METHOD_SCOPES["sessions.patch"] == ADMIN_SCOPE
+    assert patch_entry is not None
+    assert patch_entry.required_scope == ADMIN_SCOPE
+    assert authorize_call(
+        "sessions.patch",
+        patch_entry.required_scope,
+        "operator",
+        REMOTE_OPERATOR_SCOPES,
+    ) == (False, ADMIN_SCOPE)
 
 
 @pytest.mark.asyncio
@@ -1279,6 +1305,183 @@ async def test_providers_status_honors_configured_active_api_key_env(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_providers_status_probe_surfaces_classified_active_error(monkeypatch):
+    from opensquilla.provider.selector import ModelListResult, ProviderListError
+
+    leaked = "sk-or-v1-abcdefghijklmnopqrstuvwxyz"
+
+    class _Selector:
+        is_configured = True
+
+        async def list_models_detailed(self):
+            return ModelListResult(
+                errors=[
+                    ProviderListError(
+                        provider="openrouter",
+                        model_hint="openrouter/model",
+                        kind="auth_invalid",
+                        detail=f"HTTP 401 invalid key {leaked}",
+                    )
+                ]
+            )
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/model",
+            "api_key": "synthetic-unclassified-key",
+        }
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "providers.status",
+        {"provider": "openrouter", "probeModels": True},
+        _ctx(config=cfg, provider_selector=_Selector()),
+    )
+
+    assert res.error is None, res.error
+    probe = res.payload["providers"][0]["modelProbe"]
+    assert probe["status"] == "error"
+    assert probe["count"] == 0
+    assert probe["failureKind"] == "auth_invalid"
+    assert leaked not in repr(res.payload)
+
+
+@pytest.mark.asyncio
+async def test_providers_status_probe_distinguishes_empty_and_degraded_catalogs(
+    monkeypatch,
+):
+    from opensquilla.provider.selector import ModelListResult, ProviderListError
+
+    class _Selector:
+        is_configured = True
+
+        def __init__(self):
+            self.result = ModelListResult()
+
+        async def list_models_detailed(self):
+            return self.result
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    selector = _Selector()
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/model",
+            "api_key": "synthetic-unclassified-key",
+        }
+    )
+    ctx = _ctx(config=cfg, provider_selector=selector)
+
+    empty = await get_dispatcher().dispatch(
+        "r-empty",
+        "providers.status",
+        {"provider": "openrouter", "probeModels": True},
+        ctx,
+    )
+    empty_probe = empty.payload["providers"][0]["modelProbe"]
+    assert empty_probe == {
+        "attempted": True,
+        "status": "ok",
+        "count": 0,
+        "error": None,
+        "failureKind": None,
+    }
+
+    selector.result = ModelListResult(
+        models=[{"provider": "openrouter", "model_id": "available/model"}],
+        errors=[
+            ProviderListError(
+                provider="openrouter",
+                model_hint="fallback/model",
+                kind="rate_limited",
+                detail="HTTP 429",
+            )
+        ],
+    )
+    degraded = await get_dispatcher().dispatch(
+        "r-degraded",
+        "providers.status",
+        {"provider": "openrouter", "probeModels": True},
+        ctx,
+    )
+    degraded_probe = degraded.payload["providers"][0]["modelProbe"]
+    assert degraded_probe["status"] == "degraded"
+    assert degraded_probe["count"] == 1
+    assert degraded_probe["failureKind"] == "rate_limited"
+
+
+@pytest.mark.asyncio
+async def test_providers_status_conflict_blocks_probe_before_selector_call(monkeypatch):
+    calls = 0
+
+    class _Selector:
+        is_configured = True
+
+        async def list_models_detailed(self):
+            nonlocal calls
+            calls += 1
+            raise AssertionError("provider conflict must block the probe")
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "api_key": "sk_tr_abcdefghijklmnop",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r-conflict",
+        "providers.status",
+        {"probeModels": True},
+        _ctx(config=cfg, provider_selector=_Selector()),
+    )
+
+    assert res.error is None, res.error
+    assert calls == 0
+    assert res.payload["providerResolution"]["actionRequired"] is True
+    assert res.payload["providerResolution"]["effectiveProvider"] == ""
+    assert res.payload["providerResolution"]["reasonCode"] == (
+        "providerless_provider_conflict"
+    )
+    active = next(row for row in res.payload["providers"] if row["active"])
+    assert active["configured"] is False
+    assert active["modelProbe"]["status"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_providers_status_blocks_key_for_conflicting_official_endpoint():
+    cfg = GatewayConfig(
+        llm={
+            "provider": "tokenrhythm",
+            "api_key": "sk_tr_abcdefghijklmnop",
+            "base_url": "https://openrouter.ai/api/v1",
+        }
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r-endpoint-conflict",
+        "providers.status",
+        {"provider": "tokenrhythm", "probeModels": True},
+        _ctx(config=cfg),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["providerResolution"]["actionRequired"] is True
+    assert res.payload["providerResolution"]["reasonCode"] == (
+        "credential_endpoint_provider_mismatch"
+    )
+    active = res.payload["providers"][0]
+    assert active["configured"] is False
+    assert active["buildable"] is False
+    assert active["modelProbe"]["attempted"] is False
+
+
+@pytest.mark.asyncio
 async def test_providers_status_reports_ok_api_key_shape_and_null_latency(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     cfg = GatewayConfig(
@@ -1488,6 +1691,44 @@ async def test_search_status_and_query_return_structured_payloads():
     assert query.error is None, query.error
     assert query.payload["ok"] is True
     assert query.payload["results"][0]["snippet"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_search_status_reports_the_precondition_that_denies_query(tmp_path):
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.integration import configure_runtime
+
+    register_provider(
+        "fake_search_ok",
+        FakeSearchProvider,
+        SearchProviderSpec(provider_id="fake_search_ok"),
+    )
+    configure_search("fake_search_ok", max_results=4, diagnostics=True)
+    configure_runtime(
+        SandboxSettings(
+            sandbox=True,
+            security_grading=True,
+            network_default="proxy_allowlist",
+        ),
+        workspace=tmp_path,
+    )
+
+    status = await get_dispatcher().dispatch("r1", "search.status", {}, _ctx())
+    query = await get_dispatcher().dispatch(
+        "r2",
+        "search.query",
+        {"query": "hello", "limit": 2},
+        _ctx(),
+    )
+
+    assert status.error is None, status.error
+    assert status.payload["networkReady"] is False
+    reason = status.payload["networkBlockedReason"]
+    assert "Run Context grants" in reason
+    assert query.error is None, query.error
+    assert query.payload["ok"] is False
+    assert query.payload["error"]["kind"] == "policy_denied"
+    assert query.payload["error"]["message"] == reason
 
 
 @pytest.mark.asyncio

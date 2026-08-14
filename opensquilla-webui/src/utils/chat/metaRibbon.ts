@@ -60,6 +60,14 @@ export const RESCUE_ACTION_IDS = new Set<string>([
   'switch-meta-skill',
   'install-dependency',
   'continue-text-only',
+  'review-paid-submit',
+])
+
+// The backend still accepts this action for compatibility, but today it has
+// the same seed semantics as retry-step. Do not render two controls that imply
+// a choice the runtime does not actually provide.
+const SUPPRESSED_EQUIVALENT_RESCUE_ACTION_IDS = new Set<string>([
+  'retry-with-partial-context',
 ])
 
 const STATE_VALUES: MetaStepState[] = [
@@ -315,7 +323,11 @@ export function failSummary(
   const summary = copy.failedSummary(failedStep.label, truncate(errText, 80))
   const rescueActions =
     failedStep.rescue && Array.isArray(failedStep.rescue.actions)
-      ? failedStep.rescue.actions.filter((action) => action && RESCUE_ACTION_IDS.has(String(action.id)))
+      ? failedStep.rescue.actions.filter((action) => (
+          action
+          && RESCUE_ACTION_IDS.has(String(action.id))
+          && !SUPPRESSED_EQUIVALENT_RESCUE_ACTION_IDS.has(String(action.id))
+        ))
       : []
   const buttons: RibbonRescueButton[] =
     rescueActions.length > 0

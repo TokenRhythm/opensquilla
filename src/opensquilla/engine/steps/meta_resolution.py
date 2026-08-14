@@ -134,6 +134,12 @@ def _sticky_drop(session_id: str) -> None:
         _meta_sticky_cache.pop(session_id, None)
 
 
+def evict_meta_sticky(session_id: str) -> None:
+    """Drop sticky meta state for one durable session generation."""
+
+    _sticky_drop(session_id)
+
+
 def _clamp_thinking_for_meta(ctx: TurnContext) -> None:
     """Force ``thinking_level=low`` on a meta-matched turn.
 

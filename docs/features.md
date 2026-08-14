@@ -75,6 +75,15 @@ Durable agents provide named identities and defaults for recurring workstreams.
 
 Read: [`sessions.md`](sessions.md) and [`agents.md`](agents.md)
 
+### Goal Mode
+
+Goal mode keeps one durable objective and a structured progress checklist on a
+session. It can continue through ordinary agent turns while a subscribed Web UI
+or CLI owner remains connected, pauses safely on disconnect or restart, and
+defers automatic work while Plan mode is active.
+
+Read: [`goal-mode.md`](goal-mode.md)
+
 ### Usage, Diagnostics, and Permissions
 
 Usage reports explain recent model spend. Diagnostics and replay help inspect a
@@ -137,8 +146,8 @@ Bundled user-facing skills include:
 - `sub-agent`
 - `skill-creator`
 
-Retained bundled MetaSkills include `meta-kid-project-planner`,
-`meta-paper-write`, `meta-short-drama`, and `meta-skill-creator`. Experimental
+Retained bundled MetaSkills include `meta-paper-write`, `meta-short-drama`, and
+`meta-skill-creator`. Experimental
 MetaSkills may exist in development trees, but they are not presented as stable
 built-in product capabilities.
 

@@ -3,6 +3,8 @@ import type {
   CompactionPayload,
   CronResultPayload,
   EnsembleProgressPayload,
+  InputDispositionPayload,
+  ProviderActivityPayload,
   RouterDecisionPayload,
   SessionEventPayload,
   SubagentCompletionPayload,
@@ -26,8 +28,10 @@ export type ChatRpcSubscriptionHandlers = {
   onArtifact: (payload: ArtifactPayload) => void
   onStateChange: (payload: SessionEventPayload) => void
   onRunHeartbeat: (payload: SessionEventPayload) => void
+  onProviderActivity: (payload: ProviderActivityPayload) => void
   onCompaction: (payload: CompactionPayload, meta: unknown) => void
   onWarning: (payload: WarningPayload) => void
+  onInputDisposition: (payload: InputDispositionPayload) => void
   onCronResult: (payload: CronResultPayload) => void
   onSubagentCompletion: (payload: SubagentCompletionPayload) => void
   onEpochChanged: (payload: SessionEventPayload) => void
@@ -61,8 +65,10 @@ export function useChatRpcSubscriptions(
       rpc.on('session.event.artifact', handlers.onArtifact),
       rpc.on('session.event.state_change', handlers.onStateChange),
       rpc.on('session.event.run_heartbeat', handlers.onRunHeartbeat),
+      rpc.on('session.event.provider_activity', handlers.onProviderActivity),
       rpc.on('session.event.compaction', handlers.onCompaction),
       rpc.on('session.event.warning', handlers.onWarning),
+      rpc.on('session.event.input_disposition', handlers.onInputDisposition),
       rpc.on('session.event.cron_result', handlers.onCronResult),
       rpc.on('session.event.subagent_completion', handlers.onSubagentCompletion),
       rpc.on('session.epoch_changed', handlers.onEpochChanged),

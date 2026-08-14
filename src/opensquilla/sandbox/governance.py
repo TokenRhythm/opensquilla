@@ -38,6 +38,7 @@ from opensquilla.sandbox.stale_output_cache import StaleOutputCache, get_stale_o
 from opensquilla.sandbox.types import (
     ALLOW,
     ApprovalDecision,
+    ApprovedHostExecution,
     DenialReason,
     DenialResult,
     FollowupTag,
@@ -50,7 +51,7 @@ from opensquilla.sandbox.types import (
 log = logging.getLogger(__name__)
 
 DEFAULT_DENIAL_THRESHOLD = 3
-DEFAULT_APPROVAL_TIMEOUT_S = 300.0
+DEFAULT_APPROVAL_TIMEOUT_S: float | None = None
 
 
 # ─── Fingerprinting ────────────────────────────────────────────────────────
@@ -100,6 +101,8 @@ class _ApprovalQueueLike(Protocol):
     async def wait(self, approval_id: str, timeout: float | None = ...) -> bool: ...
 
     def resolve(self, approval_id: str, approved: bool) -> None: ...
+
+    def consume(self, approval_id: str) -> None: ...
 
 
 # ─── Denial ledger ─────────────────────────────────────────────────────────
@@ -239,6 +242,55 @@ _THRESHOLD_NEXT_STEP = SuggestedNextStep.ASK_USER
 _REPEAT_INTENT_NEXT_STEP = SuggestedNextStep.NARROWER_APPROVAL
 _POLICY_DENY_NEXT_STEP = SuggestedNextStep.REPLAN
 _NETWORK_ACTION_PREFIXES = ("network.", "web.")
+_L3_HOST_EXEC_ACTIONS = frozenset({"shell.exec", "shell.background", "code.exec"})
+
+
+def _channel_approval_routing(
+    request: SandboxRequest,
+    policy: SandboxPolicy,
+    *,
+    fingerprint: str,
+    session_id: str,
+) -> dict[str, object] | DenialResult | None:
+    """Return the verified route for a Channel approval, or deny it closed.
+
+    Channel turns do not have a local approval surface. A queued approval must
+    therefore carry the authenticated sender and exact session key so the
+    channel notifier can deliver the prompt and authorize its response. Keep
+    this at the common governance gate because Safe mode actions reach
+    it without going through the managed-execution elevation helpers.
+    """
+
+    try:
+        from opensquilla.tools.types import CallerKind, current_tool_context
+
+        ctx = current_tool_context.get()
+    except Exception:  # pragma: no cover - context lookup is defensive
+        ctx = None
+    if ctx is None:
+        return None
+    caller_kind = getattr(ctx, "caller_kind", None)
+    if caller_kind is not CallerKind.CHANNEL and str(caller_kind) != CallerKind.CHANNEL.value:
+        return None
+
+    from opensquilla.sandbox.elevation import channel_admin_approval_identity
+
+    identity = channel_admin_approval_identity()
+    if identity is not None and session_id == identity[1]:
+        return {"senderId": identity[0], "sessionKey": identity[1]}
+
+    return DenialResult(
+        reason=DenialReason.POLICY_DENIED,
+        suggested_next_step=SuggestedNextStep.ASK_USER,
+        level=policy.level,
+        action_fingerprint=fingerprint,
+        message=(
+            "This Channel action cannot request approval because the authenticated "
+            "administrator sender or session route is unavailable. Ask a configured "
+            "channel administrator to retry it."
+        ),
+        retryable=False,
+    )
 
 
 class ApprovalGate:
@@ -247,7 +299,7 @@ class ApprovalGate:
     * If ``policy.require_approval`` is false, :meth:`gate` returns
       :data:`ALLOW` immediately.
     * Otherwise it enqueues an approval request on the provided queue,
-      awaits the human decision (with a timeout → deny), and returns
+      awaits the human decision for as long as the owning task lives, and returns
       :data:`ALLOW` on approve or a :class:`DenialResult` on reject.
     * ``namespace`` selects which approval queue namespace to use — the
       existing code uses ``"exec"`` for shell/code and ``"plugin"`` for
@@ -259,7 +311,7 @@ class ApprovalGate:
         queue: _ApprovalQueueLike,
         *,
         namespace: str = "exec",
-        timeout: float = DEFAULT_APPROVAL_TIMEOUT_S,
+        timeout: float | None = DEFAULT_APPROVAL_TIMEOUT_S,
     ) -> None:
         self._queue = queue
         self._namespace = namespace
@@ -331,6 +383,27 @@ class ApprovalGate:
         }
         if extra_params:
             params.update(extra_params)
+        channel_routing = _channel_approval_routing(
+            request,
+            policy,
+            fingerprint=fingerprint,
+            session_id=session_id,
+        )
+        if isinstance(channel_routing, DenialResult):
+            _log_decision(
+                request,
+                policy,
+                fingerprint,
+                decision="deny",
+                approval_required=True,
+                session_id=session_id,
+                reason=channel_routing.reason.value,
+            )
+            return channel_routing
+        if channel_routing is not None:
+            # The authenticated ingress identity takes precedence over any
+            # call-site metadata so a tool cannot select another recipient.
+            params.update(channel_routing)
         approval_id = self._queue.request(namespace=self._namespace, params=params)
         try:
             approved = await self._queue.wait(approval_id, timeout=self._timeout)
@@ -342,6 +415,34 @@ class ApprovalGate:
             approved = False
 
         if approved:
+            if (
+                policy.level is SecurityLevel.LOCKED
+                and request.action_kind in _L3_HOST_EXEC_ACTIONS
+            ):
+                try:
+                    self._queue.consume(approval_id)
+                except Exception as exc:
+                    result = DenialResult(
+                        reason=DenialReason.POLICY_DENIED,
+                        suggested_next_step=SuggestedNextStep.ASK_USER,
+                        level=policy.level,
+                        action_fingerprint=fingerprint,
+                        message=(
+                            "The approved L3 execution grant could not be consumed; "
+                            "the action was not executed."
+                        ),
+                        retryable=False,
+                    )
+                    _log_decision(
+                        request,
+                        policy,
+                        fingerprint,
+                        decision="deny",
+                        approval_required=True,
+                        session_id=session_id,
+                        reason=f"{result.reason.value}:{type(exc).__name__}",
+                    )
+                    return result
             _log_decision(
                 request,
                 policy,
@@ -350,6 +451,15 @@ class ApprovalGate:
                 approval_required=True,
                 session_id=session_id,
             )
+            if (
+                policy.level is SecurityLevel.LOCKED
+                and request.action_kind in _L3_HOST_EXEC_ACTIONS
+            ):
+                return ApprovedHostExecution(
+                    approval_id=approval_id,
+                    action_fingerprint=fingerprint,
+                    level=policy.level,
+                )
             return ALLOW
 
         result = DenialResult(

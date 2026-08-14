@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest'
 import { setActivePinia, createPinia } from 'pinia'
+import { nextTick } from 'vue'
 import en from '@/locales/en.json'
 import zhHans from '@/locales/zh-Hans.json'
 import de from '@/locales/de.json'
@@ -13,6 +14,8 @@ import i18n, {
   isSupportedLocale,
 } from '@/i18n'
 import { useAppStore } from '@/stores/app'
+import { useRpcStore } from '@/stores/rpc'
+import { useToasts } from '@/composables/useToasts'
 
 function flatten(obj: Record<string, unknown>, prefix = '', out: Record<string, unknown> = {}) {
   for (const [k, v] of Object.entries(obj)) {
@@ -110,8 +113,13 @@ describe('appStore locale state', () => {
   beforeEach(() => {
     setActivePinia(createPinia())
     localStorage.clear()
+    useToasts().toasts.value = []
     i18n.global.locale.value = 'en'
     document.documentElement.removeAttribute('lang')
+  })
+
+  afterEach(() => {
+    ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = undefined
   })
 
   it('setLocale loads the chunk, persists, and applies all side effects', async () => {
@@ -126,6 +134,86 @@ describe('appStore locale state', () => {
     expect(i18n.global.t('nav.sessions')).toBe('会话')
   })
 
+  it('syncs an explicit language selection to the Gateway channel-notice locale', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'connected'
+    rpc.methods = ['config.patch.safe']
+    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+    const store = useAppStore()
+
+    await store.setLocale('zh-Hans')
+
+    expect(call).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'control_ui.default_locale': 'zh-Hans' },
+    })
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBeNull()
+  })
+
+  it('keeps a disconnected explicit selection and syncs it after reconnect', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'disconnected'
+    rpc.methods = ['config.patch.safe']
+    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+    const store = useAppStore()
+
+    await store.setLocale('zh-Hans')
+
+    expect(call).not.toHaveBeenCalled()
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+    expect(localStorage.getItem('opensquilla-locale-sync-pending')).toBe('zh-Hans')
+    const toasts = useToasts().toasts.value
+    expect(toasts[toasts.length - 1]).toMatchObject({ tone: 'warn' })
+
+    rpc.state = 'connected'
+    await nextTick()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+
+    expect(call).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'control_ui.default_locale': 'zh-Hans' },
+    })
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('retries a pending locale sync after the connected handshake publishes methods', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'disconnected'
+    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+    const store = useAppStore()
+
+    await store.setLocale('zh-Hans')
+    rpc.state = 'connected'
+    await nextTick()
+    expect(call).not.toHaveBeenCalled()
+
+    rpc.methods = ['config.patch.safe']
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    expect(call).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'control_ui.default_locale': 'zh-Hans' },
+    })
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
+  it('retains a failed locale sync without rolling back the local interface', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'connected'
+    rpc.methods = ['config.patch.safe']
+    const call = vi.spyOn(rpc, 'call').mockRejectedValue(new Error('disk full'))
+    const store = useAppStore()
+
+    await store.setLocale('zh-Hans')
+
+    expect(store.locale).toBe('zh-Hans')
+    expect(store.pendingChannelNoticeLocale).toBe('zh-Hans')
+    const toasts = useToasts().toasts.value
+    expect(toasts[toasts.length - 1]).toMatchObject({ tone: 'warn' })
+
+    call.mockResolvedValueOnce({})
+    await store.syncLocaleToGateway()
+
+    expect(store.pendingChannelNoticeLocale).toBeNull()
+  })
+
   it('setLocale ignores unsupported codes (no throw, stays en)', async () => {
     const store = useAppStore()
     await store.setLocale('ko' as never)
@@ -138,6 +226,41 @@ describe('appStore locale state', () => {
     await store.initLocale()
     expect(store.locale).toBe('zh-Hans')
     expect(document.documentElement.getAttribute('lang')).toBe('zh-Hans')
+  })
+
+  it('initLocale never writes the Gateway locale from browser-local state', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'connected'
+    rpc.methods = ['config.patch.safe']
+    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+    localStorage.setItem('opensquilla-locale', 'zh-Hans')
+    const store = useAppStore()
+
+    await store.initLocale()
+
+    expect(store.locale).toBe('zh-Hans')
+    expect(call).not.toHaveBeenCalled()
+  })
+
+  it('syncs the Desktop client locale to the Gateway on startup', async () => {
+    const rpc = useRpcStore()
+    rpc.state = 'connected'
+    rpc.methods = ['config.patch.safe']
+    const call = vi.spyOn(rpc, 'call').mockResolvedValue({})
+    ;(window as unknown as { opensquillaDesktop?: unknown }).opensquillaDesktop = {
+      getOsLocale: async () => 'zh-CN',
+    }
+    const store = useAppStore()
+
+    await store.initLocale()
+
+    expect(store.locale).toBe('zh-Hans')
+    await vi.waitFor(() => {
+      expect(call).toHaveBeenCalledWith('config.patch.safe', {
+        patches: { 'control_ui.default_locale': 'zh-Hans' },
+      })
+    })
+    expect(store.pendingChannelNoticeLocale).toBeNull()
   })
 })
 
@@ -159,6 +282,11 @@ describe('catalog parity', () => {
     }
   })
 
+  it('warns that removing a goal does not recall current-task work', () => {
+    expect(en.chat.goal.removeConfirmBody).toContain('use Stop')
+    expect(zhHans.chat.goal.removeConfirmBody).toContain('请使用“停止”')
+  })
+
   it('no zh-Hans value is left as the English source', () => {
     const enFlat = flatten(en as Record<string, unknown>)
     const zhFlat = flatten(zhHans as Record<string, unknown>)
@@ -166,6 +294,45 @@ describe('catalog parity', () => {
       (k) => typeof zhFlat[k] === 'string' && zhFlat[k] === enFlat[k] && /[A-Za-z]/.test(zhFlat[k] as string),
     )
     expect(leaked).toEqual([])
+  })
+
+  it('uses model fusion consistently in zh-Hans ensemble copy', () => {
+    const zhFlat = flatten(zhHans as Record<string, unknown>)
+    const ensemblePrefixes = [
+      'setup.modelStrategy.',
+      'setup.router.',
+      'setup.ensemble.',
+      'chat.routerFx.',
+      'chat.msgMeta.',
+      'chat.routeFeedback.',
+    ]
+    const ensembleKeys = new Set([
+      'settings.rail.ensemble',
+      'setup.provider.activateEnsembleOnPreserved',
+      'setup.provider.routingDesc',
+      'setup.toast.ensembleSaved',
+      'chat.aiModelEnsembleRouter',
+      'chat.composer.modelRoutingEnsemble',
+      'chat.stream.synthesizingCandidates',
+    ])
+    const deprecated = Object.entries(zhFlat).filter(([key, value]) =>
+      typeof value === 'string'
+      && value.includes('聚合')
+      && (ensembleKeys.has(key) || ensemblePrefixes.some(prefix => key.startsWith(prefix))),
+    )
+
+    expect(deprecated).toEqual([])
+    expect({
+      rail: zhHans.settings.rail.ensemble,
+      setup: zhHans.setup.router.summaryEnsemble,
+      composer: zhHans.chat.composer.modelRoutingEnsemble,
+      runtime: zhHans.chat.routerFx.ensembleSelecting,
+    }).toEqual({
+      rail: '模型融合',
+      setup: 'AI 智能融合路由',
+      composer: 'AI 智能融合路由',
+      runtime: 'AI 智能融合路由 · 正在选择候选',
+    })
   })
 
   it('ships the approved Model Service labels in every locale', () => {
@@ -232,7 +399,6 @@ describe('catalog parity', () => {
     expect(en.setup.provider.recommendation).toEqual({
       title: 'Recommended: TokenRhythm',
       value: 'TokenRhythm API calls are free for a limited time.',
-      registration: 'During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.',
       cta: 'Register and get an API key',
       externalLabel: 'Register and get an API key — TokenRhythm (opens in a new tab)',
       stepsLabel: 'How to connect TokenRhythm',
@@ -245,7 +411,6 @@ describe('catalog parity', () => {
     expect(zhHans.setup.provider.recommendation).toEqual({
       title: '推荐使用 TokenRhythm',
       value: 'TokenRhythm API 调用限时免费。',
-      registration: '活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
       cta: '注册并获取 API Key',
       externalLabel: '注册并获取 API Key — TokenRhythm（在新标签页中打开）',
       stepsLabel: '如何接入 TokenRhythm',
@@ -259,10 +424,6 @@ describe('catalog parity', () => {
     for (const messages of [en, zhHans, ja, fr, de, es]) {
       const copy = messages.setup.provider.recommendation
       expect(copy.title).toContain('TokenRhythm')
-      expect(copy.registration).toContain('DeepSeek')
-      expect(copy.registration).toContain('GLM')
-      expect(copy.registration).toContain('MiniMax')
-      expect(copy.registration).toContain('Kimi')
       expect(copy.cta).toBeTruthy()
       expect(copy.externalLabel).toBeTruthy()
       expect(copy.externalLabel).toContain(copy.cta)
@@ -273,5 +434,18 @@ describe('catalog parity', () => {
       expect(copy.stepSelectAndPaste).toBeTruthy()
       expect(copy.stepReplaceAndPaste).toBeTruthy()
     }
+  })
+
+  it('ships English and Simplified Chinese image-onboarding copy', () => {
+    expect(en.setup.provider.imageGenerationOptInLabel)
+      .toBe('Also enable image generation (recommended)')
+    expect(zhHans.setup.provider.imageGenerationOptInLabel)
+      .toBe('同时启用图像生成（推荐）')
+    expect(en.setup.capabilities.imageRecommendationUse).toBe('Use {provider}')
+    expect(zhHans.setup.capabilities.imageRecommendationUse).toBe('使用 {provider}')
+    expect(en.setup.capabilities.imageRecommendationRegisterExternal)
+      .toContain('opens in a new tab')
+    expect(zhHans.setup.capabilities.imageRecommendationRegisterExternal)
+      .toContain('在新标签页中打开')
   })
 })

@@ -6,11 +6,10 @@ import re
 from enum import StrEnum
 from functools import lru_cache
 
+from opensquilla.agent_ids import normalize_agent_id, normalize_id_segment
+
 # Prototype-poisoning keys blocked for account_id normalization
 _POISONING_KEYS = frozenset({"__proto__", "constructor", "prototype", "hasownproperty"})
-
-_INVALID_CHARS = re.compile(r"[^a-z0-9_-]")
-_LEADING_TRAILING_DASHES = re.compile(r"^-+|-+$")
 
 
 class DmScope(StrEnum):
@@ -26,35 +25,12 @@ class PeerKind(StrEnum):
     CHANNEL = "channel"
 
 
-def _normalize_id(value: str, max_len: int = 64) -> str:
-    """Normalize an id segment: lowercase, replace invalid chars, strip dashes, cap length."""
-    v = value.strip().lower()
-    v = _INVALID_CHARS.sub("-", v)
-    v = _LEADING_TRAILING_DASHES.sub("", v)
-    return v[:max_len] if v else "default"
-
-
-@lru_cache(maxsize=512)
-def normalize_agent_id(agent_id: str | None) -> str:
-    """Return the canonical runtime agent id.
-
-    ``default`` was historically used by Web/RPC/CLI entrypoints as a
-    no-agent sentinel. Treat it as an alias for the real default agent,
-    ``main``, so sessions, workspaces, and memory stores do not split.
-    """
-    raw = str(agent_id or "").strip()
-    if not raw or raw.lower() == "default":
-        return "main"
-    normalized = _normalize_id(raw)
-    return "main" if normalized == "default" else normalized
-
-
 @lru_cache(maxsize=512)
 def normalize_account_id(account_id: str) -> str:
     lower = account_id.strip().lower()
     if lower in _POISONING_KEYS:
         return "default"
-    return _normalize_id(account_id) or "default"
+    return normalize_id_segment(account_id) or "default"
 
 
 def build_main_key(agent_id: str = "main") -> str:
@@ -149,7 +125,7 @@ def build_subagent_key(base_key: str) -> str:
 def build_subagent_session_key(agent_id: str, run_id: str) -> str:
     """Build the canonical agent-scoped subagent session key."""
     aid = normalize_agent_id(agent_id)
-    rid = _normalize_id(run_id)
+    rid = normalize_id_segment(run_id)
     return f"agent:{aid}:subagent:{rid}"
 
 
@@ -159,6 +135,18 @@ def is_subagent_key(session_key: str) -> bool:
     return key.startswith("subagent:") or bool(re.match(r"^agent:[^:]+:subagent:[^:]+$", key))
 
 
+def is_guest_webchat_key(session_key: str | None) -> bool:
+    """Return True for server-owned anonymous WebChat session keys."""
+
+    key = canonicalize_session_key(session_key)
+    return bool(
+        re.fullmatch(
+            r"agent:[^:]+:webchat:guest:[0-9a-f]{64}:[^:]+",
+            key.lower(),
+        )
+    )
+
+
 def allows_private_memory_prompt_injection(session_key: str | None) -> bool:
     """Return whether automatic private memory may be injected into a prompt."""
     key = canonicalize_session_key(session_key)
@@ -166,7 +154,11 @@ def allows_private_memory_prompt_injection(session_key: str | None) -> bool:
         return True
 
     key_lower = key.lower()
-    if is_subagent_key(key_lower) or key_lower.startswith("cron:"):
+    if (
+        is_subagent_key(key_lower)
+        or is_guest_webchat_key(key_lower)
+        or key_lower.startswith("cron:")
+    ):
         return False
 
     chat_type = derive_chat_type(key_lower)

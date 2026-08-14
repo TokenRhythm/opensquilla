@@ -15,7 +15,13 @@ from typing import Any
 
 import pytest
 
-from opensquilla.engine.types import ErrorEvent, TextDeltaEvent, ToolUseStartEvent
+from opensquilla.engine.types import (
+    DoneEvent,
+    ErrorEvent,
+    TextDeltaEvent,
+    ThinkingEvent,
+    ToolUseStartEvent,
+)
 from opensquilla.gateway.boot import (
     TaskRuntimeStreamError,
     _emit_task_runtime_stream_events,
@@ -82,6 +88,67 @@ async def test_emit_stamps_task_id_on_every_stream_event() -> None:
         "session.event.text_delta",
     ]
     assert all(payload.get("task_id") == "task-A" for _, _, payload in emitted)
+
+
+@pytest.mark.asyncio
+async def test_emit_preserves_thinking_start_time() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield ThinkingEvent(text="checking", started_at=1_234_567)
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    await _emit_task_runtime_stream_events(
+        _stream(),
+        SESSION,
+        _emitter,
+        idle_timeout=5.0,
+        heartbeat_interval=0.0,
+    )
+
+    assert emitted == [
+        (
+            SESSION,
+            "session.event.thinking",
+            {"text": "checking", "started_at": 1_234_567},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_emit_preserves_typed_silent_reply_done_contract() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield DoneEvent(
+            text="",
+            text_snapshot="",
+            delivery="suppressed",
+            suppression_reason="no_reply",
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    await _emit_task_runtime_stream_events(
+        _stream(),
+        SESSION,
+        _emitter,
+        idle_timeout=5.0,
+        heartbeat_interval=0.0,
+        input_mode="system_event",
+        run_kind="goal",
+    )
+
+    _, event_name, payload = emitted[0]
+    assert event_name == "session.event.done"
+    assert payload["text_snapshot"] == ""
+    assert payload["delivery"] == "suppressed"
+    assert payload["suppression_reason"] == "no_reply"
+    assert payload["input_mode"] == "system_event"
+    assert payload["run_kind"] == "goal"
 
 
 @pytest.mark.asyncio

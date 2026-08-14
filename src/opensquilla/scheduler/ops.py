@@ -6,6 +6,12 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from opensquilla.run_mode import RunMode
+from opensquilla.sandbox.legacy_codec import (
+    LegacyModeContext,
+    LegacyModeDecodeError,
+    decode_legacy_run_mode,
+)
 from opensquilla.session.keys import normalize_agent_id
 
 from .delivery import validate_webhook_url
@@ -63,6 +69,30 @@ def _coerce_wake_mode(value: CronWakeMode | str) -> CronWakeMode:
     if isinstance(value, CronWakeMode):
         return value
     return CronWakeMode(str(value or CronWakeMode.NOW.value).strip().lower())
+
+
+def _persisted_run_mode(
+    value: str,
+    *,
+    creator_is_owner: bool,
+    creator_host_execute: bool,
+) -> str:
+    """Resolve the already-authorized execution mode at the scheduler boundary."""
+
+    host_execution_allowed = creator_is_owner or creator_host_execute
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return RunMode.FULL.value if host_execution_allowed else RunMode.SAFE.value
+    try:
+        mode = decode_legacy_run_mode(
+            normalized,
+            context=LegacyModeContext.EXPLICIT,
+        )
+    except LegacyModeDecodeError as exc:
+        raise ValueError(f"unsupported cron run_mode: {value!r}") from exc
+    if mode is RunMode.FULL and not host_execution_allowed:
+        return RunMode.SAFE.value
+    return mode.value
 
 
 def _delivery_requested(delivery: DeliveryConfig | None) -> bool:
@@ -130,6 +160,7 @@ class SchedulerOps:
         schedule_kind: ScheduleKind | str,
         schedule_value: str,
         schedule_tz: str = "",
+        enabled: bool = True,
         handler_key: str = "",
         payload: dict | None = None,
         session_target: SessionTarget = SessionTarget.ISOLATED,
@@ -145,6 +176,9 @@ class SchedulerOps:
         creator_session_key: str = "",
         creator_sender_id: str = "",
         creator_is_owner: bool = False,
+        creator_host_execute: bool = False,
+        run_mode: str = "",
+        idempotency_key: str = "",
     ) -> CronJob:
         """Validate the structured schedule, compute jitter, persist a new CronJob.
 
@@ -199,9 +233,17 @@ class SchedulerOps:
             delivery=delivery or DeliveryConfig(),
             explicit_delivery=delivery is not None,
         )
+        creator_host_execute = bool(creator_host_execute or creator_is_owner)
+        effective_run_mode = _persisted_run_mode(
+            run_mode,
+            creator_is_owner=creator_is_owner,
+            creator_host_execute=creator_host_execute,
+        )
 
         job = CronJob(
             name=name,
+            status=JobStatus.PENDING if enabled else JobStatus.PAUSED,
+            enabled=enabled,
             schedule_raw=schedule_raw,
             schedule_kind=kind,
             cron_expr=cron_expr,
@@ -220,6 +262,11 @@ class SchedulerOps:
             creator_session_key=creator_session_key or "",
             creator_sender_id=creator_sender_id or "",
             creator_is_owner=bool(creator_is_owner),
+            creator_host_execute=creator_host_execute,
+            run_mode=effective_run_mode,
+            elevated="full" if effective_run_mode == "full" else "",
+            execution_target="host" if effective_run_mode == "full" else "sandbox",
+            idempotency_key=idempotency_key,
         )
 
         if kind == ScheduleKind.AT:
@@ -234,8 +281,7 @@ class SchedulerOps:
             # CRON or EVERY with cron expression: scan forward
             job.next_run_at = _next_run(job, now)
 
-        await self._store.save(job)
-        return job
+        return await self._store.create_or_get(job)
 
     async def update(self, job_id: str, **patch) -> CronJob | None:
         """Apply a partial update to an existing job. Returns None if not found."""

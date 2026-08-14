@@ -1,15 +1,23 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import { useDialogLayer } from '@/composables/useDialogA11y'
+import { useChatTopbarPopoverCoordination } from '@/composables/useChatTopbarPopoverCoordinator'
 import { useBgm, BGM_LOCAL_TRACK_ID } from '@/composables/useBgm'
 
-// Topbar background-music control: a split button next to the language/theme
-// menus. The note button toggles play/pause of the current track; the caret
-// opens a picker (reusing the global .theme-menu* classes so the three topbar
-// popovers can never drift in look) with the playlist.json tracks, a volume
-// slider, and a session-only "Choose local file…" escape hatch.
+// Topbar background-music control. Full presentation is the existing split
+// button next to language/theme; compact chat headers use pause-only so active
+// audio always has a direct stop action without reserving room while paused.
+
+type BgmControlPresentation = 'full' | 'pause-only'
+
+const props = withDefaults(defineProps<{
+  presentation?: BgmControlPresentation
+}>(), {
+  presentation: 'full',
+})
 
 const { t } = useI18n()
 const {
@@ -27,13 +35,19 @@ const {
 } = useBgm()
 
 const menuOpen = ref(false)
+const rootRef = ref<HTMLDivElement | null>(null)
 const toggleRef = ref<HTMLButtonElement | null>(null)
 const caretRef = ref<HTMLButtonElement | null>(null)
 const fileInputRef = ref<HTMLInputElement | null>(null)
+useChatTopbarPopoverCoordination('bgm', menuOpen)
+const menuIsTopmost = useDialogLayer(computed(() => menuOpen.value))
 
 onMounted(() => { void initBgm() })
 
 function onToggle() {
+  // A media pause/error can update the singleton before Vue removes the
+  // pause-only button. Never let a click on that stale DOM restart playback.
+  if (props.presentation === 'pause-only' && !playing.value) return
   void toggle()
 }
 
@@ -72,15 +86,32 @@ useDocumentEvent('click', (e) => {
 })
 
 useDocumentEvent('keydown', (e) => {
-  if (e.key === 'Escape' && menuOpen.value) {
-    menuOpen.value = false
-    caretRef.value?.focus()
+  if (e.defaultPrevented || e.key !== 'Escape') return
+  if (!menuOpen.value || !menuIsTopmost.value) return
+  e.preventDefault()
+  menuOpen.value = false
+  caretRef.value?.focus()
+})
+
+watch(() => props.presentation, presentation => {
+  if (presentation === 'full') return
+  const active = document.activeElement
+  const restoreFocus = Boolean(active instanceof Node && rootRef.value?.contains(active))
+  menuOpen.value = false
+  if (restoreFocus && playing.value) {
+    void nextTick(() => toggleRef.value?.focus())
   }
 })
 </script>
 
 <template>
-  <div class="theme-menu-wrap bgm-menu-wrap">
+  <div
+    v-if="presentation === 'full' || playing"
+    ref="rootRef"
+    class="theme-menu-wrap bgm-menu-wrap"
+    :class="{ 'bgm-menu-wrap--pause-only': presentation === 'pause-only' }"
+    :data-presentation="presentation"
+  >
     <button
       ref="toggleRef"
       type="button"
@@ -94,86 +125,94 @@ useDocumentEvent('keydown', (e) => {
     >
       <Icon :name="playing ? 'pause' : 'music'" :size="16" />
     </button>
-    <button
-      ref="caretRef"
-      type="button"
-      class="btn btn--ghost bgm-caret"
-      :title="t('chrome.bgm.label')"
-      :aria-label="t('chrome.bgm.label')"
-      aria-haspopup="menu"
-      :aria-expanded="menuOpen"
-      data-testid="bgm-menu-trigger"
-      @click.stop="menuOpen = !menuOpen"
-    >
-      <Icon name="chevronDown" :size="12" />
-    </button>
-    <div v-if="menuOpen" class="theme-menu bgm-menu" role="menu" :aria-label="t('chrome.bgm.label')">
+    <template v-if="presentation === 'full'">
       <button
-        v-for="track in tracks"
-        :key="track.id"
+        ref="caretRef"
         type="button"
-        class="theme-menu__item"
-        role="menuitemradio"
-        :aria-checked="currentTrackId === track.id"
-        :data-testid="`bgm-track-${track.id}`"
-        @click="pickTrack(track.id)"
+        class="btn btn--ghost bgm-caret"
+        :title="t('chrome.bgm.label')"
+        :aria-label="t('chrome.bgm.label')"
+        aria-haspopup="menu"
+        :aria-expanded="menuOpen"
+        data-testid="bgm-menu-trigger"
+        @click.stop="menuOpen = !menuOpen"
       >
-        <Icon name="music" :size="14" />
-        <span class="bgm-menu__title">{{ track.title }}</span>
-        <Icon v-if="currentTrackId === track.id" class="theme-menu__check" name="check" :size="14" />
+        <Icon name="chevronDown" :size="12" />
       </button>
-      <!-- Session-only local pick: shown as a selectable row once a file has
-           been chosen, so it can be toggled back to after a playlist track. -->
-      <button
-        v-if="localTrackTitle"
-        type="button"
-        class="theme-menu__item"
-        role="menuitemradio"
-        :aria-checked="currentTrackId === BGM_LOCAL_TRACK_ID"
-        data-testid="bgm-track-local"
-        @click="pickTrack(BGM_LOCAL_TRACK_ID)"
+      <div
+        v-if="menuOpen"
+        class="theme-menu bgm-menu"
+        role="menu"
+        :aria-label="t('chrome.bgm.label')"
+        data-chat-topbar-popover="bgm"
       >
-        <Icon name="fileText" :size="14" />
-        <span class="bgm-menu__title">{{ localTrackTitle }}</span>
-        <Icon v-if="currentTrackId === BGM_LOCAL_TRACK_ID" class="theme-menu__check" name="check" :size="14" />
-      </button>
-      <div v-if="!tracks.length && !localTrackTitle" class="bgm-menu__empty">
-        {{ t('chrome.bgm.noTracks') }}
-      </div>
-      <!-- Volume row: adjusting must not dismiss the menu. -->
-      <div class="bgm-menu__volume" role="none" @click.stop>
-        <Icon name="volume" :size="14" />
+        <button
+          v-for="track in tracks"
+          :key="track.id"
+          type="button"
+          class="theme-menu__item"
+          role="menuitemradio"
+          :aria-checked="currentTrackId === track.id"
+          :data-testid="`bgm-track-${track.id}`"
+          @click="pickTrack(track.id)"
+        >
+          <Icon name="music" :size="14" />
+          <span class="bgm-menu__title">{{ track.title }}</span>
+          <Icon v-if="currentTrackId === track.id" class="theme-menu__check" name="check" :size="14" />
+        </button>
+        <!-- Session-only local pick: shown as a selectable row once a file has
+             been chosen, so it can be toggled back to after a playlist track. -->
+        <button
+          v-if="localTrackTitle"
+          type="button"
+          class="theme-menu__item"
+          role="menuitemradio"
+          :aria-checked="currentTrackId === BGM_LOCAL_TRACK_ID"
+          data-testid="bgm-track-local"
+          @click="pickTrack(BGM_LOCAL_TRACK_ID)"
+        >
+          <Icon name="fileText" :size="14" />
+          <span class="bgm-menu__title">{{ localTrackTitle }}</span>
+          <Icon v-if="currentTrackId === BGM_LOCAL_TRACK_ID" class="theme-menu__check" name="check" :size="14" />
+        </button>
+        <div v-if="!tracks.length && !localTrackTitle" class="bgm-menu__empty">
+          {{ t('chrome.bgm.noTracks') }}
+        </div>
+        <!-- Volume row: adjusting must not dismiss the menu. -->
+        <div class="bgm-menu__volume" role="none" @click.stop>
+          <Icon name="volume" :size="14" />
+          <input
+            type="range"
+            min="0"
+            max="1"
+            step="0.05"
+            :value="volume"
+            :aria-label="t('chrome.bgm.volume')"
+            data-testid="bgm-volume"
+            @input="onVolumeInput"
+          />
+        </div>
+        <button
+          type="button"
+          class="theme-menu__item theme-menu__item--more"
+          role="menuitem"
+          data-testid="bgm-choose-local"
+          @click="chooseLocalFile"
+        >
+          <Icon name="paperclip" :size="14" />
+          <span>{{ t('chrome.bgm.chooseLocalFile') }}</span>
+        </button>
         <input
-          type="range"
-          min="0"
-          max="1"
-          step="0.05"
-          :value="volume"
-          :aria-label="t('chrome.bgm.volume')"
-          data-testid="bgm-volume"
-          @input="onVolumeInput"
+          ref="fileInputRef"
+          type="file"
+          accept="audio/*"
+          class="bgm-file-input"
+          tabindex="-1"
+          aria-hidden="true"
+          @change="onLocalFilePicked"
         />
       </div>
-      <button
-        type="button"
-        class="theme-menu__item theme-menu__item--more"
-        role="menuitem"
-        data-testid="bgm-choose-local"
-        @click="chooseLocalFile"
-      >
-        <Icon name="paperclip" :size="14" />
-        <span>{{ t('chrome.bgm.chooseLocalFile') }}</span>
-      </button>
-      <input
-        ref="fileInputRef"
-        type="file"
-        accept="audio/*"
-        class="bgm-file-input"
-        tabindex="-1"
-        aria-hidden="true"
-        @change="onLocalFilePicked"
-      />
-    </div>
+    </template>
     <!-- Screen-reader note of what is currently playing; visual users get the
          accent-lit note button instead. -->
     <span v-if="playing && currentTitle" class="bgm-sr-now-playing">{{ currentTitle }}</span>

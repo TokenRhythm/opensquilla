@@ -1,5 +1,5 @@
 <template>
-  <div class="hub control-stage">
+  <div class="hub control-stage sessions-stage">
     <header class="control-stage__header">
       <div class="control-stage__title-block">
         <h1 class="control-stage__title">{{ t('sessions.title') }}</h1>
@@ -8,9 +8,14 @@
         </p>
       </div>
       <div class="control-stage__actions">
-        <button class="btn btn--ghost" :title="t('sessions.refresh')" :disabled="refreshing" @click="refresh">
+        <button
+          class="btn btn--icon btn--ghost sessions-refresh"
+          :title="refreshing ? t('sessions.refreshing') : t('sessions.refresh')"
+          :aria-label="refreshing ? t('sessions.refreshing') : t('sessions.refresh')"
+          :disabled="refreshing"
+          @click="refresh"
+        >
           <Icon name="refresh" :size="16" />
-          <span>{{ refreshing ? t('sessions.refreshing') : t('sessions.refresh') }}</span>
         </button>
       </div>
     </header>
@@ -68,10 +73,12 @@
         <p class="control-empty__hint">{{ t('sessions.loading') }}</p>
       </div>
 
-      <div v-else-if="allSessions.length === 0" class="hub-state control-empty">
-        <Icon name="sessions" :size="32" class="control-empty__icon" aria-hidden="true" />
-        <div class="control-empty__title">{{ t('sessions.empty.title') }}</div>
-        <p class="control-empty__hint">{{ t('sessions.empty.body') }}</p>
+      <div v-else-if="allSessions.length === 0" class="hub-state hub-state--empty control-empty">
+        <Icon name="sessions" :size="22" class="control-empty__icon" aria-hidden="true" />
+        <div class="hub-state__copy">
+          <div class="control-empty__title">{{ t('sessions.empty.title') }}</div>
+          <p class="control-empty__hint">{{ t('sessions.empty.body') }}</p>
+        </div>
       </div>
 
       <div v-else-if="ledgerEntries.length === 0" class="hub-state control-empty">
@@ -337,6 +344,7 @@ function scheduleSessionRefresh() {
 function applyLocalDeletedSessions(keys: Set<string>) {
   if (keys.size === 0) return
   sessionsList.value = sessionsList.value.filter(item => !keys.has(itemKey(item)))
+  pendingApprovals.value = pendingApprovals.value.filter(key => !keys.has(key))
   if (inspectKey.value && keys.has(inspectKey.value)) closeInspect()
 }
 
@@ -463,6 +471,40 @@ onUnmounted(teardownLive)
 </script>
 
 <style scoped>
+.sessions-stage {
+  margin-inline: auto;
+  max-width: 1280px;
+  padding-bottom: var(--sp-8);
+  width: 100%;
+}
+
+.sessions-stage .control-stage__header {
+  align-items: flex-start;
+}
+
+.sessions-stage .control-stage__title {
+  font-size: clamp(1.75rem, 1.6rem + 0.35vw, 2rem);
+  letter-spacing: -0.035em;
+  line-height: 1.1;
+}
+
+.sessions-stage .control-stage__subtitle {
+  margin-top: 7px;
+}
+
+.sessions-refresh {
+  border-radius: var(--radius-control);
+  color: var(--text-muted);
+  height: 36px;
+  padding: 0;
+  width: 36px;
+}
+
+.sessions-refresh:hover:not(:disabled) {
+  background: var(--bg-surface-2);
+  color: var(--text);
+}
+
 .hub-list {
   display: flex;
   flex-direction: column;
@@ -470,7 +512,32 @@ onUnmounted(teardownLive)
 }
 
 .hub-state {
-  min-height: 40vh;
+  min-height: 240px;
+}
+
+.hub-state--empty {
+  align-items: flex-start;
+  display: grid;
+  gap: var(--sp-3);
+  grid-template-columns: 24px minmax(0, 1fr);
+  justify-content: stretch;
+  min-height: 0;
+  padding: 40px 4px 32px;
+  text-align: left;
+}
+
+.hub-state--empty .control-empty__icon {
+  margin: 1px 0 0;
+}
+
+.hub-state__copy {
+  display: grid;
+  gap: 5px;
+}
+
+.hub-state--empty .control-empty__hint {
+  margin: 0;
+  max-width: 52ch;
 }
 
 .hub-list__head {
@@ -519,9 +586,17 @@ onUnmounted(teardownLive)
 
 
 @media (max-width: 760px) {
+  .sessions-stage {
+    padding-bottom: var(--sp-6);
+  }
+
   .hub-list__head {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .hub-state--empty {
+    padding-block: var(--sp-6);
   }
 }
 </style>

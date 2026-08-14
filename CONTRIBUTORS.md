@@ -26,6 +26,56 @@ trailers.
 | [@ab2ence](https://github.com/ab2ence) | macOS Seatbelt backend execution, denial escalation, and release-candidate type-check cleanup. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`fb1e6225`](https://github.com/opensquilla/opensquilla/pull/46/commits/fb1e6225e4db9cb0801ea347a89c2066e3e0601b), [`f73ac3eb`](https://github.com/opensquilla/opensquilla/pull/46/commits/f73ac3eb0044c64c79cfd18f9ec03d1bba9128ff), [`cf3b046f`](https://github.com/opensquilla/opensquilla/pull/46/commits/cf3b046f42a42efc951320b0af80e9d066dcf7d2) |
 | [@kimjune01](https://github.com/kimjune01) | Provider stream timeout cleanup fix that prevents double-closing provider streams. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`06e3126d`](https://github.com/opensquilla/opensquilla/pull/46/commits/06e3126d8ebda4ad4cf349ca7be0d0804e0c008d) |
 
+## OpenSquilla 0.5.3
+
+The 0.5.3 maintenance release records new human contributor work after the
+0.5.2 stable release.
+
+| Contributor | 0.5.3 contribution | Evidence |
+| --- | --- | --- |
+| [@249469326i-lang](https://github.com/249469326i-lang) | Localized remaining chat-interface strings. | [#1043](https://github.com/opensquilla/opensquilla/pull/1043) |
+| [@HuaXiawithMoon](https://github.com/HuaXiawithMoon) | Improved durable project steering, pending queues, assistant-answer presentation, reasoning aliases, compaction liveness, schedules, replay, and tool activity. | [#948](https://github.com/opensquilla/opensquilla/pull/948), [#973](https://github.com/opensquilla/opensquilla/pull/973), [#1093](https://github.com/opensquilla/opensquilla/pull/1093), [#1094](https://github.com/opensquilla/opensquilla/pull/1094), [#1098](https://github.com/opensquilla/opensquilla/pull/1098), [#1147](https://github.com/opensquilla/opensquilla/pull/1147), [#1155](https://github.com/opensquilla/opensquilla/pull/1155) |
+| [@Kiuyor](https://github.com/Kiuyor) | Prevented editing an active message while it is streaming. | [#1006](https://github.com/opensquilla/opensquilla/pull/1006) |
+| [@LHMQ878](https://github.com/LHMQ878) | Preserved billed usage receipts on error paths. | [#1058](https://github.com/opensquilla/opensquilla/pull/1058) |
+| [@Liu-RK](https://github.com/Liu-RK) | Improved Sandbox settings reliability and organized sidebar peer sections. | [#1032](https://github.com/opensquilla/opensquilla/pull/1032), [#1154](https://github.com/opensquilla/opensquilla/pull/1154) |
+| [@RickyYii](https://github.com/RickyYii) | Hardened network posture, Skills source warnings, Markdown rendering, schedules, provider idle handling, TOML parsing, and runtime monitoring. | [#815](https://github.com/opensquilla/opensquilla/pull/815), [#816](https://github.com/opensquilla/opensquilla/pull/816), [#1082](https://github.com/opensquilla/opensquilla/pull/1082), [#1109](https://github.com/opensquilla/opensquilla/pull/1109), [#1110](https://github.com/opensquilla/opensquilla/pull/1110), [#1111](https://github.com/opensquilla/opensquilla/pull/1111), [#1121](https://github.com/opensquilla/opensquilla/pull/1121), [#1142](https://github.com/opensquilla/opensquilla/pull/1142) |
+| [@Saul-Soul](https://github.com/Saul-Soul) | Added the floating, collapsible chat composer. | [#1070](https://github.com/opensquilla/opensquilla/pull/1070) |
+| [@TUOXI293](https://github.com/TUOXI293) | Improved Cron workspace reliability and added inline MetaSkill requests. | [#892](https://github.com/opensquilla/opensquilla/pull/892), [#1024](https://github.com/opensquilla/opensquilla/pull/1024) |
+| [@anujbolewar](https://github.com/anujbolewar) | Made `apply_patch` whitespace handling more tolerant. | [#957](https://github.com/opensquilla/opensquilla/pull/957) |
+| [@freeaccount-create](https://github.com/freeaccount-create) | Improved Desktop icons, renderer error containment, and flattened tool markers. | [#983](https://github.com/opensquilla/opensquilla/pull/983), [#996](https://github.com/opensquilla/opensquilla/pull/996), [#1153](https://github.com/opensquilla/opensquilla/pull/1153) |
+| [@iamasly](https://github.com/iamasly) | Forwarded renderer console and crash diagnostics to Desktop logs. | [#994](https://github.com/opensquilla/opensquilla/pull/994) |
+| [@jiaoqingrui](https://github.com/jiaoqingrui) | Strengthened recovery governance, connection stability, and OSS-first update checksum verification. | [#925](https://github.com/opensquilla/opensquilla/pull/925), [#927](https://github.com/opensquilla/opensquilla/pull/927), [#968](https://github.com/opensquilla/opensquilla/pull/968) |
+| [@lihongguang-0014](https://github.com/lihongguang-0014) | Improved chat creation, artifact publication, subagent titles, schedules, profile locking and targeting, logging, and header presentation. | [#1124](https://github.com/opensquilla/opensquilla/pull/1124), [#1125](https://github.com/opensquilla/opensquilla/pull/1125), [#1136](https://github.com/opensquilla/opensquilla/pull/1136), [#1138](https://github.com/opensquilla/opensquilla/pull/1138), [#1139](https://github.com/opensquilla/opensquilla/pull/1139), [#1144](https://github.com/opensquilla/opensquilla/pull/1144), [#1152](https://github.com/opensquilla/opensquilla/pull/1152), [#1158](https://github.com/opensquilla/opensquilla/pull/1158) |
+| [@wade19990814-hue](https://github.com/wade19990814-hue) | Contributed the original Goal product direction and channel session rename/delete behavior. | [#1025](https://github.com/opensquilla/opensquilla/pull/1025), [#1066](https://github.com/opensquilla/opensquilla/pull/1066), [#1135](https://github.com/opensquilla/opensquilla/pull/1135) |
+| [@weiconghe](https://github.com/weiconghe) | Added the overview session count. | [#1123](https://github.com/opensquilla/opensquilla/pull/1123) |
+
+## OpenSquilla 0.5.2
+
+The 0.5.2 maintenance release records new human contributor work after the
+0.5.1 stable release.
+
+| Contributor | 0.5.2 contribution | Evidence |
+| --- | --- | --- |
+| [@jiaoqingrui](https://github.com/jiaoqingrui) | Improved Desktop and Gateway startup, recovery and historical usage reliability, activity timing, custom-provider settings, and Windows sandbox setup. | [#877](https://github.com/opensquilla/opensquilla/pull/877), [#882](https://github.com/opensquilla/opensquilla/pull/882), [#884](https://github.com/opensquilla/opensquilla/pull/884), [#886](https://github.com/opensquilla/opensquilla/pull/886), [#890](https://github.com/opensquilla/opensquilla/pull/890), [#891](https://github.com/opensquilla/opensquilla/pull/891), [#897](https://github.com/opensquilla/opensquilla/pull/897), [#903](https://github.com/opensquilla/opensquilla/pull/903) |
+| [@Liu-RK](https://github.com/Liu-RK) | Brought the Desktop project picker into parity with the Web picker. | [#887](https://github.com/opensquilla/opensquilla/pull/887) |
+| [@joyfan621-png](https://github.com/joyfan621-png) | Improved provider onboarding and assistant usage presentation. | [#901](https://github.com/opensquilla/opensquilla/pull/901) |
+
+## OpenSquilla 0.5.1
+
+The 0.5.1 maintenance release records new human contributor work after the
+0.5.0 stable release.
+
+| Contributor | 0.5.1 contribution | Evidence |
+| --- | --- | --- |
+| [@joyfan621-png](https://github.com/joyfan621-png) | Improved Desktop onboarding and startup presentation, project and chat UX, provider settings, and Settings overlay behavior. | [#819](https://github.com/opensquilla/opensquilla/pull/819), [#832](https://github.com/opensquilla/opensquilla/pull/832), [#836](https://github.com/opensquilla/opensquilla/pull/836), [#838](https://github.com/opensquilla/opensquilla/pull/838), [#856](https://github.com/opensquilla/opensquilla/pull/856), [#868](https://github.com/opensquilla/opensquilla/pull/868) |
+| [@jiaoqingrui](https://github.com/jiaoqingrui) | Added Desktop deep linking and consolidated recovery profiles without discarding existing recovery data. | [#800](https://github.com/opensquilla/opensquilla/pull/800), [#828](https://github.com/opensquilla/opensquilla/pull/828), [#864](https://github.com/opensquilla/opensquilla/pull/864) |
+| [@shixi-li](https://github.com/shixi-li) | Corrected subagent usage rollup into the parent turn. | [#845](https://github.com/opensquilla/opensquilla/pull/845) |
+| [@Liu-RK](https://github.com/Liu-RK) | Added and hardened project workspaces, improved the macOS project picker, and fixed frozen Windows gateway sandbox setup paths. | [#831](https://github.com/opensquilla/opensquilla/pull/831), [#850](https://github.com/opensquilla/opensquilla/pull/850), [#851](https://github.com/opensquilla/opensquilla/pull/851), [#857](https://github.com/opensquilla/opensquilla/pull/857) |
+| [@RickyYii](https://github.com/RickyYii) | Isolated ambient proxy state from direct-upstream sandbox checks. | [#817](https://github.com/opensquilla/opensquilla/pull/817) |
+| [@HuaXiawithMoon](https://github.com/HuaXiawithMoon) | Propagated reasoning levels through direct and custom Model Ensemble paths. | [#797](https://github.com/opensquilla/opensquilla/pull/797) |
+| [@TUOXI293](https://github.com/TUOXI293) | Refined Cron, Skills, and MetaSkill workflows. | [#829](https://github.com/opensquilla/opensquilla/pull/829) |
+| [@JarvisPei](https://github.com/JarvisPei) | Added safe audio configuration, corrected gateway tool capabilities, and prevented gateway self-termination through Shell tools. | [#821](https://github.com/opensquilla/opensquilla/pull/821), [#822](https://github.com/opensquilla/opensquilla/pull/822) |
+
 ## OpenSquilla 0.5.0
 
 The 0.5.0 stable release records new human contributor work after the 0.5.0

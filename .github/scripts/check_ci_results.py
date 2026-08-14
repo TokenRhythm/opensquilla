@@ -22,6 +22,7 @@ BOOLEAN_FLAGS: Final[tuple[str, ...]] = (
     "python_changed",
     "platform_sensitive_changed",
     "build_wheel_required",
+    "toolchain_artifact_changed",
     "full_required",
 )
 
@@ -75,6 +76,13 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         return errors
 
     full = flags["full_required"]
+    windows_full_required = flags["windows_full_required"] or full
+    windows_smoke_relevant = (
+        flags["python_changed"]
+        or flags["platform_sensitive_changed"]
+        or flags["dependency_changed"]
+        or flags["release_changed"]
+    )
     conditional_results = (
         (
             "RESULT_FRONTEND",
@@ -92,16 +100,12 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         (
             "RESULT_WINDOWS_SMOKE",
             "Windows compatibility smoke tests",
-            flags["python_changed"]
-            or flags["platform_sensitive_changed"]
-            or flags["dependency_changed"]
-            or flags["release_changed"]
-            or full,
+            windows_smoke_relevant and not windows_full_required,
         ),
         (
             "RESULT_WINDOWS_FULL",
             "Windows high-risk matrix",
-            flags["windows_full_required"] or full,
+            windows_full_required,
         ),
         (
             "RESULT_MACOS_RECOVERY",
@@ -120,6 +124,11 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
             "RESULT_RELEASE",
             "Release packaging contracts",
             flags["release_changed"] or full,
+        ),
+        (
+            "RESULT_MANAGED_TOOLCHAIN_ARTIFACTS",
+            "Managed Toolchain Artifact E2E",
+            flags["toolchain_artifact_changed"] or full,
         ),
     )
     for variable, label, required in conditional_results:

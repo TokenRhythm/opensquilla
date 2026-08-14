@@ -15,8 +15,8 @@ const BASE_PROPS = {
   isNewLanding: false,
   placeholder: 'Send a message',
   sendButtonTitle: 'Send',
-  runMode: 'trusted',
-  allowedRunModes: ['standard', 'trusted', 'full'],
+  runMode: 'safe',
+  allowedRunModes: ['safe', 'full'],
   modelRoutingMode: 'off',
   modelRoutingSettingsBusy: false,
   routerVisualEffectsEnabled: true,
@@ -40,7 +40,13 @@ async function mount(overrides: Record<string, unknown> = {}) {
 // The mic button carries the recordVoice aria-label when ready and the
 // "unavailable" hint when gated — resolve both from i18n so the test never
 // hard-codes English copy.
-function micButton(el: HTMLElement): HTMLButtonElement | null {
+async function micButton(el: HTMLElement): Promise<HTMLButtonElement | null> {
+  const more = el.querySelector<HTMLButtonElement>(
+    `button[aria-label="${i18n.global.t('chrome.more')}"]`,
+  )
+  expect(more).toBeTruthy()
+  more?.click()
+  await nextTick()
   const ready = i18n.global.t('chat.recordVoice')
   const gated = i18n.global.t('chat.voiceUnavailableHint')
   return (
@@ -55,14 +61,64 @@ beforeEach(() => {
 })
 
 describe('ChatComposer voice-input gate', () => {
+  it('disables drafting and sending while a Plan questionnaire owns the input area', async () => {
+    const { app, el } = await mount({ inputDisabled: true })
+    const textarea = el.querySelector<HTMLTextAreaElement>('textarea')
+    const send = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.send')}"]`,
+    )
+
+    expect(textarea?.disabled).toBe(true)
+    expect(send?.disabled).toBe(true)
+    app.unmount()
+  })
+
   it('keeps Stop available while a background subagent group is active', async () => {
     const onStop = vi.fn()
     const { app, el } = await mount({ canStop: true, isStreaming: false, onStop })
     const stop = el.querySelector<HTMLButtonElement>(
       `button[aria-label="${i18n.global.t('chat.stopResponse')}"]`,
     )
+    const send = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.send')}"]`,
+    )
 
     expect(stop).toBeTruthy()
+    expect(send).toBeNull()
+    stop?.click()
+    await nextTick()
+    expect(onStop).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
+  it('shows Send instead of Stop when no response can be stopped', async () => {
+    const { app, el } = await mount({ canStop: false })
+    const send = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.send')}"]`,
+    )
+    const stop = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.stopResponse')}"]`,
+    )
+
+    expect(send).toBeTruthy()
+    expect(stop).toBeNull()
+    app.unmount()
+  })
+
+  it('names Stop as ending the durable plan execution when it targets a PlanRun', async () => {
+    const onStop = vi.fn()
+    const { app, el } = await mount({
+      canStop: true,
+      stopTargetsPlanRun: true,
+      onStop,
+    })
+    const stop = el.querySelector<HTMLButtonElement>(
+      `button[aria-label="${i18n.global.t('chat.planRun.stopExecution')}"]`,
+    )
+
+    expect(stop).toBeTruthy()
+    expect(stop?.getAttribute('title'))
+      .toBe(i18n.global.t('chat.planRun.stopExecutionEsc'))
     stop?.click()
     await nextTick()
     expect(onStop).toHaveBeenCalledOnce()
@@ -73,7 +129,7 @@ describe('ChatComposer voice-input gate', () => {
     const onVoiceInput = vi.fn()
     const onVoiceSetup = vi.fn()
     const { app, el } = await mount({ voiceReady: true, onVoiceInput, onVoiceSetup })
-    const btn = micButton(el)
+    const btn = await micButton(el)
     expect(btn).toBeTruthy()
     expect(btn?.disabled).toBe(false)
     expect(btn?.getAttribute('aria-label')).toBe(i18n.global.t('chat.recordVoice'))
@@ -88,7 +144,7 @@ describe('ChatComposer voice-input gate', () => {
     const onVoiceInput = vi.fn()
     const onVoiceSetup = vi.fn()
     const { app, el } = await mount({ voiceReady: false, onVoiceInput, onVoiceSetup })
-    const btn = micButton(el)
+    const btn = await micButton(el)
     expect(btn).toBeTruthy()
     // Not hard-disabled — the user can click it to be guided to configuration.
     expect(btn?.disabled).toBe(false)
@@ -104,7 +160,7 @@ describe('ChatComposer voice-input gate', () => {
 
   it('disables the mic button while a transcription is in flight', async () => {
     const { app, el } = await mount({ voiceReady: true, voiceBusy: true })
-    expect(micButton(el)?.disabled).toBe(true)
+    expect((await micButton(el))?.disabled).toBe(true)
     app.unmount()
   })
 })

@@ -66,6 +66,62 @@ class _EchoDispatcher:
         return make_ok_res(req_id, {"method": method})
 
 
+class _BlockingMetaDispatcher:
+    def __init__(self) -> None:
+        self.meta_started = asyncio.Event()
+        self.meta_cancelled = asyncio.Event()
+
+    def list_methods(self) -> list[str]:
+        return ["health", "meta.drafts.list"]
+
+    async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+        if method == "meta.drafts.list":
+            self.meta_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                self.meta_cancelled.set()
+        if method == "health":
+            await asyncio.wait_for(self.meta_started.wait(), timeout=1.0)
+        return make_ok_res(req_id, {"method": method})
+
+
+class _CancellationResistantMetaDispatcher(_BlockingMetaDispatcher):
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+        if method != "meta.drafts.list":
+            return await super().dispatch(req_id, method, params, ctx)
+        self.meta_started.set()
+        try:
+            await self.release.wait()
+        except asyncio.CancelledError:
+            self.meta_cancelled.set()
+            await self.release.wait()
+        return make_ok_res(req_id, {"method": method})
+
+
+class _WaitForResponseWebSocket(_ScriptedWebSocket):
+    def __init__(self, frames: list[str], response_id: str) -> None:
+        super().__init__(frames)
+        self._response_id = response_id
+        self._response_seen = asyncio.Event()
+
+    async def send_text(self, text: str) -> None:
+        await super().send_text(text)
+        frame = json.loads(text)
+        if frame.get("type") == "res" and frame.get("id") == self._response_id:
+            self._response_seen.set()
+
+    async def receive_text(self) -> str:
+        if self._frames:
+            return self._frames.pop(0)
+        await asyncio.wait_for(self._response_seen.wait(), timeout=1.0)
+        raise WebSocketDisconnect(code=1000)
+
+
 def _config() -> GatewayConfig:
     # Direct-send path keeps response ordering deterministic in the fake.
     return GatewayConfig(ws_writer_queue_enabled=False)
@@ -94,6 +150,71 @@ async def test_non_string_req_id_gets_error_res_and_connection_survives() -> Non
 
     # The connection outlived the bad frame: the next request still dispatched.
     assert any(r["ok"] and r["id"] == "ok1" for r in responses)
+    assert ws.close_codes == []
+
+
+async def test_slow_meta_draft_list_does_not_block_the_next_rpc_on_the_socket() -> None:
+    dispatcher = _BlockingMetaDispatcher()
+    ws = _WaitForResponseWebSocket(
+        [
+            _CONNECT_FRAME,
+            json.dumps({
+                "type": "req",
+                "id": "slow-meta",
+                "method": "meta.drafts.list",
+                "params": {"agentId": "main"},
+            }),
+            json.dumps({"type": "req", "id": "ordinary", "method": "health"}),
+        ],
+        "ordinary",
+    )
+
+    await handle_ws_connection(ws, _config(), dispatcher=dispatcher)
+
+    responses = ws.responses()
+    assert [response["id"] for response in responses] == ["ordinary"]
+    assert dispatcher.meta_started.is_set()
+    assert dispatcher.meta_cancelled.is_set()
+
+
+async def test_disconnect_does_not_wait_forever_for_a_cancellation_resistant_meta_query() -> None:
+    dispatcher = _CancellationResistantMetaDispatcher()
+    ws = _WaitForResponseWebSocket(
+        [
+            _CONNECT_FRAME,
+            json.dumps({
+                "type": "req",
+                "id": "slow-meta",
+                "method": "meta.drafts.list",
+                "params": {"agentId": "main"},
+            }),
+            json.dumps({"type": "req", "id": "ordinary", "method": "health"}),
+        ],
+        "ordinary",
+    )
+
+    await asyncio.wait_for(
+        handle_ws_connection(ws, _config(), dispatcher=dispatcher),
+        timeout=1.0,
+    )
+    assert dispatcher.meta_cancelled.is_set()
+
+    dispatcher.release.set()
+    await asyncio.sleep(0)
+    assert [response["id"] for response in ws.responses()] == ["ordinary"]
+
+
+async def test_raw_ping_pong_uses_bounded_connection_send_and_survives() -> None:
+    ws = await _run(
+        [
+            _CONNECT_FRAME,
+            '{"type":"ping"}',
+            json.dumps({"type": "req", "id": "after-ping", "method": "noop"}),
+        ]
+    )
+
+    assert '{"type":"pong"}' in ws.sent
+    assert any(r["ok"] and r["id"] == "after-ping" for r in ws.responses())
     assert ws.close_codes == []
 
 

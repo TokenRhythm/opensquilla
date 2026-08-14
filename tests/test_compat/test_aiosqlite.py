@@ -34,6 +34,18 @@ async def test_sqlite3_fallback_execute_supports_await_and_async_context(
 
         assert transformed is not None
         assert transformed[0] == "ALPHA"
+
+        traced: list[str] = []
+        await conn.set_trace_callback(traced.append)
+        async with conn.execute("SELECT name FROM items") as cur:
+            await cur.fetchone()
+        await conn.set_trace_callback(None)
+
+        assert any("SELECT name FROM items" in statement for statement in traced)
+        traced_count = len(traced)
+        async with conn.execute("SELECT name FROM items") as cur:
+            await cur.fetchone()
+        assert len(traced) == traced_count
     finally:
         await conn.close()
         monkeypatch.delenv("OPENSQUILLA_FORCE_SQLITE3_BACKEND", raising=False)

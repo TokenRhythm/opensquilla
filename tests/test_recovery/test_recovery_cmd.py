@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from typer.testing import CliRunner
 from opensquilla.cli.main import app as root_app
 from opensquilla.cli.recovery_cmd import recovery_app
 from opensquilla.recovery.cleanup import cleanup_inspect
+from opensquilla.recovery.locking import ProfileOperationLock
 
 
 def _workspace(path: Path, marker: str) -> Path:
@@ -46,11 +48,15 @@ def test_recovery_command_surface_is_registered_with_complete_offline_actions() 
         "choose-workspace",
         "apply-settings",
         "recover-settings",
+        "recover-config",
         "restore-profile",
         "recover-transaction",
+        "consolidate-profiles",
+        "acknowledge-profile-credential",
         "abandon-cleanup",
         "cleanup-inspect",
         "cleanup-apply",
+        "sandbox-upgrade-status",
     }
 
 
@@ -133,9 +139,93 @@ def test_inspect_command_emits_fixed_json_protocol(tmp_path: Path) -> None:
         "allowed_actions",
         "transaction_id",
         "revision",
+        "detail",
     }
     assert payload["outcome"] == "ready"
     assert payload["effective_workspace"] == str(workspace)
+
+
+def test_recover_config_command_repairs_corrupt_config_over_json_protocol(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    home = tmp_path / "opensquilla"
+    _workspace(home / "workspace", "current identity")
+    (home / "state").mkdir(parents=True)
+    good = 'state_dir = "state"\nworkspace_dir = "workspace"\n'
+    (home / "config.toml.backup.20260101000000000000").write_text(good, encoding="utf-8")
+    (home / "config.toml").write_text("workspace_dir = [\n", encoding="utf-8")
+
+    result = CliRunner().invoke(
+        recovery_app,
+        ["recover-config", "--home", str(home), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["outcome"] == "ready"
+    assert (home / "config.toml").read_text(encoding="utf-8") == good
+    assert list(home.glob("config.toml.corrupt.*"))
+
+
+def test_mutating_command_lock_timeout_waits_out_a_transient_writer(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """--lock-timeout rides out a short-lived writer instead of failing closed.
+
+    Desktop startup passes a small bound so a predecessor still releasing its
+    lease resolves silently; the default stays 0.0 (immediate
+    profile_lock_busy).
+    """
+
+    monkeypatch.setenv("OPENSQUILLA_USER_STATE_DIR", str(tmp_path / "user-state"))
+    home = tmp_path / "opensquilla"
+    _workspace(home / "workspace", "current identity")
+    (home / "state").mkdir(parents=True)
+    good = 'state_dir = "state"\nworkspace_dir = "workspace"\n'
+    (home / "config.toml.backup.20260101000000000000").write_text(good, encoding="utf-8")
+    (home / "config.toml").write_text("workspace_dir = [\n", encoding="utf-8")
+
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold_profile_lock() -> None:
+        # The profile lock is reentrant per thread, so contention needs a
+        # separate writer thread.
+        with ProfileOperationLock(home):
+            held.set()
+            release.wait(timeout=30)
+
+    writer = threading.Thread(target=hold_profile_lock)
+    writer.start()
+    try:
+        assert held.wait(timeout=10)
+
+        busy = CliRunner().invoke(
+            recovery_app,
+            ["recover-config", "--home", str(home), "--json"],
+        )
+        assert busy.exit_code == 2, busy.output
+        assert json.loads(busy.stdout)["stable_code"] == "profile_lock_busy"
+
+        releaser = threading.Timer(0.3, release.set)
+        releaser.start()
+        try:
+            result = CliRunner().invoke(
+                recovery_app,
+                ["recover-config", "--home", str(home), "--lock-timeout", "10", "--json"],
+            )
+        finally:
+            releaser.cancel()
+    finally:
+        release.set()
+        writer.join(timeout=10)
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["outcome"] == "ready"
+    assert (home / "config.toml").read_text(encoding="utf-8") == good
 
 
 def test_cleanup_inspect_command_emits_complete_read_only_inventory(tmp_path: Path) -> None:

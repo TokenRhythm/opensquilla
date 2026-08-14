@@ -85,6 +85,27 @@ def test_default_registry_removes_obsolete_wrapper_tools_but_keeps_canonical_too
     assert registry.get("subagents") is not None
 
 
+def test_retired_update_plan_selector_is_ignored_for_upgrade_compatibility() -> None:
+    import opensquilla.tools.builtin  # noqa: F401
+    from opensquilla.gateway.config import GatewayConfig, ToolsConfig
+    from opensquilla.tools.policy import apply_tool_policy_from_config
+    from opensquilla.tools.registry import get_default_registry
+
+    registry = get_default_registry()
+    ctx = apply_tool_policy_from_config(
+        ToolContext(is_owner=True, caller_kind=CallerKind.AGENT),
+        available_tools=registry.list_names(),
+        config=GatewayConfig(
+            tools=ToolsConfig(profile="minimal", also_allow=["update_plan"])
+        ),
+    )
+
+    assert registry.get("update_plan") is None
+    assert "update_plan" not in {
+        tool.name for tool in registry.to_tool_definitions(ctx)
+    }
+
+
 def test_owner_schema_keeps_canonical_tools_and_subagents_stays_explicit_only() -> None:
     import opensquilla.tools.builtin  # noqa: F401
     from opensquilla.tools.registry import get_default_registry
@@ -185,6 +206,78 @@ def test_channel_runtime_profile_exposes_safe_structured_file_tools() -> None:
     assert {"create_csv", "create_xlsx", "create_pdf_report", "create_pptx"} <= names
     assert "write_file" not in names
     assert "execute_code" not in names
+
+
+def test_verified_channel_admin_profile_exposes_full_runtime_tools() -> None:
+    import opensquilla.tools.builtin  # noqa: F401
+    from opensquilla.tools.registry import filter_by_profile, get_default_registry, resolve_profile
+
+    registry = get_default_registry()
+    channel_admin_ctx = ToolContext(
+        is_owner=True,
+        channel_admin_verified=True,
+        caller_kind=CallerKind.CHANNEL,
+    )
+
+    names = {
+        tool.name
+        for tool in filter_by_profile(
+            registry.to_tool_definitions(channel_admin_ctx),
+            resolve_profile(channel_admin_ctx),
+            channel_admin_ctx,
+        )
+    }
+
+    assert {
+        "exec_command",
+        "background_process",
+        "process",
+        "write_file",
+        "edit_file",
+        "apply_patch",
+    } <= names
+
+
+def test_verified_channel_admin_matches_web_owner_runtime_tool_visibility() -> None:
+    import opensquilla.tools.builtin  # noqa: F401
+    from opensquilla.tools.policy import resolve_runtime_tool_surface
+    from opensquilla.tools.registry import get_default_registry
+
+    capabilities = ToolSurfaceCapabilities(
+        session_manager=True,
+        task_runtime=True,
+        scheduler=True,
+        gateway_config=True,
+        channel_backing=True,
+        image_generation=True,
+    )
+    channel_admin_ctx = resolve_runtime_tool_surface(
+        ToolContext(
+            is_owner=True,
+            channel_admin_verified=True,
+            caller_kind=CallerKind.CHANNEL,
+            interaction_mode=InteractionMode.UNATTENDED,
+            session_key="agent:main:feishu:direct:ou_admin",
+        ),
+        capabilities=capabilities,
+    )
+    web_owner_ctx = resolve_runtime_tool_surface(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.WEB,
+            interaction_mode=InteractionMode.INTERACTIVE,
+            session_key="agent:main:feishu:direct:ou_admin",
+        ),
+        capabilities=capabilities,
+    )
+
+    registry = get_default_registry()
+    channel_names = {tool.name for tool in registry.to_tool_definitions(channel_admin_ctx)}
+    web_names = {tool.name for tool in registry.to_tool_definitions(web_owner_ctx)}
+
+    assert channel_names == web_names
+    assert "agents_list" in channel_names
+    assert {"agents_list", "subagents"}.isdisjoint(channel_admin_ctx.denied_tools)
 
 
 def test_channel_media_policy_surfaces_basic_pptx_fallback_explicitly() -> None:

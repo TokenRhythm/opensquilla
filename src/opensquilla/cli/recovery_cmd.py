@@ -11,10 +11,14 @@ from pathlib import Path
 
 import typer
 
+from opensquilla.cli.session_schema import prepare_session_schema
 from opensquilla.recovery import (
+    ConsolidationResult,
     RecoveryError,
     RecoveryReport,
+    acknowledge_profile_credential,
     choose_workspace,
+    consolidate_recovery_profiles,
     inspect_profile,
     reconcile_profile,
 )
@@ -31,6 +35,7 @@ from opensquilla.recovery.settings_transaction import (
     apply_desktop_settings,
     recover_desktop_settings,
 )
+from opensquilla.sandbox.upgrade_migration import inspect_sandbox_upgrade
 
 recovery_app = typer.Typer(
     help="Inspect and repair Desktop profiles without starting the runtime.",
@@ -39,6 +44,36 @@ recovery_app = typer.Typer(
 )
 
 _MAX_CLEANUP_APPROVAL_BYTES = 512 * 1024
+
+# Mutating commands fail closed with profile_lock_busy the instant another
+# writer holds the profile locks. Desktop startup passes a small bound here so
+# a transient writer (an exiting gateway, a cron tick) resolves on its own
+# instead of stranding the user on the manual recovery page.
+_LOCK_TIMEOUT_OPTION = typer.Option(
+    0.0,
+    "--lock-timeout",
+    min=0.0,
+    help="Seconds to wait for a busy profile writer before failing with profile_lock_busy.",
+)
+
+
+@recovery_app.command("sandbox-upgrade-status")
+def sandbox_upgrade_status(
+    home: Path = typer.Option(..., "--home", exists=True, file_okay=False),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Inspect the retained sandbox-upgrade journal without changing it."""
+    report = inspect_sandbox_upgrade(home)
+    if json_output:
+        typer.echo(json.dumps(report.to_dict(), ensure_ascii=False, sort_keys=True))
+    else:
+        typer.echo(f"{report.status}: {'ready' if report.ok else 'recovery required'}")
+        typer.echo(f"journal: {report.journal_path}")
+        typer.echo(f"snapshot: {report.snapshot_path or '-'}")
+        if report.error:
+            typer.echo(report.error, err=True)
+    if not report.ok:
+        raise typer.Exit(code=2)
 
 
 def _emit(report: RecoveryReport, *, json_output: bool) -> None:
@@ -70,17 +105,24 @@ def _failure_report(
         # can still fail below pathlib itself. Keep stdout protocol-valid.
         from opensquilla.recovery.models import RecoveryReport as Report
 
+        home_path = home.expanduser().absolute()
         return Report(
             outcome="recovery_required",
             stable_code=error.stable_code,
-            primary_home=home.expanduser().absolute(),
+            primary_home=home_path,
             effective_workspace=None,
             candidates=(),
             allowed_actions=("copy-diagnostics",),
             transaction_id="",
             revision=0,
+            detail=str(error).replace(str(home_path), "<HOME>"),
         )
-    return replace(base, outcome="recovery_required", stable_code=error.stable_code)
+    return replace(
+        base,
+        outcome="recovery_required",
+        stable_code=error.stable_code,
+        detail=str(error).replace(str(base.primary_home), "<HOME>"),
+    )
 
 
 def _run(
@@ -118,6 +160,24 @@ def _cleanup_exit(report: CleanupReport, *, json_output: bool) -> None:
     if report.outcome == "partial":
         raise typer.Exit(code=1)
     if report.outcome == "blocked":
+        raise typer.Exit(code=2)
+
+
+def _emit_consolidation(
+    report: ConsolidationResult,
+    *,
+    json_output: bool,
+) -> None:
+    if json_output:
+        typer.echo(json.dumps(report.as_dict(), ensure_ascii=False, sort_keys=True))
+    else:
+        typer.echo(f"{report.outcome}: {report.stable_code}")
+        typer.echo(f"primary: {report.primary_home}")
+        typer.echo(f"backup: {report.backup_path or '-'}")
+    if report.outcome == "blocked":
+        if not json_output:
+            for error in report.errors:
+                typer.echo(error, err=True)
         raise typer.Exit(code=2)
 
 
@@ -237,11 +297,12 @@ def recovery_reconcile(
         help="desktop-primary (default) or desktop-recovery.",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit the fixed JSON protocol."),
+    lock_timeout: float = _LOCK_TIMEOUT_OPTION,
 ) -> None:
     """Apply only a proven no-conflict legacy layout repair."""
     kind = _desktop_profile_kind(profile_kind)
     _run(
-        lambda: reconcile_profile(home, profile_kind=kind),
+        lambda: reconcile_profile(home, profile_kind=kind, lock_timeout=lock_timeout),
         home=home,
         json_output=json_output,
         profile_kind=kind,
@@ -313,11 +374,35 @@ def recovery_apply_settings(
 def recovery_recover_settings(
     home: Path = typer.Option(..., "--home", help="Desktop profile root H."),
     json_output: bool = typer.Option(False, "--json", help="Emit the fixed JSON protocol."),
+    lock_timeout: float = _LOCK_TIMEOUT_OPTION,
 ) -> None:
     """Finish an identity-proven interrupted Desktop settings transaction."""
 
     _run(
-        lambda: recover_desktop_settings(home),
+        lambda: recover_desktop_settings(home, lock_timeout=lock_timeout),
+        home=home,
+        json_output=json_output,
+        profile_kind="desktop-primary",
+    )
+
+
+@recovery_app.command("recover-config")
+def recovery_recover_config(
+    home: Path = typer.Option(..., "--home", help="Desktop profile root H."),
+    json_output: bool = typer.Option(False, "--json", help="Emit the fixed JSON protocol."),
+    lock_timeout: float = _LOCK_TIMEOUT_OPTION,
+) -> None:
+    """Replace a corrupt config.toml from its newest valid sibling backup.
+
+    The corrupt file is always preserved next to itself as
+    ``config.toml.corrupt.<stamp>`` first; without a usable backup a minimal
+    default config is written so startup can proceed.
+    """
+
+    from opensquilla.recovery.config_recovery import recover_config
+
+    _run(
+        lambda: recover_config(home, lock_timeout=lock_timeout),
         home=home,
         json_output=json_output,
         profile_kind="desktop-primary",
@@ -362,6 +447,7 @@ def recovery_recover_transaction(
         help="Inspection revision used for compare-and-swap.",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit the fixed JSON protocol."),
+    lock_timeout: float = _LOCK_TIMEOUT_OPTION,
 ) -> None:
     """Safely rollback or finalize one typed interrupted profile transaction."""
 
@@ -374,10 +460,68 @@ def recovery_recover_transaction(
             transaction_id=transaction_id,
             expected_revision=expected_revision,
             import_recoverer=recover_interrupted_profile_import,
+            lock_timeout=lock_timeout,
         ),
         home=home,
         json_output=json_output,
         profile_kind="desktop-primary",
+    )
+
+
+@recovery_app.command("consolidate-profiles")
+def recovery_consolidate_profiles(
+    user_data: Path = typer.Option(..., "--user-data", help="Electron userData root A."),
+    primary_home: Path = typer.Option(
+        ...,
+        "--primary-home",
+        help="Canonical Desktop primary profile root H.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the fixed profile-consolidation protocol.",
+    ),
+) -> None:
+    """Merge every legacy recovery profile into the primary profile."""
+
+    _emit_consolidation(
+        consolidate_recovery_profiles(
+            user_data,
+            primary_home,
+            prepare_session_schema=prepare_session_schema,
+        ),
+        json_output=json_output,
+    )
+
+
+@recovery_app.command("acknowledge-profile-credential")
+def recovery_acknowledge_profile_credential(
+    user_data: Path = typer.Option(..., "--user-data", help="Electron userData root A."),
+    primary_home: Path = typer.Option(
+        ...,
+        "--primary-home",
+        help="Canonical Desktop primary profile root H.",
+    ),
+    transaction_id: str = typer.Option(
+        ...,
+        "--transaction-id",
+        help="Profile consolidation transaction id.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit the fixed profile-consolidation protocol.",
+    ),
+) -> None:
+    """Acknowledge terminal handling of one archived Desktop credential."""
+
+    _emit_consolidation(
+        acknowledge_profile_credential(
+            user_data,
+            primary_home,
+            transaction_id,
+        ),
+        json_output=json_output,
     )
 
 
@@ -398,6 +542,7 @@ def recovery_abandon_cleanup(
         help="Inspection revision used for compare-and-swap.",
     ),
     json_output: bool = typer.Option(False, "--json", help="Emit the fixed JSON protocol."),
+    lock_timeout: float = _LOCK_TIMEOUT_OPTION,
 ) -> None:
     """Preserve a partial cleanup and archive only its exact journal."""
 
@@ -410,6 +555,7 @@ def recovery_abandon_cleanup(
             profile_kind=kind,
             transaction_id=transaction_id,
             expected_revision=expected_revision,
+            lock_timeout=lock_timeout,
         )
         return inspect_profile(home, profile_kind=kind)
 
@@ -483,9 +629,7 @@ def recovery_cleanup_apply(
     """Apply a previously inspected cleanup after exact path confirmation."""
 
     if after_parent_exit:
-        if mode != "delete-all-user-data" or os.environ.get(
-            "OPENSQUILLA_RECOVERY_OFFLINE"
-        ) != "1":
+        if mode != "delete-all-user-data" or os.environ.get("OPENSQUILLA_RECOVERY_OFFLINE") != "1":
             raise typer.BadParameter(
                 "--after-parent-exit is reserved for offline Desktop delete-all"
             )

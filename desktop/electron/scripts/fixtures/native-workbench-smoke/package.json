@@ -1,0 +1,6 @@
+{
+  "name": "opensquilla-native-workbench-smoke",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs"
+}

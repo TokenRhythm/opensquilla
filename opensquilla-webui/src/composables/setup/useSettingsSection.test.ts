@@ -59,6 +59,18 @@ describe('settings section IA', () => {
     expect(SETTINGS_SECTIONS.find(s => s.id === 'provider')?.label).toBe('Model Service')
   })
 
+  it('keeps Memory & Profile as a first-level action panel outside global save state', () => {
+    const memory = SETTINGS_SECTIONS.find(s => s.id === 'memory')
+    expect(memory).toMatchObject({
+      label: 'Memory & Profile',
+      group: 'preferences',
+      client: true,
+      desktopOnly: false,
+    })
+    expect(en.settings.rail.memory).toBe('Memory & Profile')
+    expect(zhHans.settings.rail.memory).toBe('记忆与画像')
+  })
+
   it('aliases stale Router and Ensemble deep links to Model Strategy', () => {
     expect(sectionFromRouteParam('router')).toBe('modelStrategy')
     expect(sectionFromRouteParam('ensemble')).toBe('modelStrategy')

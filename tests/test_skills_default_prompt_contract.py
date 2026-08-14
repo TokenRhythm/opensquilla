@@ -39,7 +39,6 @@ DEFAULTS = {
     "http-fetch",
     "latex-compile",
     "memory",
-    "meta-kid-project-planner",
     "meta-paper-write",
     "meta-short-drama",
     "meta-skill-creator",
@@ -60,7 +59,6 @@ DEFAULTS = {
     "skill-creator",
     "sub-agent",
     "subtitle-burner",
-    "swe-bench",
     "summarize",
     "text-file-read",
     "title-card-image",
@@ -81,11 +79,20 @@ INTERNAL_HELPERS = {
     "openrouter-video-generator",
     # meta-DAG-internal pipeline fragments: reachable via a meta-skill's `skill:`
     # directive, never invoked standalone, so hidden from the model's index.
+    "paper-artifact-runtime",
+    "paper-citation-integrity-gate",
+    "paper-delivery-summary",
+    "paper-latex-sanitizer",
+    "paper-length-gate",
+    "paper-quality-gate",
     "paper-refbib-stub",
     "paper-section-author",
+    "paper-source-readiness-gate",
     "skill-creator-linter",
     "skill-creator-proposals",
     "skill-creator-smoke-test",
+    "short-drama-delivery-audit",
+    "short-drama-review-normalizer",
     "srt-from-script",
     "stack-trace-generic-probe",
     "stack-trace-go-probe",
@@ -93,6 +100,7 @@ INTERNAL_HELPERS = {
     "stack-trace-python-probe",
     "stack-trace-rust-probe",
 }
+COMPATIBILITY_TOMBSTONES = {"meta-kid-project-planner"}
 
 
 def _ctx(
@@ -138,14 +146,14 @@ def _ctx(
     )
 
 
-def test_bundled_directory_only_contains_retained_default_skills() -> None:
+def test_bundled_directory_only_contains_retained_skills_and_tombstones() -> None:
     bundled_names = {
         path.name
         for path in BUNDLED.iterdir()
         if path.is_dir() and (path / "SKILL.md").is_file()
     }
 
-    assert bundled_names == DEFAULTS | INTERNAL_HELPERS
+    assert bundled_names == DEFAULTS | INTERNAL_HELPERS | COMPATIBILITY_TOMBSTONES
 
 
 def test_skill_filter_defaults_are_release_safe(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -207,6 +215,8 @@ async def test_default_prompt_only_injects_retained_bundled_skills(
         assert f"<name>{name}</name>" not in prompt
     for name in INTERNAL_HELPERS:
         assert f"<name>{name}</name>" not in prompt
+    for name in COMPATIBILITY_TOMBSTONES:
+        assert f"<name>{name}</name>" not in prompt
     # Coding-mode skills stay out of the default (coding mode OFF) prompt.
     for name in CODING_MODE_GATED:
         assert f"<name>{name}</name>" not in prompt
@@ -249,6 +259,41 @@ async def test_coding_mode_on_surfaces_code_task(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("missing_tool", ["background_process", "exec_command", "process"])
+async def test_coding_mode_hides_code_task_without_required_launch_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_tool: str,
+) -> None:
+    monkeypatch.setattr(
+        skills_filter_step,
+        "_elig_ctx",
+        EligibilityContext(
+            os_name="linux",
+            has_bin_cache={"git": True},
+            env_cache={},
+        ),
+    )
+    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
+    tools = {"background_process", "exec_command", "process"}
+    tools.remove(missing_tool)
+    ctx = _ctx(
+        loader,
+        tools=tools,
+        skills_config=SimpleNamespace(
+            filter_enabled=False,
+            max_skills_prompt_chars=100_000,
+            injection_mode="system",
+            coding_mode=True,
+        ),
+    )
+
+    ctx = await filter_skills(ctx)
+
+    assert "<name>code-task</name>" not in ctx.system_prompt[1]
+
+
+@pytest.mark.asyncio
 async def test_pinned_catalog_avoids_reloading_during_skill_injection() -> None:
     spec = SkillSpec(
         name="catalog-pinned",
@@ -269,6 +314,47 @@ async def test_pinned_catalog_avoids_reloading_during_skill_injection() -> None:
     out = await filter_skills(ctx)
 
     assert "<name>catalog-pinned</name>" in out.system_prompt[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("injection_mode", ["system", "user_context", "user_message"])
+async def test_production_skill_prompts_do_not_expose_host_locations(
+    injection_mode: str,
+) -> None:
+    spec = SkillSpec(
+        name="portable-community-skill",
+        description="Portable community skill",
+        layer=SkillLayer.MANAGED,
+        always=True,
+        triggers=[],
+        content="Use this skill.",
+        path=Path("/synthetic/host/skills/portable-community-skill/SKILL.md"),
+        file_path="/synthetic/host/skills/portable-community-skill/SKILL.md",
+    )
+
+    class _FailingLoader:
+        def load_all(self):
+            raise AssertionError("loader must not be read after the turn snapshot is pinned")
+
+    ctx = _ctx(
+        _FailingLoader(),  # type: ignore[arg-type]
+        skills_config=SimpleNamespace(
+            filter_enabled=False,
+            max_skills_prompt_chars=100_000,
+            injection_mode=injection_mode,
+        ),
+    )
+    ctx.skill_catalog = SimpleNamespace(skills=(spec,), generation=8)
+
+    out = await filter_skills(ctx)
+    if injection_mode == "user_context":
+        prompt = out.metadata["skills_context_prompt"]
+    else:
+        prompt = out.system_prompt[1]
+
+    assert "<name>portable-community-skill</name>" in prompt
+    assert "<location>" not in prompt
+    assert "/synthetic/host/skills" not in prompt
 
 
 @pytest.mark.asyncio

@@ -17,6 +17,9 @@ interface MountOptions {
   historyHasMore?: boolean
   onNavigate?: ReturnType<typeof vi.fn>
   onNavigateEnd?: ReturnType<typeof vi.fn>
+  ensureMessageVisible?: (sourceIndex: number) => Promise<HTMLElement | null>
+  releaseEnsuredMessage?: (sourceIndex?: number) => void
+  messageOffset?: (sourceIndex: number) => number | null
 }
 
 interface ThreadDimensions {
@@ -25,7 +28,30 @@ interface ThreadDimensions {
   scrollHeight?: number
 }
 
+interface ResizeObserverFixture {
+  callback: ResizeObserverCallback
+  targets: Set<Element>
+}
+
 const mountedApps: App<Element>[] = []
+
+function stubResizeObservers(): ResizeObserverFixture[] {
+  const observers: ResizeObserverFixture[] = []
+  vi.stubGlobal('ResizeObserver', class {
+    callback: ResizeObserverCallback
+    targets = new Set<Element>()
+
+    constructor(callback: ResizeObserverCallback) {
+      this.callback = callback
+      observers.push(this)
+    }
+
+    observe(target: Element) { this.targets.add(target) }
+    unobserve(target: Element) { this.targets.delete(target) }
+    disconnect() { this.targets.clear() }
+  })
+  return observers
+}
 
 function message(role: 'user' | 'assistant', index: number): ChatRenderedMessage {
   return {
@@ -131,6 +157,9 @@ async function mountMinimap(
     historyHasMore: options.historyHasMore,
     onNavigate: options.onNavigate,
     onNavigateEnd: options.onNavigateEnd,
+    ensureMessageVisible: options.ensureMessageVisible,
+    releaseEnsuredMessage: options.releaseEnsuredMessage,
+    messageOffset: options.messageOffset,
   })
   app.use(i18n)
   app.mount(host)
@@ -188,18 +217,36 @@ describe('ConversationMinimap', () => {
     await vi.waitFor(() => expect(host.querySelector('[role="tooltip"]')).toBeNull())
   })
 
-  it('interpolates the lens continuously between neighboring prompts while reading', async () => {
+  it('keeps idle markers short while tracking the current prompt with thickness and opacity', async () => {
     const { host, thread } = await mountMinimap()
-    thread.container.scrollTop = 20
+    thread.container.scrollTop = 1000
     thread.container.dispatchEvent(new Event('scroll'))
     await new Promise(resolve => window.requestAnimationFrame(() => resolve(undefined)))
 
     const rows = markers(host)
-    const scale = (index: number) => Number(rows[index].style.getPropertyValue('--conversation-minimap-line-scale-x'))
-    expect(scale(0)).toBeCloseTo(scale(1), 3)
-    expect(scale(0)).toBeGreaterThan(scale(2))
-    expect(rows[0].getAttribute('aria-current')).toBe('location')
+    const styleValue = (index: number, property: string) => (
+      Number(rows[index].style.getPropertyValue(property))
+    )
+    const widthScale = (index: number) => styleValue(
+      index,
+      '--conversation-minimap-line-scale-x',
+    )
+    const heightScale = (index: number) => styleValue(
+      index,
+      '--conversation-minimap-line-scale-y',
+    )
+    const opacity = (index: number) => styleValue(
+      index,
+      '--conversation-minimap-line-opacity',
+    )
+
+    expect(rows.map((_, index) => widthScale(index))).toEqual(Array(8).fill(0.2667))
+    expect(rows[2].getAttribute('aria-current')).toBe('location')
     expect(rows.filter(row => row.hasAttribute('aria-current'))).toHaveLength(1)
+    expect(heightScale(2)).toBe(1)
+    expect(opacity(2)).toBe(1)
+    expect(heightScale(1)).toBe(0.5)
+    expect(opacity(1)).toBe(0.45)
   })
 
   it('uses a continuous neighboring lens without remounting the preview while scrubbing', async () => {
@@ -222,7 +269,34 @@ describe('ConversationMinimap', () => {
     expect(scale(3)).toBeCloseTo(scale(4), 3)
     expect(scale(3)).toBeGreaterThan(scale(2))
     expect(scale(4)).toBeGreaterThan(scale(5))
+    expect(Number(
+      rows[0].style.getPropertyValue('--conversation-minimap-line-scale-y'),
+    )).toBe(1)
+    expect(Number(
+      rows[3].style.getPropertyValue('--conversation-minimap-line-scale-y'),
+    )).toBe(0.5)
     expect(host.querySelector('[role="tooltip"]')).toBe(initialTooltip)
+  })
+
+  it('collapses the pointer lens after leaving the rail', async () => {
+    const { host } = await mountMinimap()
+    const rows = markers(host)
+    const widthScale = (index: number) => Number(
+      rows[index].style.getPropertyValue('--conversation-minimap-line-scale-x'),
+    )
+
+    rows[3].dispatchEvent(new MouseEvent('mouseenter'))
+    await nextTick()
+    expect(widthScale(3)).toBe(1)
+    expect(widthScale(2)).toBeGreaterThan(0.2667)
+
+    host.querySelector<HTMLElement>('.conversation-minimap__list')?.dispatchEvent(
+      new MouseEvent('pointerleave'),
+    )
+    await nextTick()
+
+    expect(rows.map((_, index) => widthScale(index))).toEqual(Array(8).fill(0.2667))
+    await vi.waitFor(() => expect(host.querySelector('[role="tooltip"]')).toBeNull())
   })
 
   it('jumps to a prompt without forcing the conversation to the live edge', async () => {
@@ -243,6 +317,35 @@ describe('ConversationMinimap', () => {
     thread.container.dispatchEvent(new Event('scrollend'))
     expect(onNavigateEnd).toHaveBeenCalledOnce()
     expect(thread.container.querySelector('[data-chat-turn-key="user-3"]')?.classList.contains('is-history-target')).toBe(true)
+  })
+
+  it('materializes an unmounted logical prompt before minimap navigation', async () => {
+    let threadContainer: HTMLElement | null = null
+    const releaseEnsuredMessage = vi.fn()
+    const ensureMessageVisible = vi.fn(async (sourceIndex: number) => {
+      const anchor = document.createElement('div')
+      anchor.id = `chat-turn-${sourceIndex}`
+      anchor.dataset.chatTurnKey = `user-${sourceIndex / 2}`
+      anchor.tabIndex = -1
+      anchor.getBoundingClientRect = () => rect((sourceIndex / 2) * 400 - (threadContainer?.scrollTop || 0), 80)
+      threadContainer?.appendChild(anchor)
+      return anchor
+    })
+    const mounted = await mountMinimap(8, {
+      ensureMessageVisible,
+      releaseEnsuredMessage,
+      messageOffset: sourceIndex => (sourceIndex / 2) * 400,
+    })
+    threadContainer = mounted.thread.container
+    mounted.thread.container.querySelector('[data-chat-turn-key="user-3"]')?.remove()
+
+    markers(mounted.host)[3].click()
+    await vi.waitFor(() => expect(mounted.thread.scrollTo).toHaveBeenCalled())
+
+    expect(ensureMessageVisible).toHaveBeenCalledWith(6)
+    expect(mounted.thread.scrollTo).toHaveBeenLastCalledWith({ top: 1_184, behavior: 'smooth' })
+    mounted.thread.container.dispatchEvent(new Event('scrollend'))
+    expect(releaseEnsuredMessage).toHaveBeenCalledWith(6)
   })
 
   it('completes immediately when the selected prompt is already in place', async () => {
@@ -316,6 +419,18 @@ describe('ConversationMinimap', () => {
     const next = markers(host)[3]
     expect(document.activeElement).toBe(next)
     expect(next.tabIndex).toBe(0)
+    expect(Number(
+      next.style.getPropertyValue('--conversation-minimap-line-scale-x'),
+    )).toBe(1)
+    expect(Number(
+      markers(host)[2].style.getPropertyValue('--conversation-minimap-line-scale-x'),
+    )).toBeGreaterThan(0.2667)
+    expect(Number(
+      markers(host)[2].style.getPropertyValue('--conversation-minimap-line-scale-y'),
+    )).toBe(1)
+    expect(Number(
+      next.style.getPropertyValue('--conversation-minimap-line-scale-y'),
+    )).toBe(0.5)
     next.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
     expect(thread.scrollTo).toHaveBeenLastCalledWith({ top: thread.offsets[3] - 16, behavior: 'smooth' })
     expect(document.activeElement).toBe(thread.container.querySelector('[data-chat-turn-key="user-3"]'))
@@ -402,9 +517,9 @@ describe('ConversationMinimap', () => {
     expect(markers(host)).toHaveLength(8)
   })
 
-  it('enters only at the 1104px conversation-pane threshold', async () => {
+  it('enters only at the 1120px conversation-pane threshold', async () => {
     const rendered = messages(8)
-    const narrowThread = makeThread(rendered, 1103)
+    const narrowThread = makeThread(rendered, 1119)
     const narrowHost = document.createElement('div')
     document.body.appendChild(narrowHost)
     const narrowApp = createApp(ConversationMinimap, {
@@ -418,30 +533,13 @@ describe('ConversationMinimap', () => {
     await new Promise(resolve => window.setTimeout(resolve, 20))
 
     expect(narrowHost.querySelector('[data-testid="conversation-minimap"]')).toBeNull()
-    const wide = await mountMinimap(8, {}, { clientWidth: 1104 })
+    const wide = await mountMinimap(8, {}, { clientWidth: 1120 })
     expect(markers(wide.host)).toHaveLength(8)
   })
 
-  it('keeps the rail mounted until the pane crosses the 1056px exit threshold', async () => {
-    const observers: Array<{
-      callback: ResizeObserverCallback
-      targets: Set<Element>
-    }> = []
-    vi.stubGlobal('ResizeObserver', class {
-      callback: ResizeObserverCallback
-      targets = new Set<Element>()
-
-      constructor(callback: ResizeObserverCallback) {
-        this.callback = callback
-        observers.push(this)
-      }
-
-      observe(target: Element) { this.targets.add(target) }
-      unobserve(target: Element) { this.targets.delete(target) }
-      disconnect() { this.targets.clear() }
-    })
-
-    const { host, thread } = await mountMinimap(8, {}, { clientWidth: 1104 })
+  it('keeps the rail mounted until the pane crosses the 1104px collision floor', async () => {
+    const observers = stubResizeObservers()
+    const { host, thread } = await mountMinimap(8, {}, { clientWidth: 1120 })
     const shellObserver = observers.find(observer => observer.targets.has(thread.container))!
     const resizeTo = async (width: number) => {
       Object.defineProperty(thread.container, 'clientWidth', { configurable: true, value: width })
@@ -449,27 +547,38 @@ describe('ConversationMinimap', () => {
       await nextTick()
     }
 
-    await resizeTo(1057)
+    await resizeTo(1105)
     expect(markers(host)).toHaveLength(8)
-    await resizeTo(1056)
-    await vi.waitFor(() => expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull())
-    await resizeTo(1103)
-    expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull()
     await resizeTo(1104)
+    await vi.waitFor(() => expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull())
+    await resizeTo(1119)
+    expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull()
+    await resizeTo(1120)
     await vi.waitFor(() => expect(markers(host)).toHaveLength(8))
   })
 
   it('uses a lower exit threshold so small layout changes do not flicker the rail', async () => {
+    const observers = stubResizeObservers()
     const { host, thread } = await mountMinimap(8, {}, { scrollHeight: 1500 })
+    const threadObserver = observers.find(observer => observer.targets.size > 1)!
+    const resizeThread = async (scrollHeight: number) => {
+      Object.defineProperty(thread.container, 'scrollHeight', { configurable: true, value: scrollHeight })
+      threadObserver.callback(
+        [{ target: thread.container } as unknown as ResizeObserverEntry],
+        threadObserver as unknown as ResizeObserver,
+      )
+      await new Promise(resolve => window.requestAnimationFrame(() => resolve(undefined)))
+      await nextTick()
+    }
 
-    Object.defineProperty(thread.container, 'scrollHeight', { configurable: true, value: 1200 })
-    thread.container.appendChild(document.createElement('div'))
-    await new Promise(resolve => window.setTimeout(resolve, 20))
+    await resizeThread(1200)
     expect(markers(host)).toHaveLength(8)
 
-    Object.defineProperty(thread.container, 'scrollHeight', { configurable: true, value: 1199 })
-    thread.container.appendChild(document.createElement('div'))
-    await vi.waitFor(() => expect(host.querySelector('[data-testid="conversation-minimap"]')).toBeNull())
+    await resizeThread(1199)
+    expect(
+      host.querySelector('[data-testid="conversation-minimap"]')
+        ?.classList.contains('conversation-minimap-shell-leave-active'),
+    ).toBe(true)
   })
 
   it('resets threshold hysteresis when the session changes even if fallback keys overlap', async () => {

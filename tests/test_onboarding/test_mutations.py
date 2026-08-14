@@ -41,6 +41,127 @@ def test_upsert_provider_persists_fields():
     assert res.changed is True
 
 
+def test_upsert_openrouter_can_atomically_enable_provider_default_image_generation():
+    cfg = GatewayConfig()
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+        image_generation_intent="enable_provider_default",
+    )
+
+    image = res.config.image_generation
+    assert image.enabled is True
+    assert image.binding == "follow_llm"
+    assert image.primary == "openrouter/google/gemini-3.1-flash-image-preview"
+    assert image.fallbacks == []
+    assert {
+        "image_generation.enabled",
+        "image_generation.binding",
+        "image_generation.primary",
+    } <= res.config.force_persist_paths()
+    assert res.public_payload["capabilityChanges"]["imageGeneration"] == {
+        "applied": True,
+        "reason": "enabled_provider_default",
+        "binding": "follow_llm",
+        "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+    }
+
+
+def test_upsert_openrouter_legacy_save_preserves_unconfigured_image_generation():
+    cfg = GatewayConfig()
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+    )
+
+    assert res.config.image_generation.enabled is False
+    assert res.config.image_generation.binding == "custom"
+    assert "capabilityChanges" not in res.public_payload
+
+
+@pytest.mark.parametrize(
+    "image_generation",
+    [
+        {"enabled": False},
+        {
+            "enabled": True,
+            "primary": "openai/gpt-image-1",
+            "providers": {"openai": {"api_key": "synthetic-image-key"}},
+        },
+    ],
+)
+def test_upsert_openrouter_does_not_override_operator_owned_image_generation(
+    image_generation,
+):
+    cfg = GatewayConfig(image_generation=image_generation)
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+        image_generation_intent="enable_provider_default",
+    )
+
+    assert res.config.image_generation.model_dump() == cfg.image_generation.model_dump()
+    change = res.public_payload["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is False
+    assert change["reason"] == "operator_configuration_preserved"
+
+
+def test_upsert_openrouter_default_image_generation_rejects_custom_endpoint():
+    cfg = GatewayConfig()
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+        base_url="https://openrouter-compatible.example/v1",
+        image_generation_intent="enable_provider_default",
+    )
+
+    assert res.config.image_generation.enabled is False
+    change = res.public_payload["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is False
+    assert change["reason"] == "custom_endpoint_preserved"
+
+
+def test_upsert_openrouter_default_image_generation_rejects_wrong_official_path():
+    cfg = GatewayConfig()
+
+    res = upsert_llm_provider(
+        cfg,
+        provider_id="openrouter",
+        model="openai/gpt-test",
+        api_key="synthetic-openrouter-key",
+        base_url="https://openrouter.ai/compatible/v1",
+        image_generation_intent="enable_provider_default",
+    )
+
+    assert res.config.image_generation.enabled is False
+    change = res.public_payload["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is False
+    assert change["reason"] == "custom_endpoint_preserved"
+
+
+def test_upsert_provider_rejects_unknown_image_generation_intent():
+    with pytest.raises(ValueError, match="image_generation_intent"):
+        upsert_llm_provider(
+            GatewayConfig(),
+            provider_id="openrouter",
+            model="openai/gpt-test",
+            api_key="synthetic-openrouter-key",
+            image_generation_intent="silently_enable_everything",
+        )
+
+
 def test_upsert_provider_strips_trailing_paste_punctuation_from_api_key():
     cfg = GatewayConfig()
     res = upsert_llm_provider(
@@ -588,6 +709,7 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
             "source": "custom",
             "enabled": True,
             "role": "",
+            "thinking_level": "",
         }
     ]
     assert res.public_payload["candidates"] == [
@@ -597,6 +719,7 @@ def test_upsert_llm_ensemble_accepts_structured_candidates_partial_merge():
             "source": "custom",
             "enabled": True,
             "role": "",
+            "thinking_level": "",
         }
     ]
 
@@ -1822,6 +1945,85 @@ def test_upsert_image_generation_provider_configures_openrouter(monkeypatch):
     assert res.public_payload["api_key_source"] == "explicit"
 
 
+def test_upsert_image_generation_redacted_key_keeps_direct_credential_with_env_echo(
+    monkeypatch,
+):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    first = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openrouter",
+        api_key="sk-stored-direct-key",
+    )
+
+    res = upsert_image_generation_provider(
+        first.config,
+        provider_id="openrouter",
+        api_key="***",
+        api_key_env="OPENROUTER_API_KEY",
+    )
+
+    provider = res.config.image_generation.providers.openrouter
+    assert provider.api_key == "sk-stored-direct-key"
+    assert res.public_payload["api_key_source"] == "explicit"
+
+
+def test_upsert_image_generation_legacy_direct_key_accepts_default_env_echo(monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    res = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key="sk-new-direct-key",
+        api_key_env="OPENROUTER_API_KEY",
+    )
+
+    provider = res.config.image_generation.providers.openrouter
+    assert provider.api_key == "sk-new-direct-key"
+    assert provider.api_key_env == ""
+    assert res.public_payload["api_key_source"] == "explicit"
+
+
+def test_upsert_image_generation_legacy_default_env_echo_keeps_stored_direct_key(
+    monkeypatch,
+):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        image_generation={
+            "enabled": True,
+            "primary": _IMG_PRIMARY,
+            "providers": {
+                "openrouter": {
+                    "api_key": "sk-stored-direct-key",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                }
+            },
+        }
+    )
+
+    res = upsert_image_generation_provider(
+        cfg,
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key_env="OPENROUTER_API_KEY",
+    )
+
+    provider = res.config.image_generation.providers.openrouter
+    assert provider.api_key == "sk-stored-direct-key"
+    assert res.public_payload["api_key_source"] == "explicit"
+
+
+def test_upsert_image_generation_legacy_direct_key_rejects_custom_env_echo():
+    with pytest.raises(ValueError, match="either api_key or api_key_env"):
+        upsert_image_generation_provider(
+            GatewayConfig(),
+            provider_id="openrouter",
+            primary=_IMG_PRIMARY,
+            api_key="sk-new-direct-key",
+            api_key_env="CUSTOM_IMAGE_KEY",
+        )
+
+
 def test_upsert_image_generation_provider_can_use_matching_llm_key(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     cfg = GatewayConfig()
@@ -1831,6 +2033,31 @@ def test_upsert_image_generation_provider_can_use_matching_llm_key(monkeypatch):
     assert res.config.image_generation.enabled is True
     assert res.config.image_generation.providers.openrouter.api_key == ""
     assert res.public_payload["api_key_source"] == "llm_fallback"
+
+
+def test_upsert_image_generation_reuses_profile_without_copying_its_key(monkeypatch):
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/auto",
+            "api_key": "synthetic-primary-key",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_profiles={
+            "tokenrhythm": {
+                "model": "deepseek-v4-flash",
+                "api_key": "synthetic-profile-key",
+                "base_url": "https://tokenrhythm.studio/v1",
+            }
+        },
+    )
+
+    result = upsert_image_generation_provider(cfg, provider_id="tokenrhythm")
+
+    assert result.public_payload["api_key_source"] == "llm_fallback"
+    assert result.config.image_generation.providers.tokenrhythm.api_key == ""
+    assert result.config.image_generation.providers.tokenrhythm.api_key_env == ""
 
 
 def test_upsert_image_generation_provider_llm_fallback_requires_same_origin(monkeypatch):
@@ -2026,14 +2253,17 @@ def test_upsert_image_generation_does_not_restore_default_env_after_origin_chang
     ) in reauthorized.config.force_persist_path_segments()
 
 
-def test_upsert_image_generation_fresh_default_origin_uses_default_env_key(monkeypatch):
+def test_upsert_image_generation_uses_default_env_without_persisting_schema_default(
+    monkeypatch,
+):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-shared-image-env")
     res = upsert_image_generation_provider(GatewayConfig(), provider_id="openai")
-    assert res.config.image_generation.providers.openai.api_key_env == "OPENAI_API_KEY"
+    assert res.config.image_generation.providers.openai.api_key_env == ""
+    assert res.public_payload["api_key_source"] == "env"
     assert res.public_payload["api_key_source"] == "env"
 
 
-def test_upsert_image_generation_same_origin_path_change_keeps_default_env_key(monkeypatch):
+def test_upsert_image_generation_same_origin_path_keeps_implicit_default_env(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-shared-image-env")
     first = upsert_image_generation_provider(GatewayConfig(), provider_id="openai")
 
@@ -2043,7 +2273,8 @@ def test_upsert_image_generation_same_origin_path_change_keeps_default_env_key(m
         base_url="https://api.openai.com/v2",
     )
 
-    assert same.config.image_generation.providers.openai.api_key_env == "OPENAI_API_KEY"
+    assert same.config.image_generation.providers.openai.api_key_env == ""
+    assert same.public_payload["api_key_source"] == "env"
     assert same.public_payload["api_key_source"] == "env"
 
 
@@ -2340,6 +2571,45 @@ def test_upsert_image_generation_applies_size_format_fallbacks():
     assert res.public_payload["fallbacks"] == ["openai/gpt-image-1", "openrouter/x"]
 
 
+def test_upsert_image_generation_canonicalizes_openrouter_auto_model():
+    res = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openrouter",
+        primary="openrouter/auto",
+        api_key="sk-img",
+        fallbacks=["openrouter/auto"],
+    )
+
+    assert res.config.image_generation.primary == "openrouter/openrouter/auto"
+    assert res.config.image_generation.fallbacks == ["openrouter/openrouter/auto"]
+
+
+def test_upsert_image_generation_legacy_switch_normalization_requires_saved_source_fields():
+    cfg = GatewayConfig(
+        image_generation={
+            "enabled": True,
+            "primary": "openai/custom-image-model",
+            "fallbacks": ["openai/gpt-image-1"],
+            "providers": {
+                "openai": {"base_url": "https://images.example.test/v1"},
+            },
+        }
+    )
+
+    with pytest.raises(ValueError, match="primary must be a provider/model reference"):
+        upsert_image_generation_provider(
+            cfg,
+            provider_id="openrouter",
+            primary="openai/custom-image-model",
+            api_key="sk-img",
+            api_key_env="OPENROUTER_API_KEY",
+            # This differs from the stored source endpoint, so it is not an
+            # old-client draft and must not receive compatibility rewriting.
+            base_url="https://untrusted.example.test/v1",
+            fallbacks=["openai/gpt-image-1"],
+        )
+
+
 def test_upsert_image_generation_empty_keeps_current():
     cfg = GatewayConfig()
     cfg.image_generation.size = "1024x1536"
@@ -2352,6 +2622,175 @@ def test_upsert_image_generation_empty_keeps_current():
     assert ig.size == "1024x1536"
     assert ig.output_format == "jpeg"
     assert ig.fallbacks == ["openrouter/keep"]
+
+
+def test_upsert_image_generation_legacy_empty_fallbacks_keep_current():
+    cfg = GatewayConfig()
+    cfg.image_generation.fallbacks = ["openrouter/keep"]
+
+    res = upsert_image_generation_provider(
+        cfg,
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key="sk-img",
+        fallbacks=[],
+    )
+
+    assert res.config.image_generation.fallbacks == ["openrouter/keep"]
+
+
+def test_upsert_image_generation_explicit_empty_fallbacks_clear_current():
+    cfg = GatewayConfig()
+    cfg.image_generation.fallbacks = ["openrouter/keep"]
+
+    res = upsert_image_generation_provider(
+        cfg,
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key="sk-img",
+        fallbacks=[],
+        clear_fallbacks=True,
+    )
+
+    assert res.config.image_generation.fallbacks == []
+    assert res.public_payload["fallbacks"] == []
+
+
+def test_upsert_image_generation_allows_authenticated_fallback_on_primary_metadata_save(
+    monkeypatch,
+):
+    from opensquilla.onboarding.section_status import (
+        SectionStatus,
+        image_generation_section_status,
+    )
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        image_generation={
+            "enabled": True,
+            "primary": _IMG_PRIMARY,
+            "fallbacks": ["openai/gpt-image-1"],
+            "providers": {"openai": {"api_key": "sk-fallback"}},
+        }
+    )
+
+    res = upsert_image_generation_provider(
+        cfg,
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        output_format="webp",
+    )
+
+    assert res.config.image_generation.output_format == "webp"
+    assert res.config.image_generation.fallbacks == ["openai/gpt-image-1"]
+    assert image_generation_section_status(res.config) is SectionStatus.OK
+
+
+def test_upsert_image_generation_env_reference_replaces_stored_direct_key():
+    first = upsert_image_generation_provider(
+        GatewayConfig(),
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key="sk-image-direct",
+    )
+
+    replaced = upsert_image_generation_provider(
+        first.config,
+        provider_id="openrouter",
+        primary=_IMG_PRIMARY,
+        api_key_env="OPENSQUILLA_TEST_IMAGE_KEY",
+        credential_mode="env",
+    )
+
+    provider = replaced.config.image_generation.providers.openrouter
+    assert provider.api_key == ""
+    assert provider.api_key_env == "OPENSQUILLA_TEST_IMAGE_KEY"
+
+
+@pytest.mark.parametrize(
+    ("primary", "fallbacks"),
+    [
+        ("openrouter/", None),
+        ("openrouter/google//image", None),
+        ("openrouter/google image", None),
+        (_IMG_PRIMARY, ["openai/"]),
+        (_IMG_PRIMARY, ["openai/gpt image"]),
+    ],
+)
+def test_upsert_image_generation_rejects_malformed_model_references(primary, fallbacks):
+    with pytest.raises(ValueError, match="provider/model|Invalid image generation model ref"):
+        upsert_image_generation_provider(
+            GatewayConfig(),
+            provider_id="openrouter",
+            primary=primary,
+            api_key="sk-img",
+            fallbacks=fallbacks,
+        )
+
+
+def test_upsert_image_generation_rejects_foreign_official_endpoint():
+    with pytest.raises(ValueError, match="cannot use the official 'openai' endpoint"):
+        upsert_image_generation_provider(
+            GatewayConfig(),
+            provider_id="openrouter",
+            primary=_IMG_PRIMARY,
+            api_key="sk-img",
+            base_url="https://api.openai.com/v1",
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "not-a-url",
+        "https://openrouter.ai:invalid/v1",
+        "https://openrouter.ai:99999/v1",
+        "https://openrouter.ai/api/v1?tenant=test",
+        "https://openrouter.ai/api/v1#fragment",
+        "https://user:secret@openrouter.ai/api/v1",
+    ],
+)
+def test_upsert_image_generation_rejects_invalid_endpoint(base_url):
+    with pytest.raises(ValueError, match="absolute http:// or https:// URL"):
+        upsert_image_generation_provider(
+            GatewayConfig(),
+            provider_id="openrouter",
+            primary=_IMG_PRIMARY,
+            api_key="sk-img",
+            base_url=base_url,
+        )
+
+
+def test_upsert_image_generation_can_disable_unchanged_legacy_invalid_config():
+    cfg = GatewayConfig(
+        image_generation={
+            "enabled": True,
+            "primary": "openrouter/google//image",
+            "fallbacks": ["openai/"],
+            "providers": {
+                "openrouter": {
+                    "api_key": "sk-synthetic-image",
+                    "base_url": "not-a-url",
+                }
+            },
+        }
+    )
+
+    res = upsert_image_generation_provider(
+        cfg,
+        provider_id="openrouter",
+        primary=cfg.image_generation.primary,
+        fallbacks=list(cfg.image_generation.fallbacks),
+        enabled=False,
+    )
+
+    assert res.config.image_generation.enabled is False
+    assert res.config.image_generation.primary == "openrouter/google//image"
+    assert res.config.image_generation.fallbacks == ["openai/"]
+    provider = res.config.image_generation.providers.openrouter
+    assert provider.base_url == "not-a-url"
+    assert provider.api_key == "sk-synthetic-image"
 
 
 def test_upsert_image_generation_rejects_bad_size():
@@ -2562,6 +3001,26 @@ def test_image_generation_explicit_enabled_decision_is_force_persisted(tmp_path)
 
     data = _tomllib.loads(target.read_text())
     assert data["image_generation"]["enabled"] is False
+
+
+def test_audio_explicit_enabled_decision_is_force_persisted(tmp_path):
+    """An old client may still explicitly disable audio while saving a key."""
+    import tomllib as _tomllib
+
+    from opensquilla.onboarding.config_store import load_config, persist_config
+
+    target = tmp_path / "config.toml"
+    cfg = load_config(target)
+    res = upsert_audio_provider(
+        cfg,
+        provider_id="elevenlabs",
+        api_key="synthetic-audio-key",
+        enabled=False,
+    )
+    persist_config(res.config, path=target)
+
+    data = _tomllib.loads(target.read_text())
+    assert data["audio"]["enabled"] is False
 
 
 def test_upsert_channel_blank_secret_keeps_stored_value():

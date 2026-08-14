@@ -102,9 +102,7 @@ def build_bwrap_plan(
     write_mounts = tuple(_write_mount(root) for root in permissions.write_roots)
     allowed_write_paths = tuple(
         dict.fromkeys(
-            path
-            for mount in write_mounts
-            for path in (mount.root.host_path, mount.source)
+            path for mount in write_mounts for path in (mount.root.host_path, mount.source)
         )
     )
     special_overlay_roots = [Path("/dev")]
@@ -188,9 +186,7 @@ def build_bwrap_plan(
         argv.extend(_mount_target_parent_args(read_root))
         argv.extend(_mount_args(read_root, writable=False))
 
-    reopened_read_paths = tuple(
-        dict.fromkeys(root.sandbox_path for root in reopened_read_mounts)
-    )
+    reopened_read_paths = tuple(dict.fromkeys(root.sandbox_path for root in reopened_read_mounts))
     denied_ancestors_of_writes = tuple(
         sorted(
             (
@@ -226,9 +222,7 @@ def build_bwrap_plan(
     )
     early_denied_paths = tuple(
         sorted(
-            dict.fromkeys(
-                (*denied_ancestors_of_writes, *denied_ancestors_of_reads)
-            ),
+            dict.fromkeys((*denied_ancestors_of_writes, *denied_ancestors_of_reads)),
             key=_path_depth,
         )
     )
@@ -358,8 +352,7 @@ def build_bwrap_plan(
         if denied in denied_ancestors_of_reads:
             continue
         if any(
-            _is_relative_to(denied, read_root.sandbox_path)
-            for read_root in reopened_read_mounts
+            _is_relative_to(denied, read_root.sandbox_path) for read_root in reopened_read_mounts
         ):
             continue
         if any(_is_relative_to(denied, mount.source) for mount in write_mounts):
@@ -395,13 +388,31 @@ class _WriteMount:
 
 
 def _write_mount(root: LinuxRoot) -> _WriteMount:
-    source = _canonical_target_if_symlinked_path(root.host_path) or root.host_path
+    if root.frozen_write_authority is not None:
+        source = root.frozen_write_authority
+        _validate_frozen_write_authority(source)
+    else:
+        source = _canonical_target_if_symlinked_path(root.host_path) or root.host_path
     dest = (
         source
         if source != root.host_path and root.sandbox_path == root.host_path
         else root.sandbox_path
     )
     return _WriteMount(root=root, source=source, dest=dest)
+
+
+def _validate_frozen_write_authority(frozen: Path) -> None:
+    try:
+        current = frozen.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise SandboxBackendError(
+            f"cannot validate frozen writable filesystem root: {frozen}"
+        ) from exc
+    if current != frozen:
+        raise SandboxBackendError(f"retargeted writable filesystem root: {frozen}")
+    # Bubblewrap consumes pathname mount sources, not pre-opened directory FDs.
+    # This closes retargets completed before planning; a narrow plan-to-exec
+    # race remains until the backend can bind an already-validated FD.
 
 
 def _read_mount_root(root: LinuxRoot, write_mounts: tuple[_WriteMount, ...]) -> LinuxRoot:
@@ -542,16 +553,10 @@ def _append_denied_path_args(
         )
         return
     descendant_paths = (
-        allowed_write_paths
-        if overlay_descendant_paths is None
-        else overlay_descendant_paths
+        allowed_write_paths if overlay_descendant_paths is None else overlay_descendant_paths
     )
     overlay_descendants = sorted(
-        (
-            root
-            for root in descendant_paths
-            if root != path and _is_relative_to(root, path)
-        ),
+        (root for root in descendant_paths if root != path and _is_relative_to(root, path)),
         key=_path_depth,
     )
     perms = "111" if path.is_dir() and overlay_descendants else "000"
@@ -569,9 +574,7 @@ def _append_missing_empty_file_bind_data_args(
 ) -> None:
     argv.extend(["--ro-bind", _empty_bind_file_path(preserved_files), str(path)])
     if synthetic_mount_targets is not None:
-        synthetic_mount_targets.append(
-            SyntheticMountCleanupTarget(path=path, kind="empty_file")
-        )
+        synthetic_mount_targets.append(SyntheticMountCleanupTarget(path=path, kind="empty_file"))
 
 
 def _empty_bind_file_path(preserved_files: list[BinaryIO]) -> str:

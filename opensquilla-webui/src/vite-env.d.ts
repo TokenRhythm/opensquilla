@@ -3,10 +3,23 @@
 import type {
   ArtifactNativeOpenResult,
   ArtifactOpenRequest,
+  DesktopMainWindowCloseBehavior,
+  DesktopPreferences,
   DesktopRetryStartupResult,
   DesktopUpdateState,
   DesktopSettings,
   DesktopSettingsPayload,
+  NativeArtifactPreviewLeaseBrokerResult,
+  NativeArtifactPreviewLeaseControlRequest,
+  NativeArtifactPreviewLeaseCreateRequest,
+  NativeWorkbenchCreateSurfaceRequest,
+  NativeWorkbenchNavigateRequest,
+  NativeWorkbenchPermissionResponse,
+  NativeWorkbenchSurfaceEvent,
+  NativeWorkbenchSurfaceRectRequest,
+  NativeWorkbenchSurfaceResult,
+  ProjectDirectoryPickerRequest,
+  WorkbenchPreviewMode,
 } from './platform/types'
 
 type MigrationSourceKind = 'cli-home' | 'desktop-home' | 'windows-portable'
@@ -39,11 +52,24 @@ declare global {
     getDesktopSettings: () => Promise<DesktopSettings>
     saveDesktopSettings: (payload: DesktopSettingsPayload) => Promise<DesktopSettings>
     resetDesktopSettings: () => Promise<{ ok: boolean }>
+    getDesktopPreferences?: () => Promise<DesktopPreferences>
+    saveDesktopPreferences?: (
+      payload: {
+        mainWindowCloseBehavior?: DesktopMainWindowCloseBehavior
+        workbenchPreviewMode?: WorkbenchPreviewMode
+        workbenchPreviewNoticeShown?: boolean
+        sandboxUnavailableWarningSuppressed?: boolean
+      },
+    ) => Promise<DesktopPreferences>
+    reportSandboxUnavailable?: (
+      payload: { state: 'failed' | 'unavailable'; message?: string },
+    ) => Promise<{ shown: boolean; suppressed: boolean }>
+    onWindowHidden?: (callback: () => void) => () => void
     inspectDesktopCleanup?: (payload: { mode: DesktopCleanupMode }) => Promise<{
       ok: boolean
       previewId: string | null
       report: DesktopCleanupReport
-      profile: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+      profile: { kind: 'primary'; recoveryId: null }
     }>
     discardDesktopCleanup?: (payload: { previewId: string }) => Promise<boolean>
     applyDesktopCleanup?: (payload: {
@@ -57,20 +83,50 @@ declare global {
       partial?: boolean
       previewId?: string | null
       report?: DesktopCleanupReport
-      profile?: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+      profile?: { kind: 'primary'; recoveryId: null }
       detail?: string
     }>
     revealDesktopUserData?: () => Promise<boolean>
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+    chooseProjectDirectory: (
+      request?: ProjectDirectoryPickerRequest,
+    ) => Promise<{ path: string } | null>
+    createWorkbenchSurface?: (
+      payload: NativeWorkbenchCreateSurfaceRequest,
+    ) => Promise<NativeWorkbenchSurfaceResult>
+    createArtifactPreviewLease?: (
+      payload: NativeArtifactPreviewLeaseCreateRequest,
+    ) => Promise<NativeArtifactPreviewLeaseBrokerResult>
+    renewArtifactPreviewLease?: (
+      payload: NativeArtifactPreviewLeaseControlRequest,
+    ) => Promise<NativeArtifactPreviewLeaseBrokerResult>
+    revokeArtifactPreviewLease?: (
+      payload: NativeArtifactPreviewLeaseControlRequest,
+    ) => Promise<NativeArtifactPreviewLeaseBrokerResult>
+    getWorkbenchCapabilities?: () => Promise<unknown>
+    navigateWorkbenchSurface?: (
+      payload: NativeWorkbenchNavigateRequest,
+    ) => Promise<NativeWorkbenchSurfaceResult>
+    respondToWorkbenchPermission?: (
+      payload: NativeWorkbenchPermissionResponse,
+    ) => Promise<NativeWorkbenchSurfaceResult>
+    setWorkbenchSurfaceRect?: (
+      payload: NativeWorkbenchSurfaceRectRequest,
+    ) => Promise<NativeWorkbenchSurfaceResult>
+    activateWorkbenchSurface?: (surfaceId: string) => Promise<NativeWorkbenchSurfaceResult>
+    destroyWorkbenchSurface?: (surfaceId: string) => Promise<NativeWorkbenchSurfaceResult>
+    onWorkbenchSurfaceEvent?: (
+      callback: (payload: NativeWorkbenchSurfaceEvent) => void,
+    ) => () => void
     getOnboardingDefaults: () => Promise<unknown>
     saveOnboarding: (payload: unknown) => Promise<unknown>
     cancelOnboarding: () => Promise<unknown>
     getBootState: () => Promise<unknown>
     getRecoveryState?: () => Promise<unknown>
+    retryProfileConsolidation?: () => Promise<{ ok: boolean; error?: string }>
     chooseLegacyAgentDataLocation?: (payload?: Record<string, never>) => Promise<unknown>
-    getDesktopProfileKind?: () => Promise<'primary' | 'recovery' | null>
     retryStartup: () => Promise<DesktopRetryStartupResult>
     quitApp: () => Promise<unknown>
     migrationSummary?: (payload?: { source?: string }) => Promise<unknown>
@@ -80,7 +136,7 @@ declare global {
     migrationPeekLastResult?: () => Promise<unknown>
     migrationDismissLastResult?: () => Promise<unknown>
     revealRecoveryPath?: (payload: {
-      target: 'primary' | 'active' | 'backups'
+      target: 'primary' | 'backups'
     }) => Promise<boolean>
     onBootStatus: (callback: (payload: unknown) => void) => () => void
     onBootError: (callback: (payload: unknown) => void) => () => void

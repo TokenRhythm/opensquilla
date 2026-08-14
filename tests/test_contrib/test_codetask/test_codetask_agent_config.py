@@ -27,12 +27,14 @@ def test_operator_sections_replace_template_wholesale():
     user = {
         "llm": {"provider": "deepseek", "model": "deepseek-chat"},
         "models": {"deepseek": {"deepseek-chat": {"context_window": 128000}}},
+        "privacy": {"disable_network_observability": True},
     }
     bundle = build_per_run_agent_config(template, user)
     # Replaced, not field-merged: the template's max_tokens must not leak
     # under the operator's provider.
     assert bundle.payload["llm"] == {"provider": "deepseek", "model": "deepseek-chat"}
     assert bundle.payload["models"]["deepseek"]["deepseek-chat"]["context_window"] == 128000
+    assert bundle.payload["privacy"]["disable_network_observability"] is True
     # Template policy survives untouched.
     assert bundle.payload["tools"]["deny"] == ["memory*"]
     assert bundle.payload["meta_skill"]["enabled"] is False
@@ -158,20 +160,71 @@ def test_unparseable_operator_config_raises_actionably(monkeypatch, tmp_path):
     assert str(cfg) in str(exc.value)
 
 
-def test_override_env_skips_inheritance(monkeypatch, tmp_path):
+def test_override_preserves_provider_authority_and_inherits_operator_privacy(
+    monkeypatch,
+    tmp_path,
+):
     override = tmp_path / "override.toml"
     override.write_text(
-        '[llm]\nprovider = "deepseek"\nmodel = "deepseek-chat"\napi_key = "sk-keep"\n',
+        '[llm]\nprovider = "deepseek"\nmodel = "deepseek-chat"\napi_key = "sk-keep"\n'
+        "[privacy]\ndisable_network_observability = false\n",
         encoding="utf-8",
     )
     operator = tmp_path / "operator.toml"
-    operator.write_text('[llm]\nprovider = "moonshot"\nmodel = "kimi-k2.6"\n', "utf-8")
+    operator.write_text(
+        '[llm]\nprovider = "moonshot"\nmodel = "kimi-k2.6"\n'
+        "[privacy]\ndisable_network_observability = true\n",
+        "utf-8",
+    )
     monkeypatch.setenv("OPENSQUILLA_CODETASK_AGENT_CONFIG", str(override))
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(operator))
     bundle = load_agent_config_bundle()
     assert bundle.payload["llm"]["provider"] == "deepseek"
     assert bundle.payload["llm"]["api_key"] == "sk-keep"  # full authority, untouched
+    assert bundle.payload["privacy"]["disable_network_observability"] is True
     assert bundle.child_env == {}
+
+
+def test_override_survives_broken_operator_config_with_privacy_disabled(
+    monkeypatch,
+    tmp_path,
+):
+    override = tmp_path / "override.toml"
+    override.write_text(
+        '[llm]\nprovider = "deepseek"\nmodel = "deepseek-chat"\n',
+        encoding="utf-8",
+    )
+    operator = tmp_path / "broken.toml"
+    operator.write_text("[privacy\ndisable_network_observability =", encoding="utf-8")
+    monkeypatch.setenv("OPENSQUILLA_CODETASK_AGENT_CONFIG", str(override))
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(operator))
+
+    bundle = load_agent_config_bundle()
+
+    assert bundle.payload["llm"]["provider"] == "deepseek"
+    assert bundle.payload["privacy"]["disable_network_observability"] is True
+
+
+def test_override_fails_privacy_closed_when_operator_value_is_invalid(
+    monkeypatch,
+    tmp_path,
+):
+    override = tmp_path / "override.toml"
+    override.write_text(
+        '[llm]\nprovider = "deepseek"\nmodel = "deepseek-chat"\n',
+        encoding="utf-8",
+    )
+    operator = tmp_path / "operator.toml"
+    operator.write_text(
+        '[privacy]\ndisable_network_observability = "not-a-boolean"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENSQUILLA_CODETASK_AGENT_CONFIG", str(override))
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(operator))
+
+    bundle = load_agent_config_bundle()
+
+    assert bundle.payload["privacy"]["disable_network_observability"] is True
 
 
 def test_blank_override_env_is_treated_as_unset(monkeypatch, tmp_path):

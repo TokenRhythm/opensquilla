@@ -50,6 +50,7 @@ interface ProviderPanelContext {
   contextWindowTokens: Ref<string>
   contextWindowGlobal: ComputedRef<number | null>
   effectiveMaxTokens: ComputedRef<EffectiveMaxTokens | null>
+  effectiveMaxTokensPending: ComputedRef<boolean>
   providerIsLocal: ComputedRef<boolean>
   configuredProviders?: ComputedRef<Array<{
     providerId: string
@@ -114,6 +115,90 @@ export interface DiscoveredModelPricing {
   outputPer1k: number
 }
 
+export interface ModelCapabilitiesMetadata {
+  tools: boolean | null
+  reasoning: boolean | null
+  vision: boolean | null
+  anthropic: boolean | null
+  responses: boolean | null
+  streaming: boolean | null
+}
+
+export interface ModelResponsesMetadata {
+  modes: string[]
+  capabilities: string[]
+  capabilityStates: ModelResponseCapabilityStates
+}
+
+export interface ModelResponseCapabilityStates {
+  stream: boolean | null
+  tools: boolean | null
+  background: boolean | null
+  compact: boolean | null
+  webSearch: boolean | null
+  mcp: boolean | null
+  codeInterpreter: boolean | null
+  imageGeneration: boolean | null
+  fileSearch: boolean | null
+  cancel: boolean | null
+}
+
+export interface ModelPriceBuckets {
+  input: string | null
+  output: string | null
+  cacheRead: string | null
+}
+
+export interface ModelPricingMetadata {
+  currency: string | null
+  billingMode: string | null
+  billingUnit: number | null
+  hasDiscount: boolean | null
+  pricePerImage: string | null
+  standard: ModelPriceBuckets
+  discount: ModelPriceBuckets
+  effective: ModelPriceBuckets
+}
+
+export interface PublishedModelMetadata {
+  name: string
+  providerDisplayName: string | null
+  modelType: string | null
+  status: string | null
+  modalities: string[] | null
+  contextWindow: number | null
+  maxOutputTokens: number | null
+  reasoningMode: string | null
+  reasoningDefault: string | null
+  reasoningSupportedEfforts: string[] | null
+  reasoningSupportsMaxTokens: boolean | null
+  capabilities: ModelCapabilitiesMetadata
+  responses: ModelResponsesMetadata | null
+  pricing: ModelPricingMetadata | null
+}
+
+export interface DeclaredModelMetadata {
+  displayName: string | null
+  modelType: string | null
+  status: string | null
+  contextWindow: number | null
+  maxOutputTokens: number | null
+  capabilities: ModelCapabilitiesMetadata
+  responses: ModelResponsesMetadata | null
+  pricing: ModelPricingMetadata | null
+}
+
+export interface ModelMetadataV1 {
+  schemaVersion: 1
+  published: PublishedModelMetadata | null
+  declared: DeclaredModelMetadata | null
+}
+
+export interface CatalogSyncStatus {
+  lastSyncedAt: string | null
+  stale: boolean
+}
+
 /** One row of the onboarding.models.discover wire envelope (camelCase, frozen). */
 export interface DiscoveredModel {
   id: string
@@ -123,11 +208,14 @@ export interface DiscoveredModel {
   capabilities: string[]
   pricing: DiscoveredModelPricing | null
   capabilitySource: string
+  /** Optional additive metadata supplied by newer gateways. */
+  metadata?: ModelMetadataV1 | null
 }
 
 export interface DiscoveredModelCatalog {
   models: DiscoveredModel[]
   source: 'live' | 'none'
+  catalog?: CatalogSyncStatus | null
 }
 
 export interface EffectiveMaxTokens {
@@ -151,6 +239,7 @@ export interface ConnectionState {
   models: DiscoveredModel[]
   modelSource: 'live' | 'none'
   discoverError: string
+  catalog?: CatalogSyncStatus | null
 }
 
 export interface ProviderCredentialPanelState {
@@ -209,6 +298,7 @@ function freshConnection(providerId: string): ConnectionState {
     models: [],
     modelSource: 'none',
     discoverError: '',
+    catalog: null,
   }
 }
 
@@ -245,17 +335,211 @@ export function normalizeProbeTimings(response: {
   }
 }
 
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null
+}
+
+function nullableString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null
+}
+
+function nullablePositiveInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : null
+}
+
+function nullableBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null
+}
+
+function nullableDecimalString(value: unknown): string | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim()
+  if (!/^\+?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/.test(normalized)) return null
+  return normalized
+}
+
+function stringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item): item is string => typeof item === 'string')
+    .map(item => item.trim())
+    .filter(Boolean)
+}
+
+function normalizeModelCapabilities(value: unknown): ModelCapabilitiesMetadata {
+  const row = asRecord(value)
+  return {
+    tools: nullableBoolean(row?.tools),
+    reasoning: nullableBoolean(row?.reasoning),
+    vision: nullableBoolean(row?.vision),
+    anthropic: nullableBoolean(row?.anthropic),
+    responses: nullableBoolean(row?.responses),
+    streaming: nullableBoolean(row?.streaming),
+  }
+}
+
+function normalizeModelResponses(value: unknown): ModelResponsesMetadata | null {
+  const row = asRecord(value)
+  if (!row) return null
+  const capabilities = stringArray(row.capabilities)
+  const states = asRecord(row.capabilityStates)
+  const state = (name: string): boolean | null => {
+    if (states && Object.prototype.hasOwnProperty.call(states, name)) {
+      return nullableBoolean(states[name])
+    }
+    return capabilities.includes(name) ? true : null
+  }
+  return {
+    modes: stringArray(row.modes),
+    capabilities,
+    capabilityStates: {
+      stream: state('stream'),
+      tools: state('tools'),
+      background: state('background'),
+      compact: state('compact'),
+      webSearch: state('webSearch'),
+      mcp: state('mcp'),
+      codeInterpreter: state('codeInterpreter'),
+      imageGeneration: state('imageGeneration'),
+      fileSearch: state('fileSearch'),
+      cancel: state('cancel'),
+    },
+  }
+}
+
+function normalizePriceBuckets(value: unknown): ModelPriceBuckets {
+  const row = asRecord(value)
+  return {
+    input: nullableDecimalString(row?.input),
+    output: nullableDecimalString(row?.output),
+    cacheRead: nullableDecimalString(row?.cacheRead),
+  }
+}
+
+function normalizeModelPricing(value: unknown): ModelPricingMetadata | null {
+  const row = asRecord(value)
+  if (!row) return null
+  return {
+    currency: nullableString(row.currency),
+    billingMode: nullableString(row.billingMode),
+    billingUnit: nullablePositiveInteger(row.billingUnit),
+    hasDiscount: nullableBoolean(row.hasDiscount),
+    pricePerImage: nullableDecimalString(row.pricePerImage),
+    standard: normalizePriceBuckets(row.standard),
+    discount: normalizePriceBuckets(row.discount),
+    effective: normalizePriceBuckets(row.effective),
+  }
+}
+
+function normalizePublishedMetadata(
+  value: unknown,
+  fallbackName: string,
+): PublishedModelMetadata | null {
+  const row = asRecord(value)
+  if (!row) return null
+  return {
+    name: nullableString(row.name) || fallbackName,
+    providerDisplayName: nullableString(row.providerDisplayName),
+    modelType: nullableString(row.modelType),
+    status: nullableString(row.status),
+    modalities: Array.isArray(row.modalities) ? stringArray(row.modalities) : null,
+    contextWindow: nullablePositiveInteger(row.contextWindow),
+    maxOutputTokens: nullablePositiveInteger(row.maxOutputTokens),
+    reasoningMode: nullableString(row.reasoningMode),
+    reasoningDefault: nullableString(row.reasoningDefault),
+    reasoningSupportedEfforts: Array.isArray(row.reasoningSupportedEfforts)
+      ? stringArray(row.reasoningSupportedEfforts)
+      : null,
+    reasoningSupportsMaxTokens: nullableBoolean(row.reasoningSupportsMaxTokens),
+    capabilities: normalizeModelCapabilities(row.capabilities),
+    responses: normalizeModelResponses(row.responses),
+    pricing: normalizeModelPricing(row.pricing),
+  }
+}
+
+function normalizeDeclaredMetadata(value: unknown): DeclaredModelMetadata | null {
+  const row = asRecord(value)
+  if (!row) return null
+  return {
+    displayName: nullableString(row.displayName),
+    modelType: nullableString(row.modelType),
+    status: nullableString(row.status),
+    contextWindow: nullablePositiveInteger(row.contextWindow),
+    maxOutputTokens: nullablePositiveInteger(row.maxOutputTokens),
+    capabilities: normalizeModelCapabilities(row.capabilities),
+    responses: normalizeModelResponses(row.responses),
+    pricing: normalizeModelPricing(row.pricing),
+  }
+}
+
+export function normalizeModelMetadata(value: unknown, fallbackName = ''): ModelMetadataV1 | null {
+  const row = asRecord(value)
+  if (!row || row.schemaVersion !== 1) return null
+  return {
+    schemaVersion: 1,
+    published: normalizePublishedMetadata(row.published, fallbackName),
+    declared: normalizeDeclaredMetadata(row.declared),
+  }
+}
+
+export function normalizeCatalogSyncStatus(value: unknown): CatalogSyncStatus | null {
+  const row = asRecord(value)
+  if (!row || typeof row.stale !== 'boolean') return null
+  if (row.lastSyncedAt === null) {
+    return {
+      lastSyncedAt: null,
+      stale: row.stale,
+    }
+  }
+  if (typeof row.lastSyncedAt !== 'string') return null
+  const lastSyncedAt = row.lastSyncedAt.trim()
+  const timestamp = lastSyncedAt.match(
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|\+00:00)$/,
+  )
+  if (!timestamp) return null
+  const [, yearRaw, monthRaw, dayRaw, hourRaw, minuteRaw, secondRaw] = timestamp
+  const [year, month, day, hour, minute, second] = [
+    yearRaw,
+    monthRaw,
+    dayRaw,
+    hourRaw,
+    minuteRaw,
+    secondRaw,
+  ].map(Number)
+  const parsed = new Date(0)
+  parsed.setUTCFullYear(year, month - 1, day)
+  parsed.setUTCHours(hour, minute, second, 0)
+  if (
+    parsed.getUTCFullYear() !== year
+    || parsed.getUTCMonth() !== month - 1
+    || parsed.getUTCDate() !== day
+    || parsed.getUTCHours() !== hour
+    || parsed.getUTCMinutes() !== minute
+    || parsed.getUTCSeconds() !== second
+  ) return null
+  return {
+    lastSyncedAt,
+    stale: row.stale,
+  }
+}
+
 export function normalizeDiscoveredModels(rows: unknown): DiscoveredModel[] {
   if (!Array.isArray(rows)) return []
   return rows
     .filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object')
     .map(row => {
       const pricing = row.pricing
+      const id = String(row.id ?? '')
+      const name = String(row.name ?? row.id ?? '')
       return {
-        id: String(row.id ?? ''),
-        name: String(row.name ?? row.id ?? ''),
-        contextWindow: typeof row.contextWindow === 'number' ? row.contextWindow : null,
-        maxOutputTokens: typeof row.maxOutputTokens === 'number' ? row.maxOutputTokens : null,
+        id,
+        name,
+        contextWindow: nullablePositiveInteger(row.contextWindow),
+        maxOutputTokens: nullablePositiveInteger(row.maxOutputTokens),
         capabilities: Array.isArray(row.capabilities) ? row.capabilities.map(String) : [],
         pricing: pricing && typeof pricing === 'object'
           ? {
@@ -264,6 +548,7 @@ export function normalizeDiscoveredModels(rows: unknown): DiscoveredModel[] {
             }
           : null,
         capabilitySource: String(row.capabilitySource ?? ''),
+        metadata: normalizeModelMetadata(row.metadata, name || id),
       }
     })
     .filter(model => model.id)
@@ -313,10 +598,12 @@ export function useSetupProviderForm() {
   // RPC result that raced a credential edit is discarded instead of applied.
   let connectionEpoch = 0
   let discoverPromise: Promise<void> | null = null
+  let discoverPromiseForceRefresh = false
 
   function resetConnection() {
     connectionEpoch += 1
     discoverPromise = null
+    discoverPromiseForceRefresh = false
     connection.value = freshConnection(providerSelected.value)
   }
 
@@ -328,6 +615,7 @@ export function useSetupProviderForm() {
     if (connection.value.phase === 'probing') {
       connectionEpoch += 1
       discoverPromise = null
+      discoverPromiseForceRefresh = false
     }
     connection.value = {
       ...connection.value,
@@ -401,6 +689,7 @@ export function useSetupProviderForm() {
     if (!providerSelected.value || connection.value.phase === 'probing') return
     const epoch = ++connectionEpoch
     discoverPromise = null
+    discoverPromiseForceRefresh = false
     connection.value = { ...freshConnection(providerSelected.value), phase: 'probing' }
     const rpc = useRpcStore()
     let outcome: ConnectionState
@@ -456,6 +745,9 @@ export function useSetupProviderForm() {
         modelOverride: options.modelOverride,
         storedProfile: options.storedProfile,
         draftProfile: options.draftProfile,
+        // A successful explicit connection test is an event refresh: do not let
+        // a previously cached entitlement snapshot mask a newly issued key.
+        forceRefresh: true,
       })
     }
   }
@@ -464,9 +756,18 @@ export function useSetupProviderForm() {
     modelOverride?: string
     storedProfile?: boolean
     draftProfile?: boolean
+    forceRefresh?: boolean
   } = {}): Promise<void> {
     if (!providerSelected.value) return Promise.resolve()
-    if (discoverPromise) return discoverPromise
+    if (discoverPromise) {
+      if (!options.forceRefresh || discoverPromiseForceRefresh) return discoverPromise
+      const queuedEpoch = connectionEpoch
+      const queuedProvider = providerSelected.value
+      return discoverPromise.then(() => {
+        if (queuedEpoch !== connectionEpoch || queuedProvider !== providerSelected.value) return
+        return discoverModels(options)
+      })
+    }
     const epoch = connectionEpoch
     const rpc = useRpcStore()
     const request = (async () => {
@@ -477,17 +778,21 @@ export function useSetupProviderForm() {
           detail?: string
           source?: string
           models?: unknown
+          catalog?: unknown
         }>(
           options.draftProfile
             ? 'onboarding.llmProfile.draft.models.discover'
             : (options.storedProfile
                 ? 'onboarding.llmProfile.models.discover'
                 : 'onboarding.models.discover'),
-          options.draftProfile
-            ? profileDraftParams('', options.modelOverride)
-            : (options.storedProfile
-                ? { providerId: providerSelected.value }
-                : connectionParams('', options.modelOverride)),
+          {
+            ...(options.draftProfile
+              ? profileDraftParams('', options.modelOverride)
+              : (options.storedProfile
+                  ? { providerId: providerSelected.value }
+                  : connectionParams('', options.modelOverride))),
+            ...(options.forceRefresh ? { forceRefresh: true } : {}),
+          },
         )
         if (epoch !== connectionEpoch) return
         if (res?.ok) {
@@ -497,6 +802,7 @@ export function useSetupProviderForm() {
             models: modelSource === 'live' ? normalizeDiscoveredModels(res.models) : [],
             modelSource,
             discoverError: '',
+            catalog: normalizeCatalogSyncStatus(res.catalog),
           }
         } else {
           connection.value = {
@@ -504,6 +810,7 @@ export function useSetupProviderForm() {
             models: [],
             modelSource: 'none',
             discoverError: String(res?.detail || res?.failureKind || 'discover failed'),
+            catalog: null,
           }
         }
       } catch (err) {
@@ -513,15 +820,18 @@ export function useSetupProviderForm() {
           models: [],
           modelSource: 'none',
           discoverError: err instanceof Error ? err.message : String(err),
+          catalog: null,
         }
       }
     })()
     const tracked = request.finally(() => {
       if (discoverPromise === tracked) {
         discoverPromise = null
+        discoverPromiseForceRefresh = false
       }
     })
     discoverPromise = tracked
+    discoverPromiseForceRefresh = options.forceRefresh === true
     return tracked
   }
 
@@ -705,6 +1015,7 @@ export function useSetupProviderForm() {
       contextWindowTokens: context.contextWindowTokens.value,
       contextWindowGlobal: context.contextWindowGlobal.value,
       effectiveMaxTokens: context.effectiveMaxTokens.value,
+      effectiveMaxTokensPending: context.effectiveMaxTokensPending.value,
       providerIsLocal: context.providerIsLocal.value,
       configuredProviders: context.configuredProviders?.value ?? [],
       editingPrimary: context.editingPrimary?.value ?? true,

@@ -1,6 +1,6 @@
 {
   "name": "@opensquilla/desktop-electron",
-  "version": "0.5.0",
+  "version": "0.5.3",
   "private": true,
   "description": "Electron desktop shell for the OpenSquilla Control UI.",
   "repository": {
@@ -12,49 +12,75 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "build:gateway": "node scripts/build-gateway.mjs",
+    "fetch:runtimes": "node scripts/fetch-bundled-runtimes.mjs",
     "build:web": "cd ../../opensquilla-webui && npm ci && npm run build",
     "dev": "npm run build && electron .",
-    "dist:local": "npm run build:web && npm run build:gateway && npm run dist",
-    "pack:local": "npm run build:web && npm run build:gateway && npm run pack",
+    "dist:local": "npm run build:web && npm run fetch:runtimes && npm run build:gateway && npm run dist",
+    "pack:local": "npm run build:web && npm run fetch:runtimes && npm run build:gateway && npm run pack",
     "verify:icons": "node scripts/verify-icon-config.mjs",
     "verify:package": "npm run verify:icons && node scripts/verify-package.mjs",
     "verify:gateway-smoke": "node scripts/smoke-gateway.mjs",
+    "test:bundled-runtimes": "node scripts/test-bundled-runtimes.mjs",
+    "test:packaged-session-recovery": "node scripts/test-packaged-session-recovery.mjs",
+    "test:packaged-first-send-renderer": "node scripts/test-packaged-first-send-renderer.mjs",
     "test:cli-invocation": "npm run build && node scripts/test-cli-invocation.mjs",
     "test:secret-storage": "npm run build && node scripts/test-secret-storage-policy.mjs",
+    "test:sandbox-default": "npm run build && node scripts/test-desktop-sandbox-default.mjs",
     "test:update-resolver": "npm run build && node scripts/test-update-resolver.mjs",
     "test:update-scheduler": "npm run build && node scripts/test-update-check-scheduler.mjs",
     "test:desktop-locale": "npm run build && node scripts/test-desktop-locale.mjs",
+    "test:desktop-zoom": "npm run build && node scripts/test-desktop-zoom-shortcuts.mjs",
+    "test:project-workspace-picker": "npm run build && node scripts/test-project-workspace-picker.mjs",
     "test:gateway-ownership": "npm run build && node scripts/test-desktop-gateway-ownership.mjs",
     "test:gateway-lifecycle": "npm run build && node scripts/test-desktop-gateway-lifecycle.mjs",
+    "test:window-lifecycle": "npm run build && node scripts/test-desktop-window-lifecycle.mjs",
+    "test:window-background-flow": "npm run build && node scripts/test-desktop-window-background-flow.mjs",
+    "test:theme-flow": "npm run build && node scripts/test-desktop-theme-flow.mjs",
+    "test:deep-link": "npm run build && node scripts/test-desktop-deep-link.mjs",
     "test:gateway-orphan-recovery-flow": "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
-    "test:profile-substrate": "npm run build && node scripts/test-desktop-profile-substrate.mjs && node scripts/test-desktop-profile-context.mjs",
-    "test:profile-recovery-flow": "npm run build && node scripts/test-profile-recovery-flow.mjs",
-    "test:profile-recovery-accessibility": "npm run build && node scripts/test-profile-recovery-accessibility.mjs",
+    "test:profile-substrate": "npm run build && node scripts/test-desktop-profile-substrate.mjs && node scripts/test-desktop-profile-consolidation.mjs",
+    "test:profile-consolidation-flow": "npm run build && node scripts/test-profile-consolidation-flow.mjs",
+    "test:primary-repair-accessibility": "npm run build && node scripts/test-primary-repair-accessibility.mjs",
     "test:profile-import-flow": "npm run build && node scripts/test-profile-import-flow.mjs",
-    "test:unsafe-profile-no-write": "npm run build && node scripts/test-unsafe-profile-no-write.mjs",
-    "test:profile-recovery": "npm run build && node scripts/test-profile-recovery-flow.mjs && node scripts/test-profile-recovery-accessibility.mjs && node scripts/test-unsafe-profile-no-write.mjs",
+    "test:unsafe-legacy-recovery-no-write": "npm run build && node scripts/test-unsafe-legacy-recovery-no-write.mjs",
+    "test:profile-consolidation": "npm run build && node scripts/test-profile-consolidation-flow.mjs && node scripts/test-primary-repair-accessibility.mjs && node scripts/test-unsafe-legacy-recovery-no-write.mjs",
     "test:desktop-cleanup": "npm run build && node scripts/test-desktop-cleanup-contract.mjs",
     "test:desktop-cleanup-flow": "npm run build && node scripts/test-desktop-cleanup-flow.mjs",
+    "test:renderer-log": "npm run build && node scripts/test-desktop-renderer-log.mjs",
+    "test:preview-lease-broker": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs",
+    "test:desktop-workbench": "npm run build && node scripts/test-artifact-preview-lease-broker.mjs && node scripts/test-native-workbench-surface.mjs && node scripts/test-native-workbench-surface-electron.mjs && node scripts/test-native-workbench-v2-electron.mjs",
     "test:mock-update-flow": "npm run build && node scripts/test-mock-update-flow.mjs",
+    "test:local-official-upgrade": "powershell -ExecutionPolicy Bypass -File scripts/test-local-official-upgrade.ps1",
     "test:onboarding-flow": "npm run build && node scripts/test-onboarding-flow.mjs",
     "start": "electron .",
-    "pack": "npm run build && electron-builder --dir",
-    "dist": "npm run build && electron-builder"
+    "pack": "npm run build && electron-builder --dir && npm run verify:package",
+    "dist": "npm run build && electron-builder && npm run verify:package"
   },
   "dependencies": {
     "electron-updater": "^6.6.2"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
-    "electron": "^42.3.3",
-    "electron-builder": "^26.8.1",
+    "electron": "^42.4.0",
+    "electron-builder": "^26.15.3",
+    "gsap": "^3.15.0",
+    "lottie-web": "^5.13.0",
     "playwright": "^1.60.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "ws": "^8.21.1"
   },
   "build": {
     "appId": "ai.opensquilla.desktop",
     "productName": "OpenSquilla",
     "artifactName": "OpenSquilla-${version}-${os}-${arch}.${ext}",
+    "protocols": [
+      {
+        "name": "OpenSquilla",
+        "schemes": [
+          "opensquilla"
+        ]
+      }
+    ],
     "publish": [
       {
         "provider": "github",

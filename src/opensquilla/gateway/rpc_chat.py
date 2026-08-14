@@ -2,20 +2,47 @@
 
 from __future__ import annotations
 
+import asyncio
+import copy
+import time
 from typing import Any, cast
 from urllib.parse import quote
+from uuid import uuid4
 
 import structlog
 
 from opensquilla.chat.conversation import ChatSendRequest, sessions_send_params
+from opensquilla.chat.flattened_tool_markers import (
+    has_flattened_used_tool_line,
+    is_flattened_tool_result_dump,
+)
 from opensquilla.chat.history import transcript_entries_to_chat_messages
 from opensquilla.chat.source import chat_source_metadata
+from opensquilla.gateway.compaction_target import (
+    effective_session_model,
+    resolve_gateway_compaction_target,
+    resolve_selected_compaction_provider,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.context_overflow import apply_context_overflow_policy
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
-from opensquilla.gateway.session_services import get_session_lock
+from opensquilla.gateway.session_services import get_session_lock, get_session_storage
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction import build_compaction_config_from_provider
+from opensquilla.session.compaction_lifecycle import new_compaction_id
 from opensquilla.session.keys import build_webchat_key, canonicalize_session_key, parse_agent_id
+from opensquilla.session.storage import (
+    StorageBusyError,
+    bounded_interactive_storage_reads,
+)
+from opensquilla.turn_outcome_projection import (
+    extract_fork_terminal_outcome_projection,
+    terminal_turn_outcome,
+    turn_id_from_context,
+)
 
 _d = get_dispatcher()
 log = structlog.get_logger(__name__)
@@ -23,6 +50,8 @@ log = structlog.get_logger(__name__)
 _WEBCHAT_SESSION_KEY = build_webchat_key()
 _CHAT_HISTORY_DEFAULT_LIMIT = 50
 _CHAT_HISTORY_MAX_LIMIT = 200
+_CHAT_HISTORY_LOCK_BUDGET_SECONDS = 2.0
+_CHAT_HISTORY_RETRY_AFTER_MS = 100
 
 
 def _canonical_webchat_session_key(value: object = None) -> str:
@@ -33,6 +62,22 @@ def _canonical_webchat_session_key(value: object = None) -> str:
     if raw.startswith("sess-"):
         return f"agent:main:webchat:{raw[len('sess-') :]}"
     return canonicalize_session_key(raw)
+
+
+def _requested_initial_collaboration_mode(params: dict[str, Any]) -> str | None:
+    mode = params.get("collaborationMode")
+    snake_mode = params.get("collaboration_mode")
+    if mode is not None and snake_mode is not None and mode != snake_mode:
+        raise ValueError("collaborationMode and collaboration_mode must match")
+    if mode is None:
+        mode = snake_mode
+    if mode is None:
+        return None
+    if not isinstance(mode, str) or mode not in {"default", "plan"}:
+        raise ValueError("collaborationMode must be default or plan")
+    if params.get("intent") != "new_chat":
+        raise ValueError("collaborationMode requires explicit new_chat intent")
+    return mode
 
 
 def _require_chat_session_manager(ctx: RpcContext):
@@ -57,11 +102,11 @@ def _normalize_chat_history_limit(value: object) -> int:
 def _is_webchat_session_key(key: str) -> bool:
     parts = str(key or "").split(":")
     return (
-        len(parts) == 4
+        len(parts) >= 4
         and parts[0] == "agent"
         and bool(parts[1])
         and parts[2] == "webchat"
-        and bool(parts[3])
+        and all(parts[3:])
     )
 
 
@@ -80,6 +125,7 @@ def _empty_chat_history_payload(limit: int) -> dict[str, Any]:
         # normal state from a temporary reader failure or lost legacy archive.
         "canonical_complete": True,
         "compaction_summaries": [],
+        "turn_outcomes": [],
     }
 
 
@@ -91,6 +137,114 @@ def _chat_history_bool(value: object, *, default: bool) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"0", "false", "no", "off"}
     return bool(value)
+
+
+async def _chat_history_turn_outcomes(
+    ctx: RpcContext,
+    session_key: str,
+    entries: list[object],
+) -> list[dict[str, Any]]:
+    """Return typed outcomes only for explicit turn ids present in this page."""
+
+    entry_turns = [
+        (entry, turn_id)
+        for entry in entries
+        if (turn_id := turn_id_from_context(getattr(entry, "turn_context", None)))
+        is not None
+    ]
+    turn_ids = {turn_id for _entry, turn_id in entry_turns}
+    if not turn_ids:
+        return []
+
+    outcomes_by_turn: dict[str, dict[str, Any]] = {}
+    conflicting_projections: set[str] = set()
+    for entry, turn_id in entry_turns:
+        entry_session_id = getattr(entry, "session_id", None)
+        entry_session_key = getattr(entry, "session_key", None)
+        if (
+            not isinstance(entry_session_id, str)
+            or entry_session_key != session_key
+            or turn_id in conflicting_projections
+        ):
+            continue
+        projection = extract_fork_terminal_outcome_projection(
+            getattr(entry, "turn_context", None),
+            session_id=entry_session_id,
+            session_key=session_key,
+            turn_id=turn_id,
+        )
+        if projection is None:
+            continue
+        previous = outcomes_by_turn.get(turn_id)
+        if previous is not None and previous != projection:
+            outcomes_by_turn.pop(turn_id, None)
+            conflicting_projections.add(turn_id)
+            continue
+        outcomes_by_turn[turn_id] = projection
+
+    def _sorted_outcomes() -> list[dict[str, Any]]:
+        outcomes = list(outcomes_by_turn.values())
+        outcomes.sort(
+            key=lambda item: (
+                int(item.get("started_at") or 0),
+                str(item.get("task_id") or ""),
+            )
+        )
+        return outcomes
+
+    missing_turn_ids = turn_ids - outcomes_by_turn.keys()
+    if not missing_turn_ids:
+        return _sorted_outcomes()
+
+    storage = get_session_storage(getattr(ctx, "session_manager", None))
+    exact_tasks = getattr(storage, "get_agent_tasks_by_ids", None)
+    get_task = getattr(storage, "get_agent_task", None)
+    list_tasks = getattr(storage, "list_agent_tasks", None)
+    try:
+        if callable(exact_tasks):
+            rows = await exact_tasks(sorted(missing_turn_ids))
+        elif callable(get_task):
+            rows = [
+                row
+                for turn_id in sorted(missing_turn_ids)
+                if (row := await get_task(turn_id)) is not None
+            ]
+        elif callable(list_tasks):
+            rows = await list_tasks(session_key=session_key)
+        else:
+            return _sorted_outcomes()
+    except Exception:  # noqa: BLE001 - history remains readable without outcomes.
+        log.warning(
+            "chat.history.turn_outcomes_failed",
+            session_key=session_key,
+            exc_info=True,
+        )
+        return _sorted_outcomes()
+
+    for row in rows:
+        task_id = getattr(row, "task_id", None)
+        details = getattr(row, "details", None)
+        details = details if isinstance(details, dict) else {}
+        turn_id = details.get("turn_id") or task_id
+        status = getattr(row, "status", None)
+        status = str(getattr(status, "value", status) or "")
+        outcome = terminal_turn_outcome(status, details.get("turn_outcome"))
+        if outcome is None:
+            continue
+        if (
+            not isinstance(turn_id, str)
+            or turn_id not in missing_turn_ids
+        ):
+            continue
+        outcomes_by_turn[turn_id] = {
+            "turn_id": turn_id,
+            "task_id": task_id,
+            "status": status,
+            "started_at": getattr(row, "started_at", None),
+            "finished_at": getattr(row, "finished_at", None),
+            "outcome": outcome,
+        }
+    return _sorted_outcomes()
 
 
 def _chat_history_cursor(entry: object | None) -> str | None:
@@ -232,6 +386,8 @@ async def _load_chat_history_page(
                 )
                 entries, has_more, canonical_complete = _canonical_page_parts(page)
                 return entries, has_more, True, canonical_complete
+            except StorageBusyError:
+                raise
             except Exception:  # noqa: BLE001 - fall back to active transcript
                 pass
         else:
@@ -246,6 +402,8 @@ async def _load_chat_history_page(
                         after=after,
                     )
                     return entries, has_more, True, True
+                except StorageBusyError:
+                    raise
                 except Exception:  # noqa: BLE001 - fall back to active transcript
                     pass
     transcript_getter = getattr(mgr, "get_transcript", None)
@@ -261,59 +419,192 @@ async def _load_chat_history_page(
     return entries, has_more, False, False
 
 
+def _needs_legacy_tool_lookbehind(entry: object | None) -> bool:
+    if entry is None or getattr(entry, "tool_call_id", None):
+        return False
+    role = str(getattr(entry, "role", "") or "").lower()
+    content = str(getattr(entry, "content", "") or "")
+    return role in {"tool", "user"} and is_flattened_tool_result_dump(content)
+
+
+def _needs_legacy_tool_lookahead(entry: object | None) -> bool:
+    if entry is None or getattr(entry, "tool_calls", None):
+        return False
+    role = str(getattr(entry, "role", "") or "").lower()
+    content = str(getattr(entry, "content", "") or "")
+    return role == "assistant" and has_flattened_used_tool_line(content)
+
+
+async def _load_legacy_tool_projection_context(
+    mgr: object,
+    session_key: str,
+    entries: list[object],
+    *,
+    canonical_available: bool,
+) -> tuple[object | None, object | None]:
+    """Load at most one adjacent row per page edge for legacy projection.
+
+    The selected page remains the pagination/accounting unit. These bounded
+    reads only provide enough context to recognize a marker/result pair split
+    by a page boundary; neither row is added to the response page.
+    """
+
+    if not entries or not canonical_available:
+        return None, None
+    page_getter = getattr(mgr, "get_canonical_transcript_page", None)
+    if not callable(page_getter):
+        return None, None
+
+    previous_entry = None
+    next_entry = None
+    oldest_cursor = _chat_history_cursor_key(_chat_history_cursor(entries[0]))
+    newest_cursor = _chat_history_cursor_key(_chat_history_cursor(entries[-1]))
+    if _needs_legacy_tool_lookbehind(entries[0]) and oldest_cursor is not None:
+        try:
+            page = await page_getter(
+                session_key,
+                limit=1,
+                before=oldest_cursor,
+                after=None,
+            )
+            candidates, _has_more, _complete = _canonical_page_parts(page)
+        except StorageBusyError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - optional read-time projection
+            log.warning(
+                "chat_history_legacy_projection_context_unavailable",
+                edge="before",
+                error_type=type(exc).__name__,
+            )
+            return None, None
+        if candidates:
+            candidate = candidates[-1]
+            candidate_cursor = _chat_history_cursor_key(_chat_history_cursor(candidate))
+            if candidate_cursor is not None and candidate_cursor < oldest_cursor:
+                previous_entry = candidate
+
+    if _needs_legacy_tool_lookahead(entries[-1]) and newest_cursor is not None:
+        try:
+            page = await page_getter(
+                session_key,
+                limit=1,
+                before=None,
+                after=newest_cursor,
+            )
+            candidates, _has_more, _complete = _canonical_page_parts(page)
+        except StorageBusyError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - optional read-time projection
+            log.warning(
+                "chat_history_legacy_projection_context_unavailable",
+                edge="after",
+                error_type=type(exc).__name__,
+            )
+            return None, None
+        if candidates:
+            candidate = candidates[0]
+            candidate_cursor = _chat_history_cursor_key(_chat_history_cursor(candidate))
+            if candidate_cursor is not None and candidate_cursor > newest_cursor:
+                next_entry = candidate
+    return previous_entry, next_entry
+
+
+async def _project_missing_history_usage(
+    mgr: object,
+    session_key: str,
+    entries: list[object],
+) -> list[object]:
+    """Read-time repair for pre-fix assistant rows missing turn usage."""
+
+    missing_by_turn: dict[str, list[int]] = {}
+    turns_with_usage: set[str] = set()
+    for index, entry in enumerate(entries):
+        if getattr(entry, "role", None) != "assistant":
+            continue
+        turn_id = turn_id_from_context(getattr(entry, "turn_context", None))
+        if not turn_id:
+            continue
+        if isinstance(getattr(entry, "turn_usage", None), dict):
+            turns_with_usage.add(turn_id)
+        else:
+            missing_by_turn.setdefault(turn_id, []).append(index)
+    for turn_id in turns_with_usage:
+        missing_by_turn.pop(turn_id, None)
+    if not missing_by_turn:
+        return entries
+
+    storage = getattr(mgr, "storage", None)
+    batch_project = getattr(storage, "get_turn_usage_projections", None)
+    get_session = getattr(mgr, "get_session", None)
+    if not callable(batch_project) or not callable(get_session):
+        return entries
+    try:
+        session = await get_session(session_key)
+        if session is None:
+            return entries
+        projections = await batch_project(
+            session_id=str(getattr(session, "session_id", "") or ""),
+            session_epoch=max(0, int(getattr(session, "epoch", 0) or 0)),
+            turn_ids=list(missing_by_turn),
+        )
+    except Exception:  # noqa: BLE001 - usage fallback must not hide transcript history
+        log.warning(
+            "chat.history.usage_projection_failed",
+            session_key=session_key,
+            entry_count=len(entries),
+            exc_info=True,
+        )
+        return entries
+    if not projections:
+        return entries
+
+    projected = list(entries)
+    for turn_id, indexes in missing_by_turn.items():
+        usage = projections.get(turn_id)
+        if usage is None:
+            continue
+        # A well-formed turn has one assistant row. If damaged legacy history
+        # contains duplicates, attach usage only to its terminal row so the UI
+        # cannot present the same provider spend more than once.
+        index = indexes[-1]
+        entry = copy.copy(projected[index])
+        setattr(entry, "turn_usage", usage)
+        projected[index] = entry
+    return projected
+
+
 async def _chat_history_summaries(
     mgr: object,
     session_key: str,
     *,
     include_summaries: bool,
 ) -> list[dict[str, Any]]:
+    """Return requested summaries without letting lock contention hide history."""
+
     if not include_summaries:
         return []
     getter = getattr(mgr, "get_summaries", None)
     if not callable(getter):
         return []
     try:
-        summaries = await getter(session_key)
-    except Exception:  # noqa: BLE001 - summaries are optional display metadata
+        with bounded_interactive_storage_reads():
+            summaries = await getter(session_key)
+    except StorageBusyError:
+        # The message page is already available. Let callers retry the optional
+        # summary metadata instead of converting a useful history response into
+        # STORAGE_BUSY.
+        return []
+    except Exception:  # noqa: BLE001 - summaries remain optional display metadata
         return []
     return [_session_summary_to_chat_payload(summary) for summary in summaries or []]
 
 
 def _effective_compaction_model(session: object | None) -> str | None:
-    if session is None:
-        return None
-    return getattr(session, "model_override", None) or getattr(session, "model", None)
+    return effective_session_model(session)
 
 
 def _resolve_compaction_provider(ctx: RpcContext, session: object | None) -> object | None:
-    selector = getattr(ctx, "provider_selector", None)
-    if selector is None:
-        return None
-
-    resolved_selector = selector
-    clone = getattr(selector, "clone", None)
-    if callable(clone):
-        try:
-            resolved_selector = clone()
-        except Exception:  # noqa: BLE001
-            resolved_selector = selector
-
-    model = _effective_compaction_model(session)
-    if model and resolved_selector is not selector:
-        override = getattr(resolved_selector, "override_model", None)
-        if callable(override):
-            try:
-                override(model)
-            except Exception:  # noqa: BLE001
-                pass
-
-    resolver = getattr(resolved_selector, "resolve", None)
-    if not callable(resolver):
-        return None
-    try:
-        return cast(object | None, resolver())
-    except Exception:  # noqa: BLE001
-        return None
+    return resolve_selected_compaction_provider(ctx, session)
 
 
 async def _build_context_overflow_compaction_config(ctx: RpcContext, session_key: str):
@@ -324,10 +615,12 @@ async def _build_context_overflow_compaction_config(ctx: RpcContext, session_key
             session = await storage.get_session(session_key)
         except Exception:  # noqa: BLE001
             session = None
+    compaction_target = resolve_gateway_compaction_target(ctx, session)
     return build_compaction_config_from_provider(
-        _resolve_compaction_provider(ctx, session),
-        model_override=_effective_compaction_model(session),
+        compaction_target.provider,
+        model_override=compaction_target.model or _effective_compaction_model(session),
         compaction_config=getattr(getattr(ctx, "config", None), "compaction", None),
+        compaction_plan=compaction_target.plan,
     )
 
 
@@ -378,6 +671,21 @@ async def _enforce_context_overflow(
         session_key,
         run_kind="session_compaction",
     )
+    root_operation_id = new_compaction_id()
+    provider_request_correlation = None
+    if not provider_request_correlation_disabled(config=config):
+        try:
+            session = await ctx.session_manager.get_session(session_key)
+        except Exception:  # noqa: BLE001 - observability is best-effort
+            session = None
+        durable_session_id = getattr(session, "session_id", None)
+        if isinstance(durable_session_id, str) and durable_session_id:
+            provider_request_correlation = ProviderRequestCorrelation(
+                session_id=durable_session_id,
+                turn_id=root_operation_id,
+                execution_id=uuid4().hex,
+                call_kind="auxiliary.compaction",
+            )
     with bind_usage_accounting_scope(usage_scope):
         outcome = await apply_context_overflow_policy(
             config=config,
@@ -392,6 +700,8 @@ async def _enforce_context_overflow(
             compaction_marker=getattr(ctx, "turn_runner", None),
             policy_override=policy_override,
             budget_override=budget_override,
+            provider_request_correlation=provider_request_correlation,
+            root_operation_id=root_operation_id,
         )
 
     if outcome.refusal is not None:
@@ -420,18 +730,31 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     message = params["message"]
     session_key = _canonical_webchat_session_key(params.get("sessionKey"))
     agent_id = parse_agent_id(session_key)
+    initial_collaboration_mode = _requested_initial_collaboration_mode(params)
 
     # Fresh-WebUI / smoke path: when no session manager is wired (webui
     # simulator, dispatcher-only boot), instant-accept without kicking off a
     # turn. This matches the roundtrip the WebUI observes on first paint
     # before the sessions engine is attached.
     if ctx.session_manager is None:
+        if initial_collaboration_mode is not None:
+            raise RpcUnavailableError(
+                "Initial collaboration mode requires atomic turn acceptance"
+            )
         return {"ok": True, "sessionKey": session_key, "instant_accept": True}
 
     mgr = _require_chat_session_manager(ctx)
     intent = params.get("intent")
     intent_was_provided = intent is not None
     requested_intent = intent
+    if intent is None and (
+        isinstance(params.get("workspaceId"), str)
+        or isinstance(params.get("workspace_id"), str)
+    ):
+        # A project draft is always a first-turn request. Keeping this intent
+        # stable on retries lets sessions.send consult the durable ingress
+        # receipt before an already-created session can change the strategy.
+        intent = "new_chat"
 
     # WebChat must accept the turn even when existing history is oversized.
     # Context shaping happens inside TurnRunner so it can produce a request-scoped
@@ -496,6 +819,8 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             ("client_message_id", "client_message_id"),
             ("surfaceId", "surfaceId"),
             ("surface_id", "surface_id"),
+            ("workspaceId", "workspaceId"),
+            ("workspace_id", "workspace_id"),
         ):
             if source_key in params:
                 extra[target_key] = params[source_key]
@@ -528,10 +853,17 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             fingerprint_params["intent"] = requested_intent
         else:
             fingerprint_params.pop("intent", None)
+        if initial_collaboration_mode is not None:
+            # Both public spellings represent the same logical request. Keep
+            # one canonical field in the durable idempotency fingerprint.
+            fingerprint_params["initialCollaborationMode"] = (
+                initial_collaboration_mode
+            )
         result = await _handle_sessions_send(
             send_params,
             ctx,
             fingerprint_params=fingerprint_params,
+            initial_collaboration_mode=initial_collaboration_mode,
         )
         result_session_key = result.get("sessionKey") or result.get("key") or session_key
         return {"ok": True, "sessionKey": result_session_key, **result}
@@ -558,10 +890,18 @@ async def _handle_chat_abort(params: dict | None, ctx: RpcContext) -> dict:
         "key": session_key,
         "source": raw_params.get("source") or "webui_abort",
     }
+    task_id_present = "taskId" in raw_params or "task_id" in raw_params
     task_id = raw_params.get("taskId") or raw_params.get("task_id")
-    source = str(abort_params["source"])
-    if source != "webui_stop" and isinstance(task_id, str) and task_id.strip():
+    if isinstance(task_id, str) and task_id.strip():
         abort_params["task_id"] = task_id.strip()
+        # chat.abort task ids are always session-bound, even for clients that
+        # predate the explicit scope marker.
+        abort_params["scope"] = "task"
+    elif (
+        task_id_present
+        or str(raw_params.get("scope") or "").strip().lower() == "task"
+    ):
+        abort_params["scope"] = "task"
     result = await _handle_sessions_abort(
         abort_params,
         ctx,
@@ -587,33 +927,85 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
 
     mgr = _require_chat_session_manager(ctx)
 
-    async def _load_page() -> tuple[list[object], bool, bool, bool]:
-        return await _load_chat_history_page(
+    async def _load_page() -> tuple[
+        list[object],
+        bool,
+        bool,
+        bool,
+        object | None,
+        object | None,
+    ]:
+        entries, has_more, canonical_available, canonical_complete = (
+            await _load_chat_history_page(
+                mgr,
+                session_key,
+                limit=limit,
+                before=before,
+                after=after,
+                include_canonical=include_canonical,
+            )
+        )
+        entries = await _project_missing_history_usage(mgr, session_key, entries)
+        previous_entry, next_entry = await _load_legacy_tool_projection_context(
             mgr,
             session_key,
-            limit=limit,
-            before=before,
-            after=after,
-            include_canonical=include_canonical,
+            entries,
+            canonical_available=canonical_available,
+        )
+        return (
+            entries,
+            has_more,
+            canonical_available,
+            canonical_complete,
+            previous_entry,
+            next_entry,
         )
 
     try:
-        history_lock = get_session_lock(ctx.turn_runner, session_key)
-        if history_lock is None:
-            page_entries, has_more, canonical_available, canonical_complete = (
-                await _load_page()
-            )
-        else:
-            # Canonical reads and compaction rewrites share one aiosqlite
-            # connection.  SQLite statements are snapshots, but a statement on
-            # that same connection can still observe the connection's own
-            # uncommitted archive/delete/reinsert work.  Use the short session
-            # mutation lock so the page and its coverage metadata are read only
-            # before or after a rewrite, never from its intermediate state.
-            async with history_lock:
-                page_entries, has_more, canonical_available, canonical_complete = (
-                    await _load_page()
-                )
+        with bounded_interactive_storage_reads():
+            history_lock = get_session_lock(ctx.turn_runner, session_key)
+            if history_lock is None:
+                (
+                    page_entries,
+                    has_more,
+                    canonical_available,
+                    canonical_complete,
+                    previous_entry,
+                    next_entry,
+                ) = await _load_page()
+            else:
+                # Canonical reads and compaction rewrites share one aiosqlite
+                # connection.  SQLite statements are snapshots, but a statement on
+                # that same connection can still observe the connection's own
+                # uncommitted archive/delete/reinsert work.  Use the short session
+                # mutation lock so the page and its coverage metadata are read only
+                # before or after a rewrite, never from its intermediate state.
+                started = time.monotonic()
+                acquired = False
+                try:
+                    try:
+                        async with asyncio.timeout(_CHAT_HISTORY_LOCK_BUDGET_SECONDS):
+                            await history_lock.acquire()
+                    except TimeoutError as exc:
+                        raise StorageBusyError(
+                            "chat.history",
+                            waited_ms=max(0, int((time.monotonic() - started) * 1000)),
+                            retry_after_ms=_CHAT_HISTORY_RETRY_AFTER_MS,
+                            stage="lock_acquire",
+                            resource="session_mutation_lock",
+                        ) from exc
+                    acquired = True
+                    (
+                        page_entries,
+                        has_more,
+                        canonical_available,
+                        canonical_complete,
+                        previous_entry,
+                        next_entry,
+                    ) = await _load_page()
+                finally:
+                    if acquired:
+                        history_lock.release()
     except KeyError:
         if _is_webchat_session_key(session_key):
             return _empty_chat_history_payload(limit)
@@ -630,7 +1022,17 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
     else:
         history_scope = "complete"
 
-    messages = transcript_entries_to_chat_messages(page_entries, limit=None)
+    messages = transcript_entries_to_chat_messages(
+        page_entries,
+        limit=None,
+        previous_entry=previous_entry,
+        next_entry=next_entry,
+    )
+    turn_outcomes = await _chat_history_turn_outcomes(
+        ctx,
+        session_key,
+        page_entries,
+    )
     return {
         "messages": _annotate_transcript_attachment_downloads(
             messages,
@@ -645,6 +1047,7 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict:
         "canonical_available": canonical_available,
         "canonical_complete": canonical_complete,
         "compaction_summaries": summaries,
+        "turn_outcomes": turn_outcomes,
     }
 
 
@@ -683,10 +1086,9 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
                                           the awaiting branch in meta_resolution
                                           uses ``session_key`` for the CAS
 
-    The fields dict is serialised into ``key: value\\n`` text and fed
-    into the regular ``chat.send`` path so meta_resolution's awaiting
-    branch picks it up. This is purely a convenience surface — clients
-    can equivalently call ``chat.send`` with the same text.
+    A request carrying ``request_id`` resolves the exact deferred tool call and
+    continues its existing turn. Legacy Meta clarifications have no request id;
+    those remain a cross-turn protocol and are fed through ``chat.send``.
     """
     if not isinstance(params, dict):
         raise ValueError("params required: sessionKey, fields")
@@ -695,6 +1097,31 @@ async def _handle_chat_clarify_submit(params: dict | None, ctx: RpcContext) -> d
         raise ValueError("params.fields must be a non-empty mapping")
 
     session_key = _canonical_webchat_session_key(params.get("sessionKey"))
+    raw_request_id = params.get("request_id", params.get("requestId"))
+    if raw_request_id is not None:
+        request_id = str(raw_request_id).strip()
+        if not request_id:
+            raise ValueError("params.request_id must be a non-empty string")
+        task_runtime = getattr(ctx, "task_runtime", None)
+        resolve_user_input = getattr(task_runtime, "resolve_user_input", None)
+        if not callable(resolve_user_input):
+            raise RpcUnavailableError(
+                "Deferred user-input resolution is not available"
+            )
+        result = await resolve_user_input(
+            session_key=session_key,
+            request_id=request_id,
+            fields=fields,
+        )
+        log.info(
+            "chat.clarify_submit.deferred",
+            session_key=session_key,
+            request_id=request_id,
+            field_count=len(fields),
+            replayed=bool(result.get("replayed")),
+        )
+        return {"sessionKey": session_key, **result}
+
     text = _clarify_fields_to_text(fields)
 
     run_id = params.get("run_id")

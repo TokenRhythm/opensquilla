@@ -24,6 +24,7 @@ class _Manager:
             cache_read=0,
             cache_write=0,
             model_override=None,
+            model_provider=None,
         )
 
     async def get_session(self, session_key: str):
@@ -57,6 +58,7 @@ async def test_session_totals_rollup_splits_mixed_turn_cost_components() -> None
         billed_cost=0.01,
         cost_source="mixed",
         model="deepseek/deepseek-v4-pro",
+        provider="openrouter",
     )
 
     result = await adapter.rollup(
@@ -70,6 +72,8 @@ async def test_session_totals_rollup_splits_mixed_turn_cost_components() -> None
     assert result.billed_cost_usd == pytest.approx(0.01)
     assert result.estimated_cost_component_usd == pytest.approx(0.02)
     assert result.cost_source == "mixed"
+    assert result.model_provider == "openrouter"
+    assert runner._session_manager.session.model_provider == "openrouter"
     assert runner._session_manager.session.estimated_cost_component_usd == pytest.approx(0.02)
 
 
@@ -119,3 +123,50 @@ async def test_session_totals_rollup_mixes_confirmed_zero_with_estimate() -> Non
 
     assert result is not None
     assert result.cost_source == "mixed"
+
+
+@pytest.mark.asyncio
+async def test_session_totals_rollup_tracks_estimate_and_missing_independently() -> None:
+    runner = _Runner()
+    adapter = _TurnRunnerSessionTotalsAdapter(runner)  # type: ignore[arg-type]
+
+    result = await adapter.rollup(
+        session_key="agent:webchat:mixed-turn",
+        done_event=DoneEvent(
+            input_tokens=1070,
+            output_tokens=207,
+            cost_usd=0.57,
+            billed_cost=0.07,
+            cost_source="mixed",
+            missing_cost_entries=1,
+        ),
+        resolved_model="synthetic-model",
+    )
+
+    assert result is not None
+    assert result.total_cost_usd == pytest.approx(0.57)
+    assert result.billed_cost_usd == pytest.approx(0.07)
+    assert result.estimated_cost_component_usd == pytest.approx(0.5)
+    assert result.missing_cost_entries == 1
+    assert result.cost_source == "mixed"
+
+
+@pytest.mark.asyncio
+async def test_session_totals_rollup_does_not_mark_free_usage_missing() -> None:
+    runner = _Runner()
+    adapter = _TurnRunnerSessionTotalsAdapter(runner)  # type: ignore[arg-type]
+
+    result = await adapter.rollup(
+        session_key="agent:webchat:mixed-turn",
+        done_event=DoneEvent(
+            input_tokens=10,
+            output_tokens=1,
+            cost_source="unavailable",
+            estimate_basis="free",
+        ),
+        resolved_model="local-model",
+    )
+
+    assert result is not None
+    assert result.missing_cost_entries == 0
+    assert result.cost_source == "none"

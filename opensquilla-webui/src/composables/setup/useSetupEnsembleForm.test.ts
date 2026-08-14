@@ -67,6 +67,29 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
     expect(f.isDirty.value).toBe(false)
   })
 
+  it('uses the backend activation preview instead of the dormant legacy default', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({
+      enabled: false,
+      selection_mode: 'static_openrouter_b5',
+      selection_configured: false,
+      activation_preview: {
+        selection_mode: CUSTOM_B5_SELECTION_MODE,
+        candidates: [
+          { provider: 'tokenrhythm', model: 'deepseek-v4-pro', role: 'primary' },
+          { provider: 'tokenrhythm', model: 'glm-5.2', role: 'aggregator' },
+        ],
+      },
+    })
+
+    expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(f.candidates.value.map((candidate) => candidate.provider)).toEqual([
+      'tokenrhythm',
+      'tokenrhythm',
+    ])
+    expect(f.isDirty.value).toBe(false)
+  })
+
   it('falls back to the shipped defaults for an empty or invalid config slice', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({ selection_mode: 'bogus', all_failed_policy: 'bogus', min_successful_proposers: -3 })
@@ -221,11 +244,15 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     expect(f.isDirty.value).toBe(false)
   })
 
-  it('activateForProvider lands on the preset for preset providers', () => {
+  it('activateForProvider seeds preset providers into the custom editing path', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({})
     f.activateForProvider('tokenrhythm')
-    expect(f.selectionMode.value).toBe('static_tokenrhythm_b5')
+    expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(f.candidates.value.filter(c => c.role !== 'aggregator').map(c => c.model))
+      .toEqual([...TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS])
+    expect(f.candidates.value.find(c => c.role === 'aggregator')?.model)
+      .toBe(TOKENRHYTHM_FIXED_ENSEMBLE_AGGREGATOR)
   })
 
   it('activateForProvider gives other providers an explicit custom lineup seeded from tiers', () => {
@@ -903,6 +930,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
       quorum: 3,
       proposerCount: 4,
       proposerTimeoutSeconds: 300,
+      configuredAggregatorTimeoutSeconds: 3600,
       aggregatorTimeoutSeconds: 480,
       quorumGraceSeconds: 10,
     })
@@ -961,6 +989,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     })
     const facts = makePanel(f, 'openrouter').value.presetFacts
     expect(facts.proposerTimeoutSeconds).toBe(600)
+    expect(facts.configuredAggregatorTimeoutSeconds).toBe(900)
     expect(facts.aggregatorTimeoutSeconds).toBe(900)
     expect(facts.quorumGraceSeconds).toBe(10)
     // The stored timeouts are read-only facts, never a pending edit.
@@ -978,6 +1007,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     })
     const legacyFacts = makePanel(explicitLegacy, 'openrouter').value.presetFacts
     expect(legacyFacts.proposerTimeoutSeconds).toBe(300)
+    expect(legacyFacts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(legacyFacts.aggregatorTimeoutSeconds).toBe(480)
 
     // Older gateways may omit the keys from the config slice entirely.
@@ -985,6 +1015,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     absent.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
     const absentFacts = makePanel(absent, 'openrouter').value.presetFacts
     expect(absentFacts.proposerTimeoutSeconds).toBe(300)
+    expect(absentFacts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(absentFacts.aggregatorTimeoutSeconds).toBe(480)
   })
 
@@ -1001,6 +1032,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     })
     const facts = makePanel(f, 'deepseek').value.custom.facts
     expect(facts.proposerTimeoutSeconds).toBe(720)
+    expect(facts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(facts.aggregatorTimeoutSeconds).toBe(480)
     expect(facts.quorumGraceSeconds).toBe(10)
   })
@@ -1014,6 +1046,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     })
     const facts = makePanel(f, 'deepseek').value.custom.facts
     expect(facts.proposerTimeoutSeconds).toBe(3600)
+    expect(facts.configuredAggregatorTimeoutSeconds).toBe(3600)
     expect(facts.aggregatorTimeoutSeconds).toBe(3600)
     expect(facts.quorumGraceSeconds).toBe(0)
   })

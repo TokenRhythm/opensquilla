@@ -90,7 +90,10 @@ def _unsafe_desktop_profile(home: Path, *, port: int = 0) -> None:
     lifecycle = state / "gateway"
     lifecycle.mkdir(parents=True)
     missing_workspace = home.parent / "missing-workspace"
+    # config_version = 999 is the remaining hard startup gate: a config
+    # authored by a newer build must never be reinterpreted by this one.
     (home / "config.toml").write_text(
+        "config_version = 999\n"
         f"state_dir = {json.dumps(str(state))}\n"
         f"workspace_dir = {json.dumps(str(missing_workspace))}\n",
         encoding="utf-8",
@@ -184,6 +187,25 @@ def test_gateway_run_turns_missing_onboarding_env_into_recovery_hint(
     assert normalized.index("opensquillaonboardstatus--config") < normalized.index(
         expected_config
     )
+    assert "Traceback" not in output
+
+
+def test_gateway_run_reports_invalid_config_without_traceback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "custom.toml"
+    target.write_text("workspace_dir = [\n", encoding="utf-8")
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
+
+    result = runner.invoke(app, ["gateway", "run", "--config", str(target)])
+
+    assert result.exit_code == 1
+    output = result.stdout + (result.stderr or "")
+    compact = "".join(output.split())
+    assert "Invalid gateway config" in output
+    assert "custom.toml" in compact
+    assert "recoveryrecover-config" in compact
     assert "Traceback" not in output
 
 
@@ -299,7 +321,7 @@ def test_unsafe_desktop_gateway_lifecycle_blocks_before_spawn_or_write(
     assert result.ok is False
     assert result.state == "recovery_required"
     assert result.code == "DESKTOP_PROFILE_RECOVERY_REQUIRED"
-    assert result.details["stableCode"] == "effective_workspace_missing"
+    assert result.details["stableCode"] == "config_schema_too_new"
     assert _profile_tree_snapshot(home) == before
     assert not user_state.exists()
 
@@ -329,6 +351,9 @@ def test_desktop_lifecycle_rejects_config_outside_profile_before_write(
     assert result.ok is False
     assert result.code == "DESKTOP_PROFILE_RECOVERY_REQUIRED"
     assert result.details["stableCode"] == "desktop_config_outside_profile"
+    assert result.details["allowedActions"] == ["retry-primary"]
+    assert "launch-recovery-profile" not in result.details["allowedActions"]
+    assert "primary profile" in result.message
     assert _profile_tree_snapshot(home) == before
     assert not user_state.exists()
 
@@ -370,7 +395,7 @@ def test_gateway_run_emits_stable_profile_in_use_error_without_sensitive_path(
     lock_error = getattr(recovery, lock_error_name)
 
     @contextlib.contextmanager
-    def busy_profile_guard():
+    def busy_profile_guard(**_kwargs):
         raise lock_error(
             f"profile is in use by another writer: {sensitive_profile}"
         )
@@ -679,8 +704,11 @@ def test_gateway_run_uses_config_host_port_when_flags_are_omitted(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
+        captured["startup_started_at"] = _startup_started_at
 
         async def done():
             return None
@@ -702,6 +730,7 @@ def test_gateway_run_uses_config_host_port_when_flags_are_omitted(
 
     assert captured["config"].host == "127.0.0.2"
     assert captured["config"].port == 19999
+    assert isinstance(captured["startup_started_at"], float)
 
 
 def test_gateway_run_records_cli_flags_as_runtime_overrides(
@@ -721,7 +750,9 @@ def test_gateway_run_records_cli_flags_as_runtime_overrides(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
 
         async def done():
@@ -766,7 +797,9 @@ def test_gateway_run_flags_do_not_leak_into_config_via_unrelated_persist(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
 
         async def done():
@@ -824,7 +857,9 @@ def test_gateway_run_keeps_missing_explicit_config_path_for_setup(
         async def close(self, _reason):
             return None
 
-    async def fake_start_gateway_server(*, config, subscription_manager, run):
+    async def fake_start_gateway_server(
+        *, config, subscription_manager, run, _startup_started_at
+    ):
         captured["config"] = config
 
         async def done():
@@ -1166,7 +1201,7 @@ class _ShutdownProbeServer:
 
 
 def _install_fake_start(server, holder, monkeypatch) -> None:
-    async def fake_start(*, config, subscription_manager, run):
+    async def fake_start(*, config, subscription_manager, run, _startup_started_at):
         server.spawn()
         holder["server"] = server
         return server

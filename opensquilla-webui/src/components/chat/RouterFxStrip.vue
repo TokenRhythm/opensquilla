@@ -646,9 +646,8 @@ function ensembleModelElapsed(model: ChatEnsembleMetaModel): string {
 .router-fx-ensemble__meta {
   flex: 0 0 auto;
   color: var(--router-muted);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  text-transform: uppercase;
+  font-size: 12.5px;
+  font-weight: 400;
   white-space: nowrap;
 }
 

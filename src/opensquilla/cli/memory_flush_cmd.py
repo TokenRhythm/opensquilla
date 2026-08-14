@@ -5,12 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import typer
 
+from opensquilla.observability.network_policy import (
+    provider_request_correlation_disabled,
+)
+from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.compaction_lifecycle import flush_receipt_is_successful_flush
 
 
@@ -252,6 +257,21 @@ async def run_memory_flush_session(
         if session_manager is None:
             raise RuntimeError("session manager is disabled; cannot read transcript")
         transcript = await session_manager.get_transcript(session_key)
+        maintenance_turn_id = f"maintenance_{uuid.uuid4().hex}"
+        provider_request_correlation = None
+        if not provider_request_correlation_disabled(config=service_cfg):
+            try:
+                session = await session_manager.get_session(session_key)
+            except Exception:  # noqa: BLE001 - correlation must never block the flush
+                session = None
+            durable_session_id = getattr(session, "session_id", None)
+            if isinstance(durable_session_id, str) and durable_session_id:
+                provider_request_correlation = ProviderRequestCorrelation(
+                    session_id=durable_session_id,
+                    turn_id=maintenance_turn_id,
+                    execution_id=uuid.uuid4().hex,
+                    call_kind="auxiliary.session_flush",
+                )
         receipt = await flush_service.execute(
             transcript,
             session_key,
@@ -262,6 +282,8 @@ async def run_memory_flush_session(
             segment_mode=parsed_segment_mode,
             segment_max_chars=parsed_segment_max_chars,
             segment_overlap_messages=parsed_segment_overlap_messages,
+            turn_id=maintenance_turn_id,
+            provider_request_correlation=provider_request_correlation,
         )
         receipt_dict = receipt.to_dict() if hasattr(receipt, "to_dict") else dict(receipt)
         usage = receipt_dict.get("usage")
@@ -360,23 +382,29 @@ def memory_flush_session_cmd(
 ) -> None:
     """Flush a local session transcript into searchable durable memory."""
 
+    from opensquilla.recovery import guarded_desktop_profile
+
     try:
-        result = asyncio.run(
-            run_memory_flush_session(
-                key=key,
-                session_db_path=session_db_path,
-                workspace=workspace or None,
-                config_path=config_path or None,
-                agent_id=agent_id or None,
-                message_window=message_window or None,
-                flush_max_chars=flush_max_chars,
-                segment_mode=segment_mode,
-                segment_max_chars=segment_max_chars,
-                segment_overlap_messages=segment_overlap_messages,
-                timeout=timeout,
-                usage_path=usage_path or None,
+        # build_services() may recover managed-Skill transaction state. Retain
+        # the same profile capability for the complete local writer lifetime,
+        # matching the agent, standalone chat, and Gateway entry points.
+        with guarded_desktop_profile():
+            result = asyncio.run(
+                run_memory_flush_session(
+                    key=key,
+                    session_db_path=session_db_path,
+                    workspace=workspace or None,
+                    config_path=config_path or None,
+                    agent_id=agent_id or None,
+                    message_window=message_window or None,
+                    flush_max_chars=flush_max_chars,
+                    segment_mode=segment_mode,
+                    segment_max_chars=segment_max_chars,
+                    segment_overlap_messages=segment_overlap_messages,
+                    timeout=timeout,
+                    usage_path=usage_path or None,
+                )
             )
-        )
     except (KeyError, RuntimeError, ValueError) as exc:
         if json_output:
             typer.echo(json.dumps({"ok": False, "error": str(exc)}, sort_keys=True))

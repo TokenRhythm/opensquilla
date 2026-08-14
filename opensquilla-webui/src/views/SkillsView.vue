@@ -6,7 +6,7 @@
         <p class="sk-stage__subtitle control-stage__subtitle">{{ t('cronSkills.skillsView.subtitle') }}</p>
       </div>
       <div class="sk-stage__actions control-stage__actions">
-        <div class="sk-search-wrap" :style="{ visibility: activeTab === 'installed' ? 'visible' : 'hidden' }">
+        <div class="sk-search-wrap">
           <span class="sk-search-icon">
             <Icon name="search" :size="16" />
           </span>
@@ -18,59 +18,41 @@
             autocomplete="off"
           />
         </div>
+        <button class="btn btn--ghost" data-testid="skills-overview" type="button" @click="skillsOverviewOpen = true">
+          <Icon name="skills" :size="16" />
+          <span>{{ t('cronSkills.skillsView.overviewTitle') }}</span>
+        </button>
         <button
-          class="btn btn--ghost"
-          data-testid="skills-reload"
+          class="btn btn--primary sk-add-trigger"
+          data-testid="skills-add-trigger"
           type="button"
-          :disabled="reloading"
-          :aria-busy="reloading"
-          :title="t('cronSkills.skillsView.reload')"
-          @click="manualReload"
+          :disabled="mutationBusy && !queueRunning"
+          :aria-expanded="addSkillOpen"
+          aria-controls="skills-add-drawer"
+          @click="addSkillOpen = true"
         >
-          <Icon name="refresh" :size="16" />
-          <span>{{ reloading ? t('cronSkills.skillsView.refreshing') : t('cronSkills.skillsView.reload') }}</span>
+          <Icon name="plus" :size="16" />
+          <span>{{ t('cronSkills.registry.drawerTitle') }}</span>
         </button>
       </div>
     </header>
 
-    <SkillsStats
-      :tiles="statTiles"
-      :active-key="statusFilter"
-      :proposal-count="proposals.length"
-      @select="selectStatusFilter"
-      @show-proposals="showProposalsFromStats"
-    />
+    <Transition name="modal">
+      <div v-if="skillsOverviewOpen" class="sk-overview-modal" role="dialog" aria-modal="true" aria-labelledby="skills-overview-title" @click.self="skillsOverviewOpen = false">
+        <section class="sk-overview-modal__panel">
+          <header class="sk-overview-modal__head">
+            <div><span class="sk-overview-modal__eyebrow">SKILLS OVERVIEW</span><h2 id="skills-overview-title">{{ t('cronSkills.skillsView.overviewTitle') }}</h2><p>{{ t('cronSkills.skillsView.overviewDesc') }}</p></div>
+            <div class="sk-overview-modal__actions">
+              <button class="btn btn--ghost" data-testid="skills-reload" type="button" :disabled="reloading || mutationBusy" :aria-busy="reloading" @click="manualReload"><Icon name="refresh" :size="16" /><span>{{ reloading ? t('cronSkills.skillsView.refreshing') : t('cronSkills.skillsView.reload') }}</span></button>
+              <button class="btn btn--ghost sk-overview-modal__close" type="button" :aria-label="t('common.close')" @click="skillsOverviewOpen = false"><Icon name="x" :size="18" /></button>
+            </div>
+          </header>
+          <SkillsStats :tiles="statTiles" :active-key="statusFilter" :proposal-count="proposals.length" @select="selectStatusFromOverview" @show-proposals="showProposalsFromOverview" />
+        </section>
+      </div>
+    </Transition>
 
-    <div class="sk-tabs" role="tablist" :aria-label="t('cronSkills.skillsView.tabsLabel')">
-      <button
-        id="sk-tab-installed"
-        class="sk-tab"
-        :class="{ 'is-active': activeTab === 'installed' }"
-        type="button"
-        role="tab"
-        :aria-selected="activeTab === 'installed'"
-        aria-controls="sk-panel-installed"
-        @click="activeTab = 'installed'"
-      >
-        <Icon name="skills" :size="16" />
-        <span>{{ t('cronSkills.skillsView.tabInstalled') }}</span>
-      </button>
-      <button
-        id="sk-tab-registry"
-        class="sk-tab"
-        :class="{ 'is-active': activeTab === 'registry' }"
-        type="button"
-        role="tab"
-        :aria-selected="activeTab === 'registry'"
-        aria-controls="sk-panel-registry"
-        @click="activeTab = 'registry'"
-      >
-        <Icon name="download" :size="16" />
-        <span>{{ t('cronSkills.skillsView.tabCommunity') }}</span>
-      </button>
-    </div>
-
-    <div v-show="activeTab === 'installed'" class="sk-panel" role="tabpanel" id="sk-panel-installed" aria-labelledby="sk-tab-installed">
+    <div class="sk-panel" data-testid="skills-catalog">
       <div class="sk-installed">
         <details
           v-if="proposalsSettings.available"
@@ -87,6 +69,7 @@
             <label class="sk-ap-toggle">
               <ControlSwitch
                 :checked="proposalsSettings.enabled"
+                :disabled="mutationBusy"
                 :aria-label="t('cronSkills.autoPropose.scheduledLabel')"
                 @change="(v) => toggleAutoPropose('enabled', v)"
               />
@@ -98,6 +81,7 @@
             <label class="sk-ap-toggle">
               <ControlSwitch
                 :checked="proposalsSettings.on_dream_complete"
+                :disabled="mutationBusy"
                 :aria-label="t('cronSkills.autoPropose.dreamLabel')"
                 @change="(v) => toggleAutoPropose('on_dream_complete', v)"
               />
@@ -107,6 +91,7 @@
             <label class="sk-ap-toggle">
               <ControlSwitch
                 :checked="proposalsSettings.auto_enable"
+                :disabled="mutationBusy"
                 :aria-label="t('cronSkills.autoPropose.autoEnableLabel')"
                 @change="(v) => toggleAutoPropose('auto_enable', v)"
               />
@@ -120,6 +105,7 @@
               <select
                 class="sk-ap-select"
                 :value="proposalsSettings.auto_enable_max_risk || 'low'"
+                :disabled="mutationBusy"
                 @change="setAutoEnableRisk(($event.target as HTMLSelectElement).value)"
               >
                 <option value="low">{{ t('cronSkills.autoPropose.riskLow') }}</option>
@@ -134,11 +120,12 @@
         <PendingSkillProposals
           ref="proposalsPanelRef"
           :proposals="proposals"
+          :mutation-disabled="mutationBusy"
           @show="openProposalDialog"
           @accept="acceptProposal"
           @reject="rejectProposal"
         />
-        <AutoEnabledSkills :skills="autoEnabledSkills" @disable="disableAutoEnabled" />
+        <AutoEnabledSkills :skills="autoEnabledSkills" :mutation-disabled="mutationBusy" @disable="disableAutoEnabled" />
         <SkillGroup
           :title="t('cronSkills.skillsView.metaSkillsTitle')"
           :description="t('cronSkills.skillsView.metaSkillsDesc')"
@@ -170,18 +157,24 @@
       </div>
     </div>
 
-    <div v-show="activeTab === 'registry'" class="sk-panel" role="tabpanel" id="sk-panel-registry" aria-labelledby="sk-tab-registry">
-      <SkillsRegistryPanel
-        v-model:registry-query="registryQuery"
-        v-model:github-url="githubUrl"
-        :results="registryResults"
-        :loading="registryLoading"
-        :installing-id="installingId"
-        @search="searchRegistry"
-        @install-github="installGithub"
-        @install="installSkill"
-      />
-    </div>
+    <SkillsAddDrawer
+      v-model:registry-query="registryQuery"
+      v-model:github-url="githubUrl"
+      :open="addSkillOpen"
+      :results="registryResults"
+      :loading="registryLoading"
+      :registry-diagnostics="registryDiagnostics"
+      :registry-search-error="registrySearchError"
+      :activities="installActivities"
+      :running-source="runningSource"
+      :mutation-blocked="mutationBusy && !queueRunning"
+      @close="addSkillOpen = false"
+      @search="searchRegistry"
+      @install-github="installGithub"
+      @install="installSkill"
+      @retry="retryQueueItem"
+      @clear-activity="clearInstallActivity"
+    />
 
     <SkillDetailDialog
       :skill="selectedSkill"
@@ -191,6 +184,7 @@
       :install-feedback="installFeedback"
       :installing-deps-id="installingDepsId"
       :uninstalling-name="uninstallingName"
+      :mutation-disabled="mutationBusy"
       @close="closeDialog"
       @install-deps="installDepsAndMaybeClose"
       @uninstall="uninstallSkillAndClose"
@@ -207,10 +201,11 @@ import AutoEnabledSkills from '@/components/skills/AutoEnabledSkills.vue'
 import PendingSkillProposals from '@/components/skills/PendingSkillProposals.vue'
 import SkillDetailDialog from '@/components/skills/SkillDetailDialog.vue'
 import SkillGroup from '@/components/skills/SkillGroup.vue'
-import SkillsRegistryPanel from '@/components/skills/SkillsRegistryPanel.vue'
+import SkillsAddDrawer from '@/components/skills/SkillsAddDrawer.vue'
 import SkillsStats from '@/components/skills/SkillsStats.vue'
 import { useSkillProposals } from '@/composables/skills/useSkillProposals'
 import { useSkillDetailController } from '@/composables/skills/useSkillDetailController'
+import { createSkillMutationGate } from '@/composables/skills/useSkillMutationGate'
 import { useSkillRegistry } from '@/composables/skills/useSkillRegistry'
 import { skillLayerHelp, skillLayerLabel, useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
 import { useToasts } from '@/composables/useToasts'
@@ -236,16 +231,18 @@ interface SkillReloadResult {
 }
 
 const { t } = useI18n()
+const skillsOverviewOpen = ref(false)
 const { pushToast } = useToasts()
 const rpc = useRpcStore()
-const activeTab = ref('installed')
+const addSkillOpen = ref(false)
 const reloading = ref(false)
 const selectedProposal = ref<Proposal | null>(null)
 const proposalsPanelRef = ref<InstanceType<typeof PendingSkillProposals> | null>(null)
 
 let loadData: () => Promise<boolean>
+const mutationGate = createSkillMutationGate()
 
-const proposalsModel = useSkillProposals(rpc, async () => { await loadData() })
+const proposalsModel = useSkillProposals(rpc, async () => { await loadData() }, mutationGate)
 const {
   proposals,
   autoEnabledSkills,
@@ -289,7 +286,7 @@ function reloadSummary(result: SkillReloadResult): string {
 }
 
 async function manualReload() {
-  if (reloading.value) return
+  if (reloading.value || !mutationGate.acquire('reload')) return
   reloading.value = true
   try {
     await rpc.waitForConnection()
@@ -326,21 +323,29 @@ async function manualReload() {
     }), { tone: 'danger' })
   } finally {
     reloading.value = false
+    mutationGate.release('reload')
   }
 }
 
-const registry = useSkillRegistry(rpc, loadData)
+const registry = useSkillRegistry(rpc, loadData, mutationGate)
 const {
   registryQuery,
   githubUrl,
   registryResults,
   registryLoading,
-  installingId,
+  registryDiagnostics,
+  registrySearchError,
+  installActivities,
+  runningSource,
+  queueRunning,
+  mutationBusy,
   installingDepsId,
   uninstallingName,
   searchRegistry,
   installGithub,
   installSkill,
+  retryQueueItem,
+  clearInstallActivity,
   installDeps,
   uninstallSkill,
 } = registry
@@ -369,9 +374,11 @@ function teardownLive() {
   unsubs.forEach(unsub => unsub())
   unsubs = []
   closeDialog()
+  addSkillOpen.value = false
 }
 
 onActivated(() => {
+  if (queueRunning.value) return
   void loadData()
 })
 
@@ -382,13 +389,20 @@ function scrollToProposals() {
   proposalsPanelRef.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
+function selectStatusFromOverview(key: string) {
+  skillsOverviewOpen.value = false
+  selectStatusFilter(key)
+}
+
+async function showProposalsFromOverview() {
+  skillsOverviewOpen.value = false
+  await showProposalsFromStats()
+}
 function selectStatusFilter(key: string) {
-  activeTab.value = 'installed'
   setStatusFilter(key)
 }
 
 async function showProposalsFromStats() {
-  activeTab.value = 'installed'
   await nextTick()
   scrollToProposals()
 }
@@ -414,13 +428,75 @@ async function installDepsAndMaybeClose(name: string, installId: string) {
   await installCurrentDependencies(name, installId)
 }
 
-async function uninstallSkillAndClose(name: string) {
-  const removed = await uninstallSkill(name)
+async function uninstallSkillAndClose(name: string, installId: string) {
+  const removed = await uninstallSkill(name, installId)
   if (removed) closeDialog()
 }
 </script>
 
 <style>
+/* Compact skills overview */
+.sk-overview-modal {
+  align-items: center;
+  background: var(--scrim);
+  display: flex;
+  inset: 0;
+  justify-content: center;
+  padding: 24px;
+  position: fixed;
+  z-index: 1100;
+}
+
+.sk-overview-modal__panel {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--elev-3);
+  max-width: 960px;
+  padding: 22px;
+  width: 100%;
+}
+
+.sk-overview-modal__head {
+  align-items: flex-start;
+  display: flex;
+  gap: 20px;
+  justify-content: space-between;
+  margin-bottom: 18px;
+}
+
+.sk-overview-modal__eyebrow {
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: .13em;
+}
+
+.sk-overview-modal__head h2 {
+  font-size: 1.125rem;
+  margin: 4px 0 0;
+}
+
+.sk-overview-modal__head p {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  margin: 5px 0 0;
+}
+
+.sk-overview-modal__actions {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+.sk-overview-modal__close {
+  padding: 6px;
+}
+
+@media (max-width: 700px) {
+  .sk-overview-modal { align-items: flex-end; padding: 0; }
+  .sk-overview-modal__panel { border-bottom-left-radius: 0; border-bottom-right-radius: 0; max-height: 88vh; overflow: auto; padding: 18px; }
+}
+
 /* Search */
 .sk-search-wrap {
   position: relative;
@@ -463,39 +539,15 @@ async function uninstallSkillAndClose(name: string) {
   min-width: 320px;
 }
 
-/* Tabs */
-.sk-tabs {
-  display: flex;
-  gap: 0;
-  border-bottom: 1px solid var(--border);
-}
-.sk-tab {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 10px 18px;
-  background: transparent;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  color: var(--text-muted);
-  cursor: pointer;
-  transition: color var(--transition), border-color var(--transition);
-}
-.sk-tab.is-active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-}
-.sk-tab:hover:not(.is-active) {
-  color: var(--text);
-}
-
 /* Panels */
 .sk-panel {
   display: flex;
   flex-direction: column;
   gap: var(--sp-3);
+}
+
+.sk-add-trigger {
+  white-space: nowrap;
 }
 
 /* Groups */
@@ -575,6 +627,10 @@ async function uninstallSkillAndClose(name: string) {
 .sk-card__dot.is-unverified {
   background: var(--text-dim);
 }
+.sk-card__dot.is-provider-check {
+  background: var(--text-dim);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--text-dim) 18%, transparent);
+}
 .sk-card__emoji {
   font-size: 14px;
   line-height: 1;
@@ -630,6 +686,20 @@ async function uninstallSkillAndClose(name: string) {
 .sk-card__dep--advisory {
   border-style: dashed;
   color: var(--text-muted);
+}
+.sk-card__provider-status {
+  align-self: flex-start;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--text-dim) 40%, var(--border));
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  background: var(--bg-elevated);
+  font-size: 10px;
+  font-weight: 600;
 }
 .sk-card__sub-row {
   display: flex;
@@ -765,47 +835,6 @@ async function uninstallSkillAndClose(name: string) {
   border-color: var(--accent);
 }
 
-/* Registry */
-.sk-registry {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp-3);
-}
-.sk-registry__head,
-.sk-github-install {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  flex-wrap: wrap;
-}
-.sk-registry__results {
-  background: var(--bg-surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: var(--sp-4);
-  min-height: 120px;
-}
-.sk-registry__hint {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: var(--sp-5);
-  color: var(--text-muted);
-  text-align: center;
-}
-.sk-registry__hint-icon {
-  color: var(--text-dim);
-}
-.sk-registry__loading {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: var(--sp-5);
-  color: var(--text-muted);
-}
 .sk-spinner {
   width: 16px;
   height: 16px;
@@ -814,15 +843,6 @@ async function uninstallSkillAndClose(name: string) {
   border-radius: 50%;
   animation: sk-spin 0.8s linear infinite;
 }
-.sk-registry__name {
-  font-weight: 600;
-}
-.sk-registry__desc {
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-  max-width: 300px;
-}
-
 /* Dialog */
 .sk-dialog {
   position: fixed;
@@ -846,6 +866,9 @@ async function uninstallSkillAndClose(name: string) {
 .sk-detail {
   display: flex;
   flex-direction: column;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 20px;
   max-height: 85vh;
 }
 .sk-detail__header {
@@ -861,6 +884,7 @@ async function uninstallSkillAndClose(name: string) {
   align-items: center;
   gap: var(--sp-2);
   flex-wrap: wrap;
+  flex: 1 1 auto;
   min-width: 0;
 }
 .sk-detail__emoji {
@@ -868,12 +892,17 @@ async function uninstallSkillAndClose(name: string) {
   line-height: 1;
 }
 .sk-detail__name {
-  font-size: var(--fs-lg);
+  font-family: inherit;
+  font-size: 16px;
   font-weight: 600;
+  overflow-wrap: anywhere;
+  line-height: 22px;
 }
 .sk-detail__chips {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
 }
 .sk-detail__body {
   padding: var(--sp-4);
@@ -885,7 +914,9 @@ async function uninstallSkillAndClose(name: string) {
 .sk-detail__desc {
   margin: 0;
   color: var(--text-muted);
-  font-size: var(--fs-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 22px;
 }
 .sk-detail__section {
   display: flex;
@@ -893,10 +924,11 @@ async function uninstallSkillAndClose(name: string) {
   gap: var(--sp-2);
 }
 .sk-detail__section-title {
-  font-size: 10.5px;
+  font-family: inherit;
+  font-size: 13px;
   font-weight: 700;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  line-height: 20px;
   color: var(--text-dim);
 }
 .sk-detail__sub-list {
@@ -907,11 +939,18 @@ async function uninstallSkillAndClose(name: string) {
 .sk-detail__missing {
   margin: 0;
   padding-left: var(--sp-4);
-  font-size: var(--fs-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 22px;
   color: var(--text-muted);
 }
 .sk-detail__missing li {
-  margin-bottom: 4px;
+  margin-bottom: 6px;
+}
+.sk-detail__missing code {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 22px;
 }
 .sk-detail__declared {
   margin-top: 0;
@@ -935,11 +974,14 @@ async function uninstallSkillAndClose(name: string) {
 .sk-detail__dependency-stat strong {
   color: var(--text);
   font-family: var(--font-mono);
-  font-size: var(--fs-sm);
+  font-size: 13px;
+  line-height: 20px;
 }
 .sk-detail__dependency-stat span {
   color: var(--text-dim);
-  font-size: 10px;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 18px;
 }
 .sk-detail__dependency-stat.is-missing {
   border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
@@ -949,7 +991,9 @@ async function uninstallSkillAndClose(name: string) {
 }
 .sk-detail__advisory-note {
   color: var(--text-muted);
-  font-size: var(--fs-xs);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 22px;
   margin: 0;
 }
 .sk-detail__install-row {
@@ -961,12 +1005,23 @@ async function uninstallSkillAndClose(name: string) {
   background: var(--bg-elevated);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  font-size: var(--fs-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 20px;
+}
+.sk-detail__install-row--toolchain {
+  align-items: flex-start;
+  flex-direction: column;
+}
+.sk-detail__toolchain-guidance {
+  line-height: 1.45;
 }
 .sk-detail__link {
   color: var(--accent);
   text-decoration: none;
-  font-size: var(--fs-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 20px;
 }
 .sk-detail__link:hover {
   text-decoration: underline;
@@ -977,7 +1032,9 @@ async function uninstallSkillAndClose(name: string) {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   color: var(--text-muted);
-  font-size: var(--fs-sm);
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 20px;
 }
 .sk-detail__content-state--error {
   color: var(--danger);
@@ -998,7 +1055,8 @@ async function uninstallSkillAndClose(name: string) {
 }
 .sk-detail__path {
   font-family: var(--font-mono);
-  font-size: var(--fs-xs);
+  font-size: 12px;
+  line-height: 18px;
 }
 
 .sk-iconbtn {
@@ -1012,6 +1070,7 @@ async function uninstallSkillAndClose(name: string) {
   border-radius: var(--radius-md);
   color: var(--text-muted);
   cursor: pointer;
+  flex: 0 0 32px;
   transition: color var(--transition), border-color var(--transition);
 }
 .sk-iconbtn:hover {
@@ -1025,8 +1084,10 @@ async function uninstallSkillAndClose(name: string) {
   align-items: center;
   padding: 2px 8px;
   border-radius: var(--radius-sm);
-  font-size: 10.5px;
+  font-family: inherit;
+  font-size: 12px;
   font-weight: 600;
+  line-height: 18px;
   border: 1px solid var(--border);
   background: var(--bg-elevated);
   color: var(--text-muted);
@@ -1050,7 +1111,7 @@ async function uninstallSkillAndClose(name: string) {
 }
 .sk-chip--trigger {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 12px;
   background: var(--bg);
 }
 
@@ -1094,6 +1155,7 @@ async function uninstallSkillAndClose(name: string) {
   padding: var(--sp-3);
   font-family: var(--font-mono);
   font-size: 12px;
+  line-height: 20px;
   overflow-x: auto;
   white-space: pre-wrap;
   word-break: break-word;
@@ -1141,6 +1203,23 @@ async function uninstallSkillAndClose(name: string) {
 
 /* Responsive */
 @media (max-width: 720px) {
+  .sk-dialog {
+    width: calc(100vw - 24px);
+    max-height: calc(100dvh - 24px);
+  }
+  .sk-detail {
+    max-height: calc(100dvh - 24px);
+  }
+  .sk-detail__header {
+    align-items: flex-start;
+    padding: var(--sp-3);
+  }
+  .sk-detail__chips {
+    flex-basis: 100%;
+  }
+  .sk-detail__body {
+    padding: var(--sp-3);
+  }
   .sk-stage__header {
     flex-direction: column;
     align-items: stretch;
@@ -1163,5 +1242,158 @@ async function uninstallSkillAndClose(name: string) {
     flex-direction: column;
     align-items: flex-start;
   }
+}
+
+/* Skill catalog groups read as open sections, not cards inside cards. */
+.sk-group--skills {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  overflow: visible;
+}
+.sk-group--skills.sk-group--meta {
+  border: 0;
+}
+.sk-group--skills > .sk-group__head {
+  border-bottom: 0;
+  padding: 14px 2px 12px;
+}
+.sk-group--skills > .sk-grid {
+  padding: 16px 0 18px;
+}
+
+/* Skills page typography and alignment contract. */
+.sk-stage {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.sk-stage button,
+.sk-stage input,
+.sk-stage select {
+  font-family: inherit;
+}
+.sk-stage__header,
+.sk-stage__actions,
+.sk-search-wrap,
+.sk-group__head {
+  align-items: center;
+}
+.sk-stage__title {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+.sk-stage__subtitle {
+  font-size: 13px;
+  line-height: 1.6;
+}
+.sk-stage__actions .btn,
+.sk-search-input {
+  font-size: 13px;
+  line-height: 20px;
+}
+.sk-stage__actions .btn {
+  align-items: center;
+  display: inline-flex;
+  gap: 7px;
+}
+.sk-stage__actions .btn > .icon,
+.sk-search-icon > .icon {
+  align-items: center;
+  display: inline-flex;
+  height: 18px;
+  justify-content: center;
+  line-height: 0;
+  width: 18px;
+}
+.sk-stage__actions .btn > .icon svg,
+.sk-search-icon > .icon svg {
+  display: block;
+}
+.sk-search-input {
+  height: 38px;
+}
+.sk-search-icon {
+  height: 18px;
+  justify-content: center;
+  line-height: 0;
+  width: 18px;
+}
+.sk-group--skills > .sk-group__head {
+  min-height: 52px;
+}
+.sk-group__label {
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 20px;
+}
+.sk-group__count {
+  align-items: center;
+  display: inline-flex;
+  font-size: 11px;
+  height: 22px;
+  justify-content: center;
+  line-height: 1;
+  min-width: 24px;
+  padding: 0 7px;
+}
+.sk-group__meta {
+  font-size: 12px;
+  line-height: 20px;
+}
+
+/* Shared typography contract for every skill-card surface. */
+.sk-card,
+.sk-tile,
+.sk-stat,
+.sk-proposal-row {
+  font-family: var(--font-sans);
+}
+.sk-card__name {
+  font-size: 13px;
+  font-weight: 650;
+  line-height: 20px;
+}
+.sk-card__desc {
+  font-size: 13px;
+  line-height: 22px;
+}
+.sk-card__desc {
+  min-height: 44px;
+}
+.sk-card__dep,
+.sk-card__sub-label,
+.sk-card__sub-chip,
+.sk-prop-chip,
+.sk-prop-hash {
+  font-size: 11px;
+  line-height: 18px;
+}
+.sk-proposal-row__id {
+  font-size: 12px;
+  line-height: 18px;
+}
+.sk-stat__label,
+.sk-stat__hint {
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 18px;
+}
+.sk-detail h3 {
+  font-family: inherit;
+  font-size: 16px;
+  line-height: 22px;
+  margin: 0;
+}
+.sk-detail h4 {
+  color: var(--text-dim);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  line-height: 20px;
+  margin: 0;
 }
 </style>

@@ -5,6 +5,7 @@ import { useRequest } from '@/composables/useRequest'
 import { useToasts } from '@/composables/useToasts'
 import type { CronJob } from '@/types/cron'
 import { humanCountdown, humanTime } from '@/utils/cron/time'
+import { wasCronFinishNotified } from '@/utils/cron/notifications'
 
 interface CronListResponse {
   jobs?: CronJob[]
@@ -57,8 +58,9 @@ export function useCronJobs() {
     const ts = job.last_run ? new Date(job.last_run) : null
     if (ts && !isNaN(ts.getTime()) && now.value - ts.getTime() < 24 * 3600 * 1000) {
       acc.runs += 1
-      if (job.last_status === 'ok' || job.last_status === 'success') acc.ok += 1
-      if (job.last_status === 'error' || job.last_status === 'fail') acc.err += 1
+      const lastStatus = job.lastStatus || job.last_status
+      if (lastStatus === 'ok' || lastStatus === 'success') acc.ok += 1
+      if (lastStatus === 'error' || lastStatus === 'fail') acc.err += 1
     }
     return acc
   }, { runs: 0, ok: 0, err: 0 }))
@@ -102,6 +104,20 @@ export function useCronJobs() {
     reloadTimer = setTimeout(() => { void refresh() }, 750)
   }
 
+  async function recoverAfterConnectionRecycle(): Promise<void> {
+    try {
+      await rpc.waitForConnection(10_000)
+      await refresh()
+      pushToast(t('cronSkills.jobs.toastConnectionRecovered'), { tone: 'info' })
+    } catch {
+      pushToast(t('cronSkills.jobs.toastConnectionRetry'), { tone: 'warn' })
+    }
+  }
+
+  function onRunFinished() {
+    scheduleReload()
+  }
+
   function onSort(col: string) {
     if (sortCol.value === col) {
       sortAsc.value = !sortAsc.value
@@ -128,11 +144,18 @@ export function useCronJobs() {
   async function runJob(id: string) {
     runningJobIds.value = new Set(runningJobIds.value).add(id)
     try {
-      const res = await rpc.call<{ reply?: string; error?: string }>('cron.run', { id })
-      if (res?.error) pushToast(t('cronSkills.jobs.toastRunFailed', { error: res.error }), { tone: 'danger' })
-      else pushToast(res?.reply ? t('cronSkills.jobs.toastRunComplete', { reply: res.reply.substring(0, 120) }) : t('cronSkills.jobs.toastTriggered'), { tone: 'ok' })
+      const res = await rpc.call<{ runId?: string; reply?: string; error?: string }>('cron.run', { id })
+      if (!res?.runId || !wasCronFinishNotified(res.runId)) {
+        if (res?.error) pushToast(t('cronSkills.jobs.toastRunFailed', { error: res.error }), { tone: 'danger' })
+        else pushToast(res?.reply ? t('cronSkills.jobs.toastRunComplete', { reply: res.reply.substring(0, 120) }) : t('cronSkills.jobs.toastTriggered'), { tone: 'ok' })
+      }
     } catch (err) {
-      pushToast(t('cronSkills.jobs.toastRunFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
+      const message = err instanceof Error ? err.message : String(err)
+      if (isConnectionRecycleError(message)) {
+        await recoverAfterConnectionRecycle()
+      } else {
+        pushToast(t('cronSkills.jobs.toastRunFailed', { error: message }), { tone: 'danger' })
+      }
     } finally {
       const next = new Set(runningJobIds.value)
       next.delete(id)
@@ -158,16 +181,12 @@ export function useCronJobs() {
     if (tickInterval) { clearInterval(tickInterval); tickInterval = null }
     if (reloadTimer) { clearTimeout(reloadTimer); reloadTimer = null }
     if (unsubRunFinished) { unsubRunFinished(); unsubRunFinished = null }
-    rpc.call('cron.unsubscribe', {}).catch(() => {})
   }
 
   onActivated(() => {
     void loadData()
     tickInterval = setInterval(() => { now.value = Date.now() }, 1000)
-    rpc.waitForConnection()
-      .then(() => rpc.call('cron.subscribe', {}))
-      .catch(() => { /* subscription is best-effort */ })
-    unsubRunFinished = rpc.on('cron.run.finished', scheduleReload)
+    unsubRunFinished = rpc.on('cron.run.finished', onRunFinished)
   })
 
   onDeactivated(teardownLive)
@@ -226,7 +245,7 @@ export function nextRunAbs(job: CronJob, now = Date.now()): string {
 
 export function dotClass(job: CronJob): string {
   if (!job.enabled) return 'is-off'
-  const lastStatus = job.last_status || (job.last_run ? 'ok' : null)
+  const lastStatus = job.lastStatus || job.last_status || (job.last_run ? 'ok' : null)
   if (lastStatus === 'error' || lastStatus === 'fail') return 'is-error'
   return 'is-on'
 }
@@ -247,4 +266,16 @@ export function isImminent(job: CronJob, now = Date.now()): boolean {
   if (!job.next_run) return false
   const left = new Date(job.next_run).getTime() - now
   return left > 0 && left < 60_000
+}
+
+export function isConnectionRecycleError(message: string): boolean {
+  const normalized = message.toLowerCase()
+  return normalized.includes('connection recycled') ||
+    normalized.includes('connection closed') ||
+    normalized.includes('not connected')
+}
+
+export function isJobFailed(job: CronJob): boolean {
+  const status = job.lastStatus || job.last_status
+  return status === 'error' || status === 'fail'
 }

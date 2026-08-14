@@ -6,7 +6,7 @@ import tomllib
 
 import pytest
 
-import opensquilla.gateway.rpc_onboarding  # noqa: F401 - register handlers
+import opensquilla.gateway.rpc_onboarding as rpc_onboarding  # noqa: F401
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
@@ -107,6 +107,119 @@ async def test_profile_upsert_persists_but_never_echoes_secret(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_profile_upsert_discards_pool_only_when_credential_source_changes(
+    tmp_path, monkeypatch
+) -> None:
+    config_path = tmp_path / "config.toml"
+    cfg = GatewayConfig(
+        config_path=str(config_path),
+        llm_profiles={
+            "deepseek": {
+                "model": "deepseek-old",
+                "api_key": "synthetic-old-profile-key",
+            }
+        },
+    )
+    discarded: list[str] = []
+    monkeypatch.setattr(
+        "opensquilla.gateway.llm_runtime.discard_profile_credential_pool",
+        lambda provider: discarded.append(provider),
+    )
+
+    model_only = await get_dispatcher().dispatch(
+        "profile-model-only",
+        "onboarding.llmProfile.upsert",
+        {
+            "providerId": "deepseek",
+            "model": "deepseek-new",
+            "keepCurrentSecret": True,
+        },
+        _admin_ctx(cfg),
+    )
+    assert model_only.error is None, model_only.error
+    assert discarded == []
+
+    credential_change = await get_dispatcher().dispatch(
+        "profile-credential-change",
+        "onboarding.llmProfile.upsert",
+        {
+            "providerId": "deepseek",
+            "apiKey": "synthetic-new-profile-key",
+        },
+        _admin_ctx(cfg),
+    )
+    assert credential_change.error is None, credential_change.error
+    assert discarded == ["deepseek"]
+
+
+@pytest.mark.asyncio
+async def test_profile_remove_discards_pool_only_after_persist(
+    tmp_path, monkeypatch
+) -> None:
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "config.toml"),
+        llm_profiles={"deepseek": {"api_key": "synthetic-profile-key"}},
+    )
+    events: list[str] = []
+    real_persist = rpc_onboarding._persist
+
+    def recording_persist(*args, **kwargs):
+        result = real_persist(*args, **kwargs)
+        events.append("persist")
+        return result
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_onboarding._persist", recording_persist
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.llm_runtime.discard_profile_credential_pool",
+        lambda _provider: events.append("discard"),
+    )
+
+    response = await get_dispatcher().dispatch(
+        "profile-remove-pool",
+        "onboarding.llmProfile.remove",
+        {"providerId": "deepseek"},
+        _admin_ctx(cfg),
+    )
+
+    assert response.error is None, response.error
+    assert events == ["persist", "discard"]
+
+
+@pytest.mark.asyncio
+async def test_profile_upsert_persist_failure_preserves_pool(
+    tmp_path, monkeypatch
+) -> None:
+    cfg = GatewayConfig(
+        config_path=str(tmp_path / "config.toml"),
+        llm_profiles={"deepseek": {"api_key": "synthetic-old-profile-key"}},
+    )
+    discarded: list[str] = []
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_onboarding._persist",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            OSError("synthetic write failure")
+        ),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.llm_runtime.discard_profile_credential_pool",
+        lambda provider: discarded.append(provider),
+    )
+
+    response = await get_dispatcher().dispatch(
+        "profile-upsert-persist-failure",
+        "onboarding.llmProfile.upsert",
+        {"providerId": "deepseek", "apiKey": "synthetic-new-profile-key"},
+        _admin_ctx(cfg),
+    )
+
+    assert response.error is not None
+    assert cfg.llm_profiles["deepseek"].api_key == "synthetic-old-profile-key"
+    assert discarded == []
+
+
+@pytest.mark.asyncio
 async def test_profile_upsert_keep_current_secret_fails_closed_on_origin_change(
     tmp_path,
 ) -> None:
@@ -156,6 +269,194 @@ async def test_profile_remove_rejects_referenced_provider(tmp_path) -> None:
     assert response.error is not None
     assert response.error.code == "onboarding.llmProfile.invalid"
     assert "openai" in cfg.llm_profiles
+
+
+@pytest.mark.asyncio
+async def test_active_profile_remove_persists_and_hot_syncs_once(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    cfg = GatewayConfig(
+        config_path=str(config_path),
+        llm={
+            "provider": "tokenrhythm",
+            "model": "qwen3.8-max",
+            "api_key": "synthetic-old-secret",
+            "base_url": "https://tokenrhythm.studio/v1",
+        },
+        llm_profiles={
+            "deepseek": {
+                "model": "deepseek-chat",
+                "api_key": "synthetic-new-secret",
+            }
+        },
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+    ctx = _admin_ctx(cfg)
+    syncs: list[tuple[str, str]] = []
+    transitions: list[tuple[str, str, str]] = []
+    persist_calls: list[str] = []
+    real_persist = rpc_onboarding._persist
+
+    def recording_persist(*args, **kwargs):
+        persist_calls.append("persist")
+        return real_persist(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_onboarding._persist",
+        recording_persist,
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_onboarding._sync_provider_selector",
+        lambda _ctx, llm: syncs.append(("selector", llm.provider)),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_onboarding._sync_image_generation",
+        lambda config: syncs.append(("media", config.llm.provider)),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.llm_runtime.discard_profile_credential_pool",
+        lambda provider: syncs.append(("discard", provider)),
+    )
+
+    async def fake_reconcile(previous, current, *, provider_id):
+        transitions.append(
+            (
+                provider_id,
+                previous.llm.provider,
+                current.llm.provider,
+            )
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.model_catalog_refresh.reconcile_tokenrhythm_profile_transition",
+        fake_reconcile,
+    )
+
+    async def fake_refresh(config):
+        syncs.append(("catalog", config.llm.provider))
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.model_catalog_refresh.refresh_live_model_catalog",
+        fake_refresh,
+    )
+
+    response = await get_dispatcher().dispatch(
+        "profile-active-remove",
+        "onboarding.llmProfile.active.remove",
+        {
+            "providerId": "tokenrhythm",
+            "replacementProviderId": "deepseek",
+        },
+        ctx,
+    )
+
+    assert response.error is None, response.error
+    assert response.payload["entry"] == {
+        "removedProvider": "tokenrhythm",
+        "removed": True,
+        "activeProvider": "deepseek",
+        "activeModel": "deepseek-chat",
+    }
+    assert "synthetic-old-secret" not in repr(response.payload)
+    assert "synthetic-new-secret" not in repr(response.payload)
+    assert cfg.llm.provider == "deepseek"
+    assert cfg.llm_profiles == {}
+    assert persist_calls == ["persist"]
+    assert syncs == [
+        ("discard", "tokenrhythm"),
+        ("selector", "deepseek"),
+        ("media", "deepseek"),
+        ("catalog", "deepseek"),
+    ]
+    assert transitions == [("tokenrhythm", "tokenrhythm", "deepseek")]
+    persisted = tomllib.loads(config_path.read_text())
+    assert persisted["llm"]["provider"] == "deepseek"
+    assert "llm_profiles" not in persisted
+
+
+@pytest.mark.asyncio
+async def test_active_profile_remove_reference_failure_does_not_partially_activate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    cfg = GatewayConfig(
+        config_path=str(config_path),
+        llm={
+            "provider": "openai",
+            "model": "gpt-test",
+            "api_key": "synthetic-old-secret",
+        },
+        llm_profiles={
+            "deepseek": {
+                "model": "deepseek-chat",
+                "api_key": "synthetic-new-secret",
+            }
+        },
+        squilla_router={"preset_binding": "follow_primary"},
+        llm_ensemble={
+            "enabled": False,
+            "selection_mode": "custom_b5",
+            "candidates": [
+                {"provider": "openai", "model": "gpt-test", "role": "primary"},
+                {
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "role": "contrast",
+                },
+            ],
+        },
+    )
+    before = cfg.model_dump(mode="python")
+    mutation_attempts: list[str] = []
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_onboarding._persist",
+        lambda *args, **kwargs: mutation_attempts.append("persist"),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_onboarding._apply_inplace",
+        lambda *args, **kwargs: mutation_attempts.append("apply"),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_onboarding._sync_provider_selector",
+        lambda *args: mutation_attempts.append("selector"),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.rpc_onboarding._sync_image_generation",
+        lambda *args: mutation_attempts.append("media"),
+    )
+
+    async def unexpected_refresh(config):
+        mutation_attempts.append("catalog")
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.model_catalog_refresh.refresh_live_model_catalog",
+        unexpected_refresh,
+    )
+
+    response = await get_dispatcher().dispatch(
+        "profile-active-remove-referenced",
+        "onboarding.llmProfile.active.remove",
+        {
+            "providerId": "openai",
+            "replacementProviderId": "deepseek",
+        },
+        _admin_ctx(cfg),
+    )
+
+    assert response.error is not None
+    assert response.error.code == "onboarding.llmProfile.referenced"
+    assert response.error.details == {
+        "reason": "profile_referenced",
+        "providerId": "openai",
+        "replacementProviderId": "deepseek",
+        "references": ["llm_ensemble.candidates.0"],
+    }
+    assert cfg.model_dump(mode="python") == before
+    assert not config_path.exists()
+    assert mutation_attempts == []
 
 
 @pytest.mark.asyncio
@@ -448,12 +749,15 @@ async def test_profile_model_discovery_uses_resolved_profile(
     response = await get_dispatcher().dispatch(
         "profile-discover",
         "onboarding.llmProfile.models.discover",
-        {"providerId": "openai"},
+        {"providerId": "openai", "forceRefresh": True},
         _admin_ctx(cfg),
     )
 
     assert response.error is None, response.error
     assert captured["api_key"] == "synthetic-discovery-secret"
+    assert captured["force_refresh"] is True
+    assert captured["persist_catalog"] is True
+    assert captured["catalog_config"] is cfg
     assert response.payload["models"] == [{"id": "gpt-mini"}]
     assert "synthetic-discovery-secret" not in repr(response.payload)
 
@@ -500,11 +804,13 @@ async def test_profile_draft_model_discovery_uses_unsaved_deployment_without_per
             "baseUrl": "https://candidate.example/v2",
             "proxy": "http://127.0.0.1:9002",
             "keepCurrentSecret": False,
+            "forceRefresh": True,
         },
         _admin_ctx(cfg),
     )
 
     assert response.error is None, response.error
+    draft_config = captured.pop("catalog_config")
     assert captured == {
         "provider_id": "openai",
         "api_key": draft_secret,
@@ -512,7 +818,10 @@ async def test_profile_draft_model_discovery_uses_unsaved_deployment_without_per
         "base_url": "https://candidate.example/v2",
         "proxy": "http://127.0.0.1:9002",
         "allow_default_api_key_env": False,
+        "force_refresh": True,
+        "persist_catalog": False,
     }
+    assert draft_config is not cfg
     assert response.payload["models"] == [{"id": "gpt-draft-discovered"}]
     assert cfg.model_dump(mode="python") == before
     assert not config_path.exists()
@@ -583,6 +892,54 @@ async def test_profile_activate_persists_then_hot_syncs_without_secret_echo(
     assert persisted["llm"]["provider"] == "deepseek"
     assert persisted["llm_profiles"]["openai"]["model"] == "gpt-test"
     assert persisted["llm_profiles"]["openai"]["api_key"] == "old-secret"
+
+
+@pytest.mark.asyncio
+async def test_profile_activate_rpc_accepts_openrouter_image_default_intent(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    config_path = tmp_path / "config.toml"
+    cfg = GatewayConfig(
+        config_path=str(config_path),
+        llm={
+            "provider": "openai",
+            "model": "gpt-test",
+            "api_key": "synthetic-openai-key",
+        },
+        llm_profiles={
+            "openrouter": {
+                "model": "openai/gpt-test",
+                "api_key": "synthetic-openrouter-key",
+                "base_url": "https://openrouter.ai/api/v1",
+            }
+        },
+        squilla_router={"preset_binding": "follow_primary"},
+    )
+
+    async def fake_refresh(config):
+        return None
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.model_catalog_refresh.refresh_live_model_catalog",
+        fake_refresh,
+    )
+    response = await get_dispatcher().dispatch(
+        "profile-activate-openrouter-image",
+        "onboarding.llmProfile.activate",
+        {
+            "providerId": "openrouter",
+            "imageGenerationIntent": "enable_provider_default",
+        },
+        _admin_ctx(cfg),
+    )
+
+    assert response.error is None, response.error
+    change = response.payload["entry"]["capabilityChanges"]["imageGeneration"]
+    assert change["applied"] is True
+    persisted = tomllib.loads(config_path.read_text())
+    assert persisted["image_generation"]["enabled"] is True
+    assert persisted["image_generation"]["binding"] == "follow_llm"
 
 
 @pytest.mark.asyncio
@@ -940,6 +1297,7 @@ async def test_profile_activate_persist_failure_leaves_live_runtime_untouched(
 
 def test_profile_activate_requires_admin_scope() -> None:
     assert METHOD_SCOPES["onboarding.llmProfile.activate"] == ADMIN_SCOPE
+    assert METHOD_SCOPES["onboarding.llmProfile.active.remove"] == ADMIN_SCOPE
 
 
 def test_profile_draft_methods_require_admin_scope() -> None:

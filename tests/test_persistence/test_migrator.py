@@ -5,6 +5,7 @@ import contextlib
 import getpass
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -21,8 +22,126 @@ from yoyo import migrations as yoyo_migrations
 
 from opensquilla.persistence import migrator
 from opensquilla.persistence.migrator import apply_pending
+from opensquilla.session.storage import SessionStorage
 
 _REPO_MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
+
+
+@pytest.mark.asyncio
+async def test_meta_control_migration_chain_rolls_back_without_ordinary_data_loss(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "sessions.db"
+    storage = await SessionStorage.open(str(db_path))
+    await storage.close()
+
+    tail_ids = (
+        "V030__meta_control_intents",
+        "V031__meta_launch_drafts",
+        "V032__meta_launch_discard_tombstones",
+    )
+    tail_tables = (
+        "meta_control_intents",
+        "meta_launch_drafts",
+        "meta_launch_discard_tombstones",
+    )
+    meta_objects = {
+        *tail_tables,
+        "uq_meta_control_intents_correlation",
+        "idx_meta_control_intents_session_status",
+        "uq_meta_launch_drafts_request",
+        "idx_meta_launch_drafts_session_expiry",
+        "idx_meta_launch_discard_tombstones_expiry",
+    }
+    with sqlite3.connect(db_path) as connection:
+        for table in reversed(tail_tables):
+            connection.execute(f"DROP TABLE IF EXISTS {table}")
+
+    backend = migrator.get_backend(migrator._to_yoyo_url(str(db_path)))
+    try:
+        migrations = migrator.read_migrations(str(_REPO_MIGRATIONS_DIR))
+        by_id = {migration.id: migration for migration in migrations}
+        migration_list_type = type(migrations)
+        base = migration_list_type(
+            [migration for migration in migrations if migration.id < tail_ids[0]],
+            migrations.post_apply,
+        )
+        with backend.lock():
+            backend.apply_migrations(backend.to_apply(base))
+
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                "INSERT INTO sessions (session_key, session_id, created_at, updated_at) "
+                "VALUES ('agent:main:webchat:rollback-sentinel', 'session-sentinel', 1, 1)"
+            )
+            connection.execute(
+                "INSERT INTO transcript_entries ("
+                "session_id, session_key, message_id, role, content, created_at"
+                ") VALUES ("
+                "'session-sentinel', 'agent:main:webchat:rollback-sentinel', "
+                "'message-sentinel', 'user', 'ordinary data survives', 1"
+                ")"
+            )
+
+        tail = migration_list_type(
+            [by_id[item] for item in tail_ids],
+            migrations.post_apply,
+        )
+        with backend.lock():
+            backend.apply_migrations(backend.to_apply(tail))
+
+        with sqlite3.connect(db_path) as connection:
+            present = {
+                name
+                for (name,) in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name IN ("
+                    + ",".join("?" for _item in meta_objects)
+                    + ")",
+                    tuple(meta_objects),
+                )
+            }
+        assert present == meta_objects
+
+        with backend.lock():
+            backend.rollback_migrations([by_id[item] for item in reversed(tail_ids)])
+    finally:
+        backend.connection.close()
+
+    with sqlite3.connect(db_path) as connection:
+        ordinary_session = connection.execute(
+            "SELECT session_id FROM sessions WHERE session_key = ?",
+            ("agent:main:webchat:rollback-sentinel",),
+        ).fetchone()
+        ordinary_transcript = connection.execute(
+            "SELECT content FROM transcript_entries WHERE message_id = ?",
+            ("message-sentinel",),
+        ).fetchone()
+        remaining_meta_objects = {
+            name
+            for (name,) in connection.execute(
+                "SELECT name FROM sqlite_master WHERE name IN ("
+                + ",".join("?" for _item in meta_objects)
+                + ")",
+                tuple(meta_objects),
+            )
+        }
+    assert ordinary_session == ("session-sentinel",)
+    assert ordinary_transcript == ("ordinary data survives",)
+    assert remaining_meta_objects == set()
+
+    pre_v025_migrations = tmp_path / "pre-v025-migrations"
+    pre_v025_migrations.mkdir()
+    for migration in base:
+        (pre_v025_migrations / f"{migration.id}.py").write_text(
+            "from yoyo import step\n"
+            "__depends__ = set()\n"
+            "steps = [step('SELECT 1')]\n",
+            encoding="utf-8",
+        )
+    migrator.assert_schema_not_ahead(
+        migrator._to_yoyo_url(str(db_path)),
+        pre_v025_migrations,
+    )
 
 
 def test_apply_pending_registers_python312_datetime_adapter(tmp_path: Path) -> None:
@@ -677,8 +796,22 @@ def test_apply_pending_fails_loud_when_discovery_finds_nothing(
 # ---------------------------------------------------------------------------
 
 
+def _expected_sqlite_path(raw: str) -> Path:
+    logical = Path(raw).expanduser().resolve()
+    if os.name != "nt":
+        return logical
+    value = str(logical)
+    if value.startswith("\\\\?\\"):
+        return logical
+    if value.startswith("\\\\"):
+        return Path(f"\\\\?\\UNC\\{value[2:]}")
+    return Path(f"\\\\?\\{value}")
+
+
 def _expected_yoyo_url(raw: str) -> str:
-    return "sqlite:///" + quote(Path(raw).resolve().as_posix(), safe="/:")
+    expected = _expected_sqlite_path(raw)
+    value = str(expected) if os.name == "nt" else expected.as_posix()
+    return "sqlite:///" + quote(value, safe="/:")
 
 
 def test_to_yoyo_url_percent_encodes_url_metacharacters() -> None:
@@ -696,7 +829,9 @@ def test_to_yoyo_url_percent_encodes_url_metacharacters() -> None:
 
 def test_to_yoyo_url_round_trips_through_inspection_helper() -> None:
     for raw in ("/tmp/a#b/demo.db", "/tmp/pct%41/demo.db", "/tmp/weird [x]/demo.db"):
-        assert migrator._sqlite_path_from_db_url(migrator._to_yoyo_url(raw)) == Path(raw).resolve()
+        assert migrator._sqlite_path_from_db_url(
+            migrator._to_yoyo_url(raw)
+        ) == _expected_sqlite_path(raw)
 
 
 @pytest.mark.parametrize("dirname", ["note#1", "pct%41dir"])
@@ -724,6 +859,81 @@ def test_apply_pending_migrates_the_exact_file_the_guard_inspects(
     if "%41" in dirname:
         decoded_variant = tmp_path / dirname.replace("%41", "A")
         assert not decoded_variant.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path semantics only")
+async def test_bare_logical_long_path_runs_migrations_and_session_storage(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_demo_migration(migrations_dir, name="V001__long_path")
+
+    long_root = tmp_path / "long-db"
+    parent = long_root
+    native_root = migrator._native_sqlite_path(long_root)
+
+    def cleanup() -> None:
+        if os.path.exists(native_root):
+            shutil.rmtree(native_root)
+
+    request.addfinalizer(cleanup)
+    while len(str(parent / "sessions.db")) <= 280:
+        parent /= "nested-" + ("x" * 40)
+    db_path = parent / "sessions.db"
+    assert len(str(db_path)) > 260
+    assert not str(db_path).startswith("\\\\?\\")
+
+    native_parent = migrator._native_sqlite_path(parent)
+    os.makedirs(native_parent, exist_ok=True)
+
+    assert apply_pending(str(db_path), migrations_dir) == ["V001__long_path"]
+
+    native_db_path = migrator._native_sqlite_path(db_path)
+    storage = SessionStorage(native_db_path)
+    await storage.connect()
+    await storage.close()
+
+    with contextlib.closing(sqlite3.connect(native_db_path)) as connection, connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM _yoyo_migration WHERE migration_id = ?",
+            ("V001__long_path",),
+        ).fetchone() == (1,)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length path semantics only")
+def test_preformed_sqlite_url_with_long_local_path_runs_migrations(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> None:
+    migrations_dir = tmp_path / "migrations"
+    _write_demo_migration(migrations_dir, name="V001__preformed_long_url")
+
+    long_root = tmp_path / "long-url-db"
+    parent = long_root
+    native_root = migrator._native_sqlite_path(long_root)
+
+    def cleanup() -> None:
+        if os.path.exists(native_root):
+            shutil.rmtree(native_root)
+
+    request.addfinalizer(cleanup)
+    while len(str(parent / "sessions.db")) <= 280:
+        parent /= "nested-" + ("u" * 40)
+    db_path = parent / "sessions.db"
+    os.makedirs(migrator._native_sqlite_path(parent), exist_ok=True)
+
+    db_url = db_path.as_uri().replace("file://", "sqlite://", 1)
+    assert "\\\\?\\" not in db_url
+    assert apply_pending(db_url, migrations_dir) == ["V001__preformed_long_url"]
+
+    native_db_path = migrator._native_sqlite_path(db_path)
+    with contextlib.closing(sqlite3.connect(native_db_path)) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM _yoyo_migration WHERE migration_id = ?",
+            ("V001__preformed_long_url",),
+        ).fetchone() == (1,)
 
 
 # ---------------------------------------------------------------------------

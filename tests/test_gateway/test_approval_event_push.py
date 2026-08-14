@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -92,7 +93,7 @@ async def test_exec_approval_request_pushes_event_to_approvals_scoped_client() -
         assert payload["command"] == "rm -rf ./scratch dir"
         assert payload["agent"] == "main"
         assert payload["created_at"] > 0
-        assert payload["deadline"] > 0
+        assert payload["deadline"] == 0.0
         assert payload["args"] == {"command": "rm -rf ./scratch dir", "workdir": None}
         assert payload["warning"] == ""
         assert "approved" not in payload
@@ -134,6 +135,44 @@ async def test_exec_approval_resolution_mirrors_resolved_event() -> None:
         # Idempotent re-resolution must not emit a second resolved event.
         queue.resolve(approval_id, True)
         assert scheduled == []
+    finally:
+        remove()
+        queue.close()
+
+
+@pytest.mark.asyncio
+async def test_deadline_rearm_and_extend_push_updated_events() -> None:
+    approvals_conn = _FakeConn("c-approvals", frozenset({"operator.approvals"}))
+    queue, scheduled, remove = _build_bridge([approvals_conn])
+    try:
+        approval_id = queue.request(
+            namespace="exec",
+            params={
+                "toolName": "exec_command",
+                "command": "echo hi",
+                "sessionKey": "agent:main:webchat:demo",
+            },
+        )
+        await scheduled.pop()
+
+        waiter = asyncio.create_task(queue.wait(approval_id, timeout=30))
+        await asyncio.sleep(0)
+        assert len(scheduled) == 1
+        await scheduled.pop()
+        event_name, payload = approvals_conn.events[-1]
+        assert event_name == "exec.approval.updated"
+        assert payload["deadline"] > 0
+
+        extended = queue.extend(approval_id, 60)
+        assert len(scheduled) == 1
+        await scheduled.pop()
+        event_name, payload = approvals_conn.events[-1]
+        assert event_name == "exec.approval.updated"
+        assert payload["deadline"] == extended
+
+        queue.resolve(approval_id, False)
+        await scheduled.pop()
+        assert await waiter is False
     finally:
         remove()
         queue.close()
@@ -230,7 +269,9 @@ def test_build_approval_event_payload_falls_back_to_argv_command() -> None:
     )
 
     assert payload["command"] == "git status"
-    assert payload["tool_name"] == "exec"
+    assert payload["tool_name"] == ""
+    assert payload["display_kind"] == "run_command"
+    assert payload["display_target"] == "git status"
     assert payload["session_key"] == ""
     assert payload["deadline"] == 2.0
 
@@ -252,9 +293,80 @@ def test_build_approval_event_payload_includes_sandbox_kind() -> None:
     )
 
     assert payload["approval_kind"] == "sandbox_network"
-    assert payload["tool_name"] == "sandbox_network"
+    assert payload["tool_name"] == ""
+    assert payload["display_kind"] == "network_access"
     assert payload["args"] is None
     assert payload["warning"] == ""
+
+
+def test_sandbox_elevation_uses_typed_user_display_without_internal_names() -> None:
+    info = {
+        "id": "sandbox-delete-123",
+        "namespace": "exec",
+        "params": {
+            "approvalKind": "sandbox_elevation",
+            "toolName": "exec_command",
+            "action_kind": "fs.recursive_delete",
+            "sessionKey": "agent:main:webchat:demo",
+            "action": {
+                "tool_name": "exec_command",
+                "action_kind": "fs.recursive_delete",
+                "display": {
+                    "kind": "delete",
+                    "target": "/srv/demo/old-project",
+                    "destructive": True,
+                    "irreversible": True,
+                    "backup_state": "enabled",
+                },
+            },
+        },
+    }
+
+    push = build_approval_event_payload(info)
+    snapshot = build_approval_snapshot_item(info, default_mode="prompt")
+
+    assert push["tool_name"] == ""
+    assert push["display_kind"] == "delete"
+    assert push["display_target"] == "/srv/demo/old-project"
+    assert push["destructive"] is True
+    assert push["irreversible"] is True
+    assert push["backup_state"] == "enabled"
+    assert snapshot["toolName"] == ""
+    assert snapshot["displayKind"] == "delete"
+    assert snapshot["displayTarget"] == "/srv/demo/old-project"
+    assert snapshot["destructive"] is True
+    assert snapshot["irreversible"] is True
+    assert snapshot["backupState"] == "enabled"
+    encoded = json.dumps({"push": push, "snapshot": snapshot})
+    assert "exec_command" not in encoded
+    assert "fs.recursive_delete" not in encoded
+
+
+def test_malformed_sandbox_elevation_falls_back_to_safe_generic_display() -> None:
+    info = {
+        "id": "sandbox-malformed-123",
+        "namespace": "exec",
+        "params": {
+            "approvalKind": "sandbox_elevation",
+            "action": {
+                "tool_name": "previous_internal_elevation_tool",
+                "action_kind": "private.policy.action",
+                "display": {"kind": "private.policy.action"},
+            },
+        },
+    }
+
+    push = build_approval_event_payload(info)
+    snapshot = build_approval_snapshot_item(info, default_mode="prompt")
+
+    assert push["tool_name"] == ""
+    assert push["display_kind"] == "sensitive_operation"
+    assert push["display_target"] == ""
+    assert snapshot["toolName"] == ""
+    assert snapshot["displayKind"] == "sensitive_operation"
+    assert "previous_internal_elevation_tool" not in json.dumps(
+        {"push": push, "snapshot": snapshot}
+    )
 
 
 def test_sandbox_display_projection_whitelists_context_and_drops_policy_internals() -> None:
@@ -316,7 +428,9 @@ def test_path_display_projection_exposes_only_path_access_and_workspace() -> Non
         }
     )
 
-    assert payload["tool_name"] == "sandbox_path"
+    assert payload["tool_name"] == ""
+    assert payload["display_kind"] == "path_access"
+    assert payload["display_target"] == "/outside/project"
     assert payload["args"] == {
         "path": "/outside/project",
         "access": "read",
@@ -542,7 +656,9 @@ def test_approvals_http_snapshot_uses_safe_display_projection(
         assert response.status_code == 200, response.text
         item = response.json()["pending"][0]
         assert item["id"] == approval_id
-        assert item["toolName"] == "sandbox_network"
+        assert item["toolName"] == ""
+        assert item["displayKind"] == "network_access"
+        assert item["displayTarget"] == "registry.example.test"
         assert item["approvalKind"] == "sandbox_network"
         assert item["args"] == {
             "host": "registry.example.test",

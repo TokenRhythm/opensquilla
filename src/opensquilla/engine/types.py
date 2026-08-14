@@ -57,6 +57,7 @@ class AgentState(StrEnum):
 class ThinkingEvent:
     kind: Literal["thinking"] = field(default="thinking", init=False)
     text: str = ""
+    started_at: int = 0
 
 
 @dataclass
@@ -78,6 +79,39 @@ class RunHeartbeatEvent:
     elapsed_ms: int = 0
     idle_ms: int = 0
     message: str = ""
+
+
+@dataclass
+class ProviderActivityEvent:
+    """Public, provider-neutral progress for long model operations.
+
+    Fields are deliberately closed enums and counters: provider error bodies
+    and failed-leg reasoning must never cross this boundary.
+    """
+
+    kind: Literal["provider_activity"] = field(default="provider_activity", init=False)
+    schema_version: int = 1
+    activity_id: str = ""
+    phase: Literal["requesting", "reasoning", "retry_wait", "retrying", "fallback"] = (
+        "requesting"
+    )
+    reason: Literal[
+        "initial",
+        "rate_limited",
+        "provider_overloaded",
+        "transport_transient",
+        "reasoning_only",
+        "empty_response",
+        "stream_incomplete",
+        "invalid_response",
+        "context_overflow",
+        "unknown",
+    ] = "initial"
+    retry_attempt: int = 0
+    retry_limit: int = 0
+    retry_after_ms: int = 0
+    started_at: int = 0
+    heartbeat: bool = False
 
 
 @dataclass
@@ -156,6 +190,9 @@ class ErrorEvent:
     # Appended last with a default: positional construction elsewhere must not
     # shift (same hazard the DoneEvent comment in this file documents).
     error_id: str = ""
+    # Stable provider taxonomy for terminal consumers.  The provider's raw
+    # ``code`` remains available for diagnostics and wire compatibility.
+    failure_kind: str = ""
 
 
 @dataclass
@@ -219,6 +256,23 @@ class DoneEvent:
     # Configured registry identity that served the terminal model response.
     # Appended for compatibility with existing positional construction.
     provider: str = ""
+    # Historical output-token count for the parent assistant message itself.
+    # Aggregated output_tokens may also include completed in-process subagents.
+    message_output_tokens: int | None = None
+    # Number of non-free usage components whose cost could not be determined.
+    missing_cost_entries: int = 0
+    # Immutable logical router choice plus append-only physical provider calls.
+    # Appended for wire and positional-construction compatibility.
+    route_plan: dict[str, Any] | None = None
+    execution_legs: list[dict[str, Any]] = field(default_factory=list)
+    # Output ranges produced by model calls that applied a same-turn steer.
+    # Offsets are Unicode codepoint indexes into ``text_snapshot``/``text``.
+    # Appended for wire and positional-construction compatibility.
+    model_call_segments: list[dict[str, Any]] = field(default_factory=list)
+    # Typed presentation contract for silent replies. Appended so existing
+    # positional DoneEvent construction keeps its historical field order.
+    delivery: Literal["visible", "suppressed"] = "visible"
+    suppression_reason: Literal["no_reply", "heartbeat_ack"] | None = None
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -254,10 +308,9 @@ class RouterDecisionEvent:
     pre-turn pipeline resolves the tier/model. Frontend uses this to drive
     the router HUD (tier pill, tier-shift highlight, scanner popover).
 
-    Routing fires once per user-message and the tier sticks across the
-    agent loop; consumers must treat the event as last-writer-wins state,
-    because a mid-turn selector failover re-emits it once before the
-    DoneEvent with ``source="fallback"`` and the model that actually ran.
+    Routing fires once per logical turn and the plan sticks across the
+    agent loop. Provider fallback is reported through the terminal
+    ``execution_legs`` payload and never creates a second routing decision.
     """
 
     kind: Literal["router_decision"] = field(default="router_decision", init=False)
@@ -393,10 +446,17 @@ class CompactionEvent:
 
     kind: Literal["compaction"] = field(default="compaction", init=False)
     compaction_id: str | None = None
+    compaction_deadline_at_monotonic: float | None = None
+    compaction_timeout_seconds: float | None = None
     summary: str = ""
     kept_entries: list[dict] = field(default_factory=list)
     kept_count: int = 0
     removed_count: int = 0
+    summary_payload: dict[str, Any] | None = None
+    summary_format: str = "text"
+    coverage_status: str = "unknown"
+    missing_obligations: list[str] | None = None
+    critical_carry_forward: list[str] | None = None
 
 
 @dataclass
@@ -406,18 +466,37 @@ class CompactionOutcome:
     messages: list = field(default_factory=list)
     compacted: bool = False
     summary: str = ""
+    summary_payload: dict[str, Any] | None = None
+    summary_format: str = "text"
+    coverage_status: str = "unknown"
+    missing_obligations: list[str] | None = None
+    critical_carry_forward: list[str] | None = None
     kept_entries: list[dict] = field(default_factory=list)
     removed_count: int = 0
     compaction_id: str | None = None
+    compaction_deadline_at_monotonic: float | None = None
+    compaction_timeout_seconds: float | None = None
     request_context_insert_index: int | None = None
     runtime_context_insert_index: int | None = None
     protected_turn_start_index: int | None = None
+    # Request-scoped projection only. The canonical turn transcript remains
+    # raw and no CompactionEvent may be persisted for this outcome.
+    ephemeral_only: bool = False
+    # Runtime-only owner for a multi-stage overflow recovery. Durable and
+    # request-scoped projections share its absolute deadline and physical LLM
+    # call counter; it must never enter persistence, logs, or event reprs.
+    runtime_compaction_config: Any | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 AgentEvent = (
     ThinkingEvent
     | TextDeltaEvent
     | RunHeartbeatEvent
+    | ProviderActivityEvent
     | ToolUseStartEvent
     | ToolUseDeltaEvent
     | ToolResultEvent
@@ -497,6 +576,11 @@ class AgentConfig:
     provider_id: str = ""
     stop_sequences: list[str] = field(default_factory=list)
     context_window_tokens: int = 200000
+    # Positive only when the gateway operator explicitly configured the global
+    # ``llm.context_window_tokens`` value. Keep it separate from the resolved
+    # active-model window so selector fallback can apply the same precedence to
+    # its own physical deployment. Zero preserves catalog-derived rebinding.
+    context_window_tokens_global_override: int = 0
     context_overflow_threshold: float = 0.85  # trigger at 85%
     max_overflow_retries: int = 2
     max_history_turns: int = 0  # 0 = unlimited; compaction handles oversized history
@@ -533,6 +617,22 @@ class AgentConfig:
     flush_compaction_safety_mode: Literal["protect", "best_effort", "block", "off"] = "protect"
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
     compaction_protected_recent_messages: int = 0
+    compaction_total_timeout_seconds: float = 120.0
+    compaction_heartbeat_interval_seconds: float = 15.0
+    # Frozen runtime-only single-deployment chain for auxiliary compaction.
+    # Kept opaque here to avoid coupling engine types to session internals.
+    compaction_execution_plan: Any | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    # Re-resolve the selector's current physical leg at the start of each
+    # compaction operation, then freeze the returned plan for that operation.
+    compaction_execution_plan_factory: Callable[[], Any | None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     repair_enabled: bool = True
     repair_interval_seconds: float = 60.0
     repair_max_items_per_tick: int = 5
@@ -565,6 +665,10 @@ class AgentConfig:
     tool_result_dispatch_turn_max_chars: int = 0
     tool_result_provider_request_max_chars: int = 0
     provider_request_proof_max_chars: int = 0
+    # ``None`` means infer an explicit operator limit from a positive value.
+    # Internal callers that bind a cap derived for a concrete child deployment
+    # set this to ``False`` so selector fallback can re-plan independently.
+    provider_request_proof_max_chars_explicit: bool | None = None
     tool_use_argument_provider_request_max_chars: int = 0
     tool_use_argument_projection_enabled: bool = False
     tool_result_external_keep_recent: int = 2
@@ -586,6 +690,46 @@ class AgentConfig:
     # Finalize-time red-evidence gate (see engine.finalize_evidence_gate).
     # Off by default; enabled per run via OPENSQUILLA_FINALIZE_EVIDENCE_GATE.
     finalize_evidence_gate_enabled: bool = False
+    # Strict mode for the finalize-time evidence gate: adds the
+    # zero_verification trigger (a change shipped without ever running a
+    # verification-level command draws one bounded challenge). Red-first
+    # state stays report-only. Implies the gate itself (strict on activates
+    # the tracker even when the base flag is off). Off by default; enabled
+    # per run via OPENSQUILLA_FINALIZE_EVIDENCE_STRICT.
+    finalize_evidence_strict: bool = False
+    # Review-on-submit checkpoint (see engine.submit_review). Surfaces a
+    # ``submit`` tool and, when the model finishes with a non-empty diff, shows
+    # it a general hygiene checklist plus its own diff exactly once before the
+    # turn finalizes. Off by default; enabled per run via
+    # OPENSQUILLA_SUBMIT_REVIEW. ``submit_review_diff_max_chars`` bounds the diff
+    # body echoed into context (the per-file summary is always shown in full).
+    submit_review_enabled: bool = False
+    submit_review_diff_max_chars: int = 20000
+    # Finalize-time patch hygiene hard block. "off" (default) leaves patch
+    # hygiene as warn-only text; "test_paths" challenges a finalizing response
+    # while the live workspace diff still touches test-classified paths, so
+    # test edits are reverted before the patch is collected;
+    # "protected_paths" instead challenges while the diff touches paths
+    # matching the deployment's workspace write-deny globs — the same
+    # configured policy the write gates enforce, with no built-in path
+    # taxonomy. Set via OPENSQUILLA_PATCH_HYGIENE_BLOCK.
+    patch_hygiene_block_mode: Literal["off", "test_paths", "protected_paths"] = "off"
+    # Scratch verify-mirror for deny-blocked in-package test edits. When on,
+    # workspace write-deny rejections point the model at a writable mirror
+    # under <scratch>/verify-mirror/<workspace-relative-path>, and the
+    # finalize-time evidence gate credits executions that reference mirror
+    # files ONLY while every mirror copy hash-matches its workspace original
+    # (a diverged mirror would otherwise let weakened tests count as
+    # verification). Off by default; set via
+    # OPENSQUILLA_SCRATCH_VERIFY_MIRROR.
+    scratch_verify_mirror: bool = False
+    # Finalize-time variant-sweep challenge. When on, the first finalizing
+    # response after source edits receives ONE uniform challenge turn asking
+    # the model to enumerate the distinct input/construct classes reachable
+    # by its changed code paths and run its verification against each. Fires
+    # at most once per turn and never spends the last LLM call or deadline
+    # slack. Off by default; set via OPENSQUILLA_FINALIZE_VARIANT_CHALLENGE.
+    finalize_variant_challenge: bool = False
     # Keep rejection feedback visible when blocked compacted-placeholder tool
     # calls are projected out of provider requests: the blocked tool_use keeps
     # a placeholder input and its error tool_result stays in the projection.
@@ -616,6 +760,11 @@ class AgentConfig:
     # default (the retry keeps thinking on). Set via
     # OPENSQUILLA_REASONING_ONLY_THINKING_FALLBACK.
     reasoning_only_thinking_fallback: bool = False
+    # Retry provider errors mentioning thinking/reasoning with thinking
+    # disabled. Historical default on; strict benchmark arms can turn it off
+    # with OPENSQUILLA_PROVIDER_ERROR_THINKING_FALLBACK so every request keeps
+    # the frozen thinking contract.
+    provider_error_thinking_fallback: bool = True
     # Force thinking off for every provider call once remaining wall-clock
     # time drops below this many seconds. 0 = off. Complements the wrap-up
     # directive: the nudge alone leaves thinking enabled, so the model can
@@ -646,6 +795,42 @@ class AgentConfig:
     # revert cannot empty the collected diff. Set via
     # OPENSQUILLA_ENDGAME_GIT_FREEZE_MARGIN_SECONDS.
     endgame_git_freeze_margin_seconds: int = 0
+    # Let the iteration cap yield to remaining wall-clock time. 0 = off. When
+    # positive and a total turn timeout is configured, hitting max_iterations
+    # does NOT enter finalization while more than this many seconds remain;
+    # the loop keeps running normal iterations until the deadline margin is
+    # reached, then the cap applies as usual. Set via
+    # OPENSQUILLA_MAX_ITERATIONS_DEADLINE_EXTEND_SECONDS.
+    max_iterations_deadline_extend_seconds: int = 0
+    # Veto for final-diff salvage: skip candidates the agent explicitly
+    # reverted (marked lost) and candidates whose patch only adds diagnostic
+    # print/log lines — both re-apply abandoned or throwaway edits into the
+    # scored patch. Off by default; only meaningful with final_diff_salvage.
+    # Set via OPENSQUILLA_FINAL_DIFF_SALVAGE_VETO.
+    final_diff_salvage_veto: bool = False
+    # Endgame git freeze exemption: a frozen revert whose targeted diff is
+    # instrumentation-only (added print/log lines, nothing removed) is allowed
+    # through — cleaning up diagnostic output is what the wrap-up window is
+    # for. Off by default; only meaningful with the freeze margin. Set via
+    # OPENSQUILLA_ENDGAME_GIT_FREEZE_INSTRUMENTATION_EXEMPT.
+    endgame_git_freeze_instrumentation_exempt: bool = False
+    # Make the wrap-up preempt's thinking-off sticky: when the wrap-up
+    # directive preempts a reasoning stream, disable thinking for every
+    # remaining provider call this turn instead of the next call only. Off by
+    # default. Set via OPENSQUILLA_DEADLINE_WRAPUP_STICKY_THINKING_OFF.
+    deadline_wrapup_sticky_thinking_off: bool = False
+    # One-shot endgame fix directive. 0 = off. When positive, a total turn
+    # timeout is configured, and remaining wall-clock time drops below this
+    # many seconds while the workspace still shows no source change beyond
+    # diagnostic instrumentation, a single user message directs the model to
+    # commit to its best-supported fix now. Set via
+    # OPENSQUILLA_ENDGAME_FIX_DIRECTIVE_MARGIN_SECONDS.
+    endgame_fix_directive_margin_seconds: int = 0
+    # Inject an act-now user message when a provider response is reasoning
+    # only (no visible text, no tool calls) and grant one extra retry for that
+    # failure kind. Off by default (the bare retry re-requests with nothing
+    # added). Set via OPENSQUILLA_REASONING_ONLY_ACT_NOW.
+    reasoning_only_act_now: bool = False
     # Mid-budget progress nudges. Off by default. When enabled and the turn
     # has a wall-clock budget (timeout > 0), a one-shot user message is
     # appended after tool results the first time elapsed time crosses 50% and
@@ -664,6 +849,12 @@ class AgentConfig:
     # elides the older ones (keeps the newest copy full). Set via
     # OPENSQUILLA_PROVIDER_HISTORY_DEDUP_MIN_REPEATS.
     provider_history_dedup_min_repeats: int = 2
+    # Append a failure-signal scan header to tool-result projection notices:
+    # the omitted region of the original output is scanned for failure-pattern
+    # lines and the notice gains a signal_scan summary plus a ready-to-copy
+    # retrieve_tool_result call for the first match. Off by default; enabled
+    # via OPENSQUILLA_PROJECTION_SIGNAL_HINTS.
+    projection_signal_hints: bool = False
     tool_loop_observer_mode: Literal["off", "log"] = "off"
     runtime_recovery_mode: Literal["off", "log", "warn_model"] = "log"
     runtime_recovery_source_loop_max_nudges: int = 1
@@ -692,10 +883,18 @@ class AgentConfig:
 
     def __post_init__(self) -> None:
         self.flush_triggers = list(normalize_flush_triggers_strict(self.flush_triggers))
+        if self.provider_request_proof_max_chars_explicit is None:
+            self.provider_request_proof_max_chars_explicit = (
+                int(self.provider_request_proof_max_chars or 0) > 0
+            )
         self.compaction_protected_recent_messages = max(
             0,
             int(self.compaction_protected_recent_messages or 0),
         )
+        if float(self.compaction_total_timeout_seconds or 0) <= 0:
+            self.compaction_total_timeout_seconds = 120.0
+        if float(self.compaction_heartbeat_interval_seconds or 0) <= 0:
+            self.compaction_heartbeat_interval_seconds = 15.0
 
     def resolve_thinking(self, prompt: str | None = None) -> tuple[bool, int]:
         """Return (enabled, budget_tokens) based on the thinking field.

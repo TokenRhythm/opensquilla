@@ -19,14 +19,18 @@ from __future__ import annotations
 import inspect
 import os
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, cast
 
 import httpx
 import structlog
 
-from opensquilla.provider.app_attribution import is_provider_app_host
+from opensquilla.provider.app_attribution import is_host_or_subdomain
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.protocol import LLMProvider
 from opensquilla.provider.registry import get_provider_spec
@@ -162,8 +166,24 @@ async def probe_llm_provider(
             message=redact_error_text(str(exc), known_secrets=(resolved_key,)),
         )
 
-    cfg = ChatConfig(max_tokens=1, timeout=timeout, thinking=False)
+    request_budget = resolve_auxiliary_request_budget(
+        provider,
+        provider_id=provider_id,
+        model=model,
+        max_output_tokens=1,
+    )
+    cfg = ChatConfig(
+        max_tokens=1,
+        timeout=timeout,
+        thinking=False,
+        provider_request_max_chars=request_budget.provider_request_max_chars,
+    )
     messages = [Message(role="user", content="ping")]
+    ensure_auxiliary_text_fits(
+        messages,
+        max_chars=request_budget.provider_request_max_chars,
+        max_tokens=request_budget.max_input_tokens,
+    )
     start = time.monotonic()
     first_response_ms: int | None = None
     try:
@@ -266,6 +286,9 @@ class ProviderModelsDiscoverResult:
     detail: str = ""
     source: str = "none"  # "live" | "none"
     models: list[dict[str, object]] = field(default_factory=list)
+    # Additive live-catalog health metadata. ``None`` identifies providers
+    # that do not participate in the shared catalog cache.
+    catalog: dict[str, object] | None = None
 
     def to_payload(self) -> dict[str, object]:
         return {
@@ -274,7 +297,61 @@ class ProviderModelsDiscoverResult:
             "detail": self.detail,
             "source": self.source,
             "models": [dict(m) for m in self.models],
+            "catalog": dict(self.catalog) if self.catalog is not None else None,
         }
+
+
+def _provider_metadata_wire(
+    info: ModelInfo,
+    provider_id: str,
+    catalog: object,
+) -> dict[str, Any] | None:
+    """Return one normalized provider metadata envelope, if available.
+
+    New provider adapters attach the envelope directly to ``ModelInfo``.  A
+    hydrated shared catalog may also own the same typed sidecar, so consult it
+    as a compatibility fallback for cached rows constructed before the
+    ``ModelInfo.metadata`` field was added.
+    """
+
+    if isinstance(info.metadata, dict):
+        return dict(info.metadata)
+    get_metadata = getattr(catalog, "get_provider_model_metadata", None)
+    if not callable(get_metadata):
+        return None
+    typed = get_metadata(info.model_id, provider_id)
+    to_wire = getattr(typed, "to_wire", None)
+    if not callable(to_wire):
+        return None
+    wire = to_wire()
+    return dict(wire) if isinstance(wire, Mapping) else None
+
+
+def _metadata_capability(
+    metadata: Mapping[str, Any] | None,
+    capability: str,
+) -> bool | None:
+    """Resolve an explicit provider capability without collapsing ``False``.
+
+    TokenRhythm's authenticated declaration is authoritative for the current
+    credential.  Its public listing fills only facts the declaration omits.
+    Returning ``None`` means neither source knows the value, at which point
+    the legacy ``ModelInfo``/catalog fallback remains appropriate.
+    """
+
+    if metadata is None:
+        return None
+    for source_name in ("declared", "published"):
+        source = metadata.get(source_name)
+        if not isinstance(source, Mapping):
+            continue
+        capabilities = source.get("capabilities")
+        if not isinstance(capabilities, Mapping):
+            continue
+        value = capabilities.get(capability)
+        if isinstance(value, bool):
+            return value
+    return None
 
 
 def _discover_model_row(info: ModelInfo, provider_id: str) -> dict[str, object]:
@@ -291,6 +368,7 @@ def _discover_model_row(info: ModelInfo, provider_id: str) -> dict[str, object]:
 
     catalog = shared_catalog()
     entry = catalog.resolve_entry(info.model_id, provider=provider_id)
+    metadata = _provider_metadata_wire(info, provider_id, catalog)
     override_window = catalog.user_context_window_override(info.model_id, provider=provider_id)
     if override_window is not None:
         context_window = override_window
@@ -301,12 +379,23 @@ def _discover_model_row(info: ModelInfo, provider_id: str) -> dict[str, object]:
     max_output = (
         info.max_output_tokens if info.max_output_tokens > 0 else entry.max_output_tokens
     )
+    tools = _metadata_capability(metadata, "tools")
+    reasoning = _metadata_capability(metadata, "reasoning")
+    vision = _metadata_capability(metadata, "vision")
+    safe_tools = info.supports_tools or entry.supports_tools
+    tools_enabled = False if tools is False else safe_tools
+    safe_reasoning = info.supports_reasoning or entry.supports_reasoning
+    reasoning_enabled = (
+        False if reasoning is False else safe_reasoning
+    )
+    safe_vision = info.supports_vision or entry.supports_vision
+    vision_enabled = False if vision is False else safe_vision
     capabilities: list[str] = ["chat"]
-    if info.supports_tools or entry.supports_tools:
+    if tools_enabled:
         capabilities.append("tools")
-    if info.supports_reasoning or entry.supports_reasoning:
+    if reasoning_enabled:
         capabilities.append("reasoning")
-    if info.supports_vision or entry.supports_vision:
+    if vision_enabled:
         capabilities.append("vision")
 
     pricing: dict[str, float] | None = None
@@ -331,6 +420,11 @@ def _discover_model_row(info: ModelInfo, provider_id: str) -> dict[str, object]:
         "capabilities": capabilities,
         "pricing": pricing,
         "capabilitySource": entry.source,
+        # Provider adapters may attach a normalized, provider-owned metadata
+        # envelope.  Keep it additive and opaque at this boundary: the
+        # TokenRhythm catalog owns its published/declared schema and ordinary
+        # providers continue to emit ``None``.
+        "metadata": metadata,
     }
 
 
@@ -458,6 +552,9 @@ async def discover_selectable_provider_models(
     base_url: str = "",
     proxy: str = "",
     allow_default_api_key_env: bool = True,
+    force_refresh: bool = False,
+    persist_catalog: bool = False,
+    catalog_config: object | None = None,
 ) -> ProviderModelsDiscoverResult:
     """Return only verified live catalogs suitable for a model picker.
 
@@ -489,17 +586,71 @@ async def discover_selectable_provider_models(
     if (
         not uses_https
         or not spec.compat.official_host
-        or not is_provider_app_host(effective_base_url, spec.compat.official_host)
+        or not is_host_or_subdomain(effective_base_url, spec.compat.official_host)
     ):
         return ProviderModelsDiscoverResult(ok=True, provider_id=provider_id)
 
+    # TokenRhythm has two authoritative sources: its public website catalog
+    # and the authenticated account entitlement list.  The gateway-owned
+    # coordinator supplies TTL/backoff/singleflight/persistence while keeping
+    # this selector policy boundary responsible for the official-host gate.
+    if spec.live_catalog_shape == "tokenrhythm":
+        default_env_key = spec.env_key if allow_default_api_key_env else ""
+        resolved_key, key_source = _resolve_probe_api_key(
+            api_key,
+            api_key_env,
+            default_env_key,
+        )
+        if spec.requires_api_key() and not resolved_key:
+            checked = key_source or (default_env_key and f"${default_env_key}") or "no env key"
+            return ProviderModelsDiscoverResult(
+                ok=False,
+                provider_id=provider_id,
+                failure_kind=ProviderFailureKind.AUTH_INVALID.value,
+                detail=f"No API key available (checked {checked}).",
+            )
+
+        from opensquilla.gateway.model_catalog_refresh import (
+            discover_tokenrhythm_models,
+        )
+
+        return await discover_tokenrhythm_models(
+            provider_id=provider_id,
+            api_key=resolved_key,
+            base_url=effective_base_url,
+            proxy=proxy,
+            force=force_refresh,
+            persist_entitlement=persist_catalog,
+            config=catalog_config,
+        )
+
+    discovery_provider_id = (
+        spec.selectable_model_discovery_provider_id or provider_id
+    )
     discover_kwargs: dict[str, Any] = {
-        "provider_id": provider_id,
+        "provider_id": discovery_provider_id,
         "api_key": api_key,
         "api_key_env": api_key_env,
-        "base_url": base_url.strip(),
+        # A sibling discovery provider owns a different protocol path. Its
+        # registry default is the only trusted listing endpoint; never pass
+        # the configured chat base path across protocols.
+        "base_url": (
+            base_url.strip()
+            if discovery_provider_id == provider_id
+            else ""
+        ),
         "proxy": proxy,
     }
     if not allow_default_api_key_env:
         discover_kwargs["allow_default_api_key_env"] = False
-    return await discover_provider_models(**discover_kwargs)
+    result = await discover_provider_models(**discover_kwargs)
+    if result.provider_id == provider_id:
+        return result
+    return ProviderModelsDiscoverResult(
+        ok=result.ok,
+        provider_id=provider_id,
+        failure_kind=result.failure_kind,
+        detail=result.detail,
+        source=result.source,
+        models=result.models,
+    )

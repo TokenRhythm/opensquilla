@@ -343,6 +343,16 @@ _COMMANDS: tuple[CommandDef, ...] = (
         presentation=CommandPresentation.NOTICE,
         order=70,
     ),
+    CommandDef(
+        name="/coding",
+        usage="/coding [on|off|status]",
+        description="Turn Coding mode on or off.",
+        execution={_W: _local("coding.mode")},
+        category=CommandCategory.CONTROL,
+        busy_policy=CommandBusyPolicy.IMMEDIATE,
+        presentation=CommandPresentation.NOTICE,
+        order=75,
+    ),
     # ---- TUI + Channel ----------------------------------------------------
     CommandDef(
         name="/help",
@@ -353,6 +363,17 @@ _COMMANDS: tuple[CommandDef, ...] = (
         busy_policy=CommandBusyPolicy.IMMEDIATE,
         presentation=CommandPresentation.PANEL,
         order=100,
+    ),
+    CommandDef(
+        name="/keys",
+        usage="/keys",
+        description="Show keyboard shortcuts.",
+        execution={_T: _local("keys.show"), _S: _local("keys.show")},
+        aliases=("/shortcuts",),
+        category=CommandCategory.QUERY,
+        busy_policy=CommandBusyPolicy.IMMEDIATE,
+        presentation=CommandPresentation.PANEL,
+        order=101,
     ),
     CommandDef(
         name="/theme",
@@ -548,6 +569,19 @@ _COMMANDS: tuple[CommandDef, ...] = (
         order=180,
     ),
     CommandDef(
+        name="/goal",
+        usage="/goal [status|clear [--confirm]|pause|resume|<description>]",
+        description="Set a long-running goal for the agent to pursue.",
+        execution={
+            _T: _local("goal.set"),
+            _W: _local("goal.set"),
+        },
+        category=CommandCategory.CONTROL,
+        busy_policy=CommandBusyPolicy.IMMEDIATE,
+        presentation=CommandPresentation.NOTICE,
+        order=185,
+    ),
+    CommandDef(
         name="/permissions",
         usage="/permissions [mode]",
         description="Show or set the session permission override.",
@@ -642,19 +676,18 @@ _COMMANDS: tuple[CommandDef, ...] = (
     ),
     CommandDef(
         name="/sandbox",
-        usage="/sandbox <standard|trusted|full>",
+        usage="/sandbox <safe|full>",
         description="Set the channel session sandbox mode.",
         execution={_C: _rpc("sandbox.run_context.set", _sandbox_session_key)},
         argument_choices=(
-            ArgumentChoice("standard", "Use Standard-Sandbox for this channel session."),
-            ArgumentChoice("trusted", "Use Managed Execution for this channel session."),
+            ArgumentChoice("safe", "Use Safe mode for this channel session."),
             ArgumentChoice("full", "Use Full Host Access; channel admin only."),
         ),
     ),
     CommandDef(
         name="/meta",
-        usage="/meta [skill-name]",
-        description="List meta-skills, or run one with /meta <skill-name>.",
+        usage="/meta [skill-name] [request]",
+        description="List meta-skills, or run one with /meta <skill-name> [request].",
         execution={
             _W: _local("meta.menu"),
             _T: _local("meta.menu"),

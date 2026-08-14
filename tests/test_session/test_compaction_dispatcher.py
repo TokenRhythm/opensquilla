@@ -139,7 +139,7 @@ async def test_new_avoids_mid_turn_cut():
 async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
     """Turn-boundary cut must match the Agent's flattened tool-use entries."""
     entries = [
-        {"role": "user", "content": "old context", "token_count": 100},
+        {"role": "user", "content": "old context", "token_count": 1_000},
         {"role": "user", "content": "q1", "token_count": 100},
         {"role": "assistant", "content": "[Used tool: read_file]", "token_count": 5},
         {
@@ -153,7 +153,7 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
     request = CompactionRequest(
         session_id="agent-flattened-boundary-test",
         entries=entries,
-        context_window_tokens=100,
+        context_window_tokens=500,
         config=CompactionConfig(safety_margin=1.0),
     )
     result = await compact_context_new(request)
@@ -162,12 +162,23 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
     removed = entries[: len(entries) - len(result.kept_entries)]
     kept = result.kept_entries
     assert removed[-1]["content"] != "[Used tool: read_file]"
-    assert kept[0]["content"] == "[Used tool: read_file]"
+    assert kept[0]["content"] == "q1"
+    assert kept[1]["content"] == "[Used tool: read_file]"
 
 
 @pytest.mark.asyncio
-async def test_new_skips_when_only_cut_would_orphan_tool_result():
-    """If no clean boundary exists, compaction must not split tool state."""
+async def test_new_can_cut_after_completed_tool_round(monkeypatch):
+    """A paired tool call/result is a safe boundary, not live protocol state.
+
+    The branch under test sits in a two-token-wide window band: one token
+    higher and the transcript is within budget, one lower and a cut is found
+    and the quality gate rejects it. Pin token math so the band — and this test
+    — stay deterministic and offline instead of loading an optional tokenizer.
+    """
+    monkeypatch.setattr(
+        "opensquilla.session.compaction._estimate_tokens",
+        lambda text: max(1, len(text) // 4),
+    )
     entries = [
         {
             "role": "assistant",
@@ -187,21 +198,22 @@ async def test_new_skips_when_only_cut_would_orphan_tool_result():
     request = CompactionRequest(
         session_id="boundary-start-test",
         entries=entries,
-        context_window_tokens=26,
+        context_window_tokens=23,
         config=CompactionConfig(safety_margin=1.0),
     )
 
     result = await compact_context_new(request)
 
     assert result.removed_count == 0
-    assert result.summary_source == "skipped"
+    assert result.summary_source == "fallback"
     assert result.kept_entries == entries
-    assert result.skip_reason == "no_safe_turn_boundary"
+    assert result.skip_reason == "quality_gate_failed"
+    assert result.quality_report["fits_context_window"] is False
 
 
 @pytest.mark.asyncio
-async def test_new_prev_summary_prefix_injected():
-    """When custom_instructions carries __prev_summary__: the merged summary is prefixed."""
+async def test_new_prev_summary_marker_remains_backward_compatible():
+    """The legacy marker is consumed as rolling context, not as instructions."""
     entries = [
         {"role": "user", "content": "a " * 500, "token_count": 500},
         {"role": "assistant", "content": "b " * 500, "token_count": 500},
@@ -215,8 +227,8 @@ async def test_new_prev_summary_prefix_injected():
     )
     result = await compact_context_new(request)
     if result.removed_count > 0:
-        assert "[Previous context]" in result.summary
         assert "prior context here" in result.summary
+        assert "__prev_summary__:" not in result.summary
 
 
 @pytest.mark.asyncio

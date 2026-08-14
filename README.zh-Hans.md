@@ -43,7 +43,7 @@ OpenSquilla 是一个高效利用 Token 的微内核 AI Agent。本地模型路�
 Ollama、DeepSeek、Gemini、Qwen/DashScope 等 20 多个 LLM 提供商，无需改动你的代码或
 配置结构。
 
-OpenSquilla 0.5.0 是当前正式发布版本。
+OpenSquilla 0.5.3 是当前正式发布版本。
 
 如需面向任务的产品文档，请从
 [OpenSquilla 产品指南](README.product.md)或[文档索引](docs/README.md)开始。
@@ -59,8 +59,8 @@ OpenSquilla 可运行于 Windows、macOS 和 Linux。请选择与你的使用场
 发布版安装命令使用 GitHub 上已发布的 release 资源。Python wheel 安装使用带版本号的 wheel
 文件名，因为安装器会校验嵌入在 wheel 文件名中的版本号。
 
-对于 0.5.0 的桌面使用，建议从 GitHub Release 下载打包桌面安装包:macOS 上为
-`OpenSquilla-0.5.0-mac-arm64.dmg`，Windows 上为 `OpenSquilla-0.5.0-win-x64.exe`。
+对于 0.5.3 的桌面使用，建议从 GitHub Release 下载打包桌面安装包:macOS 上为
+`OpenSquilla-0.5.3-mac-arm64.dmg`，Windows 上为 `OpenSquilla-0.5.3-win-x64.exe`。
 
 | 安装方式 | 适合人群 | 何时使用 |
 | --- | --- | --- |
@@ -100,10 +100,10 @@ PowerShell 安装器会通过 `winget` 自动装好它；而**终端快速安装
 
 ### 桌面安装包
 
-0.5.0 桌面安装包将 Vue 控制台和网关运行时打包在一个 Electron 外壳中。
+0.5.3 桌面安装包将 Vue 控制台和网关运行时打包在一个 Electron 外壳中。
 
-- macOS Apple Silicon:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/OpenSquilla-0.5.0-mac-arm64.dmg>
-- Windows x64:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/OpenSquilla-0.5.0-win-x64.exe>
+- macOS Apple Silicon:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/OpenSquilla-0.5.3-mac-arm64.dmg>
+- Windows x64:<https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/OpenSquilla-0.5.3-win-x64.exe>
 
 中国大陆下载可直接使用 OSS 的固定安装包链接：
 
@@ -146,7 +146,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. 安装 OpenSquilla**——所有平台命令相同。
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/opensquilla-0.5.3-py3-none-any.whl"
 ```
 
 这会从 release URL 安装 OpenSquilla wheel，再由 `uv` 下载所选 extra 所声明的依赖。
@@ -167,7 +167,7 @@ opensquilla gateway run
 > PATH 设置命令。
 
 如需完全锁定版本的安装，请使用带版本号的 wheel URL:
-`https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl`。
+`https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/opensquilla-0.5.3-py3-none-any.whl`。
 
 <a id="install-from-source"></a>
 
@@ -333,7 +333,7 @@ opensquilla uninstall --purge-all      # 全部（会要求你输入确认）
 
 ## 安装隐私
 
-OpenSquilla 使用匿名安装遥测来估算安装数量、版本采纳情况和运行时兼容性。数据只在网关
+OpenSquilla 使用伪匿名安装遥测来估算安装数量、版本采纳情况和运行时兼容性。数据只在网关
 首次启动时上报，并且每个 OpenSquilla 版本只上报一次。它还会在本地按 UTC 日期汇总已完成
 的顶层对话次数和 token 用量，并在启动时及此后每小时尝试向遥测服务上报待发送的 UTC
 当日累计快照。OpenSquilla 也可能执行被动更新检查，包括桌面启动时以及应用持续运行期间
@@ -354,6 +354,13 @@ OpenSquilla 使用匿名安装遥测来估算安装数量、版本采纳情况�
 `install_id` 是一个本地单向 SHA-256 摘要，由可用的 MAC 地址派生；无 MAC 时使用本地 IP
 地址，并以一个随机持久化值兜底。原始 MAC/IP 值不会被上传。
 
+默认情况下，直接发往 TokenRhythm 官方 HTTPS API 的请求还可能通过可选的
+`X-OpenSquilla-Install-Id` 请求头携带同一个跨会话伪匿名安装标识。只有端口 443 上严格匹配
+`tokenrhythm.studio` 和 `api.tokenrhythm.studio` 的 HTTPS 主机才符合条件；自定义代理、
+OpenRouter、其他提供商、浏览器页面、重定向后的非官方目标，以及返回的图片/CDN 下载均不
+携带该请求头。原始 MAC/IP 值绝不会发送。若后台解析尚未完成或失败，请求头会被省略，API
+请求仍会正常继续。
+
 不发送的内容:用户名、主机名、路径、API key、提供商配置、聊天/会话/记忆/Agent 内容、
 文件名或文件内容。源 IP 在传输层可能会被 HTTP 服务器看到，但它不在上传的数据内。
 
@@ -370,7 +377,11 @@ OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY=true
 disable_network_observability = true
 ```
 
-这个统一开关覆盖自动安装遥测、每日汇总用量遥测、被动更新检查，以及桌面启动时和应用持续运行期间的自动更新检查。只要统一或兼容退出开关仍启用，用户显式触发的更新可用性检查也不会绕过它。其他用户主动操作仍可能在明确意图后访问网络服务，例如打开发布页、下载发布资产，以及使用已配置的提供商、搜索或渠道。
+这个统一开关覆盖自动安装遥测、每日汇总用量遥测、被动更新检查、桌面启动时和应用持续
+运行期间的自动更新检查，以及 TokenRhythm 安装标识请求头。只要统一或兼容退出开关仍启用，
+用户显式触发的更新可用性检查也不会绕过它。CI 和测试环境也会自动抑制安装标识请求头与
+安装遥测。其他用户主动操作仍可能在明确意图后访问网络服务，例如打开发布页、下载发布
+资产，以及使用已配置的提供商、搜索或渠道。
 
 旧环境变量仍兼容:
 
@@ -378,6 +389,11 @@ disable_network_observability = true
 OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
+
+旧遥测退出开关会抑制 TokenRhythm 安装标识请求头；仅启用更新检查退出开关则不会。
+TokenRhythm 必须将此请求头视为可选且不可信，不得将其用于认证、授权、计费、限流或反滥用
+决策。完整的目标校验与数据处理规则见
+[`PRIVACY.md`](PRIVACY.md#tokenrhythm-installation-identifier)。
 
 进阶部署可以使用自己的安装遥测端点:
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import inspect
 import json
+import subprocess
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -12,6 +14,20 @@ from opensquilla.sandbox.backend.windows_default_network import (
     network_proxy_env,
     proxy_ports_from_env,
 )
+
+
+def _symlink_or_skip(
+    link: Path,
+    target: Path,
+    *,
+    target_is_directory: bool = False,
+) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symbolic-link privilege is unavailable")
+        raise
 
 
 def test_proxy_ports_from_env_collects_loopback_proxy_ports() -> None:
@@ -236,6 +252,7 @@ def test_ensure_offline_sandbox_user_uses_configured_short_name(monkeypatch, tmp
 
     assert identity["username"] == "ShortSandboxUser"
     assert "$name = 'ShortSandboxUser';" in commands[0]
+    assert "IsAccountLocked = $false" in commands[0]
     assert "OpenSquillaSandboxOffline" not in commands[0]
 
 
@@ -265,6 +282,38 @@ def test_run_elevated_setup_helper_launches_python_module_with_runas(
     assert "-m opensquilla.sandbox.backend.windows_default_setup" in launched["parameters"]
     assert "--elevated-helper" in launched["parameters"]
     assert (Path(launched["directory"]) / "opensquilla").exists()
+
+
+def test_run_elevated_setup_helper_launches_frozen_helper_without_python_module(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    launched = {}
+    marker = tmp_path / "setup_marker.json"
+
+    monkeypatch.setattr(
+        mod.sys,
+        "executable",
+        r"C:\Program Files\OpenSquilla\opensquilla-gateway.exe",
+    )
+    monkeypatch.setattr(mod.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+
+    def fake_runas(*, executable, parameters, directory):
+        launched["executable"] = executable
+        launched["parameters"] = parameters
+        launched["directory"] = directory
+        return 0
+
+    monkeypatch.setattr(mod, "_shell_execute_runas_and_wait", fake_runas)
+
+    mod.run_elevated_setup_helper(marker)
+
+    assert launched["executable"].endswith("opensquilla-gateway.exe")
+    assert launched["parameters"].startswith("--elevated-helper ")
+    assert "-m" not in launched["parameters"]
 
 
 def test_runas_setup_helper_uses_hidden_window() -> None:
@@ -309,6 +358,163 @@ def test_elevated_setup_helper_main_writes_failure_report(monkeypatch, tmp_path)
     assert "Set-LocalUser access denied" in report["detail"]
 
 
+def test_elevated_setup_helper_accepts_desktop_profile_marker(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+    from opensquilla.sandbox.backend.windows_default_network import (
+        FIREWALL_RULE_VERSION,
+        WFP_RULE_VERSION,
+        WindowsNetworkSetup,
+    )
+
+    profile = tmp_path / "profile"
+    desktop_home = (
+        profile / "AppData" / "Roaming" / "@opensquilla" / "desktop-electron" / "opensquilla"
+    )
+    desktop_home.mkdir(parents=True)
+    marker = desktop_home / "sandbox" / "setup_marker.json"
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    network = WindowsNetworkSetup(
+        offline_user_sid="S-1-offline",
+        allowed_proxy_ports=(48123,),
+        allow_local_binding=False,
+        firewall_rule_version=FIREWALL_RULE_VERSION,
+        wfp_rule_version=WFP_RULE_VERSION,
+    )
+    locked_roots = []
+
+    def fake_lock(
+        marker_path,
+        *,
+        offline_sid,
+        real_user_sid,
+        lease,
+    ):
+        assert marker_path == marker
+        assert offline_sid == "S-1-offline"
+        assert real_user_sid == "S-1-real"
+        assert lease.profile_path == profile
+        locked_roots.extend(lease.roots)
+
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+    monkeypatch.setattr(mod, "establish_windows_network_setup", lambda _path: network)
+    monkeypatch.setattr(mod, "lock_persistent_sandbox_dirs", fake_lock)
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 0
+    assert mod.read_setup_marker(marker) is not None
+    assert mod.read_setup_helper_report(marker) == {
+        "state": "ready",
+        "detail": "setup_complete",
+    }
+    assert locked_roots == [
+        desktop_home / "sandbox",
+        desktop_home / "sandbox-secrets",
+        desktop_home / "sandbox-bin",
+    ]
+
+
+def test_elevated_setup_persists_rotated_identity_before_acl_repair(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+    from opensquilla.sandbox.backend.windows_default_network import (
+        FIREWALL_RULE_VERSION,
+        WFP_RULE_VERSION,
+        WindowsNetworkSetup,
+    )
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    marker = mod.default_setup_marker_path(profile)
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    network = WindowsNetworkSetup(
+        offline_user_sid="S-1-offline",
+        allowed_proxy_ports=(48123,),
+        allow_local_binding=False,
+        firewall_rule_version=FIREWALL_RULE_VERSION,
+        wfp_rule_version=WFP_RULE_VERSION,
+        offline_username="OpenSquillaSandbox",
+        protected_password="rotated-protected-password",
+    )
+
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+    monkeypatch.setattr(mod, "establish_windows_network_setup", lambda _path: network)
+    monkeypatch.setattr(
+        mod,
+        "lock_persistent_sandbox_dirs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("acl repair failed")),
+    )
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 1
+    persisted = mod.read_setup_marker(marker)
+    assert persisted is not None
+    assert persisted.network == network
+
+
+def test_elevated_setup_rejects_unrecognized_marker_inside_profile(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    marker = (
+        profile
+        / "AppData"
+        / "Roaming"
+        / "other-app"
+        / "opensquilla"
+        / "sandbox"
+        / "setup_marker.json"
+    )
+    payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
+    monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
+
+    assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 2
+    assert not marker.parent.exists()
+
+
+def test_windows_setup_readiness_uses_validated_desktop_marker(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+    from opensquilla.sandbox.backend.windows_default_network import (
+        FIREWALL_RULE_VERSION,
+        WFP_RULE_VERSION,
+        WindowsNetworkSetup,
+    )
+
+    profile = tmp_path / "profile"
+    marker = (
+        profile
+        / "AppData"
+        / "Roaming"
+        / "@opensquilla"
+        / "desktop-electron"
+        / "opensquilla"
+        / "sandbox"
+        / "setup_marker.json"
+    )
+    mod.write_setup_marker(
+        marker,
+        network=WindowsNetworkSetup(
+            offline_user_sid="S-1-offline",
+            allowed_proxy_ports=(48123,),
+            allow_local_binding=False,
+            firewall_rule_version=FIREWALL_RULE_VERSION,
+            wfp_rule_version=WFP_RULE_VERSION,
+        ),
+    )
+    monkeypatch.setattr(mod, "setup_marker_identity_ready", lambda _path: True)
+
+    assert mod._windows_setup_is_ready(marker) is True
+
+
 def test_elevated_setup_helper_serializes_mutation_and_rechecks_readiness(
     monkeypatch,
     tmp_path,
@@ -334,7 +540,7 @@ def test_elevated_setup_helper_serializes_mutation_and_rechecks_readiness(
     monkeypatch.setattr(
         mod,
         "_windows_setup_is_ready",
-        lambda _marker_path, _profile_path: events.append("ready_check") or False,
+        lambda _marker_path: events.append("ready_check") or False,
         raising=False,
     )
     monkeypatch.setattr(
@@ -358,6 +564,19 @@ def test_elevated_setup_helper_skips_duplicate_mutation_after_wait(
     marker = mod.default_setup_marker_path(profile)
     payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
     reports = []
+    repaired = []
+    mod.write_setup_marker(
+        marker,
+        network=mod.WindowsNetworkSetup(
+            offline_user_sid="S-1-offline",
+            allowed_proxy_ports=(48123,),
+            allow_local_binding=False,
+            firewall_rule_version=5,
+            wfp_rule_version=2,
+            offline_username="OpenSquillaSandbox",
+            protected_password="protected",
+        ),
+    )
 
     monkeypatch.setattr(mod, "_windows_profile_path_for_sid", lambda _sid: profile)
     monkeypatch.setattr(mod, "_windows_setup_is_ready", lambda *_args: True, raising=False)
@@ -371,9 +590,15 @@ def test_elevated_setup_helper_skips_duplicate_mutation_after_wait(
         "write_setup_helper_report",
         lambda _path, *, state, detail=None: reports.append((state, detail)),
     )
+    monkeypatch.setattr(
+        mod,
+        "lock_persistent_sandbox_dirs",
+        lambda *_args, **_kwargs: repaired.append(marker),
+    )
 
     assert mod.elevated_setup_helper_main(["--elevated-helper", payload]) == 0
-    assert reports == [("ready", "already_ready")]
+    assert reports == [("ready", "existing_setup_acl_repaired")]
+    assert repaired == [marker]
 
 
 def test_windows_setup_process_lock_releases_named_mutex(monkeypatch, tmp_path) -> None:
@@ -443,7 +668,7 @@ def test_elevated_setup_rejects_precreated_junction_before_writing(monkeypatch, 
     outside = tmp_path / "outside"
     profile.mkdir()
     outside.mkdir()
-    (profile / ".opensquilla").symlink_to(outside, target_is_directory=True)
+    _symlink_or_skip(profile / ".opensquilla", outside, target_is_directory=True)
     marker = mod.default_setup_marker_path(profile)
     payload = mod._encode_setup_helper_payload(marker, user_sid="S-1-real")
     reports = []
@@ -490,7 +715,7 @@ def test_setup_marker_replaces_symlink_without_writing_its_target(tmp_path) -> N
     outside = tmp_path / "outside.json"
     outside.write_text("do not touch", encoding="utf-8")
     marker = tmp_path / "setup_marker.json"
-    marker.symlink_to(outside)
+    _symlink_or_skip(marker, outside)
 
     mod.write_setup_marker(marker)
 
@@ -508,7 +733,7 @@ def test_setup_marker_windows_writer_atomically_replaces_symlink(
     outside = tmp_path / "outside.json"
     outside.write_text("do not touch", encoding="utf-8")
     marker = tmp_path / "setup_marker.json"
-    marker.symlink_to(outside)
+    _symlink_or_skip(marker, outside)
     writer_paths = []
 
     def fake_windows_writer(path, data):
@@ -558,6 +783,146 @@ def test_lock_revalidates_tree_before_each_recursive_acl_mutation(monkeypatch, t
     assert len(validations) >= len(commands)
     assert commands
     assert all("/L" in command for command in commands)
+
+
+def test_lock_batches_existing_child_acl_resets(monkeypatch, tmp_path) -> None:
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    profile = tmp_path / "profile"
+    sandbox_root = profile / ".opensquilla" / "sandbox"
+    (sandbox_root / "workspace-a").mkdir(parents=True)
+    (sandbox_root / "workspace-b").mkdir()
+    secrets_root = profile / ".opensquilla" / "sandbox-secrets"
+    (secrets_root / "provider-a").mkdir(parents=True)
+    bin_root = profile / ".opensquilla" / "sandbox-bin"
+    (bin_root / "runtime-a").mkdir(parents=True)
+    marker = sandbox_root / "setup_marker.json"
+    commands = []
+
+    class Completed:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(
+        mod.subprocess,
+        "run",
+        lambda command, **_kwargs: commands.append(command) or Completed(),
+    )
+    monkeypatch.setattr(mod, "_current_windows_user_sid", lambda: "S-1-real")
+
+    mod.lock_persistent_sandbox_dirs(marker, offline_sid="S-1-offline")
+
+    reset_commands = [command for command in commands if "/reset" in command]
+    assert reset_commands == [
+        ["icacls", str(sandbox_root / "*"), "/reset", "/t", "/L"],
+        ["icacls", str(secrets_root / "*"), "/reset", "/t", "/L"],
+        ["icacls", str(bin_root / "*"), "/reset", "/t", "/L"],
+    ]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires Windows icacls")
+def test_icacls_wildcard_reset_is_recursive_without_touching_root_or_link_target(
+    tmp_path,
+    request,
+) -> None:
+    root = tmp_path / "root"
+    nested = root / "child" / "nested"
+    outside = tmp_path / "outside"
+    nested.mkdir(parents=True)
+    outside.mkdir()
+
+    def icacls(*arguments: str) -> None:
+        completed = subprocess.run(
+            ["icacls", *arguments],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr or completed.stdout
+
+    def restore_outside_acl() -> None:
+        subprocess.run(
+            ["icacls", str(outside), "/inheritance:e", "/L"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        subprocess.run(
+            ["icacls", str(outside), "/reset", "/t", "/L"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    request.addfinalizer(restore_outside_acl)
+
+    def acl_state(path: Path) -> dict[str, object]:
+        script = (
+            "& { param($itemPath) $acl = Get-Acl -LiteralPath $itemPath; "
+            "[pscustomobject]@{ "
+            "Sddl = $acl.Sddl; Protected = $acl.AreAccessRulesProtected "
+            "} | ConvertTo-Json -Compress }"
+        )
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr or completed.stdout
+        return json.loads(completed.stdout)
+
+    icacls(str(nested), "/inheritance:r", "/L")
+    icacls(str(outside), "/inheritance:d", "/L")
+    root_before = acl_state(root)
+    outside_before = acl_state(outside)
+    assert acl_state(nested)["Protected"] is True
+
+    icacls(str(root / "*"), "/reset", "/t", "/L")
+
+    assert acl_state(root) == root_before
+    assert acl_state(nested)["Protected"] is False
+    assert acl_state(outside) == outside_before
+
+    link = root / "outside-link"
+    junction = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            (
+                "& { param($linkPath, $targetPath) "
+                "New-Item -ItemType Junction -Path $linkPath "
+                "-Target $targetPath | Out-Null }"
+            ),
+            str(link),
+            str(outside),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert junction.returncode == 0, junction.stderr or junction.stdout
+    linked_reset = subprocess.run(
+        ["icacls", str(root / "*"), "/reset", "/t", "/L"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert linked_reset.returncode in {0, 5}
+    assert acl_state(root) == root_before
+    assert acl_state(outside) == outside_before
 
 
 def test_elevated_setup_does_not_write_failure_report_after_lease_race(

@@ -657,6 +657,14 @@ function onDetailKeydown(event: KeyboardEvent) {
 // ---------------------------------------------------------------------------
 
 function guessLevel(line: string): string {
+  // debug.log's formatter emits the authoritative level before the free-form
+  // message. Prefer it so fields such as `errors=0` cannot override [INFO].
+  const formattedLevel = line.match(/\[(TRACE|DEBUG|INFO|WARN(?:ING)?|ERROR)\]/i)?.[1]?.toUpperCase()
+  if (formattedLevel === 'WARNING') return 'WARN'
+  if (formattedLevel) return formattedLevel
+
+  // Preserve severity inference for legacy or third-party lines that do not
+  // carry the gateway's canonical bracketed level.
   const u = line.toUpperCase()
   if (u.includes('ERROR')) return 'ERROR'
   if (u.includes('WARN')) return 'WARN'

@@ -1,6 +1,7 @@
 ---
 name: ai-video-script
 description: "Generate a structured short-video shooting script from a topic. Emits a strict, machine-parseable shot list (3 shots by default) with image prompt + video prompt + voiceover + on-screen text per shot. Trigger when the user asks for a video script, 分镜, 短视频文案, AI视频, 短剧脚本, or wants visual prompts ready for image/video generation."
+description_zh: "根据主题生成结构化的短视频拍摄脚本，输出严格且可机器解析的分镜清单（默认3个镜头），每个镜头含图像提示词、视频提示词、旁白和屏幕文字。当用户需要视频脚本、分镜、短视频文案、AI视频、短剧脚本，或需要可用于图像/视频生成的视觉提示词时触发。"
 provenance:
   origin: clawhub-mit0
   license: MIT-0
@@ -221,9 +222,10 @@ literal value `none` for empty `ON_SCREEN_TEXT`.
 User wrote the request in Chinese, so every field is Chinese — including
 IMAGE_PROMPT and VIDEO_PROMPT. Seedance 2.0 and Gemini 3.1 image both
 handle these prompts natively. Note the RENDER_STYLE is photoreal
-cinematic (an opt-in style — downstream seedance moderation MAY refuse
-photoreal human faces; the meta-skill's video step retries twice then
-falls back to a Ken-Burns clip if the model persistently refuses).
+cinematic (an explicit opt-in style — downstream Seedance moderation MAY
+refuse photoreal human references; a provider-policy refusal stops
+immediately without another paid submission, then the workflow falls back
+to a degraded Ken-Burns clip).
 
 Caller passes:
 - `with.identity_anchor` = `陆,28岁东亚男性,背头黑发,无框眼镜,深灰色定制西装,气场冷峻;张,35岁东亚女性,波浪长卷发,浓妆,白色职业套装,神情傲慢`

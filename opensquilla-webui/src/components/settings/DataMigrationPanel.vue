@@ -19,7 +19,7 @@ import {
 } from '@/utils/profileSourceKind'
 
 type MigrationProvider = 'desktop' | 'gateway'
-type PanelState = 'loading' | 'ready' | 'empty' | 'unsupported' | 'error' | 'recovery'
+type PanelState = 'loading' | 'ready' | 'empty' | 'unsupported' | 'error'
 
 interface MigrationCandidate {
   id: string
@@ -80,13 +80,13 @@ interface CleanupResult {
   partial?: boolean
   previewId?: string | null
   report?: CleanupReport
-  profile?: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+  profile?: { kind: 'primary'; recoveryId: null }
   detail?: string
 }
 
 interface DesktopMigrationBridge {
-  getDesktopProfileKind?: () => Promise<unknown>
   getRecoveryState?: () => Promise<unknown>
+  retryProfileConsolidation?: () => Promise<{ ok: boolean; error?: string }>
   chooseLegacyAgentDataLocation?: (payload?: Record<string, never>) => Promise<unknown>
   migrationSummary?: (payload?: { source?: string }) => Promise<{
     ok: boolean
@@ -116,7 +116,7 @@ interface DesktopMigrationBridge {
     ok: boolean
     previewId: string | null
     report: CleanupReport
-    profile: { kind: 'primary' | 'recovery'; recoveryId: string | null }
+    profile: { kind: 'primary'; recoveryId: null }
   }>
   discardDesktopCleanup?: (payload: { previewId: string }) => Promise<boolean>
   applyDesktopCleanup?: (payload: {
@@ -171,6 +171,13 @@ interface RecoveryInspection {
   allowed_actions?: string[]
 }
 
+interface RecoveryMaintenance {
+  kind?: string
+  stable_code?: string
+  retryable?: boolean
+  recovery_profile_count?: number
+}
+
 const MANUAL_SOURCE_KINDS: ProfileSourceKind[] = [
   'cli-home',
   'desktop-home',
@@ -187,11 +194,6 @@ const ATTENTION_TECHNICAL_CODES = new Set([
   'layout_reconcile_deferred',
   'layout_marker_unsafe',
   'layout_marker_write_failed',
-])
-const RECOVERY_MIGRATION_DETAILS = new Set([
-  'Import source selection is available only in the primary profile.',
-  'Recovery profiles cannot import another profile.',
-  'Return to the primary profile before importing data.',
 ])
 const MIGRATION_FAILURE_DETAIL_KEYS: Record<string, string> = {
   source_snapshot_locked: 'setup.runtime.migrationFailureLocked',
@@ -233,14 +235,13 @@ const overwrite = ref(false)
 const phase = ref('')
 const inlineError = ref('')
 const lastResult = shallowRef<MigrationTerminalResult | null>(null)
-const profileKind = ref<'primary' | 'recovery' | 'unknown'>('unknown')
 const recoveryInspection = shallowRef<RecoveryInspection | null>(null)
+const recoveryMaintenance = shallowRef<RecoveryMaintenance | null>(null)
 const headingEl = ref<HTMLElement | null>(null)
 const cleanupOpen = ref(false)
 const cleanupBusy = ref(false)
 const cleanupPreviewId = ref('')
 const cleanupReport = shallowRef<CleanupReport | null>(null)
-const cleanupProfile = ref<{ kind: 'primary' | 'recovery'; recoveryId: string | null } | null>(null)
 const cleanupAcknowledged = ref(false)
 const cleanupConfirmation = ref('')
 const cleanupTitleEl = ref<HTMLElement | null>(null)
@@ -266,6 +267,14 @@ const technicalAttention = computed(() => {
 const canChooseLegacyAgentData = computed(() => Boolean(
   knownAttention.value
   && desktopBridge?.chooseLegacyAgentDataLocation,
+))
+const consolidationMaintenance = computed(() => {
+  const maintenance = recoveryMaintenance.value
+  return maintenance?.kind === 'profile-consolidation' ? maintenance : null
+})
+const canRepairConsolidation = computed(() => Boolean(
+  consolidationMaintenance.value?.retryable
+  && desktopBridge?.retryProfileConsolidation,
 ))
 
 const candidateGroups = computed(() => ([
@@ -356,13 +365,10 @@ function stringCodes(value: unknown): string[] {
   })
 }
 
-function localizedMigrationDetail(value: unknown, failureCode?: string): string {
+function localizedMigrationDetail(_value: unknown, failureCode?: string): string {
   const failureKey = failureCode ? MIGRATION_FAILURE_DETAIL_KEYS[failureCode] : undefined
   if (failureKey) return t(failureKey)
-  const detail = typeof value === 'string' ? value.trim() : ''
-  return RECOVERY_MIGRATION_DETAILS.has(detail)
-    ? t('setup.runtime.migrationRecoveryProfile')
-    : t('settings.dataMigration.loadFailed')
+  return t('settings.dataMigration.loadFailed')
 }
 
 function presentationError(error: unknown): string {
@@ -481,28 +487,22 @@ async function loadRecoveryContext(): Promise<void> {
   try {
     const raw = await desktopBridge?.getRecoveryState?.()
     if (raw && typeof raw === 'object') {
-      const inspection = (raw as Record<string, unknown>).inspection
+      const state = raw as Record<string, unknown>
+      const inspection = state.inspection
       if (inspection && typeof inspection === 'object') {
         recoveryInspection.value = inspection as RecoveryInspection
       }
+      const maintenance = state.maintenance
+      recoveryMaintenance.value = maintenance && typeof maintenance === 'object'
+        ? maintenance as RecoveryMaintenance
+        : null
     }
   } catch {
     // Compatibility context is optional; migration discovery remains usable.
   }
 }
 
-async function loadProfileKind(): Promise<void> {
-  if (!hasDesktopMigrationBridge.value) return
-  try {
-    const kind = await desktopBridge?.getDesktopProfileKind?.()
-    profileKind.value = kind === 'primary' || kind === 'recovery' ? kind : 'unknown'
-  } catch {
-    profileKind.value = 'unknown'
-  }
-}
-
 async function loadLastResult(): Promise<void> {
-  if (profileKind.value !== 'primary') return
   const read = desktopBridge?.migrationPeekLastResult ?? desktopBridge?.migrationTakeLastResult
   if (!read) return
   try {
@@ -514,12 +514,7 @@ async function loadLastResult(): Promise<void> {
 
 async function scanDesktopSources(): Promise<void> {
   if (!desktopBridge?.migrationSummary) return
-  await loadProfileKind()
   await loadLastResult()
-  if (profileKind.value === 'recovery') {
-    panelState.value = 'recovery'
-    return
-  }
   const result = await desktopBridge.migrationSummary()
   const detected = Array.isArray(result.candidates)
     ? result.candidates.filter(isDesktopCandidate).map(normalizeDesktopCandidate)
@@ -762,6 +757,24 @@ async function chooseLegacyAgentDataLocation(): Promise<void> {
   }
 }
 
+async function repairProfileConsolidation(): Promise<void> {
+  if (!desktopBridge?.retryProfileConsolidation) return
+  busy.value = true
+  inlineError.value = ''
+  try {
+    const result = await desktopBridge.retryProfileConsolidation()
+    if (!result?.ok) {
+      throw new Error(result?.error || t('settings.dataMigration.maintenanceRepairFailed'))
+    }
+    recoveryMaintenance.value = null
+    pushToast(t('settings.dataMigration.maintenanceRepairStarted'), { tone: 'ok' })
+  } catch (error) {
+    inlineError.value = presentationError(error)
+  } finally {
+    busy.value = false
+  }
+}
+
 async function openCleanup(mode: CleanupMode, trigger?: EventTarget | null): Promise<void> {
   if (!desktopBridge?.inspectDesktopCleanup) return
   if (trigger instanceof HTMLElement) cleanupReturnFocusEl.value = trigger
@@ -774,7 +787,6 @@ async function openCleanup(mode: CleanupMode, trigger?: EventTarget | null): Pro
   try {
     const result = await desktopBridge.inspectDesktopCleanup({ mode })
     cleanupReport.value = result.report
-    cleanupProfile.value = result.profile
     cleanupPreviewId.value = result.previewId || ''
     cleanupOpen.value = true
     await nextTick()
@@ -792,7 +804,6 @@ function clearCleanupState(): void {
   cleanupOpen.value = false
   cleanupPreviewId.value = ''
   cleanupReport.value = null
-  cleanupProfile.value = null
   cleanupAcknowledged.value = false
   cleanupConfirmation.value = ''
 }
@@ -826,7 +837,6 @@ async function cancelCleanup(): Promise<void> {
 async function presentCleanupResult(result: CleanupResult): Promise<void> {
   if (result.report) cleanupReport.value = result.report
   cleanupPreviewId.value = result.previewId || ''
-  if (result.profile) cleanupProfile.value = result.profile
   cleanupAcknowledged.value = false
   cleanupConfirmation.value = ''
   cleanupOpen.value = Boolean(cleanupReport.value)
@@ -925,6 +935,29 @@ onUnmounted(unsubscribeProgress)
       </button>
     </div>
 
+    <div
+      v-if="consolidationMaintenance"
+      class="data-migration__compat"
+      data-testid="profile-consolidation-maintenance"
+    >
+      <strong>{{ t('settings.dataMigration.maintenanceTitle') }}</strong>
+      <p>{{ t('settings.dataMigration.maintenanceDesc') }}</p>
+      <button
+        v-if="canRepairConsolidation"
+        type="button"
+        class="btn btn--ghost"
+        :disabled="busy"
+        data-testid="profile-consolidation-repair"
+        @click="repairProfileConsolidation"
+      >
+        {{ t('settings.dataMigration.maintenanceRepair') }}
+      </button>
+      <details>
+        <summary>{{ t('setup.runtime.migrationTechnicalDetails') }}</summary>
+        <code>{{ consolidationMaintenance.stable_code }}</code>
+      </details>
+    </div>
+
     <div v-if="knownAttention" class="data-migration__compat" data-testid="data-migration-compatibility">
       <strong>{{ t('settings.dataMigration.compatibilityTitle') }}</strong>
       <p>{{ t('settings.dataMigration.compatibilityDesc') }}</p>
@@ -1007,10 +1040,6 @@ onUnmounted(unsubscribeProgress)
     <div v-else-if="panelState === 'unsupported'" class="data-migration__state" data-testid="data-migration-unsupported">
       <strong>{{ t('settings.dataMigration.unsupportedTitle') }}</strong>
       <p>{{ t('settings.dataMigration.unsupportedDesc') }}</p>
-    </div>
-    <div v-else-if="panelState === 'recovery'" class="data-migration__state">
-      <strong>{{ t('settings.dataMigration.recoveryTitle') }}</strong>
-      <p>{{ t('setup.runtime.migrationRecoveryProfile') }}</p>
     </div>
     <div v-else-if="panelState === 'error'" class="data-migration__state">
       <strong>{{ t('settings.dataMigration.loadFailed') }}</strong>
@@ -1239,9 +1268,7 @@ onUnmounted(unsubscribeProgress)
         <div class="cleanup-summary__head">
           <h4 id="cleanup-summary-title" ref="cleanupTitleEl" tabindex="-1">{{ cleanupModeTitle }}</h4>
           <span class="cleanup-summary__profile">
-            {{ cleanupProfile?.kind === 'recovery'
-              ? t('setup.runtime.cleanup.recoveryProfile')
-              : t('setup.runtime.cleanup.primaryProfile') }}
+            {{ t('setup.runtime.cleanup.primaryProfile') }}
           </span>
         </div>
         <p class="cleanup-summary__warning">{{ cleanupModeWarning }}</p>

@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 from opensquilla import __version__
 from opensquilla.gateway.auth import Principal
+from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, GuestRpcPolicyError
 from opensquilla.gateway.protocol import (
     ERROR_METHOD_NOT_FOUND,
     ERROR_UNAUTHORIZED,
@@ -83,19 +84,25 @@ class RpcContext:
     usage_event_sink: Any = None  # Durable per-provider-call accounting sink.
     meta_run_writer: Any = None  # MetaRunWriter instance (injected at boot)
     skill_loader: Any = None  # SkillLoader instance (injected at boot)
+    skill_management_service: Any = None  # Shared Community Skill mutation service
+    skill_management_state: dict[str, Any] = field(default_factory=dict)
     cron_scheduler: Any = None  # SchedulerEngine instance (injected at boot)
     turn_runner: TurnRunner | None = None  # TurnRunner instance (injected at boot)
     task_runtime: Any = None  # TaskRuntime instance (injected at boot)
     flush_service: Any = None  # SessionFlushService | None (injected at boot)
     heartbeat_service: Any = None  # Task-style heartbeat service (injected at boot)
     heartbeat_loop: Any = None  # Background heartbeat loop (injected at boot)
+    prompt_cache_keepalive_service: Any = None  # Opt-in, in-memory session lease service.
     agent_registry: Any = None  # AgentRegistry instance (injected at boot)
     diagnostics_state: Any = None  # DiagnosticsState instance (injected at boot)
     provider_stats: Any = None  # ProviderStatsStore instance (injected at boot)
+    profile_import_service: Any = None  # Optional injected service/factory for profile import.
     memory_managers: dict[str, Any] = field(default_factory=dict)
     memory_stores: dict[str, Any] = field(default_factory=dict)
     memory_retrievers: dict[str, Any] = field(default_factory=dict)
     originating_envelope: Any = None  # Channel RouteEnvelope for RPC side effects
+    protocol: int = 4
+    sandbox_schema_version: int = 2
 
     @property
     def role(self) -> str:
@@ -232,6 +239,15 @@ class RpcRegistry:
         if entry is None:
             return make_error_res(req_id, ERROR_METHOD_NOT_FOUND, f"Method not found: {method}")
 
+        try:
+            params = GuestRpcPolicy.authorize(method, params, ctx)
+        except GuestRpcPolicyError:
+            return make_error_res(
+                req_id,
+                ERROR_UNAUTHORIZED,
+                "Anonymous guest is not authorized for this RPC method or session",
+            )
+
         allowed, missing = authorize_call(
             method,
             entry.required_scope,
@@ -245,7 +261,11 @@ class RpcRegistry:
             )
 
         try:
-            result = await entry.handler(params, ctx)
+            from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
+
+            configured_state_dir = getattr(ctx.config, "state_dir", None)
+            with managed_toolchain_state_scope(configured_state_dir):
+                result = await entry.handler(params, ctx)
             return make_ok_res(req_id, result)
         except RpcHandlerError as exc:
             return make_error_res(
@@ -260,16 +280,21 @@ class RpcRegistry:
         except RpcUnavailableError as exc:
             return make_error_res(req_id, ERROR_UNAVAILABLE, str(exc), retryable=True)
         except StorageBusyError as exc:
+            details: dict[str, Any] = {
+                "operation": exc.operation,
+                "waited_ms": exc.waited_ms,
+            }
+            if exc.stage is not None:
+                details["stage"] = exc.stage
+            if exc.resource is not None:
+                details["resource"] = exc.resource
             return make_error_res(
                 req_id,
                 "STORAGE_BUSY",
                 "Session storage is temporarily busy. Retry this operation.",
                 retryable=True,
                 retry_after_ms=exc.retry_after_ms,
-                details={
-                    "operation": exc.operation,
-                    "waited_ms": exc.waited_ms,
-                },
+                details=details,
             )
         except ValueError as exc:
             return make_error_res(req_id, "INVALID_REQUEST", str(exc))

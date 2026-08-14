@@ -10,6 +10,43 @@ export function isAttachmentBusy(attachment: Attachment): boolean {
   return attachment.kind === 'inline_pending' || attachment.kind === 'uploading'
 }
 
+/**
+ * Collect the files carried by a paste event's DataTransfer. Every clipboard
+ * file is a candidate attachment — the attachment pipeline applies its own
+ * type and size policy — so this deliberately does not filter by MIME type.
+ * Falls back to `files` for engines that expose pasted files there without
+ * listing them in `items`.
+ */
+export function collectClipboardFiles(data: DataTransfer | null): File[] {
+  const files: File[] = []
+  if (!data) return files
+  for (const item of Array.from(data.items ?? [])) {
+    if (item.kind !== 'file') continue
+    const file = item.getAsFile()
+    if (file) files.push(file)
+  }
+  if (files.length === 0 && data.files) files.push(...Array.from(data.files))
+  return files
+}
+
+/**
+ * Decide whether a document-level file paste belongs to the chat composer.
+ * Pastes aimed at another editable surface — clarify/approval inputs, the
+ * command palette, settings fields — keep their default behavior, and an open
+ * dialog layer owns the clipboard entirely, mirroring the document keydown
+ * guard.
+ */
+export function shouldCaptureFilePaste(
+  target: EventTarget | null,
+  options: { composerTextareaFocused: boolean, dialogLayerOpen: boolean },
+): boolean {
+  if (options.dialogLayerOpen) return false
+  if (target instanceof HTMLTextAreaElement) return options.composerTextareaFocused
+  if (target instanceof HTMLInputElement) return false
+  if (target instanceof HTMLElement && target.isContentEditable) return false
+  return true
+}
+
 export function isMimeLike(value: unknown): value is string {
   return typeof value === 'string' && /^[^/\s]+\/[^/\s;]+(?:\s*;.*)?$/.test(value.trim())
 }

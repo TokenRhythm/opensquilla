@@ -18,9 +18,11 @@ from opensquilla.application.approval_rpc import (
     approval_wait_decision_rpc_payload,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
+from opensquilla.project_workspaces import ProjectWorkspaceStateError
 from opensquilla.sandbox.escalation import (
     apply_sandbox_approval_choice,
     deny_matching_pending_sandbox_approvals,
+    discard_approval_run_context_authority,
     is_sandbox_approval_kind,
     remember_sandbox_approval_denial,
     validate_sandbox_approval_choice,
@@ -260,7 +262,11 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
     )
 
     if sandbox_approval and approved:
-        claim_token = queue.claim_resolution(params["id"])
+        claim_token = queue.claim_resolution(
+            params["id"],
+            resolution_metadata={"resolutionSource": "user_web"},
+        )
+        pending = queue.get(params["id"])
         try:
             queue.finalize_claimed_resolution(
                 params["id"],
@@ -274,10 +280,21 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
         try:
             await apply_sandbox_approval_choice(
                 pending.params,
+                approval_id=params["id"],
                 choice=normalized_choice,
                 approved=True,
                 session_manager=ctx.session_manager,
                 config=ctx.config,
+            )
+        except ProjectWorkspaceStateError:
+            # This exact execution/session/workspace authority is gone.
+            # Reopening can never make the card actionable again.
+            discard_approval_run_context_authority(params["id"])
+            queue.expire_claimed_resolution(params["id"], claim_token)
+            return approval_status_rpc_payload(
+                queue,
+                params["id"],
+                queue.get_settings().mode,
             )
         except Exception:
             queue.reopen_resolved_approval(params["id"], expected_approved=True)
@@ -294,6 +311,7 @@ async def _handle_exec_approval_resolve(params: dict | None, ctx: RpcContext) ->
         approved,
         elevated_mode=None,
         allow_idempotent=not sandbox_approval,
+        resolution_metadata={"resolutionSource": "user_web"},
     )
     if sandbox_approval and not approved:
         remember_sandbox_approval_denial(pending.params, params["id"])

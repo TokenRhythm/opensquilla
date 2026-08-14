@@ -102,4 +102,3 @@ PY
 test ! -e "${install_root}/OpenSquilla.app"
 test ! -e "${install_root}/OpenSquilla.rc3.app"
 python "${probe}" verify --home "${profile}" --label "${label}"
-

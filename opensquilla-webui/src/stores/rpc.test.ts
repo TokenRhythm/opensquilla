@@ -8,6 +8,7 @@ const connectCalls: Array<{ url: string; token?: string }> = []
 const clients: Array<{
   emit: (event: string, ...args: unknown[]) => void
   disconnect: ReturnType<typeof vi.fn>
+  waitForConnection: ReturnType<typeof vi.fn>
 }> = []
 
 vi.mock('@/lib/rpc', () => ({
@@ -83,6 +84,24 @@ describe('rpc link-token bootstrap', () => {
     expect(window.location.href).toBe('http://localhost:3000/control/')
   })
 
+  it('delegates an aborted wait even when the reactive store is connected', async () => {
+    const store = useRpcStore()
+    store.init()
+    const controller = new AbortController()
+    controller.abort()
+    const abortError = new Error('aborted')
+    clients[0].waitForConnection.mockRejectedValueOnce(abortError)
+
+    await expect(
+      store.waitForConnection(123, controller.signal, { abortAction: 'reconnect' }),
+    ).rejects.toBe(abortError)
+    expect(clients[0].waitForConnection).toHaveBeenCalledWith(
+      123,
+      controller.signal,
+      { abortAction: 'reconnect' },
+    )
+  })
+
   it('reconnects with a URL token when an already-loaded app navigates to a token link', () => {
     localStorage.setItem('opensquilla.wsUrl', 'ws://localhost:3000/ws')
     localStorage.setItem('opensquilla.chat.draft:agent:main:webchat:old', 'stale draft')
@@ -145,5 +164,32 @@ describe('rpc link-token bootstrap', () => {
 
     clients[0].emit('_hello', {})
     expect(store.methods).toEqual([])
+  })
+
+  it('derives project capabilities from the current Hello owner and methods', () => {
+    const store = useRpcStore()
+    store.init()
+
+    clients[0].emit('_hello', {
+      auth: { principal: { isOwner: true } },
+      features: { methods: ['workspaces.list', 'workspaces.open'] },
+    })
+    expect(store.isLocalOwner).toBe(true)
+    expect(store.canManageProjectWorkspaces).toBe(true)
+    expect(store.canChooseProject).toBe(true)
+
+    clients[0].emit('_state', 'connecting')
+    expect(store.auth).toBeNull()
+    expect(store.methods).toEqual([])
+    expect(store.canManageProjectWorkspaces).toBe(false)
+
+    clients[0].emit('_state', 'connected')
+    clients[0].emit('_hello', {
+      auth: { principal: { isOwner: false } },
+      features: { methods: ['workspaces.list', 'workspaces.open'] },
+    })
+    expect(store.isLocalOwner).toBe(false)
+    expect(store.canManageProjectWorkspaces).toBe(false)
+    expect(store.canChooseProject).toBe(false)
   })
 })

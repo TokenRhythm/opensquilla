@@ -28,6 +28,83 @@ _BUDGET_CLASSES = frozenset(
     }
 )
 
+_SAFE_PROVIDER_FAILURE_MESSAGES = {
+    "rate_limited": "The model provider is rate-limiting requests. Try again later.",
+    "provider_overloaded": (
+        "The model provider is temporarily overloaded. Try again later."
+    ),
+    "auth_invalid": "The model provider rejected the configured credentials.",
+    "context_overflow": "The request exceeds the model provider's context window.",
+    "unsupported_feature": "The model provider does not support this request.",
+    "insufficient_credits": "The model provider account has insufficient credits.",
+    "model_not_found": "The configured model is unavailable from the provider.",
+    "transport_transient": (
+        "The connection to the model provider was interrupted. Try again."
+    ),
+    "policy_refusal": "The model provider refused this request under its policy.",
+    "empty_response": "The model provider returned an empty response.",
+    "malformed_response": "The model provider returned an invalid response.",
+    "bad_request": "The model provider rejected the request.",
+}
+_SAFE_PROVIDER_TERMINAL_CODES = frozenset(
+    {
+        "cancelled",
+        "context_length_exceeded",
+        "context_overflow",
+        "empty_response",
+        "ensemble_multimodal_unsupported",
+        "incomplete_stream",
+        "incomplete_tool_call",
+        "incomplete_tool_stream",
+        "invalid_json",
+        "invalid_response",
+        "invalid_response_status",
+        "invalid_stream_frame",
+        "invalid_stream_order",
+        "model_repetition_loop_detected",
+        "provider_protocol_error",
+        "provider_output_truncated",
+        "provider_pretext_buffer_exhausted",
+        "provider_retry_after_deadline",
+        "provider_request_budget_exhausted",
+        "provider_request_too_large",
+        "request_error",
+        "response_incomplete",
+        "synthetic_upstream_failure",
+        "timeout",
+        "usage_limit_reached",
+    }
+)
+
+
+def safe_provider_failure_message(failure_kind: str | None) -> str:
+    """Project a stable provider failure kind to allowlisted user text.
+
+    This is a defense-in-depth boundary for Gateway producers other than the
+    current Agent. Raw upstream prose can echo prompts, response bodies, or
+    credentials and must never reach a client or durable terminal record.
+    """
+
+    normalized = str(failure_kind or "").strip().lower().replace("-", "_")
+    return _SAFE_PROVIDER_FAILURE_MESSAGES.get(
+        normalized,
+        "The model provider request failed.",
+    )
+
+
+def safe_provider_failure_code(raw_code: str | None, failure_kind: str | None) -> str:
+    """Return a bounded terminal code without relaying provider-controlled text."""
+
+    normalized_code = str(raw_code or "").strip().lower().replace("-", "_")
+    if normalized_code.isascii() and normalized_code.isdigit() and len(normalized_code) <= 3:
+        return normalized_code
+    if normalized_code in _SAFE_PROVIDER_TERMINAL_CODES:
+        return normalized_code
+    normalized_kind = str(failure_kind or "").strip().lower().replace("-", "_")
+    if normalized_kind in _SAFE_PROVIDER_FAILURE_MESSAGES:
+        return f"provider_{normalized_kind}"
+    return "provider_error"
+
 
 def build_terminal_reply(
     record_or_payload: Any,
@@ -78,6 +155,11 @@ def build_terminal_reply(
         )
     if reason == "output_truncated" or error_class == "provider_output_truncated":
         return "The provider stopped because the output limit was reached before the task finished."
+    if (
+        reason == "model_repetition_loop_detected"
+        or error_class == "model_repetition_loop_detected"
+    ):
+        return "The model began repeating the same output, so OpenSquilla stopped the task."
     if status == AgentTaskStatus.CANCELLED.value or reason.startswith("cancelled"):
         return "The task was cancelled before it finished."
     if status == AgentTaskStatus.ABANDONED.value or reason == "shutdown_timeout":

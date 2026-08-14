@@ -7,8 +7,23 @@ import pytest
 from opensquilla.sandbox.run_mode import RunMode
 
 
+class _RuntimePreferenceStorage:
+    def __init__(self, run_mode: str | None = None) -> None:
+        self.run_mode = run_mode
+
+    async def get_runtime_preference(self, key: str) -> str | None:
+        assert key == "sandbox.run_mode"
+        return self.run_mode
+
+
 class _SessionManager:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        run_mode_preference: str | None = None,
+        storage: object | None = None,
+    ):
+        self.storage = storage or _RuntimePreferenceStorage(run_mode_preference)
         self.node = SimpleNamespace(
             session_key="agent:main:webchat:abc",
             agent_id="main",
@@ -41,8 +56,80 @@ class _SessionManager:
         return node
 
 
+def test_run_context_round_trips_mode_source() -> None:
+    from opensquilla.sandbox.run_context import (
+        RunContext,
+        run_context_from_origin_payload,
+    )
+
+    context = RunContext(
+        run_mode=RunMode.SAFE,
+        workspace="/tmp/project",
+        run_mode_source="project_default",
+    )
+    restored = run_context_from_origin_payload(context.to_origin_payload())
+    assert restored is not None
+    assert restored.run_mode_source == "project_default"
+
+
+def test_run_context_rejects_unknown_mode_source() -> None:
+    from opensquilla.sandbox.run_context import run_context_from_origin_payload
+
+    restored = run_context_from_origin_payload(
+        {
+            "run_mode": "full",
+            "workspace": "/tmp/project",
+            "run_mode_source": "persisted_origin_claim",
+        }
+    )
+
+    assert restored is not None
+    assert restored.run_mode_source is None
+
+
+def test_run_context_rejects_unhashable_mode_source() -> None:
+    from opensquilla.sandbox.run_context import run_context_from_origin_payload
+
+    restored = run_context_from_origin_payload(
+        {
+            "run_mode": "full",
+            "workspace": "/tmp/project",
+            "run_mode_source": {"forged": "user"},
+        }
+    )
+
+    assert restored is not None
+    assert restored.run_mode_source is None
+
+
+def test_effective_legacy_project_full_remains_full() -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.sandbox.run_context import RunContext, effective_project_run_mode
+
+    resolved = effective_project_run_mode(
+        RunContext(run_mode=RunMode.FULL, workspace="/tmp/project"),
+        GatewayConfig(),
+    )
+
+    assert resolved.run_mode is RunMode.FULL
+    assert resolved.run_mode_source is None
+
+
+def test_effective_legacy_project_preserves_explicit_full() -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.sandbox.run_context import RunContext, effective_project_run_mode
+
+    resolved = effective_project_run_mode(
+        RunContext(run_mode=RunMode.FULL, workspace="/tmp/project"),
+        GatewayConfig(sandbox={"run_mode": "full"}),
+    )
+
+    assert resolved.run_mode is RunMode.FULL
+    assert resolved.run_mode_source is None
+
+
 @pytest.mark.asyncio
-async def test_default_run_context_is_full_host_access() -> None:
+async def test_fresh_owner_default_run_context_is_full() -> None:
     from opensquilla.sandbox.config import SandboxSettings
     from opensquilla.sandbox.run_context import get_run_context
 
@@ -64,8 +151,142 @@ async def test_default_run_context_is_full_host_access() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_context_initializes_from_global_default_and_persists_override() -> None:
-    from opensquilla.sandbox.run_context import get_run_context, set_run_mode
+@pytest.mark.parametrize(
+    ("stored_mode", "updated_config_mode", "expected"),
+    [
+        pytest.param("safe", "full", RunMode.SAFE, id="stored-safe"),
+        pytest.param("full", "safe", RunMode.FULL, id="stored-full"),
+    ],
+)
+async def test_persisted_owner_preference_wins_over_direct_config_update(
+    tmp_path,
+    stored_mode: str,
+    updated_config_mode: str,
+    expected: RunMode,
+) -> None:
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.run_context import get_run_context
+    from opensquilla.session.storage import SessionStorage
+
+    database = tmp_path / f"preferences-{stored_mode}.sqlite"
+    storage = SessionStorage(str(database))
+    await storage.connect()
+    await storage.set_runtime_preference("sandbox.run_mode", stored_mode)
+    await storage.close()
+
+    restarted = SessionStorage(str(database))
+    await restarted.connect()
+    manager = _SessionManager(storage=restarted)
+    config = SimpleNamespace(
+        sandbox=SandboxSettings(run_mode=updated_config_mode),
+        permissions=SimpleNamespace(default_mode="off"),
+    )
+
+    try:
+        context = await get_run_context(
+            manager,
+            manager.node.session_key,
+            config=config,
+            workspace="/workspace",
+        )
+    finally:
+        await restarted.close()
+
+    assert context.run_mode is expected
+    assert context.source == "default"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_mode", "updated_config_mode", "expected"),
+    [
+        pytest.param("trusted", "full", RunMode.SAFE, id="legacy-trusted"),
+        pytest.param("managed", "full", RunMode.SAFE, id="legacy-managed"),
+        pytest.param("bypass", "safe", RunMode.FULL, id="legacy-full"),
+    ],
+)
+async def test_persisted_legacy_preference_names_resolve_to_current_modes(
+    stored_mode: str,
+    updated_config_mode: str,
+    expected: RunMode,
+) -> None:
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.run_context import get_run_context
+
+    manager = _SessionManager(run_mode_preference=stored_mode)
+    context = await get_run_context(
+        manager,
+        manager.node.session_key,
+        config=SimpleNamespace(
+            sandbox=SandboxSettings(run_mode=updated_config_mode),
+            permissions=SimpleNamespace(default_mode="off"),
+        ),
+        workspace="/workspace",
+    )
+
+    assert context.run_mode is expected
+    assert context.run_mode.value in {"safe", "full"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "session_key",
+    [
+        pytest.param("agent:main:cli:fresh", id="cli"),
+        pytest.param("agent:main:cron:nightly", id="background"),
+        pytest.param("agent:main:task:no-hint", id="no-hint"),
+    ],
+)
+async def test_no_hint_owner_tasks_use_persisted_preference(session_key: str) -> None:
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.run_context import get_run_context
+
+    manager = _SessionManager(run_mode_preference="safe")
+    context = await get_run_context(
+        manager,
+        session_key,
+        config=SimpleNamespace(
+            sandbox=SandboxSettings(run_mode="full"),
+            permissions=SimpleNamespace(default_mode="full"),
+        ),
+        workspace=None,
+    )
+
+    assert context.run_mode is RunMode.SAFE
+    assert context.source == "default"
+
+
+@pytest.mark.asyncio
+async def test_delegating_manager_view_resolves_persisted_preference() -> None:
+    from opensquilla.sandbox.config import SandboxSettings
+    from opensquilla.sandbox.run_context import get_run_context
+
+    manager = _SessionManager(run_mode_preference="safe")
+
+    class _DelegatingManagerView:
+        def __getattr__(self, name: str) -> object:
+            return getattr(manager, name)
+
+    context = await get_run_context(
+        _DelegatingManagerView(),
+        manager.node.session_key,
+        config=SimpleNamespace(
+            sandbox=SandboxSettings(run_mode="full"),
+            permissions=SimpleNamespace(default_mode="full"),
+        ),
+        workspace=None,
+    )
+
+    assert context.run_mode is RunMode.SAFE
+
+
+@pytest.mark.asyncio
+async def test_sandbox_run_mode_set_persists_user_provenance() -> None:
+    from opensquilla.sandbox.run_context import (
+        get_run_context,
+        run_context_from_origin_payload,
+        set_run_mode,
+    )
 
     manager = _SessionManager()
     config = SimpleNamespace(
@@ -79,12 +300,17 @@ async def test_run_context_initializes_from_global_default_and_persists_override
         config=config,
         workspace="/tmp/ws",
     )
-    assert ctx.run_mode == RunMode.STANDARD
+    assert ctx.run_mode == RunMode.SAFE
     assert ctx.source == "default"
 
-    updated = await set_run_mode(manager, manager.node.session_key, RunMode.TRUSTED, config=config)
-    assert updated.run_mode == RunMode.TRUSTED
-    assert manager.node.origin["sandbox_run_context"]["run_mode"] == "trusted"
+    updated = await set_run_mode(manager, manager.node.session_key, RunMode.SAFE, config=config)
+    assert updated.run_mode == RunMode.SAFE
+    restored = run_context_from_origin_payload(
+        manager.node.origin["sandbox_run_context"]
+    )
+    assert restored is not None
+    assert restored.run_mode is RunMode.SAFE
+    assert restored.run_mode_source == "user"
 
 
 @pytest.mark.asyncio
@@ -102,7 +328,7 @@ async def test_set_run_mode_persists_first_workspace_and_preserves_origin_keys()
     updated = await set_run_mode(
         manager,
         manager.node.session_key,
-        RunMode.TRUSTED,
+        RunMode.SAFE,
         config=config,
         workspace="/tmp/ws",
     )
@@ -113,7 +339,7 @@ async def test_set_run_mode_persists_first_workspace_and_preserves_origin_keys()
 
 
 @pytest.mark.asyncio
-async def test_globally_disabled_sandbox_overrides_saved_restricted_mode() -> None:
+async def test_saved_restricted_mode_overrides_globally_disabled_sandbox() -> None:
     from opensquilla.sandbox.run_context import get_run_context, normalize_workspace_path
 
     manager = _SessionManager()
@@ -131,9 +357,9 @@ async def test_globally_disabled_sandbox_overrides_saved_restricted_mode() -> No
         workspace="/tmp/new",
     )
 
-    assert ctx.run_mode == RunMode.FULL
+    assert ctx.run_mode == RunMode.SAFE
     assert ctx.workspace == expected_workspace
-    assert ctx.source == "global_full"
+    assert ctx.source == "saved"
 
 
 @pytest.mark.asyncio
@@ -188,6 +414,7 @@ async def test_rpc_run_context_set_rejects_non_owner_full_mode_without_mutation(
             scopes=frozenset(["operator.write", "operator.read"]),
             is_owner=False,
             authenticated=True,
+            capabilities=frozenset({"task.read"}),
         ),
         session_manager=manager,
         config=config,
@@ -234,17 +461,22 @@ async def test_rpc_run_context_set_allows_owner_full_mode() -> None:
 
     assert result["runMode"] == "full"
     assert manager.node.origin["sandbox_run_context"]["run_mode"] == "full"
+    assert manager.node.origin["sandbox_run_context"]["run_mode_source"] == "user"
 
 
 @pytest.mark.asyncio
-async def test_rpc_run_context_set_allows_non_owner_trusted_mode(
+async def test_rpc_run_context_set_decodes_non_owner_legacy_trusted_mode(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from opensquilla.gateway import rpc_sandbox
     from opensquilla.gateway.auth import Principal
     from opensquilla.gateway.rpc import RpcContext
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_set
-    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+    from opensquilla.sandbox.capability_service import (
+        REQUIRED_SAFE_CAPABILITIES,
+        WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+        CapabilityReport,
+    )
 
     manager = _SessionManager()
     config = SimpleNamespace(
@@ -266,26 +498,29 @@ async def test_rpc_run_context_set_allows_non_owner_trusted_mode(
     )
 
     async def ready_status(config):
-        return SetupResult(
-            state=SandboxSetupState.READY,
+        return CapabilityReport.available_for(
+            backend="windows_native",
             platform="win32",
-            message="ready",
-            requires_admin=True,
+            capabilities=REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES,
         )
 
-    monkeypatch.setattr(rpc_sandbox, "current_sandbox_setup_status", ready_status)
+    monkeypatch.setattr(rpc_sandbox, "current_sandbox_capability_report", ready_status)
 
     result = await _handle_sandbox_run_context_set(
         {"sessionKey": manager.node.session_key, "runMode": "trusted"},
         ctx,
     )
 
-    assert result["runMode"] == "trusted"
-    assert manager.node.origin["sandbox_run_context"]["run_mode"] == "trusted"
+    assert result["runMode"] == "safe"
+    assert manager.node.origin["sandbox_run_context"]["run_mode"] == "safe"
+    assert manager.node.origin["sandbox_run_context"]["run_mode_source"] == "user"
 
 
 @pytest.mark.asyncio
-async def test_rpc_run_context_get_coerces_non_owner_default_full_to_trusted() -> None:
+@pytest.mark.parametrize("auth_state", ["guest", "invalid"])
+async def test_rpc_run_context_get_coerces_remote_guest_default_full_to_safe(
+    auth_state: str,
+) -> None:
     from opensquilla.gateway.auth import Principal
     from opensquilla.gateway.rpc import RpcContext
     from opensquilla.gateway.rpc_sandbox import _handle_sandbox_run_context_get
@@ -304,6 +539,8 @@ async def test_rpc_run_context_get_coerces_non_owner_default_full_to_trusted() -
             scopes=frozenset(["operator.read"]),
             is_owner=False,
             authenticated=False,
+            capabilities=frozenset({"guest.safe"}),
+            auth_state=auth_state,
         ),
         session_manager=manager,
         config=config,
@@ -314,7 +551,7 @@ async def test_rpc_run_context_get_coerces_non_owner_default_full_to_trusted() -
         ctx,
     )
 
-    assert result["runMode"] == "trusted"
+    assert result["runMode"] == "safe"
     assert result["source"] == "default"
     assert manager.node.origin is None
 
@@ -326,7 +563,11 @@ async def test_rpc_run_context_set_creates_owner_new_webchat_session(
     from opensquilla.gateway import rpc_sandbox
     from opensquilla.gateway.auth import Principal
     from opensquilla.gateway.rpc import RpcContext
-    from opensquilla.sandbox.setup_state import SandboxSetupState, SetupResult
+    from opensquilla.sandbox.capability_service import (
+        REQUIRED_SAFE_CAPABILITIES,
+        WINDOWS_REQUIRED_SAFE_CAPABILITIES,
+        CapabilityReport,
+    )
 
     manager = _SessionManager()
     session_key = "agent:main:webchat:dkkwi6so"
@@ -348,21 +589,25 @@ async def test_rpc_run_context_set_creates_owner_new_webchat_session(
         config=config,
     )
 
-    async def fake_status(config: object) -> SetupResult:
-        return SetupResult(
-            state=SandboxSetupState.READY,
+    async def fake_status(config: object) -> CapabilityReport:
+        return CapabilityReport.available_for(
+            backend="windows_native",
             platform="win32",
-            message="ready",
-            requires_admin=True,
+            capabilities=REQUIRED_SAFE_CAPABILITIES | WINDOWS_REQUIRED_SAFE_CAPABILITIES,
         )
 
-    monkeypatch.setattr(rpc_sandbox, "current_sandbox_setup_status", fake_status)
+    monkeypatch.setattr(rpc_sandbox, "current_sandbox_capability_report", fake_status)
 
     result = await rpc_sandbox._handle_sandbox_run_context_set(
         {"sessionKey": session_key, "runMode": "trusted"},
         ctx,
     )
 
-    assert result["runMode"] == "trusted"
+    assert result["runMode"] == "safe"
     assert manager.created == [(session_key, "main")]
-    assert manager.sessions[session_key].origin["sandbox_run_context"]["run_mode"] == "trusted"
+    assert manager.sessions[session_key].origin["sandbox_run_context"]["run_mode"] == "safe"
+    assert (
+        manager.sessions[session_key]
+        .origin["sandbox_run_context"]["run_mode_source"]
+        == "user"
+    )

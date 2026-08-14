@@ -75,6 +75,23 @@ def test_file_is_cli_gateway_local_action_only() -> None:
     assert DEFAULT_REGISTRY.find("/file", Surface.CLI_STANDALONE) is None
 
 
+def test_coding_mode_is_a_web_only_local_slash_command() -> None:
+    cmd = DEFAULT_REGISTRY.find("/coding", Surface.WEB_CHAT)
+    assert cmd is not None
+    assert cmd.surfaces == frozenset({Surface.WEB_CHAT})
+    assert cmd.argument_choices == ()
+    assert cmd.usage == "/coding [on|off|status]"
+
+    execution = cmd.execution_for(Surface.WEB_CHAT)
+    assert execution is not None
+    assert execution.kind is ExecutionKind.LOCAL
+    assert execution.action == "coding.mode"
+
+    assert DEFAULT_REGISTRY.find("/coding", Surface.CLI_GATEWAY) is None
+    assert DEFAULT_REGISTRY.find("/coding", Surface.CLI_STANDALONE) is None
+    assert DEFAULT_REGISTRY.find("/coding", Surface.CHANNEL) is None
+
+
 def test_aliases_resolve_for_visible_surface_only() -> None:
     assert DEFAULT_REGISTRY.find("/clear", Surface.WEB_CHAT).name == "/reset"  # type: ignore[union-attr]
     assert DEFAULT_REGISTRY.find("/clear", Surface.CHANNEL).name == "/reset"  # type: ignore[union-attr]
@@ -104,7 +121,7 @@ def test_cli_gateway_command_metadata_has_curated_order_and_compatibility() -> N
         key=lambda cmd: cmd.order,
     )
 
-    assert [cmd.name for cmd in palette[:11]] == [
+    assert [cmd.name for cmd in palette[:12]] == [
         "/model",
         "/strategy",
         "/sessions",
@@ -115,6 +132,7 @@ def test_cli_gateway_command_metadata_has_curated_order_and_compatibility() -> N
         "/usage",
         "/theme",
         "/help",
+        "/keys",
         "/exit",
     ]
 

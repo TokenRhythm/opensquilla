@@ -46,29 +46,81 @@ opensquilla skills search pdf
 ```
 
 Some skills may be ineligible when optional dependencies are missing or when the
-skill is intentionally demo-only. `skills list` is the source of truth for your
-current install.
+skill is intentionally demo-only. Use `skills doctor` when you need to distinguish
+installation, loader acceptance, precedence, and dependency readiness:
+
+```sh
+opensquilla skills doctor
+opensquilla skills doctor <skill-name-or-install-id> --json
+```
 
 ## Install, Update, and Remove Skills
 
 Install a managed skill:
 
 ```sh
-opensquilla skills install <skill-name>
+opensquilla skills install <clawhub-install-reference> --source clawhub
+opensquilla skills install <owner/repo[@ref][:subpath]> --source github
 ```
 
 Update one skill or all managed skills:
 
 ```sh
 opensquilla skills update <skill-name>
+opensquilla skills update --install-id <install-id>
 opensquilla skills update --all
 ```
+
+When the heuristic scanner requests confirmation, review the returned findings
+and `confirmationToken`, then retry that exact artifact with both
+`--force --risk-confirmation <confirmation-token>`. The token is bound to the
+resolved source revision and fetched content; a changed artifact requires a new
+review. Confirmation does not bypass archive, path, digest, transaction, or
+postflight validation.
 
 Remove a managed skill:
 
 ```sh
 opensquilla skills uninstall <skill-name>
+opensquilla skills uninstall --install-id <install-id>
 ```
+
+OpenSquilla currently supports single-root, instruction-first Community Skills
+from ClawHub and GitHub. A flat package or one wrapper directory is accepted. A
+GitHub branch or tag is resolved to an immutable commit before files are fetched.
+An install commits content and provenance; it does not install declared runtime
+dependencies.
+
+An installed Skill is not necessarily usable. It may be shadowed by a
+higher-precedence Skill, disabled by configuration, or require setup. Online
+install results become observable to agent turns from the next turn because the
+current turn keeps a pinned catalog. Offline CLI installs are only validated for
+the next Gateway start; activation and readiness are evaluated at that start.
+
+Community package identity, the safe managed-directory key, and the runtime
+frontmatter `name` are tracked separately. A package can therefore retain an
+ecosystem-native runtime name without using that value as a filesystem path.
+When multiple packages expose the same runtime name, exact mutations use the
+install identity; ambiguous name-only mutations fail without changing either
+installation.
+
+This is not full Claude Skills or OpenClaw Skills execution compatibility.
+Direct `/skill` commands, argument substitution, scoped tool permissions, hooks,
+context forks, plugin/MCP activation, and executable sandbox materialization are
+not activated by Community installation. Community manifests are projected into
+an instruction-only runtime profile: instruction text and safe invocation
+metadata remain usable, while unsupported control-flow or executable fields are
+kept inert and reported as compatibility diagnostics. A Skill that declares
+`allowed-tools` does not receive that preapproval; OpenSquilla keeps the normal
+tool approval policy and reports `TOOL_PREAPPROVAL_IGNORED` through Doctor.
+Claude-style ``!`command` `` dynamic context is retained as instruction text
+rather than executed while loading; Doctor reports
+`DYNAMIC_CONTEXT_UNSUPPORTED` and marks the installation as degraded.
+
+The Web UI installs GitHub references serially, with at most 10 unique references
+per batch. Ordinary item failures do not roll back successful items or stop later
+items. A GitHub rate-limit response pauses the remaining references as not
+attempted and keeps them in the input for a later batch.
 
 ## Manage Skill Sources
 
@@ -143,12 +195,20 @@ If a skill is not selected:
 
    ```sh
    opensquilla skills view <skill-name>
+   opensquilla skills doctor <skill-name>
    ```
 
 3. Ask for the outcome in normal language. Skill names can help, but user
    intent should still be clear.
 
-4. If optional dependencies are missing, install or update the skill and retry.
+4. If Doctor reports `needs_setup`, install the declared dependency separately,
+   then rerun Doctor. Doctor itself is read-only: it does not use the network,
+   run third-party scripts, or call an LLM.
+
+If a newly upgraded CLI reports `GATEWAY_UPGRADE_REQUIRED`, restart the running
+Gateway from the same upgraded installation before retrying Doctor. The CLI
+does not silently switch to an offline scan while an older Gateway still owns
+the profile.
 
 For composed workflows, read [`meta-skills.md`](meta-skills.md). For the full
 MetaSkill user guide, read [`meta-skill-user-guide.md`](meta-skill-user-guide.md).

@@ -84,6 +84,7 @@ function isActive(path: string): boolean {
   display: flex;
   flex-direction: column;
   gap: var(--sp-4);
+  position: relative;
 }
 
 .route-hub__bar {
@@ -164,6 +165,22 @@ function isActive(path: string): boolean {
 
   .route-hub :deep(.control-stage__header) {
     padding-top: var(--sp-2);
+  }
+
+  /* A hosted view can opt its compact action-only header into the hub bar.
+     Removing it from the child stage flow avoids a blank second toolbar row,
+     while the hub's desktop top padding continues to clear the app topbar. */
+  .route-hub :deep(.control-stage--hub-actions) {
+    position: static;
+  }
+
+  .route-hub :deep(.control-stage__header--hub-actions) {
+    align-items: center;
+    height: 39px;
+    padding-top: 0;
+    position: absolute;
+    right: 0;
+    top: calc(36px + var(--sp-2));
   }
 }
 

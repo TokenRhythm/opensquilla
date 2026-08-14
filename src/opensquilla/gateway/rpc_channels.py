@@ -49,11 +49,19 @@ def _health_extra(health: Any) -> dict[str, Any]:
     return extra if isinstance(extra, dict) else {}
 
 
-def _status_for(*, connected: bool, enabled: bool, dispatch_state: str | None) -> str:
+def _status_for(
+    *,
+    connected: bool,
+    enabled: bool,
+    dispatch_state: str | None,
+    connection_phase: str | None,
+) -> str:
     if not enabled:
         return "disabled"
     if dispatch_state in {"dead", "exhausted", "restarting"}:
         return dispatch_state
+    if connection_phase in {"connecting", "reconnecting"}:
+        return "restarting"
     return _channel_status(connected)
 
 
@@ -135,6 +143,8 @@ def _diagnostics_payload(
         last_error = _diagnostic_from_health_extra(extra)
     if last_error is not None:
         payload["last_error"] = last_error
+    if extra is not None and isinstance(extra.get("connection_phase"), str):
+        payload["connection_phase"] = extra["connection_phase"]
     if extra is not None and isinstance(extra.get("transport_lease"), dict):
         payload["transport_lease"] = dict(extra["transport_lease"])
     if delivery is not None:
@@ -344,6 +354,7 @@ async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[
                     connected=connected,
                     enabled=enabled,
                     dispatch_state=extra.get("dispatch_state"),
+                    connection_phase=extra.get("connection_phase"),
                 ),
                 "bot_user_id": getattr(health, "bot_user_id", None) if health else None,
                 "connected_since": extra.get("connected_since"),
@@ -381,6 +392,7 @@ async def _handle_channels_status(params: dict | None, ctx: RpcContext) -> dict[
                     connected=connected,
                     enabled=True,
                     dispatch_state=extra.get("dispatch_state"),
+                    connection_phase=extra.get("connection_phase"),
                 ),
                 "bot_user_id": getattr(health, "bot_user_id", None),
                 "connected_since": extra.get("connected_since"),
@@ -619,14 +631,13 @@ async def _send_pairing_approved_notice(ctx: RpcContext, record: Any) -> None:
     send = getattr(adapter, "send", None)
     if not callable(send):
         return
+    from opensquilla.channels.system_messages import render_channel_message
     from opensquilla.channels.types import OutgoingMessage
 
     try:
         await send(
             OutgoingMessage(
-                content=(
-                    "Access approved. Send a message to start chatting."
-                ),
+                content=render_channel_message("pairing_approved", config=ctx.config),
                 reply_to=reply_to,
                 metadata={"pairing_approved": True},
             )

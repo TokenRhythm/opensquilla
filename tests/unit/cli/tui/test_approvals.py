@@ -314,9 +314,39 @@ async def test_handler_routes_through_host_overlay_and_resolves_approval() -> No
             "tool": "sandbox_network",
             "summary": "network access to packages.example.test",
             "choices": ["allow_once", "allow_same_type", "deny"],
+            "message": "Network access needs approval.",
         }
     ]
     assert resolver.calls == [("appr-1", True, "allow_once")]
+
+
+async def test_host_payload_omits_message_when_it_already_is_the_summary() -> None:
+    handler = tui_approval_handler(output_console=_FakeConsole())
+    resolver = _Resolver()
+    handle = _HostOutputHandle(_FakeResponse(True, choice=None))
+    renderer = _RecordingRenderer(handle)
+
+    # No command/path/host: the summary falls back to the message itself, so
+    # forwarding the message too would render the same line twice.
+    await handler(
+        {
+            "status": "approval_required",
+            "approval_id": "appr-3",
+            "tool": "custom_tool",
+            "message": "Custom action needs approval.",
+        },
+        renderer,
+        resolver,
+    )
+
+    assert handle.requests == [
+        {
+            "id": "appr-3",
+            "tool": "custom_tool",
+            "summary": "Custom action needs approval.",
+            "choices": [],
+        }
+    ]
 
 
 async def test_handler_host_choice_response_is_authoritative() -> None:
@@ -614,3 +644,33 @@ async def test_default_handler_resolves_through_host_capable_renderer() -> None:
 
     assert [request["id"] for request in handle.requests] == ["appr-2"]
     assert resolver.calls == [("appr-2", True, None)]
+
+
+async def test_host_payload_strips_control_bytes_and_dedups_after_sanitizing() -> None:
+    handler = tui_approval_handler(output_console=_FakeConsole())
+    resolver = _Resolver()
+    handle = _HostOutputHandle(_FakeResponse(True, choice=None))
+    renderer = _RecordingRenderer(handle)
+
+    # The message differs from the summary only by embedded control bytes:
+    # after sanitizing they render identically, so no message is forwarded.
+    await handler(
+        {
+            "status": "approval_required",
+            "approval_id": "appr-4",
+            "tool": "shell",
+            "command": "echo\x1b[31m ok\x07",
+            "message": "echo ok",
+        },
+        renderer,
+        resolver,
+    )
+
+    assert handle.requests == [
+        {
+            "id": "appr-4",
+            "tool": "shell",
+            "summary": "echo ok",
+            "choices": [],
+        }
+    ]

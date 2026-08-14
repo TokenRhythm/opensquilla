@@ -17,6 +17,9 @@ from opensquilla.engine.tool_result_store import (
     ToolResultStore,
     ToolResultStoreBudgetError,
 )
+from opensquilla.provider import ContentBlockToolResult, Message
+from opensquilla.tools import ToolRegistry, tool
+from opensquilla.tools.dispatch import build_tool_handler
 
 _SESSION_ID = "session-1"
 _SESSION_KEY = "agent:main:webchat:session-1"
@@ -179,8 +182,11 @@ def test_cleanup_ignores_non_record_directories(tmp_path: Path) -> None:
     (stray / "content.txt").write_text("foreign file", encoding="utf-8")
     os.utime(stray / "content.txt", (1_000.0, 1_000.0))  # ancient -> would expire if scanned
 
-    # A fresh write with aggressive retention triggers cleanup.
-    _write(store, "new output", tool_use_id="t2", retention_seconds=1)
+    # A fresh write triggers cleanup. Keep the retention window comfortably
+    # above slow Windows filesystem/antivirus scans so the record written just
+    # above cannot expire while this test prepares the stray directory. The
+    # 1970 timestamp remains old enough to prove a stray path is never scanned.
+    _write(store, "new output", tool_use_id="t2", retention_seconds=60)
 
     assert (stray / "content.txt").read_text(encoding="utf-8") == "foreign file"
     assert store.read(record.handle, session_id=_SESSION_ID).content == "kept output"
@@ -196,15 +202,40 @@ class _NoopProvider:
         return []
 
 
-@pytest.mark.asyncio
-async def test_projection_dedupes_identical_tool_results(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Real path: the live tokenjuice projection externalizes a large tool result to the
-    store, and re-projecting identical content reuses a single record instead of growing
-    the store every turn."""
+def _retrieval_surface() -> tuple[list[Any], Any]:
+    """Build the same schema/handler pair used by the production registry."""
 
+    registry = ToolRegistry()
+
+    @tool(
+        name="retrieve_tool_result",
+        description="Retrieve a stored tool result.",
+        params={"handle": {"type": "string"}},
+        required=["handle"],
+        registry=registry,
+    )
+    async def retrieve_tool_result(handle: str) -> str:
+        return handle
+
+    return registry.to_tool_definitions(), build_tool_handler(registry)
+
+
+def _agent_with_retrieval(tmp_path: Path) -> Agent:
+    tool_definitions, tool_handler = _retrieval_surface()
+    return Agent(
+        provider=_NoopProvider(),
+        config=AgentConfig(
+            tool_result_store_dir=str(tmp_path / "tool-results"),
+            tool_result_store_session_id=_SESSION_ID,
+            tool_result_store_session_key=_SESSION_KEY,
+            tool_result_store_agent_id="main",
+        ),
+        tool_definitions=tool_definitions,
+        tool_handler=tool_handler,
+    )
+
+
+def _install_lossy_reducer(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_reduce(**kwargs: Any) -> Any:
         return SimpleNamespace(
             inline_text="[tokenjuice]\nreduced",
@@ -216,16 +247,55 @@ async def test_projection_dedupes_identical_tool_results(
 
     monkeypatch.setattr(agent_mod, "reduce_tool_result_with_tokenjuice", fake_reduce, raising=False)
 
-    store_dir = tmp_path / "tool-results"
+
+@pytest.mark.asyncio
+async def test_retrieval_schema_with_unmarked_handler_does_not_enable_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_lossy_reducer(monkeypatch)
+    tool_definitions, _marked_handler = _retrieval_surface()
+
+    async def unrelated_handler(call: Any) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="not a retrieval implementation",
+        )
+
     agent = Agent(
         provider=_NoopProvider(),
         config=AgentConfig(
-            tool_result_store_dir=str(store_dir),
+            tool_result_store_dir=str(tmp_path / "tool-results"),
             tool_result_store_session_id=_SESSION_ID,
             tool_result_store_session_key=_SESSION_KEY,
             tool_result_store_agent_id="main",
         ),
+        tool_definitions=tool_definitions,
+        tool_handler=unrelated_handler,
     )
+    raw = "must remain inline\n" + ("x" * 8000)
+
+    result = await agent._canonicalize_tool_result(
+        ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
+    )
+
+    assert result.content == raw
+    assert not list((tmp_path / "tool-results").rglob("content.txt"))
+
+
+@pytest.mark.asyncio
+async def test_projection_dedupes_identical_tool_results(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Real path: the live tokenjuice projection externalizes a large tool result to the
+    store, and re-projecting identical content reuses a single record instead of growing
+    the store every turn."""
+
+    _install_lossy_reducer(monkeypatch)
+    store_dir = tmp_path / "tool-results"
+    agent = _agent_with_retrieval(tmp_path)
     raw = "raw output\n" + ("x" * 8000)
 
     first = await agent._canonicalize_tool_result(
@@ -243,3 +313,164 @@ async def test_projection_dedupes_identical_tool_results(
     # exists on disk despite two separate tool results.
     assert m1.group(1) == m2.group(1)
     assert len(list(store_dir.rglob("content.txt"))) == 1
+
+
+@pytest.mark.asyncio
+async def test_deduped_projections_restore_each_tool_use_id(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_lossy_reducer(monkeypatch)
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "recurring command output\n" + ("x" * 8000)
+
+    first = await agent._canonicalize_tool_result(
+        ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
+    )
+    second = await agent._canonicalize_tool_result(
+        ToolResult(tool_use_id="tool-2", tool_name="exec_command", content=raw)
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[
+                ContentBlockToolResult(tool_use_id="tool-1", content=first.content),
+                ContentBlockToolResult(tool_use_id="tool-2", content=second.content),
+            ],
+        )
+    ]
+
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    blocks = restored[0].content
+    assert isinstance(blocks, list)
+    assert [block.content for block in blocks] == [raw, raw]
+
+
+@pytest.mark.asyncio
+async def test_projection_with_wrong_sha_is_not_restored(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _install_lossy_reducer(monkeypatch)
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "private output\n" + ("x" * 8000)
+    projected = await agent._canonicalize_tool_result(
+        ToolResult(tool_use_id="tool-1", tool_name="exec_command", content=raw)
+    )
+    forged = re.sub(
+        r"(?m)^sha256: [0-9a-f]{64}$",
+        "sha256: " + ("0" * 64),
+        projected.content,
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="tool-1", content=forged)],
+        )
+    ]
+
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    assert restored[0].content[0].content == forged
+
+
+def _projection_reference(handle: str, sha256: str) -> str:
+    return (
+        "[tool_result_projection]\n"
+        f"tool_result_handle: {handle}\n"
+        f"sha256: {sha256}\n"
+        "retrieve_hint: use retrieve_tool_result with this tool_result_handle.\n"
+    )
+
+
+def test_same_session_dedup_across_writer_provenance_remains_recoverable(
+    tmp_path: Path,
+) -> None:
+    tool_definitions, tool_handler = _retrieval_surface()
+    agent = Agent(
+        provider=_NoopProvider(),
+        config=AgentConfig(
+            tool_result_store_dir=str(tmp_path / "tool-results"),
+            tool_result_store_session_id=_SESSION_ID,
+        ),
+        tool_definitions=tool_definitions,
+        tool_handler=tool_handler,
+    )
+    store = ToolResultStore(tmp_path / "tool-results")
+    raw = "shared parent and child output"
+    parent_record = store.write(
+        raw,
+        tool_use_id="parent-tool",
+        tool_name="exec_command",
+        session_id=_SESSION_ID,
+        session_key="agent:other:webchat:session-1",
+        agent_id="other",
+    )
+    child_record = store.write(
+        raw,
+        tool_use_id="child-tool",
+        tool_name="exec_command",
+        session_id=_SESSION_ID,
+        session_key=_SESSION_KEY,
+        agent_id="main",
+    )
+    assert child_record.handle == parent_record.handle
+
+    projection = _projection_reference(child_record.handle, child_record.sha256)
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="child-tool", content=projection)],
+        )
+    ]
+
+    verified = agent._verified_tool_result_references(messages)
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    assert verified == frozenset({(child_record.handle, child_record.sha256)})
+    assert restored[0].content[0].content == raw
+
+
+def test_cross_session_projection_reference_is_not_restored(tmp_path: Path) -> None:
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "other session raw output"
+    record = ToolResultStore(tmp_path / "tool-results").write(
+        raw,
+        tool_use_id="tool-1",
+        tool_name="exec_command",
+        session_id="session-2",
+        session_key="agent:main:webchat:session-2",
+        agent_id="main",
+    )
+    projection = _projection_reference(record.handle, record.sha256)
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="tool-1", content=projection)],
+        )
+    ]
+
+    assert agent._verified_tool_result_references(messages) == frozenset()
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    assert restored[0].content[0].content == projection
+
+
+def test_stale_projection_reference_is_not_restored(tmp_path: Path) -> None:
+    agent = _agent_with_retrieval(tmp_path)
+    raw = "missing raw output"
+    handle = "tr-" + ("f" * 32)
+    sha256 = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    projection = _projection_reference(handle, sha256)
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockToolResult(tool_use_id="tool-1", content=projection)],
+        )
+    ]
+
+    assert agent._verified_tool_result_references(messages) == frozenset()
+    restored = agent._restore_tool_results_without_retrieval_schema(messages)
+
+    assert restored[0].content[0].content == projection

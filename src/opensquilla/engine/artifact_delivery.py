@@ -53,6 +53,62 @@ class OmittedArtifactPublishResult:
     resolved_target_keys: list[str] = field(default_factory=list)
 
 
+def _plan_run_is_delivery_ready(run: Any, ctx: ToolContext) -> bool:
+    status = str(getattr(run, "status", "") or "")
+    if status == "completed":
+        return True
+    if status != "running":
+        return False
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    active_task_id = str(getattr(run, "active_task_id", "") or "").strip()
+    step_states = list(getattr(run, "step_states", []) or [])
+    return (
+        bool(task_id)
+        and active_task_id == task_id
+        and getattr(run, "current_step_id", None) is None
+        and bool(step_states)
+        and all(
+            isinstance(state, dict)
+            and str(state.get("status") or "") in {"completed", "skipped"}
+            for state in step_states
+        )
+    )
+
+
+async def attached_plan_run_ready_for_auto_publish(
+    ctx: ToolContext | None,
+) -> bool | None:
+    """Resolve live PlanRun delivery readiness before the blocking publish phase.
+
+    ``None`` means the turn has no attached PlanRun. Attached runs fail closed
+    when their authoritative state cannot be read.
+    """
+
+    if ctx is None:
+        return None
+    run_id = str(getattr(ctx, "plan_run_id", "") or "").strip()
+    if not run_id:
+        return None
+    storage = getattr(ctx, "plan_storage", None)
+    get_plan_run = getattr(storage, "get_plan_run", None)
+    if not callable(get_plan_run):
+        log.warning(
+            "artifact_delivery.plan_run_readiness_unavailable",
+            extra={"plan_run_id": run_id, "reason": "storage_unavailable"},
+        )
+        return False
+    try:
+        run = await get_plan_run(run_id)
+    except Exception:  # noqa: BLE001 - delivery backstop must fail closed
+        log.warning(
+            "artifact_delivery.plan_run_readiness_lookup_failed",
+            extra={"plan_run_id": run_id},
+            exc_info=True,
+        )
+        return False
+    return run is not None and _plan_run_is_delivery_ready(run, ctx)
+
+
 def artifact_delivery_publish_target_key(
     raw_target: str,
     *,
@@ -131,15 +187,23 @@ def auto_publish_omitted_workspace_artifacts(
     ctx: ToolContext | None,
     *,
     final_text: str,
+    attached_plan_run_ready: bool | None = None,
 ) -> OmittedArtifactPublishResult:
     """Publish deliverable files the model wrote but forgot to publish.
 
     This is intentionally conservative: a file must be written through a tracked
     workspace file tool during the current turn, have a deliverable suffix, and
-    be named in the assistant's final text.
+    be named in the assistant's final text. Attached PlanRuns additionally
+    require live delivery-ready authorization resolved before entering this
+    blocking filesystem phase.
     """
 
     if ctx is None:
+        return OmittedArtifactPublishResult()
+    if (
+        str(getattr(ctx, "plan_run_id", "") or "").strip()
+        and attached_plan_run_ready is not True
+    ):
         return OmittedArtifactPublishResult()
     if not (
         ctx.workspace_dir

@@ -7,12 +7,14 @@ from typing import Any
 
 import pytest
 
-from opensquilla.engine import Agent, AgentConfig, SubagentSpec
+from opensquilla.engine import Agent, AgentConfig, SubagentSpec, ToolResult
 from opensquilla.engine.outcome import outcome_from_error
 from opensquilla.engine.pricing import PriceEntry, ResolvedModelPrice
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
-from opensquilla.engine.types import ErrorEvent
+from opensquilla.engine.types import DoneEvent as EngineDoneEvent
+from opensquilla.engine.types import ErrorEvent, ToolCall
 from opensquilla.engine.usage_accounting import (
+    UsageAccountingBusyError,
     UsageAccountingScope,
     UsageAccountingUnavailableError,
     UsageCallResult,
@@ -23,7 +25,16 @@ from opensquilla.engine.usage_accounting import (
     normalize_provider_usage,
     usd_to_nanos,
 )
-from opensquilla.provider import ChatConfig, Message, ModelCapabilities
+from opensquilla.provider import (
+    ChatConfig,
+    Message,
+    ModelCapabilities,
+    ProviderRequestCorrelation,
+    ToolDefinition,
+    ToolInputSchema,
+    ToolUseEndEvent,
+    ToolUseStartEvent,
+)
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import ErrorEvent as ProviderError
 from opensquilla.provider import TextDeltaEvent as ProviderText
@@ -63,6 +74,18 @@ class _UnavailableSink(_RecordingSink):
         raise UsageAccountingUnavailableError("ledger busy")
 
 
+class _BusySink(_RecordingSink):
+    async def start(self, call: UsageCallStart) -> None:
+        self.started.append(call)
+        raise UsageAccountingBusyError("ledger remained busy")
+
+
+class _InternalFailureSink(_RecordingSink):
+    async def start(self, call: UsageCallStart) -> None:
+        self.started.append(call)
+        raise RuntimeError("usage accounting internal failure")
+
+
 class _DoneProvider:
     provider_name = "fake"
 
@@ -92,6 +115,21 @@ class _DoneProvider:
             cost_source="provider_billed",
             model="model-a",
         )
+
+
+class _CorrelationCapturingProvider(_DoneProvider):
+    def __init__(self, sink: _RecordingSink) -> None:
+        super().__init__(sink)
+        self.configs: list[ChatConfig | None] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.configs.append(config)
+        return super().chat(messages, tools=tools, config=config)
 
 
 class _ErrorProvider:
@@ -159,10 +197,85 @@ class _SequenceProvider:
             yield event
 
 
+class _ParentChildSequenceProvider:
+    """Three physical calls: parent tool leg, child leg, parent final leg."""
+
+    provider_name = "fake"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        del messages, tools, config
+        self.calls += 1
+        return self._stream(self.calls)
+
+    async def _stream(self, call: int) -> AsyncIterator[Any]:
+        if call == 1:
+            yield ToolUseStartEvent(tool_use_id="spawn-1", tool_name="spawn_helper")
+            yield ToolUseEndEvent(
+                tool_use_id="spawn-1",
+                tool_name="spawn_helper",
+                arguments={},
+            )
+            yield ProviderDone(
+                stop_reason="tool_use",
+                input_tokens=30,
+                output_tokens=3,
+                billed_cost=0.03,
+                cost_source="provider_billed",
+                provider="fake",
+                model="parent-model",
+            )
+            return
+        if call == 2:
+            yield ProviderText(text="child result")
+            yield ProviderDone(
+                stop_reason="end_turn",
+                input_tokens=1000,
+                output_tokens=200,
+                billed_cost=0.5,
+                cost_source="provider_billed",
+                provider="fake",
+                model="child-model",
+            )
+            return
+        yield ProviderText(text="parent answer")
+        yield ProviderDone(
+            stop_reason="end_turn",
+            input_tokens=40,
+            output_tokens=4,
+            billed_cost=0.04,
+            cost_source="provider_billed",
+            provider="fake",
+            model="parent-model",
+        )
+
+
 class _PhysicalLegProvider(_SequenceProvider):
     def __init__(self, name: str, events: list[Any]) -> None:
         super().__init__([events])
         self.provider_name = name
+
+
+class _CorrelationCapturingPhysicalLegProvider(_PhysicalLegProvider):
+    def __init__(self, name: str, events: list[Any]) -> None:
+        super().__init__(name, events)
+        self.configs: list[ChatConfig | None] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[Any] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[Any]:
+        self.configs.append(config)
+        return super().chat(messages, tools=tools, config=config)
 
 
 class _FallbackSelector:
@@ -285,6 +398,28 @@ async def test_selector_preflight_rejects_ensemble_image_before_usage_or_fallbac
 
 
 @pytest.mark.asyncio
+async def test_selector_does_not_project_usage_accounting_error_as_provider_failure() -> None:
+    sink = _InternalFailureSink()
+    primary = _PhysicalLegProvider(
+        "openai",
+        [ProviderText(text="must not run"), ProviderDone(model="primary-model")],
+    )
+    fallback = _PhysicalLegProvider(
+        "anthropic",
+        [ProviderText(text="must not run"), ProviderDone(model="fallback-model")],
+    )
+    wrapper = _SelectorFallbackProvider(primary, _FallbackSelector(fallback))
+    scope = UsageAccountingScope(sink=sink, context=_context())
+
+    with bind_usage_accounting_scope(scope):
+        with pytest.raises(RuntimeError, match="usage accounting internal failure"):
+            _ = [event async for event in wrapper.chat([])]
+
+    assert primary.calls == 0
+    assert fallback.calls == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("image_location", ["current", "history"])
 @pytest.mark.parametrize("wrapped_by_selector", [False, True])
 async def test_agent_preflight_rejects_ensemble_image_before_call_accounting(
@@ -385,6 +520,37 @@ async def test_provider_call_is_started_before_chat_and_finalized_once() -> None
     assert result.billed_cost_nanos == 123
     assert result.estimated_cost_nanos == 0
     assert result.cost_source == "provider_billed"
+
+
+@pytest.mark.asyncio
+async def test_provider_request_correlation_reaches_provider_call() -> None:
+    sink = _RecordingSink()
+    provider = _CorrelationCapturingProvider(sink)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(max_iterations=1, provider_id="fake", model_id="model-a"),
+        usage_event_sink=sink,
+        usage_execution_context=_context(),
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="execution-1",
+            call_kind="agent.chat",
+        ),
+    )
+
+    async for _ in agent.run_turn("hello"):
+        pass
+
+    assert len(provider.configs) == 1
+    config = provider.configs[0]
+    assert config is not None
+    assert config.provider_request_correlation == ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat",
+    )
 
 
 @pytest.mark.asyncio
@@ -596,6 +762,128 @@ def _tokenrhythm_receipt(*, usd_nanos: int) -> ProviderBillingReceipt:
         usd_equivalent_nanos=usd_nanos,
         fx_native_per_usd_nanos=6_975_000_000,
     )
+
+
+def _usd_receipt(
+    *,
+    status: str,
+    amount_nanos: int | None,
+    usd_nanos: int | None,
+) -> ProviderBillingReceipt:
+    return ProviderBillingReceipt(
+        currency="USD",
+        status=status,  # type: ignore[arg-type]
+        amount_nanos=amount_nanos,
+        usd_equivalent_nanos=usd_nanos,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+
+
+@pytest.mark.parametrize(
+    ("row_overrides", "expected_billed_nanos", "expected_source"),
+    [
+        ({"billed_cost": 0.25, "cost_source": "provider_billed"}, 250_000_000, "provider_billed"),
+        ({"billed_cost": 0.25, "cost_source": "openrouter_usage"}, 250_000_000, "provider_billed"),
+        ({"billed_cost": 0.25}, 250_000_000, "provider_billed"),
+        (
+            {"billed_cost_usd": 0.25, "cost_source": "provider_billed"},
+            250_000_000,
+            "provider_billed",
+        ),
+        (
+            {"billedCost": 0.25, "costSource": "provider_billed"},
+            250_000_000,
+            "provider_billed",
+        ),
+        (
+            {
+                "billed_cost": 0.05,
+                "billing_receipt": _usd_receipt(
+                    status="confirmed",
+                    amount_nanos=300_000_000,
+                    usd_nanos=300_000_000,
+                ),
+            },
+            300_000_000,
+            "provider_billed",
+        ),
+        (
+            {
+                "billed_cost": 0.0,
+                "billing_receipt": _usd_receipt(
+                    status="confirmed",
+                    amount_nanos=0,
+                    usd_nanos=0,
+                ),
+            },
+            0,
+            "provider_billed",
+        ),
+        (
+            {
+                "billed_cost": 0.25,
+                "cost_source": "provider_billed",
+                "billing_receipt": _usd_receipt(
+                    status="pending",
+                    amount_nanos=250_000_000,
+                    usd_nanos=None,
+                ),
+            },
+            0,
+            "unavailable",
+        ),
+        ({"billed_cost": 0.0, "cost_source": "free"}, 0, "free"),
+    ],
+    ids=[
+        "provider-billed",
+        "openrouter-usage",
+        "legacy-positive-bill",
+        "billed-cost-usd-alias",
+        "camel-case-aliases",
+        "confirmed-authoritative-amount",
+        "confirmed-zero",
+        "pending",
+        "explicit-free",
+    ],
+)
+def test_receipt_only_normalization_uses_canonical_billed_semantics_without_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+    row_overrides: dict[str, Any],
+    expected_billed_nanos: int,
+    expected_source: str,
+) -> None:
+    def fail_if_pricing_is_resolved(model: str, provider: str) -> ResolvedModelPrice:
+        raise AssertionError(f"unexpected price resolution for {provider}/{model}")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.usage_accounting.resolve_model_price",
+        fail_if_pricing_is_resolved,
+    )
+    row = {
+        "provider": "fake",
+        "model": "model-a",
+        "input_tokens": 10,
+        "output_tokens": 2,
+        **row_overrides,
+    }
+    result = normalize_provider_usage(
+        ProviderError(
+            message="failed after usage",
+            code="500",
+            model_usage_breakdown=[row],
+        ),
+        default_provider="fake",
+        default_model="model-a",
+        completed_at_ms=1234,
+        resolve_estimates=False,
+    )
+
+    assert result.billed_cost_nanos == expected_billed_nanos
+    assert result.estimated_cost_nanos == 0
+    assert result.cost_source == expected_source
+    assert result.items[0].billed_cost_nanos == expected_billed_nanos
+    assert result.items[0].estimated_cost_nanos == 0
+    assert result.items[0].cost_source == expected_source
 
 
 def test_tokenrhythm_single_done_reconciles_native_receipt_and_all_token_buckets() -> None:
@@ -943,6 +1231,84 @@ def test_runtime_subagent_inherits_sink_with_distinct_execution() -> None:
 
 
 @pytest.mark.asyncio
+async def test_real_subagent_rollup_preserves_three_physical_ledger_calls() -> None:
+    sink = _RecordingSink()
+    provider = _ParentChildSequenceProvider()
+    loop = asyncio.get_running_loop()
+    unhandled: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    agent: Agent | None = None
+
+    async def tool_handler(call: ToolCall) -> ToolResult:
+        assert agent is not None
+        run_id = await agent.spawn_subagent(
+            SubagentSpec(task="child task", timeout=0, max_iterations=1)
+        )
+        handle = agent.subagent_manager.registry.get(run_id)
+        assert handle is not None
+        await handle.task
+        return ToolResult(
+            tool_use_id=call.tool_use_id,
+            tool_name=call.tool_name,
+            content="child finished",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=3,
+            provider_id="fake",
+            model_id="parent-model",
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="spawn_helper",
+                description="spawn a helper",
+                input_schema=ToolInputSchema(properties={}, required=[]),
+            )
+        ],
+        tool_handler=tool_handler,
+        usage_event_sink=sink,
+        usage_execution_context=UsageExecutionContext(
+            execution_id="parent-turn",
+            agent_run_id="parent-run",
+            turn_id="parent-turn",
+            session_id="session-1",
+            session_epoch=7,
+            agent_id="main",
+            run_kind="agent",
+        ),
+    )
+
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(dict(context)))
+    try:
+        events = [event async for event in agent.run_turn("delegate this")]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    done = next(event for event in events if isinstance(event, EngineDoneEvent))
+    assert done.input_tokens == 1070
+    assert done.output_tokens == 207
+    assert done.message_output_tokens == 7
+    assert done.cost_usd == pytest.approx(0.57)
+    assert done.billed_cost == pytest.approx(0.57)
+    assert [call.run_kind for call in sink.started] == ["agent", "subagent", "agent"]
+    assert [call.run_kind for call, _result in sink.finalized] == [
+        "agent",
+        "subagent",
+        "agent",
+    ]
+    assert len(sink.started) == len(sink.finalized) == 3
+    assert sum(result.billed_cost_nanos for _call, result in sink.finalized) == (
+        usd_to_nanos("0.57")
+    )
+    assert sink.unknown == []
+    assert unhandled == []
+
+
+@pytest.mark.asyncio
 async def test_direct_meta_llm_helper_records_usage_with_parent_attribution() -> None:
     sink = _RecordingSink()
     provider = _DoneProvider(sink)
@@ -970,7 +1336,7 @@ async def test_direct_meta_llm_helper_records_usage_with_parent_attribution() ->
 @pytest.mark.asyncio
 async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplicate() -> None:
     sink = _RecordingSink()
-    fallback = _PhysicalLegProvider(
+    fallback = _CorrelationCapturingPhysicalLegProvider(
         "anthropic",
         [
             ProviderText(text="fallback"),
@@ -982,7 +1348,7 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
             ),
         ],
     )
-    primary = _PhysicalLegProvider(
+    primary = _CorrelationCapturingPhysicalLegProvider(
         "openai",
         [ProviderError(message="rate limited", code="429")],
     )
@@ -1000,6 +1366,12 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
         session_key="agent:main:test",
         usage_event_sink=sink,
         usage_execution_context=_context(),
+        provider_request_correlation=ProviderRequestCorrelation(
+            session_id="session-1",
+            turn_id="turn-1",
+            execution_id="execution-1",
+            call_kind="agent.chat",
+        ),
     )
 
     async for _ in agent.run_turn("hello"):
@@ -1018,6 +1390,19 @@ async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplic
     assert len(sink.started) == 2  # no Agent-level wrapper envelope
     assert tracker.rows[0][1]["provider"] == "anthropic"
     assert tracker.rows[0][1]["model_id"] == "fallback-model"
+    expected_correlation = ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat",
+    )
+    assert primary.configs[0].provider_request_correlation == expected_correlation
+    assert fallback.configs[0].provider_request_correlation == ProviderRequestCorrelation(
+        session_id="session-1",
+        turn_id="turn-1",
+        execution_id="execution-1",
+        call_kind="agent.chat.provider_fallback",
+    )
 
 
 @pytest.mark.asyncio
@@ -1034,7 +1419,14 @@ async def test_selector_wrapper_without_ledger_scope_is_streaming_compatible() -
 
     events = [event async for event in wrapper.chat([])]
 
-    assert [getattr(event, "kind", "") for event in events] == ["text_delta", "done"]
+    assert [getattr(event, "kind", "") for event in events] == [
+        "provider_activity",
+        "text_delta",
+        "done",
+    ]
+    assert (events[0].phase, events[0].reason) == ("fallback", "rate_limited")
+    assert events[0].retry_attempt == 1
+    assert events[0].started_at > 0
     assert primary.calls == fallback.calls == 1
 
 
@@ -1102,13 +1494,23 @@ async def test_shared_turn_scope_keeps_helper_and_agent_call_indices_unique() ->
 
 
 @pytest.mark.asyncio
-async def test_turn_runner_preserves_retryable_ledger_start_error_code() -> None:
+@pytest.mark.parametrize(
+    ("sink_type", "expected_code"),
+    [
+        (_UnavailableSink, UsageAccountingUnavailableError.code),
+        (_BusySink, UsageAccountingBusyError.code),
+    ],
+)
+async def test_turn_runner_preserves_retryable_ledger_start_error_code(
+    sink_type,
+    expected_code: str,
+) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()
     manager = SessionManager(storage)
     session_key = "agent:main:usage-start-failure"
     await manager.create(session_key)
-    sink = _UnavailableSink()
+    sink = sink_type()
     provider = _SequenceProvider([[ProviderDone()]])
     runner = TurnRunner(
         provider_selector=_SingleProviderSelector(provider),
@@ -1134,5 +1536,8 @@ async def test_turn_runner_preserves_retryable_ledger_start_error_code() -> None
 
     errors = [event for event in events if isinstance(event, ErrorEvent)]
     assert len(errors) == 1
-    assert errors[0].code == UsageAccountingUnavailableError.code
+    assert errors[0].code == expected_code
     assert provider.calls == 0
+    outcome = outcome_from_error(code=expected_code)
+    assert outcome.kind == "blocked"
+    assert outcome.retryable is True

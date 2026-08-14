@@ -23,6 +23,7 @@ type MockGatewayOptions = {
   sandboxEnsureCalls?: { value: number }
   sandboxStatus?: () => Record<string, unknown>
   sandboxStatusCalls?: { value: number }
+  runModeSetCalls?: Array<Record<string, unknown>>
 }
 
 function response(id: string | number | undefined, payload: unknown) {
@@ -64,8 +65,8 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
           policy: { tick_interval_ms: 30000 },
           auth: {
             runModePolicy: {
-              allowedRunModes: ['trusted', 'standard', 'full'],
-              defaultRunMode: 'standard',
+              allowedRunModes: ['safe', 'full'],
+              defaultRunMode: 'full',
             },
           },
         }))
@@ -120,6 +121,25 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
         ws.send(response(frame.id, options.sandboxEnsure?.() || {
           state: 'setting_up',
           platform: 'windows',
+        }))
+        return
+      }
+
+      if (method === 'sandbox.capability.status') {
+        ws.send(response(frame.id, { available: false }))
+        return
+      }
+
+      if (method === 'sandbox.run_mode.preference.get') {
+        ws.send(response(frame.id, { runMode: 'full', source: 'config' }))
+        return
+      }
+
+      if (method === 'sandbox.run_mode.preference.set') {
+        options.runModeSetCalls?.push(frame.params || {})
+        ws.send(response(frame.id, {
+          runMode: frame.params?.runMode === 'safe' ? 'safe' : 'full',
+          source: 'preference',
         }))
         return
       }
@@ -182,6 +202,15 @@ test.describe('Vue behavior contracts', () => {
 
   test('drawer, nested preview, and lightbox own Escape while composer Escape aborts once', async ({ page }) => {
     const abortCalls: Array<Record<string, unknown>> = []
+    await page.addInitScript(() => {
+      const featureWindow = window as typeof window & {
+        OPENSQUILLA_FEATURES?: Record<string, boolean>
+      }
+      featureWindow.OPENSQUILLA_FEATURES = {
+        ...(featureWindow.OPENSQUILLA_FEATURES || {}),
+        artifactWorkbench: false,
+      }
+    })
     await page.route('**/api/v1/artifacts/**', route => route.fulfill({
       status: 200,
       contentType: 'image/png',
@@ -291,12 +320,6 @@ test.describe('Vue behavior contracts', () => {
     })
     await openChat(page)
 
-    const approvalNote = page.locator('.approval-card__note')
-    await expect(approvalNote).toBeVisible({ timeout: 10000 })
-    await approvalNote.focus()
-    await page.keyboard.press('Escape')
-    expect(abortCalls).toHaveLength(0)
-
     const clarifyInput = page.locator('.clarify-field__input')
     await expect(clarifyInput).toBeVisible({ timeout: 10000 })
     await clarifyInput.focus()
@@ -359,15 +382,14 @@ test.describe('Vue behavior contracts', () => {
     await expect(cronMessage).toHaveCount(1)
   })
 
-  test('Windows Standard mode offers setup and preserves the selected run mode', async ({ page }) => {
+  test('Windows Safe mode requests setup and keeps Full until verification succeeds', async ({ page }) => {
     const statusCalls = { value: 0 }
     const ensureCalls = { value: 0 }
-    await page.addInitScript(() => {
-      localStorage.setItem('opensquilla.chat.runMode', 'standard')
-    })
+    const runModeSetCalls: Array<Record<string, unknown>> = []
     await installMockGateway(page, {
       sandboxStatusCalls: statusCalls,
       sandboxEnsureCalls: ensureCalls,
+      runModeSetCalls,
       sandboxStatus: () => ({
         state: 'not_setup',
         platform: 'windows',
@@ -381,17 +403,22 @@ test.describe('Vue behavior contracts', () => {
     })
     await openChat(page)
 
-    const banner = page.locator('.sandbox-setup')
-    await expect(banner).toBeVisible({ timeout: 10000 })
-    await expect(banner).toContainText('Sandbox setup required')
     await expect.poll(() => statusCalls.value).toBeGreaterThanOrEqual(1)
+    const runModeButton = page.locator('.chat-run-mode-btn')
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--full/)
+    await runModeButton.click()
+    const safeOption = page.locator('.composer-run-mode__option').first()
+    await expect(safeOption).toBeEnabled()
+    await safeOption.click()
 
-    await banner.getByRole('button', { name: 'Set up' }).click()
+    const setupDialog = page.getByTestId('sandbox-setup-confirm')
+    await expect(setupDialog).toBeVisible()
+    expect(runModeSetCalls).toHaveLength(0)
+
+    await page.getByTestId('sandbox-setup-continue').click()
     await expect.poll(() => ensureCalls.value).toBe(1)
-    await expect(banner).toHaveClass(/sandbox-setup--setting_up/)
-    await expect(banner).toContainText('Setting up Windows Sandbox')
-    await expect(banner.getByRole('progressbar')).toBeVisible()
-    await expect.poll(() => page.evaluate(() => localStorage.getItem('opensquilla.chat.runMode')))
-      .toBe('standard')
+    await expect(setupDialog).toBeVisible()
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--full/)
+    expect(runModeSetCalls).toHaveLength(0)
   })
 })

@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import tomllib
 
+import pytest
+
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.config_store import load_config
+from opensquilla.onboarding.section_status import SectionStatus
 from opensquilla.onboarding.setup_engine import SetupEngine
+from opensquilla.onboarding.status import get_onboarding_status
 
 
 def test_setup_engine_applies_provider_and_router_without_persisting_secret(tmp_path):
@@ -31,6 +35,40 @@ def test_setup_engine_applies_provider_and_router_without_persisting_secret(tmp_
     assert "api_key" not in data["llm"]
     assert data["squilla_router"]["tier_profile"] == "deepseek"
     assert "tiers" not in data["squilla_router"]
+
+
+def test_setup_engine_enables_openrouter_image_default_on_first_configuration():
+    engine = SetupEngine(config=GatewayConfig())
+
+    result = engine.apply(
+        "provider",
+        {
+            "providerId": "openrouter",
+            "model": "openai/gpt-test",
+            "apiKey": "synthetic-openrouter-key",
+        },
+    )
+
+    image = result.config.image_generation
+    assert image.enabled is True
+    assert image.binding == "follow_llm"
+    assert image.primary == "openrouter/google/gemini-3.1-flash-image-preview"
+
+
+@pytest.mark.parametrize("intent", ["", False])
+def test_setup_engine_rejects_invalid_image_generation_intent(intent):
+    engine = SetupEngine(config=GatewayConfig())
+
+    with pytest.raises(ValueError, match="image_generation_intent"):
+        engine.apply(
+            "provider",
+            {
+                "providerId": "openrouter",
+                "model": "openai/gpt-test",
+                "apiKey": "synthetic-openrouter-key",
+                "imageGenerationIntent": intent,
+            },
+        )
 
 
 def test_setup_engine_optional_key_preservation_is_explicit_and_legacy_safe():
@@ -195,6 +233,42 @@ def test_setup_engine_image_generation_can_use_custom_env_reference(
     provider = data["image_generation"]["providers"]["openrouter"]
     assert load_config(target).image_generation.providers.openrouter.api_key == ""
     assert provider["api_key_env"] == "OPENSQUILLA_TEST_IMAGE_KEY"
+
+
+def test_setup_engine_forwards_image_format_size_fallbacks_and_explicit_resets(tmp_path):
+    target = tmp_path / "config.toml"
+    engine = SetupEngine(path=target)
+
+    engine.apply(
+        "image-generation",
+        {
+            "providerId": "openrouter",
+            "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+            "apiKey": "sk-first",
+            "baseUrl": "https://images.example.test/v1",
+            "size": "1536x1024",
+            "outputFormat": "webp",
+            "fallbacks": ["openai/gpt-image-1"],
+        },
+    )
+    engine.apply(
+        "image-generation",
+        {
+            "providerId": "openrouter",
+            "primary": "openrouter/google/gemini-3.1-flash-image-preview",
+            "apiKey": "sk-second",
+            "baseUrl": "",
+            "fallbacks": [],
+            "clearFallbacks": True,
+        },
+    )
+    engine.persist()
+
+    saved = load_config(target).image_generation
+    assert saved.size == "1536x1024"
+    assert saved.output_format == "webp"
+    assert saved.fallbacks == []
+    assert saved.providers.openrouter.base_url == "https://openrouter.ai/api/v1"
 
 
 def test_setup_engine_accepts_short_capability_section_aliases(tmp_path, monkeypatch):
@@ -411,3 +485,25 @@ def test_setup_engine_image_enabled_none_defaults_to_enabled_for_fresh_config(
     engine.persist()
 
     assert load_config(target).image_generation.enabled is True
+
+
+def test_setup_engine_loads_legacy_image_endpoint_mismatch_as_degraded(tmp_path):
+    target = tmp_path / "config.toml"
+    target.write_text(
+        "[image_generation]\n"
+        "enabled = true\n"
+        'primary = "openrouter/google/gemini-3.1-flash-image-preview"\n'
+        "\n"
+        "[image_generation.providers.openrouter]\n"
+        'api_key = "sk-synthetic-image"\n'
+        'base_url = "https://api.openai.com/v1"\n',
+        encoding="utf-8",
+    )
+
+    engine = SetupEngine(path=target)
+    status = get_onboarding_status(engine.config)
+
+    assert engine.config.image_generation.enabled is True
+    assert status.sections["image_generation"] is SectionStatus.DEGRADED
+    assert status.image_generation_configured is False
+    assert status.section_details["image_generation"]["actionRequired"] is True

@@ -17,7 +17,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
-from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
+from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
+    ElevationAction,
+    gate_elevated_action,
+)
 from opensquilla.sandbox.integration import (
     SandboxRuntime,
     consume_backend_denial_retry,
@@ -27,14 +31,17 @@ from opensquilla.sandbox.integration import (
     get_runtime,
     preflight_subprocess_managed_network,
     prepare_subprocess_managed_network_proxy,
+    reject_windows_guest_process,
     run_under_backend,
 )
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.sandbox.policy import LevelHints
 from opensquilla.sandbox.types import (
+    ApprovedHostExecution,
     DenialResult,
     NetworkMode,
     SandboxBackendError,
+    SandboxPolicy,
     SandboxRequest,
 )
 from opensquilla.subprocess_encoding import apply_utf8_child_env, decode_subprocess_output
@@ -42,6 +49,7 @@ from opensquilla.tools.registry import tool
 from opensquilla.tools.run_mode import full_host_access_active, trusted_sandbox_active
 from opensquilla.tools.types import ToolError, current_tool_context
 from opensquilla.tools.write_tracking import (
+    enforce_workspace_write_deny_effects,
     mutation_ledger_text_hash,
     record_observed_workspace_mutations,
     snapshot_current_workspace_mutations,
@@ -652,8 +660,7 @@ def _code_elevation_effects(
             continue
         stripped = literal.strip()
         if not (
-            stripped.startswith(("/", "~", ".", "\\\\"))
-            or re.match(r"^[A-Za-z]:[\\/]", stripped)
+            stripped.startswith(("/", "~", ".", "\\\\")) or re.match(r"^[A-Za-z]:[\\/]", stripped)
         ):
             continue
         candidate = Path(stripped).expanduser()
@@ -693,6 +700,7 @@ def _code_elevation_action(
         content_length=len(code),
         risk_markers=risk_markers,
         prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+        display=ApprovalDisplay(kind="run_code", target=str(workdir)),
     )
 
 
@@ -702,7 +710,10 @@ def _windows_sandbox_backend_active(runtime: object | None) -> bool:
     return backend_name.startswith("windows_")
 
 
-def _trusted_managed_network_policy(policy, runtime: object | None):
+def _trusted_managed_network_policy(
+    policy: SandboxPolicy,
+    runtime: object | None,
+) -> SandboxPolicy:
     if getattr(policy, "network", None) is NetworkMode.PROXY_ALLOWLIST:
         return policy
     settings = getattr(runtime, "settings", None) if runtime is not None else None
@@ -714,6 +725,8 @@ def _trusted_managed_network_policy(policy, runtime: object | None):
     if getattr(policy, "network", None) is NetworkMode.NONE and (
         ctx is None or getattr(ctx, "sandbox_run_context", None) is None
     ):
+        return policy
+    if not isinstance(policy, SandboxPolicy):
         return policy
     return dataclasses.replace(policy, network=NetworkMode.PROXY_ALLOWLIST, network_proxy=None)
 
@@ -926,6 +939,9 @@ async def execute_code(
     if not code.strip():
         raise ToolError("Code must not be empty")
 
+    runtime = get_runtime()
+    reject_windows_guest_process(runtime)
+
     full_host = full_host_access_active()
     external_transfer = None if full_host else _check_code_sensitive_external_transfer(code)
     if external_transfer is not None:
@@ -962,7 +978,6 @@ async def execute_code(
     timeout = max(1.0, min(float(timeout), _MAX_TIMEOUT))
 
     ctx = current_tool_context.get()
-    runtime = get_runtime()
     from opensquilla.tools.builtin.shell import (
         _apply_windows_session_tmp_env,
         _host_execution_allowed,
@@ -989,9 +1004,7 @@ async def execute_code(
 
     elevated_code_execution = False
     if sandbox_enabled and sandbox_permissions not in {"use_default", "require_escalated"}:
-        return json.dumps(
-            {"status": "invalid_request", "reason": "invalid_sandbox_permissions"}
-        )
+        return json.dumps({"status": "invalid_request", "reason": "invalid_sandbox_permissions"})
     if sandbox_enabled and sandbox_permissions == "require_escalated":
         if not justification.strip():
             return json.dumps(
@@ -1058,7 +1071,13 @@ async def execute_code(
             before=mutation_before,
             metadata={"code_hash": mutation_ledger_text_hash(code)},
         )
-        return output
+        # Effect enforcement runs after the ledger so the raw escape stays
+        # honestly recorded before any revert rewrites the workspace.
+        return enforce_workspace_write_deny_effects(
+            tool_name="execute_code",
+            before=mutation_before,
+            output=output,
+        )
 
     if not full_host and (
         runtime is None or (runtime.effective.sandbox_enabled and not host_execution)
@@ -1072,109 +1091,116 @@ async def execute_code(
         )
         if isinstance(decision, DenialResult):
             return finish(json.dumps(decision.to_dict()))
-        retry_gate = consume_backend_denial_retry(
-            approval_id,
-            request,
-            _policy,
-            runtime=runtime,
-        )
-        if retry_gate is not None:
-            if not retry_gate.allowed:
-                return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+        if isinstance(decision, ApprovedHostExecution):
             host_execution = True
             sandbox_enabled = False
             elevated_code_execution = True
         else:
-            backend_request = SandboxRequest(
-                argv=(python_bin, "-c", code),
-                cwd=request.cwd,
-                action_kind=request.action_kind,
-                policy=_trusted_managed_network_policy(request.policy, runtime),
-                env=safe_env,
-                reason=getattr(request, "reason", ""),
-                session_id=getattr(request, "session_id", ""),
-                run_mode=getattr(request, "run_mode", ""),
+            retry_gate = consume_backend_denial_retry(
+                approval_id,
+                request,
+                _policy,
+                runtime=runtime,
             )
-            if runtime is not None:
-                preflight = await preflight_subprocess_managed_network(backend_request, runtime)
-                if isinstance(preflight, DenialResult):
-                    return finish(json.dumps(preflight.to_dict()))
-                if isinstance(preflight, dict):
-                    return finish(json.dumps(preflight))
-            try:
-                sandbox_result = await _run_backend_with_managed_network_if_needed(
-                    backend_request,
-                    runtime=runtime,
+            if retry_gate is not None:
+                if not retry_gate.allowed:
+                    return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+                host_execution = True
+                sandbox_enabled = False
+                elevated_code_execution = True
+            else:
+                backend_request = SandboxRequest(
+                    argv=(python_bin, "-c", code),
+                    cwd=request.cwd,
+                    action_kind=request.action_kind,
+                    policy=_trusted_managed_network_policy(request.policy, runtime),
+                    env=dict(getattr(request, "env", None) or safe_env),
+                    reason=getattr(request, "reason", ""),
+                    session_id=getattr(request, "session_id", ""),
+                    run_mode=getattr(request, "run_mode", ""),
                 )
-            except SandboxBackendError as exc:
-                review_action = _code_elevation_action(
-                    code,
-                    workdir=workdir_path,
-                    destructive_warning=destructive_warning,
-                    justification="Sandbox backend unavailable; retry this exact code on host.",
-                    prefix_rule=prefix_rule,
-                )
-                escalation = await escalate_unavailable_backend_in_managed_mode(
-                    exc,
-                    request,
-                    _policy,
-                    runtime=runtime,
-                    review_action=review_action,
-                )
-                if escalation is not None:
+                if runtime is not None:
+                    preflight = await preflight_subprocess_managed_network(backend_request, runtime)
+                    if isinstance(preflight, DenialResult):
+                        return finish(json.dumps(preflight.to_dict()))
+                    if isinstance(preflight, dict):
+                        return finish(json.dumps(preflight))
+                try:
+                    sandbox_result = await _run_backend_with_managed_network_if_needed(
+                        backend_request,
+                        runtime=runtime,
+                    )
+                except SandboxBackendError as exc:
+                    review_action = _code_elevation_action(
+                        code,
+                        workdir=workdir_path,
+                        destructive_warning=destructive_warning,
+                        justification=(
+                            "Sandbox backend unavailable; retry this exact code on host."
+                        ),
+                        prefix_rule=prefix_rule,
+                    )
+                    escalation = await escalate_unavailable_backend_in_managed_mode(
+                        exc,
+                        request,
+                        _policy,
+                        runtime=runtime,
+                        review_action=review_action,
+                    )
+                    if escalation is not None:
+                        if isinstance(escalation, DenialResult):
+                            return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
+                        return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
+                    return finish(
+                        _execution_result_json(
+                            returncode=-1,
+                            stdout="",
+                            stderr=f"Execution error: {exc}",
+                            timed_out=False,
+                            elapsed_ms=0,
+                        )
+                    )
+                except Exception as exc:
+                    return finish(
+                        _execution_result_json(
+                            returncode=-1,
+                            stdout="",
+                            stderr=f"Execution error: {exc}",
+                            timed_out=False,
+                            elapsed_ms=0,
+                        )
+                    )
+                if is_likely_sandbox_denied(sandbox_result):
+                    review_action = _code_elevation_action(
+                        code,
+                        workdir=workdir_path,
+                        destructive_warning=destructive_warning,
+                        justification=("Sandbox denied this exact code; retry it on host."),
+                        prefix_rule=prefix_rule,
+                    )
+                    escalation = await escalate_backend_denial(
+                        sandbox_result,
+                        request,
+                        _policy,
+                        runtime=runtime,
+                        review_action=review_action,
+                    )
                     if isinstance(escalation, DenialResult):
-                        return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
+                        return finish(json.dumps(escalation.to_dict()))
                     return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
+                elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
+                stdout = sandbox_result.stdout
+                stderr = sandbox_result.stderr
+                stderr = _append_code_exec_sandbox_network_hint(stdout=stdout, stderr=stderr)
                 return finish(
                     _execution_result_json(
-                        returncode=-1,
-                        stdout="",
-                        stderr=f"Execution error: {exc}",
-                        timed_out=False,
-                        elapsed_ms=0,
+                        returncode=sandbox_result.returncode,
+                        stdout=stdout,
+                        stderr=stderr,
+                        timed_out=sandbox_result.timed_out,
+                        elapsed_ms=elapsed_ms,
                     )
                 )
-            except Exception as exc:
-                return finish(
-                    _execution_result_json(
-                        returncode=-1,
-                        stdout="",
-                        stderr=f"Execution error: {exc}",
-                        timed_out=False,
-                        elapsed_ms=0,
-                    )
-                )
-            if is_likely_sandbox_denied(sandbox_result):
-                review_action = _code_elevation_action(
-                    code,
-                    workdir=workdir_path,
-                    destructive_warning=destructive_warning,
-                    justification="Sandbox denied this exact code; retry it on host.",
-                    prefix_rule=prefix_rule,
-                )
-                escalation = await escalate_backend_denial(
-                    sandbox_result,
-                    request,
-                    _policy,
-                    runtime=runtime,
-                    review_action=review_action,
-                )
-                if isinstance(escalation, DenialResult):
-                    return finish(json.dumps(escalation.to_dict()))
-                return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
-            elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
-            stdout = sandbox_result.stdout
-            stderr = sandbox_result.stderr
-            stderr = _append_code_exec_sandbox_network_hint(stdout=stdout, stderr=stderr)
-            return finish(
-                _execution_result_json(
-                    returncode=sandbox_result.returncode,
-                    stdout=stdout,
-                    stderr=stderr,
-                    timed_out=sandbox_result.timed_out,
-                    elapsed_ms=elapsed_ms,
-                )
-            )
 
     try:
         proc = await asyncio.create_subprocess_exec(

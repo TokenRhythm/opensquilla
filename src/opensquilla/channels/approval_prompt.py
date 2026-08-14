@@ -25,7 +25,9 @@ from __future__ import annotations
 import re
 import secrets
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
+
+from opensquilla.channels.system_messages import render_channel_message
 
 # Crockford-style base32 alphabet minus easily-confused glyphs (I, L, O, U).
 # 4 chars over a 32-symbol alphabet => 1 048 576 combinations, ample for the
@@ -82,6 +84,7 @@ class ApprovalPromptRequest:
     short_code: str
     offer_always: bool = False
     summary_label: str = "Command"
+    notice: str = ""
     origin_channel_id: str = ""
     origin_is_group: bool | None = None
     origin_chat_type: str = ""
@@ -182,24 +185,35 @@ def _adapter_supports_interactive_cards(profile: Any) -> bool:
     return bool(getattr(profile, "interactive_cards", False))
 
 
-def _prompt_text(request: ApprovalPromptRequest) -> str:
-    command = request.command_or_tool or "(unknown command)"
-    label = request.summary_label or "Command"
-    always_line = (
-        f"/approve {request.short_code} always to stop asking for this kind, or "
-        if request.offer_always
-        else ""
-    )
-    return (
-        "Approval needed to run a privileged command.\n"
-        f"{label}: {command}\n"
-        f"Code: {request.short_code}\n"
-        f"Reply /approve {request.short_code} to allow, {always_line}"
-        f"/deny {request.short_code} to refuse."
-    )
+def _summary_label(request: ApprovalPromptRequest, *, config: Any = None) -> str:
+    """Render the default summary label from the configured locale."""
+
+    if not request.summary_label or request.summary_label == "Command":
+        return render_channel_message("approval_label_command", config=config)
+    return request.summary_label
 
 
-def _interactive_card(request: ApprovalPromptRequest) -> dict[str, Any]:
+def _prompt_text(request: ApprovalPromptRequest, *, config: Any = None) -> str:
+    command = request.command_or_tool or render_channel_message(
+        "approval_unknown_command", config=config
+    )
+    label = _summary_label(request, config=config)
+    key: Literal["approval_prompt", "approval_prompt_always"] = (
+        "approval_prompt_always" if request.offer_always else "approval_prompt"
+    )
+    rendered = render_channel_message(
+        key,
+        config=config,
+        label=label,
+        command=command,
+        code=request.short_code,
+    )
+    if request.notice:
+        rendered = f"{rendered}\n⚠️ {request.notice}"
+    return rendered
+
+
+def _interactive_card(request: ApprovalPromptRequest, *, config: Any = None) -> dict[str, Any]:
     """Build a Feishu-style interactive card with Approve/Deny buttons.
 
     The action ``value`` carries the short code (not the raw approval id) plus
@@ -210,8 +224,21 @@ def _interactive_card(request: ApprovalPromptRequest) -> dict[str, Any]:
     exact originating session key from a card tap — a group-origin approval
     must not be misclassified as a DM at resolution time.
     """
-    command = request.command_or_tool or "(unknown command)"
-    label = request.summary_label or "Command"
+    command = request.command_or_tool or render_channel_message(
+        "approval_unknown_command", config=config
+    )
+    label = _summary_label(request, config=config)
+    details = render_channel_message(
+        "approval_card_details",
+        config=config,
+        question=render_channel_message("approval_card_question", config=config),
+        label=label,
+        command=command,
+        code_label=render_channel_message("approval_label_code", config=config),
+        code=request.short_code,
+    )
+    if request.notice:
+        details = f"{details}\n\n⚠️ **{request.notice}**"
 
     def _action_value(decision: str) -> dict[str, Any]:
         value: dict[str, Any] = {
@@ -232,7 +259,10 @@ def _interactive_card(request: ApprovalPromptRequest) -> dict[str, Any]:
     actions: list[dict[str, Any]] = [
         {
             "tag": "button",
-            "text": {"tag": "plain_text", "content": "Approve"},
+            "text": {
+                "tag": "plain_text",
+                "content": render_channel_message("approval_card_approve", config=config),
+            },
             "type": "primary",
             "value": _action_value(DECISION_APPROVE),
         },
@@ -241,7 +271,10 @@ def _interactive_card(request: ApprovalPromptRequest) -> dict[str, Any]:
         actions.append(
             {
                 "tag": "button",
-                "text": {"tag": "plain_text", "content": "Always allow"},
+                "text": {
+                    "tag": "plain_text",
+                    "content": render_channel_message("approval_card_always", config=config),
+                },
                 "type": "default",
                 "value": _action_value(DECISION_ALWAYS),
             }
@@ -249,21 +282,25 @@ def _interactive_card(request: ApprovalPromptRequest) -> dict[str, Any]:
     actions.append(
         {
             "tag": "button",
-            "text": {"tag": "plain_text", "content": "Deny"},
+            "text": {
+                "tag": "plain_text",
+                "content": render_channel_message("approval_card_deny", config=config),
+            },
             "type": "danger",
             "value": _action_value(DECISION_DENY),
         }
     )
-    note = f"Or reply /approve {request.short_code} or /deny {request.short_code}."
-    if request.offer_always:
-        note = (
-            f"Or reply /approve {request.short_code}, "
-            f"/approve {request.short_code} always, or /deny {request.short_code}."
-        )
+    note_key: Literal["approval_card_note", "approval_card_note_always"] = (
+        "approval_card_note_always" if request.offer_always else "approval_card_note"
+    )
+    note = render_channel_message(note_key, config=config, code=request.short_code)
     return {
         "config": {"wide_screen_mode": True},
         "header": {
-            "title": {"tag": "plain_text", "content": "Approval needed"},
+            "title": {
+                "tag": "plain_text",
+                "content": render_channel_message("approval_card_title", config=config),
+            },
             "template": "orange",
         },
         "elements": [
@@ -271,10 +308,7 @@ def _interactive_card(request: ApprovalPromptRequest) -> dict[str, Any]:
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": (
-                        f"Run a privileged command?\n**{label}:** `{command}`\n"
-                        f"**Code:** `{request.short_code}`"
-                    ),
+                    "content": details,
                 },
             },
             {
@@ -297,6 +331,8 @@ def _interactive_card(request: ApprovalPromptRequest) -> dict[str, Any]:
 def render_approval_prompt(
     profile: Any,
     request: ApprovalPromptRequest,
+    *,
+    config: Any = None,
 ) -> dict[str, Any]:
     """Render the prompt for ``request`` against an adapter ``profile``.
 
@@ -305,9 +341,9 @@ def render_approval_prompt(
     ``interactive_cards``, an additional ``card`` payload. ``profile`` is the
     adapter's :class:`ChannelCapabilityProfile` (or ``None``).
     """
-    payload: dict[str, Any] = {"text": _prompt_text(request)}
+    payload: dict[str, Any] = {"text": _prompt_text(request, config=config)}
     if _adapter_supports_interactive_cards(profile):
-        payload["card"] = _interactive_card(request)
+        payload["card"] = _interactive_card(request, config=config)
     return payload
 
 

@@ -82,6 +82,26 @@ def test_purge_state_removes_state_keeps_config(tmp_path: Path) -> None:
     assert any("config.toml" in k for k in plan.keep)
 
 
+def test_purge_state_does_not_double_schedule_managed_toolchain_child(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    toolchains = home / "state" / "toolchains"
+    toolchains.mkdir(parents=True)
+    inv = _inventory(
+        home,
+        extra_buckets=[
+            DataBucket("managed toolchains", toolchains, "runtime-data", "state")
+        ],
+    )
+
+    plan = build_plan(inv, PlanOptions(purge_state=True))
+    removed = [Path(path) for action in plan.actions for path in action.paths]
+
+    assert home / "state" in removed
+    assert toolchains not in removed
+
+
 def test_purge_config_removes_secrets_keeps_state(tmp_path: Path) -> None:
     inv = _inventory(tmp_path / "home")
     plan = build_plan(inv, PlanOptions(purge_config=True))

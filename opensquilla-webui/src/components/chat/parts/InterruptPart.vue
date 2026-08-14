@@ -5,9 +5,10 @@
     :resolution="approvalResolution"
     :busy="part.busy"
     :error="part.error"
+    :timeline="timeline"
     @allow-once="emit('resolve', part.approval.approvalId, 'allow-once')"
     @allow-always="emit('resolve', part.approval.approvalId, 'allow-always')"
-    @deny="note => emit('resolve', part.approval!.approvalId, 'deny', note)"
+    @deny="emit('resolve', part.approval.approvalId, 'deny')"
     @extend="emit('extend', part.approval.approvalId)"
   />
   <ClarifyCard
@@ -28,10 +29,13 @@ import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import type { ChatApprovalItem, ChatApprovalResolution } from '@/composables/chat/useChatApprovals'
 import type { ChatPart, InterruptApprovalData } from '@/types/parts'
 
-const props = defineProps<{ part: Extract<ChatPart, { type: 'interrupt' }> }>()
+const props = defineProps<{
+  part: Extract<ChatPart, { type: 'interrupt' }>
+  timeline?: boolean
+}>()
 
 const emit = defineEmits<{
-  resolve: [id: string, decision: 'allow-once' | 'allow-always' | 'deny', note?: string]
+  resolve: [id: string, decision: 'allow-once' | 'allow-always' | 'deny']
   extend: [id: string]
   'clarify-submit': [fields: Record<string, string>, request: NonNullable<Extract<ChatPart, { type: 'interrupt' }>['clarify']>]
   'clarify-dismiss': []
@@ -48,6 +52,11 @@ function toApprovalItem(data: InterruptApprovalData): ChatApprovalItem {
     approvalKind: data.approvalKind,
     args: data.args,
     warning: data.warning,
+    displayKind: data.displayKind,
+    displayTarget: data.displayTarget,
+    destructive: data.destructive,
+    irreversible: data.irreversible,
+    backupState: data.backupState,
     agent: data.agent,
     sessionKey: data.sessionKey,
     deadline: data.deadline,

@@ -22,15 +22,17 @@ future prompt-failure early-yield branch.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from opensquilla.provider.protocol import configured_provider_id
+from opensquilla.tools.types import is_goal_owned_main_default_turn
 
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.observability.decision_log import PipelineStepRecord
     from opensquilla.observability.prompt_report import PromptReport
+    from opensquilla.provider.types import ProviderRequestCorrelation
     from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
@@ -62,6 +64,9 @@ class RunPipelineRequest:
     base_prompt: str | tuple[str, str]
     attachments: list[dict[str, Any]]
     semantic_message: str | None = None
+    # Process-local semantic hint used only by routing and skill retrieval.
+    # It must never enter prompt text, metadata, transcripts, or wire payloads.
+    routing_hint: str | None = field(default=None, repr=False)
     ingress_pipeline_steps: list[PipelineStepRecord] | None = None
     prev_assistant_text: str | None = None
     prev_assistant_usage: dict[str, Any] | None = None
@@ -78,6 +83,10 @@ class RunPipelineRequest:
     input_provenance: dict[str, Any] | str | None = None
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
@@ -106,6 +115,7 @@ class PromptAssemblerPort(Protocol):
         prompt_metadata: dict[str, Any],
         bootstrap_context_mode: str | None,
         fresh_user_session: bool = False,
+        workspace_dir: str | None = None,
     ) -> str | tuple[str, str]: ...
 
 @runtime_checkable
@@ -246,6 +256,10 @@ class PromptAssemblerStageInput:
     input_provenance: dict[str, Any] | str | None = None
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
+    provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -369,6 +383,7 @@ class PromptAssemblerStage:
             prompt_metadata=prompt_metadata,
             bootstrap_context_mode=inp.bootstrap_context_mode,
             fresh_user_session=inp.fresh_user_session,
+            workspace_dir=getattr(inp.effective_tool_context, "workspace_dir", None),
         )
 
         # 2. Fetch router context (transcript-driven)
@@ -415,6 +430,18 @@ class PromptAssemblerStage:
         )
 
         # 3. Run pre-turn pipeline (model routing, skills, prompt cache, etc.)
+        routing_hint: str | None = None
+        goal_context_value = getattr(
+            inp.effective_tool_context,
+            "goal_context",
+            None,
+        )
+        if is_goal_owned_main_default_turn(inp.effective_tool_context):
+            from opensquilla.session.goals import GoalTurnContext
+
+            goal_context = GoalTurnContext.from_task_detail(goal_context_value)
+            if goal_context is not None and goal_context.automatic:
+                routing_hint = goal_context.objective_snapshot
         request = RunPipelineRequest(
             runtime_message=inp.runtime_message,
             session_key=inp.session_key,
@@ -424,6 +451,7 @@ class PromptAssemblerStage:
             base_prompt=base_prompt,
             attachments=inp.attachments,
             semantic_message=inp.semantic_input,
+            routing_hint=routing_hint,
             ingress_pipeline_steps=inp.ingress_pipeline_steps,
             prev_assistant_text=router_context.get("prev_assistant_text"),
             prev_assistant_usage=router_context.get("prev_assistant_usage"),
@@ -440,6 +468,7 @@ class PromptAssemblerStage:
             input_provenance=inp.input_provenance,
             skill_catalog=inp.skill_catalog,
             usage_execution_context=inp.usage_execution_context,
+            provider_request_correlation=inp.provider_request_correlation,
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 

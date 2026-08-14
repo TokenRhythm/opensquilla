@@ -95,6 +95,32 @@ def test_control_ui_vite_asset_urls_use_configured_base_path(
     assert css_urls == ["/ops/static/dist/assets/index.css"]
 
 
+def test_control_ui_root_mount_keeps_explicit_base_and_valid_asset_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    static_dir = tmp_path / "static"
+    dist_dir = _write_vite_static(static_dir)
+    monkeypatch.setattr(control_ui, "_STATIC_DIR", static_dir)
+    monkeypatch.setattr(control_ui, "_DIST_DIR", dist_dir)
+    control_config = ControlUiConfig(base_path="/")
+    config = GatewayConfig(control_ui=control_config)
+    app = Starlette(routes=create_control_ui_routes(config))
+
+    with TestClient(app) as client:
+        page = client.get("/")
+        deep_link = client.get("/sessions/synthetic")
+        asset = client.get("/static/dist/assets/index.js")
+
+    assert control_config.base_path == "/"
+    assert page.status_code == 200
+    assert deep_link.status_code == 200
+    assert asset.status_code == 200
+    assert 'data-base-path="/"' in page.text
+    assert 'src="/static/dist/assets/index.js"' in page.text
+    assert "//static/" not in page.text
+
+
 def test_read_vite_assets_extracts_every_stylesheet(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

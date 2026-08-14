@@ -14,7 +14,7 @@ This guide is the product and usage entry point. The existing
 1. Install OpenSquilla:
 
    ```sh
-   uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.0/opensquilla-0.5.0-py3-none-any.whl"
+   uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/opensquilla/opensquilla/releases/download/v0.5.3/opensquilla-0.5.3-py3-none-any.whl"
    ```
 
 2. Configure your provider:
@@ -48,6 +48,7 @@ single-turn chat alone.
 | Meta-skills | Repeatable workflows can be packaged as composable skills, so users can turn recurring multi-step work into reusable agent routines. |
 | Unified surfaces | CLI, Web UI, gateway RPC, and channels share the same runtime path, tools, memory, approvals, and usage accounting. |
 | Durable sessions | Conversations, transcripts, compaction summaries, artifacts, cost, and replay data are persisted for later inspection. |
+| Goal mode | One session can keep a persistent multi-turn objective, structured progress, usage totals, and bounded automatic continuation without bypassing the shared runtime or approvals. |
 | Personal memory | User facts, notes, and task traces can be saved and recalled through local keyword and semantic search. |
 | Multi-provider runtime | OpenRouter, OpenAI, Anthropic, Gemini, DeepSeek, DashScope, Ollama, and other provider-compatible backends can be configured through one schema. |
 | Safe tool use | File, shell, web, memory, git, artifact, media, channel, and agent tools run behind policy layers and approval surfaces. |
@@ -63,6 +64,7 @@ single-turn chat alone.
 | Learn the CLI command groups | [`docs/cli.md`](docs/cli.md) |
 | Use the local control console | [`docs/web-ui.md`](docs/web-ui.md) |
 | Resume, export, abort, or delete sessions | [`docs/sessions.md`](docs/sessions.md) |
+| Run and safely resume a persistent multi-turn Goal | [`docs/goal-mode.md`](docs/goal-mode.md) |
 | Choose and inspect LLM providers/models | [`docs/providers-and-models.md`](docs/providers-and-models.md) |
 | Configure web search | [`docs/search.md`](docs/search.md) |
 | Understand the main product capabilities | [`docs/features.md`](docs/features.md) |
@@ -164,7 +166,7 @@ Read: [`docs/features/tool-compression.md`](docs/features/tool-compression.md)
 Meta-skills let OpenSquilla present higher-level workflows instead of making the
 user re-describe the same multi-step process. They are useful for repeatable
 research reports, document-to-decision work, daily operating briefs, account
-watching, job-search preparation, kid project planning, academic paper drafting,
+watching, job-search preparation, academic paper drafting, short-drama production,
 and MetaSkill proposal creation.
 
 By default, launch them deliberately with `/meta` and `/meta <name>`.

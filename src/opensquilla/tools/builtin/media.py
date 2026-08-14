@@ -43,6 +43,14 @@ from opensquilla.provider.audio import (
     VoiceConversionResult,
     resolve_elevenlabs_api_key_env,
 )
+from opensquilla.provider.auxiliary_budget import (
+    ensure_auxiliary_text_fits,
+    resolve_auxiliary_request_budget,
+)
+from opensquilla.provider.correlation_context import (
+    bind_provider_request_correlation,
+    current_provider_request_correlation,
+)
 from opensquilla.provider.image_generation import (
     ImageGenerationRequest,
     generate_with_fallbacks,
@@ -51,7 +59,18 @@ from opensquilla.provider.image_generation import (
     parse_image_generation_model_ref,
     reset_image_generation_providers,
 )
+from opensquilla.provider.image_generation_catalog import (
+    get_image_generation_provider_catalog_entry,
+)
+from opensquilla.provider.image_generation_credentials import (
+    resolve_image_generation_credential,
+)
+from opensquilla.provider.image_generation_policy import (
+    conflicting_image_generation_endpoint_provider,
+    is_valid_image_generation_base_url,
+)
 from opensquilla.provider.protocol import provider_metadata
+from opensquilla.provider.types import ChatConfig, derive_provider_request_correlation
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools.path_aliases import resolve_workspace_alias
 from opensquilla.tools.path_policy import reject_foreign_host_path
@@ -95,7 +114,11 @@ def configure_image_generation(
     _media_gateway_config = gateway_config
     _media_llm_config = llm_config
     _media_squilla_router_config = squilla_router_config
-    reset_image_generation_providers(config, llm_config=llm_config)
+    reset_image_generation_providers(
+        config,
+        llm_config=llm_config,
+        gateway_config=gateway_config,
+    )
 
 
 def configure_audio(config: Any | None) -> None:
@@ -382,6 +405,48 @@ def _mime_to_ext(content_type: str) -> str:
 
 async def _complete_from_stream(provider: Any, messages: list, config: Any = None) -> str:
     """Consume a chat() stream and return the assembled text response."""
+    correlation = current_provider_request_correlation()
+    budget = None
+    if config is None:
+        config = ChatConfig(provider_request_correlation=correlation)
+    elif (
+        correlation is not None
+        and getattr(config, "provider_request_correlation", None) is None
+    ):
+        config = config.model_copy(
+            update={"provider_request_correlation": correlation},
+        )
+    if int(getattr(config, "provider_request_max_chars", 0) or 0) <= 0:
+        budget = resolve_auxiliary_request_budget(
+            provider,
+            max_output_tokens=int(getattr(config, "max_tokens", 0) or 0),
+        )
+        config = config.model_copy(
+            update={
+                "max_tokens": budget.max_output_tokens,
+                "provider_request_max_chars": budget.provider_request_max_chars,
+            }
+        )
+    if budget is None:
+        budget = resolve_auxiliary_request_budget(
+            provider,
+            max_output_tokens=int(getattr(config, "max_tokens", 0) or 0),
+            provider_request_max_chars=int(
+                getattr(config, "provider_request_max_chars", 0) or 0
+            ),
+        )
+    config = config.model_copy(
+        update={
+            "max_tokens": budget.max_output_tokens,
+            "provider_request_max_chars": budget.provider_request_max_chars,
+        }
+    )
+    ensure_auxiliary_text_fits(
+        messages,
+        max_chars=budget.provider_request_max_chars,
+        max_tokens=budget.max_input_tokens,
+        system=str(getattr(config, "system", "") or ""),
+    )
     scope = current_usage_accounting_scope()
     close_stream = None
     if scope is None:
@@ -434,7 +499,13 @@ async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> 
             ContentBlockText(text=prompt),
         ],
     )
-    return await _complete_from_stream(provider, [vision_message])
+    correlation = derive_provider_request_correlation(
+        current_provider_request_correlation(),
+        execution_id=uuid.uuid4().hex,
+        call_kind="auxiliary.media",
+    )
+    with bind_provider_request_correlation(correlation):
+        return await _complete_from_stream(provider, [vision_message])
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +546,7 @@ async def _call_vision_provider(b64_data: str, media_type: str, prompt: str) -> 
 )
 async def image_generate(
     prompt: str,
-    size: str = "1024x1024",
+    size: str | None = None,
     model: str | None = None,
     filename: str | None = None,
 ) -> str:
@@ -485,20 +556,27 @@ async def image_generate(
 async def _image_generate_impl(
     *,
     prompt: str,
-    size: str,
+    size: str | None,
     model: str | None,
     filename: str | None,
 ) -> str:
     if not prompt or not prompt.strip():
         raise ToolError("Prompt must not be empty")
 
-    valid_sizes = {"1024x1024", "1536x1024", "1024x1536"}
-    if size not in valid_sizes:
-        raise ToolError(f"Invalid size: {size}. Must be {' | '.join(sorted(valid_sizes))}")
-
     config = _resolve_image_generation_config()
+    effective_size = size if size is not None else getattr(config, "size", "1024x1024")
+    valid_sizes = {"1024x1024", "1536x1024", "1024x1536"}
+    if effective_size not in valid_sizes:
+        raise ToolError(
+            f"Invalid size: {effective_size}. Must be {' | '.join(sorted(valid_sizes))}"
+        )
+
     if not getattr(config, "enabled", False):
         raise ToolError("Image generation is disabled")
+    if not _image_generation_binding_is_active(config):
+        raise ToolError(
+            "Image generation is inactive because its bound LLM provider is not active"
+        )
 
     candidates = _resolve_image_generation_candidates(model, config)
     if not candidates:
@@ -506,14 +584,18 @@ async def _image_generate_impl(
 
     output_format = getattr(config, "output_format", "png")
     target = _resolve_generated_image_path(filename, output_format)
+    tool_context = current_tool_context.get()
     try:
         result = await generate_with_fallbacks(
             request=ImageGenerationRequest(
                 prompt=prompt,
                 model=candidates[0],
-                size=size or getattr(config, "size", "1024x1024"),
+                size=effective_size,
                 output_format=output_format,
                 timeout_seconds=float(getattr(config, "timeout_seconds", 180.0)),
+                credential_session_key=(
+                    str(tool_context.session_key or "") if tool_context is not None else ""
+                ),
             ),
             candidates=candidates,
         )
@@ -613,10 +695,49 @@ def _resolve_image_generation_candidates(model: str | None, config: Any) -> list
     return candidates
 
 
+def _image_generation_binding_is_active(config: Any) -> bool:
+    """Whether a system-owned route still has its bound provider credential."""
+
+    if str(getattr(config, "binding", "custom") or "custom") != "follow_llm":
+        return True
+    try:
+        provider_id, _model = parse_image_generation_model_ref(
+            str(getattr(config, "primary", "") or "")
+        )
+    except ValueError:
+        return False
+    provider = get_image_generation_provider(provider_id)
+    if provider is None:
+        return False
+    try:
+        spec = get_image_generation_provider_catalog_entry(provider_id)
+        provider_config = getattr(
+            getattr(config, "providers", None),
+            provider_id,
+            None,
+        )
+        resolution = resolve_image_generation_credential(
+            provider_id=provider_id,
+            provider_config=provider_config,
+            default_env_key=spec.env_key,
+            default_base_url=spec.default_base_url,
+            effective_base_url=spec.default_base_url,
+            gateway_config=_media_gateway_config,
+            llm_config=_media_llm_config,
+            model=spec.default_model,
+            include_image_credentials=False,
+        )
+    except (KeyError, ValueError):
+        return False
+    return resolution.available and resolution.owner in {"primary", "profile"}
+
+
 def image_generation_available(config: Any | None = None) -> bool:
     """Return whether image generation has at least one configured provider."""
     resolved_config = config if config is not None else _resolve_image_generation_config()
-    if not getattr(resolved_config, "enabled", False):
+    if not getattr(resolved_config, "enabled", False) or not _image_generation_binding_is_active(
+        resolved_config
+    ):
         return False
 
     for candidate in _resolve_image_generation_candidates(None, resolved_config):
@@ -631,6 +752,19 @@ def image_generation_available(config: Any | None = None) -> bool:
 
 
 def _image_generation_provider_has_auth(provider: Any) -> bool:
+    provider_id = str(getattr(provider, "provider_id", "") or "")
+    missing_base_url = object()
+    configured_base_url = getattr(provider, "_base_url", missing_base_url)
+    # Third-party image providers are not required to expose an HTTP endpoint
+    # by the public protocol. Built-in HTTP adapters do, and retain endpoint
+    # validation before they are surfaced as available.
+    if configured_base_url is not missing_base_url:
+        base_url = str(configured_base_url or "")
+        if not is_valid_image_generation_base_url(base_url):
+            return False
+        if conflicting_image_generation_endpoint_provider(provider_id, base_url) is not None:
+            return False
+
     resolve_api_key = getattr(provider, "_resolve_api_key", None)
     if callable(resolve_api_key):
         try:
@@ -655,7 +789,7 @@ def _resolve_generated_image_path(filename: str | None, output_format: str) -> P
         else Path.cwd()
     )
     candidate = Path(raw).expanduser()
-    if not candidate.suffix:
+    if candidate.suffix.lower() != f".{ext}":
         candidate = candidate.with_suffix(f".{ext}")
 
     target = candidate if candidate.is_absolute() else root / candidate
@@ -820,7 +954,13 @@ async def _call_llm_with_text(text: str, prompt: str) -> str:
         selector = ModelSelector(SelectorConfig(primary=cfg))
         provider = selector.resolve()
         message = Message(role="user", content=f"{prompt}\n\n---\n{text}")
-        return await _complete_from_stream(provider, [message])
+        correlation = derive_provider_request_correlation(
+            current_provider_request_correlation(),
+            execution_id=uuid.uuid4().hex,
+            call_kind="auxiliary.media",
+        )
+        with bind_provider_request_correlation(correlation):
+            return await _complete_from_stream(provider, [message])
     except Exception:
         return f"[LLM analysis not available] Extracted text ({len(text)} chars) ready."
 

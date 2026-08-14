@@ -19,6 +19,7 @@ import {
   type ChatRpcStreamApi,
   type UseChatRpcEventHandlersOptions,
 } from './useChatRpcEventHandlers'
+import { useChatTaskOwnership } from './useChatTaskOwnership'
 import { FINISHED_STREAM_TASK_ID, PENDING_STREAM_TASK_ID } from '@/utils/chat/streamEvents'
 
 const SESSION = 'agent:main:webchat:issue344'
@@ -86,8 +87,7 @@ function makeHarness(activeStreamTaskId = '') {
     schedulePendingDrainAfterTerminal: vi.fn(),
     popAllPendingIntoComposer: vi.fn(() => false),
     saveWidgetState: vi.fn(),
-    subscribeSession: vi.fn(),
-    loadHistory: vi.fn(),
+    handleSessionConnectionState: vi.fn(),
     loadCurrentSessionUsage: vi.fn(),
   }
   const scope = effectScope()
@@ -413,8 +413,12 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(newest.messages.value[newest.messages.value.length - 1]?.text).toBe('Task 8 failed.')
   })
 
-  it("accepts the stopped task's cancelled terminal event after Stop poisoned the active id", () => {
-    const { api, options, stream } = makeHarness('__opensquilla_stopped_stream_task__')
+  it("accepts the exact Stop target's cancelled terminal without poisoning the render id", () => {
+    const { api, options, stream } = makeHarness('task-B')
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-B')
+    taskOwnership.beginStop()
+    options.taskOwnership = taskOwnership
     stream.isStreaming.value = false
 
     api.handlers.onAny('task.cancelled', {
@@ -432,8 +436,12 @@ describe('issue #344 — live stream is bound to a single task', () => {
     }))
   })
 
-  it("accepts the stopped task's terminal sessions.changed payload", () => {
-    const { api, options, stream } = makeHarness('__opensquilla_stopped_stream_task__')
+  it("accepts the exact Stop target's terminal sessions.changed payload", () => {
+    const { api, options, stream } = makeHarness('task-B')
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-B')
+    taskOwnership.beginStop()
+    options.taskOwnership = taskOwnership
     stream.isStreaming.value = false
     const cancelledPayload = {
       session_key: SESSION,
@@ -463,7 +471,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     )
   })
 
-  it('keeps the stopped-output notice as a local turn result when the next user message is added', () => {
+  it('does not synthesize a stopped-output bubble before the next user message', () => {
     const { api, options, stream, messages } = makeHarness('__opensquilla_stopped_stream_task__')
     stream.isStreaming.value = true
     messages.value = [
@@ -485,10 +493,9 @@ describe('issue #344 — live stream is bound to a single task', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', 'stop immediately'],
-      ['assistant', 'Stopped after 1s'],
       ['user', 'next question'],
     ])
-    expect(messages.value[1]?.stopNotice).toBe(true)
+    expect(messages.value.some(message => message.stopNotice)).toBe(false)
   })
 
   it('does not insert a stopped-output notice before a cancelled partial assistant output is finalized', () => {

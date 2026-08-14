@@ -3,7 +3,7 @@
   <div
     v-if="resolution"
     class="approval-outcome"
-    :class="outcomeClass"
+    :class="[outcomeClass, { 'approval-outcome--timeline': timeline }]"
     data-testid="approval-outcome"
     role="status"
   >
@@ -17,40 +17,58 @@
     v-else
     class="approval-card"
     data-testid="approval-card"
+    :data-approval-id="approval.id"
+    tabindex="-1"
     role="group"
-    :aria-label="t('chat.approval.requiredFor', { tool: approval.toolName })"
+    :aria-label="t('chat.approval.requiredFor', { action: semanticTitle })"
+    :class="{
+      'approval-card--timeline': timeline,
+      'approval-card--danger': approval.irreversible,
+    }"
   >
     <!-- Concise live announcement: screen readers hear only this line, not the full card body -->
     <div
       class="approval-card__announce"
       aria-live="assertive"
       aria-atomic="true"
-    >{{ t('chat.approval.neededFor', { tool: approval.toolName }) }}</div>
+    >{{ t('chat.approval.neededFor', { action: semanticTitle }) }}</div>
     <header class="approval-card__head">
-      <span class="approval-card__eyebrow">{{ t('chat.approval.required') }}</span>
-      <span class="approval-card__tool">{{ approval.toolName }}</span>
-      <span v-if="approval.namespace && approval.namespace !== 'exec'" class="approval-card__ns">
-        {{ approval.namespace }}
+      <span class="approval-card__icon" aria-hidden="true">
+        <Icon name="shield" :size="18" />
       </span>
-      <span v-if="approval.agent" class="approval-card__agent">{{ approval.agent }}</span>
+      <div class="approval-card__heading">
+        <span class="approval-card__eyebrow">{{ t('chat.approval.required') }}</span>
+        <h3 class="approval-card__title">{{ semanticTitle }}</h3>
+      </div>
     </header>
 
     <div class="approval-card__body">
-      <template v-if="approval.command">
-        <div class="approval-card__label">{{ t('chat.approval.command') }}</div>
-        <pre class="approval-card__pre approval-card__pre--cmd">{{ approval.command }}</pre>
-      </template>
-      <dl v-if="sandboxContextRows.length" class="approval-card__context">
-        <div v-for="row in sandboxContextRows" :key="row.key" class="approval-card__context-row">
-          <dt>{{ t(row.labelKey) }}</dt>
-          <dd>{{ row.value }}</dd>
+      <dl v-if="showTarget" class="approval-card__context">
+        <div class="approval-card__context-row">
+          <dt>{{ t('chat.approval.target') }}</dt>
+          <dd><code class="approval-card__target">{{ approval.displayTarget }}</code></dd>
         </div>
       </dl>
-      <template v-else-if="!approval.command && formattedArgs">
-        <div class="approval-card__label">{{ t('chat.approval.arguments') }}</div>
-        <pre class="approval-card__pre">{{ formattedArgs }}</pre>
+      <template v-if="showCommand">
+        <div class="approval-card__label">{{ t('chat.approval.command') }}</div>
+        <pre class="approval-card__pre approval-card__pre--cmd">{{ displayCommand }}</pre>
       </template>
-      <p v-if="approval.warning" class="approval-card__warning">{{ approval.warning }}</p>
+      <section
+        v-if="riskTitle"
+        class="approval-card__risk"
+        :class="riskClass"
+        role="note"
+      >
+        <span class="approval-card__risk-icon" aria-hidden="true">
+          <Icon :name="riskIcon" :size="14" />
+        </span>
+        <div class="approval-card__risk-copy">
+          <strong>{{ riskTitle }}</strong>
+          <p v-if="riskBody">{{ riskBody }}</p>
+          <p v-if="riskSecondary">{{ riskSecondary }}</p>
+        </div>
+      </section>
+      <p v-if="visibleWarning" class="approval-card__warning">{{ visibleWarning }}</p>
     </div>
 
     <footer class="approval-card__footer">
@@ -73,17 +91,9 @@
           {{ t('chat.approval.extend') }}
         </button>
       </div>
-      <input
-        v-model="denyNote"
-        class="approval-card__note"
-        type="text"
-        :placeholder="t('chat.approval.denyReasonPlaceholder')"
-        :aria-label="t('chat.approval.denyReasonLabel')"
-        :disabled="busy"
-      />
       <div class="approval-card__actions">
         <button class="btn btn--primary" type="button" :disabled="busy" @click="$emit('allow-once')">
-          {{ t('chat.approval.allowOnce') }}
+          {{ allowLabel }}
         </button>
         <button
           v-if="isSandboxApproval"
@@ -109,14 +119,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ChatApprovalItem, ChatApprovalResolution } from '@/composables/chat/useChatApprovals'
 import { formatCountdown } from '@/composables/chat/useChatApprovals'
 
-// Below this remaining time the countdown switches to the warning token and
-// reveals the Extend affordance (WCAG 2.2.1: a countdown alone is not enough).
 const WARN_THRESHOLD_SECONDS = 60
 
 const { t } = useI18n()
@@ -126,82 +134,151 @@ const props = defineProps<{
   resolution: ChatApprovalResolution | null
   busy?: boolean
   error?: string
+  timeline?: boolean
 }>()
 
 const emit = defineEmits<{
   'allow-once': []
   'allow-always': []
-  deny: [note: string]
+  deny: []
   extend: []
 }>()
 
-const denyNote = ref('')
-
-// A 1s tick drives the countdown; only mounted while a pending card is shown.
-// Skip ticks while the tab is hidden so background-tab CPU is not wasted and
-// the visible countdown does not jump on tab restore.
 const now = ref(Date.now())
+let mounted = false
 let tick: ReturnType<typeof setInterval> | null = null
 
-function startTick() {
-  if (tick) return
-  tick = setInterval(() => {
-    if (!document.hidden) now.value = Date.now()
-  }, 1000)
+const deadline = computed(() => {
+  const value = Number(props.approval.deadline)
+  return Number.isFinite(value) && value > 0 ? value : null
+})
+const remainingSeconds = computed(() =>
+  deadline.value === null
+    ? null
+    : Math.max(0, Math.round(deadline.value - now.value / 1000)))
+const showCountdown = computed(() =>
+  !props.resolution && remainingSeconds.value !== null)
+const timeIsLow = computed(() =>
+  remainingSeconds.value !== null
+  && remainingSeconds.value <= WARN_THRESHOLD_SECONDS)
+const countdownText = computed(() =>
+  remainingSeconds.value === null
+    ? ''
+    : t('chat.approval.expiresIn', {
+        time: formatCountdown(remainingSeconds.value),
+      }))
+
+function stopTick() {
+  if (tick) clearInterval(tick)
+  tick = null
+}
+
+function syncTick() {
+  now.value = Date.now()
+  if (!mounted || !showCountdown.value) {
+    stopTick()
+    return
+  }
+  if (!tick) {
+    tick = setInterval(() => {
+      if (!document.hidden) now.value = Date.now()
+    }, 1000)
+  }
 }
 
 function onVisibilityChange() {
   if (!document.hidden) now.value = Date.now()
 }
 
+watch(
+  () => [props.approval.deadline, props.resolution],
+  syncTick,
+)
 onMounted(() => {
-  startTick()
+  mounted = true
   document.addEventListener('visibilitychange', onVisibilityChange)
+  syncTick()
 })
 onBeforeUnmount(() => {
-  if (tick) clearInterval(tick)
+  mounted = false
+  stopTick()
   document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 
-const remainingSeconds = computed(() => {
-  if (!props.approval.deadline) return null
-  return Math.max(0, Math.round(props.approval.deadline - now.value / 1000))
+const DISPLAY_KIND_KEYS: Record<string, string> = {
+  delete: 'delete',
+  modify: 'modify',
+  create: 'create',
+  run_command: 'runCommand',
+  run_code: 'runCode',
+  network_access: 'networkAccess',
+  path_access: 'pathAccess',
+  plugin_permission: 'pluginPermission',
+  sensitive_operation: 'sensitiveOperation',
+}
+
+const semanticTitle = computed(() => {
+  const key = DISPLAY_KIND_KEYS[String(props.approval.displayKind || '')]
+    || 'sensitiveOperation'
+  return t(`chat.approval.kinds.${key}`)
 })
 
-const showCountdown = computed(() => !props.resolution && remainingSeconds.value !== null)
-const timeIsLow = computed(() =>
-  remainingSeconds.value !== null && remainingSeconds.value <= WARN_THRESHOLD_SECONDS)
-const countdownText = computed(() =>
-  remainingSeconds.value === null ? '' : t('chat.approval.expiresIn', { time: formatCountdown(remainingSeconds.value) }))
+const showTarget = computed(() =>
+  Boolean(props.approval.displayTarget)
+  && props.approval.displayKind !== 'run_command')
+
+const displayCommand = computed(() =>
+  props.approval.displayKind === 'run_command'
+    ? props.approval.displayTarget || props.approval.command
+    : '')
+
+const showCommand = computed(() =>
+  Boolean(displayCommand.value))
 
 const isSandboxApproval = computed(() =>
-  String(props.approval.approvalKind || props.approval.args?.approvalKind || '').startsWith('sandbox_'))
+  !props.approval.destructive
+  && String(props.approval.approvalKind || '').startsWith('sandbox_'))
 
-const sandboxContextRows = computed(() => {
-  const args = props.approval.args
-  const kind = String(props.approval.approvalKind || args?.approvalKind || '')
-  if (!args || !kind.startsWith('sandbox_')) return []
-  const target = kind === 'sandbox_network'
-    ? [args.host, args.bundle_id]
-        .filter(value => value != null && ['string', 'number', 'boolean'].includes(typeof value))
-        .join(' · ')
-    : args.path
-  return [
-    { key: 'target', labelKey: 'chat.approval.target', value: target },
-    { key: 'access', labelKey: 'chat.approval.access', value: args.access },
-    { key: 'workspace', labelKey: 'chat.approval.workspace', value: args.workspace },
-  ].filter((row): row is { key: string; labelKey: string; value: string | number | boolean } =>
-    row.value != null && ['string', 'number', 'boolean'].includes(typeof row.value))
-})
-
-const formattedArgs = computed(() => {
-  if (!props.approval.args) return ''
-  try {
-    return JSON.stringify(props.approval.args, null, 2)
-  } catch {
-    return String(props.approval.args)
+const riskTitle = computed(() => {
+  if (props.approval.backupState === 'enabled') return t('chat.approval.backup.enabledTitle')
+  if (props.approval.backupState === 'disabled') return t('chat.approval.backup.disabledTitle')
+  if (props.approval.backupState === 'unavailable_requires_confirmation') {
+    return t('chat.approval.backup.unavailableTitle')
   }
+  if (props.approval.irreversible) return t('chat.approval.irreversibleTitle')
+  return ''
 })
+
+const riskBody = computed(() => {
+  if (props.approval.backupState === 'enabled') return t('chat.approval.backup.enabledBody')
+  if (props.approval.backupState === 'disabled') return t('chat.approval.backup.disabledBody')
+  if (props.approval.backupState === 'unavailable_requires_confirmation') {
+    return t('chat.approval.backup.unavailableBody')
+  }
+  if (props.approval.irreversible) return t('chat.approval.irreversibleBody')
+  return ''
+})
+
+const riskSecondary = computed(() =>
+  props.approval.backupState === 'disabled'
+    ? t('chat.approval.backup.settingsHint')
+    : '')
+
+const riskClass = computed(() =>
+  props.approval.backupState === 'enabled'
+    ? 'approval-card__risk--backup'
+    : 'approval-card__risk--danger')
+
+const riskIcon = computed(() =>
+  props.approval.backupState === 'enabled' ? 'check' : 'info')
+
+const visibleWarning = computed(() =>
+  props.approval.destructive ? '' : props.approval.warning)
+
+const allowLabel = computed(() =>
+  props.approval.backupState === 'unavailable_requires_confirmation'
+    ? t('chat.approval.continueWithoutBackup')
+    : t('chat.approval.allowOnce'))
 
 const outcomeText = computed(() => {
   if (props.resolution === 'unavailable') return t('chat.approval.outcomeUnavailable')
@@ -225,13 +302,15 @@ const outcomeIcon = computed(() => {
 })
 
 const summary = computed(() => {
-  const text = props.approval.command || props.approval.toolName || ''
+  const text = props.approval.displayKind === 'run_command'
+    ? displayCommand.value
+    : props.approval.displayTarget || ''
   return text.length > 60 ? text.slice(0, 60) + '…' : text
 })
 
 function emitDeny() {
   if (props.busy) return
-  emit('deny', denyNote.value)
+  emit('deny')
 }
 </script>
 
@@ -251,10 +330,11 @@ function emitDeny() {
 
 .approval-card {
   width: var(--chat-col, min(calc(100% - 48px), 980px));
+  max-width: 780px;
   margin: var(--sp-2) auto;
-  background: var(--bg-surface);
-  border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
-  border-radius: var(--radius-lg);
+  background: color-mix(in srgb, var(--bg-surface) 97%, var(--bg));
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
@@ -263,53 +343,75 @@ function emitDeny() {
      automatic min-height, so without this the card collapses when the thread
      scrolls. */
   flex-shrink: 0;
-  animation: card-enter var(--dur-enter) var(--ease-out) both;
+}
+
+.approval-card--danger {
+  border-color: color-mix(in srgb, var(--border) 82%, transparent);
+}
+
+.approval-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
 }
 
 .approval-card__head {
   display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: var(--sp-2);
-  padding: var(--sp-3) var(--sp-4) 0;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-5) 0;
+}
+
+.approval-card__icon {
+  align-items: center;
+  background: color-mix(in srgb, var(--warn) 9%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--warn) 20%, var(--border));
+  border-radius: var(--radius-sm);
+  color: var(--warn);
+  display: inline-flex;
+  flex: 0 0 auto;
+  height: 30px;
+  justify-content: center;
+  width: 30px;
+}
+
+.approval-card--danger .approval-card__icon {
+  background: color-mix(in srgb, var(--danger) 8%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--danger) 18%, var(--border));
+  color: var(--danger);
+}
+
+.approval-card__heading {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
 }
 
 .approval-card__eyebrow {
-  color: var(--warn);
+  color: var(--text-muted);
   font-size: var(--fs-xs);
-  font-weight: 700;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  font-weight: var(--fw-eyebrow);
+  letter-spacing: var(--eyebrow-track);
 }
 
-.approval-card__tool {
+.approval-card__title {
   color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--fs-sm);
-  font-weight: 600;
+  font-size: var(--fs-md);
+  font-weight: 650;
+  line-height: 1.35;
+  margin: 0;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.approval-card__ns,
-.approval-card__agent {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-  padding: 1px var(--sp-2);
-}
-
 .approval-card__body {
-  max-height: 280px;
+  max-height: 260px;
   overflow: auto;
-  padding: var(--sp-3) var(--sp-4);
+  padding: var(--sp-3) var(--sp-5) var(--sp-4);
   display: flex;
   flex-direction: column;
-  gap: var(--sp-2);
+  gap: 10px;
 }
 
 .approval-card__label {
@@ -344,22 +446,88 @@ function emitDeny() {
   margin: 0;
 }
 
-.approval-card__context {
+.approval-card__risk {
+  align-items: start;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--text);
   display: grid;
-  gap: var(--sp-2);
+  gap: 10px;
+  grid-template-columns: 22px minmax(0, 1fr);
+  padding: 10px var(--sp-3);
+}
+
+.approval-card__risk-icon {
+  align-items: center;
+  border-radius: var(--radius-sm);
+  display: inline-flex;
+  height: 22px;
+  justify-content: center;
+  width: 22px;
+}
+
+.approval-card__risk-copy {
+  min-width: 0;
+}
+
+.approval-card__risk strong {
+  display: block;
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  line-height: 1.4;
+}
+
+.approval-card__risk p {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  line-height: 1.45;
+  margin: 3px 0 0;
+}
+
+.approval-card__risk--backup {
+  background: color-mix(in srgb, var(--ok) 4%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--ok) 16%, var(--border));
+}
+
+.approval-card__risk--backup .approval-card__risk-icon {
+  background: color-mix(in srgb, var(--ok) 10%, transparent);
+  color: var(--ok);
+}
+
+.approval-card__risk--danger {
+  background: color-mix(in srgb, var(--danger) 4%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--danger) 16%, var(--border));
+}
+
+.approval-card__risk--danger .approval-card__risk-icon {
+  background: color-mix(in srgb, var(--danger) 9%, transparent);
+  color: var(--danger);
+}
+
+.approval-card__risk--danger strong {
+  color: var(--danger);
+}
+
+.approval-card__context {
   margin: 0;
 }
 
 .approval-card__context-row {
+  align-items: start;
+  background: color-mix(in srgb, var(--bg) 58%, var(--bg-surface));
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: var(--radius-md);
   display: grid;
-  grid-template-columns: minmax(88px, auto) 1fr;
-  gap: var(--sp-3);
+  gap: var(--sp-2);
+  grid-template-columns: 58px minmax(0, 1fr);
+  padding: 10px var(--sp-3);
 }
 
 .approval-card__context-row dt {
   color: var(--text-dim);
   font-size: var(--fs-xs);
   font-weight: 600;
+  line-height: 1.5;
 }
 
 .approval-card__context-row dd {
@@ -368,18 +536,26 @@ function emitDeny() {
   font-size: var(--fs-xs);
   margin: 0;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.approval-card__target {
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0;
 }
 
 /* Sticky action bar: the body above scrolls, this footer stays visible. */
 .approval-card__footer {
   position: sticky;
   bottom: 0;
-  background: var(--bg-surface);
+  background: color-mix(in srgb, var(--bg-surface) 97%, var(--bg));
   border-top: 1px solid var(--hairline);
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
-  padding: var(--sp-3) var(--sp-4);
+  padding: 10px var(--sp-5) var(--sp-3);
 }
 
 .approval-card__timer {
@@ -413,35 +589,22 @@ function emitDeny() {
   background: color-mix(in srgb, var(--warn) 10%, var(--bg-surface));
 }
 
-.approval-card__note {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  color: var(--text);
-  font-size: var(--fs-sm);
-  padding: var(--sp-2) var(--sp-3);
-  width: 100%;
-}
-
-.approval-card__note:focus-visible {
-  border-color: var(--border-focus);
-  box-shadow: var(--focus-ring);
-  outline: none;
-}
-
 .approval-card__actions {
   display: flex;
   flex-wrap: wrap;
   gap: var(--sp-2);
+  justify-content: flex-end;
 }
 
 .approval-card__deny {
-  border-color: color-mix(in srgb, var(--danger) 45%, var(--border));
-  color: var(--danger);
+  border-color: transparent;
+  color: var(--text-muted);
 }
 
-.approval-card__deny:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--danger) 10%, var(--bg-surface));
+.approval-card__deny:hover:not(:disabled),
+.approval-card__deny:focus-visible:not(:disabled) {
+  background: color-mix(in srgb, var(--danger) 7%, var(--bg-surface));
+  color: var(--danger);
 }
 
 .approval-card__error {
@@ -491,18 +654,43 @@ function emitDeny() {
   white-space: nowrap;
 }
 
-@keyframes card-enter {
-  from {
-    opacity: 0;
-    transform: translateY(7px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+.approval-outcome--timeline {
+  width: 100%;
+  margin: 0;
+  padding: 7px 8px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, currentColor 5%, transparent);
+}
+
+.approval-card--timeline {
+  width: 100%;
+  max-width: none;
+  margin: var(--sp-2) 0;
+  box-shadow: none;
 }
 
 @media (max-width: 768px) {
+  .approval-card {
+    width: calc(100% - 24px);
+  }
+
+  .approval-card__head {
+    padding: var(--sp-3) var(--sp-3) 0;
+  }
+
+  .approval-card__body {
+    padding: var(--sp-3);
+  }
+
+  .approval-card__context-row {
+    gap: var(--sp-1);
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .approval-card__footer {
+    padding: 10px var(--sp-3) var(--sp-3);
+  }
+
   .approval-card__actions {
     flex-direction: column;
     align-items: stretch;
@@ -513,9 +701,4 @@ function emitDeny() {
   }
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .approval-card {
-    animation: none;
-  }
-}
 </style>

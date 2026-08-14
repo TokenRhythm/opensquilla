@@ -113,3 +113,111 @@ def render_help_table(surface: Surface | str = DEFAULT_SURFACE) -> Table:
             cell += f"  (alias: {', '.join(command.aliases)})"
         table.add_row(escape(cell), command.description)
     return table
+
+
+@dataclass(frozen=True)
+class KeyBinding:
+    """One ``/keys`` cheatsheet row plus the host-source literals that prove it.
+
+    ``js_literals`` are exact substrings of the keyboard-handler source in
+    ``package/src/<js_file>``. The cheatsheet is a hand-maintained mirror of
+    those imperative handlers, so each row pins the condition it documents;
+    ``tests/unit/cli/tui/test_keys_cheatsheet.py`` fails when a binding is
+    removed or renamed without updating this table (the same pattern that pins
+    ``THEME_NAMES`` to ``theme.mjs``).
+    """
+
+    keys: str
+    action: str
+    js_literals: tuple[str, ...] = ()
+    js_file: str = "composer.mjs"
+
+
+OPENTUI_KEY_BINDINGS: tuple[KeyBinding, ...] = (
+    KeyBinding(
+        "Enter",
+        "Send the message — while a turn runs, steer it",
+        ('key.name === "return"',),
+    ),
+    KeyBinding(
+        "Shift+Enter / Alt+Enter",
+        "Insert a newline",
+        ("key.shift || key.option || key.meta || key.alt",),
+    ),
+    KeyBinding(
+        "Tab",
+        "Queue the draft for the next turn (while one runs)",
+        ('key.name === "tab" && turnActive',),
+    ),
+    KeyBinding("Esc", "Cancel the running turn", ('key.name === "escape"',)),
+    KeyBinding(
+        "Ctrl+C",
+        "Clear the input — when empty, cancel the turn",
+        ('key.ctrl && key.name === "c"',),
+    ),
+    KeyBinding("Ctrl+D", "Exit chat", ('key.ctrl && key.name === "d"',)),
+    KeyBinding(
+        "Ctrl+O",
+        "Expand or collapse thinking and tool details",
+        ('key?.name !== "o"',),
+        js_file="main.mjs",
+    ),
+    KeyBinding(
+        "PageUp / PageDown",
+        "Scroll the transcript",
+        ('key.name === "pageup"', 'key.name === "pagedown"'),
+    ),
+    KeyBinding(
+        "Ctrl+G / Ctrl+End",
+        "Jump back to the latest output",
+        ('key.ctrl && key.name === "g"', 'key.ctrl && key.name === "end"'),
+    ),
+    KeyBinding("Ctrl+L", "Redraw the screen", ('key.ctrl && key.name === "l"',)),
+    KeyBinding(
+        "Ctrl+A / Ctrl+E · Home / End",
+        "Go to the start / end of the line",
+        ('key.ctrl && key.name === "a"', 'key.ctrl && key.name === "e"'),
+    ),
+    KeyBinding(
+        "Ctrl+U / Ctrl+K",
+        "Cut to the line start / end",
+        ('key.name === "u" || key.name === "k" || key.name === "w"',),
+    ),
+    KeyBinding(
+        "Ctrl+W / Alt+Backspace · Alt+D",
+        "Cut the previous / next word",
+        (
+            '(key.meta || key.alt || key.option) && key.name === "backspace"',
+            '(key.meta || key.alt || key.option) && key.name === "d"',
+        ),
+    ),
+    KeyBinding("Ctrl+Y", "Paste the last cut text", ('key.ctrl && key.name === "y"',)),
+    KeyBinding(
+        "Alt+B / Alt+F · Ctrl+←/→",
+        "Move back / forward one word",
+        ('key.ctrl && key.name === "left"', 'key.ctrl && key.name === "right"'),
+    ),
+    KeyBinding("@ · /", "Complete a file path · a command (at line start)"),
+)
+
+# The plain (native) backend keeps the standard terminal line editor; only the
+# bindings its runtime actually handles are documented, mirroring the launch
+# banner wording.
+NATIVE_KEY_BINDINGS: tuple[KeyBinding, ...] = (
+    KeyBinding("Enter", "Send the message"),
+    KeyBinding("Ctrl+C", "Clear the input, or cancel the running turn"),
+    KeyBinding("Ctrl+D", "Exit chat"),
+)
+
+
+def render_keys_table(*, opentui: bool = True) -> Table:
+    table = Table(title="Keyboard Shortcuts", show_header=True, header_style=ACCENT_HEADER)
+    table.add_column("Keys", style="bold")
+    table.add_column("Action")
+    for binding in OPENTUI_KEY_BINDINGS if opentui else NATIVE_KEY_BINDINGS:
+        table.add_row(escape(binding.keys), binding.action)
+    if not opentui:
+        table.caption = (
+            "Plain-mode keys. The full-screen TUI adds editing, scroll, and detail shortcuts."
+        )
+    return table

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import inspect
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from opensquilla.redaction import redact_error_text
 
 from .anthropic import AnthropicProvider
 from .compat_policy import OpenAICompatPolicy
+from .credentials import credential_provider_hint, endpoint_provider_hint
 from .failures import classify_provider_error
 from .ollama import OllamaProvider
 from .openai import OpenAIProvider
@@ -21,6 +23,7 @@ from .registry import (
     UnknownProviderError,
     get_provider_spec,
 )
+from .types import ModelInfo
 
 
 @dataclass
@@ -76,6 +79,19 @@ class ModelListResult:
 
     models: list[dict] = field(default_factory=list)
     errors: list[ProviderListError] = field(default_factory=list)
+
+
+async def _list_provider_models_detailed(provider: LLMProvider) -> list:
+    """Ask adapters to surface listing failures when they expose that capability."""
+
+    list_models = provider.list_models
+    try:
+        supports_strict = "raise_on_error" in inspect.signature(list_models).parameters
+    except (TypeError, ValueError):
+        supports_strict = False
+    if supports_strict:
+        return await list_models(raise_on_error=True)  # type: ignore[call-arg]
+    return await list_models()
 
 
 class ProviderBuildError(Exception):
@@ -150,6 +166,19 @@ def _without_provider_state_replay(cfg: ProviderConfig) -> ProviderConfig:
 
 def _build_provider(cfg: ProviderConfig) -> LLMProvider:
     """Instantiate the correct provider class from a ProviderConfig."""
+    provider_id = str(cfg.provider or "").strip().lower()
+    credential_hint = credential_provider_hint(cfg.api_key)
+    if credential_hint and credential_hint != provider_id:
+        raise ProviderBuildError(
+            f"Credential format belongs to provider '{credential_hint}', "
+            f"not configured provider '{provider_id or '(unset)'}'"
+        )
+    endpoint_hint = endpoint_provider_hint(cfg.base_url)
+    if credential_hint and endpoint_hint and credential_hint != endpoint_hint:
+        raise ProviderBuildError(
+            f"Credential format belongs to provider '{credential_hint}', "
+            f"but the configured endpoint belongs to provider '{endpoint_hint}'"
+        )
     try:
         spec = get_provider_spec(cfg.provider)
     except UnknownProviderError as exc:
@@ -197,6 +226,7 @@ class ProviderBuildContext:
     # Spec-derived fields.
     auth_header_style: AuthHeaderStyle = "bearer"
     compat: OpenAICompatPolicy = field(default_factory=OpenAICompatPolicy)
+    static_model_ids: tuple[str, ...] = ()
 
 
 def _build_context(cfg: ProviderConfig, spec: ProviderSpec) -> ProviderBuildContext:
@@ -213,6 +243,7 @@ def _build_context(cfg: ProviderConfig, spec: ProviderSpec) -> ProviderBuildCont
         replay_provider_state=cfg.replay_provider_state,
         auth_header_style=spec.auth_header_style,
         compat=spec.compat,
+        static_model_ids=spec.static_model_ids,
     )
 
 
@@ -223,6 +254,16 @@ def _build_anthropic(ctx: ProviderBuildContext) -> LLMProvider:
         "replay_provider_state": ctx.replay_provider_state,
         "auth_header_style": ctx.auth_header_style,
         "provider_id": ctx.provider_id,
+        # Native Anthropic keeps its built-in SKU list. Compatibility
+        # endpoints use an exact registry list when present, otherwise the
+        # configured model only — never an unrelated Claude catalog.
+        "listing_model_ids": (
+            None
+            if ctx.provider_id == "anthropic"
+            else (ctx.static_model_ids or ((ctx.model,) if ctx.model else ()))
+        ),
+        "temperature_floor_model_ids": ctx.compat.temperature_floor_model_ids,
+        "temperature_floor": ctx.compat.temperature_floor,
     }
     if ctx.base_url:
         kwargs["base_url"] = ctx.base_url
@@ -606,7 +647,12 @@ class ModelSelector:
         """Aggregate models from all configured providers in the chain."""
         return (await self.list_models_detailed()).models
 
-    async def list_models_detailed(self) -> ModelListResult:
+    async def list_models_detailed(
+        self,
+        *,
+        snapshot_resolver: Callable[[ProviderConfig], Sequence[ModelInfo] | None]
+        | None = None,
+    ) -> ModelListResult:
         """Aggregate models across the chain, keeping per-provider failures.
 
         Walks the chain exactly like :meth:`list_models`, but instead of
@@ -614,12 +660,23 @@ class ModelSelector:
         :func:`classify_provider_error` and records a redacted
         :class:`ProviderListError`, so model pickers can distinguish
         "provider has no models" from "wrong key / URL".
+
+        ``snapshot_resolver`` is an additive gateway boundary for providers
+        whose ordinary model listing must be network-free. Returning ``None``
+        keeps the provider's normal listing path; returning a sequence --
+        including an empty one -- makes that sequence authoritative for the
+        individual chain link. Other links continue through their adapters,
+        so a cached provider neither suppresses their rows nor their errors.
         """
         result = ModelListResult()
         for cfg in self._chain:
             try:
+                snapshot = snapshot_resolver(cfg) if snapshot_resolver is not None else None
+                if snapshot is not None:
+                    result.models.extend(model.model_dump() for model in snapshot)
+                    continue
                 provider = _build_provider(cfg)
-                provider_models = await provider.list_models()
+                provider_models = await _list_provider_models_detailed(provider)
                 result.models.extend(m.model_dump() for m in provider_models)
             except Exception as exc:
                 result.errors.append(
@@ -652,7 +709,7 @@ def build_provider(
     proxy: str = "",
 ) -> LLMProvider:
     """Convenience factory: build a single provider directly."""
-    return _build_provider(
+    return build_provider_from_config(
         ProviderConfig(
             provider=provider,
             model=model,
@@ -662,3 +719,19 @@ def build_provider(
             proxy=proxy,
         )
     )
+
+
+def build_provider_from_config(config: ProviderConfig) -> LLMProvider:
+    """Build one provider while preserving the complete deployment config.
+
+    Callers that already resolved a :class:`ProviderConfig` must not flatten it
+    back into ``build_provider``'s legacy argument list: doing so would discard
+    provider routing and continuity policy.  Copy the only mutable member so an
+    adapter cannot mutate selector-owned configuration through a shared dict.
+    """
+
+    isolated = replace(
+        config,
+        provider_routing=dict(config.provider_routing),
+    )
+    return _build_provider(isolated)

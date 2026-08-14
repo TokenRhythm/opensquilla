@@ -13,11 +13,13 @@ import { onUnmounted, ref, shallowRef } from 'vue'
  *    state drives a shimmer.
  *  - Bounded timeout + retry: a stalled fetch flips to `timeout`/`error` with a
  *    Retry affordance instead of a permanent "loading" dead-end.
- *  - Memory: full-size blob URLs are tracked in a bounded LRU and the oldest is
- *    revoked past the cap; thumbnails are tiny and kept with the card.
+ *  - Memory: callers can reject oversized responses before buffering them;
+ *    full-size blob URLs are tracked in a bounded LRU and the oldest is revoked
+ *    past the cap. Thumbnails are tiny and kept with the card.
  */
 
 export type ArtifactPreviewState = 'idle' | 'loading' | 'loaded' | 'timeout' | 'error'
+export type ArtifactPreviewErrorCode = 'network' | 'too_large' | 'unsupported' | null
 
 export interface ArtifactPreviewOptions {
   /** Loader resolving the URL to fetch (thumbnail for grids, full for lightbox). */
@@ -32,6 +34,12 @@ export interface ArtifactPreviewOptions {
   timeoutMs?: number
   /** Max automatic-eligible retries (manual retry always allowed afterwards). */
   maxRetries?: number
+  /** Maximum response bytes retained for a preview. Omit for no size cap. */
+  maxBytes?: number
+  /** Reject cross-origin URLs before any unauthenticated preview request. */
+  requireSameOrigin?: boolean
+  /** Validate response bytes before allocating an object URL. */
+  acceptBlob?: (blob: Blob) => boolean
 }
 
 const CONCURRENCY = 3
@@ -99,6 +107,7 @@ let tokenSeq = 0
 
 export interface ArtifactPreviewController {
   state: ReturnType<typeof ref<ArtifactPreviewState>>
+  errorCode: ReturnType<typeof ref<ArtifactPreviewErrorCode>>
   progress: ReturnType<typeof ref<number | null>>
   objectUrl: ReturnType<typeof shallowRef<string>>
   load: () => void
@@ -116,12 +125,18 @@ export interface ArtifactPreviewController {
  */
 export function createArtifactPreview(options: ArtifactPreviewOptions): ArtifactPreviewController {
   const state = ref<ArtifactPreviewState>('idle')
+  const errorCode = ref<ArtifactPreviewErrorCode>(null)
   // null progress = indeterminate (no Content-Length); 0–100 otherwise.
   const progress = ref<number | null>(null)
   const objectUrl = shallowRef<string>('')
 
   const timeoutMs = options.timeoutMs ?? 30000
   const maxRetries = options.maxRetries ?? 2
+  const maxBytes = typeof options.maxBytes === 'number'
+    && Number.isFinite(options.maxBytes)
+    && options.maxBytes > 0
+    ? options.maxBytes
+    : Number.POSITIVE_INFINITY
   const fullSize = options.fullSize === true
   const sameOriginFn = options.sameOrigin ?? defaultSameOrigin
   const lruToken = `preview-${(tokenSeq += 1)}`
@@ -132,6 +147,8 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
   let observedEl: Element | null = null
   let inFlight = false
   let disposed = false
+  let activeAbortController: AbortController | null = null
+  let retryTimer: number | null = null
 
   function setObjectUrl(next: string) {
     const prev = objectUrl.value
@@ -149,11 +166,13 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
     const url = options.resolveUrl()
     if (!url) {
       state.value = 'error'
+      errorCode.value = 'network'
       return
     }
     inFlight = true
     const seq = ++runSeq
     state.value = 'loading'
+    errorCode.value = null
     progress.value = null
 
     await acquireSlot()
@@ -164,23 +183,31 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
     }
 
     const controller = new AbortController()
+    activeAbortController = controller
     const timer = window.setTimeout(() => controller.abort('timeout'), timeoutMs)
     let timedOut = false
 
     try {
       const isSame = sameOriginFn(url)
+      if (options.requireSameOrigin && !isSame) {
+        throw new ArtifactPreviewLoadError('network', 'Cross-origin preview is not allowed')
+      }
       const response = await fetch(url, {
         method: 'GET',
         headers: isSame && options.headers ? options.headers() : {},
         credentials: isSame ? 'same-origin' : 'omit',
         signal: controller.signal,
+        redirect: 'error',
       })
       if (!response.ok) throw new Error(`status ${response.status}`)
 
       const blob = await readBlobWithProgress(response, p => {
         if (seq === runSeq) progress.value = p
-      })
+      }, maxBytes)
       if (disposed || seq !== runSeq) return
+      if (options.acceptBlob && !options.acceptBlob(blob)) {
+        throw new ArtifactPreviewLoadError('unsupported', 'Preview media type is unsupported')
+      }
 
       const nextUrl = URL.createObjectURL(blob)
       setObjectUrl(nextUrl)
@@ -190,9 +217,11 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
       if (disposed || seq !== runSeq) return
       timedOut = controller.signal.aborted &&
         (controller.signal.reason === 'timeout' || (err as DOMException)?.name === 'AbortError')
+      errorCode.value = err instanceof ArtifactPreviewLoadError ? err.code : 'network'
       state.value = timedOut ? 'timeout' : 'error'
     } finally {
       window.clearTimeout(timer)
+      if (activeAbortController === controller) activeAbortController = null
       releaseSlot()
       inFlight = false
     }
@@ -205,14 +234,20 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
 
   function retry() {
     if (inFlight) return
+    if (retryTimer !== null) window.clearTimeout(retryTimer)
     attempt += 1
     const eligible = attempt <= maxRetries
     // Gentle backoff for auto-eligible retries; manual retries beyond the cap
     // fire immediately so the user is never blocked.
     const delay = eligible ? Math.min(2000, 300 * attempt) : 0
     state.value = 'loading'
+    errorCode.value = null
     progress.value = null
-    window.setTimeout(() => { if (!disposed) void run() }, delay)
+    const retrySeq = runSeq
+    retryTimer = window.setTimeout(() => {
+      retryTimer = null
+      if (!disposed && retrySeq === runSeq) void run()
+    }, delay)
   }
 
   function observe(el: Element | null) {
@@ -246,6 +281,12 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
   function release() {
     cancelObserve()
     runSeq += 1
+    if (retryTimer !== null) {
+      window.clearTimeout(retryTimer)
+      retryTimer = null
+    }
+    activeAbortController?.abort('cancelled')
+    activeAbortController = null
     if (fullSize) {
       untrackFullUrl(lruToken)
     } else if (objectUrl.value) {
@@ -253,6 +294,7 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
     }
     objectUrl.value = ''
     state.value = 'idle'
+    errorCode.value = null
     progress.value = null
     attempt = 0
   }
@@ -262,7 +304,7 @@ export function createArtifactPreview(options: ArtifactPreviewOptions): Artifact
     release()
   }
 
-  return { state, progress, objectUrl, load, retry, observe, release, dispose }
+  return { state, errorCode, progress, objectUrl, load, retry, observe, release, dispose }
 }
 
 /**
@@ -278,31 +320,55 @@ export function useArtifactPreview(options: ArtifactPreviewOptions): ArtifactPre
  * Stream the response body so a Content-Length header yields a real percentage
  * for slow transfers; without it, progress stays indeterminate (null).
  */
+class ArtifactPreviewLoadError extends Error {
+  constructor(readonly code: Exclude<ArtifactPreviewErrorCode, null>, message: string) {
+    super(message)
+    this.name = 'ArtifactPreviewLoadError'
+  }
+}
+
 async function readBlobWithProgress(
   response: Response,
   onProgress: (percent: number | null) => void,
+  maxBytes = Number.POSITIVE_INFINITY,
 ): Promise<Blob> {
   const lengthHeader = response.headers.get('Content-Length')
   const total = lengthHeader ? Number(lengthHeader) : 0
   const body = response.body
   const type = response.headers.get('Content-Type') || ''
+  const hasKnownTotal = Number.isFinite(total) && total > 0
 
-  if (!body || !total || !Number.isFinite(total) || total <= 0) {
+  if (hasKnownTotal && total > maxBytes) {
+    try { await body?.cancel() } catch {}
+    throw new ArtifactPreviewLoadError('too_large', 'Preview response is too large')
+  }
+
+  if (!body) {
     onProgress(null)
-    return response.blob()
+    const blob = await response.blob()
+    if (blob.size > maxBytes) {
+      throw new ArtifactPreviewLoadError('too_large', 'Preview response is too large')
+    }
+    return blob
   }
 
   const reader = body.getReader()
   const chunks: Uint8Array[] = []
   let received = 0
-  onProgress(0)
+  onProgress(hasKnownTotal ? 0 : null)
   for (;;) {
     const { done, value } = await reader.read()
     if (done) break
     if (value) {
       chunks.push(value)
       received += value.length
-      onProgress(Math.min(99, Math.round((received / total) * 100)))
+      if (received > maxBytes) {
+        try { await reader.cancel() } catch {}
+        throw new ArtifactPreviewLoadError('too_large', 'Preview response is too large')
+      }
+      if (hasKnownTotal) {
+        onProgress(Math.min(99, Math.round((received / total) * 100)))
+      }
     }
   }
   return new Blob(chunks as BlobPart[], type ? { type } : undefined)

@@ -33,6 +33,7 @@ function makeFold(toolCalls: ChatToolCall[], extra: Partial<FoldedTurn> = {}): F
     parts: [],
     sources: [],
     statusHistory: [],
+    timelineSegments: [],
     ...extra,
   }
 }

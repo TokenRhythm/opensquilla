@@ -21,10 +21,15 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
+import structlog
 from yoyo import exceptions, get_backend, read_migrations
 from yoyo import migrations as yoyo_migrations
 
 log = logging.getLogger(__name__)
+#: Separate structured logger: migration-directory resolution emits an
+#: operator-facing event whose fields are asserted by contract tests, while the
+#: rest of this module logs through the standard library.
+_structured_log = structlog.get_logger(__name__)
 
 #: PROCESS_QUERY_LIMITED_INFORMATION — the minimal access right needed to
 #: probe whether a Windows process exists.
@@ -57,6 +62,55 @@ class SchemaAheadError(RuntimeError):
     """
 
 
+def resolve_migrations_dir() -> Path:
+    """Locate yoyo migrations in env override, installed package, or checkout.
+
+    Lives beside :func:`apply_pending` because every caller that applies
+    migrations needs it, including offline profile consolidation.  Keeping it in
+    the gateway would force lower layers to import the gateway back.
+    """
+
+    env_dir = os.environ.get("OPENSQUILLA_MIGRATIONS_DIR")
+    if env_dir:
+        candidate = Path(env_dir)
+        if any(candidate.glob("V*.py")):
+            return candidate
+        # A pinned-but-unusable override silently falling through to a
+        # different migration set is a misconfiguration operators must see.
+        # Structured rather than this module's stdlib logger: the event name and
+        # its ``path``/``reason`` fields are a pinned operator-facing contract.
+        _structured_log.warning(
+            "resolve_migrations_dir.env_override_ignored",
+            path=str(candidate),
+            reason=(
+                "directory does not exist"
+                if not candidate.is_dir()
+                else "no V*.py migration files found"
+            ),
+        )
+
+    try:
+        from importlib import resources as importlib_resources
+
+        package_dir = importlib_resources.files("opensquilla").joinpath("_migrations")
+        if package_dir.is_dir():
+            path = Path(str(package_dir))
+            if any(path.glob("V*.py")):
+                return path
+    except Exception:
+        pass
+
+    repo_dir = Path(__file__).resolve().parents[3] / "migrations"
+    if any(repo_dir.glob("V*.py")):
+        return repo_dir
+
+    raise RuntimeError(
+        "opensquilla migrations directory not found "
+        "(checked OPENSQUILLA_MIGRATIONS_DIR, opensquilla/_migrations, "
+        "and repo migrations/)"
+    )
+
+
 def _adapt_sqlite_datetime(value: datetime) -> str:
     return value.isoformat(" ")
 
@@ -65,6 +119,28 @@ def _ensure_sqlite_datetime_adapter() -> None:
     """Register the Python 3.12 replacement for sqlite3's deprecated default."""
 
     sqlite3.register_adapter(datetime, _adapt_sqlite_datetime)
+
+
+def _native_sqlite_path(path: str | Path) -> str:
+    """Return a local SQLite spelling that bypasses legacy Windows MAX_PATH."""
+
+    value = os.fspath(Path(path).expanduser())
+    if os.name != "nt":
+        return value
+    absolute = os.path.abspath(value)
+    if absolute.startswith("\\\\?\\"):
+        return absolute
+    if absolute.startswith("\\\\"):
+        return f"\\\\?\\UNC\\{absolute[2:]}"
+    return f"\\\\?\\{absolute}"
+
+
+def _sqlite_path(path: str | Path) -> Path:
+    """Return one absolute local path, native on Windows and logical elsewhere."""
+
+    if os.name == "nt":
+        return Path(_native_sqlite_path(path))
+    return Path(path).expanduser().resolve()
 
 
 def _to_yoyo_url(db_url: str) -> str:
@@ -80,12 +156,34 @@ def _to_yoyo_url(db_url: str) -> str:
     drive letters survive.
     """
     if "://" in db_url:
-        return db_url
+        if os.name != "nt":
+            return db_url
+        local_path = _sqlite_path_from_db_url(db_url)
+        if local_path is None:
+            return db_url
+        parsed = urlparse(db_url)
+        normalized = "sqlite:///" + quote(str(local_path), safe="/:")
+        if parsed.query:
+            normalized += f"?{parsed.query}"
+        if parsed.fragment:
+            normalized += f"#{parsed.fragment}"
+        return normalized
     if db_url == ":memory:":
         return "sqlite:///:memory:"
     # bare filesystem path — normalise to absolute so yoyo opens the same db
     # regardless of the worker cwd.
-    return "sqlite:///" + quote(Path(db_url).expanduser().resolve().as_posix(), safe="/:")
+    # On Windows always select the extended namespace. Gateway boot passes a
+    # logical path, while consolidation may already pass ``\\?\``; both must
+    # resolve to the same database without depending on LongPathsEnabled.
+    normalized = _native_sqlite_path(db_url) if os.name == "nt" else _sqlite_path(db_url).as_posix()
+    return "sqlite:///" + quote(normalized, safe="/:")
+
+
+def _sqlite_read_only_uri(db_path: Path) -> str:
+    value = str(db_path)
+    if os.name == "nt" and value.startswith("\\\\?\\"):
+        return f"file:{quote(value, safe='/:')}?mode=ro"
+    return f"{db_path.as_uri()}?mode=ro"
 
 
 def _sqlite_path_from_db_url(db_url: str) -> Path | None:
@@ -94,7 +192,7 @@ def _sqlite_path_from_db_url(db_url: str) -> Path | None:
     if db_url == ":memory:":
         return None
     if "://" not in db_url:
-        return Path(db_url).expanduser().resolve()
+        return _sqlite_path(db_url)
 
     parsed = urlparse(db_url)
     if parsed.scheme != "sqlite" or parsed.netloc:
@@ -103,11 +201,13 @@ def _sqlite_path_from_db_url(db_url: str) -> Path | None:
         return None
 
     path = unquote(parsed.path)
+    if os.name == "nt" and path.startswith("/\\\\?\\"):
+        path = path[1:]
     if os.name == "nt" and len(path) >= 3 and path[0] == "/" and path[2] == ":":
         path = path[1:]
     if os.name != "nt" and path.startswith("//") and not path.startswith("///"):
         path = path[1:]
-    return Path(path).expanduser().resolve()
+    return _sqlite_path(path)
 
 
 @contextlib.contextmanager
@@ -197,7 +297,7 @@ def _is_pid_alive(pid: int) -> bool:
 
 def _read_yoyo_lock_pids(db_path: Path) -> list[int] | None:
     try:
-        connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(_sqlite_read_only_uri(db_path), uri=True)
     except sqlite3.Error as exc:
         log.warning(
             "migrator.lock_inspect_failed",
@@ -362,7 +462,7 @@ def _read_applied_migration_ids(db_path: Path) -> set[str] | None:
     database), or ``None`` when the database cannot be inspected.
     """
     try:
-        connection = sqlite3.connect(f"{db_path.as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(_sqlite_read_only_uri(db_path), uri=True)
     except sqlite3.Error as exc:
         log.warning(
             "migrator.applied_inspect_failed",

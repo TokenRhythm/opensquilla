@@ -7,7 +7,7 @@
     "start": "bun src/main.mjs",
     "smoke": "bun src/main.mjs --help",
     "test": "node --test --test-force-exit $(find src -name '*.test.mjs' ! -name '*.bun.test.mjs')",
-    "test:bun": "bun test src/*.bun.test.mjs",
+    "test:bun": "node scripts/run-bun-tests.mjs",
     "test:all": "npm run test && npm run test:bun"
   },
   "dependencies": {

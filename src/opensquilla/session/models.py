@@ -47,6 +47,21 @@ class SessionIntent(StrEnum):
     RESET_SAME_KEY = "reset_same_key"
 
 
+class CollaborationMode(StrEnum):
+    DEFAULT = "default"
+    PLAN = "plan"
+
+
+class PlanRunStatus(StrEnum):
+    QUEUED = "queued"
+    RUNNING = "running"
+    PAUSED = "paused"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+    SUPERSEDED = "superseded"
+
+
 class AgentTaskStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -69,6 +84,23 @@ def _now_ms() -> int:
 
 def _new_uuid() -> str:
     return str(uuid.uuid4())
+
+
+class ProjectWorkspace(SQLModel, table=True):
+    """A user-selected project directory that exists independently of sessions."""
+
+    __tablename__ = "project_workspaces"
+
+    workspace_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    path: str
+    path_key: str = Field(unique=True)
+    display_name: str
+    created_at: int = Field(default_factory=_now_ms)
+    updated_at: int = Field(default_factory=_now_ms)
+    position_at: int = Field(default_factory=_now_ms)
+    pinned_at: int | None = None
+    removed_at: int | None = None
+    trusted_at: int | None = None
 
 
 class SessionNode(SQLModel, table=True):
@@ -138,6 +170,9 @@ class SessionNode(SQLModel, table=True):
     reasoning_level: str | None = None
     send_policy: str = Field(default=SendPolicy.ALLOW)
     queue_mode: str = Field(default=QueueMode.STEER)
+    collaboration_mode: str = Field(default=CollaborationMode.DEFAULT)
+    collaboration_revision: int = 0
+    active_plan_revision_id: str | None = None
 
     # Labels
     label: str | None = Field(default=None, max_length=512)
@@ -152,6 +187,10 @@ class SessionNode(SQLModel, table=True):
 
     # Origin metadata (JSON blob)
     origin: dict[str, Any] | None = Field(default=None, sa_column=Column(JSON))
+
+    # Optional user-selected project workspace. Ordinary tasks keep this NULL
+    # and continue to resolve the Agent/default OpenSquilla workspace.
+    workspace_id: str | None = Field(default=None, index=True)
 
     # Agent id for multi-agent support
     agent_id: str = "main"
@@ -195,6 +234,139 @@ class TranscriptEntry(SQLModel, table=True):
 
     # Schema generation (S-MIGRATE).
     schema_version: int = 1
+
+
+class PlanRevisionRecord(SQLModel, table=True):
+    """Immutable, structured plan proposed for a session."""
+
+    __tablename__ = "plan_revisions"
+
+    revision_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    plan_id: str = Field(default_factory=_new_uuid, index=True)
+    parent_revision_id: str | None = Field(default=None, index=True)
+    generation: int = 1
+    source_session_key: str = Field(index=True, max_length=512)
+    source_session_id: str = Field(index=True)
+    source_epoch: int = 0
+    source_turn_id: str | None = Field(default=None, index=True)
+    source_message_id: str | None = Field(default=None, index=True)
+    title: str
+    markdown: str
+    steps: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    content_hash: str = Field(index=True, max_length=128)
+    created_at: int = Field(default_factory=_now_ms)
+    schema_version: int = 1
+
+
+class PlanRunRecord(SQLModel, table=True):
+    """Server-authoritative execution overlay for one immutable plan revision."""
+
+    __tablename__ = "plan_runs"
+
+    run_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    session_key: str = Field(index=True, max_length=512)
+    session_id: str = Field(index=True)
+    session_epoch: int = 0
+    plan_revision_id: str = Field(index=True)
+    supersedes_run_id: str | None = Field(default=None, index=True)
+    driver_kind: str = "manual"
+    driver_id: str | None = Field(default=None, index=True)
+    status: str = Field(default=PlanRunStatus.QUEUED, index=True)
+    step_states: list[dict[str, Any]] = Field(default_factory=list, sa_column=Column(JSON))
+    current_step_id: str | None = None
+    state_revision: int = 0
+    active_task_id: str | None = Field(default=None, index=True)
+    pause_reason: str | None = None
+    terminal_reason: str | None = None
+    created_at: int = Field(default_factory=_now_ms)
+    updated_at: int = Field(default_factory=_now_ms)
+    started_at: int | None = None
+    finished_at: int | None = None
+    schema_version: int = 1
+
+
+class GoalRecord(SQLModel, table=True):
+    """The single server-authoritative Goal for one session generation.
+
+    Goal execution is deliberately not a PlanRun overlay.  ``session_key`` is
+    the current-row identity, while ``session_id`` plus ``session_epoch`` fence
+    every task/tool write against reset and replacement races.
+    """
+
+    __tablename__ = "session_goals"
+
+    session_key: str = Field(
+        primary_key=True,
+        max_length=512,
+        foreign_key="sessions.session_key",
+    )
+    session_id: str = Field(index=True)
+    session_epoch: int = 0
+    goal_id: str = Field(default_factory=_new_uuid, unique=True, index=True)
+    objective: str
+    status: str = Field(default="active", index=True)
+
+    # Monotonic compare-and-set fences.  Timestamps are presentation fields and
+    # must never be used as optimistic-concurrency tokens.
+    state_revision: int = 1
+    objective_revision: int = 1
+    progress_revision: int = 0
+    progress_json: dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSON),
+    )
+
+    continuation_seq: int = 0
+    active_task_id: str | None = Field(default=None, index=True)
+    # Durable product anchor for the user transcript row that created this
+    # Goal.  Unlike objective text, this identity remains unambiguous after an
+    # edit and lets reconnecting clients restore the lightweight origin label.
+    source_user_message_id: str | None = None
+    # Internal replay fence for the task that durably committed the current
+    # structured complete/blocked result.  This is intentionally not exposed
+    # under its storage name: snapshots only project its semantic turn
+    # identity as ``terminalTurnId``.
+    terminal_task_id: str | None = None
+    turns_started: int = 0
+    turns_settled: int = 0
+    window_turns_started: int = 0
+
+    active_time_ms: int = 0
+    window_active_time_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    total_tokens: int = 0
+
+    pause_reason: str | None = None
+    blocked_reason: str | None = None
+    terminal_reason: str | None = None
+    created_at_ms: int = Field(default_factory=_now_ms)
+    updated_at_ms: int = Field(default_factory=_now_ms)
+    finished_at_ms: int | None = None
+    schema_version: int = 1
+
+class GoalCommandReceiptRecord(SQLModel, table=True):
+    """Durable idempotency result for one accepted Goal mutation."""
+
+    __tablename__ = "goal_command_receipts"
+
+    receipt_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    source_scope: str = Field(index=True, max_length=256)
+    request_session_key: str = Field(
+        index=True,
+        max_length=512,
+        foreign_key="sessions.session_key",
+    )
+    client_request_id: str = Field(max_length=64)
+    action: str = Field(max_length=32)
+    request_fingerprint: str = Field(max_length=128)
+    accepted_session_id: str = Field(index=True)
+    accepted_session_epoch: int = 0
+    response_json: dict[str, Any] = Field(sa_column=Column(JSON))
+    created_at_ms: int = Field(default_factory=_now_ms)
 
 
 class SessionSummary(SQLModel, table=True):
@@ -320,4 +492,56 @@ class TurnIngressReceipt(SQLModel, table=True):
     message_id: str
     task_id: str | None = Field(default=None, index=True)
     accepted_at: int = Field(default_factory=_now_ms)
+    schema_version: int = 1
+
+
+class MetaControlIntent(SQLModel, table=True):
+    """Durable authorization for one hidden MetaSkill control turn.
+
+    ``correlation_id`` is namespaced (``request:<client id>`` for a manual
+    launch and ``nonce:<nonce>`` for a failed-step replay), so it contains no
+    prompt or provider credential material.  Acceptance coordinates are bound
+    in the same transaction as the turn-ingress receipt.
+    """
+
+    __tablename__ = "meta_control_intents"
+
+    intent_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    session_key: str = Field(index=True, max_length=512)
+    control_kind: str = Field(max_length=16)
+    correlation_id: str = Field(max_length=272)
+    meta_skill_name: str = Field(max_length=256)
+    replay_run_id: str | None = None
+    replay_mode: str | None = Field(default=None, max_length=32)
+    status: str = Field(default="staged", max_length=16)
+    accepted_source_scope: str | None = Field(default=None, max_length=256)
+    accepted_request_session_key: str | None = Field(default=None, max_length=512)
+    accepted_client_request_id: str | None = Field(default=None, max_length=256)
+    accepted_request_fingerprint: str | None = Field(default=None, max_length=128)
+    accepted_message_id: str | None = None
+    accepted_task_id: str | None = Field(default=None, index=True)
+    created_at: int = Field(default_factory=_now_ms)
+    updated_at: int = Field(default_factory=_now_ms)
+    schema_version: int = 1
+
+
+class MetaLaunchDraft(SQLModel, table=True):
+    """Unaccepted manual MetaSkill request retained for crash recovery.
+
+    The launch text is user-authored content and receives the same local
+    session-database treatment as a transcript message.  It is never copied to
+    logs or provider metadata.  ``client_request_id`` is the stable identity
+    used by ``meta.run`` and the eventual hidden ``chat.send``.
+    """
+
+    __tablename__ = "meta_launch_drafts"
+
+    draft_id: str = Field(default_factory=_new_uuid, primary_key=True)
+    session_key: str = Field(index=True, max_length=512)
+    client_request_id: str = Field(max_length=256)
+    meta_skill_name: str = Field(max_length=256)
+    launch_text: str = Field(max_length=128_000)
+    created_at: int = Field(default_factory=_now_ms)
+    updated_at: int = Field(default_factory=_now_ms)
+    expires_at: int
     schema_version: int = 1

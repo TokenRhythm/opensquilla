@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import uuid
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,7 +21,9 @@ from opensquilla.gateway.config import (
     effective_agent_stream_idle_timeout_seconds,
     effective_webui_stream_idle_grace_seconds,
 )
+from opensquilla.gateway.origin_guard import websocket_origin_allowed
 from opensquilla.gateway.protocol import (
+    ERROR_UNAVAILABLE,
     PREAUTH_TIMEOUT_MS,
     PROTOCOL_VERSION,
     WS_CLOSE_SERVICE_RESTART,
@@ -32,6 +36,7 @@ from opensquilla.gateway.protocol import (
     make_event,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcDispatcher
+from opensquilla.sandbox.legacy_codec import encode_payload_for_protocol
 
 log = structlog.get_logger(__name__)
 
@@ -57,10 +62,36 @@ log = structlog.get_logger(__name__)
 # Any future addition to this set MUST be verified against the same
 # upstream invariant.
 _LOSSY_EVENTS: frozenset[str] = frozenset({"tick"})
+_DETACHED_READ_METHODS: frozenset[str] = frozenset({"chat.history"})
+_MAX_DETACHED_READS_PER_CONNECTION = 4
+_DETACHED_READ_STOP_TIMEOUT_SECONDS = 2.0
+_DIRECT_SEND_TIMEOUT_SECONDS = 2.0
+_DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
 
 # Sentinel pushed into the outbox by ``_stop_writer`` to wake a writer
 # blocked in ``await self._outbox.get()`` and exit cleanly.
 _SENTINEL_STOP: Any = object()
+# Keep this list side-effect free: the Web UI uses the advertised methods to
+# turn a reconnect-on-timeout fallback into a request-local rejection.
+_CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
+    {
+        "agents.list",
+        "artifacts.list",
+        "commands.list_for_surface",
+        "config.get",
+        "models.routing.get",
+        "onboarding.status",
+        "sandbox.run_mode.preference.get",
+        "sessions.list",
+        "usage.status",
+        "workspaces.list",
+    }
+)
+_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"}).union(
+    _CONCURRENT_OPTIONAL_READ_METHODS
+)
+_MAX_DETACHED_REQUESTS_PER_CONNECTION = 4
+_DETACHED_REQUEST_DRAIN_SECONDS = 0.25
 
 
 @dataclass(slots=True)
@@ -69,7 +100,8 @@ class _OutboundFrame:
 
     ``seq`` is deliberately absent — it is minted by ``_writer_loop`` at
     dequeue time. ``kind`` is used by same-kind eviction; for events it is
-    ``f"event:{event_name}"``, for RPC responses it is ``"res"``.
+    ``f"event:{event_name}"``, for RPC responses it is ``"res"``, and raw
+    protocol frames such as pong use ``"raw"``.
     """
 
     kind: str
@@ -78,6 +110,7 @@ class _OutboundFrame:
     event_name: str | None
     res_frame: ResFrame | None
     meta: dict[str, Any] | None = None
+    raw_text: str | None = None
 
 
 def _payload_field(payload: Any, key: str) -> Any:
@@ -93,6 +126,7 @@ class WsConnection:
 
     conn_id: str
     ws: WebSocket
+    protocol: int = PROTOCOL_VERSION
     principal: Principal = field(
         default_factory=lambda: Principal(
             role="operator",
@@ -111,7 +145,18 @@ class WsConnection:
     _writer_queue_maxsize: int = field(default=512, init=False, repr=False)
     _outbox: asyncio.Queue[Any] | None = field(default=None, init=False, repr=False)
     _writer_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _detached_read_tasks: set[asyncio.Task[None]] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
     _closing: bool = field(default=False, init=False, repr=False)
+    _detached_request_tasks: set[asyncio.Task[None]] = field(
+        default_factory=set,
+        init=False,
+        repr=False,
+    )
+    _accept_detached_responses: bool = field(default=True, init=False, repr=False)
 
     @property
     def role(self) -> str:
@@ -129,6 +174,128 @@ class WsConnection:
         self._seq += 1
         return self._seq
 
+    @staticmethod
+    def _consume_task_result(task: asyncio.Task[Any]) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except BaseException:
+            pass
+
+    def _try_start_detached_read(
+        self,
+        awaitable: Coroutine[Any, Any, None],
+        *,
+        method: str,
+    ) -> bool:
+        # Session switches and bounded retries can briefly overlap history
+        # reads. Keep that overlap bounded without ever falling back to the
+        # serial receive loop, which would recreate head-of-line blocking.
+        if len(self._detached_read_tasks) >= _MAX_DETACHED_READS_PER_CONNECTION:
+            return False
+        task = asyncio.create_task(
+            awaitable,
+            name=f"ws-read-{method}-{self.conn_id}",
+        )
+        self._detached_read_tasks.add(task)
+        task.add_done_callback(self._handle_detached_read_result)
+        return True
+
+    def _handle_detached_read_result(self, task: asyncio.Task[None]) -> None:
+        self._detached_read_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except BaseException:
+            return
+        if error is None:
+            return
+        log.warning(
+            "gateway.ws_detached_read_failed",
+            conn_id=self.conn_id,
+            task_name=task.get_name(),
+            error=str(error),
+        )
+        close_task = asyncio.create_task(
+            self.close(code=1011, reason="detached_read_failed"),
+            name=f"ws-close-detached-read-{self.conn_id}",
+        )
+        close_task.add_done_callback(self._consume_task_result)
+
+    async def _stop_detached_reads(self) -> None:
+        self._closing = True
+        tasks = tuple(self._detached_read_tasks)
+        self._detached_read_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            _, pending = await asyncio.wait(
+                tasks,
+                timeout=_DETACHED_READ_STOP_TIMEOUT_SECONDS,
+            )
+            if pending:
+                log.warning(
+                    "gateway.ws_stop_detached_reads_timeout",
+                    conn_id=self.conn_id,
+                    pending_count=len(pending),
+                )
+
+    async def _send_direct_text(self, text: str) -> None:
+        """Bound legacy direct sends so a wedged socket cannot stall an RPC."""
+
+        if self._closing or self.ws.client_state != WebSocketState.CONNECTED:
+            return
+        send_task = asyncio.create_task(
+            self.ws.send_text(text),
+            name=f"ws-direct-send-{self.conn_id}",
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {send_task},
+                timeout=_DIRECT_SEND_TIMEOUT_SECONDS,
+            )
+        except BaseException:
+            send_task.cancel()
+            send_task.add_done_callback(self._consume_task_result)
+            self._closing = True
+            raise
+        if send_task in done:
+            try:
+                await send_task
+            except BaseException:
+                self._closing = True
+                raise
+            return
+
+        send_task.cancel()
+        send_task.add_done_callback(self._consume_task_result)
+        self._closing = True
+        log.warning(
+            "gateway.ws_direct_send_timeout",
+            conn_id=self.conn_id,
+            timeout_seconds=_DIRECT_SEND_TIMEOUT_SECONDS,
+        )
+
+        close_task = asyncio.create_task(
+            self.ws.close(code=1011, reason="direct_send_timeout"),
+            name=f"ws-direct-close-{self.conn_id}",
+        )
+        done, _ = await asyncio.wait(
+            {close_task},
+            timeout=_DIRECT_CLOSE_TIMEOUT_SECONDS,
+        )
+        if close_task in done:
+            try:
+                await close_task
+            except Exception:
+                pass
+        else:
+            close_task.cancel()
+            close_task.add_done_callback(self._consume_task_result)
+        raise TimeoutError("WebSocket direct send timed out")
+
     # ------------------------------------------------------------------
     # Public send entry points
     # ------------------------------------------------------------------
@@ -139,6 +306,8 @@ class WsConnection:
         payload: Any = None,
         meta: dict[str, Any] | None = None,
     ) -> None:
+        if self._closing:
+            return
         # Atomic check + enqueue. The check and ``put_nowait`` are part of
         # one synchronous flow with no ``await`` between them, so
         # ``_force_close`` cannot flip ``_closing`` mid-flight (asyncio is
@@ -161,11 +330,18 @@ class WsConnection:
             return
         # Legacy direct-send path (pre-auth, kill-switch off, or post-stop).
         async with self._send_lock:
-            if self.ws.client_state == WebSocketState.CONNECTED:
-                wire = make_event(event, payload, seq=self.next_seq(), meta=meta)
-                await self.ws.send_text(wire.model_dump_json())
+            if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
+                wire = make_event(
+                    event,
+                    encode_payload_for_protocol(payload, protocol=self.protocol),
+                    seq=self.next_seq(),
+                    meta=meta,
+                )
+                await self._send_direct_text(wire.model_dump_json())
 
     async def send_res(self, frame: ResFrame) -> None:
+        if self._closing:
+            return
         # RPC responses are always CONTROL: they carry state-bearing payloads
         # and a slow-client overflow must close the connection rather than
         # silently dropping the response.
@@ -184,14 +360,85 @@ class WsConnection:
             self._enqueue_frame(outbound)
             return
         async with self._send_lock:
-            if self.ws.client_state == WebSocketState.CONNECTED:
-                await self.ws.send_text(frame.model_dump_json())
+            if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
+                encoded = frame.model_copy(
+                    update={
+                        "payload": encode_payload_for_protocol(
+                            frame.payload,
+                            protocol=self.protocol,
+                        )
+                    }
+                )
+                await self._send_direct_text(encoded.model_dump_json())
+
+    async def send_raw_text(self, text: str) -> None:
+        """Send a protocol-level raw frame through the connection writer."""
+
+        if self._closing:
+            return
+        if self._queue_enabled and self._outbox is not None:
+            self._enqueue_frame(
+                _OutboundFrame(
+                    kind="raw",
+                    classification="control",
+                    payload=None,
+                    event_name=None,
+                    res_frame=None,
+                    raw_text=text,
+                )
+            )
+            return
+        async with self._send_lock:
+            if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
+                await self._send_direct_text(text)
 
     async def close(self, code: int = WS_CLOSE_SERVICE_RESTART, reason: str = "") -> None:
+        self._closing = True
         try:
-            await self.ws.close(code=code)
+            if reason:
+                await self.ws.close(code=code, reason=reason)
+            else:
+                await self.ws.close(code=code)
         except Exception:
             pass
+
+    def _track_detached_request(self, task: asyncio.Task[None]) -> None:
+        self._detached_request_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._detached_request_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                log.error(
+                    "gateway.ws_detached_request_failed",
+                    conn_id=self.conn_id,
+                    error=str(error),
+                )
+
+        task.add_done_callback(finished)
+
+    async def _stop_detached_requests(self) -> None:
+        self._accept_detached_responses = False
+        tasks = tuple(self._detached_request_tasks)
+        self._detached_request_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            _, pending = await asyncio.wait(
+                tasks,
+                timeout=_DETACHED_REQUEST_DRAIN_SECONDS,
+            )
+            if pending:
+                log.warning(
+                    "gateway.ws_detached_request_drain_timeout",
+                    conn_id=self.conn_id,
+                    pending=len(pending),
+                )
 
     # ------------------------------------------------------------------
     # Writer task lifecycle
@@ -322,13 +569,26 @@ class WsConnection:
                     if item.event_name is not None:
                         wire = make_event(
                             item.event_name,
-                            item.payload,
+                            encode_payload_for_protocol(
+                                item.payload,
+                                protocol=self.protocol,
+                            ),
                             seq=self.next_seq(),
                             meta=item.meta,
                         )
                         text = wire.model_dump_json()
                     elif item.res_frame is not None:
-                        text = item.res_frame.model_dump_json()
+                        encoded = item.res_frame.model_copy(
+                            update={
+                                "payload": encode_payload_for_protocol(
+                                    item.res_frame.payload,
+                                    protocol=self.protocol,
+                                )
+                            }
+                        )
+                        text = encoded.model_dump_json()
+                    elif item.raw_text is not None:
+                        text = item.raw_text
                     else:
                         continue
                 except asyncio.CancelledError:
@@ -353,6 +613,7 @@ class WsConnection:
                 try:
                     await self.ws.send_text(text)
                 except WebSocketDisconnect:
+                    self._closing = True
                     return
                 except asyncio.CancelledError:
                     raise
@@ -362,6 +623,11 @@ class WsConnection:
                         conn_id=self.conn_id,
                         exc_info=True,
                     )
+                    self._closing = True
+                    try:
+                        await self.ws.close(code=1011, reason="writer_send_failed")
+                    except Exception:  # noqa: BLE001
+                        pass
                     return
         except asyncio.CancelledError:
             raise
@@ -486,6 +752,28 @@ class SubscriptionManager:
         self._session_subs: set[str] = set()  # conn_ids subscribed to session lifecycle
         self._message_subs: dict[str, set[str]] = {}  # session_key -> {conn_id}
         self._topic_subs: dict[str, set[str]] = {}  # topic -> {conn_id}
+        self._message_unsubscribe_listener: Any | None = None
+
+    def set_message_unsubscribe_listener(self, listener: Any | None) -> None:
+        """Install a process-local observer for lost message subscriptions."""
+
+        self._message_unsubscribe_listener = listener
+
+    def _notify_message_unsubscribed(self, conn_id: str, session_key: str) -> None:
+        listener = self._message_unsubscribe_listener
+        if listener is None:
+            return
+        try:
+            result = listener(conn_id, session_key)
+            if inspect.isawaitable(result):
+                asyncio.ensure_future(result)
+        except Exception:
+            log.warning(
+                "subscription.message_unsubscribe_listener_failed",
+                conn_id=conn_id,
+                session_key=session_key,
+                exc_info=True,
+            )
 
     # -- session-level (sessions.subscribe / sessions.unsubscribe) --
 
@@ -505,7 +793,12 @@ class SubscriptionManager:
 
     def unsubscribe_messages(self, conn_id: str, session_key: str) -> None:
         if session_key in self._message_subs:
+            removed = conn_id in self._message_subs[session_key]
             self._message_subs[session_key].discard(conn_id)
+            if not self._message_subs[session_key]:
+                del self._message_subs[session_key]
+            if removed:
+                self._notify_message_unsubscribed(conn_id, session_key)
 
     def get_message_subscribers(self, session_key: str) -> set[str]:
         return set(self._message_subs.get(session_key, set()))
@@ -527,8 +820,13 @@ class SubscriptionManager:
     def remove_connection(self, conn_id: str) -> None:
         """Clean up all subscriptions for a disconnected connection."""
         self._session_subs.discard(conn_id)
-        for subs in self._message_subs.values():
-            subs.discard(conn_id)
+        removed_message_sessions: list[str] = []
+        for session_key, subs in list(self._message_subs.items()):
+            if conn_id in subs:
+                subs.discard(conn_id)
+                removed_message_sessions.append(session_key)
+            if not subs:
+                del self._message_subs[session_key]
         empty_topics = []
         for topic, subs in self._topic_subs.items():
             subs.discard(conn_id)
@@ -536,6 +834,8 @@ class SubscriptionManager:
                 empty_topics.append(topic)
         for topic in empty_topics:
             del self._topic_subs[topic]
+        for session_key in removed_message_sessions:
+            self._notify_message_unsubscribed(conn_id, session_key)
 
 
 # Module-level registry shared across connections
@@ -587,6 +887,7 @@ async def handle_ws_connection(
     usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
+    skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
@@ -599,8 +900,18 @@ async def handle_ws_connection(
     memory_managers: dict[str, Any] | None = None,
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
+    prompt_cache_keepalive_service: Any = None,
+    skill_management_service: Any = None,
 ) -> None:
     """Main WebSocket connection handler."""
+    if not websocket_origin_allowed(ws, config):
+        log.warning(
+            "gateway.origin_rejected",
+            category="websocket_cross_origin",
+        )
+        await ws.close(code=1008)
+        return
+
     conn_id = str(uuid.uuid4())
     conn = WsConnection(conn_id=conn_id, ws=ws)
     registry = get_registry()
@@ -612,7 +923,7 @@ async def handle_ws_connection(
     nonce = str(uuid.uuid4())
     try:
         await conn.send_event("connect.challenge", {"nonce": nonce})
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, TimeoutError):
         return
 
     # Step 2: Pre-auth timeout — client must send connect request
@@ -681,8 +992,19 @@ async def handle_ws_connection(
         await conn.send_res(make_error_res(req_id, "UNAUTHORIZED", "Authentication failed"))
         await conn.close()
         return
+    if principal.auth_state == "invalid":
+        from opensquilla.gateway.token_store import default_auth_failure_limiter
 
-    from opensquilla.sandbox.run_mode_policy import hello_auth_payload
+        await default_auth_failure_limiter().wait_after_failure(
+            peer_ip,
+            principal.token_public_id,
+        )
+        log.warning(
+            "ws.auth_invalid_guest_only",
+            conn_id=conn_id,
+            peer_ip=peer_ip,
+            token_public_id=principal.token_public_id,
+        )
 
     # Step 5: Negotiate protocol version
     min_proto = params_raw.get("minProtocol", 1)
@@ -708,6 +1030,7 @@ async def handle_ws_connection(
 
     # Assign principal
     conn.principal = principal
+    conn.protocol = negotiated
 
     # Step 6: Send HelloOk
     hello = HelloOk(
@@ -721,6 +1044,8 @@ async def handle_ws_connection(
             auth_mode=config.auth.mode,
         ),
         policy=PolicyInfo(
+            concurrent_history_reads=True,
+            concurrent_optional_read_methods=sorted(_CONCURRENT_OPTIONAL_READ_METHODS),
             agent_stream_heartbeat_interval_ms=int(
                 max(0.0, float(getattr(config, "agent_stream_heartbeat_interval_seconds", 15.0)))
                 * 1000
@@ -736,9 +1061,12 @@ async def handle_ws_connection(
                 * 1000
             ),
         ),
-        auth=hello_auth_payload(principal),
+        auth=_websocket_hello_auth_payload(principal),
     )
-    await ws.send_text(hello.model_dump_json())
+    try:
+        await conn.send_raw_text(hello.model_dump_json())
+    except (WebSocketDisconnect, TimeoutError):
+        return
 
     registry.register(conn)
     # Boundary: pre-auth direct-send ends here. After registry.register(conn),
@@ -771,6 +1099,7 @@ async def handle_ws_connection(
             usage_event_sink,
             meta_run_writer,
             skill_loader,
+            skill_management_state,
             cron_scheduler,
             turn_runner,
             task_runtime,
@@ -783,17 +1112,22 @@ async def handle_ws_connection(
             memory_stores,
             memory_retrievers,
             provider_stats=provider_stats,
+            prompt_cache_keepalive_service=prompt_cache_keepalive_service,
+            skill_management_service=skill_management_service,
         )
     except WebSocketDisconnect:
         pass
     except Exception as exc:
         log.error("ws.error", conn_id=conn_id, error=str(exc))
     finally:
-        # Stop the writer FIRST, before tick_task.cancel() and before
-        # registry.unregister. Otherwise an EventBridge.emit on another
-        # coroutine could still hold a reference to this connection while
-        # the writer task is mid-cancel, producing a "zombie writer"
-        # scenario.
+        # Detached optional reads must stop before the writer so a handler that
+        # suppresses cancellation cannot enqueue a late response after teardown.
+        await conn._stop_detached_requests()
+        # Detached reads can still enqueue responses, so retire them before the
+        # writer. Then stop the writer before tick_task.cancel() and before
+        # registry.unregister. Otherwise a producer could still hold a reference
+        # to this connection while the writer is mid-cancel.
+        await conn._stop_detached_reads()
         await conn._stop_writer()
         tick_task.cancel()
         try:
@@ -806,6 +1140,23 @@ async def handle_ws_connection(
         log.info("ws.disconnected", conn_id=conn_id)
 
 
+def _websocket_hello_auth_payload(principal: Any) -> dict[str, Any]:
+    """Add the browser guest credential only to anonymous WebSocket hellos."""
+
+    from opensquilla.sandbox.run_mode_policy import hello_auth_payload
+
+    payload = hello_auth_payload(principal)
+    payload["principal"]["guestOwnerId"] = getattr(principal, "guest_owner_id", None)
+    guest_session_key = getattr(principal, "guest_session_key", None)
+    if guest_session_key and not getattr(principal, "authenticated", False):
+        # Preserve ``invalid`` and the public id internally for rate limiting,
+        # but expose exactly the same anonymous authority as a missing token.
+        payload["principal"]["authState"] = "guest"
+        payload["principal"]["tokenPublicId"] = None
+        payload["guestSessionKey"] = guest_session_key
+    return payload
+
+
 async def _tick_loop(conn: WsConnection, tick_interval_ms: int) -> None:
     interval_s = max(1.0, tick_interval_ms / 1000)
     while True:
@@ -815,6 +1166,18 @@ async def _tick_loop(conn: WsConnection, tick_interval_ms: int) -> None:
         except Exception:
             log.debug("ws.tick_failed", conn_id=conn.conn_id, exc_info=True)
             return
+
+
+async def _dispatch_request(
+    conn: WsConnection,
+    dispatcher: RpcDispatcher,
+    req_id: str,
+    method: str,
+    params: Any,
+    ctx: RpcContext,
+) -> None:
+    res = await dispatcher.dispatch(req_id, method, params, ctx)
+    await conn.send_res(res)
 
 
 async def _message_loop(
@@ -830,6 +1193,7 @@ async def _message_loop(
     usage_event_sink: Any = None,
     meta_run_writer: Any = None,
     skill_loader: Any = None,
+    skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
     turn_runner: Any = None,
     task_runtime: Any = None,
@@ -842,6 +1206,8 @@ async def _message_loop(
     memory_stores: dict[str, Any] | None = None,
     memory_retrievers: dict[str, Any] | None = None,
     provider_stats: Any = None,
+    prompt_cache_keepalive_service: Any = None,
+    skill_management_service: Any = None,
 ) -> None:
     ws = conn.ws
     keepalive_timeout = max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 0.0)))
@@ -882,7 +1248,7 @@ async def _message_loop(
         frame_type = data.get("type")
 
         if frame_type == "ping":
-            await ws.send_text('{"type":"pong"}')
+            await conn.send_raw_text('{"type":"pong"}')
             continue
 
         if frame_type == "pong":
@@ -914,6 +1280,8 @@ async def _message_loop(
             ctx = RpcContext(
                 conn_id=conn.conn_id,
                 principal=conn.principal,
+                protocol=conn.protocol,
+                sandbox_schema_version=2 if conn.protocol >= 4 else 1,
                 session_manager=session_manager,
                 config=config,
                 provider_selector=provider_selector,
@@ -929,12 +1297,15 @@ async def _message_loop(
                 usage_event_sink=usage_event_sink,
                 meta_run_writer=meta_run_writer,
                 skill_loader=skill_loader,
+                skill_management_service=skill_management_service,
+                skill_management_state=skill_management_state or {},
                 cron_scheduler=cron_scheduler,
                 turn_runner=turn_runner,
                 task_runtime=task_runtime,
                 flush_service=flush_service,
                 heartbeat_service=heartbeat_service,
                 heartbeat_loop=heartbeat_loop,
+                prompt_cache_keepalive_service=prompt_cache_keepalive_service,
                 agent_registry=agent_registry,
                 diagnostics_state=diagnostics_state,
                 provider_stats=provider_stats,
@@ -942,14 +1313,74 @@ async def _message_loop(
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},
             )
-            res = await dispatcher.dispatch(req_id, method, params, ctx)
-            await conn.send_res(res)
+            if method in _DETACHED_RPC_METHODS:
+                if (
+                    len(conn._detached_request_tasks)
+                    >= _MAX_DETACHED_REQUESTS_PER_CONNECTION
+                ):
+                    await conn.send_res(
+                        make_error_res(
+                            req_id,
+                            ERROR_UNAVAILABLE,
+                            "Too many optional recovery requests are already running",
+                            retryable=True,
+                        )
+                    )
+                    continue
+                task = asyncio.create_task(
+                    _dispatch_and_send(
+                        conn,
+                        dispatcher,
+                        req_id,
+                        method,
+                        params,
+                        ctx,
+                        detached=True,
+                    ),
+                    name=f"ws-detached-request-{conn.conn_id}",
+                )
+                conn._track_detached_request(task)
+                continue
+            request = _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
+            if method in _DETACHED_READ_METHODS:
+                if conn._try_start_detached_read(request, method=method):
+                    # History reads may wait on storage while the client still
+                    # needs the same connection for navigation and controls.
+                    continue
+                request.close()
+                await conn.send_res(
+                    make_error_res(
+                        req_id,
+                        "STORAGE_BUSY",
+                        "Too many history reads are already in progress",
+                        retryable=True,
+                        retry_after_ms=100,
+                    )
+                )
+                continue
+            await request
         else:
             # repr keeps the echo serializable for any client value (lone
             # surrogates escape to backslash form).
             await conn.send_res(
                 make_error_res("", "INVALID_REQUEST", f"Unknown frame type: {frame_type!r}")
             )
+
+
+async def _dispatch_and_send(
+    conn: WsConnection,
+    dispatcher: RpcDispatcher,
+    req_id: str,
+    method: str,
+    params: Any,
+    ctx: RpcContext,
+    *,
+    detached: bool = False,
+) -> None:
+    response = await dispatcher.dispatch(req_id, method, params, ctx)
+    if detached and not conn._accept_detached_responses:
+        return
+    await conn.send_res(response)
 
 
 def _build_features(dispatcher: RpcDispatcher) -> Any:

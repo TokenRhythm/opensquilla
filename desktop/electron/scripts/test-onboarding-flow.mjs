@@ -32,8 +32,7 @@ async function setupWindow(app) {
     for (const page of app.windows()) {
       if (page.isClosed()) continue
       await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => {})
-      const hasSetupForm = await page.locator('#setup-form').count().catch(() => 0)
-      if (hasSetupForm > 0) return page
+      if (await page.locator('#setup-form').count().catch(() => 0)) return page
     }
     return null
   }, 'desktop onboarding window')
@@ -65,17 +64,191 @@ const app = await electron.launch({
 
 try {
   const page = await setupWindow(app)
+  const pageErrors = []
+  page.on('pageerror', (error) => pageErrors.push(error.message || String(error)))
+  const providerScreen = page.locator('[data-screen="1"]')
+  async function chooseProvider(id) {
+    await page.locator('#providerSelectToggle').click()
+    await page.locator(`[data-provider-option="${id}"]`).click()
+  }
 
   await page.locator('#onboardingLocale').selectOption('zh-Hans')
+  assert.deepEqual(pageErrors, [], 'onboarding should not raise page-script errors during locale rendering')
   assert.equal(await page.evaluate(() => document.documentElement.lang), 'zh-Hans')
-  assert.equal(await page.locator('[data-screen="0"] h2').innerText(), '选择设置深度')
   assert.equal(await page.title(), '设置 OpenSquilla')
-  assert.doesNotMatch(await page.locator('[data-setup-mode="advanced"]').innerText(), /Smart Router mode/)
-  await page.locator('[data-setup-mode="advanced"]').click()
-
-  await page.locator('[data-screen="0"].active .next-button').click()
-  await page.locator('[data-screen="1"].active').waitFor({ state: 'visible', timeout: 10_000 })
-  assert.equal(await page.locator('[data-step-label="2"]').count(), 1, 'advanced setup should expose the routing-mode progress step')
+  assert.equal(await page.locator('[data-screen="0"]').count(), 0, 'setup-depth selection must be removed')
+  assert.equal(await page.locator('[data-screen="2"], [data-screen="3"], [data-screen="4"]').count(), 0, 'onboarding must use a single setup screen')
+  assert.equal(await page.locator('[data-setup-mode], [data-model-routing-mode]').count(), 0, 'advanced setup controls must be removed')
+  assert.equal(await page.locator('.rail, .progress, .step').count(), 0, 'onboarding must not render a side rail or step tracker')
+  assert.equal(await page.locator('.topbar .brand').innerText(), 'OpenSquilla')
+  assert.equal(await page.locator('.eyebrow, .card-badge').count(), 0, 'decorative step labels and badges must be removed')
+  assert.equal(await page.locator('#providerHint').count(), 0, 'provider hint banner must be removed')
+  assert.equal(await providerScreen.isVisible(), true, 'onboarding should open directly on provider setup')
+  assert.equal(await page.locator('.step-switcher, [data-route-step]').count(), 0, 'onboarding should not render a numbered step switcher')
+  assert.equal(await providerScreen.locator('.context-label').count(), 0)
+  assert.equal(await providerScreen.locator('h2').innerText(), '模型服务配置')
+  assert.equal(await providerScreen.locator('.card-head > p').innerText(), '输入 API 密钥即可开始使用')
+  assert.equal(await page.locator('#apiKeyRequiredMarker').innerText(), '*')
+  assert.equal(await page.locator('#apiKeyRequiredMarker').isVisible(), true)
+  assert.equal(
+    await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--accent').trim()),
+    '#BA4D0F',
+    'onboarding should use the in-app light-theme accent',
+  )
+  await page.mouse.move(0, 0)
+  assert.equal(
+    await page.locator('#finish').evaluate((button) => getComputedStyle(button).backgroundColor),
+    'rgb(52, 58, 64)',
+    'the single primary action should use the softer graphite treatment',
+  )
+  assert.equal(await page.locator('#finish').innerText(), '启动 OpenSquilla')
+  assert.equal(await page.locator('.next-button, .back-button').count(), 0, 'single-page onboarding must not render next or back actions')
+  assert.equal(await providerScreen.locator('.provider-feature, .provider-disclosure').count(), 0, 'provider setup should use one unified select')
+  assert.equal(await providerScreen.locator('.provider-promo').count(), 0, 'the promotion should not occupy a separate row')
+  assert.equal(await providerScreen.locator('.provider-promo-token').count(), 0)
+  assert.equal(await providerScreen.locator('.provider-promo-copy').isVisible(), true)
+  assert.equal(await providerScreen.locator('.provider-promo-copy strong').innerText(), 'TokenRhythm 限时福利')
+  assert.equal(await providerScreen.locator('.provider-promo-copy span').innerText(), '注册即领价值 68 元 Token')
+  const promoTitleBox = await page.locator('.provider-promo-copy strong').boundingBox()
+  const promoCopyBox = await page.locator('.provider-promo-copy span').boundingBox()
+  assert.ok(
+    promoTitleBox && promoCopyBox
+      && Math.abs(
+        (promoTitleBox.y + promoTitleBox.height / 2)
+        - (promoCopyBox.y + promoCopyBox.height / 2),
+    ) <= 2,
+    'the limited-time promotion copy should render on one line',
+  )
+  assert.equal(
+    await providerScreen.locator('.provider-promo-copy strong').evaluate((copy) => getComputedStyle(copy).color),
+    'rgb(186, 77, 15)',
+  )
+  assert.equal(await page.locator('#endpointPanel, #endpointToggle').count(), 0, 'simple onboarding should not expose endpoint controls')
+  assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm', 'TokenRhythm should be selected by default')
+  assert.equal(await page.locator('.provider-field-head').count(), 0)
+  assert.equal(await page.locator('#providerSelectLabel').innerText(), '提供商')
+  assert.equal(await page.locator('#providerSelectValue').innerText(), 'TokenRhythm')
+  assert.equal(
+    await page.locator('#providerSelectToggle').evaluate((toggle) => getComputedStyle(toggle).backgroundColor),
+    'rgb(247, 248, 247)',
+    'the provider row should share the recommended-model surface',
+  )
+  assert.equal(
+    await page.locator('#providerSelectToggle').evaluate((toggle) => getComputedStyle(toggle).borderTopWidth),
+    '0px',
+    'the provider row should use the same borderless treatment as the recommended-model row',
+  )
+  assert.equal(await page.locator('#modelSummary').isVisible(), true)
+  assert.equal(await page.locator('#modelEditor').isVisible(), false)
+  assert.equal(await page.locator('#modelSummaryLabel').innerText(), '推荐模型')
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4-pro')
+  assert.deepEqual(
+    await page.evaluate(() => [
+      getComputedStyle(document.getElementById('providerSelectLabel')).fontSize,
+      getComputedStyle(document.getElementById('providerSelectValue')).fontSize,
+      getComputedStyle(document.getElementById('modelSummaryLabel')).fontSize,
+      getComputedStyle(document.getElementById('modelSummaryValue')).fontSize,
+    ]),
+    ['11.5px', '11.5px', '11.5px', '11.5px'],
+    'provider and recommended-model rows should use one consistent font size',
+  )
+  assert.equal(await page.locator('#modelEditToggle').innerText(), '')
+  assert.equal(await page.locator('#modelEditToggle').getAttribute('aria-label'), '修改')
+  assert.equal(await page.locator('#modelEditToggle svg').count(), 1)
+  assert.equal(
+    await page.locator('#modelEditToggle').evaluate((button) => getComputedStyle(button).color),
+    'rgb(122, 129, 138)',
+    'the edit icon should use a neutral gray treatment',
+  )
+  await page.locator('#modelEditToggle').click()
+  assert.equal(await page.locator('#modelSummary').isVisible(), false)
+  assert.equal(await page.locator('#modelEditor').isVisible(), true)
+  assert.equal(await page.locator('label[for="model"] > .field-label-text').innerText(), '模型名称')
+  assert.equal(await page.locator('#modelEditDone').innerText(), '完成')
+  await page.locator('#modelEditDone').click()
+  assert.equal(await page.locator('#modelSummary').isVisible(), true)
+  assert.equal(await page.locator('#apiKey').getAttribute('placeholder'), 'sk-...')
+  assert.equal(await page.evaluate(() => typeof window.opensquillaDesktop.probeOnboarding), 'function')
+  assert.equal(
+    await page.locator('#verifyProvider, #providerVerifyStatus, #providerVerifyError, .provider-verify-inline').count(),
+    0,
+    'provider verification controls should not be exposed in onboarding',
+  )
+  const apiKeyLabelBox = await page.locator('.api-key-label').boundingBox()
+  const providerLabelBox = await page.locator('#providerSelectLabel').boundingBox()
+  const claimButtonBox = await page.locator('#tokenrhythmRegister').boundingBox()
+  const initialApiKeyBox = await page.locator('#apiKey').boundingBox()
+  assert.ok(
+    apiKeyLabelBox && providerLabelBox
+      && Math.abs(apiKeyLabelBox.x - providerLabelBox.x) <= 1,
+    'the API-key heading should align with the inset provider label',
+  )
+  assert.ok(
+    apiKeyLabelBox && promoTitleBox && promoCopyBox
+      && Math.abs(
+        (apiKeyLabelBox.y + apiKeyLabelBox.height / 2)
+        - (promoTitleBox.y + promoTitleBox.height / 2),
+      ) <= 3
+      && Math.abs(
+        (apiKeyLabelBox.y + apiKeyLabelBox.height / 2)
+        - (promoCopyBox.y + promoCopyBox.height / 2),
+      ) <= 3,
+    'the limited-time promotion should share the API-key heading row',
+  )
+  assert.ok(
+    apiKeyLabelBox && claimButtonBox
+      && Math.abs(
+        (apiKeyLabelBox.y + apiKeyLabelBox.height / 2)
+        - (claimButtonBox.y + claimButtonBox.height / 2),
+      ) <= 3,
+    'the claim button should share the API-key heading row',
+  )
+  assert.ok(
+    claimButtonBox && initialApiKeyBox
+      && Math.abs(
+        (claimButtonBox.x + claimButtonBox.width)
+        - (initialApiKeyBox.x + initialApiKeyBox.width),
+      ) <= 2,
+    'the claim button should align to the right edge of the API-key input',
+  )
+  assert.equal(
+    await page.locator('#providerSelectedBadges .provider-badge').count(),
+    0,
+    'the closed provider row should not repeat the limited-time promotion badge',
+  )
+  await page.locator('#providerSelectToggle').click()
+  assert.equal(await page.locator('#providerSelectToggle').getAttribute('aria-expanded'), 'true')
+  assert.equal(await page.locator('#providerSelectPanel').isVisible(), true)
+  assert.equal(await page.locator('#providerSearch, .provider-search-wrap').count(), 0, 'the provider list should open directly without a search field')
+  assert.equal(
+    await page.locator('[data-provider-option="tokenrhythm"]').evaluate((option) => document.activeElement === option),
+    true,
+  )
+  assert.deepEqual(
+    await page.locator('[data-provider-option="tokenrhythm"] .provider-badge').allInnerTexts(),
+    ['限时免费'],
+    'TokenRhythm should expose only the limited-time badge in the provider list',
+  )
+  assert.equal(await page.locator('[data-provider-group="recommended"] .provider-option-group-label').innerText(), '推荐')
+  assert.equal(await page.locator('[data-provider-group="cloud"] .provider-option-group-label').innerText(), '云端服务')
+  assert.equal(await page.locator('[data-provider-group="local"] .provider-option-group-label').innerText(), '本地服务')
+  await page.keyboard.press('Escape')
+  assert.equal(await page.locator('#providerSelectPanel').isVisible(), false)
+  await page.locator('#finish').click()
+  const apiKeyInput = page.locator('#apiKey')
+  const apiKeyError = page.locator('#apiKeyError')
+  assert.match(await apiKeyError.innerText(), /需要 TokenRhythm API 密钥/)
+  assert.equal(await apiKeyInput.getAttribute('aria-invalid'), 'true')
+  assert.equal(await page.locator('#error').innerText(), '', 'field validation must not use the global error region')
+  const apiKeyBox = await apiKeyInput.boundingBox()
+  const apiKeyErrorBox = await apiKeyError.boundingBox()
+  const providerSelectBox = await page.locator('#providerSelectToggle').boundingBox()
+  assert.ok(providerSelectBox && apiKeyBox && providerSelectBox.y + providerSelectBox.height <= apiKeyBox.y, 'provider selector must render above the API-key field')
+  assert.ok(apiKeyBox && apiKeyErrorBox && apiKeyErrorBox.y >= apiKeyBox.y + apiKeyBox.height, 'API-key error must render below its input')
+  await apiKeyInput.fill('temporary-key')
+  assert.equal(await apiKeyError.innerText(), '', 'editing the API key should clear its field error')
+  assert.equal(await apiKeyInput.getAttribute('aria-invalid'), null)
+  await apiKeyInput.fill('')
 
   assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm')
   assert.equal(await page.locator('#baseUrl').inputValue(), 'https://tokenrhythm.studio/v1')
@@ -83,200 +256,137 @@ try {
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
 
-  const tokenRhythmFeature = page.locator('[data-provider-feature="tokenrhythm"]')
-  assert.equal(await tokenRhythmFeature.count(), 1)
-  assert.equal(await tokenRhythmFeature.locator('[data-tokenrhythm-title]').innerText(), '推荐使用 TokenRhythm')
+  const tokenRhythmCta = page.locator('#tokenrhythmRegister')
+  assert.equal(await tokenRhythmCta.innerText(), '免费领取')
   assert.equal(
-    await tokenRhythmFeature.locator('[data-tokenrhythm-value]').innerText(),
-    'TokenRhythm API 调用限时免费。',
+    await tokenRhythmCta.evaluate((link) => getComputedStyle(link, '::after').content),
+    '"↗"',
+    'external registration action should expose a direction cue',
   )
   assert.equal(
-    await tokenRhythmFeature.locator('[data-tokenrhythm-registration]').innerText(),
-    '活动期间，注册并获取 API Key，即可免费调用 DeepSeek、GLM、MiniMax、Kimi 等主流模型。',
+    await tokenRhythmCta.evaluate((link) => getComputedStyle(link).backgroundColor),
+    'rgb(186, 77, 15)',
+    'the registration call to action should use the canonical light-theme accent',
   )
-  const tokenRhythmCta = tokenRhythmFeature.locator('#tokenrhythmRegister')
-  assert.equal(await tokenRhythmCta.innerText(), '注册并获取 API Key')
+  assert.equal(await tokenRhythmCta.evaluate((link) => getComputedStyle(link).color), 'rgb(255, 255, 255)')
+  assert.equal(await tokenRhythmCta.evaluate((link) => getComputedStyle(link).borderRadius), '7px')
   assert.equal(await tokenRhythmCta.getAttribute('href'), 'https://tokenrhythm.studio/register')
   assert.equal(await tokenRhythmCta.getAttribute('target'), '_blank')
   assert.equal(await tokenRhythmCta.getAttribute('rel'), 'noopener noreferrer')
-  assert.equal(
-    await tokenRhythmCta.getAttribute('aria-label'),
-    '注册并获取 API Key — TokenRhythm（在外部浏览器中打开）',
-  )
-  assert.equal(await tokenRhythmFeature.locator('img, svg, canvas').count(), 0)
-  assert.equal(await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').getAttribute('aria-pressed'), 'true')
-
-  const providerMoreToggle = page.locator('#providerMoreToggle')
-  const providerMorePanel = page.locator('#providerMorePanel')
-  assert.equal(await providerMoreToggle.getAttribute('aria-expanded'), 'false')
-  assert.equal(await providerMoreToggle.getAttribute('aria-controls'), 'providerMorePanel')
-  assert.equal(await providerMorePanel.isHidden(), true)
+  assert.equal(await tokenRhythmCta.isVisible(), true)
+  assert.equal(await page.locator('#providerMoreToggle, #providerMorePanel, #providerGrid, .provider').count(), 0)
 
   await page.locator('#onboardingLocale').selectOption('en')
-  assert.equal(await page.evaluate(() => document.documentElement.lang), 'en')
-  assert.equal(await page.locator('[data-screen="1"] h2').innerText(), 'Connect a provider')
+  assert.equal(await providerScreen.locator('h2').innerText(), 'Model service setup')
   assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm', 'locale changes should preserve the selected provider')
-  assert.equal(await tokenRhythmFeature.locator('[data-tokenrhythm-title]').innerText(), 'Recommended: TokenRhythm')
-  assert.equal(
-    await tokenRhythmFeature.locator('[data-tokenrhythm-value]').innerText(),
-    'TokenRhythm API calls are free for a limited time.',
-  )
-  assert.equal(
-    await tokenRhythmFeature.locator('[data-tokenrhythm-registration]').innerText(),
-    'During the promotion, register and get an API key to call DeepSeek, GLM, MiniMax, Kimi, and other leading models for free.',
-  )
-  assert.equal(await tokenRhythmCta.innerText(), 'Register and get an API key')
-  assert.equal(
-    await tokenRhythmCta.getAttribute('aria-label'),
-    'Register and get an API key — TokenRhythm (opens in external browser)',
-  )
 
-  await providerMoreToggle.click()
-  assert.equal(await providerMoreToggle.getAttribute('aria-expanded'), 'true')
-  assert.equal(await providerMorePanel.isVisible(), true)
-  const openRouterProvider = page.locator('#providerGrid [data-provider="openrouter"]')
-  await openRouterProvider.click()
-  assert.equal(await page.locator('#provider').inputValue(), 'openrouter')
-  assert.equal(await openRouterProvider.getAttribute('aria-pressed'), 'true')
-  assert.equal(await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').getAttribute('aria-pressed'), 'false')
-  await page.locator('#onboardingLocale').selectOption('zh-Hans')
-  assert.equal(await page.locator('#provider').inputValue(), 'openrouter', 'locale changes should preserve another provider selection')
-  await page.locator('#onboardingLocale').selectOption('en')
-  assert.equal(await page.locator('#provider').inputValue(), 'openrouter')
-  await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').click()
-  assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm', 'TokenRhythm should remain re-selectable')
+  await chooseProvider('minimax_cn', 'MiniMax Mainland')
+  assert.equal(await page.locator('#provider').inputValue(), 'minimax_cn')
+  assert.equal(await tokenRhythmCta.isVisible(), true, 'the promotion should remain available when another provider is selected')
+  assert.equal(await page.locator('#providerSelectedBadges .provider-badge').count(), 0)
+  assert.equal(await page.locator('#model').inputValue(), 'MiniMax-M2.7')
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'MiniMax-M2.7')
+  assert.equal(await page.locator('#modelSummary').isVisible(), true)
+  assert.equal(await page.locator('#apiKeyRequiredMarker').isVisible(), true)
+
+  await chooseProvider('ollama', 'Ollama')
+  assert.equal(await page.locator('#provider').inputValue(), 'ollama')
+  assert.equal(await page.locator('#apiKeyRequiredMarker').isVisible(), false)
+  assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'direct')
+  assert.equal(await page.locator('#routerMode').inputValue(), 'disabled')
+  assert.equal(await page.locator('#model').inputValue(), '')
+  assert.equal(await page.locator('#modelSummary').isVisible(), false)
+  assert.equal(await page.locator('#modelEditor').isVisible(), true)
+  assert.equal(await page.locator('#modelRequiredMarker').isVisible(), true)
+  await page.locator('#finish').click()
+  assert.equal(await providerScreen.isVisible(), true, 'invalid direct-model setup must remain on the provider screen')
+  assert.match(await page.locator('#modelError').innerText(), /Direct model is required/)
+  assert.equal(await page.locator('#model').getAttribute('aria-invalid'), 'true')
+  assert.equal(await page.locator('#error').innerText(), '')
+
+  await chooseProvider('tokenrhythm', 'TokenRhythm')
+  assert.equal(await tokenRhythmCta.isVisible(), true)
+  assert.equal(await page.locator('#providerSelectedBadges .provider-badge').count(), 0)
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
-  assert.equal(await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').getAttribute('aria-pressed'), 'true')
-  await page.locator('#onboardingLocale').selectOption('zh-Hans')
+  assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
+  assert.equal(await page.locator('#modelSummary').isVisible(), true)
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4-pro')
   await page.locator('#apiKey').fill('synthetic-tokenrhythm-key')
-  await page.locator('[data-screen="1"].active .next-button').click()
-  await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 10_000 })
-  await page.waitForTimeout(300)
-  assert.equal(await page.locator('[data-screen="2"] h2').innerText(), '选择路由模式')
-  assert.equal(await page.locator('[data-model-routing-mode="squilla_router"]').isEnabled(), true)
-  assert.equal(await page.locator('[data-model-routing-mode="direct"]').isEnabled(), true)
-  assert.equal(await page.locator('[data-model-routing-mode="llm_ensemble"]').isEnabled(), true)
-  assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
-  assert.match(
-    await page.locator('[data-model-routing-mode="squilla_router"] small').innerText(),
-    /此提供商现有的 Squilla Router 层级默认值/,
+  assert.equal(await page.locator('.inline-search-section').isVisible(), true)
+  assert.equal(await page.locator('#inlineSearchHeading').innerText(), 'Choose web search')
+  assert.equal(await page.locator('.inline-search-optional').innerText(), 'Optional')
+  assert.equal(await page.locator('#inlineSearchToggle').getAttribute('aria-expanded'), 'false')
+  assert.equal(await page.locator('#inlineSearchPanel').isVisible(), false)
+  await page.locator('#inlineSearchToggle').click()
+  assert.equal(await page.locator('#inlineSearchToggle').getAttribute('aria-expanded'), 'true')
+  assert.equal(await page.locator('#inlineSearchPanel').isVisible(), true)
+  assert.equal(
+    await page.locator('[data-search-provider="duckduckgo"]').evaluate((choice) => getComputedStyle(choice).backgroundColor),
+    'rgb(247, 248, 247)',
+    'the selected default search should use the same neutral surface as the recommended model row',
   )
-  assert.match(
-    await page.locator('[data-model-routing-mode="llm_ensemble"] small').innerText(),
-    /当前提供商的 static B5 Ensemble/,
+  assert.equal(
+    await page.locator('[data-search-provider="duckduckgo"]').evaluate((choice) => getComputedStyle(choice).boxShadow),
+    'none',
+    'the selected default search should not add a separate accent rail',
+  )
+  assert.equal(
+    await page.locator('[data-search-provider="duckduckgo"] .search-provider-billing').evaluate((billing) => getComputedStyle(billing).color),
+    'rgb(142, 58, 10)',
+    'the free status should use the canonical deep light-theme accent',
   )
   if (screenshotPath) {
     await mkdir(dirname(screenshotPath), { recursive: true })
     await page.screenshot({ path: screenshotPath })
   }
-  await page.locator('[data-screen="2"].active .next-button').click()
-  await page.locator('[data-screen="3"].active').waitFor({ state: 'visible', timeout: 10_000 })
-  assert.equal(await page.locator('[data-screen="3"] h2').innerText(), '候选模型池')
-  const tokenRhythmTierText = await page.locator('#tierBody').innerText()
-  for (const modelId of ['deepseek-v4-flash', 'deepseek-v4-pro', 'kimi-k2.7-code', 'glm-5.2', 'kimi-k2.6']) {
-    assert.match(tokenRhythmTierText, new RegExp(modelId.replaceAll('.', '\\.')))
-  }
-  await page.locator('[data-screen="3"].active .back-button').click()
-  await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 5_000 })
-  await page.locator('[data-model-routing-mode="direct"]').click()
-  assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'direct')
-  assert.equal(await page.locator('#directModelRoute').inputValue(), 'deepseek-v4-pro')
-  await page.locator('#directModelRoute').fill('glm-5.2')
-  assert.equal(await page.locator('#model').inputValue(), 'glm-5.2')
-  await page.locator('[data-model-routing-mode="llm_ensemble"]').click()
-  assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'llm_ensemble')
-  await page.locator('[data-screen="2"].active .next-button').click()
-  await page.locator('[data-screen="4"].active').waitFor({ state: 'visible', timeout: 10_000 })
-  await page.locator('[data-screen="4"].active .back-button').click()
-  await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 5_000 })
-  await page.locator('[data-screen="2"].active .back-button').click()
-  await page.locator('[data-screen="1"].active').waitFor({ state: 'visible', timeout: 5_000 })
-  await page.locator('#onboardingLocale').selectOption('en')
-
-  await page.locator('#providerGrid [data-provider="ollama"]').click()
-  assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'direct')
-  assert.equal(await page.locator('#routerMode').inputValue(), 'disabled')
-  assert.equal(await page.locator('#model').inputValue(), '', 'direct-only providers without a default model should not inherit the previous provider model')
-  assert.equal(await page.locator('#endpointToggle').getAttribute('aria-expanded'), 'true', 'direct-only providers that need a model should open the endpoint panel')
-  await page.locator('[data-screen="1"].active .next-button').click()
-  await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 5_000 })
-  assert.equal(await page.locator('[data-model-routing-mode="squilla_router"]').isDisabled(), true)
-  assert.equal(await page.locator('[data-model-routing-mode="direct"]').isEnabled(), true)
-  assert.equal(await page.locator('[data-model-routing-mode="llm_ensemble"]').isDisabled(), true)
-  assert.equal(await page.locator('[data-step-label="3"]').isVisible(), false, 'route-excluded tier step should be hidden from the progress rail')
-  await page.locator('[data-screen="2"].active .next-button').click()
-  await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 5_000 })
-  assert.match(await page.locator('#error').innerText(), /Direct model is required/)
-  await page.locator('[data-screen="2"].active .back-button').click()
-  await page.locator('[data-screen="1"].active').waitFor({ state: 'visible', timeout: 5_000 })
-
-  await page.locator('#providerGrid [data-provider="openai"]').click()
-
-  assert.equal(await page.locator('#provider').inputValue(), 'openai')
-  assert.equal(await page.locator('#baseUrl').inputValue(), 'https://api.openai.com/v1')
-  assert.equal(await page.locator('#model').inputValue(), 'gpt-5.4-mini')
-  await page.locator('#providerGrid [data-provider="openai"].active').waitFor({ state: 'visible', timeout: 5_000 })
-  const openAiHint = await page.locator('#providerHint').innerText()
-  assert.match(openAiHint, /OpenAI-only tier profile/)
-  assert.doesNotMatch(openAiHint, /OPENAI_API_KEY/)
-
-  await page.locator('#providerGrid [data-provider="bailian_coding_cn"]').click()
-  assert.equal(await page.locator('#provider').inputValue(), 'bailian_coding_cn')
-  assert.equal(
-    await page.locator('#baseUrl').inputValue(),
-    'https://coding.dashscope.aliyuncs.com/v1',
-  )
-  assert.equal(await page.locator('#model').inputValue(), 'qwen3.7-plus')
-  assert.match(await page.locator('#providerHint').innerText(), /dedicated sk-sp- API key/)
-
-  await page.locator('#providerGrid [data-provider="openai"]').click()
-  await page.locator('#apiKey').fill('test-openai-key')
-  await page.locator('[data-screen="1"].active .next-button').click()
-  await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 10_000 })
-  assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
-  assert.equal(await page.locator('[data-model-routing-mode="squilla_router"]').isEnabled(), true)
-  assert.equal(await page.locator('[data-model-routing-mode="direct"]').isEnabled(), true)
-  assert.equal(await page.locator('[data-model-routing-mode="llm_ensemble"]').isDisabled(), true)
-  await page.locator('[data-screen="2"].active .next-button').click()
-  await page.locator('[data-screen="3"].active').waitFor({ state: 'visible', timeout: 10_000 })
-  assert.match(await page.locator('[data-screen="3"] .eyebrow').innerText(), /step 04/i)
-  assert.equal(await page.locator('[data-screen="3"] h2').innerText(), 'Review tier models')
-
-  await page.locator('[data-screen="3"].active .back-button').click()
-  await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 5_000 })
-  await page.locator('[data-screen="2"].active .back-button').click()
-  await page.locator('[data-screen="1"].active').waitFor({ state: 'visible', timeout: 5_000 })
-  await tokenRhythmFeature.locator('[data-provider="tokenrhythm"]').click()
-  await page.locator('#apiKey').fill('synthetic-tokenrhythm-key')
-  await page.locator('[data-screen="1"].active .next-button').click()
-  await page.locator('[data-screen="2"].active').waitFor({ state: 'visible', timeout: 5_000 })
-  await page.locator('[data-model-routing-mode="llm_ensemble"]').click()
-  await page.locator('[data-screen="2"].active .next-button').click()
-  await page.locator('[data-screen="4"].active').waitFor({ state: 'visible', timeout: 5_000 })
+  assert.equal(await page.locator('#searchHint, .note').count(), 0, 'search provider descriptions should not be repeated in a separate banner')
+  assert.equal(await page.locator('[data-search-provider="duckduckgo"] .search-provider-billing').innerText(), 'Free')
+  assert.equal(await page.locator('#searchPaidToggle').getAttribute('aria-expanded'), 'false')
+  assert.equal(await page.locator('[data-search-provider="bocha"]').isVisible(), false)
+  assert.equal(await page.locator('#searchKeyLabel').isVisible(), false)
+  await page.locator('#searchPaidToggle').click()
+  assert.equal(await page.locator('#searchPaidToggle').getAttribute('aria-expanded'), 'true')
+  assert.equal(await page.locator('[data-search-provider="bocha"]').isVisible(), true)
+  assert.equal(await page.locator('[data-search-provider="bocha"] .search-provider-billing').innerText(), 'Paid')
+  await page.locator('[data-search-provider="bocha"]').click()
+  assert.equal(await page.locator('[data-search-provider-option="bocha"] #searchKeyLabel').isVisible(), true)
+  assert.equal(await page.locator('#searchKeyLabel .required-marker').innerText(), '*')
+  assert.equal(await page.locator('#searchApiKey').getAttribute('placeholder'), 'BOCHA_SEARCH_API_KEY')
+  await page.locator('#inlineSearchToggle').click()
+  assert.equal(await page.locator('#inlineSearchPanel').isVisible(), false)
   await page.locator('#finish').click()
+  assert.equal(await page.locator('#inlineSearchPanel').isVisible(), true, 'search validation should reopen the collapsed section')
+  assert.match(await page.locator('#searchApiKeyError').innerText(), /Bocha search API key is required/)
+  assert.equal(await page.locator('#searchApiKey').getAttribute('aria-invalid'), 'true')
+  assert.equal(await page.locator('#error').innerText(), '')
+  await page.locator('[data-search-provider="duckduckgo"]').click()
+  assert.equal(await page.locator('#searchKeyLabel').isVisible(), false)
+  assert.equal(await page.locator('#searchApiKeyError').innerText(), '')
+  assert.equal(await page.locator('#apiKey').inputValue(), 'synthetic-tokenrhythm-key')
+  await page.locator('#finish').click()
+
   const saved = await waitFor(async () => {
     const credential = JSON.parse(await readFile(join(userDataDir, 'desktop-credential.json'), 'utf8'))
-    if (credential.modelRoutingMode !== 'llm_ensemble') return null
+    if (credential.provider !== 'tokenrhythm') return null
     const config = await readFile(join(userDataDir, 'opensquilla', 'config.toml'), 'utf8')
     return { credential, config }
-  }, 'saved ensemble credential and config')
+  }, 'saved simple onboarding credential and config')
   const { credential, config } = saved
   assert.equal(credential.provider, 'tokenrhythm')
-  assert.equal(credential.modelRoutingMode, 'llm_ensemble')
+  assert.equal(credential.modelRoutingMode, 'squilla_router')
   assert.equal(credential.routerMode, 'recommended')
+  assert.equal(credential.routerDefaultTier, 'c1')
   assert.equal(credential.routerTiers.c0.model, 'deepseek-v4-flash')
   assert.equal(credential.routerTiers.c1.model, 'deepseek-v4-pro')
   assert.equal(credential.routerTiers.c2.model, 'kimi-k2.7-code')
   assert.equal(credential.routerTiers.c3.model, 'glm-5.2')
-  assert.equal(credential.routerTiers.image_model.model, 'kimi-k2.6')
   assert.match(config, /\[squilla_router\]\nenabled = true/)
-  assert.doesNotMatch(config, /tier_profile = "tokenrhythm"/)
-  assert.match(config, /\[squilla_router\.tiers\.c0\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-flash"/)
-  assert.match(config, /\[squilla_router\.tiers\.c3\]\nprovider = "tokenrhythm"\nmodel = "glm-5\.2"/)
-  assert.match(config, /\[llm_ensemble\]\nenabled = true\nselection_mode = "static_tokenrhythm_b5"/)
+  assert.match(config, /\[squilla_router\.tiers\.c1\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-pro"/)
+  assert.match(config, /\[llm_ensemble\]\nenabled = false/)
 
   console.log(JSON.stringify({
     ok: true,
+    steps: 1,
     provider: credential.provider,
     modelRoutingMode: credential.modelRoutingMode,
     routerMode: credential.routerMode,

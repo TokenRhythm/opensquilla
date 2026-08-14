@@ -22,6 +22,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import structlog
@@ -35,8 +36,11 @@ from opensquilla.channels._util import (
     truncate_to_limit,
 )
 from opensquilla.channels.admission import (
+    CHANNEL_ADMIN_VERIFIED_METADATA_KEY,
     ChannelAdmissionDecision,
     decide_channel_admission,
+    has_verified_channel_admin_stamp,
+    is_authenticated_channel_admin,
 )
 from opensquilla.channels.artifact_delivery import (
     artifact_delivery_key as _artifact_delivery_key,
@@ -63,6 +67,7 @@ from opensquilla.channels.contract import (
     classify_channel_send_error,
 )
 from opensquilla.channels.stream_policy import resolve_channel_stream_policy
+from opensquilla.channels.system_messages import render_channel_message
 from opensquilla.channels.types import IncomingMessage, OutgoingMessage
 from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
 from opensquilla.engine.types import (
@@ -136,10 +141,7 @@ def _channel_can_replace_streamed_text(channel: Any) -> bool:
     has_edit = callable(getattr(channel, "edit", None))
     profile = channel_capability_profile(channel)
     return bool(
-        profile is not None
-        and profile.edit
-        and profile.streamed_message_replacement
-        and has_edit
+        profile is not None and profile.edit and profile.streamed_message_replacement and has_edit
     )
 
 
@@ -354,13 +356,12 @@ def _compute_channel_cap(config: Any) -> int:
     """
     task_runtime_cfg = getattr(config, "task_runtime", None) if config is not None else None
     raw_cap: int = getattr(task_runtime_cfg, "channel_inflight_cap", 8)
-    max_concurrency: int = getattr(task_runtime_cfg, "max_concurrency", 4)
+    max_concurrency: int = getattr(task_runtime_cfg, "max_concurrency", 8)
     formula_cap = max(2 * max_concurrency, 1)
     return min(raw_cap, formula_cap)
 
-_DIRECTIVE_TAG_RE = re.compile(
-    r"\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*"
-)
+
+_DIRECTIVE_TAG_RE = re.compile(r"\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*")
 _INTERNAL_COMPACTION_MARKER_RE = re.compile(
     r"(?m)^[ \t]*\["
     r"(?:opensquilla_compacted:[^\]\r\n]*|"
@@ -403,9 +404,7 @@ def _split_pending_internal_compaction_marker(content: str) -> tuple[str, str]:
 
 
 def _sanitize_outgoing_message(message: OutgoingMessage) -> OutgoingMessage:
-    cleaned = _strip_internal_compaction_markers(
-        _strip_inline_directive_tags(message.content)
-    )
+    cleaned = _strip_internal_compaction_markers(_strip_inline_directive_tags(message.content))
     if cleaned == message.content:
         return message
     return message.model_copy(update={"content": cleaned})
@@ -420,23 +419,15 @@ class _DirectiveTagStreamSanitizer:
     def clean(self, chunk: str) -> str:
         text = self._pending + chunk
         self._pending = ""
-        cleaned = _strip_internal_compaction_markers(
-            _strip_inline_directive_tags(text)
-        )
+        cleaned = _strip_internal_compaction_markers(_strip_inline_directive_tags(text))
         start = cleaned.rfind("[[")
         if start == -1:
-            cleaned, pending_marker = _split_pending_internal_compaction_marker(
-                cleaned
-            )
+            cleaned, pending_marker = _split_pending_internal_compaction_marker(cleaned)
             if pending_marker:
                 self._pending = pending_marker
             return cleaned
         suffix = cleaned[start:]
-        if (
-            "]]" not in suffix
-            and "\n" not in suffix
-            and len(suffix) <= _DIRECTIVE_TAG_BUFFER_LIMIT
-        ):
+        if "]]" not in suffix and "\n" not in suffix and len(suffix) <= _DIRECTIVE_TAG_BUFFER_LIMIT:
             self._pending = suffix
             return cleaned[:start]
         cleaned, pending_marker = _split_pending_internal_compaction_marker(cleaned)
@@ -473,6 +464,16 @@ async def _maybe_lock(lock: asyncio.Lock | None) -> AsyncIterator[None]:
         return
     async with lock:
         yield
+
+
+def _channel_acceptance_lock(
+    session_lock: asyncio.Lock | None,
+    *,
+    atomic: bool,
+) -> contextlib.AbstractAsyncContextManager[None]:
+    """Keep filesystem validation out of the legacy per-session runner lock."""
+
+    return _maybe_lock(None if atomic else session_lock)
 
 
 # ── Main dispatch loop (thin orchestrator) ───────────────────────────────
@@ -522,7 +523,13 @@ async def run_channel_dispatch(
                 )
                 continue
         session_key = session_key_builder(msg)
-        admission = decide_channel_admission(channel, msg, session_key)
+        admission = decide_channel_admission(
+            channel,
+            msg,
+            session_key,
+            config=config,
+            channel_name=session_prefix,
+        )
         if not admission.admit:
             log.info(
                 "channel.admission_denied",
@@ -543,10 +550,13 @@ async def run_channel_dispatch(
                     session_prefix=session_prefix,
                 )
                 pairing_code = admission.pairing_id[:8]
+
                 notice = _route_envelope_reply_message(
-                    "Access approval is required. "
-                    f"Pairing request: {pairing_code}. "
-                    "Ask an OpenSquilla operator to approve it before sending another message.",
+                    render_channel_message(
+                        "pairing_required",
+                        config=config,
+                        pairing_code=pairing_code,
+                    ),
                     route_envelope,
                     metadata={"pairing_required": True, "pairing_code": pairing_code},
                 )
@@ -574,17 +584,17 @@ async def run_channel_dispatch(
             session_key=session_key,
             session_prefix=session_prefix,
         )
+        principal_is_owner = _stamp_channel_admin_principal(config, route_envelope, msg)
         approval_reply = await _maybe_resolve_channel_approval(
             msg=msg,
             session_key=session_key,
             config=config,
             session_manager=session_manager,
+            route_envelope=route_envelope,
         )
         if approval_reply is not None:
             try:
-                await channel.send(
-                    _preserve_route_channel_metadata(approval_reply, route_envelope)
-                )
+                await channel.send(_preserve_route_channel_metadata(approval_reply, route_envelope))
             except Exception as exc:  # noqa: BLE001 - reply delivery is best-effort
                 # The approval outcome is already recorded; a failed reply
                 # send must not escape the loop and burn the channel's
@@ -602,7 +612,7 @@ async def run_channel_dispatch(
         # fmt: off
         if getattr(channel, "supports_slash_commands", False) and rpc_dispatcher is not None and channel_rpc_context_factory is not None:  # noqa: E501
             command_reply = await _dispatch_channel_slash_command(
-                route_envelope=route_envelope, msg=msg, session_manager=session_manager, session_key=session_key, session_prefix=session_prefix, rpc_dispatcher=rpc_dispatcher, context_factory=channel_rpc_context_factory  # noqa: E501
+                route_envelope=route_envelope, msg=msg, session_manager=session_manager, session_key=session_key, session_prefix=session_prefix, rpc_dispatcher=rpc_dispatcher, context_factory=channel_rpc_context_factory, config=config  # noqa: E501
             )
             if command_reply is not None:
                 emit = log.warning if command_reply.metadata.get("denied") else log.info
@@ -638,7 +648,32 @@ async def run_channel_dispatch(
             ) -> None:
                 await _dispatch_combined_message_after_debounce(channel, combined, turn_runner, session_manager, key, session_prefix, task_runtime, config, event_bridge, _ifl, channel_rpc_context_factory=channel_rpc_context_factory, admission_decision=_admission, busy_input_mode=busy_input_mode)  # noqa: E501
 
-            await debounce_coordinator.schedule(session_key, msg, window_s=debounce_window_s, on_fire=_on_debounce_fire)  # noqa: E501
+            acquire_intent = getattr(
+                task_runtime,
+                "acquire_explicit_ingress_intent",
+                None,
+            )
+            intent_lease = (
+                await acquire_intent(session_key) if callable(acquire_intent) else None
+            )
+
+            async def _release_debounce_intent(
+                _lease: Any = intent_lease,
+            ) -> None:
+                if _lease is not None:
+                    await _lease.release()
+
+            try:
+                await debounce_coordinator.schedule(
+                    session_key,
+                    msg,
+                    window_s=debounce_window_s,
+                    on_fire=_on_debounce_fire,
+                    on_settled=_release_debounce_intent,
+                )
+            except BaseException:
+                await _release_debounce_intent()
+                raise
             continue
         # fmt: on
 
@@ -671,17 +706,19 @@ async def run_channel_dispatch(
                     route_envelope=route_envelope,
                 )
 
-        await _apply_saved_channel_run_context(
-            route_envelope,
-            session_manager=session_manager,
-            config=config,
-            workspace_dir=None,
-            principal_is_owner=_is_channel_admin_sender(config, route_envelope),
-        )
+        ingested: AttachmentIngestResult | None = None
+        if not atomic_channel_acceptance:
+            await _apply_saved_channel_run_context(
+                route_envelope,
+                session_manager=session_manager,
+                config=config,
+                workspace_dir=None,
+                principal_is_owner=principal_is_owner,
+            )
 
-        ingested = await _ingest_channel_message_attachments(
-            channel=channel, msg=msg, config=config
-        )
+            ingested = await _ingest_channel_message_attachments(
+                channel=channel, msg=msg, config=config
+            )
 
         if not atomic_channel_acceptance:
             async with _maybe_lock(session_lock):
@@ -740,68 +777,67 @@ async def run_channel_dispatch(
             stream_relay = None
             replayed = False
             try:
-                async with _maybe_lock(session_lock):
+                async with _channel_acceptance_lock(
+                    session_lock,
+                    atomic=atomic_channel_acceptance,
+                ):
                     if atomic_channel_acceptance:
-                        handle, persisted_content, stream_relay, replayed = (
-                            await _accept_channel_runtime_turn(
-                                channel=channel,
-                                msg=msg,
-                                session_manager=session_manager,
-                                session_key=session_key,
-                                route_envelope=route_envelope,
-                                task_runtime=task_runtime,
-                                ingested=ingested,
-                                raw_content=raw_content,
-                                config=config,
-                                busy_input_mode=busy_input_mode,
-                            )
+                        (
+                            handle,
+                            persisted_content,
+                            stream_relay,
+                            replayed,
+                        ) = await _accept_channel_runtime_turn(
+                            channel=channel,
+                            msg=msg,
+                            session_manager=session_manager,
+                            session_key=session_key,
+                            route_envelope=route_envelope,
+                            task_runtime=task_runtime,
+                            ingested=ingested,
+                            raw_content=raw_content,
+                            config=config,
+                            principal_is_owner=principal_is_owner,
+                            busy_input_mode=busy_input_mode,
                         )
                     else:
+                        assert ingested is not None
                         stream_relay = _RuntimeChannelStreamRelay.maybe_start(
                             channel,
                             msg,
                             task_runtime,
                             config,
                         )
-                        channel_overflow_policy = _resolve_channel_overflow_policy(
-                            channel, config
-                        )
+                        channel_overflow_policy = _resolve_channel_overflow_policy(channel, config)
                         if channel_overflow_policy is not None:
-                            apply_policy = getattr(
-                                task_runtime, "apply_overflow_policy", None
-                            )
+                            apply_policy = getattr(task_runtime, "apply_overflow_policy", None)
                             if callable(apply_policy):
-                                await apply_policy(
-                                    session_key, policy=channel_overflow_policy
-                                )
+                                await apply_policy(session_key, policy=channel_overflow_policy)
                         handle = await start_turn_via_runtime(
                             task_runtime,
                             route_envelope,
                             msg.content,
                             attachments=ingested.attachments,
-                            mode=_resolve_channel_busy_input_mode(
-                                task_runtime, busy_input_mode
-                            ),
+                            mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
                             run_kind="channel_turn",
                             semantic_message=raw_content,
                             stream_event_sink=(
                                 stream_relay.emit if stream_relay is not None else None
                             ),
                         )
-                        _persisted, persisted_content = (
-                            await _append_channel_user_message(
-                                session_manager=session_manager,
-                                session_key=session_key,
-                                text=ingested.text,
-                                attachments=ingested.attachments,
-                                config=config,
-                            )
+                        _persisted, persisted_content = await _append_channel_user_message(
+                            session_manager=session_manager,
+                            session_key=session_key,
+                            text=ingested.text,
+                            attachments=ingested.attachments,
+                            config=config,
                         )
                     msg.content = persisted_content
             except Exception as exc:
                 if stream_relay is not None:
                     await stream_relay.close()
 
+                from opensquilla.project_workspaces import ProjectWorkspaceStateError
                 from opensquilla.session.storage import (
                     StaleEpochError,
                     StorageBusyError,
@@ -846,6 +882,22 @@ async def run_channel_dispatch(
                         delivery_store.complete_inbound(
                             ingress_claim, "ingress_conflict", reason=admission.reason
                         )
+                    continue
+                if isinstance(exc, ProjectWorkspaceStateError):
+                    await status_reactor.failed(msg)
+                    workspace_message = (
+                        "Project workspace not found. Restore it and retry."
+                        if exc.reason in {"not_found", "removed"}
+                        else "The project workspace is unavailable. Restore access and retry."
+                    )
+                    await channel.send(
+                        _route_envelope_reply_message(
+                            workspace_message,
+                            route_envelope,
+                        )
+                    )
+                    if delivery_store is not None:
+                        delivery_store.fail_inbound(ingress_claim, exc)
                     continue
                 if not isinstance(exc, TaskQueueFullError):
                     if delivery_store is not None:
@@ -955,6 +1007,7 @@ async def run_channel_dispatch(
         typing_task = _start_typing_keepalive(channel, msg)
         try:
             # Gap 4: Run agent turn with streaming (or batch fallback)
+            assert ingested is not None
             await _run_turn_with_streaming(
                 channel,
                 turn_runner,
@@ -965,6 +1018,7 @@ async def run_channel_dispatch(
                 config=config,
                 route_envelope=route_envelope,
                 attachments=ingested.attachments,
+                session_manager=session_manager,
             )
         except BaseException as exc:
             if delivery_store is not None:
@@ -1016,9 +1070,7 @@ def _approval_probe_key(session_key: str, sender_id: str) -> str:
 def _approval_probe_throttled(probe_key: str) -> bool:
     now = time.monotonic()
     attempts = [
-        t
-        for t in _approval_probe_failures.get(probe_key, ())
-        if now - t < _APPROVAL_PROBE_WINDOW_S
+        t for t in _approval_probe_failures.get(probe_key, ()) if now - t < _APPROVAL_PROBE_WINDOW_S
     ]
     if attempts:
         _approval_probe_failures[probe_key] = attempts
@@ -1034,11 +1086,7 @@ def _record_approval_probe_failure(probe_key: str) -> None:
     # without bound.
     if len(_approval_probe_failures) > 1024:
         for key in list(_approval_probe_failures):
-            kept = [
-                t
-                for t in _approval_probe_failures[key]
-                if now - t < _APPROVAL_PROBE_WINDOW_S
-            ]
+            kept = [t for t in _approval_probe_failures[key] if now - t < _APPROVAL_PROBE_WINDOW_S]
             if kept:
                 _approval_probe_failures[key] = kept
             else:
@@ -1055,6 +1103,7 @@ async def _maybe_resolve_channel_approval(
     session_key: str,
     config: Any = None,
     session_manager: Any = None,
+    route_envelope: Any = None,
 ) -> OutgoingMessage | None:
     """Resolve a channel approval action without starting an agent turn.
 
@@ -1071,8 +1120,9 @@ async def _maybe_resolve_channel_approval(
     cross-chat attempts get the same reply as an unknown code — response text
     must not become a short-code existence oracle — and repeated failed
     attempts per sender hit a cooldown. The ``always`` decision additionally
-    requires the sender to still be a configured channel admin at resolution
-    time — the card payload is never trusted for that. A plain approval
+    requires the sender to carry the authenticated channel-admin stamp from
+    ingress — the card payload and raw sender ID are never trusted for that.
+    A plain approval
     forces ``elevated_mode=None`` so it permits one gated command, never
     session-wide elevation. Returns the reply to send, or ``None`` when the
     message is not an approval action.
@@ -1108,14 +1158,16 @@ async def _maybe_resolve_channel_approval(
         # Constant reply regardless of the attempted code: a throttled probe
         # must learn nothing about code validity.
         return OutgoingMessage(
-            content="Too many failed approval attempts — wait a minute and try again."
+            content=render_channel_message("approval_probe_throttled", config=config)
         )
 
     binding = resolve_short_code(code)
     if binding is None:
         log.info("channel.approval_unknown_code", code=code, session_key=session_key)
         _record_approval_probe_failure(probe_key)
-        return OutgoingMessage(content=f"No pending approval {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
 
     # Cross-session and cross-chat attempts reuse the unknown-code reply on
     # purpose: distinct texts would confirm that a guessed code is live and
@@ -1127,7 +1179,9 @@ async def _maybe_resolve_channel_approval(
             session_key=session_key,
         )
         _record_approval_probe_failure(probe_key)
-        return OutgoingMessage(content=f"No pending approval {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
 
     if binding.origin_channel_id and msg.channel_id != binding.origin_channel_id:
         log.warning(
@@ -1137,7 +1191,9 @@ async def _maybe_resolve_channel_approval(
             channel_id=msg.channel_id,
         )
         _record_approval_probe_failure(probe_key)
-        return OutgoingMessage(content=f"No pending approval {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
 
     if not sender_id or sender_id != binding.owner_sender_id:
         # Reaching this check requires matching the binding's session AND
@@ -1151,15 +1207,14 @@ async def _maybe_resolve_channel_approval(
         )
         _record_approval_probe_failure(probe_key)
         return OutgoingMessage(
-            content=(
-                "Only the session owner can resolve this. "
-                f"Ask them to reply /approve {code}."
+            content=render_channel_message(
+                "approval_owner_only",
+                config=config,
+                code=code,
             )
         )
 
-    if decision == DECISION_ALWAYS and not _sender_is_channel_admin(
-        config, binding.origin_channel_name, sender_id
-    ):
+    if decision == DECISION_ALWAYS and not has_verified_channel_admin_stamp(route_envelope):
         log.warning(
             "channel.approval_always_requires_admin",
             code=code,
@@ -1167,9 +1222,10 @@ async def _maybe_resolve_channel_approval(
             sender_id=sender_id,
         )
         return OutgoingMessage(
-            content=(
-                f"'Always' needs a channel admin. Reply /approve {code} "
-                "to allow just this once."
+            content=render_channel_message(
+                "approval_always_requires_admin",
+                config=config,
+                code=code,
             )
         )
 
@@ -1188,7 +1244,9 @@ async def _maybe_resolve_channel_approval(
         )
     except KeyError:
         log.info("channel.approval_expired", code=code, session_key=session_key)
-        return OutgoingMessage(content=f"No pending approval {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_no_pending", config=config, code=code)
+        )
     except _SandboxChoiceError as exc:
         # Malformed/incompatible choice payload — nothing was claimed, the
         # approval is genuinely still pending (distinct from the resolved
@@ -1200,15 +1258,16 @@ async def _maybe_resolve_channel_approval(
             error=str(exc),
         )
         return OutgoingMessage(
-            content=(
-                f"Could not apply approval {code} — it is still pending. "
-                "Resolve it from the console."
-            )
+            content=render_channel_message("approval_invalid_choice", config=config, code=code)
         )
     except ValueError:
         # Already resolved (race) — report idempotently rather than erroring.
         log.info("channel.approval_already_resolved", code=code, session_key=session_key)
-        return OutgoingMessage(content=f"Approval {code} was already resolved.")
+        return OutgoingMessage(
+            content=render_channel_message(
+                "approval_already_resolved", config=config, code=code
+            )
+        )
     except Exception:
         # Transient storage/session failures (e.g. a busy SQLite write while
         # applying a grant) must not escape into the dispatch loop and burn
@@ -1220,9 +1279,10 @@ async def _maybe_resolve_channel_approval(
             session_key=session_key,
         )
         return OutgoingMessage(
-            content=(
-                f"Could not apply approval {code} — it is still pending, "
-                "please try again."
+            content=render_channel_message(
+                "approval_resolution_failed",
+                config=config,
+                code=code,
             )
         )
 
@@ -1285,7 +1345,11 @@ async def _resolve_channel_approval_decision(
             # Nothing has been claimed yet — surface this as a validation
             # failure, NOT as the caller's already-resolved ValueError race.
             raise _SandboxChoiceError(str(exc)) from exc
-        claim_token = queue.claim_resolution(approval_id)
+        claim_token = queue.claim_resolution(
+            approval_id,
+            resolution_metadata={"resolutionSource": "user_channel"},
+        )
+        pending = queue.get(approval_id)
         try:
             queue.finalize_claimed_resolution(
                 approval_id,
@@ -1299,6 +1363,7 @@ async def _resolve_channel_approval_decision(
         try:
             await apply_sandbox_approval_choice(
                 pending.params,
+                approval_id=approval_id,
                 choice=choice,
                 approved=True,
                 session_manager=session_manager,
@@ -1316,6 +1381,7 @@ async def _resolve_channel_approval_decision(
             approved,
             elevated_mode=None,
             allow_idempotent=not sandbox_approval,
+            resolution_metadata={"resolutionSource": "user_channel"},
         )
         if sandbox_approval and not approved:
             remember_sandbox_approval_denial(pending.params, approval_id)
@@ -1326,12 +1392,24 @@ async def _resolve_channel_approval_decision(
             )
 
     if not approved:
-        return OutgoingMessage(content=f"Denied {code}.")
+        return OutgoingMessage(
+            content=render_channel_message("approval_denied", config=config, code=code)
+        )
     if choice == "allow_same_type":
         return OutgoingMessage(
-            content=f"Approved {code} — this kind won't ask again this session."
+            content=render_channel_message(
+                "approval_approved_always",
+                config=config,
+                code=code,
+            )
         )
-    return OutgoingMessage(content=f"Approved {code} — running …")
+    return OutgoingMessage(
+        content=render_channel_message(
+            "approval_approved_once",
+            config=config,
+            code=code,
+        )
+    )
 
 
 async def _dispatch_channel_slash_command(
@@ -1343,6 +1421,7 @@ async def _dispatch_channel_slash_command(
     session_prefix: str,
     rpc_dispatcher: Any,
     context_factory: Callable[[Any], Any],
+    config: Any = None,
 ) -> OutgoingMessage | None:
     from opensquilla.channels.command_registry import DEFAULT_COMMAND_REGISTRY
 
@@ -1352,7 +1431,7 @@ async def _dispatch_channel_slash_command(
         if head is None:
             return None
         return _route_envelope_reply_message(
-            f"Unsupported command: {head}. Try /help.",
+            render_channel_message("command_unsupported", config=config, command=head),
             route_envelope,
             metadata={"command": head[1:].lower(), "method": None, "unsupported": True},
         )
@@ -1367,6 +1446,7 @@ async def _dispatch_channel_slash_command(
             session_prefix=session_prefix,
             rpc_dispatcher=rpc_dispatcher,
             context_factory=context_factory,
+            config=config,
         )
 
     reply = await DEFAULT_COMMAND_REGISTRY.dispatch(
@@ -1374,6 +1454,7 @@ async def _dispatch_channel_slash_command(
         message_content=msg.content,
         rpc_dispatcher=rpc_dispatcher,
         context_factory=context_factory,
+        config=config,
     )
     if reply is None:
         return None
@@ -1389,6 +1470,7 @@ async def _dispatch_channel_new_command(
     session_prefix: str,
     rpc_dispatcher: Any,
     context_factory: Callable[[Any], Any],
+    config: Any = None,
 ) -> OutgoingMessage:
     from opensquilla.channels.command_registry import DEFAULT_COMMAND_REGISTRY
     from opensquilla.gateway.scopes import WRITE_SCOPE, authorize_call
@@ -1402,11 +1484,17 @@ async def _dispatch_channel_new_command(
         getattr(principal, "scopes", frozenset()),
     )
     if not allowed:
-        detail = f": missing {missing}" if missing else ""
+        detail = (
+            render_channel_message("command_missing_scope", config=config, missing=missing)
+            if missing
+            else ""
+        )
         return _route_envelope_reply_message(
-            (
-                "/new denied: Insufficient scope for method: "
-                f"sessions.reset{detail}"
+            render_channel_message(
+                "command_new_denied",
+                config=config,
+                method="sessions.reset",
+                detail=detail,
             ),
             route_envelope,
             metadata={"command": "new", "method": "sessions.reset", "denied": True},
@@ -1424,10 +1512,11 @@ async def _dispatch_channel_new_command(
         message_content=msg.content,
         rpc_dispatcher=rpc_dispatcher,
         context_factory=lambda _envelope: ctx,
+        config=config,
     )
     if reply is None:
         return _route_envelope_reply_message(
-            "/new failed: command unavailable",
+            render_channel_message("command_new_unavailable", config=config),
             route_envelope,
             metadata={"command": "new", "method": "sessions.reset", "denied": False},
         )
@@ -1439,16 +1528,24 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     from opensquilla.gateway.routing import build_channel_route_envelope
 
     msg = combined.message
-    admission = admission_decision or decide_channel_admission(channel, msg, session_key)
+    admission = admission_decision or decide_channel_admission(
+        channel,
+        msg,
+        session_key,
+        config=config,
+        channel_name=session_prefix,
+    )
     if not admission.admit:
         log.info("channel.admission_denied", channel=session_prefix, reason=admission.reason, is_group=admission.is_group)  # noqa: E501
         return
     route_envelope = build_channel_route_envelope(msg, session_key=session_key, session_prefix=session_prefix)  # noqa: E501
+    principal_is_owner = _stamp_channel_admin_principal(config, route_envelope, msg)
     approval_reply = await _maybe_resolve_channel_approval(
         msg=msg,
         session_key=session_key,
         config=config,
         session_manager=session_manager,
+        route_envelope=route_envelope,
     )
     if approval_reply is not None:
         await channel.send(_preserve_route_channel_metadata(approval_reply, route_envelope))
@@ -1465,15 +1562,21 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         if not atomic_channel_acceptance:
             await _record_delivery_context(session_manager, session_key, msg, session_prefix, route_envelope=route_envelope)  # noqa: E501
 
-    await _apply_saved_channel_run_context(
-        route_envelope,
-        session_manager=session_manager,
-        config=config,
-        workspace_dir=None,
-        principal_is_owner=_is_channel_admin_sender(config, route_envelope),
-    )
+    ingested: AttachmentIngestResult | None = None
+    if not atomic_channel_acceptance:
+        await _apply_saved_channel_run_context(
+            route_envelope,
+            session_manager=session_manager,
+            config=config,
+            workspace_dir=None,
+            principal_is_owner=principal_is_owner,
+        )
 
-    ingested = await _ingest_channel_message_attachments(channel=channel, msg=msg, config=config)
+        ingested = await _ingest_channel_message_attachments(
+            channel=channel,
+            msg=msg,
+            config=config,
+        )
 
     if not atomic_channel_acceptance:
         async with _maybe_lock(session_lock):
@@ -1516,7 +1619,10 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     stream_relay = None
     replayed = False
     try:
-        async with _maybe_lock(session_lock):
+        async with _channel_acceptance_lock(
+            session_lock,
+            atomic=atomic_channel_acceptance,
+        ):
             if atomic_channel_acceptance:
                 handle, persisted_content, stream_relay, replayed = await _accept_channel_runtime_turn(  # noqa: E501
                     channel=channel,
@@ -1528,9 +1634,11 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
                     ingested=ingested,
                     raw_content=raw_content,
                     config=config,
+                    principal_is_owner=principal_is_owner,
                     busy_input_mode=busy_input_mode,
                 )
             else:
+                assert ingested is not None
                 stream_relay = _RuntimeChannelStreamRelay.maybe_start(channel, msg, task_runtime, config)  # noqa: E501
                 channel_overflow_policy = _resolve_channel_overflow_policy(channel, config)
                 if channel_overflow_policy is not None:
@@ -1552,6 +1660,7 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
         if stream_relay is not None:
             await stream_relay.close()
 
+        from opensquilla.project_workspaces import ProjectWorkspaceStateError
         from opensquilla.session.storage import (
             StaleEpochError,
             StorageBusyError,
@@ -1570,6 +1679,20 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
             await status_reactor.failed(msg)
             log.warning("channel.ingress_idempotency_conflict", session_key=session_key)
             await channel.send(_route_envelope_reply_message("This channel message id was already used; the duplicate was ignored.", route_envelope))  # noqa: E501
+            return
+        if isinstance(exc, ProjectWorkspaceStateError):
+            await status_reactor.failed(msg)
+            workspace_message = (
+                "Project workspace not found. Restore it and retry."
+                if exc.reason in {"not_found", "removed"}
+                else "The project workspace is unavailable. Restore access and retry."
+            )
+            await channel.send(
+                _route_envelope_reply_message(
+                    workspace_message,
+                    route_envelope,
+                )
+            )
             return
         if isinstance(exc, TaskQueueFullError):
             await status_reactor.failed(msg)
@@ -1826,11 +1949,51 @@ async def _emit_run_heartbeat(
 
 
 def _is_channel_admin_sender(config: Any, envelope: Any) -> bool:
+    """Compatibility matcher for callers that only have a route envelope.
+
+    This helper intentionally does not authorize a turn.  Channel dispatch
+    uses ``_stamp_channel_admin_principal`` below, which also proves the
+    authenticated ingress principal.
+    """
+
     source_name = getattr(envelope, "source_name", None)
     sender_id = getattr(envelope, "sender_id", None)
     if not isinstance(source_name, str) or not isinstance(sender_id, str):
         return False
     return _sender_is_channel_admin(config, source_name, sender_id)
+
+
+def _stamp_channel_admin_principal(
+    config: Any,
+    envelope: Any,
+    msg: IncomingMessage,
+) -> bool:
+    """Persist authenticated channel-admin standing on an accepted route.
+
+    TaskRuntime runs after ingress has returned, so it cannot consult the
+    mutable channel configuration safely or infer ownership from a session key.
+    Record only the result of the authenticated ingress check here; raw
+    adapter metadata and a configured sender ID alone are never authorization
+    sources.
+    """
+    source_kind = getattr(envelope, "source_kind", None)
+    source_kind_value = getattr(source_kind, "value", source_kind)
+    source_name = getattr(envelope, "source_name", None)
+    route_sender_id = getattr(envelope, "sender_id", None)
+    is_owner = bool(
+        source_kind_value == "channel"
+        and route_sender_id == msg.sender_id
+        and is_authenticated_channel_admin(
+            config,
+            channel_name=source_name if isinstance(source_name, str) else None,
+            msg=msg,
+        )
+    )
+    metadata = getattr(envelope, "metadata", None)
+    if isinstance(metadata, dict):
+        metadata["principal_is_owner"] = is_owner
+        metadata[CHANNEL_ADMIN_VERIFIED_METADATA_KEY] = is_owner
+    return is_owner
 
 
 async def _run_turn_with_streaming(
@@ -1843,6 +2006,7 @@ async def _run_turn_with_streaming(
     config: Any = None,
     route_envelope: Any = None,
     attachments: list[dict[str, Any]] | None = None,
+    session_manager: Any = None,
 ) -> None:
     """Run the agent turn, sending reply via streaming or batch.
 
@@ -1855,11 +2019,15 @@ async def _run_turn_with_streaming(
     text visible.  Pre-stream errors send a standalone error message.
     """
     from opensquilla.agents.scope import resolve_agent_workspace_dir
+    from opensquilla.gateway.project_workspace_runtime import (
+        authoritative_project_run_context,
+    )
     from opensquilla.gateway.routing import build_channel_route_envelope, tool_context_from_envelope
+    from opensquilla.gateway.session_services import get_session_storage
     from opensquilla.session.keys import parse_agent_id
 
     agent_id = parse_agent_id(session_key)
-    workspace_dir = resolve_agent_workspace_dir(agent_id, config)
+    workspace_dir: Path | str | None = resolve_agent_workspace_dir(agent_id, config)
     workspace_strict = getattr(config, "workspace_strict", None)
     if not isinstance(workspace_strict, bool):
         workspace_strict = bool(workspace_dir)
@@ -1869,13 +2037,45 @@ async def _run_turn_with_streaming(
         session_prefix=getattr(channel, "channel_id", None) or "unknown",
         agent_id=agent_id,
     )
+    principal_is_owner = _stamp_channel_admin_principal(config, envelope, msg)
+    storage = get_session_storage(session_manager)
+    if storage is not None:
+        session = await storage.get_session(session_key)
+        if session is None:
+            raise KeyError(f"Session not found: {session_key}")
+        run_context, workspace_guard = await authoritative_project_run_context(
+            storage=storage,
+            session_manager=session_manager,
+            session=session,
+            config=config,
+            default_workspace=(str(workspace_dir) if workspace_dir is not None else None),
+        )
+        from opensquilla.gateway.rpc_sessions import (
+            _apply_run_context_route_metadata,
+        )
+
+        _apply_run_context_route_metadata(
+            envelope,
+            run_context,
+            principal_is_owner=principal_is_owner,
+        )
+        if run_context.workspace is not None:
+            workspace_dir = run_context.workspace
+        if workspace_guard is not None and not isinstance(
+            getattr(config, "workspace_strict", None),
+            bool,
+        ):
+            workspace_strict = True
     tool_ctx = tool_context_from_envelope(
         envelope,
-        is_owner=_is_channel_admin_sender(config, envelope),
-        workspace_dir=str(workspace_dir),
+        is_owner=principal_is_owner,
+        workspace_dir=(str(workspace_dir) if workspace_dir is not None else None),
         workspace_strict=workspace_strict,
         default_elevated=configured_default_elevated(config),
     )
+    from opensquilla.sandbox.policy_store import pin_sandbox_policy
+
+    pin_sandbox_policy(tool_ctx, config)
     use_streaming = resolve_channel_stream_policy(channel).relay_stream
 
     if use_streaming:
@@ -2129,11 +2329,7 @@ class _RuntimeChannelStreamRelay:
         while True:
             if self._coalesce_chars and size >= self._coalesce_chars:
                 return "".join(buffer), None
-            remaining = (
-                deadline - asyncio.get_event_loop().time()
-                if deadline is not None
-                else None
-            )
+            remaining = deadline - asyncio.get_event_loop().time() if deadline is not None else None
             if remaining is not None and remaining <= 0:
                 return "".join(buffer), None
             try:
@@ -2238,9 +2434,7 @@ class _RuntimeChannelStreamRelay:
             else _artifact_fallback_lines(self._artifacts)
         )
         terminal_text = (
-            self._done_snapshot_text
-            if self._done_snapshot_present
-            else "".join(self._text_deltas)
+            self._done_snapshot_text if self._done_snapshot_present else "".join(self._text_deltas)
         )
         if not self._live_preview and terminal_text:
             await self._queue.put(terminal_text)
@@ -2294,9 +2488,7 @@ class _RuntimeChannelStreamRelay:
                     continue
                 if isinstance(item, str):
                     queued_remainder.append(item)
-            undelivered_yielded = "".join(
-                self._yielded_chunks[self._undelivered_index :]
-            )
+            undelivered_yielded = "".join(self._yielded_chunks[self._undelivered_index :])
             fallback_text = undelivered_yielded + "".join(queued_remainder)
             if fallback_text:
                 try:
@@ -2425,16 +2617,24 @@ def _tool_result_payload(event: ToolResultEvent) -> dict[str, Any]:
 
 
 def _clarify_tool_arguments(event: ToolResultEvent) -> dict[str, Any] | None:
-    args = event.arguments
-    if not isinstance(args, dict):
-        return None
-    schema = args.get("clarify_schema")
-    if (
-        args.get("kind") == "user_input"
-        and args.get("paused") is True
-        and isinstance(schema, dict)
-    ):
-        return args
+    candidates: list[Any] = [event.arguments]
+    if isinstance(event.result, str):
+        try:
+            candidates.append(json.loads(event.result))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    else:
+        candidates.append(event.result)
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        schema = candidate.get("clarify_schema")
+        if (
+            candidate.get("kind") == "user_input"
+            and candidate.get("paused") is True
+            and isinstance(schema, dict)
+        ):
+            return candidate
     return None
 
 
@@ -2868,7 +3068,7 @@ async def _record_main_delivery_context_after_acceptance(
         )
 
 
-async def _accept_channel_runtime_turn(
+async def _accept_channel_runtime_turn_impl(
     *,
     channel: Any,
     msg: IncomingMessage,
@@ -2944,6 +3144,28 @@ async def _accept_channel_runtime_turn(
         agent_id=route_envelope.agent_id,
         **delivery_fields,
     )
+    from opensquilla.session.goals import ClaimGoalMutation, GoalClaimCandidate
+
+    goal_claim_candidate: GoalClaimCandidate | None = None
+    current_goal = await storage.get_goal(session_key)
+    if current_goal is not None and current_goal.status == "active":
+        goal_claim_candidate = GoalClaimCandidate(
+            session_id=current_goal.session_id,
+            epoch=current_goal.session_epoch,
+            goal_id=current_goal.goal_id,
+        )
+    workspace_guard = None
+    bound_workspace_id = getattr(intent_plan.node, "workspace_id", None)
+    if isinstance(bound_workspace_id, str) and bound_workspace_id:
+        from opensquilla.project_workspaces import (
+            resolve_validated_project_workspace,
+        )
+
+        validated_workspace = await resolve_validated_project_workspace(
+            storage,
+            bound_workspace_id,
+        )
+        workspace_guard = validated_workspace.guard
     entry, expected_epoch, persisted_text = await _prepare_channel_user_message(
         session_manager=session_manager,
         session_key=session_key,
@@ -2959,17 +3181,7 @@ async def _accept_channel_runtime_turn(
         config,
     )
     overflow_policy = _resolve_channel_overflow_policy(channel, config)
-    reservation = await reserve_turn_via_runtime(
-        task_runtime,
-        route_envelope,
-        msg.content,
-        attachments=ingested.attachments,
-        mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
-        run_kind="channel_turn",
-        semantic_message=raw_content,
-        stream_event_sink=stream_relay.emit if stream_relay is not None else None,
-        overflow_policy=overflow_policy,
-    )
+
     async def _commit_and_activate() -> tuple[
         Any | None,
         str,
@@ -2977,6 +3189,24 @@ async def _accept_channel_runtime_turn(
         bool,
     ]:
         nonlocal stream_relay
+        reservation = await reserve_turn_via_runtime(
+            task_runtime,
+            route_envelope,
+            msg.content,
+            attachments=ingested.attachments,
+            mode=_resolve_channel_busy_input_mode(task_runtime, busy_input_mode),
+            run_kind="channel_turn",
+            semantic_message=raw_content,
+            stream_event_sink=(
+                stream_relay.emit if stream_relay is not None else None
+            ),
+            overflow_policy=overflow_policy,
+            goal_candidate=(
+                goal_claim_candidate.as_task_detail()
+                if goal_claim_candidate is not None
+                else None
+            ),
+        )
         try:
             acceptance = await storage.accept_turn(
                 entry,
@@ -2989,6 +3219,12 @@ async def _accept_channel_runtime_turn(
                 request_fingerprint=identity.request_fingerprint,
                 session_node=intent_plan.node if intent_plan.action == "create" else None,
                 session_updates=delivery_fields,
+                workspace_guard=workspace_guard,
+                goal_mutation=(
+                    ClaimGoalMutation(candidate=goal_claim_candidate)
+                    if goal_claim_candidate is not None
+                    else None
+                ),
             )
         except BaseException:
             await task_runtime.abort_reservation(reservation)
@@ -3022,7 +3258,14 @@ async def _accept_channel_runtime_turn(
                 task_id=acceptance.receipt.task_id,
                 exc_info=True,
             )
-            if not reservation.activated:
+            if reservation.activated:
+                log.warning(
+                    "channel.turn_activation_error_after_start",
+                    session_key=session_key,
+                    task_id=acceptance.receipt.task_id,
+                )
+                handle = await task_runtime.activate(reservation)
+            else:
                 try:
                     await task_runtime.abort_reservation(reservation)
                 except Exception:  # noqa: BLE001 - preserve accepted channel handling.
@@ -3032,27 +3275,46 @@ async def _accept_channel_runtime_turn(
                         task_id=acceptance.receipt.task_id,
                         exc_info=True,
                     )
-            try:
-                await storage.update_agent_task(
-                    acceptance.receipt.task_id,
-                    status="failed",
-                    finished_at=int(time.time() * 1000),
-                    terminal_reason="activation_failed",
-                    error_class=type(exc).__name__,
-                    error_message=str(exc),
+                goal_compensated = False
+                goal_service = getattr(task_runtime, "goal_service", None)
+                compensate_goal = getattr(
+                    goal_service,
+                    "compensate_activation_failure",
+                    None,
                 )
-            except Exception:  # noqa: BLE001 - preserve accepted channel handling.
-                log.warning(
-                    "channel.turn_activation_failure_record_failed",
-                    session_key=session_key,
+                if acceptance.goal_context is not None and callable(compensate_goal):
+                    try:
+                        await compensate_goal(acceptance.goal_context.as_task_detail())
+                        goal_compensated = True
+                    except Exception:  # noqa: BLE001 - preserve accepted handling.
+                        log.warning(
+                            "channel.goal_activation_compensation_failed",
+                            session_key=session_key,
+                            task_id=acceptance.receipt.task_id,
+                            exc_info=True,
+                        )
+                if not goal_compensated:
+                    try:
+                        await storage.update_agent_task(
+                            acceptance.receipt.task_id,
+                            status="failed",
+                            finished_at=int(time.time() * 1000),
+                            terminal_reason="activation_failed",
+                            error_class=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                    except Exception:  # noqa: BLE001 - preserve accepted handling.
+                        log.warning(
+                            "channel.turn_activation_failure_record_failed",
+                            session_key=session_key,
+                            task_id=acceptance.receipt.task_id,
+                            exc_info=True,
+                        )
+                handle = TaskHandle(
                     task_id=acceptance.receipt.task_id,
-                    exc_info=True,
+                    session_key=acceptance.receipt.accepted_session_key,
+                    status=AgentTaskStatus.FAILED,
                 )
-            handle = TaskHandle(
-                task_id=acceptance.receipt.task_id,
-                session_key=acceptance.receipt.accepted_session_key,
-                status=AgentTaskStatus.FAILED,
-            )
 
         try:
             session_manager.notify_message_appended(entry)
@@ -3070,7 +3332,61 @@ async def _accept_channel_runtime_turn(
         )
         return handle, persisted_text, stream_relay, False
 
-    return await complete_durable_ingress(_commit_and_activate())
+    async def _commit_with_session_admission() -> tuple[
+        Any | None,
+        str,
+        _RuntimeChannelStreamRelay | None,
+        bool,
+    ]:
+        async with task_runtime.collect_admission(route_envelope.session_key):
+            return await _commit_and_activate()
+
+    return await complete_durable_ingress(_commit_with_session_admission())
+
+
+async def _accept_channel_runtime_turn(
+    *,
+    channel: Any,
+    msg: IncomingMessage,
+    session_manager: Any,
+    session_key: str,
+    route_envelope: Any,
+    task_runtime: Any,
+    ingested: AttachmentIngestResult | None,
+    raw_content: str,
+    config: Any,
+    principal_is_owner: bool | None = None,
+    busy_input_mode: str = "followup",
+) -> tuple[Any | None, str, _RuntimeChannelStreamRelay | None, bool]:
+    """Fence user intent before channel session/workspace preparation."""
+
+    async with task_runtime.explicit_ingress_intent(route_envelope.session_key):
+        if ingested is None:
+            assert principal_is_owner is not None
+            await _apply_saved_channel_run_context(
+                route_envelope,
+                session_manager=session_manager,
+                config=config,
+                workspace_dir=None,
+                principal_is_owner=principal_is_owner,
+            )
+            ingested = await _ingest_channel_message_attachments(
+                channel=channel,
+                msg=msg,
+                config=config,
+            )
+        return await _accept_channel_runtime_turn_impl(
+            channel=channel,
+            msg=msg,
+            session_manager=session_manager,
+            session_key=session_key,
+            route_envelope=route_envelope,
+            task_runtime=task_runtime,
+            ingested=ingested,
+            raw_content=raw_content,
+            config=config,
+            busy_input_mode=busy_input_mode,
+        )
 
 
 async def _append_channel_user_message(
@@ -3138,11 +3454,7 @@ async def _replayed_assistant_text(
         durable_content = details.get("terminal_assistant_message_content")
         if isinstance(durable_content, str):
             return durable_content
-    message_id = (
-        details.get("terminal_assistant_message_id")
-        if isinstance(details, dict)
-        else None
-    )
+    message_id = details.get("terminal_assistant_message_id") if isinstance(details, dict) else None
     if not isinstance(message_id, str) or not message_id:
         return None
     get_canonical_transcript = getattr(session_manager, "get_canonical_transcript", None)
@@ -3225,9 +3537,7 @@ _REPLY_RETRY_MAX_DELAY_S: float = 60.0
 
 #: Failure classes where *any* send to this target fails, so a delivery-failure
 #: notice would fail identically — attempting one just burns another call.
-_REPLY_NOTICE_HOPELESS_CLASSES: frozenset[str] = frozenset(
-    {"auth_invalid", "target_missing"}
-)
+_REPLY_NOTICE_HOPELESS_CLASSES: frozenset[str] = frozenset({"auth_invalid", "target_missing"})
 
 
 def _reply_retry_delay(error: BaseException, attempt: int) -> float:
@@ -3354,9 +3664,7 @@ def _plan_outbound_pieces(channel: Any, message: OutgoingMessage) -> list[Outgoi
     return pieces
 
 
-def _as_chunk_message(
-    message: OutgoingMessage, chunk: str, *, first: bool
-) -> OutgoingMessage:
+def _as_chunk_message(message: OutgoingMessage, chunk: str, *, first: bool) -> OutgoingMessage:
     """A one-chunk copy of ``message`` with a fresh outbox identity.
 
     The delivery id is dropped so the outbox mints a distinct one per chunk —
@@ -3385,9 +3693,7 @@ async def _deliver_reply_or_notify(
     """Send a reply; on final failure tell the user rather than going silent."""
     error_class: str | None = None
     for piece in _plan_outbound_pieces(channel, message):
-        error_class = await _send_channel_reply_guarded(
-            channel, piece, session_key=session_key
-        )
+        error_class = await _send_channel_reply_guarded(channel, piece, session_key=session_key)
         if error_class is not None:
             break
     if error_class is None:
@@ -3462,10 +3768,7 @@ async def _deliver_runtime_channel_reply(
         if exact_content is not None:
             content = exact_content
         elif replayed:
-            content = (
-                "The task completed, but its original channel reply "
-                "could not be recovered."
-            )
+            content = "The task completed, but its original channel reply could not be recovered."
         else:
             # Compatibility for tasks created before exact channel output was
             # persisted in task details. Replays never use this heuristic.
@@ -3479,19 +3782,14 @@ async def _deliver_runtime_channel_reply(
             and stream_relay.stream_error is None
             and (content or stream_relay.has_terminal_snapshot)
         ):
-            canonical_content, canonical_artifacts = _split_assistant_artifact_content(
-                content
-            )
+            canonical_content, canonical_artifacts = _split_assistant_artifact_content(content)
             if stream_relay.delivered_artifact_keys:
                 canonical_artifacts = [
                     artifact
                     for artifact in canonical_artifacts
-                    if _artifact_delivery_key(artifact)
-                    not in stream_relay.delivered_artifact_keys
+                    if _artifact_delivery_key(artifact) not in stream_relay.delivered_artifact_keys
                 ]
-            canonical_content = _strip_artifact_markers_from_channel_text(
-                canonical_content
-            )
+            canonical_content = _strip_artifact_markers_from_channel_text(canonical_content)
             canonical_content = _strip_delivered_artifact_image_references(
                 canonical_content,
                 canonical_artifacts,
@@ -3500,9 +3798,7 @@ async def _deliver_runtime_channel_reply(
                 fallback_lines = _artifact_fallback_lines(canonical_artifacts)
                 if fallback_lines:
                     canonical_content = "\n\n".join(
-                        part
-                        for part in (canonical_content, "\n".join(fallback_lines))
-                        if part
+                        part for part in (canonical_content, "\n".join(fallback_lines)) if part
                     )
             if await stream_relay.reconcile_final_text(canonical_content):
                 return
@@ -3705,8 +4001,8 @@ async def _run_turn_batch_path(
                 log.error(
                     "channel_dispatch.agent_error",
                     session_key=session_key,
-                    code=event.code,
-                    message=event.message,
+                    failure_kind=event.failure_kind or None,
+                    error_id=event.error_id or None,
                 )
                 await channel.send(
                     _build_reply_message(
@@ -3896,8 +4192,8 @@ async def _run_turn_streaming_path(
                 log.error(
                     "channel_dispatch.agent_error",
                     session_key=session_key,
-                    code=event.code,
-                    message=event.message,
+                    failure_kind=event.failure_kind or None,
+                    error_id=event.error_id or None,
                 )
                 stream_error = append_error_ref(
                     build_terminal_reply(_terminal_payload_from_error_event(event)),
@@ -3909,9 +4205,7 @@ async def _run_turn_streaming_path(
         stream_error = build_terminal_reply(_terminal_payload_from_exception(exc))
     finally:
         if not live_preview:
-            terminal_text = (
-                done_snapshot_text if done_snapshot_present else "".join(text_parts)
-            )
+            terminal_text = done_snapshot_text if done_snapshot_present else "".join(text_parts)
             if terminal_text:
                 await queue.put(terminal_text)
         # Signal end-of-stream to the consumer
@@ -3983,12 +4277,9 @@ async def _run_turn_streaming_path(
         tail = stream_sanitizer.flush()
         if tail:
             queued_remainder.append(tail)
-        undelivered_yielded = "".join(
-            yielded_stream_chunks[stream_delivered_index:]
-        )
-        fallback_text = (
-            terminal_reconcile_fallback
-            or undelivered_yielded + "".join(queued_remainder)
+        undelivered_yielded = "".join(yielded_stream_chunks[stream_delivered_index:])
+        fallback_text = terminal_reconcile_fallback or undelivered_yielded + "".join(
+            queued_remainder
         )
         if fallback_text:
             try:

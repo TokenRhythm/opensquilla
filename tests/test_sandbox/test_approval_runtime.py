@@ -13,7 +13,11 @@ from opensquilla.sandbox.approval_runtime import (
     select_sandbox_override,
 )
 from opensquilla.sandbox.config import SandboxSettings
-from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
+from opensquilla.sandbox.elevation import (
+    ElevationAction,
+    gate_elevated_action,
+    request_elevation,
+)
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 from opensquilla.tool_boundary import ToolContinuation
@@ -228,6 +232,149 @@ def test_elevation_gate_does_not_queue_override_with_denied_reads(tmp_path: Path
     assert result.status == "elevation_forbidden_denied_reads"
     assert result.allowed is False
     assert result.requested is False
+
+
+@pytest.mark.parametrize(
+    ("active_run_mode", "expected_reviewer", "human_actionable"),
+    (
+        ("standard", "user", True),
+        ("trusted", "user", True),
+    ),
+)
+def test_active_run_mode_controls_exact_elevation_reviewer(
+    tmp_path: Path,
+    active_run_mode: str,
+    expected_reviewer: str,
+    human_actionable: bool,
+) -> None:
+    queue = ApprovalQueue(db_path=":memory:")
+    configure_runtime(
+        SandboxSettings(
+            run_mode="trusted",
+            backend="noop",
+            allow_legacy_mode=True,
+            approvals_reviewer="auto_review",
+        ),
+        approval_queue=queue,
+        workspace=tmp_path,
+    )
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.AGENT,
+            session_key=f"{active_run_mode}-session",
+            workspace_dir=str(tmp_path),
+            run_mode=active_run_mode,
+        )
+    )
+    action = ElevationAction(
+        tool_name="exec_command",
+        action_kind="shell.exec",
+        argv=("powershell", "-Command", "New-Item D:\\probe"),
+        cwd=str(tmp_path),
+        sandbox_permissions="require_escalated",
+        justification="Create the exact user-requested probe outside the workspace.",
+    )
+    try:
+        result = gate_elevated_action(
+            action,
+            approval_id=None,
+            session_key=f"{active_run_mode}-session",
+            queue=queue,
+        )
+        entry = queue.get(result.approval_id or "")
+    finally:
+        current_tool_context.reset(token)
+        reset_runtime()
+        queue.close()
+
+    assert result.status == "approval_required"
+    assert entry.resolved is False
+    assert entry.params["reviewer"] == expected_reviewer
+    assert entry.params["humanActionable"] is human_actionable
+
+
+def test_standard_replaces_legacy_auto_approved_elevation_with_human_request(
+    tmp_path: Path,
+) -> None:
+    queue = ApprovalQueue(db_path=":memory:")
+    action = ElevationAction(
+        tool_name="exec_command",
+        action_kind="shell.exec",
+        argv=("powershell", "-Command", "New-Item D:\\probe"),
+        cwd=str(tmp_path),
+        sandbox_permissions="require_escalated",
+        justification="Create the exact user-requested probe outside the workspace.",
+    )
+    legacy = request_elevation(
+        queue,
+        action,
+        session_key="switch-session",
+        reviewer="auto_review",
+    )
+    queue.resolve(legacy.approval_id or "", True)
+    token = current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            session_key="switch-session",
+            workspace_dir=str(tmp_path),
+            run_mode="standard",
+        )
+    )
+    try:
+        result = gate_elevated_action(
+            action,
+            approval_id=legacy.approval_id,
+            session_key="switch-session",
+            queue=queue,
+        )
+        replacement = queue.get(result.approval_id or "")
+    finally:
+        current_tool_context.reset(token)
+        queue.close()
+
+    assert result.status == "approval_required"
+    assert result.allowed is False
+    assert result.approval_id != legacy.approval_id
+    assert replacement.resolved is False
+    assert replacement.params["reviewer"] == "user"
+    assert replacement.params["humanActionable"] is True
+
+
+def test_standard_promotes_legacy_pending_auto_elevation_to_human(
+    tmp_path: Path,
+) -> None:
+    queue = ApprovalQueue(db_path=":memory:")
+    action = ElevationAction(
+        tool_name="exec_command",
+        action_kind="shell.exec",
+        argv=("powershell", "-Command", "New-Item D:\\probe"),
+        cwd=str(tmp_path),
+        sandbox_permissions="require_escalated",
+        justification="Create the exact user-requested probe outside the workspace.",
+    )
+    legacy = request_elevation(
+        queue,
+        action,
+        session_key="pending-switch-session",
+        reviewer="auto_review",
+    )
+
+    result = request_elevation(
+        queue,
+        action,
+        session_key="pending-switch-session",
+        reviewer="user",
+    )
+    entry = queue.get(legacy.approval_id or "")
+    queue.close()
+
+    assert result.status == "approval_pending"
+    assert result.approval_id == legacy.approval_id
+    assert entry.resolved is False
+    assert entry.params["reviewer"] == "user"
+    assert entry.params["humanActionable"] is True
 
 
 @pytest.mark.asyncio

@@ -350,16 +350,60 @@ def evaluate_provider(payload: dict[str, Any]) -> list[HealthFinding]:
                 )
             )
         else:
-            findings.append(
-                HealthFinding(
-                    id="provider.active.ready",
-                    severity="ok",
-                    surface="provider",
-                    title="Active provider ready",
-                    detail=f"{provider_id} is configured and buildable.",
-                    evidence={"providerId": provider_id, "model": active_row.get("model")},
+            probe = active_row.get("modelProbe")
+            attempted = isinstance(probe, dict) and bool(probe.get("attempted"))
+            probe_status = str(probe.get("status") or "") if isinstance(probe, dict) else ""
+            if attempted and probe_status in {"error", "degraded"}:
+                failure_kind = str(probe.get("failureKind") or "unknown")
+                blocking = failure_kind in {"auth_invalid", "insufficient_credits"}
+                findings.append(
+                    HealthFinding(
+                        id=f"provider.active.probe.{failure_kind}",
+                        severity="error" if blocking else "warn",
+                        readiness_impact="blocks_ready" if blocking else "degrades",
+                        surface="provider",
+                        title="Active provider probe failed",
+                        detail=str(
+                            probe.get("error")
+                            or "The provider model-list probe did not succeed."
+                        ),
+                        evidence={
+                            "providerId": provider_id,
+                            "failureKind": failure_kind,
+                            "probeStatus": probe_status,
+                        },
+                        fix_steps=[
+                            FixStep(
+                                label="Inspect provider probe",
+                                command=(
+                                    "opensquilla providers status "
+                                    f"{provider_id} --probe-models"
+                                ),
+                            ),
+                            FixStep(
+                                label="Reconfigure provider",
+                                command=(
+                                    "opensquilla providers configure "
+                                    f"{provider_id} --api-key {_API_KEY_PLACEHOLDER}"
+                                ),
+                            ),
+                        ],
+                    )
                 )
-            )
+            else:
+                findings.append(
+                    HealthFinding(
+                        id="provider.active.ready",
+                        severity="ok",
+                        surface="provider",
+                        title="Active provider ready",
+                        detail=f"{provider_id} is configured and buildable.",
+                        evidence={
+                            "providerId": provider_id,
+                            "model": active_row.get("model"),
+                        },
+                    )
+                )
     return findings
 
 
@@ -573,6 +617,8 @@ def evaluate_search(payload: dict[str, Any]) -> list[HealthFinding]:
     requires_api_key = bool(payload.get("requiresApiKey"))
     api_key_configured = bool(payload.get("apiKeyConfigured"))
     api_key_env = str(payload.get("apiKeyEnv") or "")
+    network_ready = payload.get("networkReady")
+    network_blocked_reason = str(payload.get("networkBlockedReason") or "")
     evidence = {
         "provider": provider,
         "activeProvider": payload.get("activeProvider"),
@@ -586,6 +632,10 @@ def evaluate_search(payload: dict[str, Any]) -> list[HealthFinding]:
         "useEnvProxy": payload.get("useEnvProxy"),
         "diagnostics": payload.get("diagnostics"),
     }
+    if "networkReady" in payload:
+        evidence["networkReady"] = network_ready
+    if "networkBlockedReason" in payload:
+        evidence["networkBlockedReason"] = network_blocked_reason or None
     configure_command = f"opensquilla configure search --search-provider {provider}"
     if requires_api_key:
         configure_command = f"{configure_command} --api-key {_API_KEY_PLACEHOLDER}"
@@ -721,6 +771,30 @@ def evaluate_search(payload: dict[str, Any]) -> list[HealthFinding]:
                     FixStep(label="Restart gateway", command="opensquilla gateway restart"),
                 ],
                 restart_required=True,
+            )
+        ]
+    if network_ready is False or network_blocked_reason:
+        reason = network_blocked_reason or (
+            "The current sandbox network posture blocks in-process search queries."
+        )
+        return [
+            HealthFinding(
+                id="search.provider.network_blocked",
+                severity="warn",
+                surface="search",
+                title="Search queries are blocked by the network posture",
+                detail=f"{provider} is configured and buildable, but {reason}",
+                evidence=evidence,
+                fix_steps=[
+                    FixStep(
+                        label="Inspect search status",
+                        command=f"opensquilla search status {provider} --json",
+                    ),
+                    FixStep(
+                        label="Inspect sandbox status",
+                        command="opensquilla sandbox status --json",
+                    ),
+                ],
             )
         ]
     return [

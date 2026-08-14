@@ -93,6 +93,21 @@ export interface DesktopSettingsPayload {
   disableNetworkObservability?: boolean
 }
 
+export type DesktopMainWindowCloseBehavior = 'background' | 'quit' | 'ask'
+export type WorkbenchPreviewMode = 'full' | 'offline'
+
+export interface DesktopPreferences {
+  schemaVersion?: number
+  mainWindowCloseBehavior: DesktopMainWindowCloseBehavior
+  canRunInBackground: boolean
+  platform: 'darwin' | 'win32' | 'linux' | 'other'
+  workbenchPreviewMode?: WorkbenchPreviewMode
+  effectiveWorkbenchPreviewMode?: WorkbenchPreviewMode
+  workbenchPreviewNoticeShown?: boolean
+  workbenchPreviewForcedOffline?: boolean
+  sandboxUnavailableWarningSuppressed?: boolean
+}
+
 export interface PlatformCapabilities {
   isDesktop: boolean
   ownsGateway: boolean
@@ -114,6 +129,8 @@ export interface PlatformCapabilities {
    * in-browser blob-popup path can never succeed.
    */
   canOpenArtifactsNatively: boolean
+  /** The shell can host isolated native Workbench WebContents surfaces. */
+  hasNativeWorkbenchSurfaces: boolean
 }
 
 export interface ArtifactOpenRequest {
@@ -130,9 +147,191 @@ export interface ArtifactNativeOpenResult {
   message?: string
 }
 
+export interface ProjectDirectoryPickerRequest {
+  /** Directory the native picker should reveal when it opens. */
+  initialPath?: string
+}
+
 export interface PlatformFilesApi {
   /** Write the bytes to a temp file and open it with the OS default app. */
   openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+  /** Open the trusted host's native folder picker. Undefined on the web. */
+  chooseProjectDirectory?: (
+    request?: ProjectDirectoryPickerRequest,
+  ) => Promise<{ path: string } | null>
+}
+
+export interface NativeWorkbenchCreateSurfaceRequestV1 {
+  version: 1
+  surfaceId: string
+  kind: 'artifact-html'
+  payload: {
+    /** HTML bytes fetched through the renderer's authenticated Artifact client. */
+    data: ArrayBuffer
+    name: string
+    mime: string
+    scopeId: string
+    /** Explicit, per-surface user choice. Defaults to false in the UI. */
+    allowRemoteResources: boolean
+  }
+}
+
+export interface NativeWorkbenchCreateArtifactSurfaceRequestV2 {
+  version: 2
+  surfaceId: string
+  kind: 'artifact-preview'
+  payload: {
+    launchUrl: string
+    expectedOrigin: string
+    scopeId: string
+    mode: WorkbenchPreviewMode
+  }
+}
+
+export interface NativeWorkbenchCreateUrlSurfaceRequestV2 {
+  version: 2
+  surfaceId: string
+  kind: 'url-preview'
+  payload: {
+    url: string
+    scopeId: string
+  }
+}
+
+export type NativeWorkbenchCreateSurfaceRequest =
+  | NativeWorkbenchCreateSurfaceRequestV1
+  | NativeWorkbenchCreateArtifactSurfaceRequestV2
+  | NativeWorkbenchCreateUrlSurfaceRequestV2
+
+export interface NativeWorkbenchCapabilities {
+  protocolVersions: Array<1 | 2>
+  modes: WorkbenchPreviewMode[]
+  maxSurfaces: number
+}
+
+export interface NativeWorkbenchSurfaceRectRequest {
+  surfaceId: string
+  x: number
+  y: number
+  width: number
+  height: number
+  visible: boolean
+}
+
+export interface NativeWorkbenchSurfaceResult {
+  ok: boolean
+  message?: string
+}
+
+export type NativeWorkbenchSurfaceEventType =
+  | 'loading'
+  | 'ready'
+  | 'missing-resource'
+  | 'navigation-state'
+  | 'permission-request'
+  | 'blocked-action'
+  | 'capability-expired'
+  | 'unresponsive'
+  | 'responsive'
+  | 'error'
+  | 'crashed'
+  | 'escape'
+
+export interface NativeWorkbenchSurfaceEvent {
+  version: 1 | 2
+  surfaceId: string
+  type: NativeWorkbenchSurfaceEventType
+  detail?: {
+    requestId?: string
+    permission?: string
+    requestingOrigin?: string
+    url?: string
+    title?: string
+    loading?: boolean
+    canGoBack?: boolean
+    canGoForward?: boolean
+    action?: string
+    code?: string
+    message?: string
+    path?: string
+    reason?: string
+  }
+}
+
+export interface NativeWorkbenchNavigateRequest {
+  version: 2
+  surfaceId: string
+  action: 'back' | 'forward' | 'reload' | 'stop' | 'navigate'
+  url?: string
+}
+
+export interface NativeWorkbenchPermissionResponse {
+  version: 2
+  surfaceId: string
+  requestId: string
+  allow: boolean
+}
+
+export interface NativeArtifactPreviewLeaseCreateRequest {
+  version: 1
+  artifactId: string
+  scopeId: string
+  mode: WorkbenchPreviewMode
+  authToken?: string
+}
+
+export interface NativeArtifactPreviewLeaseControlRequest {
+  version: 1
+  leaseId: string
+  scopeId: string
+  authToken?: string
+}
+
+export type NativeArtifactPreviewLeaseBrokerResult = {
+  ok: true
+  status: number
+  payload: unknown
+} | {
+  ok: false
+  status: number
+  code: string
+  message: string
+}
+
+export interface NativeWorkbenchApi {
+  getCapabilities?(): Promise<NativeWorkbenchCapabilities>
+  createArtifactPreviewLease?(
+    request: NativeArtifactPreviewLeaseCreateRequest,
+  ): Promise<NativeArtifactPreviewLeaseBrokerResult>
+  renewArtifactPreviewLease?(
+    request: NativeArtifactPreviewLeaseControlRequest,
+  ): Promise<NativeArtifactPreviewLeaseBrokerResult>
+  revokeArtifactPreviewLease?(
+    request: NativeArtifactPreviewLeaseControlRequest,
+  ): Promise<NativeArtifactPreviewLeaseBrokerResult>
+  createSurface(
+    request: NativeWorkbenchCreateSurfaceRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  setSurfaceRect(
+    request: NativeWorkbenchSurfaceRectRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  activateSurface(surfaceId: string): Promise<NativeWorkbenchSurfaceResult>
+  destroySurface(surfaceId: string): Promise<NativeWorkbenchSurfaceResult>
+  navigateSurface?(
+    request: NativeWorkbenchNavigateRequest,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  respondToPermission?(
+    request: NativeWorkbenchPermissionResponse,
+  ): Promise<NativeWorkbenchSurfaceResult>
+  onSurfaceEvent(callback: (event: NativeWorkbenchSurfaceEvent) => void): () => void
+}
+
+export interface PlatformWorkbenchApi {
+  /**
+   * Undefined on web and on older desktop shells. Callers must keep a DOM
+   * sandbox fallback for HTML Artifact preview.
+   */
+  native?: NativeWorkbenchApi
 }
 
 export interface CliInvocation {
@@ -154,6 +353,18 @@ export interface PlatformSettingsApi {
   getDesktopSettings?: () => Promise<DesktopSettings>
   saveDesktopSettings?: (payload: DesktopSettingsPayload) => Promise<DesktopSettings>
   resetDesktopSettings?: () => Promise<{ ok: boolean }>
+  getDesktopPreferences?: () => Promise<DesktopPreferences>
+  saveDesktopPreferences?: (
+    payload: {
+      mainWindowCloseBehavior?: DesktopMainWindowCloseBehavior
+      workbenchPreviewMode?: WorkbenchPreviewMode
+      workbenchPreviewNoticeShown?: boolean
+      sandboxUnavailableWarningSuppressed?: boolean
+    },
+  ) => Promise<DesktopPreferences>
+  reportSandboxUnavailable?: (
+    payload: { state: 'failed' | 'unavailable'; message?: string },
+  ) => Promise<{ shown: boolean; suppressed: boolean }>
 }
 
 export interface PlatformOnboardingApi {
@@ -178,6 +389,7 @@ export interface Platform {
   settings: PlatformSettingsApi
   onboarding: PlatformOnboardingApi
   files: PlatformFilesApi
+  workbench: PlatformWorkbenchApi
   updates: PlatformUpdatesApi
   /**
    * The host OS locale (BCP-47), used only to seed the initial UI language on

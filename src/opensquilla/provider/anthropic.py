@@ -19,6 +19,8 @@ from .model_catalog import shared_catalog
 from .registry import AuthHeaderStyle
 from .request_proof import (
     ProviderRequestBudgetExceededError,
+    project_final_request_payload,
+    protected_tool_result_indexes,
     prove_provider_payload_from_env,
 )
 from .stream_assembly import (
@@ -33,6 +35,7 @@ from .types import (
     ErrorEvent,
     Message,
     ModelInfo,
+    ProviderFinalRequestProjection,
     StreamEvent,
     TextDeltaEvent,
     ToolDefinition,
@@ -114,6 +117,7 @@ def _build_message_payload(
     model: str | None = None,
     *,
     replay_provider_state: bool = True,
+    record_unsupported_document: bool = True,
 ) -> dict[str, Any]:
     if isinstance(msg.content, str):
         return {"role": msg.role, "content": msg.content}
@@ -153,7 +157,8 @@ def _build_message_payload(
                         "text": _document_unsupported_fallback_text(block.title),
                     }
                 )
-                _increment_document_block_unsupported()
+                if record_unsupported_document:
+                    _increment_document_block_unsupported()
                 continue
             doc_block: dict[str, Any] = {
                 "type": "document",
@@ -283,6 +288,7 @@ def _anthropic_iteration_token_counts(usage: dict[str, Any]) -> tuple[int, int]:
 class AnthropicProvider:
     """Streams from Anthropic Messages API with SSE parsing."""
 
+    final_request_admission_guaranteed = True
     provider_name = "anthropic"
 
     def __init__(
@@ -294,6 +300,9 @@ class AnthropicProvider:
         replay_provider_state: bool = True,
         auth_header_style: AuthHeaderStyle = "x-api-key",
         provider_id: str | None = None,
+        listing_model_ids: tuple[str, ...] | None = None,
+        temperature_floor_model_ids: frozenset[str] = frozenset(),
+        temperature_floor: float = 0.0,
     ) -> None:
         # The default auth style matches Anthropic proper so direct
         # construction (tests, embedding) against the default host behaves
@@ -309,6 +318,9 @@ class AnthropicProvider:
         # profiles such as MiniMax carry their own configured identity for
         # response attribution without changing Anthropic-shaped behavior.
         self.provider_id = (provider_id or self.provider_name).strip()
+        self._listing_model_ids = listing_model_ids
+        self._temperature_floor_model_ids = temperature_floor_model_ids
+        self._temperature_floor = temperature_floor
 
     @property
     def model(self) -> str:
@@ -330,21 +342,14 @@ class AnthropicProvider:
             return f"{self._base_url}{path[3:]}"
         return f"{self._base_url}{path}"
 
-    def chat(
-        self,
-        messages: list[Message],
-        tools: list[ToolDefinition] | None = None,
-        config: ChatConfig | None = None,
-    ) -> AsyncIterator[StreamEvent]:
-        cfg = config or ChatConfig()
-        return self._stream(messages, tools, cfg)
-
-    async def _stream(
+    def _build_payload(
         self,
         messages: list[Message],
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
-    ) -> AsyncIterator[StreamEvent]:
+        *,
+        record_diagnostics: bool,
+    ) -> tuple[dict[str, Any], bool]:
         max_tokens = max(1, cfg.max_tokens)
         thinking_payload: dict[str, Any] | None = None
         if cfg.thinking:
@@ -361,16 +366,20 @@ class AnthropicProvider:
 
         built_messages = [
             _build_message_payload(
-                m,
+                message,
                 model=self._model,
                 replay_provider_state=self._replay_provider_state,
+                record_unsupported_document=record_diagnostics,
             )
-            for m in messages
+            for message in messages
         ]
         request_has_document = any(
-            isinstance(m.get("content"), list)
-            and any(isinstance(p, dict) and p.get("type") == "document" for p in m["content"])
-            for m in built_messages
+            isinstance(message.get("content"), list)
+            and any(
+                isinstance(part, dict) and part.get("type") == "document"
+                for part in message["content"]
+            )
+            for message in built_messages
         )
         payload: dict[str, Any] = {
             "model": self._model,
@@ -382,13 +391,71 @@ class AnthropicProvider:
         if system_payload:
             payload["system"] = system_payload
         if cfg.temperature is not None and not cfg.thinking:
-            payload["temperature"] = cfg.temperature
+            temperature = cfg.temperature
+            if (
+                self._model.rsplit("/", 1)[-1].strip().lower()
+                in self._temperature_floor_model_ids
+            ):
+                temperature = max(temperature, self._temperature_floor)
+            payload["temperature"] = temperature
         if cfg.stop_sequences:
             payload["stop_sequences"] = cfg.stop_sequences
         if tools:
-            payload["tools"] = [_build_tool_payload(t) for t in tools]
+            payload["tools"] = [_build_tool_payload(tool) for tool in tools]
         if thinking_payload:
             payload["thinking"] = thinking_payload
+        return payload, request_has_document
+
+    def project_final_request(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+        *,
+        message_limit: int | None = None,
+    ) -> ProviderFinalRequestProjection:
+        """Project the exact Messages payload without transport or shaping."""
+
+        cfg = config or ChatConfig()
+        payload, _ = self._build_payload(
+            messages,
+            tools,
+            cfg,
+            record_diagnostics=False,
+        )
+        protected_result_indexes = protected_tool_result_indexes(messages)
+        return project_final_request_payload(
+            payload,
+            projection_adapter="anthropic",
+            proof_budget=cfg.provider_request_max_chars,
+            status_projection_mode="native_is_error",
+            active_user_message_index=cfg.active_user_message_index,
+            message_limit=message_limit,
+            protected_tool_result_indexes=protected_result_indexes,
+        )
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        cfg = config or ChatConfig()
+        return self._stream(messages, tools, cfg)
+
+    async def _stream(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None,
+        cfg: ChatConfig,
+    ) -> AsyncIterator[StreamEvent]:
+        payload, request_has_document = self._build_payload(
+            messages,
+            tools,
+            cfg,
+            record_diagnostics=True,
+        )
+        protected_result_indexes = protected_tool_result_indexes(messages)
 
         from opensquilla.engine.context_budget import coordinate_provider_context_budget
 
@@ -397,6 +464,8 @@ class AnthropicProvider:
             projection_adapter="anthropic",
             proof_budget=cfg.provider_request_max_chars,
             status_projection_mode="native_is_error",
+            active_user_message_index=cfg.active_user_message_index,
+            protected_tool_result_indexes=protected_result_indexes,
         )
         if budget_decision.action == "budget_limited":
             proof = budget_decision.proof or {}
@@ -404,6 +473,13 @@ class AnthropicProvider:
             yield ErrorEvent(
                 message=json.dumps(proof, ensure_ascii=False, sort_keys=True),
                 code="provider_request_budget_exhausted",
+            )
+            return
+        if budget_decision.action == "invalid_request":
+            log.warning("provider.request_serialization_failed")
+            yield ErrorEvent(
+                message="Provider request could not be serialized.",
+                code="provider_internal",
             )
             return
         payload = budget_decision.payload or payload
@@ -414,6 +490,8 @@ class AnthropicProvider:
                 payload,
                 projection_adapter="anthropic",
                 status_projection_mode="native_is_error",
+                active_user_message_index=cfg.active_user_message_index,
+                protected_tool_result_indexes=protected_result_indexes,
             )
         except ProviderRequestBudgetExceededError as exc:
             log.warning("provider.request_budget_exhausted", **exc.proof)
@@ -428,10 +506,11 @@ class AnthropicProvider:
             "content-type": "application/json",
             "accept": "text/event-stream",
         }
-        if self._auth_header_style == "bearer":
-            headers["Authorization"] = f"Bearer {self._api_key}"
-        else:
-            headers["x-api-key"] = self._api_key
+        if self._api_key:
+            if self._auth_header_style == "bearer":
+                headers["Authorization"] = f"Bearer {self._api_key}"
+            else:
+                headers["x-api-key"] = self._api_key
         endpoint = self._api_url("/v1/messages")
         trace = LLMTraceRecorder(
             provider="anthropic",
@@ -1011,7 +1090,6 @@ class AnthropicProvider:
                 "provider.stream_internal_error",
                 provider=self.provider_name,
                 model=self._model,
-                error=message,
                 exception_type=type(exc).__name__,
             )
             trace.record_error(
@@ -1024,20 +1102,27 @@ class AnthropicProvider:
             )
 
     async def list_models(self) -> list[ModelInfo]:
-        """Build listing rows for the adapter's SKUs from the shared catalog.
+        """Build listing rows for this provider identity from the shared catalog.
 
         The catalog's canonical costs are USD per million tokens; the
         ``ModelInfo`` wire contract carries per-1k floats (rpc_models
         renders per-1k), so entry costs are converted back (÷1000).
         Capability flags stay at ``ModelInfo`` defaults — the listing has
-        only ever advertised identity, windows, and pricing.
+        only ever advertised identity, windows, and pricing. Native Anthropic
+        uses its built-in SKU list; compatibility endpoints receive an exact
+        registry list or the configured model from the selector.
         """
         rows: list[ModelInfo] = []
-        for model_id in _LISTING_MODEL_IDS:
-            entry = shared_catalog().resolve_entry(model_id, provider=self.provider_name)
+        model_ids = (
+            _LISTING_MODEL_IDS
+            if self._listing_model_ids is None
+            else self._listing_model_ids
+        )
+        for model_id in model_ids:
+            entry = shared_catalog().resolve_entry(model_id, provider=self.provider_id)
             rows.append(
                 ModelInfo(
-                    provider=self.provider_name,
+                    provider=self.provider_id,
                     model_id=model_id,
                     display_name=entry.display_name or model_id,
                     context_window=entry.context_window,

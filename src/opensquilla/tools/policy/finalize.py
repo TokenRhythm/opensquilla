@@ -34,7 +34,7 @@ from opensquilla.router_control import router_control_payload_terminates_turn
 from opensquilla.safety.secret_redaction import redact_secret_value
 from opensquilla.tool_boundary import ToolCall, ToolResult
 from opensquilla.tools.envelope import build_tool_failure_envelope, is_denial_payload
-from opensquilla.tools.types import InteractionMode, ToolContext
+from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
 log = structlog.get_logger("opensquilla.tools.dispatch")
 
@@ -45,8 +45,44 @@ _PENDING_APPROVAL_STATUSES: frozenset[str] = frozenset(
 
 _DISPATCH_TRUNCATION_RETRIEVE_HINT = (
     "This tool result was truncated before entering model context. "
-    "Use retrieve_tool_result with tool_result_handle to inspect the original raw output."
+    "Use retrieve_tool_result with handle=<tool_result_handle> to inspect the original raw output."
 )
+
+
+def _registered_terminates_turn(registered: Any) -> bool:
+    return bool(getattr(getattr(registered, "spec", None), "terminates_turn", False))
+
+
+def _plan_checkpoint_terminates_turn(tool_name: str, content: Any) -> bool:
+    """A blocked checkpoint is a hard execution boundary."""
+
+    if tool_name != "plan_run_checkpoint":
+        return False
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    run = payload.get("plan_run")
+    return isinstance(run, dict) and run.get("status") == "blocked"
+
+
+def _user_input_terminates_turn(tool_name: str, content: Any) -> bool:
+    """Fallback surfaces without a deferred broker stop at the request."""
+
+    if tool_name != "request_user_input":
+        return False
+    try:
+        payload = json.loads(content) if isinstance(content, str) else content
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("status") == "input_required"
+        and payload.get("kind") == "user_input"
+        and payload.get("paused") is True
+    )
 
 
 def _store_dispatch_truncated_snapshot(
@@ -56,7 +92,11 @@ def _store_dispatch_truncated_snapshot(
     content: str,
 ) -> dict[str, Any] | None:
     """Persist raw output that dispatch-level result budgets truncated."""
-    if ctx is None or not ctx.tool_result_store_dir:
+    if (
+        ctx is None
+        or not ctx.tool_result_store_dir
+        or not ctx.tool_result_retrieval_available
+    ):
         return None
 
     session_id = (
@@ -148,7 +188,14 @@ def _denial_reason(content: Any) -> str:
     return "denied"
 
 def _has_live_approval_surface(ctx: ToolContext | None) -> bool:
-    return ctx is None or ctx.interaction_mode is InteractionMode.INTERACTIVE
+    return (
+        ctx is None
+        or ctx.interaction_mode is InteractionMode.INTERACTIVE
+        # Channel turns are unattended from the process perspective, but the
+        # channel approval notifier delivers a card/text decision back to the
+        # originating sender. Treat that as an approval-capable surface.
+        or ctx.caller_kind is CallerKind.CHANNEL
+    )
 
 
 def _uses_automatic_review(payload: dict[str, Any]) -> bool:
@@ -216,6 +263,7 @@ async def finalize(
                 content=json.dumps(payload),
                 is_error=False,
                 execution_status=normalize_execution_status(status),
+                terminates_turn=False,
             )
 
         envelope = redact_secret_value(
@@ -251,6 +299,7 @@ async def finalize(
             content=json.dumps(envelope),
             is_error=True,
             execution_status=normalize_execution_status(status),
+            terminates_turn=False,
         )
 
     result = redact_secret_value(raw_result)
@@ -297,6 +346,7 @@ async def finalize(
                 content=json.dumps(envelope),
                 is_error=False,
                 execution_status=normalize_execution_status(status),
+                terminates_turn=False,
             )
 
     # ---------------- Standard branch (success or denial payload) ----------------
@@ -358,16 +408,27 @@ async def finalize(
             is_error=is_error,
             arguments=call.arguments,
         )
-        content = budgeted.content
-        if budgeted.changed:
-            content = _attach_dispatch_truncated_snapshot(
-                content=content,
-                snapshot=_store_dispatch_truncated_snapshot(
-                    ctx=ctx,
-                    call=call,
-                    content=raw_budget_content,
-                ),
+        snapshot = (
+            _store_dispatch_truncated_snapshot(
+                ctx=ctx,
+                call=call,
+                content=raw_budget_content,
             )
+            if budgeted.changed
+            else None
+        )
+        content = (
+            _attach_dispatch_truncated_snapshot(
+                content=budgeted.content,
+                snapshot=snapshot,
+            )
+            if snapshot is not None
+            else budgeted.content
+        )
+        # Dispatch limits are hard safety budgets. When retrieval is visible,
+        # attach a Store handle to make the bounded result recoverable. When it
+        # is unavailable, keep the bounded result's explicit truncation marker
+        # rather than inventing a handle the model cannot use.
         if budgeted.changed and execution_status is not None:
             execution_status = mark_execution_status_truncated(execution_status)
     return ToolResult(
@@ -378,7 +439,12 @@ async def finalize(
         artifacts=artifacts,
         execution_status=execution_status,
         terminates_turn=(
-            call.tool_name == "router_control"
-            and router_control_payload_terminates_turn(content)
+            (_registered_terminates_turn(registered) and not is_error)
+            or _plan_checkpoint_terminates_turn(call.tool_name, content)
+            or _user_input_terminates_turn(call.tool_name, content)
+            or (
+                call.tool_name == "router_control"
+                and router_control_payload_terminates_turn(content)
+            )
         ),
     )

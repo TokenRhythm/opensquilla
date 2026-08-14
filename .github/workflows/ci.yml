@@ -2,6 +2,8 @@ name: CI
 
 "on":
   pull_request:
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
   workflow_dispatch:
@@ -35,6 +37,7 @@ jobs:
       python_changed: ${{ steps.classify.outputs.python_changed }}
       platform_sensitive_changed: ${{ steps.classify.outputs.platform_sensitive_changed }}
       build_wheel_required: ${{ steps.classify.outputs.build_wheel_required }}
+      toolchain_artifact_changed: ${{ steps.classify.outputs.toolchain_artifact_changed }}
       full_required: ${{ steps.classify.outputs.full_required }}
     steps:
       - name: Check out repository
@@ -53,6 +56,19 @@ jobs:
               git diff --name-only \
                 "${{ github.event.pull_request.base.sha }}" \
                 "${{ github.event.pull_request.head.sha }}" > "${changed_files}"
+              ;;
+            merge_group)
+              base="${{ github.event.merge_group.base_sha }}"
+              head="${{ github.event.merge_group.head_sha }}"
+              if [[ -n "${base}" && -n "${head}" ]] \
+                && git cat-file -e "${base}^{commit}" \
+                && git cat-file -e "${head}^{commit}" \
+                && git diff --name-only "${base}" "${head}" > "${changed_files}"; then
+                :
+              else
+                echo "Merge-group diff is unavailable; running the full CI matrix." >&2
+                printf '.ci/run-all\n' > "${changed_files}"
+              fi
               ;;
             push)
               before="${{ github.event.before }}"
@@ -209,6 +225,76 @@ jobs:
           retention-days: 31
           overwrite: true
 
+  webui-chat-recovery:
+    name: WebUI chat recovery
+    needs: [classify-changes, frontend-check]
+    if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791
+      OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI: gateway
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download verified frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-webui-dist
+          path: src/opensquilla/gateway/static/dist/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+          cache: 'npm'
+          cache-dependency-path: opensquilla-webui/package-lock.json
+
+      - name: Install Gateway dependencies
+        run: uv sync --frozen
+
+      - name: Install frontend dependencies
+        working-directory: opensquilla-webui
+        run: npm ci
+
+      - name: Install Chromium
+        working-directory: opensquilla-webui
+        run: npx playwright install --with-deps chromium
+
+      - name: Run production-dist chat and Goal recovery browser contracts
+        working-directory: opensquilla-webui
+        run: >-
+          npm run test:e2e --
+          assistant-activity.spec.ts
+          composer-paste.spec.ts
+          history-hydration.spec.ts
+          session-created-card.spec.ts
+          goal-mode.spec.ts
+          queue-steer.spec.ts
+          share.spec.ts
+          --project=chromium
+          --workers=1
+
+      - name: Upload chat recovery traces
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: webui-chat-recovery-attempt-${{ github.run_attempt }}
+          path: opensquilla-webui/test-results/
+          if-no-files-found: ignore
+          retention-days: 14
+
   tui-check:
     name: OpenTUI package tests
     needs: classify-changes
@@ -240,7 +326,20 @@ jobs:
 
       - name: Run OpenTUI Bun tests
         working-directory: src/opensquilla/cli/tui/opentui/package
-        run: bun run test:bun
+        shell: bash
+        run: |
+          set +e
+          for attempt in 1 2; do
+            bun run test:bun
+            status=$?
+            if [ "$status" -eq 0 ]; then
+              exit 0
+            fi
+            if [ "$status" -ne 132 ] || [ "$attempt" -eq 2 ]; then
+              exit "$status"
+            fi
+            echo "::warning::Bun exited with SIGILL (132); retrying once."
+          done
 
   desktop-check:
     name: Desktop Electron unit tests
@@ -279,11 +378,18 @@ jobs:
           node scripts/test-update-resolver.mjs
           node scripts/test-update-check-scheduler.mjs
           node scripts/test-desktop-locale.mjs
+          node scripts/test-desktop-zoom-shortcuts.mjs --contracts-only
           node scripts/test-desktop-profile-substrate.mjs
-          node scripts/test-desktop-profile-context.mjs
+          node scripts/test-desktop-profile-consolidation.mjs
           node scripts/test-desktop-gateway-ownership.mjs
           node scripts/test-desktop-gateway-lifecycle.mjs
+          node scripts/test-desktop-window-lifecycle.mjs
+          node scripts/test-bundled-runtimes.mjs
           node scripts/test-desktop-cleanup-contract.mjs
+          node scripts/test-desktop-renderer-log.mjs
+          node scripts/test-artifact-preview-lease-broker.mjs
+          node scripts/test-native-workbench-surface.mjs
+          node ../../.github/scripts/verify-sandbox-package.mjs --source
 
   ubuntu-quality:
     name: Lint, test, and build (ubuntu-latest, 3.12)
@@ -337,7 +443,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
           uv run pytest \
             tests/unit \
@@ -347,7 +453,16 @@ jobs:
             tests/test_recovery \
             tests/test_migration/test_opensquilla_home_migration.py \
             tests/test_engine/test_coding_mode.py \
+            tests/test_engine/test_cancelled_turn_segments.py \
+            tests/test_engine/test_history_silent_reply.py \
+            tests/test_engine/test_silent_reply.py \
+            tests/test_engine/test_silent_reply_runtime.py \
             tests/test_engine/test_stream_wrappers.py \
+            tests/test_engine/turn_runner/test_stream_consumer_stage_unit.py \
+            tests/test_engine/turn_runner/test_turn_finalizer_stage_unit.py \
+            tests/test_gateway/test_rpc_chat_history.py \
+            tests/test_persistence/test_usage_ledger.py \
+            tests/functional/test_gateway_silent_reply_process_e2e.py \
             tests/test_tools/test_shell_process_isolation.py \
             -q -m "${markers}" --durations=50
 
@@ -433,7 +548,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
 
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
@@ -457,7 +572,7 @@ jobs:
   windows-compat:
     name: Windows compatibility smoke (3.12)
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.python_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.dependency_changed == 'true' || needs.classify-changes.outputs.release_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ (needs.classify-changes.outputs.python_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.dependency_changed == 'true' || needs.classify-changes.outputs.release_changed == 'true') && needs.classify-changes.outputs.windows_full_required != 'true' && needs.classify-changes.outputs.full_required != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 20
 
@@ -635,7 +750,7 @@ jobs:
         run: |
           set -euo pipefail
           maxfail_args=()
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group" ]]; then
             maxfail_args+=(--maxfail=3)
           fi
 
@@ -667,9 +782,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          markers="not llm and not live_search and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
+          markers="not llm and not live_search and not live_skill_hub and not live_channel and not webui_browser and not tui_real_terminal and not local_golden and not agent_context_boundary and not llm_router_acc"
           maxfail_args=()
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group" ]]; then
             maxfail_args+=(--maxfail=3)
           fi
 
@@ -677,6 +792,7 @@ jobs:
             "${{ matrix.shard }}" \
             --junit "${CI_REPORT_DIR}/junit.xml" \
             --summary "${CI_REPORT_DIR}/first-failure.txt" \
+            --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
             -- \
             -q \
             -m "${markers}" \
@@ -770,7 +886,7 @@ jobs:
             --durations=50
             --junitxml="${CI_REPORT_DIR}/junit.xml"
           )
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+          if [[ "${{ github.event_name }}" == "pull_request" || "${{ github.event_name }}" == "merge_group" ]]; then
             pytest_args+=(--maxfail=3)
           fi
 
@@ -792,13 +908,28 @@ jobs:
           retention-days: 14
 
   desktop-recovery-e2e:
-    name: Desktop recovery E2E (${{ matrix.os }})
+    # Windows hosted runners can retain Chromium network resources briefly
+    # after a heavy Electron test process exits.  Run the independent recovery
+    # groups on fresh Windows runners so an earlier test cannot starve a later
+    # one of local socket buffers. Linux and macOS retain the full serial
+    # contract, which is useful for their native recovery coverage.
+    name: Desktop recovery E2E (${{ matrix.os }}, ${{ matrix.shard }})
     needs: [classify-changes, frontend-check]
     if: ${{ needs.classify-changes.outputs.frontend_changed == 'true' || needs.classify-changes.outputs.platform_sensitive_changed == 'true' || needs.classify-changes.outputs.desktop_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            shard: all
+          - os: macos-latest
+            shard: all
+          - os: windows-latest
+            shard: profiles
+          - os: windows-latest
+            shard: ownership
+          - os: windows-latest
+            shard: workbench
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
 
@@ -847,7 +978,9 @@ jobs:
         with:
           node-version: '22.12.0'
           cache: 'npm'
-          cache-dependency-path: desktop/electron/package-lock.json
+          cache-dependency-path: |
+            desktop/electron/package-lock.json
+            opensquilla-webui/package-lock.json
 
       - name: Verify downloaded frontend artifact on consumer OS
         shell: bash
@@ -861,6 +994,36 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         run: npm ci
+
+      - name: Install WebUI recovery dependencies
+        working-directory: opensquilla-webui
+        shell: bash
+        run: npm ci
+
+      - name: Install WebUI recovery browser
+        working-directory: opensquilla-webui
+        shell: bash
+        run: |
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            npx playwright install --with-deps chromium
+          else
+            npx playwright install chromium
+          fi
+
+      - name: Run cross-platform production-dist browser session hang contract
+        working-directory: opensquilla-webui
+        shell: bash
+        env:
+          OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791
+          OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI: gateway
+        run: |
+          set -euo pipefail
+          npm run test:e2e -- \
+            history-hydration.spec.ts \
+            --project=chromium \
+            --workers=1 \
+            --grep "terminates stalled" \
+            2>&1 | tee "${CI_REPORT_DIR}/session-hang-recovery.log"
 
       - name: Record Desktop recovery tool versions
         shell: bash
@@ -882,7 +1045,7 @@ jobs:
         working-directory: desktop/electron
         shell: bash
         env:
-          OPENSQUILLA_DESKTOP_RECOVERY_SCREENSHOT: ${{ runner.temp }}/desktop-recovery-e2e/recovery-page.png
+          OPENSQUILLA_DESKTOP_CONSOLIDATION_SCREENSHOT: ${{ runner.temp }}/desktop-recovery-e2e/consolidated-primary.png
           OPENSQUILLA_DESKTOP_IMPORT_SCREENSHOT_DIR: ${{ runner.temp }}/desktop-recovery-e2e/profile-import-screenshots
         run: |
           set -euo pipefail
@@ -890,34 +1053,89 @@ jobs:
           run_case() {
             local name="$1"
             local script="$2"
+            local attempt="$3"
+            local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"
             if [[ "${RUNNER_OS}" == "Linux" ]]; then
-              xvfb-run -a node "${script}" 2>&1 | tee "${CI_REPORT_DIR}/${name}.log"
+              xvfb-run -a node "${script}" 2>&1 | tee "${log_path}"
             else
-              node "${script}" 2>&1 | tee "${CI_REPORT_DIR}/${name}.log"
+              node "${script}" 2>&1 | tee "${log_path}"
             fi
           }
 
-          for entry in \
-            'profile-recovery-flow:scripts/test-profile-recovery-flow.mjs' \
-            'profile-recovery-accessibility:scripts/test-profile-recovery-accessibility.mjs' \
-            'profile-import-flow:scripts/test-profile-import-flow.mjs' \
-            'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs' \
-            'unsafe-profile-no-write:scripts/test-unsafe-profile-no-write.mjs'
+          case "${{ matrix.shard }}" in
+            all)
+              entries=(
+                'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
+                'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
+                'profile-import-flow:scripts/test-profile-import-flow.mjs'
+                'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs'
+                'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
+                'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
+                'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'theme-flow:scripts/test-desktop-theme-flow.mjs'
+                'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
+                'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
+                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
+              )
+              ;;
+            profiles)
+              entries=(
+                'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
+                'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
+                'profile-import-flow:scripts/test-profile-import-flow.mjs'
+                'desktop-cleanup-flow:scripts/test-desktop-cleanup-flow.mjs'
+              )
+              ;;
+            ownership)
+              entries=(
+                'gateway-ownership:scripts/test-desktop-gateway-ownership.mjs'
+                'gateway-orphan-recovery-flow:scripts/test-desktop-gateway-orphan-recovery-flow.mjs'
+                'window-background-flow:scripts/test-desktop-window-background-flow.mjs'
+                'theme-flow:scripts/test-desktop-theme-flow.mjs'
+              )
+              ;;
+            workbench)
+              entries=(
+                'native-workbench-surface:scripts/test-native-workbench-surface-electron.mjs'
+                'desktop-zoom-shortcuts:scripts/test-desktop-zoom-shortcuts.mjs'
+                'native-workbench-v2:scripts/test-native-workbench-v2-electron.mjs'
+                'unsafe-legacy-recovery-no-write:scripts/test-unsafe-legacy-recovery-no-write.mjs'
+              )
+              ;;
+            *)
+              echo "ERROR: unknown Desktop recovery E2E shard: ${{ matrix.shard }}" >&2
+              exit 2
+              ;;
+          esac
+
+          for entry in "${entries[@]}"
           do
             name="${entry%%:*}"
             script="${entry#*:}"
-            if ! run_case "${name}" "${script}"; then
-              printf 'failed_case=%s\n' "${name}" > "${CI_REPORT_DIR}/first-failure.txt"
-              exit 1
+            if run_case "${name}" "${script}" 1; then
+              continue
             fi
+
+            first_log="${CI_REPORT_DIR}/${name}-attempt-1.log"
+            printf 'failed_case=%s\n' "${name}" > "${CI_REPORT_DIR}/first-failure.txt"
+            if [[ "${RUNNER_OS}" == "Windows" ]] \
+              && grep -Fq 'Gateway did not become healthy' "${first_log}"
+            then
+              printf 'retry_case=%s\n' "${name}" >> "${CI_REPORT_DIR}/first-failure.txt"
+              if run_case "${name}" "${script}" 2; then
+                continue
+              fi
+            fi
+            exit 1
           done
-          printf 'e2e_status=passed\n' > "${CI_REPORT_DIR}/first-failure.txt"
+          printf 'e2e_status=passed\n' >> "${CI_REPORT_DIR}/first-failure.txt"
 
       - name: Upload Desktop recovery report
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
-          name: desktop-recovery-e2e-${{ matrix.os }}-attempt-${{ github.run_attempt }}
+          name: desktop-recovery-e2e-${{ matrix.os }}-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/desktop-recovery-e2e
           if-no-files-found: error
           retention-days: 14
@@ -963,6 +1181,7 @@ jobs:
             tests/test_root_start_scripts.py \
             tests/test_release_consistency.py \
             tests/test_public_release_hygiene.py \
+            tests/test_sandbox/test_release_contract.py \
             -q
 
   readme-locale-check:
@@ -982,6 +1201,12 @@ jobs:
         working-directory: opensquilla-webui
         run: node scripts/check-readme-locales.mjs
 
+  managed-toolchain-artifacts:
+    name: Managed Toolchain Artifact E2E
+    needs: classify-changes
+    if: ${{ needs.classify-changes.outputs.toolchain_artifact_changed == 'true' || needs.classify-changes.outputs.full_required == 'true' }}
+    uses: ./.github/workflows/managed-toolchain-artifacts.yml
+
   ci-result:
     name: CI result
     needs:
@@ -989,6 +1214,7 @@ jobs:
       - workflow-lint
       - readme-locale-check
       - frontend-check
+      - webui-chat-recovery
       - tui-check
       - desktop-check
       - ubuntu-quality
@@ -998,6 +1224,7 @@ jobs:
       - macos-recovery
       - desktop-recovery-e2e
       - release-packaging
+      - managed-toolchain-artifacts
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1009,6 +1236,24 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Check WebUI chat recovery result
+        env:
+          RESULT_WEBUI_CHAT_RECOVERY: ${{ needs.webui-chat-recovery.result }}
+          FLAG_FRONTEND_CHANGED: ${{ needs.classify-changes.outputs.frontend_changed }}
+          FLAG_PLATFORM_SENSITIVE_CHANGED: ${{ needs.classify-changes.outputs.platform_sensitive_changed }}
+          FLAG_FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
+        shell: bash
+        run: |
+          if [[ "${FLAG_FRONTEND_CHANGED}" == "true" || "${FLAG_PLATFORM_SENSITIVE_CHANGED}" == "true" || "${FLAG_FULL_REQUIRED}" == "true" ]]; then
+            if [[ "${RESULT_WEBUI_CHAT_RECOVERY}" != "success" ]]; then
+              echo "ERROR: WebUI chat recovery must succeed; got ${RESULT_WEBUI_CHAT_RECOVERY:-missing}." >&2
+              exit 1
+            fi
+          elif [[ "${RESULT_WEBUI_CHAT_RECOVERY}" != "success" && "${RESULT_WEBUI_CHAT_RECOVERY}" != "skipped" ]]; then
+            echo "ERROR: WebUI chat recovery must be successful or intentionally skipped; got ${RESULT_WEBUI_CHAT_RECOVERY:-missing}." >&2
+            exit 1
+          fi
 
       - name: Check required CI results
         env:
@@ -1025,6 +1270,7 @@ jobs:
           RESULT_MACOS_RECOVERY: ${{ needs.macos-recovery.result }}
           RESULT_DESKTOP_RECOVERY_E2E: ${{ needs.desktop-recovery-e2e.result }}
           RESULT_RELEASE: ${{ needs.release-packaging.result }}
+          RESULT_MANAGED_TOOLCHAIN_ARTIFACTS: ${{ needs.managed-toolchain-artifacts.result }}
           FLAG_DOCS_ONLY: ${{ needs.classify-changes.outputs.docs_only }}
           FLAG_RUNTIME_CHANGED: ${{ needs.classify-changes.outputs.runtime_changed }}
           FLAG_TEST_CHANGED: ${{ needs.classify-changes.outputs.test_changed }}
@@ -1038,5 +1284,6 @@ jobs:
           FLAG_PYTHON_CHANGED: ${{ needs.classify-changes.outputs.python_changed }}
           FLAG_PLATFORM_SENSITIVE_CHANGED: ${{ needs.classify-changes.outputs.platform_sensitive_changed }}
           FLAG_BUILD_WHEEL_REQUIRED: ${{ needs.classify-changes.outputs.build_wheel_required }}
+          FLAG_TOOLCHAIN_ARTIFACT_CHANGED: ${{ needs.classify-changes.outputs.toolchain_artifact_changed }}
           FLAG_FULL_REQUIRED: ${{ needs.classify-changes.outputs.full_required }}
         run: python .github/scripts/check_ci_results.py

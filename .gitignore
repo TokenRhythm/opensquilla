@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
+.coverage*
 /dist/
 /build/
 .venv/
@@ -27,9 +28,6 @@ opensquilla.toml
 !.github/workflows/
 !.github/workflows/*.yml
 data/
-# Packaged data for the SWE-bench contrib harness must ship with the wheel.
-!src/opensquilla/contrib/swebench/data/
-!src/opensquilla/contrib/swebench/data/**
 !src/opensquilla/contrib/codetask/data/
 !src/opensquilla/contrib/codetask/data/**
 .opensquilla/
@@ -66,6 +64,10 @@ GEMINI.md
 !/assets/*.png
 !/src/opensquilla/gateway/static/img/*.png
 !/opensquilla-webui/public/opensquilla-mark.png
+# Four reviewed, local chat-topbar baselines are the only tracked Playwright
+# screenshots. Reports, failures, and every other generated PNG stay ignored.
+!/opensquilla-webui/e2e/topbar-visual.spec.ts-snapshots/
+!/opensquilla-webui/e2e/topbar-visual.spec.ts-snapshots/*.png
 !/opensquilla-webui/.node-version
 !/src/opensquilla/dist/
 !/src/opensquilla/dist/**
@@ -120,3 +122,6 @@ opensquilla-webui/public/music/**/*.ogg
 opensquilla-webui/public/music/**/*.flac
 opensquilla-webui/public/music/**/*.wav
 opensquilla-webui/public/music/playlist.local.json
+
+# Isolated local implementation worktrees.
+/.worktrees/

@@ -13,6 +13,8 @@ import { useI18n } from 'vue-i18n'
 import type { ChatPart, SourcePart } from '@/types/parts'
 import { decorateCitations } from '@/utils/chat/citations'
 import { copyTextWithFallback } from '@/utils/browser'
+import { usePlatform } from '@/platform'
+import { requestBrowserWorkbenchOpen } from '@/workbench/browserItems'
 
 const props = withDefaults(
   defineProps<{
@@ -25,6 +27,7 @@ const props = withDefaults(
 const emit = defineEmits<{ citation: [sourceId: number] }>()
 
 const { t } = useI18n()
+const platform = usePlatform()
 const rootEl = ref<HTMLDivElement | null>(null)
 const missingCitationIds = ref<number[]>([])
 
@@ -130,6 +133,33 @@ function decorateCodeBlocks() {
   }
 }
 
+function decorateBrowserLinks() {
+  const root = rootEl.value
+  if (
+    !root
+    || platform.id !== 'desktop'
+    || !platform.capabilities.hasNativeWorkbenchSurfaces
+  ) return
+  for (const anchor of root.querySelectorAll<HTMLAnchorElement>('a[href]')) {
+    if (!/^https?:/i.test(anchor.href)) continue
+    const next = anchor.nextElementSibling
+    if (next?.classList.contains('link-side-browser-btn')) continue
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'link-side-browser-btn'
+    button.textContent = '↗'
+    const label = t('workbench.browser.openSide')
+    button.title = label
+    button.setAttribute('aria-label', label)
+    button.addEventListener('click', event => {
+      event.preventDefault()
+      event.stopPropagation()
+      requestBrowserWorkbenchOpen(anchor.href)
+    })
+    anchor.insertAdjacentElement('afterend', button)
+  }
+}
+
 // After `v-html` has applied the sanitized body, upgrade any `[n]` that maps to
 // a real source into a focusable citation pill. The pass works on already-clean
 // text nodes only (createElement/textContent — never innerHTML), so it adds no
@@ -146,6 +176,7 @@ function decorate() {
     },
   })
   decorateCodeBlocks()
+  decorateBrowserLinks()
 }
 
 onMounted(decorate)
@@ -175,26 +206,38 @@ watch(() => props.sources, decorate, { flush: 'post' })
   color: var(--text-muted);
 }
 .msg-ai-text :deep(pre) {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
+  background: var(--code-block-bg);
+  border: 1px solid var(--code-block-border);
   border-radius: var(--radius-md);
   padding: 0.625rem;
   overflow-x: auto;
   margin: 0.375rem 0;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
 }
 .msg-ai-text :deep(pre.code-block) {
   position: relative;
-  padding-top: 1.9rem;
+  padding-top: 2.375rem;
+  background: linear-gradient(
+    to bottom,
+    var(--code-block-header-bg) 0,
+    var(--code-block-header-bg) 1.75rem,
+    var(--code-block-bg) 1.75rem,
+    var(--code-block-bg) 100%
+  );
 }
 
 .msg-ai-text :deep(pre.code-block > .code-lang) {
-  right: 2.75rem;
+  top: 0.375rem;
+  right: 2.5rem;
+  line-height: 1rem;
+  background: transparent;
+  color: var(--text-dim);
 }
 
 .msg-ai-text :deep(.code-copy-btn) {
   position: absolute;
-  top: 0.375rem;
-  right: 0.375rem;
+  top: 0;
+  right: 0.25rem;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -208,6 +251,30 @@ watch(() => props.sources, decorate, { flush: 'post' })
   opacity: 0.78;
   cursor: pointer;
   transition: color var(--transition), background var(--transition), opacity var(--transition);
+}
+
+.msg-ai-text :deep(.link-side-browser-btn) {
+  display: inline-flex;
+  width: 1.35rem;
+  height: 1.35rem;
+  align-items: center;
+  justify-content: center;
+  margin-left: 0.2rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+  vertical-align: text-bottom;
+}
+
+.msg-ai-text :deep(.link-side-browser-btn:hover),
+.msg-ai-text :deep(.link-side-browser-btn:focus-visible) {
+  background: var(--bg-hover);
+  color: var(--accent);
 }
 
 .msg-ai-text :deep(.code-copy-btn svg) {

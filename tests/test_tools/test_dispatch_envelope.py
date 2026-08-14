@@ -222,6 +222,115 @@ async def test_dispatch_unknown_bash_tool_points_to_exec_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_dispatch_missing_tool_suggests_close_match_for_trusted_caller() -> None:
+    # A near-miss tool name (typo of a registered tool) should surface an
+    # advisory "did you mean" hint to a trusted caller plus a structured
+    # ``dispatch.registry_miss`` runtime event carrying the suggestions.
+    events: list[dict[str, object]] = []
+    handler = build_tool_handler(
+        _build_registry(),
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            agent_id="main",
+            session_key="cli:main:suggest",
+            on_runtime_event=events.append,
+        ),
+    )
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-suggest",
+            tool_name="requred_echo",
+            arguments={},
+        )
+    )
+
+    assert result.is_error is True
+    payload = json.loads(result.content)
+    assert payload["error_class"] == "ToolNotFound"
+    assert "Did you mean: required_echo?" in payload["user_message"]
+
+    miss_events = [e for e in events if e.get("name") == "dispatch.registry_miss"]
+    assert len(miss_events) == 1
+    event = miss_events[0]
+    assert event["tool_name"] == "requred_echo"
+    assert event["suggestions"] == ["required_echo"]
+    assert event["suggestion_emitted"] is True
+    assert event["untrusted_caller"] is False
+    assert event["executed"] is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_missing_tool_untrusted_caller_omits_suggestion() -> None:
+    # Untrusted CHANNEL callers must receive an opaque envelope that never
+    # echoes real tool names, so the "did you mean" hint is withheld and the
+    # runtime event records that nothing was suggested.
+    events: list[dict[str, object]] = []
+    handler = build_tool_handler(
+        _build_registry(),
+        ToolContext(
+            is_owner=False,
+            caller_kind=CallerKind.CHANNEL,
+            agent_id="chan",
+            session_key="chan:suggest",
+            on_runtime_event=events.append,
+        ),
+    )
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-untrusted",
+            tool_name="requred_echo",
+            arguments={},
+        )
+    )
+
+    assert result.is_error is True
+    payload = json.loads(result.content)
+    assert "required_echo" not in payload["user_message"]
+    assert "Did you mean" not in payload["user_message"]
+
+    miss_events = [e for e in events if e.get("name") == "dispatch.registry_miss"]
+    assert len(miss_events) == 1
+    event = miss_events[0]
+    assert event["untrusted_caller"] is True
+    assert event["suggestions"] == []
+    assert event["suggestion_emitted"] is False
+
+
+@pytest.mark.asyncio
+async def test_dispatch_unknown_bash_tool_omits_did_you_mean_suggestion() -> None:
+    # ``bash`` has a targeted exec_command redirect; it must not additionally
+    # accrue a generic "did you mean" hint even for a trusted caller.
+    events: list[dict[str, object]] = []
+    handler = build_tool_handler(
+        _build_registry(),
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            agent_id="main",
+            session_key="cli:main:bash",
+            on_runtime_event=events.append,
+        ),
+    )
+
+    result = await handler(
+        ToolCall(
+            tool_use_id="tc-bash-suggest",
+            tool_name="bash",
+            arguments={"cmd": "echo hi"},
+        )
+    )
+
+    payload = json.loads(result.content)
+    assert "Did you mean" not in payload["user_message"]
+    miss_events = [e for e in events if e.get("name") == "dispatch.registry_miss"]
+    assert len(miss_events) == 1
+    assert miss_events[0]["suggestions"] == []
+
+
+@pytest.mark.asyncio
 async def test_dispatch_tool_exception_envelope_is_canonical_five_key_shape() -> None:
     handler = build_tool_handler(_build_registry())
 
@@ -1128,7 +1237,7 @@ async def test_dispatch_rejects_mid_string_compacted_marker_before_handler() -> 
 
 
 @pytest.mark.asyncio
-async def test_dispatch_unsupported_surface_approval_payload_is_pending_status() -> None:
+async def test_dispatch_channel_approval_payload_is_pending_status() -> None:
     handler = build_tool_handler(_build_registry())
     token = current_tool_context.set(
         ToolContext(
@@ -1156,14 +1265,13 @@ async def test_dispatch_unsupported_surface_approval_payload_is_pending_status()
     assert result.execution_status["reason"] == "approval_pending"
     assert result.execution_status["preservation_class"] == "ephemeral"
     payload = json.loads(result.content)
-    assert payload["status"] == "error"
-    assert payload["tool"] == "pending"
-    assert payload["error_class"] == "UnsupportedSurface"
-    assert payload["retry_allowed"] is False
+    assert payload["status"] == "approval_required"
+    assert payload["approval_id"] == "abc123"
+    assert payload.get("error_class") != "UnsupportedSurface"
 
 
 @pytest.mark.asyncio
-async def test_dispatch_unattended_subagent_preserves_automatic_rule_review() -> None:
+async def test_dispatch_legacy_trusted_alias_keeps_safe_approval_boundary() -> None:
     reset_approval_queue()
     handler = build_tool_handler(_build_registry())
     token = current_tool_context.set(
@@ -1189,8 +1297,8 @@ async def test_dispatch_unattended_subagent_preserves_automatic_rule_review() ->
         reset_approval_queue()
 
     payload = json.loads(result.content)
-    assert payload["status"] == "approval_required"
-    assert payload.get("error_class") != "UnsupportedSurface"
+    assert payload["status"] == "error"
+    assert payload["error_class"] == "UnsupportedSurface"
 
 
 @pytest.mark.asyncio
@@ -1475,6 +1583,7 @@ async def test_dispatch_execution_policy_stores_raw_snapshot_for_truncated_exec_
         session_key="agent:main:session-1",
         tool_result_store_dir=str(tmp_path / "tool-results"),
         tool_result_store_session_id="session-1",
+        tool_result_retrieval_available=True,
         tool_result_budget_policy=ToolResultBudgetPolicy(
             max_single_execution_result_chars=10_000,
         ),
@@ -1497,6 +1606,8 @@ async def test_dispatch_execution_policy_stores_raw_snapshot_for_truncated_exec_
     assert len(payload["preview"]) + len(payload["tail"]) <= 10_000
     assert payload["tool_result_handle"].startswith("tr-")
     assert "retrieve_tool_result" in payload["retrieve_hint"]
+    assert "handle=<tool_result_handle>" in payload["retrieve_hint"]
+    assert "with tool_result_handle" not in payload["retrieve_hint"]
     assert len(result.content) < 12_000
 
     stored = ToolResultStore(tmp_path / "tool-results").read(
@@ -1507,6 +1618,52 @@ async def test_dispatch_execution_policy_stores_raw_snapshot_for_truncated_exec_
     assert stored.storage_encoding == "gzip+utf-8"
     assert stored.stored_size_bytes is not None
     assert stored.stored_size_bytes < 8 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_dispatch_does_not_emit_handle_when_retrieval_is_not_visible(
+    tmp_path,
+) -> None:
+    registry = ToolRegistry()
+    raw_output = "HEAD\n" + ("x" * 2_000) + "\nTAIL"
+
+    async def exec_command(command: str) -> str:
+        assert command == "pytest -q"
+        return raw_output
+
+    registry.register(
+        ToolSpec(
+            name="exec_command",
+            description="exec",
+            parameters={"command": {"type": "string"}},
+            required=["command"],
+        ),
+        exec_command,
+    )
+    ctx = ToolContext(
+        session_key="agent:main:session-1",
+        tool_result_store_dir=str(tmp_path / "tool-results"),
+        tool_result_store_session_id="session-1",
+        tool_result_retrieval_available=False,
+        tool_result_budget_policy=ToolResultBudgetPolicy(
+            max_single_execution_result_chars=200,
+        ),
+    )
+
+    result = await build_tool_handler(registry, ctx)(
+        ToolCall(
+            tool_use_id="tc-large-exec-no-retrieval",
+            tool_name="exec_command",
+            arguments={"command": "pytest -q"},
+        )
+    )
+
+    payload = json.loads(result.content)
+    assert payload["result_truncated"] is True
+    assert payload["result_original_chars"] == len(raw_output)
+    assert "tool_result_handle" not in payload
+    assert "retrieve_hint" not in payload
+    assert not list((tmp_path / "tool-results").rglob("meta.json"))
 
 
 @pytest.mark.asyncio

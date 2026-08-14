@@ -2,10 +2,12 @@ import { test, expect } from '@playwright/test'
 
 const CONTROL_URL = '/control/'
 // Backend-config sections carry a readiness/status dot; Connection is the first
-// entry (live socket state). Appearance, Keyboard, and Advanced are client-only.
+// entry (live socket state). Memory & Profile is an RPC action surface that
+// deliberately stays outside config save state; the remaining entries below
+// are ordinary client-only preferences.
 // (Runtime exists too, but it is desktop-only so the web rail hides it.)
 const SECTIONS = ['Connection', 'Model Service', 'Model Routing', 'Capabilities', 'Behavior', 'Privacy']
-const CLIENT_SECTIONS = ['Appearance', 'Keyboard', 'Advanced']
+const CLIENT_SECTIONS = ['Sandbox', 'Memory & Profile', 'Appearance', 'Keyboard', 'Advanced']
 
 const settingsRow = (page: import('@playwright/test').Page) =>
   page.locator('.sidebar-foot button')
@@ -96,6 +98,19 @@ test.describe('Settings modal', () => {
     await page.goBack()
     await expect(dialog(page)).toBeHidden()
     await expect(page).not.toHaveURL(/\/settings/)
+  })
+
+  test('opens Memory & Profile as a first-level action route without global save state', async ({ page }) => {
+    await openFromSidebar(page)
+
+    const memoryTab = dialog(page).getByRole('tab', { name: 'Memory & Profile', exact: true })
+    await memoryTab.click()
+
+    await expect(memoryTab).toHaveAttribute('aria-selected', 'true')
+    await expect(page).toHaveURL(/\/settings\/memory$/)
+    await expect(dialog(page).getByRole('heading', { name: 'Memory & Profile' })).toBeVisible()
+    await expect(dialog(page).locator('[data-testid="settings-memory-panel"]')).toBeVisible()
+    await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
   })
 
   test('keeps the SettingsDialog mounted when routing from default settings to a section', async ({ page }) => {
@@ -366,7 +381,7 @@ test.describe('Settings modal', () => {
     // Accepting the discard lets the same Back proceed and close the overlay.
     await page.goBack()
     await expect(confirm).toBeVisible()
-    await confirm.getByRole('button', { name: 'Discard' }).click()
+    await confirm.getByRole('button', { name: 'Confirm' }).click()
     await expect(dialog(page)).toBeHidden()
     await expect(page).not.toHaveURL(/\/settings/)
     await expect(settingsRow(page)).toBeFocused()
@@ -508,9 +523,15 @@ test.describe('Settings modal', () => {
     await expect.poll(() => page.evaluate(() => document.documentElement.getAttribute('data-theme'))).toBe('light')
     expect(await page.evaluate(() => localStorage.getItem('opensquilla-theme'))).toBe('light')
 
-    // The router visual-effects toggle is NOT duplicated here — it stays in the
-    // chat composer where its live state belongs.
-    await expect(dialog(page).locator('input[name="appearance_visual_effects"]')).toHaveCount(0)
+    // Visual effects are a low-frequency browser preference and live here
+    // instead of adding another popover to the chat composer.
+    const visualEffects = dialog(page).getByRole('switch', { name: 'Visual effects' })
+    await expect(visualEffects).toBeVisible()
+    await visualEffects.click()
+    await expect(visualEffects).not.toBeChecked()
+    expect(await page.evaluate(() => (
+      JSON.parse(localStorage.getItem('opensquilla.routerFx') || '{}').enabled
+    ))).toBe(false)
 
     // Client-only: theme changes never raise the settings dirty bar.
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()

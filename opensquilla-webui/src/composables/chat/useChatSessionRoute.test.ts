@@ -1,7 +1,10 @@
 // @vitest-environment happy-dom
 import { ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { useChatSessionRoute } from './useChatSessionRoute'
+import {
+  shouldCanonicalizeInitialDraftRoute,
+  useChatSessionRoute,
+} from './useChatSessionRoute'
 
 const { routeMock, routerMock } = vi.hoisted(() => ({
   routeMock: {
@@ -45,5 +48,41 @@ describe('useChatSessionRoute', () => {
 
     expect(route.draftAgentId()).toBe('main')
     expect(route.resolveInitialSession().sessionKey).toMatch(/^agent:main:webchat:[a-z0-9]+$/)
+  })
+
+  it('keeps only the project id in a project draft route and can return to a default draft', () => {
+    routeMock.query = { agent: 'main', project: 'project-a' }
+    const route = useChatSessionRoute(ref(''))
+
+    expect(route.readProjectFromUrl()).toBe('project-a')
+    route.goToDraft({ replace: true })
+    expect(routerMock.replace).toHaveBeenCalledWith({
+      path: '/chat/new',
+      query: { agent: 'main', project: 'project-a' },
+    })
+
+    route.goToDraft({ projectId: null, replace: true })
+    expect(routerMock.replace).toHaveBeenLastCalledWith({
+      path: '/chat/new',
+      query: { agent: 'main' },
+    })
+  })
+
+  it('never canonicalizes a slow initial draft after the user leaves Chat', () => {
+    expect(shouldCanonicalizeInitialDraftRoute({
+      disposed: false,
+      initialFullPath: '/chat/new',
+      currentFullPath: '/settings',
+      currentPathIsDraft: false,
+      hasLegacyNewChatQuery: false,
+    })).toBe(false)
+
+    expect(shouldCanonicalizeInitialDraftRoute({
+      disposed: false,
+      initialFullPath: '/chat',
+      currentFullPath: '/chat',
+      currentPathIsDraft: false,
+      hasLegacyNewChatQuery: false,
+    })).toBe(true)
   })
 })

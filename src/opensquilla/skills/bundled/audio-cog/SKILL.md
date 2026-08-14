@@ -1,6 +1,7 @@
 ---
 name: audio-cog
 description: "OpenSquilla-compatible audio generation adapter for webpage audio requests. Prefer OpenRouter config/API key in OpenSquilla; preserve the upstream CellCog workflow only as optional ClawHub provenance."
+description_zh: "与OpenSquilla兼容的音频生成适配器，用于网页音频请求。优先使用OpenSquilla中的OpenRouter配置/API密钥；仅将上游CellCog工作流作为可选的ClawHub来源保留。"
 metadata:
   openclaw:
     emoji: "🎵"
@@ -15,9 +16,6 @@ metadata:
       bins: [python3]
       env: []
       config:
-        - awesome_webpage.provider
-        - awesome_webpage.openrouter.api_key
-        - awesome_webpage.openrouter.api_key_env
         - awesome_webpage.openrouter.models.audio_generation
         - awesome_webpage.output_dir
 author: CellCog
@@ -33,10 +31,6 @@ entrypoint:
   args:
     - --model
     - "{{ with.model | default('openai/gpt-audio-mini') }}"
-    - --base-url
-    - "{{ with.base_url | default('https://openrouter.ai/api/v1') }}"
-    - --api-key-env
-    - "{{ with.api_key_env | default('OPENROUTER_API_KEY') }}"
     - --output-dir
     - "{{ with.output_dir }}"
     - --filename
@@ -44,7 +38,7 @@ entrypoint:
     - --voice
     - "{{ with.voice | default('cedar') }}"
   env:
-    "{{ with.api_key_env | default('OPENROUTER_API_KEY') }}": "{{ with.api_key | default('') }}"
+    OPENSQUILLA_META_CAPABILITY_LEASE_REQUIRED: "1"
   stdin: "{{ with.payload | default(with.prompt | default(inputs.user_message)) }}"
   parse: text
   timeout: 240
@@ -56,9 +50,10 @@ Create professional audio with AI — voiceovers, music, sound effects, and pers
 ## Meta-Skill Entrypoint
 
 Meta-skills should run this skill as `skill_exec` when they need OpenRouter
-audio. The entrypoint is a deterministic Python adapter: it uses an explicit
-`with.api_key` value by injecting it into the configured `with.api_key_env`
-child process environment variable, calls the configured
+audio. The entrypoint is a deterministic Python adapter. During MetaSkill
+execution it receives a short-lived provider connection from ordinary Provider
+Settings in the child process only; the credential and endpoint never enter
+`with`, argv, the plan, or persisted run data. It calls the configured
 OpenRouter audio model, writes a browser-playable WAV file under the supplied
 output directory, and prints either `AUDIO_READY:` or a single failure label.
 Do not spawn an LLM sub-agent just to generate audio.
@@ -80,10 +75,8 @@ configured provider. Do not require `CELLCOG_API_KEY`, do not assume the
 
 For `AwesomeWebpageMetaSkill`:
 
-- Read provider settings from `config.awesome_webpage`.
-- Use `config.awesome_webpage.provider`; the expected value is `openrouter`.
-- Use `config.awesome_webpage.openrouter.api_key` or the configured
-  `api_key_env` value, normally `OPENROUTER_API_KEY`.
+- Use the code-owned OpenRouter capability candidate and the volatile provider
+  lease resolved from ordinary Provider Settings after explicit approval.
 - Use only `config.awesome_webpage.openrouter.models.audio_generation` for
   audio model selection.
 - Save generated or processed files only under
@@ -137,8 +130,12 @@ audio-output mode, which has a strict request shape:
   concatenate the raw 24kHz mono signed-16-bit-little-endian PCM stream,
   then save it as a browser-playable WAV file.
 - Final on-disk asset is `.wav`. Set MIME to `audio/wav` in the manifest.
-- If `OPENROUTER_API_KEY` is missing, return `AUDIO_CONFIG_NEEDED`. Do not
-  fall back to CELLCOG_API_KEY or any other provider.
+- If the required MetaSkill provider lease is missing or invalid, emit
+  `AUDIO_CONFIG_NEEDED` and exit 78 before any provider submission. Direct
+  standalone CLI use may still read `OPENROUTER_API_KEY`; never fall back to
+  `CELLCOG_API_KEY` or another provider.
+- Provider/model failures after submission remain an exit-0 degradation with a
+  structured replacement slot. They are never automatically replayed.
 
 Upstream CellCog instructions are intentionally omitted from the executable
 prompt body. OpenSquilla meta-skills use the entrypoint above; provenance is

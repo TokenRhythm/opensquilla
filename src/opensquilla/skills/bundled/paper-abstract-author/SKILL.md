@@ -1,6 +1,7 @@
 ---
 name: paper-abstract-author
 description: "Write the abstract after the paper body has been revised, using the final claims and evidence."
+description_zh: "在论文正文修订完成后，依据最终的论点和证据撰写摘要。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

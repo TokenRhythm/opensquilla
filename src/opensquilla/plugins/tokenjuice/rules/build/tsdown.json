@@ -4,6 +4,7 @@
   "description": "Compact tsdown build output while preserving warnings and failures.",
   "match": {
     "toolNames": ["exec"],
+    "commandBasenames": ["tsdown"],
     "commandIncludes": ["tsdown"]
   },
   "transforms": {

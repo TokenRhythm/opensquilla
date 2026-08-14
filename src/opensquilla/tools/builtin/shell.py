@@ -54,17 +54,45 @@ from opensquilla.sandbox.backend.seatbelt import (
     seatbelt_env_for_policy,
 )
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
+from opensquilla.sandbox.backup_vault import (
+    BackupTooLarge,
+    BackupUnavailable,
+    BackupVault,
+    summarize_backup_receipts,
+)
+from opensquilla.sandbox.command_policy import (
+    CommandAction,
+    decide_shell_command,
+    parse_shell_segments,
+    strip_shell_heredoc_bodies,
+)
 from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
-from opensquilla.sandbox.elevation import ElevationAction, gate_elevated_action
+from opensquilla.sandbox.elevation import (
+    ApprovalDisplay,
+    ElevationAction,
+    gate_elevated_action,
+)
 from opensquilla.sandbox.escalation import (
     build_path_approval_params,
     current_tool_mounts,
     grant_temporary_mount_for_current_tool,
     request_sandbox_approval,
 )
+from opensquilla.sandbox.file_mutation_broker import (
+    FILE_DELETE_WARNING,
+    OVERSIZE_BACKUP_WARNING,
+    RECURSIVE_DELETE_WARNING,
+    UNAVAILABLE_BACKUP_WARNING,
+    FileMutationBroker,
+    MutationDenied,
+    MutationPlan,
+    ObjectIdentityChanged,
+)
+from opensquilla.sandbox.file_policy import authority_roots_for_state
 from opensquilla.sandbox.integration import (
     SandboxRuntime,
     active_file_system_profile,
+    active_sandbox_policy,
     consume_backend_denial_retry,
     escalate_backend_denial,
     escalate_unavailable_backend_in_managed_mode,
@@ -72,6 +100,7 @@ from opensquilla.sandbox.integration import (
     get_runtime,
     preflight_subprocess_managed_network,
     prepare_subprocess_managed_network_proxy,
+    reject_windows_guest_process,
     run_under_backend,
 )
 from opensquilla.sandbox.managed_proxy_env import (
@@ -87,13 +116,19 @@ from opensquilla.sandbox.operation_profile import (
     shell_command_approval_variants,
 )
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
+from opensquilla.sandbox.path_aliases import resolve_workspace_alias
 from opensquilla.sandbox.path_validation import (
     MountDecision,
     decide_path_access,
+    logical_tool_path,
     trusted_write_auto_grant_allowed,
 )
+from opensquilla.sandbox.permissions import FileSystemPermissionProfile
 from opensquilla.sandbox.policy import LevelHints
+from opensquilla.sandbox.runtime_launcher import apply_bundled_runtime_path
+from opensquilla.sandbox.runtime_manifest import RuntimeManifestError
 from opensquilla.sandbox.types import (
+    ApprovedHostExecution,
     DenialResult,
     MountMode,
     MountSpec,
@@ -104,7 +139,14 @@ from opensquilla.sandbox.types import (
     SandboxResult,
     sandbox_path_text,
 )
+from opensquilla.skills.runtime_env import (
+    MEDIA_FONTS_DIR_ENV,
+    PAPER_FONTS_ENV,
+    managed_skill_env,
+    managed_toolchain_readonly_paths,
+)
 from opensquilla.subprocess_encoding import apply_utf8_child_env, decode_subprocess_output
+from opensquilla.tools.builtin.shell_policy import PolicyResult as SafeBinPolicyResult
 from opensquilla.tools.builtin.shell_policy import check_safe_bin
 from opensquilla.tools.path_policy import reject_foreign_host_path
 from opensquilla.tools.registry import tool
@@ -124,6 +166,7 @@ from opensquilla.tools.types import (
 )
 from opensquilla.tools.write_tracking import (
     classify_workspace_path,
+    enforce_workspace_write_deny_effects,
     mutation_ledger_text_hash,
     record_observed_workspace_mutations,
     snapshot_current_workspace_mutations,
@@ -150,6 +193,7 @@ _EXEC_STDIN_WRITE_CHUNK_BYTES = 64 * 1024
 _EXEC_STDIN_GUARD_CHUNK_CHARS = 64 * 1024
 _EXEC_STDIN_GUARD_OVERLAP_CHARS = 1024
 _COMMAND_AUDIT_MAX_CHARS = 4096
+_EXEC_TIMEOUT_OUTPUT_TAIL_CHARS = 20000
 _POWERSHELL_SCRIPT_PROFILE_MAX_CHARS = 128 * 1024
 _WINDOWS_ENV_CANONICAL_KEYS = {
     "COMSPEC": "ComSpec",
@@ -161,9 +205,866 @@ _WINDOWS_ENV_CANONICAL_KEYS = {
     "USERPROFILE": "USERPROFILE",
     "WINDIR": "WINDIR",
 }
+
+
+def _apply_safe_command_policy(
+    command: str,
+    result: SafeBinPolicyResult,
+) -> SafeBinPolicyResult:
+    if full_host_access_active():
+        return result
+    decision = decide_shell_command(command, active_sandbox_policy())
+    if decision.action is CommandAction.DENY:
+        raise ToolError(f"command denied by Safe policy: {decision.code}")
+    return SafeBinPolicyResult(
+        allowed=bool(result.allowed),
+        needs_approval=decision.action is CommandAction.APPROVAL,
+        reason=(
+            f"command requires Safe approval: {decision.code}"
+            if decision.action is CommandAction.APPROVAL
+            else ""
+        ),
+    )
+
+
+@dataclass
+class _PendingRecursiveDelete:
+    broker: FileMutationBroker
+    plan: MutationPlan
+    action: ElevationAction
+
+
+_PENDING_RECURSIVE_DELETES: dict[str, _PendingRecursiveDelete] = {}
+_MAX_PENDING_RECURSIVE_DELETES = 256
+_DELETE_RISK_RE = re.compile(r"(?i)\b(?:rm|unlink|Remove-Item|ri|del|erase|rmdir|rd)(?:\.exe)?\b")
+_DELETE_COMMAND_BASENAMES = frozenset(
+    {"del", "erase", "rd", "remove-item", "ri", "rm", "rmdir", "unlink"}
+)
+_DELETE_WRAPPER_BASENAMES = frozenset(
+    {
+        "&",
+        ".",
+        "bash",
+        "busybox",
+        "call",
+        "chrt",
+        "cmd",
+        "command",
+        "env",
+        "eval",
+        "exec",
+        "find",
+        "fish",
+        "ionice",
+        "nice",
+        "nohup",
+        "parallel",
+        "powershell",
+        "pwsh",
+        "setsid",
+        "sh",
+        "start",
+        "stdbuf",
+        "sudo",
+        "time",
+        "timeout",
+        "xargs",
+        "zsh",
+    }
+)
+_INERT_DELETE_WORD_COMMANDS = frozenset(
+    {
+        "basename",
+        "cat",
+        "dirname",
+        "echo",
+        "egrep",
+        "fgrep",
+        "file",
+        "grep",
+        "head",
+        "ls",
+        "printf",
+        "pwd",
+        "stat",
+        "tail",
+        "type",
+        "wc",
+        "whence",
+        "where",
+        "which",
+    }
+)
+_RECURSIVE_DELETE_RISK_RE = re.compile(
+    r"(?is)(?:"
+    r"\brm(?:\.exe)?\b[^\r\n;&|]*(?:\s-[A-Za-z]*r[A-Za-z]*\b|\s--recursive\b)"
+    r"|\b(?:Remove-Item|ri)\b[^\r\n;&|]*\s-Recurse\b"
+    r"|\b(?:rmdir|rd)(?:\.exe)?\b[^\r\n;&|]*\s/(?:s|S)\b"
+    r")"
+)
+_DYNAMIC_DELETE_PATH_RE = re.compile(r"[*?\[\]{}$`]|%\w+%")
+_WINDOWS_DYNAMIC_VARIABLE_RE = re.compile(r'''%[^%"'\r\n]+%|![^!"'\r\n]+!''')
+_WINDOWS_DYNAMIC_EXECUTABLE_RE = re.compile(
+    rf'''{_WINDOWS_DYNAMIC_VARIABLE_RE.pattern}|\^'''
+)
+
+
+def _remember_pending_recursive_delete(
+    approval_id: str,
+    pending: _PendingRecursiveDelete,
+) -> None:
+    """Keep the exact-action cache bounded against abandoned approvals."""
+
+    key = str(approval_id)
+    _PENDING_RECURSIVE_DELETES.pop(key, None)
+    _PENDING_RECURSIVE_DELETES[key] = pending
+    while len(_PENDING_RECURSIVE_DELETES) > _MAX_PENDING_RECURSIVE_DELETES:
+        oldest = next(iter(_PENDING_RECURSIVE_DELETES))
+        _PENDING_RECURSIVE_DELETES.pop(oldest, None)
+
+
+def _delete_target(
+    command: str,
+    cwd: str,
+    *,
+    windows: bool | None = None,
+) -> tuple[Path | None, bool] | None:
+    """Parse one standalone literal shell deletion and its recursive scope."""
+
+    native_windows = os.name == "nt" if windows is None else windows
+    analysis_command = strip_shell_heredoc_bodies(command)
+    folded_delete = False
+    folded_dynamic = False
+    if native_windows:
+        quote_folded = analysis_command.replace('"', "").replace("'", "")
+        folded_delete = bool(
+            not _DELETE_RISK_RE.search(analysis_command)
+            and _DELETE_RISK_RE.search(quote_folded)
+        )
+        folded_dynamic = bool(
+            not _WINDOWS_DYNAMIC_VARIABLE_RE.search(analysis_command)
+            and _WINDOWS_DYNAMIC_VARIABLE_RE.search(quote_folded)
+        )
+
+    def _dynamic_executable_token(token: str) -> bool:
+        candidate = token.strip()
+        if (
+            len(candidate) >= 2
+            and candidate[0] == candidate[-1]
+            and candidate[0] in {"'", '"'}
+        ):
+            candidate = candidate[1:-1]
+        return bool(_DYNAMIC_DELETE_PATH_RE.search(candidate)) or (
+            native_windows and bool(_WINDOWS_DYNAMIC_EXECUTABLE_RE.search(candidate))
+        )
+
+    try:
+        tokens = shlex.split(analysis_command, posix=not native_windows)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    try:
+        segments = parse_shell_segments(
+            analysis_command if native_windows else command,
+            platform="windows" if native_windows else "linux",
+        )
+    except ValueError:
+        segments = ()
+    if len(segments) > 1:
+        parsed_segments = tuple(
+            _delete_target(segment.source, cwd, windows=native_windows)
+            for segment in segments
+        )
+        delete_segments = tuple(item for item in parsed_segments if item is not None)
+        if delete_segments:
+            return (None, any(recursive for _target, recursive in delete_segments))
+        return None
+    assignment_index = 0
+    if not native_windows:
+        while assignment_index < len(tokens) and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=.*",
+            tokens[assignment_index],
+        ):
+            assignment_index += 1
+    tokens = tokens[assignment_index:]
+    if not tokens:
+        return None
+    if _dynamic_executable_token(tokens[0]):
+        return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+    executable = _shell_command_basename(tokens[0])
+    if (folded_delete or folded_dynamic) and executable not in _INERT_DELETE_WORD_COMMANDS:
+        return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+    delete_syntax_present = bool(_DELETE_RISK_RE.search(analysis_command)) or any(
+        _DELETE_RISK_RE.search(token)
+        or _shell_command_basename(token) in _DELETE_COMMAND_BASENAMES
+        for token in tokens
+    )
+    dynamic_wrapper_payload = executable in _DELETE_WRAPPER_BASENAMES and any(
+        _dynamic_executable_token(token) for token in tokens[1:]
+    )
+    if not delete_syntax_present and not dynamic_wrapper_payload:
+        return None
+    recursive_hint = bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command))
+    if re.search(r"\$\(|`|[<>]\(", analysis_command):
+        return (None, recursive_hint)
+
+    def _nested_command(start: int) -> str | None:
+        if start >= len(tokens):
+            return None
+        return " ".join(shlex.quote(token) for token in tokens[start:])
+
+    def _script_command(start: int) -> str | None:
+        if start >= len(tokens):
+            return None
+        script = " ".join(tokens[start:]).strip()
+        if len(script) >= 2 and script[0] == script[-1] and script[0] in {"'", '"'}:
+            script = script[1:-1]
+        return script or None
+
+    if executable in {"bash", "fish", "sh", "zsh"}:
+        if len(tokens) >= 3 and tokens[1] in {"-c", "-lc"}:
+            script = tokens[2].strip()
+            if len(script) >= 2 and script[0] == script[-1] and script[0] in {"'", '"'}:
+                script = script[1:-1]
+            return _delete_target(script, cwd, windows=native_windows)
+        return (None, recursive_hint)
+    if executable in {"powershell", "pwsh"}:
+        index = 1
+        safe_flags = {"-nologo", "-noninteractive", "-noprofile", "-mta", "-sta"}
+        while index < len(tokens):
+            folded = tokens[index].casefold()
+            if folded in {"-c", "-command"} and index + 1 < len(tokens):
+                wrapped_script = _script_command(index + 1)
+                return (
+                    _delete_target(wrapped_script, cwd, windows=native_windows)
+                    if wrapped_script is not None
+                    else None
+                )
+            if folded in safe_flags:
+                index += 1
+                continue
+            return (None, recursive_hint)
+        return (None, recursive_hint)
+    if executable == "cmd":
+        for index, token in enumerate(tokens[1:], start=1):
+            option = token.strip("'\"").casefold()
+            if option in {"/c", "/k"}:
+                wrapped_script = _script_command(index + 1)
+                return (
+                    _delete_target(wrapped_script, cwd, windows=native_windows)
+                    if wrapped_script is not None
+                    else None
+                )
+            if option in {"/d", "/s", "/q", "/a", "/u"} or re.fullmatch(
+                r"/[efv]:(?:on|off)", option
+            ):
+                continue
+            break
+        return None
+    if executable == "command":
+        if any(token in {"-v", "-V"} for token in tokens[1:]):
+            return None
+        index = 1
+        while index < len(tokens) and tokens[index] in {"-p", "--"}:
+            index += 1
+        nested = _nested_command(index)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable == "env":
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-S", "--split-string"}:
+                wrapped_script = _script_command(index + 1)
+                return (
+                    _delete_target(wrapped_script, cwd, windows=native_windows)
+                    if wrapped_script is not None
+                    else (
+                        None,
+                        bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)),
+                    )
+                )
+            if token in {"-C", "--chdir"}:
+                return (None, recursive_hint)
+            if token.startswith("--chdir="):
+                return (None, recursive_hint)
+            if token in {"-u", "--unset"}:
+                if index + 1 >= len(tokens):
+                    return (None, recursive_hint)
+                index += 2
+                continue
+            if token.startswith("--unset="):
+                index += 1
+                continue
+            if token in {"-i", "--ignore-environment", "-0", "--null"}:
+                index += 1
+                continue
+            if token == "--":
+                index += 1
+                break
+            if token.startswith("-"):
+                return (None, recursive_hint)
+            if "=" in token:
+                index += 1
+                continue
+            break
+        nested = _nested_command(index)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable == "sudo":
+        index = 1
+        value_flags = {"-g", "--group", "-h", "--host", "-p", "--prompt", "-u", "--user"}
+        safe_flags = {
+            "-E",
+            "--preserve-env",
+            "-H",
+            "--set-home",
+            "-k",
+            "--reset-timestamp",
+            "-n",
+            "--non-interactive",
+            "-S",
+            "--stdin",
+        }
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-D", "--chdir"}:
+                return (None, recursive_hint)
+            if token.startswith("--chdir="):
+                return (None, recursive_hint)
+            if token in value_flags:
+                if index + 1 >= len(tokens):
+                    return (None, recursive_hint)
+                index += 2
+                continue
+            if token.startswith(("--group=", "--host=", "--prompt=", "--user=")):
+                index += 1
+                continue
+            if token in safe_flags or token.startswith("--preserve-env="):
+                index += 1
+                continue
+            if token == "--":
+                index += 1
+                break
+            if token.startswith("-"):
+                return (None, recursive_hint)
+            break
+        nested = _nested_command(index)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable == "busybox":
+        nested = _nested_command(1)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable in {"exec", "nohup", "time"}:
+        index = 1
+        if executable == "time" and index < len(tokens) and tokens[index] == "-p":
+            index += 1
+        if index < len(tokens) and tokens[index] == "--":
+            index += 1
+        if index < len(tokens) and tokens[index].startswith("-"):
+            return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+        nested = _nested_command(index)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable == "nice":
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in {"-n", "--adjustment"}:
+                index += 2
+                continue
+            if token.startswith("--adjustment=") or re.fullmatch(r"-\d+", token):
+                index += 1
+                continue
+            if token == "--":
+                index += 1
+            break
+        nested = _nested_command(index)
+        return (
+            _delete_target(nested, cwd, windows=native_windows)
+            if nested is not None
+            else None
+        )
+    if executable not in {
+        "rm",
+        "unlink",
+        "remove-item",
+        "ri",
+        "del",
+        "erase",
+        "rmdir",
+        "rd",
+    }:
+        try:
+            segments = parse_shell_segments(
+                analysis_command if native_windows else command,
+                platform="windows" if native_windows else "linux",
+            )
+        except ValueError:
+            segments = ()
+        if len(segments) > 1 and any(
+            _DELETE_RISK_RE.search(segment.source) for segment in segments
+        ):
+            return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+        if executable not in _INERT_DELETE_WORD_COMMANDS:
+            return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+        return None
+    if re.search(r"&&|\|\||[;\r\n|]", analysis_command):
+        # Preserve the fact that this is a recognizable deletion while making
+        # the unrepresentable target explicit to the caller.
+        return (None, bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command)))
+    recursive = bool(_RECURSIVE_DELETE_RISK_RE.search(analysis_command))
+    target_tokens: list[str] = []
+    operands_only = False
+    path_value_expected = False
+    rm_directory_allowed = False
+    for token in tokens[1:]:
+        raw_token = token.strip()
+        quoted_token = (
+            len(raw_token) >= 2
+            and raw_token[0] == raw_token[-1]
+            and raw_token[0] in {"'", '"'}
+        )
+        cleaned = raw_token.strip("'\"")
+        folded = cleaned.casefold()
+        if path_value_expected:
+            if native_windows and "," in cleaned and not quoted_token:
+                return (None, recursive)
+            target_tokens.append(cleaned)
+            path_value_expected = False
+            continue
+        if not operands_only and cleaned == "--":
+            operands_only = True
+            continue
+        if not operands_only:
+            if executable == "rm" and cleaned.startswith("-"):
+                if cleaned in {"--force", "--recursive", "--dir"}:
+                    recursive = recursive or cleaned == "--recursive"
+                    rm_directory_allowed = rm_directory_allowed or cleaned == "--dir"
+                    continue
+                if not cleaned.startswith("--") and set(cleaned[1:]) <= {
+                    "f",
+                    "r",
+                    "R",
+                    "d",
+                }:
+                    recursive = recursive or "r" in cleaned[1:].lower()
+                    rm_directory_allowed = rm_directory_allowed or "d" in cleaned[1:]
+                    continue
+                return (None, recursive)
+            if executable in {"remove-item", "ri"} and cleaned.startswith("-"):
+                if folded in {"-force", "-recurse"}:
+                    recursive = recursive or folded == "-recurse"
+                    continue
+                if folded in {"-literalpath", "-path"}:
+                    path_value_expected = True
+                    continue
+                return (None, recursive)
+            if executable in {"del", "erase"} and re.fullmatch(
+                r"/[^/\\]+", cleaned
+            ):
+                if re.fullmatch(r"/[FQ]+", cleaned, re.IGNORECASE):
+                    continue
+                return (None, recursive)
+            if executable in {"rmdir", "rd"} and re.fullmatch(
+                r"/[^/\\]+", cleaned
+            ):
+                if re.fullmatch(r"/[SQ]+", cleaned, re.IGNORECASE):
+                    continue
+                return (None, recursive)
+            if executable in {"unlink", "rmdir"} and cleaned.startswith("-"):
+                return (None, recursive)
+        if native_windows and "," in cleaned and not quoted_token:
+            return (None, recursive)
+        target_tokens.append(cleaned)
+    if path_value_expected or len(target_tokens) != 1:
+        return (None, recursive)
+    raw_target = target_tokens[0]
+    if re.search(r"(?:^|[\\/])\.{1,2}[\\/]*$", raw_target):
+        return (None, recursive)
+    if _dynamic_executable_token(raw_target):
+        return (None, recursive)
+    candidate = Path(os.path.expandvars(raw_target)).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    target = candidate.parent.resolve(strict=False) / candidate.name
+    # Recursive flags applied to a regular file still describe one file
+    # deletion. Symlinks are likewise deleted as links, never traversed.
+    recursive = recursive and target.is_dir() and not target.is_symlink()
+    if (
+        executable in {"rm", "unlink", "del", "erase"}
+        and target.is_dir()
+        and not target.is_symlink()
+        and not recursive
+        and not rm_directory_allowed
+    ):
+        return None
+    if executable in {"rmdir", "rd"} and (
+        not target.is_dir() or target.is_symlink()
+    ):
+        return None
+    return target, recursive
+
+
+def _recursive_delete_action(
+    command: str,
+    cwd: str,
+    plan: MutationPlan,
+    *,
+    without_backup: bool = False,
+    backup_enabled: bool = True,
+) -> ElevationAction:
+    warning = plan.warning or (
+        OVERSIZE_BACKUP_WARNING
+        if without_backup
+        else RECURSIVE_DELETE_WARNING
+        if plan.recursive
+        else FILE_DELETE_WARNING
+    )
+    operation_marker = "recursive-delete" if plan.recursive else "file-delete"
+    if plan.recursive:
+        action_kind = (
+            "fs.recursive_delete_without_backup" if without_backup else "fs.recursive_delete"
+        )
+    else:
+        action_kind = "fs.file_delete_without_backup" if without_backup else "fs.file_delete"
+    return ElevationAction(
+        tool_name="exec_command",
+        action_kind=action_kind,
+        argv=(operation_marker, str(plan.target)),
+        cwd=cwd,
+        sandbox_permissions="require_escalated",
+        justification=warning,
+        target_paths=((str(plan.target), "delete"),),
+        content_digest=plan.fingerprint(),
+        risk_markers=(
+            (operation_marker, "without-backup") if without_backup else (operation_marker,)
+        ),
+        display=ApprovalDisplay(
+            kind="delete",
+            target=str(plan.target),
+            destructive=True,
+            irreversible=without_backup or not backup_enabled,
+            backup_state=(
+                "unavailable_requires_confirmation"
+                if without_backup
+                else "enabled"
+                if backup_enabled
+                else "disabled"
+            ),
+        ),
+    )
+
+
+def _recursive_delete_approval_envelope(
+    gate: Any,
+    *,
+    warning: str,
+    action: ElevationAction,
+    recursive: bool,
+) -> str:
+    display = action.display or ApprovalDisplay(kind="sensitive_operation")
+    payload = gate.to_envelope()
+    payload.update(
+        {
+            "warning": warning,
+            "target": display.target,
+            "recursive": recursive,
+            "irreversible": display.irreversible,
+            "backup_state": display.backup_state,
+        }
+    )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def _gate_recursive_delete(
+    command: str,
+    *,
+    cwd: str | None,
+    approval_id: str | None,
+    require_exact: bool = False,
+) -> str | None:
+    """Approve, back up, and execute one literal shell delete in Safe."""
+
+    if full_host_access_active():
+        return None
+    effective_cwd = cwd or str(Path.cwd())
+    parsed_delete = _delete_target(command, effective_cwd)
+    if parsed_delete is None:
+        return None
+    pending = _PENDING_RECURSIVE_DELETES.get(str(approval_id or ""))
+    if approval_id and pending is None:
+        return json.dumps(
+            {
+                "status": "approval_action_mismatch",
+                "requested": True,
+                "allowed": False,
+                "approval_id": approval_id,
+                "reason": "approval_action_mismatch",
+                "recursive": bool(_RECURSIVE_DELETE_RISK_RE.search(command)),
+                "irreversible": True,
+            },
+            ensure_ascii=False,
+        )
+    if pending is None:
+        target, recursive = parsed_delete
+        if target is None:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": "recursive_delete_target_not_static",
+                    "recursive": recursive,
+                    "irreversible": True,
+                    "message": (
+                        f"{RECURSIVE_DELETE_WARNING if recursive else FILE_DELETE_WARNING} "
+                        "请把删除改成仅包含一个字面量路径的独立命令，"
+                        "OpenSquilla 才能在审批后先备份再删除。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        if not target.exists() and not target.is_symlink():
+            # Preserve normal no-op/error semantics for commands such as
+            # ``rm -f missing``; there is no current object to approve or back up.
+            return None
+        context = current_tool_context.get()
+        config = getattr(context, "sandbox_gateway_config", None)
+        state_dir = str(getattr(config, "state_dir", "") or "").strip()
+        policy = active_sandbox_policy()
+
+        def _create_backup_vault() -> BackupVault:
+            if not state_dir:
+                raise BackupUnavailable(reason="state_dir_unavailable")
+            return BackupVault(Path(state_dir) / "backup-vault")
+
+        broker = FileMutationBroker(
+            policy=policy,
+            vault_factory=_create_backup_vault,
+            authority_roots=(authority_roots_for_state(state_dir) if state_dir else ()),
+        )
+        try:
+            plan = await asyncio.to_thread(
+                broker.plan_delete,
+                target,
+                recursive=recursive,
+            )
+        except MutationDenied as exc:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": str(exc) or "file_mutation_denied",
+                    "target": str(target),
+                    "message": "This delete target cannot be approved.",
+                },
+                ensure_ascii=False,
+            )
+        except (FileNotFoundError, NotADirectoryError, OSError) as exc:
+            return json.dumps(
+                {
+                    "status": "blocked",
+                    "reason": (
+                        "recursive_delete_target_invalid" if recursive else "delete_target_invalid"
+                    ),
+                    "target": str(target),
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+            )
+        pending = _PendingRecursiveDelete(
+            broker=broker,
+            plan=plan,
+            action=_recursive_delete_action(
+                command,
+                effective_cwd,
+                plan,
+                backup_enabled=policy.files.recursive_delete_backup_enabled,
+            ),
+        )
+    context = current_tool_context.get()
+    gate = gate_elevated_action(
+        pending.action,
+        approval_id=approval_id,
+        session_key=getattr(context, "session_key", None),
+        # This approval authorizes a brokered sandbox action, not host
+        # execution.  The real Safe profile keeps authority reads denied.
+        file_system_profile=FileSystemPermissionProfile.full_access(),
+    )
+    if not gate.allowed:
+        gate_status = str(getattr(gate, "status", "approval_required"))
+        if approval_id and gate_status in {
+            "approval_denied",
+            "approval_invalid",
+            "approval_action_mismatch",
+            "approval_session_mismatch",
+        }:
+            _PENDING_RECURSIVE_DELETES.pop(approval_id, None)
+        elif gate.approval_id:
+            _remember_pending_recursive_delete(gate.approval_id, pending)
+        return _recursive_delete_approval_envelope(
+            gate,
+            warning=pending.plan.warning
+            or (RECURSIVE_DELETE_WARNING if pending.plan.recursive else FILE_DELETE_WARNING),
+            action=pending.action,
+            recursive=pending.plan.recursive,
+        )
+    if approval_id:
+        _PENDING_RECURSIVE_DELETES.pop(approval_id, None)
+    plan = pending.plan
+    if plan.backup_override_token is None:
+        plan = pending.broker.approve(plan)
+    try:
+        result = await asyncio.to_thread(pending.broker.execute, plan)
+    except BackupUnavailable as exc:
+        override = pending.broker.approve_without_backup(pending.plan, exc)
+        override_pending = _PendingRecursiveDelete(
+            broker=pending.broker,
+            plan=override,
+            action=_recursive_delete_action(
+                command,
+                effective_cwd,
+                override,
+                without_backup=True,
+            ),
+        )
+        second_gate = gate_elevated_action(
+            override_pending.action,
+            approval_id=None,
+            session_key=getattr(context, "session_key", None),
+            file_system_profile=FileSystemPermissionProfile.full_access(),
+        )
+        if second_gate.approval_id:
+            _remember_pending_recursive_delete(
+                second_gate.approval_id,
+                override_pending,
+            )
+        return _recursive_delete_approval_envelope(
+            second_gate,
+            warning=override.warning
+            or (
+                OVERSIZE_BACKUP_WARNING.format(
+                    size_bytes=exc.size_bytes,
+                    quota_bytes=exc.quota_bytes,
+                )
+                if isinstance(exc, BackupTooLarge)
+                else UNAVAILABLE_BACKUP_WARNING
+            ),
+            action=override_pending.action,
+            recursive=override_pending.plan.recursive,
+        )
+    except ObjectIdentityChanged as exc:
+        return json.dumps(
+            {
+                "status": "blocked",
+                "reason": (
+                    "recursive_delete_target_changed" if plan.recursive else "delete_target_changed"
+                ),
+                "target": str(plan.target),
+                "message": str(exc),
+            },
+            ensure_ascii=False,
+        )
+    except OSError as exc:
+        return json.dumps(
+            {
+                "status": "blocked",
+                "reason": (
+                    "recursive_delete_backup_failed" if plan.recursive else "delete_backup_failed"
+                ),
+                "target": str(plan.target),
+                "message": str(exc),
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "status": "deleted",
+            "target": str(plan.target),
+            "recursive": plan.recursive,
+            "backup": (
+                summarize_backup_receipts((result.backup,))[0]
+                if result.backup is not None
+                else None
+            ),
+        },
+        ensure_ascii=False,
+    )
+
+
+def _gate_safe_command_approval(
+    command: str,
+    *,
+    cwd: str | None,
+    reason: str,
+    approval_id: str | None,
+) -> str | None:
+    effective_cwd = cwd or str(Path.cwd())
+    action = ElevationAction(
+        tool_name="exec_command",
+        action_kind="sandbox.command",
+        argv=("safe-command", command),
+        cwd=effective_cwd,
+        sandbox_permissions="require_escalated",
+        justification=reason,
+        content_digest=hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        risk_markers=("safe-command-approval",),
+        display=ApprovalDisplay(kind="run_command", target=command),
+    )
+    context = current_tool_context.get()
+    gate = gate_elevated_action(
+        action,
+        approval_id=approval_id,
+        session_key=getattr(context, "session_key", None),
+        # The approval is consumed only as an exact user decision; execution
+        # remains inside Safe, so denied-read roots are not being bypassed.
+        file_system_profile=FileSystemPermissionProfile.full_access(),
+    )
+    return None if gate.allowed else json.dumps(gate.to_envelope(), ensure_ascii=False)
+
+
+def _base_shell_environment() -> dict[str, str]:
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.guest_safe:
+        return _runtime_shell_environment(
+            dict(ctx.environment or {}),
+            require_bundled=True,
+        )
+    return _runtime_shell_environment(dict(os.environ))
+
+
+def _runtime_shell_environment(
+    environment: dict[str, str],
+    *,
+    require_bundled: bool = False,
+) -> dict[str, str]:
+    try:
+        return apply_bundled_runtime_path(
+            environment,
+            mode=current_run_mode() or "safe",
+            policy=active_sandbox_policy().runtimes,
+            require_bundled=require_bundled,
+        )
+    except RuntimeManifestError as exc:
+        raise ToolError(str(exc)) from exc
 _SANDBOX_NETWORK_HINT = (
     "Hint: sandboxed shell/code has no direct network. Use sandbox_network approval "
-    "or trusted managed-network mode, then retry the shell command through the "
+    "or Safe mode network access, then retry the shell command through the "
     "managed proxy. Do not switch to separate web download tools for package "
     "installs unless the user explicitly asks for an offline workaround."
 )
@@ -610,6 +1511,10 @@ def _resolve_shell_script_path(raw_path: str, *, workdir: str | None = None) -> 
     if not path.is_absolute():
         base = Path(workdir).expanduser() if workdir else Path.cwd()
         path = base / path
+    workspace = _workspace_root_for_path_access()
+    alias = resolve_workspace_alias(path, workspace)
+    if alias is not None:
+        path = alias
     return path.resolve(strict=False)
 
 
@@ -671,9 +1576,7 @@ def _script_argument_for_interpreter(
     family: str,
 ) -> str | None:
     inline_flags = _SCRIPT_INTERPRETER_INLINE_FLAGS.get(family, frozenset())
-    options_with_values = _SCRIPT_INTERPRETER_OPTIONS_WITH_VALUES.get(
-        family, frozenset()
-    )
+    options_with_values = _SCRIPT_INTERPRETER_OPTIONS_WITH_VALUES.get(family, frozenset())
     cursor = 1
     while cursor < len(tokens):
         token = tokens[cursor]
@@ -730,9 +1633,7 @@ def _referenced_script_file_digests(
             continue
         family = _script_interpreter_family(tokens[0])
         raw_path = (
-            _script_argument_for_interpreter(tokens, family=family)
-            if family is not None
-            else None
+            _script_argument_for_interpreter(tokens, family=family) if family is not None else None
         )
         interpreter = tokens[0]
         if raw_path is None and family is None:
@@ -1054,11 +1955,59 @@ def _path_access_denied_message(workspace_root: Path | None) -> str:
 
 
 def _path_access_blocked_envelope(decision: MountDecision) -> dict[str, object]:
+    ctx = current_tool_context.get()
+    if ctx is not None and bool(getattr(ctx, "guest_safe", False)):
+        reason = (
+            "GUEST_WRITE_OUTSIDE_DEFAULT_WORKSPACE"
+            if decision.access == "rw"
+            else "GUEST_SENSITIVE_PATH_DENIED"
+        )
+        return {
+            "status": "blocked",
+            "reason": reason,
+            "path": decision.normalized_path,
+            "message": (
+                "Web guest mode can modify only the configured default workspace."
+                if decision.access == "rw"
+                else "Web guest mode cannot read credential or authority data."
+            ),
+        }
     return {
         "status": "blocked",
         "reason": decision.reason,
         "path": decision.normalized_path,
         "message": decision.reason,
+    }
+
+
+def _guest_path_access_block(
+    decision: MountDecision,
+) -> dict[str, object] | None:
+    ctx = current_tool_context.get()
+    if ctx is None or not bool(getattr(ctx, "guest_safe", False)):
+        return None
+    return _path_access_blocked_envelope(
+        dataclasses.replace(decision, status="blocked", reason="guest_boundary")
+    )
+
+
+def _guest_host_execution_block(
+    sandbox_permissions: str,
+) -> dict[str, object] | None:
+    ctx = current_tool_context.get()
+    if (
+        sandbox_permissions != "require_escalated"
+        or ctx is None
+        or not bool(getattr(ctx, "guest_safe", False))
+    ):
+        return None
+    return {
+        "status": "blocked",
+        "reason": "GUEST_HOST_EXECUTION_DENIED",
+        "message": (
+            "Web guest permissions cannot be elevated to host execution. "
+            "Authenticate with an authorized token first."
+        ),
     }
 
 
@@ -2186,6 +3135,8 @@ def _trusted_managed_network_policy(
         ctx is None or getattr(ctx, "sandbox_run_context", None) is None
     ):
         return policy
+    if not isinstance(policy, SandboxPolicy):
+        return policy
     return dataclasses.replace(policy, network=NetworkMode.PROXY_ALLOWLIST, network_proxy=None)
 
 
@@ -2591,6 +3542,36 @@ def _policy_with_active_tool_mounts(policy: SandboxPolicy) -> SandboxPolicy:
     return dataclasses.replace(policy, mounts=tuple(mounts_by_target.values()))
 
 
+def _policy_with_managed_toolchain_mounts(policy: SandboxPolicy) -> SandboxPolicy:
+    """Make activated, receipt-validated toolchains visible read-only."""
+
+    if not hasattr(policy, "mounts"):
+        return policy
+    env_allowlist = tuple(
+        dict.fromkeys((*policy.env_allowlist, MEDIA_FONTS_DIR_ENV, PAPER_FONTS_ENV))
+    )
+    mounts_by_target = {
+        (str(mount.host_path), sandbox_path_text(mount.sandbox_path)): mount
+        for mount in policy.mounts
+    }
+    for path in managed_toolchain_readonly_paths():
+        key = (str(path), sandbox_path_text(path))
+        existing = mounts_by_target.get(key)
+        if existing is not None and existing.mode == "rw":
+            continue
+        mounts_by_target[key] = MountSpec(
+            host_path=path,
+            sandbox_path=path,
+            mode="ro",
+            required=False,
+        )
+    return dataclasses.replace(
+        policy,
+        mounts=tuple(mounts_by_target.values()),
+        env_allowlist=env_allowlist,
+    )
+
+
 def _windows_optional_mount_is_stale(mount: MountSpec, *, windows_backend: bool) -> bool:
     return windows_backend and not mount.required and not mount.host_path.exists()
 
@@ -2697,6 +3678,9 @@ def _sandbox_workdir_access_envelope(
         return None
     if decision.status == "blocked":
         return _path_access_blocked_envelope(decision)
+    guest_block = _guest_path_access_block(decision)
+    if guest_block is not None:
+        return guest_block
     if (
         allow_trusted_auto_mount
         and trusted_sandbox_active()
@@ -2727,18 +3711,24 @@ def _sandbox_read_path_access_envelope(
     workspace = _workspace_root_for_path_access()
     if workspace is None:
         return None
+    target_workdir = _shell_redirection_workdir(command, workdir)
     for raw_path in read_paths:
+        resolved = _resolve_shell_write_target(raw_path, target_workdir)
         decision = decide_path_access(
-            _resolve_shell_write_target(raw_path, workdir),
+            resolved,
             workspace=workspace,
             mounts=_active_sandbox_mounts(),
             write=False,
             profile=active_file_system_profile(workspace),
+            logical_path=_logical_shell_write_target(raw_path, target_workdir),
         )
         if decision.status == "allowed":
             continue
         if decision.status == "blocked":
             return _path_access_blocked_envelope(decision)
+        guest_block = _guest_path_access_block(decision)
+        if guest_block is not None:
+            return guest_block
         if (
             allow_trusted_auto_mount
             and trusted_sandbox_active()
@@ -2780,14 +3770,17 @@ def _sandbox_write_path_access_envelope(
     workspace = _workspace_root_for_path_access()
     if workspace is None:
         return None
+    target_workdir = _shell_redirection_workdir(command, workdir)
     shell_file_targets = frozenset(_shell_write_targets_from_inputs(command, stdin))
     for raw_path in write_paths:
+        resolved = _resolve_shell_write_target(raw_path, target_workdir)
         decision = decide_path_access(
-            _resolve_shell_write_target(raw_path, workdir),
+            resolved,
             workspace=workspace,
             mounts=_active_sandbox_mounts(),
             write=True,
             profile=active_file_system_profile(workspace),
+            logical_path=_logical_shell_write_target(raw_path, target_workdir),
         )
         if decision.status == "allowed":
             if allow_trusted_auto_mount:
@@ -2799,6 +3792,9 @@ def _sandbox_write_path_access_envelope(
             continue
         if decision.status == "blocked":
             return _path_access_blocked_envelope(decision)
+        guest_block = _guest_path_access_block(decision)
+        if guest_block is not None:
+            return guest_block
         if (
             allow_trusted_auto_mount
             and trusted_sandbox_active()
@@ -2826,11 +3822,24 @@ def _protected_metadata_write_block(
 ) -> dict[str, object] | None:
     if full_host_access_active():
         return None
+    workspace = _workspace_root_for_path_access()
+    file_system_profile = active_file_system_profile(workspace) if workspace is not None else None
+    target_workdir = _shell_redirection_workdir(command, workdir)
     for raw_path in _shell_write_access_targets(command, profile, stdin=stdin):
-        resolved = _resolve_shell_write_target(raw_path, workdir)
-        protected_name = next(
-            (part for part in resolved.parts if part in _PROTECTED_METADATA_NAMES),
-            None,
+        logical = _logical_shell_write_target(raw_path, target_workdir)
+        resolved = _resolve_shell_write_target(raw_path, target_workdir)
+        protected_root = (
+            file_system_profile.protected_metadata_root(logical)
+            if file_system_profile is not None
+            else None
+        )
+        protected_name = (
+            protected_root.name
+            if protected_root is not None
+            else next(
+                (part for part in logical.parts if part in _PROTECTED_METADATA_NAMES),
+                None,
+            )
         )
         if protected_name is None:
             continue
@@ -2919,7 +3928,18 @@ def _resolve_shell_write_target(raw_target: str, workdir: str | None) -> Path:
     if not path.is_absolute():
         base = Path(workdir).expanduser() if workdir else Path.cwd()
         path = base / path
+    alias = resolve_workspace_alias(path, _workspace_root_for_path_access())
+    if alias is not None:
+        path = alias
     return path.resolve(strict=False)
+
+
+def _logical_shell_write_target(raw_target: str, workdir: str | None) -> Path:
+    cleaned = raw_target.strip().strip("'\"")
+    base = (
+        Path(workdir).expanduser() if workdir else (_workspace_root_for_path_access() or Path.cwd())
+    )
+    return logical_tool_path(cleaned, base=base)
 
 
 def _shell_target_is_relative(raw_target: str) -> bool:
@@ -2952,21 +3972,216 @@ def _is_special_shell_write_target(raw_target: object) -> bool:
     return _is_windows_dos_device_target(raw_target)
 
 
-_LEADING_CD_RE = re.compile(r"^\s*cd\s+((?:'[^']*')|(?:\"[^\"]*\")|(?:[^;&|]+?))\s*(?:&&|;)")
+@dataclass(frozen=True)
+class _LeadingCdPrefix:
+    targets: tuple[str, ...] = ()
+    unsafe_reason: str = ""
+
+
+_DYNAMIC_SHELL_PATH_MARKERS = frozenset("$`*?[]{}%()<>")
+_SHELL_COMMAND_BOUNDARIES = frozenset({"&&", "||", "|", "&", "(", ")", "{", "}"})
+_SHELL_COMMAND_PREFIXES = frozenset(
+    {"!", "builtin", "command", "do", "elif", "else", "if", "then", "time", "until", "while"}
+)
+_SHELL_REDIRECTION_OPERATORS = frozenset(
+    {"<", "<<", "<<-", "<<<", "<&", "<>", ">", ">&", ">>", "&>", "&>>", ">|"}
+)
+_UNMODELLED_WORKDIR_COMMANDS = frozenset(
+    {
+        ".",
+        "eval",
+        "pop-location",
+        "popd",
+        "push-location",
+        "pushd",
+        "set-location",
+        "source",
+    }
+)
+_INLINE_SHELL_COMMANDS = frozenset({"bash", "sh"})
+
+
+def _shell_statement_separator(token: str) -> bool:
+    if token == ";":
+        return True
+    if token and set(token) == {"\n"}:
+        return True
+    return token.startswith(";") and bool(token[1:]) and set(token[1:]) == {"\n"}
+
+
+def _literal_shell_cd_target(target: str) -> bool:
+    return bool(target) and not any(marker in target for marker in _DYNAMIC_SHELL_PATH_MARKERS)
+
+
+def _shell_control_token(token: str) -> bool:
+    return _shell_statement_separator(token) or token in _SHELL_COMMAND_BOUNDARIES
+
+
+def _shell_assignment_prefix(token: str) -> bool:
+    return re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token) is not None
+
+
+def _contains_unmodelled_workdir_change(tokens: tuple[str, ...], start: int = 0) -> bool:
+    """Return whether a simple command can change cwd outside the modelled grammar."""
+
+    command_position = True
+    skip_redirection_target = False
+    for index in range(start, len(tokens)):
+        token = tokens[index]
+        if _shell_control_token(token):
+            command_position = True
+            skip_redirection_target = False
+            continue
+        if not command_position:
+            continue
+        if skip_redirection_target:
+            skip_redirection_target = False
+            continue
+        if token in _SHELL_REDIRECTION_OPERATORS:
+            skip_redirection_target = True
+            continue
+        if (
+            token.isdecimal()
+            and index + 1 < len(tokens)
+            and tokens[index + 1] in _SHELL_REDIRECTION_OPERATORS
+        ):
+            continue
+        command = token.casefold() if token in {".", "!"} else Path(token).name.casefold()
+        if command == "cd" or command in _UNMODELLED_WORKDIR_COMMANDS:
+            return True
+        if command in _INLINE_SHELL_COMMANDS:
+            for argument in tokens[index + 1 :]:
+                if _shell_control_token(argument):
+                    break
+                if (
+                    argument.startswith("-")
+                    and not argument.startswith("--")
+                    and "c" in argument[1:]
+                ):
+                    return True
+        if token in _SHELL_COMMAND_PREFIXES or _shell_assignment_prefix(token):
+            continue
+        command_position = False
+    return False
+
+
+def _inline_shell_script(tokens: tuple[str, ...]) -> str | None:
+    """Return a directly nested ``sh -c`` script when its wrapper is simple."""
+
+    if not tokens or Path(tokens[0]).name.casefold() not in _INLINE_SHELL_COMMANDS:
+        return None
+    command_index: int | None = None
+    for index, token in enumerate(tokens[1:], start=1):
+        if _shell_control_token(token) or token in _SHELL_REDIRECTION_OPERATORS:
+            return None
+        if token == "--":
+            continue
+        if token.startswith("-"):
+            if "c" in token[1:]:
+                command_index = index + 1
+                break
+            continue
+        return None
+    if command_index is None or command_index >= len(tokens):
+        return None
+    if _shell_control_token(tokens[command_index]):
+        return None
+    if any(
+        _shell_control_token(token) or token in _SHELL_REDIRECTION_OPERATORS
+        for token in tokens[command_index + 1 :]
+    ):
+        return None
+    return tokens[command_index]
+
+
+def _leading_cd_prefix(command: str, *, _depth: int = 0) -> _LeadingCdPrefix:
+    """Parse the deliberately small leading-``cd`` grammar used for path gates."""
+
+    lexer = shlex.shlex(
+        command,
+        posix=True,
+        punctuation_chars=";&|<>\n",
+    )
+    lexer.commenters = ""
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    try:
+        tokens = tuple(lexer)
+    except ValueError:
+        return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+    if not tokens:
+        return _LeadingCdPrefix()
+    if Path(tokens[0]).name.casefold() in _INLINE_SHELL_COMMANDS:
+        nested = _inline_shell_script(tokens)
+        if nested is None or _depth >= 4:
+            return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+        return _leading_cd_prefix(nested, _depth=_depth + 1)
+    if tokens[0] != "cd":
+        if _contains_unmodelled_workdir_change(tokens):
+            return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+        return _LeadingCdPrefix()
+
+    targets: list[str] = []
+    index = 0
+    while index < len(tokens) and tokens[index] == "cd":
+        index += 1
+        options_terminated = False
+        if index < len(tokens) and tokens[index] == "--":
+            options_terminated = True
+            index += 1
+        if index >= len(tokens) or _shell_control_token(tokens[index]):
+            return _LeadingCdPrefix(unsafe_reason="dynamic_workdir")
+
+        target = tokens[index]
+        index += 1
+        if (
+            not _literal_shell_cd_target(target)
+            or target == "-"
+            or (target.startswith("-") and not options_terminated)
+        ):
+            return _LeadingCdPrefix(unsafe_reason="dynamic_workdir")
+        targets.append(target)
+        if index == len(tokens):
+            return _LeadingCdPrefix(targets=tuple(targets))
+
+        operator = tokens[index]
+        if operator == "&&":
+            index += 1
+            if index == len(tokens):
+                return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+        elif _shell_statement_separator(operator):
+            index += 1
+        elif (
+            operator == "||"
+            and index + 2 < len(tokens)
+            and tokens[index + 1] == "exit"
+            and _shell_statement_separator(tokens[index + 2])
+        ):
+            index += 3
+        else:
+            return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+
+        if index == len(tokens):
+            return _LeadingCdPrefix(targets=tuple(targets))
+        if tokens[index] == "cd":
+            continue
+        if _contains_unmodelled_workdir_change(tokens, index):
+            return _LeadingCdPrefix(unsafe_reason="untrusted_workdir")
+        return _LeadingCdPrefix(targets=tuple(targets))
+
+    return _LeadingCdPrefix(targets=tuple(targets))
 
 
 def _shell_redirection_workdir(command: str, workdir: str | None) -> str | None:
-    match = _LEADING_CD_RE.match(command)
-    if match is None:
+    leading_cd = _leading_cd_prefix(command)
+    if not leading_cd.targets:
         return workdir
-    raw_target = match.group(1).strip()
-    if len(raw_target) >= 2 and raw_target[0] == raw_target[-1] and raw_target[0] in {"'", '"'}:
-        raw_target = raw_target[1:-1]
-    path = Path(raw_target).expanduser()
-    if not path.is_absolute():
-        base = Path(workdir).expanduser() if workdir else Path.cwd()
-        path = base / path
-    return str(path.resolve(strict=False))
+    path = Path(workdir).expanduser() if workdir else Path.cwd()
+    for raw_target in leading_cd.targets:
+        target = Path(raw_target).expanduser()
+        path = target if target.is_absolute() else path / target
+        path = path.resolve(strict=False)
+    return str(path)
 
 
 def _is_shell_null_write_target(raw_target: str) -> bool:
@@ -3048,6 +4263,22 @@ _WRITE_DENY_TRUE_ENV_VALUES = frozenset({"1", "true", "yes", "on", "enabled"})
 
 def _write_deny_lever_enabled(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in _WRITE_DENY_TRUE_ENV_VALUES
+
+
+# Screen widenings that shipped alongside effect enforcement: ln/link link
+# names, sh -c wrapper unwrapping, deno eval, and the bun/lua interpreter
+# code flags. They stay behind the effect lever so a deployment that leaves
+# OPENSQUILLA_WORKSPACE_WRITE_DENY_EFFECT unset keeps the pre-lever screen
+# surface byte-for-byte, even with the older COMMAND_TARGETS/
+# INTERPRETER_TARGETS screens enabled.
+_HARDENED_ONLY_MUTATORS = frozenset({"ln", "link"})
+_HARDENED_ONLY_INTERPRETERS = frozenset({"bun", "lua", "luajit"})
+
+
+def _write_deny_matcher_hardening_enabled() -> bool:
+    from opensquilla.tools.write_policy import workspace_write_deny_effect_mode
+
+    return workspace_write_deny_effect_mode() != "off"
 
 
 _SHORT_OPTIONS_WITH_I_RE = re.compile(r"^-[A-Za-z]*i")
@@ -3307,6 +4538,35 @@ def _git_write_targets(argv: list[str]) -> list[str]:
     return _positional_args(sub_args)
 
 
+def _ln_write_targets(argv: list[str]) -> list[str]:
+    # ln writes the link NAME (a symlink or hardlink appearing at a protected
+    # path is a mutation of that path); the link target is only read.
+    options = argv[1:]
+    targets = [
+        token.split("=", 1)[1]
+        for token in options
+        if token.startswith("--target-directory=")
+    ]
+    targets.extend(
+        options[index + 1]
+        for index, token in enumerate(options)
+        if token in ("-t", "--target-directory") and index + 1 < len(options)
+    )
+    positionals = _positional_args(
+        options,
+        value_flags=frozenset({"-t", "--target-directory", "-S", "--suffix"}),
+    )
+    if targets:
+        return targets
+    if len(positionals) >= 2:
+        return [positionals[-1]]
+    if len(positionals) == 1:
+        # `ln [-s] TARGET` creates ./<basename of TARGET> in the cwd.
+        base = positionals[0].replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        return [base] if base else []
+    return []
+
+
 _MUTATOR_WRITE_TARGET_EXTRACTORS: dict[str, Callable[[list[str]], list[str]]] = {
     "sed": _sed_write_targets,
     "gsed": _sed_write_targets,
@@ -3321,29 +4581,45 @@ _MUTATOR_WRITE_TARGET_EXTRACTORS: dict[str, Callable[[list[str]], list[str]]] = 
     "mkdir": _rm_write_targets,
     "rmdir": _rm_write_targets,
     "git": _git_write_targets,
+    "ln": _ln_write_targets,
+    "link": _ln_write_targets,
 }
 
 
-def _mutating_command_write_targets(command: str) -> list[str]:
+def _strip_command_prefix_tokens(argv: list[str]) -> list[str]:
+    while argv and (
+        _ENV_ASSIGNMENT_RE.match(argv[0])
+        or argv[0].lower() in _COMMAND_PREFIX_WORDS
+    ):
+        argv = argv[1:]
+    return argv
+
+
+def _mutating_command_write_targets(command: str, depth: int = 0) -> list[str]:
     """Best-effort write targets of common in-place file mutators.
 
     Only consulted by the workspace write deny gate when
     OPENSQUILLA_WORKSPACE_WRITE_DENY_COMMAND_TARGETS is enabled; plain
     redirection and tee targets are covered by _shell_write_targets_from_inputs
     unconditionally. Variable expansion, command substitution, and interpreter
-    one-liners are out of scope.
+    one-liners are out of scope (the latter behind
+    OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS).
     """
 
+    hardened = _write_deny_matcher_hardening_enabled()
     targets: list[str] = []
     for segment in _mutator_command_segments(command):
-        argv = _segment_argv(segment)
-        while argv and (
-            _ENV_ASSIGNMENT_RE.match(argv[0]) or argv[0].lower() in _COMMAND_PREFIX_WORDS
-        ):
-            argv = argv[1:]
+        argv = _strip_command_prefix_tokens(_segment_argv(segment))
         if not argv:
             continue
+        if hardened and depth < _SHELL_WRAPPER_MAX_DEPTH:
+            for inner_command in _shell_wrapper_inner_commands(argv):
+                for target in _mutating_command_write_targets(inner_command, depth + 1):
+                    if target and target not in targets:
+                        targets.append(target)
         name = argv[0].replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if not hardened and name in _HARDENED_ONLY_MUTATORS:
+            continue
         extractor = _MUTATOR_WRITE_TARGET_EXTRACTORS.get(name)
         if extractor is None:
             continue
@@ -3364,6 +4640,239 @@ def _mutating_command_write_targets_from_inputs(
     ):
         for stdin_chunk in _iter_stdin_guard_chunks(stdin):
             for target in _mutating_command_write_targets(stdin_chunk):
+                if target not in targets:
+                    targets.append(target)
+    return targets
+
+
+_INTERPRETER_CODE_FLAGS: dict[str, frozenset[str]] = {
+    "python": frozenset({"-c"}),
+    "ruby": frozenset({"-e"}),
+    "perl": frozenset({"-e", "-E"}),
+    "php": frozenset({"-r"}),
+    "node": frozenset({"-e", "--eval", "-p", "--print"}),
+    "nodejs": frozenset({"-e", "--eval", "-p", "--print"}),
+    "bun": frozenset({"-e", "--eval", "-p", "--print"}),
+    "lua": frozenset({"-e"}),
+    "luajit": frozenset({"-e"}),
+}
+
+_INTERPRETER_WRITE_MODE_CHARS = frozenset("wax+")
+
+# Literal-path write forms inside interpreter code strings. Only string
+# literals are extractable; variables and computed paths stay out of scope.
+_INTERPRETER_OPEN_CALL_RE = re.compile(
+    r"\b(?:open|fopen)\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+    r"\s*,\s*(?:mode\s*=\s*)?(?P<mq>['\"])(?P<mode>(?:(?!(?P=mq)).)*)(?P=mq)"
+)
+_INTERPRETER_PATH_MUTATE_RE = re.compile(
+    r"\bPath\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)\s*\)"
+    r"\s*\.\s*(?:write_text|write_bytes|unlink|rmdir|touch|rename|replace)\s*\("
+)
+_INTERPRETER_FS_WRITE_RE = re.compile(
+    r"\b(?:writeFileSync|appendFileSync|writeFile|appendFile"
+    r"|writeTextFileSync|writeTextFile"
+    r"|unlinkSync|rmSync|rmdirSync|renameSync|truncateSync|removeSync)"
+    r"\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+_INTERPRETER_FILE_WRITE_RE = re.compile(
+    r"\b(?:(?:File|IO)\s*\.\s*(?:write|binwrite|append|delete|unlink|truncate)"
+    r"|FileUtils\s*\.\s*(?:rm_rf|rm_r|rm|remove|mv|move|touch)"
+    r"|file_put_contents"
+    r"|os\s*\.\s*(?:remove|unlink|rename|replace|truncate)"
+    r"|shutil\s*\.\s*(?:rmtree|move))"
+    r"\s*\(\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+# Perl two-arg open with the mode fused into the path string: open(FH, '>f').
+_INTERPRETER_PERL_OPEN2_RE = re.compile(
+    r"\bopen\s*\([^()]*?(?P<pq>['\"])\s*>{1,2}\s*(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+# Perl three-arg open: open(FH, '>', 'f').
+_INTERPRETER_PERL_OPEN3_RE = re.compile(
+    r"\bopen\s*\([^()]*?(?P<mq>['\"])\s*>{1,2}\s*(?P=mq)"
+    r"\s*,\s*(?P<pq>['\"])(?P<path>(?:(?!(?P=pq)).)+)(?P=pq)"
+)
+
+
+def _normalized_command_name(token: str) -> str:
+    return token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+
+
+def _interpreter_code_flag_set(name: str) -> frozenset[str] | None:
+    flags = _INTERPRETER_CODE_FLAGS.get(name)
+    if flags is not None:
+        return flags
+    return _INTERPRETER_CODE_FLAGS.get(name.rstrip("0123456789."))
+
+
+def _deno_eval_code_strings(argv: list[str]) -> list[str]:
+    # deno delivers inline code via the `eval` subcommand instead of a flag.
+    if not argv or _normalized_command_name(argv[0]) != "deno":
+        return []
+    tokens = argv[1:]
+    if not tokens or tokens[0] != "eval":
+        return []
+    positionals = _positional_args(tokens[1:], value_flags=frozenset({"--ext"}))
+    return positionals[:1]
+
+
+_SHELL_WRAPPER_NAMES = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELL_WRAPPER_DASH_C_RE = re.compile(r"^-[A-Za-z]*c$")
+_SHELL_WRAPPER_MAX_DEPTH = 3
+
+
+def _shell_wrapper_inner_commands(argv: list[str]) -> list[str]:
+    """Command strings run by a `sh -c` style wrapper, if any.
+
+    Handles busybox indirection and bundled short options (`bash -lc cmd`).
+    Only the first -c operand is the command string; later positionals become
+    $0/$@ for it.
+    """
+
+    argv = _strip_command_prefix_tokens(argv)
+    if argv and _normalized_command_name(argv[0]) == "busybox":
+        argv = argv[1:]
+    if not argv or _normalized_command_name(argv[0]) not in _SHELL_WRAPPER_NAMES:
+        return []
+    tokens = argv[1:]
+    for index, token in enumerate(tokens):
+        if token == "--":
+            break
+        if _SHELL_WRAPPER_DASH_C_RE.match(token) and index + 1 < len(tokens):
+            return [tokens[index + 1]]
+    return []
+
+
+def _interpreter_code_strings(
+    argv: list[str],
+    code_flags: frozenset[str],
+) -> list[str]:
+    codes: list[str] = []
+    tokens = argv[1:]
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            break
+        if token in code_flags:
+            if index + 1 < len(tokens):
+                codes.append(tokens[index + 1])
+                index += 2
+                continue
+        elif token.startswith("-"):
+            for flag in code_flags:
+                if len(flag) == 2 and len(token) > 2 and token.startswith(flag):
+                    codes.append(token[2:])
+                    break
+                if flag.startswith("--") and token.startswith(flag + "="):
+                    codes.append(token[len(flag) + 1 :])
+                    break
+        index += 1
+    return codes
+
+
+def _interpreter_code_write_targets(code: str) -> list[str]:
+    targets: list[str] = []
+
+    def add(path: str) -> None:
+        cleaned = path.strip()
+        if cleaned and not _is_special_shell_write_target(cleaned) and cleaned not in targets:
+            targets.append(cleaned)
+
+    for match in _INTERPRETER_OPEN_CALL_RE.finditer(code):
+        mode = match.group("mode").lower()
+        if any(char in _INTERPRETER_WRITE_MODE_CHARS for char in mode):
+            add(match.group("path"))
+    for pattern in (
+        _INTERPRETER_PATH_MUTATE_RE,
+        _INTERPRETER_FS_WRITE_RE,
+        _INTERPRETER_FILE_WRITE_RE,
+        _INTERPRETER_PERL_OPEN2_RE,
+        _INTERPRETER_PERL_OPEN3_RE,
+    ):
+        for match in pattern.finditer(code):
+            add(match.group("path"))
+    return targets
+
+
+def _interpreter_write_targets(argv: list[str]) -> list[str]:
+    argv = _strip_command_prefix_tokens(argv)
+    if not argv:
+        return []
+    hardened = _write_deny_matcher_hardening_enabled()
+    codes = _deno_eval_code_strings(argv) if hardened else []
+    if not codes:
+        name = _normalized_command_name(argv[0])
+        if not hardened and name in _HARDENED_ONLY_INTERPRETERS:
+            return []
+        code_flags = _interpreter_code_flag_set(name)
+        if code_flags is None:
+            return []
+        codes = _interpreter_code_strings(argv, code_flags)
+    targets: list[str] = []
+    for code in codes:
+        for target in _interpreter_code_write_targets(code):
+            if target not in targets:
+                targets.append(target)
+    return targets
+
+
+def _command_reads_interpreter_program_from_stdin(command: str) -> bool:
+    for segment in _mutator_command_segments(command):
+        argv = _strip_command_prefix_tokens(_segment_argv(segment))
+        if not argv:
+            continue
+        code_flags = _interpreter_code_flag_set(_normalized_command_name(argv[0]))
+        if code_flags is None:
+            continue
+        if _interpreter_code_strings(argv, code_flags):
+            # Program came from -c/-e; stdin is data for it.
+            continue
+        positionals = _positional_args(argv[1:], value_flags=code_flags)
+        if not positionals or positionals[0] == "-":
+            # Bare `python3` / `python3 -`: stdin is the program text.
+            return True
+    return False
+
+
+def _interpreter_write_targets_from_command(command: str, depth: int = 0) -> list[str]:
+    """Best-effort write targets of interpreter one-liners.
+
+    Only consulted by the workspace write deny gate when
+    OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS is enabled. Covers
+    literal write-path forms in -c/-e/-r code strings; variable expansion and
+    computed paths remain out of scope.
+    """
+
+    hardened = _write_deny_matcher_hardening_enabled()
+    targets: list[str] = []
+    for segment in _mutator_command_segments(command):
+        argv = _segment_argv(segment)
+        if hardened and depth < _SHELL_WRAPPER_MAX_DEPTH:
+            for inner_command in _shell_wrapper_inner_commands(argv):
+                for target in _interpreter_write_targets_from_command(inner_command, depth + 1):
+                    if target not in targets:
+                        targets.append(target)
+        for target in _interpreter_write_targets(argv):
+            if target not in targets:
+                targets.append(target)
+    return targets
+
+
+def _interpreter_write_targets_from_inputs(
+    command: str,
+    stdin: str | None = None,
+) -> list[str]:
+    targets = _interpreter_write_targets_from_command(command)
+    if stdin is not None:
+        stdin_is_program = _command_reads_interpreter_program_from_stdin(command)
+        for stdin_chunk in _iter_stdin_guard_chunks(stdin):
+            extra = _interpreter_write_targets_from_command(stdin_chunk)
+            if stdin_is_program:
+                # `python3 - <<EOF` / piped program text: the stdin itself is
+                # interpreter code, not shell commands.
+                extra = extra + _interpreter_code_write_targets(stdin_chunk)
+            for target in extra:
                 if target not in targets:
                     targets.append(target)
     return targets
@@ -3582,7 +5091,7 @@ def _runtime_readonly_shell_block(
                 f"{tool_name} blocked by sandbox runtime read-only policy: "
                 f"{operation} would modify the OpenSquilla runtime environment under {root}. "
                 "Create a project virtual environment in a writable workspace path, or install "
-                "runtime dependencies outside Managed Execution."
+                "runtime dependencies outside Safe mode."
             ),
             "retryable": False,
         }
@@ -3893,6 +5402,11 @@ def _workspace_write_deny_shell_block(
             if extra_target not in candidate_targets:
                 candidate_targets.append(extra_target)
                 mutator_targets.add(extra_target)
+    if _write_deny_lever_enabled("OPENSQUILLA_WORKSPACE_WRITE_DENY_INTERPRETER_TARGETS"):
+        for extra_target in _interpreter_write_targets_from_inputs(command, stdin):
+            if extra_target not in candidate_targets:
+                candidate_targets.append(extra_target)
+                mutator_targets.add(extra_target)
     for target in candidate_targets:
         resolved = _resolve_shell_write_target(target, target_workdir)
         deny_match = match_workspace_write_deny(
@@ -4063,19 +5577,30 @@ def _shell_elevation_required_envelope(
         return None
     target = ""
     reason = ""
-    if profile.host_effect:
+    leading_cd = _leading_cd_prefix(command)
+    candidates = list(_shell_write_access_targets(command, profile, stdin=stdin))
+    workdir_write = bool(cwd and _shell_workdir_requires_write(command, profile, stdin=stdin))
+    relative_write_depends_on_cwd = workdir_write or any(
+        _shell_target_is_relative(raw_path) for raw_path in candidates
+    )
+    if leading_cd.unsafe_reason and relative_write_depends_on_cwd:
+        reason = leading_cd.unsafe_reason
+    elif profile.host_effect:
         reason = profile.host_effect
     else:
-        candidates = list(_shell_write_access_targets(command, profile, stdin=stdin))
-        if cwd and _shell_workdir_requires_write(command, profile, stdin=stdin):
+        if workdir_write:
+            assert cwd is not None
             candidates.insert(0, cwd)
+        target_workdir = _shell_redirection_workdir(command, cwd)
         for raw_path in candidates:
+            resolved = _resolve_shell_write_target(raw_path, target_workdir)
             decision = decide_path_access(
-                _resolve_shell_write_target(raw_path, cwd),
+                resolved,
                 workspace=workspace,
                 mounts=_active_sandbox_mounts(),
                 write=True,
                 profile=active_file_system_profile(workspace),
+                logical_path=_logical_shell_write_target(raw_path, target_workdir),
             )
             if decision.status == "blocked":
                 return _path_access_blocked_envelope(decision)
@@ -4167,6 +5692,7 @@ def _shell_elevation_action(
         network_targets=tuple(profile.requested_domains),
         content_digest=content_digest,
         prefix_rule=tuple(prefix_rule) if prefix_rule is not None else None,
+        display=ApprovalDisplay(kind="run_command", target=command),
     )
 
 
@@ -4317,7 +5843,10 @@ def _current_bg_context_is_admin() -> bool:
         return False
     if ctx.caller_kind in {CallerKind.CLI, CallerKind.WEB}:
         return True
-    return ctx.caller_kind is CallerKind.CHANNEL and ctx.elevated in ("on", "bypass", "full")
+    # A verified channel administrator is the same operator principal as a
+    # WebUI owner. The ingress-only marker prevents an arbitrary channel
+    # context with ``is_owner=True`` from managing other sessions' processes.
+    return ctx.caller_kind is CallerKind.CHANNEL and ctx.channel_admin_verified
 
 
 def _current_bg_context_allows(session: _BgSession) -> bool:
@@ -4484,10 +6013,29 @@ async def _write_exec_stdin(proc: Any, stdin_bytes: bytes | None) -> None:
                 await wait_closed()
 
 
-async def _wait_exec_stdin_writer(writer_task: asyncio.Task[None], timeout: float) -> bool:
-    done, _ = await asyncio.wait({writer_task}, timeout=max(0.0, timeout))
-    if writer_task not in done:
-        return False
+def _use_windows_blocking_exec_stdin() -> bool:
+    return os.name == "nt"
+
+
+async def _wait_exec_stdin_writer(
+    proc: Any, writer_task: asyncio.Task[None], timeout: float
+) -> bool:
+    """Wait for stdin closure without mistaking a completed process for a hang.
+
+    Windows' proactor pipe transport can leave ``StreamWriter.wait_closed()``
+    pending briefly after the child has consumed EOF and exited. The process exit
+    is authoritative in that case; the caller cancels the stale writer task after
+    observing the return code.
+    """
+
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout)
+    while not writer_task.done() and proc.returncode is None:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return writer_task.done() or proc.returncode is not None
+        await asyncio.wait({writer_task}, timeout=min(0.01, remaining))
+    if not writer_task.done():
+        return proc.returncode is not None
     with contextlib.suppress(BrokenPipeError, ConnectionResetError):
         await writer_task
     return True
@@ -4499,13 +6047,15 @@ async def _cancel_exec_stdin_writer(proc: Any, writer_task: asyncio.Task[None] |
     if proc.stdin is not None and not proc.stdin.is_closing():
         proc.stdin.close()
     writer_task.cancel()
+    done, _pending = await asyncio.wait({writer_task}, timeout=0.05)
+    if writer_task not in done:
+        return
     with contextlib.suppress(
-        TimeoutError,
         asyncio.CancelledError,
         BrokenPipeError,
         ConnectionResetError,
     ):
-        await asyncio.wait_for(writer_task, timeout=0.05)
+        await writer_task
 
 
 async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
@@ -4517,6 +6067,107 @@ async def _await_bg_output_task(output_task: asyncio.Task[None]) -> None:
             await output_task
 
 
+def _create_windows_host_shell_process(command: str, **kwargs: Any) -> Any:
+    return subprocess.Popen(_windows_direct_powershell_argv(command), **kwargs)
+
+
+def _terminate_windows_host_shell_process(proc: Any) -> None:
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=_EXEC_TERMINATE_TIMEOUT)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    proc.kill()
+    try:
+        proc.wait(timeout=_EXEC_KILL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log.warning("exec_command_termination_timeout", pid=proc.pid)
+
+
+async def _communicate_windows_host_shell_process(
+    proc: Any,
+    stdin_bytes: bytes,
+    timeout: float,
+) -> bool:
+    """Write finite Windows stdin outside Proactor and bound the worker wait."""
+
+    communicate_task = asyncio.create_task(asyncio.to_thread(proc.communicate, input=stdin_bytes))
+    done, _pending = await asyncio.wait(
+        {communicate_task},
+        timeout=max(0.0, timeout),
+    )
+    if communicate_task in done:
+        await communicate_task
+        return True
+
+    await asyncio.to_thread(_terminate_windows_host_shell_process, proc)
+    done, _pending = await asyncio.wait(
+        {communicate_task},
+        timeout=_EXEC_TERMINATE_TIMEOUT + _EXEC_KILL_TIMEOUT,
+    )
+    if communicate_task in done:
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            await communicate_task
+    return False
+
+
+async def _run_windows_host_shell_command_with_stdin(
+    command: str,
+    *,
+    cwd: str | None,
+    env: dict[str, str],
+    stdin_bytes: bytes,
+    effective_timeout: float,
+) -> str:
+    try:
+        with tempfile.TemporaryFile() as output_file:
+            creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            proc = _create_windows_host_shell_process(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=output_file,
+                stderr=subprocess.STDOUT,
+                cwd=cwd,
+                env=env,
+                creationflags=creationflags,
+            )
+            completed = await _communicate_windows_host_shell_process(
+                proc,
+                stdin_bytes,
+                effective_timeout,
+            )
+            output_file.flush()
+            output_file.seek(0)
+            raw_output = output_file.read()
+            if not completed:
+                return _exec_timeout_output(effective_timeout, command, raw_output)
+            output = decode_subprocess_output(raw_output)
+            return f"exit_code={proc.returncode}\n{output}"
+    except Exception as exc:
+        return f"[error] {exc}"
+
+
+def _exec_timeout_output(effective_timeout: float, command: str, raw: bytes | str) -> str:
+    """Build the exec-timeout result, preserving partial output captured so far.
+
+    Keeps the ``[timeout after Ns]`` marker (asserted by tests and recognised by the
+    model as a timeout signal) and appends a tail slice of whatever the command
+    emitted before it was killed, so the model can see which test hung instead of a
+    bare marker with no evidence.
+    """
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+    text = text.strip()
+    base = f"[timeout after {effective_timeout}s]\ncommand: {command}"
+    if not text:
+        return base
+    if len(text) > _EXEC_TIMEOUT_OUTPUT_TAIL_CHARS:
+        text = "...[partial output truncated]...\n" + text[-_EXEC_TIMEOUT_OUTPUT_TAIL_CHARS:]
+    return f"{base}\n--- partial output before timeout ---\n{text}"
+
+
 async def _run_host_shell_command(
     command: str,
     *,
@@ -4525,6 +6176,14 @@ async def _run_host_shell_command(
     stdin_bytes: bytes | None,
     effective_timeout: float,
 ) -> str:
+    if _use_windows_blocking_exec_stdin() and stdin_bytes is not None:
+        return await _run_windows_host_shell_command_with_stdin(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin_bytes=stdin_bytes,
+            effective_timeout=effective_timeout,
+        )
     try:
         with tempfile.TemporaryFile() as output_file:
             subprocess_kwargs: dict[str, Any] = {
@@ -4543,31 +6202,36 @@ async def _run_host_shell_command(
 
             loop = asyncio.get_running_loop()
             deadline = loop.time() + effective_timeout
-            timeout_result = f"[timeout after {effective_timeout}s]\ncommand: {command}"
+
+            def timeout_result() -> str:
+                output_file.flush()
+                output_file.seek(0)
+                return _exec_timeout_output(effective_timeout, command, output_file.read())
 
             proc = await _create_host_shell_subprocess(command, **subprocess_kwargs)
             stdin_writer: asyncio.Task[None] | None = None
             remaining = deadline - loop.time()
             if remaining <= 0:
                 await _terminate_exec_process_tree(proc)
-                return timeout_result
+                return timeout_result()
             try:
                 if stdin_bytes is not None:
                     stdin_writer = asyncio.create_task(_write_exec_stdin(proc, stdin_bytes))
-                    if not await _wait_exec_stdin_writer(stdin_writer, remaining):
+                    if not await _wait_exec_stdin_writer(proc, stdin_writer, remaining):
                         await _cancel_exec_stdin_writer(proc, stdin_writer)
                         await _terminate_exec_process_tree(proc)
-                        return timeout_result
+                        return timeout_result()
             except TimeoutError:
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
                 await _terminate_exec_process_tree(proc)
-                return timeout_result
+                return timeout_result()
 
             remaining = deadline - loop.time()
             if remaining <= 0 or not await _wait_exec_process(proc, remaining):
                 await _cancel_exec_stdin_writer(proc, stdin_writer)
                 await _terminate_exec_process_tree(proc)
-                return timeout_result
+                return timeout_result()
+            await _cancel_exec_stdin_writer(proc, stdin_writer)
             if os.name == "posix":
                 _signal_exec_process_tree(proc, signal.SIGTERM)
 
@@ -4590,9 +6254,10 @@ async def _run_full_host_shell_command(
     """Execute directly on the host without sandbox policy or safety preflight."""
 
     runtime = get_runtime()
-    merged_env = os.environ.copy()
+    merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
+    merged_env = managed_skill_env(_runtime_shell_environment(merged_env))
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(_host_shell_env(merged_env))
@@ -4636,7 +6301,10 @@ async def _create_host_shell_subprocess(
     params={
         "command": {"type": "string", "description": "Shell command to execute."},
         "workdir": {"type": "string", "description": "Working directory (default: cwd)."},
-        "timeout": {"type": "number", "description": "Timeout in seconds (default 60)."},
+        "timeout": {
+            "type": "number",
+            "description": "Timeout in seconds (default 60, max 600).",
+        },
         "env": {
             "type": "object",
             "description": "Extra environment variable overrides.",
@@ -4697,8 +6365,8 @@ async def exec_command(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
-    import os
-
+    runtime = get_runtime()
+    reject_windows_guest_process(runtime)
     if full_host_access_active():
         cwd = _effective_workdir(workdir)
         mutation_before = snapshot_current_workspace_mutations()
@@ -4729,7 +6397,6 @@ async def exec_command(
         )
         return output
 
-    runtime = get_runtime()
     windows_process_sandbox = _windows_sandbox_backend_active(runtime)
     runtime_readonly_block = _runtime_readonly_shell_block(
         "exec_command", command, workdir, stdin=stdin, runtime=runtime
@@ -4743,6 +6410,9 @@ async def exec_command(
                 "reason": "invalid_sandbox_permissions",
             }
         )
+    guest_host_block = _guest_host_execution_block(sandbox_permissions)
+    if guest_host_block is not None:
+        return json.dumps(guest_host_block, ensure_ascii=False)
     original_profile = _profile_shell_command(command, workdir=workdir)
     host_execution = _host_execution_allowed()
     backend_retry_granted = False
@@ -4758,6 +6428,7 @@ async def exec_command(
     # Denylist: hard-block, never bypassable
     if not result.allowed:
         raise ToolError(result.reason)
+    result = _apply_safe_command_policy(command, result)
 
     sensitive_block = _sensitive_external_transfer_block(
         "exec_command", command, workdir=cwd, stdin=stdin
@@ -4773,6 +6444,23 @@ async def exec_command(
     )
     if approval_denial is not None:
         return json.dumps(approval_denial, ensure_ascii=False)
+    recursive_delete = await _gate_recursive_delete(
+        command,
+        cwd=cwd,
+        approval_id=approval_id,
+        require_exact=(result.needs_approval or sandbox_permissions == "require_escalated"),
+    )
+    if recursive_delete is not None:
+        return recursive_delete
+    if result.needs_approval:
+        command_approval = _gate_safe_command_approval(
+            command,
+            cwd=cwd,
+            reason=result.reason or "This high-risk command requires approval.",
+            approval_id=approval_id,
+        )
+        if command_approval is not None:
+            return command_approval
     scratch_block = _workspace_scratch_artifact_shell_block("exec_command", command, cwd)
     if scratch_block is not None:
         return json.dumps(scratch_block, ensure_ascii=False)
@@ -4865,9 +6553,10 @@ async def exec_command(
         if deny_block is not None:
             return json.dumps(deny_block, ensure_ascii=False)
 
-    merged_env = os.environ.copy()
+    merged_env = _base_shell_environment()
     if env:
         merged_env.update(env)
+    merged_env = managed_skill_env(_runtime_shell_environment(merged_env))
     apply_utf8_child_env(merged_env)
     _append_windows_app_alias_path(merged_env, runtime=runtime)
     merged_env = _dedupe_windows_env_keys(merged_env)
@@ -4894,7 +6583,13 @@ async def exec_command(
             before=mutation_before,
             metadata=metadata,
         )
-        return output
+        # Effect enforcement runs after the ledger so the raw escape stays
+        # honestly recorded before any revert rewrites the workspace.
+        return enforce_workspace_write_deny_effects(
+            tool_name="exec_command",
+            before=mutation_before,
+            output=output,
+        )
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
         if windows_process_sandbox:
@@ -4911,106 +6606,111 @@ async def exec_command(
         )
         if isinstance(decision, DenialResult):
             return finish(json.dumps(decision.to_dict()))
-        retry_gate = consume_backend_denial_retry(
-            approval_id,
-            request,
-            policy,
-            runtime=runtime,
-        )
-        if retry_gate is not None:
-            if not retry_gate.allowed:
-                return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+        if isinstance(decision, ApprovedHostExecution):
             host_execution = True
             backend_retry_granted = True
         else:
-            backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
-            backend_policy = request.policy
-            backend_policy = _policy_with_active_tool_mounts(backend_policy)
-            backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
-            backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
-            backend_policy = _trusted_managed_network_policy(backend_policy, runtime)
-            backend_request = SandboxRequest(
-                argv=_sandbox_shell_backend_argv(command, runtime, cwd=backend_cwd),
-                cwd=backend_cwd,
-                action_kind=request.action_kind,
-                policy=backend_policy,
-                stdin=stdin_bytes,
-                env=dict(merged_env),
-                reason=getattr(request, "reason", ""),
-                session_id=getattr(request, "session_id", ""),
-                run_mode=getattr(request, "run_mode", ""),
+            retry_gate = consume_backend_denial_retry(
+                approval_id,
+                request,
+                policy,
+                runtime=runtime,
             )
-            preflight = await preflight_subprocess_managed_network(backend_request, runtime)
-            if isinstance(preflight, DenialResult):
-                return finish(json.dumps(preflight.to_dict()))
-            if isinstance(preflight, dict):
-                return finish(json.dumps(preflight))
-            try:
-                sandbox_result = await _run_backend_with_managed_network(
-                    backend_request,
-                    runtime=runtime,
+            if retry_gate is not None:
+                if not retry_gate.allowed:
+                    return finish(json.dumps(retry_gate.to_envelope(), ensure_ascii=False))
+                host_execution = True
+                backend_retry_granted = True
+            else:
+                backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
+                backend_policy = request.policy
+                backend_policy = _policy_with_active_tool_mounts(backend_policy)
+                backend_policy = _policy_with_managed_toolchain_mounts(backend_policy)
+                backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
+                backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
+                backend_policy = _trusted_managed_network_policy(backend_policy, runtime)
+                backend_request = SandboxRequest(
+                    argv=_sandbox_shell_backend_argv(command, runtime, cwd=backend_cwd),
+                    cwd=backend_cwd,
+                    action_kind=request.action_kind,
+                    policy=backend_policy,
+                    stdin=stdin_bytes,
+                    env=dict(getattr(request, "env", None) or merged_env),
+                    reason=getattr(request, "reason", ""),
+                    session_id=getattr(request, "session_id", ""),
+                    run_mode=getattr(request, "run_mode", ""),
                 )
-            except SandboxBackendError as exc:
-                review_action = _shell_elevation_action(
-                    tool_name="exec_command",
-                    action_kind="shell.exec",
-                    command=command,
-                    cwd=cwd,
-                    profile=profile,
-                    justification=(
-                        "Sandbox backend unavailable; retry this exact command on host."
-                    ),
-                    env=env,
-                    stdin=stdin,
-                    prefix_rule=prefix_rule,
-                )
-                escalation = await escalate_unavailable_backend_in_managed_mode(
-                    exc,
-                    request,
-                    policy,
-                    runtime=runtime,
-                    review_action=review_action,
-                )
-                if escalation is not None:
+                preflight = await preflight_subprocess_managed_network(backend_request, runtime)
+                if isinstance(preflight, DenialResult):
+                    return finish(json.dumps(preflight.to_dict()))
+                if isinstance(preflight, dict):
+                    return finish(json.dumps(preflight))
+                try:
+                    sandbox_result = await _run_backend_with_managed_network(
+                        backend_request,
+                        runtime=runtime,
+                    )
+                except SandboxBackendError as exc:
+                    review_action = _shell_elevation_action(
+                        tool_name="exec_command",
+                        action_kind="shell.exec",
+                        command=command,
+                        cwd=cwd,
+                        profile=profile,
+                        justification=(
+                            "Sandbox backend unavailable; retry this exact command on host."
+                        ),
+                        env=env,
+                        stdin=stdin,
+                        prefix_rule=prefix_rule,
+                    )
+                    escalation = await escalate_unavailable_backend_in_managed_mode(
+                        exc,
+                        request,
+                        policy,
+                        runtime=runtime,
+                        review_action=review_action,
+                    )
+                    if escalation is not None:
+                        if isinstance(escalation, DenialResult):
+                            return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
+                        return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
+                    raise
+                except Exception as exc:
+                    raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
+                if is_likely_sandbox_denied(sandbox_result):
+                    review_action = _shell_elevation_action(
+                        tool_name="exec_command",
+                        action_kind="shell.exec",
+                        command=command,
+                        cwd=cwd,
+                        profile=profile,
+                        justification=("Sandbox denied this exact command; retry it on host."),
+                        env=env,
+                        stdin=stdin,
+                        prefix_rule=prefix_rule,
+                    )
+                    escalation = await escalate_backend_denial(
+                        sandbox_result,
+                        request,
+                        policy,
+                        runtime=runtime,
+                        review_action=review_action,
+                    )
                     if isinstance(escalation, DenialResult):
-                        return finish(json.dumps(escalation.to_dict(), ensure_ascii=False))
+                        return finish(json.dumps(escalation.to_dict()))
                     return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
-                raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
-            except Exception as exc:
-                raise ToolError(f"Sandboxed shell execution failed: {exc}") from exc
-            if is_likely_sandbox_denied(sandbox_result):
-                review_action = _shell_elevation_action(
-                    tool_name="exec_command",
-                    action_kind="shell.exec",
-                    command=command,
-                    cwd=cwd,
-                    profile=profile,
-                    justification="Sandbox denied this exact command; retry it on host.",
-                    env=env,
-                    stdin=stdin,
-                    prefix_rule=prefix_rule,
+                output = sandbox_result.stdout
+                if sandbox_result.stderr:
+                    output += sandbox_result.stderr
+                output = _append_sandbox_network_hint(output)
+                output = _append_patch_hygiene_warning(command, cwd, output)
+                output = _append_masked_pipeline_failure_warning(
+                    command,
+                    sandbox_result.returncode,
+                    output,
                 )
-                escalation = await escalate_backend_denial(
-                    sandbox_result,
-                    request,
-                    policy,
-                    runtime=runtime,
-                    review_action=review_action,
-                )
-                if isinstance(escalation, DenialResult):
-                    return finish(json.dumps(escalation.to_dict()))
-                return finish(json.dumps(escalation.to_envelope(), ensure_ascii=False))
-            output = sandbox_result.stdout
-            if sandbox_result.stderr:
-                output += sandbox_result.stderr
-            output = _append_sandbox_network_hint(output)
-            output = _append_patch_hygiene_warning(command, cwd, output)
-            output = _append_masked_pipeline_failure_warning(
-                command,
-                sandbox_result.returncode,
-                output,
-            )
-            return finish(f"exit_code={sandbox_result.returncode}\n{output}")
+                return finish(f"exit_code={sandbox_result.returncode}\n{output}")
 
     if host_execution:
         log.info(
@@ -5049,11 +6749,15 @@ async def _start_host_background_process(
     cwd: str | None,
     effective_timeout: float,
     runtime: object | None,
+    env: dict[str, str] | None = None,
 ) -> str:
     """Start a host background process without sandbox policy or safety preflight."""
 
     session_id = str(uuid.uuid4())[:8]
-    host_env = apply_utf8_child_env(_host_shell_env(os.environ.copy()))
+    base_env = dict(env) if env is not None else _base_shell_environment()
+    host_env = managed_skill_env(_runtime_shell_environment(base_env))
+    apply_utf8_child_env(host_env)
+    host_env = _host_shell_env(host_env)
     _append_windows_app_alias_path(host_env, runtime=runtime)
     host_env = _dedupe_windows_env_keys(host_env)
 
@@ -5161,6 +6865,8 @@ async def background_process(
     justification: str = "",
     prefix_rule: list[str] | None = None,
 ) -> str:
+    runtime = get_runtime()
+    reject_windows_guest_process(runtime)
     if full_host_access_active():
         return await _start_host_background_process(
             command,
@@ -5169,7 +6875,6 @@ async def background_process(
             runtime=get_runtime(),
         )
 
-    runtime = get_runtime()
     windows_process_sandbox = _windows_sandbox_backend_active(runtime)
     runtime_readonly_block = _runtime_readonly_shell_block(
         "background_process", command, workdir, runtime=runtime
@@ -5183,6 +6888,9 @@ async def background_process(
                 "reason": "invalid_sandbox_permissions",
             }
         )
+    guest_host_block = _guest_host_execution_block(sandbox_permissions)
+    if guest_host_block is not None:
+        return json.dumps(guest_host_block, ensure_ascii=False)
     original_profile = _profile_shell_command(command, workdir=workdir)
     host_execution = _host_execution_allowed()
     backend_retry_granted = False
@@ -5196,6 +6904,7 @@ async def background_process(
     profile = original_profile
     if not result.allowed:
         raise ToolError(result.reason)
+    result = _apply_safe_command_policy(command, result)
     sensitive_block = _sensitive_external_transfer_block("background_process", command, workdir=cwd)
     if sensitive_block is None:
         sensitive_block = _sensitive_shell_block("background_process", command, workdir=cwd)
@@ -5208,6 +6917,23 @@ async def background_process(
     )
     if approval_denial is not None:
         return json.dumps(approval_denial, ensure_ascii=False)
+    recursive_delete = await _gate_recursive_delete(
+        command,
+        cwd=cwd,
+        approval_id=approval_id,
+        require_exact=(result.needs_approval or sandbox_permissions == "require_escalated"),
+    )
+    if recursive_delete is not None:
+        return recursive_delete
+    if result.needs_approval:
+        command_approval = _gate_safe_command_approval(
+            command,
+            cwd=cwd,
+            reason=result.reason or "This high-risk command requires approval.",
+            approval_id=approval_id,
+        )
+        if command_approval is not None:
+            return command_approval
     scratch_block = _workspace_scratch_artifact_shell_block(
         "background_process",
         command,
@@ -5295,7 +7021,7 @@ async def background_process(
     effective_timeout = _resolve_background_timeout(timeout)
 
     if runtime is not None and runtime.effective.sandbox_enabled and not host_execution:
-        merged_env = dict(os.environ)
+        merged_env = managed_skill_env(_base_shell_environment())
         apply_utf8_child_env(merged_env)
         _append_windows_app_alias_path(merged_env, runtime=runtime)
         merged_env = _dedupe_windows_env_keys(merged_env)
@@ -5313,6 +7039,21 @@ async def background_process(
         )
         if isinstance(decision, DenialResult):
             return json.dumps(decision.to_dict())
+        if isinstance(decision, ApprovedHostExecution):
+            log.info(
+                "background_process_host",
+                command=_audit_command(command),
+                run_mode=_context_run_mode(),
+                elevation_grant=True,
+                host_effect=profile.host_effect,
+            )
+            return await _start_host_background_process(
+                command,
+                cwd=cwd,
+                effective_timeout=effective_timeout,
+                runtime=runtime,
+                env=dict(getattr(request, "env", None) or merged_env),
+            )
         retry_gate = consume_backend_denial_retry(
             approval_id,
             request,
@@ -5328,6 +7069,7 @@ async def background_process(
             backend_cwd = _sandbox_shell_backend_cwd(cwd, request)
             backend_policy = policy
             backend_policy = _policy_with_active_tool_mounts(backend_policy)
+            backend_policy = _policy_with_managed_toolchain_mounts(backend_policy)
             backend_policy = _policy_with_windows_shell_runtime_mounts(backend_policy, runtime)
             backend_policy = _policy_with_wall_timeout(backend_policy, effective_timeout)
             backend_policy = _trusted_managed_network_policy(backend_policy, runtime)
@@ -5336,7 +7078,7 @@ async def background_process(
                 cwd=backend_cwd,
                 action_kind=request.action_kind,
                 policy=backend_policy,
-                env=merged_env,
+                env=dict(getattr(request, "env", None) or merged_env),
                 session_id=getattr(request, "session_id", ""),
                 run_mode=getattr(request, "run_mode", ""),
             )
@@ -5561,7 +7303,7 @@ async def _spawn_sandboxed_background_process(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=str(request.cwd),
-            env=request.env,
+            env=getattr(request, "env", None) or {},
             start_new_session=True,
         )
         return _SpawnedBackgroundProcess(process=process)
@@ -5593,7 +7335,11 @@ async def _spawn_sandboxed_background_process(
                 profile_file.flush()
                 profile_path = Path(profile_file.name)
             argv = build_seatbelt_argv(request, profile_path)
-            env = seatbelt_env_for_policy(request.policy, request.env, tmp_dir=tmp_dir)
+            env = seatbelt_env_for_policy(
+                request.policy,
+                getattr(request, "env", None) or {},
+                tmp_dir=tmp_dir,
+            )
             process = await asyncio.create_subprocess_exec(
                 *argv,
                 stdin=asyncio.subprocess.PIPE,

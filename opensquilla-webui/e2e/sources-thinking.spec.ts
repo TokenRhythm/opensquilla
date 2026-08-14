@@ -4,6 +4,15 @@ const CONTROL_URL = '/control/'
 const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
 const RESEARCH_SESSION_KEY = 'agent:main:webchat:e2eresearchsources'
 
+async function openFirstAssistantActivity(page: Page) {
+  const activity = page.locator('.msg-ai .assistant-activity').first()
+  await expect(activity).toBeVisible({ timeout: 10000 })
+  await expect(activity).not.toHaveAttribute('open', '')
+  await activity.locator('summary').press('Enter')
+  await expect(activity).toHaveAttribute('open', '')
+  return activity
+}
+
 async function seedSearchHistory(page: Page, toolName: string) {
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.onMessage(message => {
@@ -147,6 +156,7 @@ test.describe('Sources row and thinking disclosure', () => {
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(RESEARCH_SESSION_KEY))
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
 
+    await openFirstAssistantActivity(page)
     await expect(page.locator('.msg-ai .tool-row[data-op="web.search"]').first()).toBeVisible({ timeout: 10000 })
 
     const sourcesRow = page.locator('.msg-ai .sources-row').first()
@@ -164,6 +174,7 @@ test.describe('Sources row and thinking disclosure', () => {
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(RESEARCH_SESSION_KEY))
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
 
+    await openFirstAssistantActivity(page)
     await expect(page.locator('.msg-ai .tool-row[data-op="web.search"]').first()).toBeVisible({ timeout: 10000 })
 
     const sourcesRow = page.locator('.msg-ai .sources-row').first()
@@ -181,6 +192,7 @@ test.describe('Sources row and thinking disclosure', () => {
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(RESEARCH_SESSION_KEY))
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
 
+    await openFirstAssistantActivity(page)
     await expect(page.locator('.msg-ai .tool-row[data-op="web.discover"]').first()).toBeVisible({ timeout: 10000 })
     await expect(page.locator('.msg-ai .sources-row')).toHaveCount(0)
   })
@@ -231,11 +243,11 @@ test.describe('Sources row and thinking disclosure', () => {
       expect(rel).toContain('noreferrer')
     }
 
-    // Thinking disclosure only renders when the routed model emitted
-    // reasoning; when present it must default to collapsed.
-    const folds = page.locator('.thinking-fold')
-    if (await folds.count() > 0) {
-      for (const isOpen of await folds.evaluateAll(nodes => nodes.map(node => node.hasAttribute('open')))) {
+    // Completed execution activity is compact by default. Reasoning, when
+    // present, lives inside this one disclosure instead of a nested accordion.
+    const activities = page.locator('.msg-ai .assistant-activity')
+    if (await activities.count() > 0) {
+      for (const isOpen of await activities.evaluateAll(nodes => nodes.map(node => node.hasAttribute('open')))) {
         expect(isOpen).toBe(false)
       }
     }
@@ -283,21 +295,23 @@ test.describe('Sources row and thinking disclosure', () => {
     await expect(ribbon).toBeVisible({ timeout: 30000 })
     await expect(ribbon).toHaveCount(0, { timeout: 180000 })
 
-    // The finished assistant turn's reasoning disclosure shows the measured
-    // elapsed. ReasoningPart renders the summary as "Thought for Ns" when
+    // The finished assistant turn's embedded reasoning label shows the measured
+    // elapsed. ReasoningPart renders "Thought for Ns" when
     // seconds >= 1 and degrades to "Thought process" when seconds is 0 — the
     // latter is what a snapshot that drops the measured seconds would produce.
-    // Bind the real summary element, not the illustrative .__elapsed node.
-    const summary = page.locator('.msg-ai .thinking-fold .thinking-fold__summary').first()
-    await expect(summary).toBeVisible({ timeout: 30000 })
-    await expect(summary).toHaveText(/Thought for \d+/)
-    await expect(summary).not.toHaveText(/Thought process/)
+    const activity = page.locator('.msg-ai .assistant-activity').first()
+    await expect(activity).toBeVisible({ timeout: 30000 })
+    await activity.locator('summary').press('Enter')
+    const reasoningLabel = activity.locator('.thinking-block__header').first()
+    await expect(reasoningLabel).toBeVisible()
+    await expect(reasoningLabel).toHaveText(/Thought for \d+/)
+    await expect(reasoningLabel).not.toHaveText(/Thought process/)
 
     // Wait past the ~50ms history-sync debounce plus a generous margin, then
     // re-assert: a sync that clobbered the row would have reset the summary to
     // "Thought process" here; the merge keeps the measured seconds.
     await page.waitForTimeout(500)
-    await expect(summary).toHaveText(/Thought for \d+/)
-    await expect(summary).not.toHaveText(/Thought process/)
+    await expect(reasoningLabel).toHaveText(/Thought for \d+/)
+    await expect(reasoningLabel).not.toHaveText(/Thought process/)
   })
 })

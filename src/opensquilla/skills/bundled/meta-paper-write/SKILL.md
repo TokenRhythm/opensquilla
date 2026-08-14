@@ -1,18 +1,19 @@
 ---
 name: meta-paper-write
-description: "Use this meta-skill instead of answering directly when the current user asks to draft, repair, compile, or produce an academic/research paper or LaTeX manuscript. It uses multi-skill orchestration for manuscript workflows that need source search, citation planning, experiment or figure/table placeholders, drafting, length checks, citation integrity, and LaTeX/PDF compilation. Ordinary paper requests use a compact draft path; explicit full/PDF/long-form requests use the full manuscript path. Do not use it for web research reports, slide decks, document decisions, or generic plotting."
+description: "Use this meta-skill instead of answering directly when the current user asks to draft or produce a new academic/research paper or LaTeX manuscript. It uses multi-skill orchestration for manuscript workflows that need source search, citation planning, experiment or figure/table placeholders, drafting, length checks, citation integrity, and LaTeX/PDF compilation. Ordinary paper requests use a compact draft path; explicit full/PDF/long-form requests use the full manuscript path. Do not use it to repair or compile an existing manuscript, or for web research reports, slide decks, document decisions, or generic plotting."
+description_zh: "当用户要求起草或产出新的学术/研究论文或 LaTeX 手稿时，使用此元技能而非直接回答。它通过多技能编排处理来源搜索、引用规划、实验或图表占位、起草、篇幅检查、引用完整性及 LaTeX/PDF 编译。普通请求走精简起草路径，明确要求完整/PDF/长篇时走完整手稿路径。不用于修复或编译现有手稿，也不用于网页研究报告、幻灯片、文档决策或通用绘图。"
 kind: meta
 meta_priority: 50
 always: false
 final_text_mode: "step:deliver_paper"
 request_template:
-  outcome: "Academic manuscript draft or repair pass with citation and compilation checks as requested."
-  outcome_zh: "按需生成或修订学术稿件，并检查引用与编译状态。"
-  outcome_en: "Academic manuscript draft or repair pass with citation and compilation checks as requested."
+  outcome: "New academic manuscript draft with citation and compilation checks as requested."
+  outcome_zh: "按需生成新的学术稿件，并检查引用与编译状态。"
+  outcome_en: "New academic manuscript draft with citation and compilation checks as requested."
   fields:
     - name: paper_topic_or_manuscript
-      label_zh: "论文主题或稿件"
-      label_en: "Paper topic or manuscript"
+      label_zh: "论文主题"
+      label_en: "Paper topic"
       required: true
     - name: mode
       label_zh: "模式"
@@ -55,7 +56,7 @@ request_template:
 output_contract:
   append_to_final_text: false
   required_sections:
-    - "Manuscript or repair output"
+    - "Manuscript output"
     - "Citation and source status"
     - "Known gaps"
     - "Next validation step"
@@ -70,7 +71,7 @@ eval_prompts:
   - name: "paper-write-baseline"
     prompt: "Draft a compact research-paper outline with citation status and known gaps for a supplied topic."
     rubric:
-      - "Manuscript or repair output"
+      - "Manuscript output"
       - "Citation and source status"
       - "Known gaps"
       - "Next validation step"
@@ -97,6 +98,12 @@ metadata:
   platform:
     requires:
       bins: ["xelatex", "bibtex"]
+    install:
+      - kind: toolchain
+        id: paper-tex
+        label: "Install verified TeX toolchain"
+        bins: ["xelatex", "bibtex"]
+        os: [darwin, linux, windows]
   opensquilla:
     risk: high
     capabilities:
@@ -127,10 +134,9 @@ composition:
             pages.
           - Use COMPACT_SKELETON when the user explicitly asks for a short
             skeleton, outline, compact draft, or does not specify length.
-          - Use REPAIR_EXISTING only when the user provides or references an
-            existing manuscript to fix.
-          - Use COMPILE_ONLY only when the user explicitly asks only to compile
-            an existing LaTeX manuscript.
+          - This workflow creates new manuscripts. Requests to repair or only
+            compile an existing workspace artifact are outside this public
+            contract and must not select a separate paper mode.
 
           Clarification policy:
           - Required field: topic.
@@ -140,6 +146,16 @@ composition:
           - If target pages are missing, use TARGET_PAGES: 4 for
             COMPACT_SKELETON and 10 for FULL_MANUSCRIPT.
           - If audience is missing, use AUDIENCE: academic.
+          - Treat phrases such as "at least 15 references", "minimum 15
+            citations", "至少15篇参考文献", and "不少于15个来源" as an
+            explicit numeric citation target. Copy the integer into
+            CITATION_TARGET; do not leave it as AUTO or move it only into
+            ASSUMPTIONS.
+          - Set EVIDENCE_STATUS: supplied ONLY when the request includes or
+            attaches completed empirical measurements, experiment outputs, or
+            a results dataset. A topic, hypothesis, desired experiment, sample
+            size proposal, or request to "write results" is not evidence.
+            Otherwise set EVIDENCE_STATUS: not_supplied.
           - Set NEEDS_CLARIFICATION: yes only when the topic is missing or
             the request explicitly asks to be interviewed before drafting.
           - Do not set NEEDS_CLARIFICATION: yes for missing paper_mode,
@@ -154,11 +170,12 @@ composition:
 
           Return exactly:
           TOPIC: <paper topic, or MISSING_TOPIC>
-          PAPER_MODE: <FULL_MANUSCRIPT|COMPACT_SKELETON|REPAIR_EXISTING|COMPILE_ONLY>
+          PAPER_MODE: <FULL_MANUSCRIPT|COMPACT_SKELETON>
           LANGUAGE: <en|zh|ja|other>
           TARGET_PAGES: <integer 1-50, or MISSING_TARGET_PAGES>
           AUDIENCE: <academic|technical|business|general>
           CITATION_TARGET: <integer if user explicitly requested one, otherwise AUTO>
+          EVIDENCE_STATUS: <supplied|not_supplied>
           NEEDS_CLARIFICATION: <yes|no>
           MISSING_FIELDS:
             - <field name, or none>
@@ -195,8 +212,6 @@ composition:
             choices:
               - FULL_MANUSCRIPT
               - COMPACT_SKELETON
-              - REPAIR_EXISTING
-              - COMPILE_ONLY
             default: COMPACT_SKELETON
             prompt: "{% if inputs.get('user_language') == 'zh' or (inputs.user_message | contains_cjk) %}类型（默认 COMPACT_SKELETON = 更快草稿；选择 FULL_MANUSCRIPT 生成完整论文 + PDF）{% else %}Mode (default COMPACT_SKELETON = faster draft; choose FULL_MANUSCRIPT for full paper + PDF){% endif %}"
             prompt_zh: "类型（默认 COMPACT_SKELETON = 更快草稿；选择 FULL_MANUSCRIPT 生成完整论文 + PDF）"
@@ -223,6 +238,14 @@ composition:
             prompt: "{% if inputs.get('user_language') == 'zh' or (inputs.user_message | contains_cjk) %}受众{% else %}Audience{% endif %}"
             prompt_zh: "受众"
             prompt_en: "Audience"
+          - name: citation_target
+            type: int
+            min: 1
+            max: 100
+            required: false
+            prompt: "{% if inputs.get('user_language') == 'zh' or (inputs.user_message | contains_cjk) %}最少可核验参考文献数量（可选）{% else %}Minimum verifiable references (optional){% endif %}"
+            prompt_zh: "最少可核验参考文献数量（可选）"
+            prompt_en: "Minimum verifiable references (optional)"
         cancel_keywords: ["算了", "取消", "cancel", "stop", "abort"]
         timeout_hours: 24
     - id: paper_contract
@@ -236,6 +259,14 @@ composition:
           Build the final paper contract. Prefer explicit clarification
           answers over the first-pass extraction. If clarification is empty,
           use only confidently extracted values. Do not invent missing topic.
+          Preserve the conservative evidence classification: use supplied only
+          when completed empirical data or results are explicitly present in
+          the original request; otherwise use not_supplied.
+          Re-scan the original request, including any [Additional user notes],
+          for an explicit minimum/reference count. A phrase such as "at least
+          15", "minimum 15 references", "至少15篇", or "不少于15个来源"
+          MUST produce CITATION_TARGET: 15 even when the first-pass extraction
+          said AUTO. Prefer the clarification field citation_target when set.
 
           First-pass extraction:
           {{ outputs.paper_collect | truncate(1200) }}
@@ -248,11 +279,12 @@ composition:
 
           Return exactly:
           TOPIC: <resolved topic>
-          PAPER_MODE: <FULL_MANUSCRIPT|COMPACT_SKELETON|REPAIR_EXISTING|COMPILE_ONLY>
+          PAPER_MODE: <FULL_MANUSCRIPT|COMPACT_SKELETON>
           LANGUAGE: <en|zh|ja|other>
           TARGET_PAGES: <integer 1-50>
           AUDIENCE: <academic|technical|business|general>
           CITATION_TARGET: <integer if explicitly requested, otherwise AUTO>
+          EVIDENCE_STATUS: <supplied|not_supplied>
           PDF_REQUIRED: yes
           ASSUMPTIONS:
             - <assumption or none>
@@ -280,7 +312,8 @@ composition:
           VENUE_STYLE: <generic research paper or inferred venue>
           LANGUAGE: <copy LANGUAGE from extracted contract verbatim — use the exact enum value, do not translate>
           TARGET_LENGTH: <copy TARGET_PAGES from extracted contract verbatim> compiled pages unless the user requested a different unit
-          CITATION_TARGET: <copy explicit citation target, otherwise derive from target length, source availability, audience, and venue style>
+          CITATION_TARGET: <integer only: copy explicit citation target, otherwise derive one integer from target length, audience, and venue style; never output AUTO, ≥, prose, or units>
+          EVIDENCE_STATUS: <copy EVIDENCE_STATUS from extracted contract verbatim>
           LENGTH_STRATEGY: <section-level page/word allocation based on TARGET_LENGTH and user intent>
           CITATION_STRATEGY: <how many sources to use per major section and why>
           CITATION_STYLE: BibTeX cite keys, LaTeX \cite{...}
@@ -291,7 +324,6 @@ composition:
       label_en: "Search translation"
       kind: llm_chat
       depends_on: [paper_contract]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
       with:
         system: "You translate paper topics into concise English academic search queries. Output only the query text."
         task: |
@@ -318,24 +350,19 @@ composition:
       kind: skill_exec
       skill: multi-search-engine
       depends_on: [paper_preferences, search_query_translation]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
       with:
-        # search_query_translation returns ONLY the English query text
-        # (no labels / no preamble), so we can inline it directly.
-        # Academic-site bias filters out blog/wiki/social.
-        query: "{{ outputs.search_query_translation | xml_escape | truncate(200) }} (site:arxiv.org OR site:aclanthology.org OR site:dl.acm.org OR site:openreview.net OR site:ieee.org OR site:nature.com OR site:science.org)"
-        engines: [brave, duckduckgo, tavily]
-        # Brave Web Search API hard-caps ``count`` at 20 (multi-search-engine
-        # clamps internally as defense in depth). Set explicitly so future
-        # readers don't need to re-discover the limit.
-        max_results: 20
+        # Keep the canonical query clean. Search backends apply their own
+        # academic metadata/domain handling; a giant cross-site OR expression
+        # materially reduces recall on Crossref and Tavily.
+        query: "{{ outputs.search_query_translation | xml_escape | truncate(200) }}"
+        engines: [crossref, brave, tavily]
+        max_results: 30
     - id: refbib
       label: "参考文献"
       label_en: "References"
       kind: skill_exec
       skill: paper-refbib-stub
       depends_on: [search_papers]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
       with:
         search_results: "{{ outputs.search_papers | truncate(8000) }}"
     - id: source_pack
@@ -343,7 +370,6 @@ composition:
       label_en: "Source pack"
       kind: llm_chat
       depends_on: [search_papers, refbib]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
       with:
         system: "You curate paper sources and enforce citation coverage."
         task: |
@@ -365,16 +391,41 @@ composition:
           {{ outputs.refbib | truncate(8000) }}
 
           Return:
+          SOURCE_STATUS: <sufficient|insufficient>
+          CITATION_TARGET: <copy the integer CITATION_TARGET from paper_preferences>
+          USABLE_REFERENCE_COUNT: <integer count of unique, relevant, verifiable primary references>
+          USABLE_KEYS:
+            - <refN, one key per line; only keys also listed under PRIMARY_REFERENCES>
+          EXCLUDED_KEYS:
+            - <refN | reason, or none>
           SOURCE_PACK:
           PRIMARY_REFERENCES:
             - refN | title | supported claim
           COVERAGE_GAPS:
             - <gap or none>
+          Count only sources that are topically relevant and have a verifiable
+          URL, DOI, or arXiv identifier in the bibliography. Search-result
+          pages, proceedings indexes, duplicates, and unrelated papers belong
+          under EXCLUDED_KEYS and must not inflate USABLE_REFERENCE_COUNT.
+    - id: source_readiness_gate
+      label: "来源就绪门禁"
+      label_en: "Source readiness gate"
+      kind: skill_exec
+      skill: paper-source-readiness-gate
+      depends_on: [paper_contract, paper_preferences, source_pack, refbib]
+      with:
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "paper_preferences": {{ outputs.paper_preferences | tojson }},
+            "source_pack": {{ outputs.source_pack | tojson }},
+            "bibliography": {{ outputs.refbib | tojson }}
+          }
     - id: experiment_design
       label: "实验设计"
       label_en: "Experiment design"
       kind: llm_chat
-      depends_on: [paper_preferences, source_pack]
+      depends_on: [paper_preferences, source_pack, source_readiness_gate]
       when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
       with:
         system: "You design rigorous, falsifiable experiments. You also decide how many figures and tables the paper needs based on the target page budget, the research questions, and the analysis dimensions — do not over- or under-provision."
@@ -386,6 +437,10 @@ composition:
 
           Paper facts:
           TOPIC: {{ outputs.paper_contract | truncate(1200) }}, MODE: {{ outputs.paper_contract | truncate(400) }}, PAGES: {{ outputs.paper_contract | truncate(400) }}
+
+          Original user request (authoritative for any user-supplied outcome
+          threshold; do not infer thresholds from literature or defaults):
+          {{ inputs.user_message | xml_escape | truncate(1200) }}
 
           Preferences:
           {{ outputs.paper_preferences | truncate(2000) }}
@@ -403,6 +458,8 @@ composition:
 
           Reply with EXACTLY this structure (verbatim section headers, no
           markdown fences):
+
+          EVIDENCE_STATUS: <copy supplied|not_supplied from paper facts verbatim>
 
           RESEARCH_QUESTIONS:
             - id: RQ1
@@ -437,7 +494,7 @@ composition:
               y_axis: <semantic + unit>
               comparison_groups: <list>
               supports: <RQ#|H#>
-              caption_hint: <short, factual>
+              caption_hint: <short planned/placeholder/hypothesis caption>
             - id: fig2
               ... (repeat per provisioning rules)
 
@@ -446,7 +503,7 @@ composition:
               columns: <list of column headers>
               rows_shape: <e.g. "one row per baseline + ours + 2 ablations">
               supports: <RQ#|H#>
-              caption_hint: <short, factual>
+              caption_hint: <short planned/placeholder/hypothesis caption>
             - id: tab2
               ... (repeat per provisioning rules)
 
@@ -462,6 +519,25 @@ composition:
           - Every RESEARCH_QUESTION is supported by ≥1 figure AND/OR ≥1 table.
           - cite_key fields must reference IDs that exist in source_pack;
             do not invent new ref keys here.
+          - When EVIDENCE_STATUS is not_supplied, every caption_hint MUST
+            explicitly identify itself as a planned evaluation placeholder or
+            hypothesis in the manuscript language. Prefer the prefix
+            "Planned evaluation placeholder:" / "计划评估占位：". A result
+            comparison is allowed only as an explicit hypothesis, question,
+            or future test (for example, "Hypothesis H1: ... will ..." /
+            "假设 H1：将检验是否……"). Never write a present- or past-tense
+            categorical finding such as "Ours achieves lower cost" or
+            "所提方法保持最低通信成本与最高精度".
+          - Concrete setup values and predefined metric thresholds may appear
+            in captions. When evidence is not supplied, a numeric outcome
+            threshold may appear only when it is copied from the original
+            user request and labeled as a decision criterion. Do not invent
+            quantitative hypotheses, expected ranges, improvements, scores,
+            latency reductions, convergence-round deltas, or ablation effects.
+            Unknown outcomes must remain TBD / 待实验确定.
+          - Do not emit Unicode U+2011, U+2013, or U+2014 punctuation. Use an
+            ASCII hyphen, LaTeX ``--`` / ``---``, or native full-width
+            sentence punctuation instead.
     - id: figure_placeholders
       label: "图占位"
       label_en: "Figure placeholders"
@@ -483,8 +559,21 @@ composition:
             * comparison_groups
             * RQ/H it supports
 
-          Caption must come from caption_hint verbatim (escape LaTeX
-          specials). Label MUST be ``\label{fig:<id>}`` so analysis_outline
+          Caption normally comes from caption_hint (escape LaTeX specials).
+          First read EVIDENCE_STATUS from the experiment design. When it is
+          not_supplied, the rendered caption MUST begin with an explicit
+          planned/placeholder/hypothesis marker in the manuscript language,
+          such as "Planned evaluation placeholder:" / "计划评估占位：" or
+          "Hypothesis H1:" / "假设 H1：". This is the only case where you
+          MUST rewrite a noncompliant caption_hint. Do not append a categorical
+          observed outcome; phrase comparisons as a question, hypothesis, or
+          future test, and leave unknown outcomes TBD / 待实验确定.
+
+          Normalize literal Unicode Greek math symbols to LaTeX math macros
+          such as ``\(\alpha\)``, ``\(\delta\)``, and ``\(\varepsilon\)``.
+          Do not emit Unicode U+2011, U+2013, or U+2014 punctuation; use an
+          ASCII hyphen or LaTeX ``--`` / ``---`` punctuation. Label MUST be
+          ``\label{fig:<id>}`` so analysis_outline
           and final_manuscript_package can ``\ref{fig:<id>}`` them.
 
           Experiment design:
@@ -529,13 +618,28 @@ composition:
           counts, scores, latency, costs, and confidence intervals must
           remain ``---`` or ``<TBD>`` until real experiments are supplied.
           Use booktabs (``\toprule``, ``\midrule``, ``\bottomrule``) for
-          clean spacing.
+          clean spacing. Wrap every ``tabular`` in
+          ``\resizebox{\linewidth}{!}{...}`` so multi-column placeholders
+          cannot overflow the text block.
+
+          Never place literal Unicode Greek letters in headers, captions, or
+          cells. Render them in math mode with named LaTeX macros, for example
+          ``\(\alpha\)``, ``\(\delta\)``, and ``\(\varepsilon\)``. Do not
+          emit Unicode U+2011, U+2013, or U+2014 punctuation; use an ASCII
+          hyphen or LaTeX ``--`` / ``---`` punctuation.
 
           Header row comes from TABLE_PLAN columns; row labels come from
           rows_shape (expand the shape into concrete row names like
           "Baseline-A", "Baseline-B", "Ours", "Ours w/o module X", …).
-          Caption is caption_hint verbatim. Label MUST be
-          ``\label{tab:<id>}``.
+          Caption normally comes from caption_hint. First read EVIDENCE_STATUS
+          from the experiment design. When it is not_supplied, the rendered
+          caption MUST begin with an explicit planned/placeholder/hypothesis
+          marker in the manuscript language, such as "Planned evaluation
+          placeholder:" / "计划评估占位：" or "Hypothesis H1:" / "假设 H1：".
+          Rewrite a noncompliant hint rather than copying a categorical
+          observed result. Comparisons must be framed as a question,
+          hypothesis, or future test; unknown outcomes remain TBD / 待实验确定.
+          Label MUST be ``\label{tab:<id>}``.
 
           Experiment design:
           {{ outputs.experiment_design | truncate(8000) }}
@@ -546,15 +650,17 @@ composition:
           % BEGIN_TABLE_PLACEHOLDERS
           \begin{table}[t]
             \centering
-            \begin{tabular}{lccc}
-              \toprule
-              Method & Acc & F1 & Latency \\
-              \midrule
-              Baseline-A & --- & --- & --- \\
-              Baseline-B & --- & --- & --- \\
-              Ours       & --- & --- & --- \\
-              \bottomrule
-            \end{tabular}
+            \resizebox{\linewidth}{!}{
+              \begin{tabular}{lccc}
+                \toprule
+                Method & Acc & F1 & Latency \\
+                \midrule
+                Baseline-A & --- & --- & --- \\
+                Baseline-B & --- & --- & --- \\
+                Ours       & --- & --- & --- \\
+                \bottomrule
+              \end{tabular}
+            }
             \caption{<caption_hint>}
             \label{tab:tab1}
           \end{table}
@@ -586,10 +692,20 @@ composition:
 
           PAPER_MODE depth control:
           - FULL_MANUSCRIPT: 1 subsection per analysis dimension; each
-            with potential_findings (3 bullets) + threats_to_validity
+            with interpretation_criteria (3 bullets) + threats_to_validity
             (1–2 bullets).
-          - COMPACT_SKELETON: 1 subsection per dimension; potential_findings
+          - COMPACT_SKELETON: 1 subsection per dimension; interpretation_criteria
             (1 bullet); skip threats_to_validity.
+
+          Evidence-safety rule:
+          - Read EVIDENCE_STATUS from experiment_design and never upgrade it.
+          - When it is not_supplied, every interpretation criterion must be a
+            future test, decision rule, or boundary condition. Do not predict
+            concrete percentages, numeric ranges, scores, latencies,
+            convergence-round changes, ablation deltas, or categorical wins.
+            Use TBD / 待实验确定 for every unknown outcome magnitude. Add depth
+            through protocol rationale and threats to validity, not invented
+            findings.
 
           Reply in this exact shape between sentinels:
 
@@ -597,7 +713,7 @@ composition:
           \subsection{Performance}
           \label{sec:analysis-performance}
           References: \ref{fig:fig1}, \ref{tab:tab1}.
-          Potential findings:
+          Planned interpretation criteria:
           \begin{itemize}
             \item ...
           \end{itemize}
@@ -613,8 +729,7 @@ composition:
       label: "大纲"
       label_en: "Outline"
       kind: llm_chat
-      depends_on: [source_pack, experiment_design]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
+      depends_on: [source_pack, source_readiness_gate, experiment_design]
       with:
         system: "You design long-form LaTeX paper outlines with citation plans."
         task: |
@@ -640,8 +755,7 @@ composition:
       label: "引用计划"
       label_en: "Citation plan"
       kind: llm_chat
-      depends_on: [outline, source_pack, refbib]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
+      depends_on: [outline, source_pack, source_readiness_gate, refbib]
       with:
         system: "You plan citation placement for clean BibTeX/LaTeX manuscripts. You ONLY use cite keys that exist in the provided bibliography — never invent keys."
         task: |
@@ -652,6 +766,12 @@ composition:
           fixed number. Use only keys that appear in the BibTeX below (every
           key must be present verbatim — verify by string match before you
           write it). Attach citations to claims, not paragraphs in bulk.
+          Treat source_pack.USABLE_KEYS as the authoritative allowlist; merely
+          appearing in the raw bibliography is not enough. If SOURCE_STATUS is
+          insufficient or USABLE_REFERENCE_COUNT is below CITATION_TARGET,
+          return CITATION_PLAN_STATUS: blocked with the concrete found/target
+          count and emit no \cite commands or placeholder assignments. Never
+          use an excluded or unrelated source merely to satisfy a count.
 
           Topic and mode:
           TOPIC: {{ outputs.paper_contract | truncate(1200) }}, MODE: {{ outputs.paper_contract | truncate(400) }}, PAGES: {{ outputs.paper_contract | truncate(400) }}
@@ -754,6 +874,9 @@ composition:
           TITLE:
           <final paper title, ≤16 words>
 
+          EVIDENCE_STATUS:
+          <copy EVIDENCE_STATUS from paper_preferences verbatim>
+
           ABSTRACT_DRAFT:
           <120-220 word draft abstract — section authors may polish but
           may not change the thesis, scope, terminology, or
@@ -790,7 +913,7 @@ composition:
               key_claims: [C1, C2, ...]
               cite_keys: []           # abstract never cites
               figures: []
-              must_mention: [TITLE, PLACEHOLDER_RESULT_TOKEN]
+              must_mention: [TITLE, PLACEHOLDER_RESULT_TOKEN, EVIDENCE_STATUS]
             introduction:
               target_words: <int>
               key_claims: [C1, C2]
@@ -840,6 +963,19 @@ composition:
           - experiments, discussion, and conclusion MUST use the same
             qualitative result placeholder until real experiment outputs
             are supplied; do not state exact numeric improvements.
+          - when EVIDENCE_STATUS is not_supplied, every results-facing section
+            MUST explicitly say that no empirical results were supplied and
+            describe evaluation in planned/future tense only.
+          - In that mode, every unknown outcome value must be written as TBD
+            or 待实验确定. Never replace it with a guessed percentage, score,
+            latency, effect size, or other concrete forecast.
+          - In that mode, every figure/table caption must be explicitly
+            labeled as a planned evaluation placeholder or hypothesis. A
+            caption may name concrete setup values or a predefined metric
+            threshold, but must not state a categorical observed finding.
+          - All section authors must avoid Unicode U+2011, U+2013, and U+2014
+            punctuation. Use an ASCII hyphen, LaTeX ``--`` / ``---``, or
+            native full-width sentence punctuation instead.
 
           WRITING_VOICE:
           - tense: <e.g. "we present / we observe", active>
@@ -869,6 +1005,9 @@ composition:
           writing_plan:
           {{ outputs.writing_plan | truncate(8000) }}
 
+          evidence_contract (authoritative even if writing_plan is truncated):
+          {{ outputs.paper_contract | truncate(1200) }}
+
           outline:
           {{ outputs.outline | truncate(3000) }}
 
@@ -885,6 +1024,9 @@ composition:
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.abstract.target_words
           - For the abstract, follow the 4-6 sentence contract first; do not
             expand it just to satisfy the long-form page target.
+          - If EVIDENCE_STATUS is not_supplied, state explicitly that empirical
+            results are not yet available; describe only the planned evaluation
+            and never claim observed findings.
           - Only output the LaTeX fragment. No commentary, no fences.
     - id: section_introduction
       label: "引言段"
@@ -900,6 +1042,9 @@ composition:
           section: introduction
           writing_plan:
           {{ outputs.writing_plan | truncate(8000) }}
+
+          evidence_contract (authoritative even if writing_plan is truncated):
+          {{ outputs.paper_contract | truncate(1200) }}
 
           previous_section_tail (last paragraphs of the abstract):
           {{ outputs.section_abstract | truncate(2000) }}
@@ -943,6 +1088,9 @@ composition:
           writing_plan:
           {{ outputs.writing_plan | truncate(8000) }}
 
+          evidence_contract (authoritative even if writing_plan is truncated):
+          {{ outputs.paper_contract | truncate(1200) }}
+
           previous_section_tail (last paragraphs of the introduction):
           {{ outputs.section_introduction | truncate(2000) }}
 
@@ -984,6 +1132,9 @@ composition:
           writing_plan:
           {{ outputs.writing_plan | truncate(8000) }}
 
+          evidence_contract (authoritative even if writing_plan is truncated):
+          {{ outputs.paper_contract | truncate(1200) }}
+
           previous_section_tail (last paragraphs of related work):
           {{ outputs.section_related_work | truncate(2000) }}
 
@@ -1008,6 +1159,11 @@ composition:
             be defined here).
           - You may inline ONE figure environment from figure_placeholders
             that supports method exposition; reference it via \ref{fig:<id>}.
+          - If pseudocode is useful, use only the `algorithm` float with the
+            `algorithmic` environment and uppercase commands such as
+            `\STATE`, `\FOR`, `\ENDFOR`, `\IF`, and `\ENDIF`. The manuscript
+            template loads `algorithm` + `algorithmic`. Do not use
+            `algorithm2e`, `algpseudocode`, or commands from another dialect.
           - Match TERMINOLOGY_LOCK / NOTATION_LOCK exactly.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.method.target_words.
           - Length floor: target_words is a lower-bound writing budget. Do
@@ -1031,6 +1187,9 @@ composition:
           section: results
           writing_plan:
           {{ outputs.writing_plan | truncate(8000) }}
+
+          evidence_contract (authoritative even if writing_plan is truncated):
+          {{ outputs.paper_contract | truncate(1200) }}
 
           previous_section_tail (last paragraphs of method):
           {{ outputs.section_method | truncate(2500) }}
@@ -1061,6 +1220,12 @@ composition:
             evidence claim. Do not state exact numeric improvements,
             percentages, scores, latency reductions, or win rates unless
             they are explicitly present in user-provided experiment data.
+          - If EVIDENCE_STATUS is not_supplied, include the literal sentence
+            "No empirical results were supplied; this section specifies the
+            planned evaluation." and keep ALL setup, results, ablation, and
+            sensitivity prose in proposed/planned/future tense. Do not claim
+            that a dataset was collected, participants were recruited, or a
+            hypothesis was confirmed.
           - Use ONLY notation/terminology locked in writing_plan.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.experiments.target_words.
           - Length floor: target_words is a lower-bound writing budget. Do
@@ -1085,6 +1250,9 @@ composition:
           writing_plan:
           {{ outputs.writing_plan | truncate(8000) }}
 
+          evidence_contract (authoritative even if writing_plan is truncated):
+          {{ outputs.paper_contract | truncate(1200) }}
+
           previous_section_tail (last paragraphs of experiments):
           {{ outputs.section_experiments | truncate(2500) }}
 
@@ -1102,9 +1270,13 @@ composition:
 
           Output rules:
           - Start with \section{Discussion}.
-          - Inline the analysis_outline subsections verbatim where they
-            fit, but expand each with 1-2 paragraphs of substantive
-            commentary referencing concrete experiment results.
+          - Inline the analysis_outline subsections verbatim where they fit,
+            but expand each with 1-2 paragraphs of substantive commentary.
+            Reference concrete experiment results only when EVIDENCE_STATUS is
+            supplied; otherwise discuss planned interpretation criteria and
+            explicitly say that empirical results are not yet available.
+            Unknown outcomes must remain TBD / 待实验确定; do not predict exact
+            percentages, scores, latency reductions, or ablation effects.
           - End the section with explicit \subsection{Limitations} and
             \subsection{Threats to Validity}.
           - Match TERMINOLOGY_LOCK / NOTATION_LOCK exactly.
@@ -1131,6 +1303,9 @@ composition:
           writing_plan:
           {{ outputs.writing_plan | truncate(8000) }}
 
+          evidence_contract (authoritative even if writing_plan is truncated):
+          {{ outputs.paper_contract | truncate(1200) }}
+
           abstract (the conclusion must echo its claims):
           {{ outputs.section_abstract | truncate(1500) }}
 
@@ -1139,12 +1314,15 @@ composition:
 
           Output rules:
           - Start with \section{Conclusion}.
-          - Cover: 1) restated thesis + headline result, 2) key contributions
+          - Cover: 1) restated thesis + headline result status, 2) key contributions
             reiterated, 3) scope and limitations, 4) future-work pointer. Use
             as many concise paragraphs as the writing_plan target_words
             requires; do not cap the conclusion at 2-3 paragraphs when the
             requested page target is long.
           - No new claims, no new figures, no \cite{}.
+          - If EVIDENCE_STATUS is not_supplied, do not state that the method
+            worked, improved, outperformed, or was statistically significant.
+            Restate that evaluation is planned and results remain unavailable.
           - Match TERMINOLOGY_LOCK exactly.
           - target_words from writing_plan.PER_SECTION_BLUEPRINT.conclusion.target_words.
           - Length floor: target_words is a lower-bound writing budget. Do
@@ -1155,202 +1333,47 @@ composition:
     - id: persist_sections
       label: "保存章节"
       label_en: "Save sections"
-      kind: tool_call
-      tool: exec_command
-      tool_allowlist: [exec_command]
+      kind: skill_exec
+      skill: paper-artifact-runtime
       depends_on: [section_abstract, section_introduction, section_related_work, section_method, section_experiments, section_discussion, section_conclusion]
       when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
-      tool_args:
+      with:
         # Persist large section bodies to disk and return only a compact
         # manifest. This keeps later LLM steps from repeatedly ingesting the
         # full manuscript and reduces repeated context-compaction pressure.
-        command: |
-          python3 - <<'PY'
-          import os, re
-          from pathlib import Path
-
-          def clean(text):
-              text = re.sub(r'^```(?:latex|tex)?\s*\n', '', text or '', flags=re.MULTILINE)
-              text = re.sub(r'\n```\s*$', '', text)
-              return text.strip()
-
-          sections = {
-              'abstract':     os.environ.get('SEC_ABSTRACT', ''),
-              'introduction': os.environ.get('SEC_INTRO', ''),
-              'related_work': os.environ.get('SEC_RELATED', ''),
-              'method':       os.environ.get('SEC_METHOD', ''),
-              'experiments':  os.environ.get('SEC_EXPERIMENTS', ''),
-              'discussion':   os.environ.get('SEC_DISCUSSION', ''),
-              'conclusion':   os.environ.get('SEC_CONCLUSION', ''),
+        payload: |
+          {
+            "operation": "persist_sections",
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "sections": {
+              "abstract": {{ outputs.section_abstract | tojson }},
+              "introduction": {{ outputs.section_introduction | tojson }},
+              "related_work": {{ outputs.section_related_work | tojson }},
+              "method": {{ outputs.section_method | tojson }},
+              "experiments": {{ outputs.section_experiments | tojson }},
+              "discussion": {{ outputs.section_discussion | tojson }},
+              "conclusion": {{ outputs.section_conclusion | tojson }}
+            }
           }
-          out_dir = Path('paper') / 'sections'
-          out_dir.mkdir(parents=True, exist_ok=True)
-
-          print('SECTION_ARTIFACTS:')
-          total = 0
-          for name, text in sections.items():
-              body = clean(text)
-              path = out_dir / f'{name}.tex'
-              path.write_text(body, encoding='utf-8')
-              chars = len(body)
-              total += chars
-              first_line = next((line.strip() for line in body.splitlines() if line.strip()), '')
-              print(f'- {name}: path={path.as_posix()} chars={chars} first_line={first_line[:120]!r}')
-          print(f'TOTAL_SECTION_CHARS: {total}')
-          print('CONTEXT_POLICY: downstream steps must read section files from disk and pass only paths/summaries to LLM prompts')
-          PY
-        workdir: "{{ inputs.workspace_dir }}"
-        timeout: 30
-        env:
-          SEC_ABSTRACT:    "{{ outputs.section_abstract }}"
-          SEC_INTRO:       "{{ outputs.section_introduction }}"
-          SEC_RELATED:     "{{ outputs.section_related_work }}"
-          SEC_METHOD:      "{{ outputs.section_method }}"
-          SEC_EXPERIMENTS: "{{ outputs.section_experiments }}"
-          SEC_DISCUSSION:  "{{ outputs.section_discussion }}"
-          SEC_CONCLUSION:  "{{ outputs.section_conclusion }}"
     - id: assemble_manuscript_tex
       label: "组装 TEX"
       label_en: "Assemble TEX"
-      kind: tool_call
-      tool: exec_command
-      tool_allowlist: [exec_command]
+      kind: skill_exec
+      skill: paper-artifact-runtime
       depends_on: [writing_plan, persist_sections, refbib]
       when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract"
-      tool_args:
+      with:
         # Concatenate section artifact files into a full LaTeX document and
-        # write it to paper/paper.tex. Return a compact manifest instead of
+        # write it to paper/<meta_run_id>/paper.tex. Return a compact manifest instead of
         # echoing the full manuscript back into the meta context.
-        command: |
-          python3 - <<'PY'
-          import os, re, sys
-          from pathlib import Path
-
-          section_dir = Path('paper') / 'sections'
-          sections = {
-              'abstract':     section_dir / 'abstract.tex',
-              'introduction': section_dir / 'introduction.tex',
-              'related_work': section_dir / 'related_work.tex',
-              'method':       section_dir / 'method.tex',
-              'experiments':  section_dir / 'experiments.tex',
-              'discussion':   section_dir / 'discussion.tex',
-              'conclusion':   section_dir / 'conclusion.tex',
+        payload: |
+          {
+            "operation": "assemble_manuscript_tex",
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "bib_text": {{ outputs.refbib | tojson }},
+            "writing_plan": {{ outputs.writing_plan | tojson }},
+            "topic": {{ (outputs.paper_contract | truncate(400)) | tojson }}
           }
-          section_text = {
-              name: path.read_text(encoding='utf-8') if path.is_file() else ''
-              for name, path in sections.items()
-          }
-          bib = os.environ.get('BIB_TEXT', '').strip()
-          # Extract TITLE from the writing_plan envelope. Falls back to the
-          # raw topic when the LLM omits a TITLE line so the PDF gets a
-          # meaningful title regardless.
-          writing_plan = os.environ.get('WRITING_PLAN', '')
-          topic_fallback = os.environ.get('TOPIC', 'Untitled Manuscript')
-          tm = re.search(r'^\s*TITLE\s*:\s*(.+?)\s*$', writing_plan, re.MULTILINE)
-          raw_title = (tm.group(1).strip() if tm else topic_fallback) or topic_fallback
-          # LaTeX-escape the title so user-provided text can't break the preamble.
-          def latex_escape(s):
-              s = s.replace('\\', r'\textbackslash{}')
-              for ch in '&%$#_{}':
-                  s = s.replace(ch, '\\' + ch)
-              s = s.replace('~', r'\textasciitilde{}')
-              s = s.replace('^', r'\textasciicircum{}')
-              return s
-
-          def scrub_placeholder_table_cells(tex):
-              """Scrub numeric-looking data cells from placeholder tables."""
-              numeric = re.compile(
-                  r'^\s*(?:\\textbf\{)?[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%|ms|s|x|MB|GB|points?)?(?:\})?\s*$',
-                  re.I,
-              )
-              out = []
-              in_tabular = False
-              after_midrule = False
-              for line in tex.splitlines():
-                  if r'\begin{tabular}' in line:
-                      in_tabular = True
-                      after_midrule = False
-                      out.append(line)
-                      continue
-                  if in_tabular and r'\end{tabular}' in line:
-                      in_tabular = False
-                      after_midrule = False
-                      out.append(line)
-                      continue
-                  if in_tabular and r'\midrule' in line:
-                      after_midrule = True
-                      out.append(line)
-                      continue
-                  if in_tabular and after_midrule and '&' in line and r'\bottomrule' not in line:
-                      suffix = r' \\' if line.rstrip().endswith(r'\\') else ''
-                      row = line.rstrip()
-                      if suffix:
-                          row = row[:-2].rstrip()
-                      cells = [cell.strip() for cell in row.split('&')]
-                      if len(cells) > 1:
-                          cells = [cells[0], *('---' if numeric.match(cell) else cell for cell in cells[1:])]
-                          indent = re.match(r'^\s*', line).group(0)
-                          line = indent + ' & '.join(cells) + suffix
-                  out.append(line)
-              return '\n'.join(out)
-          title_tex = latex_escape(raw_title)
-          # Build preamble — load xeCJK if title or any section has CJK
-          any_cjk = (re.search(r'[一-鿿]', raw_title) is not None) or any(
-              re.search(r'[一-鿿]', v) for v in section_text.values()
-          )
-          preamble = [
-              r"\documentclass{article}",
-              r"\usepackage{xeCJK}" if any_cjk else r"% no CJK",
-              r"\usepackage{graphicx}",
-              r"\usepackage{booktabs}",
-              r"\usepackage{amsmath,amssymb}",
-              r"\usepackage{hyperref}",
-              r"\usepackage{geometry}",
-              r"\geometry{margin=2.5cm}",
-              r"\title{" + title_tex + r"}",
-              r"\author{OpenSquilla meta-paper-write}",
-              r"\date{\today}",
-              r"\begin{document}",
-              r"\maketitle",
-          ]
-          body_parts = [
-              section_text['abstract'],     # \begin{abstract}...\end{abstract}
-              section_text['introduction'], # \section{Introduction}...
-              section_text['related_work'],
-              section_text['method'],
-              section_text['experiments'],
-              section_text['discussion'],
-              section_text['conclusion'],
-          ]
-          tail = [
-              r"\bibliographystyle{plain}",
-              r"\bibliography{references}",
-              r"\end{document}",
-          ]
-          tex = '\n'.join(preamble) + '\n\n' + '\n\n'.join(p for p in body_parts if p) + '\n\n' + '\n'.join(tail)
-          tex = scrub_placeholder_table_cells(tex)
-          paper_dir = Path('paper')
-          paper_dir.mkdir(exist_ok=True)
-          tex_path = paper_dir / 'paper.tex'
-          bib_path = paper_dir / 'references.bib'
-          tex_path.write_text(tex, encoding='utf-8')
-          bib_path.write_text(bib if bib else '% no verified references', encoding='utf-8')
-          print(f'MANUSCRIPT_PATH: {tex_path.resolve()}')
-          print(f'REFERENCES_PATH: {bib_path.resolve()}')
-          print(f'MANUSCRIPT_CHARS: {len(tex)}')
-          print(f'REFERENCES_CHARS: {len(bib)}')
-          print('COMPILE_NOTES:')
-          print('- assembled section-by-section via paper-section-author')
-          print(f'- sections present: {", ".join(k for k, v in section_text.items() if v)}')
-          print(f'- total section chars: {sum(len(v) for v in section_text.values())}')
-          print('- context policy: full manuscript persisted on disk; downstream prompts should use path/summary only')
-          PY
-        workdir: "{{ inputs.workspace_dir }}"
-        timeout: 30
-        env:
-          BIB_TEXT:        "{{ outputs.refbib }}"
-          WRITING_PLAN:    "{{ outputs.writing_plan }}"
-          TOPIC:           "{{ outputs.paper_contract | truncate(400) }}"
     - id: consistency_pass
       label: "一致性检查"
       label_en: "Consistency check"
@@ -1395,11 +1418,11 @@ composition:
       label_en: "Final package"
       kind: llm_chat
       depends_on: [paper_contract, outline, citation_plan, refbib, figure_placeholders, table_placeholders, analysis_outline]
-      when: "'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
+      when: "'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
       with:
         system: "You write clean LaTeX manuscripts. Output only the requested manuscript package. NEVER invent cite keys — every \\cite{...} you emit MUST exist verbatim in REFERENCES_BIB below."
         task: |
-          Draft a full manuscript package. The default output must be clean
+          Draft a compact manuscript package. The output must be clean
           LaTeX-ready paper text, not planning notes. Do not include markdown
           fences, chat commentary, progress notes, or tool logs.
 
@@ -1407,27 +1430,21 @@ composition:
           TOPIC: {{ outputs.paper_contract | truncate(1200) }}, MODE: {{ outputs.paper_contract | truncate(400) }}, PAGES: {{ outputs.paper_contract | truncate(400) }}
 
           Mode behavior:
-          - FULL_MANUSCRIPT: produce enough substance for
-            TARGET_LENGTH from paper_preferences as compiled pages, using
-            the user-requested or derived CITATION_TARGET instead of a fixed
-            reference count. Distribute verified citation keys across
-            abstract, introduction, related work, method, results, discussion,
-            limitations, and conclusion.
-          - COMPACT_SKELETON: produce a compact LaTeX-ready manuscript
-            skeleton with section goals, planned citations, and expansion
-            notes; do not pretend it is a finished paper of the requested
-            length. For this
-            mode, the final package MUST include an explicit manuscript plan,
-            a target-length expansion plan, limitations/threats-to-validity,
+          - COMPACT_SKELETON is the lower-latency authoring path, but its
+            compiled artifact MUST still meet TARGET_PAGES. Produce a coherent
+            compact manuscript, not a one-page outline followed by a promise
+            to expand later. Size substantive MANUSCRIPT_TEX prose to at least
+            TARGET_PAGES x 550 English words, or TARGET_PAGES x 950 CJK
+            characters, before returning. For the default four-page contract,
+            this normally means at least 2,200 English words (or about 3,800
+            CJK characters), distributed across every required section.
+            The final package MUST also include a concise manuscript plan,
+            target-length expansion plan, limitations/threats-to-validity,
             and reference placeholders sized to the requested/derived citation
-            strategy when verified BibTeX entries are unavailable. Keep the compact package short enough that all
-            required sections are visible before any evaluator truncation:
-            put the plan and expansion plan before the LaTeX skeleton, and
-            keep MANUSCRIPT_TEX under 2,500 words.
-          - REPAIR_EXISTING: return a repaired clean LaTeX package focused on
-            citation integrity, structure, and removal of process text.
-          - COMPILE_ONLY: return a compile handoff package and blockers only;
-            do not invent missing manuscript body.
+            strategy when verified BibTeX entries are unavailable. Put the
+            complete MANUSCRIPT_TEX first so all required sections survive any
+            downstream truncation. Do not use blank pages, repeated paragraphs,
+            oversized headings, spacing tricks, or filler to reach the target.
 
           CITATION CONTRACT (load-bearing):
           - DO NOT invent cite keys. Use ONLY keys that appear verbatim in
@@ -1442,6 +1459,33 @@ composition:
             [REF-01 needed: agent benchmark survey] in the LaTeX text and
             list them under REFERENCE_PLACEHOLDERS instead. Placeholder
             references are safer than fabricated BibTeX.
+
+          EMPIRICAL EVIDENCE CONTRACT (load-bearing):
+          - Read EVIDENCE_STATUS from paper_contract; never upgrade it.
+          - When EVIDENCE_STATUS is not_supplied, include the exact disclosure
+            "No empirical results were supplied; the evaluation described here
+            is planned." in MANUSCRIPT_TEX.
+          - In that case, describe datasets, participants, experiments,
+            ablations, sensitivity analyses, results, discussion, abstract,
+            and conclusion in proposed/planned/future tense only.
+          - Do not invent completed sample counts, measurements, p-values,
+            effect sizes, confidence intervals, numeric improvements, observed
+            findings, or novelty claims such as "first experimental evidence".
+          - Keep every result table cell as <TBD> or --- and every finding as a
+            falsifiable hypothesis or planned analysis criterion.
+          - Every figure/table caption must explicitly identify itself as a
+            planned evaluation placeholder or hypothesis. It may state setup
+            values or a predefined target threshold, but may not present a
+            categorical observed result.
+
+          LATEX GLYPH CONTRACT (load-bearing):
+          - Never emit literal Unicode Greek letters in prose, captions, or
+            tables. Use named macros in math mode, e.g. ``\(\alpha\)``,
+            ``\(\delta\)``, and ``\(\varepsilon\)``.
+          - Do not emit Unicode U+2011, U+2013, or U+2014 punctuation. Use an
+            ASCII hyphen, LaTeX ``--`` / ``---``, or native full-width
+            sentence punctuation instead.
+          - Wrap every ``tabular`` in ``\resizebox{\linewidth}{!}{...}``.
 
           FIGURE/TABLE CONTRACT:
           - Inline the figure_placeholders block verbatim into Results.
@@ -1496,11 +1540,14 @@ composition:
 
           MANUSCRIPT_TEX:
           \documentclass{article}
-          \usepackage{xeCJK}
+          \usepackage{fontspec}
+          \setmainfont[FontIndex=2]{NotoSansCJK-Regular.ttc}
           \usepackage{graphicx}
           \usepackage{booktabs}
           \usepackage{amsmath}
-          \usepackage{hyperref}
+          \usepackage{algorithm}
+          \usepackage{algorithmic}
+          \usepackage[hidelinks]{hyperref}
           \title{...}
           \author{...}
           \date{\today}
@@ -1542,372 +1589,347 @@ composition:
 
           COMPILE_NOTES:
           - <short note about figure/reference assumptions>
-    - id: citation_map
-      label: "引用映射"
-      label_en: "Citation mapping"
-      kind: tool_call
-      tool: exec_command
-      tool_allowlist: [exec_command]
-      depends_on: [final_manuscript_package, consistency_pass, assemble_manuscript_tex, refbib]
-      when: "'PAPER_MODE: COMPILE_ONLY' not in outputs.paper_contract"
-      tool_args:
-        # Deterministically parse citations from artifact files instead of
-        # sending the full manuscript back through an LLM.
-        command: |
-          python3 - <<'PY'
-          import os, re
-          from pathlib import Path
-
-          pkg = os.environ.get('MANIFEST', '')
-          m = re.search(r'MANUSCRIPT_PATH:\s*(.+)', pkg)
-          b = re.search(r'REFERENCES_PATH:\s*(.+)', pkg)
-          tex_path = Path(m.group(1).strip()) if m else Path('paper/paper.tex')
-          bib_path = Path(b.group(1).strip()) if b else Path('paper/references.bib')
-
-          tex = tex_path.read_text(encoding='utf-8', errors='ignore') if tex_path.is_file() else ''
-          bib = bib_path.read_text(encoding='utf-8', errors='ignore') if bib_path.is_file() else os.environ.get('REFBIB', '')
-
-          cite_counts = {}
-          for group in re.findall(r'\\cite\{([^}]+)\}', tex):
-              for key in [k.strip() for k in group.split(',') if k.strip()]:
-                  cite_counts[key] = cite_counts.get(key, 0) + 1
-
-          entries = {}
-          for match in re.finditer(r'@\w+\s*\{\s*([^,\s]+)\s*,(.*?)(?=\n@\w+\s*\{|\Z)', bib, re.DOTALL):
-              key = match.group(1).strip()
-              body = match.group(2)
-              title = re.search(r'title\s*=\s*[\{\"]([^}\"]+)', body, re.I)
-              url = re.search(r'(?:url|howpublished)\s*=\s*[\{\"]([^}\"]+)', body, re.I)
-              doi = re.search(r'doi\s*=\s*[\{\"]([^}\"]+)', body, re.I)
-              eprint = re.search(r'eprint\s*=\s*[\{\"]([^}\"]+)', body, re.I)
-              locator = (url.group(1) if url else '') or (f'doi:{doi.group(1)}' if doi else '') or (f'arXiv:{eprint.group(1)}' if eprint else '')
-              entries[key] = {
-                  'title': title.group(1).strip() if title else '',
-                  'locator': locator,
-              }
-
-          strong_domains = ('arxiv.org', 'aclanthology.org', 'dl.acm.org', 'openreview.net', 'ieee.org', 'nature.com', 'science.org', 'biorxiv.org', 'pnas.org')
-          weak_markers = ('medium.com', 'wikipedia.org', 'github.com', 'stackoverflow.com', 'twitter.com', 'x.com')
-          def quality(locator, invalid=False):
-              low = locator.lower()
-              if invalid:
-                  return 'INVALID'
-              if any(d in low for d in strong_domains) or 'doi:' in low or 'arxiv:' in low:
-                  return 'STRONG'
-              if any(w in low for w in weak_markers):
-                  return 'WEAK'
-              if locator:
-                  return 'OK'
-              return 'WEAK'
-
-          rows = []
-          invalid = weak = strong = ok = unused = 0
-          all_keys = sorted(set(cite_counts) | set(entries))
-          print('CITATION_MAP:')
-          print()
-          print('| Cite Key | Cited Times | Title | URL / DOI / arXiv | Source Quality |')
-          print('|---|---:|---|---|---|')
-          for key in all_keys:
-              count = cite_counts.get(key, 0)
-              entry = entries.get(key)
-              invalid_row = entry is None
-              q = quality(entry['locator'] if entry else '', invalid=invalid_row)
-              if invalid_row:
-                  invalid += 1
-              elif count == 0:
-                  unused += 1
-                  q = 'UNUSED'
-              elif q == 'STRONG':
-                  strong += 1
-              elif q == 'OK':
-                  ok += 1
-              elif q == 'WEAK':
-                  weak += 1
-              title = entry['title'] if entry else '(MISSING IN BIB)'
-              locator = entry['locator'] if entry else '-'
-              print(f'| {key} | {count} | {title} | {locator} | {q} |')
-          print()
-          print(f'SUMMARY: total_cite_keys={len(cite_counts)}, strong={strong}, ok={ok}, weak={weak}, invalid={invalid}, unused={unused}')
-          print(f'ARTIFACTS: manuscript={tex_path} references={bib_path}')
-          PY
-        workdir: "{{ inputs.workspace_dir }}"
-        timeout: 30
-        env:
-          MANIFEST: "{{ outputs.get('consistency_pass') or outputs.get('assemble_manuscript_tex') or outputs.get('final_manuscript_package', '') }}"
-          REFBIB: "{{ outputs.refbib }}"
-    - id: paper_length_gate
-      label: "篇幅门禁"
-      label_en: "Length gate"
-      kind: llm_chat
-      depends_on: [final_manuscript_package, consistency_pass, assemble_manuscript_tex]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
-      with:
-        system: "You verify manuscript length requirements before final packaging."
-        task: |
-          Check whether the manuscript package satisfies the requested paper
-          length, section coverage, and compact/skeleton mode constraints.
-
-          Paper preferences:
-          {{ outputs.paper_preferences | truncate(4000) }}
-
-          Manuscript package:
-          {{ outputs.get('consistency_pass') or outputs.get('assemble_manuscript_tex') or outputs.get('final_manuscript_package', '') | truncate(8000) }}
-
-          Reply with:
-          LENGTH_GATE: <pass|warn|block>
-          ESTIMATED_WORDS: <int or unknown>
-          BLOCKERS:
-            - <blocker or none>
-          WARNINGS:
-            - <warning or none>
-    - id: citation_integrity_gate
-      label: "引用门禁"
-      label_en: "Citation gate"
-      kind: llm_chat
-      depends_on: [final_manuscript_package, consistency_pass, assemble_manuscript_tex, citation_plan, refbib, citation_map, paper_length_gate]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
-      with:
-        system: "You verify LaTeX/BibTeX citation integrity."
-        task: |
-          Validate citation integrity before LaTeX compilation.
-
-          Requirements (LOAD-BEARING — block compilation if any fails):
-          - REFERENCES_BIB and body citations satisfy the user-requested or
-            derived CITATION_TARGET from paper_preferences when sources allow it
-          - distinct citation keys used/planned in the body match
-            paper_preferences.CITATION_STRATEGY; do not enforce a fixed count
-          - NO citation keys absent from references.bib (citation_map column
-            "INVALID" must be 0)
-          - every cited entry MUST have a verifiable URL or DOI or arXiv
-            eprint field in REFERENCES_BIB; entries with only howpublished
-            text are degraded but acceptable; entries with no URL/DOI/eprint
-            at all are blockers
-          - no Source Quality == WEAK in citation_map for primary claims
-            (introduction headline / method core / results headline);
-            warn but do not block for related-work / motivation context
-          - every major claim has nearby citation support or an explicit caveat
-
-          Citation plan:
-          {{ outputs.citation_plan | truncate(8000) }}
-
-          Bibliography:
-          {{ outputs.refbib | truncate(8000) }}
-
-          Citation audit table (read this — do NOT re-derive):
-          {{ outputs.citation_map | truncate(4000) }}
-
-          Reply with:
-          INTEGRITY: <pass|warn|block>
-          INVALID_COUNT: <int>
-          WEAK_PRIMARY_COUNT: <int>
-          UNUSED_COUNT: <int>
-          BLOCKERS:
-            - <blocker or none>
-          WARNINGS:
-            - <warning or none>
     - id: latex_sanitizer
       label: "LaTeX 清理"
       label_en: "LaTeX cleanup"
-      kind: llm_chat
-      depends_on: [citation_integrity_gate]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract or 'PAPER_MODE: COMPILE_ONLY' in outputs.paper_contract"
+      kind: skill_exec
+      skill: paper-latex-sanitizer
+      depends_on: [paper_contract, final_manuscript_package, consistency_pass, assemble_manuscript_tex]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
       with:
-        system: "You sanitize LaTeX deliverables and reject process text."
-        task: |
-          Sanitize the final LaTeX package contract before compilation. Confirm
-          that process commentary, markdown fences, chat preambles, debug logs,
-          and non-paper text are absent from MANUSCRIPT_TEX and REFERENCES_BIB.
-          Preserve valid LaTeX, CJK text, citations, figure references,
-          placeholder figure/table blocks (\fbox + tabular), and section content.
-          Reply with a concise readiness note and any blocking issue only.
-
-          Citation gate:
-          {{ outputs.citation_integrity_gate | truncate(2000) }}
-    - id: compile_latex
-      label: "编译 LaTeX"
-      label_en: "Compile LaTeX"
-      kind: llm_chat
-      depends_on: [latex_sanitizer]
-      when: "'PAPER_MODE: COMPILE_ONLY' in outputs.paper_contract"
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "user_request": {{ (inputs.user_message | truncate(4000)) | tojson }},
+            "manuscript_package": {{ (outputs.get('consistency_pass') or outputs.get('assemble_manuscript_tex') or outputs.get('final_manuscript_package', '')) | tojson }}
+          }
+    - id: materialize_manuscript
+      label: "固化稿件"
+      label_en: "Materialize manuscript"
+      kind: skill_exec
+      skill: paper-artifact-runtime
+      depends_on: [paper_contract, latex_sanitizer]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
       with:
-        system: "You prepare compile-only handoff notes without invoking LaTeX in this step."
+        payload: |
+          {
+            "operation": "materialize_manuscript",
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "manuscript_package": {{ outputs.latex_sanitizer | tojson }}
+          }
+    - id: paper_length_preflight
+      label: "篇幅预检"
+      label_en: "Length preflight"
+      kind: skill_exec
+      skill: paper-length-gate
+      depends_on: [paper_contract, materialize_manuscript]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+      with:
+        # Report-only makes the target-correlated deficit available to the
+        # bounded authoring repair below. The later paper_length_gate remains
+        # fail-closed and must pass before any compiler is invoked.
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "manuscript_package": {{ outputs.materialize_manuscript | tojson }},
+            "report_only": true
+          }
+    - id: precompile_length_expansion
+      label: "篇幅扩写"
+      label_en: "Pre-compile expansion"
+      kind: llm_chat
+      depends_on: [paper_contract, paper_preferences, outline, materialize_manuscript, paper_length_preflight]
+      when: "'below target-correlated readiness floor' in outputs.paper_length_preflight"
+      with:
+        system: "You author one substantive, evidence-safe LaTeX expansion fragment for an undersized academic manuscript."
         task: |
-          Produce a concise compile handoff note. COMPILE_ONLY is for
-          assessing an existing LaTeX manuscript. The full manuscript and
-          compact skeleton paths compile a PDF via compile_pdf after quality
-          gates pass.
+          The deterministic preflight found that this manuscript is too small
+          for its requested compiled-page contract. Produce one body-only
+          expansion that closes the reported content-unit deficit with a 15%
+          safety margin. This is the first of at most two bounded repair
+          attempts; make it substantive enough to pass now.
 
-          Sanitizer result:
-          {{ outputs.latex_sanitizer | truncate(2000) }}
+          Paper contract:
+          {{ outputs.paper_contract | truncate(1200) }}
 
-          Reply exactly:
-          COMPILE_READY: <yes|blocked>
-          NEXT_STEP: provide or select an existing manuscript package to compile
-          BLOCKERS:
-            - <blocker or none>
+          Preferences:
+          {{ outputs.paper_preferences | truncate(2000) }}
+
+          Outline:
+          {{ outputs.outline | truncate(3500) }}
+
+          Deterministic deficit report (authoritative):
+          {{ outputs.paper_length_preflight | truncate(2000) }}
+
+          Existing sanitized source excerpt (compact packages are inline;
+          full manuscripts may provide only an artifact manifest):
+          {{ outputs.latex_sanitizer | truncate(12000) }}
+
+          Run-owned artifact manifest:
+          {{ outputs.materialize_manuscript | truncate(2000) }}
+
+          Rules:
+          - Write only new subsection-level prose that deepens method
+            rationale, evaluation design, limitations, boundary conditions,
+            and reproducibility. Do not repeat paragraphs or pad formatting.
+          - Do not emit \documentclass, \begin{document}, \end{document},
+            \section, \bibliography, \input, \include, \includegraphics,
+            \usepackage, or any \cite command. Existing citations and document
+            boundaries are locked.
+          - Preserve EVIDENCE_STATUS. If evidence is not_supplied, use
+            planned/future tense, keep outcomes TBD, and invent no results,
+            measurements, sources, or citations.
+          - Match the manuscript language. Use ASCII/LaTeX-safe punctuation
+            and named math macros rather than literal Unicode Greek.
+          - Emit at least the missing MINIMUM_CONTENT_UNITS minus
+            ESTIMATED_CONTENT_UNITS, plus 15%. Cap the fragment at 3,000
+            English words or 5,000 CJK characters; if the requested target
+            cannot be repaired within that bound, still use the full budget
+            and let the strict gate fail honestly.
+
+          Return exactly:
+          % BEGIN_LENGTH_EXPANSION
+          \subsection{Target-Length Elaboration}
+          <substantive LaTeX body only>
+          % END_LENGTH_EXPANSION
+    - id: apply_precompile_length_expansion
+      label: "应用篇幅扩写"
+      label_en: "Apply pre-compile expansion"
+      kind: skill_exec
+      skill: paper-artifact-runtime
+      depends_on: [paper_contract, materialize_manuscript, paper_length_preflight, precompile_length_expansion]
+      when: "'below target-correlated readiness floor' in outputs.paper_length_preflight"
+      with:
+        payload: |
+          {
+            "operation": "apply_length_expansion",
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "repair_id": "precompile",
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "manuscript_package": {{ outputs.materialize_manuscript | tojson }},
+            "expansion": {{ outputs.precompile_length_expansion | tojson }}
+          }
+    - id: length_repair_sanitizer
+      label: "扩写清理"
+      label_en: "Expansion cleanup"
+      kind: skill_exec
+      skill: paper-latex-sanitizer
+      depends_on: [paper_contract, materialize_manuscript, apply_precompile_length_expansion]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+      with:
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "user_request": {{ (inputs.user_message | truncate(4000)) | tojson }},
+            "manuscript_package": {{ (outputs.get('apply_precompile_length_expansion') or outputs.materialize_manuscript) | tojson }}
+          }
+    - id: citation_map
+      label: "引用映射"
+      label_en: "Citation mapping"
+      kind: skill_exec
+      skill: paper-artifact-runtime
+      depends_on: [length_repair_sanitizer, refbib]
+      with:
+        # Deterministically parse citations from artifact files instead of
+        # sending the full manuscript back through an LLM.
+        payload: |
+          {
+            "operation": "citation_map",
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "manifest": {{ outputs.length_repair_sanitizer | tojson }},
+            "refbib": {{ outputs.refbib | tojson }}
+          }
+    - id: paper_length_gate
+      label: "篇幅门禁"
+      label_en: "Length gate"
+      kind: skill_exec
+      skill: paper-length-gate
+      depends_on: [paper_contract, length_repair_sanitizer]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+      with:
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "manuscript_package": {{ outputs.length_repair_sanitizer | tojson }}
+          }
+    - id: citation_integrity_gate
+      label: "引用门禁"
+      label_en: "Citation gate"
+      kind: skill_exec
+      skill: paper-citation-integrity-gate
+      depends_on: [paper_contract, paper_preferences, citation_map, paper_length_gate]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+      with:
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "paper_preferences": {{ outputs.paper_preferences | tojson }},
+            "citation_map": {{ outputs.citation_map | tojson }}
+          }
+    - id: publication_quality_gate
+      label: "发布质量门禁"
+      label_en: "Publication quality gate"
+      kind: skill_exec
+      skill: paper-quality-gate
+      depends_on: [paper_contract, length_repair_sanitizer, paper_length_gate, citation_integrity_gate]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+      with:
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "length_gate": {{ outputs.paper_length_gate | tojson }},
+            "citation_gate": {{ outputs.citation_integrity_gate | tojson }},
+            "manuscript_package": {{ outputs.length_repair_sanitizer | tojson }}
+          }
+    - id: compile_probe
+      label: "编译页数探测"
+      label_en: "Compile page probe"
+      kind: skill_exec
+      skill: paper-artifact-runtime
+      depends_on: [length_repair_sanitizer, publication_quality_gate]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+      with:
+        # This is a real compile. A short PDF is retained only as an internal
+        # probe and can never reach publish_pdf. It gives the one bounded
+        # page-shortfall repair an authoritative pypdf count.
+        payload: |
+          {
+            "operation": "compile_pdf",
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "manuscript_package": {{ outputs.length_repair_sanitizer | tojson }},
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "enforce_page_target": false,
+            "reuse_existing": false
+          }
+    - id: page_shortfall_expansion
+      label: "页数修复扩写"
+      label_en: "Page shortfall expansion"
+      kind: llm_chat
+      depends_on: [paper_contract, paper_preferences, outline, length_repair_sanitizer, compile_probe]
+      when: "'PDF_PAGE_TARGET_NOT_MET:' in outputs.compile_probe"
+      with:
+        system: "You repair one measured PDF page shortfall with substantive, evidence-safe LaTeX prose."
+        task: |
+          The real XeLaTeX+pypdf probe is shorter than TARGET_PAGES. This is
+          the final automatic repair attempt. Add enough substantive body
+          content for the measured missing pages plus one-quarter-page safety
+          margin: about 650 English words or 1,050 CJK characters per missing
+          page. Do not fake page count with spacing, blank pages, repeated
+          prose, oversized headings, or forced page breaks.
+
+          Paper contract:
+          {{ outputs.paper_contract | truncate(1200) }}
+          Compile probe (authoritative actual/target pages):
+          {{ outputs.compile_probe | truncate(1200) }}
+          Preferences:
+          {{ outputs.paper_preferences | truncate(1800) }}
+          Outline:
+          {{ outputs.outline | truncate(3000) }}
+          Existing compact package or full-manuscript writing plan (context
+          only; never reproduce it verbatim):
+          {{ (outputs.get('final_manuscript_package') or outputs.get('writing_plan', '')) | truncate(12000) }}
+
+          Rules:
+          - Write only new subsection-level method rationale, evaluation
+            protocol, robustness analysis plan, limitations, and
+            reproducibility detail. Do not repeat existing paragraphs.
+          - Do not emit \documentclass, \begin{document}, \end{document},
+            \section, \bibliography, \input, \include, \includegraphics,
+            \usepackage, \cite, or forced page/spacing commands.
+          - Preserve EVIDENCE_STATUS; when evidence is not_supplied, never
+            invent measurements, findings, sources, or completed experiments.
+          - Match the manuscript language. Cap this final fragment at 2,600
+            English words or 4,500 CJK characters. The final strict compile
+            must fail honestly if this bounded substantive repair is not enough.
+
+          Return exactly:
+          % BEGIN_LENGTH_EXPANSION
+          \subsection{Measured Page-Target Elaboration}
+          <substantive LaTeX body only>
+          % END_LENGTH_EXPANSION
+    - id: apply_page_shortfall_expansion
+      label: "应用页数修复"
+      label_en: "Apply page repair"
+      kind: skill_exec
+      skill: paper-artifact-runtime
+      depends_on: [paper_contract, length_repair_sanitizer, compile_probe, page_shortfall_expansion]
+      when: "'PDF_PAGE_TARGET_NOT_MET:' in outputs.compile_probe"
+      with:
+        payload: |
+          {
+            "operation": "apply_length_expansion",
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "repair_id": "page-shortfall",
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "manuscript_package": {{ outputs.length_repair_sanitizer | tojson }},
+            "expansion": {{ outputs.page_shortfall_expansion | tojson }}
+          }
+    - id: final_latex_sanitizer
+      label: "终稿 LaTeX 清理"
+      label_en: "Final LaTeX cleanup"
+      kind: skill_exec
+      skill: paper-latex-sanitizer
+      depends_on: [paper_contract, length_repair_sanitizer, apply_page_shortfall_expansion]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+      with:
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "user_request": {{ (inputs.user_message | truncate(4000)) | tojson }},
+            "manuscript_package": {{ (outputs.get('apply_page_shortfall_expansion') or outputs.length_repair_sanitizer) | tojson }}
+          }
+    - id: final_page_length_gate
+      label: "终稿篇幅门禁"
+      label_en: "Final length gate"
+      kind: skill_exec
+      skill: paper-length-gate
+      depends_on: [paper_contract, final_latex_sanitizer]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+      with:
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "manuscript_package": {{ outputs.final_latex_sanitizer | tojson }}
+          }
+    - id: final_publication_quality_gate
+      label: "终稿质量门禁"
+      label_en: "Final quality gate"
+      kind: skill_exec
+      skill: paper-quality-gate
+      depends_on: [paper_contract, final_latex_sanitizer, final_page_length_gate, citation_integrity_gate]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+      with:
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "length_gate": {{ outputs.final_page_length_gate | tojson }},
+            "citation_gate": {{ outputs.citation_integrity_gate | tojson }},
+            "manuscript_package": {{ outputs.final_latex_sanitizer | tojson }}
+          }
     - id: compile_pdf
       label: "编译 PDF"
       label_en: "Compile PDF"
-      kind: tool_call
-      tool: exec_command
-      tool_allowlist: [exec_command]
-      depends_on: [latex_sanitizer, consistency_pass, assemble_manuscript_tex, final_manuscript_package]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
-      tool_args:
-        # Runs the actual xelatex × bibtex × xelatex × 2 cycle so the
-        # user gets a real PDF, not just LaTeX source. Extracts
-        # MANUSCRIPT_TEX / REFERENCES_BIB from the consistency/assembly/final
-        # package contract (passed via env var to dodge shell-escape hell).
-        command: |
-          python3 - <<'PY'
-          import os, re, subprocess, sys
-          from pathlib import Path
-
-          pkg = os.environ.get('MANUSCRIPT_PKG', '')
-
-          # 1. Try MANUSCRIPT_TEX: / REFERENCES_BIB: contract markers first.
-          m = re.search(r'MANUSCRIPT_TEX:\s*(.+?)(?:REFERENCES_BIB:|COMPILE_NOTES:|\Z)', pkg, re.DOTALL)
-          tex_body = m.group(1).strip() if m else ''
-          mb = re.search(r'REFERENCES_BIB:\s*(.+?)(?:COMPILE_NOTES:|\Z)', pkg, re.DOTALL)
-          bib = mb.group(1).strip() if mb else ''
-
-          # 2. Fallback A: maybe LLM wrapped LaTeX in ```latex fences without the marker.
-          if not tex_body:
-              fenced = re.search(r'```(?:latex|tex)?\s*(\\documentclass[\s\S]+?\\end\{document\})', pkg)
-              if fenced:
-                  tex_body = fenced.group(1).strip()
-
-          # 3. Fallback B: maybe there's a raw \documentclass…\end{document} block.
-          if not tex_body:
-              raw = re.search(r'(\\documentclass[\s\S]+?\\end\{document\})', pkg)
-              if raw:
-                  tex_body = raw.group(1).strip()
-
-          # 4. Fallback C: artifact-only FULL_MANUSCRIPT path. Read the
-          # persisted manuscript and bibliography from disk instead of
-          # requiring the full document to be present in the meta context.
-          manifest_tex_path = None
-          manifest_bib_path = None
-          if not tex_body:
-              pm = re.search(r'MANUSCRIPT_PATH:\s*(.+)', pkg)
-              bm = re.search(r'REFERENCES_PATH:\s*(.+)', pkg)
-              if pm:
-                  manifest_tex_path = Path(pm.group(1).strip())
-                  if manifest_tex_path.is_file():
-                      tex_body = manifest_tex_path.read_text(encoding='utf-8')
-              if bm:
-                  manifest_bib_path = Path(bm.group(1).strip())
-                  if manifest_bib_path.is_file():
-                      bib = manifest_bib_path.read_text(encoding='utf-8')
-
-          # 5. Strip any leftover markdown fences from extracted bodies.
-          tex_body = re.sub(r'^```(?:latex|tex)?\s*\n', '', tex_body)
-          tex_body = re.sub(r'\n```\s*$', '', tex_body)
-
-          def scrub_placeholder_table_cells(tex):
-              """Scrub numeric-looking data cells from placeholder tables."""
-              numeric = re.compile(
-                  r'^\s*(?:\\textbf\{)?[-+]?\d[\d,]*(?:\.\d+)?\s*(?:%|ms|s|x|MB|GB|points?)?(?:\})?\s*$',
-                  re.I,
-              )
-              out = []
-              in_tabular = False
-              after_midrule = False
-              for line in tex.splitlines():
-                  if r'\begin{tabular}' in line:
-                      in_tabular = True
-                      after_midrule = False
-                      out.append(line)
-                      continue
-                  if in_tabular and r'\end{tabular}' in line:
-                      in_tabular = False
-                      after_midrule = False
-                      out.append(line)
-                      continue
-                  if in_tabular and r'\midrule' in line:
-                      after_midrule = True
-                      out.append(line)
-                      continue
-                  if in_tabular and after_midrule and '&' in line and r'\bottomrule' not in line:
-                      suffix = r' \\' if line.rstrip().endswith(r'\\') else ''
-                      row = line.rstrip()
-                      if suffix:
-                          row = row[:-2].rstrip()
-                      cells = [cell.strip() for cell in row.split('&')]
-                      if len(cells) > 1:
-                          cells = [cells[0], *('---' if numeric.match(cell) else cell for cell in cells[1:])]
-                          indent = re.match(r'^\s*', line).group(0)
-                          line = indent + ' & '.join(cells) + suffix
-                  out.append(line)
-              return '\n'.join(out)
-
-          # 6. If still empty, fail loudly. Quality-first paper generation
-          # must not disguise a missing manuscript as a degraded PDF.
-          if not tex_body:
-              print('COMPILE_FAILED: MANUSCRIPT_TEX block missing; refusing to create degraded PDF')
-              print('PACKAGE_PREVIEW:')
-              print(pkg[:2000])
-              sys.exit(1)
-
-          # 7. Auto-wrap if the LLM gave a body fragment but no \documentclass.
-          if '\\documentclass' not in tex_body:
-              tex_body = (
-                  r"\documentclass{article}" "\n"
-                  r"\usepackage{xeCJK}" "\n"
-                  r"\usepackage{graphicx}\usepackage{booktabs}\usepackage{amsmath}\usepackage{hyperref}" "\n"
-                  r"\begin{document}" "\n"
-                  + tex_body + "\n"
-                  r"\bibliographystyle{plain}" "\n"
-                  r"\bibliography{references}" "\n"
-                  r"\end{document}" "\n"
-              )
-
-          # 8. Auto-add xeCJK if the body contains CJK chars but doesn't load it.
-          if re.search(r'[一-鿿]', tex_body) and 'xeCJK' not in tex_body:
-              tex_body = tex_body.replace(
-                  r'\documentclass{article}',
-                  r'\documentclass{article}' + '\n' + r'\usepackage{xeCJK}',
-                  1,
-              )
-
-          tex_body = scrub_placeholder_table_cells(tex_body)
-
-          paper = Path('paper'); paper.mkdir(exist_ok=True)
-          (paper / 'paper.tex').write_text(tex_body, encoding='utf-8')
-          (paper / 'references.bib').write_text(bib, encoding='utf-8')
-
-          logs = []
-          for cmd in (
-              ['xelatex','-interaction=nonstopmode','paper.tex'],
-              ['bibtex','paper'],
-              ['xelatex','-interaction=nonstopmode','paper.tex'],
-              ['xelatex','-interaction=nonstopmode','paper.tex'],
-          ):
-              r = subprocess.run(cmd, cwd='paper', capture_output=True, text=True)
-              logs.append(f"--- {' '.join(cmd)} (rc={r.returncode}) ---")
-
-          pdf = (paper / 'paper.pdf').resolve()
-          if pdf.is_file():
-              log_text = (paper / 'paper.log').read_text(encoding='utf-8', errors='ignore') if (paper / 'paper.log').is_file() else ''
-              pm = re.search(r'Output written on .+?\((\d+) pages?', log_text)
-              pages = pm.group(1) if pm else '?'
-              print(f'PDF_PATH: {pdf}')
-              print(f'PDF_PAGES: {pages}')
-              print(f'PDF_BYTES: {pdf.stat().st_size}')
-              print(f'TEX_BYTES: {(paper / "paper.tex").stat().st_size}')
-              print(f'BIB_BYTES: {(paper / "references.bib").stat().st_size}')
-          else:
-              tail = '\n'.join(logs[-3:])
-              # Dump the last 80 lines of paper.log so the failure mode is visible.
-              log_text = (paper / 'paper.log').read_text(encoding='utf-8', errors='ignore') if (paper / 'paper.log').is_file() else ''
-              log_tail = '\n'.join(log_text.splitlines()[-80:])
-              print(f'COMPILE_FAILED:\n{tail}\n\n=== paper.log tail ===\n{log_tail}')
-              sys.exit(1)
-          PY
-        workdir: "{{ inputs.workspace_dir }}"
-        timeout: 120
-        env:
-          MANUSCRIPT_PKG: "{{ outputs.get('consistency_pass') or outputs.get('assemble_manuscript_tex') or outputs.get('final_manuscript_package', '') }}"
+      kind: skill_exec
+      skill: paper-artifact-runtime
+      depends_on: [final_latex_sanitizer, final_publication_quality_gate, compile_probe]
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
+      with:
+        # Reuses the probe only when its exact TeX/Bib inputs already met the
+        # target. A repaired manuscript differs and therefore receives exactly
+        # one second real xelatex/bibtex compile before fail-closed page checks.
+        payload: |
+          {
+            "operation": "compile_pdf",
+            "meta_run_id": {{ inputs.meta_run_id | tojson }},
+            "manuscript_package": {{ outputs.final_latex_sanitizer | tojson }},
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "enforce_page_target": true,
+            "reuse_existing": true
+          }
     - id: publish_pdf
       label: "发布 PDF"
       label_en: "Publish PDF"
@@ -1915,72 +1937,26 @@ composition:
       tool: publish_artifact
       tool_allowlist: [publish_artifact]
       depends_on: [compile_pdf]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
       tool_args:
-        path: "paper/paper.pdf"
+        path: "paper/{{ inputs.meta_run_id }}/paper.pdf"
         name: "paper.pdf"
         mime: "application/pdf"
     - id: deliver_paper
       label: "论文交付"
       label_en: "Paper delivery"
-      kind: llm_chat
+      kind: skill_exec
+      skill: paper-delivery-summary
       depends_on: [final_manuscript_package, compile_pdf, publish_pdf, citation_map]
-      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract or 'PAPER_MODE: REPAIR_EXISTING' in outputs.paper_contract"
+      when: "'PAPER_MODE: FULL_MANUSCRIPT' in outputs.paper_contract or 'PAPER_MODE: COMPACT_SKELETON' in outputs.paper_contract"
       with:
-        system: "You write a one-paragraph delivery note for a compiled academic paper. Output is concise — no LaTeX source, no markdown fences. Obey USER_LANGUAGE strictly: en means English only; zh means Chinese only."
-        task: |
-          Produce the user-facing delivery message. Confirm the PDF
-          is ready, name its location, page count, citation summary,
-          and list any open warnings from the citation audit. Keep
-          the message under 200 words.
-
-          USER_LANGUAGE: {{ inputs.get('user_language', 'zh' if (inputs.user_message | contains_cjk) else 'en') }}
-
-          Language rules:
-          - If USER_LANGUAGE is en, write English only. Do not include Chinese
-            headings, labels, warnings, or bilingual labels.
-          - If USER_LANGUAGE is zh, write Chinese only. Do not include English
-            headings except literal file paths, artifact IDs, and citation keys.
-          - Do not copy warning prose from intermediate audit text; translate
-            any warning into the selected USER_LANGUAGE.
-
-          Original request:
-          {{ inputs.user_message | xml_escape | truncate(400) }}
-
-          PDF compile result (paths are absolute):
-          {{ outputs.compile_pdf | truncate(800) }}
-
-          Artifact publication result:
-          {{ outputs.publish_pdf | truncate(800) }}
-
-          Citation audit summary tail:
-          {{ outputs.citation_map | truncate(2000) }}
-
-          {% if inputs.get('user_language') == 'zh' or (inputs.user_message | contains_cjk) %}
-          Format:
-          📄 论文已生成
-
-          - PDF: <absolute path or artifact id>
-          - 页数: <N>
-          - 引用: <total / strong / weak / invalid / unused>
-          - 备注: <one line about figures, tables, analysis dimensions>
-
-          If the audit shows INVALID > 0, prefix the message with
-          "⚠️ 注意: <N> 处引用未在 bib 中，建议重新生成" and list the offending
-          cite keys.
-          {% else %}
-          Format:
-          📄 Paper compiled
-
-          - PDF: <absolute path or artifact id>
-          - Pages: <N>
-          - Citations: <total / strong / weak / invalid / unused>
-          - Notes: <one line about figures, tables, analysis dimensions>
-
-          If the audit shows INVALID > 0, prefix the message with
-          "⚠️ Warning: <N> citation keys are missing from references.bib; regenerate
-          or repair the bibliography" and list the offending cite keys.
-          {% endif %}
+        payload: |
+          {
+            "paper_contract": {{ outputs.paper_contract | tojson }},
+            "language_instruction": {{ inputs.get('language_instruction', '') | tojson }},
+            "compile_pdf": {{ outputs.compile_pdf | tojson }},
+            "citation_map": {{ outputs.citation_map | tojson }}
+          }
 ---
 
 # meta-paper-write (Meta-Skill)
@@ -1998,50 +1974,63 @@ DAG (in order):
    requests complete inline.
 2. **`paper_preferences`** — expand the collected facts into a planning
    contract.
-3. **`search_papers`** — `multi-search-engine` query biased toward arXiv
-   / ACL Anthology / ACM DL / OpenReview / IEEE / Nature / Science so
-   the returned URLs translate into real bibliographic identifiers.
+3. **`search_papers`** — sends a clean academic query to Crossref, Brave,
+   and Tavily; backend-specific academic filtering stays with each engine.
 4. **`refbib`** — `paper-refbib-stub` now extracts ``eprint``/``doi``
    from arXiv/DOI URLs and tags each entry with ``note = {source: <domain>}``
    so downstream gates can classify provenance without re-fetching.
-5. **`source_pack`** — curate references and enforce ≥20-source coverage.
-6. **`experiment_design`** — **decides** how many figures and tables the
+5. **`source_pack`** — curates unique, relevant, verifiable references and
+   emits a machine-readable usable count against the integer citation target.
+6. **`source_readiness_gate`** — deterministically blocks before experiment
+   design or drafting when the curated primary references cannot meet the
+   target, reporting a concrete found/required count.
+7. **`experiment_design`** — **decides** how many figures and tables the
    paper needs based on RQs, hypotheses, analysis dimensions, and the
    target page budget. Every figure/table is tied to an RQ or analysis
    dimension; no decorative artefacts.
-7. **`figure_placeholders`** — render LaTeX ``\fbox{\parbox{...}}``
+8. **`figure_placeholders`** — render LaTeX ``\fbox{\parbox{...}}``
    placeholder figure environments for each entry in FIGURE_PLAN. Zero
    matplotlib dependency.
-8. **`table_placeholders`** — render LaTeX ``\begin{tabular}`` placeholder
+9. **`table_placeholders`** — render LaTeX ``\begin{tabular}`` placeholder
    tables for each entry in TABLE_PLAN. Cells contain ``---``/``<TBD>``;
    no fabricated numbers.
-9. **`analysis_outline`** — bind every figure/table id to a Discussion
+10. **`analysis_outline`** — bind every figure/table id to a Discussion
    subsection that names potential findings + threats to validity, and
    covers every ANALYSIS_DIMENSION.
-10. **`outline`** — paper outline that ties Method to experiment design
+11. **`outline`** — paper outline that ties Method to experiment design
     and Results to the figure/table plan.
-11. **`citation_plan`** — assigns concrete cite keys from `refbib` to
+12. **`citation_plan`** — assigns concrete cite keys from `refbib` to
     claims; cannot invent keys.
-12. **`writing_plan` + section authors** — the explicit FULL_MANUSCRIPT path
+13. **`writing_plan` + section authors** — the explicit FULL_MANUSCRIPT path
     converts the user's page target into section-level `target_words` and
     citation budgets before prose is written; section authors obey that plan.
-13. **`final_manuscript_package`** — compact / repair modes produce
-    MANUSCRIPT_TEX with the figure/table/analysis blocks inlined verbatim,
-    plus REFERENCES_BIB containing only the entries actually cited.
-14. **`citation_map`** — strict markdown audit table:
+14. **`final_manuscript_package`** — the lower-latency compact path still
+    writes a complete, target-sized MANUSCRIPT_TEX with the
+    figure/table/analysis blocks inlined verbatim, plus REFERENCES_BIB
+    containing only the entries actually cited.
+15. **Sanitize, materialize, and preflight** — persist the manuscript under
+    the runtime-owned run directory, then compare language-aware content units
+    with TARGET_PAGES. An undersized draft receives one bounded substantive
+    expansion; a strict second gate must pass before compilation.
+16. **`citation_map`** — strict markdown audit table:
     ``Cite Key | Cited Times | Title | URL/DOI/arXiv | Source Quality``
     with INVALID / UNUSED / WEAK detection. Inlined into the final
     deliverable AND queryable per-run via
     ``opensquilla skills meta runs show``.
-15. **`citation_integrity_gate`** — reads `citation_map` directly; blocks
-    when INVALID > 0 or any primary claim cites a WEAK source.
-16. **`latex_sanitizer`** — strips process text without rewriting the
-    paper.
-17. **`compile_pdf` / `publish_pdf` / `deliver_paper`** — compile and
-    publish the final PDF for FULL_MANUSCRIPT, COMPACT_SKELETON, and
-    REPAIR_EXISTING. The compiler refuses to create degraded PDFs when
-    MANUSCRIPT_TEX is missing.
-18. **`compile_latex`** — handoff note (COMPILE_ONLY mode).
+17. **Citation and publication gates** — deterministically read the numeric
+    `citation_map SUMMARY`; blocks when cited keys are below `CITATION_TARGET`,
+    INVALID > 0, a cited source is WEAK, or the sanitized artifact violates
+    publication rules. They never trust an LLM verdict or a fixed citation
+    count.
+18. **Compile probe and bounded page repair** — run the real
+    XeLaTeX/BibTeX cycle and count pages with `pypdf`. A measured shortfall gets
+    one final substantive expansion and one recompile. The runtime permits only
+    the fixed `precompile` and `page-shortfall` repair ids and rejects citation,
+    document-boundary, external-input, forced-page, and spacing commands.
+19. **Final gates / `compile_pdf` / publish / delivery** — re-run sanitizer,
+    length, and publication checks. An unchanged successful probe is reused by
+    input fingerprint; a changed manuscript is recompiled once and must meet
+    TARGET_PAGES before `publish_artifact` can run.
 
 Removed from the previous version:
 

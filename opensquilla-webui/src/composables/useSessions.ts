@@ -1,7 +1,14 @@
 import { ref, computed } from 'vue'
 import i18n from '@/i18n'
+import {
+  waitForSessionRpcConnection,
+} from '@/composables/chat/sessionBootstrapAdmission'
 import { useRpcStore } from '@/stores/rpc'
+import type { RpcCallOptions } from '@/lib/rpc'
 import type { RawSessionItem, RawSessionListEntry, SessionsListResponse } from '@/types/rpc'
+import type { ProjectWorkspaceItem } from '@/types/rpc'
+import { normalizeTurnOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
+import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 
 export const SESSION_LIST_VIEW = 'session-list-v1'
 
@@ -13,6 +20,7 @@ export interface SessionItem {
   subtitle: string
   groupLabel: string
   workspace?: string
+  workspaceId?: string
   workspaceLabel?: string
   workspaceDisplayPath?: string
   effectiveAgentId: string
@@ -28,6 +36,8 @@ export interface SessionItem {
   messageCount: number | null
   updatedAt: number
   interactive: boolean
+  /** Client-only draft that has not been materialized by its first send yet. */
+  provisional?: boolean
   /** True when this session was forked from its parent's transcript. */
   forkedFromParent: boolean
   contractGaps: string[]
@@ -81,9 +91,14 @@ function stoppedTaskDurationSeconds(row: RawSessionItem | undefined): number | n
 export function runStatusLabelText(status: string, row?: RawSessionItem): string {
   const t = i18n.global.t
   if (status === 'cancelled' || status === 'interrupted') {
+    const task = row?.last_task || row?.lastTask || null
+    const presentation = normalizeTurnOutcome(task)
+      ? turnOutcomePresentation(normalizeTurnOutcome(task))
+      : status === 'cancelled' ? 'stopped' : 'interrupted'
+    if (presentation === 'interrupted') return t('sessions.status.interrupted')
     const seconds = stoppedTaskDurationSeconds(row)
     if (seconds != null) return t('sessions.status.stoppedAfterSeconds', { seconds })
-    return t('sessions.status.outputInterrupted')
+    return t('sessions.status.cancelled')
   }
   const keys: Record<string, string> = {
     queued: 'sessions.status.queued',
@@ -279,10 +294,17 @@ export function normalizeSessionItem(item: unknown): SessionItem | null {
   const surface = deriveSurface(raw, key, sessionKind)
   const groupLabel = deriveGroupLabel(raw, key, sessionKind, derivedAgentId)
   const workspace = textValue(raw.workspace)
+  const workspaceId = textValue(raw.workspaceId) || textValue(raw.workspace_id)
   const workspaceLabel = textValue(raw.workspaceLabel)
   const workspaceDisplayPath = textValue(raw.workspaceDisplayPath)
   let title = normalizeRequiredString(raw, 'title', fallbackSessionTitle(raw, key, sessionKind), gaps)
-  if (sessionKind === 'task' && /^you are a subagent\b/i.test(title)) title = i18n.global.t('sessions.fallbackTitle.task')
+  if (
+    sessionKind === 'task'
+    && (
+      /^you are a subagent\b/i.test(title)
+      || title.trim().toLowerCase() === 'subagent task'
+    )
+  ) title = i18n.global.t('sessions.fallbackTitle.task')
   const subtitle = hasOwn(raw, 'subtitle') ? textValue(raw.subtitle) : ''
   if (!hasOwn(raw, 'subtitle')) gaps.push('subtitle')
   const effectiveAgentId = normalizeEffectiveAgentId(raw, gaps, derivedAgentId)
@@ -304,6 +326,7 @@ export function normalizeSessionItem(item: unknown): SessionItem | null {
     subtitle,
     groupLabel,
     workspace: workspace || undefined,
+    workspaceId: workspaceId || undefined,
     workspaceLabel: workspaceLabel || undefined,
     workspaceDisplayPath: workspaceDisplayPath || undefined,
     effectiveAgentId,
@@ -330,10 +353,15 @@ function parentField(item: SessionItem): Record<string, unknown> | null {
   return parent && typeof parent === 'object' ? parent as Record<string, unknown> : null
 }
 
-/** Parent session key for subagent rows, when the contract carries one. */
+/** Parent session key carried by the session contract. */
 export function sessionParentKey(item: SessionItem): string {
   const key = parentField(item)?.key
   return typeof key === 'string' ? key.trim() : ''
+}
+
+/** Only spawned subagent tasks form a visual hierarchy in the sidebar. */
+function isSubagentSession(item: SessionItem): boolean {
+  return item.sessionKind === 'task' || item.surface === 'subagent'
 }
 
 /** Spawn depth from the session contract; 0 when the row is not a subagent. */
@@ -367,7 +395,7 @@ export function arrangeSessionLedger(items: SessionItem[]): SessionLedgerEntry[]
   const roots: SessionItem[] = []
   for (const item of items) {
     const parentKey = sessionParentKey(item)
-    if (parentKey && parentKey !== item.key && byKey.has(parentKey)) {
+    if (isSubagentSession(item) && parentKey && parentKey !== item.key && byKey.has(parentKey)) {
       const list = children.get(parentKey) || []
       list.push(item)
       children.set(parentKey, list)
@@ -386,7 +414,7 @@ export function arrangeSessionLedger(items: SessionItem[]): SessionLedgerEntry[]
     // An orphan subagent (parent not in the visible list) still indents when
     // the contract marks it spawned; its lineage label falls back to the
     // parent title carried on the contract.
-    const orphanDepth = sessionSpawnDepth(root) > 0 ? 1 : 0
+    const orphanDepth = isSubagentSession(root) && sessionSpawnDepth(root) > 0 ? 1 : 0
     visit(root, orphanDepth, orphanDepth > 0 ? sessionParentTitle(root) : '')
   }
   return entries
@@ -397,7 +425,7 @@ export type SidebarSectionFamily = 'chats' | 'channels' | 'automations'
 
 /** A single rendered sidebar row, flattened with its indent depth. */
 export interface SidebarSectionRow {
-  rowKind: 'session' | 'workspace'
+  rowKind: 'session' | 'workspace' | 'workspace-empty'
   key: string
   title: string
   effectiveAgentId: string
@@ -408,11 +436,19 @@ export interface SidebarSectionRow {
   depth: number
   runStatus: string
   runLabel: string
+  taskAttention: SessionTaskAttention
   updatedAt: number
   hasContractGaps: boolean
   workspace?: string
+  workspaceId?: string
   workspaceLabel?: string
   workspaceDisplayPath?: string
+  workspaceTaskCount?: number
+  workspacePinned?: boolean
+  workspaceAvailable?: boolean
+  provisional?: boolean
+  /** Local sidebar preference; never changes the underlying session contract. */
+  pinned?: boolean
 }
 
 /** One collapsible family section with its recency-ordered rows. */
@@ -457,7 +493,12 @@ const SIDEBAR_SECTION_ORDER: SidebarSectionFamily[] = ['chats', 'channels', 'aut
  * spawn-depth fallback). The helper is pure: it returns all three families
  * (callers drop empty ones at render time).
  */
-export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
+export function arrangeSidebarSections(
+  items: SessionItem[],
+  projects?: readonly ProjectWorkspaceItem[],
+  sessionOrder: readonly string[] = [],
+  pinnedSessionKeys: readonly string[] = [],
+): SidebarSection[] {
   const buckets: Record<SidebarSectionFamily, SessionItem[]> = {
     chats: [],
     channels: [],
@@ -471,6 +512,19 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
   }
 
   const byRecency = (a: SessionItem, b: SessionItem) => (b.updatedAt || 0) - (a.updatedAt || 0)
+  const orderIndex = new Map(sessionOrder.map((key, index) => [key, index]))
+  const pinnedKeys = new Set(pinnedSessionKeys)
+  const bySidebarOrder = (a: SessionItem, b: SessionItem) => {
+    const pinnedDifference = Number(pinnedKeys.has(b.key)) - Number(pinnedKeys.has(a.key))
+    if (pinnedDifference !== 0) return pinnedDifference
+    const aIndex = orderIndex.get(a.key)
+    const bIndex = orderIndex.get(b.key)
+    if (aIndex !== undefined && bIndex !== undefined) return aIndex - bIndex
+    // Sessions created after the last manual reorder remain at the top.
+    if (aIndex !== undefined) return 1
+    if (bIndex !== undefined) return -1
+    return byRecency(a, b)
+  }
   const toRow = (item: SessionItem, depth: number): SidebarSectionRow => ({
     rowKind: 'session',
     key: item.key,
@@ -481,11 +535,15 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
     depth,
     runStatus: item.runStatus,
     runLabel: item.runLabel,
+    taskAttention: ['queued', 'running'].includes(item.runStatus) ? 'running' : 'none',
     updatedAt: item.updatedAt || 0,
     hasContractGaps: item.contractGaps.length > 0,
     workspace: item.workspace,
+    workspaceId: item.workspaceId,
     workspaceLabel: item.workspaceLabel,
     workspaceDisplayPath: item.workspaceDisplayPath,
+    provisional: item.provisional,
+    pinned: pinnedKeys.has(item.key),
   })
 
   type WorkspaceBucket = {
@@ -526,13 +584,10 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
       bucket.updatedAt = Math.max(bucket.updatedAt, row.updatedAt || 0)
     }
 
-    const topLevelUpdatedAt = (entry: WorkspaceTopLevel): number => {
-      if (entry.kind === 'row') return entry.row.updatedAt || 0
-      return buckets.get(entry.workspace)?.updatedAt || 0
-    }
-
     return [...topLevel]
-      .sort((a, b) => topLevelUpdatedAt(b) - topLevelUpdatedAt(a) || a.index - b.index)
+      // The ledger is already recency- or manually ordered. Preserve its first
+      // occurrence for both ordinary rows and workspace groups.
+      .sort((a, b) => a.index - b.index)
       .flatMap(entry => {
         if (entry.kind === 'row') return [entry.row]
         const bucket = buckets.get(entry.workspace)
@@ -547,14 +602,83 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
           depth: 0,
           runStatus: 'idle',
           runLabel: '',
+          taskAttention: 'none',
           updatedAt: bucket.updatedAt,
           hasContractGaps: false,
           workspace: entry.workspace,
           workspaceLabel: bucket.title,
           workspaceDisplayPath: bucket.displayPath || entry.workspace,
+          workspaceTaskCount: bucket.rows.filter(row => row.depth === 1).length,
+          workspacePinned: false,
+          workspaceAvailable: true,
         }
         return [header, ...bucket.rows]
       })
+  }
+
+  const arrangePersistedProjectRows = (
+    entries: SessionLedgerEntry[],
+    persistedProjects: readonly ProjectWorkspaceItem[],
+  ): SidebarSectionRow[] => {
+    const rows: SidebarSectionRow[] = []
+    for (const project of persistedProjects) {
+      const projectEntries = entries.filter(entry => entry.item.workspaceId === project.id)
+      rows.push({
+        rowKind: 'workspace',
+        key: `workspace:${project.id}`,
+        title: project.name,
+        effectiveAgentId: '',
+        agentName: '',
+        sessionKind: 'workspace',
+        depth: 0,
+        runStatus: 'idle',
+        runLabel: '',
+        taskAttention: 'none',
+        updatedAt: 0,
+        hasContractGaps: false,
+        workspace: project.path,
+        workspaceId: project.id,
+        workspaceLabel: project.name,
+        workspaceDisplayPath: project.path,
+        workspaceTaskCount: project.taskCount
+          + projectEntries.filter(entry => entry.item.provisional).length,
+        workspacePinned: project.pinned,
+        workspaceAvailable: project.available,
+      })
+      if (projectEntries.length === 0) {
+        rows.push({
+          rowKind: 'workspace-empty',
+          key: `workspace:${project.id}:empty`,
+          title: i18n.global.t('workspaces.noTasks'),
+          effectiveAgentId: '',
+          agentName: '',
+          sessionKind: 'workspace-empty',
+          depth: 1,
+          runStatus: 'idle',
+          runLabel: '',
+          taskAttention: 'none',
+          updatedAt: 0,
+          hasContractGaps: false,
+          workspace: project.path,
+          workspaceId: project.id,
+          workspaceLabel: project.name,
+          workspaceDisplayPath: project.path,
+        })
+      } else {
+        rows.push(...projectEntries.map(entry => ({
+          ...toRow(entry.item, Math.min(entry.depth + 1, 4)),
+          workspaceId: project.id,
+        })))
+      }
+    }
+    rows.push(
+      ...entries
+        .filter(entry => !entry.item.workspaceId)
+        .map(entry => toRow(entry.item, entry.depth)),
+    )
+    // Sessions belonging to a removed project remain durable but hidden until
+    // that project is restored to the canonical project list.
+    return rows
   }
 
   return SIDEBAR_SECTION_ORDER.map(family => {
@@ -563,8 +687,10 @@ export function arrangeSidebarSections(items: SessionItem[]): SidebarSection[] {
     if (family === 'chats') {
       // Recency-sort first so the ledger's root ordering follows recency, then
       // flatten parent → child so subagents indent directly beneath their chat.
-      const ledger = arrangeSessionLedger([...bucket].sort(byRecency))
-      rows = arrangeWorkspaceRows(ledger)
+      const ledger = arrangeSessionLedger([...bucket].sort(bySidebarOrder))
+      rows = projects === undefined
+        ? arrangeWorkspaceRows(ledger)
+        : arrangePersistedProjectRows(ledger, projects)
     } else {
       rows = [...bucket].sort(byRecency).map(item => toRow(item, 0))
     }
@@ -614,7 +740,7 @@ export function groupSessions(items: SessionItem[]): SessionGroup[] {
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
 }
 
-export function useSessions() {
+export function useSessions(readCallOptions?: RpcCallOptions) {
   const rpc = useRpcStore()
   const sessionsList = ref<RawSessionListEntry[]>([])
   const sessionListError = ref(false)
@@ -633,8 +759,15 @@ export function useSessions() {
     isLoading.value = true
     sessionListError.value = false
     try {
-      await rpc.waitForConnection()
-      const data = await rpc.call<SessionsListResponse>('sessions.list', { limit: 200, view: SESSION_LIST_VIEW })
+      await waitForSessionRpcConnection(rpc, readCallOptions)
+      const params = { limit: 200, view: SESSION_LIST_VIEW }
+      const data = readCallOptions
+        ? await rpc.call<SessionsListResponse>(
+            'sessions.list',
+            params,
+            readCallOptions,
+          )
+        : await rpc.call<SessionsListResponse>('sessions.list', params)
       const raw = data?.sessions || data?.keys || []
       sessionsList.value = raw.filter(s => !!itemKey(s))
     } catch (err: unknown) {

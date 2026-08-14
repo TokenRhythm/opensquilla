@@ -1,6 +1,9 @@
 <template>
-  <div class="ch-stage control-stage">
-    <header v-if="!selectedChannel" class="ch-stage__header control-stage__header">
+  <div class="ch-stage control-stage control-stage--hub-actions">
+    <header
+      v-if="!selectedChannel"
+      class="ch-stage__header control-stage__header control-stage__header--hub-actions"
+    >
       <div class="ch-stage__title-block control-stage__title-block">
         <h1 class="ch-stage__title control-stage__title">{{ t('console.channels.title') }}</h1>
         <p class="ch-stage__subtitle control-stage__subtitle">{{ t('console.channels.subtitle') }}</p>
@@ -147,15 +150,14 @@
         @fix-credentials="enterEdit"
       />
 
-      <!-- Fresh feishu websocket channel: the Feishu console only persists the
-           long-connection event subscription while a client is connected, so
-           the final step happens THERE, after this save. Persistent (not a
-           toast) until the first inbound event proves the subscription works;
-           webhook-mode channels never see it. -->
-      <section v-if="feishuFinalStepVisible" class="ch-alert ch-alert--step" role="status">
+      <!-- A confirmed Feishu websocket with no recorded ingress gets neutral
+           subscription guidance. Zero ingress is not itself proof that the
+           provider console is misconfigured; reconnecting and webhook-mode
+           channels never see this callout. -->
+      <section v-if="feishuSubscriptionGuidanceVisible" class="ch-alert ch-alert--step" role="status">
         <Icon name="info" :size="18" aria-hidden="true" />
         <div>
-          <strong>{{ t('console.channels.detail.finalStepTitle') }}</strong>
+          <strong>{{ t('console.channels.detail.eventSubscriptionTitle') }}</strong>
           <p>{{ t('setup.channels.aids.ws_order_note') }}</p>
         </div>
       </section>
@@ -586,22 +588,20 @@ const selectedChannel = computed(() => channels.value.find(ch => channelKey(ch) 
 const selectedProbe = computed(() =>
   selectedChannel.value ? probeResults.value[channelKey(selectedChannel.value)] : undefined)
 
-// Fresh feishu websocket channel awaiting its console-side final step: the
-// Feishu console only saves the long-connection event subscription while a
-// client is connected, so it must be flipped AFTER the first save. Resolution
-// is ANY inbound row in the delivery ledger — the lifecycle is accepted →
-// processing → completed and completed rows persist, so a channel that ever
-// received an event stays resolved. The mode check reads the LOADED entry
-// only (never the live draft, never a default while config is in flight or
-// failed), so a webhook channel can never see websocket guidance.
-const feishuFinalStepVisible = computed(() => {
+// Neutral subscription guidance for a confirmed Feishu websocket with no
+// ingress yet. Resolution is ANY inbound row in the delivery ledger — the
+// lifecycle is accepted → processing → completed and completed rows persist,
+// so a channel that ever received an event stays resolved. The mode check
+// reads the LOADED entry only (never the live draft or a guessed default), so
+// a webhook or unknown-mode channel can never see websocket guidance.
+const feishuSubscriptionGuidanceVisible = computed(() => {
   const ch = selectedChannel.value
   if (!ch || String(ch.type || '') !== 'feishu') return false
-  if (presentationFor(ch).key !== 'connected') return false
+  if (ch.status !== 'connected' || ch.connected !== true) return false
   if (ingressTotal(ch) > 0) return false
   if (editor.phase.value !== 'active' || editor.loadedName.value !== channelKey(ch)) return false
   const entry = editor.loadedEntry.value
-  return String(entry?.connection_mode || 'websocket') !== 'webhook'
+  return String(entry?.connection_mode || '') === 'websocket'
 })
 
 // Home mode — 'gallery' when nothing is configured yet (the inline platform
@@ -816,7 +816,14 @@ watch(channelsData, data => {
       return facts.pending == null || facts.pending.length !== ch.pendingPairings
     })
     .map(channelKey)
-  if (stale.length > 0) void loadHomeFacts(stale)
+  if (stale.length === 0) return
+  void loadHomeFacts(stale)
+
+  // A drilled-in Members panel owns a separate pairing snapshot. Keep it in
+  // sync with the status-driven home facts when a new request arrives.
+  if (selectedName.value && stale.includes(selectedName.value)) {
+    void members.load(selectedName.value)
+  }
 })
 
 // ---------------------------------------------------------------------------

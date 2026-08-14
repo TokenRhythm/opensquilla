@@ -21,9 +21,12 @@ EXPECTED_HEADERS = {
         "https://tokenrhythm.studio/v1",
         "https://api.tokenrhythm.studio/v1",
         "tokenrhythm.studio/v1",
+        "https://tokenrhythm.example/v1",
+        "https://api.tokenrhythm.example/v1",
+        "https://api-tokenrhythm.example/v1",
     ],
 )
-def test_provider_app_headers_accept_official_hosts(url: str) -> None:
+def test_provider_app_headers_accept_supported_hosts(url: str) -> None:
     assert provider_app_headers(url) == EXPECTED_HEADERS
 
 
@@ -35,10 +38,10 @@ def test_provider_app_headers_accept_official_hosts(url: str) -> None:
         "   ",
         "https://api.openai.com/v1",
         "http://localhost:4000/v1",
-        "https://tokenrhythm.studio.example.com/v1",
-        "https://eviltokenrhythm.studio/v1",
         "https://openrouter.ai.example.com/v1",
         "https://evilopenrouter.ai/v1",
+        "https://example.com/tokenrhythm/v1",
+        "https://example.com/v1?provider=tokenrhythm",
         "https://[tokenrhythm.studio",
         "http://[::1%.openrouter.ai]/v1",
         "http://[::1%25.openrouter.ai]/v1",

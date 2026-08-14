@@ -49,7 +49,9 @@ describe('relativeTime', () => {
     expect(relativeTime(now - 5_000, now)).toBe('just now')
     expect(relativeTime(now - 5 * 60_000, now)).toBe('5m ago')
     expect(relativeTime(now - 2 * 3_600_000, now)).toBe('2h ago')
-    expect(relativeTime(now - 3 * 86_400_000, now)).toBe('3d ago')
+    expect(relativeTime(now - 23 * 3_600_000, now)).toBe('23h ago')
+    expect(relativeTime(now - 86_400_000, now)).toBe('')
+    expect(relativeTime(now - 3 * 86_400_000, now)).toBe('')
   })
 
   it('clamps a future timestamp (clock skew) to "just now"', () => {
@@ -60,6 +62,24 @@ describe('relativeTime', () => {
     // Mirrors the e2e seed: Math.floor(Date.now()/1000) - 120.
     const seedSeconds = Math.floor(now / 1000) - 120
     expect(relativeTime(seedSeconds, now)).toBe('2m ago')
+  })
+
+  it('delegates bucket labels and counts to an injected translator', () => {
+    const calls: Array<[string, Record<string, string | number> | undefined]> = []
+    const t: (key: string, named?: Record<string, string | number>) => string = (key, named) => {
+      calls.push([key, named])
+      return `rendered:${key}`
+    }
+    expect(relativeTime(now - 5_000, now, t)).toBe('rendered:chat.time.justNow')
+    expect(relativeTime(now - 5 * 60_000, now, t)).toBe('rendered:chat.time.minutesAgo')
+    expect(relativeTime(now - 2 * 3_600_000, now, t)).toBe('rendered:chat.time.hoursAgo')
+    expect(relativeTime(now - 86_400_000, now, t)).toBe('')
+    expect(relativeTime(null, now, t)).toBe('')
+    expect(calls).toEqual([
+      ['chat.time.justNow', undefined],
+      ['chat.time.minutesAgo', { n: 5 }],
+      ['chat.time.hoursAgo', { n: 2 }],
+    ])
   })
 })
 
@@ -100,6 +120,10 @@ describe('absoluteTime', () => {
 
   it('produces a non-empty, digit-bearing local label', () => {
     expect(absoluteTime(Date.now())).toMatch(/\d/)
+  })
+
+  it('always includes the full local calendar year', () => {
+    expect(absoluteTime(MS_2026)).toContain(String(new Date(MS_2026).getFullYear()))
   })
 })
 

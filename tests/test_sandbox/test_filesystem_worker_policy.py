@@ -9,7 +9,11 @@ from opensquilla.sandbox.backend.filesystem_worker_policy import (
     build_filesystem_worker_policy,
 )
 from opensquilla.sandbox.operation_runtime import SandboxOperation
-from opensquilla.sandbox.permissions import FileSystemPermissionProfile
+from opensquilla.sandbox.permissions import (
+    FileSystemAccess,
+    FileSystemPermissionEntry,
+    FileSystemPermissionProfile,
+)
 from opensquilla.sandbox.types import (
     MountSpec,
     NetworkMode,
@@ -125,3 +129,47 @@ def test_worker_payload_does_not_serialize_resolved_profile(tmp_path: Path) -> N
     assert "file_system_profile" not in payload
     assert "fileSystemProfile" not in payload
     json.dumps(payload)
+
+
+def test_worker_policy_summary_serializes_only_present_logical_paths(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = tmp_path / "metadata-target"
+    logical = workspace / ".git"
+    profile = FileSystemPermissionProfile(
+        entries=(
+            FileSystemPermissionEntry(workspace, FileSystemAccess.WRITE),
+            FileSystemPermissionEntry(
+                target,
+                FileSystemAccess.READ,
+                logical_path=logical,
+            ),
+        )
+    )
+    operation = SandboxOperation.filesystem(
+        kind="write_text",
+        workspace=workspace,
+        run_mode="trusted",
+        path=workspace / "note.txt",
+        file_system_profile=profile,
+    )
+    policy = build_filesystem_worker_policy(
+        operation,
+        private_rw_roots=(),
+        private_ro_roots=(),
+        env_allowlist=("PATH",),
+        description="summary serialization",
+    )
+
+    file_system = policy.summary()["file_system"]
+
+    assert isinstance(file_system, dict)
+    assert file_system["entries"] == [
+        {"path": str(workspace), "access": "write"},
+        {
+            "path": str(target),
+            "access": "read",
+            "logicalPath": str(logical),
+        },
+    ]

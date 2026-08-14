@@ -246,17 +246,6 @@ async function captureOnboarding(app, path) {
   await writeFile(path, Buffer.from(base64, 'base64'))
 }
 
-async function recoveryPage(app) {
-  return await waitFor(async () => {
-    for (const page of app.windows()) {
-      if (page.isClosed()) continue
-      await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => {})
-      if (await page.locator('#recoveryPanel.visible').count().catch(() => 0)) return page
-    }
-    return null
-  }, 'recovery profile confirmation page')
-}
-
 async function controlPage(app) {
   return await waitFor(async () => {
     for (const page of app.windows()) {
@@ -272,19 +261,14 @@ async function controlPage(app) {
 }
 
 async function selectOllamaAndCompleteOnboarding(page) {
-  if (await page.locator('[data-screen="0"].active').count()) {
-    await page.locator('[data-screen="0"].active .next-button').click()
-  }
   await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
   if (await page.locator('#provider').inputValue() !== 'ollama') {
-    await page.locator('#providerMoreToggle').click()
-    await page.locator('[data-provider="ollama"]').click()
+    await page.locator('#providerSelectToggle').click()
+    await page.locator('[data-provider-option="ollama"]').click()
   }
   if (!(await page.locator('#model').inputValue()).trim()) {
     await page.locator('#model').fill('synthetic-local-model')
   }
-  await page.locator('[data-screen="1"].active .next-button').click()
-  await page.locator('[data-screen="4"].active').waitFor({ state: 'visible' })
   await page.locator('#finish').click()
 }
 
@@ -312,7 +296,8 @@ try {
   const cliOnlySourceBefore = await snapshotTree(cliOnlySource)
   app = await launchDesktop(cliOnlyUserData, cliOnlyHome, 18921)
   let page = await onboardingPage(app)
-  await page.locator('[data-screen="0"].active').waitFor({ state: 'visible' })
+  await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
+  assert.equal(await page.locator('[data-screen="0"]').count(), 0)
   assert.equal(await page.locator('[data-screen="5"]').count(), 0)
   assert.deepEqual(await snapshotTree(cliOnlySource), cliOnlySourceBefore)
   await app.close()
@@ -344,7 +329,8 @@ try {
     const settingsOnlyUserData = join(root, 'portable-settings-only-user-data')
     app = await launchDesktop(settingsOnlyUserData, portableHome, 18925)
     page = await onboardingPage(app)
-    await page.locator('[data-screen="0"].active').waitFor({ state: 'visible' })
+    await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
+    assert.equal(await page.locator('[data-screen="0"]').count(), 0)
     assert.equal(await page.locator('[data-screen="5"]').count(), 0)
     assert.equal(await page.locator('[data-migration-candidate]').count(), 0)
     await selectOllamaAndCompleteOnboarding(page)
@@ -383,7 +369,8 @@ try {
   const targetConfigBefore = await readFile(join(target, 'config.toml'))
   app = await launchDesktop(userData, importHome, 18922)
   page = await onboardingPage(app)
-  await page.locator('[data-screen="0"].active').waitFor({ state: 'visible' })
+  await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
+  assert.equal(await page.locator('[data-screen="0"]').count(), 0)
   assert.equal(await page.locator('[data-screen="5"]').count(), 0)
   if (importScreenshotDir) {
     await page.locator('#onboardingLocale').selectOption('zh-Hans')
@@ -460,11 +447,6 @@ try {
   }, { previewId: settingsPreview.previewId })
 
   const requiredKeyOnboarding = await onboardingPage(app)
-  await requiredKeyOnboarding.locator('[data-screen="0"].active').waitFor({
-    state: 'visible',
-    timeout: 90_000,
-  })
-  await requiredKeyOnboarding.locator('[data-screen="0"].active .next-button').click()
   await requiredKeyOnboarding.locator('[data-screen="1"].active').waitFor({
     state: 'visible',
     timeout: 90_000,
@@ -479,8 +461,6 @@ try {
     /disable_network_observability = true/,
   )
   await requiredKeyOnboarding.locator('#apiKey').fill('synthetic-new-imported-key')
-  await requiredKeyOnboarding.locator('[data-screen="1"].active .next-button').click()
-  await requiredKeyOnboarding.locator('[data-screen="4"].active').waitFor({ state: 'visible' })
   await requiredKeyOnboarding.locator('#finish').click()
 
   const adopted = await waitFor(async () => {
@@ -532,24 +512,6 @@ try {
   await app.close()
   app = null
 
-  // A selected recovery H can use the app, but it cannot import another profile.
-  const recoveryHome = join(root, 'recovery-home')
-  const recoveryUserData = join(root, 'recovery-user-data')
-  const recoveryId = '12345678-1234-4234-8234-123456789abc'
-  await mkdir(join(recoveryUserData, 'recovery-profiles', recoveryId, 'opensquilla'), { recursive: true })
-  await writeFile(join(recoveryUserData, 'desktop-profile-context.json'), JSON.stringify({
-    schema_version: 1,
-    active_profile_kind: 'recovery',
-    active_recovery_id: recoveryId,
-    attention_acknowledgement: null,
-    updated_at: new Date().toISOString(),
-  }, null, 2))
-  app = await launchDesktop(recoveryUserData, recoveryHome, 18923)
-  page = await recoveryPage(app)
-  const rejected = await page.evaluate(() => window.opensquillaDesktop.migrationSummary())
-  assert.equal(rejected.ok, false)
-  assert.match(rejected.raw, /primary profile/i)
-
   console.log(JSON.stringify({
     cliDoesNotTriggerOnboardingTransfer: true,
     windowsPortableSettingsOnlyTested: process.platform === 'win32',
@@ -559,7 +521,7 @@ try {
     settingsRequiredKeyCompleted: true,
     importedConfigPreserved: true,
     previousCredentialBackedUp: true,
-    recoveryProfileRejected: true,
+    primaryOnly: true,
   }, null, 2))
 } finally {
   if (app) await app.close().catch(() => {})

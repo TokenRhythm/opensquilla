@@ -1,8 +1,9 @@
-import { describe, it, expect } from 'vitest'
-import { foldTurn } from './foldTurn'
+import { describe, it, expect, vi } from 'vitest'
+import { foldTurn, TurnAccumulator } from './foldTurn'
 import type { ChatToolCall, ChatToolCallGroup } from '@/types/chat'
 import type { ArtifactPayload } from '@/types/rpc'
 import type { Frame } from '@/types/turnlog'
+import type { InterruptViewState } from '@/types/parts'
 
 // Pure stubs: the reducer's full-result / terminal-state / accumulation
 // invariants are independent of markdown rendering and tool grouping, so the
@@ -58,6 +59,45 @@ describe('foldTurn — tool result preservation', () => {
 })
 
 describe('foldTurn — text, thinking, status, artifacts', () => {
+  it('keeps a resolved approval in its true position between later timeline events', () => {
+    const interruptState = new Map<string, InterruptViewState>([
+      ['approval-1', { resolution: 'approved', busy: false, error: '' }],
+    ])
+    const f = foldTurn([
+      { kind: 'text', seq: 0, text: 'before' },
+      {
+        kind: 'interrupt',
+        seq: 1,
+        interruptKind: 'approval',
+        approvalId: 'approval-1',
+        data: {
+          approvalId: 'approval-1',
+          namespace: 'exec',
+          toolName: 'sandbox elevation',
+          command: 'python -c pass',
+          approvalKind: 'sandbox_elevation',
+          args: null,
+          warning: '',
+          agent: 'main',
+          sessionKey: 'agent:main:web',
+          deadline: 0,
+        },
+        at: 1000,
+      },
+      { kind: 'text', seq: 2, text: 'after' },
+    ], renderMarkdown, toolCallGroups, 'stream', interruptState)
+
+    expect(f.timelineItems.map(item => item.type)).toEqual(['text', 'interrupt', 'text'])
+    expect(f.timelineItems[1]).toMatchObject({
+      type: 'interrupt',
+      part: {
+        interruptKind: 'approval',
+        resolution: 'approved',
+      },
+    })
+    expect(f.parts.map(part => part.type)).toEqual(['text', 'interrupt', 'text'])
+  })
+
   it('accumulates streamed text and lets final-text override it', () => {
     expect(fold([
       { kind: 'text', seq: 0, text: 'Hello ' },
@@ -69,6 +109,21 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
       { kind: 'text', seq: 1, text: 'world' },
       { kind: 'final-text', seq: 2, text: 'Final answer' },
     ]).rawText).toBe('Final answer')
+  })
+
+  it('preserves semantic text boundaries for live answer streaming', () => {
+    const f = fold([
+      { kind: 'tool-start', seq: 0, toolId: 't', name: 'bash', input: '{}', at: 1 },
+      { kind: 'tool-result', seq: 1, toolId: 't', name: 'bash', result: 'ok', isError: false, input: '{}', at: 2 },
+      { kind: 'text', seq: 2, text: 'Checking.', presentation: 'intermediate' },
+      { kind: 'text', seq: 3, text: 'Answer', presentation: 'answer' },
+    ])
+
+    expect(f.timelineItems).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+      expect.objectContaining({ type: 'text', rawText: 'Checking.', presentation: 'intermediate' }),
+      expect.objectContaining({ type: 'text', rawText: 'Answer', presentation: 'answer' }),
+    ])
   })
 
   it('replaces stale text around tools with one canonical terminal segment', () => {
@@ -131,6 +186,48 @@ describe('foldTurn — text, thinking, status, artifacts', () => {
     expect(f.statusHistory[0].at).toBeLessThanOrEqual(f.statusHistory[1].at)
   })
 
+  it('merges maintenance completion into its original compaction row', () => {
+    const f = fold([
+      {
+        kind: 'status',
+        seq: 0,
+        action: 'context_compaction',
+        label: '',
+        at: 1000,
+        id: 'cmp-1',
+        category: 'maintenance',
+        state: 'running',
+        source: 'automatic',
+        durability: 'durable',
+      },
+      {
+        kind: 'status',
+        seq: 1,
+        action: 'context_compaction',
+        label: '',
+        at: 2000,
+        id: 'cmp-1',
+        category: 'maintenance',
+        state: 'completed',
+        source: 'automatic',
+        durability: 'durable',
+        detail: 'Stable context compacted',
+      },
+    ])
+
+    expect(f.statusHistory).toEqual([{
+      action: 'context_compaction',
+      label: '',
+      at: 1000,
+      id: 'cmp-1',
+      category: 'maintenance',
+      state: 'completed',
+      source: 'automatic',
+      durability: 'durable',
+      detail: 'Stable context compacted',
+    }])
+  })
+
   it('preserves artifact arrival order', () => {
     const a1 = { id: 'a1', name: 'one.txt' } as unknown as ArtifactPayload
     const a2 = { id: 'a2', name: 'two.txt' } as unknown as ArtifactPayload
@@ -153,5 +250,104 @@ describe('foldTurn — purity', () => {
     const b = fold(events)
     expect(a.rawText).toBe(b.rawText)
     expect(a.toolCalls).toEqual(b.toolCalls)
+  })
+})
+
+describe('TurnAccumulator — incremental live projection', () => {
+  it('matches the pure replay oracle across text, tools, status, and terminal reconcile', () => {
+    const events: Frame[] = [
+      { kind: 'status', seq: 0, action: 'requesting', label: 'Waiting', at: 1 },
+      { kind: 'thinking', seq: 1, text: 'checking', at: 2 },
+      { kind: 'text', seq: 2, text: 'stale', presentation: 'intermediate' },
+      { kind: 'tool-start', seq: 3, toolId: 't', name: 'bash', input: '{', at: 3 },
+      { kind: 'tool-delta', seq: 4, toolId: 't', fragment: '}' },
+      { kind: 'tool-result', seq: 5, toolId: 't', name: 'bash', input: '{}', result: 'ok', isError: false, at: 4 },
+      { kind: 'final-text', seq: 6, text: 'canonical' },
+    ]
+    const accumulator = new TurnAccumulator()
+    events.forEach(event => accumulator.append(event))
+
+    const incremental = accumulator.snapshot(renderMarkdown, toolCallGroups)
+    const replayed = fold(events)
+    expect(incremental.rawText).toBe(replayed.rawText)
+    expect(incremental.thinkingText).toBe(replayed.thinkingText)
+    expect(incremental.timelineSegments).toEqual(replayed.timelineSegments)
+    expect(incremental.toolCalls).toEqual(replayed.toolCalls)
+    expect(incremental.statusHistory).toEqual(replayed.statusHistory)
+    expect(incremental.parts).toEqual(replayed.parts)
+  })
+
+  it('does not invoke Markdown for a tool-only burst', () => {
+    const accumulator = new TurnAccumulator()
+    accumulator.append({
+      kind: 'tool-start',
+      seq: 0,
+      toolId: 'tool-1',
+      name: 'bash',
+      input: '',
+      at: 1,
+    })
+    for (let index = 0; index < 10_000; index += 1) {
+      accumulator.append({
+        kind: 'tool-delta',
+        seq: index + 1,
+        toolId: 'tool-1',
+        fragment: 'x',
+      })
+    }
+    const renderer = vi.fn((text: string) => text)
+    const snapshot = accumulator.snapshot(renderer, toolCallGroups)
+    expect(renderer).not.toHaveBeenCalled()
+    expect(snapshot.toolCalls[0]?.inputRaw).toHaveLength(10_000)
+  })
+
+  it('renders a provisional answer after a later tool moves it into activity', () => {
+    const accumulator = new TurnAccumulator()
+    accumulator.append({
+      kind: 'tool-start',
+      seq: 0,
+      toolId: 'inspect',
+      name: 'read_file',
+      input: '{}',
+      at: 1,
+    })
+    accumulator.append({
+      kind: 'text',
+      seq: 1,
+      text: 'Draft candidate.',
+      presentation: 'answer',
+    })
+    const initial = accumulator.snapshot(
+      text => `<p>${text}</p>`,
+      toolCallGroups,
+      undefined,
+      undefined,
+      false,
+    )
+    expect(initial.timelineItems[1]).toMatchObject({ html: '' })
+    accumulator.append({
+      kind: 'tool-start',
+      seq: 2,
+      toolId: 'verify',
+      name: 'bash_exec',
+      input: '{}',
+      at: 2,
+    })
+
+    const renderer = vi.fn((text: string) => `<p>${text}</p>`)
+    const snapshot = accumulator.snapshot(
+      renderer,
+      toolCallGroups,
+      undefined,
+      undefined,
+      false,
+    )
+
+    expect(renderer).toHaveBeenCalledWith('Draft candidate.')
+    expect(snapshot.timelineItems[1]).toMatchObject({
+      type: 'text',
+      rawText: 'Draft candidate.',
+      html: '<p>Draft candidate.</p>',
+    })
   })
 })

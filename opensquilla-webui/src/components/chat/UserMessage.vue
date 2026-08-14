@@ -1,7 +1,11 @@
 <template>
   <div
     class="msg-user"
-    :class="{ 'msg-user--share-mode': shareMode, 'msg-user--share-selected': shareSelected }"
+    :class="{
+      'msg-user--share-mode': shareMode,
+      'msg-user--share-selected': shareSelected,
+      'msg-user--steer': !!message.inputDisposition,
+    }"
     :data-message-id="message.messageId"
     :data-share-message-id="shareMessageId"
     :data-share-selected="shareSelected ? 'true' : undefined"
@@ -70,6 +74,22 @@
       <div v-if="message.text" class="msg-user-bubble">
         {{ stripTimePrefix(message.text) }}
       </div>
+      <span v-if="isGoalSource" class="msg-user-goal-origin" role="status">
+        <Icon name="target" :size="14" aria-hidden="true" />
+        {{ t('chat.goal.sentAsGoal') }}
+      </span>
+      <span
+        v-if="steerStatusLabel"
+        class="msg-user-steer-status"
+        :class="`msg-user-steer-status--${message.inputDisposition}`"
+        role="status"
+      >
+        {{ steerStatusLabel }}
+      </span>
+      <TurnOutcomeStatus
+        v-if="showTurnOutcome && message.turnOutcome"
+        :outcome="message.turnOutcome"
+      />
     </div>
     <div v-if="!shareMode" class="msg-user-actions">
       <button
@@ -82,22 +102,31 @@
         <Icon :name="copyIconName" :size="12" />
       </button>
       <span class="msg-copy-live" aria-live="polite">{{ copyLiveText }}</span>
-      <button type="button" class="msg-action" :title="t('chat.edit')" :aria-label="t('chat.edit')" @click="$emit('edit', message)">
+      <button
+        type="button"
+        class="msg-action"
+        :class="{ 'msg-action--disabled': isStreaming }"
+        :title="isStreaming ? t('chat.pending.editWhileStreaming') : t('chat.edit')"
+        :aria-label="isStreaming ? t('chat.pending.editWhileStreaming') : t('chat.edit')"
+        :disabled="isStreaming"
+        @click="$emit('edit', message)"
+      >
         <Icon name="edit" :size="12" />
       </button>
       <time v-if="timeIso" class="msg-time" :datetime="timeIso" :title="timeFull">
         <span class="msg-time__abs">{{ timeAbs }}</span>
-        <span class="msg-time__dot" aria-hidden="true">·</span>
-        <span class="msg-time__rel">{{ timeRel }}</span>
+        <span v-if="timeRel" class="msg-time__dot" aria-hidden="true">·</span>
+        <span v-if="timeRel" class="msg-time__rel">{{ timeRel }}</span>
       </time>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, reactive } from 'vue'
+import { computed, onBeforeUnmount, reactive, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import type { ChatRenderedMessage, DisplayAttachment } from '@/types/chat'
@@ -114,6 +143,9 @@ const props = defineProps<{
   stripTimePrefix: (text: string) => string
   copyMessage: (message: ChatRenderedMessage) => Promise<boolean>
   downloadAttachment: (attachment: DisplayAttachment) => Promise<boolean>
+  showTurnOutcome?: boolean
+  isStreaming?: boolean
+  isGoalSource?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -130,8 +162,52 @@ const { copyState, copyIconName, copyTitle, copyLiveText, onCopyClick } = useCop
 const now = useRelativeNow()
 const timeIso = computed(() => isoTime(props.message.ts))
 const timeAbs = computed(() => absoluteTime(props.message.ts))
-const timeRel = computed(() => relativeTime(props.message.ts, now.value))
+const timeRel = computed(() => relativeTime(props.message.ts, now.value, t))
 const timeFull = computed(() => fullTime(props.message.ts))
+const STEER_WAIT_DETAIL_DELAY_MS = 700
+const showSteerWaitDetail = ref(false)
+let steerWaitDetailTimer: ReturnType<typeof setTimeout> | undefined
+
+function syncSteerWaitDetail(disposition: ChatRenderedMessage['inputDisposition']) {
+  if (steerWaitDetailTimer !== undefined) {
+    clearTimeout(steerWaitDetailTimer)
+    steerWaitDetailTimer = undefined
+  }
+  showSteerWaitDetail.value = false
+  if (disposition !== 'steering') return
+  steerWaitDetailTimer = setTimeout(() => {
+    steerWaitDetailTimer = undefined
+    if (props.message.inputDisposition === 'steering') {
+      showSteerWaitDetail.value = true
+    }
+  }, STEER_WAIT_DETAIL_DELAY_MS)
+}
+
+watch(
+  () => props.message.inputDisposition,
+  disposition => syncSteerWaitDetail(disposition),
+  { immediate: true },
+)
+
+onBeforeUnmount(() => {
+  if (steerWaitDetailTimer !== undefined) clearTimeout(steerWaitDetailTimer)
+})
+
+const steerStatusLabel = computed(() => {
+  const disposition = props.message.inputDisposition
+  if (!disposition) return ''
+  if (disposition === 'steering') {
+    return showSteerWaitDetail.value
+      ? `${t('chat.steerMode')} · ${t('chat.steerStatus.waiting')}`
+      : t('chat.steerMode')
+  }
+  if (disposition === 'applied') return t('chat.steerMode')
+  return t({
+    promoted: 'chat.steerStatus.promoted',
+    cancelled: 'chat.steerStatus.notApplied',
+    rejected: 'chat.steerStatus.notApplied',
+  }[disposition])
+})
 const downloadingAttachments = reactive(new Set<string>())
 const failedDownloads = reactive(new Set<string>())
 
@@ -271,6 +347,50 @@ function attachmentMeta(attachment: DisplayAttachment): string {
   min-width: 0;
 }
 
+.msg-user-steer-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 1.25rem;
+  margin-top: -0.0625rem;
+  padding: 0.125rem 0.4375rem;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
+}
+
+.msg-user-steer-status::before {
+  width: 0.3125rem;
+  height: 0.3125rem;
+  flex: 0 0 auto;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 78%, var(--text));
+  content: "";
+}
+
+.msg-user-steer-status--cancelled,
+.msg-user-steer-status--rejected {
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
+}
+
+.msg-user-steer-status--cancelled::before,
+.msg-user-steer-status--rejected::before {
+  background: var(--warn);
+}
+
+.msg-user-goal-origin {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 1.25rem;
+  padding-inline: 0.25rem;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
+}
+
 /* Arrival feedback stays local to the destination instead of washing the full
    conversation row with accent color. The guide glides in beside the user
    bubble, settles, then fades, preserving orientation without a screen flash. */
@@ -334,6 +454,16 @@ function attachmentMeta(attachment: DisplayAttachment): string {
   word-break: break-word;
 }
 
+.msg-user--steer .msg-user-bubble {
+  border: 1px solid color-mix(in srgb, var(--accent) 14%, var(--border));
+  background: linear-gradient(
+    135deg,
+    color-mix(in srgb, var(--msg-bubble) 94%, var(--accent) 6%),
+    var(--msg-bubble)
+  );
+  box-shadow: 0 8px 24px -22px color-mix(in srgb, var(--accent) 54%, transparent);
+}
+
 .msg-user-actions {
   display: flex;
   gap: 0.125rem;
@@ -386,6 +516,19 @@ function attachmentMeta(attachment: DisplayAttachment): string {
 .msg-action:hover {
   color: var(--text-muted);
   background: var(--bg-hover);
+}
+
+.msg-action:disabled,
+.msg-action.msg-action--disabled {
+  cursor: not-allowed;
+  color: var(--text-dim);
+  opacity: 0.45;
+}
+
+.msg-action:disabled:hover,
+.msg-action.msg-action--disabled:hover {
+  color: var(--text-dim);
+  background: none;
 }
 
 .msg-action.msg-action--ok,

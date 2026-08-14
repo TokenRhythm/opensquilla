@@ -27,7 +27,9 @@ SandboxOperationDomain = Literal[
     "custom",
 ]
 
-SANDBOX_FILESYSTEM_WRITE_KINDS = frozenset({"write_text", "edit_text", "apply_patch"})
+SANDBOX_FILESYSTEM_WRITE_KINDS = frozenset(
+    {"write_text", "edit_text", "create_source", "edit_source", "apply_patch"}
+)
 
 
 @dataclass(frozen=True)
@@ -104,6 +106,7 @@ class FilesystemOperationRequest:
     """Typed request for filesystem operations delegated to backend workers."""
 
     path: Path | None = None
+    logical_path: Path | None = None
     paths: tuple[Path, ...] = ()
     display_path: str = ""
     content: str = ""
@@ -116,9 +119,11 @@ class FilesystemOperationRequest:
     pattern: str = ""
     include: str | None = None
     max_results: int | None = None
+    expected_revision: str = ""
+    edits: tuple[dict[str, object], ...] = ()
 
     def to_payload(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "path": str(self.path) if self.path is not None else None,
             "paths": [str(path) for path in self.paths],
             "displayPath": self.display_path,
@@ -133,6 +138,13 @@ class FilesystemOperationRequest:
             "include": self.include,
             "maxResults": self.max_results,
         }
+        if self.logical_path is not None:
+            payload["logicalPath"] = str(self.logical_path)
+        if self.expected_revision:
+            payload["expectedRevision"] = self.expected_revision
+        if self.edits:
+            payload["edits"] = list(self.edits)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -448,6 +460,7 @@ class SandboxOperation:
         workspace: Path,
         run_mode: str,
         path: Path | None = None,
+        logical_path: Path | None = None,
         paths: tuple[Path, ...] = (),
         display_path: str = "",
         content: str = "",
@@ -460,11 +473,14 @@ class SandboxOperation:
         pattern: str = "",
         include: str | None = None,
         max_results: int | None = None,
+        expected_revision: str = "",
+        edits: tuple[dict[str, object], ...] = (),
         file_system_profile: FileSystemPermissionProfile | None = None,
     ) -> SandboxOperation:
         operation_paths = paths or ((path,) if path is not None else ())
         request = FilesystemOperationRequest(
             path=path,
+            logical_path=logical_path,
             paths=tuple(candidate for candidate in operation_paths if candidate is not None),
             display_path=display_path,
             content=content,
@@ -477,6 +493,8 @@ class SandboxOperation:
             pattern=pattern,
             include=include,
             max_results=max_results,
+            expected_revision=expected_revision,
+            edits=edits,
         )
         return cls(
             domain="filesystem",
@@ -501,9 +519,7 @@ class SandboxOperation:
             "summary": self.summary,
             "permissions": self.permissions.to_payload(),
             "approval": self.approval.to_payload(),
-            "request": self.request.to_payload()
-            if hasattr(self.request, "to_payload")
-            else {},
+            "request": self.request.to_payload() if hasattr(self.request, "to_payload") else {},
         }
         if isinstance(self.request, FilesystemOperationRequest):
             payload.update(self.request.to_payload())
@@ -516,6 +532,7 @@ class SandboxOperationResult:
 
     message: str
     created: bool = False
+    metadata: dict[str, object] = field(default_factory=dict)
 
     @classmethod
     def from_worker_stdout(cls, stdout: str) -> SandboxOperationResult:
@@ -528,7 +545,15 @@ class SandboxOperationResult:
         message = payload.get("message")
         if not isinstance(message, str):
             raise SandboxBackendError("sandbox operation worker payload is missing message")
-        return cls(message=message, created=bool(payload.get("created", False)))
+        return cls(
+            message=message,
+            created=bool(payload.get("created", False)),
+            metadata={
+                str(key): value
+                for key, value in payload.items()
+                if key not in {"message", "created"}
+            },
+        )
 
 
 def backend_supports_operation(backend: object, domain: str) -> bool:
@@ -583,6 +608,11 @@ class SandboxOperationRuntime:
         runtime = self.runtime
         if runtime is None:
             raise SandboxBackendError("process operation is missing sandbox runtime")
+        # Import lazily because integration owns the process-wide runtime and
+        # imports this module while it is initialising.
+        from opensquilla.sandbox.integration import reject_windows_guest_process
+
+        reject_windows_guest_process(runtime)
         if not isinstance(operation.request, ProcessOperationRequest):
             raise SandboxBackendError("process operation is missing SandboxRequest")
         if operation.request.request is None:

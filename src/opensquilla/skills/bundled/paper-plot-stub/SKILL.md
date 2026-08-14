@@ -1,6 +1,7 @@
 ---
 name: paper-plot-stub
 description: "Plot a results CSV (x, y_baseline, y_ours) as a two-line matplotlib chart and write a PDF. Demo-only."
+description_zh: "将结果CSV（x, y_baseline, y_ours）绘制为matplotlib双线图并输出PDF。仅供演示。"
 provenance:
   origin: opensquilla-original
   license: Apache-2.0

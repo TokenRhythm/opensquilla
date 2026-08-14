@@ -30,13 +30,14 @@ interface HostState {
 function mountAlerts(state: HostState, handlers: {
   onApprove?: (asAdmin: boolean) => void
   onSetAsAdmin?: (asAdmin: boolean) => void
-} = {}) {
+} = {}, attrs: Record<string, unknown> = {}) {
   i18n.global.locale.value = 'en'
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(defineComponent({
     setup() {
       return () => h(ChannelAlerts, {
+        ...attrs,
         pendingPairing: state.pendingPairing,
         defaultAsAdmin: state.defaultAsAdmin,
         ...(state.asAdminChecked !== undefined ? { asAdminChecked: state.asAdminChecked } : {}),
@@ -139,6 +140,50 @@ describe('ChannelAlerts as-admin override (host-controlled)', () => {
       expect(checkbox(el).checked).toBe(true)
       el.querySelector<HTMLButtonElement>('.chal__btn')!.click()
       expect(onApprove).toHaveBeenLastCalledWith(true)
+    } finally {
+      app.unmount()
+    }
+  })
+})
+
+describe('ChannelAlerts layout boundary', () => {
+  it('inherits host layout attributes on one root when both alerts render', () => {
+    const state = reactive<HostState>({
+      pendingPairing: pairing('pair-1'),
+      defaultAsAdmin: false,
+    })
+    const { app, el } = mountAlerts(
+      state,
+      {},
+      {
+        class: 'external-layout-slot',
+        errorText: 'invalid credentials',
+      },
+    )
+    try {
+      const root = el.querySelector('.external-layout-slot')
+      expect(root?.parentElement).toBe(el)
+      expect(el.children).toHaveLength(1)
+      expect(root?.querySelector('.chal--pending')).not.toBeNull()
+      expect(root?.querySelector('.chal--error')).not.toBeNull()
+    } finally {
+      app.unmount()
+    }
+  })
+
+  it('does not leave an empty layout root when there is no alert', () => {
+    const state = reactive<HostState>({
+      pendingPairing: null,
+      defaultAsAdmin: false,
+    })
+    const { app, el } = mountAlerts(
+      state,
+      {},
+      { class: 'external-layout-slot' },
+    )
+    try {
+      expect(el.querySelector('.external-layout-slot')).toBeNull()
+      expect(el.children).toHaveLength(0)
     } finally {
       app.unmount()
     }
