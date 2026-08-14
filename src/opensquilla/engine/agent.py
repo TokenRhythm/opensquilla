@@ -9944,7 +9944,11 @@ class Agent:
 
                             if (
                                 attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                                and thinking_enabled
+                                and (
+                                    thinking_enabled
+                                    or (attempt_classification.stop_reason or "").lower()
+                                    == "length"
+                                )
                                 and _retry_policy.can_retry_attempt(
                                     _ProviderAttemptKind.REASONING_ONLY,
                                     _attempt_retries_used,

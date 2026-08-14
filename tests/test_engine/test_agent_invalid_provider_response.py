@@ -954,7 +954,6 @@ async def test_large_length_capped_reasoning_only_retry_disables_thinking() -> N
     agent = Agent(
         provider=provider,
         config=AgentConfig(
-            thinking=ThinkingLevel.MEDIUM,
             model_id="deepseek-v4-flash-0731",
             max_tokens=16_384,
             max_provider_retries=1,
@@ -966,7 +965,8 @@ async def test_large_length_capped_reasoning_only_retry_disables_thinking() -> N
     events = [event async for event in agent.run_turn("hello")]
 
     assert len(provider.calls) == 2
-    assert provider.calls[0]["config"].thinking is True
+    assert provider.calls[0]["config"].thinking is False
+    assert provider.calls[0]["config"].thinking_level is None
     assert provider.calls[0]["config"].max_tokens == 16_384
     assert provider.calls[1]["config"].thinking is False
     assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
