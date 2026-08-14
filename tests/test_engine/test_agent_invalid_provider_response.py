@@ -871,6 +871,47 @@ async def test_large_reasoning_only_uses_fallback_before_same_model_retry() -> N
     assert any(event.kind == "done" and event.text == "ok" for event in events)
 
 
+@pytest.mark.parametrize("thinking", [False, ThinkingLevel.MEDIUM])
+@pytest.mark.asyncio
+async def test_large_length_capped_reasoning_only_fallback_disables_thinking(
+    thinking: bool | ThinkingLevel,
+) -> None:
+    provider = _FallbackSequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="length",
+                    input_tokens=35_858,
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal reasoning",
+                )
+            ],
+            [
+                ProviderText(text="ok"),
+                ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=1),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=thinking,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert provider.fallback_reasons == ["reasoning_only"]
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["config"].thinking is False
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
+    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
+
+
 @pytest.mark.asyncio
 async def test_large_reasoning_only_without_fallback_keeps_thinking_by_default() -> None:
     provider = _SequenceProvider(

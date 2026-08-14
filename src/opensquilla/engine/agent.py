@@ -9920,6 +9920,14 @@ class Agent:
                                 )
                             ):
                                 _invalid_response_fallback_done = True
+                                if (
+                                    attempt_classification.kind
+                                    == _ProviderAttemptKind.REASONING_ONLY
+                                    and (attempt_classification.stop_reason or "").lower()
+                                    == "length"
+                                ):
+                                    _thinking_fallback_done = True
+                                    _disable_thinking_for_next_provider_call = True
                                 fallback_reason = _provider_activity_reason_for_attempt(
                                     attempt_classification.kind
                                 )
