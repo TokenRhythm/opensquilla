@@ -1205,6 +1205,13 @@ _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted
 _INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX = "[invalid_provider_context_projection:"
 _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY = "_invalid_provider_context_arguments"
 _PROMPT_ANNOTATION_WRITER_TOOLS = frozenset({"document_apply"})
+_DOCUMENT_MUTATION_PROPOSAL_MAX_TOKENS = 8_192
+_DOCUMENT_MUTATION_FINALIZATION_MAX_TOKENS = 256
+_DOCUMENT_MUTATION_FINALIZATION_SYSTEM = (
+    "You are OpenSquilla. No tools are available for this response. "
+    "State the supplied authoritative document outcome concisely in the requested language. "
+    "Do not mention internal protocols, capabilities, identifiers, source text, or paths."
+)
 _AGGREGATE_TOOL_RESULT_MAX_SHARE = 0.25
 # Below this size a duplicate tool result is not worth eliding: the dedup stub
 # itself costs ~200 chars, so tiny repeated payloads would grow, not shrink.
@@ -2399,6 +2406,10 @@ class _IterationStreamTimeoutError(TimeoutError):
 
 class _RaisedProviderBoundaryError(RuntimeError):
     """Content-free marker for an exception raised by provider call/iteration."""
+
+    def __init__(self, *, timeout: bool) -> None:
+        super().__init__("provider boundary failed")
+        self.timeout = timeout
 
 
 _STREAM_DEADLINE_ATTRIBUTE = "_opensquilla_stream_deadline_at_monotonic"
@@ -6947,6 +6958,33 @@ class Agent:
                 )
             return text[:1000]
 
+        def _document_mutation_response_locale() -> str:
+            configured = str(
+                self.config.metadata.get("locale")
+                or self.config.metadata.get("language")
+                or "en"
+            ).strip()
+            if not re.fullmatch(
+                r"[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*",
+                configured,
+            ):
+                configured = "en"
+            language_samples = [str(self._current_turn_message or "")]
+            artifact_context = getattr(self._tool_context, "artifact_context", None)
+            snapshots = getattr(artifact_context, "snapshots", ())
+            if isinstance(snapshots, (list, tuple)):
+                language_samples.extend(
+                    str(snapshot.get("body") or "")
+                    for snapshot in snapshots[:16]
+                    if isinstance(snapshot, Mapping)
+                )
+            combined = "\n".join(language_samples)
+            if re.search(r"[\u3040-\u30ff]", combined):
+                return "ja"
+            if re.search(r"[\u3400-\u4dbf\u4e00-\u9fff]", combined):
+                return "zh-Hans"
+            return configured
+
         def _document_mutation_finalization_request() -> list[Message]:
             instructions: list[str] = []
             artifact_context = getattr(self._tool_context, "artifact_context", None)
@@ -6983,16 +7021,7 @@ class Agent:
                 if key in safe_outcome_keys
                 and isinstance(value, (str, int, float, bool))
             }
-            requested_locale = str(
-                self.config.metadata.get("locale")
-                or self.config.metadata.get("language")
-                or "en"
-            ).strip()
-            if not re.fullmatch(
-                r"[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*",
-                requested_locale,
-            ):
-                requested_locale = "en"
+            requested_locale = _document_mutation_response_locale()
             payload = {
                 "userInstructions": instructions,
                 "documentMutationOutcome": outcome,
@@ -7012,11 +7041,7 @@ class Agent:
         def _document_mutation_fallback_text() -> str:
             outcome = document_mutation_outcome or {}
             status = str(outcome.get("status") or "not_attempted")
-            locale = str(
-                self.config.metadata.get("locale")
-                or self.config.metadata.get("language")
-                or "en"
-            ).lower()
+            locale = _document_mutation_response_locale().lower()
             language = re.split(r"[-_]", locale, maxsplit=1)[0]
             translations = {
                 "en": {
@@ -8595,6 +8620,39 @@ class Agent:
                             workspace_edit_gate_recovery_reads_remaining
                         ),
                     )
+                    if self._artifact_writer_controller() is not None:
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "max_tokens": max(
+                                    1,
+                                    min(
+                                        int(call_chat_cfg.max_tokens),
+                                        _DOCUMENT_MUTATION_PROPOSAL_MAX_TOKENS,
+                                    ),
+                                ),
+                            }
+                        )
+                    if document_mutation_finalization_pending:
+                        # The finalizer is an outcome-only presentation call,
+                        # not another planning step. Keep both its prompt and
+                        # output budget independent from the restricted tool
+                        # turn so no capability names or long reasoning stream
+                        # can leak into this one-shot request.
+                        call_chat_cfg = call_chat_cfg.model_copy(
+                            update={
+                                "max_tokens": max(
+                                    1,
+                                    min(
+                                        int(call_chat_cfg.max_tokens),
+                                        _DOCUMENT_MUTATION_FINALIZATION_MAX_TOKENS,
+                                    ),
+                                ),
+                                "system": _DOCUMENT_MUTATION_FINALIZATION_SYSTEM,
+                                "thinking": False,
+                                "thinking_level": None,
+                                "tool_choice": None,
+                            }
+                        )
                     if goal_terminal_final_response_pending:
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={"tool_choice": None}
@@ -8825,12 +8883,14 @@ class Agent:
                                 )
                         except (asyncio.CancelledError, UsageAccountingUnavailableError):
                             raise
-                        except Exception:  # noqa: BLE001 - provider boundary
+                        except Exception as exc:  # noqa: BLE001 - provider boundary
                             # Never retain upstream prose on the exception that
                             # crosses into the agent loop.  The original
                             # exception is deliberately not chained because SDK
                             # messages may contain response bodies or secrets.
-                            raise _RaisedProviderBoundaryError from None
+                            raise _RaisedProviderBoundaryError(
+                                timeout=isinstance(exc, TimeoutError)
+                            ) from None
                         raw_stream = guard_provider_text_stream(raw_stream)
                         pending_install_deadline: float | None = (
                             self._pending_durable_compaction_event
@@ -10101,7 +10161,7 @@ class Agent:
                             )
                         )
                         raise
-                    except _RaisedProviderBoundaryError:
+                    except _RaisedProviderBoundaryError as exc:
                         # Some SDKs raise from call creation or async iteration
                         # instead of yielding a ProviderErrorEvent.  Only those
                         # two provider-boundary operations are wrapped in this
@@ -10143,6 +10203,56 @@ class Agent:
                                 message=(
                                     "The document outcome was preserved, but its generated "
                                     "summary used a deterministic localized fallback."
+                                ),
+                            )
+                            break
+                        if (
+                            self._artifact_writer_controller() is not None
+                            and not document_mutation_finalization_attempted
+                        ):
+                            await self._fail_artifact_writer_intent(
+                                guarded_writer_intent_id,
+                                failure_code="writer_stream_timed_out"
+                                if exc.timeout
+                                else "writer_stream_failed",
+                            )
+                            prior_outcome = dict(document_mutation_outcome or {})
+                            outcome_code = (
+                                "document_mutation_provider_timeout"
+                                if exc.timeout
+                                else "document_mutation_provider_exception"
+                            )
+                            document_mutation_outcome = {
+                                "version": 1,
+                                "status": str(
+                                    prior_outcome.get("status") or "not_attempted"
+                                ),
+                                "phase": str(prior_outcome.get("phase") or "proposal"),
+                                "retryPolicy": "new_turn",
+                                "code": outcome_code,
+                            }
+                            for detail_key in ("corrected", "proposalAttempts"):
+                                if detail_key in prior_outcome:
+                                    document_mutation_outcome[detail_key] = prior_outcome[
+                                        detail_key
+                                    ]
+                            document_mutation_finalization_pending = True
+                            document_mutation_finalization_message = Message(
+                                role="user",
+                                content=(
+                                    "The document provider timed out. Do not call tools. "
+                                    if exc.timeout
+                                    else "The document provider stopped unexpectedly. "
+                                )
+                                + "Summarize only the authoritative mutation outcome.",
+                            )
+                            final_text_parts.clear()
+                            applied_model_call_boundaries.clear()
+                            yield WarningEvent(
+                                code=outcome_code,
+                                message=(
+                                    "The provider failed before the document turn completed; "
+                                    "the authoritative outcome was preserved."
                                 ),
                             )
                             break
@@ -12407,6 +12517,18 @@ class Agent:
                             provider_error.code != "provider_retry_after_deadline"
                             and _fallback.should_retry(kind, _retry_attempt)
                         )
+                        if should_retry and self._artifact_writer_controller() is not None:
+                            # Restricted document turns reserve exactly one provider call
+                            # after a terminal outcome for the tools-disabled summary. A
+                            # generic provider retry here would consume that boundary and
+                            # produce an extra tool-enabled request before finalization.
+                            _log.warning(
+                                "provider.retry_suppressed",
+                                reason="document_mutation_finalization_reserved",
+                                kind=kind.value,
+                                provider=getattr(self.provider, "provider_name", ""),
+                            )
+                            should_retry = False
                         retry_failed_call_safe = (
                             getattr(
                                 self.provider,
@@ -18081,8 +18203,8 @@ class Agent:
             stream_iter = stream.__aiter__()
         except (asyncio.CancelledError, UsageAccountingUnavailableError):
             raise
-        except Exception:  # noqa: BLE001 - provider boundary
-            raise _RaisedProviderBoundaryError from None
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            raise _RaisedProviderBoundaryError(timeout=isinstance(exc, TimeoutError)) from None
         try:
             async for event in self._stream_provider_events_with_deadline_unclosed(
                 stream_iter,
@@ -18102,70 +18224,80 @@ class Agent:
         total_deadline: float | None,
         deadline_provider: Callable[[], float | None] | None = None,
     ) -> AsyncIterator[Any]:
-        while True:
-            dynamic_deadline = (
-                deadline_provider()
-                if deadline_provider is not None
-                else None
-            )
-            active_deadline = total_deadline
-            if dynamic_deadline is not None:
-                active_deadline = (
-                    min(active_deadline, dynamic_deadline)
-                    if active_deadline is not None
-                    else dynamic_deadline
+        next_event: asyncio.Future[Any] | None = None
+        try:
+            while True:
+                dynamic_deadline = (
+                    deadline_provider()
+                    if deadline_provider is not None
+                    else None
                 )
-            wait_budget = max(0.001, self.config.iteration_timeout)
-            total_deadline_limits_wait = False
-            if active_deadline is not None:
-                remaining_total = active_deadline - loop.time()
-                if remaining_total <= 0:
-                    raise _provider_stream_deadline_timeout(
-                        timeout_seconds=self.config.timeout,
-                        deadline_at_monotonic=active_deadline,
+                active_deadline = total_deadline
+                if dynamic_deadline is not None:
+                    active_deadline = (
+                        min(active_deadline, dynamic_deadline)
+                        if active_deadline is not None
+                        else dynamic_deadline
                     )
-                if remaining_total <= wait_budget:
-                    wait_budget = remaining_total
-                    total_deadline_limits_wait = True
+                wait_budget = max(0.001, self.config.iteration_timeout)
+                total_deadline_limits_wait = False
+                if active_deadline is not None:
+                    remaining_total = active_deadline - loop.time()
+                    if remaining_total <= 0:
+                        raise _provider_stream_deadline_timeout(
+                            timeout_seconds=self.config.timeout,
+                            deadline_at_monotonic=active_deadline,
+                        )
+                    if remaining_total <= wait_budget:
+                        wait_budget = remaining_total
+                        total_deadline_limits_wait = True
 
-            next_event: asyncio.Future[Any] = asyncio.ensure_future(stream_iter.__anext__())
-            try:
-                done, _ = await asyncio.wait({next_event}, timeout=wait_budget)
-            except (asyncio.CancelledError, GeneratorExit):
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
-                raise
-            if not done:
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
-                if total_deadline_limits_wait or (
-                    active_deadline is not None
-                    and loop.time() >= active_deadline
+                next_event = asyncio.ensure_future(stream_iter.__anext__())
+                try:
+                    done, _ = await asyncio.wait({next_event}, timeout=wait_budget)
+                except (asyncio.CancelledError, GeneratorExit):
+                    next_event.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                        await next_event
+                    raise
+                if not done:
+                    next_event.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                        await next_event
+                    if total_deadline_limits_wait or (
+                        active_deadline is not None
+                        and loop.time() >= active_deadline
+                    ):
+                        assert active_deadline is not None
+                        raise _provider_stream_deadline_timeout(
+                            timeout_seconds=self.config.timeout,
+                            deadline_at_monotonic=active_deadline,
+                        )
+                    raise _IterationStreamTimeoutError
+                try:
+                    event = next_event.result()
+                except StopAsyncIteration:
+                    return
+                except (
+                    asyncio.CancelledError,
+                    UsageAccountingUnavailableError,
+                    ModelRepetitionLoopError,
                 ):
-                    assert active_deadline is not None
-                    raise _provider_stream_deadline_timeout(
-                        timeout_seconds=self.config.timeout,
-                        deadline_at_monotonic=active_deadline,
-                    )
-                raise _IterationStreamTimeoutError
-            try:
-                event = next_event.result()
-            except StopAsyncIteration:
-                return
-            except (
-                asyncio.CancelledError,
-                UsageAccountingUnavailableError,
-                ModelRepetitionLoopError,
-            ):
-                raise
-            except Exception:  # noqa: BLE001 - provider boundary
-                # TimeoutError raised *by the provider* is different from the
-                # deadline timeouts raised above by this wrapper.  Project it
-                # through the same content-free provider failure path.
-                raise _RaisedProviderBoundaryError from None
-            yield event
+                    raise
+                except Exception as exc:  # noqa: BLE001 - provider boundary
+                    # TimeoutError raised *by the provider* is different from
+                    # the deadline timeouts raised above by this wrapper.
+                    raise _RaisedProviderBoundaryError(
+                        timeout=isinstance(exc, TimeoutError)
+                    ) from None
+                finally:
+                    next_event = None
+                yield event
+        finally:
+            if next_event is not None and not next_event.done():
+                next_event.cancel()
+                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                    await next_event
 
     @staticmethod
     async def _close_provider_stream(stream_iter: AsyncIterator[Any]) -> None:

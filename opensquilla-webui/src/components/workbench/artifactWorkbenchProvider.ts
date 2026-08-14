@@ -649,15 +649,28 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     } else if (actionId === 'refresh') {
       if (this.annotationMode) await this.setAnnotationMode(false)
       else this.invalidateAnnotationSelectionAttempt()
+      let refreshedDocument = false
       if (artifact && !isPreparedImmutableResourcePreview(this.item)) {
-        await this.options.artifactDocuments?.load(
+        const workspace = await this.options.artifactDocuments?.load(
           artifact,
           artifactSessionKey(item, this.options),
           { force: true },
         ).catch(() => undefined)
+        refreshedDocument = Boolean(
+          workspace
+          && typeof workspace === 'object'
+          && (workspace as { source?: unknown }).source === 'document-api',
+        )
       }
       if (this.context.getRenderState().previewBlocked === true) {
         await this.retryLeasePreview()
+        return
+      }
+      // A document refresh must resolve a new lease against the canonical
+      // current head. Reloading the existing native surface would only reload
+      // the immutable URL for the previous Revision.
+      if (refreshedDocument && previewLeaseEnabledForItem(this.item, this.options)) {
+        await this.replaceLeasePreview()
         return
       }
       if (

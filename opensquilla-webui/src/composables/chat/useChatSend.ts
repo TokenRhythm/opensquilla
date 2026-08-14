@@ -2089,7 +2089,6 @@ export function useChatSend(options: UseChatSendOptions) {
       ) return
     }
 
-    const compactInFlight = options.isCompactInFlightForCurrentSession()
     if (hasPayload && promptAnnotationSendIsBusy(composerSnapshot.promptAnnotationIds)) {
       rejectBusyPromptAnnotationSend()
       return
@@ -3181,6 +3180,7 @@ export function useChatSend(options: UseChatSendOptions) {
       usageBarrierReplayAttempt,
       {
         requestSessionKey,
+        promptAnnotationIds: [],
         text,
         attachments: [],
         intent: null,
@@ -3539,6 +3539,8 @@ export function useChatSend(options: UseChatSendOptions) {
       clientMessageId,
       composerText: displayText,
       requestSessionKey,
+      promptAnnotationIds: [],
+      promptAnnotations: [],
       text: providerText,
       attachments: [],
       intent: hiddenSessionIntent,

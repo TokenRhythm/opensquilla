@@ -110,8 +110,9 @@ def _artifact_routing_facts_for_turn(ctx: TurnContext) -> ArtifactRoutingFacts |
 def _router_text_fallback_chain(
     selected_tier: object,
     tiers: dict,
-    *,
     minimum_tier: object | None = None,
+    *,
+    allow_stronger_fallbacks: bool = False,
 ) -> list[dict[str, str]]:
     selected = normalize_text_tier(selected_tier)
     if selected is None:
@@ -120,9 +121,6 @@ def _router_text_fallback_chain(
         selected_index = TEXT_TIERS.index(selected)
     except ValueError:
         return []
-    minimum = normalize_text_tier(minimum_tier)
-    minimum_index = TEXT_TIERS.index(minimum) if minimum in TEXT_TIERS else 0
-
     minimum = normalize_text_tier(minimum_tier)
     if minimum is None:
         candidate_tiers = list(reversed(TEXT_TIERS[:selected_index]))
@@ -137,8 +135,9 @@ def _router_text_fallback_chain(
         # while ensuring c2/c3 mutations can never fall through to c1/c0.
         candidate_tiers = [
             *reversed(TEXT_TIERS[minimum_index:selected_index]),
-            *TEXT_TIERS[selected_index + 1 :],
         ]
+        if allow_stronger_fallbacks:
+            candidate_tiers.extend(TEXT_TIERS[selected_index + 1 :])
 
     chain: list[dict[str, str]] = []
     for tier_name in candidate_tiers:
@@ -1538,6 +1537,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                     decision.tier,
                     tiers,
                     minimum_context_tier,
+                    allow_stronger_fallbacks=artifact_facts is not None,
                 )
                 if bool(tiers.get(entry["tier"], {}).get("supports_image", False))
             ]
@@ -1622,6 +1622,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             decision.tier,
             tiers,
             minimum_tier=minimum_execution_tier,
+            allow_stronger_fallbacks=artifact_facts is not None,
         )
         if artifact_facts is not None:
             ctx.metadata["router_fallback_strict"] = True
@@ -1722,6 +1723,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                 decision.tier,
                 tiers,
                 minimum_tier=minimum_execution_tier,
+                allow_stronger_fallbacks=artifact_facts is not None,
             )
             if artifact_facts is not None:
                 ctx.metadata["router_fallback_strict"] = True
@@ -1988,6 +1990,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         decision.tier,
         tiers,
         minimum_tier=minimum_execution_tier,
+        allow_stronger_fallbacks=artifact_facts is not None,
     )
     if artifact_facts is not None:
         ctx.metadata["router_fallback_strict"] = True

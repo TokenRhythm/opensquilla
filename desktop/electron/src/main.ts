@@ -51,6 +51,7 @@ import {
   type TrustedDesktopCleanupPreview,
 } from './desktop-cleanup.js'
 import { secretStorageBackendForPolicy, shouldUseChromiumMockKeychainForPolicy } from './secret-storage-policy.js'
+import { SecretDecryptionCache } from './secret-decryption-cache.js'
 import { freshDesktopSandboxConfigLines } from './desktop-sandbox-default.js'
 import {
   GITHUB_UPDATE_OWNER,
@@ -480,6 +481,7 @@ let gatewayStartPromise: Promise<GatewayState> | null = null
 let resolveOnboarding: ((credential: DesktopConnection) => void) | null = null
 let rejectOnboarding: ((error: Error) => void) | null = null
 let secretStorageBackendCache: SecretEncryption | null = null
+const decryptedSecretCache = new SecretDecryptionCache()
 let macCodeSignatureDiagnosticCache: string | null = null
 let bootStatus: BootStatus = {
   phaseId: 'profile',
@@ -1921,9 +1923,40 @@ function decryptSecret(encryptedValue: string | undefined, encryption: SecretEnc
     if (desktopSecretStorageBackend() !== 'safeStorage') {
       throw new Error('Saved desktop credential requires macOS Keychain, but this local build uses plain credential storage.')
     }
-    return safeStorage.decryptString(payload)
+    return decryptedSecretCache.resolve(
+      activeDesktopProfile().home,
+      encryptedValue,
+      encryption,
+      () => safeStorage.decryptString(payload),
+    )
   }
   return payload.toString('utf8')
+}
+
+function rememberDecryptedCredentialSecrets(
+  record: DesktopConnection,
+  apiKey: string,
+  searchApiKey: string,
+  profile = activeDesktopProfile(),
+): void {
+  if (record.encryption !== 'safeStorage') return
+  const profileScope = profile.home
+  if (record.encryptedApiKey && apiKey) {
+    decryptedSecretCache.remember(
+      profileScope,
+      record.encryptedApiKey,
+      record.encryption,
+      apiKey,
+    )
+  }
+  if (record.encryptedSearchApiKey && searchApiKey) {
+    decryptedSecretCache.remember(
+      profileScope,
+      record.encryptedSearchApiKey,
+      record.encryption,
+      searchApiKey,
+    )
+  }
 }
 
 function decryptApiKey(record: DesktopConnection): string {
@@ -2378,6 +2411,12 @@ async function saveDesktopCredential(
       writerReserved,
       configLocale,
     )
+    rememberDecryptedCredentialSecrets(
+      credential,
+      resolvedApiKey,
+      resolvedSearchApiKey,
+      targetProfile,
+    )
     return credential
   } finally {
     finishWriter()
@@ -2429,6 +2468,7 @@ async function saveImportedDesktopCredential(
     throw new Error('A gateway is still serving this profile; stop it before adopting credentials.')
   }
   const credential = buildImportedDesktopCredential(prefill, importTransactionId, apiKeyOverride)
+  const candidateCredential = JSON.stringify(credential, null, 2)
   const finishWriter = writerReserved
     ? () => {}
     : beginDesktopWriterOperation('adopt imported desktop credential')
@@ -2447,7 +2487,7 @@ async function saveImportedDesktopCredential(
         expected_config: importedConfig,
         config: importedConfig,
         expected_credential: expectedCredential,
-        credential: JSON.stringify(credential, null, 2),
+        credential: candidateCredential,
       }),
       true,
     )
@@ -2457,8 +2497,10 @@ async function saveImportedDesktopCredential(
     if (result.outcome === 'recovery_required') {
       throw new Error(`Imported credential was not adopted (${result.stable_code}).`)
     }
-    const readback = await loadDesktopCredential()
+    if (candidateCredential !== expectedCredential) decryptedSecretCache.clear()
     const expectedKey = apiKeyOverride.trim() || prefill.apiKey.trim()
+    rememberDecryptedCredentialSecrets(credential, expectedKey, '', profile)
+    const readback = await loadDesktopCredential()
     if (
       !readback
       || readback.configAuthority !== 'profile'
@@ -2671,6 +2713,7 @@ async function applyDesktopSettingsPair(
     if (!restartSafe) {
       throw new Error(`Desktop settings were not applied (${result.stable_code}).`)
     }
+    if (candidateCredential !== expectedCredential) decryptedSecretCache.clear()
     return result
   } finally {
     if (ownedGatewayWasRunning && desktopProfileKey() === targetProfileKey) {
@@ -7273,6 +7316,8 @@ async function adoptConsolidatedDesktopCredential(
       disposition = 'primary_exists'
     } else {
       let credential: DesktopConnection | null = null
+      let resolvedCredentialApiKey = ''
+      let resolvedCredentialSearchApiKey = ''
       let credentialPhase: 'parse' | 'decrypt' = 'parse'
       try {
         const raw = sourceCredential
@@ -7321,16 +7366,12 @@ async function adoptConsolidatedDesktopCredential(
         // Validate OS-keychain ciphertext before publishing it at the primary path.
         // Unusable historical secrets are skipped so normal onboarding can collect
         // a fresh credential instead of permanently blocking every startup.
-        if (
-          candidateCredential.encryptedApiKey
-          && !decryptApiKey(candidateCredential)
-        ) {
+        resolvedCredentialApiKey = decryptApiKey(candidateCredential)
+        if (candidateCredential.encryptedApiKey && !resolvedCredentialApiKey) {
           throw new Error('provider credential decrypted to an empty value')
         }
-        if (
-          candidateCredential.encryptedSearchApiKey
-          && !decryptSearchApiKey(candidateCredential)
-        ) {
+        resolvedCredentialSearchApiKey = decryptSearchApiKey(candidateCredential)
+        if (candidateCredential.encryptedSearchApiKey && !resolvedCredentialSearchApiKey) {
           throw new Error('search credential decrypted to an empty value')
         }
         // Publish eligibility is assigned only after both safeStorage/plaintext
@@ -7398,9 +7439,20 @@ async function adoptConsolidatedDesktopCredential(
           }
         }
         // Force the normal loader to validate the bytes at their final primary path.
-        if (!await loadDesktopCredential()) {
+        const publishedCredential = await loadDesktopCredential()
+        if (!publishedCredential) {
           throw new Error('The consolidated Desktop credential was not published.')
         }
+        // Publishing replaces the primary credential authority. Drop every
+        // previous-profile/value reference, then retain only the secrets that
+        // were successfully validated for the published ciphertext above.
+        decryptedSecretCache.clear()
+        rememberDecryptedCredentialSecrets(
+          publishedCredential,
+          resolvedCredentialApiKey,
+          resolvedCredentialSearchApiKey,
+          primary,
+        )
         desktopLog('desktop_profile_consolidation_credential_adopted', {
           sourceRecoveryId,
         })
@@ -10817,6 +10869,9 @@ async function restoreAfterIncompleteCleanup(
   preserveControlUi = false,
 ): Promise<void> {
   isQuitting = false
+  // A partial cleanup may already have replaced or removed credential bytes.
+  // Never carry a pre-cleanup plaintext reference into the recovered profile.
+  decryptedSecretCache.clear()
   clearReusableGatewayState()
   const inspection = await inspectDesktopProfile(profile)
   recoveryInspection = inspection
@@ -10922,6 +10977,7 @@ async function applyApprovedDesktopCleanup(
         refreshed.scope_fingerprint,
         report,
       )
+      decryptedSecretCache.clear()
       shouldQuit = true
       return { ok: true, scheduled: true, report }
     }
@@ -10935,6 +10991,7 @@ async function applyApprovedDesktopCleanup(
       '--json',
     ])
     if (result.outcome === 'complete') {
+      decryptedSecretCache.clear()
       if (report.mode === 'reset-current-settings') {
         transientPendingMigrationProviderSetup = null
         forceOnboardingOnNextStartup = true
@@ -12165,6 +12222,10 @@ ipcMain.handle('desktop:migration:run', async (
         )
         if (receipt) {
           migrationApplied = true
+          // The imported target is now authoritative, even if subsequent
+          // credential reconciliation needs onboarding. Discard any plaintext
+          // resolved from the profile that existed before the import.
+          decryptedSecretCache.clear()
           if (!migrationVerified) report = receipt.report
           // Publication of a validated, previously-unseen target receipt is the
           // durable commit authority. The CLI child can lose stdout or exit

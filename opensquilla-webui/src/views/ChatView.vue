@@ -1963,7 +1963,7 @@ const chatRenderedMessages = useChatRenderedMessages({
   isSubagentCompletionMessage,
   timeTranslator: t,
 })
-const { renderedMessages, routerDecisionCells } = chatRenderedMessages
+const { renderedMessages } = chatRenderedMessages
 const sessionCreationRouterPresentation = computed(() => (
   projectSessionCreationRouterPresentation(renderedMessages.value, isStreaming.value)
 ))

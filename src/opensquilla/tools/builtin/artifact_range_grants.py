@@ -122,6 +122,7 @@ class ArtifactRangeGrantRegistry:
         self._cursors: dict[str, _CursorEntry] = {}
         self._context_nonces: dict[tuple[object, ...], str] = {}
         self._query_count = 0
+        self._query_keys: set[str] = set()
         self._lock = threading.Lock()
 
     def clear(self) -> None:
@@ -130,17 +131,28 @@ class ArtifactRangeGrantRegistry:
             self._cursors.clear()
             self._context_nonces.clear()
             self._query_count = 0
+            self._query_keys.clear()
 
-    def consume_query_budget(self) -> None:
-        """Reserve one shared locate/search query before it can mint any grants."""
+    def consume_query_budget(self, *, query_key: str | None = None) -> int:
+        """Reserve one unique locate/search query and return the remaining budget.
+
+        Repeating an identical, already-admitted lookup cannot broaden the
+        model's authority, so it reuses the original budget slot. Distinct
+        targets or operations remain bounded by the turn-wide ceiling.
+        """
 
         with self._lock:
+            if query_key is not None and query_key in self._query_keys:
+                return MAX_RANGE_QUERIES_PER_TURN - self._query_count
             if self._query_count >= MAX_RANGE_QUERIES_PER_TURN:
                 raise ArtifactRangeGrantError(
                     "ARTIFACT_RANGE_QUERY_LIMIT",
                     "This turn has reached the source range query limit.",
                 )
             self._query_count += 1
+            if query_key is not None:
+                self._query_keys.add(query_key)
+            return MAX_RANGE_QUERIES_PER_TURN - self._query_count
 
     def mint_range(
         self,

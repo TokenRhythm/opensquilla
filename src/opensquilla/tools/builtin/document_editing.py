@@ -119,6 +119,15 @@ def _grant_payload(
     apply_template: dict[str, object] = {"grant_token": token}
     if expects_value:
         apply_template["value"] = ""
+    value_constraints: dict[str, object] | None = None
+    if source_range.operation == "set_style":
+        value_constraints = {
+            "format": "css_declaration_list",
+            "example": "color: #222; background-color: #fff;",
+            "forbidSelectors": True,
+            "forbidRuleBraces": True,
+            "forbidStyleWrapper": True,
+        }
     return {
         "grantToken": token,
         "operation": source_range.operation,
@@ -130,6 +139,7 @@ def _grant_payload(
         "detail": source_range.detail,
         "expectsValue": expects_value,
         "valueKind": value_kind,
+        "valueConstraints": value_constraints,
         "applyTemplate": apply_template,
     }
 
@@ -357,7 +367,10 @@ _DOCUMENT_LOCATE_SCHEMA: dict[str, Any] = {
     description=(
         "Locate one exact selected-document target for replace_text, set_attribute, "
         "remove_attribute, set_style, or remove_node. Returns an opaque, turn-scoped grant; "
-        "never returns source offsets."
+        "never returns source offsets. Reuse an existing grant instead of locating the same "
+        "annotation and operation again. For set_style, apply only a CSS declaration list "
+        "such as 'color: #222; background-color: #fff;' without selectors, braces, or a "
+        "style= wrapper."
     ),
     params=_DOCUMENT_LOCATE_SCHEMA,
     owner_only=True,
@@ -388,8 +401,19 @@ async def document_locate(
         "document_locate",
         require_anchor=True,
     )
-    _consume_range_query(scope)
     order = _annotation_order(annotation_order, len(scope.anchors))
+    query_key = json.dumps(
+        [
+            scope.document.document_id,
+            scope.revision.revision_id,
+            order,
+            operation,
+            attribute_name,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    remaining_queries = _consume_range_query(scope, query_key=query_key)
     locations = _locations_for_operation(
         adapter=adapter,
         scope=scope,
@@ -407,6 +431,7 @@ async def document_locate(
             "attributeName": attribute_name,
             "locations": locations,
             "retryAllowed": not locations,
+            "remainingUniqueLocateQueries": remaining_queries,
         }
     )
 

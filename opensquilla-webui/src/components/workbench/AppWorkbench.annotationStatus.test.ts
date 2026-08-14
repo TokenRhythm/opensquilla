@@ -33,4 +33,26 @@ describe('AppWorkbench annotation mode status', () => {
     expect(appWorkbenchSource).toContain(':aria-describedby="isActiveAnnotationToolbarItem(toolbarItem)')
     expect(appWorkbenchSource).toContain("? 'workbench-annotation-mode-status'")
   })
+
+  it('refreshes mounted document metadata after state events and reconnects', () => {
+    expect(appWorkbenchSource).toContain(
+      'async function refreshArtifactDocumentItem',
+    )
+    expect(appWorkbenchSource).toContain(
+      'payload: { ...current.payload }',
+    )
+    expect(appWorkbenchSource).toContain(
+      'void refreshArtifactDocumentItem(item)',
+    )
+    expect(appWorkbenchSource).toContain(
+      'const previousRevisionId = artifactDocuments.snapshot',
+    )
+    expect(appWorkbenchSource).toContain(
+      'runtimeManager.handleComponentEvent(updated',
+    )
+    expect(appWorkbenchSource).toContain("type: 'artifact-head-changed'")
+    expect(appWorkbenchSource).toContain(
+      'refreshOpenArtifactDocuments(sessionKey)',
+    )
+  })
 })

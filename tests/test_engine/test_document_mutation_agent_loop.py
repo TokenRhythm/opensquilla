@@ -80,6 +80,48 @@ class _ScriptedMutationProvider:
             yield event
 
 
+class _CloseAwareStream:
+    def __init__(self, events: list[object]) -> None:
+        self.events = iter(events)
+        self.closed = False
+
+    def __aiter__(self) -> _CloseAwareStream:
+        return self
+
+    async def __anext__(self) -> object:
+        try:
+            event = next(self.events)
+        except StopIteration as exc:
+            raise StopAsyncIteration from exc
+        if isinstance(event, BaseException):
+            raise event
+        return event
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class _CloseAwareMutationProvider:
+    provider_name = "close-aware-document-mutation"
+
+    def __init__(self, scripts: list[list[object]]) -> None:
+        self.scripts = scripts
+        self.calls: list[dict[str, Any]] = []
+        self.streams: list[_CloseAwareStream] = []
+
+    def chat(
+        self,
+        messages: list[Any],
+        tools: list[Any] | None = None,
+        config: Any | None = None,
+    ) -> _CloseAwareStream:
+        call_index = len(self.calls)
+        self.calls.append({"messages": list(messages), "tools": tools, "config": config})
+        stream = _CloseAwareStream(self.scripts[call_index])
+        self.streams.append(stream)
+        return stream
+
+
 def _tool_call_events(tool_use_id: str, arguments: dict[str, Any]) -> list[object]:
     return [
         ProviderToolUseStartEvent(
@@ -130,7 +172,7 @@ def _effect_result(
 
 
 def _agent(
-    provider: _ScriptedMutationProvider,
+    provider: Any,
     controller: _MutationController,
     handler: Any,
     *,
@@ -207,6 +249,11 @@ async def test_committed_mutation_gets_real_outcome_only_tools_disabled_finaliza
 
     assert len(provider.calls) == 2
     assert provider.calls[1]["tools"] is None
+    assert provider.calls[0]["config"].max_tokens == 8_192
+    assert provider.calls[1]["config"].max_tokens == 256
+    assert provider.calls[1]["config"].thinking is False
+    assert provider.calls[1]["config"].system
+    assert "document_apply" not in provider.calls[1]["config"].system
     finalization_wire = _serialized_messages(provider.calls[1])
     for forbidden in ("secret-grant", "document_apply", "grant_token", "offset", "path"):
         assert forbidden not in finalization_wire
@@ -597,6 +644,36 @@ async def test_finalization_provider_failure_keeps_outcome_and_local_fallback() 
 
 
 @pytest.mark.asyncio
+async def test_finalization_provider_error_closes_the_underlying_stream() -> None:
+    provider = _CloseAwareMutationProvider(
+        [
+            _tool_call_events("apply-committed", {"mutations": []}),
+            [ProviderErrorEvent(message="provider unavailable", code="503")],
+        ]
+    )
+    controller = _MutationController()
+
+    async def handler(call: Any) -> ToolResult:
+        controller.committed_ids.add(call.tool_use_id)
+        return _effect_result(
+            call.tool_use_id,
+            status="applied",
+            effect_state="committed",
+            retry_policy="never",
+            loop_action="finalize_without_tools",
+            code="document_mutation_applied",
+            is_error=False,
+        )
+
+    events = [event async for event in _agent(provider, controller, handler).run_turn("edit")]
+    done = next(event for event in events if event.kind == "done")
+
+    assert done.document_mutation_outcome["status"] == "applied"
+    assert len(provider.streams) == 2
+    assert all(stream.closed for stream in provider.streams)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid_finalization",
     [
@@ -814,3 +891,42 @@ async def test_finalization_failure_fallback_uses_the_client_locale(
 
     assert done.document_mutation_outcome["status"] == "applied"
     assert done.text == expected
+
+
+@pytest.mark.asyncio
+async def test_finalization_prefers_the_annotation_turn_language_over_ui_locale() -> None:
+    provider = _ScriptedMutationProvider(
+        [
+            _tool_call_events("apply-committed", {"mutations": []}),
+            [ProviderErrorEvent(message="provider unavailable", code="503")],
+        ]
+    )
+    controller = _MutationController()
+
+    async def handler(call: Any) -> ToolResult:
+        controller.committed_ids.add(call.tool_use_id)
+        return _effect_result(
+            call.tool_use_id,
+            status="applied",
+            effect_state="committed",
+            retry_policy="never",
+            loop_action="finalize_without_tools",
+            code="document_mutation_applied",
+            is_error=False,
+        )
+
+    events = [
+        event
+        async for event in _agent(
+            provider,
+            controller,
+            handler,
+            locale="en",
+        ).run_turn("请按批注修改文档")
+    ]
+    done = next(event for event in events if event.kind == "done")
+
+    assert provider.calls[1]["tools"] is None
+    finalization_payload = json.loads(provider.calls[1]["messages"][0].content)
+    assert finalization_payload["responseLocale"] == "zh-Hans"
+    assert done.text == "文档修改已成功应用。"

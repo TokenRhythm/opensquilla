@@ -172,7 +172,11 @@ def render_active_prompt_annotation_context(values: object) -> str | None:
         "the required semantic operations. Submit all prepared mutations together with "
         "document_apply. Never calculate or submit source offsets, paths, document identifiers, "
         "or markup patches. Cover every ordered annotation in the apply proposal. Validation is "
-        "performed by the server adapter. Correct a rejected proposal only when the tool outcome "
+        "performed by the server adapter. Locate each annotation-operation pair at most once and "
+        "reuse its returned grant; after the required grants are ready, apply promptly instead of "
+        "re-reading or re-locating the same targets. A set_style value is only a CSS declaration "
+        "list such as 'color: #222; background-color: #fff;' and must not contain selectors, rule "
+        "braces, or a style= wrapper. Correct a rejected proposal only when the tool outcome "
         "permits it; a stale or invalid grant must not create a revision. Do not claim success "
         "without an applied tool receipt."
     )

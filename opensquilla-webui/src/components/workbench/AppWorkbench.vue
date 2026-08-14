@@ -619,6 +619,51 @@ function refreshResourceCollectionItem(sessionKey: string) {
   }))
 }
 
+async function refreshArtifactDocumentItem(
+  item: WorkbenchItem,
+) {
+  const artifact = artifactFromWorkbenchItem(item)
+  if (!artifact) return
+  const sessionKey = sessionKeyFromWorkbenchItem(item)
+  if (!sessionKey) return
+  const previousRevisionId = artifactDocuments.snapshot(
+    artifact,
+    sessionKey,
+  ).workspace?.document.headRevisionId
+  const workspace = await artifactDocuments.refresh(artifact, sessionKey)
+  const current = store.items.find(candidate => candidate.id === item.id)
+  if (!current) return
+  // The document snapshot lives in a separate Pinia store. Refresh the
+  // descriptor identity as well so an already-mounted panel recomputes its
+  // Versions/Changes props immediately, even when the state event arrived
+  // during a WebSocket reconnect boundary.
+  const updated = {
+    ...current,
+    payload: { ...current.payload },
+  }
+  store.updateItem(updated)
+  if (
+    workspace.source === 'document-api'
+    && previousRevisionId
+    && previousRevisionId !== workspace.document.headRevisionId
+  ) {
+    // Route the head change with the descriptor that updateItem just made
+    // authoritative. RuntimeManager deliberately rejects the stale descriptor
+    // captured before the asynchronous metadata refresh.
+    runtimeManager.handleComponentEvent(updated, { type: 'artifact-head-changed' })
+  }
+}
+
+function refreshOpenArtifactDocuments(sessionKey: string) {
+  for (const item of store.items) {
+    const artifact = artifactFromWorkbenchItem(item)
+    if (!artifact || sessionKeyFromWorkbenchItem(item) !== sessionKey) continue
+    const workspace = artifactDocuments.snapshot(artifact, sessionKey).workspace
+    if (workspace?.source !== 'document-api') continue
+    void refreshArtifactDocumentItem(item)
+  }
+}
+
 function panelComponent(item: WorkbenchItem) {
   return workbenchPanelRegistry.resolve(item)?.component || null
 }
@@ -805,10 +850,7 @@ function onArtifactState(event: ArtifactStateEventPayload) {
     const itemSessionKey = sessionKeyFromWorkbenchItem(item)
     const snapshot = artifactDocuments.snapshot(artifact, itemSessionKey)
     if (snapshot.workspace?.document.documentId !== documentId) continue
-    void artifactDocuments.refresh(artifact, itemSessionKey).then(() => {
-      if (!headChanged) return
-      runtimeManager.handleComponentEvent(item, { type: 'artifact-head-changed' })
-    })
+    void refreshArtifactDocumentItem(item)
   }
 }
 
@@ -974,12 +1016,14 @@ watch(
     if (
       state !== 'connected'
       || !props.routeActive
-      || !props.workbenchResourcesEnabled
       || !sessionKey
     ) return
-    void workbenchResources.load(sessionKey, true).then(() => {
-      refreshResourceCollectionItem(sessionKey)
-    })
+    if (props.workbenchResourcesEnabled) {
+      void workbenchResources.load(sessionKey, true).then(() => {
+        refreshResourceCollectionItem(sessionKey)
+      })
+    }
+    refreshOpenArtifactDocuments(sessionKey)
   },
 )
 

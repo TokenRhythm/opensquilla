@@ -1706,6 +1706,7 @@ class SessionStorage:
     ) -> None:
         self._db_path = db_path
         self._conn: Any | None = None
+        self._connection_generation = 0
         self._meta_run_writer = meta_run_writer
         self._operation_lock = asyncio.Lock()
         self._usage_backfill_index_lock = asyncio.Lock()
@@ -1766,6 +1767,7 @@ class SessionStorage:
         goal_pause_reason: str = "process_restart",
     ) -> None:
         self._conn = await aiosqlite.connect(self._db_path, isolation_level=None)
+        self._connection_generation += 1
         self._conn.row_factory = aiosqlite.Row
         # Unicode-aware case folding for non-ASCII LIKE search (see _py_lower).
         # aiosqlite proxies create_function to sqlite3 at runtime; its stub omits it.
@@ -1999,6 +2001,35 @@ class SessionStorage:
         finally:
             if acquired:
                 self._operation_lock.release()
+
+    @property
+    def connection_generation(self) -> int:
+        """Monotonic identity for consumers that cache per-connection setup."""
+
+        if self._conn is None:
+            raise RuntimeError("Storage not connected. Call connect() first.")
+        return self._connection_generation
+
+    @asynccontextmanager
+    async def read_transaction(self, operation: str) -> AsyncIterator[Any]:
+        """Run a bounded read snapshot on the canonical connection.
+
+        The operation gate prevents interleaving transactions on the shared
+        aiosqlite connection.  A deferred ``BEGIN`` intentionally avoids
+        reserving SQLite's writer slot, so independent WAL writers remain
+        available while the short snapshot runs.
+        """
+
+        qualified_operation = f"read.{operation}"
+        async with self._operation_lock:
+            self._raise_if_poisoned()
+            conn = self.conn
+            try:
+                await self._finish_sqlite_call(conn.execute("BEGIN"))
+                yield conn
+            finally:
+                if bool(getattr(conn, "in_transaction", False)):
+                    await self._rollback_transaction(conn, qualified_operation)
 
     async def _initialize_schema(
         self,

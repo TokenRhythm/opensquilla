@@ -66,7 +66,7 @@ _MUTATION_ATTEMPT_TURN_QUERY_CHUNK_SIZE = 400
 
 
 class _SessionStorageBinding(Protocol):
-    """Narrow existing-storage seam used without changing SessionStorage."""
+    """Narrow transaction seam exposed by SessionStorage."""
 
     def _write_transaction(
         self,
@@ -75,16 +75,13 @@ class _SessionStorageBinding(Protocol):
         budget_seconds: float | None = None,
     ) -> AbstractAsyncContextManager[Any]: ...
 
+    def read_transaction(
+        self,
+        operation: str,
+    ) -> AbstractAsyncContextManager[Any]: ...
+
     @property
-    def conn(self) -> Any: ...
-
-    _operation_lock: asyncio.Lock
-
-    def _raise_if_poisoned(self) -> None: ...
-
-    async def _finish_sqlite_call(self, awaitable: Any) -> Any: ...
-
-    async def _rollback_transaction(self, conn: Any, operation: str) -> None: ...
+    def connection_generation(self) -> int: ...
 
 
 class _StorageInitializationState:
@@ -92,7 +89,7 @@ class _StorageInitializationState:
 
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
-        self.connection: Any | None = None
+        self.generation = -1
 
 
 _STORAGE_INITIALIZATION: weakref.WeakKeyDictionary[
@@ -108,32 +105,6 @@ def _storage_initialization_state(
         state = _StorageInitializationState()
         _STORAGE_INITIALIZATION[storage] = state
     return state
-
-
-@asynccontextmanager
-async def _session_storage_read_transaction(
-    storage: _SessionStorageBinding,
-    operation: str,
-) -> AsyncIterator[Any]:
-    """Run a non-writing snapshot on SessionStorage's canonical connection.
-
-    SQLite connections cannot interleave statements from separate transactions,
-    so the normal operation gate still protects the shared connection.  A plain
-    deferred ``BEGIN`` deliberately avoids reserving the database writer slot:
-    WAL writers on other connections remain available while these bounded reads
-    execute.
-    """
-
-    qualified_operation = f"artifact_session.{operation}"
-    async with storage._operation_lock:
-        storage._raise_if_poisoned()
-        conn = storage.conn
-        try:
-            await storage._finish_sqlite_call(conn.execute("BEGIN"))
-            yield conn
-        finally:
-            if bool(getattr(conn, "in_transaction", False)):
-                await storage._rollback_transaction(conn, qualified_operation)
 
 
 def _now_ms() -> int:
@@ -472,7 +443,7 @@ class ArtifactSessionRepository:
             return storage._write_transaction(f"artifact_session.{operation}")
 
         def read_transaction(operation: str) -> AbstractAsyncContextManager[Any]:
-            return _session_storage_read_transaction(storage, operation)
+            return storage.read_transaction(f"artifact_session.{operation}")
 
         repository = cls(
             transaction,
@@ -482,10 +453,10 @@ class ArtifactSessionRepository:
         )
         state = _storage_initialization_state(storage)
         async with state.lock:
-            connection = storage.conn
-            if state.connection is not connection:
+            generation = storage.connection_generation
+            if state.generation != generation:
                 await repository.initialize()
-                state.connection = connection
+                state.generation = generation
         return repository
 
     @classmethod

@@ -24,7 +24,7 @@
     "test:packaged-session-recovery": "node scripts/test-packaged-session-recovery.mjs",
     "test:packaged-first-send-renderer": "node scripts/test-packaged-first-send-renderer.mjs",
     "test:cli-invocation": "npm run build && node scripts/test-cli-invocation.mjs",
-    "test:secret-storage": "npm run build && node scripts/test-secret-storage-policy.mjs",
+    "test:secret-storage": "npm run build && node scripts/test-secret-storage-policy.mjs && node scripts/test-secret-decryption-cache.mjs",
     "test:sandbox-default": "npm run build && node scripts/test-desktop-sandbox-default.mjs",
     "test:update-resolver": "npm run build && node scripts/test-update-resolver.mjs",
     "test:update-scheduler": "npm run build && node scripts/test-update-check-scheduler.mjs",

@@ -85,10 +85,11 @@
      "text": "please summarize this short note",
      "thinking_mode": "T1",
      "top1_label": "R1",
-     "turn_index": 1
+     "turn_index": 0
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -184,10 +185,11 @@
      "text": "please summarize this short note",
      "thinking_mode": "T1",
      "top1_label": "R1",
-     "turn_index": 1
+     "turn_index": 0
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -297,10 +299,11 @@
      "text": "please summarize this short note",
      "thinking_mode": "T3",
      "top1_label": "R1",
-     "turn_index": 1
+     "turn_index": 0
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -412,10 +415,11 @@
      "text": "please summarize this short note",
      "thinking_mode": "T2",
      "top1_label": "R0",
-     "turn_index": 2
+     "turn_index": 0
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -520,10 +524,11 @@
      "text": "please summarize this short note",
      "thinking_mode": "T2",
      "top1_label": "R1",
-     "turn_index": 1
+     "turn_index": 0
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -623,10 +628,11 @@
      "text": "please summarize this short note",
      "thinking_mode": "T2",
      "top1_label": "R2",
-     "turn_index": 1
+     "turn_index": 0
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -722,10 +728,11 @@
      "text": "please summarize this short note",
      "thinking_mode": "T1",
      "top1_label": "R1",
-     "turn_index": 1
+     "turn_index": 0
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -827,6 +834,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -923,6 +931,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -936,7 +945,9 @@
   "error": null,
   "message_len": 3,
   "message_tail": "   ",
-  "metadata": {},
+  "metadata": {
+   "routing_turn_index": 0
+  },
   "model": "dummy-base-model"
  },
  "classifier_unknown_tier_falls_back_default": {
@@ -1003,6 +1014,7 @@
     }
    ],
    "routing_source": "default",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -1114,10 +1126,11 @@
      "text": "please summarize this short note",
      "thinking_mode": "T3",
      "top1_label": "R0",
-     "turn_index": 1
+     "turn_index": 0
     }
    ],
    "routing_source": "large_context_floor",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -1222,6 +1235,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -1333,10 +1347,11 @@
      "text": "you are wrong, redo",
      "thinking_mode": "T3",
      "top1_label": "R3",
-     "turn_index": 1
+     "turn_index": 0
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -1442,6 +1457,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -1549,6 +1565,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -1658,6 +1675,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -1751,6 +1769,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -1844,6 +1863,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -1957,6 +1977,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -2062,6 +2083,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -2177,10 +2199,11 @@
      "text": "you missed my point, redo",
      "thinking_mode": "T3",
      "top1_label": "R0",
-     "turn_index": 1
+     "turn_index": 0
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -2288,6 +2311,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -2385,6 +2409,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -2480,6 +2505,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -2579,6 +2605,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -2674,6 +2701,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -2771,6 +2799,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -2859,6 +2888,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -2925,6 +2955,7 @@
     }
    ],
    "routing_source": "default",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -3049,6 +3080,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -3144,6 +3176,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -3232,6 +3265,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -3318,6 +3352,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -3409,6 +3444,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -3433,6 +3469,7 @@
    "routing_applied": true,
    "routing_confidence": 1.0,
    "routing_source": "image_route",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0
@@ -3454,6 +3491,7 @@
    "routing_applied": true,
    "routing_confidence": 1.0,
    "routing_source": "image_route",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0
@@ -3476,6 +3514,7 @@
    "routing_applied": true,
    "routing_confidence": 1.0,
    "routing_source": "image_route",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0
@@ -3497,6 +3536,7 @@
    "routing_applied": true,
    "routing_confidence": 1.0,
    "routing_source": "image_route",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0
@@ -3507,7 +3547,9 @@
   "error": "RuntimeError: No image-capable SquillaRouter tier is configured for this image request. Configure squilla_router.tiers.image_model with supports_image=true.",
   "message_len": 32,
   "message_tail": "please summarize this short note",
-  "metadata": {},
+  "metadata": {
+   "routing_turn_index": 0
+  },
   "model": "dummy-base-model"
  },
  "large_context_below_floor_boundary": {
@@ -3590,6 +3632,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -3697,6 +3740,7 @@
     }
    ],
    "routing_source": "large_context_floor",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -3806,6 +3850,7 @@
     }
    ],
    "routing_source": "large_context_floor",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -3915,6 +3960,7 @@
     }
    ],
    "routing_source": "large_context_floor",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -4024,6 +4070,7 @@
     }
    ],
    "routing_source": "large_context_floor",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -4133,6 +4180,7 @@
     }
    ],
    "routing_source": "large_context_floor",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -4244,6 +4292,7 @@
     }
    ],
    "routing_source": "large_context_floor",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -4341,6 +4390,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -4430,6 +4480,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -4537,6 +4588,7 @@
     }
    ],
    "routing_source": "large_context_floor",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -4634,6 +4686,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -4738,6 +4791,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -4751,7 +4805,9 @@
   "error": null,
   "message_len": 32,
   "message_tail": "please summarize this short note",
-  "metadata": {},
+  "metadata": {
+   "routing_turn_index": 0
+  },
   "model": "dummy-base-model"
  },
  "p2_policy_no_hint_injection": {
@@ -4842,6 +4898,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -4930,6 +4987,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -5026,6 +5084,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -5124,6 +5183,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -5223,6 +5283,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -5320,6 +5381,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -5434,6 +5496,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,
@@ -5524,6 +5587,7 @@
     }
    ],
    "routing_source": "v4_phase3",
+   "routing_turn_index": 0,
    "savings_max_price_per_m": 3.0,
    "savings_pct": 0.0,
    "savings_routed_price_per_m": 3.0,

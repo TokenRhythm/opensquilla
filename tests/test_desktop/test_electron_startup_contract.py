@@ -854,17 +854,18 @@ def test_consolidated_safe_storage_failure_cannot_publish_or_ack_as_adopted() ->
     # safeStorage can throw while decrypting ciphertext from another OS
     # keychain. Keep the candidate local to the guarded try until both secrets
     # have been validated, so the catch path leaves the publish guard null.
-    assert "return safeStorage.decryptString(payload)" in decrypt_secret
+    assert "() => safeStorage.decryptString(payload)" in decrypt_secret
+    assert "decryptedSecretCache.resolve(" in decrypt_secret
 
     candidate_index = credential_adoption.index(
         "const candidateCredential = normalizeDesktopCredential("
     )
     provider_validation_index = credential_adoption.index(
-        "!decryptApiKey(candidateCredential)",
+        "resolvedCredentialApiKey = decryptApiKey(candidateCredential)",
         candidate_index,
     )
     search_validation_index = credential_adoption.index(
-        "!decryptSearchApiKey(candidateCredential)",
+        "resolvedCredentialSearchApiKey = decryptSearchApiKey(candidateCredential)",
         provider_validation_index,
     )
     publish_eligibility_index = credential_adoption.index(

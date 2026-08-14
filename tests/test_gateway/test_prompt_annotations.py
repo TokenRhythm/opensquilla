@@ -61,6 +61,9 @@ def test_prompt_annotation_context_escapes_instruction_and_wraps_source_quote() 
         "document_apply",
     ):
         assert tool_name in rendered
+    assert "Locate each annotation-operation pair at most once" in rendered
+    assert "CSS declaration list" in rendered
+    assert "must not contain selectors" in rendered
     assert "html_edit_source" not in rendered
 
 

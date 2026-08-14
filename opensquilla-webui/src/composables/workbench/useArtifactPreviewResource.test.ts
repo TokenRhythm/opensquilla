@@ -134,15 +134,17 @@ describe('createArtifactPreviewResource', () => {
     expect(controller.errorCode.value).toBe('missing-url')
   })
 
-  it('renders an authenticated inline attachment locally without widening URL trust', async () => {
+  it('decodes a server-validated inline UTF-8 HTML attachment without fetch', async () => {
     const observed: { blob?: Blob } = {}
-    const inlineUrl = 'data:text/html;base64,PGgxPklubGluZTwvaDE+'
-    const fetchImpl = vi.fn().mockResolvedValue(response('<h1>Inline</h1>', 'text/html'))
+    const inlineUrl = 'data:text/html;charset=utf-8;base64,PCFkb2N0eXBlIGh0bWw+PGgxPuS9oOWlve+8jElubGluZSDimJU8L2gxPg=='
+    const fetchImpl = vi.fn()
     const controller = createArtifactPreviewResource({
       artifact: () => artifact({
         id: undefined,
         name: 'inline.html',
         mime: 'text/html',
+        sha256: 'f65982a5bbec7babf0dfda6e60b973dd750a40545a8f52f62a924a5d7c8184e2',
+        size: 43,
         download_url: inlineUrl,
         workbenchResourceType: 'attachment',
       }),
@@ -156,14 +158,74 @@ describe('createArtifactPreviewResource', () => {
 
     await controller.load()
 
-    expect(fetchImpl).toHaveBeenCalledWith(inlineUrl, expect.objectContaining({
-      credentials: 'omit',
-      headers: {},
-      redirect: 'error',
-    }))
+    expect(fetchImpl).not.toHaveBeenCalled()
     expect(controller.state.value).toBe('ready')
     expect(controller.objectUrl.value).toBe('blob:inline-preview')
+    expect(await observed.blob?.text()).toContain('你好，Inline ☕')
     expect(await observed.blob?.text()).toContain("connect-src 'none'")
+  })
+
+  it('fails closed when an inline attachment contains malformed base64', async () => {
+    const fetchImpl = vi.fn()
+    const controller = createArtifactPreviewResource({
+      artifact: () => artifact({
+        id: undefined,
+        name: 'inline.html',
+        mime: 'text/html',
+        download_url: 'data:text/html;base64,abcde',
+        workbenchResourceType: 'attachment',
+      }),
+      fetchImpl,
+    })
+
+    await controller.load()
+
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('invalid-content')
+  })
+
+  it('rejects an oversized inline attachment before decoding or fetching it', async () => {
+    const fetchImpl = vi.fn()
+    const encoded = 'AAAA'.repeat(Math.ceil(ARTIFACT_TEXT_PREVIEW_LIMIT / 3) + 1)
+    const controller = createArtifactPreviewResource({
+      artifact: () => artifact({
+        id: undefined,
+        name: 'inline.html',
+        mime: 'text/html',
+        download_url: `data:text/html;base64,${encoded}`,
+        workbenchResourceType: 'attachment',
+      }),
+      fetchImpl,
+    })
+
+    await controller.load()
+
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(controller.state.value).toBe('unsupported')
+    expect(controller.errorCode.value).toBe('too-large')
+  })
+
+  it('reports inline attachment integrity mismatches explicitly', async () => {
+    const fetchImpl = vi.fn()
+    const controller = createArtifactPreviewResource({
+      artifact: () => artifact({
+        id: undefined,
+        name: 'inline.html',
+        mime: 'text/html',
+        sha256: '0'.repeat(64),
+        size: 15,
+        download_url: 'data:text/html;base64,PGgxPklubGluZTwvaDE+',
+        workbenchResourceType: 'attachment',
+      }),
+      fetchImpl,
+    })
+
+    await controller.load()
+
+    expect(fetchImpl).not.toHaveBeenCalled()
+    expect(controller.state.value).toBe('error')
+    expect(controller.errorCode.value).toBe('integrity-error')
   })
 
   it('emits native HTML bytes and reports unresolved relative resources', async () => {

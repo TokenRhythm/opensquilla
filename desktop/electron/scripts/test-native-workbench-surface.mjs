@@ -61,6 +61,16 @@ assert.match(
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
+  /request\.enabled\s*\? this\.annotationRecordForUiRequest\(request\.surfaceId\)\s*: this\.annotationRecordForCleanupRequest\(request\.surfaceId\)/,
+  'picker disable must resolve the exact live v3 surface even while its overlay hides the preview',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
+  /annotationRecordForCleanupRequest\(surfaceId\) \{[\s\S]*?record\.kind === 'artifact-preview'[\s\S]*?record\.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V3[\s\S]*?!record\.disposed/,
+  'picker cleanup lookup must remain scoped to an undisposed protocol-v3 artifact preview',
+)
+assert.match(
+  nativeWorkbenchSurfaceRuntime,
   /catch \(error\) \{[\s\S]*?annotationPickerActive = false;[\s\S]*?clearAnnotationInspectState\(record, true\)/,
   'picker enable failures must roll the native inspect overlay back',
 )

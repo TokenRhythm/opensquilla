@@ -572,16 +572,29 @@ describe('artifact Workbench provider', () => {
       nativeHtml: true,
       sessionKey: 'session-a',
     })
+    const legacy = createLegacyArtifactWorkspace({
+      ...artifact,
+      documentId: 'document-1',
+    }, 'session-a')
+    const workspace = {
+      ...legacy,
+      source: 'document-api' as const,
+      document: {
+        ...legacy.document,
+        documentId: 'document-1',
+        headRevisionId: 'revision-1',
+      },
+    }
     const definition = createArtifactWorkbenchDefinitions({
       artifactDocuments: {
-        load: vi.fn(async () => undefined),
+        load: vi.fn(async () => workspace),
         snapshot: vi.fn(() => ({
           key: 'session-a\0artifact-1',
           loading: false,
           loaded: true,
           stale: false,
           error: null,
-          workspace: null,
+          workspace,
         })),
         headArtifact: vi.fn(() => currentHead),
       },
@@ -620,6 +633,15 @@ describe('artifact Workbench provider', () => {
       artifactId: 'artifact-head-2',
     }))
     expect(destroySurface).toHaveBeenCalledOnce()
+    currentHead = {
+      ...currentHead,
+      id: 'artifact-head-3',
+    }
+    await runtime.performAction?.('refresh', item)
+    expect(createLease).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      artifactId: 'artifact-head-3',
+    }))
+    expect(destroySurface).toHaveBeenCalledTimes(2)
     await runtime.dispose?.('closed')
   })
 

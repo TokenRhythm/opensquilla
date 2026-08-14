@@ -214,18 +214,24 @@ async def test_empty_artifact_prompt_routes_to_floor_even_in_observe_mode(
 
 
 def test_artifact_fallback_chain_never_crosses_c2_floor() -> None:
-    chain = _router_text_fallback_chain("c2", TIERS, minimum_tier="c2")
+    chain = _router_text_fallback_chain(
+        "c2", TIERS, minimum_tier="c2", allow_stronger_fallbacks=True
+    )
 
     assert [item["tier"] for item in chain] == ["c3"]
 
 
 def test_artifact_c3_fallback_can_use_c2_but_not_lower_tiers() -> None:
-    chain = _router_text_fallback_chain("c3", TIERS, minimum_tier="c2")
+    chain = _router_text_fallback_chain(
+        "c3", TIERS, minimum_tier="c2", allow_stronger_fallbacks=True
+    )
 
     assert [item["tier"] for item in chain] == ["c2"]
 
 
 def test_structural_edit_c3_floor_has_no_lower_fallback() -> None:
-    chain = _router_text_fallback_chain("c3", TIERS, minimum_tier="c3")
+    chain = _router_text_fallback_chain(
+        "c3", TIERS, minimum_tier="c3", allow_stronger_fallbacks=True
+    )
 
     assert chain == []

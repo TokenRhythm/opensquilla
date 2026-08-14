@@ -992,7 +992,14 @@ export class NativeWorkbenchSurfaceManager {
   async setArtifactAnnotationMode(
     request: NativeWorkbenchAnnotationModeRequest,
   ): Promise<NativeWorkbenchSurfaceResult> {
-    const record = this.annotationRecordForUiRequest(request.surfaceId)
+    // Enabling is only valid for the active, visible preview. Disabling must
+    // also accept the exact live v3 surface while its trusted annotation
+    // overlay is visible: presenting that overlay intentionally hides the
+    // preview, so the stricter active-record predicate cannot be used to
+    // acknowledge Stop and clean up the binding.
+    const record = request.enabled
+      ? this.annotationRecordForUiRequest(request.surfaceId)
+      : this.annotationRecordForCleanupRequest(request.surfaceId)
     if (!record) {
       return {
         ok: false,
@@ -1283,6 +1290,18 @@ export class NativeWorkbenchSurfaceManager {
   ): NativeWorkbenchSurfaceRecord | null {
     const record = this.surfaces.get(surfaceId)
     return record && this.isActiveAnnotationRecord(record) ? record : null
+  }
+
+  private annotationRecordForCleanupRequest(
+    surfaceId: string,
+  ): NativeWorkbenchSurfaceRecord | null {
+    const record = this.surfaces.get(surfaceId)
+    return record
+      && record.kind === 'artifact-preview'
+      && record.version === NATIVE_WORKBENCH_PROTOCOL_VERSION_V3
+      && !record.disposed
+      ? record
+      : null
   }
 
   private isActiveAnnotationRecord(record: NativeWorkbenchSurfaceRecord): boolean {

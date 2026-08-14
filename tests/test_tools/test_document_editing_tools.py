@@ -15,6 +15,7 @@ from opensquilla.artifact_session import (
     ArtifactConflictError,
     ArtifactKind,
     ArtifactMutationAttemptController,
+    ArtifactNotFoundError,
     ArtifactSessionService,
     ChangeSetStatus,
     MutationAttemptStatus,
@@ -425,11 +426,22 @@ async def test_document_removes_void_img_with_one_atomic_change_set(tmp_path: Pa
         remove_location = next(
             item for item in locations if item["operation"] == "remove_node"
         )
+        style_location = next(
+            item for item in locations if item["operation"] == "set_style"
+        )
         assert remove_location["grantToken"].startswith("hrg_")
         assert remove_location["expectsValue"] is False
         assert remove_location["valueKind"] is None
         assert remove_location["applyTemplate"] == {
             "grant_token": remove_location["grantToken"]
+        }
+        assert style_location["valueKind"] == "css_declarations"
+        assert style_location["valueConstraints"] == {
+            "format": "css_declaration_list",
+            "example": "color: #222; background-color: #fff;",
+            "forbidSelectors": True,
+            "forbidRuleBraces": True,
+            "forbidStyleWrapper": True,
         }
         projection = json.dumps(payload, sort_keys=True)
         assert "start_offset" not in projection
@@ -519,6 +531,54 @@ async def test_document_removes_void_img_with_one_atomic_change_set(tmp_path: Pa
         assert mismatch_outcome["attemptId"] == receipt.mutation_attempt_id
         assert len(await service.list_revisions(created.document.document_id)) == 2
         assert len(await service.list_change_sets(created.document.document_id)) == 1
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_document_remove_grant_rejects_even_empty_value_before_commit(
+    tmp_path: Path,
+) -> None:
+    service, _store, _source, _ref, created, _anchor, ctx = await _sent_img_context(
+        tmp_path
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        inspected = await _call(handler, "document_inspect", {})
+        locations = json.loads(inspected.content)["annotations"][0]["initialLocations"]
+        removal = next(item for item in locations if item["operation"] == "remove_node")
+        controller = ctx.artifact_mutation_attempt_controller
+        assert controller is not None
+        await controller.observe_intent("call-empty-remove-value")
+
+        result = await _call(
+            handler,
+            "document_apply",
+            {
+                "mutations": [
+                    {
+                        "grant_token": removal["grantToken"],
+                        "value": "",
+                    }
+                ],
+            },
+            tool_use_id="call-empty-remove-value",
+        )
+
+        assert result.is_error is True
+        assert "DOCUMENT_MUTATION_VALUE_UNEXPECTED" in result.content
+        assert "omit the value field entirely" in result.content
+        assert result.effect_outcome is not None
+        assert result.effect_outcome.effect_state == "none"
+        assert result.effect_outcome.retry_policy == "same_turn"
+        assert await service.list_change_sets(created.document.document_id) == ()
+        assert len(await service.list_revisions(created.document.document_id)) == 1
+        with pytest.raises(ArtifactNotFoundError):
+            await service.reconcile_mutation_attempt(
+                document_id=created.document.document_id,
+                turn_id=TURN_ID,
+                tool_use_id="call-empty-remove-value",
+            )
     finally:
         await service.close()
 

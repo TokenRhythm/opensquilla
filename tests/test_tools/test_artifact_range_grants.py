@@ -200,6 +200,19 @@ def test_registry_enforces_one_shared_four_query_budget() -> None:
     registry.consume_query_budget()
 
 
+def test_registry_reuses_budget_for_an_identical_query_without_broadening_authority() -> None:
+    registry = ArtifactRangeGrantRegistry()
+
+    assert registry.consume_query_budget(query_key="annotation-0:set_style") == 3
+    assert registry.consume_query_budget(query_key="annotation-0:set_style") == 3
+    assert registry.consume_query_budget(query_key="annotation-1:replace_text") == 2
+    assert registry.consume_query_budget(query_key="annotation-2:set_attribute:src") == 1
+    assert registry.consume_query_budget(query_key="annotation-2:set_style") == 0
+
+    with pytest.raises(ArtifactRangeGrantError, match="ARTIFACT_RANGE_QUERY_LIMIT"):
+        registry.consume_query_budget(query_key="annotation-3:remove_node")
+
+
 @pytest.mark.asyncio
 async def test_agent_turn_finally_clears_range_registry_after_success() -> None:
     ctx = ToolContext(is_owner=True, session_key="agent:main:webchat:range-cleanup")

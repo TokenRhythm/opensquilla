@@ -537,9 +537,9 @@ def _range_error(exc: ArtifactRangeGrantError) -> DocumentMutationError:
     )
 
 
-def _consume_range_query(scope: _ArtifactScope) -> None:
+def _consume_range_query(scope: _ArtifactScope, *, query_key: str | None = None) -> int:
     try:
-        registry_for_context(scope.ctx).consume_query_budget()
+        return registry_for_context(scope.ctx).consume_query_budget(query_key=query_key)
     except ArtifactRangeGrantError as exc:
         raise _range_error(exc) from None
 
@@ -1731,6 +1731,30 @@ async def _prepare_html_document_mutation(
         expected_text = source[grant.start : grant.end]
         if semantic_mutations:
             assert adapter is not None
+            grant_parts = grant.kind.split("|")
+            granted_operation = grant_parts[3] if len(grant_parts) == 7 else ""
+            has_value = "value" in patch
+            if granted_operation in {"remove_attribute", "remove_node"} and has_value:
+                registry.release_reservation(reservation_id)
+                raise DocumentMutationError(
+                    "DOCUMENT_MUTATION_VALUE_UNEXPECTED",
+                    "This mutation grant does not accept a value. Copy its applyTemplate "
+                    "exactly and omit the value field entirely.",
+                    retry_policy="correctable",
+                )
+            value_required = granted_operation in {
+                "replace_text",
+                "set_attribute",
+                "set_style",
+            }
+            if value_required and not has_value:
+                registry.release_reservation(reservation_id)
+                raise DocumentMutationError(
+                    "DOCUMENT_MUTATION_VALUE_REQUIRED",
+                    "This mutation grant requires a string value. Copy its applyTemplate "
+                    "and replace the empty value placeholder.",
+                    retry_policy="correctable",
+                )
             value = patch.get("value")
             assert value is None or isinstance(value, str)
             try:
