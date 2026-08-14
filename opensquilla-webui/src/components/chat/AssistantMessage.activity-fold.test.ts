@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h, nextTick, reactive, type App } from 'vue'
 import { createPinia } from 'pinia'
 
@@ -316,6 +316,7 @@ beforeEach(() => {
 afterEach(() => {
   while (mountedApps.length) mountedApps.pop()?.unmount()
   document.body.innerHTML = ''
+  vi.unstubAllGlobals()
 })
 
 describe('AssistantMessage activity disclosure', () => {
@@ -599,6 +600,181 @@ describe('AssistantMessage activity disclosure', () => {
     expect(activity?.querySelector('.activity-narration')?.textContent).toContain('Draft prefix')
     expect(activity?.textContent).toContain('Draft prefix')
     expect(el.textContent).not.toContain('Draft suffix')
+  })
+
+  it('restores routine phase rows and reopens settled reasoning content', async () => {
+    const startedAt = Date.parse('2026-01-01T00:00:00.000Z')
+    const el = mountMessage(baseMessage({
+      ts: '2026-01-01T00:00:07.000Z',
+      timelineItems: [],
+      statusHistory: [
+        { action: 'Sending', label: 'Sending', at: startedAt + 1_000 },
+        { action: 'provider:requesting', label: 'Waiting', at: startedAt + 2_000 },
+        { action: 'provider:reasoning', label: 'Reasoning', at: startedAt + 3_000 },
+        { action: 'write:1', label: 'Writing', at: startedAt + 4_000 },
+      ],
+    }))
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')!
+    activity.querySelector<HTMLButtonElement>('.assistant-activity__summary')?.click()
+    await nextTick()
+    expect(activity.textContent).not.toContain('Working')
+    expect(activity.textContent).toContain('Model response · 1s')
+    expect(activity.textContent).toContain('Thinking deeply · 1s')
+    expect(activity.textContent).toContain('Answer composition · 3s')
+    const processText = activity.textContent || ''
+    expect(processText.indexOf('Model response'))
+      .toBeLessThan(processText.indexOf('Thinking deeply'))
+    expect(processText.indexOf('Thinking deeply'))
+      .toBeLessThan(processText.indexOf('Answer composition'))
+
+    const reasoning = activity.querySelector<HTMLDetailsElement>('.thinking-fold')!
+    expect(reasoning.open).toBe(false)
+    reasoning.querySelector<HTMLElement>('.thinking-fold__summary')?.click()
+    await nextTick()
+    expect(reasoning.open).toBe(true)
+    expect(reasoning.querySelector('.thinking-fold__body')?.textContent)
+      .toBe('Checked the available evidence.')
+  })
+
+  it('retains separate completed reasoning blocks and lets each reopen', async () => {
+    const el = mountMessage(baseMessage({
+      timelineItems: [],
+      reasoningBlocks: [
+        {
+          id: 'reasoning-1',
+          index: 0,
+          text: 'First physical call.',
+          status: 'completed',
+          startedAt: 1_000,
+          endedAt: 3_000,
+          contentKind: 'reasoning',
+        },
+        {
+          id: 'reasoning-2',
+          index: 1,
+          text: 'Second physical call.',
+          status: 'completed',
+          startedAt: 4_000,
+          endedAt: 7_000,
+          contentKind: 'reasoning',
+        },
+      ],
+    }))
+    await nextTick()
+
+    const folds = el.querySelectorAll<HTMLDetailsElement>('.reasoning-timeline details')
+    expect(folds).toHaveLength(2)
+    expect([...folds].every(fold => !fold.open)).toBe(true)
+    expect(folds[0]?.textContent).toContain('Thinking deeply · 2s')
+    expect(folds[1]?.textContent).toContain('Thinking deeply · 3s')
+
+    folds[0]?.querySelector<HTMLElement>('summary')?.click()
+    folds[1]?.querySelector<HTMLElement>('summary')?.click()
+    await nextTick()
+    expect(folds[0]?.open).toBe(true)
+    expect(folds[1]?.open).toBe(true)
+    expect(folds[0]?.textContent).toContain('First physical call.')
+    expect(folds[1]?.textContent).toContain('Second physical call.')
+  })
+
+  it('continues an unfinished coarse reveal across the live-to-settled remount', async () => {
+    const callbacks: FrameRequestCallback[] = []
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      callbacks.push(callback)
+      return callbacks.length
+    })
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+    const fullText = 'coarse terminal reasoning '.repeat(80)
+    const el = mountMessage(baseMessage({
+      timelineItems: [],
+      reasoningPresentationPending: true,
+      reasoningBlocks: [{
+        id: 'reasoning-1',
+        index: 0,
+        text: fullText,
+        status: 'completed',
+        startedAt: 1_000,
+        endedAt: 3_000,
+        contentKind: 'reasoning',
+      }],
+    }))
+    await nextTick()
+
+    const activitySummary = el.querySelector<HTMLButtonElement>('.assistant-activity__summary')
+    const body = () => el.querySelector<HTMLElement>('.thinking-fold__body')?.textContent || ''
+    expect(activitySummary?.getAttribute('aria-expanded')).toBe('true')
+    expect(body().length).toBeGreaterThan(0)
+    expect(body().length).toBeLessThan(fullText.length)
+
+    while (callbacks.length) {
+      callbacks.shift()?.(performance.now())
+      await nextTick()
+    }
+    expect(body()).toBe(fullText)
+    expect(activitySummary?.getAttribute('aria-expanded')).toBe('false')
+  })
+
+  it('uses the status timeline clock for the parent total when outcome timing is shorter', async () => {
+    const startedAt = Date.parse('2026-01-01T00:00:00.000Z')
+    const el = mountMessage(baseMessage({
+      ts: '2026-01-01T00:00:07.000Z',
+      timelineItems: [],
+      statusHistory: [
+        { action: 'Sending', label: 'Sending', at: startedAt + 1_000 },
+        { action: 'provider:requesting', label: 'Waiting', at: startedAt + 2_000 },
+        { action: 'provider:reasoning', label: 'Reasoning', at: startedAt + 3_000 },
+        { action: 'write:1', label: 'Writing', at: startedAt + 4_000 },
+      ],
+      turnOutcome: {
+        turnId: 'turn-short-server-clock',
+        status: 'succeeded',
+        kind: 'completed',
+        startedAt: startedAt + 2_000,
+        finishedAt: startedAt + 5_000,
+      },
+    }))
+    await nextTick()
+
+    // The status phases occupy five seconds and the complete client-observed
+    // turn occupies six. The three-second server outcome is a fallback only,
+    // otherwise the child phase sum can exceed its parent total.
+    expect(el.querySelector('.assistant-activity__summary')?.textContent)
+      .toContain('Completed · 6s')
+    expect(el.querySelector('.assistant-activity__detail')).toBeNull()
+  })
+
+  it('never shows a parent total shorter than the rendered phase durations', async () => {
+    const startedAt = Date.parse('2026-01-01T00:00:00.000Z')
+    const el = mountMessage(baseMessage({
+      ts: '2026-01-01T00:00:04.000Z',
+      timelineItems: [],
+      parts: [{
+        type: 'reasoning',
+        key: 'assistant-1:reasoning',
+        text: 'Checked the available evidence.',
+        seconds: 2,
+      }],
+      statusHistory: [
+        { action: 'provider:requesting', label: 'Waiting', at: startedAt + 1_000 },
+        // A block-qualified action still projects a one-second reasoning
+        // phase, while the rendered reasoning part owns its two-second
+        // provider duration.
+        { action: 'provider:reasoning:block-1', label: 'Reasoning', at: startedAt + 2_000 },
+        { action: 'write:1', label: 'Writing', at: startedAt + 3_000 },
+      ],
+    }))
+    await nextTick()
+
+    const activity = el.querySelector<HTMLElement>('.assistant-activity')!
+    activity.querySelector<HTMLButtonElement>('.assistant-activity__summary')?.click()
+    await nextTick()
+    expect(activity.textContent).toContain('Model response · 1s')
+    expect(activity.textContent).toContain('Thinking deeply · 2s')
+    expect(activity.textContent).toContain('Answer composition · 1s')
+    expect(activity.querySelector('.assistant-activity__summary')?.textContent)
+      .toContain('Completed · 4s')
   })
 
   it('defaults successful activity to collapsed', async () => {
@@ -970,7 +1146,7 @@ describe('AssistantMessage activity disclosure', () => {
 
     expect(el.querySelector('.assistant-activity__summary')?.textContent)
       .toContain('Completed · 21s')
-    expect(el.querySelector('.assistant-activity__detail')?.textContent).toContain('Worked for 21s')
+    expect(el.querySelector('.assistant-activity__detail')?.textContent).not.toContain('Worked for')
   })
 
   it('keeps the exact duration when same-session history replaces the local row', async () => {
@@ -984,7 +1160,7 @@ describe('AssistantMessage activity disclosure', () => {
       timelineItems: successfulTimeline(),
     }))
     await nextTick()
-    expect(local.querySelector('.assistant-activity__detail')?.textContent).toContain('Worked for 21s')
+    expect(local.querySelector('.assistant-activity__summary')?.textContent).toContain('Completed · 21s')
 
     const restored = mountMessage(baseMessage({
       id: 'server-assistant',
@@ -993,7 +1169,7 @@ describe('AssistantMessage activity disclosure', () => {
       timelineItems: successfulTimeline(),
     }))
     await nextTick()
-    expect(restored.querySelector('.assistant-activity__detail')?.textContent).toContain('Worked for 21s')
+    expect(restored.querySelector('.assistant-activity__summary')?.textContent).toContain('Completed · 21s')
   })
 
   it('keeps the collapsed row compact and moves footprint and elapsed time into details', async () => {
@@ -1013,11 +1189,12 @@ describe('AssistantMessage activity disclosure', () => {
 
     expect(el.querySelector('.assistant-activity__label')?.textContent)
       .toBe('Completed · 21s')
-    // The expanded detail preserves the exact footprint and elapsed metadata.
+    // The expanded detail preserves only concrete work footprints; the parent
+    // completion label is the single owner of total elapsed time.
     expect(el.querySelector('.assistant-activity__label')?.textContent)
       .not.toContain('item')
     expect(el.querySelector('.assistant-activity__detail')?.textContent)
-      .toBe('1 web action · 1 command · 2 more · Worked for 21s')
+      .toBe('1 web action · 1 command · 2 more')
   })
 
   it('persists a measured duration from a watcher even when no disclosure reads it', async () => {
@@ -1043,8 +1220,8 @@ describe('AssistantMessage activity disclosure', () => {
     }))
     await nextTick()
 
-    expect(restored.querySelector('.assistant-activity__detail')?.textContent)
-      .toContain('Worked for 21s')
+    expect(restored.querySelector('.assistant-activity__summary')?.textContent)
+      .toContain('Completed · 21s')
   })
 
   it('expands streaming work and automatically folds it when settled', async () => {

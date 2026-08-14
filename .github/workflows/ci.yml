@@ -277,6 +277,7 @@ jobs:
         run: >-
           npm run test:e2e --
           assistant-activity.spec.ts
+          composer-paste.spec.ts
           history-hydration.spec.ts
           session-created-card.spec.ts
           goal-mode.spec.ts

@@ -1094,7 +1094,7 @@
       "capacityWarn": "每轮 {calls} 次模型调用——费用线性增长，超过 4 个提案模型后融合收益明显递减。",
       "capacityFull": "已达上限 {max} 个提案模型——更多草稿不会带来更好的融合结果，请先移除一个再添加。",
       "diversityHint": "多个提案来自同一模型家族——添加不同厂商的模型通常能提升融合质量。",
-      "effectiveFacts": "每轮 {calls} 次模型调用 · {quorum}/{proposers} 个候选正常返回即可融合 · 候选超时 {proposerTimeout} 秒 · 融合超时 {aggregatorTimeout} 秒 · 达标后宽限 {grace} 秒",
+      "effectiveFacts": "每轮 {calls} 次模型调用 · {quorum}/{proposers} 个候选正常返回即可融合 · 候选总超时 {proposerTimeout} 秒 · 融合空闲超时 {aggregatorTimeout} 秒 · 达标后宽限 {grace} 秒",
       "effectiveSummary": "{proposers} 个提案模型并行 + 1 个融合模型 · 预计每轮 {calls} 次调用",
       "runtimeStrategyTitle": "运行策略",
       "runtimeStrategyDesc": "正常返回阈值、失败处理与时限",
@@ -1103,7 +1103,7 @@
       "successThresholdExact": "至少 {quorum}/{proposers} 正常返回",
       "failurePolicyLabel": "无法完成融合时",
       "runtimeLimitsLabel": "运行时限",
-      "runtimeLimits": "每个提案最长 {proposerTimeout} 秒 · 达到阈值后再等待最多 {grace} 秒 · 融合最长 {aggregatorTimeout} 秒",
+      "runtimeLimits": "每个提案总时限 {proposerTimeout} 秒 · 融合模型事件间空闲时限 {aggregatorTimeout} 秒（配置值 {configuredAggregatorTimeout} 秒）· 整轮总时限另行控制 · 达标后宽限 {grace} 秒",
       "quorumFailureLabel": "正常返回的提案不足 {quorum} 个时"
     },
     "behavior": {
@@ -1876,6 +1876,7 @@
     "refresh": "刷新",
     "refreshing": "正在刷新…",
     "loading": "正在加载任务…",
+    "loadMore": "加载更多会话",
     "unknownAgent": "未知智能体",
     "deletedAgent": "已删除的智能体 · {id}",
     "msgCount": "{count} 条消息",
@@ -3478,12 +3479,14 @@
       "lifecycle": {
         "working": "正在工作",
         "answering": "正在组织回答",
+        "answerPrepared": "组织回答",
         "settled": "已完成",
         "interrupted": "已中断",
         "failed": "已失败"
       },
       "provider": {
         "waiting": "等待模型",
+        "responded": "模型响应",
         "reasoning": "深度思考",
         "rateLimited": "受到限流 · {seconds} 秒后重试",
         "retryWait": "{seconds} 秒后重试",
@@ -3911,6 +3914,9 @@
     "compact": {
       "compacting": "正在整理上下文…",
       "compacted": "上下文已整理",
+      "historyPreserved": "更早的上下文已汇总；原始消息仍可在历史记录中查看",
+      "historyIncomplete": "更早的上下文已汇总；部分原始消息不可用",
+      "historySummarized": "更早的上下文已汇总",
       "failed": "上下文整理失败",
       "withinBudget": "无需整理，上下文空间充足",
       "skipped": "未能应用上下文整理",
@@ -3942,7 +3948,6 @@
     "chips": {
       "whatCanYouDo": "你能做什么？",
       "buildGame": "帮我做个游戏",
-      "buildGamePrompt": "构建一个可玩的浏览器端体素竞速游戏原型，包含响应式操控、加速/刹车、可读赛道、碰撞检测、检查点、圈速计时和重启流程。用代码生成体素风格的赛车和场景，不使用付费素材。运行游戏、测试控制、修复阻塞性问题后交付。我希望风景更好,开放世界。且地图在有opensquilla和 tokenrhythm这两个标识 是赞助商彩蛋",
       "summarizeWebpage": "帮我总结一个网页",
       "planWeek": "为我这一周拟定计划",
       "searchAiNews": "搜索今天的 AI 新闻",
@@ -4085,6 +4090,7 @@
       "loadError": "无法加载任务",
       "noMatches": "无匹配项",
       "noConversations": "暂无任务。",
+      "allLoaded": "已加载全部任务",
       "startChat": "开始任务",
       "linkSessions": "会话",
       "currentTask": "当前任务",

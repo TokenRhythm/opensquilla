@@ -2,7 +2,10 @@ import type { ChatRenderedMessage } from '@/types/chat'
 
 export function chatMessageKey(message: ChatRenderedMessage, index: number): string {
   if (message.isRouterStrip && message.routerTurnKey) return message.routerTurnKey
-  return message.messageId || message.clientId || message.id || `${message.displayRole || message.role}-${message.sourceIndex ?? index}`
+  // A local row keeps clientId when the first canonical history snapshot adds
+  // messageId. Prefer that stable optimistic identity so stateful disclosures
+  // are not unmounted at the live-to-history handoff.
+  return message.clientId || message.messageId || message.id || `${message.displayRole || message.role}-${message.sourceIndex ?? index}`
 }
 
 let clientMessageSequence = 0

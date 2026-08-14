@@ -10,6 +10,7 @@ const FACTS = {
   quorum: 1,
   proposerCount: 2,
   proposerTimeoutSeconds: 300,
+  configuredAggregatorTimeoutSeconds: 3600,
   aggregatorTimeoutSeconds: 480,
   quorumGraceSeconds: 10,
 }
@@ -111,6 +112,7 @@ function panel(overrides: Record<string, unknown> = {}) {
         quorum: 3,
         proposerCount: 4,
         proposerTimeoutSeconds: 300,
+        configuredAggregatorTimeoutSeconds: 3600,
         aggregatorTimeoutSeconds: 480,
         quorumGraceSeconds: 10,
       },
@@ -943,6 +945,10 @@ describe('SetupModelStrategyPanel', () => {
     runtime.querySelector('summary')?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await nextTick()
     expect(runtime.open).toBe(true)
+    expect(runtime.textContent).toContain(
+      'aggregator 480s idle between provider events (configured 3600s)',
+    )
+    expect(runtime.textContent).toContain('outer turn deadline separate')
 
     const threshold = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_min_successful"]')!
     threshold.value = '2'

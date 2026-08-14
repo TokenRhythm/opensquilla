@@ -203,6 +203,24 @@ def test_build_terminal_reply_accepts_agent_task_record_like_objects() -> None:
         assert raw not in message
 
 
+def test_repetition_loop_has_stable_code_and_specific_terminal_reply() -> None:
+    code = safe_provider_failure_code(
+        "model_repetition_loop_detected",
+        "unknown",
+    )
+    message = build_terminal_reply(
+        {
+            "status": "failed",
+            "terminal_reason": code,
+            "error_class": code,
+        }
+    )
+
+    assert code == "model_repetition_loop_detected"
+    assert "repeating" in message.lower()
+    assert "stopped" in message.lower()
+
+
 def test_sanitize_agent_error_rewrites_raw_provider_output_limit_message() -> None:
     error_class, message = sanitize_agent_error(
         "Provider output limit reached before completion",

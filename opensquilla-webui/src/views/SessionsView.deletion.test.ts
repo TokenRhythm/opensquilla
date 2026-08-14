@@ -15,4 +15,16 @@ describe('SessionsView deletion contract', () => {
       'pendingApprovals.value = pendingApprovals.value.filter(key => !keys.has(key))',
     )
   })
+
+  it('resets session pagination after the RPC connection recovers', () => {
+    const handlerStart = sessionsViewSource.indexOf('function handleConnectionState')
+    const handlerEnd = sessionsViewSource.indexOf('// ---------------------------------------------------------------------------', handlerStart)
+    const handler = sessionsViewSource.slice(handlerStart, handlerEnd)
+    const activationStart = sessionsViewSource.indexOf('onActivated(() =>')
+    const activationEnd = sessionsViewSource.indexOf('onDeactivated(', activationStart)
+    const activation = sessionsViewSource.slice(activationStart, activationEnd)
+
+    expect(handler).toContain("if (state === 'connected') scheduleSessionRefresh()")
+    expect(activation).toContain("rpc.on('_state', handleConnectionState)")
+  })
 })

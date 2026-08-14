@@ -45,6 +45,11 @@ def test_registry_attaches_kind_policy() -> None:
     assert specs["openrouter"].compat.post_terminal_metadata_keys == frozenset(
         {"provider"}
     )
+    assert specs["zhipu"].compat.official_reasoning_dialect == "zai"
+    assert (
+        specs["zhipu"].compat.official_reasoning_api_root
+        == specs["zhipu"].default_base_url
+    )
     assert specs["volcengine"].compat.tool_schema_unsupported_keywords
     assert specs["vllm"].compat.display_name == "OpenAI"  # kind-aliased to openai
 

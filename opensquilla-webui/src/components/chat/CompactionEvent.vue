@@ -53,6 +53,11 @@ const labelCode = computed(() => {
   if (maintenance.value?.state === 'stale' || maintenance.value?.state === 'cancelled') {
     return 'chat.compact.cancelled'
   }
+  if (maintenance.value?.historyArchived) {
+    if (maintenance.value.canonicalComplete === true) return 'chat.compact.historyPreserved'
+    if (maintenance.value.canonicalComplete === false) return 'chat.compact.historyIncomplete'
+    return 'chat.compact.historySummarized'
+  }
   return 'chat.compact.compacted'
 })
 const liveRole = computed(() => {

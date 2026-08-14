@@ -71,7 +71,25 @@ _DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
 # Sentinel pushed into the outbox by ``_stop_writer`` to wake a writer
 # blocked in ``await self._outbox.get()`` and exit cleanly.
 _SENTINEL_STOP: Any = object()
-_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"})
+# Keep this list side-effect free: the Web UI uses the advertised methods to
+# turn a reconnect-on-timeout fallback into a request-local rejection.
+_CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
+    {
+        "agents.list",
+        "artifacts.list",
+        "commands.list_for_surface",
+        "config.get",
+        "models.routing.get",
+        "onboarding.status",
+        "sandbox.run_mode.preference.get",
+        "sessions.list",
+        "usage.status",
+        "workspaces.list",
+    }
+)
+_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"}).union(
+    _CONCURRENT_OPTIONAL_READ_METHODS
+)
 _MAX_DETACHED_REQUESTS_PER_CONNECTION = 4
 _DETACHED_REQUEST_DRAIN_SECONDS = 0.25
 
@@ -1027,6 +1045,7 @@ async def handle_ws_connection(
         ),
         policy=PolicyInfo(
             concurrent_history_reads=True,
+            concurrent_optional_read_methods=sorted(_CONCURRENT_OPTIONAL_READ_METHODS),
             agent_stream_heartbeat_interval_ms=int(
                 max(0.0, float(getattr(config, "agent_stream_heartbeat_interval_seconds", 15.0)))
                 * 1000

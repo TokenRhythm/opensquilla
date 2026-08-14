@@ -261,6 +261,9 @@ async function assertSettledMessageReceipt(page) {
     0,
     'usage details must not be embedded in the activity disclosure',
   )
+  // Keep the pointer outside the hover target so Escape exercises the pinned
+  // popover state consistently across Electron's Windows and macOS builds.
+  await page.mouse.move(1, 1)
   await page.keyboard.press('Escape')
   await usagePopover.waitFor({ state: 'hidden', timeout: SEND_TIMEOUT_MS })
 }
@@ -336,10 +339,19 @@ try {
   for (let iteration = 1; iteration <= iterations; iteration += 1) {
     await page.setViewportSize(iteration % 2 === 1 ? WIDE_VIEWPORT : TIGHT_VIEWPORT)
     const draftUrl = new URL(page.url())
+    const alreadyOnEmptyDraft = draftUrl.pathname === '/control/chat/new'
+      && draftUrl.search === ''
+      && draftUrl.hash === ''
     draftUrl.pathname = '/control/chat/new'
     draftUrl.search = ''
     draftUrl.hash = ''
-    await page.goto(draftUrl.toString(), { waitUntil: 'domcontentloaded' })
+    // Packaged macOS Electron can report ERR_ABORTED for a redundant
+    // same-document navigation immediately after launch. The first iteration
+    // already starts on the empty draft; later iterations still exercise the
+    // real transition back from a materialized session.
+    if (!alreadyOnEmptyDraft) {
+      await page.goto(draftUrl.toString(), { waitUntil: 'domcontentloaded' })
+    }
 
     const composer = page.locator('.chat-textarea')
     const header = page.locator('#app-route-header [data-testid="chat-header-actions"]')
@@ -348,6 +360,10 @@ try {
       timeout: SEND_TIMEOUT_MS,
     })
     await composer.waitFor({ state: 'visible', timeout: SEND_TIMEOUT_MS })
+    // The packaged app can expose its initial draft URL before Vue has mounted
+    // the permanent route header. Establish the landing-route baseline before
+    // asserting that session materialization preserves the same DOM node.
+    await header.waitFor({ state: 'attached', timeout: SEND_TIMEOUT_MS })
     assert.equal(
       await header.count(),
       1,

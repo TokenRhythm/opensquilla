@@ -164,6 +164,44 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('keeps the turn elapsed clock running across phase transitions', () => {
+    const { api } = makeStream()
+    api.startStreaming()
+
+    vi.advanceTimersByTime(5_000)
+    expect(api.streamTurnElapsed.value).toBe('5s')
+    expect(api.streamPhaseElapsed.value).toBe('5s')
+
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    expect(api.streamTurnElapsed.value).toBe('5s')
+    expect(api.streamPhaseElapsed.value).toBe('0s')
+
+    vi.advanceTimersByTime(3_000)
+    api.setStreamActivity('Thinking deeply', 'provider:reasoning')
+    expect(api.streamTurnElapsed.value).toBe('8s')
+    expect(api.streamPhaseElapsed.value).toBe('0s')
+    api.cleanup()
+  })
+
+  it('restores the turn elapsed clock from a replayed reasoning boundary', () => {
+    vi.setSystemTime(20_000)
+    const { api } = makeStream()
+    api.startStreaming()
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'replayed-reasoning',
+      blockIndex: 0,
+      at: 8_000,
+      contentKind: 'reasoning',
+    })
+    api.scheduleRender()
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+
+    expect(api.streamTurnElapsed.value).toBe('12s')
+    api.cleanup()
+  })
+
   it('preserves the authoritative active-task steer capability when streaming starts late', () => {
     const { api, runStatus, applySessionRunState } = makeStream()
     runStatus.value = {
@@ -391,6 +429,119 @@ describe('useChatStream render coalescing', () => {
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
       { type: 'text', raw: suffix },
     ])
+    api.cleanup()
+  })
+
+  it('retains structured reasoning blocks on the completed assistant row', () => {
+    vi.setSystemTime(5_000)
+    const { api, messages } = makeStream()
+    api.startStreaming()
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      at: 1_000,
+      contentKind: 'reasoning',
+    })
+    api.appendFrame({
+      kind: 'thinking',
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      text: 'inspect',
+      at: 2_000,
+    })
+    api.appendFrame({
+      kind: 'thinking-end',
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      status: 'completed',
+      at: 3_000,
+    })
+    api.appendDelta('answer')
+    vi.advanceTimersByTime(50)
+    rafCbs.shift()?.(0)
+
+    api.endStreaming()
+
+    expect(messages.value[0]?.reasoningBlocks).toEqual([expect.objectContaining({
+      id: 'reasoning-1',
+      text: 'inspect',
+      status: 'completed',
+      startedAt: 1_000,
+      endedAt: 3_000,
+    })])
+    api.cleanup()
+  })
+
+  it('keeps an interrupted reasoning-only turn instead of dropping it as empty', () => {
+    vi.setSystemTime(5_000)
+    const { api, messages } = makeStream()
+    api.startStreaming()
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'reasoning-only',
+      blockIndex: 0,
+      at: 1_000,
+      contentKind: 'reasoning',
+    })
+    api.appendFrame({
+      kind: 'thinking',
+      blockId: 'reasoning-only',
+      blockIndex: 0,
+      text: 'partial thought',
+      at: 2_000,
+    })
+    api.scheduleRender()
+    vi.advanceTimersByTime(50)
+    rafCbs.shift()?.(0)
+
+    api.endStreaming({ reason: 'aborted' })
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'assistant',
+      text: '',
+      interrupted: true,
+      reasoningBlocks: [{
+        id: 'reasoning-only',
+        text: 'partial thought',
+        status: 'interrupted',
+      }],
+    })
+    api.cleanup()
+  })
+
+  it('hands an unfinished coarse reveal to the settled assistant row', () => {
+    const { api, messages } = makeStream()
+    const coarse = 'reasoning '.repeat(80)
+    api.startStreaming()
+    api.noteReasoningPresentationDelta(coarse)
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'coarse-reasoning',
+      blockIndex: 0,
+      at: 1_000,
+      contentKind: 'reasoning',
+    })
+    api.appendFrame({
+      kind: 'thinking',
+      blockId: 'coarse-reasoning',
+      blockIndex: 0,
+      text: coarse,
+      at: 1_000,
+    })
+    api.appendFrame({
+      kind: 'thinking-end',
+      blockId: 'coarse-reasoning',
+      blockIndex: 0,
+      status: 'completed',
+      at: 2_000,
+    })
+    api.appendDelta('answer')
+    api.endStreaming()
+
+    expect(messages.value[0]?.reasoningPresentationPending).toBe(true)
+    expect(messages.value[0]?.reasoningBlocks?.[0]?.text).toBe(coarse)
     api.cleanup()
   })
 

@@ -293,18 +293,21 @@
           <div class="msg-ai-main">
             <ActivityDisclosure
               default-open
-              :lifecycle="liveAnswerPart ? 'answering' : 'working'"
+              lifecycle="working"
               :step-count="executionDockRun?.status === 'running' ? 0 : liveActivityStepCount"
               :failure-count="liveActivityFailureCount"
               :phase-label="liveActivityPhaseLabel"
-              :elapsed-label="streamPhaseElapsed"
+              :elapsed-label="streamTurnElapsed"
               :stale="streamActivityStale"
             >
-              <!-- Reasoning remains available as a flat, secondary disclosure,
-                   rendered by the same part component settled turns use so the
-                   chevron affordance and wording stay consistent; `live`
-                   selects the streaming "Thinking · Ns" label. -->
-              <ReasoningPart v-if="liveReasoningPart" :part="liveReasoningPart" live />
+              <ReasoningTimeline
+                v-if="liveReasoningBlocks.length"
+                :blocks="liveReasoningBlocks"
+                :collapse-active="liveReasoningCollapseActive"
+                pace-bursts
+                nested
+                @reveal-complete="completeReasoningPresentation"
+              />
 
               <AssistantActivityTimeline
                 v-if="
@@ -726,8 +729,8 @@ import ClarifyCard from '@/components/chat/ClarifyCard.vue'
 import ConversationMinimap from '@/components/chat/ConversationMinimap.vue'
 import EmptyStateChips from '@/components/chat/EmptyStateChips.vue'
 import InterruptPart from '@/components/chat/parts/InterruptPart.vue'
-import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import StreamingTextPart from '@/components/chat/parts/StreamingTextPart.vue'
+import ReasoningTimeline from '@/components/chat/ReasoningTimeline.vue'
 import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
 import MetaSkillSetupCard from '@/components/chat/MetaSkillSetupCard.vue'
@@ -885,6 +888,7 @@ import {
   type SandboxRunMode,
 } from '@/types/sandbox'
 import type { ChatPart, InterruptViewState } from '@/types/parts'
+import type { ReasoningBlock } from '@/types/turnlog'
 import type {
   PromptCacheKeepaliveStatus,
   PromptCacheKeepaliveStatusUpdate,
@@ -965,7 +969,6 @@ import {
 import {
   isSemanticActivityStatusStep,
   projectAssistantActivityTimeline,
-  providerActivityRemainingSeconds,
   splitLiveAssistantTimeline,
 } from '@/utils/chat/assistantActivity'
 
@@ -1359,8 +1362,8 @@ const {
   streamHasVisibleOutput,
   streamTimelineItems,
   streamActivityStale,
-  streamPhaseLabel,
   streamPhaseElapsed,
+  streamTurnElapsed,
   streamToolElapsedText,
   streamIdleTimeoutMs,
   thinkingVisible,
@@ -1381,6 +1384,7 @@ const {
   foldedTurn,
   appendInterruptFrame,
   ensureInterruptBubble,
+  completeReasoningPresentation,
 } = chatStream
 watch(
   () => rpc.state,
@@ -2604,6 +2608,15 @@ const chatSend = useChatSend({
       freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
     }
     persistSession(key, { source: 'chatView.draftAccepted' })
+    // The provisional draft bootstrap can finish before the Gateway creates
+    // the first durable session. Re-register immediately after acceptance so
+    // buffered text, tool, and reasoning frames replay into the first turn.
+    const bootstrap = startSessionBootstrap({ includeHistory: false, force: true })
+    void bootstrap.live.then(outcome => {
+      if (outcome.authoritative && sessionKey.value === key) {
+        void handleAuthoritativeSessionSubscription(key)
+      }
+    })
   },
   aborted,
   activeStreamTaskId,
@@ -3063,47 +3076,27 @@ const liveActivityStatusHistory = computed(() =>
   foldLiveTurnMode.value === false ? [] : foldedTurn.value.statusHistory,
 )
 const liveActivityProjection = computed(() =>
-  projectAssistantActivityTimeline(liveActivityTimelineItems.value, {
-    lifecycle: liveAnswerPart.value ? 'answering' : 'working',
-    statusHistory: liveActivityStatusHistory.value,
-  }),
+  {
+    // The shared activity tick advances both the current phase duration and
+    // the stable turn-level header without requiring provider wire traffic.
+    void streamPhaseElapsed.value
+    return projectAssistantActivityTimeline(liveActivityTimelineItems.value, {
+      lifecycle: liveAnswerPart.value ? 'answering' : 'working',
+      statusHistory: liveActivityStatusHistory.value,
+      endedAt: Date.now(),
+    })
+  },
 )
 const liveActivityPhaseLabel = computed(() => {
-  // The elapsed chip is backed by the shared one-second activity tick. Reading
-  // it here keeps a Retry-After countdown moving without extra provider events.
-  void streamPhaseElapsed.value
-  if (runStatus.value.status === 'queued' || streamActivityStale.value) {
-    return streamPhaseLabel.value
-  }
-  // Keep the slot-acquired boundary explicit until a real provider/router
-  // signal replaces it. Once that activity exists, use the established
-  // timeline projection (for example Working during a tool turn).
-  if (
-    !streamHasVisibleOutput.value
-    && streamPhaseLabel.value === String(t('chat.status.running'))
-  ) {
-    return streamPhaseLabel.value
-  }
-  const currentStatus = [...liveActivityProjection.value.statusSteps]
-    .reverse()
-    .find(step => step.isCurrent)
-  if (
-    currentStatus
-    && currentStatus.category !== 'maintenance'
-    && !currentStatus.label.code.startsWith('chat.activity.lifecycle.')
-    && !liveActivityProjection.value.currentClusterKey
-  ) {
-    const retrySeconds = providerActivityRemainingSeconds(currentStatus)
-    return String(t(currentStatus.label.code, retrySeconds === null
-      ? currentStatus.label.params
-      : { ...currentStatus.label.params, seconds: retrySeconds }))
-  }
-  return String(t(
-    liveAnswerPart.value
-      ? 'chat.activity.lifecycle.answering'
-      : 'chat.activity.lifecycle.working',
-  ))
+  return String(t('chat.activity.lifecycle.working'))
 })
+const liveCurrentPhaseCode = computed(() => [...liveActivityProjection.value.statusSteps]
+  .reverse()
+  .find(step => step.isCurrent && step.category !== 'maintenance')
+  ?.label.code)
+const liveReasoningCollapseActive = computed(() =>
+  liveCurrentPhaseCode.value === 'chat.activity.lifecycle.answering',
+)
 const liveToolStateScope = computed(() => JSON.stringify([sessionKey.value || '', 'stream']))
 // Elapsed readouts in the live turn round to whole seconds ("4s"), matching
 // streamPhaseElapsed and streamThinkingElapsedText. The shared tool formatter
@@ -3120,18 +3113,21 @@ const liveArtifacts = computed(() =>
 const liveThinkingText = computed(() =>
   foldLiveTurnMode.value === true ? foldedTurn.value.thinkingText : streamThinkingText.value,
 )
-// Live reasoning rendered through the shared part component, so the live turn
-// and settled turns use one wording and one disclosure affordance. The seconds
-// derive from the ticking elapsed text, which is always `${seconds}s` live.
-const liveReasoningPart = computed<Extract<ChatPart, { type: 'reasoning' }> | null>(() => {
-  if (!liveThinkingText.value) return null
-  const seconds = Number.parseInt(streamThinkingElapsedText.value, 10)
-  return {
-    type: 'reasoning',
-    key: 'live-reasoning',
-    text: liveThinkingText.value,
-    seconds: Number.isFinite(seconds) ? seconds : 0,
+const liveReasoningBlocks = computed<ReasoningBlock[]>(() => {
+  if (foldLiveTurnMode.value === true) {
+    return foldedTurn.value.reasoningBlocks.filter(block => block.text)
   }
+  if (!liveThinkingText.value) return []
+  const seconds = Number.parseInt(streamThinkingElapsedText.value, 10)
+  const elapsed = Number.isFinite(seconds) ? seconds : 0
+  return [{
+    id: 'legacy-live-reasoning',
+    index: 0,
+    text: liveThinkingText.value,
+    status: 'streaming',
+    startedAt: Date.now() - elapsed * 1000,
+    contentKind: 'reasoning',
+  }]
 })
 // No clamp and no raw status count: the header chip must agree with the
 // visible body, which renders clusters plus only the semantic status steps.
@@ -3140,7 +3136,7 @@ const liveReasoningPart = computed<Extract<ChatPart, { type: 'reasoning' }> | nu
 const liveActivityStepCount = computed(() =>
   liveActivityProjection.value.activityClusters.length
     + liveActivityProjection.value.statusSteps.filter(isSemanticActivityStatusStep).length
-    + (liveThinkingText.value ? 1 : 0),
+    + liveReasoningBlocks.value.length,
 )
 const liveActivityFailureCount = computed(() =>
   liveActivityProjection.value.activityClusters.filter(cluster => cluster.isFailure).length,

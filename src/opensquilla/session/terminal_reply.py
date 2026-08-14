@@ -61,6 +61,7 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "invalid_response_status",
         "invalid_stream_frame",
         "invalid_stream_order",
+        "model_repetition_loop_detected",
         "provider_protocol_error",
         "provider_output_truncated",
         "provider_pretext_buffer_exhausted",
@@ -154,6 +155,11 @@ def build_terminal_reply(
         )
     if reason == "output_truncated" or error_class == "provider_output_truncated":
         return "The provider stopped because the output limit was reached before the task finished."
+    if (
+        reason == "model_repetition_loop_detected"
+        or error_class == "model_repetition_loop_detected"
+    ):
+        return "The model began repeating the same output, so OpenSquilla stopped the task."
     if status == AgentTaskStatus.CANCELLED.value or reason.startswith("cancelled"):
         return "The task was cancelled before it finished."
     if status == AgentTaskStatus.ABANDONED.value or reason == "shutdown_timeout":

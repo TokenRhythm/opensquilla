@@ -1043,7 +1043,7 @@
       "capacityWarn": "{calls} appels de modèle par tour — le coût croît linéairement et le gain de fusion s'estompe au-delà de 4 proposants.",
       "capacityFull": "Limite de {max} proposants atteinte — davantage de brouillons n'améliore plus la fusion ; retirez-en un d'abord.",
       "diversityHint": "Plusieurs proposants partagent la même famille de modèles — ajouter un autre fournisseur améliore généralement la fusion.",
-      "effectiveFacts": "Par tour : {calls} appels de modèle · fusion dès {quorum}/{proposers} proposants réussis · timeout proposant {proposerTimeout}s · timeout agrégateur {aggregatorTimeout}s · {grace}s de grâce après quorum",
+      "effectiveFacts": "Par tour : {calls} appels de modèle · fusion dès {quorum}/{proposers} proposants réussis · délai total proposant {proposerTimeout}s · délai d'inactivité agrégateur {aggregatorTimeout}s · {grace}s de grâce après quorum",
       "effectiveSummary": "{proposers} proposants en parallèle + 1 agrégateur · environ {calls} appels par tour",
       "runtimeStrategyTitle": "Stratégie d'exécution",
       "runtimeStrategyDesc": "Seuil de réussite, repli et limites de temps",
@@ -1052,7 +1052,7 @@
       "successThresholdExact": "{quorum} sur {proposers}",
       "failurePolicyLabel": "Si l'agrégation ne peut pas aboutir",
       "runtimeLimitsLabel": "Limites de temps",
-      "runtimeLimits": "Proposants {proposerTimeout}s · agrégateur {aggregatorTimeout}s · {grace}s de grâce après le seuil",
+      "runtimeLimits": "Proposants {proposerTimeout}s au total · inactivité de l'agrégateur entre événements {aggregatorTimeout}s (configurée {configuredAggregatorTimeout}s) · délai total du tour séparé · {grace}s de grâce après le seuil",
       "quorumFailureLabel": "Si moins de {quorum} proposants réussissent"
     },
     "behavior": {
@@ -1825,6 +1825,7 @@
     "refresh": "Actualiser",
     "refreshing": "Actualisation…",
     "loading": "Chargement des sessions…",
+    "loadMore": "Charger plus de sessions",
     "unknownAgent": "Agent inconnu",
     "deletedAgent": "Agent supprimé · {id}",
     "msgCount": "{count} msg",
@@ -3425,12 +3426,14 @@
       "lifecycle": {
         "working": "En cours",
         "answering": "Rédaction de la réponse",
+        "answerPrepared": "Préparation de la réponse",
         "settled": "Terminé",
         "interrupted": "Interrompu",
         "failed": "Échec"
       },
       "provider": {
         "waiting": "En attente du modèle",
+        "responded": "Réponse du modèle",
         "reasoning": "Réflexion approfondie",
         "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
         "retryWait": "Nouvel essai dans {seconds}s",
@@ -3858,6 +3861,9 @@
     "compact": {
       "compacting": "Compactage du contexte",
       "compacted": "Contexte compacté",
+      "historyPreserved": "Contexte antérieur résumé ; les messages d’origine restent disponibles dans l’historique",
+      "historyIncomplete": "Contexte antérieur résumé ; certains messages d’origine ne sont pas disponibles",
+      "historySummarized": "Contexte antérieur résumé",
       "failed": "Échec du compactage",
       "withinBudget": "Contexte dans les limites du budget.",
       "skipped": "Le compactage du contexte n’a pas été appliqué.",
@@ -3889,7 +3895,6 @@
     "chips": {
       "whatCanYouDo": "Que peux-tu faire ?",
       "buildGame": "Crée-moi un jeu",
-      "buildGamePrompt": "Construis un prototype jouable dans le navigateur d’un jeu de course en voxels, avec des commandes réactives, accélération et freinage, une piste lisible, la détection des collisions, des points de contrôle, le chronométrage des tours et un parcours de redémarrage. Génère en code la voiture et les décors en style voxel, sans ressources payantes. Lance le jeu, teste les commandes, corrige les problèmes bloquants, puis livre-le. Je veux de plus beaux paysages et un monde ouvert. Ajoute sur la carte des enseignes OpenSquilla et TokenRhythm comme clins d’œil de sponsors.",
       "summarizeWebpage": "Résume une page web pour moi",
       "planWeek": "Ébauche un plan pour ma semaine",
       "searchAiNews": "Recherche les actualités IA du jour",
@@ -4032,6 +4037,7 @@
       "loadError": "Impossible de charger les tâches",
       "noMatches": "Aucune correspondance",
       "noConversations": "Aucune tâche pour l'instant.",
+      "allLoaded": "Toutes les tâches sont chargées",
       "startChat": "Démarrer une tâche",
       "linkSessions": "Sessions",
       "currentTask": "Tâche actuelle",

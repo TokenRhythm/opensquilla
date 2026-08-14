@@ -1773,6 +1773,11 @@ async def _emit_task_runtime_stream_events(
                 if not key.startswith("_")
             }
         event_kind = event_dict.pop("kind", getattr(event, "kind", event.__class__.__name__))
+        if event_kind == "thinking" and not event_dict.get("block_id"):
+            # Preserve the exact legacy payload for producers that still
+            # construct an unscoped ThinkingEvent.
+            event_dict.pop("block_id", None)
+            event_dict.pop("block_index", None)
         if event_kind == "artifact":
             event_dict = enrich_artifact_event_dict(event_dict)
         if event_kind == "error":
@@ -1796,9 +1801,14 @@ async def _emit_task_runtime_stream_events(
             code_text = str(code or "").lower()
             is_timeout = "timeout" in code_text or "stream idle" in error_message.lower()
             is_output_truncated = code_text == "provider_output_truncated"
-            terminal_reason = (
-                "timeout" if is_timeout else "output_truncated" if is_output_truncated else "error"
-            )
+            if is_timeout:
+                terminal_reason = "timeout"
+            elif is_output_truncated:
+                terminal_reason = "output_truncated"
+            elif code_text == "model_repetition_loop_detected":
+                terminal_reason = "model_repetition_loop_detected"
+            else:
+                terminal_reason = "error"
             terminal_payload = {
                 "status": "timeout" if is_timeout else "failed",
                 "terminal_reason": terminal_reason,

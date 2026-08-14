@@ -27,6 +27,24 @@ def _load_smoke_module():
 smoke = _load_smoke_module()
 
 
+def _load_thinking_smoke_module():
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "scripts"
+        / "live_provider_thinking_smoke.py"
+    )
+    spec = importlib.util.spec_from_file_location("live_provider_thinking_smoke", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+thinking_smoke = _load_thinking_smoke_module()
+
+
 def test_live_smoke_env_maps_cover_openai_zhipu_kimi_and_minimax() -> None:
     assert smoke._MODEL_ENV["anthropic"] == "ANTHROPIC_MODEL"
     assert smoke._BASE_ENV["anthropic"] == "ANTHROPIC_BASE_URL"
@@ -257,10 +275,66 @@ def test_direct_smoke_explicitly_disables_supported_reasoning_dialects(
         payload,
         provider=provider,
         model=model,
-        base_url="https://provider.example/v1",
+        base_url=(
+            "https://open.bigmodel.cn/api/paas/v4"
+            if provider == "zhipu"
+            else "https://provider.example/v1"
+        ),
     )
 
     assert payload == expected
+
+
+@pytest.mark.parametrize("suffix", ["", "/"])
+def test_zhipu_direct_smokes_keep_native_controls_on_official_api(suffix: str) -> None:
+    base_url = f"https://open.bigmodel.cn/api/paas/v4{suffix}"
+    payload: dict[str, Any] = {}
+
+    smoke._apply_direct_reasoning_off(
+        payload,
+        provider="zhipu",
+        model="glm-5.2",
+        base_url=base_url,
+    )
+
+    assert payload == {"thinking": {"type": "disabled"}}
+    assert thinking_smoke._provider_thinking_payload(
+        "zhipu",
+        model="glm-5.2",
+        base_url=base_url,
+        enabled=True,
+        budget=1024,
+    ) == {"thinking": {"type": "enabled"}}
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://relay.example.test/v1",
+        "https://open.bigmodel.cn/api/paas/v4?",
+        "https://open.bigmodel.cn/api/paas/v4#",
+    ],
+)
+def test_zhipu_direct_smokes_omit_native_controls_on_nonofficial_api(
+    base_url: str,
+) -> None:
+    payload: dict[str, Any] = {}
+
+    smoke._apply_direct_reasoning_off(
+        payload,
+        provider="zhipu",
+        model="glm-5.2",
+        base_url=base_url,
+    )
+
+    assert payload == {}
+    assert thinking_smoke._provider_thinking_payload(
+        "zhipu",
+        model="glm-5.2",
+        base_url=base_url,
+        enabled=True,
+        budget=1024,
+    ) == {}
 
 
 def test_live_smoke_parses_csv_model_lists() -> None:
