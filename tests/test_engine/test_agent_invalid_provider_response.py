@@ -283,6 +283,62 @@ async def test_reasoning_only_prefill_recovery_cleans_synthetic_history(tmp_path
     assert recovery_event["injected_to_model"] is True
 
 
+@pytest.mark.parametrize(
+    ("reasoning_format", "warning_code"),
+    [
+        ("openrouter", "provider_reasoning_prefill_continue"),
+        ("dashscope", "provider_reasoning_continuation"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_length_capped_reasoning_recovery_disables_thinking_on_next_call(
+    tmp_path,
+    reasoning_format: str,
+    warning_code: str,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="length",
+                    input_tokens=35_858,
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal reasoning",
+                    model="test-reasoning",
+                )
+            ],
+            [
+                ProviderText(text="ok"),
+                ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=1),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                supports_tools=True,
+                reasoning_format=reasoning_format,
+            ),
+            reasoning_prefill_recovery_mode="recover",
+            runtime_events_path=str(tmp_path / "runtime_events.jsonl"),
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["config"].thinking is False
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
+    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert any(event.kind == "warning" and event.code == warning_code for event in events)
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
+
+
 @pytest.mark.asyncio
 async def test_tool_loop_observer_logs_reasoning_only_runtime_event(tmp_path) -> None:
     provider = _SequenceProvider(

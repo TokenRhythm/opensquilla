@@ -9710,6 +9710,15 @@ class Agent:
                             attempt_classification.kind,
                             input_tokens=iter_input_tokens,
                         )
+                        if (
+                            large_context_invalid
+                            and attempt_classification.kind
+                            == _ProviderAttemptKind.REASONING_ONLY
+                            and (attempt_classification.stop_reason or "").lower()
+                            == "length"
+                        ):
+                            _thinking_fallback_done = True
+                            _disable_thinking_for_next_provider_call = True
                         supports_reasoning_replay = supports_reasoning_prefill_replay(
                             model_capabilities=self.config.model_capabilities,
                             reasoning_content=iter_reasoning_content,
@@ -9920,14 +9929,6 @@ class Agent:
                                 )
                             ):
                                 _invalid_response_fallback_done = True
-                                if (
-                                    attempt_classification.kind
-                                    == _ProviderAttemptKind.REASONING_ONLY
-                                    and (attempt_classification.stop_reason or "").lower()
-                                    == "length"
-                                ):
-                                    _thinking_fallback_done = True
-                                    _disable_thinking_for_next_provider_call = True
                                 fallback_reason = _provider_activity_reason_for_attempt(
                                     attempt_classification.kind
                                 )
