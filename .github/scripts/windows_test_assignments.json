@@ -491,6 +491,7 @@
       "tests/test_gateway/test_rpc_cron_update_enabled.py",
       "tests/test_gateway/test_rpc_diagnostics.py",
       "tests/test_gateway/test_rpc_doctor.py",
+      "tests/test_gateway/test_rpc_ingress_validation.py",
       "tests/test_gateway/test_rpc_llm_profiles.py",
       "tests/test_gateway/test_rpc_logs.py",
       "tests/test_gateway/test_rpc_memory_import.py",

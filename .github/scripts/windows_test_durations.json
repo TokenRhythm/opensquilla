@@ -459,6 +459,7 @@
     "tests/test_gateway/test_rpc_cron_update_enabled.py": 0.435,
     "tests/test_gateway/test_rpc_diagnostics.py": 0.19,
     "tests/test_gateway/test_rpc_doctor.py": 0.742,
+    "tests/test_gateway/test_rpc_ingress_validation.py": 0.01,
     "tests/test_gateway/test_rpc_logs.py": 0.441,
     "tests/test_gateway/test_rpc_migration.py": 0.01,
     "tests/test_gateway/test_rpc_model_routing.py": 0.01,
