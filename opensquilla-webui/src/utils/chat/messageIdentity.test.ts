@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { chatMessageKey } from './messageIdentity'
+import { chatMessageKey, stableClientUuid } from './messageIdentity'
 import type { ChatRenderedMessage } from '@/types/chat'
 
 describe('chatMessageKey', () => {
@@ -19,5 +19,18 @@ describe('chatMessageKey', () => {
 
     expect(chatMessageKey(before, 0)).toBe('local-assistant')
     expect(chatMessageKey(after, 0)).toBe('local-assistant')
+  })
+})
+
+describe('stableClientUuid', () => {
+  it('returns a deterministic canonical UUIDv8 without merging distinct identities', async () => {
+    const first = await stableClientUuid('usage-barrier\0session-a\0message-a')
+
+    expect(first).toBe(await stableClientUuid('usage-barrier\0session-a\0message-a'))
+    expect(first).not.toBe(await stableClientUuid('usage-barrier\0session-a\0message-b'))
+    expect(first).not.toBe(await stableClientUuid('usage-barrier\0session-b\0message-a'))
+    expect(first).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
   })
 })

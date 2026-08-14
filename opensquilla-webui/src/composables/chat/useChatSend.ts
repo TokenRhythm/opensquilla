@@ -31,6 +31,7 @@ import type {
 import type { ChatSteerDeliveryApi } from '@/composables/chat/useChatSteerDelivery'
 import type { SlashCommandClassification } from '@/composables/chat/useChatSlashCommands'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
+import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
 import {
   hasSendableModelInputImageAttachment,
   isSendableAttachment,
@@ -40,7 +41,11 @@ import {
 } from '@/utils/chat/attachments'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
 import { isControlInput } from '@/utils/chat/inputSemantics'
-import { createClientMessageId, createClientRequestId } from '@/utils/chat/messageIdentity'
+import {
+  createClientMessageId,
+  createClientRequestId,
+  stableClientUuid,
+} from '@/utils/chat/messageIdentity'
 import {
   type HiddenControlStorage,
   listHiddenControls,
@@ -83,6 +88,7 @@ interface SendAttempt {
   restoreComposerOnHandoffFailure?: boolean
   handoffWalOwnerId?: string
   handoffWalRevision?: number
+  replayCoordinationKey?: string
   params: ChatSendParams
   requiresIdempotentReplay?: boolean
   // A Stop issued before durable acceptance is known belongs to this exact
@@ -144,6 +150,12 @@ interface DispatchSendOptions {
   preDispatchGuard?: (stage: 'preflight' | 'before_rpc') => boolean
   /** Require a non-replayable WAL preparation that is armed immediately before RPC. */
   requirePreparedHandoff?: boolean
+  /** Stable cross-tab identity for one protocol-owned replay. */
+  replayCoordination?: {
+    key: string
+    clientRequestId: string
+    clientMessageId: string
+  }
 }
 
 export interface UsageBarrierReplayPayload {
@@ -1001,6 +1013,9 @@ export function useChatSend(options: UseChatSendOptions) {
       ...(attempt.restoreComposerOnHandoffFailure === false
         ? { restoreComposerOnFailure: false }
         : {}),
+      ...(attempt.replayCoordinationKey
+        ? { replayCoordinationKey: attempt.replayCoordinationKey }
+        : {}),
       ...(requirePrepared
         ? {
             walOwnerId: attempt.handoffWalOwnerId!,
@@ -1020,6 +1035,7 @@ export function useChatSend(options: UseChatSendOptions) {
           current?.state === 'preparing'
           && current.ownerRequestId === record.ownerRequestId
           && current.clientMessageId === record.clientMessageId
+          && current.replayCoordinationKey === record.replayCoordinationKey
           && current.walOwnerId === record.walOwnerId
           && current.walRevision === record.walRevision
         ) return current
@@ -2440,9 +2456,11 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!attempt) {
       const durablePendingItem = sendOpts.durablePendingItem
       const clientMessageId = durablePendingItem?.pendingClientMessageId
+        || sendOpts.replayCoordination?.clientMessageId
         || createClientMessageId()
       const params: ChatSendParams = {
         clientRequestId: durablePendingItem?.pendingClientRequestId
+          || sendOpts.replayCoordination?.clientRequestId
           || createClientRequestId(),
         clientMessageId,
         message: text || 'Describe these attachments',
@@ -2477,6 +2495,9 @@ export function useChatSend(options: UseChatSendOptions) {
         workspaceId,
         ...(sendOpts.acceptedVisibleReplay
           ? { restoreComposerOnHandoffFailure: false }
+          : {}),
+        ...(sendOpts.replayCoordination
+          ? { replayCoordinationKey: sendOpts.replayCoordination.key }
           : {}),
         params,
       }
@@ -2920,6 +2941,26 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!requestSessionKey || !text || !forkBeforeMessageId || usageBarrierReplayInFlight) {
       return false
     }
+    const invalidCoordinationIdentity = (value: string) => (
+      value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)
+    )
+    if (
+      invalidCoordinationIdentity(requestSessionKey)
+      || invalidCoordinationIdentity(forkBeforeMessageId)
+    ) return false
+    const replayCoordinationKey = await stableClientUuid(
+      `usage-barrier-coordinate\0${canonicalSessionKey(requestSessionKey)}\0${forkBeforeMessageId}`,
+    )
+    if (!replayCoordinationKey) return false
+    const stableClientRequestId = await stableClientUuid(
+      `usage-barrier-request\0${replayCoordinationKey}`,
+    )
+    const stableMessageUuid = await stableClientUuid(
+      `usage-barrier-message\0${replayCoordinationKey}`,
+    )
+    if (!stableClientRequestId || !stableMessageUuid) return false
+    const stableClientMessageId = `local-${stableMessageUuid}`
+    if (stableClientRequestId.length > 256 || stableClientMessageId.length > 256) return false
     const replayAnchorIsCurrent = () => {
       const anchor = options.messages.value.find(message => (
         message.role === 'user'
@@ -2983,6 +3024,11 @@ export function useChatSend(options: UseChatSendOptions) {
         suppressRejectedFailureMessage: true,
         includeEmptyAttachments: true,
         requirePreparedHandoff: true,
+        replayCoordination: {
+          key: replayCoordinationKey,
+          clientRequestId: stableClientRequestId,
+          clientMessageId: stableClientMessageId,
+        },
         preDispatchGuard: stage => !replayIsBlocked(stage === 'before_rpc'),
       })
       if (outcome === 'accepted') usageBarrierReplayAttempt = null

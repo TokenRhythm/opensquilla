@@ -244,6 +244,182 @@ function usageReplayMessages(): ChatMessage[] {
 }
 
 describe('useChatSend dedicated usage-barrier replay', () => {
+  it('atomically admits only one of two cross-tab clicks for the same barrier', async () => {
+    const pendingInputWal = memoryHandoffWal()
+    let releaseSend!: (value: unknown) => void
+    const sendBlocked = new Promise(resolve => { releaseSend = resolve })
+    const first = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    const second = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    first.rpc.call.mockImplementation(() => sendBlocked)
+    second.rpc.call.mockImplementation(() => sendBlocked)
+
+    const results = [first, second].map(harness => harness.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    }))
+    await vi.waitFor(() => expect(
+      first.rpc.call.mock.calls.length + second.rpc.call.mock.calls.length,
+    ).toBe(1))
+    releaseSend({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'cross-tab-winner',
+    })
+
+    expect((await Promise.all(results)).sort()).toEqual([false, true])
+    const wire = (first.rpc.call.mock.calls[0] || second.rpc.call.mock.calls[0])?.[1]
+    expect(wire).toMatchObject({
+      forkBeforeMessageId: 'usage-primary',
+      attachments: [],
+    })
+    expect(wire?.clientRequestId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+  })
+
+  it('reuses the server receipt after winner cleanup when another tab still shows the card', async () => {
+    const pendingInputWal = memoryHandoffWal()
+    const first = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    const second = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    first.rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'first-accepted-task',
+    })
+    second.rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'same-receipt-task',
+      replayed: true,
+    })
+
+    expect(await first.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(await second.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+
+    expect(second.rpc.call.mock.calls[0]?.[1]).toMatchObject({
+      clientRequestId: first.rpc.call.mock.calls[0]?.[1]?.clientRequestId,
+      clientMessageId: first.rpc.call.mock.calls[0]?.[1]?.clientMessageId,
+      message: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+  })
+
+  it('lets another tab safely recover a rejected winner with the same stable receipt', async () => {
+    const pendingInputWal = memoryHandoffWal()
+    const first = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    const second = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    first.rpc.call.mockRejectedValue(Object.assign(new Error('busy'), {
+      accepted: false,
+      retryable: true,
+    }))
+
+    expect(await first.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(false)
+    const rejectedWire = first.rpc.call.mock.calls[0]?.[1]
+
+    await second.api.recoverResponseHandoffs()
+    expect(second.rpc.call).not.toHaveBeenCalled()
+
+    second.rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'recovered-winner',
+    })
+    expect(await second.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(second.rpc.call.mock.calls[0]?.[1]).toMatchObject({
+      clientRequestId: rejectedWire?.clientRequestId,
+      clientMessageId: rejectedWire?.clientMessageId,
+      forkBeforeMessageId: 'usage-primary',
+    })
+  })
+
+  it('isolates stable receipts by session and primary barrier without changing ordinary sends', async () => {
+    const pendingInputWal = memoryHandoffWal()
+    const sessionA = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    const sessionB = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+      sessionKey: ref('agent:main:webchat:other'),
+    })
+    const otherBarrierMessages = usageReplayMessages().map(message => (
+      message.messageId === 'usage-primary'
+        ? { ...message, messageId: 'usage-primary-2' }
+        : message
+    ))
+    const barrierB = makeOptions({
+      messages: ref(otherBarrierMessages),
+      pendingInputWal,
+    })
+    const ordinary = makeOptions({
+      inputText: ref('ordinary send'),
+      pendingInputWal,
+    })
+
+    expect(await sessionA.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(await sessionB.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(await barrierB.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary-2',
+    })).toBe(true)
+    await ordinary.api.onSend()
+    expect(ordinary.rpc.call).toHaveBeenCalledOnce()
+
+    const requestIds = [sessionA, sessionB, barrierB, ordinary].map(
+      harness => harness.rpc.call.mock.calls[0]?.[1]?.clientRequestId,
+    )
+    expect(new Set(requestIds).size).toBe(4)
+  })
+
+  it.each([
+    'x'.repeat(513),
+    'usage-primary\nforged',
+  ])('rejects an unsafe durable primary identity before coordination: %j', async (messageId) => {
+    const messages = usageReplayMessages().map(message => (
+      message.messageId === 'usage-primary' ? { ...message, messageId } : message
+    ))
+    const { api, rpc } = makeOptions({ messages: ref(messages) })
+
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: messageId,
+    })).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
   it('sends literal slash text with an exact fork and empty attachments without touching the draft', async () => {
     const messages = ref(usageReplayMessages())
     const inputText = ref('unrelated Goal/Replan draft')
