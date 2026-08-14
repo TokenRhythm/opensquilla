@@ -2542,6 +2542,9 @@ def test_all_zhipu_catalog_models_scope_zai_to_the_official_api_root(
         ("https://user:pass@open.bigmodel.cn/api/paas/v4", False),
         ("https://open.bigmodel.cn/api/paas/v4?relay=1", False),
         ("https://open.bigmodel.cn/api/paas/v4#relay", False),
+        ("https://open.bigmodel.cn/api/paas/v4?", False),
+        ("https://open.bigmodel.cn/api/paas/v4#", False),
+        ("https://open.bigmodel.cn/api/paas/v4?#", False),
         ("https://open.bigmodel.cn.evil.test/api/paas/v4", False),
         ("https://evil-open.bigmodel.cn/api/paas/v4", False),
         ("https://open.bigmodel.cn\\@evil.test/api/paas/v4", False),
@@ -2573,7 +2576,16 @@ def test_zhipu_zai_endpoint_identity_matrix(
 
 
 @pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://trusted-zai-relay.example.test/v1",
+        "https://trusted-zai-relay.example.test/v1/%3F",
+        "https://trusted-zai-relay.example.test/v1;mode=compat",
+    ],
+)
 def test_custom_provider_with_explicit_zai_format_remains_available(
+    base_url: str,
     thinking: bool,
 ) -> None:
     catalog = ModelCatalog()
@@ -2587,7 +2599,7 @@ def test_custom_provider_with_explicit_zai_format_remains_available(
         }
     )
     payload = _project_zhipu_payload(
-        base_url="https://trusted-zai-relay.example.test/v1",
+        base_url=base_url,
         thinking=thinking,
         provider_kind="custom",
         capabilities=catalog.get_capabilities(
