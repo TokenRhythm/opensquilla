@@ -137,6 +137,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     messages,
     sessionKey: ref('agent:main:webchat:test'),
     pendingQueueOwnerContext: ref(null),
+    hasPendingQueueWork: () => false,
     pendingInputWal: memoryHandoffWal(),
     busySendMode: ref<BusySendMode>('queue'),
     modelRoutingMode: ref<'off'>('off'),
@@ -187,6 +188,271 @@ function sameTurnSteerOptions(
     activeStreamTaskId: ref(expectedTurnId),
   }
 }
+
+function usageReplayMessages(): ChatMessage[] {
+  return [
+    {
+      role: 'user',
+      text: '/reset',
+      ts: null,
+      messageId: 'usage-primary',
+      turnId: 'usage-turn',
+    },
+    {
+      role: 'user',
+      text: 'same-turn steer',
+      ts: null,
+      messageId: 'usage-steer',
+      turnId: 'usage-turn',
+    },
+    {
+      role: 'error',
+      text: 'Usage accounting temporarily unavailable.',
+      ts: null,
+      messageId: 'usage-error',
+      turnId: 'usage-turn',
+      errorCode: 'usage_accounting_busy',
+    },
+  ]
+}
+
+describe('useChatSend dedicated usage-barrier replay', () => {
+  it('sends literal slash text with an exact fork and empty attachments without touching the draft', async () => {
+    const messages = ref(usageReplayMessages())
+    const inputText = ref('unrelated Goal/Replan draft')
+    const pendingForkBeforeMessageId = ref<string | null>('draft-fork')
+    const pendingSessionIntent = ref<string | null>('new_chat')
+    const pendingAttachments = ref<Attachment[]>([
+      {
+        kind: 'inline',
+        local_id: 1,
+        name: 'draft-inline.txt',
+        mime: 'text/plain',
+        data: 'aW5saW5l',
+      },
+      {
+        kind: 'staged',
+        local_id: 2,
+        name: 'draft-staged.pdf',
+        mime: 'application/pdf',
+        file_uuid: 'draft-upload',
+      },
+      {
+        kind: 'failed',
+        local_id: 3,
+        name: 'draft-failed.txt',
+        mime: 'text/plain',
+        error: 'keep me',
+      },
+    ])
+    const { api, options, rpc } = makeOptions({
+      messages,
+      inputText,
+      pendingAttachments,
+      pendingSessionIntent,
+      pendingForkBeforeMessageId,
+    })
+    rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'usage-replay-task',
+      user_message_id: 'usage-replay-message',
+    })
+
+    const accepted = await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+
+    expect(accepted).toBe(true)
+    expect(options.classifySlashCommand).not.toHaveBeenCalled()
+    expect(options.executeSlashCommand).not.toHaveBeenCalled()
+    expect(options.enqueuePendingInput).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+      queueMode: 'followup',
+      attachments: [],
+    }))
+    expect(inputText.value).toBe('unrelated Goal/Replan draft')
+    expect(pendingAttachments.value).toHaveLength(3)
+    expect(pendingAttachments.value.map(attachment => attachment.local_id)).toEqual([1, 2, 3])
+    expect(pendingSessionIntent.value).toBe('new_chat')
+    expect(pendingForkBeforeMessageId.value).toBe('draft-fork')
+    expect(messages.value).toMatchObject([{
+      role: 'user',
+      text: '/reset',
+      clientId: expect.any(String),
+      messageId: 'usage-replay-message',
+      turnId: 'usage-replay-task',
+    }])
+  })
+
+  it.each([
+    'streaming',
+    'authoritative work',
+    'compaction',
+    'pending queue',
+    'pending queue ownership',
+  ])('fails closed during %s instead of queuing or dropping the fork anchor', async (blockedBy) => {
+    const messages = ref(usageReplayMessages())
+    const inputText = ref('keep draft')
+    const pendingForkBeforeMessageId = ref<string | null>('keep-draft-fork')
+    const pendingQueueOwnerContext = ref<UseChatSendOptions['pendingQueueOwnerContext']['value']>(null)
+    const taskOwnership = blockedBy === 'authoritative work'
+      ? {
+          hydrationResolved: ref(true),
+          hasAuthoritativeWork: ref(true),
+        } as unknown as NonNullable<UseChatSendOptions['taskOwnership']>
+      : undefined
+    const { api, rpc, stream, options } = makeOptions({
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingQueueOwnerContext,
+      ...(taskOwnership ? { taskOwnership } : {}),
+      ...(blockedBy === 'compaction'
+        ? { isCompactInFlightForCurrentSession: () => true }
+        : {}),
+      ...(blockedBy === 'pending queue'
+        ? { hasPendingQueueWork: () => true }
+        : {}),
+    })
+    if (blockedBy === 'streaming') stream.isStreaming.value = true
+    if (blockedBy === 'pending queue ownership') {
+      pendingQueueOwnerContext.value = {
+        sessionKey: options.sessionKey.value,
+        ownerRequestId: 'pending-owner',
+      }
+    }
+
+    const accepted = await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+
+    expect(accepted).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(options.enqueuePendingInput).not.toHaveBeenCalled()
+    expect(messages.value).toEqual(usageReplayMessages())
+    expect(inputText.value).toBe('keep draft')
+    expect(pendingForkBeforeMessageId.value).toBe('keep-draft-fork')
+  })
+
+  it('fails closed behind an existing fork handoff without sending a second request', async () => {
+    let resolveFirst!: (value: unknown) => void
+    const firstResponse = new Promise(resolve => { resolveFirst = resolve })
+    const messages = ref<ChatMessage[]>([
+      ...usageReplayMessages(),
+      { role: 'user', text: 'ordinary fork', ts: null, messageId: 'ordinary-anchor' },
+    ])
+    const pendingForkBeforeMessageId = ref<string | null>('ordinary-anchor')
+    const { api, rpc } = makeOptions({
+      messages,
+      inputText: ref('ordinary fork'),
+      pendingForkBeforeMessageId,
+    })
+    rpc.call.mockImplementationOnce(() => firstResponse)
+
+    const ordinarySend = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledTimes(1))
+    const accepted = await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+
+    expect(accepted).toBe(false)
+    expect(rpc.call).toHaveBeenCalledTimes(1)
+    resolveFirst({ sessionKey: 'agent:main:webchat:test' })
+    await ordinarySend
+  })
+
+  it('keeps history and composer unchanged after rejection, then retries the exact receipt', async () => {
+    const messages = ref(usageReplayMessages())
+    const originalMessages = [...messages.value]
+    const inputText = ref('draft survives')
+    const pendingForkBeforeMessageId = ref<string | null>('draft-fork')
+    const { api, rpc } = makeOptions({ messages, inputText, pendingForkBeforeMessageId })
+    rpc.call
+      .mockRejectedValueOnce(Object.assign(new Error('busy'), {
+        accepted: false,
+        retryable: true,
+      }))
+      .mockResolvedValueOnce({
+        sessionKey: 'agent:main:webchat:test',
+        task_id: 'usage-retry-task',
+        user_message_id: 'usage-retry-message',
+      })
+
+    const first = await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    const firstParams = rpc.call.mock.calls[0]?.[1]
+
+    expect(first).toBe(false)
+    expect(messages.value).toEqual(originalMessages)
+    expect(inputText.value).toBe('draft survives')
+    expect(pendingForkBeforeMessageId.value).toBe('draft-fork')
+
+    const second = await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+
+    expect(second).toBe(true)
+    expect(rpc.call.mock.calls[1]?.[1]).toMatchObject({
+      clientRequestId: firstParams?.clientRequestId,
+      clientMessageId: firstParams?.clientMessageId,
+      message: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+      attachments: [],
+    })
+    expect(inputText.value).toBe('draft survives')
+    expect(pendingForkBeforeMessageId.value).toBe('draft-fork')
+  })
+
+  it('never restores a definitely rejected protocol replay into the composer from handoff WAL', async () => {
+    let retained: ResponseHandoffWalRecord | null = null
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const messages = ref(usageReplayMessages())
+    const inputText = ref('do not replace this draft')
+    const pendingForkBeforeMessageId = ref<string | null>('draft-fork')
+    const { api, rpc } = makeOptions({
+      messages,
+      inputText,
+      pendingForkBeforeMessageId,
+      pendingInputWal,
+    })
+    rpc.call.mockRejectedValue(Object.assign(new Error('rejected'), {
+      accepted: false,
+      retryable: false,
+    }))
+
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(false)
+    expect(retained).toMatchObject({
+      state: 'failed',
+      restoreComposerOnFailure: false,
+    })
+
+    await api.recoverResponseHandoffs()
+
+    expect(retained).toBeNull()
+    expect(inputText.value).toBe('do not replace this draft')
+    expect(pendingForkBeforeMessageId.value).toBe('draft-fork')
+    expect(messages.value).toEqual(usageReplayMessages())
+  })
+})
 
 describe('useChatSend attachment payloads', () => {
   it('replays a persisted handoff identity after refresh and repairs its owner queue', async () => {
@@ -2211,12 +2477,12 @@ describe('useChatSend attachment payloads', () => {
     const actions = useChatMessageActions({
       messages,
       inputText,
-      pendingAttachments: ref<Attachment[]>([]),
       isStreaming: harness.stream.isStreaming,
       sanitizeCopyText: text => text,
       stripTimePrefix: text => text,
       autoResizeTextarea: vi.fn(),
       sendCurrentInput: vi.fn(),
+      sendUsageBarrierReplay: vi.fn(async () => false),
       focusComposer: vi.fn(),
       pendingForkBeforeMessageId,
     })

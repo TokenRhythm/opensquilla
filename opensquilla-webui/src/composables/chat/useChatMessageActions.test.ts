@@ -6,7 +6,6 @@ import { nextTick, ref } from 'vue'
 import { useChatMessageActions, type UseChatMessageActionsOptions } from './useChatMessageActions'
 import { useChatTextRendering } from './useChatTextRendering'
 import type {
-  Attachment,
   ChatMessage,
   ChatRenderedMessage,
   ChatTurnOutcome,
@@ -71,12 +70,12 @@ function makeOptions(
   const options: UseChatMessageActionsOptions = {
     messages: ref(messages),
     inputText: ref(''),
-    pendingAttachments: ref<Attachment[]>([]),
     isStreaming: ref(false),
     sanitizeCopyText,
     stripTimePrefix: text => text,
     autoResizeTextarea: vi.fn(),
     sendCurrentInput: vi.fn(),
+    sendUsageBarrierReplay: vi.fn(async () => true),
     focusComposer: vi.fn(),
     pendingForkBeforeMessageId,
     aiGeneratedLabel,
@@ -123,7 +122,7 @@ describe('useChatMessageActions branching edits', () => {
       { role: 'user', text: 'C', ts: null, messageId: 'msg-C' },
     ])
 
-    const accepted = api.regenerateMessage(renderedMessage({
+    const accepted = await api.regenerateMessage(renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 3,
@@ -139,7 +138,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(accepted).toBe(true)
   })
 
-  it('retries a usage-accounting error through the normal durable regenerate path', async () => {
+  it('dispatches usage replay directly even when Goal/Replan blocks the composer', async () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       {
         role: 'user',
@@ -164,15 +163,10 @@ describe('useChatMessageActions branching edits', () => {
         turnId: 'turn-1',
       },
     ])
-    options.pendingAttachments.value = [{
-      kind: 'inline',
-      local_id: 99,
-      name: 'unrelated-draft.txt',
-      mime: 'text/plain',
-      data: 'ZHJhZnQ=',
-    }]
+    options.inputText.value = 'unrelated draft'
+    options.canDeliver = () => false
 
-    const accepted = api.regenerateMessage(renderedMessage({
+    const accepted = await api.regenerateMessage(renderedMessage({
       role: 'error',
       displayRole: 'error',
       sourceIndex: 2,
@@ -184,11 +178,14 @@ describe('useChatMessageActions branching edits', () => {
     }))
     await nextTick()
 
-    expect(pendingForkBeforeMessageId.value).toBe('msg-user')
-    expect(options.messages.value).toEqual([])
-    expect(options.inputText.value).toBe('bill this safely')
-    expect(options.pendingAttachments.value).toEqual([])
-    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({
+      text: 'bill this safely',
+      forkBeforeMessageId: 'msg-user',
+    })
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toHaveLength(3)
+    expect(options.inputText.value).toBe('unrelated draft')
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
     expect(accepted).toBe(true)
   })
 
@@ -214,15 +211,7 @@ describe('useChatMessageActions branching edits', () => {
         },
       ]
       const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
-      const draftAttachment: Attachment = {
-        kind: 'inline',
-        local_id: 77,
-        name: 'draft.txt',
-        mime: 'text/plain',
-        data: 'ZHJhZnQ=',
-      }
       options.inputText.value = 'unrelated draft'
-      options.pendingAttachments.value = [draftAttachment]
 
       const accepted = api.regenerateMessage(renderedMessage({
         role: 'error',
@@ -239,8 +228,8 @@ describe('useChatMessageActions branching edits', () => {
       expect(accepted).toBe(false)
       expect(options.messages.value).toEqual(messages)
       expect(options.inputText.value).toBe('unrelated draft')
-      expect(options.pendingAttachments.value).toEqual([draftAttachment])
       expect(pendingForkBeforeMessageId.value).toBeNull()
+      expect(options.sendUsageBarrierReplay).not.toHaveBeenCalled()
       expect(options.sendCurrentInput).not.toHaveBeenCalled()
     },
   )
@@ -271,7 +260,7 @@ describe('useChatMessageActions branching edits', () => {
       },
     ])
 
-    const accepted = api.regenerateMessage(renderedMessage({
+    const accepted = await api.regenerateMessage(renderedMessage({
       role: 'error',
       displayRole: 'error',
       sourceIndex: 2,
@@ -284,10 +273,14 @@ describe('useChatMessageActions branching edits', () => {
     await nextTick()
 
     expect(accepted).toBe(true)
-    expect(pendingForkBeforeMessageId.value).toBe('msg-primary')
-    expect(options.messages.value).toEqual([])
-    expect(options.inputText.value).toBe('primary request')
-    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({
+      text: 'primary request',
+      forkBeforeMessageId: 'msg-primary',
+    })
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toHaveLength(3)
+    expect(options.inputText.value).toBe('')
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
   })
 
   it('blocks an unsafe usage barrier on an assistant status-only bubble', async () => {
@@ -316,7 +309,7 @@ describe('useChatMessageActions branching edits', () => {
     ]
     const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
 
-    const accepted = api.regenerateMessage(renderedMessage({
+    const accepted = await api.regenerateMessage(renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 2,
@@ -428,7 +421,7 @@ describe('useChatMessageActions branching edits', () => {
       },
     ])
 
-    const accepted = api.regenerateMessage(renderedMessage({
+    const accepted = await api.regenerateMessage(renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 2,
@@ -440,10 +433,14 @@ describe('useChatMessageActions branching edits', () => {
     await nextTick()
 
     expect(accepted).toBe(true)
-    expect(pendingForkBeforeMessageId.value).toBe('msg-primary')
-    expect(options.messages.value).toEqual([])
-    expect(options.inputText.value).toBe('primary request')
-    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({
+      text: 'primary request',
+      forkBeforeMessageId: 'msg-primary',
+    })
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toHaveLength(3)
+    expect(options.inputText.value).toBe('')
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
   })
 
   it.each([

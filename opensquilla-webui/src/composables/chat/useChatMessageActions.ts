@@ -1,6 +1,5 @@
 import { nextTick, type Ref } from 'vue'
 import type {
-  Attachment,
   ChatMessage,
   ChatRenderedMessage,
   ChatStreamTimelineItem,
@@ -18,7 +17,6 @@ import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentine
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
   inputText: Ref<string>
-  pendingAttachments: Ref<Attachment[]>
   isStreaming: Ref<boolean>
   sanitizeCopyText: (text: string, opts?: {
     assistantBoundary?: boolean
@@ -27,6 +25,10 @@ export interface UseChatMessageActionsOptions {
   stripTimePrefix: (text: string) => string
   autoResizeTextarea: () => void
   sendCurrentInput: () => void
+  sendUsageBarrierReplay: (payload: {
+    text: string
+    forkBeforeMessageId: string
+  }) => Promise<boolean>
   focusComposer: () => void
   pendingForkBeforeMessageId: Ref<string | null>
   aiGeneratedLabel?: () => string
@@ -132,7 +134,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     return -1
   }
 
-  function regenerateMessage(message: ChatRenderedMessage): boolean {
+  function regenerateMessage(message: ChatRenderedMessage): boolean | Promise<boolean> {
     if (options.isStreaming.value) {
       console.warn('Wait for the current response to finish')
       return false
@@ -146,13 +148,6 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     )
     if (usageBarrierRetry && usageBarrierUserIndex < 0) {
       console.warn('Usage accounting retry is missing a safe replay proof or primary user')
-      return false
-    }
-    // Regenerate is a send action that also truncates local history and
-    // replaces the composer. Fail closed before any of those mutations when
-    // live delivery cannot receive the resulting turn.
-    if (options.canDeliver && !options.canDeliver()) {
-      options.notifyDeliveryBlocked?.()
       return false
     }
     const userMsgIndex = usageBarrierRetry
@@ -171,10 +166,21 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       return false
     }
     const userText = userMessage?.text || ''
+    if (usageBarrierRetry) {
+      return options.sendUsageBarrierReplay({
+        text: userText,
+        forkBeforeMessageId,
+      })
+    }
+    // Ordinary regenerate remains composer-backed. Fail closed before any of
+    // its local mutations when live delivery cannot receive the resulting turn.
+    if (options.canDeliver && !options.canDeliver()) {
+      options.notifyDeliveryBlocked?.()
+      return false
+    }
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = options.messages.value.slice(0, userMsgIndex)
     options.inputText.value = userText
-    if (usageBarrierRetry) options.pendingAttachments.value = []
     options.autoResizeTextarea()
     nextTick(() => options.sendCurrentInput())
     return true

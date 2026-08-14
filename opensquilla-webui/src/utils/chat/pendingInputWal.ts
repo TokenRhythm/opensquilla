@@ -48,6 +48,8 @@ export interface ResponseHandoffWalRecord {
   params: ChatSendParams
   composerText: string
   recoveryAttachments: Attachment[]
+  /** A protocol-owned replay must never be restored into the user composer. */
+  restoreComposerOnFailure?: boolean
   state: ResponseHandoffWalState
   acceptedSessionKey?: string
   errorCode?: string
@@ -160,6 +162,10 @@ function isResponseHandoffWalRecord(value: unknown): value is ResponseHandoffWal
     && record.recoveryAttachments.every(attachment => (
       attachment !== null && typeof attachment === 'object'
     ))
+    && (
+      record.restoreComposerOnFailure === undefined
+      || typeof record.restoreComposerOnFailure === 'boolean'
+    )
     && ['submitting', 'accepted', 'failed'].includes(String(record.state || ''))
     && typeof record.createdAt === 'number'
     && Number.isFinite(record.createdAt)

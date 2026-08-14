@@ -1412,6 +1412,10 @@ watch(
 
 let sendCurrentInput: () => void = () => {}
 let sendAutomaticInput: () => void = () => {}
+let sendUsageBarrierReplay: (payload: {
+  text: string
+  forkBeforeMessageId: string
+}) => Promise<boolean> = async () => false
 // Late-bound: dispatchHiddenSend is created below (useChatSend) but the /meta
 // slash handler (useChatSlashCommands, created earlier) needs it at call time.
 let dispatchHiddenForMeta: (
@@ -1901,12 +1905,12 @@ const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured ==
 const chatMessageActions = useChatMessageActions({
   messages,
   inputText,
-  pendingAttachments,
   isStreaming,
   sanitizeCopyText,
   stripTimePrefix,
   autoResizeTextarea,
   sendCurrentInput: () => sendCurrentInput(),
+  sendUsageBarrierReplay: payload => sendUsageBarrierReplay(payload),
   focusComposer: () => composerRef.value?.focusTextarea(),
   pendingForkBeforeMessageId,
   aiGeneratedLabel: () => aiGeneratedLabel.value,
@@ -1925,11 +1929,11 @@ const {
   editMessage,
 } = chatMessageActions
 
-function handleRegenerateMessage(
+async function handleRegenerateMessage(
   message: ChatRenderedMessage,
   settle?: (accepted: boolean) => void,
 ) {
-  const accepted = regenerateMessage(message)
+  const accepted = await regenerateMessage(message)
   settle?.(accepted)
 }
 
@@ -2595,6 +2599,7 @@ const chatSend = useChatSend({
   messages,
   sessionKey,
   pendingQueueOwnerContext,
+  hasPendingQueueWork: () => pendingQueue.value.length > 0,
   pendingInputWal,
   busySendMode,
   modelRoutingMode,
@@ -2676,6 +2681,7 @@ const {
   onStop,
   sendQueuedSteer,
   sendQueuedFollowup,
+  sendUsageBarrierReplay: dispatchUsageBarrierReplay,
   dispatchComposerPrompt,
   dispatchHiddenSend,
   dispatchQueuedHiddenSend,
@@ -2686,6 +2692,7 @@ const {
   sendHiddenMetaPreflightConfirmation,
   recoverResponseHandoffs,
 } = chatSend
+sendUsageBarrierReplay = dispatchUsageBarrierReplay
 void recoverResponseHandoffs()
 watch(
   [() => rpc.state, sessionKey],

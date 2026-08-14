@@ -80,6 +80,7 @@ interface SendAttempt {
   initialCollaborationMode: CollaborationMode | null
   forkBeforeMessageId: string | null
   workspaceId: string | null
+  restoreComposerOnHandoffFailure?: boolean
   params: ChatSendParams
   requiresIdempotentReplay?: boolean
   // A Stop issued before durable acceptance is known belongs to this exact
@@ -131,6 +132,17 @@ interface DispatchSendOptions {
   retryAttempt?: SendAttempt | null
   rememberRetryableAttempt?: (attempt: SendAttempt) => void
   durablePendingItem?: ChatPendingItem
+  /** Delay branch truncation and optimistic rendering until ingress accepts. */
+  acceptedVisibleReplay?: { forkBeforeMessageId: string }
+  /** Protocol replays keep a rejected attempt on their own surface. */
+  suppressRejectedFailureMessage?: boolean
+  /** Preserve an explicit empty attachment list on the chat.send wire. */
+  includeEmptyAttachments?: boolean
+}
+
+export interface UsageBarrierReplayPayload {
+  text: string
+  forkBeforeMessageId: string
 }
 
 interface ResponseHandoffGate {
@@ -319,6 +331,7 @@ export interface UseChatSendOptions {
   messages: Ref<ChatMessage[]>
   sessionKey: Ref<string>
   pendingQueueOwnerContext: Ref<PendingQueueOwnerContext | null>
+  hasPendingQueueWork?: () => boolean
   pendingInputWal?: PendingInputWal | null
   busySendMode: Ref<BusySendMode>
   modelRoutingMode: Readonly<Ref<ModelRoutingMode>>
@@ -429,6 +442,8 @@ export function useChatSend(options: UseChatSendOptions) {
   let activeResponseHandoff: ResponseHandoffGate | null = null
   let activeProjectPreflightToken: symbol | null = null
   let recoveredAttempt: SendAttempt | null = null
+  let usageBarrierReplayAttempt: SendAttempt | null = null
+  let usageBarrierReplayInFlight = false
   let handoffRecoveryPromise: Promise<void> | null = null
   const acceptanceRecoveryWorkers = new Map<string, Promise<void>>()
   const stoppedAcceptanceAttempts = new Map<string, SendAttempt>()
@@ -969,6 +984,9 @@ export function useChatSend(options: UseChatSendOptions) {
       params: structuredClone(attempt.params),
       composerText: attempt.composerText,
       recoveryAttachments: attempt.attachments.map(attachment => ({ ...attachment })),
+      ...(attempt.restoreComposerOnHandoffFailure === false
+        ? { restoreComposerOnFailure: false }
+        : {}),
       state: 'submitting',
       createdAt: now,
       updatedAt: now,
@@ -1143,6 +1161,7 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function restoreResponseHandoffDraft(record: ResponseHandoffWalRecord): boolean {
     if (options.sessionKey.value !== record.requestSessionKey) return false
+    if (record.restoreComposerOnFailure === false) return true
     const restoredText = record.composerText.trim()
     if (restoredText && options.inputText.value !== restoredText) {
       options.inputText.value = [restoredText, options.inputText.value]
@@ -2136,6 +2155,32 @@ export function useChatSend(options: UseChatSendOptions) {
 
     const userText = text
     let attempt = retryAttempt
+    let acceptedVisibleReplayCommitted = false
+    const commitAcceptedVisibleReplay = (accepted?: {
+      messageId?: string
+      turnId?: string
+    }): boolean => {
+      const replay = sendOpts.acceptedVisibleReplay
+      if (!replay || acceptedVisibleReplayCommitted || !attempt) return true
+      const anchorIndex = options.messages.value.findIndex(message => (
+        message.role === 'user'
+        && message.messageId === replay.forkBeforeMessageId
+      ))
+      if (anchorIndex < 0) return false
+      options.messages.value = options.messages.value.slice(0, anchorIndex)
+      options.messages.value.push({
+        role: 'user',
+        text: userText,
+        ts: new Date().toISOString(),
+        clientId: attempt.clientMessageId,
+        ...(accepted?.messageId ? { messageId: accepted.messageId } : {}),
+        ...(accepted?.turnId ? { turnId: accepted.turnId } : {}),
+      })
+      options.autoScroll.value = true
+      options.scrollToBottom()
+      acceptedVisibleReplayCommitted = true
+      return true
+    }
     let durableHandoffRecord: ResponseHandoffWalRecord | null = null
     if (!attempt) {
       const durablePendingItem = sendOpts.durablePendingItem
@@ -2159,7 +2204,7 @@ export function useChatSend(options: UseChatSendOptions) {
         params.collaborationMode = initialCollaborationMode
       }
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
-      if (attachmentsToSend.length > 0) {
+      if (attachmentsToSend.length > 0 || sendOpts.includeEmptyAttachments) {
         params.displayText = userText
         params.attachments = attachmentsToSend.map(serializeSendableAttachment)
       }
@@ -2175,22 +2220,27 @@ export function useChatSend(options: UseChatSendOptions) {
         initialCollaborationMode,
         forkBeforeMessageId,
         workspaceId,
+        ...(sendOpts.acceptedVisibleReplay
+          ? { restoreComposerOnHandoffFailure: false }
+          : {}),
         params,
       }
       if (attempt.forkBeforeMessageId) {
         durableHandoffRecord = await persistResponseHandoff(attempt)
       }
-      const now = new Date().toISOString()
-      const displayAttachments = attachmentsToSend.map(serializeDisplayAttachment)
-      options.messages.value.push({
-        role: 'user',
-        text: userText,
-        ts: now,
-        clientId: clientMessageId,
-        ...(displayAttachments.length > 0 ? { attachments: displayAttachments } : {}),
-      })
-      options.autoScroll.value = true
-      options.scrollToBottom()
+      if (!sendOpts.acceptedVisibleReplay) {
+        const now = new Date().toISOString()
+        const displayAttachments = attachmentsToSend.map(serializeDisplayAttachment)
+        options.messages.value.push({
+          role: 'user',
+          text: userText,
+          ts: now,
+          clientId: clientMessageId,
+          ...(displayAttachments.length > 0 ? { attachments: displayAttachments } : {}),
+        })
+        options.autoScroll.value = true
+        options.scrollToBottom()
+      }
     }
     if (attempt.forkBeforeMessageId && !durableHandoffRecord) {
       durableHandoffRecord = await persistResponseHandoff(attempt)
@@ -2260,6 +2310,12 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
+      if (!commitAcceptedVisibleReplay({
+        messageId: res?.user_message_id || res?.message_id || '',
+        turnId: acceptedTaskId(res),
+      })) {
+        options.scheduleHistorySync()
+      }
       if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
         recoveredAttempt = null
       }
@@ -2405,6 +2461,11 @@ export function useChatSend(options: UseChatSendOptions) {
     } catch (err: unknown) {
       const rpcError = err as RpcClientError | null | undefined
       const acceptedError = acceptedErrorInfo(err)
+      if (acceptedError && !commitAcceptedVisibleReplay({
+        messageId: acceptedError.messageId,
+      })) {
+        options.scheduleHistorySync()
+      }
       if (
         acceptedError
         && recoveredAttempt?.clientRequestId === attempt.clientRequestId
@@ -2521,17 +2582,98 @@ export function useChatSend(options: UseChatSendOptions) {
         await markResponseHandoffFailed(responseHandoff, err)
       }
       rememberRetryableAttempt(true)
-      options.messages.value.push({
-        role: 'error',
-        text: sendFailureMessage(err),
-        errorCode: errorCode(err),
-        ts: new Date().toISOString(),
-      })
+      if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
+        options.messages.value.push({
+          role: 'error',
+          text: sendFailureMessage(err),
+          errorCode: errorCode(err),
+          ts: new Date().toISOString(),
+        })
+      }
       return acceptedError ? 'accepted' : 'retryable_failure'
     } finally {
       attempt.acceptanceInFlight = false
       finishAcceptanceTransaction(acceptanceTransaction)
       finishResponseHandoff(responseHandoff)
+    }
+  }
+
+  async function sendUsageBarrierReplay(
+    payload: UsageBarrierReplayPayload,
+  ): Promise<boolean> {
+    const requestSessionKey = options.sessionKey.value
+    const text = payload.text
+    const forkBeforeMessageId = payload.forkBeforeMessageId.trim()
+    if (!requestSessionKey || !text || !forkBeforeMessageId || usageBarrierReplayInFlight) {
+      return false
+    }
+    const replayAnchorIsCurrent = () => {
+      const anchor = options.messages.value.find(message => (
+        message.role === 'user'
+        && message.messageId === forkBeforeMessageId
+      ))
+      return Boolean(
+        anchor
+        && anchor.text === text
+        && (anchor.attachments?.length ?? 0) === 0,
+      )
+    }
+    const replayIsBlocked = () => (
+      options.sessionKey.value !== requestSessionKey
+      || !replayAnchorIsCurrent()
+      || Boolean(options.sendBlockedReason?.value)
+      || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
+      || options.stream.isStreaming.value
+      || hasAuthoritativeWork()
+      || options.isCompactInFlightForCurrentSession()
+      || responseHandoffBlocksCurrentSession()
+      || Boolean(handoffRecoveryPromise)
+      || options.hasPendingQueueWork?.() === true
+      || options.pendingQueueOwnerContext.value?.sessionKey === requestSessionKey
+    )
+    if (replayIsBlocked()) return false
+
+    if (options.validateActiveProjectBeforeSend) {
+      if (await refreshedActiveProjectBlocksSend()) return false
+    }
+    if (replayIsBlocked()) return false
+
+    if (usageBarrierReplayAttempt && !matchesRecoveredDraft(
+      usageBarrierReplayAttempt,
+      {
+        requestSessionKey,
+        text,
+        attachments: [],
+        intent: null,
+        initialCollaborationMode: null,
+        forkBeforeMessageId,
+        workspaceId: null,
+      },
+    )) return false
+
+    usageBarrierReplayInFlight = true
+    try {
+      const outcome = await dispatchSend(text, {
+        payload: {
+          attachments: [],
+          intent: null,
+          forkBeforeMessageId,
+          workspaceId: null,
+          initialCollaborationMode: null,
+        },
+        preserveComposer: true,
+        retryAttempt: usageBarrierReplayAttempt,
+        rememberRetryableAttempt: attempt => {
+          usageBarrierReplayAttempt = attempt
+        },
+        acceptedVisibleReplay: { forkBeforeMessageId },
+        suppressRejectedFailureMessage: true,
+        includeEmptyAttachments: true,
+      })
+      if (outcome === 'accepted') usageBarrierReplayAttempt = null
+      return outcome === 'accepted'
+    } finally {
+      usageBarrierReplayInFlight = false
     }
   }
 
@@ -3308,6 +3450,7 @@ export function useChatSend(options: UseChatSendOptions) {
     restoreHiddenControls,
     recoverResponseHandoffs,
     sendHiddenMetaPreflightConfirmation,
+    sendUsageBarrierReplay,
     acceptanceRecoveryPendingForCurrentSession,
   }
 }
