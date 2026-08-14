@@ -452,6 +452,157 @@ describe('useChatSend dedicated usage-barrier replay', () => {
     expect(pendingForkBeforeMessageId.value).toBe('draft-fork')
     expect(messages.value).toEqual(usageReplayMessages())
   })
+
+  it('rechecks the session after delayed attachment preparation before creating an attempt', async () => {
+    let releasePreparation!: (ready: boolean) => void
+    const preparation = new Promise<boolean>(resolve => { releasePreparation = resolve })
+    const prepareAttachmentsForSend = vi.fn(() => preparation)
+    const messages = ref(usageReplayMessages())
+    const inputText = ref('keep draft')
+    const sessionKey = ref('agent:main:webchat:test')
+    const { api, rpc } = makeOptions({
+      messages,
+      inputText,
+      sessionKey,
+      prepareAttachmentsForSend,
+    })
+
+    const replay = api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await vi.waitFor(() => expect(prepareAttachmentsForSend).toHaveBeenCalledOnce())
+    sessionKey.value = 'agent:main:webchat:other'
+    releasePreparation(true)
+
+    expect(await replay).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(messages.value).toEqual(usageReplayMessages())
+    expect(inputText.value).toBe('keep draft')
+  })
+
+  it.each([
+    'session switch',
+    'busy stream',
+    'authoritative work',
+    'compaction',
+    'pending queue',
+    'anchor disappearance',
+  ])('rechecks %s after delayed handoff persistence and keeps the same retry receipt', async (invalidatedBy) => {
+    let releasePersistence!: () => void
+    const persistence = new Promise<void>(resolve => { releasePersistence = resolve })
+    let firstPersist = true
+    let retained: ResponseHandoffWalRecord | null = null
+    const putHandoff = vi.fn(async (record: ResponseHandoffWalRecord) => {
+      retained = structuredClone(record)
+      if (firstPersist) {
+        firstPersist = false
+        await persistence
+      }
+    })
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff,
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    let pendingQueueWork = false
+    let compactInFlight = false
+    const taskOwnership = useChatTaskOwnership()
+    const messages = ref(usageReplayMessages())
+    const sessionKey = ref('agent:main:webchat:test')
+    const { api, rpc, stream } = makeOptions({
+      messages,
+      sessionKey,
+      pendingInputWal,
+      hasPendingQueueWork: () => pendingQueueWork,
+      isCompactInFlightForCurrentSession: () => compactInFlight,
+      taskOwnership,
+    })
+    rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'retried-task',
+      user_message_id: 'retried-message',
+    })
+
+    const firstReplay = api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await vi.waitFor(() => expect(putHandoff).toHaveBeenCalledOnce())
+    const firstParams = structuredClone(retained!.params)
+    if (invalidatedBy === 'session switch') {
+      sessionKey.value = 'agent:main:webchat:other'
+    } else if (invalidatedBy === 'busy stream') {
+      stream.isStreaming.value = true
+    } else if (invalidatedBy === 'authoritative work') {
+      taskOwnership.runningTaskId.value = 'other-running-task'
+    } else if (invalidatedBy === 'compaction') {
+      compactInFlight = true
+    } else if (invalidatedBy === 'pending queue') {
+      pendingQueueWork = true
+    } else {
+      messages.value = messages.value.filter(message => message.messageId !== 'usage-primary')
+    }
+    releasePersistence()
+
+    expect(await firstReplay).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toBeNull()
+
+    sessionKey.value = 'agent:main:webchat:test'
+    stream.isStreaming.value = false
+    taskOwnership.runningTaskId.value = ''
+    compactInFlight = false
+    pendingQueueWork = false
+    messages.value = usageReplayMessages()
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId: firstParams.clientRequestId,
+      clientMessageId: firstParams.clientMessageId,
+      forkBeforeMessageId: 'usage-primary',
+      attachments: [],
+    }))
+  })
+
+  it('tears down its fresh stream when the final pre-RPC guard becomes blocked', async () => {
+    let pendingQueueWork = false
+    const activeStreamTaskId = ref('')
+    const activeStreamSessionKey = ref('')
+    const aborted = ref(true)
+    const { api, rpc, stream } = makeOptions({
+      messages: ref(usageReplayMessages()),
+      activeStreamTaskId,
+      activeStreamSessionKey,
+      aborted,
+      hasPendingQueueWork: () => pendingQueueWork,
+    })
+    stream.startStreaming = vi.fn(() => {
+      stream.isStreaming.value = true
+      pendingQueueWork = true
+    })
+    stream.endStreaming = vi.fn(() => {
+      stream.isStreaming.value = false
+    })
+
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(false)
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(stream.endStreaming).toHaveBeenCalledOnce()
+    expect(stream.isStreaming.value).toBe(false)
+    expect(activeStreamTaskId.value).toBe('')
+    expect(activeStreamSessionKey.value).toBe('')
+    expect(aborted.value).toBe(true)
+  })
 })
 
 describe('useChatSend attachment payloads', () => {

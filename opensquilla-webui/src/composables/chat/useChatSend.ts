@@ -138,6 +138,8 @@ interface DispatchSendOptions {
   suppressRejectedFailureMessage?: boolean
   /** Preserve an explicit empty attachment list on the chat.send wire. */
   includeEmptyAttachments?: boolean
+  /** Revalidate protocol-owned sends after every awaited pre-dispatch step. */
+  preDispatchGuard?: (stage: 'preflight' | 'before_rpc') => boolean
 }
 
 export interface UsageBarrierReplayPayload {
@@ -995,8 +997,26 @@ export function useChatSend(options: UseChatSendOptions) {
       await options.pendingInputWal.putHandoff(record)
       return record
     } catch {
+      // A storage adapter may fail after partially writing. Remove that owner
+      // identity before callers decide whether an in-memory send can proceed,
+      // so recovery cannot later dispatch a request the live gate rejected.
+      await options.pendingInputWal.deleteHandoff?.(record.ownerRequestId).catch(() => {})
       return null
     }
+  }
+
+  async function discardUnsentResponseHandoff(
+    record: ResponseHandoffWalRecord | null,
+  ): Promise<void> {
+    if (!record) return
+    const failed: ResponseHandoffWalRecord = {
+      ...record,
+      state: 'failed',
+      errorCode: 'client_pre_dispatch_guard',
+      updatedAt: Date.now(),
+    }
+    await options.pendingInputWal?.putHandoff?.(failed).catch(() => {})
+    await options.pendingInputWal?.deleteHandoff?.(record.ownerRequestId).catch(() => {})
   }
 
   async function markResponseHandoffAccepted(
@@ -2047,6 +2067,10 @@ export function useChatSend(options: UseChatSendOptions) {
     const requestSessionKey = options.sessionKey.value
     if (!requestSessionKey) return 'not_sent'
     if (options.sendBlockedReason?.value) return 'not_sent'
+    const preDispatchAllowed = (
+      stage: 'preflight' | 'before_rpc' = 'preflight',
+    ) => sendOpts.preDispatchGuard?.(stage) !== false
+    if (!preDispatchAllowed()) return 'not_sent'
     let preserveComposer = sendOpts.preserveComposer === true
     const sourceAttachments = sendOpts.payload?.attachments ?? options.pendingAttachments.value
     const intent = sendOpts.payload
@@ -2115,6 +2139,7 @@ export function useChatSend(options: UseChatSendOptions) {
       })
       if (!ready) return 'not_sent'
       if (options.sessionKey.value !== requestSessionKey) return 'not_sent'
+      if (!preDispatchAllowed()) return 'not_sent'
     }
     const composerChanged = sendOpts.composerSnapshot
       ? !composerMatchesSnapshot(sendOpts.composerSnapshot)
@@ -2146,13 +2171,6 @@ export function useChatSend(options: UseChatSendOptions) {
       return 'not_sent'
     }
 
-    options.aborted.value = false
-    if (!preserveComposer) options.closeSlashMenu()
-    recordSessionNavigationDiag('send.start', {
-      requestSession: requestSessionKey,
-      current: requestSessionKey,
-    })
-
     const userText = text
     let attempt = retryAttempt
     let acceptedVisibleReplayCommitted = false
@@ -2182,6 +2200,13 @@ export function useChatSend(options: UseChatSendOptions) {
       return true
     }
     let durableHandoffRecord: ResponseHandoffWalRecord | null = null
+    const rejectBeforeDispatch = async (): Promise<ChatSendOutcome> => {
+      if (attempt && sendOpts.acceptedVisibleReplay) {
+        sendOpts.rememberRetryableAttempt?.(attempt)
+      }
+      await discardUnsentResponseHandoff(durableHandoffRecord)
+      return 'not_sent'
+    }
     if (!attempt) {
       const durablePendingItem = sendOpts.durablePendingItem
       const clientMessageId = durablePendingItem?.pendingClientMessageId
@@ -2227,6 +2252,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       if (attempt.forkBeforeMessageId) {
         durableHandoffRecord = await persistResponseHandoff(attempt)
+        if (!preDispatchAllowed()) return rejectBeforeDispatch()
       }
       if (!sendOpts.acceptedVisibleReplay) {
         const now = new Date().toISOString()
@@ -2244,7 +2270,14 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     if (attempt.forkBeforeMessageId && !durableHandoffRecord) {
       durableHandoffRecord = await persistResponseHandoff(attempt)
+      if (!preDispatchAllowed()) return rejectBeforeDispatch()
     }
+    if (!preDispatchAllowed()) return rejectBeforeDispatch()
+    if (!preserveComposer) options.closeSlashMenu()
+    recordSessionNavigationDiag('send.start', {
+      requestSession: requestSessionKey,
+      current: requestSessionKey,
+    })
     if (!preserveComposer) {
       recoveredAttempt = null
       const composerTextBeforeSend = options.inputText.value
@@ -2268,9 +2301,20 @@ export function useChatSend(options: UseChatSendOptions) {
     // A steer send rides an already-active stream; restarting it would wipe
     // the partial output of the run being steered.
     const wasStreaming = options.stream.isStreaming.value
+    if (!preDispatchAllowed()) return rejectBeforeDispatch()
     const freshSendToken = wasStreaming
       ? null
       : beginFreshStream(requestSessionKey, attempt)
+    if (!preDispatchAllowed('before_rpc')) {
+      if (freshSendToken && activeFreshSendToken === freshSendToken) {
+        activeFreshSendToken = null
+        options.activeStreamTaskId.value = ''
+        options.activeStreamSessionKey.value = ''
+        options.stream.endStreaming()
+      }
+      return rejectBeforeDispatch()
+    }
+    options.aborted.value = false
     let responseHandoff = (
       attempt.forkBeforeMessageId
         ? beginResponseHandoff(
@@ -2618,12 +2662,12 @@ export function useChatSend(options: UseChatSendOptions) {
         && (anchor.attachments?.length ?? 0) === 0,
       )
     }
-    const replayIsBlocked = () => (
+    const replayIsBlocked = (allowOwnedStream = false) => (
       options.sessionKey.value !== requestSessionKey
       || !replayAnchorIsCurrent()
       || Boolean(options.sendBlockedReason?.value)
       || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
-      || options.stream.isStreaming.value
+      || (!allowOwnedStream && options.stream.isStreaming.value)
       || hasAuthoritativeWork()
       || options.isCompactInFlightForCurrentSession()
       || responseHandoffBlocksCurrentSession()
@@ -2669,6 +2713,7 @@ export function useChatSend(options: UseChatSendOptions) {
         acceptedVisibleReplay: { forkBeforeMessageId },
         suppressRejectedFailureMessage: true,
         includeEmptyAttachments: true,
+        preDispatchGuard: stage => !replayIsBlocked(stage === 'before_rpc'),
       })
       if (outcome === 'accepted') usageBarrierReplayAttempt = null
       return outcome === 'accepted'
