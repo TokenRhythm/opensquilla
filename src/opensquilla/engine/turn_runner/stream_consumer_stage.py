@@ -1682,6 +1682,7 @@ class StreamConsumerStage:
             elif isinstance(event, ThinkingEvent):
                 if event.text:
                     state.reasoning.append(event.text)
+                    state.reasoning_parts.append(event.text)
                 transformed = event
             elif isinstance(event, TextDeltaEvent):
                 transformed = self._text_delta_handler.handle(event, state)
@@ -1695,10 +1696,6 @@ class StreamConsumerStage:
                         )
                         buffered_text_observed = True
                     transformed = _SUPPRESS
-            elif isinstance(event, ThinkingEvent):
-                if event.text:
-                    state.reasoning_parts.append(event.text)
-                transformed = event
             elif isinstance(event, ToolUseStartEvent):
                 transformed = self._tool_use_start_handler.handle(event, state)
             elif isinstance(event, ToolUseDeltaEvent):
