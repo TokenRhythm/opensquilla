@@ -80,6 +80,28 @@ interface UsageStatusResult {
   total_tokens?: number
 }
 
+const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
+  '/coding',
+  '/compact',
+  '/goal',
+  '/new',
+  '/plan',
+  '/reset',
+  '/usage',
+  'coding.mode',
+  'compact_context',
+  'goal.set',
+  'meta.menu',
+  'new_chat',
+  'plans.setMode',
+  'plans.toggleMode',
+  'reset_session',
+  'sessions.contextCompact',
+  'sessions.reset',
+  'usage.status',
+  'usage_status',
+])
+
 export interface UseChatSlashCommandsOptions {
   rpc: RpcClient
   catalogCallOptions?: RpcCallOptions
@@ -238,7 +260,10 @@ function isValidSlashCommandPayload(value: unknown): value is SlashCommandPayloa
       )
     ) return false
   }
-  return true
+  const rawAction = command.execution?.action || command.name || command.cmd
+  return typeof rawAction === 'string'
+    && rawAction === rawAction.trim()
+    && SUPPORTED_WEB_SLASH_ACTIONS.has(rawAction)
 }
 
 function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): ChatSlashCommand {

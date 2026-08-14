@@ -151,6 +151,7 @@ describe('useChatSlashCommands plan compatibility', () => {
       name: '/planning',
       description: 'A different command',
       aliases: [],
+      execution: { action: 'plans.setMode' },
     }])
     await api.loadSlashCommands()
     inputText.value = '/plan'
@@ -389,6 +390,14 @@ describe('useChatSlashCommands recovery', () => {
         execution: { action: 'goal.set' },
       }],
     },
+    { commands: [{ name: '/foo', aliases: [], execution: {} }] },
+    {
+      commands: [{
+        name: '/reset',
+        aliases: [],
+        execution: { action: 'unsupported.action' },
+      }],
+    },
   ])('keeps a malformed command catalog unavailable', async response => {
     const { api, armGoal, notify, rpc } = harness(false)
     rpc.call.mockResolvedValue(response)
@@ -398,6 +407,17 @@ describe('useChatSlashCommands recovery', () => {
 
     expect(armGoal).not.toHaveBeenCalled()
     expect(notify).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a legacy supported command without execution metadata registered', async () => {
+    const { api, rpc } = harness(false, [{ name: '/reset', aliases: [] }])
+
+    await expect(api.classifySlashCommand('/reset')).resolves.toBe('registered')
+    await expect(api.executeSlashCommand('/reset', 'registered')).resolves.toBe(true)
+
+    expect(rpc.call).toHaveBeenCalledWith('sessions.reset', {
+      key: 'agent:main:webchat:test',
+    })
   })
 
   it('falls through silently for unknown slash input', async () => {

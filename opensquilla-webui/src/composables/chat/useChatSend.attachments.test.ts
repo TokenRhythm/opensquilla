@@ -6027,6 +6027,98 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     }
   })
 
+  it('durably queues and drains an escaped registered slash as literal text', async () => {
+    vi.useFakeTimers()
+    try {
+      const attachment: Attachment = {
+        kind: 'staged',
+        local_id: 95,
+        name: 'literal-context.txt',
+        mime: 'text/plain',
+        file_uuid: 'file-literal-slash-attachment',
+      }
+      const inputText = ref('//coding')
+      const pendingAttachments = ref<Attachment[]>([attachment])
+      const pendingSessionIntent = ref<string | null>(null)
+      const sessionKey = ref('agent:main:webchat:test')
+      const { stream } = makeOptions()
+      stream.isStreaming.value = true
+      const pendingRecords = new Map<
+        string,
+        import('@/utils/chat/pendingInputWal').PendingInputWalRecord
+      >()
+      let sendApi!: ReturnType<typeof useChatSend>
+      const pending = useChatPendingQueue({
+        sessionKey,
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        isStreaming: stream.isStreaming,
+        isBlocked: () => false,
+        autoResizeTextarea: vi.fn(),
+        sendCurrentInput: vi.fn(),
+        resetInputHistory: vi.fn(),
+        hasComposer: () => true,
+        pendingInputWal: {
+          put: async record => { pendingRecords.set(record.pendingInputId, record) },
+          list: async key => [...pendingRecords.values()].filter(record => (
+            record.sessionKey === key
+          )),
+          delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
+          close: () => {},
+        },
+        supportsMethod: () => false,
+        dispatchPendingItem: (item, ownerSessionKey) => (
+          sendApi.sendQueuedFollowup(item, ownerSessionKey)
+        ),
+      })
+      const classifySlashCommand = vi.fn(async () => 'registered' as const)
+      const executeSlashCommand = vi.fn(async () => true)
+      const configured = makeOptions({
+        inputText,
+        pendingAttachments,
+        pendingSessionIntent,
+        sessionKey,
+        stream,
+        busySendMode: pending.busySendMode,
+        enqueuePendingInput: pending.enqueuePendingInput,
+        enqueuePendingPayload: pending.enqueuePendingPayload,
+        popAllPendingIntoComposer: pending.popAllPendingIntoComposer,
+        classifySlashCommand,
+        executeSlashCommand,
+      })
+      sendApi = configured.api
+
+      await sendApi.onSend()
+
+      expect(pending.pendingQueue.value).toHaveLength(1)
+      expect(pending.pendingQueue.value[0]).toMatchObject({
+        text: '//coding',
+        attachments: [attachment],
+      })
+      expect(pendingRecords.size).toBe(1)
+      stream.isStreaming.value = false
+      pending.schedulePendingDrainAfterTerminal()
+      await vi.runAllTimersAsync()
+      await nextTick()
+
+      expect(classifySlashCommand).not.toHaveBeenCalled()
+      expect(executeSlashCommand).not.toHaveBeenCalled()
+      expect(configured.rpc.call).toHaveBeenCalledOnce()
+      expect(configured.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+        message: '/coding',
+        attachments: [expect.objectContaining({
+          file_uuid: 'file-literal-slash-attachment',
+        })],
+      }))
+      expect(pending.pendingQueue.value).toHaveLength(0)
+      expect(pendingRecords.size).toBe(0)
+      pending.cleanup()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it.each(['registered', 'unavailable'] as const)(
     'keeps %s slash input editable while a turn is busy',
     async classification => {

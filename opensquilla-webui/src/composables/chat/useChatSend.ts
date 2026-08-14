@@ -1630,6 +1630,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const bypassSlashCommand = invocation.bypassSlashCommand === true
     const composerText = invocation.composerText ?? options.inputText.value
     let text = (invocation.textOverride ?? options.inputText.value).trim()
+    let durableText = text
     let sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
     let hasPayload = text || sendableAttachments.length > 0
     let isLiteralSlash = false
@@ -1643,6 +1644,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!bypassSlashCommand && text.startsWith('//')) {
       isLiteralSlash = true
       text = text.slice(1)
+      durableText = `/${text}`
       sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
       hasPayload = text || sendableAttachments.length > 0
     }
@@ -1786,17 +1788,20 @@ export function useChatSend(options: UseChatSendOptions) {
         const queued = await Promise.resolve(
           composerChanged || invocation.textOverride !== undefined
             ? options.enqueuePendingPayload?.({
-              text,
+              text: durableText,
               attachments: composerSnapshot.payloadAttachments,
               intent: composerSnapshot.intent,
             }, queueOwnerFromSnapshot(composerSnapshot)) ?? false
             : slashClassification === 'unknown'
               ? options.enqueuePendingInput(
-                text,
+                durableText,
                 queueOwnerFromSnapshot(composerSnapshot),
                 { confirmedPlainText: true },
               )
-              : options.enqueuePendingInput(text, queueOwnerFromSnapshot(composerSnapshot)),
+              : options.enqueuePendingInput(
+                durableText,
+                queueOwnerFromSnapshot(composerSnapshot),
+              ),
         )
         if (!queued) {
           pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
@@ -1842,6 +1847,9 @@ export function useChatSend(options: UseChatSendOptions) {
     expectedSessionKey?: string,
   ): Promise<ChatSendOutcome> {
     const text = item.text.trim()
+    const dispatchText = !item.hiddenControl && text.startsWith('//')
+      ? text.slice(1)
+      : text
     const ownerSessionKey = expectedSessionKey
       || item.ownerSessionKey
       || options.sessionKey.value
@@ -1953,7 +1961,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (delivery === 'steer') {
       return dispatchSteerV2(text, { queuedItem: item })
     }
-    const outcome = await dispatchSend(text, {
+    const outcome = await dispatchSend(dispatchText, {
       composerText: item.text,
       payload: {
         attachments: item.attachments,
