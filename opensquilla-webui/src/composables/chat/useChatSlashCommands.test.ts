@@ -382,6 +382,13 @@ describe('useChatSlashCommands recovery', () => {
     { commands: null },
     { commands: [{}] },
     { commands: [null] },
+    {
+      commands: [{
+        name: '/goal',
+        aliases: [{}],
+        execution: { action: 'goal.set' },
+      }],
+    },
   ])('keeps a malformed command catalog unavailable', async response => {
     const { api, armGoal, notify, rpc } = harness(false)
     rpc.call.mockResolvedValue(response)

@@ -205,11 +205,40 @@ function normalizeSlashCommand(cmd: SlashCommandPayload): ChatSlashCommand {
 function isValidSlashCommandPayload(value: unknown): value is SlashCommandPayload {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const command = value as SlashCommandPayload
-  const rawKey = [command.name, command.cmd]
-    .find(candidate => typeof candidate === 'string' && candidate.trim())
-  if (!rawKey) return false
-  const trimmedKey = rawKey.trim()
-  return !/\s/.test(trimmedKey) && slashCommandKey(trimmedKey).length > 1
+  const isValidKey = (candidate: unknown): candidate is string => {
+    if (typeof candidate !== 'string') return false
+    const trimmedKey = candidate.trim()
+    return Boolean(
+      trimmedKey
+      && !/\s/.test(trimmedKey)
+      && slashCommandKey(trimmedKey).length > 1,
+    )
+  }
+  const declaredKeys = [command.name, command.cmd]
+  if (!declaredKeys.some(isValidKey)) return false
+  if (declaredKeys.some(key => key !== undefined && !isValidKey(key))) return false
+  if (
+    command.aliases !== undefined
+    && (
+      !Array.isArray(command.aliases)
+      || !command.aliases.every(isValidKey)
+    )
+  ) return false
+  if (command.execution !== undefined) {
+    if (
+      !command.execution
+      || typeof command.execution !== 'object'
+      || Array.isArray(command.execution)
+    ) return false
+    if (
+      command.execution.action !== undefined
+      && (
+        typeof command.execution.action !== 'string'
+        || !command.execution.action.trim()
+      )
+    ) return false
+  }
+  return true
 }
 
 function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): ChatSlashCommand {

@@ -117,6 +117,7 @@ interface ComposerSnapshot {
   forkBeforeMessageId: string | null
   workspaceId: string | null
   initialCollaborationMode: CollaborationMode | null
+  queueOwnerRequestId: string | null
 }
 
 interface DispatchSendOptions {
@@ -468,6 +469,7 @@ export function useChatSend(options: UseChatSendOptions) {
   function captureComposerSnapshot(): ComposerSnapshot {
     const intent = options.pendingSessionIntent.value
     const attachmentRefs = [...options.pendingAttachments.value]
+    const queueOwnerContext = options.pendingQueueOwnerContext.value
     return {
       revision: options.composerRevision?.value ?? null,
       inputText: options.inputText.value,
@@ -477,7 +479,24 @@ export function useChatSend(options: UseChatSendOptions) {
       forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       workspaceId: pendingWorkspaceForIntent(intent),
       initialCollaborationMode: initialModeForIntent(intent),
+      queueOwnerRequestId: queueOwnerContext?.sessionKey === options.sessionKey.value
+        ? queueOwnerContext.ownerRequestId
+        : null,
     }
+  }
+
+  function queueOwnerMatchesSnapshot(snapshot: ComposerSnapshot): boolean {
+    const context = options.pendingQueueOwnerContext.value
+    const currentOwnerRequestId = context?.sessionKey === options.sessionKey.value
+      ? context.ownerRequestId
+      : null
+    return currentOwnerRequestId === snapshot.queueOwnerRequestId
+  }
+
+  function queueOwnerFromSnapshot(snapshot: ComposerSnapshot): PendingQueueOwner | undefined {
+    return snapshot.queueOwnerRequestId
+      ? { ownerRequestId: snapshot.queueOwnerRequestId }
+      : undefined
   }
 
   function composerMatchesSnapshot(snapshot: ComposerSnapshot): boolean {
@@ -1638,6 +1657,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (options.sessionKey.value !== requestSessionKey) return
+      if (!queueOwnerMatchesSnapshot(composerSnapshot)) return
       if (options.sendBlockedReason?.value) return
       if (
         invocation.cancelIfComposerChanged
@@ -1693,15 +1713,26 @@ export function useChatSend(options: UseChatSendOptions) {
       && text.startsWith('/')
       ? await options.classifySlashCommand(text)
       : null
-    if (
-      slashClassification !== null
-      && (
+    if (slashClassification !== null) {
+      if (
         options.sessionKey.value !== requestSessionKey
         || !composerMatchesSnapshot(composerSnapshot)
+        || !queueOwnerMatchesSnapshot(composerSnapshot)
         || Boolean(options.sendBlockedReason?.value)
         || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
-      )
-    ) return
+      ) return
+      if (
+        options.validateActiveProjectBeforeSend
+        && await refreshedActiveProjectBlocksSend()
+      ) return
+      if (
+        options.sessionKey.value !== requestSessionKey
+        || !composerMatchesSnapshot(composerSnapshot)
+        || !queueOwnerMatchesSnapshot(composerSnapshot)
+        || Boolean(options.sendBlockedReason?.value)
+        || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
+      ) return
+    }
 
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     if (
@@ -1758,14 +1789,14 @@ export function useChatSend(options: UseChatSendOptions) {
               text,
               attachments: composerSnapshot.payloadAttachments,
               intent: composerSnapshot.intent,
-            }, pendingQueueOwner()) ?? false
+            }, queueOwnerFromSnapshot(composerSnapshot)) ?? false
             : slashClassification === 'unknown'
               ? options.enqueuePendingInput(
                 text,
-                pendingQueueOwner(),
+                queueOwnerFromSnapshot(composerSnapshot),
                 { confirmedPlainText: true },
               )
-              : options.enqueuePendingInput(text, pendingQueueOwner()),
+              : options.enqueuePendingInput(text, queueOwnerFromSnapshot(composerSnapshot)),
         )
         if (!queued) {
           pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
@@ -1855,7 +1886,6 @@ export function useChatSend(options: UseChatSendOptions) {
     if (
       delivery === 'followup'
       && !item.hiddenControl
-      && item.attachments.length === 0
       && item.text.trim().startsWith('/')
       && !item.text.trim().startsWith('//')
     ) {
@@ -1872,6 +1902,14 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       if (options.sendBlockedReason?.value) return blockedOutcome()
       if (
+        options.validateActiveProjectBeforeSend
+        && await refreshedActiveProjectBlocksSend()
+      ) return blockedOutcome()
+      if (options.sessionKey.value !== ownerSessionKey) {
+        return preserveRetryState('not_sent')
+      }
+      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (
         options.stream.isStreaming.value
         || hasAuthoritativeWork()
         || options.isCompactInFlightForCurrentSession()
@@ -1883,6 +1921,9 @@ export function useChatSend(options: UseChatSendOptions) {
         return preserveRetryState('retryable_failure')
       }
       if (slashClassification === 'registered') {
+        if (item.attachments.length > 0) {
+          return preserveRetryState('retryable_failure')
+        }
         return await options.executeSlashCommand(item.text.trim(), 'registered')
           ? 'accepted'
           : preserveRetryState('retryable_failure')

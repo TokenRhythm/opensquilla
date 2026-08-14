@@ -6167,6 +6167,68 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     expect(inputText.value).toBe('/gamemode creative')
   })
 
+  it('keeps an idle slash draft with its original handoff owner during classification', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    const sessionKey = ref('agent:main:webchat:test')
+    const inputText = ref('/gamemode creative')
+    const pendingQueueOwnerContext = ref({
+      sessionKey: sessionKey.value,
+      ownerRequestId: 'owner-request-A',
+    })
+    const enqueuePendingInput = vi.fn(() => true)
+    const classifySlashCommand = vi.fn(() => classification)
+    const { api, rpc, stream } = makeOptions({
+      sessionKey,
+      inputText,
+      pendingQueueOwnerContext,
+      enqueuePendingInput,
+      classifySlashCommand,
+    })
+    stream.isStreaming.value = true
+
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(classifySlashCommand).toHaveBeenCalledOnce())
+    pendingQueueOwnerContext.value = {
+      sessionKey: sessionKey.value,
+      ownerRequestId: 'owner-request-B',
+    }
+    resolveClassification('unknown')
+    await sending
+
+    expect(enqueuePendingInput).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('/gamemode creative')
+  })
+
+  it('keeps an idle slash draft when its workspace becomes unavailable during classification', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    let projectBlocker: string | null = null
+    const validateActiveProjectBeforeSend = vi.fn(async () => projectBlocker)
+    const inputText = ref('/gamemode creative')
+    const classifySlashCommand = vi.fn(() => classification)
+    const { api, rpc } = makeOptions({
+      inputText,
+      validateActiveProjectBeforeSend,
+      classifySlashCommand,
+    })
+
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(classifySlashCommand).toHaveBeenCalledOnce())
+    projectBlocker = 'removed'
+    resolveClassification('unknown')
+    await sending
+
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('/gamemode creative')
+  })
+
   it('sends // escaped input as literal text with one slash stripped', async () => {
     const inputText = ref('//usr/bin/env')
     const executeSlashCommand = vi.fn(async () => true)
@@ -6228,74 +6290,118 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     expect(rpc.call).not.toHaveBeenCalled()
   })
 
-  it('keeps a durable queued slash item when the command catalog is unavailable', async () => {
-    vi.useFakeTimers()
-    try {
-      const inputText = ref('')
-      const pendingAttachments = ref<Attachment[]>([])
-      const pendingSessionIntent = ref<string | null>(null)
-      const sessionKey = ref('agent:main:webchat:test')
-      const isStreaming = ref(false)
-      const pendingRecords = new Map<
-        string,
-        import('@/utils/chat/pendingInputWal').PendingInputWalRecord
-      >()
-      let sendApi!: ReturnType<typeof useChatSend>
-      const pending = useChatPendingQueue({
-        sessionKey,
-        inputText,
-        pendingAttachments,
-        pendingSessionIntent,
-        isStreaming,
-        isBlocked: () => false,
-        autoResizeTextarea: vi.fn(),
-        sendCurrentInput: vi.fn(),
-        resetInputHistory: vi.fn(),
-        hasComposer: () => true,
-        pendingInputWal: {
-          put: async record => { pendingRecords.set(record.pendingInputId, record) },
-          list: async key => [...pendingRecords.values()].filter(record => (
-            record.sessionKey === key
-          )),
-          delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
-          close: () => {},
-        },
-        supportsMethod: () => false,
-        dispatchPendingItem: (item, ownerSessionKey) => (
-          sendApi.sendQueuedFollowup(item, ownerSessionKey)
-        ),
-      })
-      const executeSlashCommand = vi.fn(async () => true)
-      const classifySlashCommand = vi.fn(async () => 'unavailable' as const)
-      const configured = makeOptions({
-        inputText,
-        pendingAttachments,
-        pendingSessionIntent,
-        sessionKey,
-        busySendMode: pending.busySendMode,
-        enqueuePendingInput: pending.enqueuePendingInput,
-        enqueuePendingPayload: pending.enqueuePendingPayload,
-        popAllPendingIntoComposer: pending.popAllPendingIntoComposer,
-        classifySlashCommand,
-        executeSlashCommand,
-      })
-      sendApi = configured.api
-      await pending.enqueuePendingPayload({ text: '/gamemode creative' })
+  it.each(['unavailable', 'registered'] as const)(
+    'keeps a durable queued slash item with attachments when catalog is %s',
+    async classification => {
+      vi.useFakeTimers()
+      try {
+        const inputText = ref('')
+        const pendingAttachments = ref<Attachment[]>([])
+        const pendingSessionIntent = ref<string | null>(null)
+        const sessionKey = ref('agent:main:webchat:test')
+        const isStreaming = ref(false)
+        const pendingRecords = new Map<
+          string,
+          import('@/utils/chat/pendingInputWal').PendingInputWalRecord
+        >()
+        let sendApi!: ReturnType<typeof useChatSend>
+        const pending = useChatPendingQueue({
+          sessionKey,
+          inputText,
+          pendingAttachments,
+          pendingSessionIntent,
+          isStreaming,
+          isBlocked: () => false,
+          autoResizeTextarea: vi.fn(),
+          sendCurrentInput: vi.fn(),
+          resetInputHistory: vi.fn(),
+          hasComposer: () => true,
+          pendingInputWal: {
+            put: async record => { pendingRecords.set(record.pendingInputId, record) },
+            list: async key => [...pendingRecords.values()].filter(record => (
+              record.sessionKey === key
+            )),
+            delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
+            close: () => {},
+          },
+          supportsMethod: () => false,
+          dispatchPendingItem: (item, ownerSessionKey) => (
+            sendApi.sendQueuedFollowup(item, ownerSessionKey)
+          ),
+        })
+        const executeSlashCommand = vi.fn(async () => true)
+        const classifySlashCommand = vi.fn(async () => classification)
+        const configured = makeOptions({
+          inputText,
+          pendingAttachments,
+          pendingSessionIntent,
+          sessionKey,
+          busySendMode: pending.busySendMode,
+          enqueuePendingInput: pending.enqueuePendingInput,
+          enqueuePendingPayload: pending.enqueuePendingPayload,
+          popAllPendingIntoComposer: pending.popAllPendingIntoComposer,
+          classifySlashCommand,
+          executeSlashCommand,
+        })
+        sendApi = configured.api
+        const attachment: Attachment = {
+          kind: 'staged',
+          local_id: 94,
+          name: 'slash-context.txt',
+          mime: 'text/plain',
+          file_uuid: 'file-durable-slash-attachment',
+        }
+        await pending.enqueuePendingPayload({
+          text: '/gamemode creative',
+          attachments: [attachment],
+        })
 
-      pending.schedulePendingDrainAfterTerminal()
-      await vi.runAllTimersAsync()
-      await nextTick()
+        pending.schedulePendingDrainAfterTerminal()
+        await vi.runAllTimersAsync()
+        await nextTick()
 
-      expect(classifySlashCommand).toHaveBeenCalledOnce()
-      expect(executeSlashCommand).not.toHaveBeenCalled()
-      expect(configured.rpc.call).not.toHaveBeenCalled()
-      expect(pending.pendingQueue.value).toHaveLength(1)
-      expect(pending.pendingQueue.value[0]?.deliveryState).toBe('retryable')
-      expect(pendingRecords.size).toBe(1)
-      pending.cleanup()
-    } finally {
-      vi.useRealTimers()
+        expect(classifySlashCommand).toHaveBeenCalledOnce()
+        expect(executeSlashCommand).not.toHaveBeenCalled()
+        expect(configured.rpc.call).not.toHaveBeenCalled()
+        expect(pending.pendingQueue.value).toHaveLength(1)
+        expect(pending.pendingQueue.value[0]?.deliveryState).toBe('retryable')
+        expect(pending.pendingQueue.value[0]?.attachments).toEqual([attachment])
+        expect(pendingRecords.size).toBe(1)
+        pending.cleanup()
+      } finally {
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('keeps a queued slash item when its workspace becomes unavailable during classification', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    let projectBlocker: string | null = null
+    const validateActiveProjectBeforeSend = vi.fn(async () => projectBlocker)
+    const classifySlashCommand = vi.fn(() => classification)
+    const { api, rpc } = makeOptions({
+      validateActiveProjectBeforeSend,
+      classifySlashCommand,
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-workspace-blocked-slash',
+      ownerSessionKey: 'agent:main:webchat:test',
+      text: '/gamemode creative',
+      attachments: [],
+      intent: null,
     }
+
+    const sending = api.sendQueuedFollowup(queued, 'agent:main:webchat:test')
+    await vi.waitFor(() => expect(classifySlashCommand).toHaveBeenCalledOnce())
+    projectBlocker = 'removed'
+    resolveClassification('unknown')
+
+    await expect(sending).resolves.toBe('deferred')
+    expect(validateActiveProjectBeforeSend).toHaveBeenCalledTimes(2)
+    expect(rpc.call).not.toHaveBeenCalled()
   })
 
   it('keeps a queued slash item owned by A when classification finishes after switching to B', async () => {
