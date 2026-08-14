@@ -203,6 +203,29 @@ def test_capacity_bounded_fallback_chain_drops_configured_lower_models(
     assert [config.model for config in selector.remaining_chain()] == expected_models
 
 
+def test_capacity_bound_filters_plugin_failover_replacement() -> None:
+    class _Plugin:
+        def failover_hook(self, primary_failure: Exception) -> list[ProviderConfig]:
+            del primary_failure
+            return [
+                ProviderConfig("openrouter", "unknown-small", api_key="plugin-key")
+            ]
+
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openrouter", "baseline", api_key="test-key")
+        ),
+        plugin=_Plugin(),
+    )
+    selector.override_model_with_bounded_fallback_chain(
+        HIGH_TIER_MODEL,
+        [{"provider": "openrouter", "model": MID_TIER_MODEL}],
+    )
+
+    with pytest.raises(IndexError, match="No fallback chain available"):
+        selector.next_fallback_after_failure(RuntimeError("primary failed"))
+
+
 # A synthetic, public-dummy credential: it only exists to prove redaction.
 FAKE_LEAKED_KEY = "sk-test-000fakefakefakefake"
 

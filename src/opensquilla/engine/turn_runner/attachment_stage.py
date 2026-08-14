@@ -45,6 +45,7 @@ _UNAVAILABLE_MARKER = "[attachment unavailable:"
 _GENERATED_TEXT_ATTACHMENT_SOURCE = "input_normalization"
 _ATTACHMENT_PREPARATION_TIMEOUT_SECONDS = 30.0
 _ATTACHMENT_PREPARATION_WORKERS = 2
+_ATTACHMENT_PREPARATION_ADMISSION_CAPACITY = 4
 
 
 class _AttachmentPreparationCancelledError(Exception):
@@ -246,6 +247,12 @@ class AttachmentStage:
             max_workers=_ATTACHMENT_PREPARATION_WORKERS,
             thread_name_prefix="opensquilla-attachment-preparation",
         )
+        # ThreadPoolExecutor's internal queue is unbounded. Keep at most one
+        # queued job per worker in addition to the active workers; later turns
+        # wait here without submitting a closure to the executor.
+        self._admission = asyncio.BoundedSemaphore(
+            _ATTACHMENT_PREPARATION_ADMISSION_CAPACITY
+        )
 
     async def run(
         self,
@@ -280,8 +287,9 @@ class AttachmentStage:
             and configured_timeout > 0
         ):
             timeout_seconds = min(timeout_seconds, float(configured_timeout))
+        deadline_at_monotonic = time.monotonic() + timeout_seconds
         control = _AttachmentPreparationControl(
-            deadline_at_monotonic=time.monotonic() + timeout_seconds
+            deadline_at_monotonic=deadline_at_monotonic
         )
 
         def _prepare() -> tuple[list[Any] | None, AttachmentMaterializationStats]:
@@ -311,20 +319,47 @@ class AttachmentStage:
             )
             return extra, stats
 
+        try:
+            await asyncio.wait_for(
+                self._admission.acquire(),
+                timeout=max(0.0, deadline_at_monotonic - time.monotonic()),
+            )
+        except TimeoutError as exc:
+            control.cancel()
+            raise TimeoutError(
+                f"attachment preparation timed out after {timeout_seconds:g}s"
+            ) from exc
+
+        remaining_seconds = deadline_at_monotonic - time.monotonic()
+        if remaining_seconds <= 0:
+            self._admission.release()
+            control.cancel()
+            raise TimeoutError(
+                f"attachment preparation timed out after {timeout_seconds:g}s"
+            )
+
         loop = asyncio.get_running_loop()
-        future = loop.run_in_executor(self._executor, _prepare)
+        try:
+            future = loop.run_in_executor(self._executor, _prepare)
+        except BaseException:
+            self._admission.release()
+            raise
+        def _release_admission(done: asyncio.Future[Any]) -> None:
+            self._admission.release()
+            if not done.cancelled():
+                done.exception()
+
+        future.add_done_callback(_release_admission)
         try:
             extra_messages, stats = await asyncio.wait_for(
-                future,
-                timeout=timeout_seconds,
+                asyncio.shield(future),
+                timeout=remaining_seconds,
             )
         except asyncio.CancelledError:
             control.cancel()
-            future.cancel()
             raise
         except TimeoutError as exc:
             control.cancel()
-            future.cancel()
             raise TimeoutError(
                 f"attachment preparation timed out after {timeout_seconds:g}s"
             ) from exc

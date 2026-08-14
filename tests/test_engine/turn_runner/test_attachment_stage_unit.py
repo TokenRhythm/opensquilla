@@ -9,6 +9,7 @@ exception-propagation contract without the runtime wrapper.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import threading
 import time
 from dataclasses import dataclass, field
@@ -290,3 +291,45 @@ async def test_attachment_preparation_deadline_stops_started_worker() -> None:
 
     assert builder.started.is_set()
     assert await asyncio.to_thread(builder.stopped.wait, 1.0)
+
+
+@pytest.mark.asyncio
+async def test_attachment_preparation_bounds_executor_admission() -> None:
+    class _CountingExecutor(concurrent.futures.ThreadPoolExecutor):
+        def __init__(self) -> None:
+            super().__init__(max_workers=2)
+            self.submitted = 0
+
+        def submit(self, fn: Any, /, *args: Any, **kwargs: Any):
+            self.submitted += 1
+            return super().submit(fn, *args, **kwargs)
+
+    builder = _StartedCancellableBuilder()
+    stage = AttachmentStage(builder=builder)
+    stage._executor.shutdown(wait=True)
+    executor = _CountingExecutor()
+    stage._executor = executor
+    tasks = [
+        asyncio.create_task(
+            stage.run(
+                AttachmentStageInput(
+                    effective_runtime_message="hi",
+                    attachments=[{"type": "text/plain", "data": "eA=="}],
+                )
+            )
+        )
+        for _ in range(5)
+    ]
+    try:
+        for _ in range(100):
+            if executor.submitted == 4:
+                break
+            await asyncio.sleep(0.005)
+        assert executor.submitted == 4
+        await asyncio.sleep(0.02)
+        assert executor.submitted == 4
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.to_thread(executor.shutdown, True)

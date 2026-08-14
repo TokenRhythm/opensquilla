@@ -10,6 +10,7 @@ cross-provider tier path (credential resolution + continuity gate).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -21,13 +22,15 @@ _ROUTE_SAVINGS_KEYS = (
     "savings_max_price_per_m",
     "savings_routed_price_per_m",
 )
+_FALLBACK_NON_MATERIAL_INPUT_HEADROOM_TOKENS = 8_192
+_FALLBACK_THINKING_RESERVE_TOKENS = 4_096
 
 
 def _capacity_approved_configured_fallbacks(
     selector: Any,
     turn_metadata: dict[str, Any],
 ) -> list[dict[str, str]]:
-    """Keep only configured fallbacks with definite floor/context capacity."""
+    """Keep only configured fallbacks with definite request-budget capacity."""
 
     remaining_chain = getattr(selector, "remaining_chain", None)
     if not callable(remaining_chain):
@@ -37,27 +40,74 @@ def _capacity_approved_configured_fallbacks(
     except Exception:  # noqa: BLE001 - an opaque selector fails closed
         return []
 
+    entries = [
+        {
+            "provider": str(getattr(config, "provider", "") or "").strip(),
+            "model": str(getattr(config, "model", "") or "").strip(),
+        }
+        for config in configured_tail
+    ]
+    return _capacity_approved_fallback_entries(selector, entries, turn_metadata)
+
+
+def _capacity_approved_fallback_entries(
+    selector: Any,
+    entries: Sequence[object],
+    turn_metadata: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Admit fallbacks only when catalog data proves the full input budget fits."""
+
     material_tokens = turn_metadata.get("large_context_material_tokens")
     if not isinstance(material_tokens, int) or isinstance(material_tokens, bool):
         material_tokens = 0
+    if material_tokens <= 0:
+        return []
 
+    from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor
     from opensquilla.provider.model_catalog import shared_catalog
 
+    current_config = getattr(selector, "current_config", None)
+    default_provider = str(getattr(current_config, "provider", "") or "").strip()
     catalog = shared_catalog()
     approved: list[dict[str, str]] = []
-    for config in configured_tail:
-        provider = str(getattr(config, "provider", "") or "").strip()
-        model = str(getattr(config, "model", "") or "").strip()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider") or default_provider).strip()
+        model = str(entry.get("model") or "").strip()
         if not provider or not model:
             continue
-        if material_tokens <= 0:
-            continue
         try:
-            window, source = catalog.resolve_context_window_with_source(model, provider)
+            window, window_source = catalog.resolve_context_window_with_source(
+                model,
+                provider,
+            )
+            max_output, _output_source = catalog.resolve_max_tokens_with_source(
+                model,
+                user_override=0,
+                provider=provider,
+            )
         except Exception:  # noqa: BLE001 - missing/invalid capability fails closed
             continue
-        if source in {"catalog", "override"} and window >= material_tokens:
-            approved.append({"provider": provider, "model": model})
+        if window_source not in {"catalog", "override"}:
+            continue
+        budget = ContextBudgetGovernor.from_values(
+            context_window_tokens=window,
+            max_output_tokens=max_output,
+            thinking_budget_tokens=_FALLBACK_THINKING_RESERVE_TOKENS,
+            context_overflow_threshold=0.85,
+        ).snapshot()
+        safe_input_tokens = budget.provider_request_max_chars // CHARS_PER_TOKEN
+        if (
+            material_tokens + _FALLBACK_NON_MATERIAL_INPUT_HEADROOM_TOKENS
+            > safe_input_tokens
+        ):
+            continue
+        approved_entry = {"provider": provider, "model": model}
+        tier = str(entry.get("tier") or "").strip()
+        if tier:
+            approved_entry["tier"] = tier
+        approved.append(approved_entry)
     return approved
 
 
@@ -380,7 +430,21 @@ def apply_model_override(
     (its entries are same-provider models of the provider being left).
     """
     if tier_provider_config is not None and hasattr(selector, "override_provider_config"):
-        selector.override_provider_config(tier_provider_config)
+        bounded_provider_override = getattr(
+            selector,
+            "override_provider_config_with_bounded_fallbacks",
+            None,
+        )
+        if (
+            turn_metadata.get("large_context_floor_min_tier")
+            and callable(bounded_provider_override)
+        ):
+            bounded_provider_override(
+                tier_provider_config,
+                _capacity_approved_configured_fallbacks(selector, turn_metadata),
+            )
+        else:
+            selector.override_provider_config(tier_provider_config)
         turn_metadata["routed_provider_applied"] = tier_provider_config.provider
         turn_metadata["provider_state_replay_disabled"] = "cross_provider_route"
         _disable_selector_provider_state_replay(selector, turn_metadata)
@@ -452,13 +516,18 @@ def apply_model_override(
         and callable(override_with_bounded_fallback_chain)
         and isinstance(router_fallback_chain, list)
     ):
+        approved_router_fallbacks = _capacity_approved_fallback_entries(
+            selector,
+            router_fallback_chain,
+            turn_metadata,
+        )
         approved_configured_fallbacks = _capacity_approved_configured_fallbacks(
             selector,
             turn_metadata,
         )
         override_with_bounded_fallback_chain(
             model,
-            router_fallback_chain,
+            approved_router_fallbacks,
             approved_configured_fallbacks,
         )
     elif callable(override_with_fallback_chain) and isinstance(router_fallback_chain, list):
