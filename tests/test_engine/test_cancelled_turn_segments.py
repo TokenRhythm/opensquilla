@@ -306,8 +306,12 @@ async def test_cancelled_reasoning_only_turn_persists_assistant_history(tmp_path
         await asyncio.wait_for(provider.reasoning_consumed.wait(), timeout=5.0)
         await asyncio.sleep(0)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        try:
             await task
+        except asyncio.CancelledError:
+            pass
+        else:
+            pytest.fail("Expected CancelledError when awaiting cancelled task")
 
         transcript = await manager.get_transcript(session_key)
         assistants = [entry for entry in transcript if entry.role == "assistant"]
@@ -317,8 +321,10 @@ async def test_cancelled_reasoning_only_turn_persists_assistant_history(tmp_path
     finally:
         if not task.done():
             task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            try:
                 await task
+            except asyncio.CancelledError:
+                pass
         await storage.close()
 
 
