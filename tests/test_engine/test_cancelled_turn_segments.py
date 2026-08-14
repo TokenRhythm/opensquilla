@@ -324,6 +324,7 @@ async def test_cancelled_reasoning_only_turn_persists_assistant_history(tmp_path
             try:
                 await task
             except asyncio.CancelledError:
+                # Cancellation is the expected cleanup outcome for this task.
                 pass
         await storage.close()
 
