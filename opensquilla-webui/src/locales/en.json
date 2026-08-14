@@ -3478,12 +3478,14 @@
       "lifecycle": {
         "working": "Working",
         "answering": "Writing the answer",
+        "answerPrepared": "Answer composition",
         "settled": "Completed",
         "interrupted": "Interrupted",
         "failed": "Failed"
       },
       "provider": {
         "waiting": "Waiting for model",
+        "responded": "Model response",
         "reasoning": "Thinking deeply",
         "rateLimited": "Rate limited · retrying in {seconds}s",
         "retryWait": "Retrying in {seconds}s",

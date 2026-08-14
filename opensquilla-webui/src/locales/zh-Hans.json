@@ -3478,12 +3478,14 @@
       "lifecycle": {
         "working": "正在工作",
         "answering": "正在组织回答",
+        "answerPrepared": "组织回答",
         "settled": "已完成",
         "interrupted": "已中断",
         "failed": "已失败"
       },
       "provider": {
         "waiting": "等待模型",
+        "responded": "模型响应",
         "reasoning": "深度思考",
         "rateLimited": "受到限流 · {seconds} 秒后重试",
         "retryWait": "{seconds} 秒后重试",

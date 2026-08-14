@@ -263,7 +263,7 @@ const resolvedSummaryLabel = computed(() => {
 .assistant-activity__live-elapsed {
   flex: 0 0 auto;
   color: var(--text-muted);
-  font-size: 0.75rem;
+  font-size: inherit;
   font-variant-numeric: tabular-nums;
 }
 
@@ -302,6 +302,19 @@ const resolvedSummaryLabel = computed(() => {
 .assistant-activity__summary:hover {
   color: var(--text);
   background: transparent;
+}
+
+/* Completed turns use the outer outcome as the visual anchor. The phase rows
+   underneath are supporting detail, so their previous size relationship is
+   deliberately inverted. */
+.assistant-activity--settled > .assistant-activity__summary {
+  color: color-mix(in srgb, var(--text) 76%, transparent);
+  font-size: 0.875rem;
+}
+
+.assistant-activity--settled :deep(.assistant-activity-status__row),
+.assistant-activity--settled :deep(.tool-row) {
+  font-size: 0.75rem;
 }
 
 .assistant-activity__summary:focus-visible {

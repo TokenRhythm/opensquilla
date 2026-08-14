@@ -3425,12 +3425,14 @@
       "lifecycle": {
         "working": "En curso",
         "answering": "Redactando la respuesta",
+        "answerPrepared": "Preparación de la respuesta",
         "settled": "Completado",
         "interrupted": "Interrumpido",
         "failed": "Fallido"
       },
       "provider": {
         "waiting": "Esperando al modelo",
+        "responded": "Respuesta del modelo",
         "reasoning": "Razonamiento profundo",
         "rateLimited": "Límite de solicitudes · reintento en {seconds}s",
         "retryWait": "Reintento en {seconds}s",

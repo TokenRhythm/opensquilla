@@ -154,6 +154,15 @@ class SessionStreamRegistry:
         return str(raw) if raw is not None else ""
 
     @staticmethod
+    def _thinking_block_id(payload: dict[str, Any]) -> str:
+        raw = payload.get("block_id", payload.get("blockId"))
+        if isinstance(raw, str) and raw:
+            return raw
+        # Events produced before block identities existed form one compatible
+        # legacy block, but the sentinel stays internal to snapshot compaction.
+        return "__legacy_reasoning__"
+
+    @staticmethod
     def _delta_field(payload: dict[str, Any]) -> str:
         for field in ("json_fragment", "jsonFragment", "fragment"):
             if field in payload:
@@ -198,8 +207,12 @@ class SessionStreamRegistry:
 
         events = self._live_events_by_session.setdefault(session_key, [])
         if event.event_name == "session.event.thinking":
+            block_id = self._thinking_block_id(event.payload)
             for index, existing in enumerate(events):
-                if existing.event_name == event.event_name:
+                if (
+                    existing.event_name == event.event_name
+                    and self._thinking_block_id(existing.payload) == block_id
+                ):
                     self._replace_compacted_event(events, index, event, field="text")
                     return
         elif event.event_name == "session.event.tool_use_delta":

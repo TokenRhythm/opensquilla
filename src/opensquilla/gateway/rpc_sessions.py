@@ -3893,6 +3893,9 @@ async def _handle_sessions_send_impl(
             ):
                 event_dict = asdict(event)
                 event_kind = event_dict.pop("kind", event.__class__.__name__)
+                if event_kind == "thinking" and not event_dict.get("block_id"):
+                    event_dict.pop("block_id", None)
+                    event_dict.pop("block_index", None)
                 if event_kind == "artifact":
                     event_dict = enrich_artifact_event_dict(event_dict)
                 if event_kind in ("done", "error"):

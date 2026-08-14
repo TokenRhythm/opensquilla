@@ -4323,7 +4323,41 @@ class OpenAIProvider:
                                 )
                                 return
 
-                            # Text content
+                            # Reasoning content (always parsed, not gated on thinking).
+                            # Streamed in real time as ReasoningDeltaEvent; the
+                            # accumulator also retains the joined text for DoneEvent.
+                            # Counts as an emitted stream event: once the caller
+                            # has received reasoning deltas, an empty-stream or
+                            # timeout fallback retry would deliver (and bill)
+                            # the turn twice.
+                            for fragment in _openai_reasoning_fragments(delta):
+                                reasoning_event = reasoning.emit(fragment)
+                                if reasoning_event is None:
+                                    continue
+                                emitted_stream_event = True
+                                if text_tool_normalizer.native_lifecycle_deferred:
+                                    _append_coalesced_stream_event(
+                                        deferred_post_native_events,
+                                        reasoning_event,
+                                    )
+                                    if deferred_queue_is_oversized():
+                                        for release_event in release_deferred_queue():
+                                            if isinstance(
+                                                release_event,
+                                                TextDeltaEvent,
+                                            ):
+                                                visible_assistant_text_parts.append(
+                                                    release_event.text
+                                                )
+                                            yield release_event
+                                else:
+                                    yield reasoning_event
+
+                            # Text content follows reasoning when an
+                            # OpenAI-compatible gateway puts both fields in the
+                            # same delta. The wire object has no meaningful JSON
+                            # key order, but our semantic lifecycle does: a
+                            # thinking block must open before visible answer text.
                             text = delta.get("content")
                             if text:
                                 emitted_stream_event = True
@@ -4355,36 +4389,6 @@ class OpenAIProvider:
                                                 release_event.text
                                             )
                                         yield release_event
-
-                            # Reasoning content (always parsed, not gated on thinking).
-                            # Streamed in real time as ReasoningDeltaEvent; the
-                            # accumulator also retains the joined text for DoneEvent.
-                            # Counts as an emitted stream event: once the caller
-                            # has received reasoning deltas, an empty-stream or
-                            # timeout fallback retry would deliver (and bill)
-                            # the turn twice.
-                            for fragment in _openai_reasoning_fragments(delta):
-                                reasoning_event = reasoning.emit(fragment)
-                                if reasoning_event is None:
-                                    continue
-                                emitted_stream_event = True
-                                if text_tool_normalizer.native_lifecycle_deferred:
-                                    _append_coalesced_stream_event(
-                                        deferred_post_native_events,
-                                        reasoning_event,
-                                    )
-                                    if deferred_queue_is_oversized():
-                                        for release_event in release_deferred_queue():
-                                            if isinstance(
-                                                release_event,
-                                                TextDeltaEvent,
-                                            ):
-                                                visible_assistant_text_parts.append(
-                                                    release_event.text
-                                                )
-                                            yield release_event
-                                else:
-                                    yield reasoning_event
 
                             # Gemini thought_signature on non-FC deltas
                             # (streamed thinking path): Gemini sends it on

@@ -31,7 +31,7 @@ import {
   type SessionSubscriptionOutcome,
 } from '@/composables/chat/useChatSessionSubscription'
 import type { SessionBootstrapRun } from '@/composables/chat/useChatSessionBootstrap'
-import type { FrameInput } from '@/types/turnlog'
+import type { FrameInput, ReasoningBlock } from '@/types/turnlog'
 import type { StatusPart } from '@/types/parts'
 import type { FoldLiveTurnMode } from '@/composables/chat/useChatTurnLog'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
@@ -92,6 +92,7 @@ export interface ChatRpcStreamApi {
   // live-turn shadow log: the thinking ref lives here, so this composable appends
   // its own thinking frames into the stream-owned log after the legacy mutation.
   appendFrame: (frame: FrameInput) => void
+  noteReasoningPresentationDelta?: (text: string) => void
   useReducer: Ref<FoldLiveTurnMode>
   getThinkingText?: () => string
 }
@@ -347,6 +348,14 @@ interface TurnReasoningRecord {
   text: string
   seconds: number
   messageText: string
+  blocks: ReasoningBlock[]
+}
+
+interface TurnActivityRecord {
+  sessionKey: string
+  turnId?: string
+  messageText: string
+  statusHistory: StatusPart[]
 }
 
 export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions) {
@@ -374,6 +383,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   // Live thinking deltas for the current turn (session.event.thinking).
   const streamThinking = ref<LiveThinking | null>(null)
   const turnReasoningLog: TurnReasoningRecord[] = []
+  const turnActivityLog: TurnActivityRecord[] = []
   const pendingTerminalEvents = new Map<string, BufferedTerminalEvent>()
   const pendingStreamEvents = new Map<string, BufferedPendingStreamEvent[]>()
   const settledTaskIds = new Set<string>()
@@ -604,7 +614,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         authoritativeLive: true,
         replayed: false,
       })
-    } else if (event === 'session.event.thinking') {
+    } else if (
+      event === 'session.event.thinking_start'
+      || event === 'session.event.thinking'
+      || event === 'session.event.thinking_end'
+    ) {
       handleRpcAny(event, payload)
     }
   }
@@ -758,6 +772,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function appendThinkingDelta(text: string, payload: SessionEventPayload) {
     if (!text) return
     if (!stream.isStreaming.value) stream.startStreaming()
+    stream.noteReasoningPresentationDelta?.(text)
     const current = streamThinking.value
     if (current) {
       // Production renders reasoning from the non-reactive accumulator on the
@@ -777,7 +792,22 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     }
     // The fold concats the same text into its thinkingText. Gating already
     // passed upstream (handleRpcAny), so this frame mirrors an accepted delta.
-    if (stream.useReducer.value) stream.appendFrame({ kind: 'thinking', text, at: Date.now() })
+    if (stream.useReducer.value) {
+      const blockId = typeof payload.block_id === 'string'
+        ? payload.block_id
+        : typeof payload.blockId === 'string'
+          ? payload.blockId
+          : undefined
+      const rawBlockIndex = payload.block_index ?? payload.blockIndex
+      const blockIndex = typeof rawBlockIndex === 'number' ? rawBlockIndex : undefined
+      stream.appendFrame({
+        kind: 'thinking',
+        text,
+        at: trustedReasoningStartedAt(payload.started_at, Date.now()) ?? Date.now(),
+        ...(blockId ? { blockId } : {}),
+        ...(blockIndex !== undefined ? { blockIndex } : {}),
+      })
+    }
     // Reasoning growth must re-pin the thread to the bottom just like answer
     // text and tool deltas. Schedule the same batched render/scroll flush so a
     // long thinking phase keeps following the live turn instead of only
@@ -789,6 +819,53 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     streamThinking.value = null
   }
 
+  function handleThinkingStart(payload: SessionEventPayload) {
+    if (!stream.isStreaming.value) stream.startStreaming()
+    if (!stream.useReducer.value) return
+    const blockId = typeof payload.block_id === 'string'
+      ? payload.block_id
+      : typeof payload.blockId === 'string'
+        ? payload.blockId
+        : ''
+    if (!blockId) return
+    const rawBlockIndex = payload.block_index ?? payload.blockIndex
+    const rawContentKind = payload.content_kind ?? payload.contentKind
+    stream.appendFrame({
+      kind: 'thinking-start',
+      blockId,
+      blockIndex: typeof rawBlockIndex === 'number' ? rawBlockIndex : 0,
+      at: trustedReasoningStartedAt(payload.started_at, Date.now()) ?? Date.now(),
+      contentKind: rawContentKind === 'summary' ? 'summary' : 'reasoning',
+    })
+    stream.scheduleRender()
+  }
+
+  function handleThinkingEnd(payload: SessionEventPayload) {
+    if (!stream.useReducer.value) return
+    const blockId = typeof payload.block_id === 'string'
+      ? payload.block_id
+      : typeof payload.blockId === 'string'
+        ? payload.blockId
+        : ''
+    if (!blockId) return
+    const rawBlockIndex = payload.block_index ?? payload.blockIndex
+    const rawStatus = payload.status
+    const status = rawStatus === 'interrupted' || rawStatus === 'error'
+      ? rawStatus
+      : 'completed'
+    const rawEndedAt = payload.ended_at ?? payload.endedAt
+    stream.appendFrame({
+      kind: 'thinking-end',
+      blockId,
+      blockIndex: typeof rawBlockIndex === 'number' ? rawBlockIndex : 0,
+      status,
+      at: typeof rawEndedAt === 'number' && Number.isFinite(rawEndedAt)
+        ? rawEndedAt
+        : Date.now(),
+    })
+    stream.scheduleRender()
+  }
+
   // Walk recorded turn reasonings (newest first) and re-bind each to the
   // newest unclaimed assistant message it identifies: a row that already
   // carries this record's reasoning text gets its measured duration
@@ -798,28 +875,92 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   // showing one turn's reasoning under another turn's answer. Idempotent:
   // safe to run after every history replacement.
   function attachTurnReasoning() {
-    if (turnReasoningLog.length === 0) return
     const list = messages.value
+    if (turnReasoningLog.length > 0) {
+      const claimed = new Set<ChatMessage>()
+      for (let r = turnReasoningLog.length - 1; r >= 0; r--) {
+        const record = turnReasoningLog[r]
+        if (record.sessionKey !== sessionKey.value) continue
+        for (let i = list.length - 1; i >= 0; i--) {
+          const msg = list[i]
+          if (msg.role !== 'assistant' || claimed.has(msg)) continue
+          const carriesRecordReasoning = msg.reasoning?.text === record.text
+          const matchesAnswerText =
+            !msg.reasoning && record.messageText !== '' && msg.text.trim() === record.messageText
+          if (!carriesRecordReasoning && !matchesAnswerText) continue
+          claimed.add(msg)
+          msg.reasoning = { text: record.text, seconds: record.seconds }
+          if (record.blocks.length) {
+            msg.reasoningBlocks = record.blocks.map(block => ({ ...block }))
+          }
+          break
+        }
+      }
+    }
+    attachTurnActivity()
+  }
+
+  // Canonical chat history may not yet persist client activity markers. Keep
+  // the just-finished turn's safe structured phases attached across the
+  // immediate history replacement so its completed disclosure remains a full
+  // process record instead of collapsing back to reasoning-only.
+  function attachTurnActivity() {
+    if (turnActivityLog.length === 0) return
     const claimed = new Set<ChatMessage>()
-    for (let r = turnReasoningLog.length - 1; r >= 0; r--) {
-      const record = turnReasoningLog[r]
+    for (let r = turnActivityLog.length - 1; r >= 0; r--) {
+      const record = turnActivityLog[r]
       if (record.sessionKey !== sessionKey.value) continue
-      for (let i = list.length - 1; i >= 0; i--) {
-        const msg = list[i]
+      for (let i = messages.value.length - 1; i >= 0; i--) {
+        const msg = messages.value[i]
         if (msg.role !== 'assistant' || claimed.has(msg)) continue
-        const carriesRecordReasoning = msg.reasoning?.text === record.text
-        const matchesAnswerText =
-          !msg.reasoning && record.messageText !== '' && msg.text.trim() === record.messageText
-        if (!carriesRecordReasoning && !matchesAnswerText) continue
+        const matchesTurn = Boolean(record.turnId && msg.turnId === record.turnId)
+        const matchesAnswer = (!record.turnId || !msg.turnId)
+          && record.messageText !== ''
+          && msg.text.trim() === record.messageText
+        if (!matchesTurn && !matchesAnswer) continue
         claimed.add(msg)
-        msg.reasoning = { text: record.text, seconds: record.seconds }
+        const existing = msg.statusHistory ?? []
+        const localPhaseKeys = new Set(record.statusHistory.map(step =>
+          `${step.action}\u001f${step.at}\u001f${step.id || ''}`,
+        ))
+        msg.statusHistory = [
+          ...record.statusHistory.map(step => ({ ...step })),
+          ...existing.filter(step => !localPhaseKeys.has(
+            `${step.action}\u001f${step.at}\u001f${step.id || ''}`,
+          )),
+        ]
         break
       }
     }
   }
 
-  function recordTurnReasoning(text: string, seconds: number, messageText: string) {
-    turnReasoningLog.push({ sessionKey: sessionKey.value, text, seconds, messageText })
+  function recordTurnActivity(message: ChatMessage) {
+    if (!message.statusHistory?.length) return
+    turnActivityLog.push({
+      sessionKey: sessionKey.value,
+      turnId: message.turnId,
+      messageText: message.text.trim(),
+      statusHistory: message.statusHistory.map(step => ({ ...step })),
+    })
+    if (turnActivityLog.length > REASONING_LOG_LIMIT) {
+      turnActivityLog.splice(0, turnActivityLog.length - REASONING_LOG_LIMIT)
+    }
+    attachTurnActivity()
+  }
+
+  function recordTurnReasoning(
+    text: string,
+    seconds: number,
+    messageText: string,
+    blocks?: ReasoningBlock[],
+  ) {
+    turnReasoningLog.push({
+      sessionKey: sessionKey.value,
+      text,
+      seconds,
+      messageText,
+      blocks: (blocks ?? []).map(block => ({ ...block })),
+    })
     if (turnReasoningLog.length > REASONING_LOG_LIMIT) {
       turnReasoningLog.splice(0, turnReasoningLog.length - REASONING_LOG_LIMIT)
     }
@@ -861,6 +1002,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   watch(sessionKey, () => {
     streamThinking.value = null
     turnReasoningLog.length = 0
+    turnActivityLog.length = 0
     pendingTerminalEvents.clear()
     pendingStreamEvents.clear()
     settledTaskIds.clear()
@@ -1614,7 +1756,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       return
     }
     if (
-      rawEvent === 'session.event.thinking' &&
+      (
+        rawEvent === 'session.event.thinking_start'
+        || rawEvent === 'session.event.thinking'
+        || rawEvent === 'session.event.thinking_end'
+      ) &&
       bufferPendingStreamEvent(rawEvent, payloadObj)
     ) return
     // A stale task's terminal/done/error must not end the current turn's stream
@@ -1657,12 +1803,26 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (event.startsWith('session.event.task_group.')) return
     if (event === 'sessions.changed') return
 
+    if (event === 'session.event.thinking_start') {
+      if (aborted.value) return
+      stream.resetStreamIdleTimer()
+      handleThinkingStart(payload)
+      return
+    }
+
     if (event === 'session.event.thinking') {
       if (aborted.value) return
       const thinkingText = (payload as SessionEventPayload).text
       if (typeof thinkingText !== 'string' || !thinkingText) return
       stream.resetStreamIdleTimer()
       appendThinkingDelta(thinkingText, payload)
+      return
+    }
+
+    if (event === 'session.event.thinking_end') {
+      if (aborted.value) return
+      stream.resetStreamIdleTimer()
+      handleThinkingEnd(payload)
       return
     }
 
@@ -1734,6 +1894,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
         : null
       if (completedAssistant) {
         completedAssistant.turnId = doneTurnId(donePayload) ?? completedAssistant.turnId
+        recordTurnActivity(completedAssistant)
       }
       if (completedAssistant && payload?.reason !== 'aborted') {
         completedAssistant.turnInputMode = doneTurnProvenance(
@@ -1755,7 +1916,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       }
       if (reasoningText && payload?.reason !== 'aborted' && completedAssistant) {
         completedAssistant.reasoning = { text: reasoningText, seconds: reasoningSeconds }
-        recordTurnReasoning(reasoningText, reasoningSeconds, completedAssistant.text.trim())
+        recordTurnReasoning(
+          reasoningText,
+          reasoningSeconds,
+          completedAssistant.text.trim(),
+          completedAssistant.reasoningBlocks,
+        )
       }
       options.scheduleHistorySync()
 
