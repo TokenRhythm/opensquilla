@@ -5763,7 +5763,7 @@ describe('useChatSend Ensemble image guard', () => {
 
     await api.onSend()
 
-    expect(executeSlashCommand).toHaveBeenCalledWith('/status')
+    expect(executeSlashCommand).toHaveBeenCalledWith('/status', 'registered')
     expect(rpc.call).not.toHaveBeenCalled()
     expect(inputText.value).toBe('/status')
     expect(pendingAttachments.value).toEqual([image])
@@ -6050,13 +6050,15 @@ describe('useChatSend slash-prefixed input fall-through', () => {
   it('sends an unknown slash-prefixed input as a normal message exactly once', async () => {
     const inputText = ref('/gamemode creative')
     const executeSlashCommand = vi.fn(async () => false)
-    const { api, rpc } = makeOptions({ inputText, executeSlashCommand })
+    const { api, rpc } = makeOptions({
+      inputText,
+      classifySlashCommand: vi.fn(async () => 'unknown' as const),
+      executeSlashCommand,
+    })
 
     await api.onSend()
 
-    // executeSlashCommand reports "unhandled" for unknown slash inputs, so
-    // onSend must fall through to the normal chat.send path — and only once.
-    expect(executeSlashCommand).toHaveBeenCalledWith('/gamemode creative')
+    expect(executeSlashCommand).not.toHaveBeenCalled()
     expect(rpc.call).toHaveBeenCalledOnce()
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       message: '/gamemode creative',
@@ -6074,6 +6076,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     const { api, rpc } = makeOptions({
       inputText: ref('/usr/bin/env'),
       pendingAttachments,
+      classifySlashCommand: vi.fn(async () => 'unknown' as const),
       executeSlashCommand: vi.fn(async () => false),
     })
 
@@ -6091,13 +6094,77 @@ describe('useChatSend slash-prefixed input fall-through', () => {
   it('does not send when a registered slash command handles the input', async () => {
     const inputText = ref('/coding')
     const executeSlashCommand = vi.fn(async () => true)
-    const { api, rpc } = makeOptions({ inputText, executeSlashCommand })
+    const { api, rpc } = makeOptions({
+      inputText,
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      executeSlashCommand,
+    })
 
     await api.onSend()
 
     // A registered command is handled by the command path: no chat.send.
-    expect(executeSlashCommand).toHaveBeenCalledWith('/coding')
+    expect(executeSlashCommand).toHaveBeenCalledWith('/coding', 'registered')
     expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it('keeps an idle slash draft owned by A when classification finishes in B', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    const sessionKey = ref('agent:main:webchat:A')
+    const inputText = ref('/gamemode creative')
+    const pendingAttachments = ref<Attachment[]>([{
+      kind: 'staged',
+      local_id: 93,
+      name: 'commands.txt',
+      mime: 'text/plain',
+      file_uuid: 'file-idle-slash-text',
+    }])
+    const classifySlashCommand = vi.fn(() => classification)
+    const executeSlashCommand = vi.fn(async () => false)
+    const { api, rpc } = makeOptions({
+      sessionKey,
+      inputText,
+      pendingAttachments,
+      classifySlashCommand,
+      executeSlashCommand,
+    })
+
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(classifySlashCommand).toHaveBeenCalledOnce())
+    sessionKey.value = 'agent:main:webchat:B'
+    resolveClassification('unknown')
+    await sending
+
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('/gamemode creative')
+    expect(pendingAttachments.value).toHaveLength(1)
+  })
+
+  it('keeps an idle slash draft when sending becomes blocked during classification', async () => {
+    let resolveClassification!: (classification: 'unknown') => void
+    const classification = new Promise<'unknown'>(resolve => {
+      resolveClassification = resolve
+    })
+    const inputText = ref('/gamemode creative')
+    const sendBlockedReason = ref('')
+    const classifySlashCommand = vi.fn(() => classification)
+    const { api, rpc } = makeOptions({
+      inputText,
+      sendBlockedReason,
+      classifySlashCommand,
+    })
+
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(classifySlashCommand).toHaveBeenCalledOnce())
+    sendBlockedReason.value = 'Live updates are unavailable'
+    resolveClassification('unknown')
+    await sending
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(inputText.value).toBe('/gamemode creative')
   })
 
   it('sends // escaped input as literal text with one slash stripped', async () => {

@@ -1688,29 +1688,33 @@ export function useChatSend(options: UseChatSendOptions) {
       return
     }
 
+    const slashClassification = !bypassSlashCommand
+      && !isLiteralSlash
+      && text.startsWith('/')
+      ? await options.classifySlashCommand(text)
+      : null
+    if (
+      slashClassification !== null
+      && (
+        options.sessionKey.value !== requestSessionKey
+        || !composerMatchesSnapshot(composerSnapshot)
+        || Boolean(options.sendBlockedReason?.value)
+        || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
+      )
+    ) return
+
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     if (
       options.stream.isStreaming.value
       || hasAuthoritativeWork()
       || compactInFlight
-      || handoffInFlight
+      || responseHandoffBlocksCurrentSession()
     ) {
-      const slashClassification = !bypassSlashCommand
-        && !isLiteralSlash
-        && text.startsWith('/')
-        ? await options.classifySlashCommand(text)
-        : null
-      if (
-        slashClassification !== null
-        && (
-          options.sessionKey.value !== requestSessionKey
-          || !composerMatchesSnapshot(composerSnapshot)
-        )
-      ) return
+      const currentHandoffInFlight = responseHandoffBlocksCurrentSession()
       const stillBusy = options.stream.isStreaming.value
         || hasAuthoritativeWork()
         || options.isCompactInFlightForCurrentSession()
-        || responseHandoffBlocksCurrentSession()
+        || currentHandoffInFlight
       if (stillBusy) {
         if (
           !bypassSlashCommand
@@ -1725,7 +1729,7 @@ export function useChatSend(options: UseChatSendOptions) {
           return
         }
         if (!hasPayload) return
-        if (handoffInFlight && !activeResponseHandoff?.durableRecord) {
+        if (currentHandoffInFlight && !activeResponseHandoff?.durableRecord) {
           // The fork itself may proceed without IndexedDB, but a follow-up must
           // stay editable until the target session is known. Otherwise refresh
           // can strand an ownerless message on the parent session.
@@ -1770,9 +1774,8 @@ export function useChatSend(options: UseChatSendOptions) {
       }
     }
 
-    if (!bypassSlashCommand && !isLiteralSlash && text.startsWith('/')) {
-      if (!composerMatchesSnapshot(composerSnapshot)) return
-      const handled = await options.executeSlashCommand(text)
+    if (slashClassification !== null && slashClassification !== 'unknown') {
+      const handled = await options.executeSlashCommand(text, slashClassification)
       if (handled) return
     }
 

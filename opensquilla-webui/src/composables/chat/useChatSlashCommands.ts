@@ -202,6 +202,16 @@ function normalizeSlashCommand(cmd: SlashCommandPayload): ChatSlashCommand {
   }
 }
 
+function isValidSlashCommandPayload(value: unknown): value is SlashCommandPayload {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const command = value as SlashCommandPayload
+  const rawKey = [command.name, command.cmd]
+    .find(candidate => typeof candidate === 'string' && candidate.trim())
+  if (!rawKey) return false
+  const trimmedKey = rawKey.trim()
+  return !/\s/.test(trimmedKey) && slashCommandKey(trimmedKey).length > 1
+}
+
 function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): ChatSlashCommand {
   const full = parent.cmd + ' ' + choice.value
   return {
@@ -428,7 +438,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
             'commands.list_for_surface',
             params,
           )
-      if (!Array.isArray(res?.commands)) throw new Error('invalid command catalog')
+      if (
+        !Array.isArray(res?.commands)
+        || !res.commands.every(isValidSlashCommandPayload)
+      ) throw new Error('invalid command catalog')
       slashCmds.value = res.commands.map(normalizeSlashCommand)
       if (
         options.activatePlanMode
