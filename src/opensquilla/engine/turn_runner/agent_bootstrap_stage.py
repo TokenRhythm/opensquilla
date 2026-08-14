@@ -811,6 +811,14 @@ class AgentBootstrapStage:
                 inp.active_provider_id,
             )
 
+        # Capacity diagnostics contain resolved numeric limits only. They are
+        # safe for turn metadata and make catalog-vs-provider failures
+        # distinguishable without exposing attachment names or contents.
+        inp.turn.metadata["resolved_output_cap_tokens"] = int(catalog.max_tokens)
+        inp.turn.metadata["resolved_context_window_tokens"] = int(
+            catalog.context_window
+        )
+
         # 3. Build AgentConfig auxiliaries (thinking, projection, store, mem cfg)
         aux = self._agent_config_builder.build_auxiliaries(
             agent_id=inp.agent_id,

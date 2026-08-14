@@ -651,6 +651,8 @@ async def test_case05_no_model_catalog_fallback() -> None:
     assert out.output.agent_config.max_tokens == 8192
     assert out.output.agent_config.context_window_tokens == 200_000
     assert out.output.model_capabilities is None
+    assert out.output.agent_config.metadata["resolved_output_cap_tokens"] == 8192
+    assert out.output.agent_config.metadata["resolved_context_window_tokens"] == 200_000
 
 
 @pytest.mark.asyncio

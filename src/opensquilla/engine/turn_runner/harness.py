@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -258,6 +259,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "flags_text_override": request.flags_text_override,
             "tool_context": request.tool_context,
             "normalization_metadata": request.normalization_metadata,
+            "attachment_materialization": request.attachment_materialization,
             "input_provenance": request.input_provenance,
             "skill_catalog": request.skill_catalog,
             "usage_execution_context": request.usage_execution_context,
@@ -1426,6 +1428,28 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
             workspace_attachment_budget_bytes=(
                 workspace_attachment_budget_from_config(self._runner._config)
             ),
+        )
+
+    def build_cancellable(
+        self,
+        message: str,
+        attachments: list[dict],
+        *,
+        workspace_dir: str | Path | None = None,
+        session_id: str | None = None,
+        cancel_check: Callable[[], None],
+    ) -> list[Any] | None:
+        return self._runner._build_attachment_messages(
+            message,
+            attachments,
+            media_root=self._runner._attachment_media_root(),
+            workspace_dir=workspace_dir
+            or getattr(self._runner._config, "workspace_dir", None),
+            session_id=session_id,
+            workspace_attachment_budget_bytes=(
+                workspace_attachment_budget_from_config(self._runner._config)
+            ),
+            cancel_check=cancel_check,
         )
 
 

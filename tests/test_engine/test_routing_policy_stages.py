@@ -26,6 +26,7 @@ from opensquilla.engine.routing import (
     previous_final_tier,
     provider_mismatch,
     reconcile_controller_with_final_tier,
+    resolve_large_context_floor_tier,
 )
 from opensquilla.engine.routing.policy_data import COMPLAINT_TERMS
 
@@ -435,6 +436,32 @@ def test_large_context_floor_without_extra_dict() -> None:
     )
     assert floored.tier == "c3"
     assert updates["large_context_floor_from_tier"] == "c0"
+
+
+def test_large_context_floor_uses_next_configured_tier_when_exact_tier_missing() -> None:
+    tiers = {name: cfg for name, cfg in TIERS.items() if name != "c2"}
+    valid_tiers = ["c0", "c1", "c3"]
+    decision = RoutingDecision(
+        tier="c0",
+        model="dummy-nano-1",
+        confidence=0.9,
+        source="v4_phase3",
+    )
+    updates: dict = {}
+
+    floored = large_context_floor(
+        decision,
+        tiers=tiers,
+        valid_tiers=valid_tiers,
+        material_tokens=30_000,
+        context_window_tokens=200_000,
+        extra=None,
+        metadata_updates=updates,
+    )
+
+    assert resolve_large_context_floor_tier("c2", valid_tiers) == "c3"
+    assert floored.tier == "c3"
+    assert floored.model == "dummy-max-1"
 
 
 def test_large_context_floor_no_trigger_paths() -> None:

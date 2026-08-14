@@ -93,6 +93,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_ci/test_session_storage_connection_contract.py",
     "tests/test_channels/test_stream_terminal_routing.py",
     "tests/test_engine/test_agent_canonical_text_contract.py",
+    "tests/test_engine/test_attachment_aware_routing.py",
     "tests/test_engine/test_done_text_snapshot_consumers.py",
     "tests/test_engine/test_provider_request_correlation.py",
     "tests/test_engine/test_provider_activity.py",

@@ -9797,6 +9797,15 @@ class Agent:
                             attempt_classification.kind,
                             input_tokens=iter_input_tokens,
                         )
+                        if (
+                            large_context_invalid
+                            and attempt_classification.kind
+                            == _ProviderAttemptKind.REASONING_ONLY
+                            and (attempt_classification.stop_reason or "").lower()
+                            == "length"
+                        ):
+                            _thinking_fallback_done = True
+                            _disable_thinking_for_next_provider_call = True
                         supports_reasoning_replay = supports_reasoning_prefill_replay(
                             model_capabilities=self.config.model_capabilities,
                             reasoning_content=iter_reasoning_content,
@@ -10031,18 +10040,26 @@ class Agent:
 
                             if (
                                 attempt_classification.kind == _ProviderAttemptKind.REASONING_ONLY
-                                and thinking_enabled
+                                and (
+                                    thinking_enabled
+                                    or (attempt_classification.stop_reason or "").lower()
+                                    == "length"
+                                )
                                 and _retry_policy.can_retry_attempt(
                                     _ProviderAttemptKind.REASONING_ONLY,
                                     _attempt_retries_used,
                                 )
                             ):
                                 _attempt_retries_used[_ProviderAttemptKind.REASONING_ONLY] += 1
-                                disable_thinking = bool(
-                                    getattr(
-                                        self.config,
-                                        "reasoning_only_thinking_fallback",
-                                        False,
+                                disable_thinking = (
+                                    (attempt_classification.stop_reason or "").lower()
+                                    == "length"
+                                    or bool(
+                                        getattr(
+                                            self.config,
+                                            "reasoning_only_thinking_fallback",
+                                            False,
+                                        )
                                     )
                                 )
                                 if disable_thinking:
@@ -10097,11 +10114,20 @@ class Agent:
                                 continue
 
                             yield self._transition(AgentState.ERROR)
+                            if self.config.metadata.get("had_attachments"):
+                                recovery_guidance = (
+                                    "Split, summarize, or shorten the attached material, "
+                                    "or use a stronger model."
+                                )
+                            else:
+                                recovery_guidance = (
+                                    "Send the material as an attachment, summarize or "
+                                    "shorten the prompt, or use a stronger model."
+                                )
                             terminal_error = ErrorEvent(
                                 message=(
                                     "Provider returned no visible response for a large input. "
-                                    "Send the material as an attachment, summarize or shorten "
-                                    "the prompt, or use a stronger model."
+                                    + recovery_guidance
                                 ),
                                 code="empty_response",
                             )

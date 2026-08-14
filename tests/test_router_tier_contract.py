@@ -4,10 +4,18 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from opensquilla.engine.capacity_admission import (
+    LargeContextCapacityError,
+    model_has_request_capacity,
+)
 from opensquilla.engine.selector_override import apply_model_override
 from opensquilla.engine.steps.squilla_router import _flag_tier_provider_mismatch
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.mutations import _cross_provider_tier_warnings, upsert_router
+from opensquilla.provider.model_catalog import DeploymentModelLimits, ModelCatalog
+from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.router_tiers import TierConfig
 
 # ---------------------------------------------------------------------------
@@ -89,6 +97,19 @@ class _StubSelector:
     def override_model_with_fallback_chain(self, model: str, chain: list) -> None:
         self.calls.append(("override_with_chain", (model, chain)))
 
+    def override_model_with_bounded_fallback_chain(
+        self,
+        model: str,
+        chain: list,
+        approved_configured_fallbacks: list | None = None,
+    ) -> None:
+        self.calls.append(
+            (
+                "override_with_bounded_chain",
+                (model, chain, approved_configured_fallbacks),
+            )
+        )
+
     def resolve(self) -> object:
         return "provider-sentinel"
 
@@ -117,6 +138,747 @@ def test_override_without_routing_uses_plain_override() -> None:
     assert selector.calls[0][0] == "override_model"
     # Observe phase: routed_model intentionally keeps the would-be choice.
     assert metadata["routed_model"] == "would-be-routed"
+
+
+def test_large_context_floor_uses_capacity_bounded_selector_chain() -> None:
+    selector = _StubSelector()
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [{"tier": "c2", "model": "capacity-safe"}],
+        "large_context_floor_min_tier": "c2",
+        "routed_model": "routed",
+    }
+
+    apply_model_override(
+        selector,
+        "routed",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert selector.calls[0][0] == "override_with_bounded_chain"
+
+
+def test_large_context_capacity_block_stops_selector_execution() -> None:
+    selector = _StubSelector()
+    metadata = {
+        "large_context_capacity_blocked": True,
+        "large_context_capacity_block_reason": "No proven large-context route.",
+    }
+
+    with pytest.raises(LargeContextCapacityError, match="No proven"):
+        apply_model_override(
+            selector,
+            "baseline-small",
+            turn_metadata=metadata,
+            realign_routed_model=False,
+        )
+
+    assert selector.calls == []
+
+
+def test_large_context_floor_keeps_only_definitely_capable_configured_fallbacks(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/configured-lower": {"context_window": 20_000},
+            "openai/configured-same": {"context_window": 50_000},
+            "openai/configured-higher": {"context_window": 128_000},
+            "openai/routed-at-floor": {"context_window": 200_000},
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog._shared_catalog",
+        catalog,
+    )
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                "openai",
+                "configured-lower",
+                api_key="test-key",
+            ),
+            fallbacks=[
+                ProviderConfig("openai", "configured-same", api_key="test-key"),
+                ProviderConfig("openai", "configured-higher", api_key="test-key"),
+                ProviderConfig("openai", "configured-unknown", api_key="test-key"),
+            ],
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [],
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "routed-at-floor",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-at-floor",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == [
+        "routed-at-floor",
+        "configured-higher",
+    ]
+
+
+def test_large_context_floor_retains_safe_original_primary_as_fallback(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/original-safe": {"context_window": 128_000},
+            "openai/routed-at-floor": {"context_window": 200_000},
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "original-safe", api_key="test-key")
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [],
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "routed-at-floor",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-at-floor",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == [
+        "routed-at-floor",
+        "original-safe",
+    ]
+
+
+def test_large_context_floor_validates_router_fallback_capacity(monkeypatch) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/router-small": {"context_window": 32_000},
+            "openai/router-safe": {"context_window": 128_000},
+            "openai/routed-at-floor": {"context_window": 200_000},
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "configured-primary", api_key="test-key")
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [
+            {"tier": "c2", "model": "router-small"},
+            {"tier": "c2", "model": "router-unknown"},
+            {"tier": "c2", "model": "router-safe"},
+        ],
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "routed-at-floor",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-at-floor",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == [
+        "routed-at-floor",
+        "router-safe",
+    ]
+
+
+def test_capacity_admission_reserves_actual_high_thinking_budget(monkeypatch) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/reasoning-model": {
+                "context_window": 128_000,
+                "max_output_tokens": 10_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+
+    assert model_has_request_capacity(
+        provider="openai",
+        model="reasoning-model",
+        material_tokens=60_000,
+        thinking_budget_tokens=4_096,
+    )
+    assert not model_has_request_capacity(
+        provider="openai",
+        model="reasoning-model",
+        material_tokens=60_000,
+        thinking_budget_tokens=20_000,
+    )
+
+
+def test_capacity_admission_honors_global_context_and_output_overrides(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_live_provider_entries(
+        "openai",
+        {
+            "override-model": {
+                "context_window": 200_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+
+    assert model_has_request_capacity(
+        provider="openai",
+        model="override-model",
+        material_tokens=50_000,
+        thinking_budget_tokens=0,
+    )
+    assert not model_has_request_capacity(
+        provider="openai",
+        model="override-model",
+        material_tokens=50_000,
+        thinking_budget_tokens=0,
+        context_window_override_tokens=80_000,
+        max_output_override_tokens=10_000,
+    )
+
+
+def test_capacity_admission_honors_endpoint_and_explicit_proof_caps(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/endpoint-model": {
+                "context_window": 200_000,
+                "max_output_tokens": 10_000,
+            }
+        }
+    )
+    monkeypatch.setattr(
+        catalog,
+        "resolve_deployment_limits",
+        lambda *_args, **kwargs: DeploymentModelLimits(
+            context_window=(80_000 if kwargs.get("base_url") else 200_000),
+            max_output_tokens=10_000,
+            max_output_tokens_known=True,
+        ),
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+
+    assert not model_has_request_capacity(
+        provider="openai",
+        model="endpoint-model",
+        material_tokens=50_000,
+        thinking_budget_tokens=0,
+        base_url="https://deployment.example/v1",
+    )
+    assert not model_has_request_capacity(
+        provider="openai",
+        model="endpoint-model",
+        material_tokens=50_000,
+        thinking_budget_tokens=0,
+        provider_request_proof_max_chars=160_000,
+    )
+
+
+def test_large_context_fallback_rejects_model_at_high_thinking_budget(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/router-borderline": {
+                "context_window": 128_000,
+                "max_output_tokens": 10_000,
+            },
+            "openai/routed-at-floor": {
+                "context_window": 200_000,
+                "max_output_tokens": 10_000,
+            },
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "configured-primary", api_key="test-key")
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [
+            {"tier": "c3", "model": "router-borderline"},
+        ],
+        "large_context_floor_min_tier": "c3",
+        "large_context_material_tokens": 60_000,
+        "large_context_thinking_budget_tokens": 20_000,
+        "routed_model": "routed-at-floor",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-at-floor",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == [
+        "routed-at-floor"
+    ]
+
+
+def test_large_context_final_head_honors_global_context_override(monkeypatch) -> None:
+    catalog = ModelCatalog()
+    catalog.set_live_provider_entries(
+        "openai",
+        {
+            "catalog-large": {
+                "context_window": 200_000,
+                "max_output_tokens": 4_000,
+            },
+            "routed-at-floor": {
+                "context_window": 200_000,
+                "max_output_tokens": 4_000,
+            },
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "configured-primary", api_key="test-key")
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [{"tier": "c3", "model": "catalog-large"}],
+        "large_context_floor_min_tier": "c3",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "large_context_context_window_override_tokens": 80_000,
+        "large_context_max_output_override_tokens": 10_000,
+        "routed_model": "routed-at-floor",
+    }
+
+    with pytest.raises(LargeContextCapacityError, match="final model deployment"):
+        apply_model_override(
+            selector,
+            "routed-at-floor",
+            turn_metadata=metadata,
+            realign_routed_model=False,
+        )
+
+    assert metadata["large_context_capacity_blocked"] is True
+
+
+def test_configured_fallback_uses_its_exact_endpoint_limits(monkeypatch) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/endpoint-fallback": {
+                "context_window": 200_000,
+                "max_output_tokens": 10_000,
+            },
+            "openai/routed-at-floor": {
+                "context_window": 200_000,
+                "max_output_tokens": 10_000,
+            },
+        }
+    )
+    monkeypatch.setattr(
+        catalog,
+        "resolve_deployment_limits",
+        lambda *_args, **kwargs: DeploymentModelLimits(
+            context_window=(
+                80_000 if kwargs.get("base_url") == "https://small.example/v1" else 200_000
+            ),
+            max_output_tokens=10_000,
+            max_output_tokens_known=True,
+        ),
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "configured-primary", api_key="test-key"),
+            fallbacks=[
+                ProviderConfig(
+                    "openai",
+                    "endpoint-fallback",
+                    api_key="fallback-key",
+                    base_url="https://small.example/v1",
+                )
+            ],
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [],
+        "large_context_floor_min_tier": "c3",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "routed-at-floor",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-at-floor",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == [
+        "routed-at-floor"
+    ]
+
+
+def test_cross_provider_large_context_floor_filters_original_tail(monkeypatch) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/original-small": {"context_window": 32_000},
+            "openai/routed-large": {"context_window": 200_000},
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                "openrouter",
+                "original-small",
+                api_key="original-key",
+            ),
+            fallbacks=[
+                ProviderConfig("openrouter", "unknown-tail", api_key="fallback-key")
+            ],
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "routed_model": "routed-large",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-large",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+        tier_provider_config=ProviderConfig(
+            "openai",
+            "routed-large",
+            api_key="routed-key",
+        ),
+    )
+
+    assert [
+        (config.provider, config.model) for config in selector.remaining_chain()
+    ] == [("openai", "routed-large")]
+
+
+def test_cross_provider_large_context_floor_retains_safe_original_primary(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/original-safe": {"context_window": 128_000},
+            "openai/routed-large": {"context_window": 200_000},
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                "openrouter",
+                "original-safe",
+                api_key="original-key",
+            )
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "routed-large",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-large",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+        tier_provider_config=ProviderConfig(
+            "openai",
+            "routed-large",
+            api_key="routed-key",
+        ),
+    )
+
+    assert [
+        (config.provider, config.model) for config in selector.remaining_chain()
+    ] == [
+        ("openai", "routed-large"),
+        ("openrouter", "original-safe"),
+    ]
+
+
+def test_cross_provider_large_context_head_uses_exact_endpoint_limits(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "tokenrhythm/routed-large": {
+                "context_window": 200_000,
+                "max_output_tokens": 10_000,
+            }
+        }
+    )
+    monkeypatch.setattr(
+        catalog,
+        "resolve_deployment_limits",
+        lambda *_args, **kwargs: DeploymentModelLimits(
+            context_window=(
+                80_000
+                if kwargs.get("base_url") == "https://small.example/v1"
+                else 200_000
+            ),
+            max_output_tokens=10_000,
+            max_output_tokens_known=True,
+        ),
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "configured-primary", api_key="test-key")
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "routed-large",
+    }
+
+    with pytest.raises(LargeContextCapacityError, match="cross-provider"):
+        apply_model_override(
+            selector,
+            "routed-large",
+            turn_metadata=metadata,
+            realign_routed_model=False,
+            tier_provider_config=ProviderConfig(
+                "tokenrhythm",
+                "routed-large",
+                api_key="routed-key",
+                base_url="https://small.example/v1",
+            ),
+        )
+
+    assert selector.current_config.provider == "openai"
+    assert selector.current_config.model == "configured-primary"
+
+
+def test_large_context_explicit_override_requires_final_head_capacity(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/routed-large": {"context_window": 200_000},
+            "openai/explicit-small": {"context_window": 80_000},
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "configured-primary", api_key="test-key")
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [],
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "routed-large",
+    }
+
+    with pytest.raises(LargeContextCapacityError, match="final model deployment"):
+        apply_model_override(
+            selector,
+            "explicit-small",
+            turn_metadata=metadata,
+            realign_routed_model=True,
+        )
+
+    assert metadata["large_context_capacity_blocked"] is True
+
+
+def test_cross_provider_large_context_explicit_restore_revalidates_primary(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "tokenrhythm/routed-large": {"context_window": 200_000},
+            "openai/explicit-small": {"context_window": 80_000},
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "configured-primary", api_key="test-key")
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "routed-large",
+    }
+    apply_model_override(
+        selector,
+        "routed-large",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+        tier_provider_config=ProviderConfig(
+            "tokenrhythm",
+            "routed-large",
+            api_key="routed-key",
+        ),
+    )
+
+    with pytest.raises(LargeContextCapacityError, match="explicit model override"):
+        apply_model_override(
+            selector,
+            "explicit-small",
+            turn_metadata=metadata,
+            realign_routed_model=True,
+        )
+
+    assert selector.current_config.provider == "openai"
+    assert selector.current_config.model == "explicit-small"
+
+
+def test_large_context_blocked_route_rejects_unsafe_primary_rebound(
+    monkeypatch,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {"openai/primary-small": {"context_window": 80_000}}
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "primary-small", api_key="test-key")
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_provider": "tokenrhythm",
+        "routed_provider_blocked": "missing_credential",
+        "routed_model": "routed-large",
+    }
+
+    with pytest.raises(LargeContextCapacityError, match="configured primary"):
+        apply_model_override(
+            selector,
+            "routed-large",
+            turn_metadata=metadata,
+            realign_routed_model=False,
+        )
+
+    assert selector.current_config.model == "primary-small"
+
+
+def test_router_fallback_uses_exact_configured_endpoint_capacity(monkeypatch) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openai/routed-large": {"context_window": 200_000},
+            "tokenrhythm/fallback-large": {"context_window": 200_000},
+        }
+    )
+    monkeypatch.setattr(
+        catalog,
+        "resolve_deployment_limits",
+        lambda *_args, **kwargs: DeploymentModelLimits(
+            context_window=(
+                80_000
+                if kwargs.get("base_url") == "https://small.example/v1"
+                else 200_000
+            ),
+            max_output_tokens=10_000,
+            max_output_tokens_known=True,
+        ),
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openai", "configured-primary", api_key="test-key"),
+            fallbacks=[
+                ProviderConfig(
+                    "tokenrhythm",
+                    "fallback-large",
+                    api_key="fallback-key",
+                    base_url="https://small.example/v1",
+                )
+            ],
+        )
+    )
+    metadata = {
+        "routing_applied": True,
+        "router_fallback_chain": [
+            {
+                "tier": "c2",
+                "provider": "tokenrhythm",
+                "model": "fallback-large",
+            }
+        ],
+        "large_context_floor_min_tier": "c2",
+        "large_context_material_tokens": 50_000,
+        "large_context_thinking_budget_tokens": 0,
+        "routed_model": "routed-large",
+    }
+
+    apply_model_override(
+        selector,
+        "routed-large",
+        turn_metadata=metadata,
+        realign_routed_model=False,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == [
+        "routed-large"
+    ]
 
 
 def test_explicit_override_realigns_routed_model_and_drops_savings() -> None:
