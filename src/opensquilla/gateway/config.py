@@ -536,7 +536,10 @@ class LlmEnsembleConfig(BaseSettings):
     # operator explicitly enables the ensemble surface.
     enabled: bool = False
     mode: Literal["b5_fusion"] = "b5_fusion"
-    selection_mode: EnsembleSelectionMode = STATIC_OPENROUTER_B5_SELECTION_MODE
+    selection_mode: EnsembleSelectionMode = cast(
+        EnsembleSelectionMode,
+        STATIC_OPENROUTER_B5_SELECTION_MODE,
+    )
     # Expose tool schemas to proposers as advisory vocabulary only. Proposer
     # output is never dispatched; only the aggregator owns an executable tool
     # boundary.
