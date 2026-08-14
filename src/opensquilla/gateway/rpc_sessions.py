@@ -5393,7 +5393,6 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
     display_control = display_text.strip() if display_text is not None else ""
     literal_slash_escape = (
         control.startswith("/")
-        and not control.startswith("//")
         and display_control.startswith("//")
         and display_control[1:] == control
     )

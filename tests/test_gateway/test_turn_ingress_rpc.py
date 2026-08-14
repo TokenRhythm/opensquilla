@@ -150,8 +150,14 @@ def _assert_no_runtime_acceptance_state(runtime: TaskRuntime) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "display_text"),
+    [("/coding", "//coding"), ("//usr/bin/env", "///usr/bin/env")],
+)
 async def test_pending_input_literal_slash_escape_dispatches_normalized_message(
     tmp_path: Path,
+    message: str,
+    display_text: str,
 ) -> None:
     async with _open_real_stack(tmp_path / "pending-literal-slash.db") as stack:
         staged = await get_dispatcher().dispatch(
@@ -162,16 +168,16 @@ async def test_pending_input_literal_slash_escape_dispatches_normalized_message(
                 "pendingInputId": "pending-literal-slash",
                 "clientRequestId": "pending-literal-slash-request",
                 "clientMessageId": "pending-literal-slash-message",
-                "message": "/coding",
-                "displayText": "//coding",
+                "message": message,
+                "displayText": display_text,
             },
             stack.context,
         )
         assert staged.ok is True
         row = await stack.storage.get_pending_chat_input("pending-literal-slash")
         assert row is not None
-        assert row.payload["message"] == "/coding"
-        assert row.payload["displayText"] == "//coding"
+        assert row.payload["message"] == message
+        assert row.payload["displayText"] == display_text
 
         listed = await get_dispatcher().dispatch(
             "pending-literal-slash-list",
@@ -180,8 +186,8 @@ async def test_pending_input_literal_slash_escape_dispatches_normalized_message(
             stack.context,
         )
         assert listed.ok is True
-        assert listed.payload["items"][0]["message"] == "/coding"
-        assert listed.payload["items"][0]["displayText"] == "//coding"
+        assert listed.payload["items"][0]["message"] == message
+        assert listed.payload["items"][0]["displayText"] == display_text
 
         accepted = await get_dispatcher().dispatch(
             "pending-literal-slash-dispatch",
@@ -202,8 +208,8 @@ async def test_pending_input_literal_slash_escape_dispatches_normalized_message(
             if item.message_id == accepted.payload["message_id"]
         )
         persisted_content = json.loads(entry.content)
-        assert persisted_content["text"] == "/coding"
-        assert persisted_content["display_text"] == "//coding"
+        assert persisted_content["text"] == message
+        assert persisted_content["display_text"] == display_text
 
 
 @pytest.mark.asyncio

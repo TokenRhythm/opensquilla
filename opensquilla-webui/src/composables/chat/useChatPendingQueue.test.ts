@@ -1185,6 +1185,136 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('retains a reclassified draft when the cancel acknowledgement is lost', async () => {
+    const { wal, records } = memoryWal([{
+      schemaVersion: 1,
+      pendingInputId: 'pending-retain-after-cancel',
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'request-retain-after-cancel',
+      clientMessageId: 'message-retain-after-cancel',
+      text: '/gamemode creative',
+      attachments: [],
+      intent: null,
+      confirmedPlainText: true,
+      state: 'staged',
+      mayHaveServerCopy: true,
+      requestFingerprint: 'sha256:retain-after-cancel',
+      serverRevision: 3,
+      createdAt: 1,
+      updatedAt: 2,
+    }])
+    let serverRowExists = true
+    let cancelCalls = 0
+    const rpcCall = vi.fn(async (method: string): Promise<unknown> => {
+      if (method === 'sessions.pending_inputs.list') {
+        return {
+          items: serverRowExists
+            ? [{
+                pendingInputId: 'pending-retain-after-cancel',
+                clientRequestId: 'request-retain-after-cancel',
+                clientMessageId: 'message-retain-after-cancel',
+                requestFingerprint: 'sha256:retain-after-cancel',
+                revision: 3,
+                message: '/gamemode creative',
+                confirmedPlainText: true,
+                attachments: [],
+              }]
+            : [],
+        }
+      }
+      if (method === 'sessions.pending_inputs.cancel') {
+        cancelCalls += 1
+        if (cancelCalls === 1) {
+          serverRowExists = false
+          throw new Error('cancel committed but acknowledgement was lost')
+        }
+        return { cancelled: true, alreadyMissing: true }
+      }
+      if (method === 'sessions.pending_inputs.enqueue') {
+        throw new Error('retained drafts must never be re-staged')
+      }
+      throw new Error(`unexpected method: ${method}`)
+    })
+    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
+        void params
+        return rpcCall(method) as Promise<T>
+      },
+    }
+    const initial = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      {
+        pendingInputWal: wal,
+        rpc,
+        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+      },
+    )
+    await vi.waitFor(() => {
+      expect(initial.queue.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
+    })
+    const item = initial.queue.pendingQueue.value[0]!
+
+    await expect(initial.queue.cancelDurableItem(
+      item,
+      { retainAfterCancel: true },
+    )).resolves.toBe(false)
+    expect(records.get('pending-retain-after-cancel')).toMatchObject({
+      state: 'cancelling',
+      retainAfterCancel: true,
+    })
+    item.deliveryState = 'retryable'
+
+    await initial.queue.hydratePendingQueue()
+    await vi.waitFor(() => {
+      expect(initial.queue.pendingQueue.value[0]).toMatchObject({
+        text: '/gamemode creative',
+        pendingPersistenceState: 'local_only',
+        pendingMayHaveServerCopy: false,
+        pendingRetainAfterCancel: true,
+      })
+      expect(initial.queue.pendingQueue.value[0]?.deliveryState).toBeUndefined()
+    })
+    expect(records.get('pending-retain-after-cancel')).toMatchObject({
+      state: 'local_only',
+      mayHaveServerCopy: false,
+      retainAfterCancel: true,
+    })
+    expect(cancelCalls).toBe(2)
+    initial.queue.cleanup()
+
+    const restored = makeQueue(
+      undefined,
+      () => false,
+      undefined,
+      undefined,
+      {
+        pendingInputWal: wal,
+        rpc,
+        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+      },
+    )
+    await vi.waitFor(() => {
+      expect(restored.queue.pendingQueue.value[0]).toMatchObject({
+        text: '/gamemode creative',
+        pendingPersistenceState: 'local_only',
+      })
+    })
+    expect(rpcCall.mock.calls.map(call => call[0])).not.toContain(
+      'sessions.pending_inputs.enqueue',
+    )
+
+    expect(restored.queue.editPendingItem(pendingUiId(restored.queue, 0))).toBe(true)
+    await vi.waitFor(() => {
+      expect(restored.queue.pendingQueue.value).toEqual([])
+      expect(restored.inputText.value).toBe('/gamemode creative')
+      expect(records.has('pending-retain-after-cancel')).toBe(false)
+    })
+    restored.queue.cleanup()
+  })
+
   it.each([
     'PENDING_INPUT_CANCELLED',
     'PENDING_INPUT_ALREADY_DISPATCHED',

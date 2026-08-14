@@ -83,6 +83,10 @@ export interface PendingQueueOwner {
   ownerRequestId?: string
 }
 
+export interface PendingCancelOptions {
+  retainAfterCancel?: boolean
+}
+
 export interface PendingQueueOwnerContext {
   sessionKey: string
   ownerRequestId: string
@@ -257,6 +261,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...(item.ownerRequestId ? { ownerRequestId: item.ownerRequestId } : {}),
       state,
       mayHaveServerCopy: item.pendingMayHaveServerCopy === true,
+      ...(item.pendingRetainAfterCancel ? { retainAfterCancel: true } : {}),
       ...(item.pendingRequestFingerprint
         ? { requestFingerprint: item.pendingRequestFingerprint }
         : {}),
@@ -294,6 +299,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       pendingClientMessageId: record.clientMessageId,
       pendingPersistenceState: record.state,
       pendingMayHaveServerCopy: mayHaveServerCopy,
+      ...(record.retainAfterCancel ? { pendingRetainAfterCancel: true } : {}),
       ...(record.requestFingerprint
         ? { pendingRequestFingerprint: record.requestFingerprint }
         : {}),
@@ -455,7 +461,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const pendingInputId = item.pendingInputId
     if (!pendingInputId || !options.pendingInputWal) return
     if (item.ownerRequestId) return
-    if (item.pendingPersistenceState === 'cancelling') return
+    if (
+      item.pendingPersistenceState === 'cancelling'
+      || item.pendingRetainAfterCancel === true
+    ) return
     const sessionKey = item.ownerSessionKey || options.sessionKey.value
     if (wasRemoved(sessionKey, pendingInputId)) return
     const existing = stagingOperations.get(pendingInputId)
@@ -605,17 +614,29 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function mergeWalRecords(records: PendingInputWalRecord[], sessionKey: string) {
-    const existingIds = new Set(
-      pendingQueue.value.map(item => item.pendingInputId).filter(Boolean),
+    const existingById = new Map(
+      pendingQueue.value
+        .filter(item => item.pendingInputId)
+        .map(item => [item.pendingInputId!, item]),
     )
     for (const record of records) {
+      const existing = existingById.get(record.pendingInputId)
+      if (existing && record.retainAfterCancel === true) {
+        Object.assign(existing, itemFromWalRecord(record))
+        delete existing.deliveryState
+        delete existing.pendingRequestFingerprint
+        delete existing.pendingServerRevision
+        delete existing.pendingPosition
+        continue
+      }
       if (
         record.sessionKey !== sessionKey
-        || existingIds.has(record.pendingInputId)
+        || existing
         || wasRemoved(sessionKey, record.pendingInputId)
       ) continue
-      pendingQueue.value.push(itemFromWalRecord(record))
-      existingIds.add(record.pendingInputId)
+      const added = itemFromWalRecord(record)
+      pendingQueue.value.push(added)
+      existingById.set(record.pendingInputId, added)
     }
     sortOrdinaryPendingItems()
   }
@@ -655,7 +676,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         // A cancellation WAL is a durable delete intent, never a draft to
         // downgrade or re-enqueue. Keep it intact until a queue-capable
         // Gateway can accept the idempotent tombstone.
-        if (item.pendingPersistenceState === 'cancelling') continue
+        if (
+          item.pendingPersistenceState === 'cancelling'
+          || item.pendingRetainAfterCancel === true
+        ) continue
         if (item.pendingPersistenceState !== 'local_only') {
           void writeWalItem(item, 'local_only')
         }
@@ -763,6 +787,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           void retryCancellingItem(item)
           continue
         }
+        if (item.pendingRetainAfterCancel === true) continue
         if (item.pendingPersistenceState === 'staged') {
           // Another tab either cancelled or dispatched the server row. Both
           // outcomes are terminal for this WAL entry.
@@ -1011,10 +1036,54 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     broadcastChange(sessionKey, item.pendingInputId, action)
   }
 
-  async function cancelDurableItem(item: ChatPendingItem): Promise<boolean> {
+  async function retainCancelledDraft(
+    item: ChatPendingItem,
+    sessionKey: string,
+  ): Promise<boolean> {
+    const previousMayHaveServerCopy = item.pendingMayHaveServerCopy
+    const previousFingerprint = item.pendingRequestFingerprint
+    const previousServerRevision = item.pendingServerRevision
+    const previousPosition = item.pendingPosition
+    item.pendingMayHaveServerCopy = false
+    delete item.deliveryState
+    delete item.pendingRequestFingerprint
+    delete item.pendingServerRevision
+    delete item.pendingPosition
+    try {
+      await writeWalItem(item, 'local_only')
+      broadcastChange(sessionKey, item.pendingInputId, 'changed')
+      return true
+    } catch {
+      item.pendingPersistenceState = 'cancelling'
+      item.pendingMayHaveServerCopy = previousMayHaveServerCopy
+      if (previousFingerprint) item.pendingRequestFingerprint = previousFingerprint
+      if (previousServerRevision) item.pendingServerRevision = previousServerRevision
+      if (Number.isSafeInteger(previousPosition)) item.pendingPosition = previousPosition
+      broadcastChange(sessionKey, item.pendingInputId, 'changed')
+      return false
+    }
+  }
+
+  async function cancelDurableItem(
+    item: ChatPendingItem,
+    cancelOptions: PendingCancelOptions = {},
+  ): Promise<boolean> {
     if (!durableItem(item)) return true
     const previousState = item.pendingPersistenceState || 'saving'
     const sessionKey = item.ownerSessionKey || options.sessionKey.value
+    const retainAfterCancel = cancelOptions.retainAfterCancel === true
+    if (item.pendingRetainAfterCancel === true && !retainAfterCancel) {
+      try {
+        await forgetDurableItem(item, 'removed')
+        return true
+      } catch {
+        broadcastChange(sessionKey, item.pendingInputId, 'changed')
+        return false
+      }
+    }
+    const previousRetainAfterCancel = item.pendingRetainAfterCancel
+    if (retainAfterCancel) item.pendingRetainAfterCancel = true
+    else delete item.pendingRetainAfterCancel
     rememberRemoval(sessionKey, item.pendingInputId!)
     try {
       await writeWalItem(item, 'cancelling')
@@ -1022,6 +1091,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       // The delete intent never became durable, so the composer/queue must keep
       // owning the previous state. No cancellation RPC was sent.
       forgetRemoval(sessionKey, item.pendingInputId!)
+      if (previousRetainAfterCancel) item.pendingRetainAfterCancel = true
+      else delete item.pendingRetainAfterCancel
       await writeWalItem(item, previousState).catch(() => {})
       broadcastChange(sessionKey, item.pendingInputId, 'changed')
       return false
@@ -1036,6 +1107,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         return false
       }
       try {
+        if (retainAfterCancel) return retainCancelledDraft(item, sessionKey)
         await forgetDurableItem(item, 'removed')
         return true
       } catch {
@@ -1059,6 +1131,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           ? { expectedRevision: item.pendingServerRevision }
           : {}),
       })
+      if (retainAfterCancel) return retainCancelledDraft(item, sessionKey)
       await forgetDurableItem(item, 'removed')
       return true
     } catch {
@@ -1077,8 +1150,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
     const existing = cancellationOperations.get(pendingInputId)
     if (existing) return existing
-    const operation = cancelDurableItem(item).then(cancelled => {
+    const operation = cancelDurableItem(item, {
+      retainAfterCancel: item.pendingRetainAfterCancel === true,
+    }).then(cancelled => {
       if (!cancelled) return false
+      if (
+        item.pendingPersistenceState === 'local_only'
+        && item.pendingRetainAfterCancel === true
+      ) return true
       removePendingIdentity(
         item.ownerSessionKey || options.sessionKey.value,
         pendingInputId,

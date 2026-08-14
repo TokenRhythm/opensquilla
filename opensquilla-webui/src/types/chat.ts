@@ -105,6 +105,8 @@ export interface ChatPendingItem {
    * delete intent.
    */
   pendingMayHaveServerCopy?: boolean
+  /** A cancelling transport row must become a local editable draft after tombstoning. */
+  pendingRetainAfterCancel?: boolean
   /** Browser/server staging lifecycle. Unknown enqueue results remain `saving`. */
   pendingPersistenceState?:
     | 'saving'

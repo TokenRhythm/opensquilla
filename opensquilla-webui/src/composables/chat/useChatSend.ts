@@ -23,6 +23,7 @@ import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandler
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import type {
   BusySendMode,
+  PendingCancelOptions,
   PendingQueueOwner,
   PendingQueueOwnerContext,
   PendingSteerPayload,
@@ -384,7 +385,10 @@ export interface UseChatSendOptions {
     },
     owner?: PendingQueueOwner,
   ) => boolean | Promise<boolean>
-  cancelDurablePendingItem?: (item: ChatPendingItem) => Promise<boolean>
+  cancelDurablePendingItem?: (
+    item: ChatPendingItem,
+    options?: PendingCancelOptions,
+  ) => Promise<boolean>
   enqueueHiddenControl?: (
     item: {
       text: string
@@ -1939,20 +1943,9 @@ export function useChatSend(options: UseChatSendOptions) {
           return preserveRetryState('retryable_failure')
         }
         if (serverStagedItem) {
-          if (!await options.cancelDurablePendingItem?.(item)) {
+          if (!await options.cancelDurablePendingItem?.(item, { retainAfterCancel: true })) {
             return preserveRetryState('retryable_failure')
           }
-          // The server row and WAL are gone. Detach their identity so a
-          // navigation or new turn that wins the await race leaves a usable
-          // in-memory draft instead of a permanently `cancelling` item.
-          delete item.pendingInputId
-          delete item.pendingClientRequestId
-          delete item.pendingClientMessageId
-          delete item.pendingRequestFingerprint
-          delete item.pendingServerRevision
-          delete item.pendingPosition
-          delete item.pendingPersistenceState
-          delete item.pendingMayHaveServerCopy
         }
         // A queued item was previously classified as ordinary text. If the
         // catalog now recognizes it, never turn a background drain into an

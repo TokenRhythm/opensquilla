@@ -6522,10 +6522,8 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     await expect(api.sendQueuedFollowup(queued)).resolves.toBe('not_sent')
 
     expect(events).toEqual(['cancel'])
-    expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued)
+    expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued, { retainAfterCancel: true })
     expect(executeSlashCommand).not.toHaveBeenCalled()
-    expect(queued.pendingInputId).toBeUndefined()
-    expect(queued.pendingPersistenceState).toBeUndefined()
     expect(rpc.call).not.toHaveBeenCalled()
   })
 
@@ -6552,7 +6550,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
 
     await expect(api.sendQueuedFollowup(queued)).resolves.toBe('retryable_failure')
 
-    expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued)
+    expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued, { retainAfterCancel: true })
     expect(executeSlashCommand).not.toHaveBeenCalled()
   })
 
@@ -6584,14 +6582,15 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     }
 
     const send = api.sendQueuedFollowup(queued)
-    await vi.waitFor(() => expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued))
+    await vi.waitFor(() => expect(cancelDurablePendingItem).toHaveBeenCalledWith(
+      queued,
+      { retainAfterCancel: true },
+    ))
     sessionKey.value = 'session-b'
     resolveCancel(true)
 
     await expect(send).resolves.toBe('not_sent')
     expect(executeSlashCommand).not.toHaveBeenCalled()
-    expect(queued.pendingInputId).toBeUndefined()
-    expect(queued.pendingPersistenceState).toBeUndefined()
   })
 
   it('never grants concurrent cancel winners authority to execute a staged command', async () => {

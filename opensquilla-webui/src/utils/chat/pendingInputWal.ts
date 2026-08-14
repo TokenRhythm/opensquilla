@@ -27,6 +27,8 @@ export interface PendingInputWalRecord {
   state: PendingInputWalState
   /** True once enqueue may have crossed the browser/Gateway boundary. */
   mayHaveServerCopy?: boolean
+  /** Complete an in-flight tombstone by preserving the text as a local draft. */
+  retainAfterCancel?: boolean
   requestFingerprint?: string
   serverRevision?: number
   position?: number
@@ -117,6 +119,10 @@ function isPendingInputWalRecord(value: unknown): value is PendingInputWalRecord
     && (
       record.mayHaveServerCopy === undefined
       || typeof record.mayHaveServerCopy === 'boolean'
+    )
+    && (
+      record.retainAfterCancel === undefined
+      || typeof record.retainAfterCancel === 'boolean'
     )
     && (
       record.position === undefined
