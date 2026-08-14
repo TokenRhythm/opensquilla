@@ -15,6 +15,7 @@ import {
   isSemanticActivityStatusStep,
   projectAssistantActivity,
   projectAssistantActivityTimeline,
+  providerActivityRemainingSeconds,
   splitLiveAssistantTimeline,
 } from './assistantActivity'
 import type { AssistantActivityStatusStep } from './assistantActivity'
@@ -986,6 +987,78 @@ describe('projectAssistantActivityTimeline', () => {
     expect(JSON.stringify(projection.statusSteps)).not.toContain('secret')
   })
 
+  it('projects provider lifecycle actions from closed semantic codes', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'working',
+      statusHistory: [
+        { action: 'provider:requesting', label: 'raw provider request', at: 1_000 },
+        { action: 'provider:reasoning', label: 'raw reasoning body', at: 2_000 },
+        { action: 'provider:rate_limited:8', label: 'raw 429 response', at: 3_000 },
+        { action: 'provider:retry_wait:12', label: 'raw retry response', at: 4_000 },
+        { action: 'provider:retrying:2:3', label: 'raw retry response', at: 5_000 },
+        { action: 'provider:fallback', label: 'raw fallback response', at: 6_000 },
+      ],
+    })
+
+    expect(projection.statusSteps.map(step => step.label)).toEqual([
+      { code: 'chat.activity.provider.waiting', params: {} },
+      { code: 'chat.activity.provider.reasoning', params: {} },
+      { code: 'chat.activity.provider.rateLimited', params: { seconds: 8 } },
+      { code: 'chat.activity.provider.retryWait', params: { seconds: 12 } },
+      {
+        code: 'chat.activity.provider.retrying',
+        params: { attempt: 2, limit: 3 },
+      },
+      { code: 'chat.activity.provider.fallback', params: {} },
+    ])
+    expect(JSON.stringify(projection.statusSteps)).not.toContain('raw 429 response')
+    expect(JSON.stringify(projection.statusSteps)).not.toContain('raw reasoning body')
+  })
+
+  it('derives each phase duration from the next transition and terminal boundary', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      endedAt: 12_000,
+      statusHistory: [
+        { action: 'provider:requesting', label: 'Waiting', at: 1_000 },
+        { action: 'provider:reasoning', label: 'Reasoning', at: 4_000 },
+        { action: 'write:1', label: 'Writing', at: 9_000 },
+      ],
+    })
+
+    expect(projection.statusSteps.map(step => step.durationSeconds)).toEqual([3, 5, 3])
+  })
+
+  it('counts down provider retry waits locally without changing other phases', () => {
+    const statusStep = (
+      overrides: Partial<AssistantActivityStatusStep>,
+    ): AssistantActivityStatusStep => ({
+      key: 'activity-status:provider',
+      at: 10_000,
+      isCurrent: true,
+      label: { code: 'chat.activity.provider.waiting', params: {} },
+      ...overrides,
+    })
+    const rateLimited = statusStep({
+      at: 10_000,
+      label: { code: 'chat.activity.provider.rateLimited', params: { seconds: 8 } },
+    })
+    const retryWait = statusStep({
+      at: 10_000,
+      label: { code: 'chat.activity.provider.retryWait', params: { seconds: 12 } },
+    })
+    const reasoning = statusStep({
+      at: 10_000,
+      label: { code: 'chat.activity.provider.reasoning', params: {} },
+    })
+
+    expect(providerActivityRemainingSeconds(rateLimited, 10_999)).toBe(8)
+    expect(providerActivityRemainingSeconds(rateLimited, 13_000)).toBe(5)
+    expect(providerActivityRemainingSeconds(rateLimited, 30_000)).toBe(0)
+    expect(providerActivityRemainingSeconds(retryWait, 15_000)).toBe(7)
+    expect(providerActivityRemainingSeconds(reasoning, 15_000)).toBeNull()
+  })
+
   it('projects skipped, stale, and cancelled compactions as settled outcomes', () => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
@@ -1174,6 +1247,21 @@ describe('isSemanticActivityStatusStep', () => {
     expect(isSemanticActivityStatusStep(statusStep({
       label: { code: 'chat.activity.lifecycle.answering', params: {} },
     }))).toBe(false)
+  })
+
+  it('rejects routine provider phases while preserving exceptional transitions', () => {
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.waiting', params: {} },
+    }))).toBe(false)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.reasoning', params: {} },
+    }))).toBe(false)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.fallback', params: {} },
+    }))).toBe(true)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.retryWait', params: { seconds: 3 } },
+    }))).toBe(true)
   })
 
   it('rejects maintenance rows so compaction does not inflate semantic step counts', () => {

@@ -1,10 +1,10 @@
-"""V036 - durable prompt-annotation drafts bound to artifact revisions."""
+"""V037 - durable prompt-annotation drafts bound to artifact revisions."""
 
 from __future__ import annotations
 
 from yoyo import step
 
-__depends__: set[str] = {"V035__artifact_sessions"}
+__depends__: set[str] = {"V036__artifact_sessions"}
 
 CREATE_STATEMENTS: tuple[str, ...] = (
     """

@@ -371,6 +371,90 @@ describe('useChatHistory canonical pagination', () => {
     })
   })
 
+  it('keeps one legacy activity row across prepend and canonical refresh', async () => {
+    const activity = {
+      id: 'legacy-tools',
+      message_id: 'legacy-tools',
+      role: 'assistant',
+      text: '',
+      timestamp: '2026-07-06T00:00:01Z',
+      tool_calls: [
+        { type: 'text', text: 'Inspect the source.' },
+        { type: 'tool_use', tool_use_id: 'call-read', name: 'read_file', input: {} },
+        { type: 'text', text: 'Compare the directory.' },
+        { type: 'tool_use', tool_use_id: 'call-list', name: 'list_dir', input: {} },
+        { type: 'tool_result', tool_use_id: 'call-read', name: 'read_file', result: 'source' },
+        { type: 'tool_result', tool_use_id: 'call-list', name: 'list_dir', result: 'directory' },
+      ],
+    }
+    const { api, rpc, messages } = makeHistory(false, {
+      response: {
+        messages: [activity],
+        canonical_complete: false,
+        has_more: true,
+        oldest_cursor: 'cursor-tools',
+        newest_cursor: 'cursor-tools',
+      },
+    })
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [activity],
+        canonical_complete: false,
+        has_more: true,
+        oldest_cursor: 'cursor-tools',
+        newest_cursor: 'cursor-tools',
+      })
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'older-user',
+          message_id: 'older-user',
+          role: 'user',
+          text: 'Earlier request',
+          timestamp: '2026-07-06T00:00:00Z',
+        }],
+        canonical_complete: false,
+        has_more: false,
+        oldest_cursor: 'cursor-older',
+        newest_cursor: 'cursor-older',
+      })
+      .mockResolvedValueOnce({
+        messages: [
+          activity,
+          {
+            id: 'later-user',
+            message_id: 'later-user',
+            role: 'user',
+            text: 'Continue',
+            timestamp: '2026-07-06T00:00:02Z',
+          },
+        ],
+        canonical_complete: true,
+        has_more: false,
+        oldest_cursor: 'cursor-tools',
+        newest_cursor: 'cursor-later',
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'older-user',
+      'legacy-tools',
+      'later-user',
+    ])
+    expect(messages.value.filter(message => message.messageId === 'legacy-tools')).toHaveLength(1)
+    expect(messages.value[1]?.tool_calls?.map(segment => segment.tool_use_id)).toEqual([
+      undefined,
+      'call-read',
+      undefined,
+      'call-list',
+      'call-read',
+      'call-list',
+    ])
+    expect(api.historyState.value.canonicalComplete).toBe(true)
+  })
+
   it('restores manual compaction summaries in stable transcript chronology', async () => {
     const baseTime = 1_720_000_000_000
     const response: ChatHistoryResponse = {
@@ -397,6 +481,7 @@ describe('useChatHistory canonical pagination', () => {
           timestamp: baseTime + 3_000,
         },
       ],
+      canonical_complete: true,
       compaction_summaries: [
         {
           id: 9,
@@ -449,6 +534,7 @@ describe('useChatHistory canonical pagination', () => {
       'assistant-1',
       'maintenance:context-compaction:summary:7',
       'maintenance:context-compaction:summary:9',
+      'maintenance:context-compaction:summary:8',
       'user-2',
     ]
     expect(messages.value.map(message => message.messageId)).toEqual(expectedIds)
@@ -465,6 +551,16 @@ describe('useChatHistory canonical pagination', () => {
         durability: 'durable',
         removedCount: 5,
         keptCount: 1,
+        historyArchived: true,
+        canonicalComplete: true,
+      },
+    })
+    expect(messages.value[4]).toMatchObject({
+      maintenance: {
+        compactionId: 'cmp-auto',
+        source: 'automatic',
+        historyArchived: true,
+        canonicalComplete: true,
       },
     })
     expect(messages.value.filter(message =>
@@ -787,7 +883,7 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value[0]?.turnId).toBe('turn-1')
   })
 
-  it('restores durable compaction activity from canonical history', async () => {
+  it('prefers a durable summary boundary over duplicate activity metadata', async () => {
     const { api, messages } = makeHistory(false, {
       response: {
         messages: [{
@@ -806,6 +902,7 @@ describe('useChatHistory canonical pagination', () => {
             }],
           },
         }],
+        canonical_complete: true,
         compaction_summaries: [{
           id: 12,
           compaction_id: 'cmp-history',
@@ -818,21 +915,19 @@ describe('useChatHistory canonical pagination', () => {
 
     await api.loadHistory()
 
-    expect(messages.value[0]).toMatchObject({
+    const assistant = messages.value.find(message => message.role === 'assistant')
+    expect(assistant).toMatchObject({
       restoredFromHistory: true,
-      statusHistory: [{
-        action: 'context_compaction',
-        label: '',
-        at: 1_720_000_000_000,
-        id: 'cmp-history',
-        category: 'maintenance',
-        state: 'completed',
-        source: 'automatic',
-        durability: 'durable',
-      }],
+      statusHistory: [],
     })
-    expect(messages.value).toHaveLength(1)
-    expect(messages.value.some(message => message.role === 'maintenance')).toBe(false)
+    expect(messages.value).toHaveLength(2)
+    expect(messages.value.find(message => message.role === 'maintenance')).toMatchObject({
+      maintenance: {
+        compactionId: 'cmp-history',
+        historyArchived: true,
+        canonicalComplete: true,
+      },
+    })
   })
 
   it('interleaves cold same-turn output when the steer crosses a page boundary', async () => {
@@ -2005,6 +2100,380 @@ describe('useChatHistory optimistic local rows', () => {
       status: 'cancelled',
       cancellationSource: 'webui_stop',
     })
+  })
+
+  it('restores usage barrier activity and its retryable error from terminal history', async () => {
+    const { api, messages } = makeHistory(true, {
+      response: {
+        messages: [
+          {
+            id: 'user-usage',
+            message_id: 'user-usage',
+            role: 'user',
+            text: 'retry this turn',
+            timestamp: '2026-07-07T10:00:00Z',
+            turn_context: { turn_id: 'turn-usage' },
+          },
+          {
+            id: 'system-usage',
+            message_id: 'system-usage',
+            role: 'system',
+            text: 'Error: usage ledger unavailable',
+            timestamp: '2026-07-07T10:00:01Z',
+            turn_context: { turn_id: 'turn-usage' },
+          },
+        ],
+        turn_outcomes: [{
+          turn_id: 'turn-usage',
+          task_id: 'turn-usage',
+          status: 'failed',
+          error_class: 'usage_accounting_busy',
+          retryable: true,
+          usage_call_index: 1,
+          no_prior_provider_dispatch: true,
+          replay_safe: true,
+          user_message_id: 'user-usage',
+          terminal_message: 'server fallback',
+          activity_snapshot: {
+            version: 1,
+            task_id: 'turn-usage',
+            turn_id: 'turn-usage',
+            phases: [
+              { kind: 'router', phase: 'decided', at: 1_000 },
+              { kind: 'state', phase: 'thinking', at: 1_100 },
+            ],
+          },
+          outcome: {
+            kind: 'blocked',
+            reason: 'usage_accounting_busy',
+            error_class: 'usage_accounting_busy',
+            retryable: true,
+            usage_call_index: 1,
+            no_prior_provider_dispatch: true,
+            replay_safe: true,
+            user_message_id: 'user-usage',
+          },
+        }],
+        has_more: false,
+        oldest_cursor: null,
+        newest_cursor: null,
+        history_scope: 'session',
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'assistant', 'error'])
+    expect(messages.value[1]).toMatchObject({
+      turnId: 'turn-usage',
+      text: '',
+      statusHistory: [
+        expect.objectContaining({ action: 'router:decided', at: 1_000 }),
+        expect.objectContaining({ action: 'Planning next step', at: 1_100 }),
+      ],
+    })
+    expect(messages.value[2]).toMatchObject({
+      role: 'error',
+      errorCode: 'usage_accounting_busy',
+      terminalNotice: true,
+      text: 'The provider request was not sent and no usage was billed. You can safely retry this turn.',
+      turnOutcome: expect.objectContaining({ userMessageId: 'user-usage' }),
+    })
+  })
+
+  it('restores a usage barrier retry card when the transcript error row is absent', async () => {
+    const { api, messages } = makeHistory(true, {
+      response: {
+        messages: [{
+          id: 'user-usage',
+          message_id: 'user-usage',
+          role: 'user',
+          text: 'retry this turn',
+          timestamp: '2026-07-07T10:00:00Z',
+          turn_context: { turn_id: 'turn-usage' },
+        }],
+        turn_outcomes: [{
+          turn_id: 'turn-usage',
+          task_id: 'task-usage',
+          status: 'failed',
+          finished_at: 2_000,
+          error_class: 'usage_accounting_unavailable',
+          retryable: true,
+          usage_call_index: 1,
+          no_prior_provider_dispatch: true,
+          replay_safe: true,
+          user_message_id: 'user-usage',
+          terminal_message: 'server fallback',
+          activity_snapshot: {
+            version: 1,
+            task_id: 'turn-usage',
+            turn_id: 'turn-usage',
+            phases: [{ kind: 'router', phase: 'decided', at: 1_000 }],
+          },
+        }],
+        has_more: false,
+        oldest_cursor: null,
+        newest_cursor: null,
+        history_scope: 'session',
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'assistant', 'error'])
+    expect(messages.value[2]).toMatchObject({
+      messageId: 'terminal-error:task-usage',
+      turnId: 'turn-usage',
+      errorCode: 'usage_accounting_unavailable',
+      terminalNotice: true,
+      restoredFromHistory: true,
+      text: 'The provider request was not sent and no usage was billed. You can safely retry this turn.',
+      turnOutcome: expect.objectContaining({
+        turnId: 'turn-usage',
+        userMessageId: 'user-usage',
+      }),
+    })
+  })
+
+  it('restores a usage barrier retry card without an activity snapshot', async () => {
+    const { api, messages } = makeHistory(true, {
+      response: {
+        messages: [{
+          id: 'user-usage',
+          message_id: 'user-usage',
+          role: 'user',
+          text: 'retry this turn',
+          timestamp: '2026-07-07T10:00:00Z',
+          turn_context: { turn_id: 'turn-usage' },
+        }],
+        turn_outcomes: [{
+          turn_id: 'turn-usage',
+          task_id: 'task-usage',
+          status: 'failed',
+          error_class: 'usage_accounting_busy',
+          retryable: true,
+          usage_call_index: 1,
+          no_prior_provider_dispatch: true,
+          replay_safe: true,
+        }],
+        has_more: false,
+        oldest_cursor: null,
+        newest_cursor: null,
+        history_scope: 'session',
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(messages.value[1]).toMatchObject({
+      messageId: 'terminal-error:task-usage',
+      turnId: 'turn-usage',
+      errorCode: 'usage_accounting_busy',
+      terminalNotice: true,
+      restoredFromHistory: true,
+    })
+  })
+
+  it('restores a later-call usage barrier without claiming replay is safe', async () => {
+    const { api, messages } = makeHistory(true, {
+      response: {
+        messages: [{
+          id: 'user-usage',
+          message_id: 'user-usage',
+          role: 'user',
+          text: 'continue after tools',
+          timestamp: '2026-07-07T10:00:00Z',
+          turn_context: { turn_id: 'turn-usage' },
+        }],
+        turn_outcomes: [{
+          turn_id: 'turn-usage',
+          task_id: 'task-usage',
+          status: 'failed',
+          error_class: 'usage_accounting_busy',
+          retryable: true,
+          usage_call_index: 2,
+          no_prior_provider_dispatch: false,
+          replay_safe: false,
+          outcome: {
+            kind: 'blocked',
+            reason: 'usage_accounting_busy',
+            error_class: 'usage_accounting_busy',
+            retryable: true,
+            usage_call_index: 2,
+            no_prior_provider_dispatch: false,
+            replay_safe: false,
+          },
+        }],
+        has_more: false,
+        oldest_cursor: null,
+        newest_cursor: null,
+        history_scope: 'session',
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(messages.value[1]).toMatchObject({
+      errorCode: 'usage_accounting_busy',
+      text: 'This provider request was not sent. Earlier work in this turn may already have run or been billed, so review it before trying again.',
+      turnOutcome: {
+        usageCallIndex: 2,
+        noPriorProviderDispatch: false,
+        replaySafe: false,
+        retryable: true,
+      },
+    })
+  })
+
+  it('prefers a durable usage barrier row when the turn crosses a page boundary', async () => {
+    const { api, rpc, messages } = makeHistory(true)
+    const outcome = {
+      turn_id: 'turn-usage',
+      task_id: 'task-usage',
+      status: 'failed',
+      error_class: 'usage_accounting_busy',
+      retryable: true,
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+    }
+    rpc.call
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'system-usage',
+          message_id: 'system-usage',
+          role: 'system',
+          text: 'Error: usage ledger busy',
+          timestamp: '2026-07-07T10:00:01Z',
+          turn_context: { turn_id: 'turn-usage' },
+        }],
+        turn_outcomes: [outcome],
+        has_more: true,
+        oldest_cursor: 'cursor-system',
+        newest_cursor: 'cursor-system',
+        history_scope: 'session',
+      })
+      .mockResolvedValueOnce({
+        messages: [{
+          id: 'user-usage',
+          message_id: 'user-usage',
+          role: 'user',
+          text: 'retry this turn',
+          timestamp: '2026-07-07T10:00:00Z',
+          turn_context: { turn_id: 'turn-usage' },
+        }],
+        turn_outcomes: [outcome],
+        has_more: false,
+        oldest_cursor: 'cursor-user',
+        newest_cursor: 'cursor-user',
+        history_scope: 'session',
+      })
+
+    await api.loadHistory()
+    await api.loadEarlierHistory()
+
+    expect(messages.value.map(message => message.messageId)).toEqual([
+      'user-usage',
+      'system-usage',
+    ])
+    expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+  })
+
+  it('keeps exact-turn optimistic usage activity through repeated history catch-up', async () => {
+    const pendingResponse: ChatHistoryResponse = {
+      messages: [{
+        id: 'user-usage',
+        message_id: 'user-usage',
+        role: 'user',
+        text: 'retry this turn',
+        timestamp: '2026-07-07T10:00:00Z',
+        turn_context: { turn_id: 'turn-usage' },
+      }],
+      has_more: false,
+      oldest_cursor: null,
+      newest_cursor: null,
+      history_scope: 'session',
+    }
+    const { api, rpc, messages } = makeHistory(true, {
+      messages: [
+        {
+          role: 'user',
+          text: 'retry this turn',
+          ts: 'local-user',
+          messageId: 'user-usage',
+          turnId: 'turn-usage',
+        },
+        {
+          role: 'assistant',
+          text: '',
+          ts: 'local-activity',
+          turnId: 'turn-usage',
+          statusHistory: [{ action: 'router:decided', label: 'Route selected', at: 1_000 }],
+        },
+        {
+          role: 'error',
+          text: 'The provider request was not sent.',
+          ts: 'local-error',
+          turnId: 'turn-usage',
+          errorCode: 'usage_accounting_busy',
+          terminalNotice: true,
+        },
+      ],
+      response: pendingResponse,
+    })
+
+    await api.loadHistory()
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'assistant', 'error'])
+    expect(messages.value[1]).toMatchObject({
+      turnId: 'turn-usage',
+      statusHistory: [expect.objectContaining({ action: 'router:decided', at: 1_000 })],
+    })
+    expect(messages.value[1]?.messageId).toBeUndefined()
+    expect(messages.value[2]).toMatchObject({
+      turnId: 'turn-usage',
+      errorCode: 'usage_accounting_busy',
+      terminalNotice: true,
+    })
+
+    rpc.call.mockResolvedValueOnce({
+      ...pendingResponse,
+      messages: [
+        ...(pendingResponse.messages || []),
+        {
+          id: 'system-usage',
+          message_id: 'system-usage',
+          role: 'system',
+          text: 'Error: usage ledger unavailable',
+          timestamp: '2026-07-07T10:00:01Z',
+          turn_context: { turn_id: 'turn-usage' },
+        },
+      ],
+      turn_outcomes: [{
+        turn_id: 'turn-usage',
+        task_id: 'turn-usage',
+        status: 'failed',
+        error_class: 'usage_accounting_busy',
+        retryable: true,
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+        activity_snapshot: {
+          version: 1,
+          task_id: 'turn-usage',
+          turn_id: 'turn-usage',
+          phases: [{ kind: 'router', phase: 'decided', at: 1_000 }],
+        },
+      }],
+    })
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'assistant', 'error'])
+    expect(messages.value[1]?.messageId).toBe('terminal-activity:turn-usage')
+    expect(messages.value.filter(message => message.role === 'assistant')).toHaveLength(1)
   })
 
   it('keeps a terminal replay error until server history contains a durable error row', async () => {

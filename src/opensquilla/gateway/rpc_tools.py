@@ -8,7 +8,10 @@ from typing import Any
 
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.redaction import redact_error_text
-from opensquilla.sandbox.integration import run_in_process_network_action
+from opensquilla.sandbox.integration import (
+    in_process_network_precondition,
+    run_in_process_network_action,
+)
 from opensquilla.sandbox.types import DenialResult
 from opensquilla.tools.builtin.web import (
     _search_plan_argv_token,
@@ -389,7 +392,16 @@ async def _handle_search_status(params: dict | None, ctx: RpcContext) -> dict[st
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
     provider = (params or {}).get("provider")
-    return search_runtime_status(str(provider) if provider else None)
+    payload = search_runtime_status(str(provider) if provider else None)
+    # Configured and buildable is only half of ready. `search.query` below runs
+    # through the sandbox network path, which can refuse before the provider is
+    # reached, so report that half from the same posture the query will resolve.
+    # Every readiness surface reaches this handler — the CLI table, and the
+    # Control UI Overview through the doctor — so one field covers all of them.
+    reason = in_process_network_precondition()
+    payload["networkReady"] = reason is None
+    payload["networkBlockedReason"] = reason
+    return payload
 
 
 def _query_limit(params: dict[str, Any]) -> int | None:

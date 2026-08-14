@@ -16,7 +16,6 @@ from enum import StrEnum
 import structlog
 
 from opensquilla.http_retry import parse_retry_after
-from opensquilla.redaction import redact_error_text
 
 from .registry import UnknownProviderError, get_provider_spec
 
@@ -332,6 +331,10 @@ _SHARED_TAIL_MATCHERS: tuple[FailureMatcher, ...] = (
     FailureMatcher(ProviderFailureKind.RATE_LIMITED, status_codes=frozenset({429})),
     FailureMatcher(ProviderFailureKind.RATE_LIMITED, message_substrings=("rate limit",)),
     FailureMatcher(
+        ProviderFailureKind.RATE_LIMITED,
+        raw_codes=frozenset({"provider_retry_after_deadline"}),
+    ),
+    FailureMatcher(
         ProviderFailureKind.PROVIDER_OVERLOADED,
         status_codes=_GATEWAY_TRANSIENT_STATUS_CODES,
     ),
@@ -349,7 +352,16 @@ _SHARED_TAIL_MATCHERS: tuple[FailureMatcher, ...] = (
     # would downgrade recovery to SURFACE.
     FailureMatcher(
         ProviderFailureKind.TRANSPORT_TRANSIENT,
-        raw_codes=frozenset({"incomplete_stream", "incomplete_tool_call"}),
+        raw_codes=frozenset(
+            {
+                "incomplete_stream",
+                "incomplete_tool_call",
+                "incomplete_tool_stream",
+                "provider_pretext_buffer_exhausted",
+                "request_error",
+                "response_incomplete",
+            }
+        ),
     ),
     FailureMatcher(
         ProviderFailureKind.MALFORMED_RESPONSE,
@@ -391,8 +403,8 @@ def classify_provider_error(
         provider=provider,
         failure_family=family,
         status_code=status_code,
-        raw_code=raw_code,
-        message_head=redact_error_text(message),
+        raw_code_chars=len(raw_code or ""),
+        message_chars=len(message or ""),
     )
     return ProviderFailureKind.UNKNOWN
 

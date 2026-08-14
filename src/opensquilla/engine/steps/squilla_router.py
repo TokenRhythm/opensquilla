@@ -16,6 +16,10 @@ from typing import Any, Protocol, cast
 
 import structlog
 
+from opensquilla.engine.capacity_admission import (
+    MAX_THINKING_BUDGET_TOKENS,
+    model_has_request_capacity,
+)
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.pricing import lookup_price
 from opensquilla.engine.routing import (
@@ -29,11 +33,13 @@ from opensquilla.engine.routing import (
     TierCapability,
     calibration_path,
     effective_artifact_floor,
+    large_context_min_tier,
     load_calibration,
     provider_mismatch,
     provider_mismatch_veto,
     reconcile_controller_with_final_tier,
     record_provider_mismatch_veto_trail,
+    resolve_large_context_floor_tier,
     route_class_for_tier,
 )
 from opensquilla.engine.routing.policy_data import DEFAULT_CONTEXT_WINDOW_TOKENS
@@ -61,6 +67,7 @@ from opensquilla.squilla_router.controller import (
     synthetic_one_hot,
     thinking_mode_to_level,
 )
+from opensquilla.token_estimation import estimate_material_text_tokens
 
 log = structlog.get_logger(__name__)
 _log_std = logging.getLogger(__name__)
@@ -113,6 +120,8 @@ def _router_text_fallback_chain(
         selected_index = TEXT_TIERS.index(selected)
     except ValueError:
         return []
+    minimum = normalize_text_tier(minimum_tier)
+    minimum_index = TEXT_TIERS.index(minimum) if minimum in TEXT_TIERS else 0
 
     minimum = normalize_text_tier(minimum_tier)
     if minimum is None:
@@ -293,6 +302,17 @@ _PENDING_ROUTING_HISTORY_ENTRY_KEY = "_pending_squilla_router_history_entry"
 _PENDING_ROUTING_HISTORY_SESSION_KEY = "_pending_squilla_router_history_session"
 _ROUTING_TURN_INDEX_KEY = "routing_turn_index"
 _THINKING_LEVELS = {"minimal", "low", "medium", "high", "xhigh", "adaptive"}
+# Capacity admission runs before AgentConfig can be constructed.  Keep the
+# public thinking levels here without importing engine.types, whose session
+# dependency graph includes this step during module initialization.
+_THINKING_CAPACITY_BUDGETS = {
+    "off": 0,
+    "minimal": 1_024,
+    "low": 4_096,
+    "medium": 10_000,
+    "high": 20_000,
+    "xhigh": 50_000,
+}
 
 
 def _ensure_routing_turn_index(ctx: TurnContext) -> int:
@@ -824,19 +844,168 @@ def _token_estimate(value: object) -> int | None:
 
 def _material_estimated_tokens(ctx: TurnContext, semantic_message: str) -> int:
     metadata = getattr(ctx, "metadata", {}) or {}
-    candidates: list[int] = [max(len(semantic_message) // 4, 0)]
+    prompt_tokens = estimate_material_text_tokens(semantic_message)
+    attachment_tokens = _token_estimate(
+        metadata.get("attachment_material_estimated_tokens")
+    ) or 0
+    generated_normalization_tokens = _token_estimate(
+        metadata.get("attachment_generated_normalization_estimated_tokens")
+    ) or 0
+    non_generated_attachment_tokens = max(
+        0, attachment_tokens - generated_normalization_tokens
+    )
+    candidates: list[int] = [prompt_tokens + attachment_tokens]
 
     top_level = _token_estimate(metadata.get("material_estimated_tokens"))
     if top_level is not None:
-        candidates.append(top_level)
+        candidates.append(top_level + non_generated_attachment_tokens)
 
     normalization = metadata.get("input_normalization")
     if isinstance(normalization, dict):
         nested = _token_estimate(normalization.get("material_estimated_tokens"))
         if nested is not None:
-            candidates.append(nested)
+            candidates.append(nested + non_generated_attachment_tokens)
 
     return max(candidates)
+
+
+def _route_thinking_budget_tokens(
+    ctx: TurnContext,
+    router_cfg: object,
+    tier_cfg: dict,
+    *,
+    thinking_mode: str | None = None,
+    rollout_phase: str = "full",
+) -> int:
+    """Resolve the capacity reserve using the same config/router precedence."""
+
+    explicit = getattr(getattr(ctx.config, "llm", None), "thinking", None)
+    raw: object = explicit
+    if explicit is None or not str(explicit).strip():
+        if not getattr(router_cfg, "auto_thinking", True):
+            return 0
+        if thinking_mode is not None and rollout_phase in {"observe", "full"}:
+            raw = thinking_mode_to_level(thinking_mode)
+        else:
+            raw = _tier_thinking_level(tier_cfg)
+    level = _normalize_thinking_level(raw)
+    if level is None:
+        return 0
+    if level == "adaptive":
+        return MAX_THINKING_BUDGET_TOKENS
+    return _THINKING_CAPACITY_BUDGETS.get(level, MAX_THINKING_BUDGET_TOKENS)
+
+
+def _capacity_active_provider_only(router_cfg: object) -> bool:
+    mismatch_mode = str(
+        getattr(router_cfg, "tier_provider_mismatch", "route") or "route"
+    ).strip().lower()
+    return mismatch_mode == "veto" and not bool(
+        getattr(router_cfg, "cross_provider_tiers", False)
+    )
+
+
+def _llm_capacity_overrides(ctx: TurnContext) -> tuple[int, int, int]:
+    llm = getattr(getattr(ctx, "config", None), "llm", None)
+    return (
+        _token_estimate(getattr(llm, "context_window_tokens", None)) or 0,
+        _token_estimate(getattr(llm, "max_tokens", None)) or 0,
+        _token_estimate(getattr(llm, "provider_request_proof_max_chars", None)) or 0,
+    )
+
+
+def _active_capacity_deployment_fields(
+    ctx: TurnContext,
+    provider: str,
+) -> tuple[str, str, str]:
+    llm = getattr(getattr(ctx, "config", None), "llm", None)
+    active_provider = str(getattr(llm, "provider", "") or "").strip().lower()
+    if provider.strip().lower() != active_provider:
+        return "", "", ""
+    return (
+        str(getattr(llm, "api_key", "") or ""),
+        str(getattr(llm, "base_url", "") or ""),
+        str(getattr(llm, "proxy", "") or ""),
+    )
+
+
+def _block_large_context_route(ctx: TurnContext, reason: str) -> TurnContext:
+    """Persist a fail-closed signal past the pipeline's fail-open step wrapper."""
+
+    ctx.metadata["large_context_capacity_blocked"] = True
+    ctx.metadata["large_context_capacity_block_reason"] = reason
+    ctx.metadata["routing_applied"] = False
+    ctx.metadata["routing_source"] = "large_context_capacity_blocked"
+    ctx.metadata["applied_model"] = ctx.model
+    return ctx
+
+
+def _capacity_safe_tier(
+    ctx: TurnContext,
+    router_cfg: object,
+    tiers: dict,
+    candidate_names: list[str],
+    *,
+    minimum_tier: str | None,
+    material_tokens: int,
+    requires_image: bool = False,
+    active_provider_only: bool = False,
+    thinking_mode: str | None = None,
+    rollout_phase: str = "full",
+) -> str | None:
+    """Pick the first candidate whose deployment definitely fits this turn."""
+
+    minimum_index = tier_index(minimum_tier)
+    active_provider = str(
+        getattr(getattr(ctx.config, "llm", None), "provider", "") or ""
+    ).strip().lower()
+    context_window_override, max_output_override, proof_max_chars = (
+        _llm_capacity_overrides(ctx)
+    )
+    ordered = list(dict.fromkeys(candidate_names))
+    for name in ordered:
+        candidate_index = tier_index(name)
+        if minimum_index >= 0:
+            if candidate_index >= 0 and candidate_index < minimum_index:
+                continue
+            if candidate_index < 0 and not requires_image:
+                continue
+        raw = tiers.get(name)
+        if not isinstance(raw, dict):
+            continue
+        tier = TierConfig.from_value(raw)
+        if not tier.model or (requires_image and not tier.supports_image):
+            continue
+        declared_provider = (tier.provider or active_provider).strip().lower()
+        if active_provider_only and declared_provider != active_provider:
+            continue
+        provider = (
+            declared_provider
+            if bool(getattr(router_cfg, "cross_provider_tiers", False))
+            else active_provider or declared_provider
+        )
+        api_key, base_url, proxy = _active_capacity_deployment_fields(ctx, provider)
+        thinking_budget = _route_thinking_budget_tokens(
+            ctx,
+            router_cfg,
+            raw,
+            thinking_mode=thinking_mode,
+            rollout_phase=rollout_phase,
+        )
+        if model_has_request_capacity(
+            provider=provider,
+            model=tier.model,
+            material_tokens=material_tokens,
+            thinking_budget_tokens=thinking_budget,
+            context_window_override_tokens=context_window_override,
+            max_output_override_tokens=max_output_override,
+            provider_request_proof_max_chars=proof_max_chars,
+            api_key=api_key,
+            base_url=base_url,
+            proxy=proxy,
+        ):
+            return name
+    return None
 
 
 def _context_window_tokens(ctx: TurnContext, router_cfg: object) -> int:
@@ -1251,6 +1420,42 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     # decision in the session receives one monotonic identity.
     routing_turn_index = _ensure_routing_turn_index(ctx)
 
+    material_estimated_tokens = _material_estimated_tokens(ctx, routing_message)
+    required_context_tier = large_context_min_tier(
+        material_estimated_tokens,
+        _context_window_tokens(ctx, router_cfg),
+    )
+    minimum_context_tier = (
+        resolve_large_context_floor_tier(required_context_tier, valid_tiers)
+        or required_context_tier
+    )
+    execution_floor_candidates = [
+        tier
+        for tier in (artifact_floor, minimum_context_tier)
+        if tier is not None
+    ]
+    minimum_execution_tier = (
+        max(execution_floor_candidates, key=tier_index)
+        if execution_floor_candidates
+        else None
+    )
+    if minimum_context_tier is not None:
+        ctx.metadata["large_context_floor_min_tier"] = minimum_context_tier
+        ctx.metadata["large_context_material_tokens"] = material_estimated_tokens
+        context_window_override, max_output_override, proof_max_chars = (
+            _llm_capacity_overrides(ctx)
+        )
+        if context_window_override > 0:
+            ctx.metadata["large_context_context_window_override_tokens"] = (
+                context_window_override
+            )
+        if max_output_override > 0:
+            ctx.metadata["large_context_max_output_override_tokens"] = max_output_override
+        if proof_max_chars > 0:
+            ctx.metadata["large_context_provider_request_proof_max_chars"] = (
+                proof_max_chars
+            )
+
     # Image-aware routing: skip ML and pick directly from supports_image tiers
     # for current uploads. Historical images require the upstream semantic
     # follow-up gate; recent-image/sticky metadata alone is observability and
@@ -1281,6 +1486,31 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
                 "Configure squilla_router.tiers.image_model with supports_image=true."
             )
         tier_name = next(iter(image_tiers))
+        if minimum_context_tier is not None:
+            safe_image_tier = _capacity_safe_tier(
+                ctx,
+                router_cfg,
+                tiers,
+                sorted(
+                    image_tiers,
+                    key=lambda name: (
+                        tier_index(name) < 0,
+                        tier_index(name),
+                    ),
+                ),
+                minimum_tier=minimum_context_tier,
+                material_tokens=material_estimated_tokens,
+                requires_image=True,
+                active_provider_only=_capacity_active_provider_only(router_cfg),
+                rollout_phase=rollout_phase,
+            )
+            if safe_image_tier is None:
+                return _block_large_context_route(
+                    ctx,
+                    "No image-capable SquillaRouter deployment has proven capacity "
+                    "for this attachment request.",
+                )
+            tier_name = safe_image_tier
         decision = RoutingDecision(
             tier=tier_name,
             model=image_tiers[tier_name].get("model", ctx.model),
@@ -1301,6 +1531,16 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         ctx.metadata["applied_model"] = ctx.model
         ctx.metadata["routing_confidence"] = decision.confidence
         ctx.metadata["routing_source"] = decision.source
+        if minimum_context_tier is not None:
+            ctx.metadata["router_fallback_chain"] = [
+                entry
+                for entry in _router_text_fallback_chain(
+                    decision.tier,
+                    tiers,
+                    minimum_context_tier,
+                )
+                if bool(tiers.get(entry["tier"], {}).get("supports_image", False))
+            ]
         image_route_reason = "current_turn" if current_turn_has_image else "gate_history"
         ctx.metadata["image_route_reason"] = image_route_reason
         history_turns = 1
@@ -1317,6 +1557,15 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         # mismatch telemetry is emitted.
         _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=True)
         _record_thinking_metadata(ctx, router_cfg, image_tiers[tier_name])
+        if minimum_context_tier is not None:
+            ctx.metadata["large_context_thinking_budget_tokens"] = (
+                _route_thinking_budget_tokens(
+                    ctx,
+                    router_cfg,
+                    image_tiers[tier_name],
+                    rollout_phase=rollout_phase,
+                )
+            )
         stage_router_decision(ctx, decision=decision)
         log.debug("squilla_router.image_routed", tier=decision.tier, model=decision.model)
         return ctx
@@ -1325,18 +1574,41 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     # still has a deterministic capability floor and must route to it. This is
     # only reached for non-image turns; the vision bypass handles empty captions.
     if not routing_message.strip():
-        if artifact_facts is None:
+        if minimum_execution_tier is None:
             return ctx
-        assert artifact_floor is not None
-        tier_cfg = tiers[artifact_floor]
+        selected_tier = minimum_execution_tier
+        if minimum_context_tier is not None:
+            capacity_tier = _capacity_safe_tier(
+                ctx,
+                router_cfg,
+                tiers,
+                valid_tiers,
+                minimum_tier=minimum_execution_tier,
+                material_tokens=material_estimated_tokens,
+                active_provider_only=_capacity_active_provider_only(router_cfg),
+                rollout_phase=rollout_phase,
+            )
+            if capacity_tier is None:
+                return _block_large_context_route(
+                    ctx,
+                    "No SquillaRouter deployment has proven capacity for this "
+                    "attachment request.",
+                )
+            selected_tier = capacity_tier
+        tier_cfg = tiers[selected_tier]
         decision = RoutingDecision(
-            tier=artifact_floor,
+            tier=selected_tier,
             model=tier_cfg.get("model", ctx.model),
             confidence=1.0,
-            source="artifact_floor",
+            source=(
+                "artifact_floor"
+                if artifact_facts is not None and minimum_context_tier is None
+                else "large_context_attachment_route"
+            ),
         )
-        ctx.metadata.update(artifact_facts.to_telemetry())
-        ctx.metadata["artifact_floor_applied"] = True
+        if artifact_facts is not None:
+            ctx.metadata.update(artifact_facts.to_telemetry())
+            ctx.metadata["artifact_floor_applied"] = True
         ctx.metadata["baseline_model"] = ctx.model
         ctx.model = decision.model
         ctx.metadata["routed_tier"] = decision.tier
@@ -1349,32 +1621,77 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         ctx.metadata["router_fallback_chain"] = _router_text_fallback_chain(
             decision.tier,
             tiers,
-            minimum_tier=artifact_facts.minimum_tier,
+            minimum_tier=minimum_execution_tier,
         )
-        ctx.metadata["router_fallback_strict"] = True
+        if artifact_facts is not None:
+            ctx.metadata["router_fallback_strict"] = True
         ctx.metadata.update(_compute_savings(decision.model, tiers))
         _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=True)
         _record_thinking_metadata(ctx, router_cfg, tier_cfg)
         stage_router_decision(ctx, decision=decision)
+        if minimum_context_tier is not None:
+            ctx.metadata["large_context_thinking_budget_tokens"] = (
+                _route_thinking_budget_tokens(
+                    ctx,
+                    router_cfg,
+                    tier_cfg,
+                    rollout_phase=rollout_phase,
+                )
+            )
+        stage_router_decision(ctx, decision=decision)
         log.debug(
-            "squilla_router.empty_artifact_routed",
+            "squilla_router.empty_constrained_turn_routed",
             tier=decision.tier,
             model=decision.model,
         )
         return ctx
 
+    # Order valid_tiers by the canonical c0<c1<c2<c3 ladder rather than TOML
+    # insertion order — downstream policy stages rank tiers by position in this
+    # list, so trusting declaration order inverted upgrades/holds for configs
+    # that list tiers out of order. Unknown/custom tier names (tier_index == -1)
+    # sort after the canonical ones, preserving their relative order (stable).
     if not valid_tiers:
+        if minimum_context_tier is not None:
+            return _block_large_context_route(
+                ctx,
+                "No text-capable SquillaRouter deployment has proven capacity "
+                "for this attachment request.",
+            )
         return ctx
 
     hold_store = ctx.metadata.get("router_control_hold_store")
     if isinstance(hold_store, RouterControlHoldStore):
         hold = hold_store.get_valid(ctx.session_key, decrement=True)
         if hold is not None and hold.tier in tiers and hold.tier in valid_tiers:
+            applied_hold_tier = hold.tier
+            if minimum_context_tier is not None:
+                safe_hold_tier = _capacity_safe_tier(
+                    ctx,
+                    router_cfg,
+                    tiers,
+                    [hold.tier, *valid_tiers],
+                    minimum_tier=minimum_context_tier,
+                    material_tokens=material_estimated_tokens,
+                    active_provider_only=_capacity_active_provider_only(router_cfg),
+                    rollout_phase=rollout_phase,
+                )
+                if safe_hold_tier is None:
+                    return _block_large_context_route(
+                        ctx,
+                        "No held or fallback SquillaRouter deployment has proven "
+                        "capacity for this attachment request.",
+                    )
+                applied_hold_tier = safe_hold_tier
             decision = RoutingDecision(
-                tier=hold.tier,
-                model=hold.model,
+                tier=applied_hold_tier,
+                model=tiers[applied_hold_tier].get("model", hold.model),
                 confidence=1.0,
-                source="router_control_hold",
+                source=(
+                    "router_control_hold"
+                    if applied_hold_tier == hold.tier
+                    else "large_context_floor"
+                ),
             )
             if (
                 artifact_facts is not None
@@ -1404,13 +1721,13 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             ctx.metadata["router_fallback_chain"] = _router_text_fallback_chain(
                 decision.tier,
                 tiers,
-                minimum_tier=(
-                    artifact_facts.minimum_tier if artifact_facts is not None else None
-                ),
+                minimum_tier=minimum_execution_tier,
             )
             if artifact_facts is not None:
                 ctx.metadata["router_fallback_strict"] = True
             ctx.metadata["router_control_hold_applied"] = True
+            if applied_hold_tier != hold.tier:
+                ctx.metadata["router_control_hold_capacity_clamped"] = True
             ctx.metadata["router_control_action"] = "set_hold"
             ctx.metadata["router_control_target_tier"] = hold.tier
             ctx.metadata["router_control_target_model"] = hold.model
@@ -1419,6 +1736,15 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
             ctx.metadata.update(_compute_savings(decision.model, tiers))
             _flag_tier_provider_mismatch(ctx, tiers, decision.tier, routing_applied=True)
             _record_thinking_metadata(ctx, router_cfg, tiers[decision.tier])
+            if minimum_context_tier is not None:
+                ctx.metadata["large_context_thinking_budget_tokens"] = (
+                    _route_thinking_budget_tokens(
+                        ctx,
+                        router_cfg,
+                        tiers[decision.tier],
+                        rollout_phase=rollout_phase,
+                    )
+                )
             stage_router_decision(ctx, decision=decision)
             log.debug(
                 "squilla_router.router_control_hold_applied",
@@ -1590,7 +1916,11 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     _log_budget_outcome(ctx)
 
     # Artifact floors are execution constraints, not observe-only telemetry.
-    routing_applied = rollout_phase != "observe" or artifact_facts is not None
+    routing_applied = (
+        rollout_phase != "observe"
+        or artifact_facts is not None
+        or minimum_context_tier is not None
+    )
     provider_valid_tiers = valid_tiers
     if artifact_floor is not None:
         provider_valid_tiers = [
@@ -1608,6 +1938,43 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
         prompt_policy,
         routing_applied=routing_applied,
     )
+    if minimum_context_tier is not None:
+        active_provider_only = _capacity_active_provider_only(router_cfg)
+        minimum_index = tier_index(minimum_context_tier)
+        capacity_candidates = [
+            decision.tier,
+            *[
+                name
+                for name in valid_tiers
+                if tier_index(name) >= minimum_index
+            ],
+        ]
+        capacity_tier = _capacity_safe_tier(
+            ctx,
+            router_cfg,
+            tiers,
+            capacity_candidates,
+            minimum_tier=minimum_context_tier,
+            material_tokens=material_estimated_tokens,
+            active_provider_only=active_provider_only,
+            thinking_mode=thinking_mode,
+            rollout_phase=rollout_phase,
+        )
+        if capacity_tier is None:
+            return _block_large_context_route(
+                ctx,
+                "No SquillaRouter deployment has proven capacity for this "
+                "attachment request.",
+            )
+        if capacity_tier != decision.tier:
+            ctx.metadata["large_context_final_route_clamped"] = True
+            ctx.metadata["large_context_final_route_from_tier"] = decision.tier
+            decision = RoutingDecision(
+                tier=capacity_tier,
+                model=tiers[capacity_tier].get("model", decision.model),
+                confidence=decision.confidence,
+                source="large_context_floor",
+            )
     if routing_applied:
         ctx.model = decision.model
     ctx.metadata["routed_tier"] = decision.tier
@@ -1620,7 +1987,7 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     ctx.metadata["router_fallback_chain"] = _router_text_fallback_chain(
         decision.tier,
         tiers,
-        minimum_tier=(artifact_facts.minimum_tier if artifact_facts is not None else None),
+        minimum_tier=minimum_execution_tier,
     )
     if artifact_facts is not None:
         ctx.metadata["router_fallback_strict"] = True
@@ -1655,6 +2022,16 @@ async def apply_squilla_router(ctx: TurnContext) -> TurnContext:
     except Exception:
         log.warning("squilla_router.controller_apply_error", exc_info=True)
         _record_thinking_metadata(ctx, router_cfg, tiers[decision.tier])
+    if minimum_context_tier is not None:
+        ctx.metadata["large_context_thinking_budget_tokens"] = (
+            _route_thinking_budget_tokens(
+                ctx,
+                router_cfg,
+                tiers[decision.tier],
+                thinking_mode=thinking_mode,
+                rollout_phase=rollout_phase,
+            )
+        )
 
     # History-aware routers accumulate routing_extra into per-session history.
     if _is_history_strategy(strategy_name):

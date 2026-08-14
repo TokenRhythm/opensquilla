@@ -2,11 +2,40 @@ import type { ChatRenderedMessage } from '@/types/chat'
 
 export function chatMessageKey(message: ChatRenderedMessage, index: number): string {
   if (message.isRouterStrip && message.routerTurnKey) return message.routerTurnKey
-  return message.messageId || message.clientId || message.id || `${message.displayRole || message.role}-${message.sourceIndex ?? index}`
+  // A local row keeps clientId when the first canonical history snapshot adds
+  // messageId. Prefer that stable optimistic identity so stateful disclosures
+  // are not unmounted at the live-to-history handoff.
+  return message.clientId || message.messageId || message.id || `${message.displayRole || message.role}-${message.sourceIndex ?? index}`
 }
 
 let clientMessageSequence = 0
 let clientRequestSequence = 0
+
+/** Return a SHA-256-derived canonical UUIDv8, or null when Web Crypto is unavailable. */
+export async function stableClientUuid(identity: string): Promise<string | null> {
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle) return null
+  let digest: ArrayBuffer
+  try {
+    digest = await subtle.digest('SHA-256', new TextEncoder().encode(identity))
+  } catch {
+    return null
+  }
+  const hex = Array.from(new Uint8Array(digest).slice(0, 16), byte => (
+    byte.toString(16).padStart(2, '0')
+  )).join('').split('')
+  hex[12] = '8'
+  const variant = Number.parseInt(hex[16]!, 16)
+  hex[16] = ((variant & 0x3) | 0x8).toString(16)
+  const value = hex.join('')
+  return [
+    value.slice(0, 8),
+    value.slice(8, 12),
+    value.slice(12, 16),
+    value.slice(16, 20),
+    value.slice(20),
+  ].join('-')
+}
 
 export function createClientMessageId(): string {
   clientMessageSequence += 1

@@ -57,6 +57,7 @@ def test_full_fresh_migration_audit_never_uses_fqdn(
         audit_rows = connection.execute(
             "SELECT migration_id, hostname FROM _yoyo_log WHERE operation = 'apply'"
         ).fetchall()
-    assert len(audit_rows) == len(applied) == 39
+    # V010 has two historical migrations, so V039 is the 40th applied file.
+    assert len(audit_rows) == len(applied) == 40
     assert {migration_id for migration_id, _hostname in audit_rows} == set(applied)
     assert {hostname for _migration_id, hostname in audit_rows} == {"synthetic-local-host"}

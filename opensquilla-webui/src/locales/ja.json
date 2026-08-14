@@ -1109,7 +1109,7 @@
       "capacityWarn": "1 ターンあたり {calls} 回のモデル呼び出し — コストは線形に増え、候補 4 つを超えると集約の効果は逓減します。",
       "capacityFull": "候補の上限 {max} に達しました — これ以上追加しても集約は改善しません。先に 1 つ削除してください。",
       "diversityHint": "複数の候補が同じモデルファミリーです — 別ベンダーのモデルを追加すると集約が改善されることが多いです。",
-      "effectiveFacts": "1 ターンあたり {calls} 回のモデル呼び出し · {quorum}/{proposers} 件の成功で集約開始 · 候補タイムアウト {proposerTimeout} 秒 · 集約タイムアウト {aggregatorTimeout} 秒 · 充足後 {grace} 秒の猶予",
+      "effectiveFacts": "1 ターンあたり {calls} 回のモデル呼び出し · {quorum}/{proposers} 件の成功で集約開始 · 候補の合計タイムアウト {proposerTimeout} 秒 · 集約のアイドルタイムアウト {aggregatorTimeout} 秒 · 充足後 {grace} 秒の猶予",
       "effectiveSummary": "{proposers} 個の提案モデルを並列実行 + 1 個の集約モデル · 1 ターン約 {calls} 回呼び出し",
       "runtimeStrategyTitle": "実行戦略",
       "runtimeStrategyDesc": "成功条件、失敗時の動作、制限時間",
@@ -1118,7 +1118,7 @@
       "successThresholdExact": "{quorum}/{proposers}",
       "failurePolicyLabel": "集約を完了できない場合",
       "runtimeLimitsLabel": "制限時間",
-      "runtimeLimits": "提案モデル {proposerTimeout} 秒 · 集約モデル {aggregatorTimeout} 秒 · 条件達成後の猶予 {grace} 秒",
+      "runtimeLimits": "提案モデルは合計 {proposerTimeout} 秒 · 集約モデルはプロバイダーイベント間のアイドル {aggregatorTimeout} 秒（設定値 {configuredAggregatorTimeout} 秒）· ターン全体の期限は別管理 · 条件達成後の猶予 {grace} 秒",
       "quorumFailureLabel": "成功した候補が {quorum} 件未満の場合"
     },
     "behavior": {
@@ -1891,6 +1891,7 @@
     "refresh": "更新",
     "refreshing": "更新中…",
     "loading": "セッションを読み込み中…",
+    "loadMore": "さらにセッションを読み込む",
     "unknownAgent": "不明なエージェント",
     "deletedAgent": "削除済みエージェント · {id}",
     "msgCount": "{count} 件",
@@ -3240,6 +3241,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "チャットを作成しました",
+      "open": "チャットを開く"
+    },
     "promptCacheKeepalive": {
       "action": "プロンプトキャッシュの維持",
       "title": "プロンプトキャッシュの維持",
@@ -3416,6 +3421,9 @@
     "subagentPrefix": "サブエージェント: ",
     "subagentCompletion": "サブエージェントの完了",
     "turnFailed": "ターンが失敗しました",
+    "usageAccountingBlockedTitle": "使用量の記録を一時的に利用できません",
+    "usageAccountingBlockedMessage": "モデルプロバイダーにはリクエストが送信されておらず、料金も発生していません。このターンは安全に再試行できます。",
+    "usageAccountingBlockedUnsafeMessage": "このモデルリクエストは送信されませんでした。ただし、このターンの以前の処理が実行済みまたは課金済みの可能性があります。再試行する前に結果を確認してください。",
     "sandboxPausedResume": "実行を再開",
     "sandboxResumed": "自律実行を再開しました。続行するにはリクエストを再送信してください。",
     "sandboxResumeFailed": "実行を再開できませんでした:{error}",
@@ -3499,9 +3507,19 @@
       "lifecycle": {
         "working": "作業中",
         "answering": "回答を作成中",
+        "answerPrepared": "回答の構成",
         "settled": "完了",
         "interrupted": "中断",
         "failed": "失敗"
+      },
+      "provider": {
+        "waiting": "モデルを待機中",
+        "responded": "モデル応答",
+        "reasoning": "深く思考中",
+        "rateLimited": "レート制限 · {seconds}秒後に再試行",
+        "retryWait": "{seconds}秒後に再試行",
+        "retrying": "再試行中 {attempt}/{limit}",
+        "fallback": "予備モデルに切り替え中"
       },
       "purpose": {
         "discover": "リンクを検出",
@@ -3825,6 +3843,10 @@
       "steerRetryUnknownHint": "OpenSquilla はこの誘導が受け付けられたか確認できませんでした。再試行すると元のリクエストを変更せず安全に再送します。",
       "removeUnknownSteer": "保留中メッセージ {index} のこの端末での再試行を破棄します。サーバーが未受信という意味ではありません",
       "queueHint": "キューモード: これらのメッセージは現在の応答が完了すると順番に自動送信されます",
+      "reorderHint": "0.75 秒間長押ししてからドラッグすると順序を変更できます。Alt+矢印キーでも移動できます。",
+      "reorderStarted": "「{label}」を並べ替えています。新しい位置までドラッグして離してください。",
+      "reorderPosition": "「{label}」を {count} 件中 {position} 番目に移動しました。",
+      "reorderRecovering": "キューの順序を復元しています…",
       "clearAll": "すべてクリア",
       "editMessage": "メッセージを編集",
       "editWhileStreaming": "現在の返信が終わってから編集してください",
@@ -3920,6 +3942,9 @@
     "compact": {
       "compacting": "コンテキストを圧縮中",
       "compacted": "コンテキストを圧縮しました",
+      "historyPreserved": "以前のコンテキストを要約しました。元のメッセージは履歴で引き続き確認できます",
+      "historyIncomplete": "以前のコンテキストを要約しました。一部の元のメッセージは利用できません",
+      "historySummarized": "以前のコンテキストを要約しました",
       "failed": "圧縮に失敗しました",
       "withinBudget": "コンテキストは予算内です。",
       "skipped": "コンテキストの圧縮は適用されませんでした。",
@@ -3951,7 +3976,6 @@
     "chips": {
       "whatCanYouDo": "何ができますか？",
       "buildGame": "ゲームを作って",
-      "buildGamePrompt": "レスポンスの良い操作、加速とブレーキ、見やすいコース、衝突判定、チェックポイント、ラップタイム計測、リスタート手順を備えた、ブラウザで遊べるボクセルレーシングゲームのプロトタイプを構築してください。ボクセル調のレーシングカーと風景は有料素材を使わずコードで生成してください。ゲームを実行し、操作をテストし、進行を妨げる問題を修正してから納品してください。美しい風景とオープンワールドを実現し、マップ上にスポンサーのイースターエッグとして OpenSquilla と TokenRhythm の看板を配置してください。",
       "summarizeWebpage": "ウェブページを要約して",
       "planWeek": "今週の計画を立てて",
       "searchAiNews": "今日の AI ニュースを検索して",
@@ -4004,6 +4028,7 @@
       "waitResponseBeforeCommand": "{command} を実行する前に現在の応答が完了するまでお待ちください。",
       "promptAnnotationBusy": "現在の応答が完了してから、成果物の編集指示を送信してください。",
       "queueFull": "キューがいっぱいです — 現在の応答が完了するまでお待ちください。",
+      "queuePersistenceUnavailable": "分岐が完了するまでこのメッセージを入力欄に残してください。永続的な復旧は現在利用できません。",
       "messageStillSaving": "このメッセージはまだ保存が完了していません — しばらくしてからもう一度お試しください。",
       "artifactOpenFailed": "成果物を開けませんでした。代わりにダウンロードを使用してください。"
     },
@@ -4088,11 +4113,13 @@
     "sidebar": {
       "recentConversations": "最近のタスク",
       "recents": "最近",
+      "pinned": "ピン留め",
       "refresh": "タスクを再読み込み",
       "clearAgentFilter": "エージェントフィルターをクリア: {name}",
       "loadError": "タスクを読み込めません",
       "noMatches": "一致なし",
       "noConversations": "タスクがまだありません。",
+      "allLoaded": "すべてのタスクを読み込みました",
       "startChat": "タスクを開始",
       "linkSessions": "セッション",
       "currentTask": "現在のタスク",

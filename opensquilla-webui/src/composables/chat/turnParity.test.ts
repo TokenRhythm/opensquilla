@@ -35,6 +35,7 @@ function makeFold(toolCalls: ChatToolCall[], extra: Partial<FoldedTurn> = {}): F
     statusHistory: [],
     timelineSegments: [],
     ...extra,
+    reasoningBlocks: extra.reasoningBlocks ?? [],
   }
 }
 

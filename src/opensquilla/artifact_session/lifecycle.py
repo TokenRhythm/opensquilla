@@ -43,7 +43,7 @@ async def purge_session_on_connection(
 ) -> ArtifactSessionPurgeResult:
     """Fence and delete ArtifactSession rows on an existing write transaction.
 
-    This helper is intentionally compatible with databases predating V035: if
+    This helper is intentionally compatible with databases predating V036: if
     the additive ArtifactSession tables are absent, it is a no-op.  Once the
     tables exist, any SQL/FK failure propagates so the caller's encompassing
     reset/delete transaction rolls back as a unit.

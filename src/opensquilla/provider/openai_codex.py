@@ -426,10 +426,11 @@ class OpenAICodexProvider:
                 code="candidate_artifact_limit_exceeded",
             )
         except Exception as exc:  # noqa: BLE001 - chat() contract: ErrorEvent instead of raising
-            log.exception(
+            log.error(
                 "provider.stream_internal_error",
                 provider=self.provider_name,
                 model=self._model,
+                exception_type=type(exc).__name__,
             )
             yield ErrorEvent(
                 message=redact_upstream_error_text(

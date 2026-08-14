@@ -137,7 +137,8 @@ async def test_auth_invalid_surfaces_without_retry() -> None:
 
     error = next(event for event in events if event.kind == "error")
     assert error.code == "401"
-    assert error.message == "injected invalid api key"
+    assert error.message == "The model provider rejected the configured credentials."
+    assert error.failure_kind == ProviderFailureKind.AUTH_INVALID.value
     assert provider.calls == []  # surfaced before any provider contact
     assert injector.consumed == [ProviderFailureKind.AUTH_INVALID]
     assert not any(entry.get("event") == "provider.retry" for entry in captured)
@@ -254,4 +255,13 @@ async def test_no_injector_and_empty_script_produce_identical_turns() -> None:
     # The delegated call is argument-identical to the direct one.
     assert plain_provider.calls[0]["messages"] == injected_provider.calls[0]["messages"]
     assert plain_provider.calls[0]["tools"] == injected_provider.calls[0]["tools"]
-    assert plain_provider.calls[0]["config"] == injected_provider.calls[0]["config"]
+    plain_config = plain_provider.calls[0]["config"]
+    injected_config = injected_provider.calls[0]["config"]
+    assert plain_config.turn_deadline_at_monotonic is not None
+    assert injected_config.turn_deadline_at_monotonic is not None
+    # Each turn owns a distinct monotonic deadline. Normalize only that
+    # runtime clock value; every other field, including other excluded runtime
+    # fields, must remain argument-identical.
+    assert plain_config.model_copy(
+        update={"turn_deadline_at_monotonic": None}
+    ) == injected_config.model_copy(update={"turn_deadline_at_monotonic": None})

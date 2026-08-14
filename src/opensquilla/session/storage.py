@@ -164,6 +164,26 @@ class TurnIngressConflictError(ValueError):
     """Raised when a client request id is reused for a different turn payload."""
 
 
+class PendingChatInputConflictError(ValueError):
+    """Raised when a staged-input identity or compare-and-set fence conflicts."""
+
+
+class PendingChatInputCapacityError(RuntimeError):
+    """Raised when a session already owns the maximum staged inputs."""
+
+
+class PendingChatInputNotFoundError(KeyError):
+    """Raised when a staged input disappeared before it could be dispatched."""
+
+
+class PendingChatInputCancelledError(RuntimeError):
+    """Raised when a durable cancellation tombstone rejects a delayed enqueue."""
+
+
+class PendingChatInputAlreadyDispatchedError(RuntimeError):
+    """Raised when a delayed enqueue targets an already accepted staged input."""
+
+
 class MetaControlIntentConflictError(ValueError):
     """Raised when a durable MetaSkill control identity is reused incompatibly."""
 
@@ -235,6 +255,38 @@ class StrandedSteerInput:
     entry: TranscriptEntry
     receipt: TurnIngressReceipt
     target_task: AgentTaskRecord
+
+
+@dataclass(frozen=True, slots=True)
+class PendingChatInput:
+    """One server-staged follow-up awaiting exactly-once dispatch."""
+
+    pending_input_id: str
+    session_key: str
+    source_scope: str
+    client_request_id: str
+    client_message_id: str
+    request_fingerprint: str
+    payload: dict[str, Any]
+    position: int
+    state_revision: int
+    created_at: int
+    updated_at: int
+    schema_version: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class PendingChatInputDispatchReceipt:
+    """Durable binding between one staged identity and its accepted turn receipt."""
+
+    pending_input_id: str
+    session_key: str
+    source_scope: str
+    client_request_id: str
+    client_message_id: str
+    request_fingerprint: str
+    accepted_at: int
+    schema_version: int = 1
 
 
 async def _verify_project_workspace_guard(
@@ -455,11 +507,13 @@ def _serialized_read[**P, R](
 # and discard tombstones. Version 19 added the generation-fenced current Goal
 # and Goal command idempotency ledger. Version 20 added the durable Goal origin
 # message anchor used by reconnect-safe transcript presentation. Version 21
-# added durable ArtifactSession documents, immutable revisions, change sets,
-# editor sessions, writer leases, anchors, and audit events. Version 22 added
-# prompt-annotation drafts atomically consumed by chat turns. Version 23 added
+# added the bounded durable pending-chat-input outbox.
+# Version 22 added durable ArtifactSession documents, immutable revisions,
+# change sets, editor sessions, anchors, and audit events. Version 23 added
+# prompt-annotation drafts atomically consumed by chat turns. Version 24 added
 # durable idempotency receipts for artifact mutation attempts.
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
+MAX_PENDING_CHAT_INPUTS = 5
 
 # Session rows at or above this semantic version were created by fork logic
 # that records enough existing metadata for canonical coverage to be checked
@@ -971,6 +1025,80 @@ ON turn_ingress_receipts(source_scope, request_session_key, client_request_id)
 _CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION = """
 CREATE INDEX IF NOT EXISTS idx_turn_ingress_receipts_accepted_session
 ON turn_ingress_receipts(accepted_session_key, accepted_at)
+"""
+
+_CREATE_PENDING_CHAT_INPUTS = """
+CREATE TABLE IF NOT EXISTS pending_chat_inputs (
+    pending_input_id       TEXT PRIMARY KEY,
+    session_key            TEXT NOT NULL,
+    source_scope           TEXT NOT NULL,
+    client_request_id      TEXT NOT NULL,
+    client_message_id      TEXT NOT NULL,
+    request_fingerprint    TEXT NOT NULL,
+    payload_json           TEXT NOT NULL,
+    position               INTEGER NOT NULL DEFAULT 0,
+    state_revision         INTEGER NOT NULL DEFAULT 1 CHECK (state_revision >= 1),
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_REQUEST = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_inputs_request
+ON pending_chat_inputs(session_key, client_request_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_MESSAGE = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_inputs_message
+ON pending_chat_inputs(session_key, client_message_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_SESSION_ORDER = """
+CREATE INDEX IF NOT EXISTS idx_pending_chat_inputs_session_order
+ON pending_chat_inputs(session_key, position, created_at, pending_input_id)
+"""
+
+_CREATE_PENDING_CHAT_INPUT_CANCELLATIONS = """
+CREATE TABLE IF NOT EXISTS pending_chat_input_cancellations (
+    pending_input_id       TEXT PRIMARY KEY,
+    session_key            TEXT NOT NULL,
+    cancelled_at           INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_CANCELLATIONS_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_pending_chat_input_cancellations_session
+ON pending_chat_input_cancellations(session_key, cancelled_at, pending_input_id)
+"""
+
+_CREATE_PENDING_CHAT_INPUT_DISPATCH_RECEIPTS = """
+CREATE TABLE IF NOT EXISTS pending_chat_input_dispatch_receipts (
+    pending_input_id       TEXT PRIMARY KEY,
+    session_key            TEXT NOT NULL,
+    source_scope           TEXT NOT NULL,
+    client_request_id      TEXT NOT NULL,
+    client_message_id      TEXT NOT NULL,
+    request_fingerprint    TEXT NOT NULL,
+    accepted_at            INTEGER NOT NULL,
+    schema_version         INTEGER NOT NULL DEFAULT 1 CHECK (schema_version >= 1)
+)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_REQUEST = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_input_dispatch_request
+ON pending_chat_input_dispatch_receipts(source_scope, session_key, client_request_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_MESSAGE = """
+CREATE UNIQUE INDEX IF NOT EXISTS uq_pending_chat_input_dispatch_message
+ON pending_chat_input_dispatch_receipts(session_key, client_message_id)
+"""
+
+_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_SESSION = """
+CREATE INDEX IF NOT EXISTS idx_pending_chat_input_dispatch_session
+ON pending_chat_input_dispatch_receipts(session_key, accepted_at, pending_input_id)
 """
 
 _CREATE_META_CONTROL_INTENTS = """
@@ -1549,6 +1677,24 @@ def _json_object_or_none(value: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+@dataclass(frozen=True, slots=True)
+class SessionListCursor:
+    """Stable descending sort position for a session-list page."""
+
+    activity_at: int
+    updated_at: int
+    session_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionListPage:
+    """One keyset-paginated page of sessions."""
+
+    sessions: list[SessionNode]
+    next_cursor: SessionListCursor | None
+    has_more: bool
+
+
 class SessionStorage:
     """Low-level async SQLite operations for session persistence."""
 
@@ -1900,6 +2046,18 @@ class SessionStorage:
         await self._conn.execute(_CREATE_TURN_INGRESS_RECEIPTS)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_REQUEST)
         await self._conn.execute(_CREATE_IDX_TURN_INGRESS_ACCEPTED_SESSION)
+        await self._conn.execute(_CREATE_PENDING_CHAT_INPUTS)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_REQUEST)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_MESSAGE)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_SESSION_ORDER)
+        await self._conn.execute(_CREATE_PENDING_CHAT_INPUT_CANCELLATIONS)
+        await self._conn.execute(
+            _CREATE_IDX_PENDING_CHAT_INPUT_CANCELLATIONS_SESSION
+        )
+        await self._conn.execute(_CREATE_PENDING_CHAT_INPUT_DISPATCH_RECEIPTS)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_REQUEST)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_MESSAGE)
+        await self._conn.execute(_CREATE_IDX_PENDING_CHAT_INPUT_DISPATCH_SESSION)
         await self._conn.execute(_CREATE_META_CONTROL_INTENTS)
         await self._conn.execute(_CREATE_IDX_META_CONTROL_CORRELATION)
         await self._conn.execute(_CREATE_IDX_META_CONTROL_SESSION_STATUS)
@@ -4799,7 +4957,8 @@ class SessionStorage:
             {where}
             ORDER BY
                 max(sessions.updated_at, COALESCE(active_tasks.active_at, 0)) DESC,
-                sessions.updated_at DESC
+                sessions.updated_at DESC,
+                sessions.session_key DESC
             LIMIT ? OFFSET ?
         """
         query_params = [
@@ -4812,6 +4971,116 @@ class SessionStorage:
         async with self.conn.execute(sql, query_params) as cur:
             rows = await cur.fetchall()
         return [SessionNode(**_deserialize_row(dict(r))) for r in rows]
+
+    @_serialized_read
+    async def list_sessions_page(
+        self,
+        *,
+        limit: int,
+        cursor: SessionListCursor | None = None,
+        guest_owner_id: str | None = None,
+    ) -> SessionListPage:
+        """Return a stable keyset page in the same order as ``list_sessions``."""
+
+        page_limit = max(1, int(limit))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if guest_owner_id is not None:
+            owner_id = str(guest_owner_id).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", owner_id):
+                return SessionListPage(sessions=[], next_cursor=None, has_more=False)
+            clauses.append(
+                "sessions.session_key GLOB ? "
+                "AND (length(sessions.session_key) - "
+                "length(replace(sessions.session_key, ':', ''))) = 5"
+            )
+            params.append(f"agent:?*:webchat:guest:{owner_id}:?*")
+        source_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        cursor_where = ""
+        cursor_params: list[Any] = []
+        if cursor is not None:
+            cursor_where = """
+                WHERE list_activity_at < ?
+                   OR (list_activity_at = ? AND updated_at < ?)
+                   OR (
+                       list_activity_at = ?
+                       AND updated_at = ?
+                       AND session_key < ?
+                   )
+            """
+            cursor_params = [
+                cursor.activity_at,
+                cursor.activity_at,
+                cursor.updated_at,
+                cursor.activity_at,
+                cursor.updated_at,
+                cursor.session_key,
+            ]
+
+        sql = f"""
+            WITH active_tasks AS (
+                SELECT
+                    session_key,
+                    MAX(
+                        max(
+                            max(COALESCE(updated_at, 0), COALESCE(started_at, 0)),
+                            COALESCE(created_at, 0)
+                        )
+                    ) AS active_at
+                FROM agent_tasks
+                WHERE status IN (?, ?)
+                GROUP BY session_key
+            ), ordered_sessions AS (
+                SELECT
+                    sessions.*,
+                    max(
+                        sessions.updated_at,
+                        COALESCE(active_tasks.active_at, 0)
+                    ) AS list_activity_at
+                FROM sessions
+                LEFT JOIN active_tasks
+                    ON active_tasks.session_key = sessions.session_key
+                {source_where}
+            )
+            SELECT *
+            FROM ordered_sessions
+            {cursor_where}
+            ORDER BY list_activity_at DESC, updated_at DESC, session_key DESC
+            LIMIT ?
+        """
+        query_params = [
+            AgentTaskStatus.QUEUED.value,
+            AgentTaskStatus.RUNNING.value,
+            *params,
+            *cursor_params,
+            page_limit + 1,
+        ]
+        async with self.conn.execute(sql, query_params) as cur:
+            rows = await cur.fetchall()
+
+        has_more = len(rows) > page_limit
+        page_rows = rows[:page_limit]
+        sessions: list[SessionNode] = []
+        positions: list[SessionListCursor] = []
+        for row in page_rows:
+            data = dict(row)
+            activity_at = int(data.pop("list_activity_at"))
+            session = SessionNode(**_deserialize_row(data))
+            sessions.append(session)
+            positions.append(
+                SessionListCursor(
+                    activity_at=activity_at,
+                    updated_at=int(session.updated_at),
+                    session_key=session.session_key,
+                )
+            )
+        next_cursor = positions[-1] if has_more and positions else None
+        return SessionListPage(
+            sessions=sessions,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
 
     async def _delete_session_rows(
         self,
@@ -4861,6 +5130,18 @@ class SessionStorage:
             )
         await conn.execute(
             "DELETE FROM turn_ingress_receipts WHERE accepted_session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM pending_chat_inputs WHERE session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM pending_chat_input_cancellations WHERE session_key = ?",
+            (session.session_key,),
+        )
+        await conn.execute(
+            "DELETE FROM pending_chat_input_dispatch_receipts WHERE session_key = ?",
             (session.session_key,),
         )
         await conn.execute(
@@ -4914,6 +5195,18 @@ class SessionStorage:
             )
             await conn.execute(
                 "DELETE FROM meta_launch_drafts WHERE session_key = ?",
+                (session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM pending_chat_inputs WHERE session_key = ?",
+                (session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM pending_chat_input_cancellations WHERE session_key = ?",
+                (session_key,),
+            )
+            await conn.execute(
+                "DELETE FROM pending_chat_input_dispatch_receipts WHERE session_key = ?",
                 (session_key,),
             )
             await conn.execute(
@@ -9580,6 +9873,715 @@ class SessionStorage:
             )
 
     @staticmethod
+    def _pending_chat_input_from_row(row: Any) -> PendingChatInput:
+        raw = dict(row)
+        payload_raw = raw.pop("payload_json", None)
+        try:
+            payload = json.loads(payload_raw) if isinstance(payload_raw, str) else None
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("pending chat input contains invalid payload JSON") from exc
+        if not isinstance(payload, dict):
+            raise RuntimeError("pending chat input payload must be an object")
+        return PendingChatInput(payload=payload, **raw)
+
+    @staticmethod
+    async def _select_pending_chat_input(
+        conn: Any,
+        *,
+        pending_input_id: str,
+    ) -> PendingChatInput | None:
+        async with conn.execute(
+            "SELECT * FROM pending_chat_inputs WHERE pending_input_id = ?",
+            (pending_input_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return (
+            SessionStorage._pending_chat_input_from_row(row)
+            if row is not None
+            else None
+        )
+
+    @staticmethod
+    async def _select_pending_chat_input_cancellation(
+        conn: Any,
+        *,
+        pending_input_id: str,
+    ) -> tuple[str, int] | None:
+        async with conn.execute(
+            """
+            SELECT session_key, cancelled_at
+            FROM pending_chat_input_cancellations
+            WHERE pending_input_id = ?
+            """,
+            (pending_input_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        return str(row["session_key"]), int(row["cancelled_at"])
+
+    @staticmethod
+    async def _select_pending_chat_input_dispatch_receipt(
+        conn: Any,
+        *,
+        pending_input_id: str,
+    ) -> PendingChatInputDispatchReceipt | None:
+        async with conn.execute(
+            """
+            SELECT * FROM pending_chat_input_dispatch_receipts
+            WHERE pending_input_id = ?
+            """,
+            (pending_input_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return (
+            PendingChatInputDispatchReceipt(**_deserialize_row(dict(row)))
+            if row is not None
+            else None
+        )
+
+    @staticmethod
+    async def _find_pending_chat_input_dispatch_receipts(
+        conn: Any,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+    ) -> list[PendingChatInputDispatchReceipt]:
+        async with conn.execute(
+            """
+            SELECT * FROM pending_chat_input_dispatch_receipts
+            WHERE pending_input_id = ?
+               OR (
+                    session_key = ?
+                AND source_scope = ?
+                AND client_request_id = ?
+               )
+               OR (session_key = ? AND client_message_id = ?)
+            ORDER BY accepted_at ASC, pending_input_id ASC
+            """,
+            (
+                pending_input_id,
+                session_key,
+                source_scope,
+                client_request_id,
+                session_key,
+                client_message_id,
+            ),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [
+            PendingChatInputDispatchReceipt(**_deserialize_row(dict(row)))
+            for row in rows
+        ]
+
+    @staticmethod
+    async def _insert_pending_chat_input_dispatch_receipt(
+        conn: Any,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+        request_fingerprint: str,
+        accepted_at: int,
+    ) -> None:
+        await conn.execute(
+            """
+            INSERT INTO pending_chat_input_dispatch_receipts (
+                pending_input_id, session_key, source_scope,
+                client_request_id, client_message_id, request_fingerprint, accepted_at,
+                schema_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+            """,
+            (
+                pending_input_id,
+                session_key,
+                source_scope,
+                client_request_id,
+                client_message_id,
+                request_fingerprint,
+                accepted_at,
+            ),
+        )
+
+    async def enqueue_pending_chat_input(
+        self,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+        request_fingerprint: str,
+        payload: dict[str, Any],
+        position: int | None = None,
+    ) -> tuple[PendingChatInput, bool]:
+        """Stage one follow-up, returning ``(row, replayed)``.
+
+        Capacity and all three stable identities are checked under the same
+        write lock.  An ambiguous enqueue can therefore retry byte-for-byte;
+        the retry either returns the original row or raises a hard conflict.
+        """
+
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        source_scope = source_scope.strip()
+        client_request_id = client_request_id.strip()
+        client_message_id = client_message_id.strip()
+        request_fingerprint = request_fingerprint.strip()
+        identifiers = {
+            "pending_input_id": pending_input_id,
+            "session_key": session_key,
+            "source_scope": source_scope,
+            "client_request_id": client_request_id,
+            "client_message_id": client_message_id,
+            "request_fingerprint": request_fingerprint,
+        }
+        if any(not value for value in identifiers.values()):
+            raise ValueError("pending input identities must be non-empty")
+        for name in ("pending_input_id", "client_request_id", "client_message_id"):
+            if len(identifiers[name]) > 256:
+                raise ValueError(f"{name} must not exceed 256 characters")
+        if len(session_key) > 512 or len(source_scope) > 256:
+            raise ValueError("pending input session/source identity is too long")
+        if not isinstance(payload, dict):
+            raise ValueError("pending input payload must be an object")
+        payload_json = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now = _now_ms()
+        async with self._write_transaction("enqueue_pending_chat_input") as conn:
+            dispatch_receipts = (
+                await self._find_pending_chat_input_dispatch_receipts(
+                    conn,
+                    pending_input_id=pending_input_id,
+                    session_key=session_key,
+                    source_scope=source_scope,
+                    client_request_id=client_request_id,
+                    client_message_id=client_message_id,
+                )
+            )
+            if dispatch_receipts:
+                exact = (
+                    len(dispatch_receipts) == 1
+                    and dispatch_receipts[0].pending_input_id == pending_input_id
+                    and dispatch_receipts[0].session_key == session_key
+                    and dispatch_receipts[0].source_scope == source_scope
+                    and dispatch_receipts[0].client_request_id
+                    == client_request_id
+                    and dispatch_receipts[0].client_message_id
+                    == client_message_id
+                    and dispatch_receipts[0].request_fingerprint
+                    == request_fingerprint
+                )
+                if exact:
+                    raise PendingChatInputAlreadyDispatchedError(
+                        "pending input was already dispatched"
+                    )
+                raise PendingChatInputConflictError(
+                    "pending input dispatch identity was already used"
+                )
+            cancellation = await self._select_pending_chat_input_cancellation(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if cancellation is not None:
+                cancelled_session_key, _cancelled_at = cancellation
+                if cancelled_session_key != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input cancellation belongs to a different session"
+                    )
+                raise PendingChatInputCancelledError(
+                    "pending input was durably cancelled"
+                )
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE pending_input_id = ?
+                   OR (session_key = ? AND client_request_id = ?)
+                   OR (session_key = ? AND client_message_id = ?)
+                ORDER BY created_at ASC
+                """,
+                (
+                    pending_input_id,
+                    session_key,
+                    client_request_id,
+                    session_key,
+                    client_message_id,
+                ),
+            ) as cur:
+                matches = await cur.fetchall()
+            if matches:
+                rows = [self._pending_chat_input_from_row(row) for row in matches]
+                first = rows[0]
+                exact = (
+                    len(rows) == 1
+                    and first.pending_input_id == pending_input_id
+                    and first.session_key == session_key
+                    and first.source_scope == source_scope
+                    and first.client_request_id == client_request_id
+                    and first.client_message_id == client_message_id
+                    and first.request_fingerprint == request_fingerprint
+                    and first.payload == payload
+                )
+                if exact:
+                    return first, True
+                raise PendingChatInputConflictError(
+                    "pending input identity was already used for a different payload"
+                )
+
+            async with conn.execute(
+                "SELECT COUNT(*) FROM pending_chat_inputs WHERE session_key = ?",
+                (session_key,),
+            ) as cur:
+                count_row = await cur.fetchone()
+            if int(count_row[0] if count_row is not None else 0) >= MAX_PENDING_CHAT_INPUTS:
+                raise PendingChatInputCapacityError(
+                    f"session already has {MAX_PENDING_CHAT_INPUTS} pending inputs"
+                )
+            if position is None:
+                async with conn.execute(
+                    "SELECT COALESCE(MAX(position), -1) + 1 "
+                    "FROM pending_chat_inputs WHERE session_key = ?",
+                    (session_key,),
+                ) as cur:
+                    position_row = await cur.fetchone()
+                position = int(position_row[0] if position_row is not None else 0)
+            if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+                raise ValueError("position must be a non-negative integer")
+            await conn.execute(
+                """
+                INSERT INTO pending_chat_inputs (
+                    pending_input_id, session_key, source_scope,
+                    client_request_id, client_message_id, request_fingerprint,
+                    payload_json, position, state_revision, created_at, updated_at,
+                    schema_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 1)
+                """,
+                (
+                    pending_input_id,
+                    session_key,
+                    source_scope,
+                    client_request_id,
+                    client_message_id,
+                    request_fingerprint,
+                    payload_json,
+                    position,
+                    now,
+                    now,
+                ),
+            )
+            row = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            assert row is not None
+            return row, False
+
+    @_serialized_read
+    async def get_pending_chat_input(
+        self,
+        pending_input_id: str,
+    ) -> PendingChatInput | None:
+        return await self._select_pending_chat_input(
+            self.conn,
+            pending_input_id=pending_input_id.strip(),
+        )
+
+    @_serialized_read
+    async def get_pending_chat_input_dispatch_receipt(
+        self,
+        pending_input_id: str,
+    ) -> PendingChatInputDispatchReceipt | None:
+        return await self._select_pending_chat_input_dispatch_receipt(
+            self.conn,
+            pending_input_id=pending_input_id.strip(),
+        )
+
+    async def consume_replayed_pending_chat_input(
+        self,
+        *,
+        pending_input_id: str,
+        session_key: str,
+        source_scope: str,
+        client_request_id: str,
+        client_message_id: str,
+        request_fingerprint: str,
+        expected_revision: int,
+    ) -> bool:
+        """Remove a stale staged row after its turn receipt already committed.
+
+        Older or racing clients may retry enqueue after another tab committed
+        dispatch but before observing its acknowledgement.  The accepted turn
+        remains exactly once through ``turn_ingress_receipts``; this repair
+        consumes the otherwise permanent queue ghost only after all durable
+        request and message identities match the dispatch receipt.
+        """
+
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        source_scope = source_scope.strip()
+        client_request_id = client_request_id.strip()
+        client_message_id = client_message_id.strip()
+        request_fingerprint = request_fingerprint.strip()
+        if any(
+            not value
+            for value in (
+                pending_input_id,
+                session_key,
+                source_scope,
+                client_request_id,
+                client_message_id,
+                request_fingerprint,
+            )
+        ):
+            raise ValueError("pending dispatch replay identities must be non-empty")
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+
+        async with self._write_transaction(
+            "consume_replayed_pending_chat_input"
+        ) as conn:
+            receipts = await self._find_pending_chat_input_dispatch_receipts(
+                conn,
+                pending_input_id=pending_input_id,
+                session_key=session_key,
+                source_scope=source_scope,
+                client_request_id=client_request_id,
+                client_message_id=client_message_id,
+            )
+            if len(receipts) != 1:
+                raise PendingChatInputConflictError(
+                    "pending input dispatch receipt is missing or ambiguous"
+                )
+            receipt = receipts[0]
+            if (
+                receipt.session_key != session_key
+                or receipt.source_scope != source_scope
+                or receipt.client_request_id != client_request_id
+                or receipt.client_message_id != client_message_id
+                or receipt.request_fingerprint != request_fingerprint
+            ):
+                raise PendingChatInputConflictError(
+                    "pending input does not match its accepted dispatch receipt"
+                )
+
+            pending = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if pending is None:
+                return False
+            if (
+                pending.session_key != session_key
+                or pending.source_scope != source_scope
+                or pending.client_request_id != client_request_id
+                or pending.client_message_id != client_message_id
+                or pending.request_fingerprint != request_fingerprint
+                or pending.state_revision != expected_revision
+            ):
+                raise PendingChatInputConflictError(
+                    "pending input changed before dispatch replay cleanup"
+                )
+            async with conn.execute(
+                """
+                DELETE FROM pending_chat_inputs
+                WHERE pending_input_id = ?
+                  AND session_key = ?
+                  AND source_scope = ?
+                  AND client_request_id = ?
+                  AND client_message_id = ?
+                  AND request_fingerprint = ?
+                  AND state_revision = ?
+                """,
+                (
+                    pending_input_id,
+                    session_key,
+                    source_scope,
+                    client_request_id,
+                    client_message_id,
+                    request_fingerprint,
+                    expected_revision,
+                ),
+            ) as cur:
+                consumed = int(cur.rowcount or 0)
+            if consumed != 1:
+                raise PendingChatInputConflictError(
+                    "pending input changed before dispatch replay cleanup"
+                )
+            return True
+
+    @_serialized_read
+    async def list_pending_chat_inputs(self, session_key: str) -> list[PendingChatInput]:
+        session_key = canonicalize_session_key(session_key)
+        async with self.conn.execute(
+            """
+            SELECT * FROM pending_chat_inputs
+            WHERE session_key = ?
+            ORDER BY position ASC, created_at ASC, pending_input_id ASC
+            """,
+            (session_key,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._pending_chat_input_from_row(row) for row in rows]
+
+    async def update_pending_chat_input(
+        self,
+        pending_input_id: str,
+        *,
+        session_key: str,
+        expected_revision: int,
+        position: int,
+    ) -> PendingChatInput:
+        """Move one row using a monotonic compare-and-set revision."""
+
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+            raise ValueError("position must be a non-negative integer")
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        async with self._write_transaction("update_pending_chat_input") as conn:
+            async with conn.execute(
+                """
+                UPDATE pending_chat_inputs
+                SET position = ?, state_revision = state_revision + 1, updated_at = ?
+                WHERE pending_input_id = ? AND session_key = ? AND state_revision = ?
+                """,
+                (position, _now_ms(), pending_input_id, session_key, expected_revision),
+            ) as cur:
+                changed = int(cur.rowcount or 0)
+            if changed != 1:
+                existing = await self._select_pending_chat_input(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if existing is None:
+                    raise PendingChatInputNotFoundError(pending_input_id)
+                if existing.session_key != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input belongs to a different session"
+                    )
+                raise PendingChatInputConflictError(
+                    "pending input revision changed before update"
+                )
+            row = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            assert row is not None
+            return row
+
+    async def reorder_pending_chat_inputs(
+        self,
+        *,
+        session_key: str,
+        expected_revisions: list[tuple[str, int]],
+    ) -> list[PendingChatInput]:
+        """Replace one session's complete pending order atomically.
+
+        The caller supplies every currently staged row in the desired order.
+        Comparing the complete identity set and every state revision prevents a
+        concurrent enqueue, cancel, dispatch, or peer reorder from producing a
+        partially-applied order.
+        """
+
+        session_key = canonicalize_session_key(session_key)
+        if not 2 <= len(expected_revisions) <= MAX_PENDING_CHAT_INPUTS:
+            raise ValueError(
+                f"expected_revisions must contain 2-{MAX_PENDING_CHAT_INPUTS} rows"
+            )
+        pending_ids: list[str] = []
+        revisions: dict[str, int] = {}
+        for raw_pending_id, revision in expected_revisions:
+            pending_input_id = raw_pending_id.strip()
+            if not pending_input_id or len(pending_input_id) > 256:
+                raise ValueError("pending_input_id must be a non-empty bounded string")
+            if pending_input_id in revisions:
+                raise ValueError("pending_input_id values must be unique")
+            if (
+                isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 1
+            ):
+                raise ValueError("expected revision must be a positive integer")
+            pending_ids.append(pending_input_id)
+            revisions[pending_input_id] = revision
+
+        async with self._write_transaction("reorder_pending_chat_inputs") as conn:
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE session_key = ?
+                ORDER BY position ASC, created_at ASC, pending_input_id ASC
+                """,
+                (session_key,),
+            ) as cur:
+                current_rows = await cur.fetchall()
+            current = [self._pending_chat_input_from_row(row) for row in current_rows]
+            if len(current) != len(pending_ids):
+                raise PendingChatInputConflictError(
+                    "pending input set changed before reorder"
+                )
+            current_by_id = {row.pending_input_id: row for row in current}
+            if set(current_by_id) != set(pending_ids):
+                raise PendingChatInputConflictError(
+                    "pending input set changed before reorder"
+                )
+            for pending_input_id, expected_revision in revisions.items():
+                if current_by_id[pending_input_id].state_revision != expected_revision:
+                    raise PendingChatInputConflictError(
+                        "pending input revision changed before reorder"
+                    )
+
+            updated_at = _now_ms()
+            for position, pending_input_id in enumerate(pending_ids):
+                async with conn.execute(
+                    """
+                    UPDATE pending_chat_inputs
+                    SET position = ?, state_revision = state_revision + 1,
+                        updated_at = ?
+                    WHERE pending_input_id = ? AND session_key = ?
+                      AND state_revision = ?
+                    """,
+                    (
+                        position,
+                        updated_at,
+                        pending_input_id,
+                        session_key,
+                        revisions[pending_input_id],
+                    ),
+                ) as cur:
+                    if int(cur.rowcount or 0) != 1:
+                        raise PendingChatInputConflictError(
+                            "pending input changed during reorder"
+                        )
+
+            async with conn.execute(
+                """
+                SELECT * FROM pending_chat_inputs
+                WHERE session_key = ?
+                ORDER BY position ASC, created_at ASC, pending_input_id ASC
+                """,
+                (session_key,),
+            ) as cur:
+                reordered_rows = await cur.fetchall()
+            return [self._pending_chat_input_from_row(row) for row in reordered_rows]
+
+    async def cancel_pending_chat_input(
+        self,
+        pending_input_id: str,
+        *,
+        session_key: str,
+        expected_revision: int | None = None,
+    ) -> bool:
+        """Cancel one staged row; missing rows are an idempotent success."""
+
+        pending_input_id = pending_input_id.strip()
+        session_key = canonicalize_session_key(session_key)
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        async with self._write_transaction("cancel_pending_chat_input") as conn:
+            existing = await self._select_pending_chat_input(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if existing is None:
+                dispatch_receipt = (
+                    await self._select_pending_chat_input_dispatch_receipt(
+                        conn,
+                        pending_input_id=pending_input_id,
+                    )
+                )
+                if dispatch_receipt is not None:
+                    if dispatch_receipt.session_key != session_key:
+                        raise PendingChatInputConflictError(
+                            "pending input dispatch belongs to a different session"
+                        )
+                    return False
+                cancellation = await self._select_pending_chat_input_cancellation(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if cancellation is not None:
+                    if cancellation[0] != session_key:
+                        raise PendingChatInputConflictError(
+                            "pending input cancellation belongs to a different session"
+                        )
+                    return False
+                await conn.execute(
+                    """
+                    INSERT INTO pending_chat_input_cancellations (
+                        pending_input_id, session_key, cancelled_at, schema_version
+                    ) VALUES (?, ?, ?, 1)
+                    """,
+                    (pending_input_id, session_key, _now_ms()),
+                )
+                return False
+            if existing.session_key != session_key:
+                raise PendingChatInputConflictError(
+                    "pending input belongs to a different session"
+                )
+            if (
+                expected_revision is not None
+                and existing.state_revision != expected_revision
+            ):
+                raise PendingChatInputConflictError(
+                    "pending input revision changed before cancellation"
+                )
+            dispatch_receipt = await self._select_pending_chat_input_dispatch_receipt(
+                conn,
+                pending_input_id=pending_input_id,
+            )
+            if dispatch_receipt is not None:
+                if dispatch_receipt.session_key != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input dispatch belongs to a different session"
+                    )
+            else:
+                cancellation = await self._select_pending_chat_input_cancellation(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if cancellation is not None and cancellation[0] != session_key:
+                    raise PendingChatInputConflictError(
+                        "pending input cancellation belongs to a different session"
+                    )
+                if cancellation is None:
+                    await conn.execute(
+                        """
+                        INSERT INTO pending_chat_input_cancellations (
+                            pending_input_id, session_key, cancelled_at, schema_version
+                        ) VALUES (?, ?, ?, 1)
+                        """,
+                        (pending_input_id, session_key, _now_ms()),
+                    )
+            await conn.execute(
+                "DELETE FROM pending_chat_inputs WHERE pending_input_id = ?",
+                (pending_input_id,),
+            )
+            return True
+
+    @staticmethod
     async def _select_meta_control_intent(
         conn: Any,
         *,
@@ -10590,6 +11592,9 @@ class SessionStorage:
         ) = None,
         expected_prompt_annotations: Sequence[PromptAnnotation] = (),
         prompt_annotation_turn_id: str | None = None,
+        pending_input_id: str | None = None,
+        pending_input_fingerprint: str | None = None,
+        pending_input_revision: int | None = None,
     ) -> TurnAcceptanceResult:
         """Commit one user message, optional task, and request receipt atomically.
 
@@ -10640,6 +11645,30 @@ class SessionStorage:
                 prompt_annotation_turn_id := prompt_annotation_turn_id.strip()
             ):
                 raise ValueError("prompt_annotation_turn_id is required")
+        pending_guard_values = (
+            pending_input_id,
+            pending_input_fingerprint,
+            pending_input_revision,
+        )
+        if any(value is not None for value in pending_guard_values) and not all(
+            value is not None for value in pending_guard_values
+        ):
+            raise ValueError("pending input dispatch guard must be complete")
+        if pending_input_id is not None:
+            pending_input_id = pending_input_id.strip()
+            pending_input_fingerprint = str(pending_input_fingerprint).strip()
+            if not pending_input_id or not pending_input_fingerprint:
+                raise ValueError("pending input dispatch identity must not be blank")
+            if request_fingerprint != pending_input_fingerprint:
+                raise PendingChatInputConflictError(
+                    "pending input fingerprint must match the accepted turn fingerprint"
+                )
+            if (
+                isinstance(pending_input_revision, bool)
+                or not isinstance(pending_input_revision, int)
+                or pending_input_revision < 1
+            ):
+                raise ValueError("pending input revision must be a positive integer")
 
         request_session_key = canonicalize_session_key(request_session_key)
         entry.session_key = canonicalize_session_key(entry.session_key)
@@ -10786,6 +11815,7 @@ class SessionStorage:
                 "active_plan_revision_id may only select the accepted plan run"
             )
 
+        pending_dispatch_client_message_id: str | None = None
         async with self._write_transaction("accept_turn") as conn:
             selected = await self._select_turn_ingress_receipt(
                 conn,
@@ -10814,6 +11844,45 @@ class SessionStorage:
                     """,
                     (request_session_key, client_request_id),
                 )
+                if pending_input_id is not None:
+                    dispatch_receipt = (
+                        await self._select_pending_chat_input_dispatch_receipt(
+                            conn,
+                            pending_input_id=pending_input_id,
+                        )
+                    )
+                    if dispatch_receipt is None or (
+                        dispatch_receipt.session_key != request_session_key
+                        or dispatch_receipt.source_scope != source_scope
+                        or dispatch_receipt.client_request_id != client_request_id
+                        or dispatch_receipt.request_fingerprint
+                        != pending_input_fingerprint
+                    ):
+                        raise PendingChatInputConflictError(
+                            "pending input is not bound to the accepted turn receipt"
+                        )
+                    pending = await self._select_pending_chat_input(
+                        conn,
+                        pending_input_id=pending_input_id,
+                    )
+                    if pending is not None:
+                        if (
+                            pending.session_key != request_session_key
+                            or pending.source_scope != source_scope
+                            or pending.client_request_id != client_request_id
+                            or pending.client_message_id
+                            != dispatch_receipt.client_message_id
+                            or pending.request_fingerprint
+                            != pending_input_fingerprint
+                            or pending.state_revision != pending_input_revision
+                        ):
+                            raise PendingChatInputConflictError(
+                                "pending input does not match the accepted turn receipt"
+                            )
+                        await conn.execute(
+                            "DELETE FROM pending_chat_inputs WHERE pending_input_id = ?",
+                            (pending_input_id,),
+                        )
                 if isinstance(goal_mutation, StartGoalMutation):
                     goal_command_result = await self._replay_goal_command_on_conn(
                         conn,
@@ -10860,6 +11929,37 @@ class SessionStorage:
                     turn_id=prompt_annotation_turn_id,
                     updated_at=updated_at,
                 )
+            if pending_input_id is not None:
+                pending = await self._select_pending_chat_input(
+                    conn,
+                    pending_input_id=pending_input_id,
+                )
+                if pending is None:
+                    raise PendingChatInputNotFoundError(pending_input_id)
+                if (
+                    pending.session_key != request_session_key
+                    or pending.source_scope != source_scope
+                    or pending.client_request_id != client_request_id
+                    or pending.request_fingerprint != pending_input_fingerprint
+                ):
+                    raise PendingChatInputConflictError(
+                        "pending input dispatch identity changed before acceptance"
+                    )
+                if pending.state_revision != pending_input_revision:
+                    raise PendingChatInputConflictError(
+                        "pending input revision changed before acceptance"
+                    )
+                turn_context = entry.turn_context if isinstance(entry.turn_context, dict) else {}
+                turn_client_message_id = turn_context.get("client_message_id")
+                if (
+                    isinstance(turn_client_message_id, str)
+                    and turn_client_message_id
+                    and turn_client_message_id != pending.client_message_id
+                ):
+                    raise PendingChatInputConflictError(
+                        "pending input message identity changed before acceptance"
+                    )
+                pending_dispatch_client_message_id = pending.client_message_id
 
             if meta_control_intent_id is not None:
                 if task_record is None:
@@ -11691,6 +12791,50 @@ class SessionStorage:
                 f"VALUES ({placeholders})",
                 [_serialize(data[col]) for col in cols],
             )
+            if pending_input_id is not None:
+                if pending_dispatch_client_message_id is None:
+                    raise AssertionError(
+                        "validated pending input lost its client message identity"
+                    )
+                try:
+                    await self._insert_pending_chat_input_dispatch_receipt(
+                        conn,
+                        pending_input_id=pending_input_id,
+                        session_key=request_session_key,
+                        source_scope=source_scope,
+                        client_request_id=client_request_id,
+                        client_message_id=pending_dispatch_client_message_id,
+                        request_fingerprint=str(pending_input_fingerprint),
+                        accepted_at=receipt.accepted_at,
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise PendingChatInputConflictError(
+                        "pending input dispatch identity was already consumed"
+                    ) from exc
+                async with conn.execute(
+                    """
+                    DELETE FROM pending_chat_inputs
+                    WHERE pending_input_id = ?
+                      AND session_key = ?
+                      AND source_scope = ?
+                      AND client_request_id = ?
+                      AND request_fingerprint = ?
+                      AND state_revision = ?
+                    """,
+                    (
+                        pending_input_id,
+                        request_session_key,
+                        source_scope,
+                        client_request_id,
+                        pending_input_fingerprint,
+                        pending_input_revision,
+                    ),
+                ) as cur:
+                    consumed = int(cur.rowcount or 0)
+                if consumed != 1:
+                    raise PendingChatInputConflictError(
+                        "pending input changed before atomic dispatch"
+                    )
             await conn.execute(
                 """
                 DELETE FROM meta_launch_drafts

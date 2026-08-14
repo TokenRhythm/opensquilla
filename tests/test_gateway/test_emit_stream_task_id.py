@@ -19,7 +19,9 @@ from opensquilla.engine.types import (
     DoneEvent,
     ErrorEvent,
     TextDeltaEvent,
+    ThinkingEndEvent,
     ThinkingEvent,
+    ThinkingStartEvent,
     ToolUseStartEvent,
 )
 from opensquilla.gateway.boot import (
@@ -149,6 +151,48 @@ async def test_emit_preserves_typed_silent_reply_done_contract() -> None:
     assert payload["suppression_reason"] == "no_reply"
     assert payload["input_mode"] == "system_event"
     assert payload["run_kind"] == "goal"
+
+
+@pytest.mark.asyncio
+async def test_emit_preserves_reasoning_block_lifecycle() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield ThinkingStartEvent(block_id="reasoning-1", block_index=0, started_at=1_000)
+        yield ThinkingEvent(
+            text="checking",
+            started_at=1_000,
+            block_id="reasoning-1",
+            block_index=0,
+        )
+        yield ThinkingEndEvent(
+            block_id="reasoning-1",
+            block_index=0,
+            status="completed",
+            ended_at=2_000,
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    await _emit_task_runtime_stream_events(
+        _stream(),
+        SESSION,
+        _emitter,
+        idle_timeout=5.0,
+        heartbeat_interval=0.0,
+    )
+
+    assert [event_name for _, event_name, _ in emitted] == [
+        "session.event.thinking_start",
+        "session.event.thinking",
+        "session.event.thinking_end",
+    ]
+    assert [payload["block_id"] for _, _, payload in emitted] == [
+        "reasoning-1",
+        "reasoning-1",
+        "reasoning-1",
+    ]
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,12 @@ from typing import Any
 import pytest
 
 from opensquilla.session.models import AgentTaskStatus
-from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
+from opensquilla.session.terminal_reply import (
+    build_terminal_reply,
+    safe_provider_failure_code,
+    safe_provider_failure_message,
+    sanitize_agent_error,
+)
 
 RAW_INTERNAL_STRINGS = (
     "Gateway task timeout",
@@ -183,6 +188,53 @@ def test_ensemble_multimodal_reply_is_actionable_and_stable() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "proof",
+    [
+        {"replay_safe": True},
+        {
+            "usage_call_index": "1",
+            "no_prior_provider_dispatch": True,
+            "replay_safe": True,
+        },
+        {
+            "usage_call_index": 2,
+            "no_prior_provider_dispatch": True,
+            "replay_safe": True,
+        },
+    ],
+)
+def test_usage_barrier_reply_requires_complete_native_replay_proof(
+    proof: dict[str, object],
+) -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "error_class": "usage_accounting_busy",
+            **proof,
+        }
+    )
+
+    assert "earlier work" in reply.lower()
+    assert "no usage was billed" not in reply.lower()
+    assert "safe to retry" not in reply.lower()
+
+
+def test_usage_barrier_reply_accepts_complete_native_replay_proof() -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "error_class": "usage_accounting_busy",
+            "usage_call_index": 1,
+            "no_prior_provider_dispatch": True,
+            "replay_safe": True,
+        }
+    )
+
+    assert "no usage was billed" in reply.lower()
+    assert "safe to retry" in reply.lower()
+
+
 def test_build_terminal_reply_accepts_agent_task_record_like_objects() -> None:
     record = SimpleNamespace(
         status=AgentTaskStatus.TIMEOUT,
@@ -196,6 +248,24 @@ def test_build_terminal_reply_accepts_agent_task_record_like_objects() -> None:
     assert "timed out" in message.lower()
     for raw in RAW_INTERNAL_STRINGS:
         assert raw not in message
+
+
+def test_repetition_loop_has_stable_code_and_specific_terminal_reply() -> None:
+    code = safe_provider_failure_code(
+        "model_repetition_loop_detected",
+        "unknown",
+    )
+    message = build_terminal_reply(
+        {
+            "status": "failed",
+            "terminal_reason": code,
+            "error_class": code,
+        }
+    )
+
+    assert code == "model_repetition_loop_detected"
+    assert "repeating" in message.lower()
+    assert "stopped" in message.lower()
 
 
 def test_sanitize_agent_error_rewrites_raw_provider_output_limit_message() -> None:
@@ -218,3 +288,17 @@ def test_sanitize_agent_error_rewrites_raw_iteration_timeout_message() -> None:
     assert error_class == "iteration_timeout"
     assert "timed out" in message.lower()
     assert "Iteration 1 exceeded iteration_timeout" not in message
+
+
+def test_safe_provider_failure_message_is_allowlisted() -> None:
+    assert safe_provider_failure_message("rate_limited") == (
+        "The model provider is rate-limiting requests. Try again later."
+    )
+    assert safe_provider_failure_message("unrecognized-private-provider-body") == (
+        "The model provider request failed."
+    )
+    assert safe_provider_failure_code("429", "rate_limited") == "429"
+    assert safe_provider_failure_code(
+        "PRIVATE_PROVIDER_CODE_BODY",
+        "rate_limited",
+    ) == "provider_rate_limited"

@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
+from opensquilla.token_estimation import estimate_material_text_tokens
+
 LARGE_PASTE_CHARS = 20_000
 PAGE_DUMP_CHARS = 8_000
 PAGE_DUMP_MARKER_MIN_SCORE = 3
@@ -50,38 +52,9 @@ class NormalizedInput:
 
 
 def estimate_text_tokens(text: str) -> int:
-    if not text:
-        return 0
-    if text.isascii():
-        return max(1, len(text) // 4)
+    """Backward-compatible gateway wrapper for the shared material estimate."""
 
-    ascii_chars = 0
-    cjk_chars = 0
-    other_non_ascii_chars = 0
-    for ch in text:
-        codepoint = ord(ch)
-        if codepoint < 128:
-            ascii_chars += 1
-        elif _is_cjk_token_like(codepoint):
-            cjk_chars += 1
-        else:
-            other_non_ascii_chars += 1
-    estimate = (ascii_chars // 4) + cjk_chars + ((other_non_ascii_chars + 1) // 2)
-    return max(1, estimate)
-
-
-def _is_cjk_token_like(codepoint: int) -> bool:
-    return (
-        0x3400 <= codepoint <= 0x4DBF
-        or 0x4E00 <= codepoint <= 0x9FFF
-        or 0xF900 <= codepoint <= 0xFAFF
-        or 0x20000 <= codepoint <= 0x2A6DF
-        or 0x2A700 <= codepoint <= 0x2B73F
-        or 0x2B740 <= codepoint <= 0x2B81F
-        or 0x2B820 <= codepoint <= 0x2CEAF
-        or 0x3040 <= codepoint <= 0x30FF
-        or 0xAC00 <= codepoint <= 0xD7AF
-    )
+    return estimate_material_text_tokens(text)
 
 
 def page_dump_marker_score(text: str) -> int:

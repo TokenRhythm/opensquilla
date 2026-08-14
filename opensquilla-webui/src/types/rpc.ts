@@ -132,6 +132,12 @@ export interface SessionsListResponse {
   /** Exact number of sessions visible to the caller, independent of page size. */
   totalCount?: number
   total_count?: number
+  /** Whether another stable session-list page is available. */
+  hasMore?: boolean
+  has_more?: boolean
+  /** Opaque keyset cursor for the next session-list page. */
+  nextCursor?: string | null
+  next_cursor?: string | null
 }
 
 export interface ProjectWorkspaceItem {
@@ -242,6 +248,8 @@ export interface StreamEventEnvelope {
   session_key?: string
   sessionKey?: string
   epoch?: number
+  stream_generation?: string
+  streamGeneration?: string
   stream_seq?: number
   [key: string]: unknown
 }
@@ -281,6 +289,37 @@ export interface ArtifactStateEventPayload extends SessionEventPayload {
   revisionId?: string | null
   changeSetId?: string | null
   action?: string
+}
+
+export type ProviderActivityPhase =
+  | 'requesting'
+  | 'reasoning'
+  | 'retry_wait'
+  | 'retrying'
+  | 'fallback'
+
+export type ProviderActivityReason =
+  | 'initial'
+  | 'rate_limited'
+  | 'provider_overloaded'
+  | 'transport_transient'
+  | 'reasoning_only'
+  | 'empty_response'
+  | 'stream_incomplete'
+  | 'invalid_response'
+  | 'context_overflow'
+  | 'unknown'
+
+export interface ProviderActivityPayload extends SessionEventPayload {
+  schema_version?: 1
+  activity_id?: string
+  phase?: ProviderActivityPhase
+  reason?: ProviderActivityReason
+  retry_attempt?: number
+  retry_limit?: number
+  retry_after_ms?: number
+  started_at?: number
+  heartbeat?: boolean
 }
 
 export interface CronResultMessagePayload {
@@ -388,6 +427,7 @@ export interface ToolResultPayload extends ToolUsePayload {
 
 export interface SessionMessagesSubscribeParams {
   key: string
+  since_stream_generation?: string
   since_stream_seq?: number
   [key: string]: unknown
 }
@@ -400,6 +440,7 @@ export interface SessionLiveSnapshotEvent {
 export interface SessionMessagesSnapshotResponse {
   key: string
   task_id?: string | null
+  stream_generation?: string
   current_stream_seq?: number
   events?: SessionLiveSnapshotEvent[]
 }
@@ -659,6 +700,16 @@ export interface ChatHistoryTurnOutcome {
   outcome?: Record<string, unknown>
   document_mutation_outcome?: Record<string, unknown>
   documentMutationOutcome?: Record<string, unknown>
+  code?: string
+  error_class?: string
+  retryable?: boolean
+  retry_after_ms?: number
+  terminal_message?: string
+  activity_snapshot?: Record<string, unknown>
+  usage_call_index?: number
+  no_prior_provider_dispatch?: boolean
+  replay_safe?: boolean
+  user_message_id?: string
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {
@@ -826,6 +877,7 @@ export interface RpcEventMap {
   'session.event.router_control_replay': SessionEventPayload
   'session.event.state_change': SessionEventPayload
   'session.event.run_heartbeat': SessionEventPayload
+  'session.event.provider_activity': ProviderActivityPayload
   'session.event.compaction': CompactionPayload
   'session.event.goal': SessionEventPayload
   'session.event.warning': SessionEventPayload

@@ -185,15 +185,15 @@ admitted commit may advance the head.
 
 Four additive migrations provide the durable substrate:
 
-- `V035__artifact_sessions` creates documents, immutable revisions, change
+- `V036__artifact_sessions` creates documents, immutable revisions, change
   sets, anchors, writer leases, edit sessions, and audit events. It also adds
   immutability triggers and document/turn indexes.
-- `V036__artifact_prompt_annotations` creates durable annotation drafts with
+- `V037__artifact_prompt_annotations` creates durable annotation drafts with
   `draft`, `sent`, and `discarded` states. It depends on V035 and enforces body,
   send-linkage, session, document, and revision indexes.
-- `V037__artifact_mutation_attempts` adds the durable, proposal-bound commit
+- `V038__artifact_mutation_attempts` adds the durable, proposal-bound commit
   receipt used for idempotency and restart reconciliation.
-- `V038__document_resources` adds source bindings plus import and immutable
+- `V039__document_resources` adds source bindings plus import and immutable
   publication journals for Workbench resources.
 
 Before an upgrade, take the normal profile/database backup and verify it is
@@ -249,10 +249,10 @@ Run all commands from the repository root unless the command changes directory.
 ```sh
 uv run pytest -q \
   tests/test_artifact_session \
-  tests/test_migrations/test_v035_artifact_sessions.py \
-  tests/test_migrations/test_v036_artifact_prompt_annotations.py \
-  tests/test_migrations/test_v037_artifact_mutation_attempts.py \
-  tests/test_migrations/test_v038_document_resources.py \
+  tests/test_migrations/test_v036_artifact_sessions.py \
+  tests/test_migrations/test_v037_artifact_prompt_annotations.py \
+  tests/test_migrations/test_v038_artifact_mutation_attempts.py \
+  tests/test_migrations/test_v039_document_resources.py \
   tests/test_gateway/test_artifact_tool_context.py \
   tests/test_gateway/test_desktop_artifact_bridge.py \
   tests/test_gateway/test_prompt_annotations.py \

@@ -11,10 +11,10 @@ from yoyo import get_backend, read_migrations
 from opensquilla.persistence.migrator import apply_pending
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MIGRATION_ID = "V036__artifact_prompt_annotations"
+MIGRATION_ID = "V037__artifact_prompt_annotations"
 
 
-def test_v036_creates_prompt_annotation_constraints_and_indexes(tmp_path: Path) -> None:
+def test_v037_creates_prompt_annotation_constraints_and_indexes(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     assert MIGRATION_ID in apply_pending(str(db_path), MIGRATIONS_DIR)
 
@@ -106,7 +106,7 @@ def test_v036_creates_prompt_annotation_constraints_and_indexes(tmp_path: Path) 
             )
 
 
-def test_v036_rolls_back_only_prompt_annotations(tmp_path: Path) -> None:
+def test_v037_rolls_back_only_prompt_annotations(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     apply_pending(str(db_path), MIGRATIONS_DIR)
     backend = get_backend("sqlite:///" + str(db_path))

@@ -627,6 +627,112 @@ def _metadata_for_meta_subagent(base_config: AgentConfig) -> dict[str, Any]:
     return metadata
 
 
+# Meta steps replace the parent's prompt and loop policy, but they execute on
+# the same physical deployment. Keep the inherited contract explicit and
+# narrow: model/request budgets, compaction, and recoverable tool-result
+# storage. Dynamic prompt state, output schemas, forced tool choices, memory
+# flush, and benchmark/endgame behavior intentionally fall back to clean
+# defaults.
+_META_SUBAGENT_REQUEST_FIELDS = (
+    "timeout",
+    "iteration_timeout",
+    "request_timeout",
+    "tool_timeout",
+    "max_safe_tool_concurrency",
+    "max_tokens",
+    "max_turn_llm_calls",
+    "max_turn_input_tokens",
+    "max_turn_output_tokens",
+    "max_turn_billed_cost_usd",
+    "max_turn_cost_usd",
+    "max_turn_tool_errors",
+    "temperature",
+    "top_p",
+    "thinking",
+    "thinking_budget_tokens",
+    "stop_sequences",
+    "model_id",
+    "provider_id",
+    "context_window_tokens",
+    "context_window_tokens_global_override",
+    "context_overflow_threshold",
+    "max_overflow_retries",
+    "max_history_turns",
+    "max_provider_retries",
+    "length_capped_continuations",
+    "retry_base_backoff_ms",
+    "retry_max_backoff_ms",
+    "reasoning_only_thinking_fallback",
+    "provider_error_thinking_fallback",
+    "reasoning_prefill_recovery_mode",
+    "cache_mode",
+    "model_capabilities",
+)
+_META_SUBAGENT_COMPACTION_FIELDS = (
+    "compaction_profile",
+    "compaction_protected_recent_messages",
+    "compaction_total_timeout_seconds",
+    "compaction_heartbeat_interval_seconds",
+    "compaction_execution_plan",
+    "compaction_execution_plan_factory",
+)
+_META_SUBAGENT_RECOVERY_FIELDS = (
+    "tool_result_projection_max_inline_chars",
+    "tool_result_fresh_diagnostic_policy_enabled",
+    "tool_result_diagnostic_retrieval_gate_enabled",
+    "tool_result_fresh_diagnostic_inline_max_chars",
+    "tool_result_dispatch_max_chars",
+    "tool_result_dispatch_turn_max_chars",
+    "tool_result_provider_request_max_chars",
+    "provider_request_proof_max_chars",
+    "provider_request_proof_max_chars_explicit",
+    "tool_use_argument_provider_request_max_chars",
+    "tool_use_argument_projection_enabled",
+    "tool_result_external_keep_recent",
+    "runtime_events_path",
+    "tool_result_store_dir",
+    "tool_result_store_session_id",
+    "tool_result_store_session_key",
+    "tool_result_store_agent_id",
+    "tool_result_store_full_trace",
+    "tool_result_store_max_bytes",
+    "tool_result_store_disk_budget_bytes",
+    "tool_result_store_retention_seconds",
+    "provider_call_observer",
+)
+
+
+def _derive_meta_subagent_config(
+    base_config: AgentConfig,
+    *,
+    system_prompt: str,
+    workspace_dir: str | None,
+) -> AgentConfig:
+    inherited_fields = (
+        _META_SUBAGENT_REQUEST_FIELDS
+        + _META_SUBAGENT_COMPACTION_FIELDS
+        + _META_SUBAGENT_RECOVERY_FIELDS
+    )
+    inherited = {name: getattr(base_config, name) for name in inherited_fields}
+    inherited["stop_sequences"] = list(base_config.stop_sequences)
+    configured_iterations = max(0, int(base_config.max_iterations or 0))
+    inherited.update(
+        {
+            "max_iterations": min(configured_iterations or 30, 30),
+            "system_prompt": system_prompt,
+            "extra_system_prompt": None,
+            "cache_breakpoints": (
+                [{"text": system_prompt, "cache": "true"}]
+                if base_config.cache_breakpoints
+                else None
+            ),
+            "workspace_dir": workspace_dir,
+            "metadata": _metadata_for_meta_subagent(base_config),
+        }
+    )
+    return AgentConfig(**inherited)
+
+
 class MetaOrchestrator:
     """Run one MetaPlan end-to-end with per-step kind dispatch.
 
@@ -2132,6 +2238,11 @@ def make_agent_runner_from_parent(
                 ):
                     return await tool_handler(call)
 
+            setattr(
+                _child_tool_handler,
+                "_opensquilla_available_tools",
+                getattr(tool_handler, "_opensquilla_available_tools", frozenset()),
+            )
             child_tool_handler = _child_tool_handler
         # Per-call recovery: prefer the live tool_context's workspace_dir
         # over the (possibly stale or None) factory closure value. The
@@ -2187,19 +2298,14 @@ def make_agent_runner_from_parent(
                 f"approval."
             )
 
-        sub_config = AgentConfig(
-            model_id=getattr(base_config, "model_id", None),
-            provider_id=getattr(base_config, "provider_id", ""),
-            max_iterations=min(getattr(base_config, "max_iterations", 30), 30),
+        sub_config = _derive_meta_subagent_config(
+            base_config,
             system_prompt=sub_system_prompt,
-            extra_system_prompt=None,
-            metadata=_metadata_for_meta_subagent(base_config),
-            # Forward the resolved workspace_dir so sub-Agent's write_file /
-            # memory_save / shell tools resolve paths inside the operator's
-            # workspace rather than falling back to process cwd. Without
-            # this, sub-Agents trip workspace_strict ToolError loops in the
-            # persist / publish_artifact steps of multi-step DAGs.
-            workspace_dir=workspace_dir,
+            # Use the live per-call workspace for both prompt grounding and
+            # tool resolution. The factory closure may be stale after a session
+            # rebind, while effective_workspace_dir was resolved immediately
+            # above from the current ToolContext.
+            workspace_dir=effective_workspace_dir,
         )
 
         # Strip meta_invoke from the sub-Agent's tool surface so a step

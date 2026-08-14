@@ -11,10 +11,10 @@ from yoyo import get_backend, read_migrations
 from opensquilla.persistence.migrator import apply_pending
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
-MIGRATION_ID = "V037__artifact_mutation_attempts"
+MIGRATION_ID = "V038__artifact_mutation_attempts"
 
 
-def _apply_through_v036(db_path: Path) -> None:
+def _apply_through_v037(db_path: Path) -> None:
     backend = get_backend("sqlite:///" + str(db_path))
     try:
         migrations = read_migrations(str(MIGRATIONS_DIR)).filter(
@@ -59,9 +59,9 @@ def _seed_document(conn: sqlite3.Connection, suffix: str) -> None:
     )
 
 
-def test_v037_upgrades_v036_profile_and_enforces_receipt_constraints(tmp_path: Path) -> None:
+def test_v038_upgrades_v037_profile_and_enforces_receipt_constraints(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
-    _apply_through_v036(db_path)
+    _apply_through_v037(db_path)
     with sqlite3.connect(db_path) as conn:
         _seed_document(conn, "1")
         _seed_document(conn, "2")
@@ -162,7 +162,7 @@ def test_v037_upgrades_v036_profile_and_enforces_receipt_constraints(tmp_path: P
         )
 
 
-def test_v037_rolls_back_only_mutation_attempt_receipts(tmp_path: Path) -> None:
+def test_v038_rolls_back_only_mutation_attempt_receipts(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     apply_pending(str(db_path), MIGRATIONS_DIR)
     backend = get_backend("sqlite:///" + str(db_path))

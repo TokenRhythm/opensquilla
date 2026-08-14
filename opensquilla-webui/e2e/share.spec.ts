@@ -474,11 +474,12 @@ test.describe('Share mode interaction shell', () => {
       includeAssistantMeta: true,
       includeTurnOutcome: true,
     })
-    const receipt = page.getByTestId('assistant-activity')
-    await expect(receipt).toBeVisible()
-    await receipt.getByRole('button').click()
-    await expect(receipt.locator('[data-turn-usage-details]')).toContainText(SEEDED_MODEL)
-    await expect(receipt.locator('[data-turn-usage-details]')).toContainText(SEEDED_COST)
+    const usageTrigger = page.locator('.msg-ai .msg-meta__more-btn')
+    await expect(usageTrigger).toBeVisible()
+    await usageTrigger.click()
+    const usagePopover = page.locator('.msg-ai .msg-meta-popover')
+    await expect(usagePopover).toContainText(SEEDED_MODEL)
+    await expect(usagePopover).toContainText(SEEDED_COST)
     await enterShareMode(page)
 
     // Select both bubbles, then Save renders the PNG and opens the preview.

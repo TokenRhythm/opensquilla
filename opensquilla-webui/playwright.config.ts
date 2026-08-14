@@ -20,7 +20,16 @@ const webServer = managedServer === 'gateway'
       reuseExistingServer: false,
       timeout: 120_000,
     }
-  : managedServer === '1'
+  : managedServer === 'preview'
+    ? {
+        // Release-gate path: serve the already-built artifact rather than
+        // compiling modules on demand through the Vite development server.
+        command: `npm run preview -- --host 127.0.0.1 --port ${gatewayPort} --strictPort --base /control/`,
+        url: `${baseURL.replace(/\/$/, '')}/control/`,
+        reuseExistingServer: false,
+        timeout: 120_000,
+      }
+    : managedServer === '1'
     ? {
         command: `npm run dev -- --host 127.0.0.1 --port ${gatewayPort} --strictPort`,
         url: `${baseURL.replace(/\/$/, '')}/control/`,

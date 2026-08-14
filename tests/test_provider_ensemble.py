@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any, Literal
@@ -503,6 +503,28 @@ async def test_heartbeat_wrapper_still_times_out_when_no_event_completed(
         async for _ in wrapped:
             pass
     release.set()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_wrapper_idle_timeout_excludes_consumer_processing() -> None:
+    async def _source() -> AsyncIterator[StreamEvent]:
+        yield TextDeltaEvent(text="first")
+        yield DoneEvent(model="m")
+
+    wrapped = _stream_with_heartbeats(
+        _source(),
+        phase="unit",
+        message="waiting",
+        timeout_seconds=0.02,
+        reset_deadline_on_event=True,
+    )
+    events: list[StreamEvent] = []
+    async for event in wrapped:
+        events.append(event)
+        if isinstance(event, TextDeltaEvent):
+            await asyncio.sleep(0.05)
+
+    assert [type(event) for event in events] == [TextDeltaEvent, DoneEvent]
 
 
 def _tool() -> ToolDefinition:
@@ -3734,7 +3756,7 @@ async def test_aggregator_empty_incomplete_stream_is_retried_in_place(
 
 
 @pytest.mark.asyncio
-async def test_aggregator_timeout_before_content_is_retried_in_place(
+async def test_aggregator_timeout_before_content_is_terminal_without_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry(
@@ -3778,12 +3800,11 @@ async def test_aggregator_timeout_before_content_is_retried_in_place(
 
     events = await _collect(provider)
 
-    assert call_count[0] == 2
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.usage_missing_count == 1
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["final_request"]["retry_count"] == 1
+    assert call_count[0] == 1
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_aggregator_timeout"
+    assert error.usage_missing_count == 1
+    assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 @pytest.mark.asyncio
@@ -4123,13 +4144,540 @@ async def test_ensemble_emits_proposer_progress_events(
     assert next(row for row in rows if row["role"] == "aggregator")["elapsed_ms"] >= 0
 
 
+class _ScriptedProvider(_ExactProjectionMixin):
+    def __init__(
+        self,
+        stream_factory: Callable[[], AsyncIterator[StreamEvent]],
+        *,
+        provider_name: str,
+    ) -> None:
+        self._stream_factory = stream_factory
+        self.provider_name = provider_name
+        self.calls: list[dict[str, Any]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "tools": tools,
+                "config": config,
+            }
+        )
+        return self._stream_factory()
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+def _aggregator_timeout_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    aggregator_stream: Callable[[], AsyncIterator[StreamEvent]],
+    fallback_stream: Callable[[], AsyncIterator[StreamEvent]] | None,
+    proposer_done: DoneEvent | None = None,
+    timeout_seconds: float = 0.01,
+    all_failed_policy: Literal["fallback_single", "error"] = "fallback_single",
+    selection_plan: dict[str, Any] | None = None,
+) -> tuple[
+    EnsembleProvider,
+    _FakeRegistry,
+    _ScriptedProvider,
+    _ScriptedProvider | None,
+]:
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_AGGREGATOR_RETRY_BACKOFF_SECONDS",
+        (0.0,),
+    )
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft"),
+                    proposer_done or DoneEvent(model="p1"),
+                ]
+            )
+        }
+    )
+    aggregator = _ScriptedProvider(aggregator_stream, provider_name="fake")
+    fallback = (
+        _ScriptedProvider(fallback_stream, provider_name="fallback")
+        if fallback_stream is not None
+        else None
+    )
+
+    def build_provider(cfg: ProviderConfig) -> Any:
+        if cfg.model == "agg":
+            return aggregator
+        return registry.provider_for(cfg)
+
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", build_provider)
+    provider = EnsembleProvider(
+        profile_name="default",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=fallback,
+        fallback_provider_name="fallback",
+        fallback_model="fallback",
+        all_failed_policy=all_failed_policy,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=timeout_seconds,
+        shuffle_candidates=False,
+        selection_plan=selection_plan,
+    )
+    return provider, registry, aggregator, fallback
+
+
+@pytest.mark.asyncio
+async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proposer_receipt = ProviderBillingReceipt(
+        currency="USD",
+        status="confirmed",
+        amount_nanos=1_000,
+        usd_equivalent_nanos=1_000,
+        fx_native_per_usd_nanos=1_000_000_000,
+    )
+    fallback_receipt = replace(
+        proposer_receipt,
+        amount_nanos=2_000,
+        usd_equivalent_nanos=2_000,
+    )
+
+    async def stalled_aggregator() -> AsyncIterator[StreamEvent]:
+        await asyncio.sleep(0.05)
+        yield DoneEvent(model="agg")
+
+    async def successful_fallback() -> AsyncIterator[StreamEvent]:
+        yield TextDeltaEvent(text="fallback")
+        yield DoneEvent(
+            input_tokens=11,
+            output_tokens=5,
+            billed_cost=0.000002,
+            cost_source="provider_billed",
+            model="fallback",
+            billing_receipt=fallback_receipt,
+        )
+
+    selection_plan = {
+        "configured_aggregator_timeout_seconds": 3600.0,
+        "effective_aggregator_timeout_seconds": 0.01,
+    }
+    provider, registry, aggregator, fallback = _aggregator_timeout_harness(
+        monkeypatch,
+        aggregator_stream=stalled_aggregator,
+        fallback_stream=successful_fallback,
+        proposer_done=DoneEvent(
+            input_tokens=7,
+            output_tokens=3,
+            billed_cost=0.000001,
+            cost_source="provider_billed",
+            model="p1",
+            billing_receipt=proposer_receipt,
+        ),
+        selection_plan=selection_plan,
+    )
+
+    events = await _collect(provider)
+
+    assert [call["model"] for call in registry.calls] == ["p1"]
+    # A completed idle budget immediately selects the safe fallback path;
+    # retrying the aggregator would repeat a full, potentially billed stall.
+    assert len(aggregator.calls) == 1
+    assert fallback is not None and len(fallback.calls) == 1
+    fallback_messages = fallback.calls[0]["messages"]
+    assert [(message.role, message.content) for message in fallback_messages] == [
+        ("user", "answer this")
+    ]
+    assert "<CANDIDATE" not in str(fallback_messages)
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert [
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ] == ["fallback"]
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert (done.input_tokens, done.output_tokens) == (18, 8)
+    assert [row["role"] for row in done.model_usage_breakdown] == [
+        "proposer",
+        "fallback_single",
+    ]
+    assert [row["billing_receipt"] for row in done.model_usage_breakdown] == [
+        proposer_receipt,
+        fallback_receipt,
+    ]
+    assert done.billing_receipt is None
+    assert done.usage_missing_count == 1
+
+    trace = done.ensemble_trace
+    assert trace is not None
+    assert trace["fallback_used"] is True
+    assert trace["fallback_code"] == "ensemble_aggregator_timeout"
+    assert "no stream events" in trace["fallback_reason"]
+    assert trace["aggregator_timeout_mode"] == "idle"
+    assert trace["aggregator_total_deadline_source"] == "outer_turn_runtime"
+    assert trace["selection_plan"] == selection_plan
+    assert trace["llm_request_count"] == 3
+    assert trace["final_request"]["role"] == "fallback_single"
+    assert trace["final_request"]["output"]["text"] == "fallback"
+    prior_request = trace["prior_final_request"]
+    assert prior_request["request_started"] is True
+    assert prior_request["execution"]["model"] == "agg"
+    assert prior_request.get("retry_count", 0) == 0
+    assert prior_request["terminal_code"] == "ensemble_aggregator_timeout"
+
+    aggregator_finish = next(
+        event
+        for event in events
+        if isinstance(event, EnsembleProgressEvent) and event.event_type == "aggregator_finish"
+    )
+    fallback_heartbeat = next(
+        event
+        for event in events
+        if isinstance(event, ProviderHeartbeatEvent) and event.phase == "ensemble_fallback"
+    )
+    fallback_delta = next(
+        event
+        for event in events
+        if isinstance(event, TextDeltaEvent) and event.text == "fallback"
+    )
+    assert (
+        events.index(aggregator_finish)
+        < events.index(fallback_heartbeat)
+        < events.index(fallback_delta)
+        < events.index(done)
+    )
+    usage = normalize_provider_usage(
+        done,
+        default_provider="ensemble",
+        default_model="fallback",
+        completed_at_ms=1234,
+    )
+    assert len(usage.items) == 2
+    assert usage.missing_usage_entries == 1
+
+
+@pytest.mark.asyncio
+async def test_aggregator_stream_survives_past_timeout_while_events_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def slow_steady_aggregator() -> AsyncIterator[StreamEvent]:
+        for index in range(6):
+            await asyncio.sleep(0.02)
+            yield TextDeltaEvent(text=f"chunk{index}")
+        yield DoneEvent(input_tokens=11, output_tokens=5, model="agg")
+
+    async def unused_fallback() -> AsyncIterator[StreamEvent]:
+        yield DoneEvent(model="fallback")
+
+    provider, _, _, fallback = _aggregator_timeout_harness(
+        monkeypatch,
+        aggregator_stream=slow_steady_aggregator,
+        fallback_stream=unused_fallback,
+        proposer_done=DoneEvent(input_tokens=7, output_tokens=3, model="p1"),
+        timeout_seconds=0.05,
+    )
+
+    events = await _collect(provider)
+
+    assert fallback is not None and fallback.calls == []
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        f"chunk{index}" for index in range(6)
+    ]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert [row["role"] for row in done.model_usage_breakdown] == [
+        "proposer",
+        "aggregator",
+    ]
+    assert done.usage_missing_count == 0
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["llm_request_count"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "partial_event",
+    [
+        TextDeltaEvent(text="partial"),
+        ReasoningDeltaEvent(text="thinking"),
+        ToolUseStartEvent(tool_use_id="call-1", tool_name="lookup"),
+    ],
+    ids=["text", "reasoning", "tool"],
+)
+async def test_aggregator_partial_output_idle_timeout_is_terminal_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    partial_event: StreamEvent,
+) -> None:
+    async def partial_aggregator() -> AsyncIterator[StreamEvent]:
+        yield partial_event
+        await asyncio.sleep(0.05)
+        yield DoneEvent(model="agg")
+
+    async def duplicate_fallback() -> AsyncIterator[StreamEvent]:
+        yield TextDeltaEvent(text="duplicate")
+        yield DoneEvent(model="fallback")
+
+    provider, _, _, fallback = _aggregator_timeout_harness(
+        monkeypatch,
+        aggregator_stream=partial_aggregator,
+        fallback_stream=duplicate_fallback,
+        proposer_done=DoneEvent(input_tokens=7, output_tokens=3, model="p1"),
+    )
+
+    events = await _collect(provider)
+
+    assert fallback is not None and fallback.calls == []
+    assert partial_event in events
+    assert not any(
+        isinstance(event, TextDeltaEvent) and event.text == "duplicate" for event in events
+    )
+    progress = [
+        event
+        for event in events
+        if isinstance(event, EnsembleProgressEvent) and event.event_type.startswith("aggregator_")
+    ]
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert [event.event_type for event in progress] == [
+        "aggregator_start",
+        "aggregator_finish",
+    ]
+    assert error.code == "ensemble_aggregator_timeout"
+    assert error.usage_missing_count == 1
+    assert events.index(progress[-1]) < events.index(error)
+
+
+@pytest.mark.asyncio
+async def test_aggregator_timeout_respects_error_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stalled_aggregator() -> AsyncIterator[StreamEvent]:
+        await asyncio.sleep(0.05)
+        yield DoneEvent(model="agg")
+
+    async def unused_fallback() -> AsyncIterator[StreamEvent]:
+        yield DoneEvent(model="fallback")
+
+    provider, _, _, fallback = _aggregator_timeout_harness(
+        monkeypatch,
+        aggregator_stream=stalled_aggregator,
+        fallback_stream=unused_fallback,
+        all_failed_policy="error",
+    )
+
+    events = await _collect(provider)
+
+    assert fallback is not None and fallback.calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_aggregator_timeout"
+    assert error.usage_missing_count == 1
+
+
+@pytest.mark.asyncio
+async def test_aggregator_timeout_then_fallback_error_counts_both_missing_requests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def stalled_aggregator() -> AsyncIterator[StreamEvent]:
+        await asyncio.sleep(0.05)
+        yield DoneEvent(model="agg")
+
+    async def failing_fallback() -> AsyncIterator[StreamEvent]:
+        yield ErrorEvent(message="fallback failed", code="fallback_failed")
+
+    provider, _, _, fallback = _aggregator_timeout_harness(
+        monkeypatch,
+        aggregator_stream=stalled_aggregator,
+        fallback_stream=failing_fallback,
+        proposer_done=DoneEvent(input_tokens=7, output_tokens=3, model="p1"),
+    )
+
+    events = await _collect(provider)
+
+    assert fallback is not None and len(fallback.calls) == 1
+    errors = [event for event in events if isinstance(event, ErrorEvent)]
+    assert len(errors) == 1
+    assert errors[0].code == "fallback_failed"
+    assert [row["model"] for row in errors[0].model_usage_breakdown] == ["p1"]
+    assert errors[0].usage_missing_count == 2
+
+
+@pytest.mark.asyncio
+async def test_aggregator_retries_then_timeout_preserves_request_counts_in_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    aggregator_attempts = 0
+
+    def retry_then_stall() -> AsyncIterator[StreamEvent]:
+        nonlocal aggregator_attempts
+        aggregator_attempts += 1
+        attempt = aggregator_attempts
+
+        async def stream() -> AsyncIterator[StreamEvent]:
+            if attempt <= 2:
+                yield ErrorEvent(message="upstream rate limit", code="429")
+                return
+            await asyncio.sleep(0.05)
+            yield DoneEvent(model="agg")
+
+        return stream()
+
+    async def successful_fallback() -> AsyncIterator[StreamEvent]:
+        yield DoneEvent(input_tokens=11, output_tokens=5, model="fallback")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_AGGREGATOR_RETRY_BACKOFF_SECONDS",
+        (0.0,),
+    )
+    provider, _, _, fallback = _aggregator_timeout_harness(
+        monkeypatch,
+        aggregator_stream=retry_then_stall,
+        fallback_stream=successful_fallback,
+        proposer_done=DoneEvent(input_tokens=7, output_tokens=3, model="p1"),
+    )
+
+    events = await _collect(provider)
+
+    assert aggregator_attempts == 3
+    assert fallback is not None and len(fallback.calls) == 1
+    assert (
+        len(
+            [
+                event
+                for event in events
+                if isinstance(event, EnsembleProgressEvent)
+                and event.event_type == "aggregator_finish"
+            ]
+        )
+        == 1
+    )
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.usage_missing_count == 3
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["llm_request_count"] == 5
+    assert done.ensemble_trace["prior_final_request"]["retry_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_aggregator_timeout_fallback_retains_reported_retry_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    aggregator_attempts = 0
+
+    def reported_error_then_stall() -> AsyncIterator[StreamEvent]:
+        nonlocal aggregator_attempts
+        aggregator_attempts += 1
+        attempt = aggregator_attempts
+
+        async def stream() -> AsyncIterator[StreamEvent]:
+            if attempt == 1:
+                yield DoneEvent(
+                    input_tokens=13,
+                    output_tokens=1,
+                    model="agg",
+                    stop_reason="error",
+                )
+                return
+            await asyncio.sleep(0.05)
+            yield DoneEvent(model="agg")
+
+        return stream()
+
+    async def successful_fallback() -> AsyncIterator[StreamEvent]:
+        yield DoneEvent(input_tokens=11, output_tokens=5, model="fallback")
+
+    provider, _, aggregator, fallback = _aggregator_timeout_harness(
+        monkeypatch,
+        aggregator_stream=reported_error_then_stall,
+        fallback_stream=successful_fallback,
+        proposer_done=DoneEvent(input_tokens=7, output_tokens=3, model="p1"),
+    )
+
+    events = await _collect(provider)
+
+    assert aggregator_attempts == 2
+    assert len(aggregator.calls) == 2
+    assert fallback is not None and len(fallback.calls) == 1
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert (done.input_tokens, done.output_tokens) == (31, 9)
+    assert [row["role"] for row in done.model_usage_breakdown] == [
+        "proposer",
+        "aggregator",
+        "fallback_single",
+    ]
+    retry_row = done.model_usage_breakdown[1]
+    assert retry_row["attempt_index"] == 1
+    assert retry_row["attempt_ok"] is False
+    assert retry_row["usage_reported"] is True
+    assert done.usage_missing_count == 1
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["llm_request_count"] == 4
+    assert done.ensemble_trace["prior_final_request"]["retry_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_aggregator_timeout_cleanup_is_bounded_before_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    cancellation_seen = asyncio.Event()
+    closed = asyncio.Event()
+
+    async def cancellation_resistant_aggregator() -> AsyncIterator[StreamEvent]:
+        try:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+            yield TextDeltaEvent(text="late-after-timeout")
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+
+    async def successful_fallback() -> AsyncIterator[StreamEvent]:
+        yield TextDeltaEvent(text="fallback")
+        yield DoneEvent(model="fallback")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS",
+        0.005,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS",
+        0.01,
+    )
+    provider, _, _, fallback = _aggregator_timeout_harness(
+        monkeypatch,
+        aggregator_stream=cancellation_resistant_aggregator,
+        fallback_stream=successful_fallback,
+        timeout_seconds=0.02,
+    )
+
+    started = time.monotonic()
+    events = await asyncio.wait_for(_collect(provider), timeout=0.5)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.3
+    assert cancellation_seen.is_set() is True
+    assert fallback is not None and len(fallback.calls) == 1
+    assert [
+        event.text for event in events if isinstance(event, TextDeltaEvent)
+    ] == ["fallback"]
+    release.set()
+    await asyncio.wait_for(closed.wait(), timeout=0.5)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mode", "expected_code", "expected_error"),
     [
         ("error", "agg_failed", "aggregator rejected request"),
         ("incomplete", "ensemble_aggregator_incomplete", "ended before DoneEvent"),
-        ("timeout", "ensemble_aggregator_timeout", "timed out after"),
+        ("timeout", "ensemble_aggregator_timeout", "no stream events for"),
     ],
 )
 async def test_ensemble_emits_aggregator_finish_before_terminal_error(
@@ -4183,8 +4731,7 @@ async def test_ensemble_emits_aggregator_finish_before_terminal_error(
     assert expected_error in aggregator_progress[-1].error
     assert terminal_error.code == expected_code
     assert [row["model"] for row in terminal_error.model_usage_breakdown] == ["p1"]
-    expected_missing_count = 3 if mode == "timeout" else 1
-    assert terminal_error.usage_missing_count == expected_missing_count
+    assert terminal_error.usage_missing_count == 1
     assert events.index(aggregator_progress[-1]) < events.index(terminal_error)
 
 

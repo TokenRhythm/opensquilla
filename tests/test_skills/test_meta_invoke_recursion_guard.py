@@ -489,6 +489,226 @@ def test_sub_agent_metadata_excludes_outer_meta_activation_controls() -> None:
     assert "meta_match_tool_surface_restricted" not in metadata
 
 
+def test_meta_sub_agent_inherits_physical_request_contract_without_outer_state(
+    tmp_path,
+) -> None:
+    """A meta Agent step keeps the parent's physical deployment contract.
+
+    Prompt-local state belongs to the outer turn and must be rebuilt for the
+    one-shot sub-Agent.  In contrast, request budgets, compaction policy, and
+    recoverable-result storage describe the physical deployment and must not
+    silently fall back to :class:`AgentConfig` defaults.
+    """
+    from opensquilla.engine.types import AgentConfig, ThinkingLevel
+    from opensquilla.skills.meta.orchestrator import _derive_meta_subagent_config
+
+    observer = lambda **_kwargs: None  # noqa: E731
+    capabilities = object()
+    execution_plan = object()
+
+    def execution_plan_factory() -> object:
+        return execution_plan
+
+    parent = AgentConfig(
+        model_id="provider/model-v2",
+        provider_id="provider-v2",
+        model_capabilities=capabilities,
+        context_window_tokens=262_144,
+        context_window_tokens_global_override=196_608,
+        context_overflow_threshold=0.79,
+        max_overflow_retries=5,
+        max_history_turns=17,
+        max_tokens=32_768,
+        max_turn_output_tokens=98_765,
+        thinking=ThinkingLevel.HIGH,
+        thinking_budget_tokens=24_000,
+        cache_mode="on",
+        cache_breakpoints=[{"text": "outer prompt", "cache": "true"}],
+        timeout=901.0,
+        iteration_timeout=902.0,
+        request_timeout=903.0,
+        tool_timeout=904.0,
+        max_provider_retries=7,
+        length_capped_continuations=8,
+        retry_base_backoff_ms=1_234,
+        retry_max_backoff_ms=56_789,
+        reasoning_only_thinking_fallback=True,
+        provider_error_thinking_fallback=False,
+        reasoning_prefill_recovery_mode="recover",
+        stop_sequences=["STOP-A", "STOP-B"],
+        flush_enabled=True,
+        flush_triggers=["manual", "pre_compaction"],
+        flush_pre_compaction=True,
+        compaction_profile="research",
+        compaction_protected_recent_messages=9,
+        compaction_total_timeout_seconds=321.0,
+        compaction_heartbeat_interval_seconds=7.0,
+        compaction_execution_plan=execution_plan,
+        compaction_execution_plan_factory=execution_plan_factory,
+        tool_result_projection_max_inline_chars=54_321,
+        tool_result_provider_request_max_chars=45_678,
+        provider_request_proof_max_chars=34_567,
+        provider_request_proof_max_chars_explicit=True,
+        tool_result_store_dir=str(tmp_path / "tool-results"),
+        tool_result_store_session_id="session-1",
+        tool_result_store_session_key="session-key-1",
+        tool_result_store_agent_id="agent-1",
+        tool_result_store_full_trace=True,
+        tool_result_store_max_bytes=1_000_001,
+        tool_result_store_disk_budget_bytes=2_000_002,
+        tool_result_store_retention_seconds=3_003,
+        runtime_events_path=str(tmp_path / "runtime.jsonl"),
+        provider_call_observer=observer,
+        max_iterations=0,
+        system_prompt="outer system",
+        extra_system_prompt="outer extra",
+        request_context_prompt="outer request context",
+        skills_context_prompt="outer skill context",
+        output_json_schema={"type": "object", "required": ["outer"]},
+        output_json_schema_strict=False,
+        metadata={
+            "meta_match": object(),
+            "meta_match_tool_choice": {"name": "meta_invoke"},
+            "meta_match_tool_surface_restricted": True,
+            "meta_skill_runtime_env_provider": object(),
+            "keep": "still-visible",
+        },
+    )
+
+    child = _derive_meta_subagent_config(
+        parent,
+        system_prompt="sub system",
+        workspace_dir="/live/workspace",
+    )
+
+    # Physical provider/model, context, output, thinking and cache policy.
+    assert child.model_id == "provider/model-v2"
+    assert child.provider_id == "provider-v2"
+    assert child.model_capabilities is capabilities
+    assert child.context_window_tokens == 262_144
+    assert child.context_window_tokens_global_override == 196_608
+    assert child.context_overflow_threshold == pytest.approx(0.79)
+    assert child.max_overflow_retries == 5
+    assert child.max_history_turns == 17
+    assert child.max_tokens == 32_768
+    assert child.max_turn_output_tokens == 98_765
+    assert child.thinking is ThinkingLevel.HIGH
+    assert child.thinking_budget_tokens == 24_000
+    assert child.cache_mode == "on"
+    assert child.cache_breakpoints == [
+        {"text": "sub system", "cache": "true"}
+    ]
+
+    # Timeout/retry, compaction, recovery and observability contracts.
+    assert (child.timeout, child.iteration_timeout) == (901.0, 902.0)
+    assert (child.request_timeout, child.tool_timeout) == (903.0, 904.0)
+    assert child.max_provider_retries == 7
+    assert child.length_capped_continuations == 8
+    assert child.retry_base_backoff_ms == 1_234
+    assert child.retry_max_backoff_ms == 56_789
+    assert child.reasoning_only_thinking_fallback is True
+    assert child.provider_error_thinking_fallback is False
+    assert child.reasoning_prefill_recovery_mode == "recover"
+    # Memory flush is an outer lifecycle concern, not part of the one-shot
+    # sub-Agent's physical request/compaction contract.
+    assert child.flush_enabled is False
+    assert child.flush_triggers == ["session_reset", "manual", "idle"]
+    assert child.flush_pre_compaction is False
+    assert child.compaction_profile == "research"
+    assert child.compaction_protected_recent_messages == 9
+    assert child.compaction_total_timeout_seconds == 321.0
+    assert child.compaction_heartbeat_interval_seconds == 7.0
+    assert child.compaction_execution_plan is execution_plan
+    assert child.compaction_execution_plan_factory is execution_plan_factory
+    assert child.tool_result_projection_max_inline_chars == 54_321
+    assert child.tool_result_provider_request_max_chars == 45_678
+    assert child.provider_request_proof_max_chars == 34_567
+    assert child.provider_request_proof_max_chars_explicit is True
+    assert child.tool_result_store_dir == str(tmp_path / "tool-results")
+    assert child.tool_result_store_session_id == "session-1"
+    assert child.tool_result_store_session_key == "session-key-1"
+    assert child.tool_result_store_agent_id == "agent-1"
+    assert child.tool_result_store_full_trace is True
+    assert child.tool_result_store_max_bytes == 1_000_001
+    assert child.tool_result_store_disk_budget_bytes == 2_000_002
+    assert child.tool_result_store_retention_seconds == 3_003
+    assert child.runtime_events_path == str(tmp_path / "runtime.jsonl")
+    assert child.provider_call_observer is observer
+
+    # The sub-Agent owns a fresh prompt/loop envelope.  Parent dynamic prompt
+    # layers, output schema and forced outer meta activation never cross it.
+    assert child.max_iterations == 30
+    assert child.system_prompt == "sub system"
+    assert child.workspace_dir == "/live/workspace"
+    assert child.extra_system_prompt is None
+    assert child.request_context_prompt is None
+    assert child.skills_context_prompt is None
+    assert child.output_json_schema is None
+    assert child.output_json_schema_strict is True
+    assert child.metadata == {"keep": "still-visible"}
+
+    # Mutable policy lists and the rebuilt breakpoint belong to the child.
+    assert child.stop_sequences == parent.stop_sequences
+    assert child.stop_sequences is not parent.stop_sequences
+    assert child.flush_triggers is not parent.flush_triggers
+    assert child.cache_breakpoints is not parent.cache_breakpoints
+    child.stop_sequences.append("CHILD-ONLY")
+    child.flush_triggers.append("pre_compaction")
+    assert parent.stop_sequences == ["STOP-A", "STOP-B"]
+    assert parent.flush_triggers == ["manual", "pre_compaction"]
+    assert parent.cache_breakpoints == [
+        {"text": "outer prompt", "cache": "true"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_meta_sub_agent_uses_live_tool_context_workspace_for_prompt_and_config(
+    tmp_path,
+) -> None:
+    """The per-call ToolContext wins over the factory's stale workspace."""
+    from opensquilla.engine.types import AgentConfig
+    from opensquilla.skills.meta.orchestrator import make_agent_runner_from_parent
+    from opensquilla.tools.types import ToolContext, current_tool_context
+
+    factory_workspace = tmp_path / "factory-workspace"
+    live_workspace = tmp_path / "live-workspace"
+    captured: dict[str, Any] = {}
+
+    def agent_factory(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+
+        class _DummyAgent:
+            async def run_turn(self, _msg: str):
+                if False:
+                    yield None  # pragma: no cover
+
+        return _DummyAgent()
+
+    runner = make_agent_runner_from_parent(
+        provider=None,  # type: ignore[arg-type]
+        base_config=AgentConfig(model_id="stub"),
+        tool_definitions=[],
+        tool_handler=None,
+        agent_factory=agent_factory,
+        workspace_dir=str(factory_workspace),
+    )
+
+    token = current_tool_context.set(
+        ToolContext(workspace_dir=str(live_workspace), is_owner=True)
+    )
+    try:
+        async for _ in runner("skill system", "user task"):
+            pass
+    finally:
+        current_tool_context.reset(token)
+
+    config = captured["config"]
+    assert config.workspace_dir == str(live_workspace)
+    assert "skill system" in config.system_prompt
+    assert f"`{live_workspace}`" in config.system_prompt
+    assert str(factory_workspace) not in config.system_prompt
+
+
 # ---------------------------------------------------------------------------
 # Change 2: depth + per-turn cap enforcement in _run_one_streaming
 # ---------------------------------------------------------------------------

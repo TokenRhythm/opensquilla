@@ -4,12 +4,12 @@ import { createPinia } from 'pinia'
 import { createApp, nextTick, type App } from 'vue'
 
 import i18n from '@/i18n'
-import type { ChatRenderedMessage } from '@/types/chat'
+import type { ChatRenderedMessage, DisplayAttachment } from '@/types/chat'
 import ChatMessageList from './ChatMessageList.vue'
 
 const apps: App<Element>[] = []
 
-function user(id: string, turnKey: string): ChatRenderedMessage {
+function user(id: string, turnKey: string, turnId?: string): ChatRenderedMessage {
   return {
     id,
     messageId: id,
@@ -20,6 +20,77 @@ function user(id: string, turnKey: string): ChatRenderedMessage {
     text: `Question ${id}`,
     timeStr: '',
     showHeader: false,
+    turnId,
+  }
+}
+
+function usageBarrierError(
+  id: string,
+  turnId: string,
+  userMessageId?: string,
+): ChatRenderedMessage {
+  return {
+    id,
+    messageId: id,
+    turnId,
+    role: 'error',
+    displayRole: 'error',
+    roleLabel: 'Error',
+    text: 'Usage accounting temporarily unavailable.',
+    timeStr: '',
+    showHeader: true,
+    errorCode: 'usage_accounting_busy',
+    turnOutcome: {
+      turnId,
+      status: 'failed',
+      usageCallIndex: 1,
+      noPriorProviderDispatch: true,
+      replaySafe: true,
+      ...(userMessageId ? { userMessageId } : {}),
+    },
+  }
+}
+
+function usageBarrierAssistant(
+  id: string,
+  turnId: string,
+  userMessageId: string,
+  usageCallIndex: number,
+): ChatRenderedMessage {
+  return {
+    id,
+    messageId: id,
+    turnId,
+    turnKey: `turn:${turnId}`,
+    role: 'assistant',
+    displayRole: 'assistant',
+    roleLabel: 'Assistant',
+    text: '',
+    timeStr: '',
+    showHeader: false,
+    parts: [],
+    statusHistory: [],
+    turnOutcome: {
+      turnId,
+      status: 'failed',
+      errorClass: 'usage_accounting_busy',
+      usageCallIndex,
+      noPriorProviderDispatch: usageCallIndex === 1,
+      replaySafe: usageCallIndex === 1,
+      userMessageId,
+    },
+  }
+}
+
+function displayAttachment(kind: DisplayAttachment['kind']): DisplayAttachment {
+  return {
+    kind,
+    displayId: `history:${kind}`,
+    renderKey: `history:${kind}`,
+    name: `${kind}.txt`,
+    mime: 'text/plain',
+    ...(kind === 'inline' ? { downloadData: 'cmVxdWVzdA==' } : {}),
+    ...(kind === 'staged' ? { sha256_ref: 'a'.repeat(64) } : {}),
   }
 }
 
@@ -126,5 +197,86 @@ describe('ChatMessageList fork targets', () => {
     ], { isStreaming: true })
 
     expect(host.querySelector('[data-testid="fork-conversation"]')).toBeNull()
+  })
+})
+
+describe('ChatMessageList usage barrier retry anchor', () => {
+  it('shows Retry when the durable same-turn user is loaded', () => {
+    const { host } = mountList([
+      user('user-safe', 'turn:safe', 'turn-safe'),
+      user('user-steer', 'turn:safe-steer', 'turn-safe'),
+      usageBarrierError('error-safe', 'turn-safe', 'user-safe'),
+    ])
+
+    expect(host.querySelector('.msg-error-card__resume')?.textContent).toContain('Retry')
+  })
+
+  it('hides Retry when pagination only retained a previous-turn user', () => {
+    const { host } = mountList([
+      user('user-old', 'turn:old', 'turn-old'),
+      usageBarrierError('error-new', 'turn-new', 'user-new'),
+    ])
+
+    expect(host.querySelector('.msg-error-card__resume')).toBeNull()
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['wrong', 'user-steer'],
+  ])('hides Retry when the primary-user identity is %s', (_label, userMessageId) => {
+    const { host } = mountList([
+      user('user-primary', 'turn:safe', 'turn-safe'),
+      usageBarrierError('error-safe', 'turn-safe', userMessageId),
+    ])
+
+    expect(host.querySelector('.msg-error-card__resume')).toBeNull()
+  })
+
+  it.each(['inline', 'staged', 'file'] as const)(
+    'hides Retry when the primary request has a %s display attachment',
+    (kind) => {
+      const primary = user('user-primary', 'turn:safe', 'turn-safe')
+      primary.attachments = [displayAttachment(kind)]
+      const { host } = mountList([
+        primary,
+        usageBarrierError('error-safe', 'turn-safe', 'user-primary'),
+      ])
+
+      expect(host.querySelector('.msg-error-card__resume')).toBeNull()
+    },
+  )
+})
+
+describe('ChatMessageList assistant usage barrier regenerate', () => {
+  it('hides Regenerate for an unsafe status-only barrier with a same-turn steer', () => {
+    const { host } = mountList([
+      user('user-primary', 'turn:primary', 'turn-safe'),
+      user('user-steer', 'turn:steer', 'turn-safe'),
+      usageBarrierAssistant('assistant-status', 'turn-safe', 'user-primary', 2),
+    ])
+
+    expect(host.querySelector('[aria-label="Regenerate"]')).toBeNull()
+  })
+
+  it('keeps Regenerate for a safe status-only barrier anchored to the primary user', () => {
+    const { host } = mountList([
+      user('user-primary', 'turn:primary', 'turn-safe'),
+      user('user-steer', 'turn:steer', 'turn-safe'),
+      usageBarrierAssistant('assistant-status', 'turn-safe', 'user-primary', 1),
+    ])
+
+    expect(host.querySelector('[aria-label="Regenerate"]')).not.toBeNull()
+  })
+
+  it('hides Regenerate when a safe status-only barrier points to a request with attachments', () => {
+    const primary = user('user-primary', 'turn:primary', 'turn-safe')
+    primary.attachments = [displayAttachment('inline')]
+    const { host } = mountList([
+      primary,
+      user('user-steer', 'turn:steer', 'turn-safe'),
+      usageBarrierAssistant('assistant-status', 'turn-safe', 'user-primary', 1),
+    ])
+
+    expect(host.querySelector('[aria-label="Regenerate"]')).toBeNull()
   })
 })

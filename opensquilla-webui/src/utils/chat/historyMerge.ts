@@ -1,5 +1,6 @@
 import type { ChatMessage } from '@/types/chat'
 import type { StatusPart } from '@/types/parts'
+import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 
 const TERMINAL_STEER_DISPOSITIONS = new Set([
   'applied',
@@ -57,7 +58,15 @@ export function rehomePromotedSteerRows(messages: ChatMessage[]): ChatMessage[] 
 // from a local Stop) and are absent from a fresh history map. Re-apply them
 // when the server snapshot lacks a richer value, keyed strictly by messageId so
 // a synthetic-key collision can never graft one turn's state onto another.
-export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): ChatMessage {
+interface LiveFieldMergeOptions {
+  preserveTurnIdentity?: boolean
+}
+
+export function mergeLiveOnlyFields(
+  prev: ChatMessage,
+  server: ChatMessage,
+  options: LiveFieldMergeOptions = {},
+): ChatMessage {
   const merged: ChatMessage = { ...server }
 
   // Keep the optimistic row identity after the backend assigns a durable
@@ -65,10 +74,24 @@ export function mergeLiveOnlyFields(prev: ChatMessage, server: ChatMessage): Cha
   // during the first authoritative history replacement.
   if (!server.clientId && prev.clientId) merged.clientId = prev.clientId
 
+  // Older history projections do not carry turn_context. Once the caller has
+  // proved that the canonical row is the same live row, retain its turn id so
+  // canonical reconciliation cannot split one logical turn into two frontend
+  // identities. A server-provided turn id always remains authoritative.
+  if (options.preserveTurnIdentity && !server.turnId && prev.turnId) {
+    merged.turnId = prev.turnId
+  }
+
   // reasoning: server wins if it measured seconds; else keep the live seconds.
   const serverSeconds = prev.role === 'assistant' ? server.reasoning?.seconds ?? 0 : 0
   if (serverSeconds <= 0 && (prev.reasoning?.seconds ?? 0) > 0) {
     merged.reasoning = prev.reasoning
+  }
+  // History currently persists the canonical concatenated reasoning text but
+  // not its physical-call boundaries. Preserve the just-finished structured
+  // blocks after this function has already proved both rows are the same turn.
+  if (!server.reasoningBlocks?.length && prev.reasoningBlocks?.length) {
+    merged.reasoningBlocks = prev.reasoningBlocks.map(block => ({ ...block }))
   }
 
   // The fold's phase snapshot supplies an exact same-session activity start.
@@ -187,7 +210,9 @@ export function reconcileHistoryMessages(prev: ChatMessage[], incoming: ChatMess
   }
   return incoming.map(server => {
     const prior = server.messageId ? prevById.get(server.messageId) : undefined
-    if (prior) return mergeLiveOnlyFields(prior, server)
+    if (prior) {
+      return mergeLiveOnlyFields(prior, server, { preserveTurnIdentity: true })
+    }
 
     // The terminal stream row is optimistic and does not yet know the durable
     // message id. Graft only on a unique exact role/text match, which avoids
@@ -265,7 +290,11 @@ function reconcileOptimisticTurnFields(
     const previousAssistant = prev[previousAssistants[0]]
     const incomingAssistantIndex = incomingAssistants[0]
     const serverAssistant = merged[incomingAssistantIndex]
-    merged[incomingAssistantIndex] = mergeLiveOnlyFields(previousAssistant, serverAssistant)
+    merged[incomingAssistantIndex] = mergeLiveOnlyFields(
+      previousAssistant,
+      serverAssistant,
+      { preserveTurnIdentity: true },
+    )
     consumedOptimisticRows?.add(previousAssistant)
   })
 
@@ -476,6 +505,43 @@ export function reconcileClientTerminalNotices(
       .slice(userIndex + 1, turnEnd)
       .some(message => message.role === 'error')
     if (durableErrorExists) continue
+
+    // A retryable pre-provider failure can leave a status-only assistant with
+    // no durable message id while the terminal task projection is still
+    // catching up. Preserve that activity only when both snapshots prove the
+    // same durable user id and exact turn id. Once canonical history carries a
+    // same-turn status snapshot, it replaces this optimistic row naturally.
+    const exactTurnId = notice.turnId?.trim()
+    const previousUser = prev[priorUserIndex]
+    const exactIncomingUserIndex = exactTurnId && previousUser?.messageId
+      ? merged.findIndex(message =>
+          message.role === 'user'
+          && message.messageId === previousUser.messageId
+          && message.turnId === exactTurnId,
+        )
+      : -1
+    if (
+      isUsageAccountingBarrier(notice.errorCode)
+      && exactIncomingUserIndex >= 0
+      && previousUser.turnId === exactTurnId
+    ) {
+      const optimisticActivities = prev.slice(priorUserIndex + 1, i).filter(message =>
+        message.role === 'assistant'
+        && message.turnId === exactTurnId
+        && !message.messageId
+        && (message.statusHistory?.length ?? 0) > 0,
+      )
+      const durableActivityExists = merged.some(message =>
+        message.role === 'assistant'
+        && message.turnId === exactTurnId
+        && Boolean(message.messageId)
+        && (message.statusHistory?.length ?? 0) > 0,
+      )
+      if (optimisticActivities.length === 1 && !durableActivityExists) {
+        merged.splice(turnEnd, 0, optimisticActivities[0]!)
+        turnEnd += 1
+      }
+    }
     merged.splice(turnEnd, 0, notice)
   }
 

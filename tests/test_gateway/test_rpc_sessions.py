@@ -36,10 +36,11 @@ from opensquilla.gateway.routing import tool_context_from_envelope
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
+from opensquilla.gateway.session_lifecycle import SessionTaskSnapshot
 from opensquilla.gateway.session_streams import SessionStreamRegistry, get_session_streams
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
-from opensquilla.project_workspaces import ProjectWorkspaceStateError
+from opensquilla.project_workspaces import ProjectWorkspaceStateError, project_path_key
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.sandbox.capability_service import CapabilityReport
@@ -1190,6 +1191,197 @@ class TestSessionsList:
         assert res.payload["totalCount"] == 201
 
     @pytest.mark.asyncio
+    async def test_session_list_view_pages_beyond_200_without_gaps(
+        self, dispatcher, tmp_path
+    ):
+        storage = SessionStorage(str(tmp_path / "sessions-page.db"))
+        await storage.connect()
+        try:
+            for index in range(201):
+                await storage.upsert_session(
+                    SessionNode(
+                        session_key=f"agent:main:webchat:session-{index:03d}",
+                        session_id=f"session-{index:03d}",
+                        agent_id="main",
+                        status="idle",
+                        created_at=1000,
+                        updated_at=1000,
+                    )
+                )
+            ctx = make_ctx(session_manager=SimpleNamespace(storage=storage))
+
+            first = await dispatcher.dispatch(
+                "page-1",
+                "sessions.list",
+                {"limit": 200, "view": "session-list-v1"},
+                ctx,
+            )
+            assert first.ok is True
+            assert first.payload["count"] == 200
+            assert first.payload["has_more"] is True
+            assert first.payload["hasMore"] is True
+            assert first.payload["next_cursor"] == first.payload["nextCursor"]
+
+            second = await dispatcher.dispatch(
+                "page-2",
+                "sessions.list",
+                {
+                    "limit": 200,
+                    "view": "session-list-v1",
+                    "cursor": first.payload["next_cursor"],
+                },
+                ctx,
+            )
+            assert second.ok is True
+            assert second.payload["count"] == 1
+            assert second.payload["has_more"] is False
+            assert second.payload["next_cursor"] is None
+
+            keys = [
+                row["key"]
+                for row in [*first.payload["sessions"], *second.payload["sessions"]]
+            ]
+            assert len(keys) == len(set(keys)) == 201
+            assert keys == sorted(keys, reverse=True)
+        finally:
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_session_list_view_round_trips_max_length_unicode_cursor_key(
+        self, dispatcher, tmp_path
+    ):
+        storage = SessionStorage(str(tmp_path / "sessions-unicode-cursor.db"))
+        await storage.connect()
+        long_key = "agent:main:webchat:" + ("😀" * 493)
+        assert len(long_key) == 512
+        try:
+            for session_key in (long_key, "agent:main:webchat:a"):
+                await storage.upsert_session(
+                    SessionNode(
+                        session_key=session_key,
+                        session_id=session_key,
+                        agent_id="main",
+                        status="idle",
+                        created_at=1000,
+                        updated_at=1000,
+                    )
+                )
+            ctx = make_ctx(session_manager=SimpleNamespace(storage=storage))
+
+            first = await dispatcher.dispatch(
+                "unicode-page-1",
+                "sessions.list",
+                {"limit": 1, "view": "session-list-v1"},
+                ctx,
+            )
+            assert first.ok is True
+            assert first.payload["sessions"][0]["key"] == long_key
+            assert first.payload["has_more"] is True
+            assert len(first.payload["next_cursor"]) > 2048
+
+            second = await dispatcher.dispatch(
+                "unicode-page-2",
+                "sessions.list",
+                {
+                    "limit": 1,
+                    "view": "session-list-v1",
+                    "cursor": first.payload["next_cursor"],
+                },
+                ctx,
+            )
+            assert second.ok is True
+            assert [row["key"] for row in second.payload["sessions"]] == [
+                "agent:main:webchat:a"
+            ]
+            assert second.payload["has_more"] is False
+        finally:
+            await storage.close()
+
+    @pytest.mark.asyncio
+    async def test_session_list_view_rejects_malformed_cursor(self, dispatcher):
+        ctx = make_ctx(session_manager=FakeSessionManager())
+
+        res = await dispatcher.dispatch(
+            "bad-cursor",
+            "sessions.list",
+            {"limit": 200, "view": "session-list-v1", "cursor": "not-a-cursor"},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+
+    @pytest.mark.parametrize(
+        ("timestamp_field", "timestamp_value"),
+        [("a", -1), ("a", 1 << 63), ("u", -1), ("u", 1 << 63)],
+    )
+    @pytest.mark.asyncio
+    async def test_session_list_view_rejects_cursor_timestamps_outside_sqlite_range(
+        self,
+        dispatcher,
+        timestamp_field,
+        timestamp_value,
+    ):
+        ctx = make_ctx(session_manager=FakeSessionManager())
+        payload = {
+            "v": 1,
+            "a": 1,
+            "u": 1,
+            "k": "agent:main:webchat:cursor-range",
+        }
+        payload[timestamp_field] = timestamp_value
+        cursor = base64.urlsafe_b64encode(
+            json.dumps(payload, separators=(",", ":")).encode()
+        ).decode().rstrip("=")
+
+        res = await dispatcher.dispatch(
+            "out-of-range-cursor",
+            "sessions.list",
+            {"limit": 200, "view": "session-list-v1", "cursor": cursor},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+
+    @pytest.mark.asyncio
+    async def test_session_list_view_rejects_non_utf8_cursor_key(self, dispatcher):
+        ctx = make_ctx(session_manager=FakeSessionManager())
+        cursor = base64.urlsafe_b64encode(
+            b'{"v":1,"a":1,"u":1,"k":"\\ud800"}'
+        ).decode().rstrip("=")
+
+        res = await dispatcher.dispatch(
+            "non-utf8-cursor",
+            "sessions.list",
+            {"limit": 200, "view": "session-list-v1", "cursor": cursor},
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+
+    @pytest.mark.asyncio
+    async def test_session_list_view_marks_legacy_storage_page_terminal(self, dispatcher):
+        ctx = make_ctx(
+            session_manager=FakeSessionManager(
+                [FakeSession(session_key="agent:main:webchat:legacy")]
+            )
+        )
+
+        res = await dispatcher.dispatch(
+            "legacy-page",
+            "sessions.list",
+            {"limit": 200, "view": "session-list-v1"},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert len(res.payload["sessions"]) == 1
+        assert res.payload["has_more"] is False
+        assert res.payload["next_cursor"] is None
+
+    @pytest.mark.asyncio
     async def test_count_view_is_scoped_to_the_guest_owner(self, dispatcher):
         owner_id = "a" * 64
         other_owner_id = "b" * 64
@@ -1392,6 +1584,27 @@ class TestSessionsList:
         assert res.payload["sessions"][0]["title"] == "Agent PM面试清单"
 
     @pytest.mark.asyncio
+    async def test_list_webchat_title_skips_flattened_tool_result(self, dispatcher):
+        session = FakeSession(
+            session_key="agent:main:webchat:tool-result-title",
+            display_name="WebChat",
+        )
+        manager = FakeSessionManager([session])
+        manager._storage._transcripts[session.session_id] = [
+            SimpleNamespace(
+                role="user",
+                content="[Tool result (call-1): internal result projection]",
+            ),
+            SimpleNamespace(role="user", content="Keep the visible request as the title"),
+        ]
+        ctx = make_ctx(session_manager=manager)
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        assert res.payload["sessions"][0]["title"] == "Keep the visible request as the..."
+
+    @pytest.mark.asyncio
     async def test_list_contract_cli_current_tui_compatible_row(self, dispatcher):
         session = FakeSession(session_key="agent:main:cli:a1b2c3d4")
         ctx = make_ctx(session_manager=FakeSessionManager([session]))
@@ -1548,7 +1761,12 @@ class TestSessionsList:
             session_key="agent:main:subagent:760b927a",
             parent_session_key=parent_key,
             spawned_by="task-123",
-            origin={"kind": "subagent", "spawnDepth": 1},
+            derived_title="Analyze Issue #1130 search readiness",
+            origin={
+                "kind": "subagent",
+                "spawnDepth": 1,
+                "task": "Analyze Issue #1130 search readiness",
+            },
         )
         manager = FakeSessionManager([session])
         manager._storage._agent_tasks[session.session_key] = [
@@ -1573,6 +1791,7 @@ class TestSessionsList:
         self._assert_contract_base(row)
         assert row["sessionKind"] == "task"
         assert row["surface"] == "subagent"
+        assert row["title"] == "Analyze Issue #1130 search readiness"
         assert row["conversationKind"] == "unknown"
         assert row["runStatus"] == "running"
         assert row["interactive"] is False
@@ -1835,6 +2054,43 @@ class TestSessionsList:
         row = res.payload["sessions"][0]
         assert row["active_task"]["task_id"] == "task-running"
         assert row["run_status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_list_prefers_oldest_queued_task_as_fifo_foreground(self, dispatcher):
+        session = FakeSession(session_key="agent:main:webchat:queued-fifo")
+        manager = FakeSessionManager([session])
+        manager._storage._agent_tasks[session.session_key] = [
+            SimpleNamespace(
+                task_id="task-first",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+            ),
+            SimpleNamespace(
+                task_id="task-second",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=200,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+            ),
+        ]
+        ctx = make_ctx(session_manager=manager, task_runtime=None)
+
+        res = await dispatcher.dispatch("r1", "sessions.list", None, ctx)
+
+        assert res.ok is True
+        row = res.payload["sessions"][0]
+        assert row["active_task"]["task_id"] == "task-first"
+        assert row["run_status"] == "queued"
 
     @pytest.mark.asyncio
     async def test_list_batches_persisted_task_state_for_visible_sessions(self, dispatcher):
@@ -2936,6 +3192,28 @@ class TestSessionsSend:
         )
         assert payload["turn_outcome"]["kind"] == "failed"
 
+    def test_terminal_error_preserves_transient_retryability(self):
+        payload = _normalize_terminal_event_payload(
+            "session.event.error",
+            {
+                "message": "raw provider body with private prompt material",
+                "code": "PRIVATE_PROVIDER_CODE_BODY",
+                "response_body": "private upstream response body",
+                "request_payload_head": "private prompt payload",
+                "turn_outcome": {
+                    "failure_kind": "rate_limited",
+                },
+            },
+        )
+
+        assert payload["turn_outcome"]["failure_kind"] == "rate_limited"
+        assert payload["turn_outcome"]["retryable"] is True
+        assert payload["code"] == "provider_rate_limited"
+        assert payload["error_message"] == (
+            "The model provider is rate-limiting requests. Try again later."
+        )
+        assert "private" not in repr(payload).lower()
+
     @pytest.mark.asyncio
     async def test_send_reset_same_key_intent_applies_before_append(
         self, dispatcher, ctx_with_sessions, session
@@ -3933,6 +4211,15 @@ class TestSessionsSteer:
         key = "agent:main:webchat:steer-v2"
         store = SessionStorage(str(tmp_path / "steer-v2.db"))
         await store.connect()
+        project = tmp_path / "steer-v2-project"
+        project.mkdir()
+        workspace = await store.create_or_restore_project_workspace(
+            path=str(project.resolve()),
+            path_key=project_path_key(project, strict=True),
+            display_name="steer-v2-project",
+            trusted_at=100,
+            now_ms=100,
+        )
         await store.upsert_session(
             SessionNode(
                 session_key=key,
@@ -3940,6 +4227,7 @@ class TestSessionsSteer:
                 agent_id="main",
                 created_at=100,
                 updated_at=100,
+                workspace_id=workspace.workspace_id,
             )
         )
         manager = SessionManager(store, inject_time_prefix=False)
@@ -3978,12 +4266,6 @@ class TestSessionsSteer:
                 params,
                 ctx,
             )
-            replayed = await dispatcher.dispatch(
-                "r-steer-v2-replay",
-                "sessions.steer.v2",
-                params,
-                ctx,
-            )
             mismatch = await dispatcher.dispatch(
                 "r-steer-v2-mismatch",
                 "sessions.steer.v2",
@@ -3992,6 +4274,40 @@ class TestSessionsSteer:
                     "client_request_id": "request-steer-v2-mismatch",
                     "client_message_id": "client-steer-v2-mismatch",
                     "expected_turn_id": "another-turn",
+                },
+                ctx,
+            )
+            original_accept_turn = store.accept_turn
+            store.accept_turn = AsyncMock(  # type: ignore[method-assign]
+                side_effect=ProjectWorkspaceStateError("binding_changed")
+            )
+            try:
+                raced = await dispatcher.dispatch(
+                    "r-steer-v2-workspace-race",
+                    "sessions.steer.v2",
+                    {
+                        **params,
+                        "client_request_id": "request-steer-v2-workspace-race",
+                        "client_message_id": "client-steer-v2-workspace-race",
+                    },
+                    ctx,
+                )
+            finally:
+                store.accept_turn = original_accept_turn  # type: ignore[method-assign]
+            await store.remove_project_workspace(workspace.workspace_id, now_ms=200)
+            replayed = await dispatcher.dispatch(
+                "r-steer-v2-replay",
+                "sessions.steer.v2",
+                params,
+                ctx,
+            )
+            unavailable = await dispatcher.dispatch(
+                "r-steer-v2-workspace-unavailable",
+                "sessions.steer.v2",
+                {
+                    **params,
+                    "client_request_id": "request-steer-v2-workspace-unavailable",
+                    "client_message_id": "client-steer-v2-workspace-unavailable",
                 },
                 ctx,
             )
@@ -4007,10 +4323,23 @@ class TestSessionsSteer:
             assert replayed.payload["replayed"] is True
             assert replayed.payload["revision"] == 1
             assert replayed.payload["user_message_id"] == accepted.payload["user_message_id"]
+            assert unavailable.ok is False
+            assert unavailable.error.accepted is False
+            assert unavailable.error.details == {
+                "reason": "removed",
+                "fallback_safe": True,
+            }
             assert mismatch.ok is True
             assert mismatch.payload["accepted"] is False
             assert mismatch.payload["failure_code"] == "EXPECTED_TURN_MISMATCH"
             assert mismatch.payload["fallback_safe"] is True
+            assert raced.ok is False
+            assert raced.error.accepted is False
+            assert raced.error.retryable is False
+            assert raced.error.details == {
+                "reason": "binding_changed",
+                "fallback_safe": True,
+            }
 
             transcript = await store.get_transcript("session-steer-v2")
             assert len(transcript) == 1
@@ -4361,18 +4690,18 @@ class TestSessionsAbort:
                         "reason": reason,
                     }
                 )
-                return 1
+                return int(task_id == "task-new" and session_key == session.session_key)
 
             async def wait(self, task_id: str):
                 return SimpleNamespace(task_id=task_id, status="cancelled")
 
         runtime = Runtime()
         ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=runtime)
-        background_cancel_calls: list[str] = []
+        task_background_cancel_calls: list[tuple[str, str]] = []
         approval_cancel_calls: list[str] = []
 
-        async def cancel_background(session_key: str) -> int:
-            background_cancel_calls.append(session_key)
+        async def cancel_task_background(session_key: str, task_id: str) -> int:
+            task_background_cancel_calls.append((session_key, task_id))
             return 1
 
         class ApprovalQueue:
@@ -4381,8 +4710,8 @@ class TestSessionsAbort:
                 return 1
 
         monkeypatch.setattr(
-            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_session",
-            cancel_background,
+            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
+            cancel_task_background,
         )
         monkeypatch.setattr(
             "opensquilla.gateway.approval_queue.get_approval_queue",
@@ -4404,8 +4733,18 @@ class TestSessionsAbort:
         assert res.ok is True
         assert res.payload["aborted"] is False
         assert res.payload["reason"] == "task_mismatch"
-        assert runtime.cancel_calls == []
-        assert background_cancel_calls == []
+        # The exact cancel is the in-memory authority.  The advisory task list
+        # is consulted only after its side-effect-free no-op to classify the
+        # stale identity for the client.
+        assert runtime.cancel_calls == [
+            {
+                "task_id": "task-old",
+                "session_key": session.session_key,
+                "source": "webui_stop",
+                "reason": "user_abort",
+            }
+        ]
+        assert task_background_cancel_calls == []
         assert approval_cancel_calls == []
 
     @pytest.mark.asyncio
@@ -4466,6 +4805,80 @@ class TestSessionsAbort:
             }
         ]
         assert runtime.wait_calls == ["task-current"]
+
+    @pytest.mark.asyncio
+    async def test_cancel_queued_task_preserves_running_task_session_registries(
+        self, dispatcher, session, monkeypatch
+    ):
+        class Runtime:
+            def __init__(self) -> None:
+                self.cancel_calls: list[dict[str, Any]] = []
+                self.wait_calls: list[str] = []
+
+            async def list(self, session_key: str | None = None):
+                assert session_key == session.session_key
+                return [
+                    SimpleNamespace(task_id="task-running", status="running"),
+                    SimpleNamespace(task_id="task-queued", status="queued"),
+                ]
+
+            async def cancel(self, **kwargs: Any) -> int:
+                self.cancel_calls.append(kwargs)
+                return int(kwargs.get("task_id") == "task-queued")
+
+            async def wait(self, task_id: str):
+                self.wait_calls.append(task_id)
+                return SimpleNamespace(task_id=task_id, status="cancelled")
+
+        task_background_cancel_calls: list[tuple[str, str]] = []
+        approval_cancel_calls: list[str] = []
+
+        async def cancel_task_background(session_key: str, task_id: str) -> int:
+            task_background_cancel_calls.append((session_key, task_id))
+            return 1
+
+        class ApprovalQueue:
+            def resolve_pending_for_session(self, session_key: str, *, approved: bool) -> int:
+                assert approved is False
+                approval_cancel_calls.append(session_key)
+                return 1
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
+            cancel_task_background,
+        )
+        monkeypatch.setattr(
+            "opensquilla.gateway.approval_queue.get_approval_queue",
+            lambda: ApprovalQueue(),
+        )
+        runtime = Runtime()
+        ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=runtime)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "chat.abort",
+            {
+                "sessionKey": session.session_key,
+                "taskId": "task-queued",
+                "source": "webui_stop",
+                "scope": "task",
+            },
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["aborted"] is True
+        assert runtime.cancel_calls == [
+            {
+                "task_id": "task-queued",
+                "session_key": session.session_key,
+                "source": "webui_stop",
+                "reason": "user_abort",
+            }
+        ]
+        assert runtime.wait_calls == ["task-queued"]
+        assert task_background_cancel_calls == [(session.session_key, "task-queued")]
+        assert approval_cancel_calls == []
 
     @pytest.mark.asyncio
     async def test_chat_task_scoped_stop_without_valid_task_id_never_widens_to_session_abort(
@@ -5220,6 +5633,94 @@ class TestSessionsPatch:
         )
         assert res.ok is False
         assert res.error.code == "NOT_FOUND"
+
+
+class TestSessionsRename:
+    @pytest.mark.asyncio
+    async def test_rename_is_available_to_operator_write(
+        self,
+        dispatcher,
+        session,
+    ):
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            scopes=["operator.read", "operator.write"],
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.rename",
+            {"key": session.session_key, "displayName": "  Renamed task  "},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload == {
+            "key": session.session_key,
+            "updated": ["displayName"],
+        }
+        assert session.display_name == "Renamed task"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("display_name", "expected_ok"),
+        [
+            pytest.param("界" * 512, True, id="unicode-512"),
+            pytest.param("界" * 513, False, id="unicode-513"),
+            pytest.param("界" * 100_000, False, id="unicode-100000"),
+        ],
+    )
+    async def test_rename_enforces_bounded_display_name(
+        self,
+        dispatcher,
+        session,
+        display_name: str,
+        expected_ok: bool,
+    ):
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            scopes=["operator.read", "operator.write"],
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.rename",
+            {"key": session.session_key, "displayName": display_name},
+            ctx,
+        )
+
+        assert res.ok is expected_ok
+        if expected_ok:
+            assert session.display_name == display_name
+        else:
+            assert res.error.code == "INVALID_PARAMS"
+            assert res.error.details == {"field": "displayName", "maxLength": 512}
+            assert session.display_name is None
+
+    @pytest.mark.asyncio
+    async def test_rename_rejects_admin_patch_fields(self, dispatcher, session):
+        session.model = "original-model"
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            scopes=["operator.read", "operator.write"],
+        )
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.rename",
+            {
+                "key": session.session_key,
+                "displayName": "Renamed task",
+                "model": "unauthorized-model",
+            },
+            ctx,
+        )
+
+        assert res.ok is False
+        assert res.error.code == "INVALID_PARAMS"
+        assert res.error.details == {"unexpected_fields": ["model"]}
+        assert session.display_name is None
+        assert session.model == "original-model"
 
 
 class TestSessionsReset:
@@ -7419,6 +7920,7 @@ class TestSessionsMessagesSubscribe:
         assert res.payload == {
             "key": key,
             "task_id": "task-live-snapshot",
+            "stream_generation": stream_registry.stream_generation,
             "current_stream_seq": 2,
             "events": [
                 {
@@ -7427,6 +7929,7 @@ class TestSessionsMessagesSubscribe:
                         "task_id": "task-live-snapshot",
                         "text": "Inspecting",
                         "session_key": key,
+                        "stream_generation": stream_registry.stream_generation,
                         "stream_seq": 1,
                         "emitted_at": ANY,
                     },
@@ -7910,6 +8413,134 @@ class TestSessionsMessagesSubscribe:
         assert subscriptions.get_message_subscribers(key) == set()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method",
+        ["sessions.messages.hydrate", "sessions.bootstrap"],
+    )
+    async def test_hydration_uses_runtime_fifo_for_same_timestamp_queued_tasks(
+        self,
+        dispatcher,
+        method: str,
+    ) -> None:
+        key = "agent:main:webchat:runtime-fifo-hydration"
+        session = FakeSession(session_key=key, session_id="runtime-fifo-hydration")
+        manager = FakeSessionManager([session])
+        manager._storage._agent_tasks[key] = [
+            SimpleNamespace(
+                task_id="task-z-first",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+                details={},
+            ),
+            SimpleNamespace(
+                task_id="task-a-second",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+                details={},
+            ),
+        ]
+        runtime = SimpleNamespace(
+            session_task_snapshot=lambda candidate: (
+                SessionTaskSnapshot(
+                    running_task_id=None,
+                    queued_task_ids=("task-z-first", "task-a-second"),
+                )
+                if candidate == key
+                else SessionTaskSnapshot(None, ())
+            ),
+            pending_user_inputs=lambda _candidate: [],
+            steer_capability=lambda _candidate: None,
+        )
+        context = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        response = await dispatcher.dispatch("hydrate-fifo", method, {"key": key}, context)
+
+        assert response.ok is True
+        assert response.payload["active_task"]["task_id"] == "task-z-first"
+        assert response.payload["active_task"]["status"] == "queued"
+        assert response.payload["queued_task_ids"] == [
+            "task-z-first",
+            "task-a-second",
+        ]
+        assert response.payload["run_status"] == "queued"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method",
+        ["sessions.messages.hydrate", "sessions.bootstrap"],
+    )
+    async def test_hydration_keeps_durable_queue_during_runtime_activation_window(
+        self,
+        dispatcher,
+        method: str,
+    ) -> None:
+        key = "agent:main:webchat:runtime-activation-window"
+        session = FakeSession(session_key=key, session_id="runtime-activation-window")
+        manager = FakeSessionManager([session])
+        manager._storage._agent_tasks[key] = [
+            SimpleNamespace(
+                task_id="task-durable-before-activation",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=100,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+                details={},
+            ),
+            SimpleNamespace(
+                task_id="task-second-before-activation",
+                status="queued",
+                queue_mode="followup",
+                run_kind="web_turn",
+                source_kind="webui",
+                created_at=200,
+                started_at=None,
+                finished_at=None,
+                terminal_reason=None,
+                details={},
+            ),
+        ]
+        runtime = SimpleNamespace(
+            # The SQLite acceptance transaction committed, but activate() has
+            # not yet inserted the task into TaskRuntime's in-memory lane.
+            session_task_snapshot=lambda _candidate: SessionTaskSnapshot(None, ()),
+            pending_user_inputs=lambda _candidate: [],
+            steer_capability=lambda _candidate: None,
+        )
+        context = make_ctx(session_manager=manager, task_runtime=runtime)
+
+        response = await dispatcher.dispatch(
+            "hydrate-activation-window",
+            method,
+            {"key": key},
+            context,
+        )
+
+        assert response.ok is True
+        assert response.payload["active_task"]["task_id"] == "task-durable-before-activation"
+        assert response.payload["active_task"]["status"] == "queued"
+        assert response.payload["queued_task_ids"] == [
+            "task-durable-before-activation",
+            "task-second-before-activation",
+        ]
+        assert response.payload["run_status"] == "queued"
+
+    @pytest.mark.asyncio
     async def test_messages_subscribe_reports_persisted_task_run_mode_lock(
         self, dispatcher
     ):
@@ -8084,6 +8715,79 @@ class TestSessionsMessagesSubscribe:
         assert conn.events == [("session.event.done", second, {"replayed": True})]
 
     @pytest.mark.asyncio
+    async def test_messages_subscribe_reports_generation_change_without_legacy_promotion(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        key = "agent:main:generation-restart"
+        streams = SessionStreamRegistry(stream_generation="gateway-generation-new")
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+        current = streams.record(
+            key,
+            "session.event.text_delta",
+            {"task_id": "task-new", "text": "new"},
+        )
+        context = make_ctx(
+            session_manager=FakeSessionManager([FakeSession(session_key=key)]),
+            conn_id="generation-restart-conn",
+            subscription_manager=SubscriptionManager(),
+        )
+
+        response = await dispatcher.dispatch(
+            "generation-restart",
+            "sessions.messages.subscribe",
+            {
+                "key": key,
+                "since_stream_generation": "gateway-generation-old",
+                "since_stream_seq": 9_000,
+                "fast_ack": True,
+            },
+            context,
+        )
+
+        assert response.ok is True
+        assert response.payload["stream_generation"] == "gateway-generation-new"
+        assert response.payload["current_stream_seq"] == current["stream_seq"]
+        assert response.payload["replay_complete"] is False
+        assert response.payload["replay_gap_reason"] == "stream_generation_changed"
+        assert response.payload["replayed_count"] == 0
+        assert streams.current_seq(key) == current["stream_seq"]
+
+    @pytest.mark.asyncio
+    async def test_messages_subscribe_promotes_legacy_cursor_before_next_event(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        key = "agent:main:legacy-generation-restart"
+        streams = SessionStreamRegistry(stream_generation="gateway-generation-new")
+        monkeypatch.setattr(rpc_sessions, "get_session_streams", lambda: streams)
+        context = make_ctx(
+            session_manager=FakeSessionManager([FakeSession(session_key=key)]),
+            conn_id="legacy-generation-restart-conn",
+            subscription_manager=SubscriptionManager(),
+        )
+
+        response = await dispatcher.dispatch(
+            "legacy-generation-restart",
+            "sessions.messages.subscribe",
+            {"key": key, "since_stream_seq": 9_000, "fast_ack": True},
+            context,
+        )
+        following = streams.record(
+            key,
+            "session.event.text_delta",
+            {"task_id": "task-new", "text": "visible"},
+        )
+
+        assert response.ok is True
+        assert response.payload["stream_generation"] == "gateway-generation-new"
+        assert response.payload["current_stream_seq"] == 9_000
+        assert response.payload["replay_complete"] is True
+        assert following["stream_seq"] == 9_001
+
+    @pytest.mark.asyncio
     async def test_messages_subscribe_ack_is_not_blocked_by_writer_queue_socket(
         self,
         dispatcher,
@@ -8217,13 +8921,17 @@ class TestSessionsMessagesSubscribe:
         res = await dispatcher.dispatch(
             "r1",
             "sessions.messages.subscribe",
-            {"key": key, "since_stream_seq": 7},
+            {
+                "key": key,
+                "since_stream_generation": "retired-gateway-generation",
+                "since_stream_seq": 7,
+            },
             ctx,
         )
 
         assert res.ok is True
         assert res.payload["replay_complete"] is False
-        assert res.payload["replay_gap_reason"] == "stream_buffer_reset"
+        assert res.payload["replay_gap_reason"] == "stream_generation_changed"
         assert res.payload["last_task"]["task_id"] == "task-abandoned"
         assert res.payload["run_status"] == "interrupted"
         assert res.payload["hydration_complete"] is True

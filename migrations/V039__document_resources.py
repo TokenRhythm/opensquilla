@@ -1,10 +1,10 @@
-"""V038 - document source, import, and immutable publication receipts."""
+"""V039 - document source, import, and immutable publication receipts."""
 
 from __future__ import annotations
 
 from yoyo import step
 
-__depends__: set[str] = {"V037__artifact_mutation_attempts"}
+__depends__: set[str] = {"V038__artifact_mutation_attempts"}
 
 CREATE_STATEMENTS: tuple[str, ...] = (
     """

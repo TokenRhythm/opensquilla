@@ -141,12 +141,24 @@ describe('ChatMessageList history anchors', () => {
         source: 'manual',
         state: 'completed',
         durability: 'durable',
+        historyArchived: true,
+        canonicalComplete: true,
+      },
+    }
+    const incompleteMessage: ChatRenderedMessage = {
+      ...maintenanceMessage,
+      id: 'maintenance-2',
+      messageId: 'maintenance:context-compaction:summary:8',
+      maintenance: {
+        ...maintenanceMessage.maintenance!,
+        compactionId: 'cmp-8',
+        canonicalComplete: false,
       },
     }
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(ChatMessageList, {
-      messages: [maintenanceMessage],
+      messages: [maintenanceMessage, incompleteMessage],
       shareMode: false,
       selectedMessageIds: new Set<string>(),
       stripTimePrefix: (value: string) => value,
@@ -175,7 +187,13 @@ describe('ChatMessageList history anchors', () => {
       durability: 'durable',
       placement: 'transcript',
     })
-    expect(event?.textContent).toContain('Context organized')
+    expect(event?.textContent).toContain(
+      'Earlier context summarized; original messages remain available in history',
+    )
+    const events = host.querySelectorAll<HTMLElement>('[data-testid="compaction-event"]')
+    expect(events[1]?.textContent).toContain(
+      'Earlier context summarized; some original messages are unavailable',
+    )
     expect(host.querySelector('.msg-system')).toBeNull()
     expect(host.querySelector('.msg-ai')).toBeNull()
   })

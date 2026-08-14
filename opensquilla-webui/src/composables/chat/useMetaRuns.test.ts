@@ -9,13 +9,17 @@ type RpcCall = (
   params?: Record<string, unknown>,
 ) => Promise<unknown>
 
-function makeOptions(call: RpcCall) {
+function makeOptions(
+  call: RpcCall,
+  extra: { observeStreamGeneration?: (payload: unknown) => boolean } = {},
+) {
   const sendComposerText = vi.fn()
   const sendHiddenReplay = vi.fn()
   const sendHiddenConfirmation = vi.fn()
   const pushToast = vi.fn()
   const sessionKey = ref('agent:main:replay-session')
   const handlers = new Map<string, (...args: unknown[]) => void>()
+  const lastStreamSeq = ref(0)
   const api = useMetaRuns({
     rpc: {
       call: <T = unknown>(
@@ -29,7 +33,8 @@ function makeOptions(call: RpcCall) {
     },
     sessionKey,
     currentEpoch: ref(1),
-    lastStreamSeq: ref(0),
+    lastStreamSeq,
+    observeStreamGeneration: extra.observeStreamGeneration,
     sendHiddenConfirmation,
     sendHiddenReplay,
     scrollToStepCard: vi.fn(),
@@ -45,8 +50,46 @@ function makeOptions(call: RpcCall) {
     sendHiddenReplay,
     pushToast,
     sessionKey,
+    lastStreamSeq,
   }
 }
+
+describe('useMetaRuns stream generation', () => {
+  it('observes a new generation before its independent stale-seq gate', () => {
+    let cursor = ref(0)
+    const observeStreamGeneration = vi.fn((payload: unknown) => {
+      if ((payload as { stream_generation?: string }).stream_generation !== 'generation-2') {
+        return false
+      }
+      cursor.value = 0
+      return true
+    })
+    const { api, handlers, lastStreamSeq } = makeOptions(
+      async () => ({}),
+      { observeStreamGeneration },
+    )
+    cursor = lastStreamSeq
+    lastStreamSeq.value = 700
+    const unsubscribe = api.subscribe()
+    try {
+      handlers.get('session.event.meta_run_announced')?.({
+        session_key: 'agent:main:replay-session',
+        epoch: 1,
+        stream_generation: 'generation-2',
+        stream_seq: 1,
+        run_id: 'run-after-restart',
+        meta_skill_name: 'meta-paper-write',
+        language: 'en',
+        steps: [],
+        total: 0,
+      })
+      expect(observeStreamGeneration).toHaveBeenCalledOnce()
+      expect(api.ribbons.value.has('run-after-restart')).toBe(true)
+    } finally {
+      unsubscribe()
+    }
+  })
+})
 
 function recoveryPayload(runId: string) {
   return {

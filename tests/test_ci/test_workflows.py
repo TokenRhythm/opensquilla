@@ -183,7 +183,8 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     data = _workflow("ci.yml")
     text = ci_path.read_text(encoding="utf-8")
 
-    assert {"pull_request", "push", "workflow_dispatch"} <= _trigger_keys(data)
+    assert {"pull_request", "merge_group", "push", "workflow_dispatch"} <= _trigger_keys(data)
+    assert data["on"]["merge_group"]["types"] == ["checks_requested"]
     assert "branches: [main]" in text
     assert "PYTHONPATH: ${{ github.workspace }}" in text
     assert "Configure runtime directories" in text
@@ -199,6 +200,10 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert "Release packaging contracts" in text
     assert "CI result" in text
     assert 'push)\n              before="${{ github.event.before }}"' in text
+    assert 'merge_group)\n              base="${{ github.event.merge_group.base_sha }}"' in text
+    assert 'head="${{ github.event.merge_group.head_sha }}"' in text
+    assert 'git diff --name-only "${base}" "${head}" > "${changed_files}"' in text
+    assert "Merge-group diff is unavailable; running the full CI matrix." in text
     assert 'git diff --name-only "${before}" "${after}" > "${changed_files}"' in text
     assert 'printf \'.ci/run-all\\n\' > "${changed_files}"' in text
     assert "runtime_changed" in text
@@ -217,6 +222,10 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert ".github/scripts/check_ci_results.py" in text
     assert "code_changed" not in text
     assert "workflow_changed" not in text
+    assert text.count(
+        '"${{ github.event_name }}" == "pull_request" || '
+        '"${{ github.event_name }}" == "merge_group"'
+    ) == 3
 
 
 def test_default_ci_keeps_main_pushes_targeted_and_manual_runs_full() -> None:
@@ -595,16 +604,31 @@ def test_pr_target_branch_workflow_runs_trusted_base_validator() -> None:
     data = _workflow("pr-target-branch.yml")
     text = (WORKFLOW_DIR / "pr-target-branch.yml").read_text(encoding="utf-8")
 
-    assert _trigger_keys(data) == {"pull_request"}
+    assert _trigger_keys(data) == {"pull_request", "merge_group"}
+    assert data["on"]["merge_group"]["types"] == ["checks_requested"]
     assert "pull_request_target" not in text
     assert "Validate target branch" in text
     assert "github.event.repository.default_branch" in text
     assert "hashFiles('.github/scripts/validate-pr-target-branch.sh') == ''" in text
     assert "github.event.pull_request.head.sha" in text
+    assert "github.event.merge_group.base_ref" in text
+    assert "github.event.merge_group.head_ref" in text
     assert "pull-requests: read" in text
     assert "PR_LABELS" in text
     assert "PR_NUMBER" in text
     assert ".github/scripts/validate-pr-target-branch.sh" in text
+
+
+def test_pr_target_validator_accepts_merge_group_base_ref(tmp_path: Path) -> None:
+    result = _validate_pr_target(tmp_path, base="refs/heads/main")
+
+    assert result.returncode == 0
+    assert "targets main" in result.stdout
+
+    blocked = _validate_pr_target(tmp_path, base="refs/heads/feature/private-target")
+
+    assert blocked.returncode == 1
+    assert "Ordinary pull requests should target main" in blocked.stderr
 
 
 def test_pr_body_lint_workflow_warns_from_trusted_base() -> None:
@@ -1238,7 +1262,14 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "desktop_changed == 'true'" in jobs["desktop-check"]["if"]
     assert "python_changed == 'true'" in jobs["ubuntu-quality"]["if"]
     assert "full_required == 'true'" in jobs["ubuntu-full"]["if"]
-    assert "platform_sensitive_changed == 'true'" in jobs["windows-compat"]["if"]
+    assert jobs["windows-compat"]["if"] == (
+        "${{ (needs.classify-changes.outputs.python_changed == 'true' || "
+        "needs.classify-changes.outputs.platform_sensitive_changed == 'true' || "
+        "needs.classify-changes.outputs.dependency_changed == 'true' || "
+        "needs.classify-changes.outputs.release_changed == 'true') && "
+        "needs.classify-changes.outputs.windows_full_required != 'true' && "
+        "needs.classify-changes.outputs.full_required != 'true' }}"
+    )
     assert "windows_full_required == 'true'" in jobs["windows-full"]["if"]
     assert "platform_sensitive_changed == 'true'" in jobs["macos-recovery"]["if"]
     assert "desktop_changed == 'true'" in jobs["macos-recovery"]["if"]
@@ -1372,6 +1403,10 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "test-desktop-gateway-ownership.mjs" in run["run"]
     assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
     assert 'case "${{ matrix.shard }}" in' in run["run"]
+    assert 'local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"' in run["run"]
+    assert '[[ "${RUNNER_OS}" == "Windows" ]]' in run["run"]
+    assert "grep -Fq 'Gateway did not become healthy'" in run["run"]
+    assert 'run_case "${name}" "${script}" 2' in run["run"]
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"
     assert upload["with"]["name"] == (
@@ -1403,8 +1438,23 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     assert install_gateway["run"] == "uv sync --frozen"
     assert job["env"]["OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI"] == "gateway"
     assert job["env"]["OPENSQUILLA_WEBUI_BASE_URL"].endswith(":18791")
-    assert "history-hydration.spec.ts" in run["run"]
-    assert "goal-mode.spec.ts" in run["run"]
+    selected_specs = {
+        argument
+        for argument in run["run"].split()
+        if argument.endswith(".spec.ts")
+    }
+    required_specs = {
+        "assistant-activity.spec.ts",
+        "composer-paste.spec.ts",
+        "goal-mode.spec.ts",
+        "history-hydration.spec.ts",
+        "queue-steer.spec.ts",
+        "session-created-card.spec.ts",
+        "share.spec.ts",
+    }
+    assert selected_specs == required_specs
+    for spec in required_specs:
+        assert (Path("opensquilla-webui/e2e") / spec).is_file()
 
 
 def test_windows_smoke_does_not_install_bun_by_default() -> None:

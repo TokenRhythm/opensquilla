@@ -1,10 +1,10 @@
-"""V035 - durable artifact revisions, change sets, anchors, and audit state."""
+"""V036 - durable artifact revisions, change sets, anchors, and audit state."""
 
 from __future__ import annotations
 
 from yoyo import step
 
-__depends__: set[str] = {"V034__goal_message_anchor"}
+__depends__: set[str] = {"V035__pending_chat_inputs"}
 
 CREATE_STATEMENTS: tuple[str, ...] = (
     """

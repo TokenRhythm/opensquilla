@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import i18n from '@/i18n'
+import zhHans from '@/locales/zh-Hans.json'
 import {
   arrangeSidebarSections,
   normalizeSessionItem,
@@ -21,6 +23,37 @@ function sectionFor(sections: SidebarSection[], family: SidebarSection['family']
   if (!found) throw new Error(`missing section: ${family}`)
   return found
 }
+
+describe('normalizeSessionItem subagent titles', () => {
+  it('keeps a durable task title and preserves the legacy grounding-prompt fallback', () => {
+    expect(session({
+      key: 'agent:main:subagent:new',
+      sessionKind: 'task',
+      title: 'Analyze checkout failures',
+    }).title).toBe('Analyze checkout failures')
+
+    expect(session({
+      key: 'agent:main:subagent:legacy',
+      sessionKind: 'task',
+      title: 'You are a subagent. Execute the delegated task',
+    }).title).toBe('Subagent task')
+  })
+
+  it('localizes the generic title returned for legacy task rows', () => {
+    i18n.global.setLocaleMessage('zh-Hans', zhHans)
+    i18n.global.locale.value = 'zh-Hans'
+    try {
+      expect(session({
+        key: 'agent:main:subagent:legacy-generic',
+        sessionKind: 'task',
+        title: 'Subagent task',
+      }).title).toBe('子智能体任务')
+    }
+    finally {
+      i18n.global.locale.value = 'en'
+    }
+  })
+})
 
 describe('arrangeSidebarSections — family bucketing', () => {
   it('buckets chat, channel, and cron sessions into their families', () => {

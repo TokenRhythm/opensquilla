@@ -6,7 +6,8 @@ import {
   reconcileRunningHistoryMessages,
   rehomePromotedSteerRows,
 } from './historyMerge'
-import type { ChatMessage, ChatReasoning } from '@/types/chat'
+import type { ChatMessage, ChatReasoning, ChatRenderedMessage } from '@/types/chat'
+import { chatMessageKey } from './messageIdentity'
 
 function msg(overrides: Partial<ChatMessage>): ChatMessage {
   return { role: 'assistant', text: '', ts: null, ...overrides } as ChatMessage
@@ -47,12 +48,15 @@ describe('rehomePromotedSteerRows', () => {
 
 describe('mergeLiveOnlyFields', () => {
   it('keeps the optimistic identity across the first authoritative replacement', () => {
+    const optimistic = msg({ clientId: 'local-turn' })
     const merged = mergeLiveOnlyFields(
-      msg({ clientId: 'local-turn', messageId: 'server-turn' }),
+      optimistic,
       msg({ messageId: 'server-turn' }),
     )
 
     expect(merged.clientId).toBe('local-turn')
+    expect(chatMessageKey({ ...optimistic, id: 'assistant-0' } as ChatRenderedMessage, 0))
+      .toBe(chatMessageKey({ ...merged, id: 'assistant-0' } as ChatRenderedMessage, 0))
   })
 
   it('keeps live reasoning seconds when the server snapshot measured none', () => {
@@ -63,6 +67,25 @@ describe('mergeLiveOnlyFields', () => {
   it('lets the server win when it measured its own seconds', () => {
     const merged = mergeLiveOnlyFields(msg({ reasoning: reasoning(8) }), msg({ reasoning: reasoning(12) }))
     expect(merged.reasoning?.seconds).toBe(12)
+  })
+
+  it('keeps structured reasoning blocks when history only has flattened text', () => {
+    const reasoningBlocks = [{
+      id: 'reasoning-1',
+      index: 0,
+      text: 'inspect',
+      status: 'completed' as const,
+      startedAt: 1_000,
+      endedAt: 3_000,
+      contentKind: 'reasoning' as const,
+    }]
+    const merged = mergeLiveOnlyFields(
+      msg({ reasoning: { text: 'inspect', seconds: 2 }, reasoningBlocks }),
+      msg({ reasoning: { text: 'inspect', seconds: 0 } }),
+    )
+
+    expect(merged.reasoningBlocks).toEqual(reasoningBlocks)
+    expect(merged.reasoningBlocks).not.toBe(reasoningBlocks)
   })
 
   it('keeps the live activity snapshot when history has no persisted phases', () => {
@@ -246,6 +269,142 @@ describe('reconcileHistoryMessages', () => {
 })
 
 describe('reconcileHistoryWindow', () => {
+  it('preserves a live turn id when durable user ownership uniquely matches old history', () => {
+    const previous = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        messageId: 'user-1',
+        turnId: 'live-turn-1',
+      }),
+      msg({
+        role: 'assistant',
+        text: 'done',
+        turnId: 'live-turn-1',
+      }),
+    ]
+    const latestWindow = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        messageId: 'user-1',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'done',
+        messageId: 'assistant-1',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const merged = reconcileHistoryWindow(previous, latestWindow)
+
+    expect(merged.map(message => message.turnId)).toEqual([
+      'live-turn-1',
+      'live-turn-1',
+    ])
+  })
+
+  it('keeps an explicit server turn id authoritative over the live identity', () => {
+    const previous = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        messageId: 'user-1',
+        turnId: 'live-turn-1',
+      }),
+      msg({
+        role: 'assistant',
+        text: 'done',
+        turnId: 'live-turn-1',
+      }),
+    ]
+    const latestWindow = [
+      msg({
+        role: 'user',
+        text: 'build it',
+        messageId: 'user-1',
+        turnId: 'server-turn-1',
+        restoredFromHistory: true,
+      }),
+      msg({
+        role: 'assistant',
+        text: 'done',
+        messageId: 'assistant-1',
+        turnId: 'server-turn-1',
+        restoredFromHistory: true,
+      }),
+    ]
+
+    const merged = reconcileHistoryWindow(previous, latestWindow)
+
+    expect(merged.map(message => message.turnId)).toEqual([
+      'server-turn-1',
+      'server-turn-1',
+    ])
+  })
+
+  it.each([
+    {
+      name: 'different durable user ownership',
+      previous: [
+        msg({
+          role: 'user',
+          text: 'first turn',
+          messageId: 'user-1',
+          turnId: 'live-turn-1',
+        }),
+        msg({ role: 'assistant', text: 'done', turnId: 'live-turn-1' }),
+      ],
+      latestWindow: [
+        msg({
+          role: 'user',
+          text: 'different turn',
+          messageId: 'user-2',
+          restoredFromHistory: true,
+        }),
+        msg({
+          role: 'assistant',
+          text: 'done',
+          messageId: 'assistant-2',
+          restoredFromHistory: true,
+        }),
+      ],
+    },
+    {
+      name: 'ambiguous optimistic assistants',
+      previous: [
+        msg({
+          role: 'user',
+          text: 'build it',
+          messageId: 'user-1',
+          turnId: 'live-turn-1',
+        }),
+        msg({ role: 'assistant', text: 'first', turnId: 'live-turn-1' }),
+        msg({ role: 'assistant', text: 'second', turnId: 'live-turn-1' }),
+      ],
+      latestWindow: [
+        msg({
+          role: 'user',
+          text: 'build it',
+          messageId: 'user-1',
+          restoredFromHistory: true,
+        }),
+        msg({
+          role: 'assistant',
+          text: 'done',
+          messageId: 'assistant-1',
+          restoredFromHistory: true,
+        }),
+      ],
+    },
+  ])('does not infer an assistant turn id from $name', ({ previous, latestWindow }) => {
+    const merged = reconcileHistoryWindow(previous, latestWindow)
+
+    expect(merged[merged.length - 1]?.turnId).toBeUndefined()
+  })
+
   it('keeps optimistic turn identity and assistant activity on the first authoritative refresh', () => {
     const statusHistory = [
       { action: 'inspect', label: 'Inspecting', at: 1_000 },

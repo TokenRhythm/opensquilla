@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { ref } from 'vue'
+import { ref, watchEffect } from 'vue'
 import {
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   streamIdleTimeoutFromPolicy,
@@ -83,6 +83,125 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('keeps one hard-idle timer across a high-frequency delta burst', () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout')
+    const { api } = makeStream()
+
+    api.startStreaming()
+    const timersAfterStart = setTimeoutSpy.mock.calls.length
+    for (let index = 0; index < 10_000; index += 1) {
+      api.resetStreamIdleTimer()
+    }
+
+    expect(setTimeoutSpy.mock.calls.length).toBe(timersAfterStart)
+    api.cleanup()
+  })
+
+  it('extends the single hard-idle deadline from the latest heartbeat', () => {
+    const { api } = makeStream(undefined, () => ({ webui_stream_idle_grace_ms: 1_000 }))
+
+    api.startStreaming()
+    vi.advanceTimersByTime(750)
+    api.resetStreamIdleTimer({ progress: false })
+    vi.advanceTimersByTime(750)
+    expect(api.isStreaming.value).toBe(true)
+    vi.advanceTimersByTime(251)
+    expect(api.isStreaming.value).toBe(false)
+    api.cleanup()
+  })
+
+  it('pauses the hard-idle deadline while the live connection is unavailable', () => {
+    const { api } = makeStream()
+
+    api.startStreaming()
+    api.resetStreamIdleTimer()
+    api.setStreamConnectionAvailable(false)
+    vi.advanceTimersByTime(DEFAULT_STREAM_IDLE_TIMEOUT_MS + 1)
+    expect(api.isStreaming.value).toBe(true)
+
+    api.setStreamConnectionAvailable(true)
+    vi.advanceTimersByTime(DEFAULT_STREAM_IDLE_TIMEOUT_MS + 1)
+    expect(api.isStreaming.value).toBe(false)
+    api.cleanup()
+  })
+
+  it('pauses the hard-idle deadline while the page is hidden', () => {
+    const listeners = new Map<string, EventListener>()
+    const fakeDocument = {
+      hidden: true,
+      addEventListener: (name: string, listener: EventListener) => listeners.set(name, listener),
+      removeEventListener: (name: string) => listeners.delete(name),
+    }
+    vi.stubGlobal('document', fakeDocument)
+    const { api } = makeStream()
+
+    api.startStreaming()
+    api.resetStreamIdleTimer()
+    vi.advanceTimersByTime(DEFAULT_STREAM_IDLE_TIMEOUT_MS + 1)
+    expect(api.isStreaming.value).toBe(true)
+
+    fakeDocument.hidden = false
+    listeners.get('visibilitychange')?.(new Event('visibilitychange'))
+    vi.advanceTimersByTime(DEFAULT_STREAM_IDLE_TIMEOUT_MS + 1)
+    expect(api.isStreaming.value).toBe(false)
+    api.cleanup()
+  })
+
+  it('keeps a durable queued task in the queue phase without model narration', () => {
+    const { api, runStatus } = makeStream()
+    api.startStreaming()
+    runStatus.value = {
+      status: 'queued',
+      label: 'Queued',
+      task: { task_id: 'queued-task', status: 'queued' },
+    }
+
+    expect(api.streamPhaseLabel.value).toBe('Queued')
+    expect(api.streamPhaseElapsed.value).toBe('')
+    vi.advanceTimersByTime(15_000)
+    expect(api.streamPhaseLabel.value).toBe('Queued')
+    expect(api.streamPhaseLabel.value).not.toContain('model')
+    api.cleanup()
+  })
+
+  it('keeps the turn elapsed clock running across phase transitions', () => {
+    const { api } = makeStream()
+    api.startStreaming()
+
+    vi.advanceTimersByTime(5_000)
+    expect(api.streamTurnElapsed.value).toBe('5s')
+    expect(api.streamPhaseElapsed.value).toBe('5s')
+
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    expect(api.streamTurnElapsed.value).toBe('5s')
+    expect(api.streamPhaseElapsed.value).toBe('0s')
+
+    vi.advanceTimersByTime(3_000)
+    api.setStreamActivity('Thinking deeply', 'provider:reasoning')
+    expect(api.streamTurnElapsed.value).toBe('8s')
+    expect(api.streamPhaseElapsed.value).toBe('0s')
+    api.cleanup()
+  })
+
+  it('restores the turn elapsed clock from a replayed reasoning boundary', () => {
+    vi.setSystemTime(20_000)
+    const { api } = makeStream()
+    api.startStreaming()
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'replayed-reasoning',
+      blockIndex: 0,
+      at: 8_000,
+      contentKind: 'reasoning',
+    })
+    api.scheduleRender()
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+
+    expect(api.streamTurnElapsed.value).toBe('12s')
+    api.cleanup()
+  })
+
   it('preserves the authoritative active-task steer capability when streaming starts late', () => {
     const { api, runStatus, applySessionRunState } = makeStream()
     runStatus.value = {
@@ -156,9 +275,146 @@ describe('useChatStream render coalescing', () => {
 
     // Rendered once over the combined text, with highlighting deferred.
     expect(renderMarkdown).toHaveBeenCalledTimes(1)
-    expect(renderMarkdown).toHaveBeenCalledWith('abc', { highlight: false })
+    expect(renderMarkdown).toHaveBeenCalledWith('abc', {
+      highlight: false,
+      cache: 'none',
+      math: 'defer',
+    })
     expect(scrollToBottom).toHaveBeenCalledTimes(1)
 
+    api.cleanup()
+  })
+
+  it('publishes a large burst once instead of folding every accepted delta', () => {
+    const { api, renderMarkdown, scrollToBottom } = makeStream()
+
+    for (let index = 0; index < 2_048; index += 1) api.appendDelta('x')
+    expect(rafCbs).toHaveLength(1)
+    expect(renderMarkdown).not.toHaveBeenCalled()
+
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+
+    expect(renderMarkdown).toHaveBeenCalledTimes(1)
+    expect(api.foldedTurn.value.rawText).toHaveLength(2_048)
+    expect(scrollToBottom).toHaveBeenCalledTimes(1)
+    api.cleanup()
+  })
+
+  it('publishes a provider phase even when no text or tool delta follows it', () => {
+    const { api } = makeStream()
+
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+
+    // A status-only upstream wait must reach the non-reactive accumulator's
+    // publication clock; otherwise the visible phase remains generic Working.
+    expect(rafCbs).toHaveLength(1)
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+    expect(api.foldedTurn.value.statusHistory).toEqual([
+      expect.objectContaining({
+        action: 'provider:requesting',
+        label: 'Waiting for model',
+      }),
+    ])
+    api.cleanup()
+  })
+
+  it('persists a status-only turn when a terminal error ends the stream', () => {
+    const { api, messages } = makeStream()
+
+    api.startStreaming()
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+    api.endStreaming()
+
+    expect(messages.value).toEqual([
+      expect.objectContaining({
+        role: 'assistant',
+        text: '',
+        statusHistory: expect.arrayContaining([
+          expect.objectContaining({ action: 'provider:requesting' }),
+        ]),
+      }),
+    ])
+    api.cleanup()
+  })
+
+  it('merges durable activity occurrences without dropping repeated retry phases', () => {
+    const { api } = makeStream()
+
+    api.startStreaming()
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+    api.restoreStatusHistory([
+      { action: 'provider:requesting', label: 'Waiting for model', at: 1_000 },
+      { action: 'provider:retry_wait:0', label: 'Waiting to retry', at: 2_000 },
+      { action: 'provider:retrying:0:0', label: 'Retrying', at: 3_000 },
+      { action: 'provider:retry_wait:0', label: 'Waiting to retry', at: 4_000 },
+    ])
+
+    expect(api.foldedTurn.value.statusHistory.map(entry => entry.action)).toEqual([
+      'Sending',
+      'provider:requesting',
+      'provider:retry_wait:0',
+      'provider:retrying:0:0',
+      'provider:retry_wait:0',
+    ])
+    api.cleanup()
+  })
+
+  it('does not invalidate the activity surface for same-phase progress deltas', () => {
+    const { api } = makeStream()
+    let activityRuns = 0
+    const stop = watchEffect(() => {
+      void api.streamPhaseLabel.value
+      void api.streamPhaseElapsed.value
+      activityRuns++
+    }, { flush: 'sync' })
+
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    const runsAfterPhaseChange = activityRuns
+    for (let index = 0; index < 1_000; index += 1) {
+      api.setStreamActivity('Waiting for model', 'provider:requesting')
+    }
+
+    expect(activityRuns).toBe(runsAfterPhaseChange)
+    stop()
+    api.cleanup()
+  })
+
+  it('clears a stale activity warning immediately on same-phase progress', () => {
+    const { api } = makeStream()
+
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    vi.advanceTimersByTime(20_001)
+    expect(api.streamActivityStale.value).toBe(true)
+
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    expect(api.streamActivityStale.value).toBe(false)
+    api.cleanup()
+  })
+
+  it('does not parse the growing answer in the production reducer path', () => {
+    const { api, renderMarkdown } = makeStream()
+    api.useReducer.value = true
+
+    for (let index = 0; index < 2_048; index += 1) api.appendDelta('x')
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+
+    expect(renderMarkdown).not.toHaveBeenCalled()
+    expect(api.foldedTurn.value.rawText).toHaveLength(2_048)
+    expect(api.foldedTurn.value.timelineItems).toEqual([
+      expect.objectContaining({
+        type: 'text',
+        html: '',
+        rawText: 'x'.repeat(2_048),
+        presentation: 'answer',
+      }),
+    ])
     api.cleanup()
   })
 
@@ -176,7 +432,11 @@ describe('useChatStream render coalescing', () => {
     vi.advanceTimersByTime(50)
     rafCbs[1](0)
     expect(renderMarkdown).toHaveBeenCalledTimes(2)
-    expect(renderMarkdown).toHaveBeenLastCalledWith('ab', { highlight: false })
+    expect(renderMarkdown).toHaveBeenLastCalledWith('ab', {
+      highlight: false,
+      cache: 'none',
+      math: 'defer',
+    })
 
     api.cleanup()
   })
@@ -214,6 +474,119 @@ describe('useChatStream render coalescing', () => {
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
       { type: 'text', raw: suffix },
     ])
+    api.cleanup()
+  })
+
+  it('retains structured reasoning blocks on the completed assistant row', () => {
+    vi.setSystemTime(5_000)
+    const { api, messages } = makeStream()
+    api.startStreaming()
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      at: 1_000,
+      contentKind: 'reasoning',
+    })
+    api.appendFrame({
+      kind: 'thinking',
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      text: 'inspect',
+      at: 2_000,
+    })
+    api.appendFrame({
+      kind: 'thinking-end',
+      blockId: 'reasoning-1',
+      blockIndex: 0,
+      status: 'completed',
+      at: 3_000,
+    })
+    api.appendDelta('answer')
+    vi.advanceTimersByTime(50)
+    rafCbs.shift()?.(0)
+
+    api.endStreaming()
+
+    expect(messages.value[0]?.reasoningBlocks).toEqual([expect.objectContaining({
+      id: 'reasoning-1',
+      text: 'inspect',
+      status: 'completed',
+      startedAt: 1_000,
+      endedAt: 3_000,
+    })])
+    api.cleanup()
+  })
+
+  it('keeps an interrupted reasoning-only turn instead of dropping it as empty', () => {
+    vi.setSystemTime(5_000)
+    const { api, messages } = makeStream()
+    api.startStreaming()
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'reasoning-only',
+      blockIndex: 0,
+      at: 1_000,
+      contentKind: 'reasoning',
+    })
+    api.appendFrame({
+      kind: 'thinking',
+      blockId: 'reasoning-only',
+      blockIndex: 0,
+      text: 'partial thought',
+      at: 2_000,
+    })
+    api.scheduleRender()
+    vi.advanceTimersByTime(50)
+    rafCbs.shift()?.(0)
+
+    api.endStreaming({ reason: 'aborted' })
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'assistant',
+      text: '',
+      interrupted: true,
+      reasoningBlocks: [{
+        id: 'reasoning-only',
+        text: 'partial thought',
+        status: 'interrupted',
+      }],
+    })
+    api.cleanup()
+  })
+
+  it('hands an unfinished coarse reveal to the settled assistant row', () => {
+    const { api, messages } = makeStream()
+    const coarse = 'reasoning '.repeat(80)
+    api.startStreaming()
+    api.noteReasoningPresentationDelta(coarse)
+    api.appendFrame({
+      kind: 'thinking-start',
+      blockId: 'coarse-reasoning',
+      blockIndex: 0,
+      at: 1_000,
+      contentKind: 'reasoning',
+    })
+    api.appendFrame({
+      kind: 'thinking',
+      blockId: 'coarse-reasoning',
+      blockIndex: 0,
+      text: coarse,
+      at: 1_000,
+    })
+    api.appendFrame({
+      kind: 'thinking-end',
+      blockId: 'coarse-reasoning',
+      blockIndex: 0,
+      status: 'completed',
+      at: 2_000,
+    })
+    api.appendDelta('answer')
+    api.endStreaming()
+
+    expect(messages.value[0]?.reasoningPresentationPending).toBe(true)
+    expect(messages.value[0]?.reasoningBlocks?.[0]?.text).toBe(coarse)
     api.cleanup()
   })
 
@@ -523,6 +896,59 @@ describe('useChatStream render coalescing', () => {
     ])
     expect(messages.value[0]?.tool_calls?.[0]).toMatchObject({
       tool_use_id: 'tool-1',
+      result: 'ok',
+    })
+    api.cleanup()
+  })
+
+  it('keeps production text solely in the accumulator across reconcile and steer', () => {
+    const { api, messages } = makeStream()
+    api.useReducer.value = true
+
+    api.appendDelta('before')
+    expect(api.streamTimelineItems.value).toEqual([])
+    expect(api.foldedTurn.value.rawText).toBe('before')
+    api.checkpointForUserMessage('turn-production-steer')
+    expect(messages.value[0]).toMatchObject({ role: 'assistant', text: 'before' })
+    expect(api.foldedTurn.value.rawText).toBe('')
+
+    api.appendDelta('stale')
+    api.reconcileFinalText('canonical')
+    expect(api.streamTimelineItems.value).toEqual([])
+    expect(api.foldedTurn.value.rawText).toBe('canonical')
+    api.endStreaming()
+    expect(messages.value[1]).toMatchObject({ role: 'assistant', text: 'canonical' })
+    api.cleanup()
+  })
+
+  it('commits the complete production tool input from the accumulator', () => {
+    const { api, messages } = makeStream()
+    api.useReducer.value = true
+
+    api.appendToolCall({ tool_use_id: 'tool-long', tool_name: 'web_search' })
+    for (let index = 0; index < 1_000; index += 1) {
+      api.appendToolDelta({
+        tool_use_id: 'tool-long',
+        tool_name: 'web_search',
+        fragment: 'x',
+      })
+    }
+    const liveTool = api.foldedTurn.value.toolCalls[0]
+    expect(liveTool).toBeDefined()
+    expect(String(liveTool!.inputRaw || '').length).toBeLessThan(1_000)
+    expect(liveTool!.inputPreview).toHaveLength(200)
+
+    api.appendToolResult({
+      tool_use_id: 'tool-long',
+      tool_name: 'web_search',
+      result: 'ok',
+    })
+    expect(api.foldedTurn.value.toolCalls[0]?.inputRaw).toHaveLength(1_000)
+    api.endStreaming()
+
+    expect(messages.value[0]?.tool_calls?.[0]).toMatchObject({
+      tool_use_id: 'tool-long',
+      input: 'x'.repeat(1_000),
       result: 'ok',
     })
     api.cleanup()

@@ -220,6 +220,10 @@ class ToolContext:
         default_factory=list,
         repr=False,
     )
+    # Frozen after the final provider-visible tool schema is built. Dispatch
+    # and projection code use this bit to avoid replacing raw tool output with
+    # a handle that the current model is not authorized to retrieve.
+    tool_result_retrieval_available: bool = False
 
     def __post_init__(self) -> None:
         # A restricted turn's ceiling is an authority boundary, not a policy

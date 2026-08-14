@@ -1109,7 +1109,7 @@
       "capacityWarn": "{calls} llamadas de modelo por turno — el coste crece linealmente y la mejora de fusión decae pasados 4 proponentes.",
       "capacityFull": "Límite de {max} proponentes alcanzado — más borradores no mejoran la fusión; quita uno antes de añadir otro.",
       "diversityHint": "Varios proponentes comparten familia de modelos — añadir otro proveedor suele mejorar la fusión.",
-      "effectiveFacts": "Por turno: {calls} llamadas de modelo · fusiona al lograr {quorum}/{proposers} proponentes · timeout de proponente {proposerTimeout}s · timeout de agregador {aggregatorTimeout}s · {grace}s de gracia tras el quórum",
+      "effectiveFacts": "Por turno: {calls} llamadas de modelo · fusiona al lograr {quorum}/{proposers} proponentes · timeout total de proponente {proposerTimeout}s · timeout de inactividad del agregador {aggregatorTimeout}s · {grace}s de gracia tras el quórum",
       "effectiveSummary": "{proposers} proponentes en paralelo + 1 agregador · unas {calls} llamadas por turno",
       "runtimeStrategyTitle": "Estrategia de ejecución",
       "runtimeStrategyDesc": "Umbral de éxito, alternativa y límites de tiempo",
@@ -1118,7 +1118,7 @@
       "successThresholdExact": "{quorum} de {proposers}",
       "failurePolicyLabel": "Si no se puede completar la agregación",
       "runtimeLimitsLabel": "Límites de tiempo",
-      "runtimeLimits": "Proponentes {proposerTimeout}s · agregador {aggregatorTimeout}s · {grace}s de gracia tras alcanzar el umbral",
+      "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado · {grace}s de gracia tras el umbral",
       "quorumFailureLabel": "Si menos de {quorum} proponentes tienen éxito"
     },
     "behavior": {
@@ -1891,6 +1891,7 @@
     "refresh": "Actualizar",
     "refreshing": "Actualizando…",
     "loading": "Cargando sesiones…",
+    "loadMore": "Cargar más sesiones",
     "unknownAgent": "Agente desconocido",
     "deletedAgent": "Agente eliminado · {id}",
     "msgCount": "{count} msj.",
@@ -3240,6 +3241,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Chat creado",
+      "open": "Abrir chat"
+    },
     "promptCacheKeepalive": {
       "action": "Mantener caché del prompt",
       "title": "Mantener caché del prompt",
@@ -3416,6 +3421,9 @@
     "subagentPrefix": "Subagente: ",
     "subagentCompletion": "Finalización del subagente",
     "turnFailed": "El turno falló",
+    "usageAccountingBlockedTitle": "La contabilidad de uso no está disponible temporalmente",
+    "usageAccountingBlockedMessage": "La solicitud no se envió al proveedor del modelo y no se facturó ningún uso. Puedes reintentar este turno de forma segura.",
+    "usageAccountingBlockedUnsafeMessage": "Esta solicitud al modelo no se envió. Es posible que el trabajo anterior de este turno ya se haya ejecutado o facturado; revísalo antes de volver a intentarlo.",
     "sandboxPausedResume": "Reanudar la ejecución",
     "sandboxResumed": "Ejecución autónoma reanudada. Reenvía tu solicitud para continuar.",
     "sandboxResumeFailed": "No se pudo reanudar la ejecución: {error}",
@@ -3499,9 +3507,19 @@
       "lifecycle": {
         "working": "En curso",
         "answering": "Redactando la respuesta",
+        "answerPrepared": "Preparación de la respuesta",
         "settled": "Completado",
         "interrupted": "Interrumpido",
         "failed": "Fallido"
+      },
+      "provider": {
+        "waiting": "Esperando al modelo",
+        "responded": "Respuesta del modelo",
+        "reasoning": "Razonamiento profundo",
+        "rateLimited": "Límite de solicitudes · reintento en {seconds}s",
+        "retryWait": "Reintento en {seconds}s",
+        "retrying": "Reintentando {attempt}/{limit}",
+        "fallback": "Cambiando al modelo alternativo"
       },
       "purpose": {
         "discover": "Enlaces descubiertos",
@@ -3825,6 +3843,10 @@
       "steerRetryUnknownHint": "OpenSquilla no pudo confirmar si se aceptó esta indicación. Al reintentar se repite de forma segura la solicitud original sin cambios.",
       "removeUnknownSteer": "Descartar el reintento local del mensaje pendiente {index}; esto no significa que el servidor no lo haya recibido",
       "queueHint": "Modo cola: estos mensajes se envían automáticamente en orden cuando termina la respuesta actual",
+      "reorderHint": "Mantén pulsado durante 0,75 segundos y arrastra para cambiar el orden. Alt+Flecha también mueve el mensaje.",
+      "reorderStarted": "Reordenando {label}. Arrastra a la nueva posición y suelta.",
+      "reorderPosition": "{label} se movió a la posición {position} de {count}.",
+      "reorderRecovering": "Restaurando el orden de la cola…",
       "clearAll": "Borrar todo",
       "editMessage": "Editar mensaje",
       "editWhileStreaming": "Espera a que termine la respuesta actual antes de editar",
@@ -3920,6 +3942,9 @@
     "compact": {
       "compacting": "Compactando el contexto",
       "compacted": "Contexto compactado",
+      "historyPreserved": "Contexto anterior resumido; los mensajes originales siguen disponibles en el historial",
+      "historyIncomplete": "Contexto anterior resumido; algunos mensajes originales no están disponibles",
+      "historySummarized": "Contexto anterior resumido",
       "failed": "Error al compactar",
       "withinBudget": "Contexto dentro del presupuesto.",
       "skipped": "No se aplicó la compactación del contexto.",
@@ -3951,7 +3976,6 @@
     "chips": {
       "whatCanYouDo": "¿Qué puedes hacer?",
       "buildGame": "Hazme un juego",
-      "buildGamePrompt": "Construye un prototipo jugable en el navegador de un juego de carreras de vóxeles, con controles responsivos, aceleración y frenado, una pista legible, detección de colisiones, puntos de control, cronometraje de vueltas y un flujo de reinicio. Genera con código el coche de carreras y los escenarios de estilo vóxel, sin usar recursos de pago. Ejecuta el juego, prueba los controles, corrige los problemas bloqueantes y luego entrégalo. Quiero mejores paisajes y un mundo abierto. Incluye señalización de OpenSquilla y TokenRhythm en el mapa como guiños de patrocinadores.",
       "summarizeWebpage": "Resúmeme una página web",
       "planWeek": "Esboza un plan para mi semana",
       "searchAiNews": "Busca las noticias de IA de hoy",
@@ -4004,6 +4028,7 @@
       "waitResponseBeforeCommand": "Espera a la respuesta actual antes de ejecutar {command}.",
       "promptAnnotationBusy": "Espera a que termine la respuesta actual antes de enviar instrucciones del artefacto.",
       "queueFull": "La cola está llena — espera a que termine la respuesta actual.",
+      "queuePersistenceUnavailable": "Conserva este mensaje en el editor hasta que termine la bifurcación; la recuperación duradera no está disponible.",
       "messageStillSaving": "Este mensaje aún no se ha guardado — inténtalo de nuevo en un momento.",
       "artifactOpenFailed": "No se pudo abrir el artefacto. Usa Descargar en su lugar."
     },
@@ -4088,11 +4113,13 @@
     "sidebar": {
       "recentConversations": "Tareas recientes",
       "recents": "Recientes",
+      "pinned": "Fijadas",
       "refresh": "Recargar tareas",
       "clearAgentFilter": "Borrar filtro de agente: {name}",
       "loadError": "No se pueden cargar las tareas",
       "noMatches": "Sin coincidencias",
       "noConversations": "Aún no hay tareas.",
+      "allLoaded": "Todas las tareas cargadas",
       "startChat": "Iniciar una tarea",
       "linkSessions": "Sesiones",
       "currentTask": "Tarea actual",

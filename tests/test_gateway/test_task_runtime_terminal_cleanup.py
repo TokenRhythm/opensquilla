@@ -728,6 +728,39 @@ async def test_terminal_expires_pending_approvals_for_owning_session(
 
 
 @pytest.mark.asyncio
+async def test_prestart_queued_cancel_preserves_running_owner_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = MagicMock()
+    monkeypatch.setattr(
+        "opensquilla.application.approval_queue.get_approval_queue",
+        lambda: queue,
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _handler(run: Any) -> None:
+        if run.message == "running":
+            started.set()
+            await release.wait()
+
+    rt = _make_runtime(turn_handler=_handler, max_concurrency=1)
+    env = _make_envelope("agent-1::approval-running-owner")
+    running = await rt.enqueue(env, "running")
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    queued = await rt.enqueue(env, "queued")
+
+    assert await rt.cancel(task_id=queued.task_id, source="webui_stop") == 1
+    queued_record = await rt.wait(queued.task_id, timeout=2.0)
+    assert queued_record.status is AgentTaskStatus.CANCELLED
+    queue.expire_pending_for_session.assert_not_called()
+
+    release.set()
+    await rt.wait(running.task_id, timeout=2.0)
+    queue.expire_pending_for_session.assert_called_once_with(env.session_key)
+
+
+@pytest.mark.asyncio
 async def test_preallocated_turn_identity_is_propagated_to_handler() -> None:
     observed: list[dict[str, Any] | None] = []
 

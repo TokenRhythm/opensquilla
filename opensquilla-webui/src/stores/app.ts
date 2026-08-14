@@ -18,6 +18,7 @@ import {
   parseSidebarWidthPreference,
   type SidebarWidthPreference,
 } from '@/utils/sidebarLayout'
+import type { ChatLiveConnectionPhase } from '@/utils/chat/chatConnectionState'
 
 // 'system' or any registered value-theme id. The string branch keeps custom
 // themes typeable while preserving autocomplete for the built-ins.
@@ -70,6 +71,7 @@ export const useAppStore = defineStore('app', () => {
   const locale = ref<LocaleCode>('en')
   const pendingChannelNoticeLocale = ref<LocaleCode | null>(readPendingLocaleSync())
   const sidebarOpen = ref(true)
+  const chatLivePhase = ref<ChatLiveConnectionPhase>('idle')
   // Browser-local layout preference, hydrated synchronously so the first
   // mounted frame uses the saved width. Viewport clamping is intentionally a
   // consumer concern: zooming or rotating must not overwrite this preference.
@@ -332,6 +334,10 @@ export const useAppStore = defineStore('app', () => {
     sidebarOpen.value = open
   }
 
+  function setChatLivePhase(phase: ChatLiveConnectionPhase) {
+    chatLivePhase.value = phase
+  }
+
   function toggleSidebar() {
     sidebarOpen.value = !sidebarOpen.value
   }
@@ -460,6 +466,7 @@ export const useAppStore = defineStore('app', () => {
     pendingChannelNoticeLocale,
     resolvedTheme,
     sidebarOpen,
+    chatLivePhase,
     sidebarWidthPreference,
     approvalCount,
     pendingApprovals,
@@ -474,6 +481,7 @@ export const useAppStore = defineStore('app', () => {
     setLocale,
     syncLocaleToGateway,
     setSidebarOpen,
+    setChatLivePhase,
     toggleSidebar,
     setSidebarWidthPreference,
     resetSidebarWidthPreference,

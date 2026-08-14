@@ -298,7 +298,13 @@ export function normalizeSessionItem(item: unknown): SessionItem | null {
   const workspaceLabel = textValue(raw.workspaceLabel)
   const workspaceDisplayPath = textValue(raw.workspaceDisplayPath)
   let title = normalizeRequiredString(raw, 'title', fallbackSessionTitle(raw, key, sessionKind), gaps)
-  if (sessionKind === 'task' && /^you are a subagent\b/i.test(title)) title = i18n.global.t('sessions.fallbackTitle.task')
+  if (
+    sessionKind === 'task'
+    && (
+      /^you are a subagent\b/i.test(title)
+      || title.trim().toLowerCase() === 'subagent task'
+    )
+  ) title = i18n.global.t('sessions.fallbackTitle.task')
   const subtitle = hasOwn(raw, 'subtitle') ? textValue(raw.subtitle) : ''
   if (!hasOwn(raw, 'subtitle')) gaps.push('subtitle')
   const effectiveAgentId = normalizeEffectiveAgentId(raw, gaps, derivedAgentId)
@@ -739,6 +745,11 @@ export function useSessions(readCallOptions?: RpcCallOptions) {
   const sessionsList = ref<RawSessionListEntry[]>([])
   const sessionListError = ref(false)
   const isLoading = ref(false)
+  const isLoadingMore = ref(false)
+  const loadMoreError = ref(false)
+  const hasMore = ref(false)
+  const nextCursor = ref<string | null>(null)
+  let requestGeneration = 0
 
   const allSessions = computed((): SessionItem[] =>
     sessionsList.value
@@ -749,26 +760,81 @@ export function useSessions(readCallOptions?: RpcCallOptions) {
 
   const groupedSessions = computed((): SessionGroup[] => groupSessions(allSessions.value))
 
+  function callSessionsList(params: Record<string, unknown>) {
+    return readCallOptions
+      ? rpc.call<SessionsListResponse>('sessions.list', params, readCallOptions)
+      : rpc.call<SessionsListResponse>('sessions.list', params)
+  }
+
+  function applyPageState(data: SessionsListResponse | null | undefined, requestedCursor?: string) {
+    const rawHasMore = data?.hasMore ?? data?.has_more
+    const rawNextCursor = data?.nextCursor ?? data?.next_cursor
+    const candidate = typeof rawNextCursor === 'string' && rawNextCursor
+      ? rawNextCursor
+      : null
+    // Missing metadata means an older server. A repeated cursor or a page that
+    // claims more rows without a usable cursor is terminal, preventing loops.
+    const usable = rawHasMore === true
+      && candidate !== null
+      && candidate !== requestedCursor
+    hasMore.value = usable
+    nextCursor.value = usable ? candidate : null
+  }
+
   async function loadSessions() {
+    const generation = ++requestGeneration
     isLoading.value = true
+    isLoadingMore.value = false
     sessionListError.value = false
+    loadMoreError.value = false
     try {
       await waitForSessionRpcConnection(rpc, readCallOptions)
       const params = { limit: 200, view: SESSION_LIST_VIEW }
-      const data = readCallOptions
-        ? await rpc.call<SessionsListResponse>(
-            'sessions.list',
-            params,
-            readCallOptions,
-          )
-        : await rpc.call<SessionsListResponse>('sessions.list', params)
+      const data = await callSessionsList(params)
+      if (generation !== requestGeneration) return
       const raw = data?.sessions || data?.keys || []
       sessionsList.value = raw.filter(s => !!itemKey(s))
+      applyPageState(data)
     } catch (err: unknown) {
+      if (generation !== requestGeneration) return
       console.error('[useSessions] sessions.list error:', err instanceof Error ? err.message : err)
       sessionListError.value = true
+      hasMore.value = false
+      nextCursor.value = null
     } finally {
-      isLoading.value = false
+      if (generation === requestGeneration) isLoading.value = false
+    }
+  }
+
+  async function loadMoreSessions() {
+    const cursor = nextCursor.value
+    if (!hasMore.value || !cursor || isLoading.value || isLoadingMore.value) return
+    const generation = requestGeneration
+    isLoadingMore.value = true
+    loadMoreError.value = false
+    try {
+      await waitForSessionRpcConnection(rpc, readCallOptions)
+      const data = await callSessionsList({
+        limit: 200,
+        view: SESSION_LIST_VIEW,
+        cursor,
+      })
+      if (generation !== requestGeneration || nextCursor.value !== cursor) return
+      const raw = (data?.sessions || data?.keys || []).filter(s => !!itemKey(s))
+      const existingKeys = new Set(sessionsList.value.map(itemKey))
+      const additions = raw.filter(item => !existingKeys.has(itemKey(item)))
+      sessionsList.value = [...sessionsList.value, ...additions]
+      applyPageState(data, cursor)
+      if (raw.length === 0) {
+        hasMore.value = false
+        nextCursor.value = null
+      }
+    } catch (err: unknown) {
+      if (generation !== requestGeneration) return
+      console.error('[useSessions] sessions.list next page error:', err instanceof Error ? err.message : err)
+      loadMoreError.value = true
+    } finally {
+      if (generation === requestGeneration) isLoadingMore.value = false
     }
   }
 
@@ -776,8 +842,12 @@ export function useSessions(readCallOptions?: RpcCallOptions) {
     sessionsList,
     sessionListError,
     isLoading,
+    isLoadingMore,
+    loadMoreError,
+    hasMore,
     groupedSessions,
     allSessions,
     loadSessions,
+    loadMoreSessions,
   }
 }

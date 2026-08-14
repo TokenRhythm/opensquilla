@@ -1109,7 +1109,7 @@
       "capacityWarn": "{calls} appels de modèle par tour — le coût croît linéairement et le gain de fusion s'estompe au-delà de 4 proposants.",
       "capacityFull": "Limite de {max} proposants atteinte — davantage de brouillons n'améliore plus la fusion ; retirez-en un d'abord.",
       "diversityHint": "Plusieurs proposants partagent la même famille de modèles — ajouter un autre fournisseur améliore généralement la fusion.",
-      "effectiveFacts": "Par tour : {calls} appels de modèle · fusion dès {quorum}/{proposers} proposants réussis · timeout proposant {proposerTimeout}s · timeout agrégateur {aggregatorTimeout}s · {grace}s de grâce après quorum",
+      "effectiveFacts": "Par tour : {calls} appels de modèle · fusion dès {quorum}/{proposers} proposants réussis · délai total proposant {proposerTimeout}s · délai d'inactivité agrégateur {aggregatorTimeout}s · {grace}s de grâce après quorum",
       "effectiveSummary": "{proposers} proposants en parallèle + 1 agrégateur · environ {calls} appels par tour",
       "runtimeStrategyTitle": "Stratégie d'exécution",
       "runtimeStrategyDesc": "Seuil de réussite, repli et limites de temps",
@@ -1118,7 +1118,7 @@
       "successThresholdExact": "{quorum} sur {proposers}",
       "failurePolicyLabel": "Si l'agrégation ne peut pas aboutir",
       "runtimeLimitsLabel": "Limites de temps",
-      "runtimeLimits": "Proposants {proposerTimeout}s · agrégateur {aggregatorTimeout}s · {grace}s de grâce après le seuil",
+      "runtimeLimits": "Proposants {proposerTimeout}s au total · inactivité de l'agrégateur entre événements {aggregatorTimeout}s (configurée {configuredAggregatorTimeout}s) · délai total du tour séparé · {grace}s de grâce après le seuil",
       "quorumFailureLabel": "Si moins de {quorum} proposants réussissent"
     },
     "behavior": {
@@ -1891,6 +1891,7 @@
     "refresh": "Actualiser",
     "refreshing": "Actualisation…",
     "loading": "Chargement des sessions…",
+    "loadMore": "Charger plus de sessions",
     "unknownAgent": "Agent inconnu",
     "deletedAgent": "Agent supprimé · {id}",
     "msgCount": "{count} msg",
@@ -3240,6 +3241,10 @@
     }
   },
   "chat": {
+    "sessionCreated": {
+      "title": "Discussion créée",
+      "open": "Ouvrir la discussion"
+    },
     "promptCacheKeepalive": {
       "action": "Maintien du cache de prompt",
       "title": "Maintien du cache de prompt",
@@ -3416,6 +3421,9 @@
     "subagentPrefix": "Sous-agent : ",
     "subagentCompletion": "Achèvement du sous-agent",
     "turnFailed": "Échec du tour",
+    "usageAccountingBlockedTitle": "Comptabilisation de l’utilisation temporairement indisponible",
+    "usageAccountingBlockedMessage": "La requête n’a pas été envoyée au fournisseur du modèle et aucune utilisation n’a été facturée. Vous pouvez réessayer ce tour en toute sécurité.",
+    "usageAccountingBlockedUnsafeMessage": "Cette requête au modèle n’a pas été envoyée. Des opérations antérieures de ce tour ont peut-être déjà été exécutées ou facturées ; vérifiez-les avant de réessayer.",
     "sandboxPausedResume": "Reprendre l'exécution",
     "sandboxResumed": "Exécution autonome reprise. Renvoyez votre demande pour continuer.",
     "sandboxResumeFailed": "Impossible de reprendre l'exécution : {error}",
@@ -3499,9 +3507,19 @@
       "lifecycle": {
         "working": "En cours",
         "answering": "Rédaction de la réponse",
+        "answerPrepared": "Préparation de la réponse",
         "settled": "Terminé",
         "interrupted": "Interrompu",
         "failed": "Échec"
+      },
+      "provider": {
+        "waiting": "En attente du modèle",
+        "responded": "Réponse du modèle",
+        "reasoning": "Réflexion approfondie",
+        "rateLimited": "Limite atteinte · nouvel essai dans {seconds}s",
+        "retryWait": "Nouvel essai dans {seconds}s",
+        "retrying": "Nouvel essai {attempt}/{limit}",
+        "fallback": "Passage au modèle de secours"
       },
       "purpose": {
         "discover": "Liens découverts",
@@ -3825,6 +3843,10 @@
       "steerRetryUnknownHint": "OpenSquilla n’a pas pu confirmer l’acceptation de cette instruction. Réessayer rejoue de façon sûre la demande d’origine inchangée.",
       "removeUnknownSteer": "Abandonner la nouvelle tentative locale du message en attente {index} ; cela ne signifie pas que le serveur ne l’a pas reçu",
       "queueHint": "Mode file d'attente : ces messages s'envoient automatiquement dans l'ordre à la fin de la réponse actuelle",
+      "reorderHint": "Maintenez pendant 0,75 seconde puis faites glisser pour réorganiser. Alt+Flèche déplace aussi ce message.",
+      "reorderStarted": "Réorganisation de {label}. Faites glisser vers la nouvelle position puis relâchez.",
+      "reorderPosition": "{label} a été déplacé en position {position} sur {count}.",
+      "reorderRecovering": "Restauration de l’ordre de la file…",
       "clearAll": "Tout effacer",
       "editMessage": "Modifier le message",
       "editWhileStreaming": "Attendez la fin de la réponse en cours avant de modifier",
@@ -3920,6 +3942,9 @@
     "compact": {
       "compacting": "Compactage du contexte",
       "compacted": "Contexte compacté",
+      "historyPreserved": "Contexte antérieur résumé ; les messages d’origine restent disponibles dans l’historique",
+      "historyIncomplete": "Contexte antérieur résumé ; certains messages d’origine ne sont pas disponibles",
+      "historySummarized": "Contexte antérieur résumé",
       "failed": "Échec du compactage",
       "withinBudget": "Contexte dans les limites du budget.",
       "skipped": "Le compactage du contexte n’a pas été appliqué.",
@@ -3951,7 +3976,6 @@
     "chips": {
       "whatCanYouDo": "Que peux-tu faire ?",
       "buildGame": "Crée-moi un jeu",
-      "buildGamePrompt": "Construis un prototype jouable dans le navigateur d’un jeu de course en voxels, avec des commandes réactives, accélération et freinage, une piste lisible, la détection des collisions, des points de contrôle, le chronométrage des tours et un parcours de redémarrage. Génère en code la voiture et les décors en style voxel, sans ressources payantes. Lance le jeu, teste les commandes, corrige les problèmes bloquants, puis livre-le. Je veux de plus beaux paysages et un monde ouvert. Ajoute sur la carte des enseignes OpenSquilla et TokenRhythm comme clins d’œil de sponsors.",
       "summarizeWebpage": "Résume une page web pour moi",
       "planWeek": "Ébauche un plan pour ma semaine",
       "searchAiNews": "Recherche les actualités IA du jour",
@@ -4004,6 +4028,7 @@
       "waitResponseBeforeCommand": "Attendez la réponse actuelle avant d'exécuter {command}.",
       "promptAnnotationBusy": "Attendez la fin de la réponse en cours avant d’envoyer les instructions sur le livrable.",
       "queueFull": "La file d'attente est pleine — attendez la fin de la réponse actuelle.",
+      "queuePersistenceUnavailable": "Conservez ce message dans l’éditeur jusqu’à la fin de la bifurcation ; la récupération durable est indisponible.",
       "messageStillSaving": "Ce message n'est pas encore enregistré — réessayez dans un instant.",
       "artifactOpenFailed": "Échec de l'ouverture de l'artefact. Utilisez Télécharger à la place."
     },
@@ -4088,11 +4113,13 @@
     "sidebar": {
       "recentConversations": "Tâches récentes",
       "recents": "Récentes",
+      "pinned": "Épinglées",
       "refresh": "Recharger les tâches",
       "clearAgentFilter": "Effacer le filtre d'agent : {name}",
       "loadError": "Impossible de charger les tâches",
       "noMatches": "Aucune correspondance",
       "noConversations": "Aucune tâche pour l'instant.",
+      "allLoaded": "Toutes les tâches sont chargées",
       "startChat": "Démarrer une tâche",
       "linkSessions": "Sessions",
       "currentTask": "Tâche actuelle",

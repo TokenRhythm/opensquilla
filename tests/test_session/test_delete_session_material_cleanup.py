@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.artifacts import ArtifactNotFoundError, ArtifactStore
-from opensquilla.attachment_refs import transcript_material_dir, write_transcript_material
+from opensquilla.attachment_refs import (
+    transcript_material_dir,
+    write_pending_chat_input_material,
+    write_transcript_material,
+)
 from opensquilla.attachment_workspace import _safe_path_segment
 from opensquilla.gateway.boot import (
     build_session_material_cleanup,
@@ -39,6 +43,12 @@ def _workspace_attachment_dir(workspace: Path, session_id: str) -> Path:
 
 async def _seed_material(media_root: Path, workspace: Path, session_id: str) -> tuple[str, str]:
     write_transcript_material(media_root=media_root, session_id=session_id, payload=b"bytes")
+    write_pending_chat_input_material(
+        media_root=media_root,
+        session_id=session_id,
+        pending_input_id=f"pending-{session_id}",
+        payload=b"queued bytes",
+    )
     att_dir = _workspace_attachment_dir(workspace, session_id)
     att_dir.mkdir(parents=True, exist_ok=True)
     (att_dir / "doc.pdf").write_bytes(b"%PDF-1.4\n")

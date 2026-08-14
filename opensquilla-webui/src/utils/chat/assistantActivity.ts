@@ -24,6 +24,7 @@ export type AssistantActivityClusterState =
 export type AssistantActivityLifecycleCode =
   | 'chat.activity.lifecycle.working'
   | 'chat.activity.lifecycle.answering'
+  | 'chat.activity.lifecycle.answerPrepared'
   | 'chat.activity.lifecycle.settled'
   | 'chat.activity.lifecycle.interrupted'
   | 'chat.activity.lifecycle.failed'
@@ -109,6 +110,13 @@ export interface AssistantActivityCluster {
 export type AssistantActivityStatusCode =
   | AssistantActivityLifecycleCode
   | AssistantActivityPurposeCode
+  | 'chat.activity.provider.waiting'
+  | 'chat.activity.provider.responded'
+  | 'chat.activity.provider.reasoning'
+  | 'chat.activity.provider.rateLimited'
+  | 'chat.activity.provider.retryWait'
+  | 'chat.activity.provider.retrying'
+  | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
   | 'chat.compact.withinBudget'
@@ -128,6 +136,8 @@ export interface AssistantActivityStatusStep {
   durability?: string
   detail?: string
   reason?: string
+  /** Whole seconds spent in this phase, bounded by the next phase or turn end. */
+  durationSeconds?: number
 }
 
 export interface AssistantActivityTimelineProjection {
@@ -148,6 +158,8 @@ export interface AssistantActivityTimelineProjection {
 export interface ProjectAssistantActivityOptions {
   lifecycle?: AssistantActivityLifecycle
   statusHistory?: readonly StatusPart[]
+  /** Presentation-time terminal/current boundary used to derive phase durations. */
+  endedAt?: number
 }
 
 export interface LiveAssistantTimelineSplit {
@@ -758,6 +770,7 @@ function descriptorCount(
 function statusLabelFor(
   entry: StatusPart,
   clusters: AssistantActivityCluster[],
+  lifecycle: AssistantActivityLifecycle,
 ): AssistantActivityCodeDescriptor<AssistantActivityStatusCode> | null {
   if (entry.category === 'maintenance') {
     if (entry.state === 'failed') return codeDescriptor('chat.compact.failed')
@@ -770,6 +783,35 @@ function statusLabelFor(
   }
   const action = String(entry.action || '').trim()
   const normalized = action.toLowerCase()
+  if (normalized.startsWith('provider:')) {
+    const [, phase = '', first = '0', second = '0'] = normalized.split(':')
+    if (phase === 'requesting') {
+      return codeDescriptor(
+        lifecycle === 'settled'
+          ? 'chat.activity.provider.responded'
+          : 'chat.activity.provider.waiting',
+      )
+    }
+    if (phase === 'reasoning') return codeDescriptor('chat.activity.provider.reasoning')
+    if (phase === 'rate_limited') {
+      return codeDescriptor('chat.activity.provider.rateLimited', {
+        seconds: Math.max(0, Number.parseInt(first, 10) || 0),
+      })
+    }
+    if (phase === 'retry_wait') {
+      return codeDescriptor('chat.activity.provider.retryWait', {
+        seconds: Math.max(0, Number.parseInt(first, 10) || 0),
+      })
+    }
+    if (phase === 'retrying') {
+      return codeDescriptor('chat.activity.provider.retrying', {
+        attempt: Math.max(0, Number.parseInt(first, 10) || 0),
+        limit: Math.max(0, Number.parseInt(second, 10) || 0),
+      })
+    }
+    if (phase === 'fallback') return codeDescriptor('chat.activity.provider.fallback')
+    return codeDescriptor('chat.activity.lifecycle.working')
+  }
   if (normalized.startsWith('tool:')) {
     const toolId = action.slice(action.indexOf(':') + 1)
     const cluster = clusters.find(candidate =>
@@ -781,7 +823,11 @@ function statusLabelFor(
     return cluster ? null : codeDescriptor('chat.activity.purpose.use')
   }
   if (normalized.startsWith('write:') || normalized === 'writing reply') {
-    return codeDescriptor('chat.activity.lifecycle.answering')
+    return codeDescriptor(
+      lifecycle === 'settled'
+        ? 'chat.activity.lifecycle.answerPrepared'
+        : 'chat.activity.lifecycle.answering',
+    )
   }
   const purpose = STATUS_PURPOSE_CODES[normalized]
   if (purpose) return codeDescriptor(purpose)
@@ -795,9 +841,78 @@ function statusLabelFor(
  * by construction.
  */
 export function isSemanticActivityStatusStep(step: AssistantActivityStatusStep): boolean {
+  const code = step.label.code
   return step.category !== 'maintenance'
     && !step.isCurrent
-    && !step.label.code.startsWith('chat.activity.lifecycle.')
+    && !code.startsWith('chat.activity.lifecycle.')
+    // Requesting and reasoning are live provider phases, not durable work
+    // items. The live disclosure header owns them; retaining them in the body
+    // produces empty-looking "Waiting / Thinking" rows during and after a
+    // turn. Retry, fallback and rate-limit phases remain inspectable because
+    // they explain exceptional execution behavior.
+    && code !== 'chat.activity.provider.waiting'
+    && code !== 'chat.activity.provider.reasoning'
+}
+
+/** Routine model phases shown as the small per-phase flow underneath the turn header. */
+export function isRoutineActivityPhaseStep(step: AssistantActivityStatusStep): boolean {
+  return step.category !== 'maintenance' && (
+    step.label.code === 'chat.activity.provider.waiting'
+    || step.label.code === 'chat.activity.provider.responded'
+    || step.label.code === 'chat.activity.provider.reasoning'
+    || step.label.code === 'chat.activity.lifecycle.answering'
+    || step.label.code === 'chat.activity.lifecycle.answerPrepared'
+  )
+}
+
+export function isBeforeReasoningActivityStatusStep(
+  step: AssistantActivityStatusStep,
+): boolean {
+  return step.category !== 'maintenance' && (
+    step.label.code === 'chat.activity.provider.waiting'
+    || step.label.code === 'chat.activity.provider.responded'
+  )
+}
+
+/**
+ * Status rows worth retaining in the finished activity record. Reasoning owns
+ * a richer disclosure, so its status boundary is used for timing but is not
+ * duplicated as an empty row.
+ */
+export function isVisibleActivityStatusStep(step: AssistantActivityStatusStep): boolean {
+  if (step.category === 'maintenance') return true
+  if (step.label.code === 'chat.activity.provider.reasoning') return false
+  if (
+    step.label.code === 'chat.activity.provider.waiting'
+    || step.label.code === 'chat.activity.provider.responded'
+    || step.label.code === 'chat.activity.lifecycle.answering'
+    || step.label.code === 'chat.activity.lifecycle.answerPrepared'
+  ) return true
+  if (step.label.code.startsWith('chat.activity.provider.')) return true
+  return isSemanticActivityStatusStep(step)
+}
+
+/**
+ * Return the client-side retry countdown for a current provider wait step.
+ *
+ * Provider activity events deliberately carry only a safe, bounded initial
+ * delay.  Keeping the one-second ticking local avoids turning countdown UI
+ * into wire traffic while still making a long Retry-After visibly progress.
+ */
+export function providerActivityRemainingSeconds(
+  step: AssistantActivityStatusStep,
+  nowMs: number = Date.now(),
+): number | null {
+  if (
+    step.label.code !== 'chat.activity.provider.rateLimited'
+    && step.label.code !== 'chat.activity.provider.retryWait'
+  ) {
+    return null
+  }
+  const initialSeconds = Number(step.label.params.seconds ?? 0)
+  if (!Number.isFinite(initialSeconds)) return 0
+  const elapsedSeconds = Math.floor(Math.max(0, nowMs - step.at) / 1000)
+  return Math.max(0, Math.floor(initialSeconds) - elapsedSeconds)
 }
 
 function isAutomaticCompletedMaintenance(step: AssistantActivityStatusStep): boolean {
@@ -846,11 +961,12 @@ function projectStatusSteps(
   history: readonly StatusPart[],
   clusters: AssistantActivityCluster[],
   lifecycle: AssistantActivityLifecycle,
+  endedAt: number,
 ): AssistantActivityStatusStep[] {
   const steps: AssistantActivityStatusStep[] = []
   const maintenanceById = new Map<string, number>()
   for (const entry of history) {
-    const label = statusLabelFor(entry, clusters)
+    const label = statusLabelFor(entry, clusters, lifecycle)
     if (!label) continue
     if (entry.category === 'maintenance') {
       const step: AssistantActivityStatusStep = {
@@ -892,6 +1008,13 @@ function projectStatusSteps(
   ) {
     const lastPhase = [...mergedSteps].reverse().find(step => step.category !== 'maintenance')
     if (lastPhase) lastPhase.isCurrent = true
+  }
+  const phaseSteps = mergedSteps.filter(step => step.category !== 'maintenance')
+  for (const [index, step] of phaseSteps.entries()) {
+    const nextAt = phaseSteps[index + 1]?.at
+    const boundary = nextAt && nextAt >= step.at ? nextAt : endedAt
+    if (!Number.isFinite(boundary) || boundary < step.at) continue
+    step.durationSeconds = Math.max(0, Math.floor((boundary - step.at) / 1000))
   }
   return mergedSteps
 }
@@ -942,6 +1065,7 @@ export function projectAssistantActivityTimeline(
     options.statusHistory ?? [],
     activityClusters,
     lifecycle,
+    options.endedAt ?? Date.now(),
   )
   return {
     lifecycle,

@@ -40,6 +40,7 @@ from .compat_policy import (
     OpenAICompatPolicy,
     ReasoningModelRule,
     compat_policy_for_kind,
+    effective_reasoning_format,
 )
 from .context_capabilities import supports_openrouter_explicit_prompt_cache
 from .error_redaction import (
@@ -3448,7 +3449,7 @@ class OpenAIProvider:
         if (caps and caps.supports_reasoning and cfg.thinking) or (
             thinking_toggle_model and cfg.thinking
         ):
-            reasoning_format = (
+            resolved_reasoning_format = (
                 reasoning_rule.reasoning_format
                 if reasoning_rule and reasoning_rule.reasoning_format
                 else (
@@ -3456,6 +3457,11 @@ class OpenAIProvider:
                     if caps is not None
                     else self._compat.default_reasoning_format
                 )
+            )
+            reasoning_format = effective_reasoning_format(
+                self._compat,
+                resolved_reasoning_format,
+                self._base_url,
             )
             reasoning_effort_override: str | None = None
             if reasoning_rule and reasoning_rule.reasoning_format:
@@ -3508,9 +3514,14 @@ class OpenAIProvider:
                     "none",
                     "off",
                 }:
+                    reasoning_format = effective_reasoning_format(
+                        self._compat,
+                        reasoning_rule.reasoning_format,
+                        self._base_url,
+                    )
                     apply_reasoning_disable(
                         payload,
-                        reasoning_rule.reasoning_format,
+                        reasoning_format,
                         ReasoningDisableArgs(model=self._model),
                     )
             else:
@@ -3518,7 +3529,9 @@ class OpenAIProvider:
         elif caps and caps.supports_reasoning:
             apply_reasoning_disable(
                 payload,
-                caps.reasoning_format,
+                effective_reasoning_format(
+                    self._compat, caps.reasoning_format, self._base_url
+                ),
                 ReasoningDisableArgs(
                     model=self._model,
                     disable_reasoning_by_default_models=(
@@ -4038,24 +4051,12 @@ class OpenAIProvider:
                                 message_limit_proof=message_limit_proof,
                             )
                             return
-                        # Diagnostic: dump payload head (no auth headers)
-                        # so 400s from picky upstreams are debuggable. Truncated
-                        # to keep memory low.
-                        try:
-                            _payload_head = json.dumps(
-                                payload,
-                                ensure_ascii=False,
-                            )[:4000]
-                        except Exception:  # noqa: BLE001
-                            _payload_head = repr(payload)[:4000]
                         log.warning(
                             "provider.chat_http_error",
                             provider=self._provider_kind,
                             model=self._model,
                             status_code=response.status_code,
-                            message=message,
-                            response_body=safe_body_text[:2000],
-                            request_payload_head=_payload_head,
+                            response_body_chars=len(response.text),
                         )
                         trace.record_error(
                             code=str(response.status_code),
@@ -4142,8 +4143,7 @@ class OpenAIProvider:
                                 "provider.stream_error_frame",
                                 provider=self._provider_kind,
                                 model=self._model,
-                                code=err_code,
-                                message=err_message,
+                                error_message_chars=len(err_message),
                             )
                             trace.record_error(
                                 code=err_code,
@@ -4350,7 +4350,41 @@ class OpenAIProvider:
                                 )
                                 return
 
-                            # Text content
+                            # Reasoning content (always parsed, not gated on thinking).
+                            # Streamed in real time as ReasoningDeltaEvent; the
+                            # accumulator also retains the joined text for DoneEvent.
+                            # Counts as an emitted stream event: once the caller
+                            # has received reasoning deltas, an empty-stream or
+                            # timeout fallback retry would deliver (and bill)
+                            # the turn twice.
+                            for fragment in _openai_reasoning_fragments(delta):
+                                reasoning_event = reasoning.emit(fragment)
+                                if reasoning_event is None:
+                                    continue
+                                emitted_stream_event = True
+                                if text_tool_normalizer.native_lifecycle_deferred:
+                                    _append_coalesced_stream_event(
+                                        deferred_post_native_events,
+                                        reasoning_event,
+                                    )
+                                    if deferred_queue_is_oversized():
+                                        for release_event in release_deferred_queue():
+                                            if isinstance(
+                                                release_event,
+                                                TextDeltaEvent,
+                                            ):
+                                                visible_assistant_text_parts.append(
+                                                    release_event.text
+                                                )
+                                            yield release_event
+                                else:
+                                    yield reasoning_event
+
+                            # Text content follows reasoning when an
+                            # OpenAI-compatible gateway puts both fields in the
+                            # same delta. The wire object has no meaningful JSON
+                            # key order, but our semantic lifecycle does: a
+                            # thinking block must open before visible answer text.
                             text = delta.get("content")
                             if text:
                                 emitted_stream_event = True
@@ -4382,36 +4416,6 @@ class OpenAIProvider:
                                                 release_event.text
                                             )
                                         yield release_event
-
-                            # Reasoning content (always parsed, not gated on thinking).
-                            # Streamed in real time as ReasoningDeltaEvent; the
-                            # accumulator also retains the joined text for DoneEvent.
-                            # Counts as an emitted stream event: once the caller
-                            # has received reasoning deltas, an empty-stream or
-                            # timeout fallback retry would deliver (and bill)
-                            # the turn twice.
-                            for fragment in _openai_reasoning_fragments(delta):
-                                reasoning_event = reasoning.emit(fragment)
-                                if reasoning_event is None:
-                                    continue
-                                emitted_stream_event = True
-                                if text_tool_normalizer.native_lifecycle_deferred:
-                                    _append_coalesced_stream_event(
-                                        deferred_post_native_events,
-                                        reasoning_event,
-                                    )
-                                    if deferred_queue_is_oversized():
-                                        for release_event in release_deferred_queue():
-                                            if isinstance(
-                                                release_event,
-                                                TextDeltaEvent,
-                                            ):
-                                                visible_assistant_text_parts.append(
-                                                    release_event.text
-                                                )
-                                            yield release_event
-                                else:
-                                    yield reasoning_event
 
                             # Gemini thought_signature on non-FC deltas
                             # (streamed thinking path): Gemini sends it on
@@ -5255,7 +5259,6 @@ class OpenAIProvider:
                     model=self._model,
                     timeout_seconds=cfg.timeout,
                     timeout_phase=type(exc).__name__,
-                    error=safe_error,
                 )
                 yield ProviderHeartbeatEvent(
                     phase="llm_fallback",
@@ -5312,7 +5315,6 @@ class OpenAIProvider:
                         "provider.stream_internal_error",
                         provider=self._provider_kind,
                         model=self._model,
-                        error=fallback_error,
                         exception_type=type(fallback_exc).__name__,
                     )
                     trace.record_error(code="provider_internal", message=fallback_error)
@@ -5432,7 +5434,6 @@ class OpenAIProvider:
                 "provider.stream_internal_error",
                 provider=self._provider_kind,
                 model=self._model,
-                error=safe_error,
                 exception_type=type(exc).__name__,
             )
             trace.record_error(
@@ -5540,7 +5541,7 @@ class OpenAIProvider:
                 "openrouter.non_stream_fallback_timeout",
                 model=self._model,
                 timeout_seconds=cfg.timeout,
-                stream_error=safe_error,
+                timeout_phase=type(timeout_exc).__name__,
             )
             trace.record_error(
                 code="timeout",

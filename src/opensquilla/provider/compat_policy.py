@@ -21,6 +21,8 @@ from fnmatch import fnmatchcase
 from typing import Literal
 from urllib.parse import urlsplit
 
+from opensquilla.endpoint_identity import base_url_matches_official_api
+
 from .model_identity import DEEPSEEK_V4_MODEL_IDS
 from .qwen_token_plan import (
     QWEN_TOKEN_PLAN_DEEPSEEK_V4_MODEL_IDS,
@@ -258,6 +260,12 @@ class OpenAICompatPolicy:
     # Reasoning format assumed when no model capabilities are available.
     default_reasoning_format: str = ""
 
+    # One provider-native reasoning dialect may be valid only at an exact API
+    # root. A custom endpoint using another explicitly configured dialect is
+    # unaffected, and an empty pair leaves compatible relays unrestricted.
+    official_reasoning_dialect: str = ""
+    official_reasoning_api_root: str = ""
+
     # Models that need an explicit thinking enable/disable payload even when
     # no capability profile is available (exact ids, lowercase).
     thinking_toggle_model_ids: frozenset[str] = frozenset()
@@ -332,6 +340,26 @@ class OpenAICompatPolicy:
         """
 
         return self.text_tool_profile.enabled
+
+
+def effective_reasoning_format(
+    policy: OpenAICompatPolicy,
+    reasoning_format: str,
+    base_url: str,
+) -> str:
+    """Suppress a provider-native dialect outside its exact official API root."""
+
+    restricted_dialect = policy.official_reasoning_dialect.strip().lower()
+    if (
+        restricted_dialect
+        and reasoning_format.strip().lower() == restricted_dialect
+        and not base_url_matches_official_api(
+            policy.official_reasoning_api_root,
+            base_url,
+        )
+    ):
+        return ""
+    return reasoning_format
 
 
 _ARK_UNSUPPORTED_TOOL_SCHEMA_KEYWORDS = frozenset(
@@ -477,7 +505,12 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "mimo": OpenAICompatPolicy(display_name="MiMo"),
     "mistral": OpenAICompatPolicy(display_name="Mistral"),
     "groq": OpenAICompatPolicy(display_name="Groq"),
-    "zhipu": OpenAICompatPolicy(display_name="Zhipu"),
+    "zhipu": OpenAICompatPolicy(
+        display_name="Zhipu",
+        official_host="open.bigmodel.cn",
+        official_reasoning_dialect="zai",
+        official_reasoning_api_root="https://open.bigmodel.cn/api/paas/v4",
+    ),
     "qianfan": OpenAICompatPolicy(display_name="Qianfan"),
     "siliconflow": OpenAICompatPolicy(display_name="SiliconFlow"),
     "aihubmix": OpenAICompatPolicy(display_name="AiHubMix"),

@@ -21,6 +21,7 @@ import type {
   InterruptApprovalData,
   InterruptClarifyData,
   InterruptViewState,
+  StatusPart,
 } from '@/types/parts'
 import {
   isEmptyToolPreview,
@@ -36,7 +37,9 @@ import {
 import { segmentsToTimelineItems } from '@/utils/chat/segmentsToTimelineItems'
 import { reconcileTextSnapshot } from '@/utils/chat/foldTurn'
 import { useChatTurnLog } from '@/composables/chat/useChatTurnLog'
+import type { ReasoningBlock } from '@/types/turnlog'
 import { isLegacySilentSentinelOnly } from '@/utils/chat/silentSentinels'
+import { createClientMessageId } from '@/utils/chat/messageIdentity'
 
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 630_000
 const THINKING_DELAY_MS = 400
@@ -46,7 +49,7 @@ const THINKING_TTL_MS = 60000
 // than this (longer than any realistic provider tool run) as skew/garbage.
 const SERVER_CLOCK_TOLERANCE_MS = 5000
 const MAX_TRUSTED_TOOL_AGE_MS = 60 * 60 * 1000
-const SQUILLA_VERBS = ['Planning next step', 'Reading context', 'Waiting for model', 'Preparing output']
+const SQUILLA_VERBS = ['Planning next step', 'Reading context', 'Preparing output']
 
 // Internal phase labels stay English (they double as stable keys for dedup,
 // matching, and the appended status-frame action). Localize only at the display
@@ -54,6 +57,7 @@ const SQUILLA_VERBS = ['Planning next step', 'Reading context', 'Waiting for mod
 // back to their English text.
 const STREAM_LABEL_KEYS: Record<string, string> = {
   Sending: 'chat.stream.sending',
+  Running: 'chat.status.running',
   'Planning next step': 'chat.stream.planningNextStep',
   'Reading context': 'chat.stream.readingContext',
   'Waiting for model': 'chat.stream.waitingForModel',
@@ -89,7 +93,14 @@ export interface UseChatStreamOptions {
   autoScroll: Ref<boolean>
   runStatus?: Ref<ChatRunStatus>
   applySessionRunState: (source: ChatRunStatusSource | null | undefined) => void
-  renderMarkdown: (text: string, opts?: { highlight?: boolean }) => string
+  renderMarkdown: (
+    text: string,
+    opts?: {
+      highlight?: boolean
+      cache?: 'settled' | 'none'
+      math?: 'full' | 'defer'
+    },
+  ) => string
   stripDirectiveTags: (text: string) => string
   stripGeneratedArtifactMarkers: (text: string) => string
   scrollToBottom: () => void
@@ -124,16 +135,34 @@ export function useChatStream(options: UseChatStreamOptions) {
   const streamShowHeader = ref(false)
 
   const streamHasVisibleOutput = computed(() => {
+    if (useReducer.value === true) {
+      const folded = foldedTurn.value
+      return Boolean(
+        folded.rawText
+        || folded.reasoningBlocks.some(block => block.text)
+        || folded.toolCalls.length
+        || folded.artifacts.length
+        || folded.parts.some(part => part.type === 'interrupt'),
+      )
+    }
     return streamSegments.value.length > 0 ||
       streamToolCalls.value.length > 0 ||
       streamArtifacts.value.length > 0
   })
 
   const streamActivity = ref({ label: 'Sending', key: 'Sending', startedAt: 0 })
+  // Turn ownership is intentionally separate from the mutable phase clock.
+  // Provider/router transitions may restart the small phase timer, but the
+  // disclosure header must measure one uninterrupted user-visible run.
+  const streamTurnStartedAt = ref(0)
   const streamActivityTick = ref(0)
   let streamActivityTimer: ReturnType<typeof setInterval> | null = null
   const streamRound = ref(1)
-  const lastSignalAt = ref(0)
+  // Provider deltas can arrive tens of thousands of times per turn. Their
+  // timestamp is sampled by the one-second activity clock; making every write
+  // reactive invalidated the activity ribbon (and style) once per delta even
+  // though no visible label changed.
+  let lastSignalAt = 0
   const toolTimes = ref(new Map<string, { startedAt: number; endedAt?: number }>())
 
   // The ribbon stays up for the whole run, including while tool rows render.
@@ -143,35 +172,40 @@ export function useChatStream(options: UseChatStreamOptions) {
 
   const streamActivityStale = computed(() => {
     streamActivityTick.value
-    return lastSignalAt.value > 0 && Date.now() - lastSignalAt.value > STALE_SIGNAL_MS
+    return lastSignalAt > 0 && Date.now() - lastSignalAt > STALE_SIGNAL_MS
   })
 
   // Phase narration on its own, used by the activity head where elapsed and
   // the step chip render as separate elements rather than one packed string.
   const streamPhaseLabel = computed(() => {
     streamActivityTick.value
+    // A queued task is durable but has not acquired a TaskRuntime slot. Keep
+    // that boundary authoritative: local animation timers must not relabel it
+    // as model or router work that has not started.
+    if (options.runStatus?.value.status === 'queued') {
+      return i18n.global.t('chat.status.queued')
+    }
     const now = Date.now()
-    if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) {
+    if (lastSignalAt > 0 && now - lastSignalAt > STALE_SIGNAL_MS) {
       // Static on purpose: this feeds a polite live region, so a ticking
       // seconds value here would be re-announced every second for the whole
       // stall. The aria-hidden elapsed chip carries the seconds instead.
       return i18n.global.t('chat.activity.stale')
     }
-    const startedAt = streamActivity.value.startedAt || now
-    const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
-    return seconds >= 10 && streamActivity.value.label === 'Planning next step'
-      ? i18n.global.t('chat.stream.stillWaiting')
-      : localizeStreamLabel(streamActivity.value.label)
+    return localizeStreamLabel(streamActivity.value.label)
   })
 
   // Elapsed seconds for the current phase, rendered as its own chip.
   const streamPhaseElapsed = computed(() => {
     streamActivityTick.value
+    // task.queued has no authoritative server timestamp. Do not present the
+    // optimistic browser send clock as durable queue wait time.
+    if (options.runStatus?.value.status === 'queued') return ''
     const now = Date.now()
-    if (lastSignalAt.value > 0 && now - lastSignalAt.value > STALE_SIGNAL_MS) {
+    if (lastSignalAt > 0 && now - lastSignalAt > STALE_SIGNAL_MS) {
       // During a stall the phase label is static for screen readers, so the
       // silence duration ticks here, out of the announced sentence.
-      return `${Math.floor((now - lastSignalAt.value) / 1000)}s`
+      return `${Math.floor((now - lastSignalAt) / 1000)}s`
     }
     const startedAt = streamActivity.value.startedAt || now
     const seconds = Math.max(0, Math.floor((now - startedAt) / 1000))
@@ -197,10 +231,35 @@ export function useChatStream(options: UseChatStreamOptions) {
   const {
     appendFrame,
     checkpointText,
+    finalizeToolInputs,
+    peekRawText,
+    publish: publishTurnLog,
     resetLog,
     useReducer,
     foldedTurn,
   } = turnLog
+
+  const streamTurnElapsed = computed(() => {
+    streamActivityTick.value
+    if (options.runStatus?.value.status === 'queued') return ''
+    // Snapshot/reconnect replay can rebuild a reasoning block whose server
+    // start predates the fresh browser stream shell. Use that durable boundary
+    // so reloading never makes a long-running turn jump back to zero.
+    const replayStartedAt = foldedTurn.value.reasoningBlocks
+      .map(block => block.startedAt)
+      .filter(value => Number.isFinite(value) && value > 0)
+      .sort((left, right) => left - right)[0]
+    const localStartedAt = streamTurnStartedAt.value
+    const startedAt = replayStartedAt && localStartedAt
+      ? Math.min(replayStartedAt, localStartedAt)
+      : replayStartedAt || localStartedAt
+    if (!startedAt) return '0s'
+    return `${Math.max(0, Math.floor((Date.now() - startedAt) / 1000))}s`
+  })
+
+  function currentStreamRaw(): string {
+    return useReducer.value === true ? peekRawText() : streamRaw.value
+  }
 
   // Bound shadow-parity check: assembles this composable's legacy live surface,
   // injecting the live thinking text (owned by the event handlers) so the fold's
@@ -222,9 +281,12 @@ export function useChatStream(options: UseChatStreamOptions) {
   let thinkingDelayTimer: ReturnType<typeof setTimeout> | null = null
   let thinkingStartTime = 0
 
-  const streamIdleTimer = ref<ReturnType<typeof setTimeout> | null>(null)
+  let streamIdleTimer: ReturnType<typeof setTimeout> | null = null
+  let streamIdleTimerPolicyMs = 0
+  let lastStreamEventAt = 0
   const streamIdleTimeoutMs = ref(DEFAULT_STREAM_IDLE_TIMEOUT_MS)
   const streamIdlePausedForApproval = ref(false)
+  let streamConnectionAvailable = true
   // Stream render coalescing. Tokens arrive far faster than the display can
   // paint, so re-renders are batched onto the frame clock (requestAnimationFrame)
   // rather than a fixed setTimeout: frame-aligned flushes avoid the mid-frame
@@ -233,11 +295,18 @@ export function useChatStream(options: UseChatStreamOptions) {
   // re-render every single frame; the hidden-tab fallback keeps output landing
   // when rAF is paused in a background tab.
   const MIN_FLUSH_INTERVAL_MS = 33
+  const MEDIUM_FLUSH_INTERVAL_MS = 50
+  const LARGE_FLUSH_INTERVAL_MS = 100
+  const MEDIUM_STREAM_CHARS = 8 * 1024
+  const LARGE_STREAM_CHARS = 32 * 1024
   const HIDDEN_FLUSH_FALLBACK_MS = 250
+  const COARSE_REASONING_BURST_CHARS = 96
   let renderRaf: number | null = null
   let renderFallbackTimer: ReturnType<typeof setTimeout> | null = null
   let lastFlushAt = 0
   let renderDirty = false
+  let reasoningCharsSinceFlush = 0
+  const reasoningPresentationPending = ref(false)
 
   function resetStreamState() {
     streamRaw.value = ''
@@ -245,6 +314,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamToolCalls.value = []
     streamArtifacts.value = []
     toolTimes.value = new Map()
+    reasoningCharsSinceFlush = 0
+    reasoningPresentationPending.value = false
     // Clear the live-turn log alongside the legacy refs so the next turn's fold
     // starts empty. A steer checkpoint deliberately resets only the current
     // visible segment; checkpointedRaw remains available to de-duplicate an
@@ -253,7 +324,12 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   function noteStreamSignal() {
-    lastSignalAt.value = Date.now()
+    const now = Date.now()
+    const recoveredFromStall = lastSignalAt > 0 && now - lastSignalAt > STALE_SIGNAL_MS
+    lastSignalAt = now
+    // A fresh delta after a visible stall must clear the warning immediately;
+    // ordinary high-frequency progress waits for the existing one-second clock.
+    if (recoveredFromStall) streamActivityTick.value++
   }
 
   // `key` identifies the activity phase: the elapsed counter restarts only
@@ -264,8 +340,11 @@ export function useChatStream(options: UseChatStreamOptions) {
     const current = streamActivity.value
     let isNewPhase = false
     if (current.key === key) {
-      if (current.label !== label) {
-        streamActivity.value = { label, key, startedAt: current.startedAt || Date.now() }
+      if (!current.startedAt) {
+        streamActivity.value = { label, key, startedAt: Date.now() }
+        isNewPhase = true
+      } else if (current.label !== label) {
+        streamActivity.value = { label, key, startedAt: current.startedAt }
       }
     } else {
       streamActivity.value = { label, key, startedAt: Date.now() }
@@ -278,8 +357,11 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (isNewPhase && useReducer.value) {
       const committed = streamActivity.value
       appendFrame({ kind: 'status', action: committed.key, label: committed.label, at: committed.startedAt })
+      // TurnAccumulator is intentionally non-reactive. A provider phase can be
+      // the only semantic progress for minutes, so publish the status through
+      // the same frame clock even when no text/tool delta follows it.
+      scheduleRender()
     }
-    streamActivityTick.value++
     if (!streamActivityTimer) {
       streamActivityTimer = setInterval(() => {
         streamActivityTick.value++
@@ -360,6 +442,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     openToolItems.value = new Set()
     streamToolGroupSeq = 0
     streamRound.value = 1
+    streamTurnStartedAt.value = Date.now()
     noteStreamSignal()
     streamBubble.value = true
     streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
@@ -369,9 +452,19 @@ export function useChatStream(options: UseChatStreamOptions) {
   }
 
   function endStreaming(opts?: { reason?: string, suppressed?: boolean }) {
+    // Running calls keep fragment chunks during the live phase. Materialize
+    // them once before the canonical history row is detached.
+    if (useReducer.value === true) {
+      finalizeToolInputs()
+      // Done can arrive before the frame-clock publish that would expose the
+      // final reasoning delta/end. Materialize the canonical accumulator now
+      // so the settled row receives the complete structured blocks even when
+      // the live component never mounted for that batch.
+      publishTurnLog()
+    }
     const wasAborted = opts?.reason === 'aborted'
     const preReconcileText = options.stripDirectiveTags(
-      options.stripGeneratedArtifactMarkers(streamRaw.value),
+      options.stripGeneratedArtifactMarkers(currentStreamRaw()),
     ).trim()
     // Compatibility for gateways predating the explicit delivery contract.
     // This only recognizes a response made entirely from standalone boundary
@@ -388,7 +481,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (
       suppressText
       && (
-        streamRaw.value !== ''
+        currentStreamRaw() !== ''
         || streamSegments.value.some(segment => segment.type === 'text')
       )
     ) {
@@ -407,19 +500,33 @@ export function useChatStream(options: UseChatStreamOptions) {
       // Markdown/XML is a leaked tool protocol: doing so mutates local history,
       // copy/export/share, and can disagree with the durable server transcript.
       const cleanedText = options.stripDirectiveTags(
-        options.stripGeneratedArtifactMarkers(streamRaw.value),
+        options.stripGeneratedArtifactMarkers(currentStreamRaw()),
       ).trim()
 
       // After Stop, partial streamed output (text, tool rows, artifacts) is
       // kept; only a bubble with nothing visible at all is dropped.
-      const foldedInterrupts = foldedTurn.value.parts.filter(
+      const terminalFold = foldedTurn.value
+      const foldedInterrupts = terminalFold.parts.filter(
         (part): part is Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }> =>
           part.type === 'interrupt',
       )
+      const terminalToolCalls = useReducer.value === true
+        ? terminalFold.toolCalls
+        : streamToolCalls.value
+      const terminalAt = Date.now()
+      const terminalReasoningBlocks: ReasoningBlock[] = terminalFold.reasoningBlocks.map(block => ({
+        ...block,
+        status: block.status === 'streaming'
+          ? wasAborted ? 'interrupted' : 'completed'
+          : block.status,
+        endedAt: block.endedAt ?? terminalAt,
+      }))
       const emptyStream = !cleanedText
+        && terminalReasoningBlocks.every(block => !block.text)
         && streamArtifacts.value.length === 0
-        && streamToolCalls.value.length === 0
+        && terminalToolCalls.length === 0
         && foldedInterrupts.length === 0
+        && (suppressText || terminalFold.statusHistory.length === 0)
       if (emptyStream) {
         streamBubble.value = false
         isStreaming.value = false
@@ -427,27 +534,35 @@ export function useChatStream(options: UseChatStreamOptions) {
         checkpointedRaw = ''
         checkpointedAcrossToolBoundary = false
         activeStreamTurnId = ''
+        streamTurnStartedAt.value = 0
         return
       }
 
       options.messages.value.push({
         role: 'assistant',
+        clientId: createClientMessageId(),
         text: cleanedText,
         ts: new Date().toISOString(),
         turnId: activeStreamTurnId || undefined,
         artifacts: streamArtifacts.value.slice(),
-        tool_calls: streamToolCalls.value.map(streamToolCallToHistoryCall),
+        tool_calls: terminalToolCalls.map(streamToolCallToHistoryCall),
         timeline: useReducer.value
-          ? foldedTurn.value.timelineSegments.slice()
+          ? terminalFold.timelineSegments.slice()
           : streamTimelineSnapshot(cleanedText),
         interrupts: foldedInterrupts.map(part => ({ ...part })),
         // Detach the fold's activity history from the about-to-be-reset log. In
-        // OFF mode this is [], so the field is harmless. The empty/sentinel drop
-        // path above returns before this push, so a status-only ghost turn never
-        // persists an orphan history.
-        statusHistory: foldedTurn.value.statusHistory.slice(),
+        // OFF mode this is [], so the field is harmless. A status-only terminal
+        // turn remains visible because its activity is the useful result.
+        statusHistory: terminalFold.statusHistory.slice(),
+        reasoningBlocks: terminalReasoningBlocks,
+        reasoningPresentationPending: reasoningPresentationPending.value || undefined,
         interrupted: wasAborted || undefined,
       })
+      // Replacing the live block with canonical Markdown/KaTeX can change its
+      // measured height after the final stream flush. Pin once after Vue's
+      // settled render (and TextPart's post-flush decoration), while preserving
+      // the existing autoScroll guard for readers who moved away from the edge.
+      if (options.autoScroll.value) options.scrollToBottom()
     }
 
     streamBubble.value = false
@@ -456,6 +571,38 @@ export function useChatStream(options: UseChatStreamOptions) {
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
+    streamTurnStartedAt.value = 0
+  }
+
+  function restoreStatusHistory(entries: readonly StatusPart[]) {
+    if (!entries.length || useReducer.value === false) return
+    if (!isStreaming.value) startStreaming()
+    // Consume matching live occurrences one-for-one. A Set would erase valid
+    // repeated retry_wait/retrying phases from the durable terminal trace.
+    const liveActionCounts = new Map<string, number>()
+    for (const entry of foldedTurn.value.statusHistory) {
+      liveActionCounts.set(entry.action, (liveActionCounts.get(entry.action) || 0) + 1)
+    }
+    const currentAction = streamActivity.value.key
+    if (currentAction && !liveActionCounts.has(currentAction)) {
+      liveActionCounts.set(currentAction, 1)
+    }
+    for (const entry of entries) {
+      if (!entry.action) continue
+      const liveCount = liveActionCounts.get(entry.action) || 0
+      if (liveCount > 0) {
+        liveActionCounts.set(entry.action, liveCount - 1)
+        continue
+      }
+      appendFrame({
+        kind: 'status',
+        action: entry.action,
+        label: entry.label,
+        at: entry.at,
+        ...(entry.durability ? { durability: entry.durability } : {}),
+      })
+    }
+    publishTurnLog()
   }
 
   function checkpointForUserMessage(turnId: string) {
@@ -464,7 +611,7 @@ export function useChatStream(options: UseChatStreamOptions) {
 
     clearRenderTimer()
     const cleanedText = options.stripDirectiveTags(
-      options.stripGeneratedArtifactMarkers(streamRaw.value),
+      options.stripGeneratedArtifactMarkers(currentStreamRaw()),
     ).trim()
     if (cleanedText) {
       options.messages.value.push({
@@ -480,12 +627,12 @@ export function useChatStream(options: UseChatStreamOptions) {
       streamToolCalls.value.length
       || streamSegments.value.some(segment => segment.type === 'tool-group'),
     )
-    checkpointedRaw += streamRaw.value
+    checkpointedRaw += currentStreamRaw()
     // A steer is another user message inside the same turn. Split only the
     // answer text so it stays chronologically above that message; the running
     // tools, artifacts, interrupts, reasoning and status history continue to
     // belong to the one live activity disclosure below it.
-    streamRaw.value = ''
+    if (useReducer.value !== true) streamRaw.value = ''
     streamSegments.value = streamSegments.value.filter(
       segment => segment.type !== 'text',
     )
@@ -513,6 +660,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
+    streamTurnStartedAt.value = 0
   }
 
   function normalizeIncomingTextDelta(text: string): string {
@@ -524,15 +672,16 @@ export function useChatStream(options: UseChatStreamOptions) {
     ) {
       raw = raw.slice(checkpointedRaw.length)
     }
-    if (!raw || !streamRaw.value) return raw
+    const currentRaw = currentStreamRaw()
+    if (!raw || !currentRaw) return raw
 
     const sawToolBoundary =
       streamToolCalls.value.length > 0 ||
       streamSegments.value.some(seg => seg.type === 'tool-group')
     if (!sawToolBoundary) return raw
 
-    if (raw === streamRaw.value) return ''
-    if (raw.startsWith(streamRaw.value)) return raw.slice(streamRaw.value.length)
+    if (raw === currentRaw) return ''
+    if (raw.startsWith(currentRaw)) return raw.slice(currentRaw.length)
     return raw
   }
 
@@ -545,24 +694,26 @@ export function useChatStream(options: UseChatStreamOptions) {
     if (!deltaText) return
     if (!isStreaming.value) startStreaming()
     setStreamActivity('Writing reply', `write:${streamRound.value}`)
-    streamRaw.value += deltaText
+    if (useReducer.value !== true) streamRaw.value += deltaText
 
-    const lastSegment = streamSegments.value[streamSegments.value.length - 1]
-    if (
-      !lastSegment
-      || lastSegment.type !== 'text'
-      || lastSegment.presentation !== presentation
-    ) {
-      streamSegments.value.push({
-        type: 'text',
-        raw: deltaText,
-        html: '',
-        dirty: true,
-        presentation,
-      })
-    } else {
-      lastSegment.raw = (lastSegment.raw || '') + deltaText
-      lastSegment.dirty = true
+    if (useReducer.value !== true) {
+      const lastSegment = streamSegments.value[streamSegments.value.length - 1]
+      if (
+        !lastSegment
+        || lastSegment.type !== 'text'
+        || lastSegment.presentation !== presentation
+      ) {
+        streamSegments.value.push({
+          type: 'text',
+          raw: deltaText,
+          html: '',
+          dirty: true,
+          presentation,
+        })
+      } else {
+        lastSegment.raw = (lastSegment.raw || '') + deltaText
+        lastSegment.dirty = true
+      }
     }
 
     if (useReducer.value) appendFrame({ kind: 'text', text: deltaText, presentation })
@@ -588,12 +739,23 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
   }
 
+  function noteReasoningPresentationDelta(text: string) {
+    reasoningCharsSinceFlush += text.length
+    if (reasoningCharsSinceFlush > COARSE_REASONING_BURST_CHARS) {
+      reasoningPresentationPending.value = true
+    }
+  }
+
+  function completeReasoningPresentation() {
+    reasoningPresentationPending.value = false
+  }
+
   function onRenderFrame() {
     renderRaf = null
     // Coalesce bursts to the frame clock but cap the heavy re-parse: if the last
     // flush was very recent, wait for the next frame instead of re-rendering the
     // whole growing segment again this frame.
-    if (Date.now() - lastFlushAt < MIN_FLUSH_INTERVAL_MS) {
+    if (Date.now() - lastFlushAt < visibleFlushIntervalMs()) {
       renderRaf = requestAnimationFrame(onRenderFrame)
       return
     }
@@ -610,20 +772,48 @@ export function useChatStream(options: UseChatStreamOptions) {
   function flushRender() {
     if (!renderDirty) return
 
-    for (const seg of streamSegments.value) {
-      if (seg.type === 'text' && seg.dirty) {
-        // Live reveal renders without syntax highlighting (the heaviest per-flush
-        // cost); the committed message re-renders with full highlight on end.
-        // A half-streamed ``` fence is closed for the render only (raw untouched)
-        // so a code block renders stably as a <pre> while it grows, instead of
-        // flickering paragraph↔block on every flush — the worst mid-stream jump.
-        seg.html = options.renderMarkdown(stabilizeStreamingMarkdown(seg.raw || ''), { highlight: false })
-        seg.dirty = false
+    // The reducer is the production render source. Do not also parse the
+    // invisible legacy segment: that used to double the Markdown work on every
+    // flush. DEV shadow and the explicit kill switch keep the legacy renderer
+    // for parity/rollback.
+    if (useReducer.value === false) {
+      for (const seg of streamSegments.value) {
+        if (seg.type === 'text' && seg.dirty) {
+          seg.html = options.renderMarkdown(stabilizeStreamingMarkdown(seg.raw || ''), {
+            highlight: false,
+            cache: 'none',
+            math: 'defer',
+          })
+          seg.dirty = false
+        }
       }
     }
 
+    publishTurnLog()
+    reasoningCharsSinceFlush = 0
+    if (useReducer.value === 'shadow') {
+      // Shadow mode still compares the legacy shape, but reuses the one
+      // accumulator render instead of parsing identical Markdown twice.
+      const foldedText = foldedTurn.value.timelineItems.filter(
+        item => item.type === 'text',
+      )
+      let textIndex = 0
+      for (const segment of streamSegments.value) {
+        if (segment.type !== 'text') continue
+        const rendered = foldedText[textIndex++]
+        if (rendered?.type === 'text') segment.html = rendered.html
+        segment.dirty = false
+      }
+    }
     renderDirty = false
     if (options.autoScroll.value) options.scrollToBottom()
+  }
+
+  function visibleFlushIntervalMs(): number {
+    const size = currentStreamRaw().length
+    if (size >= LARGE_STREAM_CHARS) return LARGE_FLUSH_INTERVAL_MS
+    if (size >= MEDIUM_STREAM_CHARS) return MEDIUM_FLUSH_INTERVAL_MS
+    return MIN_FLUSH_INTERVAL_MS
   }
 
   // Render-only stabilization of incomplete markdown during streaming: an
@@ -669,24 +859,78 @@ export function useChatStream(options: UseChatStreamOptions) {
     thinkingVisible.value = false
   }
 
-  function resetStreamIdleTimer() {
+  function resetStreamIdleTimer(opts: { progress?: boolean } = {}) {
     // Every gateway event funnels through here, including run heartbeats, so
-    // it doubles as the liveness signal for the staleness note.
-    noteStreamSignal()
+    // keep the hard connection timeout alive. Generic heartbeats are not model
+    // progress, however, and must not hide a 20s provider-progress stall.
+    lastStreamEventAt = Date.now()
+    if (opts.progress !== false) noteStreamSignal()
+    const nextTimeoutMs = streamIdleTimeoutFromPolicy(options.rpcPolicy?.())
+    streamIdleTimeoutMs.value = nextTimeoutMs
+    if (
+      !isStreaming.value
+      || streamIdlePausedForApproval.value
+      || !streamConnectionAvailable
+      || (typeof document !== 'undefined' && document.hidden)
+    ) {
+      clearStreamIdleTimer()
+      return
+    }
+    // Keep one watchdog alive across a delta flood. Clearing and allocating a
+    // new 630s timer for every reasoning/tool/text fragment retained tens of
+    // thousands of cancelled timer records until V8's next collection. At the
+    // deadline, compare against the latest event and arm only the remaining
+    // interval; policy changes remain immediate.
+    if (streamIdleTimer && streamIdleTimerPolicyMs === nextTimeoutMs) return
     clearStreamIdleTimer()
-    streamIdleTimeoutMs.value = streamIdleTimeoutFromPolicy(options.rpcPolicy?.())
-    if (!isStreaming.value || streamIdlePausedForApproval.value) return
-    streamIdleTimer.value = setTimeout(() => {
-      if (isStreaming.value && !streamIdlePausedForApproval.value) {
-        endStreaming()
-        const seconds = Math.round(streamIdleTimeoutMs.value / 1000)
-        options.messages.value.push({ role: 'error', text: `Response timed out -- no events received for ${seconds}s`, ts: new Date().toISOString() })
+    armStreamIdleTimer(nextTimeoutMs)
+  }
+
+  function armStreamIdleTimer(delayMs: number) {
+    streamIdleTimerPolicyMs = streamIdleTimeoutMs.value
+    streamIdleTimer = setTimeout(() => {
+      streamIdleTimer = null
+      if (
+        !isStreaming.value
+        || streamIdlePausedForApproval.value
+        || !streamConnectionAvailable
+        || (typeof document !== 'undefined' && document.hidden)
+      ) return
+      const idleForMs = Math.max(0, Date.now() - lastStreamEventAt)
+      const remainingMs = streamIdleTimeoutMs.value - idleForMs
+      if (remainingMs > 0) {
+        armStreamIdleTimer(remainingMs)
+        return
       }
-    }, streamIdleTimeoutMs.value)
+      endStreaming()
+      const seconds = Math.round(streamIdleTimeoutMs.value / 1000)
+      options.messages.value.push({ role: 'error', text: `Response timed out -- no events received for ${seconds}s`, ts: new Date().toISOString() })
+    }, Math.max(1, delayMs))
   }
 
   function clearStreamIdleTimer() {
-    if (streamIdleTimer.value) { clearTimeout(streamIdleTimer.value); streamIdleTimer.value = null }
+    if (streamIdleTimer) clearTimeout(streamIdleTimer)
+    streamIdleTimer = null
+    streamIdleTimerPolicyMs = 0
+  }
+
+  function setStreamConnectionAvailable(available: boolean) {
+    streamConnectionAvailable = available
+    if (!available) {
+      clearStreamIdleTimer()
+      return
+    }
+    resetStreamIdleTimer({ progress: false })
+  }
+
+  function handleVisibilityChange() {
+    if (typeof document === 'undefined') return
+    if (document.hidden) clearStreamIdleTimer()
+    else resetStreamIdleTimer({ progress: false })
+  }
+
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', handleVisibilityChange)
   }
 
   // The server-stamped tool start time (epoch ms), or null when absent/invalid.
@@ -796,13 +1040,25 @@ export function useChatStream(options: UseChatStreamOptions) {
     const tc = existing || ensureStreamToolCall(payload, { running: true })
     if (!tc) return
 
-    const nextInput = `${tc.inputRaw || ''}${fragmentText}`
-    tc.inputRaw = nextInput
-    if (!isEmptyToolPreview(nextInput)) {
-      tc.inputPreview = truncateToolPreview(nextInput, 200)
-      tc.displayName = toolDisplayName(tc.name, nextInput)
+    // The accumulator owns the complete production input. The legacy call is
+    // retained only as bounded narration metadata; concatenating the same 10k
+    // fragment prefix here doubled both allocation churn and retained state.
+    const previousInput = tc.inputRaw || ''
+    const nextInput = useReducer.value === true
+      ? previousInput.length >= 200
+        ? previousInput
+        : `${previousInput}${fragmentText}`.slice(0, 200)
+      : `${previousInput}${fragmentText}`
+    if (nextInput !== previousInput) {
+      tc.inputRaw = nextInput
+      if (!isEmptyToolPreview(nextInput)) {
+        tc.inputPreview = truncateToolPreview(nextInput, 200)
+        tc.displayName = toolDisplayName(tc.name, nextInput)
+      }
     }
-    if (tc.isRunning) narrateToolCall(tc)
+    if (tc.isRunning && (useReducer.value !== true || nextInput !== previousInput)) {
+      narrateToolCall(tc)
+    }
     // The fold concats the same fragment onto the same call's inputRaw. When
     // this delta created the call, ensureStreamToolCall already emitted the
     // seeding tool-start above, so the call exists in the fold before this.
@@ -936,6 +1192,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   // the idle timer, so the fold-driven activity surface keeps rendering the part.
   function ensureInterruptBubble() {
     if (streamBubble.value) return
+    if (!streamTurnStartedAt.value) streamTurnStartedAt.value = Date.now()
     streamBubble.value = true
     streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
     isStreaming.value = true
@@ -950,6 +1207,12 @@ export function useChatStream(options: UseChatStreamOptions) {
     const segmentFinalText = checkpointedRaw && finalText.startsWith(checkpointedRaw)
       ? finalText.slice(checkpointedRaw.length)
       : finalText
+    if (useReducer.value === true) {
+      const changed = currentStreamRaw() !== segmentFinalText
+      appendFrame({ kind: 'final-text', text: segmentFinalText })
+      if (changed) scheduleRender()
+      return
+    }
     const reconciled = reconcileTextSnapshot(
       streamSegments.value,
       streamRaw.value,
@@ -1000,6 +1263,9 @@ export function useChatStream(options: UseChatStreamOptions) {
     clearStreamIdleTimer()
     hideThinkingIndicator()
     clearStreamActivity()
+    if (typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
   }
 
   return {
@@ -1012,6 +1278,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamActivityStale,
     streamPhaseLabel,
     streamPhaseElapsed,
+    streamTurnElapsed,
     streamStepLabel,
     streamToolElapsedText,
     streamIdleTimeoutMs,
@@ -1032,8 +1299,10 @@ export function useChatStream(options: UseChatStreamOptions) {
     ensureInterruptBubble,
     reconcileFinalText,
     resetStreamIdleTimer,
+    setStreamConnectionAvailable,
     clearStreamIdleTimer,
     setStreamActivity,
+    restoreStatusHistory,
     recordCompactionActivity,
     showThinkingIndicator,
     hideThinkingIndicator,
@@ -1046,8 +1315,11 @@ export function useChatStream(options: UseChatStreamOptions) {
     // (which own the thinking ref) append their frame; assertLiveParity is run
     // from a DEV watchEffect; foldedTurn is the fold output (not rendered yet).
     appendFrame,
+    noteReasoningPresentationDelta,
+    completeReasoningPresentation,
     useReducer,
     foldedTurn,
+    getThinkingText: () => foldedTurn.value.thinkingText,
     assertLiveParity,
   }
 }

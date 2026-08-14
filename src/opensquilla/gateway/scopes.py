@@ -129,6 +129,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.messages.subscribe": READ_SCOPE,
     "sessions.messages.hydrate": READ_SCOPE,
     "sessions.messages.unsubscribe": READ_SCOPE,
+    "sessions.pending_inputs.list": READ_SCOPE,
     "sessions.promptCacheKeepalive.status": READ_SCOPE,
     "artifacts.list": READ_SCOPE,
     "artifacts.get": READ_SCOPE,
@@ -245,6 +246,11 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.fork": WRITE_SCOPE,
     "sessions.forkThroughTurn": WRITE_SCOPE,
     "sessions.send": WRITE_SCOPE,
+    "sessions.pending_inputs.enqueue": WRITE_SCOPE,
+    "sessions.pending_inputs.update": WRITE_SCOPE,
+    "sessions.pending_inputs.reorder": WRITE_SCOPE,
+    "sessions.pending_inputs.cancel": WRITE_SCOPE,
+    "sessions.pending_inputs.dispatch": WRITE_SCOPE,
     "plans.capabilities": READ_SCOPE,
     "plans.setMode": WRITE_SCOPE,
     "plans.implement": WRITE_SCOPE,
@@ -278,6 +284,9 @@ METHOD_SCOPES: dict[str, str] = {
     # REMOTE_OPERATOR_SCOPES (no admin) — surfacing as "Failed to delete session"
     # (issues #357, #307).
     "sessions.delete": WRITE_SCOPE,
+    # Display-name-only session rename. Deployment/model rebinding remains on
+    # the separately admin-gated sessions.patch surface.
+    "sessions.rename": WRITE_SCOPE,
     "sessions.promptCacheKeepalive.set": WRITE_SCOPE,
     "sandbox.workspace.set": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.
     "sandbox.mount.add": WRITE_SCOPE,  # OpenSquilla-only; owner-guarded handler.

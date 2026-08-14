@@ -199,7 +199,7 @@ class MemorySyncNotifyPort(Protocol):
 WarningTransformer = Callable[["WarningEvent"], "WarningEvent"]
 
 # ---------------------------------------------------------------------------
-# Stream state -- four owned + four pass-by-reference accumulators
+# Stream state -- four owned + five pass-by-reference accumulators
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -226,6 +226,7 @@ class _StreamState:
     done_event: DoneEvent | None = None
     # PASSED IN by the harness -- references, not copies.
     final_text_parts: list[str] = field(default_factory=list)
+    reasoning_parts: list[str] = field(default_factory=list)
     turn_segments: list[dict] = field(default_factory=list)
     turn_artifacts: list[dict[str, Any]] = field(default_factory=list)
     artifact_delivery_failures: list[str] = field(default_factory=list)
@@ -1532,6 +1533,7 @@ class StreamConsumerStage:
             EnsembleProgressEvent,
             ErrorEvent,
             TextDeltaEvent,
+            ThinkingEvent,
             ToolResultEvent,
             ToolUseDeltaEvent,
             ToolUseStartEvent,
@@ -1572,6 +1574,10 @@ class StreamConsumerStage:
                         )
                         buffered_text_observed = True
                     transformed = _SUPPRESS
+            elif isinstance(event, ThinkingEvent):
+                if event.text:
+                    state.reasoning_parts.append(event.text)
+                transformed = event
             elif isinstance(event, ToolUseStartEvent):
                 transformed = self._tool_use_start_handler.handle(event, state)
             elif isinstance(event, ToolUseDeltaEvent):

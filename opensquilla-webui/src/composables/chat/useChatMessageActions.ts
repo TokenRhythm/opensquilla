@@ -7,6 +7,10 @@ import type {
 import { copyTextWithFallback } from '@/utils/browser'
 import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 import { turnOutcomePresentation } from '@/utils/chat/turnOutcome'
+import {
+  isUsageAccountingBarrierMessage,
+  strictUsageBarrierRetryUserMessageIndex,
+} from '@/utils/chat/usageAccountingFailure'
 import { sanitizeAssistantPresentationSegments } from '@/utils/chat/silentSentinels'
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
 
@@ -21,6 +25,10 @@ export interface UseChatMessageActionsOptions {
   stripTimePrefix: (text: string) => string
   autoResizeTextarea: () => void
   sendCurrentInput: () => void
+  sendUsageBarrierReplay: (payload: {
+    text: string
+    forkBeforeMessageId: string
+  }) => Promise<boolean>
   focusComposer: () => void
   pendingForkBeforeMessageId: Ref<string | null>
   aiGeneratedLabel?: () => string
@@ -126,23 +134,28 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     return -1
   }
 
-  function regenerateMessage(message: ChatRenderedMessage) {
+  function regenerateMessage(message: ChatRenderedMessage): boolean | Promise<boolean> {
     if (options.isStreaming.value) {
       console.warn('Wait for the current response to finish')
-      return
+      return false
     }
-    // Regenerate is a send action that also truncates local history and
-    // replaces the composer. Fail closed before any of those mutations when
-    // live delivery cannot receive the resulting turn.
-    if (options.canDeliver && !options.canDeliver()) {
-      options.notifyDeliveryBlocked?.()
-      return
-    }
+    const usageBarrierRetry = isUsageAccountingBarrierMessage(message)
     const assistantIndex = sourceMessageIndex(message)
-    const userMsgIndex = previousUserMessageIndex(assistantIndex)
+    const usageBarrierUserIndex = strictUsageBarrierRetryUserMessageIndex(
+      options.messages.value,
+      assistantIndex,
+      message,
+    )
+    if (usageBarrierRetry && usageBarrierUserIndex < 0) {
+      console.warn('Usage accounting retry is missing a safe replay proof or primary user')
+      return false
+    }
+    const userMsgIndex = usageBarrierRetry
+      ? usageBarrierUserIndex
+      : previousUserMessageIndex(assistantIndex)
     if (userMsgIndex < 0) {
       console.warn('No previous message to regenerate')
-      return
+      return false
     }
 
     const userMessage = options.messages.value[userMsgIndex]
@@ -150,14 +163,27 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     if (!forkBeforeMessageId) {
       console.warn('Wait for the message to finish saving before regenerating')
       options.notifyMessagePending?.()
-      return
+      return false
     }
     const userText = userMessage?.text || ''
+    if (usageBarrierRetry) {
+      return options.sendUsageBarrierReplay({
+        text: userText,
+        forkBeforeMessageId,
+      })
+    }
+    // Ordinary regenerate remains composer-backed. Fail closed before any of
+    // its local mutations when live delivery cannot receive the resulting turn.
+    if (options.canDeliver && !options.canDeliver()) {
+      options.notifyDeliveryBlocked?.()
+      return false
+    }
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = options.messages.value.slice(0, userMsgIndex)
     options.inputText.value = userText
     options.autoResizeTextarea()
     nextTick(() => options.sendCurrentInput())
+    return true
   }
 
   function editMessage(message: ChatRenderedMessage) {

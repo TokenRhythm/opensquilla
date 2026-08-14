@@ -114,6 +114,17 @@ async def cancel_background_completion_for_session(parent_session_key: str) -> i
     return int(await cancel_session(parent_session_key))
 
 
+async def cancel_background_completion_for_task(
+    parent_session_key: str,
+    parent_task_id: str,
+) -> int:
+    """Block only one task-owned child-completion group."""
+    cancel_task = getattr(_background_completion_manager, "cancel_task", None)
+    if not callable(cancel_task):
+        return 0
+    return int(await cancel_task(parent_session_key, parent_task_id))
+
+
 async def active_background_completion_group_ids(parent_session_key: str) -> list[str]:
     """Return active background groups for session subscription hydration."""
     active_group_ids = getattr(_background_completion_manager, "active_group_ids", None)
