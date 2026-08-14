@@ -104,10 +104,10 @@ INDEPENDENT_ENSEMBLE_SELECTION_MODES = frozenset(
     {*STATIC_B5_SELECTION_MODES, CUSTOM_B5_SELECTION_MODE}
 )
 EnsembleSelectionMode = Literal[
-    STATIC_OPENROUTER_B5_SELECTION_MODE,
-    STATIC_TOKENRHYTHM_B5_SELECTION_MODE,
-    CUSTOM_B5_SELECTION_MODE,
-    ROUTER_DYNAMIC_SELECTION_MODE,
+    "static_openrouter_b5",
+    "static_tokenrhythm_b5",
+    "custom_b5",
+    "router_dynamic",
 ]
 
 # Legacy OpenRouter model options remain readable for old configs.  They are

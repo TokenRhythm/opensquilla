@@ -506,7 +506,7 @@ async def _provider_stream_with_lifecycle(
                     continue
                 if getattr(event, "generation_epoch", None) is None:
                     with contextlib.suppress(AttributeError, TypeError):
-                        event.generation_epoch = event_epoch
+                        setattr(event, "generation_epoch", event_epoch)
                 with contextlib.suppress(AttributeError, TypeError):
                     setattr(event, "_turn_execution_sequence", event_sequence)
                     setattr(event, "_turn_execution_accepted", True)
