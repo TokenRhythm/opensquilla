@@ -5921,6 +5921,11 @@ class TurnRunner:
                 code=event_code,
                 error_id=error_id or "",
                 failure_kind=provider_boundary_failure_kind,
+                retry_after_ms=(
+                    getattr(exc, "retry_after_ms", None)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
             )
 
     @staticmethod

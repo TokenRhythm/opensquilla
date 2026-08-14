@@ -50,6 +50,10 @@ class UsageAccountingUnavailableError(RuntimeError):
     code = "usage_accounting_unavailable"
     retryable = True
 
+    def __init__(self, message: str, *, retry_after_ms: int | None = None) -> None:
+        super().__init__(message)
+        self.retry_after_ms = retry_after_ms
+
 
 class UsageAccountingBusyError(UsageAccountingUnavailableError):
     """A transient ledger lock remained busy after its bounded retry."""

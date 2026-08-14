@@ -3395,6 +3395,8 @@
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent completion",
     "turnFailed": "Turn failed",
+    "usageAccountingBlockedTitle": "Usage accounting temporarily unavailable",
+    "usageAccountingBlockedMessage": "The provider request was not sent and no usage was billed. You can safely retry this turn.",
     "sandboxPausedResume": "Resume execution",
     "sandboxResumed": "Autonomous execution resumed. Resend your request to continue.",
     "sandboxResumeFailed": "Could not resume execution: {error}",

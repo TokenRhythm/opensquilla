@@ -18,7 +18,14 @@ function errorMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRendere
   }
 }
 
-async function mountMsg(message: ChatRenderedMessage, onResume?: () => void) {
+async function mountMsg(
+  message: ChatRenderedMessage,
+  onResume?: () => void,
+  onRetry?: (
+    message: ChatRenderedMessage,
+    settle: (accepted: boolean) => void,
+  ) => void,
+) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(SystemMessage, {
@@ -26,6 +33,7 @@ async function mountMsg(message: ChatRenderedMessage, onResume?: () => void) {
     subagentSummary: (t: string) => t,
     subagentBody: (t: string) => t,
     onResume,
+    onRetry,
   })
   app.use(i18n)
   app.mount(el)
@@ -77,6 +85,40 @@ describe('SystemMessage sandbox resume', () => {
       errorMessage({ role: 'system', displayRole: 'system', errorCode: 'sandbox_threshold_exceeded' }),
     )
     expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    app.unmount()
+  })
+
+  it('locks safe retry only after the parent accepts it', async () => {
+    let accepted = false
+    const onRetry = vi.fn((
+      _message: ChatRenderedMessage,
+      settle: (accepted: boolean) => void,
+    ) => settle(accepted))
+    const message = errorMessage({
+      errorCode: 'usage_accounting_busy',
+      text: 'The provider request was not sent.',
+    })
+    const { app, el } = await mountMsg(message, undefined, onRetry)
+
+    expect(el.querySelector('.msg-error-card__heading')?.textContent).toContain(
+      'Usage accounting temporarily unavailable',
+    )
+    const btn = el.querySelector<HTMLButtonElement>('.msg-error-card__resume')
+    expect(btn?.textContent).toContain('Retry')
+    btn?.click()
+    await nextTick()
+    expect(onRetry).toHaveBeenCalledOnce()
+    expect(onRetry.mock.calls[0]?.[0]).toBe(message)
+    expect(btn?.disabled).toBe(false)
+
+    accepted = true
+    btn?.click()
+    await nextTick()
+    expect(onRetry).toHaveBeenCalledTimes(2)
+    expect(btn?.disabled).toBe(true)
+    btn?.click()
+    await nextTick()
+    expect(onRetry).toHaveBeenCalledTimes(2)
     app.unmount()
   })
 })

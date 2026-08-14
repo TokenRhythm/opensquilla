@@ -107,6 +107,7 @@
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
           @resume="$emit('resumeSandbox')"
+          @retry="forwardSystemRetry"
         />
       </div>
     </template>
@@ -192,9 +193,12 @@ const props = defineProps<{
   followLiveEdge?: boolean
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
-  regenerateMessage: [message: ChatRenderedMessage]
+  regenerateMessage: [
+    message: ChatRenderedMessage,
+    settle?: (accepted: boolean) => void,
+  ]
   toggleShareMessage: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]
   openArtifact: [artifact: ArtifactPayload]
@@ -215,6 +219,13 @@ defineEmits<{
 
 const VIRTUALIZATION_STORAGE_KEY = 'opensquilla.chat.virtualizeHistory'
 const MESSAGE_GAP_PX = 4
+
+function forwardSystemRetry(
+  message: ChatRenderedMessage,
+  settle: (accepted: boolean) => void,
+) {
+  emit('regenerateMessage', message, settle)
+}
 
 const listRootRef = ref<HTMLElement | null>(null)
 const viewportStart = ref(0)

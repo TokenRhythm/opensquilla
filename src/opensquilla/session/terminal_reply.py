@@ -191,6 +191,17 @@ def build_terminal_reply(
             "The task was blocked because a tool it needed is not permitted by the "
             "current policy."
         )
+    if error_class in {
+        "usage_accounting_busy",
+        "usage_accounting_unavailable",
+    } or reason in {
+        "usage_accounting_busy",
+        "usage_accounting_unavailable",
+    }:
+        return (
+            "Usage accounting is temporarily unavailable. The provider request was not "
+            "sent, so it is safe to retry this turn."
+        )
     if status == AgentTaskStatus.FAILED.value or reason in {"error", "tool_error"}:
         return "The task failed before it could finish."
     if status == AgentTaskStatus.SUCCEEDED.value or reason in {"completed", "done"}:

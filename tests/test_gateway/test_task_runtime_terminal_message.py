@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from opensquilla.engine.types import ErrorEvent
+from opensquilla.engine.types import AgentState, ErrorEvent, RouterDecisionEvent, StateChangeEvent
 from opensquilla.gateway.boot import (
     TaskRuntimeStreamError,
     _emit_task_runtime_stream_events,
@@ -19,6 +19,7 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.task_runtime import SubagentCompletionEvent, TaskRuntime
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
+from opensquilla.session.storage import SessionStorage
 
 
 def _make_envelope(
@@ -147,6 +148,93 @@ async def test_typed_provider_exception_is_sanitized_in_task_record_and_wire_eve
 
 
 @pytest.mark.asyncio
+async def test_usage_barrier_stream_error_emits_typed_retry_and_activity_snapshot() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield RouterDecisionEvent(tier="c1")
+        yield StateChangeEvent(from_state=AgentState.IDLE, to_state=AgentState.THINKING)
+        yield ErrorEvent(
+            message="usage ledger temporarily unavailable; provider request was not sent",
+            code="usage_accounting_busy",
+            retry_after_ms=125,
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    with pytest.raises(TaskRuntimeStreamError) as caught:
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            "agent:main:test",
+            _emitter,
+            task_id="task-usage-busy",
+            idle_timeout=1.0,
+            heartbeat_interval=0.0,
+        )
+
+    payload = emitted[-1][2]
+    assert emitted[-1][1] == "session.event.error"
+    assert payload["code"] == payload["error_class"] == "usage_accounting_busy"
+    assert payload["retryable"] is True
+    assert payload["retry_after_ms"] == 125
+    assert payload["turn_outcome"]["kind"] == "blocked"
+    assert payload["turn_outcome"]["retryable"] is True
+    snapshot = payload["activity_snapshot"]
+    assert snapshot["version"] == 1
+    assert snapshot["task_id"] == snapshot["turn_id"] == "task-usage-busy"
+    assert [
+        (phase["kind"], phase["phase"])
+        for phase in snapshot["phases"]
+    ] == [("router", "decided"), ("state", "thinking")]
+    assert all(phase["at"] > 0 for phase in snapshot["phases"])
+    assert "safe to retry" in payload["terminal_message"].lower()
+    assert caught.value.retry_after_ms == 125
+    assert caught.value.activity_snapshot == payload["activity_snapshot"]
+
+
+@pytest.mark.asyncio
+async def test_usage_barrier_task_failed_matches_rich_terminal_contract() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+    activity = {
+        "version": 1,
+        "task_id": "ignored",
+        "turn_id": "ignored",
+        "phases": [{"kind": "state", "phase": "thinking", "at": 1_000}],
+    }
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    async def _handler(_run: Any) -> None:
+        raise TaskRuntimeStreamError(
+            "usage ledger temporarily unavailable; provider request was not sent",
+            code="usage_accounting_busy",
+            terminal_reason="error",
+            retry_after_ms=125,
+            activity_snapshot=activity,
+        )
+
+    runtime = _make_runtime(_handler, event_emitter=_emitter)
+    handle = await runtime.enqueue(_make_envelope(), "hello")
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    payload = next(event[2] for event in emitted if event[1] == "task.failed")
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.error_class == "usage_accounting_busy"
+    assert record.details is not None
+    assert record.details["turn_outcome"]["kind"] == "blocked"
+    assert record.details["retry_after_ms"] == 125
+    assert record.details["activity_snapshot"]["task_id"] == handle.task_id
+    assert payload["code"] == payload["error_class"] == "usage_accounting_busy"
+    assert payload["retryable"] is True
+    assert payload["retry_after_ms"] == 125
+    assert payload["turn_outcome"] == record.details["turn_outcome"]
+    assert payload["activity_snapshot"] == record.details["activity_snapshot"]
+    assert "safe to retry" in payload["terminal_message"].lower()
+
+
+@pytest.mark.asyncio
 async def test_terminal_event_still_emits_when_terminal_persistence_is_locked() -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
     storage = _make_storage()
@@ -178,6 +266,131 @@ async def test_terminal_event_still_emits_when_terminal_persistence_is_locked() 
     assert payload["task_id"] == handle.task_id
     assert payload["terminal_reason"] == "error"
     assert "failed" in payload["terminal_message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_usage_barrier_terminal_fallback_keeps_retry_hint_when_persistence_is_locked(
+) -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+    storage = _make_storage()
+    base_update = storage.update_agent_task
+
+    async def _locked_terminal_update(task_id: str, **kwargs: Any) -> None:
+        if kwargs.get("finished_at") is not None:
+            raise sqlite3.OperationalError("database is locked")
+        await base_update(task_id, **kwargs)
+
+    storage.update_agent_task = _locked_terminal_update
+
+    async def _failing_handler(_run: Any) -> None:
+        raise TaskRuntimeStreamError(
+            "usage ledger temporarily unavailable; provider request was not sent",
+            code="usage_accounting_busy",
+            terminal_reason="error",
+            retry_after_ms=125,
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    runtime = _make_runtime(_failing_handler, event_emitter=_emitter, storage=storage)
+    handle = await runtime.enqueue(_make_envelope(), "hello")
+
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.status == AgentTaskStatus.FAILED
+    payload = next(event[2] for event in emitted if event[1] == "task.failed")
+    assert payload["code"] == payload["error_class"] == "usage_accounting_busy"
+    assert payload["retryable"] is True
+    assert payload["retry_after_ms"] == 125
+    assert payload["turn_outcome"]["retry_after_ms"] == 125
+
+
+@pytest.mark.asyncio
+async def test_usage_barrier_terminal_compensation_survives_lock_release_and_restart(
+    tmp_path: Any,
+) -> None:
+    db_path = tmp_path / "terminal-compensation.sqlite"
+    storage = await SessionStorage.open(str(db_path))
+    base_get_agent_task = storage.get_agent_task
+    task_reads = 0
+
+    async def _temporarily_unavailable_read(task_id: str) -> AgentTaskRecord | None:
+        nonlocal task_reads
+        task_reads += 1
+        if task_reads <= 2:
+            raise OSError("storage temporarily unavailable")
+        return await base_get_agent_task(task_id)
+
+    storage.get_agent_task = _temporarily_unavailable_read  # type: ignore[method-assign]
+    handler_started = asyncio.Event()
+    fail_turn = asyncio.Event()
+    lock_released = False
+    activity = {
+        "version": 1,
+        "task_id": "ignored",
+        "turn_id": "ignored",
+        "phases": [
+            {"kind": "router", "phase": "decided", "at": 1_000},
+            {"kind": "state", "phase": "thinking", "at": 1_100},
+        ],
+    }
+
+    async def _failing_handler(_run: Any) -> None:
+        handler_started.set()
+        await fail_turn.wait()
+        raise TaskRuntimeStreamError(
+            "usage ledger temporarily unavailable; provider request was not sent",
+            code="usage_accounting_busy",
+            terminal_reason="error",
+            retry_after_ms=125,
+            activity_snapshot=activity,
+        )
+
+    lock_connection = sqlite3.connect(db_path, isolation_level=None)
+
+    async def _emitter(
+        _session_key: str,
+        event_name: str,
+        _payload: dict[str, Any],
+    ) -> None:
+        nonlocal lock_released
+        if event_name == "task.failed" and not lock_released:
+            lock_connection.execute("ROLLBACK")
+            lock_released = True
+
+    runtime = _make_runtime(_failing_handler, event_emitter=_emitter, storage=storage)
+    handle = await runtime.enqueue(_make_envelope(), "hello")
+    await asyncio.wait_for(handler_started.wait(), timeout=2.0)
+    lock_connection.execute("BEGIN IMMEDIATE")
+    fail_turn.set()
+
+    record = await runtime.wait(handle.task_id, timeout=6.0)
+    assert lock_released is True
+    assert task_reads >= 4
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.error_class == "usage_accounting_busy"
+    assert record.details is not None
+    assert record.details["retry_after_ms"] == 125
+    assert record.details["turn_outcome"]["retryable"] is True
+    assert record.details["activity_snapshot"]["phases"] == activity["phases"]
+
+    await storage.close()
+    lock_connection.close()
+
+    restarted = await SessionStorage.open(str(db_path))
+    try:
+        recovered = await restarted.get_agent_task(handle.task_id)
+        assert recovered is not None
+        assert recovered.status == AgentTaskStatus.FAILED
+        assert recovered.terminal_reason == "error"
+        assert recovered.error_class == "usage_accounting_busy"
+        assert recovered.details is not None
+        assert recovered.details["retry_after_ms"] == 125
+        assert recovered.details["turn_outcome"]["retryable"] is True
+        assert recovered.details["activity_snapshot"]["phases"] == activity["phases"]
+    finally:
+        await restarted.close()
 
 
 @pytest.mark.asyncio

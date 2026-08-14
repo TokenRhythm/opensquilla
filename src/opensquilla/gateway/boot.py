@@ -55,6 +55,12 @@ from opensquilla.gateway.session_lifecycle import (
 )
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.session_streams import get_session_streams, reset_session_streams
+from opensquilla.gateway.terminal_activity import (
+    append_activity_phase,
+    is_usage_accounting_barrier,
+    safe_retry_after_ms,
+    terminal_activity_snapshot,
+)
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.paths import default_opensquilla_home
 from opensquilla.permissions import configured_default_elevated
@@ -314,11 +320,15 @@ class TaskRuntimeStreamError(RuntimeError):
         code: str | None = None,
         terminal_reason: str | None = None,
         failure_kind: str | None = None,
+        retry_after_ms: int | None = None,
+        activity_snapshot: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.terminal_reason = terminal_reason
         self.failure_kind = failure_kind
+        self.retry_after_ms = retry_after_ms
+        self.activity_snapshot = activity_snapshot
 
 
 # fmt: off
@@ -1758,6 +1768,9 @@ async def _emit_task_runtime_stream_events(
     error_code: str | None = None
     failure_kind: str | None = None
     terminal_reason: str | None = None
+    retry_after_ms: int | None = None
+    activity_phases: list[dict[str, Any]] = []
+    activity_snapshot: dict[str, Any] | None = None
     async for event in wrap_stream(
         raw_stream,
         idle_timeout=idle_timeout,
@@ -1773,6 +1786,12 @@ async def _emit_task_runtime_stream_events(
                 if not key.startswith("_")
             }
         event_kind = event_dict.pop("kind", getattr(event, "kind", event.__class__.__name__))
+        append_activity_phase(
+            activity_phases,
+            event_kind=event_kind,
+            payload=event_dict,
+            observed_at_ms=int(time.time() * 1_000),
+        )
         if event_kind == "artifact":
             event_dict = enrich_artifact_event_dict(event_dict)
         if event_kind == "error":
@@ -1782,6 +1801,7 @@ async def _emit_task_runtime_stream_events(
             )
             code = event_dict.get("code")
             error_code = str(code) if code else None
+            raw_retry_after_ms = event_dict.pop("retry_after_ms", None)
             # Keep the normalized provider classification internal to the
             # durable task outcome; it is not part of the public stream event.
             raw_failure_kind = event_dict.pop("failure_kind", None)
@@ -1834,15 +1854,31 @@ async def _emit_task_runtime_stream_events(
             # without exposing a second raw top-level field. Clients can now
             # offer an explicit retry for transient terminal failures even
             # when a Retry-After hint exceeded the remaining turn deadline.
-            if failure_kind:
+            if failure_kind or is_usage_accounting_barrier(error_code):
                 from opensquilla.engine.outcome import outcome_from_error
 
-                event_dict["turn_outcome"] = outcome_from_error(
+                outcome = outcome_from_error(
                     code=error_code,
                     message=safe_error_message,
                     error_class=error_code,
                     failure_kind=failure_kind,
                 ).to_dict()
+                if is_usage_accounting_barrier(error_code):
+                    retry_after_ms = safe_retry_after_ms(raw_retry_after_ms)
+                    if retry_after_ms is not None:
+                        outcome["retry_after_ms"] = retry_after_ms
+                        event_dict["retry_after_ms"] = retry_after_ms
+                    event_dict["error_class"] = error_code
+                    event_dict["retryable"] = True
+                    if task_id:
+                        activity_snapshot = terminal_activity_snapshot(
+                            activity_phases,
+                            task_id=task_id,
+                            turn_id=task_id,
+                        )
+                        if activity_snapshot is not None:
+                            event_dict["activity_snapshot"] = activity_snapshot
+                event_dict["turn_outcome"] = outcome
         if stream_event_sink is not None:
             # Internal stream relays normally consume only text/done/artifact
             # events. Still, project provider failures through the same safe
@@ -1892,6 +1928,8 @@ async def _emit_task_runtime_stream_events(
             code=error_code,
             terminal_reason=terminal_reason,
             failure_kind=failure_kind,
+            retry_after_ms=retry_after_ms,
+            activity_snapshot=activity_snapshot,
         )
 
 

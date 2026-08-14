@@ -126,23 +126,23 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     return -1
   }
 
-  function regenerateMessage(message: ChatRenderedMessage) {
+  function regenerateMessage(message: ChatRenderedMessage): boolean {
     if (options.isStreaming.value) {
       console.warn('Wait for the current response to finish')
-      return
+      return false
     }
     // Regenerate is a send action that also truncates local history and
     // replaces the composer. Fail closed before any of those mutations when
     // live delivery cannot receive the resulting turn.
     if (options.canDeliver && !options.canDeliver()) {
       options.notifyDeliveryBlocked?.()
-      return
+      return false
     }
     const assistantIndex = sourceMessageIndex(message)
     const userMsgIndex = previousUserMessageIndex(assistantIndex)
     if (userMsgIndex < 0) {
       console.warn('No previous message to regenerate')
-      return
+      return false
     }
 
     const userMessage = options.messages.value[userMsgIndex]
@@ -150,7 +150,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     if (!forkBeforeMessageId) {
       console.warn('Wait for the message to finish saving before regenerating')
       options.notifyMessagePending?.()
-      return
+      return false
     }
     const userText = userMessage?.text || ''
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
@@ -158,6 +158,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     options.inputText.value = userText
     options.autoResizeTextarea()
     nextTick(() => options.sendCurrentInput())
+    return true
   }
 
   function editMessage(message: ChatRenderedMessage) {

@@ -3342,6 +3342,8 @@
     "subagentPrefix": "Subagente: ",
     "subagentCompletion": "Finalización del subagente",
     "turnFailed": "El turno falló",
+    "usageAccountingBlockedTitle": "La contabilidad de uso no está disponible temporalmente",
+    "usageAccountingBlockedMessage": "La solicitud no se envió al proveedor del modelo y no se facturó ningún uso. Puedes reintentar este turno de forma segura.",
     "sandboxPausedResume": "Reanudar la ejecución",
     "sandboxResumed": "Ejecución autónoma reanudada. Reenvía tu solicitud para continuar.",
     "sandboxResumeFailed": "No se pudo reanudar la ejecución: {error}",

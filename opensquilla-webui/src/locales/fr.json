@@ -3342,6 +3342,8 @@
     "subagentPrefix": "Sous-agent : ",
     "subagentCompletion": "Achèvement du sous-agent",
     "turnFailed": "Échec du tour",
+    "usageAccountingBlockedTitle": "Comptabilisation de l’utilisation temporairement indisponible",
+    "usageAccountingBlockedMessage": "La requête n’a pas été envoyée au fournisseur du modèle et aucune utilisation n’a été facturée. Vous pouvez réessayer ce tour en toute sécurité.",
     "sandboxPausedResume": "Reprendre l'exécution",
     "sandboxResumed": "Exécution autonome reprise. Renvoyez votre demande pour continuer.",
     "sandboxResumeFailed": "Impossible de reprendre l'exécution : {error}",

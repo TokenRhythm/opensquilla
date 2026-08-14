@@ -41,6 +41,7 @@ function makeStream(): ChatRpcStreamApi {
     resetStreamIdleTimer: vi.fn(),
     clearStreamIdleTimer: vi.fn(),
     setStreamActivity: vi.fn(),
+    restoreStatusHistory: vi.fn(),
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
@@ -241,6 +242,56 @@ describe('issue #344 — live stream is bound to a single task', () => {
     })
     scope.stop()
     i18n.global.locale.value = 'en'
+  })
+
+  it('keeps a rich usage barrier error when task.failed follows it', () => {
+    const { api, stream, messages, scope } = makeHarness('task-B')
+    const activitySnapshot = {
+      version: 1,
+      task_id: 'task-B',
+      turn_id: 'task-B',
+      phases: [
+        { kind: 'router', phase: 'decided', at: 1_000 },
+        { kind: 'state', phase: 'thinking', at: 1_100 },
+      ],
+    }
+
+    api.handlers.onAny('session.event.error', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      code: 'usage_accounting_busy',
+      error_class: 'usage_accounting_busy',
+      terminal_message: 'server fallback',
+      retryable: true,
+      activity_snapshot: activitySnapshot,
+      turn_outcome: {
+        kind: 'blocked',
+        reason: 'usage_accounting_busy',
+        error_class: 'usage_accounting_busy',
+        retryable: true,
+      },
+    })
+    api.handlers.onAny('task.failed', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      terminal_message: 'generic failure must not replace rich error',
+    })
+
+    expect(stream.restoreStatusHistory).toHaveBeenCalledWith([
+      expect.objectContaining({ action: 'router:decided', at: 1_000 }),
+      expect.objectContaining({ action: 'Planning next step', at: 1_100 }),
+    ])
+    expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+    expect(messages.value[messages.value.length - 1]).toMatchObject({
+      role: 'error',
+      errorCode: 'usage_accounting_busy',
+      text: 'The provider request was not sent and no usage was billed. You can safely retry this turn.',
+      turnOutcome: {
+        kind: 'blocked',
+        retryable: true,
+      },
+    })
+    scope.stop()
   })
 
   it('binds activeStreamTaskId from task.running, then filters the prior task', () => {

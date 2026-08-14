@@ -87,7 +87,7 @@ describe('useChatMessageActions branching edits', () => {
       { role: 'user', text: 'C', ts: null, messageId: 'msg-C' },
     ])
 
-    api.regenerateMessage(renderedMessage({
+    const accepted = api.regenerateMessage(renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 3,
@@ -100,6 +100,43 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
     expect(options.inputText.value).toBe('B')
     expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(accepted).toBe(true)
+  })
+
+  it('retries a usage-accounting error through the normal durable regenerate path', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      { role: 'user', text: 'bill this safely', ts: null, messageId: 'msg-user' },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'error',
+        text: 'Usage accounting temporarily unavailable.',
+        ts: null,
+        messageId: 'terminal-error:task-1',
+        errorCode: 'usage_accounting_busy',
+      },
+    ])
+
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: 2,
+      messageId: 'terminal-error:task-1',
+      errorCode: 'usage_accounting_busy',
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(pendingForkBeforeMessageId.value).toBe('msg-user')
+    expect(options.messages.value).toEqual([])
+    expect(options.inputText.value).toBe('bill this safely')
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(accepted).toBe(true)
   })
 
   it('preserves history, fork state, and the current draft when live delivery is unavailable', async () => {
@@ -111,7 +148,7 @@ describe('useChatMessageActions branching edits', () => {
     options.inputText.value = 'unrelated draft'
     options.canDeliver = () => false
 
-    api.regenerateMessage(renderedMessage({
+    const accepted = api.regenerateMessage(renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 1,
@@ -125,6 +162,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.sendCurrentInput).not.toHaveBeenCalled()
     expect(options.notifyDeliveryBlocked).toHaveBeenCalledOnce()
+    expect(accepted).toBe(false)
   })
 
   it('keeps an optimistic user row intact until its durable fork id arrives', () => {
@@ -174,20 +212,21 @@ describe('useChatMessageActions branching edits', () => {
     expect(notifyEditBlocked).toHaveBeenCalledOnce()
   })
 
-  it('does not regenerate as a parent send when the durable fork id is missing', async () => {
+  it('accepts retry after its durable fork id is bound later', async () => {
     const messages: ChatMessage[] = [
       { role: 'user', text: 'still saving', ts: null, clientId: 'client-only' },
       { role: 'assistant', text: 'partial answer', ts: null, messageId: 'assistant-local' },
     ]
     const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
 
-    api.regenerateMessage(renderedMessage({
+    const rendered = renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 1,
       messageId: 'assistant-local',
       text: 'partial answer',
-    }))
+    })
+    const firstAccepted = api.regenerateMessage(rendered)
     await nextTick()
 
     expect(options.messages.value).toEqual(messages)
@@ -195,6 +234,15 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.sendCurrentInput).not.toHaveBeenCalled()
     expect(options.notifyMessagePending).toHaveBeenCalledOnce()
+
+    options.messages.value[0]!.messageId = 'msg-now-durable'
+    const secondAccepted = api.regenerateMessage(rendered)
+    await nextTick()
+
+    expect(firstAccepted).toBe(false)
+    expect(secondAccepted).toBe(true)
+    expect(pendingForkBeforeMessageId.value).toBe('msg-now-durable')
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
   })
 
   it('regenerates and edits without pending feedback when ids are durable', async () => {

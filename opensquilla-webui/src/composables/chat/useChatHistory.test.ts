@@ -2052,6 +2052,168 @@ describe('useChatHistory optimistic local rows', () => {
     })
   })
 
+  it('restores usage barrier activity and its retryable error from terminal history', async () => {
+    const { api, messages } = makeHistory(true, {
+      response: {
+        messages: [
+          {
+            id: 'user-usage',
+            message_id: 'user-usage',
+            role: 'user',
+            text: 'retry this turn',
+            timestamp: '2026-07-07T10:00:00Z',
+            turn_context: { turn_id: 'turn-usage' },
+          },
+          {
+            id: 'system-usage',
+            message_id: 'system-usage',
+            role: 'system',
+            text: 'Error: usage ledger unavailable',
+            timestamp: '2026-07-07T10:00:01Z',
+            turn_context: { turn_id: 'turn-usage' },
+          },
+        ],
+        turn_outcomes: [{
+          turn_id: 'turn-usage',
+          task_id: 'turn-usage',
+          status: 'failed',
+          error_class: 'usage_accounting_busy',
+          retryable: true,
+          terminal_message: 'server fallback',
+          activity_snapshot: {
+            version: 1,
+            task_id: 'turn-usage',
+            turn_id: 'turn-usage',
+            phases: [
+              { kind: 'router', phase: 'decided', at: 1_000 },
+              { kind: 'state', phase: 'thinking', at: 1_100 },
+            ],
+          },
+          outcome: {
+            kind: 'blocked',
+            reason: 'usage_accounting_busy',
+            error_class: 'usage_accounting_busy',
+            retryable: true,
+          },
+        }],
+        has_more: false,
+        oldest_cursor: null,
+        newest_cursor: null,
+        history_scope: 'session',
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'assistant', 'error'])
+    expect(messages.value[1]).toMatchObject({
+      turnId: 'turn-usage',
+      text: '',
+      statusHistory: [
+        expect.objectContaining({ action: 'router:decided', at: 1_000 }),
+        expect.objectContaining({ action: 'Planning next step', at: 1_100 }),
+      ],
+    })
+    expect(messages.value[2]).toMatchObject({
+      role: 'error',
+      errorCode: 'usage_accounting_busy',
+      terminalNotice: true,
+      text: 'The provider request was not sent and no usage was billed. You can safely retry this turn.',
+    })
+  })
+
+  it('keeps exact-turn optimistic usage activity through repeated history catch-up', async () => {
+    const pendingResponse: ChatHistoryResponse = {
+      messages: [{
+        id: 'user-usage',
+        message_id: 'user-usage',
+        role: 'user',
+        text: 'retry this turn',
+        timestamp: '2026-07-07T10:00:00Z',
+        turn_context: { turn_id: 'turn-usage' },
+      }],
+      has_more: false,
+      oldest_cursor: null,
+      newest_cursor: null,
+      history_scope: 'session',
+    }
+    const { api, rpc, messages } = makeHistory(true, {
+      messages: [
+        {
+          role: 'user',
+          text: 'retry this turn',
+          ts: 'local-user',
+          messageId: 'user-usage',
+          turnId: 'turn-usage',
+        },
+        {
+          role: 'assistant',
+          text: '',
+          ts: 'local-activity',
+          turnId: 'turn-usage',
+          statusHistory: [{ action: 'router:decided', label: 'Route selected', at: 1_000 }],
+        },
+        {
+          role: 'error',
+          text: 'The provider request was not sent.',
+          ts: 'local-error',
+          turnId: 'turn-usage',
+          errorCode: 'usage_accounting_busy',
+          terminalNotice: true,
+        },
+      ],
+      response: pendingResponse,
+    })
+
+    await api.loadHistory()
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'assistant', 'error'])
+    expect(messages.value[1]).toMatchObject({
+      turnId: 'turn-usage',
+      statusHistory: [expect.objectContaining({ action: 'router:decided', at: 1_000 })],
+    })
+    expect(messages.value[1]?.messageId).toBeUndefined()
+    expect(messages.value[2]).toMatchObject({
+      turnId: 'turn-usage',
+      errorCode: 'usage_accounting_busy',
+      terminalNotice: true,
+    })
+
+    rpc.call.mockResolvedValueOnce({
+      ...pendingResponse,
+      messages: [
+        ...(pendingResponse.messages || []),
+        {
+          id: 'system-usage',
+          message_id: 'system-usage',
+          role: 'system',
+          text: 'Error: usage ledger unavailable',
+          timestamp: '2026-07-07T10:00:01Z',
+          turn_context: { turn_id: 'turn-usage' },
+        },
+      ],
+      turn_outcomes: [{
+        turn_id: 'turn-usage',
+        task_id: 'turn-usage',
+        status: 'failed',
+        error_class: 'usage_accounting_busy',
+        retryable: true,
+        activity_snapshot: {
+          version: 1,
+          task_id: 'turn-usage',
+          turn_id: 'turn-usage',
+          phases: [{ kind: 'router', phase: 'decided', at: 1_000 }],
+        },
+      }],
+    })
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'assistant', 'error'])
+    expect(messages.value[1]?.messageId).toBe('terminal-activity:turn-usage')
+    expect(messages.value.filter(message => message.role === 'assistant')).toHaveLength(1)
+  })
+
   it('keeps a terminal replay error until server history contains a durable error row', async () => {
     const { api, messages } = makeHistory(true, {
       messages: [

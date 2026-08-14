@@ -42,6 +42,11 @@ from opensquilla.gateway.session_lifecycle import (
     TaskLifecycleEvent,
     TaskLifecycleListener,
 )
+from opensquilla.gateway.terminal_activity import (
+    is_usage_accounting_barrier,
+    safe_retry_after_ms,
+    terminal_activity_snapshot,
+)
 from opensquilla.safety.injection_guard import xml_escape
 from opensquilla.session.goals import (
     GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
@@ -3674,6 +3679,8 @@ class TaskRuntime:
                 error_class=str(getattr(exc, "code", None) or type(exc).__name__),
                 error_message=str(exc),
                 failure_kind=failure_kind,
+                retry_after_ms=safe_retry_after_ms(getattr(exc, "retry_after_ms", None)),
+                activity_snapshot=getattr(exc, "activity_snapshot", None),
                 promote_pending_steers=True,
             )
         finally:
@@ -5142,6 +5149,8 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        retry_after_ms: int | None = None,
+        activity_snapshot: object = None,
         promote_pending_steers: bool = False,
         activate_promoted_steers: bool = True,
     ) -> None:
@@ -5157,6 +5166,8 @@ class TaskRuntime:
                         error_class=error_class,
                         error_message=error_message,
                         failure_kind=failure_kind,
+                        retry_after_ms=retry_after_ms,
+                        activity_snapshot=activity_snapshot,
                         promote_pending_steers=promote_pending_steers,
                         activate_promoted_steers=activate_promoted_steers,
                     )
@@ -5175,6 +5186,8 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        retry_after_ms: int | None = None,
+        activity_snapshot: object = None,
         promote_pending_steers: bool = False,
         activate_promoted_steers: bool = True,
     ) -> None:
@@ -5270,6 +5283,8 @@ class TaskRuntime:
                     error_class=error_class,
                     error_message=error_message,
                     failure_kind=failure_kind,
+                    retry_after_ms=retry_after_ms,
+                    activity_snapshot=activity_snapshot,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - terminal feedback still matters.
@@ -5330,11 +5345,66 @@ class TaskRuntime:
             }
             if status != AgentTaskStatus.SUCCEEDED:
                 payload["terminal_message"] = build_terminal_reply(terminal_payload)
-            await _complete_terminal_settlement(
-                self._emit(task.envelope.session_key, f"task.{status.value}", payload)
-            )
-            async with self._state_lock:
-                task.terminal_emitted = True
+            if status != AgentTaskStatus.SUCCEEDED and is_usage_accounting_barrier(error_class):
+                details = terminal_update.get("details")
+                details = details if isinstance(details, dict) else {}
+                turn_outcome = details.get("turn_outcome")
+                snapshot = details.get("activity_snapshot")
+                payload.update(
+                    {
+                        "code": error_class,
+                        "error_class": error_class,
+                        "retryable": True,
+                    }
+                )
+                if not isinstance(turn_outcome, dict):
+                    turn_outcome = outcome_from_error(
+                        code=error_class,
+                        message=error_message,
+                        error_class=error_class,
+                        failure_kind=failure_kind,
+                    ).to_dict()
+                    if retry_after_ms is not None:
+                        turn_outcome["retry_after_ms"] = retry_after_ms
+                payload["turn_outcome"] = dict(turn_outcome)
+                if not isinstance(snapshot, dict):
+                    snapshot = terminal_activity_snapshot(
+                        activity_snapshot,
+                        task_id=task.task_id,
+                        turn_id=task.task_id,
+                    )
+                if snapshot is not None:
+                    payload["activity_snapshot"] = dict(snapshot)
+                safe_retry = safe_retry_after_ms(details.get("retry_after_ms"))
+                if safe_retry is None:
+                    safe_retry = safe_retry_after_ms(retry_after_ms)
+                if safe_retry is not None:
+                    payload["retry_after_ms"] = safe_retry
+            try:
+                await _complete_terminal_settlement(
+                    self._emit(task.envelope.session_key, f"task.{status.value}", payload)
+                )
+                async with self._state_lock:
+                    task.terminal_emitted = True
+            finally:
+                if not terminal_persisted:
+                    # The first write already exhausted the storage layer's bounded
+                    # busy budget.  Publish the terminal event before making one
+                    # more bounded, idempotent update of the same task row so a
+                    # lock released by an observer cannot leave startup recovery
+                    # looking at RUNNING.  This does not append transcript or usage
+                    # rows and remains part of the driver's shutdown/drain fence.
+                    terminal_persisted = await self._compensate_terminal_persistence(
+                        task,
+                        terminal_update=terminal_update,
+                        status=status,
+                        terminal_reason=terminal_reason,
+                        error_class=error_class,
+                        error_message=error_message,
+                        failure_kind=failure_kind,
+                        retry_after_ms=retry_after_ms,
+                        activity_snapshot=activity_snapshot,
+                    )
             await _complete_terminal_settlement(
                 self._notify_task_lifecycle(
                     TaskLifecycleEvent(
@@ -5738,6 +5808,8 @@ class TaskRuntime:
         error_class: str | None,
         error_message: str | None,
         failure_kind: str | None,
+        retry_after_ms: int | None,
+        activity_snapshot: object,
     ) -> dict[str, Any]:
         outcome = _subagent_group_outcome_from_provenance(task.envelope.input_provenance)
         existing = await self._storage.get_agent_task(task.task_id)
@@ -5792,6 +5864,18 @@ class TaskRuntime:
             ).to_dict()
             if cancellation is not None:
                 turn_outcome["cancellation_source"] = cancellation["source"]
+            if is_usage_accounting_barrier(error_class):
+                safe_retry = safe_retry_after_ms(retry_after_ms)
+                if safe_retry is not None:
+                    turn_outcome["retry_after_ms"] = safe_retry
+                    details["retry_after_ms"] = safe_retry
+                snapshot = terminal_activity_snapshot(
+                    activity_snapshot,
+                    task_id=task.task_id,
+                    turn_id=task.task_id,
+                )
+                if snapshot is not None:
+                    details["activity_snapshot"] = snapshot
             details["turn_outcome"] = turn_outcome
         if outcome is not None:
             details["subagent_group_outcome"] = outcome
@@ -5838,6 +5922,59 @@ class TaskRuntime:
             if hasattr(record, key):
                 setattr(record, key, value)
         self._terminal_fallback_records[task.task_id] = record
+
+    async def _compensate_terminal_persistence(
+        self,
+        task: _RuntimeTask,
+        *,
+        terminal_update: dict[str, Any],
+        status: AgentTaskStatus,
+        terminal_reason: str,
+        error_class: str | None,
+        error_message: str | None,
+        failure_kind: str | None,
+        retry_after_ms: int | None,
+        activity_snapshot: object,
+    ) -> bool:
+        """Retry one terminal task-row update after its public fallback event."""
+
+        try:
+            terminal_update.update(
+                await self._terminal_details_update(
+                    task,
+                    status=status,
+                    terminal_reason=terminal_reason,
+                    error_class=error_class,
+                    error_message=error_message,
+                    failure_kind=failure_kind,
+                    retry_after_ms=retry_after_ms,
+                    activity_snapshot=activity_snapshot,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - retain any first-pass details.
+            log.warning(
+                "task_runtime.terminal_details_compensation_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                error=str(exc),
+            )
+        try:
+            await self._storage.update_agent_task(task.task_id, **terminal_update)
+        except Exception as exc:  # noqa: BLE001 - the in-memory terminal stays usable.
+            log.warning(
+                "task_runtime.terminal_persist_compensation_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                error=str(exc),
+            )
+            return False
+        self._terminal_fallback_records.pop(task.task_id, None)
+        log.info(
+            "task_runtime.terminal_persist_compensated",
+            task_id=task.task_id,
+            session_key=task.envelope.session_key,
+        )
+        return True
 
 
 def _subagent_group_outcome_from_provenance(

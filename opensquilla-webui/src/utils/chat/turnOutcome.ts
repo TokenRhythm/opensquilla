@@ -1,5 +1,9 @@
 import type { ChatRunTask, ChatTurnOutcome } from '@/types/chat'
 import type { ChatHistoryTurnOutcome } from '@/types/rpc'
+import {
+  terminalActivityStatusHistory,
+  usageAccountingErrorCode,
+} from '@/utils/chat/usageAccountingFailure'
 
 type RawOutcomeRecord = Record<string, unknown>
 
@@ -47,6 +51,27 @@ export function normalizeTurnOutcome(
   const startedAt = record.started_at ?? record.startedAt ?? nested.started_at ?? nested.startedAt
   const finishedAt = record.finished_at ?? record.finishedAt ?? nested.finished_at ?? nested.finishedAt
   const retryable = bool(record.retryable ?? nested.retryable)
+  const errorClass = text(
+    record.error_class
+    ?? record.errorClass
+    ?? nested.error_class
+    ?? nested.errorClass
+    ?? usageAccountingErrorCode(record),
+  )
+  const terminalMessage = text(
+    record.terminal_message
+    ?? record.terminalMessage
+    ?? nested.terminal_message
+    ?? nested.terminalMessage,
+  )
+  const retryAfterRaw = record.retry_after_ms ?? record.retryAfterMs
+    ?? nested.retry_after_ms ?? nested.retryAfterMs
+  const retryAfter = Number(retryAfterRaw)
+  const statusHistory = terminalActivityStatusHistory(
+    record.activity_snapshot ?? record.activitySnapshot
+      ?? nested.activity_snapshot ?? nested.activitySnapshot,
+    turnId,
+  )
   return {
     turnId,
     ...(taskId ? { taskId } : {}),
@@ -57,6 +82,10 @@ export function normalizeTurnOutcome(
     ...(startedAt != null ? { startedAt: startedAt as string | number } : {}),
     ...(finishedAt != null ? { finishedAt: finishedAt as string | number } : {}),
     ...(retryable !== undefined ? { retryable } : {}),
+    ...(errorClass ? { errorClass } : {}),
+    ...(terminalMessage ? { terminalMessage } : {}),
+    ...(Number.isFinite(retryAfter) && retryAfter > 0 ? { retryAfterMs: retryAfter } : {}),
+    ...(statusHistory.length ? { statusHistory } : {}),
   }
 }
 

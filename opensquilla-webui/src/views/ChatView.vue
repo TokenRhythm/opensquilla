@@ -197,7 +197,7 @@
           :goal-elapsed="goalLastElapsed"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
-          @regenerate-message="regenerateMessage"
+          @regenerate-message="handleRegenerateMessage"
           @toggle-share-message="toggleShareMessage"
           @download-artifact="downloadArtifact"
           @open-artifact="openArtifact"
@@ -1918,6 +1918,14 @@ const {
   regenerateMessage,
   editMessage,
 } = chatMessageActions
+
+function handleRegenerateMessage(
+  message: ChatRenderedMessage,
+  settle?: (accepted: boolean) => void,
+) {
+  const accepted = regenerateMessage(message)
+  settle?.(accepted)
+}
 
 let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
 let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}

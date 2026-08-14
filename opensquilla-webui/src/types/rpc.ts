@@ -673,6 +673,12 @@ export interface ChatHistoryTurnOutcome {
   started_at?: string | number
   finished_at?: string | number
   outcome?: Record<string, unknown>
+  code?: string
+  error_class?: string
+  retryable?: boolean
+  retry_after_ms?: number
+  terminal_message?: string
+  activity_snapshot?: Record<string, unknown>
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {

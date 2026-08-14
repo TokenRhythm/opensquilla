@@ -53,6 +53,8 @@ import {
   taskTerminalStatus as eventTaskTerminalStatus,
 } from '@/utils/chat/streamEvents'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
+import { usageAccountingErrorCode } from '@/utils/chat/usageAccountingFailure'
 import {
   useChatSteerDelivery,
   type ChatSteerDeliveryApi,
@@ -86,6 +88,7 @@ export interface ChatRpcStreamApi {
   resetStreamIdleTimer: (opts?: { progress?: boolean }) => void
   clearStreamIdleTimer: () => void
   setStreamActivity: (label: string, key?: string) => void
+  restoreStatusHistory?: (entries: readonly StatusPart[]) => void
   recordCompactionActivity?: (payload: CompactionPayload) => void
   showThinkingIndicator: () => void
   hideThinkingIndicator: () => void
@@ -1783,14 +1786,32 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       markTaskSettled(payload)
       options.clearPendingRouterDecision()
       clearLiveThinking()
+      const terminalTurnId = payloadTaskId(payload)
+      const turnOutcome = normalizeTurnOutcome({
+        ...(payload || {}),
+        turn_id: terminalTurnId,
+        status: 'failed',
+      })
+      if (turnOutcome?.statusHistory?.length) {
+        stream.restoreStatusHistory?.(turnOutcome.statusHistory)
+      }
+      const messageCountBeforeEnd = messages.value.length
       stream.endStreaming()
+      const completedMessage = messages.value[messageCountBeforeEnd]
+      if (completedMessage?.role === 'assistant') {
+        completedMessage.turnId = terminalTurnId || completedMessage.turnId
+        completedMessage.turnOutcome = turnOutcome
+      }
       const rawErrorCode = (payload as { code?: unknown })?.code
-      const errorCode = typeof rawErrorCode === 'string' ? rawErrorCode : undefined
+      const errorCode = usageAccountingErrorCode(payload)
+        ?? (typeof rawErrorCode === 'string' ? rawErrorCode : undefined)
       const serverMessage = eventSessionErrorMessage(payload)
       messages.value.push({
         role: 'error',
         text: localizedChatErrorMessage(errorCode, serverMessage),
         errorCode,
+        turnId: terminalTurnId || undefined,
+        turnOutcome,
         terminalNotice: true,
         ts: new Date().toISOString(),
       })
