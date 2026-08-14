@@ -11,6 +11,7 @@ import structlog.testing
 
 from opensquilla.engine.types import ThinkingLevel
 from opensquilla.provider.compat_policy import compat_policy_for_kind
+from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.provider.openai import (
     OpenAIProvider,
     _build_openai_tool,
@@ -2442,54 +2443,206 @@ def test_zai_non_thinking_sends_provider_disabled_for_default_thinking_model(
     assert captured["payload"]["thinking"] == {"type": "disabled"}
 
 
-def test_zai_thinking_omits_provider_thinking_object_off_official_host(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
+_ZHIPU_CATALOG_MODELS = (
+    ("glm-4.5", True),
+    ("glm-4.5-air", True),
+    ("glm-4.5-flash", True),
+    ("glm-4.5v", True),
+    ("glm-4.6", False),
+    ("glm-4.6v", False),
+    ("glm-4.7", True),
+    ("glm-4.7-flash", True),
+    ("glm-4.7-flashx", True),
+    ("glm-5", True),
+    ("glm-5-turbo", True),
+    ("glm-5.1", True),
+    ("glm-5.2", True),
+    ("glm-5v-turbo", True),
+)
+
+
+def _project_zhipu_payload(
+    *,
+    model: str = "glm-5.2",
+    base_url: str,
+    thinking: bool,
+    capabilities: ModelCapabilities,
+    provider_kind: str = "zhipu",
+) -> dict[str, Any]:
     provider = OpenAIProvider(
         api_key="test",
-        model="glm-5.2",
-        base_url="https://openrouter.ai/api/v1",
-        provider_kind="zhipu",
+        model=model,
+        base_url=base_url,
+        provider_kind=provider_kind,
     )
-    cfg = ChatConfig(
+    return provider.project_final_request(
+        [Message(role="user", content="hi")],
+        config=ChatConfig(
+            thinking=thinking,
+            thinking_level=ThinkingLevel.HIGH,
+            model_capabilities=capabilities,
+        ),
+    ).payload
+
+
+@pytest.mark.parametrize(("model", "supports_reasoning"), _ZHIPU_CATALOG_MODELS)
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    ("base_url", "official"),
+    [
+        ("https://open.bigmodel.cn/api/paas/v4", True),
+        ("https://relay.example.test/v1", False),
+    ],
+)
+def test_all_zhipu_catalog_models_scope_zai_to_the_official_api_root(
+    model: str,
+    supports_reasoning: bool,
+    thinking: bool,
+    base_url: str,
+    official: bool,
+) -> None:
+    capabilities = ModelCatalog().get_capabilities(
+        model,
+        provider_name="zhipu",
+        base_url=base_url,
+    )
+    assert capabilities.supports_reasoning is supports_reasoning
+    assert capabilities.reasoning_format == ("zai" if supports_reasoning else "none")
+
+    payload = _project_zhipu_payload(
+        model=model,
+        base_url=base_url,
+        thinking=thinking,
+        capabilities=capabilities,
+    )
+
+    expected = {"type": "enabled" if thinking else "disabled"}
+    if official and supports_reasoning:
+        assert payload["thinking"] == expected
+    else:
+        assert "thinking" not in payload
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+@pytest.mark.parametrize(
+    ("base_url", "official"),
+    [
+        ("https://open.bigmodel.cn/api/paas/v4", True),
+        ("HTTPS://OPEN.BIGMODEL.CN/api/paas/v4", True),
+        ("https://open.bigmodel.cn:443/api/paas/v4", True),
+        ("https://open.bigmodel.cn/api/paas/v4/", True),
+        ("http://open.bigmodel.cn/api/paas/v4", False),
+        ("http://open.bigmodel.cn:80/api/paas/v4", False),
+        ("https://open.bigmodel.cn:80/api/paas/v4", False),
+        ("https://open.bigmodel.cn:8443/api/paas/v4", False),
+        ("https://open.bigmodel.cn", False),
+        ("https://open.bigmodel.cn/api/paas", False),
+        ("https://open.bigmodel.cn/api/paas/v4/chat/completions", False),
+        ("https://user@open.bigmodel.cn/api/paas/v4", False),
+        ("https://user:pass@open.bigmodel.cn/api/paas/v4", False),
+        ("https://open.bigmodel.cn/api/paas/v4?relay=1", False),
+        ("https://open.bigmodel.cn/api/paas/v4#relay", False),
+        ("https://open.bigmodel.cn.evil.test/api/paas/v4", False),
+        ("https://evil-open.bigmodel.cn/api/paas/v4", False),
+        ("https://open.bigmodel.cn\\@evil.test/api/paas/v4", False),
+        ("https://open.bigmodel.cn:bad/api/paas/v4", False),
+        ("open.bigmodel.cn/api/paas/v4", False),
+    ],
+)
+def test_zhipu_zai_endpoint_identity_matrix(
+    base_url: str,
+    official: bool,
+    thinking: bool,
+) -> None:
+    payload = _project_zhipu_payload(
+        base_url=base_url,
+        thinking=thinking,
+        capabilities=ModelCapabilities(
+            supports_reasoning=True,
+            supports_tools=True,
+            reasoning_format="zai",
+        ),
+    )
+
+    if official:
+        assert payload["thinking"] == {
+            "type": "enabled" if thinking else "disabled"
+        }
+    else:
+        assert "thinking" not in payload
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+def test_custom_provider_with_explicit_zai_format_remains_available(
+    thinking: bool,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "custom/glm-5.2": {
+                "supports_reasoning": True,
+                "supports_tools": True,
+                "reasoning_format": "zai",
+            }
+        }
+    )
+    payload = _project_zhipu_payload(
+        base_url="https://trusted-zai-relay.example.test/v1",
+        thinking=thinking,
+        provider_kind="custom",
+        capabilities=catalog.get_capabilities(
+            "glm-5.2",
+            provider_name="custom",
+        ),
+    )
+
+    assert payload["thinking"] == {"type": "enabled" if thinking else "disabled"}
+
+
+@pytest.mark.parametrize("thinking", [True, False])
+def test_zhipu_model_override_with_non_zai_format_is_not_host_gated(
+    thinking: bool,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "zhipu/glm-4.6": {
+                "supports_reasoning": True,
+                "supports_tools": True,
+                "reasoning_format": "deepseek",
+            }
+        }
+    )
+    payload = _project_zhipu_payload(
+        model="glm-4.6",
+        base_url="https://trusted-deepseek-relay.example.test/v1",
+        thinking=thinking,
+        capabilities=catalog.get_capabilities(
+            "glm-4.6",
+            provider_name="zhipu",
+        ),
+    )
+
+    assert payload["thinking"] == {"type": "enabled" if thinking else "disabled"}
+    if thinking:
+        assert payload["reasoning_effort"] == "high"
+    else:
+        assert "reasoning_effort" not in payload
+
+
+def test_other_provider_zai_format_is_not_gated_by_zhipu_endpoint_policy() -> None:
+    payload = _project_zhipu_payload(
+        base_url="https://another-provider.example.test/v1",
         thinking=True,
-        model_capabilities=ModelCapabilities(
+        provider_kind="openai",
+        capabilities=ModelCapabilities(
             supports_reasoning=True,
             supports_tools=True,
             reasoning_format="zai",
         ),
     )
 
-    _collect(provider, cfg)
-
-    assert "thinking" not in captured["payload"]
-
-
-def test_zai_non_thinking_omits_provider_thinking_object_off_official_host(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="glm-5.2",
-        base_url="https://openrouter.ai/api/v1",
-        provider_kind="zhipu",
-    )
-    cfg = ChatConfig(
-        thinking=False,
-        model_capabilities=ModelCapabilities(
-            supports_reasoning=True,
-            supports_tools=True,
-            reasoning_format="zai",
-        ),
-    )
-
-    _collect(provider, cfg)
-
-    assert "thinking" not in captured["payload"]
+    assert payload["thinking"] == {"type": "enabled"}
 
 
 def test_dashscope_cache_on_marks_system_and_latest_user(monkeypatch: Any) -> None:

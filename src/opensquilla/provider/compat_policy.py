@@ -258,10 +258,11 @@ class OpenAICompatPolicy:
     # Reasoning format assumed when no model capabilities are available.
     default_reasoning_format: str = ""
 
-    # Whether the reasoning dialect's payload (e.g. a vendor-specific
-    # ``thinking`` object) is only valid on this provider's official_host;
-    # off-host requests omit it instead of sending an unrecognized field.
-    reasoning_dialect_requires_official_host: bool = False
+    # One provider-native reasoning dialect may be valid only at an exact API
+    # root. A custom endpoint using another explicitly configured dialect is
+    # unaffected, and an empty pair leaves compatible relays unrestricted.
+    official_reasoning_dialect: str = ""
+    official_reasoning_api_root: str = ""
 
     # Models that need an explicit thinking enable/disable payload even when
     # no capability profile is available (exact ids, lowercase).
@@ -485,7 +486,8 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "zhipu": OpenAICompatPolicy(
         display_name="Zhipu",
         official_host="open.bigmodel.cn",
-        reasoning_dialect_requires_official_host=True,
+        official_reasoning_dialect="zai",
+        official_reasoning_api_root="https://open.bigmodel.cn/api/paas/v4",
     ),
     "qianfan": OpenAICompatPolicy(display_name="Qianfan"),
     "siliconflow": OpenAICompatPolicy(display_name="SiliconFlow"),
