@@ -6472,7 +6472,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     }))
   })
 
-  it('does not send a queued follow-up when a registered slash command handles it', async () => {
+  it('keeps a queued follow-up editable when it becomes a registered command', async () => {
     const executeSlashCommand = vi.fn(async () => true)
     const { api, rpc } = makeOptions({
       classifySlashCommand: vi.fn(async () => 'registered' as const),
@@ -6485,14 +6485,13 @@ describe('useChatSend slash-prefixed input fall-through', () => {
       intent: null,
     }
 
-    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('not_sent')
 
-    // A registered command is handled by the command path: no chat.send.
-    expect(executeSlashCommand).toHaveBeenCalledWith('/coding', 'registered')
+    expect(executeSlashCommand).not.toHaveBeenCalled()
     expect(rpc.call).not.toHaveBeenCalled()
   })
 
-  it('cancels a server-staged row before executing a newly registered command', async () => {
+  it('cancels a server-staged row without auto-executing a newly registered command', async () => {
     const events: string[] = []
     const cancelDurablePendingItem = vi.fn(async () => {
       events.push('cancel')
@@ -6520,10 +6519,13 @@ describe('useChatSend slash-prefixed input fall-through', () => {
       pendingPersistenceState: 'staged',
     }
 
-    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('accepted')
+    await expect(api.sendQueuedFollowup(queued)).resolves.toBe('not_sent')
 
-    expect(events).toEqual(['cancel', 'execute'])
+    expect(events).toEqual(['cancel'])
     expect(cancelDurablePendingItem).toHaveBeenCalledWith(queued)
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+    expect(queued.pendingInputId).toBeUndefined()
+    expect(queued.pendingPersistenceState).toBeUndefined()
     expect(rpc.call).not.toHaveBeenCalled()
   })
 
@@ -6590,6 +6592,45 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     expect(executeSlashCommand).not.toHaveBeenCalled()
     expect(queued.pendingInputId).toBeUndefined()
     expect(queued.pendingPersistenceState).toBeUndefined()
+  })
+
+  it('never grants concurrent cancel winners authority to execute a staged command', async () => {
+    const firstExecute = vi.fn(async () => true)
+    const secondExecute = vi.fn(async () => true)
+    const firstCancel = vi.fn(async () => true)
+    const secondCancel = vi.fn(async () => true)
+    const first = makeOptions({
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      cancelDurablePendingItem: firstCancel,
+      executeSlashCommand: firstExecute,
+    })
+    const second = makeOptions({
+      classifySlashCommand: vi.fn(async () => 'registered' as const),
+      cancelDurablePendingItem: secondCancel,
+      executeSlashCommand: secondExecute,
+    })
+    const stagedItem = (): ChatPendingItem => ({
+      pendingUiId: 'pending-ui-concurrent-registered',
+      text: '/reset',
+      attachments: [],
+      intent: null,
+      confirmedPlainText: true,
+      pendingInputId: 'pending-concurrent-registered',
+      pendingClientRequestId: 'request-concurrent-registered',
+      pendingClientMessageId: 'message-concurrent-registered',
+      pendingRequestFingerprint: 'sha256:concurrent-registered',
+      pendingPersistenceState: 'staged',
+    })
+
+    await expect(Promise.all([
+      first.api.sendQueuedFollowup(stagedItem()),
+      second.api.sendQueuedFollowup(stagedItem()),
+    ])).resolves.toEqual(['not_sent', 'not_sent'])
+
+    expect(firstCancel).toHaveBeenCalledOnce()
+    expect(secondCancel).toHaveBeenCalledOnce()
+    expect(firstExecute).not.toHaveBeenCalled()
+    expect(secondExecute).not.toHaveBeenCalled()
   })
 
   it.each(['unavailable', 'registered'] as const)(

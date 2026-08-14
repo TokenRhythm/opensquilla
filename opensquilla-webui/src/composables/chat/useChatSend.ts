@@ -1953,28 +1953,14 @@ export function useChatSend(options: UseChatSendOptions) {
           delete item.pendingPosition
           delete item.pendingPersistenceState
           delete item.pendingMayHaveServerCopy
-          if (options.sessionKey.value !== ownerSessionKey) {
-            return preserveRetryState('not_sent')
-          }
-          if (options.sendBlockedReason?.value) return blockedOutcome()
-          if (
-            options.validateActiveProjectBeforeSend
-            && await refreshedActiveProjectBlocksSend()
-          ) return blockedOutcome()
-          if (options.sessionKey.value !== ownerSessionKey) {
-            return preserveRetryState('not_sent')
-          }
-          if (options.sendBlockedReason?.value) return blockedOutcome()
-          if (
-            options.stream.isStreaming.value
-            || hasAuthoritativeWork()
-            || options.isCompactInFlightForCurrentSession()
-            || responseHandoffBlocksCurrentSession()
-          ) return preserveRetryState('deferred')
         }
-        return await options.executeSlashCommand(item.text.trim(), 'registered')
-          ? 'accepted'
-          : preserveRetryState('retryable_failure')
+        // A queued item was previously classified as ordinary text. If the
+        // catalog now recognizes it, never turn a background drain into an
+        // automatic control action. In particular, an idempotent cancel can
+        // report success in multiple tabs (or after a lost ACK), so it cannot
+        // grant exactly-once authority to execute /reset, /new, /goal, etc.
+        // Leave the detached item editable for an explicit user decision.
+        return preserveRetryState('not_sent')
       }
       // Confirmed unknown slash input falls through to the normal send path
       // below, mirroring the primary onSend contract.
