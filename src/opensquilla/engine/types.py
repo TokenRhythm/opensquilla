@@ -219,6 +219,12 @@ class ErrorEvent:
     # Optional bounded retry hint for errors that prove no provider dispatch.
     # Appended for positional-construction compatibility.
     retry_after_ms: int | None = None
+    # Usage-ledger admission evidence. ``retryable`` describes the transient
+    # error class; these fields separately prove whether replaying the whole
+    # user turn cannot duplicate an earlier provider dispatch or side effect.
+    usage_call_index: int | None = None
+    no_prior_provider_dispatch: bool | None = None
+    replay_safe: bool | None = None
 
 
 @dataclass

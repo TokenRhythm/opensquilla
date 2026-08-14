@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
+import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import SystemMessage from './SystemMessage.vue'
 
 function errorMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
@@ -97,6 +98,13 @@ describe('SystemMessage sandbox resume', () => {
     const message = errorMessage({
       errorCode: 'usage_accounting_busy',
       text: 'The provider request was not sent.',
+      turnOutcome: {
+        turnId: 'turn-usage',
+        status: 'failed',
+        usageCallIndex: 1,
+        noPriorProviderDispatch: true,
+        replaySafe: true,
+      },
     })
     const { app, el } = await mountMsg(message, undefined, onRetry)
 
@@ -119,6 +127,73 @@ describe('SystemMessage sandbox resume', () => {
     btn?.click()
     await nextTick()
     expect(onRetry).toHaveBeenCalledTimes(2)
+    app.unmount()
+  })
+
+  it('does not offer whole-turn retry without an explicit replay-safe proof', async () => {
+    const { app, el } = await mountMsg(errorMessage({
+      errorCode: 'usage_accounting_busy',
+      turnOutcome: {
+        turnId: 'turn-usage',
+        status: 'failed',
+        retryable: true,
+        usageCallIndex: 2,
+        noPriorProviderDispatch: false,
+        replaySafe: false,
+      },
+    }))
+
+    expect(el.querySelector('.msg-error-card__heading')?.textContent).toContain(
+      'Usage accounting temporarily unavailable',
+    )
+    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
+    app.unmount()
+  })
+
+  it.each([
+    [
+      'string index',
+      { usage_call_index: '1', no_prior_provider_dispatch: true, replay_safe: true },
+      false,
+    ],
+    ['null index', { usage_call_index: null }, undefined],
+    [
+      'zero index',
+      { usage_call_index: 0, no_prior_provider_dispatch: true, replay_safe: true },
+      false,
+    ],
+    [
+      'NaN index',
+      { usage_call_index: Number.NaN, no_prior_provider_dispatch: true, replay_safe: true },
+      false,
+    ],
+    ['conflicting index', {
+      usage_call_index: 2,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      outcome: {
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    }, false],
+  ])('fails closed for an invalid usage replay proof: %s', async (
+    _label,
+    proof,
+    expectedReplaySafe,
+  ) => {
+    const turnOutcome = normalizeTurnOutcome({
+      turn_id: 'turn-usage',
+      status: 'failed',
+      ...proof,
+    })
+    expect(turnOutcome?.replaySafe).toBe(expectedReplaySafe)
+
+    const { app, el } = await mountMsg(errorMessage({
+      errorCode: 'usage_accounting_busy',
+      turnOutcome,
+    }))
+    expect(el.querySelector('.msg-error-card__resume')).toBeNull()
     app.unmount()
   })
 })

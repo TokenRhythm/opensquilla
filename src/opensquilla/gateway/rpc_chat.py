@@ -31,6 +31,7 @@ from opensquilla.gateway.terminal_activity import (
     is_usage_accounting_barrier,
     safe_retry_after_ms,
     terminal_activity_snapshot,
+    usage_barrier_replay_proof,
 )
 from opensquilla.observability.network_policy import (
     provider_request_correlation_disabled,
@@ -253,15 +254,24 @@ async def _chat_history_turn_outcomes(
         error_class = getattr(row, "error_class", None)
         if is_usage_accounting_barrier(error_class):
             projected = outcomes_by_turn[turn_id]
+            replay_proof = usage_barrier_replay_proof(
+                usage_call_index=details.get("usage_call_index"),
+                no_prior_provider_dispatch=details.get(
+                    "no_prior_provider_dispatch"
+                ),
+                replay_safe=details.get("replay_safe"),
+            )
             projected["code"] = error_class
             projected["error_class"] = error_class
             projected["retryable"] = True
+            projected.update(replay_proof)
             projected["terminal_message"] = build_terminal_reply(
                 {
                     "status": status,
                     "terminal_reason": getattr(row, "terminal_reason", None),
                     "error_class": error_class,
                     "error_message": getattr(row, "error_message", None),
+                    **replay_proof,
                 }
             )
             retry_after_ms = safe_retry_after_ms(details.get("retry_after_ms"))

@@ -158,6 +158,9 @@ async def test_usage_barrier_stream_error_emits_typed_retry_and_activity_snapsho
             message="usage ledger temporarily unavailable; provider request was not sent",
             code="usage_accounting_busy",
             retry_after_ms=125,
+            usage_call_index=1,
+            no_prior_provider_dispatch=True,
+            replay_safe=True,
         )
 
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
@@ -178,6 +181,9 @@ async def test_usage_barrier_stream_error_emits_typed_retry_and_activity_snapsho
     assert payload["code"] == payload["error_class"] == "usage_accounting_busy"
     assert payload["retryable"] is True
     assert payload["retry_after_ms"] == 125
+    assert payload["usage_call_index"] == 1
+    assert payload["no_prior_provider_dispatch"] is True
+    assert payload["replay_safe"] is True
     assert payload["turn_outcome"]["kind"] == "blocked"
     assert payload["turn_outcome"]["retryable"] is True
     snapshot = payload["activity_snapshot"]
@@ -190,6 +196,9 @@ async def test_usage_barrier_stream_error_emits_typed_retry_and_activity_snapsho
     assert all(phase["at"] > 0 for phase in snapshot["phases"])
     assert "safe to retry" in payload["terminal_message"].lower()
     assert caught.value.retry_after_ms == 125
+    assert caught.value.usage_call_index == 1
+    assert caught.value.no_prior_provider_dispatch is True
+    assert caught.value.replay_safe is True
     assert caught.value.activity_snapshot == payload["activity_snapshot"]
 
 
@@ -213,6 +222,9 @@ async def test_usage_barrier_task_failed_matches_rich_terminal_contract() -> Non
             terminal_reason="error",
             retry_after_ms=125,
             activity_snapshot=activity,
+            usage_call_index=1,
+            no_prior_provider_dispatch=True,
+            replay_safe=True,
         )
 
     runtime = _make_runtime(_handler, event_emitter=_emitter)
@@ -229,9 +241,45 @@ async def test_usage_barrier_task_failed_matches_rich_terminal_contract() -> Non
     assert payload["code"] == payload["error_class"] == "usage_accounting_busy"
     assert payload["retryable"] is True
     assert payload["retry_after_ms"] == 125
+    assert payload["replay_safe"] is True
     assert payload["turn_outcome"] == record.details["turn_outcome"]
     assert payload["activity_snapshot"] == record.details["activity_snapshot"]
     assert "safe to retry" in payload["terminal_message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_later_usage_barrier_does_not_claim_whole_turn_replay_is_safe() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _handler(_run: Any) -> None:
+        raise TaskRuntimeStreamError(
+            "usage ledger temporarily unavailable; provider request was not sent",
+            code="usage_accounting_busy",
+            terminal_reason="error",
+            retry_after_ms=125,
+            usage_call_index=2,
+            # Even inconsistent upstream booleans cannot override call-index
+            # authority at the terminal boundary.
+            no_prior_provider_dispatch=True,
+            replay_safe=True,
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    runtime = _make_runtime(_handler, event_emitter=_emitter)
+    handle = await runtime.enqueue(_make_envelope(), "hello")
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    payload = next(event[2] for event in emitted if event[1] == "task.failed")
+    assert record.details is not None
+    assert record.details["usage_call_index"] == 2
+    assert record.details["no_prior_provider_dispatch"] is False
+    assert record.details["replay_safe"] is False
+    assert payload["turn_outcome"]["retryable"] is True
+    assert payload["replay_safe"] is False
+    assert "earlier work" in payload["terminal_message"].lower()
+    assert "safe to retry" not in payload["terminal_message"].lower()
 
 
 @pytest.mark.asyncio
@@ -288,6 +336,9 @@ async def test_usage_barrier_terminal_fallback_keeps_retry_hint_when_persistence
             code="usage_accounting_busy",
             terminal_reason="error",
             retry_after_ms=125,
+            usage_call_index=1,
+            no_prior_provider_dispatch=True,
+            replay_safe=True,
         )
 
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
@@ -345,6 +396,9 @@ async def test_usage_barrier_terminal_compensation_survives_lock_release_and_res
             terminal_reason="error",
             retry_after_ms=125,
             activity_snapshot=activity,
+            usage_call_index=1,
+            no_prior_provider_dispatch=True,
+            replay_safe=True,
         )
 
     lock_connection = sqlite3.connect(db_path, isolation_level=None)

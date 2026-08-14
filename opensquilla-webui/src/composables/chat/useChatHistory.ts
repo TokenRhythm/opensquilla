@@ -382,6 +382,7 @@ function attachHistoryTurnOutcomes(
             text: localizedChatErrorMessage(
               outcome.errorClass,
               outcome.terminalMessage || message.text,
+              outcome.replaySafe === true,
             ),
             errorCode: outcome.errorClass,
             terminalNotice: true,
@@ -445,6 +446,7 @@ function attachHistoryTurnOutcomes(
       text: localizedChatErrorMessage(
         outcome.errorClass,
         outcome.terminalMessage || '',
+        outcome.replaySafe === true,
       ),
       ts: outcome.finishedAt ?? null,
       turnId: outcome.turnId,

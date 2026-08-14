@@ -266,6 +266,9 @@ export interface ChatTurnOutcome {
   terminalMessage?: string
   retryAfterMs?: number
   statusHistory?: import('./parts').StatusPart[]
+  usageCallIndex?: number
+  noPriorProviderDispatch?: boolean
+  replaySafe?: boolean
 }
 
 export interface ChatRunTask {

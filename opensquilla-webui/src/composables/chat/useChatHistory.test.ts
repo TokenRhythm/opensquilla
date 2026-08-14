@@ -2079,6 +2079,9 @@ describe('useChatHistory optimistic local rows', () => {
           status: 'failed',
           error_class: 'usage_accounting_busy',
           retryable: true,
+          usage_call_index: 1,
+          no_prior_provider_dispatch: true,
+          replay_safe: true,
           terminal_message: 'server fallback',
           activity_snapshot: {
             version: 1,
@@ -2094,6 +2097,9 @@ describe('useChatHistory optimistic local rows', () => {
             reason: 'usage_accounting_busy',
             error_class: 'usage_accounting_busy',
             retryable: true,
+            usage_call_index: 1,
+            no_prior_provider_dispatch: true,
+            replay_safe: true,
           },
         }],
         has_more: false,
@@ -2140,6 +2146,9 @@ describe('useChatHistory optimistic local rows', () => {
           finished_at: 2_000,
           error_class: 'usage_accounting_unavailable',
           retryable: true,
+          usage_call_index: 1,
+          no_prior_provider_dispatch: true,
+          replay_safe: true,
           terminal_message: 'server fallback',
           activity_snapshot: {
             version: 1,
@@ -2186,6 +2195,9 @@ describe('useChatHistory optimistic local rows', () => {
           status: 'failed',
           error_class: 'usage_accounting_busy',
           retryable: true,
+          usage_call_index: 1,
+          no_prior_provider_dispatch: true,
+          replay_safe: true,
         }],
         has_more: false,
         oldest_cursor: null,
@@ -2206,6 +2218,58 @@ describe('useChatHistory optimistic local rows', () => {
     })
   })
 
+  it('restores a later-call usage barrier without claiming replay is safe', async () => {
+    const { api, messages } = makeHistory(true, {
+      response: {
+        messages: [{
+          id: 'user-usage',
+          message_id: 'user-usage',
+          role: 'user',
+          text: 'continue after tools',
+          timestamp: '2026-07-07T10:00:00Z',
+          turn_context: { turn_id: 'turn-usage' },
+        }],
+        turn_outcomes: [{
+          turn_id: 'turn-usage',
+          task_id: 'task-usage',
+          status: 'failed',
+          error_class: 'usage_accounting_busy',
+          retryable: true,
+          usage_call_index: 2,
+          no_prior_provider_dispatch: false,
+          replay_safe: false,
+          outcome: {
+            kind: 'blocked',
+            reason: 'usage_accounting_busy',
+            error_class: 'usage_accounting_busy',
+            retryable: true,
+            usage_call_index: 2,
+            no_prior_provider_dispatch: false,
+            replay_safe: false,
+          },
+        }],
+        has_more: false,
+        oldest_cursor: null,
+        newest_cursor: null,
+        history_scope: 'session',
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value.map(message => message.role)).toEqual(['user', 'error'])
+    expect(messages.value[1]).toMatchObject({
+      errorCode: 'usage_accounting_busy',
+      text: 'This provider request was not sent. Earlier work in this turn may already have run or been billed, so review it before trying again.',
+      turnOutcome: {
+        usageCallIndex: 2,
+        noPriorProviderDispatch: false,
+        replaySafe: false,
+        retryable: true,
+      },
+    })
+  })
+
   it('prefers a durable usage barrier row when the turn crosses a page boundary', async () => {
     const { api, rpc, messages } = makeHistory(true)
     const outcome = {
@@ -2214,6 +2278,9 @@ describe('useChatHistory optimistic local rows', () => {
       status: 'failed',
       error_class: 'usage_accounting_busy',
       retryable: true,
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
     }
     rpc.call
       .mockResolvedValueOnce({
@@ -2334,6 +2401,9 @@ describe('useChatHistory optimistic local rows', () => {
         status: 'failed',
         error_class: 'usage_accounting_busy',
         retryable: true,
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
         activity_snapshot: {
           version: 1,
           task_id: 'turn-usage',

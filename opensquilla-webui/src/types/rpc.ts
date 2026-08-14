@@ -685,6 +685,9 @@ export interface ChatHistoryTurnOutcome {
   retry_after_ms?: number
   terminal_message?: string
   activity_snapshot?: Record<string, unknown>
+  usage_call_index?: number
+  no_prior_provider_dispatch?: boolean
+  replay_safe?: boolean
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {

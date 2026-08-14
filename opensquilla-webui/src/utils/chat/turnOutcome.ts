@@ -51,6 +51,18 @@ export function normalizeTurnOutcome(
   const startedAt = record.started_at ?? record.startedAt ?? nested.started_at ?? nested.startedAt
   const finishedAt = record.finished_at ?? record.finishedAt ?? nested.finished_at ?? nested.finishedAt
   const retryable = bool(record.retryable ?? nested.retryable)
+  const noPriorProviderDispatch = bool(
+    record.no_prior_provider_dispatch
+    ?? record.noPriorProviderDispatch
+    ?? nested.no_prior_provider_dispatch
+    ?? nested.noPriorProviderDispatch,
+  )
+  const replaySafe = bool(
+    record.replay_safe
+    ?? record.replaySafe
+    ?? nested.replay_safe
+    ?? nested.replaySafe,
+  )
   const errorClass = text(
     record.error_class
     ?? record.errorClass
@@ -67,6 +79,19 @@ export function normalizeTurnOutcome(
   const retryAfterRaw = record.retry_after_ms ?? record.retryAfterMs
     ?? nested.retry_after_ms ?? nested.retryAfterMs
   const retryAfter = Number(retryAfterRaw)
+  const usageCallIndexRaw = record.usage_call_index ?? record.usageCallIndex
+    ?? nested.usage_call_index ?? nested.usageCallIndex
+  const usageCallIndex = typeof usageCallIndexRaw === 'number'
+    && Number.isInteger(usageCallIndexRaw)
+    && usageCallIndexRaw > 0
+    ? usageCallIndexRaw
+    : undefined
+  const hasUsageReplayProof = usageCallIndex !== undefined
+    || noPriorProviderDispatch !== undefined
+    || replaySafe !== undefined
+  const provedNoPriorProviderDispatch = usageCallIndex === 1
+    && noPriorProviderDispatch === true
+  const provedReplaySafe = provedNoPriorProviderDispatch && replaySafe === true
   const statusHistory = terminalActivityStatusHistory(
     record.activity_snapshot ?? record.activitySnapshot
       ?? nested.activity_snapshot ?? nested.activitySnapshot,
@@ -82,9 +107,14 @@ export function normalizeTurnOutcome(
     ...(startedAt != null ? { startedAt: startedAt as string | number } : {}),
     ...(finishedAt != null ? { finishedAt: finishedAt as string | number } : {}),
     ...(retryable !== undefined ? { retryable } : {}),
+    ...(hasUsageReplayProof
+      ? { noPriorProviderDispatch: provedNoPriorProviderDispatch }
+      : {}),
+    ...(hasUsageReplayProof ? { replaySafe: provedReplaySafe } : {}),
     ...(errorClass ? { errorClass } : {}),
     ...(terminalMessage ? { terminalMessage } : {}),
     ...(Number.isFinite(retryAfter) && retryAfter > 0 ? { retryAfterMs: retryAfter } : {}),
+    ...(usageCallIndex !== undefined ? { usageCallIndex } : {}),
     ...(statusHistory.length ? { statusHistory } : {}),
   }
 }

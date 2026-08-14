@@ -60,6 +60,7 @@ from opensquilla.gateway.terminal_activity import (
     is_usage_accounting_barrier,
     safe_retry_after_ms,
     terminal_activity_snapshot,
+    usage_barrier_replay_proof,
 )
 from opensquilla.gateway.websocket import get_registry
 from opensquilla.paths import default_opensquilla_home
@@ -322,6 +323,9 @@ class TaskRuntimeStreamError(RuntimeError):
         failure_kind: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: dict[str, Any] | None = None,
+        usage_call_index: int | None = None,
+        no_prior_provider_dispatch: bool = False,
+        replay_safe: bool = False,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -329,6 +333,9 @@ class TaskRuntimeStreamError(RuntimeError):
         self.failure_kind = failure_kind
         self.retry_after_ms = retry_after_ms
         self.activity_snapshot = activity_snapshot
+        self.usage_call_index = usage_call_index
+        self.no_prior_provider_dispatch = no_prior_provider_dispatch
+        self.replay_safe = replay_safe
 
 
 # fmt: off
@@ -1771,6 +1778,10 @@ async def _emit_task_runtime_stream_events(
     retry_after_ms: int | None = None
     activity_phases: list[dict[str, Any]] = []
     activity_snapshot: dict[str, Any] | None = None
+    replay_proof: dict[str, Any] = {
+        "no_prior_provider_dispatch": False,
+        "replay_safe": False,
+    }
     async for event in wrap_stream(
         raw_stream,
         idle_timeout=idle_timeout,
@@ -1807,6 +1818,11 @@ async def _emit_task_runtime_stream_events(
             code = event_dict.get("code")
             error_code = str(code) if code else None
             raw_retry_after_ms = event_dict.pop("retry_after_ms", None)
+            raw_usage_call_index = event_dict.pop("usage_call_index", None)
+            raw_no_prior_provider_dispatch = event_dict.pop(
+                "no_prior_provider_dispatch", None
+            )
+            raw_replay_safe = event_dict.pop("replay_safe", None)
             # Keep the normalized provider classification internal to the
             # durable task outcome; it is not part of the public stream event.
             raw_failure_kind = event_dict.pop("failure_kind", None)
@@ -1845,6 +1861,13 @@ async def _emit_task_runtime_stream_events(
                 event_dict["code"] = safe_error_code
                 terminal_payload["error_class"] = safe_error_code
                 terminal_payload["error_message"] = safe_error_message
+            if is_usage_accounting_barrier(error_code):
+                replay_proof = usage_barrier_replay_proof(
+                    usage_call_index=raw_usage_call_index,
+                    no_prior_provider_dispatch=raw_no_prior_provider_dispatch,
+                    replay_safe=raw_replay_safe,
+                )
+                terminal_payload.update(replay_proof)
             terminal_message = build_terminal_reply(terminal_payload)
             # Additive ref suffix joining the reply to its durable turn_errors
             # row; absent when no record was written (error_id empty).
@@ -1875,6 +1898,8 @@ async def _emit_task_runtime_stream_events(
                         event_dict["retry_after_ms"] = retry_after_ms
                     event_dict["error_class"] = error_code
                     event_dict["retryable"] = True
+                    event_dict.update(replay_proof)
+                    outcome.update(replay_proof)
                     if task_id:
                         activity_snapshot = terminal_activity_snapshot(
                             activity_phases,
@@ -1935,6 +1960,11 @@ async def _emit_task_runtime_stream_events(
             failure_kind=failure_kind,
             retry_after_ms=retry_after_ms,
             activity_snapshot=activity_snapshot,
+            usage_call_index=replay_proof.get("usage_call_index"),
+            no_prior_provider_dispatch=(
+                replay_proof.get("no_prior_provider_dispatch") is True
+            ),
+            replay_safe=replay_proof.get("replay_safe") is True,
         )
 
 

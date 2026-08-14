@@ -46,6 +46,7 @@ from opensquilla.gateway.terminal_activity import (
     is_usage_accounting_barrier,
     safe_retry_after_ms,
     terminal_activity_snapshot,
+    usage_barrier_replay_proof,
 )
 from opensquilla.safety.injection_guard import xml_escape
 from opensquilla.session.goals import (
@@ -3681,6 +3682,11 @@ class TaskRuntime:
                 failure_kind=failure_kind,
                 retry_after_ms=safe_retry_after_ms(getattr(exc, "retry_after_ms", None)),
                 activity_snapshot=getattr(exc, "activity_snapshot", None),
+                usage_call_index=getattr(exc, "usage_call_index", None),
+                no_prior_provider_dispatch=(
+                    getattr(exc, "no_prior_provider_dispatch", False) is True
+                ),
+                replay_safe=getattr(exc, "replay_safe", False) is True,
                 promote_pending_steers=True,
             )
         finally:
@@ -5151,6 +5157,9 @@ class TaskRuntime:
         failure_kind: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: object = None,
+        usage_call_index: int | None = None,
+        no_prior_provider_dispatch: bool = False,
+        replay_safe: bool = False,
         promote_pending_steers: bool = False,
         activate_promoted_steers: bool = True,
     ) -> None:
@@ -5168,6 +5177,9 @@ class TaskRuntime:
                         failure_kind=failure_kind,
                         retry_after_ms=retry_after_ms,
                         activity_snapshot=activity_snapshot,
+                        usage_call_index=usage_call_index,
+                        no_prior_provider_dispatch=no_prior_provider_dispatch,
+                        replay_safe=replay_safe,
                         promote_pending_steers=promote_pending_steers,
                         activate_promoted_steers=activate_promoted_steers,
                     )
@@ -5188,6 +5200,9 @@ class TaskRuntime:
         failure_kind: str | None = None,
         retry_after_ms: int | None = None,
         activity_snapshot: object = None,
+        usage_call_index: int | None = None,
+        no_prior_provider_dispatch: bool = False,
+        replay_safe: bool = False,
         promote_pending_steers: bool = False,
         activate_promoted_steers: bool = True,
     ) -> None:
@@ -5285,6 +5300,9 @@ class TaskRuntime:
                     failure_kind=failure_kind,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=activity_snapshot,
+                    usage_call_index=usage_call_index,
+                    no_prior_provider_dispatch=no_prior_provider_dispatch,
+                    replay_safe=replay_safe,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - terminal feedback still matters.
@@ -5357,6 +5375,14 @@ class TaskRuntime:
                         "retryable": True,
                     }
                 )
+                replay_proof = usage_barrier_replay_proof(
+                    usage_call_index=usage_call_index,
+                    no_prior_provider_dispatch=no_prior_provider_dispatch,
+                    replay_safe=replay_safe,
+                )
+                payload.update(replay_proof)
+                terminal_payload.update(replay_proof)
+                payload["terminal_message"] = build_terminal_reply(terminal_payload)
                 if not isinstance(turn_outcome, dict):
                     turn_outcome = outcome_from_error(
                         code=error_class,
@@ -5366,6 +5392,7 @@ class TaskRuntime:
                     ).to_dict()
                     if retry_after_ms is not None:
                         turn_outcome["retry_after_ms"] = retry_after_ms
+                turn_outcome.update(replay_proof)
                 payload["turn_outcome"] = dict(turn_outcome)
                 if not isinstance(snapshot, dict):
                     snapshot = terminal_activity_snapshot(
@@ -5404,6 +5431,9 @@ class TaskRuntime:
                         failure_kind=failure_kind,
                         retry_after_ms=retry_after_ms,
                         activity_snapshot=activity_snapshot,
+                        usage_call_index=usage_call_index,
+                        no_prior_provider_dispatch=no_prior_provider_dispatch,
+                        replay_safe=replay_safe,
                     )
             await _complete_terminal_settlement(
                 self._notify_task_lifecycle(
@@ -5810,6 +5840,9 @@ class TaskRuntime:
         failure_kind: str | None,
         retry_after_ms: int | None,
         activity_snapshot: object,
+        usage_call_index: int | None,
+        no_prior_provider_dispatch: bool,
+        replay_safe: bool,
     ) -> dict[str, Any]:
         outcome = _subagent_group_outcome_from_provenance(task.envelope.input_provenance)
         existing = await self._storage.get_agent_task(task.task_id)
@@ -5865,6 +5898,13 @@ class TaskRuntime:
             if cancellation is not None:
                 turn_outcome["cancellation_source"] = cancellation["source"]
             if is_usage_accounting_barrier(error_class):
+                replay_proof = usage_barrier_replay_proof(
+                    usage_call_index=usage_call_index,
+                    no_prior_provider_dispatch=no_prior_provider_dispatch,
+                    replay_safe=replay_safe,
+                )
+                turn_outcome.update(replay_proof)
+                details.update(replay_proof)
                 safe_retry = safe_retry_after_ms(retry_after_ms)
                 if safe_retry is not None:
                     turn_outcome["retry_after_ms"] = safe_retry
@@ -5935,6 +5975,9 @@ class TaskRuntime:
         failure_kind: str | None,
         retry_after_ms: int | None,
         activity_snapshot: object,
+        usage_call_index: int | None,
+        no_prior_provider_dispatch: bool,
+        replay_safe: bool,
     ) -> bool:
         """Retry one terminal task-row update after its public fallback event."""
 
@@ -5949,6 +5992,9 @@ class TaskRuntime:
                     failure_kind=failure_kind,
                     retry_after_ms=retry_after_ms,
                     activity_snapshot=activity_snapshot,
+                    usage_call_index=usage_call_index,
+                    no_prior_provider_dispatch=no_prior_provider_dispatch,
+                    replay_safe=replay_safe,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - retain any first-pass details.

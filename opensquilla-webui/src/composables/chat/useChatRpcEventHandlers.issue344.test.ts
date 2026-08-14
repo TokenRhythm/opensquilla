@@ -263,12 +263,18 @@ describe('issue #344 — live stream is bound to a single task', () => {
       error_class: 'usage_accounting_busy',
       terminal_message: 'server fallback',
       retryable: true,
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
       activity_snapshot: activitySnapshot,
       turn_outcome: {
         kind: 'blocked',
         reason: 'usage_accounting_busy',
         error_class: 'usage_accounting_busy',
         retryable: true,
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
       },
     })
     api.handlers.onAny('task.failed', {
@@ -289,6 +295,44 @@ describe('issue #344 — live stream is bound to a single task', () => {
       turnOutcome: {
         kind: 'blocked',
         retryable: true,
+        replaySafe: true,
+      },
+    })
+    scope.stop()
+  })
+
+  it('keeps later-call barriers retryable without presenting them as replay safe', () => {
+    const { api, messages, scope } = makeHarness('task-B')
+
+    api.handlers.onAny('session.event.error', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      code: 'usage_accounting_busy',
+      error_class: 'usage_accounting_busy',
+      retryable: true,
+      usage_call_index: 2,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      turn_outcome: {
+        kind: 'blocked',
+        reason: 'usage_accounting_busy',
+        error_class: 'usage_accounting_busy',
+        retryable: true,
+        usage_call_index: 2,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    })
+
+    expect(messages.value[messages.value.length - 1]).toMatchObject({
+      role: 'error',
+      errorCode: 'usage_accounting_busy',
+      text: 'This provider request was not sent. Earlier work in this turn may already have run or been billed, so review it before trying again.',
+      turnOutcome: {
+        retryable: true,
+        usageCallIndex: 2,
+        noPriorProviderDispatch: false,
+        replaySafe: false,
       },
     })
     scope.stop()

@@ -3345,6 +3345,7 @@
     "turnFailed": "ターンが失敗しました",
     "usageAccountingBlockedTitle": "使用量の記録を一時的に利用できません",
     "usageAccountingBlockedMessage": "モデルプロバイダーにはリクエストが送信されておらず、料金も発生していません。このターンは安全に再試行できます。",
+    "usageAccountingBlockedUnsafeMessage": "このモデルリクエストは送信されませんでした。ただし、このターンの以前の処理が実行済みまたは課金済みの可能性があります。再試行する前に結果を確認してください。",
     "sandboxPausedResume": "実行を再開",
     "sandboxResumed": "自律実行を再開しました。続行するにはリクエストを再送信してください。",
     "sandboxResumeFailed": "実行を再開できませんでした:{error}",

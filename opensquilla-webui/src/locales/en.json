@@ -3398,6 +3398,7 @@
     "turnFailed": "Turn failed",
     "usageAccountingBlockedTitle": "Usage accounting temporarily unavailable",
     "usageAccountingBlockedMessage": "The provider request was not sent and no usage was billed. You can safely retry this turn.",
+    "usageAccountingBlockedUnsafeMessage": "This provider request was not sent. Earlier work in this turn may already have run or been billed, so review it before trying again.",
     "sandboxPausedResume": "Resume execution",
     "sandboxResumed": "Autonomous execution resumed. Resend your request to continue.",
     "sandboxResumeFailed": "Could not resume execution: {error}",

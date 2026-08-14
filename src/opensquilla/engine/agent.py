@@ -6803,6 +6803,11 @@ class Agent:
         )
         turn_llm_calls = 0
         turn_tool_errors = 0
+        # Whole-turn replay is safe only while no provider admission has
+        # completed and no tool execution has crossed an external-effect
+        # boundary. The usage call index supplies the durable half of this
+        # proof; this flag supplies the live turn half.
+        turn_irreversible_effect_started = False
         # A durable inline candidate is installed only after the rebuilt
         # request crosses the provider adapter's final admission boundary.
         self._pending_durable_compaction_event = None
@@ -8360,7 +8365,17 @@ class Agent:
                     if usage_scope is not None and not provider_accounts_physical_usage(
                         self.provider
                     ):
-                        usage_call = await self._usage_call_start(usage_scope)
+                        try:
+                            usage_call = await self._usage_call_start(usage_scope)
+                        except UsageAccountingUnavailableError as exc:
+                            exc.bind_replay_safety(
+                                no_prior_irreversible_effect=(
+                                    turn_llm_calls == 1
+                                    and not turn_irreversible_effect_started
+                                )
+                            )
+                            raise
+                        turn_irreversible_effect_started = True
 
                     yield ProviderActivityEvent(
                         activity_id=provider_activity_id,
@@ -9473,6 +9488,12 @@ class Agent:
                         reasoning_end = _finish_reasoning_block("error")
                         if reasoning_end is not None:
                             yield reasoning_end
+                        exc.bind_replay_safety(
+                            no_prior_irreversible_effect=(
+                                turn_llm_calls == 1
+                                and not turn_irreversible_effect_started
+                            )
+                        )
                         raise
                     except _RaisedProviderBoundaryError:
                         # Some SDKs raise from call creation or async iteration
@@ -12811,6 +12832,7 @@ class Agent:
                     return max(0.001, remaining)
 
                 async def _run_one(tc: ToolCall) -> ToolResult:
+                    nonlocal turn_irreversible_effect_started
                     nonlocal workspace_edit_gate_details
                     nonlocal workspace_edit_gate_recovery_read_paths
                     nonlocal workspace_edit_gate_recovery_reads_remaining
@@ -12910,6 +12932,7 @@ class Agent:
                         res = preflight_result
                     else:
                         try:
+                            turn_irreversible_effect_started = True
                             res = await asyncio.wait_for(
                                 self._execute_tool(execution_tc), timeout=tool_timeout
                             )

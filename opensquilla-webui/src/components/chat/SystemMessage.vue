@@ -76,11 +76,18 @@ const showResume = computed(
     props.message.displayRole === 'error' &&
     props.message.errorCode === 'sandbox_threshold_exceeded',
 )
-const showRetry = computed(
+const isUsageBarrier = computed(
   () => props.message.displayRole === 'error' && isUsageAccountingBarrier(props.message.errorCode),
 )
+const showRetry = computed(
+  () =>
+    isUsageBarrier.value
+    && props.message.turnOutcome?.usageCallIndex === 1
+    && props.message.turnOutcome?.noPriorProviderDispatch === true
+    && props.message.turnOutcome?.replaySafe === true,
+)
 const errorHeading = computed(() =>
-  showRetry.value ? t('chat.usageAccountingBlockedTitle') : t('chat.turnFailed'),
+  isUsageBarrier.value ? t('chat.usageAccountingBlockedTitle') : t('chat.turnFailed'),
 )
 
 function onResume() {

@@ -3345,6 +3345,7 @@
     "turnFailed": "Échec du tour",
     "usageAccountingBlockedTitle": "Comptabilisation de l’utilisation temporairement indisponible",
     "usageAccountingBlockedMessage": "La requête n’a pas été envoyée au fournisseur du modèle et aucune utilisation n’a été facturée. Vous pouvez réessayer ce tour en toute sécurité.",
+    "usageAccountingBlockedUnsafeMessage": "Cette requête au modèle n’a pas été envoyée. Des opérations antérieures de ce tour ont peut-être déjà été exécutées ou facturées ; vérifiez-les avant de réessayer.",
     "sandboxPausedResume": "Reprendre l'exécution",
     "sandboxResumed": "Exécution autonome reprise. Renvoyez votre demande pour continuer.",
     "sandboxResumeFailed": "Impossible de reprendre l'exécution : {error}",

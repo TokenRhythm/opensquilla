@@ -5966,6 +5966,21 @@ class TurnRunner:
                     if isinstance(exc, UsageAccountingUnavailableError)
                     else None
                 ),
+                usage_call_index=(
+                    getattr(exc, "usage_call_index", None)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
+                no_prior_provider_dispatch=(
+                    getattr(exc, "no_prior_provider_dispatch", False)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
+                replay_safe=(
+                    getattr(exc, "replay_safe", False)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
             )
 
     @staticmethod

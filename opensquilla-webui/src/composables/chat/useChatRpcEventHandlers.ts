@@ -1974,7 +1974,11 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       const serverMessage = eventSessionErrorMessage(payload)
       messages.value.push({
         role: 'error',
-        text: localizedChatErrorMessage(errorCode, serverMessage),
+        text: localizedChatErrorMessage(
+          errorCode,
+          serverMessage,
+          turnOutcome?.replaySafe === true,
+        ),
         errorCode,
         turnId: terminalTurnId || undefined,
         turnOutcome,

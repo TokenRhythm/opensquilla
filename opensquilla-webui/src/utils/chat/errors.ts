@@ -8,9 +8,14 @@ export const ENSEMBLE_MULTIMODAL_UNSUPPORTED = 'ensemble_multimodal_unsupported'
 export function localizedChatErrorMessage(
   code: unknown,
   fallback: string,
+  replaySafe = false,
 ): string {
   if (isUsageAccountingBarrier(code)) {
-    return i18n.global.t('chat.usageAccountingBlockedMessage')
+    return i18n.global.t(
+      replaySafe
+        ? 'chat.usageAccountingBlockedMessage'
+        : 'chat.usageAccountingBlockedUnsafeMessage',
+    )
   }
   return code === ENSEMBLE_MULTIMODAL_UNSUPPORTED
     ? i18n.global.t('chat.composer.ensembleImageUnsupported')

@@ -41,6 +41,29 @@ def safe_retry_after_ms(value: object) -> int | None:
     return min(parsed, _MAX_RETRY_AFTER_MS)
 
 
+def usage_barrier_replay_proof(
+    *,
+    usage_call_index: object,
+    no_prior_provider_dispatch: object,
+    replay_safe: object,
+) -> dict[str, Any]:
+    """Normalize the closed proof required before offering whole-turn replay."""
+
+    call_index = (
+        usage_call_index
+        if isinstance(usage_call_index, int)
+        and not isinstance(usage_call_index, bool)
+        and usage_call_index > 0
+        else None
+    )
+    no_prior = call_index == 1 and no_prior_provider_dispatch is True
+    return {
+        **({"usage_call_index": call_index} if call_index is not None else {}),
+        "no_prior_provider_dispatch": no_prior,
+        "replay_safe": no_prior and replay_safe is True,
+    }
+
+
 def append_activity_phase(
     phases: list[dict[str, Any]],
     *,
@@ -132,4 +155,5 @@ __all__ = [
     "is_usage_accounting_barrier",
     "safe_retry_after_ms",
     "terminal_activity_snapshot",
+    "usage_barrier_replay_proof",
 ]
