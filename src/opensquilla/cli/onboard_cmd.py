@@ -53,7 +53,11 @@ from opensquilla.onboarding.setup_engine import (
 )
 from opensquilla.onboarding.setup_paths import web_setup_url
 from opensquilla.onboarding.status import OnboardingStatus, get_onboarding_status
-from opensquilla.router_tiers import DEFAULT_TEXT_TIER, TEXT_TIERS
+from opensquilla.router_tiers import (
+    DEFAULT_TEXT_TIER,
+    ENSEMBLE_SELECTION_MODE_ORDER,
+    TEXT_TIERS,
+)
 
 # Exit code for a user-initiated cancellation (Esc/Ctrl+C in the wizard).
 # 130 = 128 + SIGINT, the conventional shell exit status for an interrupt;
@@ -1457,8 +1461,8 @@ def configure_command(
         "",
         "--selection-mode",
         help=(
-            "Ensemble selection mode: router_dynamic, static_openrouter_b5, "
-            "static_tokenrhythm_b5, or custom_b5."
+            "Ensemble selection mode: "
+            f"{', '.join(ENSEMBLE_SELECTION_MODE_ORDER)}."
         ),
         rich_help_panel="LLM ensemble",
     ),

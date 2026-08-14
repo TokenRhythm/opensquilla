@@ -9596,6 +9596,116 @@ class SessionStorage:
                 expected_epoch=expected_epoch,
             )
 
+    @classmethod
+    async def _upsert_transcript_entry(
+        cls,
+        conn: Any,
+        entry: TranscriptEntry,
+        *,
+        expected_epoch: int | None,
+    ) -> bool:
+        """Materialize or replace one row identified by session + message id.
+
+        ``message_id`` is not made a database-wide unique key: it is a
+        caller-supplied identity scoped to the current session.  The enclosing
+        write transaction serializes the select/update-or-insert decision, and
+        the epoch guard remains identical to ordinary transcript writes.
+        """
+
+        if expected_epoch is not None:
+            async with conn.execute(
+                "SELECT epoch FROM sessions WHERE session_key = ?",
+                (entry.session_key,),
+            ) as cur:
+                session_row = await cur.fetchone()
+            if session_row is None or int(session_row[0]) != expected_epoch:
+                await cls._raise_stale_epoch(
+                    conn,
+                    session_key=entry.session_key,
+                    expected_epoch=expected_epoch,
+                )
+
+        async with conn.execute(
+            """
+            SELECT id, created_at
+            FROM transcript_entries
+            WHERE session_id = ? AND message_id = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (entry.session_id, entry.message_id),
+        ) as cur:
+            existing = await cur.fetchone()
+
+        if existing is None:
+            await cls._insert_transcript_entry(
+                conn,
+                entry,
+                expected_epoch=expected_epoch,
+            )
+            return True
+
+        entry.id = int(existing[0])
+        entry.created_at = int(existing[1])
+        data = entry.model_dump(exclude={"id", "created_at"})
+        assignments = [f"{column} = ?" for column in data]
+        values = [_serialize(data[column]) for column in data]
+        values.append(entry.id)
+        await conn.execute(
+            f"UPDATE transcript_entries SET {', '.join(assignments)} WHERE id = ?",
+            values,
+        )
+        return False
+
+    async def upsert_transcript_entry_and_touch(
+        self,
+        entry: TranscriptEntry,
+        *,
+        expected_epoch: int,
+        updated_at: int,
+        token_delta: int = 0,
+        mark_total_tokens_stale: bool = False,
+    ) -> bool:
+        """Upsert caller-identified content and touch its session once.
+
+        Returns ``True`` only when a new row was materialized.  Replaying the
+        same finalization therefore cannot add another transcript row or count
+        its token delta a second time.
+        """
+
+        entry.session_key = canonicalize_session_key(entry.session_key)
+        async with self._write_transaction("upsert_transcript_entry_and_touch") as conn:
+            inserted = await self._upsert_transcript_entry(
+                conn,
+                entry,
+                expected_epoch=expected_epoch,
+            )
+            effective_token_delta = token_delta if inserted else 0
+            async with conn.execute(
+                """
+                UPDATE sessions
+                SET updated_at = ?,
+                    total_tokens = total_tokens + ?,
+                    total_tokens_fresh = CASE WHEN ? THEN 0 ELSE total_tokens_fresh END
+                WHERE session_key = ? AND epoch = ?
+                """,
+                (
+                    updated_at,
+                    effective_token_delta,
+                    int(mark_total_tokens_stale and inserted),
+                    entry.session_key,
+                    expected_epoch,
+                ),
+            ) as cur:
+                touched = cur.rowcount or 0
+            if touched == 0:
+                await self._raise_stale_epoch(
+                    conn,
+                    session_key=entry.session_key,
+                    expected_epoch=expected_epoch,
+                )
+        return inserted
+
     async def append_transcript_entry_and_touch(
         self,
         entry: TranscriptEntry,

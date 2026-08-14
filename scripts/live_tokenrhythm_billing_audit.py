@@ -2,7 +2,9 @@
 """Live TokenRhythm billing audit with a deliberately narrow report surface.
 
 The audit performs one direct call, one call for every curated inline router
-tier, and the static TokenRhythm B5 lineup with its default and strict quorum.
+tier, and the static TokenRhythm B5 lineup with its default and legacy strict
+quorum configuration. Both configurations use the runtime one-draft gate; the
+second scenario only verifies upgrade compatibility.
 It never records response content or prompts. The only persistent artifact is a
 sanitized accounting report below an operating-system temporary directory.
 
@@ -531,7 +533,9 @@ async def _run_ensemble_scenario(
         outer_timeout_seconds=(timeout_seconds * 2) + 30.0,
     )
     return _scenario_report(
-        scenario_id="b5_strict_quorum" if strict else "b5_default_quorum",
+        scenario_id=(
+            "b5_legacy_strict_config" if strict else "b5_default_config"
+        ),
         kind="b5_ensemble",
         done=done,
         error=error,

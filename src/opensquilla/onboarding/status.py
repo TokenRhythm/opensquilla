@@ -12,10 +12,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from opensquilla.ensemble_plan import effective_ensemble_selection_mode
 from opensquilla.gateway.config import (
-    LEGACY_OPENROUTER_MODEL_OPTIONS,
-    STATIC_B5_SELECTION_MODE_PROVIDERS,
     GatewayConfig,
     LlmProviderProfile,
 )
@@ -58,6 +55,10 @@ from opensquilla.provider.image_generation_credentials import (
 )
 from opensquilla.provider.preset_registry import get_preset
 from opensquilla.router_tiers import (
+    LEGACY_OPENROUTER_MODEL_OPTIONS,
+    ROUTER_DYNAMIC_SELECTION_MODE,
+    STATIC_B5_SELECTION_MODE_PROVIDERS,
+    effective_ensemble_selection_mode,
     router_dynamic_tier_members_active,
     router_tier_provider_roles,
     tier_provider_role,
@@ -343,7 +344,7 @@ def _ensemble_candidate_provider_ids(cfg: GatewayConfig) -> list[str]:
 
     router = getattr(cfg, "squilla_router", None)
     tiers = getattr(router, "tiers", {}) or {}
-    if selection_mode == "router_dynamic" and isinstance(tiers, dict):
+    if selection_mode == ROUTER_DYNAMIC_SELECTION_MODE and isinstance(tiers, dict):
         for tier_cfg in tiers.values():
             if isinstance(tier_cfg, dict):
                 add(tier_cfg.get("provider") or getattr(llm, "provider", ""))

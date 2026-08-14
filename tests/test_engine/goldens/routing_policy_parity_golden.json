@@ -16,6 +16,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -94,7 +95,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -115,6 +117,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -193,7 +196,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -222,6 +226,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -306,7 +311,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  },
@@ -331,6 +337,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -421,7 +428,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -446,6 +454,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -529,7 +538,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -554,6 +564,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -632,7 +643,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -653,6 +665,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -731,7 +744,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -760,6 +774,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -856,6 +871,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -928,7 +944,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -956,6 +973,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.0,
    "routing_extra": {
@@ -1008,7 +1026,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -1040,6 +1059,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -1134,7 +1154,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  },
@@ -1162,6 +1183,7 @@
     }
    ],
    "router_tier_provider_mismatch": "otherprov",
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -1244,7 +1266,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -1273,6 +1296,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.2,
    "routing_extra": {
@@ -1359,7 +1383,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  },
@@ -1388,6 +1413,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -1464,7 +1490,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  },
@@ -1489,6 +1516,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -1571,7 +1599,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -1596,6 +1625,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -1680,7 +1710,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -1701,6 +1732,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -1773,7 +1805,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -1794,6 +1827,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -1866,7 +1900,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -1895,6 +1930,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.3,
    "routing_extra": {
@@ -1979,7 +2015,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  },
@@ -2000,6 +2037,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -2084,7 +2122,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -2113,6 +2152,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -2203,7 +2243,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  },
@@ -2228,6 +2269,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -2310,7 +2352,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -2335,6 +2378,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.1,
    "routing_extra": {
@@ -2407,7 +2451,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -2428,6 +2473,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.3,
    "routing_extra": {
@@ -2502,7 +2548,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -2523,6 +2570,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.4,
    "routing_extra": {
@@ -2601,7 +2649,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -2622,6 +2671,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.44,
    "routing_extra": {
@@ -2696,7 +2746,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -2721,6 +2772,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.46,
    "routing_extra": {
@@ -2793,7 +2845,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -2809,6 +2862,7 @@
    "routed_model": "dummy-nano-1",
    "routed_tier": "c0",
    "router_fallback_chain": [],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.5,
    "routing_extra": {
@@ -2895,6 +2949,7 @@
    "routed_model": "dummy-nano-1",
    "routed_tier": "c0",
    "router_fallback_chain": [],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.0,
    "routing_extra": {
@@ -2999,6 +3054,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3071,7 +3127,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -3092,6 +3149,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3166,7 +3224,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -3182,6 +3241,7 @@
    "routed_model": "dummy-nano-1",
    "routed_tier": "c0",
    "router_fallback_chain": [],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3268,6 +3328,7 @@
    "routed_model": "dummy-nano-1",
    "routed_tier": "c0",
    "router_fallback_chain": [],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3359,6 +3420,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3431,7 +3493,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "low",
    "thinking_mode": "T1",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-mini-1"
  },
@@ -3447,6 +3510,7 @@
    "route_max_history_turns": 1,
    "routed_model": "dummy-vision-1",
    "routed_tier": "image_model",
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 1.0,
    "routing_source": "image_route",
@@ -3468,6 +3532,7 @@
    "route_max_history_turns": 1,
    "routed_model": "dummy-vision-1",
    "routed_tier": "image_model",
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 1.0,
    "routing_source": "image_route",
@@ -3489,6 +3554,7 @@
    "route_max_history_turns": 8,
    "routed_model": "dummy-vision-1",
    "routed_tier": "image_model",
+   "router_tier_provider_role": "direct",
    "router_vision_followup_needs_image": true,
    "routing_applied": true,
    "routing_confidence": 1.0,
@@ -3511,6 +3577,7 @@
    "route_max_history_turns": 1,
    "routed_model": "dummy-vision-1",
    "routed_tier": "image_model",
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 1.0,
    "routing_source": "image_route",
@@ -3521,7 +3588,7 @@
   "model": "dummy-vision-1"
  },
  "image_without_image_tier_errors": {
-  "error": "RuntimeError: No image-capable SquillaRouter tier is configured for this image request. Configure squilla_router.tiers.image_model with supports_image=true.",
+  "error": "RuntimeError: No image-capable SquillaRouter tier is configured with a non-empty model for this image request. Configure squilla_router.tiers.image_model with supports_image=true and a model.",
   "message_len": 32,
   "message_tail": "please summarize this short note",
   "metadata": {},
@@ -3540,6 +3607,7 @@
    "routed_model": "dummy-nano-1",
    "routed_tier": "c0",
    "router_fallback_chain": [],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3638,6 +3706,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3726,7 +3795,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -3758,6 +3828,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": false,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3846,7 +3917,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-base-model"
  },
@@ -3878,6 +3950,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3966,7 +4039,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  },
@@ -3994,6 +4068,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4082,7 +4157,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -4114,6 +4190,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4202,7 +4279,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  },
@@ -4232,6 +4310,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4320,7 +4399,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -4350,6 +4430,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4422,7 +4503,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  },
@@ -4439,6 +4521,7 @@
    "routed_model": "dummy-nano-1",
    "routed_tier": "c0",
    "router_fallback_chain": [],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4541,6 +4624,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4629,7 +4713,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "high",
    "thinking_mode": "T3",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  },
@@ -4654,6 +4739,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4726,7 +4812,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -4758,6 +4845,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": false,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4830,7 +4918,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-base-model"
  },
@@ -4862,6 +4951,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4934,7 +5024,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -4950,6 +5041,7 @@
    "routed_model": "dummy-nano-1",
    "routed_tier": "c0",
    "router_fallback_chain": [],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -5046,6 +5138,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -5118,7 +5211,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -5144,6 +5238,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -5216,7 +5311,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -5243,6 +5339,7 @@
     }
    ],
    "router_tier_provider_mismatch": "otherprov",
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -5315,7 +5412,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -5340,6 +5438,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": false,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -5412,7 +5511,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-base-model"
  },
@@ -5444,6 +5544,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -5526,7 +5627,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "medium",
    "thinking_mode": "T2",
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-pro-1"
  },
@@ -5562,6 +5664,7 @@
      "tier": "c0"
     }
    ],
+   "router_tier_provider_role": "direct",
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -5616,7 +5719,8 @@
    "savings_routed_price_per_m": 3.0,
    "thinking_level": "xhigh",
    "thinking_mode": null,
-   "thinking_requested": true
+   "thinking_requested": true,
+   "thinking_source": "squilla_router_tier"
   },
   "model": "dummy-max-1"
  }

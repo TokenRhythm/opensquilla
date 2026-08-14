@@ -35,7 +35,6 @@ from opensquilla.engine.routing import (
 )
 from opensquilla.engine.routing.policy_data import DEFAULT_CONTEXT_WINDOW_TOKENS
 from opensquilla.engine.steps.router_decision_record import stage_router_decision
-from opensquilla.ensemble_plan import effective_ensemble_selection_mode
 from opensquilla.provider.context_capabilities import provider_state_continuity_diagnostic
 from opensquilla.provider.model_catalog import shared_catalog
 from opensquilla.provider.types import ModelCapabilities
@@ -50,6 +49,7 @@ from opensquilla.router_tiers import (
     IMAGE_TIER,
     TEXT_TIERS,
     TierConfig,
+    effective_ensemble_selection_mode,
     normalize_text_tier,
     router_dynamic_tier_members_active,
     tier_ensemble_active,

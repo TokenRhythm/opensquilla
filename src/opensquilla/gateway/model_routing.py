@@ -11,17 +11,17 @@ import copy
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from opensquilla.ensemble_plan import (
+from opensquilla.router_tiers import (
+    CUSTOM_B5_PROPOSER_ROLES,
+    CUSTOM_B5_SELECTION_MODE,
+    INDEPENDENT_ENSEMBLE_SELECTION_MODES,
+    STATIC_B5_PROFILES,
     effective_ensemble_selection_mode,
     ensemble_selection_configured,
+    static_b5_profile,
 )
 
 ModelRoutingMode = Literal["direct", "router", "ensemble"]
-
-_INDEPENDENT_ENSEMBLE_MODES = frozenset(
-    {"static_openrouter_b5", "static_tokenrhythm_b5", "custom_b5"}
-)
-
 
 @dataclass(frozen=True, slots=True)
 class _ModelRoutingConfigSnapshot:
@@ -90,11 +90,6 @@ def _provider_ensemble_candidates(config: Any) -> list[dict[str, Any]]:
     """Build the provider-aware first-activation custom lineup."""
 
     provider = _clean(getattr(getattr(config, "llm", None), "provider", ""))
-    from opensquilla.provider.ensemble import (
-        CUSTOM_B5_PROPOSER_ROLES,
-        STATIC_B5_PROFILES,
-    )
-
     static_profile = next(
         (
             profile
@@ -185,10 +180,10 @@ def ensemble_activation_patches(config: Any) -> dict[str, Any]:
     if ensemble_selection_configured(config):
         return {}
     selection_mode = effective_ensemble_selection_mode(config)
-    if selection_mode != "custom_b5":
+    if selection_mode != CUSTOM_B5_SELECTION_MODE:
         return {"llm_ensemble.selection_mode": selection_mode}
     return {
-        "llm_ensemble.selection_mode": "custom_b5",
+        "llm_ensemble.selection_mode": CUSTOM_B5_SELECTION_MODE,
         "llm_ensemble.candidates": _provider_ensemble_candidates(config),
     }
 
@@ -210,7 +205,7 @@ def ensemble_activation_preview(config: Any) -> dict[str, Any]:
         patches = ensemble_activation_patches(config)
     except ValueError as exc:
         return {
-            "selection_mode": "custom_b5",
+            "selection_mode": CUSTOM_B5_SELECTION_MODE,
             "proposer_count": 0,
             "member_providers": [],
             "candidates": [],
@@ -220,8 +215,6 @@ def ensemble_activation_preview(config: Any) -> dict[str, Any]:
         patches.get("llm_ensemble.selection_mode")
         or getattr(ensemble, "selection_mode", "")
     )
-    from opensquilla.provider.ensemble import static_b5_profile
-
     static_profile = static_b5_profile(selection_mode)
     if static_profile is not None:
         return {
@@ -276,7 +269,7 @@ def model_routing_snapshot(config: Any) -> dict[str, Any]:
     ensemble_enabled = bool(getattr(ensemble, "enabled", False))
     rollout_phase = _clean(getattr(router, "rollout_phase", "observe")) or "observe"
     selection_mode = _clean(getattr(ensemble, "selection_mode", ""))
-    router_required = selection_mode not in _INDEPENDENT_ENSEMBLE_MODES
+    router_required = selection_mode not in INDEPENDENT_ENSEMBLE_SELECTION_MODES
 
     if ensemble_enabled:
         mode: ModelRoutingMode = "ensemble"
@@ -332,7 +325,7 @@ def model_routing_patches(
     return {
         **patches,
         "llm_ensemble.enabled": True,
-        "squilla_router.enabled": selection_mode not in _INDEPENDENT_ENSEMBLE_MODES,
+        "squilla_router.enabled": selection_mode not in INDEPENDENT_ENSEMBLE_SELECTION_MODES,
         "squilla_router.rollout_phase": "full",
     }
 

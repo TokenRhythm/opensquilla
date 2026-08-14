@@ -14,6 +14,7 @@ from opensquilla.provider import (
     EnsembleProvider,
     ErrorEvent,
     Message,
+    ProviderGenerationResetEvent,
     TextDeltaEvent,
 )
 from opensquilla.provider.selector import (
@@ -956,7 +957,7 @@ async def test_shared_c3_all_failed_policy_keeps_the_global_fallback_contract(
     fallback_usage = next(
         row
         for row in done.model_usage_breakdown
-        if row["role"] == "fallback_single"
+        if row["role"] == "fixed_direct"
     )
     assert fallback_usage["provider"] == "tokenrhythm"
     assert fallback_usage["model"] == fixed_model
@@ -1068,9 +1069,13 @@ async def test_shared_c3_outer_selector_does_not_retry_the_global_fixed_model(
         )
     ]
 
-    assert calls == [fixed_model, secondary_model]
-    assert isinstance(events[-1], DoneEvent)
-    assert events[-1].model == secondary_model
+    # Fixed takeover is sticky. The one allowed transient retry reuses the
+    # same global fixed deployment; the outer selector must not hop to its
+    # secondary chain or re-enter model selection.
+    assert calls == [fixed_model, fixed_model]
+    assert isinstance(events[-1], ProviderGenerationResetEvent)
+    assert events[-1].terminal is True
+    assert secondary_model not in calls
 
 
 async def test_shared_c3_follows_an_explicit_change_to_the_global_plan(

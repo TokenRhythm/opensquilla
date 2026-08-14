@@ -3892,7 +3892,8 @@ async def _handle_sessions_send_impl(
     def _turn_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(payload)
         enriched.setdefault("session_id", session_id)
-        enriched.setdefault("turn_id", turn_id)
+        if not enriched.get("turn_id"):
+            enriched["turn_id"] = turn_id
         enriched.setdefault("client_message_id", client_message_id)
         if user_message_id:
             enriched.setdefault("user_message_id", user_message_id)
@@ -3951,7 +3952,10 @@ async def _handle_sessions_send_impl(
                 )
                 return
 
-            from opensquilla.engine.stream_wrappers import wrap_stream
+            from opensquilla.engine.stream_wrappers import (
+                is_context_bound_owner,
+                wrap_stream,
+            )
             from opensquilla.gateway.routing import tool_context_from_envelope
             from opensquilla.permissions import configured_default_elevated
 
@@ -4025,6 +4029,7 @@ async def _handle_sessions_send_impl(
                 idle_timeout=stream_idle_timeout,
                 heartbeat_interval=heartbeat_interval,
                 heartbeat_message="Agent run is still active",
+                context_bound=is_context_bound_owner(ctx.turn_runner),
             ):
                 event_dict = asdict(event)
                 event_kind = event_dict.pop("kind", event.__class__.__name__)

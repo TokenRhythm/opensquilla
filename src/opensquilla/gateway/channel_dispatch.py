@@ -79,6 +79,8 @@ from opensquilla.engine.types import (
     RunHeartbeatEvent,
     TextDeltaEvent,
     ToolResultEvent,
+    ToolUseDeltaEvent,
+    ToolUseEndEvent,
     ToolUseStartEvent,
     done_text_snapshot,
 )
@@ -1909,7 +1911,12 @@ def _optional_positive_config_float(config: Any, attr: str, default: float) -> f
     return value if value > 0 else None
 
 
-def _wrap_channel_turn_stream(stream: Any, config: Any) -> Any:
+def _wrap_channel_turn_stream(
+    stream: Any,
+    config: Any,
+    *,
+    context_bound: bool | None = None,
+) -> Any:
     from opensquilla.engine.stream_wrappers import wrap_stream
 
     raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(config)
@@ -1926,6 +1933,7 @@ def _wrap_channel_turn_stream(stream: Any, config: Any) -> Any:
         ),
         heartbeat_phase="channel",
         heartbeat_message="Still working",
+        context_bound=context_bound,
     )
 
 
@@ -2597,6 +2605,24 @@ def _tool_use_start_payload(event: ToolUseStartEvent) -> dict[str, Any]:
         "tool_use_id": event.tool_use_id,
         "tool_name": event.tool_name,
         "name": event.tool_name,
+        "synthetic_from_text": event.synthetic_from_text,
+    }
+
+
+def _tool_use_delta_payload(event: ToolUseDeltaEvent) -> dict[str, Any]:
+    return {
+        "tool_use_id": event.tool_use_id,
+        "json_fragment": event.json_fragment,
+    }
+
+
+def _tool_use_end_payload(event: ToolUseEndEvent) -> dict[str, Any]:
+    return {
+        "tool_use_id": event.tool_use_id,
+        "tool_name": event.tool_name,
+        "name": event.tool_name,
+        "arguments": event.arguments,
+        "input": event.arguments,
         "synthetic_from_text": event.synthetic_from_text,
     }
 
@@ -3938,7 +3964,13 @@ async def _run_turn_batch_path(
             session_key,
             **run_kwargs,
         )
-        async for event in _wrap_channel_turn_stream(stream, config):
+        from opensquilla.engine.stream_wrappers import is_context_bound_owner
+
+        async for event in _wrap_channel_turn_stream(
+            stream,
+            config,
+            context_bound=is_context_bound_owner(turn_runner),
+        ):
             if isinstance(event, TextDeltaEvent):
                 if clarify_card_sent:
                     continue
@@ -3987,6 +4019,20 @@ async def _run_turn_batch_path(
                         session_key,
                         "session.event.tool_use_start",
                         _tool_use_start_payload(event),
+                    )
+            elif isinstance(event, ToolUseDeltaEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_delta",
+                        _tool_use_delta_payload(event),
+                    )
+            elif isinstance(event, ToolUseEndEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_end",
+                        _tool_use_end_payload(event),
                     )
             elif isinstance(event, ToolResultEvent):
                 if event_bridge is not None:
@@ -4124,7 +4170,13 @@ async def _run_turn_streaming_path(
             session_key,
             **run_kwargs,
         )
-        async for event in _wrap_channel_turn_stream(stream, config):
+        from opensquilla.engine.stream_wrappers import is_context_bound_owner
+
+        async for event in _wrap_channel_turn_stream(
+            stream,
+            config,
+            context_bound=is_context_bound_owner(turn_runner),
+        ):
             if isinstance(event, TextDeltaEvent):
                 if clarify_card_sent:
                     continue
@@ -4178,6 +4230,20 @@ async def _run_turn_streaming_path(
                         session_key,
                         "session.event.tool_use_start",
                         _tool_use_start_payload(event),
+                    )
+            elif isinstance(event, ToolUseDeltaEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_delta",
+                        _tool_use_delta_payload(event),
+                    )
+            elif isinstance(event, ToolUseEndEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_end",
+                        _tool_use_end_payload(event),
                     )
             elif isinstance(event, ToolResultEvent):
                 if event_bridge is not None:

@@ -1552,6 +1552,21 @@ def test_upsert_router_materializes_the_shared_tokenrhythm_plan_without_global_e
     assert "llm_ensemble.selection_mode" in res.config.force_persist_paths()
 
 
+@pytest.mark.parametrize("tier", ["c0", "c1", "c2"])
+def test_upsert_router_rejects_shared_ensemble_flag_outside_c3(tier: str):
+    cfg = GatewayConfig()
+
+    with pytest.raises(
+        ValueError,
+        match=rf"router tier {tier!r} ensembleEnabled is only supported for c3",
+    ):
+        upsert_router(
+            cfg,
+            mode="custom",
+            tiers={tier: {"ensembleEnabled": True}},
+        )
+
+
 def test_upsert_router_disabled_does_not_materialize_a_dormant_shared_tier():
     cfg = GatewayConfig()
 

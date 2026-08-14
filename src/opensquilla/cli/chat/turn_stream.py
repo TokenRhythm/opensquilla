@@ -548,7 +548,40 @@ def optional_positive_config_float(config_source: Any, attr: str, default: float
     return value if value > 0 else None
 
 
-def wrap_cli_turn_stream(stream: Any, config_source: Any) -> Any:
+class _ContextBoundStream:
+    """Carry the turn-owner marker through legacy two-argument wrappers."""
+
+    context_bound = True
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+
+    def __aiter__(self) -> _ContextBoundStream:
+        return self
+
+    async def __anext__(self) -> Any:
+        return await self._stream.__anext__()
+
+    async def aclose(self) -> None:
+        close = getattr(self._stream, "aclose", None)
+        if callable(close):
+            await close()
+
+
+def _bind_stream_to_turn_context(stream: Any, turn_runner: Any) -> Any:
+    from opensquilla.engine.stream_wrappers import is_context_bound_owner
+
+    if is_context_bound_owner(turn_runner):
+        return _ContextBoundStream(stream)
+    return stream
+
+
+def wrap_cli_turn_stream(
+    stream: Any,
+    config_source: Any,
+    *,
+    context_bound: bool | None = None,
+) -> Any:
     from opensquilla.engine.stream_wrappers import wrap_stream
 
     return wrap_stream(
@@ -565,6 +598,7 @@ def wrap_cli_turn_stream(stream: Any, config_source: Any) -> Any:
         ),
         heartbeat_phase="cli",
         heartbeat_message="Still working",
+        context_bound=context_bound,
     )
 
 
@@ -1277,6 +1311,7 @@ async def stream_response_turnrunner(
                     timeout=timeout,
                     pending_input_provider=pending_input_provider,
                 )
+                stream = _bind_stream_to_turn_context(stream, turn_runner)
                 async for event in stream_deps.stream_wrapper(stream, svc):
                     if isinstance(event, TextDeltaEvent):
                         reasoning_mid_stream = False
@@ -1615,6 +1650,7 @@ async def handle_image_command_turnrunner(
                     timeout=timeout,
                     pending_input_provider=pending_input_provider,
                 )
+                stream = _bind_stream_to_turn_context(stream, turn_runner)
                 async for event in stream_deps.stream_wrapper(stream, svc):
                     if isinstance(event, TextDeltaEvent):
                         await _append_text_delta(

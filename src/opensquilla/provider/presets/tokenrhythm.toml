@@ -12,7 +12,6 @@ provider = "tokenrhythm"
 label = "TokenRhythm"
 description = "Curated TokenRhythm router ladder (Qwen 3.7 Flash, DeepSeek V4 Flash 0731, GLM 5.2, then shared B5 fusion), applied as inline tiers."
 default_model = "deepseek-v4-flash-0731"
-default_ensemble_selection_mode = "static_tokenrhythm_b5"
 
 [tiers.c0]
 provider = "tokenrhythm"

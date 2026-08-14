@@ -57,10 +57,10 @@ def test_interactive_ensemble_configure_persists(tmp_path, monkeypatch):
             calls.append(message)
             if message == "Ensemble selection mode":
                 assert kwargs.get("choices") == [
-                    "router_dynamic",
                     "static_openrouter_b5",
                     "static_tokenrhythm_b5",
                     "custom_b5",
+                    "router_dynamic",
                 ]
                 assert kwargs.get("default") == "static_openrouter_b5"
                 return _Answer("router_dynamic")

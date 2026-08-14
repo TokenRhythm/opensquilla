@@ -11,12 +11,7 @@ from typing import Any, Literal, cast, get_args
 from pydantic import ValidationError
 
 from opensquilla.channels.registry import discover_all, parse_channel_entry
-from opensquilla.ensemble_plan import (
-    effective_ensemble_selection_mode,
-    ensemble_selection_configured,
-)
 from opensquilla.gateway.config import (
-    STATIC_B5_SELECTION_MODE_PROVIDERS,
     AudioConfig,
     ChannelsConfig,
     GatewayConfig,
@@ -73,9 +68,13 @@ from opensquilla.provider.image_generation_policy import (
 from opensquilla.provider.preset_registry import ProviderPreset, get_preset
 from opensquilla.router_tiers import (
     DEFAULT_TEXT_TIER,
+    HIGHEST_TEXT_TIER,
     ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
+    STATIC_B5_SELECTION_MODE_PROVIDERS,
     TEXT_TIERS,
     TierConfig,
+    effective_ensemble_selection_mode,
+    ensemble_selection_configured,
     normalize_text_tier,
     router_dynamic_tier_members_active,
     tier_provider_role,
@@ -383,20 +382,17 @@ def _validate_router_tiers(tiers: dict[str, Any], default_tier: str) -> None:
             "ensemble_enabled",
             tier.get("ensembleEnabled"),
         )
-        if raw_ensemble_enabled is not None and not isinstance(
-            raw_ensemble_enabled, bool
-        ):
+        if raw_ensemble_enabled is not None and not isinstance(raw_ensemble_enabled, bool):
+            raise ValueError(f"router tier {tier_name!r} ensembleEnabled must be a boolean")
+        if tier_name != HIGHEST_TEXT_TIER and raw_ensemble_enabled is True:
             raise ValueError(
-                f"router tier {tier_name!r} ensembleEnabled must be a boolean"
+                f"router tier {tier_name!r} ensembleEnabled is only supported "
+                f"for {HIGHEST_TEXT_TIER}"
             )
-        if (
-            selection_mode
-            and selection_mode not in ROUTER_TIER_ENSEMBLE_SELECTION_MODES
-        ):
+        if selection_mode and selection_mode not in ROUTER_TIER_ENSEMBLE_SELECTION_MODES:
             allowed = ", ".join(sorted(ROUTER_TIER_ENSEMBLE_SELECTION_MODES))
             raise ValueError(
-                f"router tier {tier_name!r} ensembleSelectionMode must be one of: "
-                f"{allowed}"
+                f"router tier {tier_name!r} ensembleSelectionMode must be one of: {allowed}"
             )
 
 
@@ -1214,11 +1210,12 @@ def upsert_router(
         # A genuine enable is a strategy switch: route through the canonical
         # mode patch (ensemble off, rollout_phase full, force-persisted).
         apply_model_routing_mode(new_cfg, "router")
-    shared_tier_enabled = bool(
-        getattr(new_cfg.squilla_router, "enabled", False)
-    ) and any(
-        TierConfig.from_value(tier).ensemble_enabled is True
-        for tier in (getattr(new_cfg.squilla_router, "tiers", {}) or {}).values()
+    shared_tier_enabled = (
+        bool(getattr(new_cfg.squilla_router, "enabled", False))
+        and TierConfig.from_value(
+            (getattr(new_cfg.squilla_router, "tiers", {}) or {}).get(HIGHEST_TEXT_TIER)
+        ).ensemble_enabled
+        is True
     )
     if shared_tier_enabled and not ensemble_selection_configured(new_cfg):
         activation = ensemble_activation_patches(new_cfg)

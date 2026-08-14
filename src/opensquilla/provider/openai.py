@@ -3617,18 +3617,23 @@ class OpenAIProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
+        # A coordinator-issued physical attempt is already the one upstream
+        # request for this adapter call.  Keep the legacy compatibility
+        # fallbacks available for unbounded direct calls, but never turn a
+        # coordinator-owned attempt into a hidden stream/non-stream resend.
+        coordinator_owns_retry = cfg.physical_attempt_limit == 1
         non_stream_fallback_allowed = (
             self._provider_kind != "dashscope"
             or _dashscope_non_stream_fallback_from_env()
         )
         stream_timeout_fallback = (
             self._compat.stream_timeout_fallback
-            and cfg.physical_attempt_limit != 1
+            and not coordinator_owns_retry
             and non_stream_fallback_allowed
         )
         empty_stream_fallback = (
             self._compat.empty_stream_fallback
-            and cfg.physical_attempt_limit != 1
+            and not coordinator_owns_retry
             and non_stream_fallback_allowed
         )
         (

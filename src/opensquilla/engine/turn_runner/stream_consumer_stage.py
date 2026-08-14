@@ -40,6 +40,7 @@ from opensquilla.observability.decision_log import build_vision_followup_gate_re
 from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
 
 if TYPE_CHECKING:
+    from opensquilla.contracts.turn_execution import TurnExecutionContext
     from opensquilla.engine.agent import Agent
     from opensquilla.engine.agent_injection import PendingInputProvider
     from opensquilla.engine.artifact_delivery import OmittedArtifactPublishResult
@@ -48,6 +49,7 @@ if TYPE_CHECKING:
         AgentEvent,
         ArtifactEvent,
         CompactionEvent,
+        ControlTerminalEvent,
         DoneEvent,
         ErrorEvent,
         TextDeltaEvent,
@@ -232,6 +234,9 @@ class _StreamState:
     artifact_delivery_failures: list[str] = field(default_factory=list)
     artifact_delivery_failures_by_target: dict[str, str] = field(default_factory=dict)
     completed_meta_skill_without_text: str | None = None
+    reasoning: list[str] = field(default_factory=list)
+    terminal_generation_reset: bool = False
+    control_terminal_event: ControlTerminalEvent | None = None
 
 
 @dataclass(frozen=True)
@@ -305,6 +310,42 @@ class StreamConsumerStageInput:
     # ``system_event``; their text is held until the terminal snapshot can be
     # canonicalized so silent-reply protocol markers never flash on a client.
     input_mode: str = "user"
+    execution_context: TurnExecutionContext | None = None
+
+
+def _supports_realtime_generation(inp: StreamConsumerStageInput) -> bool:
+    """Return whether this delivery surface can retract speculative output."""
+
+    context = inp.execution_context
+    if context is None:
+        return True
+    surface = context.surface
+    return bool(
+        surface.supports_streaming
+        and surface.supports_edit
+        and surface.supports_generation_reset
+    )
+
+
+def _control_reason_for_error_code(code: Any) -> Any | None:
+    """Map only typed control/error codes; provider failures stay recoverable."""
+
+    from opensquilla.engine.types import ControlTerminalReason
+
+    normalized = str(code or "").strip().lower().replace("-", "_")
+    return {
+        "agent_runtime_timeout": ControlTerminalReason.HARD_DEADLINE,
+        "hard_deadline": ControlTerminalReason.HARD_DEADLINE,
+        "hard_deadline_exceeded": ControlTerminalReason.HARD_DEADLINE,
+        "shutdown": ControlTerminalReason.SHUTDOWN,
+        "gateway_shutdown": ControlTerminalReason.SHUTDOWN,
+        "cancel": ControlTerminalReason.CANCEL,
+        "cancelled": ControlTerminalReason.CANCEL,
+        "canceled": ControlTerminalReason.CANCEL,
+        "platform_validation": ControlTerminalReason.PLATFORM_VALIDATION,
+        "platform_safety": ControlTerminalReason.PLATFORM_SAFETY,
+        "safety_control": ControlTerminalReason.PLATFORM_SAFETY,
+    }.get(normalized)
 
 # ---------------------------------------------------------------------------
 # Per-event handler classes
@@ -315,6 +356,36 @@ def _has_tool_boundary(state: _StreamState) -> bool:
         segment.get("type") in {"tool_use", "tool_result"}
         for segment in state.turn_segments
     )
+
+
+def _reset_generation_stream_state(state: _StreamState) -> None:
+    """Discard answer state for a replaced generation, retaining completed tools."""
+
+    completed_tool_ids = {
+        str(segment.get("tool_use_id"))
+        for segment in state.turn_segments
+        if isinstance(segment, dict)
+        and segment.get("type") == "tool_result"
+        and segment.get("tool_use_id")
+    }
+    state.current_text_parts[:] = []
+    state.final_text_parts[:] = []
+    state.reasoning[:] = []
+    state.error_message = None
+    state.pending_error_event = None
+    state.done_event = None
+    state.turn_segments[:] = [
+        segment
+        for segment in state.turn_segments
+        if not isinstance(segment, dict)
+        or (
+            segment.get("type") != "text"
+            and (
+                segment.get("type") != "tool_use"
+                or str(segment.get("tool_use_id")) in completed_tool_ids
+            )
+        )
+    ]
 
 
 def _normalize_cumulative_text_delta(text: str, state: _StreamState) -> str:
@@ -1527,8 +1598,10 @@ class StreamConsumerStage:
     ) -> AsyncIterator[AgentEvent]:
         # Late imports keep the module import-cycle-free.
         from opensquilla.engine.types import (
+            AnswerGenerationResetEvent,
             ArtifactEvent,
             CompactionEvent,
+            ControlTerminalEvent,
             DoneEvent,
             EnsembleProgressEvent,
             ErrorEvent,
@@ -1536,6 +1609,7 @@ class StreamConsumerStage:
             ThinkingEvent,
             ToolResultEvent,
             ToolUseDeltaEvent,
+            ToolUseEndEvent,
             ToolUseStartEvent,
             WarningEvent,
             done_text_snapshot,
@@ -1553,6 +1627,30 @@ class StreamConsumerStage:
         released_system_event_text: str | None = None
         released_system_event_source_text: str | None = None
         released_suppressed_source_text: str | None = None
+        realtime_generation = _supports_realtime_generation(inp)
+        deferred_generation_events: list[AgentEvent] = []
+
+        def _is_deferred_generation_event(candidate: object) -> bool:
+            return isinstance(
+                candidate,
+                (
+                    TextDeltaEvent,
+                    ThinkingEvent,
+                    ToolUseStartEvent,
+                    ToolUseDeltaEvent,
+                    ToolUseEndEvent,
+                    ToolResultEvent,
+                    ArtifactEvent,
+                ),
+            )
+
+        def _drop_speculative_text() -> None:
+            deferred_generation_events[:] = [
+                candidate
+                for candidate in deferred_generation_events
+                if not isinstance(candidate, (TextDeltaEvent, ThinkingEvent))
+            ]
+
         async for event in self._agent_run.run_turn(
             inp.agent,
             turn_input=inp.turn_input,
@@ -1562,7 +1660,30 @@ class StreamConsumerStage:
         ):
             transformed: AgentEvent | object
             extra_yields: list[AgentEvent] = []
-            if isinstance(event, TextDeltaEvent):
+            if isinstance(event, AnswerGenerationResetEvent):
+                _reset_generation_stream_state(state)
+                if not realtime_generation:
+                    _drop_speculative_text()
+                if event.terminal:
+                    terminal_snapshot = str(event.terminal_text_snapshot or "")
+                    if terminal_snapshot:
+                        state.current_text_parts.append(terminal_snapshot)
+                        state.final_text_parts.append(terminal_snapshot)
+                        state.turn_segments.append(
+                            {"type": "text", "text": terminal_snapshot}
+                        )
+                    state.terminal_generation_reset = True
+                transformed = event
+            elif isinstance(event, ControlTerminalEvent):
+                state.control_terminal_event = event
+                if not realtime_generation:
+                    _drop_speculative_text()
+                transformed = event
+            elif isinstance(event, ThinkingEvent):
+                if event.text:
+                    state.reasoning.append(event.text)
+                transformed = event
+            elif isinstance(event, TextDeltaEvent):
                 transformed = self._text_delta_handler.handle(event, state)
                 if buffer_system_event_text:
                     if event.text and not buffered_text_observed:
@@ -1581,6 +1702,8 @@ class StreamConsumerStage:
             elif isinstance(event, ToolUseStartEvent):
                 transformed = self._tool_use_start_handler.handle(event, state)
             elif isinstance(event, ToolUseDeltaEvent):
+                transformed = event
+            elif isinstance(event, ToolUseEndEvent):
                 transformed = event
             elif isinstance(event, ToolResultEvent):
                 transformed = self._tool_result_handler.handle(
@@ -1676,6 +1799,20 @@ class StreamConsumerStage:
             elif isinstance(event, WarningEvent):
                 transformed = self._warning_handler.handle(event, state)
             elif isinstance(event, DoneEvent):
+                if state.terminal_generation_reset:
+                    # Agent may emit one accounting-only DoneEvent after a
+                    # terminal generation replacement when failed physical
+                    # attempts carried usage. Preserve that receipt for the
+                    # finalizer, but the terminal reset remains the only public
+                    # outcome and its friendly snapshot remains authoritative.
+                    terminal_snapshot = "".join(state.final_text_parts)
+                    state.done_event = replace(
+                        event,
+                        text=terminal_snapshot,
+                        text_snapshot=terminal_snapshot,
+                    )
+                    transformed = _SUPPRESS
+                    continue
                 if (
                     buffer_system_event_text
                     and released_system_event_source_text is not None
@@ -1813,14 +1950,40 @@ class StreamConsumerStage:
                     output_tokens=event.output_tokens,
                     cost_usd=event.cost_usd,
                     error=event.error,
+                    generation_epoch=event.generation_epoch,
                 )
             else:
                 transformed = event
 
+            if realtime_generation:
+                for extra_event in extra_yields:
+                    yield extra_event
+                if transformed is not _SUPPRESS:
+                    yield transformed  # type: ignore[misc]
+                continue
+
             for extra_event in extra_yields:
-                yield extra_event
-            if transformed is not _SUPPRESS:
-                yield transformed  # type: ignore[misc]
+                if _is_deferred_generation_event(extra_event):
+                    deferred_generation_events.append(extra_event)
+                else:
+                    yield extra_event
+
+            if transformed is _SUPPRESS:
+                continue
+            if _is_deferred_generation_event(transformed):
+                deferred_generation_events.append(transformed)  # type: ignore[arg-type]
+                continue
+            if isinstance(
+                transformed,
+                (DoneEvent, ErrorEvent, ControlTerminalEvent),
+            ) or (
+                isinstance(transformed, AnswerGenerationResetEvent)
+                and transformed.terminal
+            ):
+                for deferred_event in deferred_generation_events:
+                    yield deferred_event
+                deferred_generation_events.clear()
+            yield transformed  # type: ignore[misc]
 
         # Post-stream: notify sync manager once.
         self._memory_sync_notify.notify_message_bytes(

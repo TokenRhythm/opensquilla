@@ -5027,7 +5027,9 @@ async def test_large_tool_argument_stream_emits_progress_heartbeat() -> None:
         lambda event: (
             isinstance(event, RunHeartbeatEvent)
             and event.phase == "llm_tool_arguments"
-            and "write_file" in (event.message or "")
+            # Pending tool identity stays private until a legal DoneEvent
+            # commits the transactional tool timeline.
+            and event.message == "Receiving tool arguments"
         ),
     )
     done_index = _event_index(events, lambda event: isinstance(event, DoneEvent))

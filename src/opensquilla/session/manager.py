@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from opensquilla.contracts.turn_execution import AssistantMessageReservation
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.session.compaction import (
@@ -1877,12 +1878,38 @@ class SessionManager:
 
     # ── Transcript ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def reserve_assistant_message(
+        turn_id: str,
+        assistant_message_id: str,
+        session_key: str,
+        channel_id: str | None = None,
+    ) -> AssistantMessageReservation:
+        """Reserve an assistant identity without creating a transcript row.
+
+        The reservation is intentionally just a value object.  Materialization
+        happens on the first visible/final assistant write using the same id.
+        """
+
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("turn_id must be a non-empty string")
+        if not isinstance(assistant_message_id, str) or not assistant_message_id.strip():
+            raise ValueError("assistant_message_id must be a non-empty string")
+        return AssistantMessageReservation(
+            turn_id=turn_id,
+            assistant_message_id=assistant_message_id,
+            session_key=canonicalize_session_key(session_key),
+            channel_id=channel_id,
+        )
+
     async def prepare_message(
         self,
         session_key: str,
         role: str,
         content: str,
         *,
+        message_id: str | None = None,
+        assistant_message_id: str | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
@@ -1903,7 +1930,16 @@ class SessionManager:
         if node is None:
             raise KeyError(f"Session not found: {session_key}")
 
+        if message_id is not None and assistant_message_id is not None:
+            if message_id != assistant_message_id:
+                raise ValueError("message_id and assistant_message_id must match")
+        message_id = assistant_message_id or message_id
         content = self._maybe_stamp_user_message(role, content)
+
+        if message_id is not None and (
+            not isinstance(message_id, str) or not message_id.strip()
+        ):
+            raise ValueError("message_id must be a non-empty string when supplied")
 
         if turn_context is None:
             from opensquilla.session.turn_context import current_turn_context
@@ -1913,6 +1949,7 @@ class SessionManager:
         entry = TranscriptEntry(
             session_id=node.session_id,
             session_key=session_key,
+            message_id=message_id or str(uuid.uuid4()),
             role=role,
             content=content,
             tool_calls=tool_calls,
@@ -1951,6 +1988,8 @@ class SessionManager:
         role: str,
         content: str,
         *,
+        message_id: str | None = None,
+        assistant_message_id: str | None = None,
         tool_calls: list[dict[str, Any]] | None = None,
         tool_call_id: str | None = None,
         reasoning_content: str | None = None,
@@ -1960,10 +1999,15 @@ class SessionManager:
     ) -> TranscriptEntry:
         """Append a message and narrowly touch its session in one transaction."""
 
+        if message_id is not None and assistant_message_id is not None:
+            if message_id != assistant_message_id:
+                raise ValueError("message_id and assistant_message_id must match")
+        message_id = assistant_message_id or message_id
         entry, expected_epoch = await self.prepare_message(
             session_key,
             role,
             content,
+            message_id=message_id,
             tool_calls=tool_calls,
             tool_call_id=tool_call_id,
             reasoning_content=reasoning_content,
@@ -1978,13 +2022,22 @@ class SessionManager:
             else None
         )
         if submitted_plan is None:
-            await self._storage.append_transcript_entry_and_touch(
-                entry,
-                expected_epoch=expected_epoch,
-                updated_at=_now_ms(),
-                token_delta=token_delta,
-                mark_total_tokens_stale=bool(token_delta),
-            )
+            if message_id is None:
+                await self._storage.append_transcript_entry_and_touch(
+                    entry,
+                    expected_epoch=expected_epoch,
+                    updated_at=_now_ms(),
+                    token_delta=token_delta,
+                    mark_total_tokens_stale=bool(token_delta),
+                )
+            else:
+                await self._storage.upsert_transcript_entry_and_touch(
+                    entry,
+                    expected_epoch=expected_epoch,
+                    updated_at=_now_ms(),
+                    token_delta=token_delta,
+                    mark_total_tokens_stale=bool(token_delta),
+                )
         else:
             node = await self._storage.get_session(session_key)
             if node is None:

@@ -1373,6 +1373,8 @@ async def dispatch_task_runtime_turn(
     heartbeat_interval = _optional_positive_timeout(
         config, "agent_stream_heartbeat_interval_seconds", 15.0
     )
+    from opensquilla.engine.stream_wrappers import is_context_bound_owner
+
     try:
         with accepted_turn_config_scope(getattr(run, "accepted_config", None)):
             raw_stream = turn_runner.run(run.message, run.session_key, **run_kwargs)
@@ -1382,6 +1384,7 @@ async def dispatch_task_runtime_turn(
                 event_emitter,
                 idle_timeout=stream_idle_timeout,
                 heartbeat_interval=heartbeat_interval,
+                context_bound=is_context_bound_owner(turn_runner),
                 stream_event_sink=getattr(run, "stream_event_sink", None),
                 task_id=getattr(run, "task_id", None),
                 session_id=getattr(run.envelope, "session_id", None),
@@ -1734,6 +1737,7 @@ async def _emit_task_runtime_stream_events(
     *,
     idle_timeout: float | None = 180.0,
     heartbeat_interval: float | None = None,
+    context_bound: bool | None = None,
     stream_event_sink: Any = None,
     task_id: str | None = None,
     session_id: str | None = None,
@@ -1763,6 +1767,7 @@ async def _emit_task_runtime_stream_events(
         idle_timeout=idle_timeout,
         heartbeat_interval=heartbeat_interval,
         heartbeat_message="Agent run is still active",
+        context_bound=context_bound,
     ):
         if is_dataclass(event):
             event_dict = asdict(event)
@@ -1870,7 +1875,11 @@ async def _emit_task_runtime_stream_events(
                 )
         if task_id:
             event_dict["task_id"] = task_id
-            event_dict["turn_id"] = task_id
+            # Typed generation-reset events carry the engine-owned turn id.
+            # Preserve it; ordinary legacy events still receive the runtime
+            # task id as their turn identity.
+            if not event_dict.get("turn_id"):
+                event_dict["turn_id"] = task_id
         if session_id:
             event_dict["session_id"] = session_id
         if client_message_id:

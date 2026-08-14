@@ -20,6 +20,7 @@ from opensquilla.provider.preset_registry import (
     list_presets,
 )
 from opensquilla.provider.registry import list_provider_specs
+from opensquilla.router_tiers import recommended_ensemble_selection_mode_for_provider
 
 GOLDEN_PATH = Path(__file__).parent / "golden" / "router_tier_profiles.json"
 LEGACY_NINE = frozenset(
@@ -148,7 +149,11 @@ def test_tokenrhythm_curated_ladder() -> None:
     assert preset.synthesized is False
     assert preset.persistable is False
     assert preset.default_model == "deepseek-v4-flash-0731"
-    assert preset.default_ensemble_selection_mode == "static_tokenrhythm_b5"
+    assert not hasattr(preset, "default_ensemble_selection_mode")
+    assert (
+        recommended_ensemble_selection_mode_for_provider(preset.provider_id)
+        == "static_tokenrhythm_b5"
+    )
     expected_models = {
         "c0": "qwen3.7-flash",
         "c1": "deepseek-v4-flash-0731",

@@ -26,7 +26,6 @@ from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 from opensquilla import __version__
-from opensquilla.ensemble_plan import effective_ensemble_selection_mode
 from opensquilla.gateway.config_migration import (
     LATEST_CONFIG_VERSION,
     ConfigParseError,
@@ -40,10 +39,22 @@ from opensquilla.provider.credentials import (
 )
 from opensquilla.provider.preset_registry import get_preset, legacy_profile_ids
 from opensquilla.router_tiers import (
+    CUSTOM_B5_MAX_PROPOSERS,
+    CUSTOM_B5_MAX_TOTAL_CALLS,
+    CUSTOM_B5_MIN_PROPOSERS,
+    CUSTOM_B5_SELECTION_MODE,
     DEFAULT_TEXT_TIER,
+    ENSEMBLE_CANDIDATE_ROLES,
+    LEGACY_OPENROUTER_MODEL_OPTIONS,
     ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
+    STATIC_B5_SELECTION_MODE_PROVIDERS,  # noqa: F401 - legacy import surface
+    STATIC_B5_SELECTION_MODES,
+    STATIC_OPENROUTER_B5_SELECTION_MODE,
+    STATIC_TOKENRHYTHM_B5_SELECTION_MODE,  # noqa: F401 - legacy import surface
     TEXT_TIERS,
+    EnsembleSelectionMode,
     TierConfig,
+    effective_ensemble_selection_mode,
     effective_tier_ensemble_selection_modes,
     normalize_text_tier,
     normalize_tier_mapping,
@@ -451,17 +462,6 @@ class LlmProviderConfig(BaseSettings):
         return self
 
 
-LEGACY_OPENROUTER_MODEL_OPTIONS = [
-    "deepseek/deepseek-v4-pro",
-    "z-ai/glm-5.2",
-    "qwen/qwen3.7-plus",
-    "deepseek/deepseek-v4-flash",
-    "qwen/qwen3.7-max",
-    "moonshotai/kimi-k2.6",
-    "moonshotai/kimi-k2.7-code",
-    "minimax/minimax-m3",
-]
-
 # Backward-compatible alias for older imports. New configs do not use these as
 # defaults; they are only recognized as the old OpenRouter preset payload.
 DEFAULT_LLM_ENSEMBLE_MODEL_OPTIONS = LEGACY_OPENROUTER_MODEL_OPTIONS
@@ -476,21 +476,8 @@ def _default_llm_ensemble_model_options() -> list[str]:
 # labels surfaced in the UI and the decision trace; "aggregator" is
 # structural — it marks the single member that fuses drafts and produces
 # the final answer. Empty string = unassigned (runs as a proposer).
-LLM_ENSEMBLE_CANDIDATE_ROLES = (
-    "",
-    "primary",
-    "contrast",
-    "fast_check",
-    "critic",
-    "aggregator",
-)
-
-# custom_b5 lineup bounds. The proposer cap covers total per-turn proposer
-# calls; the aggregator adds one more. See the ensemble builder for how the
-# lineup maps onto the shared B5 fusion defaults.
-CUSTOM_B5_MIN_PROPOSERS = 2
-CUSTOM_B5_MAX_PROPOSERS = 6
-CUSTOM_B5_MAX_TOTAL_CALLS = 8
+# Backward-compatible symbol for callers that imported the old gateway table.
+LLM_ENSEMBLE_CANDIDATE_ROLES = ENSEMBLE_CANDIDATE_ROLES
 
 
 class LlmEnsembleCandidateConfig(BaseModel):
@@ -549,9 +536,7 @@ class LlmEnsembleConfig(BaseSettings):
     # operator explicitly enables the ensemble surface.
     enabled: bool = False
     mode: Literal["b5_fusion"] = "b5_fusion"
-    selection_mode: Literal[
-        "router_dynamic", "static_openrouter_b5", "static_tokenrhythm_b5", "custom_b5"
-    ] = "static_openrouter_b5"
+    selection_mode: EnsembleSelectionMode = STATIC_OPENROUTER_B5_SELECTION_MODE
     # Expose tool schemas to proposers as advisory vocabulary only. Proposer
     # output is never dispatched; only the aggregator owns an executable tool
     # boundary.
@@ -571,8 +556,9 @@ class LlmEnsembleConfig(BaseSettings):
     candidate_max_chars: int = Field(default=24_000, ge=0)
     proposer_timeout_seconds: float = Field(default=3600.0, gt=0.0)
     aggregator_timeout_seconds: float = Field(default=3600.0, gt=0.0)
-    # Optional end-to-end wall-clock budget. None selects the profile default;
-    # zero explicitly disables the total cap.
+    # Deprecated read-compatibility field. The ensemble runtime intentionally
+    # ignores it and relies on the per-call proposer/aggregator/fixed-provider
+    # idle timeouts instead.
     total_timeout_seconds: float | None = Field(default=None, ge=0.0)
     shuffle_candidates: bool = True
     record_candidates: bool = False
@@ -602,7 +588,7 @@ class LlmEnsembleConfig(BaseSettings):
             )
         if (
             self.selection_mode
-            in {"static_openrouter_b5", "static_tokenrhythm_b5"}
+            in STATIC_B5_SELECTION_MODES
             and self.target_successful_proposers is not None
             and self.target_successful_proposers > 4
         ):
@@ -633,7 +619,7 @@ class LlmEnsembleConfig(BaseSettings):
                 "llm_ensemble.candidates may mark at most one enabled "
                 "candidate with role='aggregator'"
             )
-        if self.selection_mode != "custom_b5":
+        if self.selection_mode != CUSTOM_B5_SELECTION_MODE:
             return self
         proposers = [
             candidate
@@ -673,16 +659,6 @@ class LlmEnsembleConfig(BaseSettings):
         return self
 
 
-STATIC_OPENROUTER_B5_SELECTION_MODE = "static_openrouter_b5"
-STATIC_TOKENRHYTHM_B5_SELECTION_MODE = "static_tokenrhythm_b5"
-# selection_mode → member provider id for the static B5 profiles. Must stay
-# in lockstep with provider.ensemble.STATIC_B5_PROFILES (gateway must not be
-# imported from provider, so a parity test pins the two tables together).
-STATIC_B5_SELECTION_MODE_PROVIDERS: dict[str, str] = {
-    STATIC_OPENROUTER_B5_SELECTION_MODE: "openrouter",
-    STATIC_TOKENRHYTHM_B5_SELECTION_MODE: "tokenrhythm",
-}
-STATIC_B5_SELECTION_MODES = frozenset(STATIC_B5_SELECTION_MODE_PROVIDERS)
 STATIC_OPENROUTER_B5_MIN_AGENT_STREAM_IDLE_TIMEOUT_SECONDS = 1200.0
 STATIC_OPENROUTER_B5_MIN_WEBUI_STREAM_IDLE_GRACE_SECONDS = 1260.0
 

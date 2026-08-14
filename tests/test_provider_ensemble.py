@@ -10,6 +10,13 @@ from typing import Any, Literal
 
 import pytest
 
+from opensquilla.contracts.turn_execution import (
+    ProviderAdmissionError,
+    StickyExecutionRole,
+    SurfaceCapabilities,
+    TurnExecutionContext,
+    TurnIdentity,
+)
 from opensquilla.engine.usage_accounting import normalize_provider_usage
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider import (
@@ -20,6 +27,7 @@ from opensquilla.provider import (
     DoneEvent,
     ErrorEvent,
     Message,
+    ProviderGenerationResetEvent,
     ProviderHeartbeatEvent,
     ProviderRequestCorrelation,
     ReasoningDeltaEvent,
@@ -31,21 +39,25 @@ from opensquilla.provider import (
     ToolUseStartEvent,
 )
 from opensquilla.provider.ensemble import (
+    ENSEMBLE_FIXED_TERMINAL_MESSAGE,
     EnsembleMemberConfig,
     EnsembleProvider,
     _member_chat_config,
     _member_from_ref,
     _MemberRequestBudgetBinding,
+    _provider_stream_with_lifecycle,
     _runtime_member_request_budget_bindings,
     _stream_with_heartbeats,
     build_ensemble_provider_from_config,
     ensemble_runtime_status,
 )
+from opensquilla.provider.failures import ProviderFailureKind
 from opensquilla.provider.request_proof import project_final_request_payload
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import (
     ContentBlockImage,
     EnsembleProgressEvent,
+    FailureInjector,
     ProviderBillingReceipt,
     ProviderFinalRequestProjection,
     ProviderMessageCountProjection,
@@ -401,78 +413,6 @@ async def test_ensemble_emits_heartbeat_while_waiting_for_slow_proposers(
 
 
 @pytest.mark.asyncio
-async def test_ensemble_total_timeout_cancels_inflight_members(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gate = asyncio.Event()
-    started = asyncio.Event()
-    closed = asyncio.Event()
-    registry = _FakeRegistry(
-        {
-            "p1": _FakePlan(
-                [TextDeltaEvent(text="late"), DoneEvent(model="p1")],
-                gate=gate,
-                started=started,
-                closed=closed,
-            ),
-            "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
-        }
-    )
-    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
-    provider = EnsembleProvider(
-        profile_name="default",
-        proposers=[_member("p1")],
-        aggregator=_member("agg"),
-        proposer_timeout_seconds=1,
-        aggregator_timeout_seconds=1,
-        total_timeout_seconds=0.03,
-        shuffle_candidates=False,
-    )
-
-    events = await asyncio.wait_for(_collect(provider), timeout=0.5)
-
-    assert started.is_set() is True
-    assert closed.is_set() is True
-    errors = [event for event in events if isinstance(event, ErrorEvent)]
-    assert errors[-1].code == "ensemble_total_timeout"
-    assert errors[-1].usage_missing_count == 1
-    assert not any(isinstance(event, DoneEvent) for event in events)
-
-
-@pytest.mark.asyncio
-async def test_zero_ensemble_total_timeout_disables_wall_clock_cap(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    registry = _FakeRegistry(
-        {
-            "p1": _FakePlan(
-                [TextDeltaEvent(text="draft"), DoneEvent(model="p1")],
-                delay=0.04,
-            ),
-            "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
-        }
-    )
-    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
-    provider = EnsembleProvider(
-        profile_name="default",
-        proposers=[_member("p1")],
-        aggregator=_member("agg"),
-        proposer_timeout_seconds=1,
-        aggregator_timeout_seconds=1,
-        total_timeout_seconds=0,
-        shuffle_candidates=False,
-    )
-
-    events = await asyncio.wait_for(_collect(provider), timeout=0.5)
-
-    assert any(isinstance(event, DoneEvent) for event in events)
-    assert not any(
-        isinstance(event, ErrorEvent) and event.code == "ensemble_total_timeout"
-        for event in events
-    )
-
-
-@pytest.mark.asyncio
 async def test_ensemble_emits_heartbeat_while_waiting_for_slow_aggregator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -734,7 +674,7 @@ async def test_tokenrhythm_b5_default_quorum_reconciles_five_physical_receipts(
 
 
 @pytest.mark.asyncio
-async def test_tokenrhythm_b5_strict_quorum_partial_failure_preserves_fallback_receipt(
+async def test_tokenrhythm_b5_partial_failure_still_aggregates_all_completed_drafts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry(
@@ -792,7 +732,13 @@ async def test_tokenrhythm_b5_strict_quorum_partial_failure_preserves_fallback_r
 
     events = await _collect(provider)
 
-    assert "agg" not in [call["model"] for call in registry.calls]
+    assert [call["model"] for call in registry.calls] == [
+        "p1",
+        "p2",
+        "p3",
+        "p4",
+        "agg",
+    ]
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.billing_receipt is None
     assert done.cost_source == "provider_billed"
@@ -801,27 +747,27 @@ async def test_tokenrhythm_b5_strict_quorum_partial_failure_preserves_fallback_r
         "proposer",
         "proposer",
         "proposer",
-        "fallback_single",
+        "aggregator",
     ]
     receipts = [row["billing_receipt"] for row in done.model_usage_breakdown]
-    assert sum(receipt.amount_nanos or 0 for receipt in receipts) == 279_000
-    assert done.input_tokens == 1_000
-    assert done.output_tokens == 100
-    assert done.reasoning_tokens == 30
-    assert done.cached_tokens == 200
-    assert done.cache_write_tokens == 10
-    assert done.billed_cost == pytest.approx(0.00004)
+    assert sum(receipt.amount_nanos or 0 for receipt in receipts) == 306_900
+    assert done.input_tokens == 1_100
+    assert done.output_tokens == 110
+    assert done.reasoning_tokens == 33
+    assert done.cached_tokens == 220
+    assert done.cache_write_tokens == 11
+    assert done.billed_cost == pytest.approx(0.000044)
 
     result = normalize_provider_usage(
         done,
         default_provider="ensemble",
-        default_model="fallback",
+        default_model="agg",
         completed_at_ms=1234,
     )
     assert len(result.items) == 4
     assert result.missing_usage_entries == 1
     assert result.cost_source == "provider_billed"
-    assert result.billed_cost_nanos == 40_000
+    assert result.billed_cost_nanos == 44_000
     assert result.estimated_cost_nanos == 0
     assert result.billed_cost_nanos == sum(item.billed_cost_nanos for item in result.items)
     assert result.input_tokens == sum(item.input_tokens for item in result.items)
@@ -1246,7 +1192,7 @@ async def test_ensemble_fallback_trace_preserves_uniform_request_budget_root_cau
 
 
 @pytest.mark.asyncio
-async def test_no_fallback_error_preserves_completed_proposer_usage(
+async def test_no_fallback_error_preserves_completed_proposer_and_primary_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry(
@@ -1274,13 +1220,20 @@ async def test_no_fallback_error_preserves_completed_proposer_usage(
     events = await _collect(provider)
 
     error = next(event for event in events if isinstance(event, ErrorEvent))
-    [usage_row] = error.model_usage_breakdown
+    usage_row = next(
+        row for row in error.model_usage_breakdown if row["role"] == "proposer"
+    )
     assert usage_row["profile"] == "usage-preservation"
     assert usage_row["label"] == "p1"
     assert usage_row["model"] == "p1"
     assert usage_row["input_tokens"] == 7
     assert usage_row["output_tokens"] == 3
-    assert error.usage_missing_count == 1
+    primary_rows = [
+        row for row in error.model_usage_breakdown if row["role"] == "aggregator"
+    ]
+    assert len(primary_rows) == 1
+    assert [row["attempt_index"] for row in primary_rows] == [1]
+    assert error.usage_missing_count == 2
 
 
 @pytest.mark.asyncio
@@ -1466,6 +1419,455 @@ async def test_ensemble_runs_proposers_concurrently_and_tools_only_reach_aggrega
     assert final_request["output"]["text"] == "final"
     assert final_request["usage"]["model"] == "agg"
     json.dumps(done.ensemble_trace)
+
+
+@pytest.mark.asyncio
+async def test_ensemble_provider_records_real_attempt_lifecycle_in_turn_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _AttemptRegistry(
+        {
+            "p1": [
+                _FakePlan([ErrorEvent(message="rate limited", code="504")]),
+                _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="p1")]),
+            ],
+            "agg": [_FakePlan([DoneEvent(model="agg")])],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_PROPOSER_RETRY_BACKOFF_SECONDS",
+        (),
+    )
+    provider = EnsembleProvider(
+        profile_name="context-lifecycle",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        proposer_max_retries=1,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-ensemble-lifecycle",
+            "assistant-ensemble-lifecycle",
+            "agent:main:lifecycle",
+        )
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer this")],
+            execution_context=context,
+        )
+    ]
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    proposer_ledger = context.attempt_ledgers[(StickyExecutionRole.PROPOSER, 0)]
+    primary_ledger = context.attempt_ledgers[(StickyExecutionRole.PRIMARY_AGGREGATOR, 0)]
+    assert proposer_ledger.attempt_indices == [0, 1]
+    assert len(proposer_ledger.outcomes) == 2
+    assert proposer_ledger.request_starts == 2
+    assert primary_ledger.attempt_indices == [0]
+    assert len(primary_ledger.outcomes) == 1
+    assert primary_ledger.request_starts == 1
+    assert context.proposer_admissions == 2
+    assert context.proposer_request_starts == 2
+
+
+@pytest.mark.asyncio
+async def test_synthetic_failure_stream_does_not_claim_physical_request_start() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-injected-no-request",
+            "assistant-injected-no-request",
+            "agent:main:injected-no-request",
+        )
+    )
+    injector = FailureInjector(script=[ProviderFailureKind.AUTH_INVALID])
+    stream = _provider_stream_with_lifecycle(
+        lambda: injector.chat(
+            SimpleNamespace(),
+            [Message(role="user", content="answer this")],
+        ),
+        execution_context=context,
+        role=StickyExecutionRole.PRIMARY_AGGREGATOR,
+        logical_call_index=0,
+        attempt_index=0,
+        owner="injected-primary",
+        phase="test",
+        message="test",
+        timeout_seconds=1,
+        reset_deadline_on_event=False,
+    )
+
+    events = [event async for event in stream]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ErrorEvent)
+    ledger = context.attempt_ledgers[(StickyExecutionRole.PRIMARY_AGGREGATOR, 0)]
+    assert ledger.attempt_indices == [0]
+    assert ledger.request_starts == 0
+    assert ledger.outcomes[0]["request_started"] is False
+
+
+@pytest.mark.asyncio
+async def test_late_unstamped_stream_events_keep_their_admission_epoch() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-late-epoch",
+            "assistant-late-epoch",
+            "agent:main:late-epoch",
+        )
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def source() -> AsyncIterator[StreamEvent]:
+        started.set()
+        await release.wait()
+        yield TextDeltaEvent(text="late old text")
+        yield DoneEvent(model="old-model")
+
+    async def collect() -> list[StreamEvent]:
+        return [
+            event
+            async for event in _provider_stream_with_lifecycle(
+                source,
+                execution_context=context,
+                role=StickyExecutionRole.PRIMARY_AGGREGATOR,
+                logical_call_index=0,
+                attempt_index=0,
+                owner="old-primary",
+                phase="test",
+                message="test",
+                timeout_seconds=1,
+                reset_deadline_on_event=False,
+            )
+        ]
+
+    task = asyncio.create_task(collect())
+    await started.wait()
+    context.begin_generation_reset(
+        StickyExecutionRole.PRIMARY_AGGREGATOR,
+        StickyExecutionRole.PRIMARY_AGGREGATOR,
+        "retry replaced old stream",
+    )
+    release.set()
+
+    assert await task == []
+    ledger = context.attempt_ledgers[(StickyExecutionRole.PRIMARY_AGGREGATOR, 0)]
+    assert ledger.request_starts == 1
+    assert ledger.outcomes[0]["status"] == "incomplete"
+
+
+@pytest.mark.asyncio
+async def test_context_fixed_takeover_is_activated_once_and_is_sticky(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="p1")]),
+            "agg": _FakePlan([ErrorEvent(message="unauthorized", code="401")]),
+            "fixed": _FakePlan([TextDeltaEvent(text="fixed"), DoneEvent(model="fixed")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    fallback = registry.provider_for(ProviderConfig(provider="fake", model="fixed"))
+    provider = EnsembleProvider(
+        profile_name="context-fixed",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=fallback,
+        fallback_provider_name="fake",
+        fallback_model="fixed",
+        shuffle_candidates=False,
+    )
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-ensemble-fixed", "assistant-ensemble-fixed", "agent:main:fixed")
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer this")],
+            execution_context=context,
+        )
+    ]
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert context.current_role() is StickyExecutionRole.FIXED_AGGREGATOR
+    assert context.fallback_activation_count == 1
+    fixed_ledger = context.attempt_ledgers[(StickyExecutionRole.FIXED_AGGREGATOR, 0)]
+    assert fixed_ledger.attempt_indices == [0]
+    assert fixed_ledger.request_starts == 1
+    assert context.selector_hops_after_fixed == 0
+
+
+@pytest.mark.asyncio
+async def test_context_no_fixed_provider_emits_only_terminal_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry({"agg": _FakePlan([])})
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="context-terminal",
+        proposers=[],
+        aggregator=_member("agg"),
+        fallback_provider=None,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+    )
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-ensemble-terminal", "assistant-ensemble-terminal", "agent:main:terminal")
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer this")],
+            execution_context=context,
+        )
+    ]
+
+    assert len(events) == 1
+    assert isinstance(events[0], ProviderGenerationResetEvent)
+    assert events[0].terminal is True
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_non_editable_generation_buffer_limit_uses_fixed_takeover(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_GENERATION_BUFFER_MAX_BYTES",
+        4,
+    )
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="p1")]),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="too long"), DoneEvent(model="agg")]
+            ),
+            "fixed": _FakePlan(
+                [TextDeltaEvent(text="ok"), DoneEvent(model="fixed")]
+            ),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="buffer-limit",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=registry.provider_for(
+            ProviderConfig(provider="fake", model="fixed")
+        ),
+        fallback_provider_name="fake",
+        fallback_model="fixed",
+        shuffle_candidates=False,
+    )
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-buffer", "assistant-buffer", "agent:main:buffer"),
+        surface=SurfaceCapabilities(
+            supports_streaming=False,
+            supports_edit=False,
+            supports_generation_reset=False,
+        ),
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer")],
+            execution_context=context,
+        )
+    ]
+
+    resets = [
+        event for event in events if isinstance(event, ProviderGenerationResetEvent)
+    ]
+    assert len(resets) == 1
+    assert resets[0].terminal is False
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    assert "buffer exceeded" in done.ensemble_trace["fallback_reason"]
+    assert done.ensemble_trace["final_request_role"] == "fixed_aggregator"
+
+
+@pytest.mark.asyncio
+async def test_fixed_generation_buffer_limit_is_one_terminal_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_GENERATION_BUFFER_MAX_BYTES",
+        4,
+    )
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="p1")]),
+            "agg": _FakePlan([ErrorEvent(message="unauthorized", code="401")]),
+            "fixed": _FakePlan(
+                [TextDeltaEvent(text="too long"), DoneEvent(model="fixed")]
+            ),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="fixed-buffer-limit",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=registry.provider_for(
+            ProviderConfig(provider="fake", model="fixed")
+        ),
+        fallback_provider_name="fake",
+        fallback_model="fixed",
+        shuffle_candidates=False,
+    )
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-fixed-buffer",
+            "assistant-fixed-buffer",
+            "agent:main:fixed-buffer",
+        ),
+        surface=SurfaceCapabilities(
+            supports_streaming=False,
+            supports_edit=False,
+            supports_generation_reset=False,
+        ),
+    )
+
+    events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer")],
+            execution_context=context,
+        )
+    ]
+
+    resets = [
+        event for event in events if isinstance(event, ProviderGenerationResetEvent)
+    ]
+    assert len(resets) == 2
+    assert resets[-1].terminal is True
+    assert resets[-1].terminal_error_code == "ensemble_generation_buffer_limit"
+    assert not any(isinstance(event, (DoneEvent, ErrorEvent)) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_control_rejection_never_enters_fixed_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="p1")]),
+            "agg": _FakePlan([TextDeltaEvent(text="answer"), DoneEvent(model="agg")]),
+            "fixed": _FakePlan([TextDeltaEvent(text="fixed"), DoneEvent(model="fixed")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    fixed = registry.provider_for(ProviderConfig(provider="fake", model="fixed"))
+    provider = EnsembleProvider(
+        profile_name="control-terminal",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=fixed,
+        fallback_provider_name="fake",
+        fallback_model="fixed",
+        shuffle_candidates=False,
+    )
+    context = TurnExecutionContext.create(
+        TurnIdentity("turn-control", "assistant-control", "agent:main:control"),
+        control=lambda: True,
+    )
+
+    with pytest.raises(ProviderAdmissionError, match="control"):
+        _ = [
+            event
+            async for event in provider.chat(
+                [Message(role="user", content="answer this")],
+                tools=[_tool()],
+                config=ChatConfig(max_tokens=99, thinking=False),
+                execution_context=context,
+            )
+        ]
+
+    assert registry.calls == []
+
+
+@pytest.mark.asyncio
+async def test_control_wins_if_it_arrives_with_primary_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cancelled = asyncio.Event()
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="p1")]),
+            "fixed": _FakePlan(
+                [TextDeltaEvent(text="must not run"), DoneEvent(model="fixed")]
+            ),
+        }
+    )
+
+    class _CancellingAggregator(_ExactProjectionMixin):
+        provider_name = "fake"
+        _projection_model = "agg"
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[ToolDefinition] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            registry.calls.append(
+                {"model": "agg", "messages": messages, "tools": tools, "config": config}
+            )
+            return self._chat()
+
+        async def _chat(self) -> AsyncIterator[StreamEvent]:
+            cancelled.set()
+            yield ErrorEvent(message="unauthorized", code="401")
+
+    def build_provider(cfg: ProviderConfig) -> Any:
+        if cfg.model == "agg":
+            return _CancellingAggregator()
+        return registry.provider_for(cfg)
+
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", build_provider)
+    provider = EnsembleProvider(
+        profile_name="control-race",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=registry.provider_for(
+            ProviderConfig(provider="fake", model="fixed")
+        ),
+        fallback_provider_name="fake",
+        fallback_model="fixed",
+        shuffle_candidates=False,
+    )
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-control-race",
+            "assistant-control-race",
+            "agent:main:control-race",
+        ),
+        control=lambda: cancelled.is_set(),
+    )
+    observed: list[StreamEvent] = []
+
+    with pytest.raises(ProviderAdmissionError, match="control"):
+        async for event in provider.chat(
+            [Message(role="user", content="answer this")],
+            execution_context=context,
+        ):
+            observed.append(event)
+
+    assert cancelled.is_set() is True
+    assert [call["model"] for call in registry.calls] == ["p1", "agg"]
+    assert not any(isinstance(event, ProviderGenerationResetEvent) for event in observed)
+    assert context.fallback_activation_count == 0
 
 
 @pytest.mark.asyncio
@@ -1777,7 +2179,7 @@ async def test_ensemble_fallback_forces_normal_candidate_mode(
             session_id="session-1",
             turn_id="turn-1",
             execution_id="execution-1",
-            call_kind="subagent.ensemble.fallback_single",
+            call_kind="subagent.ensemble.fixed_direct",
         )
     )
 
@@ -2314,7 +2716,7 @@ async def test_cross_provider_zero_cap_member_preserves_fallback_policy(
 
 
 @pytest.mark.asyncio
-async def test_static_proposer_quorum_failure_skips_all_proposer_spend(
+async def test_static_unavailable_proposers_do_not_block_one_ready_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     unready = replace(
@@ -2396,21 +2798,22 @@ async def test_static_proposer_quorum_failure_skips_all_proposer_spend(
         )
     ]
 
-    assert [call["model"] for call in registry.calls] == ["fallback"]
+    assert [call["model"] for call in registry.calls] == ["billed-ready", "agg"]
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
     trace = done.ensemble_trace
-    assert trace["llm_request_count"] == 1
+    assert trace["llm_request_count"] == 2
     assert len(trace["candidates"]) == 5
-    assert all(candidate["request_started"] is False for candidate in trace["candidates"])
-    assert {
-        candidate["model"]: candidate["error_code"]
-        for candidate in trace["candidates"]
-    } == {
-        "unready": "missing_credential",
-        "cross": "provider_request_budget_exhausted",
-        "billed-ready": "quorum_unreachable",
+    assert sum(candidate["request_started"] for candidate in trace["candidates"]) == 1
+    candidates_by_model = {
+        candidate["model"]: candidate for candidate in trace["candidates"]
     }
+    assert candidates_by_model["unready"]["error_code"] == "missing_credential"
+    assert (
+        candidates_by_model["cross"]["error_code"]
+        == "provider_request_budget_exhausted"
+    )
+    assert "error_code" not in candidates_by_model["billed-ready"]
 
 
 @pytest.mark.parametrize(
@@ -2959,7 +3362,7 @@ async def test_optional_candidates_cannot_crowd_out_an_admitted_quorum(
 
 
 @pytest.mark.asyncio
-async def test_ensemble_uses_fallback_when_too_few_proposers_succeed(
+async def test_ensemble_uses_fixed_aggregator_after_primary_failure_with_one_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry(
@@ -3008,18 +3411,18 @@ async def test_ensemble_uses_fallback_when_too_few_proposers_succeed(
 
     events = await _collect(provider)
 
-    assert [call["model"] for call in registry.calls] == ["p1", "p2"]
+    assert [call["model"] for call in registry.calls] == ["p1", "p2", "agg"]
     assert any(isinstance(event, TextDeltaEvent) and event.text == "single" for event in events)
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.input_tokens == 8
     assert done.output_tokens == 10
-    assert done.model_usage_breakdown[-1]["role"] == "fallback_single"
+    assert done.model_usage_breakdown[-1]["role"] == "fixed_aggregator"
     assert done.model_usage_breakdown[-1]["provider"] == "deepseek"
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["fallback_used"] is True
-    assert done.ensemble_trace["llm_request_count"] == 3
-    assert "requires 2" in done.ensemble_trace["fallback_reason"]
-    assert done.ensemble_trace["final_request"]["role"] == "fallback_single"
+    assert done.ensemble_trace["llm_request_count"] == 4
+    assert "aggregator failed" in done.ensemble_trace["fallback_reason"]
+    assert done.ensemble_trace["final_request"]["role"] == "fixed_aggregator"
     assert done.ensemble_trace["final_request"]["request_started"] is True
     assert done.ensemble_trace["final_request"]["output"]["text"] == "single"
     assert done.ensemble_trace["final_request"]["usage"]["model"] == "single"
@@ -3040,6 +3443,10 @@ async def test_fallback_timeout_is_idle_based_and_cleanup_is_bounded(
     monkeypatch.setattr(
         "opensquilla.provider.ensemble._ENSEMBLE_CANCEL_CLEANUP_TIMEOUT_SECONDS",
         0.01,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_AGGREGATOR_RETRY_BACKOFF_SECONDS",
+        (0.0,),
     )
     release = asyncio.Event()
     cancellation_seen = asyncio.Event()
@@ -3094,18 +3501,24 @@ async def test_fallback_timeout_is_idle_based_and_cleanup_is_bounded(
         )
     ]
     elapsed = time.monotonic() - started
+    release.set()
+    await asyncio.wait_for(closed.wait(), timeout=0.5)
 
     assert elapsed < 0.3
     assert cancellation_seen.is_set() is True
     assert any(
         isinstance(event, ProviderHeartbeatEvent)
-        and event.phase == "ensemble_fallback_wait"
+        and event.phase == "ensemble_fixed_wait"
         for event in events
     )
-    error = next(event for event in events if isinstance(event, ErrorEvent))
-    assert error.code == "ensemble_fallback_timeout"
-    release.set()
-    await asyncio.wait_for(closed.wait(), timeout=0.5)
+    terminal = next(
+        event
+        for event in events
+        if isinstance(event, ProviderGenerationResetEvent) and event.terminal
+    )
+    assert terminal.terminal_error_code == "ensemble_fixed_timeout"
+    assert terminal.terminal_text_snapshot == ENSEMBLE_FIXED_TERMINAL_MESSAGE
+    assert not any(isinstance(event, (DoneEvent, ErrorEvent)) for event in events)
     assert cancellation_count >= 2
 
 
@@ -3166,11 +3579,11 @@ async def test_fallback_stream_survives_past_request_timeout_while_events_flow(
         event.text for event in events if isinstance(event, TextDeltaEvent)
     ] == [f"chunk{index}" for index in range(6)]
     done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.model_usage_breakdown[-1]["role"] == "fallback_single"
+    assert done.model_usage_breakdown[-1]["role"] == "fixed_direct"
 
 
 @pytest.mark.asyncio
-async def test_fallback_stream_without_done_returns_incomplete_error(
+async def test_fallback_stream_without_done_returns_terminal_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry(
@@ -3220,11 +3633,21 @@ async def test_fallback_stream_without_done_returns_incomplete_error(
         isinstance(event, TextDeltaEvent) and event.text == "partial"
         for event in events
     )
-    error = next(event for event in events if isinstance(event, ErrorEvent))
-    assert error.code == "ensemble_fallback_incomplete"
-    assert [row["model"] for row in error.model_usage_breakdown] == ["p1"]
-    assert error.model_usage_breakdown[0]["input_tokens"] == 7
-    assert error.usage_missing_count == 2  # failed proposer plus fallback
+    terminal = next(
+        event
+        for event in events
+        if isinstance(event, ProviderGenerationResetEvent) and event.terminal
+    )
+    assert terminal.terminal_error_code == "ensemble_fixed_incomplete"
+    assert terminal.terminal_text_snapshot == ENSEMBLE_FIXED_TERMINAL_MESSAGE
+    assert [row["model"] for row in terminal.model_usage_breakdown] == [
+        "p1",
+        "agg",
+        "",
+    ]
+    assert terminal.model_usage_breakdown[0]["input_tokens"] == 7
+    assert terminal.usage_missing_count == 3  # failed proposer, primary, fixed
+    assert not any(isinstance(event, (DoneEvent, ErrorEvent)) for event in events)
 
 
 @pytest.mark.asyncio
@@ -3283,9 +3706,14 @@ async def test_ensemble_redacts_fallback_key_from_terminal_error(
     events = await _collect(provider)
 
     assert api_key not in repr(events)
-    terminal = next(event for event in events if isinstance(event, ErrorEvent))
-    assert api_key not in terminal.message
-    assert api_key not in terminal.code
+    terminal = next(
+        event
+        for event in events
+        if isinstance(event, ProviderGenerationResetEvent) and event.terminal
+    )
+    assert api_key not in terminal.terminal_error_message
+    assert api_key not in terminal.terminal_error_code
+    assert not any(isinstance(event, (DoneEvent, ErrorEvent)) for event in events)
 
 
 @pytest.mark.asyncio
@@ -3428,7 +3856,7 @@ async def test_unready_aggregator_uses_fallback_without_burning_proposer_spend(
     assert registry.calls == []
     assert not any(isinstance(event, ErrorEvent) for event in events)
     done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.model_usage_breakdown[-1]["role"] == "fallback_single"
+    assert done.model_usage_breakdown[-1]["role"] == "fixed_direct"
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["fallback_used"] is True
     assert "aggregator deployment is not ready" in done.ensemble_trace["fallback_reason"]
@@ -3492,7 +3920,7 @@ async def test_aggregator_build_failure_uses_fallback_before_proposer_usage(
     assert not any(isinstance(event, ErrorEvent) for event in events)
     done = next(event for event in events if isinstance(event, DoneEvent))
     rows = done.model_usage_breakdown
-    assert [row["role"] for row in rows] == ["fallback_single"]
+    assert [row["role"] for row in rows] == ["fixed_direct"]
     assert done.ensemble_trace is not None
     assert "could not be initialized" in done.ensemble_trace["fallback_reason"]
 
@@ -3624,7 +4052,7 @@ async def test_aggregator_transient_error_is_retried_in_place(
 
 
 @pytest.mark.asyncio
-async def test_aggregator_error_finish_before_content_retries_and_preserves_receipts(
+async def test_aggregator_error_finish_before_content_does_not_retry_and_preserves_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     failed = _aggregator_done_with_receipt(scale=1, stop_reason="error")
@@ -3639,38 +4067,22 @@ async def test_aggregator_error_finish_before_content_retries_and_preserves_rece
 
     events = await _collect(_retry_test_provider())
 
-    assert call_count[0] == 2
-    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
-        "final"
-    ]
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert call_count[0] == 1
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
     aggregator_rows = [
         row
-        for row in done.model_usage_breakdown
+        for row in terminal.model_usage_breakdown
         if row["role"] == "aggregator"
     ]
-    assert [row["attempt_index"] for row in aggregator_rows] == [1, 2]
-    assert [row["stop_reason"] for row in aggregator_rows] == ["error", "stop"]
-    assert [row["input_tokens"] for row in aggregator_rows] == [10, 20]
-    assert [row["output_tokens"] for row in aggregator_rows] == [20, 40]
-    assert [row["billed_cost"] for row in aggregator_rows] == pytest.approx(
-        [0.01, 0.02]
-    )
-    assert [row["billing_receipt"] for row in aggregator_rows] == [
-        failed.billing_receipt,
-        succeeded.billing_receipt,
-    ]
-    assert done.input_tokens == 30
-    assert done.output_tokens == 60
-    assert done.reasoning_tokens == 9
-    assert done.cached_tokens == 12
-    assert done.cache_write_tokens == 3
-    assert done.billed_cost == pytest.approx(0.03)
-    assert done.usage_missing_count == 0
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["final_request"]["retry_count"] == 1
-    assert done.ensemble_trace["llm_request_count"] == 3
+    assert [row["attempt_index"] for row in aggregator_rows] == [1]
+    assert [row["stop_reason"] for row in aggregator_rows] == ["error"]
+    assert [row["input_tokens"] for row in aggregator_rows] == [10]
+    assert [row["output_tokens"] for row in aggregator_rows] == [20]
+    assert [row["billed_cost"] for row in aggregator_rows] == pytest.approx([0.01])
+    assert [row["billing_receipt"] for row in aggregator_rows] == [failed.billing_receipt]
+    assert terminal.usage_missing_count == 0
 
 
 @pytest.mark.asyncio
@@ -3714,7 +4126,7 @@ async def test_aggregator_error_finish_after_visible_content_is_terminal_without
 
 
 @pytest.mark.asyncio
-async def test_aggregator_error_finish_retry_exhaustion_preserves_all_receipts(
+async def test_aggregator_error_finish_is_nonretryable_even_when_more_plans_exist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     failed_attempts = [
@@ -3728,7 +4140,7 @@ async def test_aggregator_error_finish_retry_exhaustion_preserves_all_receipts(
 
     events = await _collect(_retry_test_provider())
 
-    assert call_count[0] == 3
+    assert call_count[0] == 1
     assert not any(isinstance(event, TextDeltaEvent) for event in events)
     assert not any(isinstance(event, DoneEvent) for event in events)
     terminal = next(event for event in events if isinstance(event, ErrorEvent))
@@ -3737,19 +4149,13 @@ async def test_aggregator_error_finish_retry_exhaustion_preserves_all_receipts(
         for row in terminal.model_usage_breakdown
         if row["role"] == "aggregator"
     ]
-    assert [row["attempt_index"] for row in aggregator_rows] == [1, 2, 3]
-    assert [row["stop_reason"] for row in aggregator_rows] == [
-        "error",
-        "error",
-        "error",
-    ]
-    assert [row["input_tokens"] for row in aggregator_rows] == [10, 20, 30]
-    assert [row["output_tokens"] for row in aggregator_rows] == [20, 40, 60]
-    assert [row["billed_cost"] for row in aggregator_rows] == pytest.approx(
-        [0.01, 0.02, 0.03]
-    )
+    assert [row["attempt_index"] for row in aggregator_rows] == [1]
+    assert [row["stop_reason"] for row in aggregator_rows] == ["error"]
+    assert [row["input_tokens"] for row in aggregator_rows] == [10]
+    assert [row["output_tokens"] for row in aggregator_rows] == [20]
+    assert [row["billed_cost"] for row in aggregator_rows] == pytest.approx([0.01])
     assert [row["billing_receipt"] for row in aggregator_rows] == [
-        event.billing_receipt for event in failed_attempts
+        failed_attempts[0].billing_receipt
     ]
     assert terminal.usage_missing_count == 0
 
@@ -3803,7 +4209,7 @@ async def test_aggregator_transient_exception_is_retried_in_place(
 
 
 @pytest.mark.asyncio
-async def test_aggregator_empty_incomplete_stream_is_retried_in_place(
+async def test_aggregator_empty_incomplete_stream_is_nonretryable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, call_count = _flaky_aggregator_harness(
@@ -3819,16 +4225,15 @@ async def test_aggregator_empty_incomplete_stream_is_retried_in_place(
 
     events = await _collect(_retry_test_provider())
 
-    assert call_count[0] == 2
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.usage_missing_count == 1
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["final_request"]["retry_count"] == 1
+    assert call_count[0] == 1
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    assert terminal.code == "ensemble_aggregator_incomplete"
+    assert terminal.usage_missing_count == 1
 
 
 @pytest.mark.asyncio
-async def test_aggregator_timeout_before_content_is_terminal_without_retry(
+async def test_aggregator_timeout_owns_its_streaming_read_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry(
@@ -3873,9 +4278,8 @@ async def test_aggregator_timeout_before_content_is_terminal_without_retry(
     events = await _collect(provider)
 
     assert call_count[0] == 1
-    error = next(event for event in events if isinstance(event, ErrorEvent))
-    assert error.code == "ensemble_aggregator_timeout"
-    assert error.usage_missing_count == 1
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    assert terminal.code == "ensemble_aggregator_timeout"
     assert not any(isinstance(event, DoneEvent) for event in events)
 
 
@@ -3900,7 +4304,7 @@ async def test_aggregator_non_transient_error_is_not_retried(
 
 
 @pytest.mark.asyncio
-async def test_aggregator_transient_error_after_content_is_terminal(
+async def test_aggregator_transient_error_after_content_resets_and_retries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _, call_count = _flaky_aggregator_harness(
@@ -3916,10 +4320,18 @@ async def test_aggregator_transient_error_after_content_is_terminal(
 
     events = await _collect(_retry_test_provider())
 
-    # Replaying after user-visible content would duplicate output downstream.
-    assert call_count[0] == 1
-    error = next(event for event in events if isinstance(event, ErrorEvent))
-    assert error.code == "429"
+    assert call_count[0] == 2
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "partial answer",
+        "never",
+    ]
+    resets = [
+        event for event in events if isinstance(event, ProviderGenerationResetEvent)
+    ]
+    assert len(resets) == 1
+    assert resets[0].terminal is False
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert any(isinstance(event, DoneEvent) for event in events)
 
 
 @pytest.mark.asyncio
@@ -3933,11 +4345,11 @@ async def test_aggregator_retry_budget_is_bounded(
 
     events = await _collect(_retry_test_provider())
 
-    assert call_count[0] == 3  # initial attempt + two bounded retries
+    assert call_count[0] == 2  # initial attempt + one bounded retry
     error = next(event for event in events if isinstance(event, ErrorEvent))
     assert error.code == "429"
-    # p1 receipt exists; three aggregator attempts started with no receipt.
-    assert error.usage_missing_count == 3
+    # p1 receipt exists; two aggregator attempts started with no receipt.
+    assert error.usage_missing_count == 2
 
 
 @pytest.mark.asyncio
@@ -4305,7 +4717,7 @@ def _aggregator_timeout_harness(
 
 
 @pytest.mark.asyncio
-async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_usage(
+async def test_aggregator_no_output_timeout_uses_fixed_aggregator_and_preserves_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     proposer_receipt = ProviderBillingReceipt(
@@ -4363,10 +4775,12 @@ async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_u
     assert len(aggregator.calls) == 1
     assert fallback is not None and len(fallback.calls) == 1
     fallback_messages = fallback.calls[0]["messages"]
-    assert [(message.role, message.content) for message in fallback_messages] == [
-        ("user", "answer this")
-    ]
-    assert "<CANDIDATE" not in str(fallback_messages)
+    assert (fallback_messages[0].role, fallback_messages[0].content) == (
+        "user",
+        "answer this",
+    )
+    assert "<CANDIDATE 1>" in str(fallback_messages[-1].content)
+    assert "draft" in str(fallback_messages[-1].content)
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert [
         event.text for event in events if isinstance(event, TextDeltaEvent)
@@ -4376,10 +4790,12 @@ async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_u
     assert (done.input_tokens, done.output_tokens) == (18, 8)
     assert [row["role"] for row in done.model_usage_breakdown] == [
         "proposer",
-        "fallback_single",
+        "aggregator",
+        "fixed_aggregator",
     ]
-    assert [row["billing_receipt"] for row in done.model_usage_breakdown] == [
+    assert [row.get("billing_receipt") for row in done.model_usage_breakdown] == [
         proposer_receipt,
+        None,
         fallback_receipt,
     ]
     assert done.billing_receipt is None
@@ -4391,16 +4807,14 @@ async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_u
     assert trace["fallback_code"] == "ensemble_aggregator_timeout"
     assert "no stream events" in trace["fallback_reason"]
     assert trace["aggregator_timeout_mode"] == "idle"
-    assert trace["aggregator_total_deadline_source"] == "outer_turn_runtime"
     assert trace["selection_plan"] == selection_plan
     assert trace["llm_request_count"] == 3
-    assert trace["final_request"]["role"] == "fallback_single"
+    assert trace["final_request"]["role"] == "fixed_aggregator"
     assert trace["final_request"]["output"]["text"] == "fallback"
-    prior_request = trace["prior_final_request"]
+    prior_request = trace["primary_request"]
     assert prior_request["request_started"] is True
     assert prior_request["execution"]["model"] == "agg"
     assert prior_request.get("retry_count", 0) == 0
-    assert prior_request["terminal_code"] == "ensemble_aggregator_timeout"
 
     aggregator_finish = next(
         event
@@ -4410,7 +4824,8 @@ async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_u
     fallback_heartbeat = next(
         event
         for event in events
-        if isinstance(event, ProviderHeartbeatEvent) and event.phase == "ensemble_fallback"
+        if isinstance(event, ProviderHeartbeatEvent)
+        and event.phase == "ensemble_fixed_takeover"
     )
     fallback_delta = next(
         event
@@ -4429,7 +4844,7 @@ async def test_aggregator_no_output_timeout_uses_single_fallback_and_preserves_u
         default_model="fallback",
         completed_at_ms=1234,
     )
-    assert len(usage.items) == 2
+    assert len(usage.items) == 3
     assert usage.missing_usage_entries == 1
 
 
@@ -4481,7 +4896,7 @@ async def test_aggregator_stream_survives_past_timeout_while_events_flow(
     ],
     ids=["text", "reasoning", "tool"],
 )
-async def test_aggregator_partial_output_idle_timeout_is_terminal_without_fallback(
+async def test_aggregator_partial_output_idle_timeout_is_replaced_by_fixed_aggregator(
     monkeypatch: pytest.MonkeyPatch,
     partial_event: StreamEvent,
 ) -> None:
@@ -4503,28 +4918,38 @@ async def test_aggregator_partial_output_idle_timeout_is_terminal_without_fallba
 
     events = await _collect(provider)
 
-    assert fallback is not None and fallback.calls == []
+    assert fallback is not None and len(fallback.calls) == 1
     assert partial_event in events
-    assert not any(
-        isinstance(event, TextDeltaEvent) and event.text == "duplicate" for event in events
+    replacement = next(
+        event
+        for event in events
+        if isinstance(event, TextDeltaEvent) and event.text == "duplicate"
     )
+    reset = next(
+        event
+        for event in events
+        if isinstance(event, ProviderGenerationResetEvent) and not event.terminal
+    )
+    assert events.index(partial_event) < events.index(reset) < events.index(replacement)
     progress = [
         event
         for event in events
         if isinstance(event, EnsembleProgressEvent) and event.event_type.startswith("aggregator_")
     ]
-    error = next(event for event in events if isinstance(event, ErrorEvent))
     assert [event.event_type for event in progress] == [
         "aggregator_start",
         "aggregator_finish",
     ]
-    assert error.code == "ensemble_aggregator_timeout"
-    assert error.usage_missing_count == 1
-    assert events.index(progress[-1]) < events.index(error)
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.usage_missing_count == 1
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["fallback_code"] == "ensemble_aggregator_timeout"
+    assert done.ensemble_trace["final_request_role"] == "fixed_aggregator"
 
 
 @pytest.mark.asyncio
-async def test_aggregator_timeout_respects_error_policy(
+async def test_aggregator_timeout_ignores_legacy_error_policy_and_uses_fixed_aggregator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def stalled_aggregator() -> AsyncIterator[StreamEvent]:
@@ -4543,14 +4968,17 @@ async def test_aggregator_timeout_respects_error_policy(
 
     events = await _collect(provider)
 
-    assert fallback is not None and fallback.calls == []
-    error = next(event for event in events if isinstance(event, ErrorEvent))
-    assert error.code == "ensemble_aggregator_timeout"
-    assert error.usage_missing_count == 1
+    assert fallback is not None and len(fallback.calls) == 1
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.usage_missing_count == 1
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["fallback_code"] == "ensemble_aggregator_timeout"
+    assert done.ensemble_trace["final_request_role"] == "fixed_aggregator"
 
 
 @pytest.mark.asyncio
-async def test_aggregator_timeout_then_fallback_error_counts_both_missing_requests(
+async def test_aggregator_timeout_then_fixed_error_is_one_terminal_reset(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def stalled_aggregator() -> AsyncIterator[StreamEvent]:
@@ -4570,11 +4998,21 @@ async def test_aggregator_timeout_then_fallback_error_counts_both_missing_reques
     events = await _collect(provider)
 
     assert fallback is not None and len(fallback.calls) == 1
-    errors = [event for event in events if isinstance(event, ErrorEvent)]
-    assert len(errors) == 1
-    assert errors[0].code == "fallback_failed"
-    assert [row["model"] for row in errors[0].model_usage_breakdown] == ["p1"]
-    assert errors[0].usage_missing_count == 2
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    resets = [
+        event for event in events if isinstance(event, ProviderGenerationResetEvent)
+    ]
+    assert len(resets) == 2
+    assert resets[0].terminal is False
+    terminal = resets[1]
+    assert terminal.terminal is True
+    assert terminal.terminal_error_code == "fallback_failed"
+    assert [row["role"] for row in terminal.model_usage_breakdown] == [
+        "proposer",
+        "aggregator",
+        "fixed_aggregator",
+    ]
+    assert terminal.usage_missing_count == 2
 
 
 @pytest.mark.asyncio
@@ -4589,7 +5027,7 @@ async def test_aggregator_retries_then_timeout_preserves_request_counts_in_fallb
         attempt = aggregator_attempts
 
         async def stream() -> AsyncIterator[StreamEvent]:
-            if attempt <= 2:
+            if attempt == 1:
                 yield ErrorEvent(message="upstream rate limit", code="429")
                 return
             await asyncio.sleep(0.05)
@@ -4613,7 +5051,7 @@ async def test_aggregator_retries_then_timeout_preserves_request_counts_in_fallb
 
     events = await _collect(provider)
 
-    assert aggregator_attempts == 3
+    assert aggregator_attempts == 2
     assert fallback is not None and len(fallback.calls) == 1
     assert (
         len(
@@ -4627,14 +5065,14 @@ async def test_aggregator_retries_then_timeout_preserves_request_counts_in_fallb
         == 1
     )
     done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.usage_missing_count == 3
+    assert done.usage_missing_count == 2
     assert done.ensemble_trace is not None
-    assert done.ensemble_trace["llm_request_count"] == 5
-    assert done.ensemble_trace["prior_final_request"]["retry_count"] == 2
+    assert done.ensemble_trace["llm_request_count"] == 4
+    assert done.ensemble_trace["primary_request"]["retry_count"] == 1
 
 
 @pytest.mark.asyncio
-async def test_aggregator_timeout_fallback_retains_reported_retry_usage(
+async def test_aggregator_error_finish_fallback_retains_reported_usage_without_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     aggregator_attempts = 0
@@ -4670,24 +5108,24 @@ async def test_aggregator_timeout_fallback_retains_reported_retry_usage(
 
     events = await _collect(provider)
 
-    assert aggregator_attempts == 2
-    assert len(aggregator.calls) == 2
+    assert aggregator_attempts == 1
+    assert len(aggregator.calls) == 1
     assert fallback is not None and len(fallback.calls) == 1
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert (done.input_tokens, done.output_tokens) == (31, 9)
     assert [row["role"] for row in done.model_usage_breakdown] == [
         "proposer",
         "aggregator",
-        "fallback_single",
+        "fixed_aggregator",
     ]
     retry_row = done.model_usage_breakdown[1]
     assert retry_row["attempt_index"] == 1
     assert retry_row["attempt_ok"] is False
     assert retry_row["usage_reported"] is True
-    assert done.usage_missing_count == 1
+    assert done.usage_missing_count == 0
     assert done.ensemble_trace is not None
-    assert done.ensemble_trace["llm_request_count"] == 4
-    assert done.ensemble_trace["prior_final_request"]["retry_count"] == 1
+    assert done.ensemble_trace["llm_request_count"] == 3
+    assert done.ensemble_trace["primary_request"].get("retry_count", 0) == 0
 
 
 @pytest.mark.asyncio
@@ -4749,7 +5187,7 @@ async def test_aggregator_timeout_cleanup_is_bounded_before_fallback(
     [
         ("error", "agg_failed", "aggregator rejected request"),
         ("incomplete", "ensemble_aggregator_incomplete", "ended before DoneEvent"),
-        ("timeout", "ensemble_aggregator_timeout", "no stream events for"),
+        ("timeout", "ensemble_aggregator_timeout", "no stream events"),
     ],
 )
 async def test_ensemble_emits_aggregator_finish_before_terminal_error(
@@ -4802,7 +5240,10 @@ async def test_ensemble_emits_aggregator_finish_before_terminal_error(
     ]
     assert expected_error in aggregator_progress[-1].error
     assert terminal_error.code == expected_code
-    assert [row["model"] for row in terminal_error.model_usage_breakdown] == ["p1"]
+    assert [row["model"] for row in terminal_error.model_usage_breakdown] == [
+        "p1",
+        "agg",
+    ]
     assert terminal_error.usage_missing_count == 1
     assert events.index(aggregator_progress[-1]) < events.index(terminal_error)
 
@@ -4860,7 +5301,7 @@ async def test_ensemble_streams_proposer_progress_live_not_buffered(
 
 
 @pytest.mark.asyncio
-async def test_target_four_waits_past_floor_three_before_aggregation(
+async def test_all_started_proposers_reach_terminal_before_aggregation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fourth_gate = asyncio.Event()
@@ -4905,13 +5346,14 @@ async def test_target_four_waits_past_floor_three_before_aggregation(
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["successful_proposers"] == 4
-    assert done.ensemble_trace["min_successful_proposers"] == 3
+    assert done.ensemble_trace["configured_min_successful_proposers"] == 3
+    assert done.ensemble_trace["min_successful_proposers"] == 1
     assert done.ensemble_trace["target_successful_proposers"] == 4
     assert done.ensemble_trace["selected_candidate_count"] == 4
 
 
 @pytest.mark.asyncio
-async def test_transient_partial_504_retries_then_degrades_to_floor_three(
+async def test_transient_partial_504_gets_one_retry_then_uses_other_drafts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _AttemptRegistry(
@@ -4955,24 +5397,25 @@ async def test_transient_partial_504_retries_then_degrades_to_floor_three(
 
     events = await _collect(provider)
 
-    assert [call["model"] for call in registry.calls].count("glm") == 3
+    assert [call["model"] for call in registry.calls].count("glm") == 2
     assert [call["model"] for call in registry.calls][-1] == "agg"
     done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.usage_missing_count == 3
+    assert done.usage_missing_count == 2
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["successful_proposers"] == 3
     assert done.ensemble_trace["selected_candidate_count"] == 3
-    assert done.ensemble_trace["llm_request_count"] == 7
+    assert done.ensemble_trace["llm_request_count"] == 6
+    assert done.ensemble_trace["configured_proposer_max_retries"] == 2
+    assert done.ensemble_trace["proposer_max_retries"] == 1
     glm_trace = next(
         row
         for row in done.ensemble_trace["candidates"]
         if row["model"] == "glm"
     )
     assert glm_trace["ok"] is False
-    assert glm_trace["content"]["text"] == "discard partial 3"
-    assert glm_trace["attempt_count"] == 3
+    assert glm_trace["content"]["text"] == "discard partial 2"
+    assert glm_trace["attempt_count"] == 2
     assert [attempt["retry_reason"] for attempt in glm_trace["attempts"]] == [
-        "transient_upstream",
         "transient_upstream",
         "transient_upstream",
     ]
@@ -4981,12 +5424,12 @@ async def test_transient_partial_504_retries_then_degrades_to_floor_three(
         for row in done.model_usage_breakdown
         if row["model"] == "glm"
     ]
-    assert [row["attempt_index"] for row in glm_usage] == [1, 2, 3]
+    assert [row["attempt_index"] for row in glm_usage] == [1, 2]
     assert all(row["usage_receipt_missing"] is True for row in glm_usage)
 
 
 @pytest.mark.asyncio
-async def test_empty_and_length_only_attempts_retry_without_losing_usage(
+async def test_invalid_proposer_stops_after_one_retry_without_losing_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     receipts = [
@@ -5081,30 +5524,18 @@ async def test_empty_and_length_only_attempts_retry_without_losing_usage(
 
     events = await _collect(provider)
 
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.input_tokens == 65
-    assert done.output_tokens == 8300
-    assert done.reasoning_tokens == 8212
-    assert done.billed_cost == pytest.approx(0.06)
-    assert done.usage_missing_count == 0
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["llm_request_count"] == 4
-    kimi_trace = done.ensemble_trace["candidates"][0]
-    assert kimi_trace["ok"] is True
-    assert kimi_trace["content"]["text"] == "usable draft"
-    assert [attempt["error_code"] for attempt in kimi_trace["attempts"]] == [
-        "candidate_empty_output",
-        "candidate_length_no_visible_text",
-        "",
-    ]
+    assert [call["model"] for call in registry.calls] == ["kimi", "kimi"]
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    assert terminal.code == "ensemble_insufficient_proposers"
+    assert terminal.usage_missing_count == 0
     proposer_rows = [
         row
-        for row in done.model_usage_breakdown
+        for row in terminal.model_usage_breakdown
         if row["role"] == "proposer"
     ]
-    assert [row["attempt_index"] for row in proposer_rows] == [1, 2, 3]
-    assert [row["output_tokens"] for row in proposer_rows] == [62, 8192, 40]
-    assert [row["billing_receipt"] for row in proposer_rows] == receipts
+    assert [row["attempt_index"] for row in proposer_rows] == [1, 2]
+    assert [row["output_tokens"] for row in proposer_rows] == [62, 8192]
+    assert [row["billing_receipt"] for row in proposer_rows] == receipts[:2]
     assert all(row["usage_receipt_missing"] is False for row in proposer_rows)
 
 
@@ -5246,7 +5677,7 @@ async def test_visible_error_finish_retries_and_only_final_candidate_reaches_agg
 
 
 @pytest.mark.asyncio
-async def test_visible_error_finish_exhaustion_blocks_strict_floor_and_preserves_attempts(
+async def test_failed_proposer_keeps_attempt_usage_without_blocking_other_drafts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     receipts = [
@@ -5305,35 +5736,34 @@ async def test_visible_error_finish_exhaustion_blocks_strict_floor_and_preserves
 
     events = await _collect(provider)
 
-    terminal = next(event for event in events if isinstance(event, ErrorEvent))
-    assert terminal.code == "ensemble_insufficient_proposers"
-    assert "requires 4" in terminal.message
-    assert not any(isinstance(event, DoneEvent) for event in events)
-    assert [call["model"] for call in registry.calls].count("p1") == 3
-    assert "agg" not in [call["model"] for call in registry.calls]
-    assert terminal.usage_missing_count == 0
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert [call["model"] for call in registry.calls].count("p1") == 2
+    assert [call["model"] for call in registry.calls][-1] == "agg"
+    assert done.usage_missing_count == 0
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["configured_min_successful_proposers"] == 4
+    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
+    assert done.ensemble_trace["successful_proposers"] == 3
 
     p1_rows = [
         row
-        for row in terminal.model_usage_breakdown
+        for row in done.model_usage_breakdown
         if row["role"] == "proposer" and row["model"] == "p1"
     ]
-    assert [row["attempt_index"] for row in p1_rows] == [1, 2, 3]
-    assert [row["input_tokens"] for row in p1_rows] == [11, 12, 13]
-    assert [row["output_tokens"] for row in p1_rows] == [21, 22, 23]
+    assert [row["attempt_index"] for row in p1_rows] == [1, 2]
+    assert [row["input_tokens"] for row in p1_rows] == [11, 12]
+    assert [row["output_tokens"] for row in p1_rows] == [21, 22]
     assert [row["billed_cost"] for row in p1_rows] == pytest.approx(
-        [0.01, 0.02, 0.03]
+        [0.01, 0.02]
     )
-    assert [row["billing_receipt"] for row in p1_rows] == receipts
-    assert [row["attempt_ok"] for row in p1_rows] == [False, False, False]
-    assert [row["stop_reason"] for row in p1_rows] == ["error", "error", "error"]
+    assert [row["billing_receipt"] for row in p1_rows] == receipts[:2]
+    assert [row["attempt_ok"] for row in p1_rows] == [False, False]
+    assert [row["stop_reason"] for row in p1_rows] == ["error", "error"]
     assert [row["error_code"] for row in p1_rows] == [
-        "candidate_error_finish_reason",
         "candidate_error_finish_reason",
         "candidate_error_finish_reason",
     ]
     assert [row["retry_reason"] for row in p1_rows] == [
-        "error_finish_reason",
         "error_finish_reason",
         "error_finish_reason",
     ]
@@ -5341,7 +5771,7 @@ async def test_visible_error_finish_exhaustion_blocks_strict_floor_and_preserves
 
 
 @pytest.mark.asyncio
-async def test_floor_not_met_errors_without_single_model_fallback(
+async def test_configured_floor_is_diagnostic_when_two_proposers_succeed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _AttemptRegistry(
@@ -5369,16 +5799,18 @@ async def test_floor_not_met_errors_without_single_model_fallback(
 
     events = await _collect(provider)
 
-    terminal = next(event for event in events if isinstance(event, ErrorEvent))
-    assert terminal.code == "ensemble_insufficient_proposers"
-    assert "requires 3" in terminal.message
-    assert "agg" not in [call["model"] for call in registry.calls]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert [call["model"] for call in registry.calls][-1] == "agg"
     assert [call["model"] for call in registry.calls].count("p3") == 1
     assert [call["model"] for call in registry.calls].count("p4") == 1
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["configured_min_successful_proposers"] == 3
+    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
+    assert done.ensemble_trace["successful_proposers"] == 2
 
 
 @pytest.mark.asyncio
-async def test_static_openrouter_b5_quorum_cancels_slow_proposer(
+async def test_configured_quorum_grace_does_not_cancel_slow_proposer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     slow_gate = asyncio.Event()
@@ -5417,6 +5849,10 @@ async def test_static_openrouter_b5_quorum_cancels_slow_proposer(
 
     consume_task = asyncio.create_task(_collect(provider))
     try:
+        await asyncio.sleep(0.05)
+        assert aggregator_started.is_set() is False
+        assert slow_closed.is_set() is False
+        slow_gate.set()
         await asyncio.wait_for(aggregator_started.wait(), timeout=1.0)
         events = await asyncio.wait_for(consume_task, timeout=1.0)
     finally:
@@ -5424,32 +5860,28 @@ async def test_static_openrouter_b5_quorum_cancels_slow_proposer(
             consume_task.cancel()
         await asyncio.gather(consume_task, return_exceptions=True)
 
-    assert slow_gate.is_set() is False
+    assert slow_gate.is_set() is True
     assert slow_closed.is_set() is True
     assert [call["model"] for call in registry.calls] == ["p1", "p2", "p3", "p4", "agg"]
     done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.usage_missing_count == 1
     assert done.ensemble_trace is not None
-    assert done.ensemble_trace["successful_proposers"] == 3
-    assert done.ensemble_trace["selected_candidate_count"] == 3
-    assert done.ensemble_trace["selected_candidate_indexes"] == [0, 1, 2]
+    assert done.ensemble_trace["successful_proposers"] == 4
+    assert done.ensemble_trace["selected_candidate_count"] == 4
+    assert done.ensemble_trace["selected_candidate_indexes"] == [0, 1, 2, 3]
     assert done.ensemble_trace["llm_request_count"] == 5
-    assert done.ensemble_trace["quorum_grace_seconds"] == 0.02
+    assert done.ensemble_trace["configured_quorum_grace_seconds"] == 0.02
+    assert done.ensemble_trace["quorum_grace_seconds"] == 0.0
     p4 = done.ensemble_trace["candidates"][3]
     assert p4["model"] == "p4"
-    assert p4["ok"] is False
-    assert p4["error_code"] == "quorum_cancelled"
-    # WebUI keeps this narrow, host-generated wording as a compatibility
-    # fallback for older progress payloads that predate the typed error code.
-    assert p4["error"] == "proposer cancelled after 0.02s ensemble quorum grace"
+    assert p4["ok"] is True
     assert "d1" in str(registry.calls[-1]["messages"][-1].content)
     assert "d2" in str(registry.calls[-1]["messages"][-1].content)
     assert "d3" in str(registry.calls[-1]["messages"][-1].content)
-    assert "d4" not in str(registry.calls[-1]["messages"][-1].content)
+    assert "d4" in str(registry.calls[-1]["messages"][-1].content)
 
 
 @pytest.mark.asyncio
-async def test_cancel_resistant_straggler_counts_as_missing_usage(
+async def test_cancellation_resistant_proposer_is_not_detached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A straggler that outlives the cancel window still issued a real request."""
@@ -5481,6 +5913,7 @@ async def test_cancel_resistant_straggler_counts_as_missing_usage(
                             # Simulate a provider adapter whose teardown
                             # swallows cancellation while unwinding I/O.
                             continue
+                    yield TextDeltaEvent(text="d2")
                     yield DoneEvent(model="straggler")
                 finally:
                     closed.set()
@@ -5511,10 +5944,11 @@ async def test_cancel_resistant_straggler_counts_as_missing_usage(
         shuffle_candidates=False,
     )
 
-    try:
-        events = await asyncio.wait_for(_collect(provider), timeout=2.0)
-    finally:
-        release.set()
+    consume_task = asyncio.create_task(_collect(provider))
+    await asyncio.sleep(0.05)
+    assert "agg" not in [call["model"] for call in registry.calls]
+    release.set()
+    events = await asyncio.wait_for(consume_task, timeout=2.0)
     await asyncio.wait_for(closed.wait(), timeout=1.0)
 
     done = next(event for event in events if isinstance(event, DoneEvent))
@@ -5524,29 +5958,16 @@ async def test_cancel_resistant_straggler_counts_as_missing_usage(
         for row in done.ensemble_trace["candidates"]
         if row["model"] == "straggler"
     )
-    assert straggler_row["ok"] is False
-    assert straggler_row["error_code"] == "quorum_cancelled"
+    assert straggler_row["ok"] is True
     assert straggler_row["request_started"] is True
-    # The detached request may bill upstream without a usage receipt; the
-    # reconciliation counter must flag it rather than report a clean turn.
-    assert done.usage_missing_count == 1
+    assert "d2" in str(registry.calls[-1]["messages"][-1].content)
 
 
 @pytest.mark.asyncio
-async def test_quorum_grace_keeps_a_final_proposer_that_finishes_in_window(
+async def test_configured_quorum_grace_never_starts_aggregation_early(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     slow_gate = asyncio.Event()
-    grace_started = asyncio.Event()
-    real_asyncio_wait = asyncio.wait
-
-    async def observed_wait(
-        futures: set[asyncio.Task[Any]],
-        **kwargs: Any,
-    ) -> tuple[set[asyncio.Task[Any]], set[asyncio.Task[Any]]]:
-        if kwargs.get("timeout") == 0.5:
-            grace_started.set()
-        return await real_asyncio_wait(futures, **kwargs)
 
     registry = _FakeRegistry(
         {
@@ -5561,7 +5982,6 @@ async def test_quorum_grace_keeps_a_final_proposer_that_finishes_in_window(
         }
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
-    monkeypatch.setattr("opensquilla.provider.ensemble.asyncio.wait", observed_wait)
     provider = EnsembleProvider(
         profile_name="static_openrouter_b5",
         proposers=[_member("p1"), _member("p2"), _member("p3"), _member("p4")],
@@ -5575,8 +5995,9 @@ async def test_quorum_grace_keeps_a_final_proposer_that_finishes_in_window(
 
     consume_task = asyncio.create_task(_collect(provider))
     try:
-        await asyncio.wait_for(grace_started.wait(), timeout=1.0)
+        await asyncio.sleep(0.05)
         assert slow_gate.is_set() is False
+        assert "agg" not in [call["model"] for call in registry.calls]
         slow_gate.set()
         events = await asyncio.wait_for(consume_task, timeout=1.0)
     finally:
@@ -5600,25 +6021,11 @@ async def test_quorum_grace_keeps_a_final_proposer_that_finishes_in_window(
 
 
 @pytest.mark.asyncio
-async def test_failed_proposer_does_not_start_grace_before_success_quorum(
+async def test_failed_proposer_does_not_cancel_other_started_proposers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     quorum_gate = asyncio.Event()
     straggler_gate = asyncio.Event()
-    waiting_below_quorum = asyncio.Event()
-    grace_started = asyncio.Event()
-    real_asyncio_wait = asyncio.wait
-
-    async def observed_wait(
-        futures: set[asyncio.Task[Any]],
-        **kwargs: Any,
-    ) -> tuple[set[asyncio.Task[Any]], set[asyncio.Task[Any]]]:
-        timeout = kwargs.get("timeout")
-        if timeout is None and len(futures) == 2:
-            waiting_below_quorum.set()
-        elif timeout == 0.02:
-            grace_started.set()
-        return await real_asyncio_wait(futures, **kwargs)
 
     registry = _FakeRegistry(
         {
@@ -5636,7 +6043,6 @@ async def test_failed_proposer_does_not_start_grace_before_success_quorum(
         }
     )
     monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
-    monkeypatch.setattr("opensquilla.provider.ensemble.asyncio.wait", observed_wait)
     provider = EnsembleProvider(
         profile_name="static_openrouter_b5",
         proposers=[_member("p1"), _member("p2"), _member("p3"), _member("p4")],
@@ -5650,10 +6056,12 @@ async def test_failed_proposer_does_not_start_grace_before_success_quorum(
 
     consume_task = asyncio.create_task(_collect(provider))
     try:
-        await asyncio.wait_for(waiting_below_quorum.wait(), timeout=1.0)
-        assert grace_started.is_set() is False
+        await asyncio.sleep(0.05)
+        assert "agg" not in [call["model"] for call in registry.calls]
         quorum_gate.set()
-        await asyncio.wait_for(grace_started.wait(), timeout=1.0)
+        await asyncio.sleep(0.05)
+        assert "agg" not in [call["model"] for call in registry.calls]
+        straggler_gate.set()
         events = await asyncio.wait_for(consume_task, timeout=1.0)
     finally:
         if not consume_task.done():
@@ -5662,21 +6070,22 @@ async def test_failed_proposer_does_not_start_grace_before_success_quorum(
 
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
-    assert done.ensemble_trace["successful_proposers"] == 2
-    assert done.ensemble_trace["selected_candidate_indexes"] == [0, 2]
+    assert done.ensemble_trace["successful_proposers"] == 3
+    assert done.ensemble_trace["selected_candidate_indexes"] == [0, 2, 3]
     assert done.ensemble_trace["candidates"][1]["error_code"] == "upstream"
-    assert done.ensemble_trace["candidates"][3]["error_code"] == "quorum_cancelled"
+    assert done.ensemble_trace["candidates"][3]["ok"] is True
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("quorum_grace_seconds", [0.0, 0.02])
-async def test_unreachable_quorum_cancels_pending_and_uses_fallback(
+async def test_configured_quorum_cannot_cancel_pending_successful_proposers(
     monkeypatch: pytest.MonkeyPatch,
     quorum_grace_seconds: float,
 ) -> None:
     slow_gate = asyncio.Event()
     p3_closed = asyncio.Event()
     p4_closed = asyncio.Event()
+    fallback_started = asyncio.Event()
     registry = _FakeRegistry(
         {
             "p1": _FakePlan([ErrorEvent(message="p1 failed", code="upstream")]),
@@ -5706,6 +6115,7 @@ async def test_unreachable_quorum_cancels_pending_and_uses_fallback(
             config: ChatConfig | None = None,
         ) -> AsyncIterator[StreamEvent]:
             async def _stream() -> AsyncIterator[StreamEvent]:
+                fallback_started.set()
                 yield TextDeltaEvent(text="single")
                 yield DoneEvent(model="single")
 
@@ -5726,37 +6136,43 @@ async def test_unreachable_quorum_cancels_pending_and_uses_fallback(
         shuffle_candidates=False,
     )
 
-    events = await asyncio.wait_for(_collect(provider), timeout=1.0)
+    consume_task = asyncio.create_task(_collect(provider))
+    await asyncio.sleep(0.05)
+    assert "agg" not in [call["model"] for call in registry.calls]
+    assert fallback_started.is_set() is False
+    slow_gate.set()
+    events = await asyncio.wait_for(consume_task, timeout=1.0)
 
-    assert slow_gate.is_set() is False
+    assert slow_gate.is_set() is True
     assert p3_closed.is_set() is True
     assert p4_closed.is_set() is True
-    assert "agg" not in [call["model"] for call in registry.calls]
+    assert [call["model"] for call in registry.calls][-1] == "agg"
+    assert fallback_started.is_set() is False
     progress = [event for event in events if isinstance(event, EnsembleProgressEvent)]
     assert len([event for event in progress if event.event_type == "proposer_start"]) == 4
     assert len([event for event in progress if event.event_type == "proposer_finish"]) == 4
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
-    assert done.ensemble_trace["successful_proposers"] == 0
+    assert done.ensemble_trace["successful_proposers"] == 2
     assert done.ensemble_trace["total_candidates"] == 4
     assert done.ensemble_trace["llm_request_count"] == 5
+    assert done.ensemble_trace["configured_min_successful_proposers"] == 3
+    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
     candidates = done.ensemble_trace["candidates"]
     assert [candidate["error_code"] for candidate in candidates[:2]] == [
         "upstream",
         "upstream",
     ]
-    assert [candidate["error_code"] for candidate in candidates[2:]] == [
-        "quorum_unreachable",
-        "quorum_unreachable",
-    ]
+    assert [candidate["ok"] for candidate in candidates[2:]] == [True, True]
 
 
 @pytest.mark.asyncio
-async def test_required_all_quorum_cancels_remaining_after_failure(
+async def test_configured_all_success_does_not_cancel_remaining_after_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     slow_gate = asyncio.Event()
     slow_closed = asyncio.Event()
+    fallback_started = asyncio.Event()
     registry = _FakeRegistry(
         {
             "p1": _FakePlan([ErrorEvent(message="p1 failed", code="upstream")]),
@@ -5780,6 +6196,7 @@ async def test_required_all_quorum_cancels_remaining_after_failure(
             config: ChatConfig | None = None,
         ) -> AsyncIterator[StreamEvent]:
             async def _stream() -> AsyncIterator[StreamEvent]:
+                fallback_started.set()
                 yield TextDeltaEvent(text="single")
                 yield DoneEvent(model="single")
 
@@ -5800,14 +6217,23 @@ async def test_required_all_quorum_cancels_remaining_after_failure(
         shuffle_candidates=False,
     )
 
-    events = await asyncio.wait_for(_collect(provider), timeout=1.0)
-
-    assert slow_gate.is_set() is False
-    assert slow_closed.is_set() is True
+    consume_task = asyncio.create_task(_collect(provider))
+    await asyncio.sleep(0.05)
     assert "agg" not in [call["model"] for call in registry.calls]
+    assert fallback_started.is_set() is False
+    slow_gate.set()
+    events = await asyncio.wait_for(consume_task, timeout=1.0)
+
+    assert slow_gate.is_set() is True
+    assert slow_closed.is_set() is True
+    assert [call["model"] for call in registry.calls][-1] == "agg"
+    assert fallback_started.is_set() is False
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
-    assert done.ensemble_trace["candidates"][1]["error_code"] == "quorum_unreachable"
+    assert done.ensemble_trace["successful_proposers"] == 1
+    assert done.ensemble_trace["configured_min_successful_proposers"] == 2
+    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
+    assert done.ensemble_trace["candidates"][1]["ok"] is True
 
 
 @pytest.mark.asyncio
@@ -5931,6 +6357,119 @@ async def test_selector_wrapper_preserves_provider_control_event_contract() -> N
     assert isinstance(events[1], ProviderHeartbeatEvent)
     assert events[1].phase == "ensemble_proposers_wait"
     assert isinstance(events[2], DoneEvent)
+
+
+@pytest.mark.asyncio
+async def test_selector_wrapper_forwards_turn_execution_context() -> None:
+    from opensquilla.contracts.turn_execution import TurnExecutionContext, TurnIdentity
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-selector-context",
+            "assistant-selector-context",
+            "agent:main:selector-context",
+        )
+    )
+    observed_contexts: list[TurnExecutionContext | None] = []
+
+    class _Provider:
+        provider_name = "ensemble"
+        execution_context_aware = True
+
+        async def chat(
+            self,
+            messages: list[Any],
+            tools: Any = None,
+            config: Any = None,
+            *,
+            execution_context: TurnExecutionContext | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+            observed_contexts.append(execution_context)
+            yield DoneEvent(model="ensemble")
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    class _Selector:
+        current_config = ProviderConfig(provider="ensemble", model="ensemble")
+
+    provider = _SelectorFallbackProvider(_Provider(), _Selector())
+
+    events = [
+        event
+        async for event in provider.chat([], execution_context=context)
+    ]
+
+    assert observed_contexts == [context]
+    assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.asyncio
+async def test_selector_wrapper_yields_generation_reset_before_pulling_new_text() -> None:
+    from opensquilla.contracts.turn_execution import (
+        StickyExecutionRole,
+        TurnExecutionContext,
+        TurnIdentity,
+    )
+    from opensquilla.engine.runtime import _SelectorFallbackProvider
+    from opensquilla.provider.types import ProviderGenerationResetEvent
+
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-selector-reset",
+            "assistant-selector-reset",
+            "agent:main:selector-reset",
+        )
+    )
+
+    class _Provider:
+        provider_name = "ensemble"
+        execution_context_aware = True
+
+        async def chat(
+            self,
+            messages: list[Any],
+            tools: Any = None,
+            config: Any = None,
+            *,
+            execution_context: TurnExecutionContext | None = None,
+        ) -> AsyncIterator[StreamEvent]:
+            del messages, tools, config
+            assert execution_context is context
+            yield ProviderGenerationResetEvent(
+                from_role=StickyExecutionRole.PRIMARY_AGGREGATOR,
+                to_role=StickyExecutionRole.FIXED_AGGREGATOR,
+                safe_reason="primary failed",
+            )
+            # The wrapper must suspend at the reset.  The consumer owns epoch
+            # advancement and must get a chance to apply it before the new
+            # provider generation emits its first chunk.
+            assert context.generation_epoch == 1
+            yield TextDeltaEvent(text="first fixed chunk")
+            yield DoneEvent(model="fixed")
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    class _Selector:
+        current_config = ProviderConfig(provider="ensemble", model="ensemble")
+
+    stream = _SelectorFallbackProvider(_Provider(), _Selector()).chat(
+        [],
+        execution_context=context,
+    ).__aiter__()
+
+    reset = await stream.__anext__()
+    assert isinstance(reset, ProviderGenerationResetEvent)
+    context.begin_generation_reset(
+        reset.from_role,
+        reset.to_role,
+        reset.safe_reason,
+    )
+    assert isinstance(await stream.__anext__(), TextDeltaEvent)
+    assert isinstance(await stream.__anext__(), DoneEvent)
 
 
 @pytest.mark.asyncio
@@ -6614,3 +7153,456 @@ def test_ensemble_runtime_status_checks_inherited_custom_aggregator_credential(
     assert status["configurationReady"] is False
     assert status["aggregatorCount"] == 1
     assert "groq" in str(status["blockedReason"])
+
+
+class _Step3FixedProvider:
+    provider_name = "fixed"
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "config": config,
+            }
+        )
+
+        async def _stream() -> AsyncIterator[StreamEvent]:
+            yield TextDeltaEvent(text="fixed answer")
+            yield DoneEvent(input_tokens=5, output_tokens=7, model="fixed-model")
+
+        return _stream()
+
+    async def list_models(self) -> list[Any]:
+        return []
+
+
+class _Step3FailingFixedProvider(_Step3FixedProvider):
+    def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        self.calls.append(
+            {
+                "messages": messages,
+                "tools": tools,
+                "config": config,
+            }
+        )
+
+        async def _stream() -> AsyncIterator[StreamEvent]:
+            yield TextDeltaEvent(text="partial fixed answer")
+            yield ErrorEvent(message="unauthorized", code="401")
+
+        return _stream()
+
+
+@pytest.mark.asyncio
+async def test_step3_aggregator_auth_failure_uses_immutable_candidate_bundle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            **{
+                f"p{index}": _FakePlan(
+                    [
+                        TextDeltaEvent(text=f"draft-{index}"),
+                        DoneEvent(model=f"p{index}"),
+                    ]
+                )
+                for index in range(1, 5)
+            },
+            "agg": _FakePlan([ErrorEvent(message="unauthorized", code="401")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    fixed = _Step3FixedProvider()
+    provider = EnsembleProvider(
+        profile_name="step3",
+        proposers=[_member(f"p{index}") for index in range(1, 5)],
+        aggregator=_member("agg"),
+        fallback_provider=fixed,
+        fallback_provider_name="fixed",
+        fallback_model="fixed-model",
+        min_successful_proposers=3,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    terminals = [event for event in events if isinstance(event, (DoneEvent, ErrorEvent))]
+    assert len([event for event in terminals if isinstance(event, DoneEvent)]) == 1
+    assert not any(isinstance(event, ErrorEvent) for event in terminals)
+    assert [call["model"] for call in registry.calls] == [
+        "p1",
+        "p2",
+        "p3",
+        "p4",
+        "agg",
+    ]
+    assert len(fixed.calls) == 1
+    fixed_call = fixed.calls[0]
+    assert fixed_call["tools"] is not None
+    assert fixed_call["tools"][0].name == "lookup"
+    candidate_prompt = str(fixed_call["messages"][-1].content)
+    assert "<CANDIDATE 1>" in candidate_prompt
+    assert "draft-4" in candidate_prompt
+    done = next(event for event in terminals if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["final_request_role"] == "fixed_aggregator"
+    assert [row["role"] for row in done.model_usage_breakdown[-2:]] == [
+        "aggregator",
+        "fixed_aggregator",
+    ]
+    assert done.model_usage_breakdown[-2]["error_code"] == "401"
+
+
+@pytest.mark.asyncio
+async def test_step3_fixed_final_failure_is_one_friendly_terminal_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft"), DoneEvent(model="p1")]
+            ),
+            "agg": _FakePlan(
+                [ErrorEvent(message="aggregator unauthorized", code="401")]
+            ),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    fixed = _Step3FailingFixedProvider()
+    provider = EnsembleProvider(
+        profile_name="step3",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=fixed,
+        fallback_provider_name="fixed",
+        fallback_model="fixed-model",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    resets = [
+        event for event in events if isinstance(event, ProviderGenerationResetEvent)
+    ]
+    assert len(resets) == 2
+    assert resets[0].terminal is False
+    terminal = resets[1]
+    assert terminal.terminal is True
+    assert terminal.terminal_text_snapshot == ENSEMBLE_FIXED_TERMINAL_MESSAGE
+    assert "partial fixed answer" not in str(terminal.terminal_text_snapshot)
+    assert terminal.terminal_error_code == "401"
+    assert [row["role"] for row in terminal.model_usage_breakdown[-2:]] == [
+        "aggregator",
+        "fixed_aggregator",
+    ]
+    assert not any(isinstance(event, (DoneEvent, ErrorEvent)) for event in events)
+    assert len(fixed.calls) == 1
+    assert [call["model"] for call in registry.calls] == ["p1", "agg"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("aggregator_events", "aggregator_timeout"),
+    [
+        ([TextDeltaEvent(text="partial")], 1.0),
+        ([DoneEvent(model="agg")], 0.01),
+    ],
+    ids=["incomplete", "timeout"],
+)
+async def test_step3_aggregator_incomplete_or_idle_timeout_uses_fixed_takeover(
+    monkeypatch: pytest.MonkeyPatch,
+    aggregator_events: list[StreamEvent],
+    aggregator_timeout: float,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="p1")]),
+            "agg": _FakePlan(
+                aggregator_events,
+                delay=0.05 if aggregator_timeout < 1 else 0.0,
+            ),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_AGGREGATOR_RETRY_BACKOFF_SECONDS",
+        (0.0,),
+    )
+    fixed = _Step3FixedProvider()
+    provider = EnsembleProvider(
+        profile_name="step3",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=fixed,
+        fallback_provider_name="fixed",
+        fallback_model="fixed-model",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=aggregator_timeout,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["final_request_role"] == "fixed_aggregator"
+    assert len(fixed.calls) == 1
+    assert [call["model"] for call in registry.calls].count("agg") == 1
+    primary_rows = [row for row in done.model_usage_breakdown if row["role"] == "aggregator"]
+    assert len(primary_rows) == 1
+    assert all(row["attempt_ok"] is False for row in primary_rows)
+    assert done.model_usage_breakdown[-1]["role"] == "fixed_aggregator"
+
+
+@pytest.mark.asyncio
+async def test_step3_zero_drafts_use_fixed_direct_on_original_conversation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([ErrorEvent(message="invalid", code="400")]),
+            "agg": _FakePlan([DoneEvent(model="must-not-run")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    fixed = _Step3FixedProvider()
+    provider = EnsembleProvider(
+        profile_name="step3",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=fixed,
+        fallback_provider_name="fixed",
+        fallback_model="fixed-model",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    assert [call["model"] for call in registry.calls] == ["p1"]
+    assert len(fixed.calls) == 1
+    assert len(fixed.calls[0]["messages"]) == 1
+    assert fixed.calls[0]["messages"][0].content == "answer this"
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["final_request_role"] == "fixed_direct"
+    assert [row["role"] for row in done.model_usage_breakdown] == ["fixed_direct"]
+
+
+@pytest.mark.asyncio
+async def test_step3_fixed_takeover_is_sticky_across_tool_continuation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(model="p1")]),
+            "agg": _FakePlan([ErrorEvent(message="unauthorized", code="401")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    fixed = _Step3FixedProvider()
+    provider = EnsembleProvider(
+        profile_name="step3",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=fixed,
+        fallback_provider_name="fixed",
+        fallback_model="fixed-model",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    first_events = await _collect(provider)
+    first_registry_call_count = len(registry.calls)
+    continuation_events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="tool result")],
+            tools=[_tool()],
+            config=ChatConfig(
+                max_tokens=99,
+                thinking=False,
+                provider_request_correlation=ProviderRequestCorrelation(
+                    session_id="session-1",
+                    turn_id="turn-1",
+                    execution_id="execution-1",
+                    call_kind="subagent.chat",
+                ),
+            ),
+        )
+    ]
+
+    assert first_registry_call_count == 2
+    assert len(registry.calls) == first_registry_call_count
+    assert len(fixed.calls) == 2
+    assert [message.content for message in fixed.calls[1]["messages"][:2]] == [
+        "answer this",
+        "tool result",
+    ]
+    assert "draft" in str(fixed.calls[1]["messages"][-1].content)
+    assert fixed.calls[1]["tools"][0].name == "lookup"
+    assert any(isinstance(event, DoneEvent) for event in first_events)
+    assert any(isinstance(event, DoneEvent) for event in continuation_events)
+    assert fixed.calls[1]["config"].provider_request_correlation.call_kind == (
+        "subagent.ensemble.fixed_aggregator"
+    )
+
+
+@pytest.mark.asyncio
+async def test_step3_first_success_does_not_cancel_slow_proposer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    slow_gate = asyncio.Event()
+    slow_closed = asyncio.Event()
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([TextDeltaEvent(text="fast"), DoneEvent(model="p1")]),
+            "p2": _FakePlan(
+                [TextDeltaEvent(text="slow"), DoneEvent(model="p2")],
+                gate=slow_gate,
+                closed=slow_closed,
+            ),
+            "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="step3",
+        proposers=[_member("p1"), _member("p2")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        quorum_grace_seconds=0.01,
+        shuffle_candidates=False,
+    )
+
+    task = asyncio.create_task(_collect(provider))
+    await asyncio.sleep(0.03)
+    assert [call["model"] for call in registry.calls] == ["p1", "p2"]
+    assert "agg" not in [call["model"] for call in registry.calls]
+    assert slow_closed.is_set() is False
+    slow_gate.set()
+    events = await asyncio.wait_for(task, timeout=1.0)
+
+    assert slow_closed.is_set() is True
+    assert [call["model"] for call in registry.calls] == ["p1", "p2", "agg"]
+    assert any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.asyncio
+async def test_step3_meaningful_stream_can_exceed_per_call_idle_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS",
+        0.003,
+    )
+
+    async def _source() -> AsyncIterator[StreamEvent]:
+        for index in range(4):
+            await asyncio.sleep(0.012)
+            yield TextDeltaEvent(text=f"chunk-{index}")
+        yield DoneEvent(model="steady")
+
+    wrapped = _stream_with_heartbeats(
+        _source(),
+        phase="step3",
+        message="waiting",
+        timeout_seconds=0.02,
+        reset_deadline_on_event=True,
+    )
+    events = [event async for event in wrapped]
+
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "chunk-0",
+        "chunk-1",
+        "chunk-2",
+        "chunk-3",
+    ]
+    assert isinstance(events[-1], DoneEvent)
+
+
+@pytest.mark.asyncio
+async def test_step3_synthetic_heartbeat_alone_does_not_refresh_per_call_idle_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_HEARTBEAT_INTERVAL_SECONDS",
+        0.003,
+    )
+
+    async def _source() -> AsyncIterator[StreamEvent]:
+        while True:
+            await asyncio.sleep(0.004)
+            yield ProviderHeartbeatEvent(phase="upstream", message="synthetic")
+
+    wrapped = _stream_with_heartbeats(
+        _source(),
+        phase="step3",
+        message="waiting",
+        timeout_seconds=0.015,
+        reset_deadline_on_event=True,
+    )
+    with pytest.raises(TimeoutError):
+        async for _ in wrapped:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_step3_configured_minimum_is_diagnostic_and_effective_minimum_is_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            **{
+                f"p{index}": _FakePlan(
+                    [TextDeltaEvent(text=f"draft-{index}"), DoneEvent(model=f"p{index}")]
+                )
+                for index in range(1, 5)
+            },
+            "agg": _FakePlan([DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="step3",
+        proposers=[_member(f"p{index}") for index in range(1, 5)],
+        aggregator=_member("agg"),
+        min_successful_proposers=3,
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+    done = next(event for event in events if isinstance(event, DoneEvent))
+
+    assert provider.configured_min_successful_proposers == 3
+    assert provider.min_successful_proposers == 1
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["configured_min_successful_proposers"] == 3
+    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
+    assert done.ensemble_trace["min_successful_proposers"] == 1
+    assert done.ensemble_trace["successful_proposers"] == 4

@@ -1,13 +1,16 @@
 [
   {
+    "generation_epoch": null,
     "text": "Let me think",
     "type": "ReasoningDeltaEvent"
   },
   {
+    "generation_epoch": null,
     "text": " about this.",
     "type": "ReasoningDeltaEvent"
   },
   {
+    "generation_epoch": null,
     "text": "The answer is 4.",
     "type": "TextDeltaEvent"
   },
@@ -17,6 +20,7 @@
     "cached_tokens": 0,
     "cost_source": "none",
     "ensemble_trace": null,
+    "generation_epoch": null,
     "input_tokens": 15,
     "model": "claude-test",
     "model_usage_breakdown": [],

@@ -504,7 +504,6 @@ async def test_timeout_fallback_persists_one_completed_turn_without_error_record
             "fallback_used": True,
             "fallback_code": "ensemble_aggregator_timeout",
             "aggregator_timeout_mode": "idle",
-            "aggregator_total_deadline_source": "outer_turn_runtime",
             "llm_request_count": 3,
             "prior_final_request": {
                 "role": "aggregator",

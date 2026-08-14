@@ -20,7 +20,7 @@ from starlette.websockets import WebSocketState
 from opensquilla.agents.registry import AgentRegistry
 from opensquilla.agents.scope import default_workspace_dir
 from opensquilla.attachment_refs import transcript_material_path
-from opensquilla.engine.types import DoneEvent, ErrorEvent
+from opensquilla.engine.types import AnswerGenerationResetEvent, DoneEvent, ErrorEvent
 from opensquilla.gateway import rpc_chat, rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.attachment_ingest import (
@@ -2137,6 +2137,145 @@ class TestSessionsList:
 
 
 class TestSessionsSend:
+    @pytest.mark.asyncio
+    async def test_direct_send_serializes_generation_reset_without_error(
+        self,
+        dispatcher,
+        monkeypatch,
+    ):
+        session = FakeSession(session_key="agent:main:webchat:direct-generation-reset")
+        manager = FakeSessionManager([session])
+        emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+        async def emit(
+            _ctx: RpcContext,
+            session_key: str,
+            event_name: str,
+            payload: dict[str, Any],
+        ) -> None:
+            emitted.append((session_key, event_name, payload))
+
+        class ResetRunner:
+            async def run(self, _message: str, _session_key: str, **kwargs: Any):
+                yield AnswerGenerationResetEvent(
+                    turn_id=kwargs["root_turn_id"],
+                    assistant_message_id="assistant-direct-1",
+                    old_generation_epoch=0,
+                    new_generation_epoch=1,
+                    safe_reason="direct fallback",
+                    sequence=12,
+                )
+                yield DoneEvent()
+
+        monkeypatch.setattr(rpc_sessions, "_send_prepared_to_subscribers", emit)
+        ctx = make_ctx(
+            session_manager=manager,
+            task_runtime=None,
+            turn_runner=ResetRunner(),
+        )
+
+        response = await dispatcher.dispatch(
+            "direct-generation-reset",
+            "sessions.send",
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+        task = get_agent_task_registry().get(session.session_key)
+        if task is not None:
+            await task
+
+        assert response.ok is True
+        reset_events = [
+            (event_name, payload)
+            for _session_key, event_name, payload in emitted
+            if event_name == "session.event.answer_generation_reset"
+        ]
+        assert len(reset_events) == 1
+        event_name, payload = reset_events[0]
+        assert event_name == "session.event.answer_generation_reset"
+        assert payload["turn_id"] == response.payload["turn_id"]
+        assert payload["assistant_message_id"] == "assistant-direct-1"
+        assert payload["old_generation_epoch"] == 0
+        assert payload["new_generation_epoch"] == 1
+        assert payload["sequence"] == 12
+        assert not any(
+            event_name == "session.event.error"
+            for _session_key, event_name, _payload in emitted
+        )
+
+    @pytest.mark.asyncio
+    async def test_context_bound_wrapper_timeout_does_not_append_second_terminal(
+        self,
+        dispatcher,
+        monkeypatch,
+    ):
+        session = FakeSession(session_key="agent:main:webchat:context-bound-timeout")
+        manager = FakeSessionManager([session])
+        emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+        async def emit(
+            _ctx: RpcContext,
+            session_key: str,
+            event_name: str,
+            payload: dict[str, Any],
+        ) -> None:
+            emitted.append((session_key, event_name, payload))
+
+        class DelayedCanonicalRunner:
+            context_bound = True
+
+            async def run(self, _message: str, _session_key: str, **kwargs: Any):
+                await asyncio.sleep(0.04)
+                yield AnswerGenerationResetEvent(
+                    turn_id=kwargs["root_turn_id"],
+                    assistant_message_id="assistant-context-bound",
+                    old_generation_epoch=0,
+                    new_generation_epoch=1,
+                    safe_reason="canonical ensemble takeover",
+                    sequence=3,
+                )
+                yield DoneEvent(text="fixed answer")
+
+        monkeypatch.setattr(rpc_sessions, "_send_prepared_to_subscribers", emit)
+        ctx = make_ctx(
+            session_manager=manager,
+            task_runtime=None,
+            turn_runner=DelayedCanonicalRunner(),
+            config=GatewayConfig(
+                memory={"flush_enabled": False},
+                agent_stream_idle_timeout_seconds=0.001,
+                agent_stream_heartbeat_interval_seconds=0.0,
+            ),
+        )
+
+        response = await dispatcher.dispatch(
+            "context-bound-timeout",
+            "sessions.send",
+            {"key": session.session_key, "message": "hello"},
+            ctx,
+        )
+        task = get_agent_task_registry().get(session.session_key)
+        if task is not None:
+            await task
+
+        assert response.ok is True
+        terminal_events = [
+            event_name
+            for _session_key, event_name, _payload in emitted
+            if event_name
+            in {
+                "session.event.answer_generation_reset",
+                "session.event.done",
+                "session.event.error",
+            }
+        ]
+        assert terminal_events == [
+            "session.event.answer_generation_reset",
+            "session.event.done",
+        ]
+        assert not any(event_name == "session.event.error" for _, event_name, _ in emitted)
+        assert not any(role == "system" for _key, role, _content in manager.created_messages)
+
     @pytest.mark.asyncio
     async def test_send_valid(self, dispatcher, ctx_with_sessions, session):
         res = await dispatcher.dispatch(

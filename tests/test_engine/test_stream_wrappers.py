@@ -5,8 +5,17 @@ from contextvars import ContextVar
 import pytest
 
 from opensquilla.engine import stream_wrappers
-from opensquilla.engine.stream_wrappers import heartbeat_stream, idle_timeout_stream
-from opensquilla.engine.types import RunHeartbeatEvent, TextDeltaEvent
+from opensquilla.engine.stream_wrappers import (
+    heartbeat_stream,
+    idle_timeout_stream,
+    wrap_stream,
+)
+from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
+    DoneEvent,
+    RunHeartbeatEvent,
+    TextDeltaEvent,
+)
 
 # A wedged wrapper must fail the assertion, not wedge the test run.
 _HARD_LIMIT = 5.0
@@ -522,3 +531,45 @@ async def test_idle_timeout_still_propagates_upstream_failures() -> None:
                 seen.append(event)
 
     assert [event.text for event in seen] == ["first"]
+
+
+@pytest.mark.asyncio
+async def test_context_bound_stream_does_not_let_legacy_timeout_create_terminal() -> None:
+    async def source():
+        await asyncio.sleep(0.04)
+        yield AnswerGenerationResetEvent(
+            turn_id="turn-context-bound",
+            assistant_message_id="assistant-context-bound",
+            old_generation_epoch=0,
+            new_generation_epoch=1,
+            safe_reason="canonical ensemble takeover",
+            sequence=1,
+        )
+        yield DoneEvent(text="fixed answer")
+
+    events = [
+        event
+        async for event in wrap_stream(
+            source(),
+            idle_timeout=0.001,
+            heartbeat_interval=None,
+            context_bound=True,
+        )
+    ]
+
+    assert [event.kind for event in events] == ["answer_generation_reset", "done"]
+
+
+@pytest.mark.asyncio
+async def test_unmarked_stream_keeps_legacy_idle_timeout_behavior() -> None:
+    async def source():
+        await asyncio.sleep(0.04)
+        yield TextDeltaEvent(text="late")
+
+    with pytest.raises(TimeoutError, match="Stream idle"):
+        async for _event in wrap_stream(
+            source(),
+            idle_timeout=0.001,
+            heartbeat_interval=None,
+        ):
+            pass

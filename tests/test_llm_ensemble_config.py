@@ -53,14 +53,15 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
         "qwen/qwen3.7-max",
     ]
     assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
-    assert provider.min_successful_proposers == 3
+    # Static profiles retain their legacy 3-of-4 target for diagnostics, but
+    # one completed draft is now sufficient to continue the fusion flow.
+    assert provider.min_successful_proposers == 1
     assert provider.target_successful_proposers == 3
     assert provider.proposer_max_retries == 0
     assert provider.proposer_timeout_seconds == 120.0
     assert provider.aggregator_timeout_seconds == 180.0
-    assert provider.total_timeout_seconds == 300.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 10.0
+    assert provider.quorum_grace_seconds == 0.0
 
 
 def test_static_openrouter_b5_does_not_need_model_options() -> None:
@@ -125,12 +126,11 @@ def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
     assert provider.aggregator.provider_config.provider == "tokenrhythm"
     assert provider.aggregator.provider_config.model == "glm-5.2"
     # Same aggregation defaults as the static OpenRouter profile.
-    assert provider.min_successful_proposers == 3
+    assert provider.min_successful_proposers == 1
     assert provider.proposer_timeout_seconds == 120.0
     assert provider.aggregator_timeout_seconds == 180.0
-    assert provider.total_timeout_seconds == 300.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 10.0
+    assert provider.quorum_grace_seconds == 0.0
 
 
 def test_static_b5_mode_tables_agree_across_gateway_and_provider() -> None:
@@ -362,7 +362,7 @@ def test_router_dynamic_ensemble_uses_small_c0_slot_template() -> None:
         "deepseek/deepseek-v4-flash"
     )
     assert len(provider.proposers) == 2
-    assert provider.min_successful_proposers == 2
+    assert provider.min_successful_proposers == 1
     assert provider.selection_plan["slot_template"] == ["anchor", "cheap_contrast"]
     assert provider.selection_plan["aggregator_slot"] == "aggregator_fast"
     assert provider.selection_plan["duplicate_policy"] == "selected_penalty"
@@ -455,23 +455,24 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "aggregator_model": "z-ai/glm-5.2",
             "proposer_count": 4,
             "configured_min_successful_proposers": 9,
-            "effective_min_successful_proposers": 4,
+            "effective_min_successful_proposers": 1,
             "configured_proposer_timeout_seconds": 3600.0,
             "effective_proposer_timeout_seconds": 120.0,
             "configured_aggregator_timeout_seconds": 3600.0,
             "effective_aggregator_timeout_seconds": 180.0,
-            "configured_total_timeout_seconds": None,
-            "effective_total_timeout_seconds": 300.0,
             "configured_shuffle_candidates": False,
             "effective_shuffle_candidates": False,
-            "quorum_grace_seconds": 10.0,
+            "configured_quorum_grace_seconds": 10.0,
+            "effective_quorum_grace_seconds": 0.0,
+            "quorum_grace_seconds": 0.0,
+            "configured_proposer_max_retries": 0,
+            "effective_proposer_max_retries": 0,
         }
-        assert provider.min_successful_proposers == 4
+        assert provider.min_successful_proposers == 1
         assert provider.proposer_timeout_seconds == 120.0
         assert provider.aggregator_timeout_seconds == 180.0
-        assert provider.total_timeout_seconds == 300.0
         assert provider.shuffle_candidates is False
-        assert provider.quorum_grace_seconds == 10.0
+        assert provider.quorum_grace_seconds == 0.0
         members = [*provider.proposers, provider.aggregator]
         assert all(member.provider_config.provider == "openrouter" for member in members)
         assert all(member.provider_config.api_key == "fake" for member in members)
@@ -509,12 +510,11 @@ def test_static_openrouter_b5_ensemble_uses_profile_effective_defaults() -> None
     assert cfg.llm_ensemble.aggregator_timeout_seconds == 3600.0
     assert cfg.llm_ensemble.total_timeout_seconds is None
     assert cfg.llm_ensemble.shuffle_candidates is True
-    assert provider.min_successful_proposers == 3
+    assert provider.min_successful_proposers == 1
     assert provider.proposer_timeout_seconds == 120.0
     assert provider.aggregator_timeout_seconds == 180.0
-    assert provider.total_timeout_seconds == 300.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 10.0
+    assert provider.quorum_grace_seconds == 0.0
 
 
 def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> None:
@@ -539,11 +539,35 @@ def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> No
         fallback_provider=None,
     )
 
-    assert provider.min_successful_proposers == 2
+    assert provider.min_successful_proposers == 1
     assert provider.proposer_timeout_seconds == 180.0
     assert provider.aggregator_timeout_seconds == 900.0
-    assert provider.total_timeout_seconds == 300.0
     assert provider.shuffle_candidates is False
+
+
+def test_legacy_total_timeout_is_readable_but_has_no_runtime_effect() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+            "total_timeout_seconds": 1.0,
+        }
+    )
+    provider = build_ensemble_provider_from_config(
+        config=cfg,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="routed/model",
+            api_key="fake",
+            base_url="https://openrouter.example/api/v1",
+        ),
+        fallback_provider=None,
+    )
+
+    assert cfg.llm_ensemble.total_timeout_seconds == 1.0
+    assert not hasattr(provider, "total_timeout_seconds")
+    assert "configured_total_timeout_seconds" not in provider.selection_plan
+    assert "effective_total_timeout_seconds" not in provider.selection_plan
 
 
 def test_static_b5_supports_score_target_above_resilient_floor() -> None:
@@ -568,15 +592,17 @@ def test_static_b5_supports_score_target_above_resilient_floor() -> None:
         fallback_provider=None,
     )
 
-    assert provider.min_successful_proposers == 3
+    assert provider.min_successful_proposers == 1
     assert provider.target_successful_proposers == 4
-    assert provider.proposer_max_retries == 2
+    assert provider.proposer_max_retries == 1
     # Legacy ``error`` remains loadable, but runtime has one effective
     # contract: fall back through the configured fixed deployment.
     assert provider.all_failed_policy == "fallback_single"
     assert provider.selection_plan["configured_target_successful_proposers"] == 4
     assert provider.selection_plan["effective_target_successful_proposers"] == 4
-    assert provider.selection_plan["proposer_max_retries"] == 2
+    assert provider.selection_plan["configured_proposer_max_retries"] == 2
+    assert provider.selection_plan["effective_proposer_max_retries"] == 1
+    assert provider.selection_plan["proposer_max_retries"] == 1
 
 
 def test_success_target_cannot_be_below_floor() -> None:
@@ -653,14 +679,14 @@ def test_custom_b5_uses_fixed_lineup_effective_defaults_with_auto_quorum() -> No
         fallback_provider=None,
     )
 
-    # Stored legacy defaults are replaced by the fixed-lineup family; quorum
-    # is derived as N-1 for the 3-proposer lineup.
+    # Stored legacy defaults remain diagnostic-only. Runtime admission is one
+    # completed draft and there is no first-result grace-window cancellation.
     assert cfg.llm_ensemble.min_successful_proposers == 1
-    assert provider.min_successful_proposers == 2
+    assert provider.min_successful_proposers == 1
     assert provider.proposer_timeout_seconds == 300.0
     assert provider.aggregator_timeout_seconds == 480.0
     assert provider.shuffle_candidates is False
-    assert provider.quorum_grace_seconds == 10.0
+    assert provider.quorum_grace_seconds == 0.0
 
 
 def test_custom_b5_preserves_explicit_quorum_and_timeouts() -> None:
@@ -675,7 +701,7 @@ def test_custom_b5_preserves_explicit_quorum_and_timeouts() -> None:
         fallback_provider=None,
     )
 
-    assert provider.min_successful_proposers == 3
+    assert provider.min_successful_proposers == 1
     assert provider.proposer_timeout_seconds == 120.0
     assert provider.aggregator_timeout_seconds == 600.0
 
@@ -1034,6 +1060,11 @@ async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_re
         def disable_provider_state_replay(self) -> None:
             self.replay_provider_state = False
 
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            yield TextDeltaEvent(text="fixed answer")
+            yield DoneEvent(model="primary-model", input_tokens=1, output_tokens=1)
+
     class _FallbackAdapter:
         provider_name = "anthropic"
 
@@ -1152,11 +1183,11 @@ async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_re
     ]
 
     assert any(
-        isinstance(event, TextDeltaEvent) and event.text == "fallback answer"
+        isinstance(event, TextDeltaEvent) and event.text == "fixed answer"
         for event in events
     )
-    assert selector_builds[-1].model == "plugin-fallback"
-    assert selector_builds[-1].replay_provider_state is False
+    assert selector_builds
+    assert all(config.model == "primary-model" for config in selector_builds)
     assert turn_selector.current_config.replay_provider_state is False
     assert direct_fallback.replay_provider_state is False
     assert plugin_fallback_config.replay_provider_state is True

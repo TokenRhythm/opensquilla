@@ -14,6 +14,14 @@ from opensquilla.router_runtime_diagnostics import (
     classify_router_runtime_error,
     router_runtime_hint,
 )
+from opensquilla.router_tiers import (
+    CUSTOM_B5_SELECTION_MODE,
+    ROUTER_DYNAMIC_SELECTION_MODE,
+    static_b5_profile,
+)
+from opensquilla.router_tiers import (
+    ROUTER_TIER_ENSEMBLE_SELECTION_MODES as _ENSEMBLE_SELECTION_MODES,
+)
 
 _LEGACY_PROVIDER_REPLACEMENTS = {
     "zai": "zhipu",
@@ -1753,17 +1761,6 @@ def evaluate_sandbox(payload: dict[str, Any]) -> list[HealthFinding]:
     ]
 
 
-# selection_mode → (member-provider label, env-key fallback) for the static
-# B5 profiles. Payload-driven mirror of the gateway's static-B5 mode table.
-_STATIC_B5_MODE_DETAILS = {
-    "static_openrouter_b5": ("OpenRouter", "OPENROUTER_API_KEY"),
-    "static_tokenrhythm_b5": ("TokenRhythm", "TOKENRHYTHM_API_KEY"),
-}
-_ENSEMBLE_SELECTION_MODES = frozenset(
-    {"custom_b5", "router_dynamic", *_STATIC_B5_MODE_DETAILS}
-)
-
-
 def _deprecated_ensemble_failure_policy(
     payload: dict[str, Any],
 ) -> HealthFinding | None:
@@ -1954,16 +1951,16 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
             ),
             *policy_findings,
         ]
-    if enabled and selection_mode == "custom_b5":
+    if enabled and selection_mode == CUSTOM_B5_SELECTION_MODE:
         return [*_evaluate_custom_b5_ensemble(payload), *policy_findings]
     if (
-        selection_mode == "router_dynamic"
+        selection_mode == ROUTER_DYNAMIC_SELECTION_MODE
         and str(payload.get("runtimeStatus") or "") == "blocked"
     ):
         reason = str(payload.get("blockedReason") or "dynamic_member_unavailable")
         return [
             HealthFinding(
-                id="llm_ensemble.router_dynamic.not_ready",
+                id=f"llm_ensemble.{ROUTER_DYNAMIC_SELECTION_MODE}.not_ready",
                 severity="warn",
                 surface="llm_ensemble",
                 title="Dynamic LLM ensemble is not ready",
@@ -2000,10 +1997,11 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
             ),
             *policy_findings,
         ]
-    mode_details = _STATIC_B5_MODE_DETAILS.get(selection_mode)
-    if mode_details is None:
+    static_profile = static_b5_profile(selection_mode)
+    if static_profile is None:
         return policy_findings
-    provider_label, env_key_fallback = mode_details
+    provider_label = static_profile.label
+    env_key_fallback = static_profile.api_key_env
     api_key_env = str(payload.get("apiKeyEnv") or env_key_fallback)
     credential_available = bool(payload.get("credentialAvailable"))
     evidence = {
@@ -2098,7 +2096,7 @@ def _evaluate_custom_b5_ensemble(payload: dict[str, Any]) -> list[HealthFinding]
     reason = str(payload.get("lineupBlockedReason") or "")
     evidence = {
         "enabled": True,
-        "selectionMode": "custom_b5",
+        "selectionMode": CUSTOM_B5_SELECTION_MODE,
         "activeProvider": payload.get("activeProvider"),
         "lineupReady": ready,
         "lineupBlockedReason": reason,
@@ -2106,7 +2104,7 @@ def _evaluate_custom_b5_ensemble(payload: dict[str, Any]) -> list[HealthFinding]
     if ready:
         return [
             HealthFinding(
-                id="llm_ensemble.custom_b5.ready",
+                id=f"llm_ensemble.{CUSTOM_B5_SELECTION_MODE}.ready",
                 severity="ok",
                 surface="llm_ensemble",
                 title="LLM ensemble ready",
@@ -2139,7 +2137,7 @@ def _evaluate_custom_b5_ensemble(payload: dict[str, Any]) -> list[HealthFinding]
         )
     return [
         HealthFinding(
-            id="llm_ensemble.custom_b5.not_ready",
+            id=f"llm_ensemble.{CUSTOM_B5_SELECTION_MODE}.not_ready",
             severity="warn",
             surface="llm_ensemble",
             title="LLM ensemble is enabled but cannot run",

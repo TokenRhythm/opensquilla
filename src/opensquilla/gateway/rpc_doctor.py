@@ -269,9 +269,9 @@ def _router_payload(ctx: RpcContext, *, deep: bool = False) -> dict[str, Any]:
     active_provider = str(getattr(getattr(config, "llm", None), "provider", "") or "")
     mismatched_tier_providers: dict[str, str] = {}
     tiers = getattr(router, "tiers", {}) or {}
-    from opensquilla.ensemble_plan import effective_ensemble_selection_mode
     from opensquilla.router_tiers import (
         TierConfig,
+        effective_ensemble_selection_mode,
         router_dynamic_tier_members_active,
         router_tier_provider_roles,
         tier_provider_role,
@@ -370,8 +370,11 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
 
     from opensquilla.provider.ensemble import (
         ensemble_runtime_status,
-        static_b5_profile,
         tier_ensemble_runtime_statuses,
+    )
+    from opensquilla.router_tiers import (
+        CUSTOM_B5_SELECTION_MODE,
+        static_b5_profile,
     )
 
     def decorate(runtime: dict[str, Any]) -> dict[str, Any]:
@@ -390,7 +393,7 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
             decorated["credentialAvailable"] = bool(
                 decorated["configurationReady"]
             )
-        elif decorated["enabled"] and decorated["selectionMode"] == "custom_b5":
+        elif decorated["enabled"] and decorated["selectionMode"] == CUSTOM_B5_SELECTION_MODE:
             decorated["lineupReady"] = bool(decorated["configurationReady"])
             decorated["lineupBlockedReason"] = str(
                 decorated["blockedReason"] or ""
