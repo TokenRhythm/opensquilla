@@ -749,6 +749,47 @@ describe('useChatPendingQueue delivery state', () => {
     queue.cleanup()
   })
 
+  it('restores the confirmed plain-text marker for a server-staged unknown slash', async () => {
+    const { wal, records } = memoryWal()
+    const rpcCall = vi.fn(async (method: string): Promise<unknown> => {
+      if (method === 'sessions.pending_inputs.list') {
+        return {
+          items: [{
+            pendingInputId: 'pending-unknown-slash',
+            clientRequestId: 'request-unknown-slash',
+            clientMessageId: 'message-unknown-slash',
+            requestFingerprint: 'sha256:unknown-slash',
+            revision: 1,
+            message: '/gamemode creative',
+            confirmedPlainText: true,
+            attachments: [],
+          }],
+        }
+      }
+      throw new Error(`unexpected method: ${method}`)
+    })
+    const rpc: NonNullable<UseChatPendingQueueOptions['rpc']> = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => {
+        void params
+        return rpcCall(method) as Promise<T>
+      },
+    }
+    const { queue } = makeQueue(undefined, () => false, undefined, undefined, {
+      pendingInputWal: wal,
+      rpc,
+      supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
+    })
+
+    await vi.waitFor(() => expect(queue.pendingQueue.value).toHaveLength(1))
+    expect(queue.pendingQueue.value[0]).toMatchObject({
+      text: '/gamemode creative',
+      confirmedPlainText: true,
+      pendingPersistenceState: 'staged',
+    })
+    expect(records.get('pending-unknown-slash')?.confirmedPlainText).toBe(true)
+    queue.cleanup()
+  })
+
   it('strips an ACK-lost upload token when server reconciliation proves ownership', async () => {
     const { wal, records } = memoryWal([{
       schemaVersion: 1,

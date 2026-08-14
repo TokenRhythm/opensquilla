@@ -92,10 +92,12 @@ export interface PendingQueuePayload {
   text: string
   attachments?: Attachment[]
   intent?: string | null
+  confirmedPlainText?: boolean
 }
 
 export interface PendingSteerPayload {
   request: SessionSteerV2Params
+  durableText?: string
   phase?: PendingSteerPhase
 }
 
@@ -252,6 +254,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       text: item.text,
       attachments: (item.attachments || []).map(attachment => ({ ...attachment })),
       intent: item.intent,
+      ...(item.confirmedPlainText ? { confirmedPlainText: true } : {}),
       ...(item.ownerRequestId ? { ownerRequestId: item.ownerRequestId } : {}),
       state,
       mayHaveServerCopy: item.pendingMayHaveServerCopy === true,
@@ -284,6 +287,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       text: record.text,
       attachments: record.attachments.map(attachment => ({ ...attachment })),
       intent: record.intent,
+      ...(record.confirmedPlainText ? { confirmedPlainText: true } : {}),
       ownerSessionKey: record.sessionKey,
       ...(record.ownerRequestId ? { ownerRequestId: record.ownerRequestId } : {}),
       pendingInputId: record.pendingInputId,
@@ -510,6 +514,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
                 clientMessageId: item.pendingClientMessageId,
                 message: providerMessage || 'Describe these attachments',
                 attachments: sendable.map(serializeSendableAttachment),
+                ...(item.confirmedPlainText ? { confirmedPlainText: true } : {}),
                 ...(sendable.length > 0 || literalSlashEscape
                   ? { displayText: queuedText }
                   : {}),
@@ -708,6 +713,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
               : String(serverItem.message || ''),
             attachments: serverAttachments,
             intent: typeof serverItem.intent === 'string' ? serverItem.intent : null,
+            ...(serverItem.confirmedPlainText === true ? { confirmedPlainText: true } : {}),
             ownerSessionKey: sessionKey,
             pendingInputId,
             pendingClientRequestId: clientRequestId,
@@ -830,6 +836,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       text: payload.text,
       attachments: (payload.attachments || []).map(a => ({ ...a })),
       intent: payload.intent ?? null,
+      ...(payload.confirmedPlainText ? { confirmedPlainText: true } : {}),
       ownerSessionKey: options.sessionKey.value,
       ...(ownerRequestId ? { ownerRequestId } : {}),
     }
@@ -877,6 +884,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       text,
       attachments: options.pendingAttachments.value,
       intent: composerIntent,
+      ...(enqueueOptions?.confirmedPlainText ? { confirmedPlainText: true } : {}),
     }, owner)
     const clearMatchingComposer = () => {
       if (
@@ -977,7 +985,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const ownerRequestId = resolveOwnerRequestId(owner)
     const item: ChatPendingItem = {
       pendingUiId: request.client_request_id || createClientRequestId(),
-      text: request.message,
+      text: payload.durableText ?? request.message,
       attachments: [],
       intent: null,
       ownerSessionKey: options.sessionKey.value,

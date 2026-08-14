@@ -5359,6 +5359,8 @@ def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> 
     display_text = payload.get("displayText")
     if isinstance(display_text, str):
         result["displayText"] = display_text
+    if payload.get("confirmedPlainText") is True:
+        result["confirmedPlainText"] = True
     return result
 
 
@@ -5368,6 +5370,12 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
         raise ValueError("params.message must be a non-empty string")
     control = message.strip()
     display_text = _optional_string_param(params, "displayText", "display_text")
+    confirmed_plain_text = params.get(
+        "confirmedPlainText",
+        params.get("confirmed_plain_text", False),
+    )
+    if not isinstance(confirmed_plain_text, bool):
+        raise ValueError("params.confirmedPlainText must be a boolean")
     display_control = display_text.strip() if display_text is not None else ""
     literal_slash_escape = (
         control.startswith("/")
@@ -5379,6 +5387,7 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
         control.startswith("/")
         and not control.startswith("//")
         and not literal_slash_escape
+        and not confirmed_plain_text
     ):
         raise RpcHandlerError(
             "PENDING_CONTROL_COMMAND_UNSUPPORTED",
@@ -5419,6 +5428,8 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
             payload[target] = value
     if display_text is not None:
         payload["displayText"] = display_text
+    if confirmed_plain_text:
+        payload["confirmedPlainText"] = True
     return payload
 
 

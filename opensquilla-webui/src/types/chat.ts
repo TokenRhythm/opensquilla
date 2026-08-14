@@ -63,6 +63,8 @@ export interface ChatPendingItem {
   text: string
   attachments: Attachment[]
   intent: string | null
+  /** Slash-prefixed text that a complete command catalog classified as ordinary input. */
+  confirmedPlainText?: boolean
   /** Generic non-v2 queue/hidden-control delivery lease. V2 Steer uses `steerAttempt`. */
   deliveryState?: 'steering' | 'retryable'
   /** Canonical transport identity/state for a not-yet-durable steer. */

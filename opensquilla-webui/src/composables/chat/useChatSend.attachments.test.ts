@@ -119,7 +119,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     ?? ((payload) => {
       const item: ChatPendingItem = {
         pendingUiId: `pending-ui-${pendingQueue.value.length}`,
-        text: payload.request.message,
+        text: payload.durableText ?? payload.request.message,
         attachments: [],
         intent: null,
         ownerSessionKey: payload.request.key,
@@ -971,6 +971,94 @@ describe('useChatSend attachment payloads', () => {
       expect(rpc.call).not.toHaveBeenCalled()
     },
   )
+
+  it('sends a queued literal slash Steer with normalized provider text', async () => {
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        accepted: true,
+        turn_id: 'turn-current',
+        user_message_id: 'user-literal-steer',
+        disposition: 'steering',
+      }),
+    }
+    const { api, options, pendingQueue, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      busySendMode: ref<BusySendMode>('steer'),
+    })
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-literal-steer',
+      text: '//coding',
+      attachments: [],
+      intent: null,
+    }
+    pendingQueue.value.push(queued)
+    stream.isStreaming.value = true
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
+
+    expect(rpc.call).toHaveBeenCalledWith('sessions.steer.v2', expect.objectContaining({
+      message: '/coding',
+    }))
+    expect(options.messages.value).toContainEqual(expect.objectContaining({
+      role: 'user',
+      text: '//coding',
+      messageId: 'user-literal-steer',
+    }))
+  })
+
+  it('preserves literal slash intent when a busy Steer falls back to follow-up', async () => {
+    const rpcCall = vi.fn(async (
+      method: string,
+      params?: Record<string, unknown>,
+    ) => {
+      void params
+      if (method === 'sessions.steer.v2') {
+        return {
+          accepted: false,
+          fallback_safe: true,
+          failure_code: 'turn_mismatch',
+        }
+      }
+      if (method === 'chat.send') {
+        return { sessionKey: 'agent:main:webchat:test' }
+      }
+      throw new Error(`unexpected method: ${method}`)
+    })
+    const rpc: UseChatSendOptions['rpc'] = {
+      call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+        rpcCall(method, params) as Promise<T>
+      ),
+    }
+    const executeSlashCommand = vi.fn(async () => true)
+    const { api, options, pendingQueue, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      rpc,
+      inputText: ref('//coding'),
+      busySendMode: ref<BusySendMode>('steer'),
+      executeSlashCommand,
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(rpcCall).toHaveBeenCalledWith('sessions.steer.v2', expect.objectContaining({
+      message: '/coding',
+    }))
+    expect(pendingQueue.value).toMatchObject([{
+      text: '//coding',
+    }])
+    expect(pendingQueue.value[0]).not.toHaveProperty('steerAttempt')
+
+    stream.isStreaming.value = false
+    options.activeStreamTaskId.value = ''
+    await expect(api.sendQueuedFollowup(pendingQueue.value[0]!)).resolves.toBe('accepted')
+
+    expect(rpcCall).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/coding',
+    }))
+    expect(executeSlashCommand).not.toHaveBeenCalled()
+  })
 
   it('falls back safely to the visible pending queue when v2 rejects before admission', async () => {
     const rpc = {
@@ -5966,6 +6054,24 @@ describe('useChatSend slash-prefixed input fall-through', () => {
         string,
         import('@/utils/chat/pendingInputWal').PendingInputWalRecord
       >()
+      const rpcCall = vi.fn(async (
+        method: string,
+        params: Record<string, unknown> = {},
+      ): Promise<Record<string, unknown>> => {
+        if (method === 'sessions.pending_inputs.list') return { items: [] }
+        if (method === 'sessions.pending_inputs.enqueue') {
+          return { requestFingerprint: 'sha256:unknown-slash', revision: 1 }
+        }
+        if (method === 'sessions.pending_inputs.dispatch') {
+          return { sessionKey: sessionKey.value }
+        }
+        throw new Error(`unexpected method: ${method} ${JSON.stringify(params)}`)
+      })
+      const rpc: UseChatSendOptions['rpc'] = {
+        call: <T = unknown>(method: string, params?: Record<string, unknown>) => (
+          rpcCall(method, params) as Promise<T>
+        ),
+      }
       let sendApi!: ReturnType<typeof useChatSend>
       const pending = useChatPendingQueue({
         sessionKey,
@@ -5986,7 +6092,8 @@ describe('useChatSend slash-prefixed input fall-through', () => {
           delete: async pendingInputId => { pendingRecords.delete(pendingInputId) },
           close: () => {},
         },
-        supportsMethod: () => false,
+        rpc,
+        supportsMethod: method => method.startsWith('sessions.pending_inputs.'),
         dispatchPendingItem: (item, ownerSessionKey) => (
           sendApi.sendQueuedFollowup(item, ownerSessionKey)
         ),
@@ -5997,6 +6104,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
         pendingSessionIntent,
         sessionKey,
         stream,
+        rpc,
         busySendMode: pending.busySendMode,
         enqueuePendingInput: pending.enqueuePendingInput,
         enqueuePendingPayload: pending.enqueuePendingPayload,
@@ -6009,16 +6117,33 @@ describe('useChatSend slash-prefixed input fall-through', () => {
 
       expect(pending.pendingQueue.value).toHaveLength(1)
       expect(pendingRecords.size).toBe(1)
+      await vi.waitFor(() => {
+        expect(pending.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged')
+      })
+      expect(pendingRecords.values().next().value).toMatchObject({
+        text: '/gamemode creative',
+        confirmedPlainText: true,
+      })
+      expect(rpcCall).toHaveBeenCalledWith(
+        'sessions.pending_inputs.enqueue',
+        expect.objectContaining({
+          message: '/gamemode creative',
+          confirmedPlainText: true,
+        }),
+      )
       expect(inputText.value).toBe('')
       stream.isStreaming.value = false
       pending.schedulePendingDrainAfterTerminal()
       await vi.runAllTimersAsync()
       await nextTick()
 
-      expect(configured.rpc.call).toHaveBeenCalledOnce()
-      expect(configured.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
-        message: '/gamemode creative',
-      }))
+      expect(rpcCall).toHaveBeenCalledWith(
+        'sessions.pending_inputs.dispatch',
+        expect.objectContaining({
+          requestFingerprint: 'sha256:unknown-slash',
+        }),
+      )
+      expect(rpcCall).not.toHaveBeenCalledWith('chat.send', expect.anything())
       expect(pending.pendingQueue.value).toHaveLength(0)
       expect(pendingRecords.size).toBe(0)
       pending.cleanup()

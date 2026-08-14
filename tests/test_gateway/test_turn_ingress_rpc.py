@@ -207,6 +207,60 @@ async def test_pending_input_literal_slash_escape_dispatches_normalized_message(
 
 
 @pytest.mark.asyncio
+async def test_pending_input_confirmed_plain_slash_survives_staging_and_dispatch(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-confirmed-plain.db") as stack:
+        staged = await get_dispatcher().dispatch(
+            "pending-confirmed-plain-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-confirmed-plain",
+                "clientRequestId": "pending-confirmed-plain-request",
+                "clientMessageId": "pending-confirmed-plain-message",
+                "message": "/gamemode creative",
+                "confirmedPlainText": True,
+            },
+            stack.context,
+        )
+        assert staged.ok is True
+        row = await stack.storage.get_pending_chat_input("pending-confirmed-plain")
+        assert row is not None
+        assert row.payload["message"] == "/gamemode creative"
+        assert row.payload["confirmedPlainText"] is True
+
+        listed = await get_dispatcher().dispatch(
+            "pending-confirmed-plain-list",
+            "sessions.pending_inputs.list",
+            {"key": SESSION_KEY},
+            stack.context,
+        )
+        assert listed.ok is True
+        assert listed.payload["items"][0]["confirmedPlainText"] is True
+
+        accepted = await get_dispatcher().dispatch(
+            "pending-confirmed-plain-dispatch",
+            "sessions.pending_inputs.dispatch",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-confirmed-plain",
+                "clientRequestId": "pending-confirmed-plain-request",
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            },
+            stack.context,
+        )
+        assert accepted.ok is True
+        transcript = await stack.storage.get_transcript(stack.session_id)
+        entry = next(
+            item
+            for item in transcript
+            if item.message_id == accepted.payload["message_id"]
+        )
+        assert entry.content == "/gamemode creative"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("display_text", [None, "//different"])
 async def test_pending_input_rejects_unmarked_control_commands(
     tmp_path: Path,

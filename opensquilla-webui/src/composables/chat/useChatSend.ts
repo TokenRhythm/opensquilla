@@ -380,6 +380,7 @@ export interface UseChatSendOptions {
       text: string
       attachments?: Attachment[]
       intent?: string | null
+      confirmedPlainText?: boolean
     },
     owner?: PendingQueueOwner,
   ) => boolean | Promise<boolean>
@@ -606,8 +607,9 @@ export function useChatSend(options: UseChatSendOptions) {
     attachments: readonly Attachment[],
     intent: string | null,
     forkBeforeMessageId: string | null,
+    allowLiteralSlash = false,
   ): boolean {
-    return !isControlInput(text)
+    return (!isControlInput(text) || allowLiteralSlash)
       && attachments.length === 0
       && !intent
       && !forkBeforeMessageId
@@ -618,9 +620,16 @@ export function useChatSend(options: UseChatSendOptions) {
     attachments: readonly Attachment[],
     intent: string | null,
     forkBeforeMessageId: string | null,
+    allowLiteralSlash = false,
   ): boolean {
     return supportsSameTurnSteer()
-      && isPlainSteerPayload(text, attachments, intent, forkBeforeMessageId)
+      && isPlainSteerPayload(
+        text,
+        attachments,
+        intent,
+        forkBeforeMessageId,
+        allowLiteralSlash,
+      )
       && !options.isCompactInFlightForCurrentSession()
       && !responseHandoffBlocksCurrentSession()
   }
@@ -1426,6 +1435,7 @@ export function useChatSend(options: UseChatSendOptions) {
     optionsForSteer: {
       composerSnapshot?: ComposerSnapshot
       queuedItem?: ChatPendingItem
+      durableText?: string
     } = {},
   ): Promise<ChatSendOutcome> {
     const requestSessionKey = options.sessionKey.value
@@ -1433,6 +1443,9 @@ export function useChatSend(options: UseChatSendOptions) {
     const recovered = pendingItem
       ? options.steerDelivery.attemptForItem(pendingItem)
       : null
+    const durableSteerText = (optionsForSteer.durableText ?? pendingItem?.text ?? text).trim()
+    const literalSlashEscape = durableSteerText.startsWith('//')
+      && durableSteerText.slice(1) === text.trim()
     if (!requestSessionKey || !text.trim()) return 'not_sent'
     if (!options.supportsMethod?.('sessions.steer.v2')) {
       return recovered ? 'retryable_failure' : 'not_sent'
@@ -1444,6 +1457,7 @@ export function useChatSend(options: UseChatSendOptions) {
         pendingItem ? pendingItem.attachments : options.pendingAttachments.value,
         pendingItem ? pendingItem.intent : options.pendingSessionIntent.value,
         pendingItem ? null : options.pendingForkBeforeMessageId.value,
+        literalSlashEscape,
       )
     ) return 'not_sent'
     if (options.sendBlockedReason?.value || options.hasPendingAttachmentWork()) {
@@ -1474,6 +1488,9 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!pendingItem) {
       pendingItem = options.enqueuePendingSteerAttempt?.({
         request: freshParams,
+        ...(optionsForSteer.durableText
+          ? { durableText: optionsForSteer.durableText }
+          : {}),
         phase: 'submitting',
       }, pendingQueueOwner()) || undefined
       if (!pendingItem) return 'not_sent'
@@ -1776,9 +1793,10 @@ export function useChatSend(options: UseChatSendOptions) {
             composerSnapshot.payloadAttachments,
             composerSnapshot.intent,
             composerSnapshot.forkBeforeMessageId,
+            isLiteralSlash,
           )
         ) {
-          await dispatchSteerV2(text, { composerSnapshot })
+          await dispatchSteerV2(text, { composerSnapshot, durableText })
           return
         }
         // Surface a full queue instead of silently dropping the send: the draft is
@@ -1791,6 +1809,9 @@ export function useChatSend(options: UseChatSendOptions) {
               text: durableText,
               attachments: composerSnapshot.payloadAttachments,
               intent: composerSnapshot.intent,
+              ...(slashClassification === 'unknown'
+                ? { confirmedPlainText: true }
+                : {}),
             }, queueOwnerFromSnapshot(composerSnapshot)) ?? false
             : slashClassification === 'unknown'
               ? options.enqueuePendingInput(
@@ -1959,7 +1980,10 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     if (delivery === 'steer') {
-      return dispatchSteerV2(text, { queuedItem: item })
+      return dispatchSteerV2(dispatchText, {
+        queuedItem: item,
+        durableText: item.text,
+      })
     }
     const outcome = await dispatchSend(dispatchText, {
       composerText: item.text,
