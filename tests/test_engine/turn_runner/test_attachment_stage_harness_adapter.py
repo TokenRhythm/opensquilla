@@ -26,6 +26,7 @@ def test_attachment_builder_adapter_prefers_resolved_workspace(tmp_path: Path) -
             workspace_dir: str | Path | None = None,
             session_id: str | None = None,
             workspace_attachment_budget_bytes: int | None = None,
+            model_supports_vision: bool | None = None,
         ) -> None:
             calls.append(
                 {
@@ -35,6 +36,7 @@ def test_attachment_builder_adapter_prefers_resolved_workspace(tmp_path: Path) -
                     "workspace_dir": workspace_dir,
                     "session_id": session_id,
                     "workspace_attachment_budget_bytes": workspace_attachment_budget_bytes,
+                    "model_supports_vision": model_supports_vision,
                 }
             )
             return None
@@ -47,6 +49,7 @@ def test_attachment_builder_adapter_prefers_resolved_workspace(tmp_path: Path) -
         [{"type": "text/plain", "data": "aGk="}],
         workspace_dir=agent_workspace,
         session_id="session-a",
+        model_supports_vision=False,
     )
 
     assert calls == [
@@ -59,5 +62,6 @@ def test_attachment_builder_adapter_prefers_resolved_workspace(tmp_path: Path) -
             # The fake config has no attachments section, so the budget
             # resolver falls back to unbounded.
             "workspace_attachment_budget_bytes": None,
+            "model_supports_vision": False,
         }
     ]

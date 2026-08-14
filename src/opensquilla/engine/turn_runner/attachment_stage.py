@@ -58,6 +58,7 @@ class AttachmentMessageBuilderPort(Protocol):
         *,
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
+        model_supports_vision: bool | None = None,
     ) -> list[Any] | None: ...
 
 @dataclass(frozen=True)
@@ -76,6 +77,7 @@ class AttachmentStageInput:
     attachments: list[dict] | None
     workspace_dir: str | Path | None = None
     session_id: str | None = None
+    model_supports_vision: bool | None = None
 
 @dataclass(frozen=True)
 class AttachmentStageOutput:
@@ -128,6 +130,7 @@ class AttachmentStage:
             inp.attachments or [],
             workspace_dir=inp.workspace_dir,
             session_id=inp.session_id,
+            model_supports_vision=inp.model_supports_vision,
         )
         turn_input = (
             inp.effective_runtime_message if extra_messages is None else ""

@@ -1,6 +1,7 @@
 """Tests for context window compaction logic."""
 
 import asyncio
+import base64
 import json
 
 import pytest
@@ -10,6 +11,8 @@ from opensquilla.session.compaction import (
     CompactionConfig,
     CompactionRequest,
     _api_round_groups,
+    _strip_inline_image_data,
+    _summarize_if_envelope,
     arm_compaction_deadline,
     await_compaction_phase,
     build_compaction_config_from_provider,
@@ -17,6 +20,7 @@ from opensquilla.session.compaction import (
     compact_context,
     compaction_remaining_seconds,
     estimate_entries_model_replay_chars,
+    estimate_entry_model_replay_chars,
     estimate_entry_model_replay_tokens,
     estimate_entry_replay_tokens,
 )
@@ -479,6 +483,112 @@ async def test_budget_check_counts_full_tool_call_replay_not_summarized_previews
 
     assert result.skip_reason != "within_compaction_budget"
     assert result.removed_count > 0
+
+
+# ---------------------------------------------------------------------------
+# Replay estimates exclude inline image base64 (fix for repeated compaction
+# when a vision model receives an uploaded image).
+# ---------------------------------------------------------------------------
+
+
+def _image_envelope_entry(b64: str) -> dict:
+    return {
+        "role": "user",
+        "content": json.dumps(
+            {
+                "text": "look at this",
+                "attachments": [
+                    {"type": "image/png", "data": b64, "name": "p.png"}
+                ],
+            }
+        ),
+        "token_count": None,
+    }
+
+
+def test_replay_token_estimate_strips_inline_image_base64() -> None:
+    # A ~1MB image persisted inline as base64 must not inflate the estimate to
+    # millions of tokens (which triggered repeated compaction on every turn).
+    payload = b"\x89PNG\r\n" + bytes(range(256)) * 4000
+    b64 = base64.b64encode(payload).decode("ascii")
+    entry = _image_envelope_entry(b64)
+
+    assert len(entry["content"]) > 1_000_000
+    tokens = estimate_entry_model_replay_tokens(entry)
+    assert 0 < tokens < 500
+    chars = estimate_entry_model_replay_chars(entry)
+    assert 0 < chars < 2000
+
+
+def test_replay_char_estimate_strips_inline_image_base64() -> None:
+    payload = b"\x89PNG\r\n" + bytes(range(256)) * 2000
+    b64 = base64.b64encode(payload).decode("ascii")
+    entry = _image_envelope_entry(b64)
+
+    assert estimate_entries_model_replay_chars([entry]) < 1000
+
+
+def test_replay_estimate_keeps_text_attachment_data() -> None:
+    # Non-image attachment payloads genuinely replay as text blocks, so their
+    # base64 must still count against the budget.
+    body = ("hello " * 2000).encode("ascii")
+    entry = {
+        "role": "user",
+        "content": json.dumps(
+            {
+                "text": "doc",
+                "attachments": [
+                    {
+                        "type": "text/plain",
+                        "data": base64.b64encode(body).decode("ascii"),
+                        "name": "a.txt",
+                    }
+                ],
+            }
+        ),
+        "token_count": None,
+    }
+    assert estimate_entry_model_replay_tokens(entry) > 500
+
+
+def test_compact_input_estimate_uses_envelope_summary() -> None:
+    # estimate_entry_replay_tokens feeds the compaction LLM input, which is
+    # built with _summarize_if_envelope — the estimate must match that shape
+    # rather than counting raw attachment base64.
+    payload = b"\x89PNG\r\n" + bytes(range(256)) * 2000
+    b64 = base64.b64encode(payload).decode("ascii")
+    entry = _image_envelope_entry(b64)
+    tokens = estimate_entry_replay_tokens(entry)
+    assert 0 < tokens < 500
+    assert "[user attached:" in _summarize_if_envelope(entry["content"])
+
+
+def test_strip_inline_image_data_passthrough_non_envelope() -> None:
+    assert _strip_inline_image_data("plain text") == "plain text"
+    assert _strip_inline_image_data('{"text": "no attachments"}') == '{"text": "no attachments"}'
+
+
+def test_replay_estimates_preserve_staged_image_refs() -> None:
+    # Staged uploads persist a small sha256_ref envelope; estimates stay small
+    # and unchanged in shape (no base64 to strip, no behavior change).
+    entry = {
+        "role": "user",
+        "content": json.dumps(
+            {
+                "text": "ref image",
+                "attachments": [
+                    {
+                        "sha256_ref": "abc123",
+                        "mime": "image/png",
+                        "name": "p.png",
+                        "size": 8,
+                    }
+                ],
+            }
+        ),
+        "token_count": None,
+    }
+    assert 0 < estimate_entry_model_replay_tokens(entry) < 500
 
 
 def test_replay_token_estimate_uses_tool_payload_summary_not_raw_arguments():

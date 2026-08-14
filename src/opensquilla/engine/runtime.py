@@ -3077,6 +3077,44 @@ def _render_file_context_block(filename: str, mime: str, content: str) -> str:
     return f'<file name="{safe_name}" mime="{safe_mime}">\n{safe_content}\n</file>'
 
 
+def _render_image_vision_degrade_marker(
+    *,
+    raw_bytes: bytes,
+    filename: str,
+    media_type: str,
+    turn_materializer: AttachmentWorkspaceMaterializer | None,
+    session_id: str | None,
+) -> str:
+    """Build the text marker for an image sent to a definitely non-vision model.
+
+    The image bytes never reach the provider, so a non-vision model no longer
+    receives a doomed request (upstream 400 ``MODEL_CAPABILITY_NOT_SUPPORTED``)
+    and the image never inflates the model context. When a workspace exists the
+    image is materialized so tools (filesystem/vision/OCR skills, MCP) can still
+    reach it; the marker names the workspace path.
+    """
+    marker = (
+        f"[image omitted: the resolved model does not support vision input; "
+        f"{filename} ({media_type}, {len(raw_bytes)} bytes) was not sent to the model."
+    )
+    if turn_materializer is not None:
+        result = turn_materializer.materialize_bytes(
+            raw_bytes,
+            name=filename,
+            mime=media_type,
+            session_id=session_id,
+        )
+        if result.available and result.rel_path:
+            marker += (
+                f"\nThe image is available in the workspace at {result.rel_path} — "
+                "inspect or convert it with filesystem, shell, or image tools if needed."
+            )
+        else:
+            detail = result.error or "workspace materialization unavailable"
+            marker += f"\n[workspace materialization unavailable: {detail}]"
+    return marker
+
+
 def _truncate_attachment_text(text: str, *, limit: int = _PDF_ATTACHMENT_TEXT_LIMIT) -> str:
     if len(text) <= limit:
         return text
@@ -4849,12 +4887,23 @@ class TurnRunner:
                 )
                 if attachment_materialization_session_id is None:
                     attachment_materialization_session_id = session_key
+            model_supports_vision = None
+            if attachments and model_caps is not None:
+                supports_vision = getattr(model_caps, "supports_vision", None)
+                if supports_vision is True:
+                    model_supports_vision = True
+                elif supports_vision is False and self._model_vision_capability_known(
+                    resolved_model,
+                    active_provider_id,
+                ):
+                    model_supports_vision = False
             att_outcome = await self._attachment_stage.run(
                 AttachmentStageInput(
                     effective_runtime_message=effective_runtime_message,
                     attachments=attachments,
                     workspace_dir=agent_config.workspace_dir,
                     session_id=attachment_materialization_session_id,
+                    model_supports_vision=model_supports_vision,
                 )
             )
             att_out = att_outcome.require_output()
@@ -11371,6 +11420,25 @@ class TurnRunner:
     def _attachment_media_root(self) -> Path:
         return self._attachment_media_root_from_config(self._config)
 
+    def _model_vision_capability_known(self, model: str, provider: str) -> bool:
+        """True when the catalog resolved the model beyond the synthesized floor.
+
+        ``ModelCatalog.get_capabilities`` reports ``supports_vision=False`` for
+        models nothing in the layered catalog knows (the synthesized floor has
+        no vision knowledge). Treating that as a definite fact would degrade
+        image uploads for self-hosted/unknown vision models. The vision gate
+        only acts on definitive catalog knowledge, mirroring the routing
+        capability gate's "never act on ignorance" rule.
+        """
+        catalog = self._model_catalog
+        if catalog is None:
+            return False
+        try:
+            entry = catalog.resolve_entry(model, provider=provider)
+        except Exception:  # noqa: BLE001 - best-effort capability probe
+            return False
+        return getattr(entry, "source", "synthesized") != "synthesized"
+
     @staticmethod
     def _build_attachment_messages(
         message: str,
@@ -11380,6 +11448,7 @@ class TurnRunner:
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
         workspace_attachment_budget_bytes: int | None = None,
+        model_supports_vision: bool | None = None,
     ) -> list | None:
         """Build a multimodal user message that carries the attachments.
 
@@ -11392,6 +11461,15 @@ class TurnRunner:
                                      ``<file name="…" mime="…">…</file>``
                                      envelope with escaped filename and content
                                      boundaries.
+
+        ``model_supports_vision`` is ``True``/``False`` when the resolved model's
+        catalog capability is definite and ``None`` when it is unknown. When a
+        resolved model is definitely NOT vision-capable, image attachments are
+        degraded instead of sent: the bytes are materialized into the agent
+        workspace and replaced with a text marker (``_render_image_vision_degrade_marker``)
+        so the turn never dispatches a request the provider is guaranteed to
+        reject with a vision capability error, and the image never enters the
+        model context. ``None`` keeps the historical behavior (image block sent).
         """
 
         if not attachments:
@@ -11502,7 +11580,22 @@ class TurnRunner:
                 continue
 
             if media_type in _IMAGE_ATTACHMENT_MIMES:
-                attachment_blocks.append(ContentBlockImage(media_type=media_type, data=data))
+                if model_supports_vision is False:
+                    attachment_blocks.append(
+                        ContentBlockText(
+                            text=_render_image_vision_degrade_marker(
+                                raw_bytes=raw_bytes,
+                                filename=filename,
+                                media_type=media_type,
+                                turn_materializer=turn_materializer,
+                                session_id=session_id,
+                            )
+                        )
+                    )
+                else:
+                    attachment_blocks.append(
+                        ContentBlockImage(media_type=media_type, data=data)
+                    )
             elif media_type == "application/pdf":
                 try:
                     extracted_pdf_text = _extract_pdf_attachment_text(raw_bytes, filename)
