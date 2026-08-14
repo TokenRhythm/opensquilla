@@ -751,7 +751,7 @@ async def test_agent_does_not_replay_after_user_visible_text_then_raised_excepti
 
 
 @pytest.mark.asyncio
-async def test_agent_does_not_replay_after_visible_tool_lifecycle_starts() -> None:
+async def test_agent_retries_after_uncommitted_tool_lifecycle_fails() -> None:
     class _PartialToolThenSuccessProvider:
         provider_name = "openai"
 
@@ -772,7 +772,7 @@ async def test_agent_does_not_replay_after_visible_tool_lifecycle_starts() -> No
             if attempt == 1:
                 yield ToolUseStartEvent(tool_use_id="partial", tool_name="echo")
                 raise RuntimeError("partial tool stream")
-            yield TextDeltaEvent(text="must not replay")
+            yield TextDeltaEvent(text="retry response")
             yield DoneEvent(stop_reason="stop")
 
     provider = _PartialToolThenSuccessProvider()
@@ -787,13 +787,13 @@ async def test_agent_does_not_replay_after_visible_tool_lifecycle_starts() -> No
 
     events = [event async for event in agent.run_turn("hello")]
 
-    assert provider.calls == 1
-    assert len(
-        [event for event in events if getattr(event, "kind", "") == "tool_use_start"]
-    ) == 1
-    terminal = next(event for event in events if isinstance(event, EngineErrorEvent))
-    assert terminal.code == "response_incomplete"
-    assert not any("must not replay" in repr(event) for event in events)
+    assert provider.calls == 2
+    assert not any(
+        getattr(event, "kind", "").startswith("tool_use_") for event in events
+    )
+    assert any(getattr(event, "text", "") == "retry response" for event in events)
+    assert any(isinstance(event, EngineDoneEvent) for event in events)
+    assert not any(isinstance(event, EngineErrorEvent) for event in events)
 
 
 @pytest.mark.asyncio
