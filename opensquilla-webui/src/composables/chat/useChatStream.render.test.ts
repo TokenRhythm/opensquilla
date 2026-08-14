@@ -356,6 +356,7 @@ describe('useChatStream render coalescing', () => {
     ])
 
     expect(api.foldedTurn.value.statusHistory.map(entry => entry.action)).toEqual([
+      'Sending',
       'provider:requesting',
       'provider:retry_wait:0',
       'provider:retrying:0:0',
