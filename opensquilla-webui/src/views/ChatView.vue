@@ -2537,6 +2537,7 @@ const {
   closeSlashMenu,
   completeSlashCmd,
   activateSlashCmd,
+  classifySlashCommand,
   executeSlashCommand,
   restoreDurableMetaDrafts: restoreServerMetaDrafts,
 } = chatSlashCommands
@@ -2640,6 +2641,7 @@ const chatSend = useChatSend({
   restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
   reconcileTaskOwnership: () => retrySessionMetadata(),
+  classifySlashCommand,
   executeSlashCommand,
   closeSlashMenu,
   autoResizeTextarea,

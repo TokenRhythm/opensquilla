@@ -142,6 +142,8 @@ export interface MetaCommandInvocation {
 
 export type DurableMetaDraft = MetaLaunchDraftPayload
 
+export type SlashCommandClassification = 'registered' | 'unknown' | 'unavailable'
+
 export function parseMetaCommandInvocation(args: string): MetaCommandInvocation | null {
   const trimmed = String(args || '').trim()
   if (!trimmed) return null
@@ -828,25 +830,35 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   }
 
   async function executeSlashCommand(text: string): Promise<boolean> {
-    if (!slashCatalogLoaded.value) await loadSlashCommands()
+    const classification = await classifySlashCommand(text)
     const trimmed = text.trim()
     const firstWhitespace = trimmed.search(/\s/)
     const cmdText = firstWhitespace === -1 ? trimmed : trimmed.slice(0, firstWhitespace)
     const args = firstWhitespace === -1 ? '' : trimmed.slice(firstWhitespace).trimStart()
+    if (classification === 'unavailable') {
+      closeSlashMenu()
+      options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmdText }))
+      return true
+    }
     const commandKey = slashCommandKey(cmdText)
     const cmd = slashCmds.value.find(command =>
       slashCommandKeys(command).includes(commandKey),
     )
     if (!cmd) {
       closeSlashMenu()
-      options.notify(i18n.global.t('chat.slashCommands.unknown', { command: cmdText }))
-      // Unknown slash input is NOT a command: report unhandled so the caller
-      // (useChatSend.onSend) falls through and sends it as ordinary chat text.
-      // The notify above still surfaces a visible hint to the user.
       return false
     }
     selectSlashCmd(cmd, args)
     return true
+  }
+
+  async function classifySlashCommand(text: string): Promise<SlashCommandClassification> {
+    if (!slashCatalogLoaded.value) await loadSlashCommands()
+    if (!slashCatalogLoaded.value) return 'unavailable'
+    const commandKey = slashCommandKey(text)
+    return slashCmds.value.some(command => slashCommandKeys(command).includes(commandKey))
+      ? 'registered'
+      : 'unknown'
   }
 
   return {
@@ -860,6 +872,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     completeSlashCmd,
     activateSlashCmd,
     selectSlashCmd,
+    classifySlashCommand,
     executeSlashCommand,
     restoreDurableMetaDrafts,
   }

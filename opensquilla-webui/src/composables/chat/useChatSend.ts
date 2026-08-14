@@ -28,6 +28,7 @@ import type {
   PendingSteerPayload,
 } from '@/composables/chat/useChatPendingQueue'
 import type { ChatSteerDeliveryApi } from '@/composables/chat/useChatSteerDelivery'
+import type { SlashCommandClassification } from '@/composables/chat/useChatSlashCommands'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
 import {
   hasSendableModelInputImageAttachment,
@@ -401,6 +402,7 @@ export interface UseChatSendOptions {
   reconcileTaskOwnership?: () => void | Promise<unknown>
   hiddenControlStorage?: HiddenControlStorage | null
   metaDiscardStorage?: MetaDiscardStorage | null
+  classifySlashCommand: (text: string) => Promise<SlashCommandClassification>
   executeSlashCommand: (text: string) => Promise<boolean>
   closeSlashMenu: () => void
   autoResizeTextarea: () => void
@@ -1689,10 +1691,28 @@ export function useChatSend(options: UseChatSendOptions) {
       || compactInFlight
       || handoffInFlight
     ) {
-      if (!bypassSlashCommand && !isLiteralSlash && isControlInput(text)) {
-        // Slash and bang inputs are client control-plane commands. Running
+      const slashClassification = !bypassSlashCommand
+        && !isLiteralSlash
+        && text.startsWith('/')
+        ? await options.classifySlashCommand(text)
+        : null
+      if (
+        slashClassification !== null
+        && (
+          options.sessionKey.value !== requestSessionKey
+          || !composerMatchesSnapshot(composerSnapshot)
+        )
+      ) return
+      if (
+        !bypassSlashCommand
+        && !isLiteralSlash
+        && isControlInput(text)
+        && slashClassification !== 'unknown'
+      ) {
+        // Registered slash commands and bang inputs are live controls. Running
         // them later can target a different task/session, so keep the exact
-        // command editable in the composer while the current turn is busy.
+        // command editable while busy. Confirmed unknown slash input is plain
+        // text and continues into the ordinary follow-up queue below.
         return
       }
       if (!hasPayload) return

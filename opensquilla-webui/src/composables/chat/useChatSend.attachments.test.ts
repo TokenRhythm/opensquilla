@@ -164,6 +164,7 @@ function makeOptions(overrides: Partial<UseChatSendOptions> = {}) {
     steerDelivery,
     popAllPendingIntoComposer: vi.fn(() => false),
     hiddenControlStorage: memoryStorage(),
+    classifySlashCommand: vi.fn(async () => 'registered' as const),
     executeSlashCommand: vi.fn(async () => false),
     closeSlashMenu: vi.fn(),
     autoResizeTextarea: vi.fn(),
@@ -5930,6 +5931,44 @@ describe('useChatSend Ensemble image guard', () => {
 })
 
 describe('useChatSend slash-prefixed input fall-through', () => {
+  it('queues unknown slash-prefixed text as a follow-up while a turn is busy', async () => {
+    const inputText = ref('/gamemode creative')
+    const enqueuePendingInput = vi.fn(() => true)
+    const classifySlashCommand = vi.fn(async () => 'unknown' as const)
+    const { api, rpc, stream } = makeOptions({
+      inputText,
+      enqueuePendingInput,
+      classifySlashCommand,
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(classifySlashCommand).toHaveBeenCalledWith('/gamemode creative')
+    expect(enqueuePendingInput).toHaveBeenCalledWith('/gamemode creative', undefined)
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
+  it.each(['registered', 'unavailable'] as const)(
+    'keeps %s slash input editable while a turn is busy',
+    async classification => {
+      const inputText = ref('/coding')
+      const enqueuePendingInput = vi.fn(() => true)
+      const { api, rpc, stream } = makeOptions({
+        inputText,
+        enqueuePendingInput,
+        classifySlashCommand: vi.fn(async () => classification),
+      })
+      stream.isStreaming.value = true
+
+      await api.onSend()
+
+      expect(enqueuePendingInput).not.toHaveBeenCalled()
+      expect(rpc.call).not.toHaveBeenCalled()
+      expect(inputText.value).toBe('/coding')
+    },
+  )
+
   it('sends an unknown slash-prefixed input as a normal message exactly once', async () => {
     const inputText = ref('/gamemode creative')
     const executeSlashCommand = vi.fn(async () => false)
@@ -5943,6 +5982,31 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     expect(rpc.call).toHaveBeenCalledOnce()
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       message: '/gamemode creative',
+    }))
+  })
+
+  it('keeps attachments on an unknown slash-prefixed normal message', async () => {
+    const pendingAttachments = ref<Attachment[]>([{
+      kind: 'staged',
+      local_id: 92,
+      name: 'commands.txt',
+      mime: 'text/plain',
+      file_uuid: 'file-slash-text',
+    }])
+    const { api, rpc } = makeOptions({
+      inputText: ref('/usr/bin/env'),
+      pendingAttachments,
+      executeSlashCommand: vi.fn(async () => false),
+    })
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: '/usr/bin/env',
+      attachments: [expect.objectContaining({
+        file_uuid: 'file-slash-text',
+        mime: 'text/plain',
+      })],
     }))
   })
 

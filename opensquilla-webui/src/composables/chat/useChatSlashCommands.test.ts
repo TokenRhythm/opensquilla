@@ -377,7 +377,7 @@ describe('useChatSlashCommands Coding mode', () => {
 })
 
 describe('useChatSlashCommands recovery', () => {
-  it('falls through to a normal send for an unknown slash input while still showing a hint', async () => {
+  it('falls through silently for unknown slash input', async () => {
     const {
       api,
       inputText,
@@ -387,11 +387,9 @@ describe('useChatSlashCommands recovery', () => {
 
     const handled = await api.executeSlashCommand(inputText.value)
 
-    // Unknown slash input is NOT a command: report unhandled so the caller
-    // (useChatSend.onSend) sends it as ordinary chat text.
     expect(handled).toBe(false)
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/gamemode'))
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('//'))
+    expect(notify).not.toHaveBeenCalled()
+    await expect(api.classifySlashCommand(inputText.value)).resolves.toBe('unknown')
   })
 
   it('still executes a registered slash command as a command', async () => {
