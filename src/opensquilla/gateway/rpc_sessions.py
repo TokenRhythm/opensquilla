@@ -2208,12 +2208,8 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
             guest_limit = 50
         limit = max(1, min(guest_limit, 100))
         sessions = await storage.list_sessions(limit=limit, guest_owner_id=owner_id)
-        has_more = False
-        next_cursor = None
     else:
         sessions = await storage.list_sessions(limit=limit)
-        has_more = False
-        next_cursor = None
 
     if is_guest:
         sessions = [

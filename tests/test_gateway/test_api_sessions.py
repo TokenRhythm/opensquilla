@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from starlette.testclient import TestClient
 
-from opensquilla.gateway.app import create_gateway_app
+import opensquilla.gateway.app as gateway_app
 from opensquilla.gateway.config import GatewayConfig
 
 
@@ -32,12 +32,11 @@ class _FakeDispatcher:
 
 def test_api_sessions_forwards_pagination_query_params() -> None:
     dispatcher = _FakeDispatcher()
-    import opensquilla.gateway.app as gateway_app
 
     original = gateway_app.get_dispatcher
     gateway_app.get_dispatcher = lambda: dispatcher
     try:
-        app = create_gateway_app(GatewayConfig())
+        app = gateway_app.create_gateway_app(GatewayConfig())
     finally:
         gateway_app.get_dispatcher = original
 
@@ -59,12 +58,11 @@ def test_api_sessions_forwards_pagination_query_params() -> None:
 
 def test_api_sessions_without_query_params_keeps_default_rpc_params() -> None:
     dispatcher = _FakeDispatcher()
-    import opensquilla.gateway.app as gateway_app
 
     original = gateway_app.get_dispatcher
     gateway_app.get_dispatcher = lambda: dispatcher
     try:
-        app = create_gateway_app(GatewayConfig())
+        app = gateway_app.create_gateway_app(GatewayConfig())
     finally:
         gateway_app.get_dispatcher = original
 
@@ -85,12 +83,11 @@ def test_api_sessions_maps_empty_cursor_param_to_bad_request() -> None:
             error=SimpleNamespace(code="INVALID_PARAMS", message="invalid cursor"),
         )
     )
-    import opensquilla.gateway.app as gateway_app
 
     original = gateway_app.get_dispatcher
     gateway_app.get_dispatcher = lambda: dispatcher
     try:
-        app = create_gateway_app(GatewayConfig())
+        app = gateway_app.create_gateway_app(GatewayConfig())
     finally:
         gateway_app.get_dispatcher = original
 
