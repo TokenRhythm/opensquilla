@@ -61,6 +61,33 @@ function memoryHandoffWal(): PendingInputWal {
     list: async () => [],
     delete: async () => {},
     putHandoff: async record => { handoffs.set(record.ownerRequestId, structuredClone(record)) },
+    prepareHandoff: async record => {
+      const current = handoffs.get(record.ownerRequestId)
+      if (current) return { applied: false, record: structuredClone(current) }
+      const prepared = structuredClone(record)
+      handoffs.set(record.ownerRequestId, prepared)
+      return { applied: true, record: structuredClone(prepared) }
+    },
+    compareAndSwapHandoff: async (
+      ownerRequestId,
+      expectedWalOwnerId,
+      expectedWalRevision,
+      record,
+    ) => {
+      const current = handoffs.get(ownerRequestId)
+      if (
+        !current
+        || current.walOwnerId !== expectedWalOwnerId
+        || current.walRevision !== expectedWalRevision
+      ) return { applied: false, record: current ? structuredClone(current) : null }
+      if (!record) {
+        handoffs.delete(ownerRequestId)
+        return { applied: true, record: null }
+      }
+      const next = structuredClone(record)
+      handoffs.set(ownerRequestId, next)
+      return { applied: true, record: structuredClone(next) }
+    },
     listHandoffs: async () => [...handoffs.values()].map(record => structuredClone(record)),
     acceptHandoff: async (ownerRequestId, acceptedSessionKey) => {
       const record = handoffs.get(ownerRequestId)
@@ -418,6 +445,20 @@ describe('useChatSend dedicated usage-barrier replay', () => {
       list: async () => [],
       delete: async () => {},
       putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        if (retained) return { applied: false, record: structuredClone(retained) }
+        retained = structuredClone(record)
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
       listHandoffs: async () => retained ? [structuredClone(retained)] : [],
       deleteHandoff: async () => { retained = null },
       close: () => {},
@@ -481,6 +522,301 @@ describe('useChatSend dedicated usage-barrier replay', () => {
     expect(inputText.value).toBe('keep draft')
   })
 
+  it('never recovers an unarmed write-after-throw and safely retries the same receipt', async () => {
+    let retained: ResponseHandoffWalRecord | null = null
+    let failPrepareAfterWrite = true
+    let failDelete = true
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        if (retained) return { applied: false, record: structuredClone(retained) }
+        retained = structuredClone(record)
+        if (failPrepareAfterWrite) {
+          failPrepareAfterWrite = false
+          throw new Error('storage reported failure after write')
+        }
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        if (!record && failDelete) throw new Error('delete unavailable')
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { throw new Error('legacy delete unavailable') },
+      close: () => {},
+    }
+    const { api, rpc } = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toMatchObject({ state: 'preparing', walRevision: 1 })
+    const firstParams = structuredClone(retained!.params)
+
+    await api.recoverResponseHandoffs()
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toMatchObject({ state: 'preparing', walRevision: 1 })
+
+    failDelete = false
+    rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'retry-after-unarmed',
+    })
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId: firstParams.clientRequestId,
+      clientMessageId: firstParams.clientMessageId,
+      forkBeforeMessageId: 'usage-primary',
+    }))
+  })
+
+  it('does not dispatch when arming the prepared handoff fails', async () => {
+    let retained: ResponseHandoffWalRecord | null = null
+    let failArm = true
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        if (retained) return { applied: false, record: structuredClone(retained) }
+        retained = structuredClone(record)
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        if (record?.state === 'submitting' && failArm) {
+          failArm = false
+          throw new Error('arm transaction aborted')
+        }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const { api, rpc } = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(false)
+
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toBeNull()
+  })
+
+  it.each([
+    'session switch',
+    'busy work',
+    'anchor disappearance',
+  ])('rechecks %s after delayed arm and safely retries the same receipt', async (invalidatedBy) => {
+    let retained: ResponseHandoffWalRecord | null = null
+    let releaseArm!: () => void
+    const armBlocked = new Promise<void>(resolve => { releaseArm = resolve })
+    let blockFirstArm = true
+    let armStarted = false
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        if (retained) return { applied: false, record: structuredClone(retained) }
+        retained = structuredClone(record)
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        if (record?.state === 'submitting' && blockFirstArm) {
+          blockFirstArm = false
+          armStarted = true
+          await armBlocked
+        }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const taskOwnership = useChatTaskOwnership()
+    const sessionKey = ref('agent:main:webchat:test')
+    const messages = ref(usageReplayMessages())
+    const { api, rpc } = makeOptions({
+      messages,
+      pendingInputWal,
+      sessionKey,
+      taskOwnership,
+    })
+    rpc.call.mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test',
+      task_id: 'post-arm-retry',
+    })
+
+    const replay = api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await vi.waitFor(() => expect(armStarted).toBe(true))
+    const firstParams = structuredClone(retained!.params)
+    if (invalidatedBy === 'session switch') {
+      sessionKey.value = 'agent:main:webchat:other'
+    } else if (invalidatedBy === 'busy work') {
+      taskOwnership.runningTaskId.value = 'other-running-task'
+    } else {
+      messages.value = messages.value.filter(message => message.messageId !== 'usage-primary')
+    }
+    releaseArm()
+
+    expect(await replay).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toBeNull()
+
+    sessionKey.value = 'agent:main:webchat:test'
+    taskOwnership.runningTaskId.value = ''
+    messages.value = usageReplayMessages()
+    expect(await api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })).toBe(true)
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      clientRequestId: firstParams.clientRequestId,
+      clientMessageId: firstParams.clientMessageId,
+      forkBeforeMessageId: 'usage-primary',
+    }))
+  })
+
+  it('lets recovery delete an unarmed record before a concurrent arm without sending it', async () => {
+    let retained: ResponseHandoffWalRecord | null = null
+    let releasePrepare!: () => void
+    const prepareBlocked = new Promise<void>(resolve => { releasePrepare = resolve })
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        retained = structuredClone(record)
+        await prepareBlocked
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const live = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+    })
+    const recovery = makeOptions({ pendingInputWal })
+
+    const replay = live.api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await vi.waitFor(() => expect(retained?.state).toBe('preparing'))
+    await recovery.api.recoverResponseHandoffs()
+    releasePrepare()
+
+    expect(await replay).toBe(false)
+    expect(live.rpc.call).not.toHaveBeenCalled()
+    expect(recovery.rpc.call).not.toHaveBeenCalled()
+    expect(retained).toBeNull()
+  })
+
+  it('does not let stale pre-dispatch cleanup erase a concurrently armed record', async () => {
+    let retained: ResponseHandoffWalRecord | null = null
+    let releasePrepare!: () => void
+    const prepareBlocked = new Promise<void>(resolve => { releasePrepare = resolve })
+    const sessionKey = ref('agent:main:webchat:test')
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff: async record => {
+        retained = structuredClone(record)
+        await prepareBlocked
+        return { applied: true, record: structuredClone(record) }
+      },
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
+      listHandoffs: async () => retained ? [structuredClone(retained)] : [],
+      deleteHandoff: async () => { retained = null },
+      close: () => {},
+    }
+    const { api, rpc } = makeOptions({
+      messages: ref(usageReplayMessages()),
+      pendingInputWal,
+      sessionKey,
+    })
+
+    const replay = api.sendUsageBarrierReplay({
+      text: '/reset',
+      forkBeforeMessageId: 'usage-primary',
+    })
+    await vi.waitFor(() => expect(retained?.state).toBe('preparing'))
+    retained = {
+      ...retained!,
+      state: 'submitting',
+      walRevision: retained!.walRevision! + 1,
+      updatedAt: Date.now(),
+    }
+    sessionKey.value = 'agent:main:webchat:other'
+    releasePrepare()
+
+    expect(await replay).toBe(false)
+    expect(rpc.call).not.toHaveBeenCalled()
+    expect(retained).toMatchObject({ state: 'submitting', walRevision: 2 })
+  })
+
   it.each([
     'session switch',
     'busy stream',
@@ -493,18 +829,29 @@ describe('useChatSend dedicated usage-barrier replay', () => {
     const persistence = new Promise<void>(resolve => { releasePersistence = resolve })
     let firstPersist = true
     let retained: ResponseHandoffWalRecord | null = null
-    const putHandoff = vi.fn(async (record: ResponseHandoffWalRecord) => {
+    const prepareHandoff = vi.fn(async (record: ResponseHandoffWalRecord) => {
       retained = structuredClone(record)
       if (firstPersist) {
         firstPersist = false
         await persistence
       }
+      return { applied: true, record: structuredClone(record) }
     })
     const pendingInputWal: PendingInputWal = {
       put: async () => {},
       list: async () => [],
       delete: async () => {},
-      putHandoff,
+      putHandoff: async record => { retained = structuredClone(record) },
+      prepareHandoff,
+      compareAndSwapHandoff: async (_owner, expectedOwner, expectedRevision, record) => {
+        if (
+          !retained
+          || retained.walOwnerId !== expectedOwner
+          || retained.walRevision !== expectedRevision
+        ) return { applied: false, record: retained ? structuredClone(retained) : null }
+        retained = record ? structuredClone(record) : null
+        return { applied: true, record: retained ? structuredClone(retained) : null }
+      },
       listHandoffs: async () => retained ? [structuredClone(retained)] : [],
       deleteHandoff: async () => { retained = null },
       close: () => {},
@@ -532,7 +879,7 @@ describe('useChatSend dedicated usage-barrier replay', () => {
       text: '/reset',
       forkBeforeMessageId: 'usage-primary',
     })
-    await vi.waitFor(() => expect(putHandoff).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(prepareHandoff).toHaveBeenCalledOnce())
     const firstParams = structuredClone(retained!.params)
     if (invalidatedBy === 'session switch') {
       sessionKey.value = 'agent:main:webchat:other'

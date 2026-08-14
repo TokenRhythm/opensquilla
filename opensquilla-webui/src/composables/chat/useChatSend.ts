@@ -81,6 +81,8 @@ interface SendAttempt {
   forkBeforeMessageId: string | null
   workspaceId: string | null
   restoreComposerOnHandoffFailure?: boolean
+  handoffWalOwnerId?: string
+  handoffWalRevision?: number
   params: ChatSendParams
   requiresIdempotentReplay?: boolean
   // A Stop issued before durable acceptance is known belongs to this exact
@@ -140,6 +142,8 @@ interface DispatchSendOptions {
   includeEmptyAttachments?: boolean
   /** Revalidate protocol-owned sends after every awaited pre-dispatch step. */
   preDispatchGuard?: (stage: 'preflight' | 'before_rpc') => boolean
+  /** Require a non-replayable WAL preparation that is armed immediately before RPC. */
+  requirePreparedHandoff?: boolean
 }
 
 export interface UsageBarrierReplayPayload {
@@ -974,9 +978,17 @@ export function useChatSend(options: UseChatSendOptions) {
 
   async function persistResponseHandoff(
     attempt: SendAttempt,
+    requirePrepared = false,
   ): Promise<ResponseHandoffWalRecord | null> {
-    if (!options.pendingInputWal?.putHandoff) return null
+    const wal = options.pendingInputWal
+    if (!wal) return null
+    if (requirePrepared && (!wal.prepareHandoff || !wal.compareAndSwapHandoff)) return null
+    if (!requirePrepared && !wal.putHandoff) return null
     const now = Date.now()
+    if (requirePrepared) {
+      attempt.handoffWalOwnerId ||= createClientRequestId()
+      attempt.handoffWalRevision ||= 1
+    }
     const record: ResponseHandoffWalRecord = {
       schemaVersion: 1,
       ownerRequestId: attempt.clientRequestId,
@@ -989,26 +1001,128 @@ export function useChatSend(options: UseChatSendOptions) {
       ...(attempt.restoreComposerOnHandoffFailure === false
         ? { restoreComposerOnFailure: false }
         : {}),
-      state: 'submitting',
+      ...(requirePrepared
+        ? {
+            walOwnerId: attempt.handoffWalOwnerId!,
+            walRevision: attempt.handoffWalRevision!,
+          }
+        : {}),
+      state: requirePrepared ? 'preparing' : 'submitting',
       createdAt: now,
       updatedAt: now,
     }
     try {
-      await options.pendingInputWal.putHandoff(record)
+      if (requirePrepared) {
+        const prepared = await wal.prepareHandoff!(record)
+        if (prepared.applied) return prepared.record
+        const current = prepared.record
+        if (
+          current?.state === 'preparing'
+          && current.ownerRequestId === record.ownerRequestId
+          && current.clientMessageId === record.clientMessageId
+          && current.walOwnerId === record.walOwnerId
+          && current.walRevision === record.walRevision
+        ) return current
+        return null
+      }
+      await wal.putHandoff!(record)
       return record
     } catch {
-      // A storage adapter may fail after partially writing. Remove that owner
-      // identity before callers decide whether an in-memory send can proceed,
-      // so recovery cannot later dispatch a request the live gate rejected.
-      await options.pendingInputWal.deleteHandoff?.(record.ownerRequestId).catch(() => {})
+      if (requirePrepared && record.walOwnerId && record.walRevision) {
+        // The create operation may report failure after its write became
+        // visible. A conditional delete cannot erase another tab's arm or
+        // acceptance, and a failed delete leaves only an unarmed record.
+        await wal.compareAndSwapHandoff?.(
+          record.ownerRequestId,
+          record.walOwnerId,
+          record.walRevision,
+          null,
+        ).catch(() => {})
+      } else {
+        await wal.deleteHandoff?.(record.ownerRequestId).catch(() => {})
+      }
       return null
     }
+  }
+
+  async function armPreparedResponseHandoff(
+    record: ResponseHandoffWalRecord | null,
+    attempt: SendAttempt,
+  ): Promise<ResponseHandoffWalRecord | null> {
+    const wal = options.pendingInputWal
+    if (
+      !record
+      || record.state !== 'preparing'
+      || !record.walOwnerId
+      || !record.walRevision
+      || !wal?.compareAndSwapHandoff
+    ) return null
+    const armed: ResponseHandoffWalRecord = {
+      ...record,
+      state: 'submitting',
+      walRevision: record.walRevision + 1,
+      updatedAt: Date.now(),
+    }
+    try {
+      const transition = await wal.compareAndSwapHandoff(
+        record.ownerRequestId,
+        record.walOwnerId,
+        record.walRevision,
+        armed,
+      )
+      if (!transition.applied || !transition.record) return null
+      attempt.handoffWalRevision = transition.record.walRevision
+      return transition.record
+    } catch {
+      return null
+    }
+  }
+
+  async function disarmResponseHandoff(
+    record: ResponseHandoffWalRecord,
+    attempt: SendAttempt,
+  ): Promise<ResponseHandoffWalRecord | null> {
+    const wal = options.pendingInputWal
+    if (
+      record.state !== 'submitting'
+      || !record.walOwnerId
+      || !record.walRevision
+      || !wal?.compareAndSwapHandoff
+    ) return null
+    const preparing: ResponseHandoffWalRecord = {
+      ...record,
+      state: 'preparing',
+      walRevision: record.walRevision + 1,
+      updatedAt: Date.now(),
+    }
+    const transition = await wal.compareAndSwapHandoff(
+      record.ownerRequestId,
+      record.walOwnerId,
+      record.walRevision,
+      preparing,
+    ).catch(() => null)
+    if (!transition?.applied || !transition.record) return null
+    attempt.handoffWalRevision = transition.record.walRevision
+    return transition.record
   }
 
   async function discardUnsentResponseHandoff(
     record: ResponseHandoffWalRecord | null,
   ): Promise<void> {
     if (!record) return
+    if (
+      record.walOwnerId
+      && record.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      await options.pendingInputWal.compareAndSwapHandoff(
+        record.ownerRequestId,
+        record.walOwnerId,
+        record.walRevision,
+        null,
+      ).catch(() => {})
+      return
+    }
     const failed: ResponseHandoffWalRecord = {
       ...record,
       state: 'failed',
@@ -1019,33 +1133,122 @@ export function useChatSend(options: UseChatSendOptions) {
     await options.pendingInputWal?.deleteHandoff?.(record.ownerRequestId).catch(() => {})
   }
 
+  async function deleteResponseHandoff(
+    record: ResponseHandoffWalRecord,
+  ): Promise<boolean> {
+    if (
+      record.walOwnerId
+      && record.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      const deletion = await options.pendingInputWal.compareAndSwapHandoff(
+        record.ownerRequestId,
+        record.walOwnerId,
+        record.walRevision,
+        null,
+      ).catch(() => null)
+      return deletion?.applied === true
+    }
+    if (!options.pendingInputWal?.deleteHandoff) return false
+    try {
+      await options.pendingInputWal.deleteHandoff(record.ownerRequestId)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   async function markResponseHandoffAccepted(
     gate: ResponseHandoffGate,
     acceptedSessionKey: string,
   ): Promise<void> {
-    if (!gate.durableRecord || !options.pendingInputWal?.putHandoff) return
-    gate.durableRecord = {
-      ...gate.durableRecord,
+    const current = gate.durableRecord
+    if (!current) return
+    const accepted: ResponseHandoffWalRecord = {
+      ...current,
       state: 'accepted',
       acceptedSessionKey,
+      ...(current.walRevision ? { walRevision: current.walRevision + 1 } : {}),
       updatedAt: Date.now(),
     }
-    await options.pendingInputWal.putHandoff(gate.durableRecord).catch(() => {})
+    if (
+      current.walOwnerId
+      && current.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      const transition = await options.pendingInputWal.compareAndSwapHandoff(
+        current.ownerRequestId,
+        current.walOwnerId,
+        current.walRevision,
+        accepted,
+      ).catch(() => null)
+      if (transition?.applied && transition.record) gate.durableRecord = transition.record
+      return
+    }
+    if (!options.pendingInputWal?.putHandoff) return
+    gate.durableRecord = accepted
+    await options.pendingInputWal.putHandoff(accepted).catch(() => {})
   }
 
   async function markResponseHandoffFailed(
     gate: ResponseHandoffGate,
     error: unknown,
   ): Promise<void> {
-    if (!gate.durableRecord || !options.pendingInputWal?.putHandoff) return
-    gate.durableRecord = {
-      ...gate.durableRecord,
+    const current = gate.durableRecord
+    if (!current) return
+    const failed: ResponseHandoffWalRecord = {
+      ...current,
       state: 'failed',
       errorCode: errorCode(error),
+      ...(current.walRevision ? { walRevision: current.walRevision + 1 } : {}),
       updatedAt: Date.now(),
     }
-    await options.pendingInputWal.putHandoff(gate.durableRecord).catch(() => {})
+    if (
+      current.walOwnerId
+      && current.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      const transition = await options.pendingInputWal.compareAndSwapHandoff(
+        current.ownerRequestId,
+        current.walOwnerId,
+        current.walRevision,
+        failed,
+      ).catch(() => null)
+      if (transition?.applied && transition.record) gate.durableRecord = transition.record
+    } else if (options.pendingInputWal?.putHandoff) {
+      gate.durableRecord = failed
+      await options.pendingInputWal.putHandoff(failed).catch(() => {})
+    }
     await options.failPendingQueueHandoff?.(gate.ownerRequestId)
+  }
+
+  async function resetResponseHandoffForRetry(
+    gate: ResponseHandoffGate,
+    attempt: SendAttempt,
+  ): Promise<void> {
+    const current = gate.durableRecord
+    if (
+      !current?.walOwnerId
+      || !current.walRevision
+      || current.state !== 'submitting'
+      || !options.pendingInputWal?.compareAndSwapHandoff
+    ) return
+    const preparing: ResponseHandoffWalRecord = {
+      ...current,
+      state: 'preparing',
+      walRevision: current.walRevision + 1,
+      updatedAt: Date.now(),
+    }
+    const transition = await options.pendingInputWal.compareAndSwapHandoff(
+      current.ownerRequestId,
+      current.walOwnerId,
+      current.walRevision,
+      preparing,
+    ).catch(() => null)
+    if (transition?.applied && transition.record) {
+      gate.durableRecord = transition.record
+      attempt.handoffWalRevision = transition.record.walRevision
+    }
   }
 
   function responseHandoffBlocksCurrentSession(): boolean {
@@ -1074,8 +1277,7 @@ export function useChatSend(options: UseChatSendOptions) {
           gate.ownerRequestId,
         )
       : await options.adoptResponseSession(key, gate.ownerRequestId)
-    if (gate.durableRecord && options.pendingInputWal?.deleteHandoff) {
-      await options.pendingInputWal.deleteHandoff(gate.ownerRequestId).catch(() => {})
+    if (gate.durableRecord && await deleteResponseHandoff(gate.durableRecord)) {
       gate.durableRecord = null
     }
     gate.authoritativeIdle = adoption?.authoritativeIdle === true
@@ -1165,18 +1367,35 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       return
     }
-    await options.pendingInputWal?.putHandoff?.({
+    let acceptedRecord: ResponseHandoffWalRecord = {
       ...record,
       state: 'accepted',
       acceptedSessionKey: targetSessionKey,
+      ...(record.walRevision ? { walRevision: record.walRevision + 1 } : {}),
       updatedAt: Date.now(),
-    }).catch(() => {})
+    }
+    if (
+      record.walOwnerId
+      && record.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      const transition = await options.pendingInputWal.compareAndSwapHandoff(
+        record.ownerRequestId,
+        record.walOwnerId,
+        record.walRevision,
+        acceptedRecord,
+      ).catch(() => null)
+      if (!transition?.applied || !transition.record) return
+      acceptedRecord = transition.record
+    } else {
+      await options.pendingInputWal?.putHandoff?.(acceptedRecord).catch(() => {})
+    }
     await options.recoverPendingQueueHandoff?.(
       record.requestSessionKey,
       targetSessionKey,
       record.ownerRequestId,
     )
-    await options.pendingInputWal?.deleteHandoff?.(record.ownerRequestId).catch(() => {})
+    await deleteResponseHandoff(acceptedRecord)
   }
 
   function restoreResponseHandoffDraft(record: ResponseHandoffWalRecord): boolean {
@@ -1225,9 +1444,20 @@ export function useChatSend(options: UseChatSendOptions) {
         return
       }
       for (const record of records) {
+        if (record.state === 'preparing') {
+          if (record.walOwnerId && record.walRevision) {
+            await wal.compareAndSwapHandoff?.(
+              record.ownerRequestId,
+              record.walOwnerId,
+              record.walRevision,
+              null,
+            ).catch(() => {})
+          }
+          continue
+        }
         if (record.state === 'failed') {
           if (restoreResponseHandoffDraft(record)) {
-            await wal.deleteHandoff?.(record.ownerRequestId).catch(() => {})
+            await deleteResponseHandoff(record)
           }
           continue
         }
@@ -2251,7 +2481,13 @@ export function useChatSend(options: UseChatSendOptions) {
         params,
       }
       if (attempt.forkBeforeMessageId) {
-        durableHandoffRecord = await persistResponseHandoff(attempt)
+        durableHandoffRecord = await persistResponseHandoff(
+          attempt,
+          sendOpts.requirePreparedHandoff,
+        )
+        if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
+          return rejectBeforeDispatch()
+        }
         if (!preDispatchAllowed()) return rejectBeforeDispatch()
       }
       if (!sendOpts.acceptedVisibleReplay) {
@@ -2269,7 +2505,13 @@ export function useChatSend(options: UseChatSendOptions) {
       }
     }
     if (attempt.forkBeforeMessageId && !durableHandoffRecord) {
-      durableHandoffRecord = await persistResponseHandoff(attempt)
+      durableHandoffRecord = await persistResponseHandoff(
+        attempt,
+        sendOpts.requirePreparedHandoff,
+      )
+      if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
+        return rejectBeforeDispatch()
+      }
       if (!preDispatchAllowed()) return rejectBeforeDispatch()
     }
     if (!preDispatchAllowed()) return rejectBeforeDispatch()
@@ -2313,6 +2555,29 @@ export function useChatSend(options: UseChatSendOptions) {
         options.stream.endStreaming()
       }
       return rejectBeforeDispatch()
+    }
+    if (sendOpts.requirePreparedHandoff) {
+      const armed = await armPreparedResponseHandoff(durableHandoffRecord, attempt)
+      if (!armed) {
+        if (freshSendToken && activeFreshSendToken === freshSendToken) {
+          activeFreshSendToken = null
+          options.activeStreamTaskId.value = ''
+          options.activeStreamSessionKey.value = ''
+          options.stream.endStreaming()
+        }
+        return rejectBeforeDispatch()
+      }
+      durableHandoffRecord = armed
+      if (!preDispatchAllowed('before_rpc')) {
+        durableHandoffRecord = await disarmResponseHandoff(armed, attempt) || armed
+        if (freshSendToken && activeFreshSendToken === freshSendToken) {
+          activeFreshSendToken = null
+          options.activeStreamTaskId.value = ''
+          options.activeStreamSessionKey.value = ''
+          options.stream.endStreaming()
+        }
+        return rejectBeforeDispatch()
+      }
     }
     options.aborted.value = false
     let responseHandoff = (
@@ -2622,8 +2887,12 @@ export function useChatSend(options: UseChatSendOptions) {
         options.activeStreamSessionKey.value = ''
         options.stream.endStreaming()
       }
-      if (responseHandoff && rpcError?.accepted === false && rpcError.retryable === false) {
-        await markResponseHandoffFailed(responseHandoff, err)
+      if (responseHandoff && rpcError?.accepted === false) {
+        if (sendOpts.requirePreparedHandoff && rpcError.retryable !== false) {
+          await resetResponseHandoffForRetry(responseHandoff, attempt)
+        } else if (rpcError.retryable === false) {
+          await markResponseHandoffFailed(responseHandoff, err)
+        }
       }
       rememberRetryableAttempt(true)
       if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
@@ -2713,6 +2982,7 @@ export function useChatSend(options: UseChatSendOptions) {
         acceptedVisibleReplay: { forkBeforeMessageId },
         suppressRejectedFailureMessage: true,
         includeEmptyAttachments: true,
+        requirePreparedHandoff: true,
         preDispatchGuard: stage => !replayIsBlocked(stage === 'before_rpc'),
       })
       if (outcome === 'accepted') usageBarrierReplayAttempt = null
