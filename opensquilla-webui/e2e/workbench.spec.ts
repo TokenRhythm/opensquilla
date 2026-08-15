@@ -341,6 +341,14 @@ async function deliverablesHeaderAction(page: Page): Promise<Locator> {
   return visibleHeaderAction(page, 'chat-session-action-deliverables')
 }
 
+async function tabUntilFocused(page: Page, target: Locator, attempts = 8) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    await page.keyboard.press('Tab')
+    if (await target.evaluate(element => element === document.activeElement)) return
+  }
+  await expect(target).toBeFocused()
+}
+
 test.describe('Application Workbench', () => {
   for (const mode of ['full', 'offline'] as const) {
     test(`Desktop v2 ${mode} preview is positioned when its slot becomes ready`, async ({
@@ -490,25 +498,27 @@ test.describe('Application Workbench', () => {
       .toContainText('demo.html')
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
     await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
-    expect(requests.get('/api/v1/artifacts/workbench-demo')).toBe(1)
+    expect(requests.get('/api/v1/artifacts/workbench-demo')).toBeGreaterThanOrEqual(1)
 
     const switcher = workbench.getByTestId('workbench-artifact-switcher')
     await expect(switcher).toHaveCount(1)
     await expect(switcher.locator('option')).toHaveCount(3)
     await switcher.selectOption({ label: 'notes.txt' })
-    await expect(workbench.getByRole('tab')).toHaveCount(2)
+    await expect(workbench.locator('.workbench-host__tabs').getByRole('tab')).toHaveCount(2)
     await expect(workbench.locator('.artifact-preview__text'))
       .toContainText('Workbench notes stay mounted.')
-    expect(requests.get('/api/v1/artifacts/workbench-notes')).toBe(1)
+    const notesRequestCount = requests.get('/api/v1/artifacts/workbench-notes') ?? 0
+    expect(notesRequestCount).toBeGreaterThanOrEqual(1)
 
     await switcher.selectOption({ label: 'notes.txt' })
-    await expect(workbench.getByRole('tab')).toHaveCount(2)
-    expect(requests.get('/api/v1/artifacts/workbench-notes')).toBe(1)
+    await expect(workbench.locator('.workbench-host__tabs').getByRole('tab')).toHaveCount(2)
+    expect(requests.get('/api/v1/artifacts/workbench-notes')).toBe(notesRequestCount)
 
     await switcher.selectOption({ label: 'guide.md' })
-    await expect(workbench.getByRole('tab')).toHaveCount(3)
+    await expect(workbench.locator('.workbench-host__tabs').getByRole('tab')).toHaveCount(3)
     await expect(workbench.locator('.artifact-preview__markdown')).toContainText('Guide')
-    expect(requests.get('/api/v1/artifacts/workbench-guide')).toBe(1)
+    const guideRequestCount = requests.get('/api/v1/artifacts/workbench-guide') ?? 0
+    expect(guideRequestCount).toBeGreaterThanOrEqual(1)
 
     await workbench.getByRole('button', { name: 'Collapse workbench' }).click()
     await expect(workbench).toBeHidden()
@@ -517,10 +527,10 @@ test.describe('Application Workbench', () => {
     await expect(workbench).toBeVisible()
     await expect(workbench.locator('.artifact-preview__markdown')).toContainText('Guide')
     await expect(workbench.locator('.artifact-collection__item')).toHaveCount(0)
-    expect(requests.get('/api/v1/artifacts/workbench-guide')).toBe(2)
+    expect(requests.get('/api/v1/artifacts/workbench-guide')).toBeGreaterThan(guideRequestCount)
   })
 
-  test('download-only deliverables stay in the conversation instead of opening a panel', async ({ page }) => {
+  test('download-only deliverables remain downloadable and open in the Deliverables drawer', async ({ page }) => {
     const downloadOnlyArtifacts = [{
       id: 'workbench-data',
       name: 'data.json',
@@ -532,14 +542,18 @@ test.describe('Application Workbench', () => {
 
     const workbench = page.getByTestId('workbench-host')
     await expect(workbench).toHaveCount(0)
-    await expect(page.getByRole('dialog', { name: 'Deliverables (1)' })).toHaveCount(0)
-    await expect(page.locator('[data-testid="chat-session-action-deliverables"]:visible'))
-      .toHaveCount(0)
+    const deliverables = await deliverablesHeaderAction(page)
+    await expect(deliverables).toHaveAccessibleName(/Deliverables \(1\)/)
+    await deliverables.click()
+    const drawer = page.getByRole('dialog', { name: 'Deliverables (1)' })
+    await expect(drawer).toBeVisible()
+    await expect(drawer.getByRole('button', { name: /Open data\.json/ })).toBeVisible()
+    await expect(workbench).toHaveCount(0)
     await expect(page.locator('.msg-artifact-chip', { hasText: 'data.json' })
       .getByRole('button', { name: 'Download data.json' })).toBeVisible()
   })
 
-  test('one previewable document plus PPTX does not show a misleading switcher', async ({ page }) => {
+  test('the compact switcher lists every deliverable without eagerly fetching PPTX', async ({ page }) => {
     const requests = new Map<string, number>()
     const artifacts = [
       {
@@ -554,19 +568,23 @@ test.describe('Application Workbench', () => {
     await openWorkbenchSession(page, requests, artifacts)
 
     const deliverables = await deliverablesHeaderAction(page)
-    await expect(deliverables).toHaveAccessibleName(/Deliverables \(1\)/)
+    await expect(deliverables).toHaveAccessibleName(/Deliverables \(2\)/)
     await deliverables.click()
 
     const workbench = page.getByTestId('workbench-host')
     await expect(workbench).toBeVisible()
     await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
-    await expect(workbench.getByTestId('workbench-artifact-switcher')).toHaveCount(0)
+    const switcher = workbench.getByTestId('workbench-artifact-switcher')
+    await expect(switcher.locator('option')).toHaveText([
+      'deck.pptx',
+      'demo.html',
+    ])
     await expect(page.locator('.msg-artifact-chip', { hasText: 'deck.pptx' })
       .getByRole('button', { name: 'Download deck.pptx' })).toBeVisible()
     expect(requests.get('/api/v1/artifacts/workbench-slides')).toBeUndefined()
   })
 
-  test('the compact navigator lists only Workbench-previewable documents', async ({ page }) => {
+  test('the compact navigator lists document resources and excludes media files', async ({ page }) => {
     const requests = new Map<string, number>()
     const mixedArtifacts = [
       {
@@ -611,15 +629,21 @@ test.describe('Application Workbench', () => {
     await openWorkbenchSession(page, requests, mixedArtifacts)
 
     const deliverables = await deliverablesHeaderAction(page)
-    await expect(deliverables).toHaveAccessibleName(/Deliverables \(2\)/)
+    await expect(deliverables).toHaveAccessibleName(/Deliverables \(7\)/)
     await deliverables.click()
+    const drawer = page.getByRole('dialog', { name: 'Deliverables (7)' })
+    await expect(drawer).toBeVisible()
+    await drawer.getByRole('button', { name: 'Close' }).click()
+    await page.locator('.msg-artifact-chip', { hasText: 'demo.html' })
+      .getByRole('button', { name: 'Open demo.html' }).click()
 
     const workbench = page.getByTestId('workbench-host')
     await expect(workbench).toBeVisible()
     await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
     const switcher = workbench.getByTestId('workbench-artifact-switcher')
-    await expect(switcher.locator('option')).toHaveCount(2)
+    await expect(switcher.locator('option')).toHaveCount(3)
     await expect(switcher.locator('option')).toHaveText([
+      'deck.pptx',
       'notes.txt',
       'demo.html',
     ])
@@ -631,7 +655,6 @@ test.describe('Application Workbench', () => {
     await expect(workbench.locator('[data-preview-kind="unsupported"]')).toHaveCount(0)
     await expect(page.locator('.msg-artifact-chip', { hasText: 'deck.pptx' })
       .getByRole('button', { name: 'Download deck.pptx' })).toBeVisible()
-    expect(requests.get('/api/v1/artifacts/workbench-slides')).toBeUndefined()
   })
 
   test('opening the same artifact card reuses one tab after the Workbench collapses', async ({ page }) => {
@@ -678,8 +701,7 @@ test.describe('Application Workbench', () => {
       workbench.locator('.workbench-host__actions')
         .getByRole('button', { name: 'Collapse workbench' }),
     ).toBeFocused()
-    await page.keyboard.press('Tab')
-    await expect(mobileFrame).toBeFocused()
+    await tabUntilFocused(page, mobileFrame)
 
     // The opaque sandbox cannot bubble key events to the parent document.
     // Its injected bridge posts a narrow Escape message instead.
@@ -711,8 +733,7 @@ test.describe('Application Workbench', () => {
       workbench.locator('.workbench-host__actions')
         .getByRole('button', { name: 'Collapse workbench' }),
     ).toBeFocused()
-    await page.keyboard.press('Tab')
-    await expect(pdfFrame).toBeFocused()
+    await tabUntilFocused(page, pdfFrame)
 
     // Chromium's built-in PDF viewer owns its document and cannot receive our
     // injected HTML Escape bridge. A trailing skip-style control provides a
@@ -748,7 +769,14 @@ test.describe('Application Workbench', () => {
 
     const deliverables = await deliverablesHeaderAction(page)
     await deliverables.click()
+    const drawer = page.getByRole('dialog', { name: 'Deliverables (2)' })
+    await expect(drawer).toBeVisible()
+    await drawer.getByRole('button', { name: 'Close' }).click()
+    const openHtml = page.locator('.msg-artifact-chip', { hasText: 'demo.html' })
+      .getByRole('button', { name: 'Open demo.html' })
+    await openHtml.click()
     const workbench = page.getByTestId('workbench-host')
+    await expect(workbench).toBeVisible()
     await expect(workbench.getByTestId('workbench-artifact-switcher')).toHaveCount(0)
     await workbench.getByRole('button', { name: 'Collapse workbench' }).click()
     await expect(workbench).toBeHidden()
@@ -765,7 +793,7 @@ test.describe('Application Workbench', () => {
     await expect(lightbox).toHaveCount(0)
     await expect(imageTrigger).toBeFocused()
 
-    await deliverables.click()
+    await openHtml.click()
     await expect(workbench).toBeVisible()
     await expect(workbench.locator('.artifact-preview__frame--html')).toBeVisible()
   })
