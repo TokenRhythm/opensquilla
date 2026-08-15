@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
 import pytest
 
-import opensquilla.engine.action_completion as action_completion
 from opensquilla.engine import Agent, AgentConfig, ToolResult
 from opensquilla.engine.action_completion import (
     ACTION_COMPLETION_TOOL_NAME,
@@ -345,7 +345,7 @@ def test_nested_shell_payload_quotes_are_platform_independent(monkeypatch: Any) 
     )
 
     for platform_name in ("posix", "nt"):
-        monkeypatch.setattr(action_completion.os, "name", platform_name)
+        monkeypatch.setattr(os, "name", platform_name)
         assert resolve_tool_completion_effect(
             definition,
             {"command": "sh -c 'cat README.md'"},
