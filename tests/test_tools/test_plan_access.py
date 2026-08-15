@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from importlib import import_module
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -86,6 +87,7 @@ def test_completion_effect_resolver_is_runtime_only_registry_metadata() -> None:
 
 
 def test_builtin_completion_effect_inventory_has_no_unknown_entries() -> None:
+    import_module("opensquilla.skills.creator")
     registry = get_default_registry()
     specs = {registered.spec.name: registered.spec for registered in registry.all_tools()}
 

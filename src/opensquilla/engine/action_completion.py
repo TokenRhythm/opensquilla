@@ -329,22 +329,30 @@ def _outer_shell_argv(source: str) -> tuple[str, ...]:
 
 
 def _nested_shell_command(argv: tuple[str, ...]) -> str | None:
+    def command_argument(value: str) -> str:
+        # ``shlex.split(..., posix=False)`` preserves the wrapping quotes used
+        # by Windows command strings. They delimit the nested shell payload;
+        # they are not part of the command that the inner shell executes.
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            return value[1:-1]
+        return value
+
     if not argv:
         return None
     command = _trusted_command_name(argv[0])
     if command in {"bash", "sh", "zsh", "fish"}:
         for index, token in enumerate(argv[1:], start=1):
             if token in {"-c", "-lc"} and index + 1 < len(argv):
-                return argv[index + 1]
+                return command_argument(argv[index + 1])
         return None
     if command == "cmd":
         if len(argv) >= 3 and argv[1].casefold() in {"/c", "/k"}:
-            return argv[2]
+            return command_argument(argv[2])
         return None
     if command in {"powershell", "pwsh"}:
         for index, token in enumerate(argv[1:], start=1):
             if token.casefold() in {"-c", "-command"} and index + 1 < len(argv):
-                return argv[index + 1]
+                return command_argument(argv[index + 1])
     return None
 
 
