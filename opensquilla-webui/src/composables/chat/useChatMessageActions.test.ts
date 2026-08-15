@@ -5,8 +5,14 @@ import { nextTick, ref } from 'vue'
 
 import { useChatMessageActions, type UseChatMessageActionsOptions } from './useChatMessageActions'
 import { useChatTextRendering } from './useChatTextRendering'
-import type { ChatMessage, ChatRenderedMessage } from '@/types/chat'
+import type {
+  ChatMessage,
+  ChatRenderedMessage,
+  ChatTurnOutcome,
+  DisplayAttachment,
+} from '@/types/chat'
 import { copyTextWithFallback } from '@/utils/browser'
+import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 
 vi.mock('@/utils/browser', () => ({
   copyTextWithFallback: vi.fn().mockResolvedValue(undefined),
@@ -21,6 +27,34 @@ function renderedMessage(overrides: Partial<ChatRenderedMessage>): ChatRenderedM
     timeStr: '',
     showHeader: false,
     ...overrides,
+  }
+}
+
+function safeUsageOutcome(
+  turnId: string,
+  userMessageId = 'msg-user',
+): ChatTurnOutcome {
+  return {
+    turnId,
+    status: 'failed',
+    errorClass: 'usage_accounting_busy',
+    retryable: true,
+    usageCallIndex: 1,
+    noPriorProviderDispatch: true,
+    replaySafe: true,
+    userMessageId,
+  }
+}
+
+function displayAttachment(kind: DisplayAttachment['kind']): DisplayAttachment {
+  return {
+    kind,
+    displayId: `history:${kind}`,
+    renderKey: `history:${kind}`,
+    name: `${kind}.txt`,
+    mime: 'text/plain',
+    ...(kind === 'inline' ? { downloadData: 'cmVxdWVzdA==' } : {}),
+    ...(kind === 'staged' ? { sha256_ref: 'a'.repeat(64) } : {}),
   }
 }
 
@@ -41,6 +75,7 @@ function makeOptions(
     stripTimePrefix: text => text,
     autoResizeTextarea: vi.fn(),
     sendCurrentInput: vi.fn(),
+    sendUsageBarrierReplay: vi.fn(async () => true),
     focusComposer: vi.fn(),
     pendingForkBeforeMessageId,
     aiGeneratedLabel,
@@ -87,7 +122,7 @@ describe('useChatMessageActions branching edits', () => {
       { role: 'user', text: 'C', ts: null, messageId: 'msg-C' },
     ])
 
-    api.regenerateMessage(renderedMessage({
+    const accepted = await api.regenerateMessage(renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 3,
@@ -100,6 +135,475 @@ describe('useChatMessageActions branching edits', () => {
     expect(options.messages.value.map(message => message.text)).toEqual(['A', 'ack A'])
     expect(options.inputText.value).toBe('B')
     expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+    expect(accepted).toBe(true)
+  })
+
+  it('dispatches usage replay directly even when Goal/Replan blocks the composer', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      {
+        role: 'user',
+        text: 'bill this safely',
+        ts: null,
+        messageId: 'msg-user',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'error',
+        text: 'Usage accounting temporarily unavailable.',
+        ts: null,
+        messageId: 'terminal-error:task-1',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-1',
+      },
+    ])
+    options.inputText.value = 'unrelated draft'
+    options.canDeliver = () => false
+
+    const accepted = await api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: 2,
+      messageId: 'terminal-error:task-1',
+      errorCode: 'usage_accounting_busy',
+      turnId: 'turn-1',
+      turnOutcome: safeUsageOutcome('turn-1'),
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({
+      text: 'bill this safely',
+      forkBeforeMessageId: 'msg-user',
+    })
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toHaveLength(3)
+    expect(options.inputText.value).toBe('unrelated draft')
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    expect(accepted).toBe(true)
+  })
+
+  it.each(['inline', 'staged', 'file'] as const)(
+    'rejects programmatic whole-turn retry when the primary request has a %s display attachment',
+    async (kind) => {
+      const messages: ChatMessage[] = [
+        {
+          role: 'user',
+          text: 'request with attachment',
+          ts: null,
+          messageId: 'msg-primary',
+          turnId: 'turn-attachment',
+          attachments: [displayAttachment(kind)],
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:attachment',
+          errorCode: 'usage_accounting_busy',
+          turnId: 'turn-attachment',
+        },
+      ]
+      const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+      options.inputText.value = 'unrelated draft'
+
+      const accepted = api.regenerateMessage(renderedMessage({
+        role: 'error',
+        displayRole: 'error',
+        sourceIndex: 1,
+        messageId: 'terminal-error:attachment',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-attachment',
+        turnOutcome: safeUsageOutcome('turn-attachment', 'msg-primary'),
+        text: 'Usage accounting temporarily unavailable.',
+      }))
+      await nextTick()
+
+      expect(accepted).toBe(false)
+      expect(options.messages.value).toEqual(messages)
+      expect(options.inputText.value).toBe('unrelated draft')
+      expect(pendingForkBeforeMessageId.value).toBeNull()
+      expect(options.sendUsageBarrierReplay).not.toHaveBeenCalled()
+      expect(options.sendCurrentInput).not.toHaveBeenCalled()
+    },
+  )
+
+  it('retries the authoritative primary user instead of a later same-turn steer', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'error',
+        text: 'Usage accounting temporarily unavailable.',
+        ts: null,
+        messageId: 'terminal-error:task-1',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-1',
+      },
+    ])
+
+    const accepted = await api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: 2,
+      messageId: 'terminal-error:task-1',
+      errorCode: 'usage_accounting_busy',
+      turnId: 'turn-1',
+      turnOutcome: safeUsageOutcome('turn-1', 'msg-primary'),
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(true)
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({
+      text: 'primary request',
+      forkBeforeMessageId: 'msg-primary',
+    })
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toHaveLength(3)
+    expect(options.inputText.value).toBe('')
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('blocks an unsafe usage barrier on an assistant status-only bubble', async () => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+
+    const accepted = await api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 2,
+      messageId: 'terminal-activity:task-1',
+      turnId: 'turn-1',
+      turnOutcome: {
+        ...safeUsageOutcome('turn-1', 'msg-primary'),
+        usageCallIndex: 2,
+        noPriorProviderDispatch: false,
+        replaySafe: false,
+      },
+      text: '',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('blocks an assistant bubble when normalized error classes conflict around a barrier', () => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+    const turnOutcome = normalizeTurnOutcome({
+      turn_id: 'turn-1',
+      status: 'failed',
+      error_class: 'provider_error',
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      user_message_id: 'msg-primary',
+      outcome: {
+        error_class: 'usage_accounting_busy',
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+        user_message_id: 'msg-primary',
+      },
+    })
+
+    expect(turnOutcome).toMatchObject({
+      errorClass: 'usage_accounting_busy',
+      replaySafe: false,
+    })
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 2,
+      messageId: 'terminal-activity:task-1',
+      errorCode: 'provider_error',
+      turnId: 'turn-1',
+      turnOutcome,
+      text: '',
+    }))
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it('retries the exact primary from a safe assistant status-only bubble', async () => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions([
+      {
+        role: 'user',
+        text: 'primary request',
+        ts: null,
+        messageId: 'msg-primary',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'user',
+        text: 'same-turn steer',
+        ts: null,
+        messageId: 'msg-steer',
+        turnId: 'turn-1',
+      },
+      {
+        role: 'assistant',
+        text: '',
+        ts: null,
+        messageId: 'terminal-activity:task-1',
+        turnId: 'turn-1',
+      },
+    ])
+
+    const accepted = await api.regenerateMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      sourceIndex: 2,
+      messageId: 'terminal-activity:task-1',
+      turnId: 'turn-1',
+      turnOutcome: safeUsageOutcome('turn-1', 'msg-primary'),
+      text: '',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(true)
+    expect(options.sendUsageBarrierReplay).toHaveBeenCalledWith({
+      text: 'primary request',
+      forkBeforeMessageId: 'msg-primary',
+    })
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.messages.value).toHaveLength(3)
+    expect(options.inputText.value).toBe('')
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [
+      'the current page only has a previous-turn user',
+      [
+        {
+          role: 'user',
+          text: 'previous turn',
+          ts: null,
+          messageId: 'msg-old',
+          turnId: 'turn-old',
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:task-new',
+          errorCode: 'usage_accounting_busy',
+          turnId: 'turn-new',
+        },
+      ] satisfies ChatMessage[],
+      'turn-new',
+    ],
+    [
+      'the error has no durable turn id',
+      [
+        {
+          role: 'user',
+          text: 'unknown turn',
+          ts: null,
+          messageId: 'msg-user',
+          turnId: 'turn-known',
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:task-unknown',
+          errorCode: 'usage_accounting_busy',
+        },
+      ] satisfies ChatMessage[],
+      undefined,
+    ],
+    [
+      'the same-turn user is not durable',
+      [
+        {
+          role: 'user',
+          text: 'previous durable turn',
+          ts: null,
+          messageId: 'msg-old',
+          turnId: 'turn-old',
+        },
+        {
+          role: 'user',
+          text: 'same turn but pending',
+          ts: null,
+          clientId: 'client-new',
+          turnId: 'turn-new',
+        },
+        {
+          role: 'error',
+          text: 'Usage accounting temporarily unavailable.',
+          ts: null,
+          messageId: 'terminal-error:task-new',
+          errorCode: 'usage_accounting_busy',
+          turnId: 'turn-new',
+        },
+      ] satisfies ChatMessage[],
+      'turn-new',
+    ],
+  ])('fails closed when %s', async (_label, messages, turnId) => {
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: messages.length - 1,
+      messageId: messages[messages.length - 1]?.messageId,
+      errorCode: 'usage_accounting_busy',
+      turnId,
+      turnOutcome: safeUsageOutcome(turnId || '', 'missing-or-pending-user'),
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['missing proof', undefined],
+    ['second call', {
+      ...safeUsageOutcome('turn-safe'),
+      usageCallIndex: 2,
+    }],
+    ['string call index', {
+      ...safeUsageOutcome('turn-safe'),
+      usageCallIndex: '1',
+    } as unknown as ChatTurnOutcome],
+    ['false no-prior proof', {
+      ...safeUsageOutcome('turn-safe'),
+      noPriorProviderDispatch: false,
+    }],
+    ['false replay-safe proof', {
+      ...safeUsageOutcome('turn-safe'),
+      replaySafe: false,
+    }],
+    ['missing primary user id', {
+      ...safeUsageOutcome('turn-safe'),
+      userMessageId: undefined,
+    }],
+    ['wrong primary user id', {
+      ...safeUsageOutcome('turn-safe'),
+      userMessageId: 'msg-steer',
+    }],
+    ['conflicting second-call proof', {
+      ...safeUsageOutcome('turn-safe'),
+      usageCallIndex: 2,
+      noPriorProviderDispatch: true,
+      replaySafe: true,
+    }],
+  ])('rejects programmatic usage retry with %s', async (_label, turnOutcome) => {
+    const messages: ChatMessage[] = [
+      {
+        role: 'user',
+        text: 'do not resend without proof',
+        ts: null,
+        messageId: 'msg-user',
+        turnId: 'turn-safe',
+      },
+      {
+        role: 'error',
+        text: 'Usage accounting temporarily unavailable.',
+        ts: null,
+        messageId: 'terminal-error:task-safe',
+        errorCode: 'usage_accounting_busy',
+        turnId: 'turn-safe',
+      },
+    ]
+    const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
+
+    const accepted = api.regenerateMessage(renderedMessage({
+      role: 'error',
+      displayRole: 'error',
+      sourceIndex: 1,
+      messageId: 'terminal-error:task-safe',
+      errorCode: 'usage_accounting_busy',
+      turnId: 'turn-safe',
+      turnOutcome,
+      text: 'Usage accounting temporarily unavailable.',
+    }))
+    await nextTick()
+
+    expect(accepted).toBe(false)
+    expect(options.messages.value).toEqual(messages)
+    expect(options.inputText.value).toBe('')
+    expect(pendingForkBeforeMessageId.value).toBeNull()
+    expect(options.sendCurrentInput).not.toHaveBeenCalled()
   })
 
   it('preserves history, fork state, and the current draft when live delivery is unavailable', async () => {
@@ -111,7 +615,7 @@ describe('useChatMessageActions branching edits', () => {
     options.inputText.value = 'unrelated draft'
     options.canDeliver = () => false
 
-    api.regenerateMessage(renderedMessage({
+    const accepted = api.regenerateMessage(renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 1,
@@ -125,6 +629,7 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.sendCurrentInput).not.toHaveBeenCalled()
     expect(options.notifyDeliveryBlocked).toHaveBeenCalledOnce()
+    expect(accepted).toBe(false)
   })
 
   it('keeps an optimistic user row intact until its durable fork id arrives', () => {
@@ -174,20 +679,21 @@ describe('useChatMessageActions branching edits', () => {
     expect(notifyEditBlocked).toHaveBeenCalledOnce()
   })
 
-  it('does not regenerate as a parent send when the durable fork id is missing', async () => {
+  it('accepts retry after its durable fork id is bound later', async () => {
     const messages: ChatMessage[] = [
       { role: 'user', text: 'still saving', ts: null, clientId: 'client-only' },
       { role: 'assistant', text: 'partial answer', ts: null, messageId: 'assistant-local' },
     ]
     const { api, options, pendingForkBeforeMessageId } = makeOptions(messages)
 
-    api.regenerateMessage(renderedMessage({
+    const rendered = renderedMessage({
       role: 'assistant',
       displayRole: 'assistant',
       sourceIndex: 1,
       messageId: 'assistant-local',
       text: 'partial answer',
-    }))
+    })
+    const firstAccepted = api.regenerateMessage(rendered)
     await nextTick()
 
     expect(options.messages.value).toEqual(messages)
@@ -195,6 +701,15 @@ describe('useChatMessageActions branching edits', () => {
     expect(pendingForkBeforeMessageId.value).toBeNull()
     expect(options.sendCurrentInput).not.toHaveBeenCalled()
     expect(options.notifyMessagePending).toHaveBeenCalledOnce()
+
+    options.messages.value[0]!.messageId = 'msg-now-durable'
+    const secondAccepted = api.regenerateMessage(rendered)
+    await nextTick()
+
+    expect(firstAccepted).toBe(false)
+    expect(secondAccepted).toBe(true)
+    expect(pendingForkBeforeMessageId.value).toBe('msg-now-durable')
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
   })
 
   it('regenerates and edits without pending feedback when ids are durable', async () => {

@@ -2238,6 +2238,8 @@ class _RuntimeChannelStreamRelay:
         self._queue: asyncio.Queue[str | object] = asyncio.Queue()
         self._artifacts: list[dict[str, Any]] = []
         self.delivered_artifact_keys: set[str] = set()
+        self.attempted_artifact_keys: set[str] = set()
+        self._attempted_artifact_ids: set[str] = set()
         self._task: asyncio.Task[Any] | None = None
         self._closed = False
         self._live_preview = _channel_can_replace_streamed_text(channel)
@@ -2424,6 +2426,13 @@ class _RuntimeChannelStreamRelay:
     def has_terminal_snapshot(self) -> bool:
         return self._done_snapshot_present
 
+    def attempted_artifact(self, artifact: dict[str, Any]) -> bool:
+        artifact_id = artifact.get("id")
+        if isinstance(artifact_id, str) and artifact_id in self._attempted_artifact_ids:
+            return True
+        key = _artifact_delivery_key(artifact)
+        return bool(key and key in self.attempted_artifact_keys)
+
     async def close(self, timeout: float = 10.0) -> None:
         if self._closed:
             return
@@ -2509,6 +2518,17 @@ class _RuntimeChannelStreamRelay:
                 self._undelivered_index = len(self._yielded_chunks)
 
         if _can_deliver_channel_files(self._channel):
+            self.attempted_artifact_keys.update(
+                key
+                for artifact in self._artifacts
+                if (key := _artifact_delivery_key(artifact))
+            )
+            self._attempted_artifact_ids.update(
+                artifact_id
+                for artifact in self._artifacts
+                if isinstance((artifact_id := artifact.get("id")), str)
+                and artifact_id
+            )
             undelivered = await _deliver_artifacts_as_channel_files(
                 self._channel,
                 self._inbound,
@@ -3830,6 +3850,12 @@ async def _deliver_runtime_channel_reply(
             ]
         content = _strip_artifact_markers_from_channel_text(content)
         content = _strip_delivered_artifact_image_references(content, artifacts)
+        if stream_relay is not None and stream_relay.attempted_artifact_keys:
+            artifacts = [
+                artifact
+                for artifact in artifacts
+                if not stream_relay.attempted_artifact(artifact)
+            ]
         if _can_deliver_channel_files(channel):
             if content:
                 await _deliver_reply_or_notify(

@@ -77,6 +77,7 @@
           :workbench-enabled="workbenchEnabled"
           :artifact-navigation-items="artifactNavigationItems"
           :copy-message="copyMessage"
+          :regenerate-available="assistantRegenerateAvailable(entry.index)"
           :is-tip="isForkableAssistant(entry.index)"
           :fork-busy="forkBusy"
           :plan-action-pending="planActionPending"
@@ -106,7 +107,9 @@
           :message="messages[entry.index]"
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
+          :retry-available="usageBarrierRetryAvailable(entry.index)"
           @resume="$emit('resumeSandbox')"
+          @retry="forwardSystemRetry"
         />
       </div>
     </template>
@@ -148,6 +151,10 @@ import {
 } from '@/composables/chat/useChatGoals'
 import type { PlanCardAction, PlanCardActionTarget } from '@/types/plans'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
+import {
+  isUsageAccountingBarrierMessage,
+  strictUsageBarrierRetryUserMessageIndex,
+} from '@/utils/chat/usageAccountingFailure'
 import {
   buildVariableWindow,
   CHAT_HISTORY_VIRTUALIZATION_THRESHOLD,
@@ -192,9 +199,12 @@ const props = defineProps<{
   followLiveEdge?: boolean
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   editMessage: [message: ChatRenderedMessage]
-  regenerateMessage: [message: ChatRenderedMessage]
+  regenerateMessage: [
+    message: ChatRenderedMessage,
+    settle?: (accepted: boolean) => void,
+  ]
   toggleShareMessage: [messageId: string]
   downloadArtifact: [artifact: ArtifactPayload]
   openArtifact: [artifact: ArtifactPayload]
@@ -215,6 +225,28 @@ defineEmits<{
 
 const VIRTUALIZATION_STORAGE_KEY = 'opensquilla.chat.virtualizeHistory'
 const MESSAGE_GAP_PX = 4
+
+function forwardSystemRetry(
+  message: ChatRenderedMessage,
+  settle: (accepted: boolean) => void,
+) {
+  emit('regenerateMessage', message, settle)
+}
+
+function usageBarrierRetryAvailable(index: number): boolean {
+  const message = props.messages[index]
+  return Boolean(
+    message
+    && isUsageAccountingBarrierMessage(message)
+    && strictUsageBarrierRetryUserMessageIndex(props.messages, index, message) >= 0,
+  )
+}
+
+function assistantRegenerateAvailable(index: number): boolean {
+  const message = props.messages[index]
+  if (!message || !isUsageAccountingBarrierMessage(message)) return true
+  return strictUsageBarrierRetryUserMessageIndex(props.messages, index, message) >= 0
+}
 
 const listRootRef = ref<HTMLElement | null>(null)
 const viewportStart = ref(0)

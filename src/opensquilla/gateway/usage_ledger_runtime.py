@@ -274,7 +274,8 @@ class SessionUsageEventSink:
                 if attempt >= len(self._start_retry_delays):
                     raise UsageAccountingBusyError(
                         "usage ledger is temporarily busy after retry; "
-                        "provider request was not sent"
+                        "provider request was not sent",
+                        retry_after_ms=exc.retry_after_ms,
                     ) from exc
                 delay = self._start_retry_delays[attempt]
                 attempt += 1

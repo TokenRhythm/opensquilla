@@ -1116,7 +1116,9 @@ async def test_direct_channel_batch_turn_sends_artifact_fallback() -> None:
         config,
     )
 
-    assert channel.sent[-1].content == "Generated file: report.txt -> available in WebUI"
+    assert channel.sent[-1].content == (
+        "Generated file: report.txt -> available in the OpenSquilla task"
+    )
     assert "/api/v1/artifacts" not in channel.sent[-1].content
     assert "sessionKey" not in channel.sent[-1].content
     event_artifact = bridge.events[-1][2]
@@ -1511,7 +1513,7 @@ def test_channel_artifact_fallback_uses_only_channel_safe_absolute_links() -> No
                 "download_url": "/api/v1/artifacts/art-1?sessionKey=secret",
             }
         ]
-    ) == ["Generated file: report.txt -> available in WebUI"]
+    ) == ["Generated file: report.txt -> available in the OpenSquilla task"]
 
     assert _artifact_fallback_lines(
         [
@@ -1531,7 +1533,7 @@ def test_channel_artifact_fallback_uses_only_channel_safe_absolute_links() -> No
                 "channel_download_url": "/api/v1/artifacts/art-3?token=long",
             }
         ]
-    ) == ["Generated file: bad.txt -> available in WebUI"]
+    ) == ["Generated file: bad.txt -> available in the OpenSquilla task"]
 
 
 @pytest.mark.asyncio
@@ -1563,7 +1565,9 @@ async def test_runtime_channel_stream_relay_emits_artifact_fallback() -> None:
     )
     await relay.close()
 
-    assert channel.chunks == ["Generated file: stream.txt -> available in WebUI"]
+    assert channel.chunks == [
+        "Generated file: stream.txt -> available in the OpenSquilla task"
+    ]
     assert relay.text_emitted is True
 
 
@@ -1599,7 +1603,7 @@ async def test_runtime_channel_stream_relay_appends_artifact_fallback_to_text() 
 
     assert channel.chunks == [
         "done",
-        "\n\nGenerated file: stream.txt -> available in WebUI",
+        "\n\nGenerated file: stream.txt -> available in the OpenSquilla task",
     ]
 
 
@@ -1653,6 +1657,88 @@ async def test_runtime_channel_stream_relay_sends_artifact_with_adapter_upload(
     assert channel.chunks == ["done"]
     assert channel.files == [("c1", "report.pptx")]
     assert channel.sent == []
+
+
+@pytest.mark.asyncio
+async def test_stream_failure_does_not_replay_attempted_artifact_at_terminal_reply(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    ref = store.publish_bytes(
+        b"%PDF-1.4\nreport",
+        session_id="session-1",
+        session_key="agent:main:channel-test",
+        name="report.pdf",
+        mime="application/pdf",
+        source="publish_artifact",
+    )
+
+    class FailingStreamingFileChannel(_FakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.file_attempts = 0
+
+        async def send_streaming(self, chunks, **kwargs):
+            del chunks, kwargs
+            raise RuntimeError("stream transport failed")
+
+        async def send_file(self, chat_id: str, file_path: str) -> None:
+            del chat_id, file_path
+            self.file_attempts += 1
+            raise RuntimeError("visible artifact result is unknown")
+
+    class FakeTaskRuntime:
+        async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
+            del envelope, message, stream_event_sink
+
+        async def wait(self, task_id: str):
+            del task_id
+            return SimpleNamespace(status="succeeded")
+
+    class FakeSessionManager:
+        async def read_transcript(self, key: str):
+            del key
+            return [
+                {"role": "user", "content": "make report"},
+                {
+                    "role": "assistant",
+                    "content": json.dumps(
+                        {"text": "Report ready.", "artifacts": [ref.to_dict()]}
+                    ),
+                },
+            ]
+
+    channel = FailingStreamingFileChannel()
+    runtime = FakeTaskRuntime()
+    config = SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path)))
+    inbound = _message()
+    relay = _RuntimeChannelStreamRelay.maybe_start(channel, inbound, runtime, config)
+    assert relay is not None
+    await relay.emit(TextDeltaEvent(text="Report ready."))
+    await relay.emit(ArtifactEvent(**ref.to_dict()))
+
+    await _deliver_runtime_channel_reply(
+        channel=channel,
+        task_runtime=runtime,
+        session_manager=FakeSessionManager(),
+        session_key="agent:main:channel-test",
+        task_id="task-1",
+        route_envelope=SimpleNamespace(reply_target=None),
+        inbound=inbound,
+        transcript_watermark=1,
+        config=config,
+        stream_relay=relay,
+    )
+
+    assert channel.file_attempts == 1
+    fallback_messages = [
+        message.content
+        for message in channel.sent
+        if "Generated file: report.pdf" in message.content
+    ]
+    assert fallback_messages == [
+        "Generated file: report.pdf -> available in the OpenSquilla task"
+    ]
 
 
 @pytest.mark.asyncio
