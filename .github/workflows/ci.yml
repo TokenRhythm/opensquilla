@@ -1062,6 +1062,13 @@ jobs:
             fi
           }
 
+          is_retryable_windows_failure() {
+            local log_path="$1"
+            [[ "${RUNNER_OS}" == "Windows" ]] || return 1
+            grep -Fq 'Gateway did not become healthy' "${log_path}" \
+              || grep -Fq 'Timed out waiting for post-exit delete-all helper completion' "${log_path}"
+          }
+
           case "${{ matrix.shard }}" in
             all)
               entries=(
@@ -1119,8 +1126,7 @@ jobs:
 
             first_log="${CI_REPORT_DIR}/${name}-attempt-1.log"
             printf 'failed_case=%s\n' "${name}" > "${CI_REPORT_DIR}/first-failure.txt"
-            if [[ "${RUNNER_OS}" == "Windows" ]] \
-              && grep -Fq 'Gateway did not become healthy' "${first_log}"
+            if is_retryable_windows_failure "${first_log}"
             then
               printf 'retry_case=%s\n' "${name}" >> "${CI_REPORT_DIR}/first-failure.txt"
               if run_case "${name}" "${script}" 2; then

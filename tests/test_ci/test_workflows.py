@@ -1404,8 +1404,14 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]
     assert 'case "${{ matrix.shard }}" in' in run["run"]
     assert 'local log_path="${CI_REPORT_DIR}/${name}-attempt-${attempt}.log"' in run["run"]
-    assert '[[ "${RUNNER_OS}" == "Windows" ]]' in run["run"]
+    assert "is_retryable_windows_failure()" in run["run"]
+    assert '[[ "${RUNNER_OS}" == "Windows" ]] || return 1' in run["run"]
     assert "grep -Fq 'Gateway did not become healthy'" in run["run"]
+    assert (
+        "grep -Fq 'Timed out waiting for post-exit delete-all helper completion'"
+        in run["run"]
+    )
+    assert 'if is_retryable_windows_failure "${first_log}"' in run["run"]
     assert 'run_case "${name}" "${script}" 2' in run["run"]
     assert "exit 1" in run["run"]
     assert upload["if"] == "${{ always() }}"
@@ -1901,3 +1907,12 @@ def test_linux_desktop_recovery_e2e_scripts_preserve_x11_authority() -> None:
             "DISPLAY/XAUTHORITY, so the ubuntu Desktop recovery E2E job will fail with "
             "'Missing X server or $DISPLAY'"
         )
+
+
+def test_desktop_cleanup_flow_allows_windows_helper_release_latency() -> None:
+    source = Path(
+        "desktop/electron/scripts/test-desktop-cleanup-flow.mjs"
+    ).read_text(encoding="utf-8")
+
+    assert "process.platform === 'win32' ? 90_000 : 30_000" in source
+    assert "pending synthetic targets" in source
