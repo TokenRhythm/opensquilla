@@ -26,6 +26,10 @@ NORMALIZED_ERROR_KEYS = frozenset(
         "terminal_reason",
         "error_message",
         "turn_outcome",
+        "retry_after_ms",
+        "usage_call_index",
+        "no_prior_provider_dispatch",
+        "replay_safe",
     }
 )
 

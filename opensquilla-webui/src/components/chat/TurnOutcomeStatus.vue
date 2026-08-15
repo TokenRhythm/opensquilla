@@ -1,13 +1,25 @@
 <template>
   <div
     class="turn-outcome"
-    :class="`turn-outcome--${presentation}`"
+    :class="[
+      `turn-outcome--${presentation}`,
+      { 'turn-outcome--process-restart': processRestart },
+    ]"
     role="status"
     :data-testid="`turn-outcome-${presentation}`"
   >
     <span class="turn-outcome__dot" aria-hidden="true" />
-    <span>{{ label }}</span>
-    <span v-if="durationLabel" class="turn-outcome__duration">· {{ durationLabel }}</span>
+    <span v-if="processRestart" class="turn-outcome__content">
+      <span class="turn-outcome__title">
+        {{ t('chat.restartInterruptedTitle') }}
+        <span v-if="durationLabel" class="turn-outcome__duration">· {{ durationLabel }}</span>
+      </span>
+      <span class="turn-outcome__guidance">{{ t('chat.restartInterruptedGuidance') }}</span>
+    </span>
+    <template v-else>
+      <span>{{ label }}</span>
+      <span v-if="durationLabel" class="turn-outcome__duration">· {{ durationLabel }}</span>
+    </template>
   </div>
 </template>
 
@@ -16,6 +28,7 @@ import { computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ChatTurnOutcome } from '@/types/chat'
 import {
+  isProcessRestartOutcome,
   turnOutcomeDurationSeconds,
   turnOutcomePresentation,
 } from '@/utils/chat/turnOutcome'
@@ -23,6 +36,7 @@ import {
 const props = defineProps<{ outcome: ChatTurnOutcome }>()
 const { t } = useI18n()
 const presentation = computed(() => turnOutcomePresentation(props.outcome))
+const processRestart = computed(() => isProcessRestartOutcome(props.outcome))
 const label = computed(() => t({
   completed: 'chat.activity.lifecycle.settled',
   stopped: 'sessions.status.cancelled',
@@ -55,6 +69,31 @@ const durationLabel = computed(() => {
   border-radius: var(--radius-full);
   background: currentColor;
   opacity: 0.65;
+}
+
+.turn-outcome--process-restart {
+  align-items: flex-start;
+  width: min(100%, 42rem);
+}
+
+.turn-outcome--process-restart .turn-outcome__dot {
+  margin-top: 0.5rem;
+}
+
+.turn-outcome__content {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.turn-outcome__title {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.turn-outcome__guidance {
+  color: var(--text-dim);
 }
 
 .turn-outcome--failed,

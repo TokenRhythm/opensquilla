@@ -54,9 +54,17 @@ _INLINE_SECRET = re.compile(
 _TELEGRAM_URL_TOKEN = re.compile(r"(?i)(/bot)[^/\s]+")
 _DELIVERY_UNSUPPORTED: dict[str, str] = {
     "dingtalk": (
-        "DingTalk robot delivery requires an inbound sessionWebhook context; "
-        "ephemeral certification intentionally does not start ingress."
+        "DingTalk text delivery requires an inbound sessionWebhook and native artifact "
+        "delivery requires the originating inbound context; ephemeral certification "
+        "intentionally does not start ingress."
     ),
+}
+# Robot Code is required by the fresh setup form because it enables the newly
+# advertised native artifact surface. It is not required for the existing,
+# non-mutating Stream credential probe, so legacy text-only installations must
+# remain certifiable without it.
+_CERTIFICATION_OPTIONAL_FIELDS: dict[str, frozenset[str]] = {
+    "dingtalk": frozenset({"robot_code"}),
 }
 
 
@@ -85,7 +93,8 @@ def certification_environment(provider: str) -> dict[str, dict[str, Any]]:
     return {
         field.name: {
             "environment": certification_env_name(provider, field.name),
-            "required": field.required,
+            "required": field.required
+            and field.name not in _CERTIFICATION_OPTIONAL_FIELDS.get(provider, frozenset()),
             "secret": field.secret,
         }
         for field in spec.fields
@@ -170,6 +179,7 @@ def _ephemeral_entry(
         for field in spec.fields
         if field.name not in _COMMON_FIELDS
         and field.required
+        and field.name not in _CERTIFICATION_OPTIONAL_FIELDS.get(provider, frozenset())
         and _visible(field, payload)
         and not str(payload.get(field.name, "")).strip()
     ]

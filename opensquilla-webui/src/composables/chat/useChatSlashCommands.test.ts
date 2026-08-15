@@ -151,6 +151,7 @@ describe('useChatSlashCommands plan compatibility', () => {
       name: '/planning',
       description: 'A different command',
       aliases: [],
+      execution: { action: 'plans.setMode' },
     }])
     await api.loadSlashCommands()
     inputText.value = '/plan'
@@ -377,20 +378,95 @@ describe('useChatSlashCommands Coding mode', () => {
 })
 
 describe('useChatSlashCommands recovery', () => {
-  it('keeps an unknown slash command in the composer and shows a visible hint', async () => {
+  it.each([
+    {},
+    { commands: null },
+    { commands: [{}] },
+    { commands: [null] },
+    {
+      commands: [{
+        name: '/goal',
+        aliases: [{}],
+        execution: { action: 'goal.set' },
+      }],
+    },
+    { commands: [{ name: '/foo', aliases: [], execution: {} }] },
+    {
+      commands: [{
+        name: '/reset',
+        aliases: [],
+        execution: { action: 'unsupported.action' },
+      }],
+    },
+  ])('keeps a malformed command catalog unavailable', async response => {
+    const { api, armGoal, notify, rpc } = harness(false)
+    rpc.call.mockResolvedValue(response)
+
+    await expect(api.classifySlashCommand('/goal')).resolves.toBe('unavailable')
+    await expect(api.executeSlashCommand('/goal')).resolves.toBe(true)
+
+    expect(armGoal).not.toHaveBeenCalled()
+    expect(notify).toHaveBeenCalledOnce()
+  })
+
+  it('keeps a legacy supported command without execution metadata registered', async () => {
+    const { api, rpc } = harness(false, [{ name: '/reset', aliases: [] }])
+
+    await expect(api.classifySlashCommand('/reset')).resolves.toBe('registered')
+    await expect(api.executeSlashCommand('/reset', 'registered')).resolves.toBe(true)
+
+    expect(rpc.call).toHaveBeenCalledWith('sessions.reset', {
+      key: 'agent:main:webchat:test',
+    })
+  })
+
+  it('executes a legacy Goal command without execution metadata', async () => {
+    const { api, armGoal, goalStatus } = harness(false, [{
+      name: '/goal',
+      aliases: [],
+    }])
+
+    await expect(api.classifySlashCommand('/goal')).resolves.toBe('registered')
+    await expect(api.executeSlashCommand('/goal', 'registered')).resolves.toBe(true)
+    await Promise.resolve()
+
+    expect(goalStatus).toHaveBeenCalledTimes(1)
+    expect(armGoal).toHaveBeenCalledTimes(1)
+  })
+
+  it('falls through silently for unknown slash input', async () => {
     const {
       api,
       inputText,
       notify,
     } = harness(false)
-    inputText.value = '/codng'
+    inputText.value = '/gamemode creative'
 
     const handled = await api.executeSlashCommand(inputText.value)
 
+    expect(handled).toBe(false)
+    expect(notify).not.toHaveBeenCalled()
+    await expect(api.classifySlashCommand(inputText.value)).resolves.toBe('unknown')
+  })
+
+  it('still executes a registered slash command as a command', async () => {
+    const goalCommand = {
+      name: '/goal',
+      cmd: '/goal',
+      label: '/goal',
+      desc: 'Set a long-running goal for the agent to pursue.',
+      aliases: [],
+      execution: { action: 'goal.set' },
+    }
+    const { api, inputText, armGoal } = harness(false, [goalCommand])
+    inputText.value = '/goal'
+
+    const handled = await api.executeSlashCommand(inputText.value)
+    await Promise.resolve()
+
+    // Registered commands stay handled: they run as commands, not messages.
     expect(handled).toBe(true)
-    expect(inputText.value).toBe('/codng')
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('/codng'))
-    expect(notify).toHaveBeenCalledWith(expect.stringContaining('//'))
+    expect(armGoal).toHaveBeenCalledTimes(1)
   })
 })
 

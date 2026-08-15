@@ -396,6 +396,28 @@ def test_engine_cap_lowers_routed_tier() -> None:
     assert result.metadata_updates["router_budget_to_tier"] == "c0"
 
 
+def test_engine_budget_cap_cannot_lower_large_context_floor() -> None:
+    engine = RoutingPolicyEngine()
+    result = engine.run(
+        make_inputs(
+            tier="c0",
+            confidence=0.99,
+            tokens=90_000,
+            budget=budget_input(
+                action="cap",
+                limit_usd=1.0,
+                spend_usd=9.0,
+                cap_tier="c0",
+            ),
+        )
+    )
+
+    assert result.decision.tier == "c3"
+    assert result.decision.source == "large_context_floor"
+    assert result.metadata_updates["large_context_floor_min_tier"] == "c3"
+    assert result.metadata_updates["router_budget_outcome"] == "warn"
+
+
 def test_engine_default_budget_writes_no_budget_metadata() -> None:
     engine = RoutingPolicyEngine()
     result = engine.run(make_inputs(tier="c2", budget=None))

@@ -12,6 +12,10 @@ from opensquilla.session.terminal_reply import (
     safe_provider_failure_message,
     sanitize_agent_error,
 )
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+)
 
 RAW_INTERNAL_STRINGS = (
     "Gateway task timeout",
@@ -186,6 +190,65 @@ def test_ensemble_multimodal_reply_is_actionable_and_stable() -> None:
         "Ensemble does not support image input yet. "
         "Switch to a single-model routing mode and try again."
     )
+
+
+def test_human_silent_reply_failure_has_actionable_terminal_message() -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "terminal_reason": "error",
+            "error_class": SILENT_REPLY_NOT_ALLOWED_CODE,
+        }
+    )
+
+    assert reply == SILENT_REPLY_NOT_ALLOWED_MESSAGE
+
+
+@pytest.mark.parametrize(
+    "proof",
+    [
+        {"replay_safe": True},
+        {
+            "usage_call_index": "1",
+            "no_prior_provider_dispatch": True,
+            "replay_safe": True,
+        },
+        {
+            "usage_call_index": 2,
+            "no_prior_provider_dispatch": True,
+            "replay_safe": True,
+        },
+    ],
+)
+def test_usage_barrier_reply_requires_complete_native_replay_proof(
+    proof: dict[str, object],
+) -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "error_class": "usage_accounting_busy",
+            **proof,
+        }
+    )
+
+    assert "earlier work" in reply.lower()
+    assert "no usage was billed" not in reply.lower()
+    assert "safe to retry" not in reply.lower()
+
+
+def test_usage_barrier_reply_accepts_complete_native_replay_proof() -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "error_class": "usage_accounting_busy",
+            "usage_call_index": 1,
+            "no_prior_provider_dispatch": True,
+            "replay_safe": True,
+        }
+    )
+
+    assert "no usage was billed" in reply.lower()
+    assert "safe to retry" in reply.lower()
 
 
 def test_build_terminal_reply_accepts_agent_task_record_like_objects() -> None:

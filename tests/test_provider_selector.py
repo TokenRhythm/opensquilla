@@ -164,6 +164,104 @@ def test_override_model_with_router_fallback_chain_prefers_lower_tiers(monkeypat
     assert [cfg.model for cfg in built] == resolved_models
 
 
+@pytest.mark.parametrize(
+    "router_chain, expected_models",
+    [
+        ([], [HIGH_TIER_MODEL]),
+        (
+            [{"tier": "c2", "provider": "openrouter", "model": MID_TIER_MODEL}],
+            [HIGH_TIER_MODEL, MID_TIER_MODEL],
+        ),
+    ],
+)
+def test_capacity_bounded_fallback_chain_drops_configured_lower_models(
+    router_chain: list[object],
+    expected_models: list[str],
+) -> None:
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig(
+                provider="openrouter",
+                model=BASELINE_MODEL,
+                api_key="sk-test",
+            ),
+            fallbacks=[
+                ProviderConfig(
+                    provider="openrouter",
+                    model=LOW_TIER_MODEL,
+                    api_key="sk-test",
+                )
+            ],
+        )
+    )
+
+    selector.override_model_with_bounded_fallback_chain(
+        HIGH_TIER_MODEL,
+        router_chain,
+    )
+
+    assert [config.model for config in selector.remaining_chain()] == expected_models
+
+
+def test_capacity_bound_filters_plugin_failover_replacement() -> None:
+    class _Plugin:
+        def failover_hook(self, primary_failure: Exception) -> list[ProviderConfig]:
+            del primary_failure
+            return [
+                ProviderConfig("openrouter", "unknown-small", api_key="plugin-key")
+            ]
+
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openrouter", "baseline", api_key="test-key")
+        ),
+        plugin=_Plugin(),
+    )
+    selector.override_model_with_bounded_fallback_chain(
+        HIGH_TIER_MODEL,
+        [{"provider": "openrouter", "model": MID_TIER_MODEL}],
+    )
+
+    with pytest.raises(IndexError, match="No fallback chain available"):
+        selector.next_fallback_after_failure(RuntimeError("primary failed"))
+
+
+def test_capacity_bound_rejects_plugin_endpoint_swap_for_same_model() -> None:
+    approved = ProviderConfig(
+        "tokenrhythm",
+        "same-model",
+        api_key="approved-key",
+        base_url="https://approved.example/v1",
+    )
+
+    class _Plugin:
+        def failover_hook(self, primary_failure: Exception) -> list[ProviderConfig]:
+            del primary_failure
+            return [
+                ProviderConfig(
+                    "tokenrhythm",
+                    "same-model",
+                    api_key="other-key",
+                    base_url="https://smaller.example/v1",
+                )
+            ]
+
+    selector = ModelSelector(
+        SelectorConfig(
+            primary=ProviderConfig("openrouter", "baseline", api_key="test-key"),
+            fallbacks=[approved],
+        ),
+        plugin=_Plugin(),
+    )
+    selector.override_model_with_bounded_fallback_chain(
+        HIGH_TIER_MODEL,
+        [approved],
+    )
+
+    with pytest.raises(IndexError, match="No fallback chain available"):
+        selector.next_fallback_after_failure(RuntimeError("primary failed"))
+
+
 # A synthetic, public-dummy credential: it only exists to prove redaction.
 FAKE_LEAKED_KEY = "sk-test-000fakefakefakefake"
 

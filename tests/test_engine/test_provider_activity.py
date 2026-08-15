@@ -355,7 +355,168 @@ async def test_first_reasoning_delta_emits_activity_before_thinking() -> None:
 
 
 @pytest.mark.asyncio
-async def test_selector_fallback_precedes_request_and_hides_failed_reasoning() -> None:
+async def test_selector_streams_each_primary_reasoning_delta_before_text() -> None:
+    provider = _SequenceProvider(
+        [[
+            ReasoningDeltaEvent(text="first "),
+            ReasoningDeltaEvent(text="second"),
+            TextDeltaEvent(text="answer"),
+            DoneEvent(stop_reason="stop"),
+        ]]
+    )
+
+    class _Selector:
+        current_config = SimpleNamespace(provider="openrouter", model="primary/model")
+
+    events = [
+        event
+        async for event in _SelectorFallbackProvider(provider, _Selector()).chat(
+            [Message(role="user", content="hi")]
+        )
+    ]
+
+    visible = [
+        event
+        for event in events
+        if isinstance(event, (ReasoningDeltaEvent, TextDeltaEvent))
+    ]
+    assert [type(event) for event in visible] == [
+        ReasoningDeltaEvent,
+        ReasoningDeltaEvent,
+        TextDeltaEvent,
+    ]
+    assert [event.text for event in visible] == ["first ", "second", "answer"]
+
+
+@pytest.mark.asyncio
+async def test_selector_streams_each_fallback_reasoning_delta_before_text() -> None:
+    primary = _SequenceProvider([[ErrorEvent(message="busy", code="503")]])
+    fallback = _SequenceProvider(
+        [[
+            ReasoningDeltaEvent(text="fallback first "),
+            ReasoningDeltaEvent(text="fallback second"),
+            TextDeltaEvent(text="answer"),
+            DoneEvent(stop_reason="stop"),
+        ]]
+    )
+
+    class _Selector:
+        current_config = SimpleNamespace(provider="openrouter", model="primary/model")
+
+        def next_fallback_after_failure(self, exc: Exception) -> Any:
+            del exc
+            self.current_config = SimpleNamespace(
+                provider="openrouter",
+                model="fallback/model",
+            )
+            return fallback
+
+    events = [
+        event
+        async for event in _SelectorFallbackProvider(primary, _Selector()).chat(
+            [Message(role="user", content="hi")]
+        )
+    ]
+
+    visible = [
+        event
+        for event in events
+        if isinstance(event, (ReasoningDeltaEvent, TextDeltaEvent))
+    ]
+    assert [event.text for event in visible] == [
+        "fallback first ",
+        "fallback second",
+        "answer",
+    ]
+    assert primary.calls == fallback.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_selector_reasoning_does_not_commit_incomplete_primary_tool_frames() -> None:
+    secret_fragment = '{"api_key":"must-not-escape"'
+    primary = _SequenceProvider(
+        [[
+            ToolUseStartEvent(tool_use_id="open", tool_name="echo"),
+            ToolUseDeltaEvent(tool_use_id="open", json_fragment=secret_fragment),
+            ReasoningDeltaEvent(text="reasoning after an incomplete tool"),
+        ]]
+    )
+    fallback = _SequenceProvider(
+        [[TextDeltaEvent(text="safe fallback"), DoneEvent(stop_reason="stop")]]
+    )
+
+    class _Selector:
+        current_config = SimpleNamespace(provider="openrouter", model="primary/model")
+
+        def next_fallback_after_failure(self, exc: Exception) -> Any:
+            del exc
+            self.current_config = SimpleNamespace(
+                provider="openrouter",
+                model="fallback/model",
+            )
+            return fallback
+
+    events = [
+        event
+        async for event in _SelectorFallbackProvider(primary, _Selector()).chat(
+            [Message(role="user", content="hi")]
+        )
+    ]
+
+    assert primary.calls == fallback.calls == 1
+    assert secret_fragment not in repr(events)
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ReasoningDeltaEvent))
+        for event in events
+    )
+    assert any(
+        isinstance(event, TextDeltaEvent) and event.text == "safe fallback"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_selector_reasoning_does_not_commit_incomplete_fallback_tool_frames() -> None:
+    secret_fragment = '{"token":"must-not-escape"'
+    primary = _SequenceProvider([[ErrorEvent(message="busy", code="503")]])
+    fallback = _SequenceProvider(
+        [[
+            ToolUseStartEvent(tool_use_id="open", tool_name="echo"),
+            ToolUseDeltaEvent(tool_use_id="open", json_fragment=secret_fragment),
+            ReasoningDeltaEvent(text="reasoning after an incomplete tool"),
+        ]]
+    )
+
+    class _Selector:
+        current_config = SimpleNamespace(provider="openrouter", model="primary/model")
+
+        def next_fallback_after_failure(self, exc: Exception) -> Any:
+            del exc
+            self.current_config = SimpleNamespace(
+                provider="openrouter",
+                model="fallback/model",
+            )
+            return fallback
+
+    events = [
+        event
+        async for event in _SelectorFallbackProvider(primary, _Selector()).chat(
+            [Message(role="user", content="hi")]
+        )
+    ]
+
+    assert primary.calls == fallback.calls == 1
+    assert secret_fragment not in repr(events)
+    assert not any(
+        isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent, ReasoningDeltaEvent))
+        for event in events
+    )
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    assert terminal.code == "invalid_stream_order"
+
+
+@pytest.mark.asyncio
+async def test_selector_reasoning_commits_primary_and_suppresses_fallback() -> None:
     primary = _SequenceProvider(
         [[
             ReasoningDeltaEvent(text="failed secret"),
@@ -388,27 +549,28 @@ async def test_selector_fallback_precedes_request_and_hides_failed_reasoning() -
     wrapper = _SelectorFallbackProvider(primary, _Selector(), health_ledger=health)
     events = [event async for event in wrapper.chat([Message(role="user", content="hi")])]
 
-    fallback_index = next(
-        index
-        for index, event in enumerate(events)
-        if isinstance(event, ProviderDomainActivityEvent) and event.phase == "fallback"
-    )
     reasoning_index = next(
         index
         for index, event in enumerate(events)
         if isinstance(event, ProviderDomainActivityEvent) and event.phase == "reasoning"
     )
     text_index = next(
-        index for index, event in enumerate(events) if isinstance(event, TextDeltaEvent)
+        index for index, event in enumerate(events) if isinstance(event, ReasoningDeltaEvent)
     )
-    assert reasoning_index < fallback_index
-    assert fallback_index < text_index
-    assert not any(
-        isinstance(event, ReasoningDeltaEvent) and "failed secret" in event.text
+    assert reasoning_index < text_index
+    assert primary.calls == 1
+    assert fallback.calls == 0
+    assert any(
+        isinstance(event, ReasoningDeltaEvent) and event.text == "failed secret"
         for event in events
     )
+    assert not any(
+        isinstance(event, ProviderDomainActivityEvent) and event.phase == "fallback"
+        for event in events
+    )
+    assert any(isinstance(event, ErrorEvent) for event in events)
     clock.now += 60.0
-    assert health.is_benched("openrouter", "primary/model")
+    assert not health.is_benched("openrouter", "primary/model")
 
 
 @pytest.mark.asyncio
@@ -497,7 +659,7 @@ async def test_selector_buffer_exhaustion_falls_back_before_agent_surfaces_error
 
 
 @pytest.mark.asyncio
-async def test_selector_drops_reasoning_only_leg_before_agent_retry() -> None:
+async def test_selector_exposes_reasoning_only_leg_after_visible_commit() -> None:
     provider = _SequenceProvider(
         [[ReasoningDeltaEvent(text="failed secret"), DoneEvent(reasoning_content="failed secret")]]
     )
@@ -508,5 +670,8 @@ async def test_selector_drops_reasoning_only_leg_before_agent_retry() -> None:
     wrapper = _SelectorFallbackProvider(provider, _Selector())
     events = [event async for event in wrapper.chat([Message(role="user", content="hi")])]
 
-    assert not any(isinstance(event, ReasoningDeltaEvent) for event in events)
+    assert any(
+        isinstance(event, ReasoningDeltaEvent) and event.text == "failed secret"
+        for event in events
+    )
     assert any(isinstance(event, DoneEvent) for event in events)

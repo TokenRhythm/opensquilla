@@ -6,6 +6,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from opensquilla.session.models import AgentTaskStatus
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+)
 
 CONTEXT_PAYLOAD_TOO_LARGE_CODE = "provider_request_too_large"
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE = "ensemble_multimodal_unsupported"
@@ -190,6 +194,35 @@ def build_terminal_reply(
         return (
             "The task was blocked because a tool it needed is not permitted by the "
             "current policy."
+        )
+    if (
+        error_class == SILENT_REPLY_NOT_ALLOWED_CODE
+        or reason == SILENT_REPLY_NOT_ALLOWED_CODE
+    ):
+        return SILENT_REPLY_NOT_ALLOWED_MESSAGE
+    if error_class in {
+        "usage_accounting_busy",
+        "usage_accounting_unavailable",
+    } or reason in {
+        "usage_accounting_busy",
+        "usage_accounting_unavailable",
+    }:
+        usage_call_index = _read_value(record_or_payload, "usage_call_index")
+        replay_safe = (
+            isinstance(usage_call_index, int)
+            and not isinstance(usage_call_index, bool)
+            and usage_call_index == 1
+            and _read_value(record_or_payload, "no_prior_provider_dispatch") is True
+            and _read_value(record_or_payload, "replay_safe") is True
+        )
+        if replay_safe:
+            return (
+                "Usage accounting is temporarily unavailable. The provider request was not "
+                "sent and no usage was billed, so it is safe to retry this turn."
+            )
+        return (
+            "Usage accounting is temporarily unavailable. This provider request was not "
+            "sent. Earlier work in this turn may already have run or been billed."
         )
     if status == AgentTaskStatus.FAILED.value or reason in {"error", "tool_error"}:
         return "The task failed before it could finish."

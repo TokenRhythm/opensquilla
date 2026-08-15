@@ -32,6 +32,13 @@
         >
           <span>{{ t(step.label.code, step.label.params) }}</span>
           <span
+            v-if="step.durationSeconds !== undefined"
+            class="assistant-activity-status__duration"
+            aria-hidden="true"
+          >
+            · {{ formatDuration(step.durationSeconds) }}
+          </span>
+          <span
             v-if="step.category === 'maintenance' && step.durability === 'request_scoped'"
             class="assistant-activity-status__detail"
           >
@@ -125,11 +132,13 @@ import type {
 } from '@/types/chat'
 import {
   type AssistantActivityTimelineProjection,
-  isSemanticActivityStatusStep,
+  isBeforeReasoningActivityStatusStep,
+  isRoutineActivityPhaseStep,
+  isVisibleActivityStatusStep,
 } from '@/utils/chat/assistantActivity'
 import { toolIconName, toolOperationKey } from '@/utils/chat/toolDisplay'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   projection: AssistantActivityTimelineProjection
   timelineItems?: ChatStreamTimelineItem[]
   isToolGroupOpen: (groupId: string) => boolean
@@ -140,7 +149,12 @@ const props = defineProps<{
   toolElapsedText?: (call: ChatToolCallRenderItem) => string
   variant?: 'checklist'
   stateScope?: string
-}>()
+  statusPosition?: 'all' | 'before-reasoning' | 'after-reasoning'
+  showItems?: boolean
+}>(), {
+  statusPosition: 'all',
+  showItems: true,
+})
 
 defineEmits<{
   toggleGroup: [groupId: string]
@@ -158,18 +172,30 @@ const { t } = useI18n()
 const statusSteps = computed(() => {
   const isLive = props.projection.lifecycle === 'working'
     || props.projection.lifecycle === 'answering'
-  if (!isLive) return props.projection.statusSteps
+  const meaningfulSteps = props.projection.statusSteps
+    .filter(isVisibleActivityStatusStep)
+  const positionedSteps = props.statusPosition === 'before-reasoning'
+    ? meaningfulSteps.filter(isBeforeReasoningActivityStatusStep)
+    : props.statusPosition === 'after-reasoning'
+      ? meaningfulSteps.filter(step => !isBeforeReasoningActivityStatusStep(step))
+      : meaningfulSteps
+  if (!isLive) return positionedSteps
 
-  // The live header owns the current lifecycle phase. Repeating that phase in
-  // the body creates pairs such as "Working / Working" and makes transport
-  // phases look like meaningful agent actions. The shared predicate keeps this
-  // body filter and the header's step count agreeing by construction;
-  // completed/history playback can still show the full phase record when the
-  // user expands it.
-  return props.projection.statusSteps
-    .filter(step => step.category === 'maintenance' || isSemanticActivityStatusStep(step))
+  // During a live turn, routine phase narration is a single changing row.
+  // Completed model phases return once the terminal record is rendered.
+  return positionedSteps
+    .filter(step => !isRoutineActivityPhaseStep(step) || step.isCurrent)
     .slice(-3)
 })
+
+function formatDuration(seconds: number): string {
+  const whole = Math.max(0, Math.floor(seconds))
+  if (whole < 60) return String(t('chat.activityDurationSeconds', { seconds: whole }))
+  return String(t('chat.activityDurationMinutes', {
+    minutes: Math.floor(whole / 60),
+    seconds: whole % 60,
+  }))
+}
 
 function clusterItem(
   cluster: AssistantActivityTimelineProjection['activityClusters'][number],
@@ -199,6 +225,7 @@ function clusterItem(
 }
 
 const items = computed<ChatStreamTimelineItem[]>(() => {
+  if (props.showItems === false) return []
   if (props.timelineItems?.length) {
     const clusterByCall = new Map(
       props.projection.activityClusters.flatMap(cluster =>

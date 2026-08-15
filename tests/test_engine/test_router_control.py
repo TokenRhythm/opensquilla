@@ -12,6 +12,7 @@ from opensquilla.gateway.config import (
     SquillaRouterConfig,
     _router_tier_profile_defaults,
 )
+from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.router_control import (
     RouterControlHoldStore,
     RouterControlValidationError,
@@ -195,6 +196,106 @@ async def test_squilla_router_applies_hold_before_normal_classification(monkeypa
         "c1",
         "c0",
     ]
+
+
+@pytest.mark.asyncio
+async def test_large_attachment_clamps_held_tier_to_proven_capacity(monkeypatch) -> None:
+    tiers = {
+        "c0": {"provider": "openrouter", "model": "held-small"},
+        "c3": {"provider": "openrouter", "model": "capacity-large"},
+    }
+    cfg = _router_cfg(tiers)
+    target = resolve_router_control_target(cfg, "tier:c0")
+    store = RouterControlHoldStore()
+    store.set_hold("agent:main:test-capacity-hold", target, evidence="use c0")
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/held-small": {
+                "context_window": 128_000,
+                "max_output_tokens": 10_000,
+            },
+            "openrouter/capacity-large": {
+                "context_window": 300_000,
+                "max_output_tokens": 10_000,
+            },
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.squilla_router._get_strategy",
+        lambda _cfg: pytest.fail("a valid hold must bypass classification"),
+    )
+    ctx = TurnContext(
+        message="review the attached archive",
+        session_key="agent:main:test-capacity-hold",
+        config=SimpleNamespace(squilla_router=cfg),
+        provider=None,
+        model="default-model",
+        tool_defs=[],
+        system_prompt="system",
+        metadata={
+            "router_control_hold_store": store,
+            "attachment_material_estimated_tokens": 50_000,
+        },
+    )
+
+    out = await apply_squilla_router(ctx)
+
+    assert out.metadata["router_control_hold_applied"] is True
+    assert out.metadata["router_control_hold_capacity_clamped"] is True
+    assert out.metadata["routing_source"] == "large_context_floor"
+    assert out.metadata["routed_tier"] == "c3"
+    assert out.model == "capacity-large"
+    assert out.metadata["router_fallback_chain"] == []
+
+
+@pytest.mark.asyncio
+async def test_large_attachment_foreign_hold_veto_fails_closed(monkeypatch) -> None:
+    tiers = {
+        "c0": {"provider": "openrouter", "model": "active-small"},
+        "c3": {"provider": "foreign", "model": "held-large"},
+    }
+    cfg = _router_cfg(tiers)
+    cfg.tier_provider_mismatch = "veto"
+    target = resolve_router_control_target(cfg, "tier:c3")
+    store = RouterControlHoldStore()
+    store.set_hold("agent:main:test-foreign-hold", target, evidence="use c3")
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "foreign/held-large": {
+                "context_window": 300_000,
+                "max_output_tokens": 10_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = TurnContext(
+        message="review the attached archive",
+        session_key="agent:main:test-foreign-hold",
+        config=SimpleNamespace(
+            squilla_router=cfg,
+            llm=SimpleNamespace(
+                provider="openrouter",
+                context_window_tokens=0,
+                max_tokens=0,
+            ),
+        ),
+        provider=None,
+        model="active-small",
+        tool_defs=[],
+        system_prompt="system",
+        metadata={
+            "router_control_hold_store": store,
+            "attachment_material_estimated_tokens": 90_000,
+        },
+    )
+
+    out = await apply_squilla_router(ctx)
+
+    assert out.metadata["large_context_capacity_blocked"] is True
+    assert "routed_tier" not in out.metadata
 
 
 @pytest.mark.asyncio

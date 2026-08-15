@@ -54,10 +54,33 @@ class AgentState(StrEnum):
 
 
 @dataclass
+class ThinkingStartEvent:
+    kind: Literal["thinking_start"] = field(default="thinking_start", init=False)
+    block_id: str = ""
+    block_index: int = 0
+    started_at: int = 0
+    content_kind: Literal["summary", "reasoning"] = "reasoning"
+
+
+@dataclass
 class ThinkingEvent:
     kind: Literal["thinking"] = field(default="thinking", init=False)
     text: str = ""
     started_at: int = 0
+    # Optional block identity keeps the existing thinking delta wire contract
+    # compatible while allowing newer clients to preserve provider-call
+    # boundaries. Empty/-1 remain the legacy single-block representation.
+    block_id: str = ""
+    block_index: int = -1
+
+
+@dataclass
+class ThinkingEndEvent:
+    kind: Literal["thinking_end"] = field(default="thinking_end", init=False)
+    block_id: str = ""
+    block_index: int = 0
+    status: Literal["completed", "interrupted", "error"] = "completed"
+    ended_at: int = 0
 
 
 @dataclass
@@ -193,6 +216,15 @@ class ErrorEvent:
     # Stable provider taxonomy for terminal consumers.  The provider's raw
     # ``code`` remains available for diagnostics and wire compatibility.
     failure_kind: str = ""
+    # Optional bounded retry hint for errors that prove no provider dispatch.
+    # Appended for positional-construction compatibility.
+    retry_after_ms: int | None = None
+    # Usage-ledger admission evidence. ``retryable`` describes the transient
+    # error class; these fields separately prove whether replaying the whole
+    # user turn cannot duplicate an earlier provider dispatch or side effect.
+    usage_call_index: int | None = None
+    no_prior_provider_dispatch: bool | None = None
+    replay_safe: bool | None = None
 
 
 @dataclass
@@ -493,7 +525,9 @@ class CompactionOutcome:
 
 
 AgentEvent = (
-    ThinkingEvent
+    ThinkingStartEvent
+    | ThinkingEvent
+    | ThinkingEndEvent
     | TextDeltaEvent
     | RunHeartbeatEvent
     | ProviderActivityEvent
