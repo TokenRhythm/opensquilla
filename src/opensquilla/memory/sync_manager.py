@@ -157,6 +157,7 @@ class MemorySyncManager:
         if (
             is_search_reason
             and not self._dirty
+            and not force
             and not session_delta_pending
             and (self._session_indexer is None or self._session_search_synced)
         ):
