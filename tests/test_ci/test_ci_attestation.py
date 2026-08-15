@@ -37,7 +37,9 @@ def _write(repo: Path, relative: str, value: str) -> None:
     path.write_text(value, encoding="utf-8")
 
 
-def _merge_preview_repo(tmp_path: Path) -> tuple[Path, str, str, str]:
+def _merge_preview_repo(
+    tmp_path: Path, *, advance_base: bool = False
+) -> tuple[Path, str, str, str]:
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init", "-b", "main")
@@ -58,6 +60,11 @@ def _merge_preview_repo(tmp_path: Path) -> tuple[Path, str, str, str]:
     head_sha = _git(repo, "rev-parse", "HEAD")
 
     _git(repo, "switch", "main")
+    if advance_base:
+        _write(repo, "src/base_update.py", "UPDATED_BASE = True\n")
+        _git(repo, "add", "src/base_update.py")
+        _git(repo, "commit", "-m", "advance base")
+    base_sha = _git(repo, "rev-parse", "HEAD")
     _git(repo, "merge", "--no-ff", "feature", "-m", "merge preview")
     merge_sha = _git(repo, "rev-parse", "HEAD")
     return repo, base_sha, head_sha, merge_sha
@@ -127,6 +134,43 @@ def test_create_attestation_pins_merge_parents_tree_and_policy(tmp_path: Path) -
     assert attestation["tested_tree_sha"] == _git(repo, "rev-parse", "HEAD^{tree}")
     assert attestation["policy_digest"] == policy_digest(repo)
     assert attestation["validation_profile"] == "precise-v1"
+
+
+def test_create_attestation_uses_tested_base_when_event_base_is_stale(
+    tmp_path: Path,
+) -> None:
+    repo, tested_base_sha, head_sha, merge_sha = _merge_preview_repo(
+        tmp_path, advance_base=True
+    )
+    event_base_sha = _git(repo, "rev-parse", f"{head_sha}^")
+
+    assert event_base_sha != tested_base_sha
+    attestation = create_attestation(
+        repo=repo,
+        repository="opensquilla/opensquilla",
+        event=_event(event_base_sha, head_sha, merge_sha),
+        workflow_run_id=123,
+        workflow_run_attempt=1,
+        workflow_ref="opensquilla/opensquilla/.github/workflows/ci.yml@refs/pull/42/merge",
+        optimization_mode="enforce",
+    )
+
+    assert attestation["base_sha"] == tested_base_sha
+
+
+def test_create_attestation_rejects_merge_for_another_head(tmp_path: Path) -> None:
+    repo, base_sha, head_sha, merge_sha = _merge_preview_repo(tmp_path)
+
+    with pytest.raises(AttestationError, match="tested merge head"):
+        create_attestation(
+            repo=repo,
+            repository="opensquilla/opensquilla",
+            event=_event(base_sha, "0" * 40, merge_sha),
+            workflow_run_id=123,
+            workflow_run_attempt=1,
+            workflow_ref="workflow-ref",
+            optimization_mode="enforce",
+        )
 
 
 def test_validate_candidate_rejects_non_green_or_mismatched_runs(tmp_path: Path) -> None:

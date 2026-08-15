@@ -134,7 +134,7 @@ def create_attestation(
         raise AttestationError("pull request head/base metadata is missing")
 
     head_sha = _require_sha(head.get("sha"), "pull request head SHA")
-    event_base_sha = _require_sha(base.get("sha"), "pull request base SHA")
+    _require_sha(base.get("sha"), "pull request base SHA")
     merge_commit = _require_sha(_git("rev-parse", "HEAD", cwd=repo), "tested commit SHA")
     merge_tree = _require_sha(
         _git("rev-parse", "HEAD^{tree}", cwd=repo), "tested tree SHA"
@@ -144,8 +144,11 @@ def create_attestation(
         raise AttestationError("pull request CI must test a two-parent merge preview")
     tested_base_sha = _require_sha(parents[1], "tested base SHA")
     tested_head_sha = _require_sha(parents[2], "tested head SHA")
-    if tested_base_sha != event_base_sha or tested_head_sha != head_sha:
-        raise AttestationError("tested merge parents do not match the pull request event")
+    # GitHub's pull_request base SHA can predate the merge preview when main advances. The
+    # preview's first parent is the base that CI actually tested; queue validation still requires
+    # that exact base, tree, and policy before reusing this attestation.
+    if tested_head_sha != head_sha:
+        raise AttestationError("tested merge head does not match the pull request event")
 
     head_repo = head.get("repo")
     head_repository = head_repo.get("full_name") if isinstance(head_repo, dict) else None
