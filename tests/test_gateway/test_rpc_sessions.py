@@ -4664,7 +4664,7 @@ class TestSessionsAbort:
         ]
 
     @pytest.mark.asyncio
-    async def test_chat_user_stop_with_stale_task_id_is_a_side_effect_free_mismatch(
+    async def test_chat_user_stop_with_stale_task_id_cleans_only_exact_auxiliary_owner(
         self, dispatcher, session, monkeypatch
     ):
         class Runtime:
@@ -4731,11 +4731,10 @@ class TestSessionsAbort:
         )
 
         assert res.ok is True
-        assert res.payload["aborted"] is False
-        assert res.payload["reason"] == "task_mismatch"
-        # The exact cancel is the in-memory authority.  The advisory task list
-        # is consulted only after its side-effect-free no-op to classify the
-        # stale identity for the client.
+        assert res.payload["aborted"] is True
+        # Runtime cancellation remains a no-op for the stale identity, while
+        # exact task-keyed auxiliary cleanup is safe and prevents already
+        # detached work from surviving a Stop retry.
         assert runtime.cancel_calls == [
             {
                 "task_id": "task-old",
@@ -4744,7 +4743,9 @@ class TestSessionsAbort:
                 "reason": "user_abort",
             }
         ]
-        assert task_background_cancel_calls == []
+        assert task_background_cancel_calls == [
+            (session.session_key, "task-old"),
+        ]
         assert approval_cancel_calls == []
 
     @pytest.mark.asyncio
@@ -5089,6 +5090,176 @@ class TestSessionsAbort:
                     },
                 },
             )
+        ]
+
+    async def test_task_scoped_stop_cancels_only_task_owned_subagent_descendants(
+        self,
+        dispatcher,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        root_key = "agent:main:webchat:owned-tree"
+        child_key = "agent:worker:subagent:owned-child"
+        grandchild_key = "agent:reviewer:subagent:owned-grandchild"
+        finished_child_key = "agent:worker:subagent:owned-finished-child"
+        sibling_key = "agent:worker:subagent:unrelated-sibling"
+        session = FakeSession(session_key=root_key)
+
+        def record(
+            task_id: str,
+            session_key: str,
+            *,
+            parent_task_id: str | None = None,
+            parent_session_key: str | None = None,
+            run_kind: str = "default",
+            status: str = "running",
+        ) -> SimpleNamespace:
+            metadata = {}
+            if parent_task_id is not None:
+                metadata = {
+                    "parent_task_id": parent_task_id,
+                    "parent_session_key": parent_session_key,
+                }
+            return SimpleNamespace(
+                task_id=task_id,
+                session_key=session_key,
+                status=status,
+                run_kind=run_kind,
+                details={"metadata": metadata},
+            )
+
+        rows = [
+            record("task-root", root_key),
+            record(
+                "task-child",
+                child_key,
+                parent_task_id="task-root",
+                parent_session_key=root_key,
+                run_kind="subagent",
+            ),
+            record(
+                "task-grandchild",
+                grandchild_key,
+                parent_task_id="task-child",
+                parent_session_key=child_key,
+                run_kind="subagent",
+            ),
+            record(
+                "task-finished-child",
+                finished_child_key,
+                parent_task_id="task-root",
+                parent_session_key=root_key,
+                run_kind="subagent",
+                status="succeeded",
+            ),
+            record(
+                "task-sibling",
+                sibling_key,
+                parent_task_id="task-other-root",
+                parent_session_key=root_key,
+                run_kind="subagent",
+            ),
+        ]
+
+        class Runtime:
+            def __init__(self) -> None:
+                self.cancel_calls: list[tuple[str, str]] = []
+
+            async def status(self, task_id: str):
+                return next(row for row in rows if row.task_id == task_id)
+
+            async def list(
+                self,
+                session_key: str | None = None,
+                status: str | None = None,
+            ):
+                return [
+                    row
+                    for row in rows
+                    if (session_key is None or row.session_key == session_key)
+                    and (status is None or row.status == status)
+                ]
+
+            async def cancel_exact(
+                self,
+                *,
+                task_id: str,
+                session_key: str,
+                source: str,
+                reason: str,
+            ) -> int:
+                assert source == "webui_stop"
+                assert reason == "user_abort"
+                row = next(
+                    (
+                        candidate
+                        for candidate in rows
+                        if candidate.task_id == task_id
+                        and candidate.session_key == session_key
+                        and candidate.status in {"queued", "running"}
+                    ),
+                    None,
+                )
+                if row is None:
+                    return 0
+                self.cancel_calls.append((session_key, task_id))
+                row.status = "cancelled"
+                return 1
+
+            async def wait(self, task_id: str):
+                return next(row for row in rows if row.task_id == task_id)
+
+        completion_calls: list[tuple[str, str]] = []
+        process_calls: list[tuple[str, str]] = []
+
+        async def cancel_completion(session_key: str, task_id: str) -> int:
+            completion_calls.append((session_key, task_id))
+            return 0
+
+        async def cancel_processes(session_key: str, task_id: str) -> int:
+            process_calls.append((session_key, task_id))
+            return 0
+
+        monkeypatch.setattr(
+            "opensquilla.gateway.subagent_announce.cancel_background_completion_for_task",
+            cancel_completion,
+        )
+        monkeypatch.setattr(
+            "opensquilla.tools.builtin.shell.cancel_background_processes_for_task",
+            cancel_processes,
+        )
+        monkeypatch.setattr(
+            "opensquilla.tools.builtin.shell.active_background_process_task_owners",
+            lambda: ((finished_child_key, "task-finished-child"),),
+        )
+
+        runtime = Runtime()
+        response = await dispatcher.dispatch(
+            "task-owned-tree",
+            "chat.abort",
+            {
+                "sessionKey": root_key,
+                "taskId": "task-root",
+                "scope": "task",
+                "source": "webui_stop",
+            },
+            make_ctx(
+                session_manager=FakeSessionManager([session]),
+                task_runtime=runtime,
+            ),
+        )
+
+        assert response.ok is True
+        assert response.payload["aborted"] is True
+        assert runtime.cancel_calls == [
+            (root_key, "task-root"),
+            (child_key, "task-child"),
+            (grandchild_key, "task-grandchild"),
+        ]
+        assert completion_calls == process_calls == [
+            (root_key, "task-root"),
+            (child_key, "task-child"),
+            (grandchild_key, "task-grandchild"),
+            (finished_child_key, "task-finished-child"),
         ]
 
     @pytest.mark.asyncio

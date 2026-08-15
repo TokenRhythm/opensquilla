@@ -459,6 +459,9 @@ async def _run_linux_helper_payload(payload: HelperPayload) -> dict[str, object]
                 proc.communicate(),
                 timeout=_outer_helper_timeout_s(payload),
             )
+        except asyncio.CancelledError:
+            await asyncio.shield(_terminate_process_group(proc))
+            raise
         except TimeoutError as exc:
             await _terminate_process_group(proc)
             raise SandboxBackendError("linux helper timed out") from exc

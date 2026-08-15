@@ -1302,6 +1302,56 @@ async def test_run_timeout_returns_timed_out_result(
 
 
 @pytest.mark.asyncio
+async def test_run_caller_cancel_terminates_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    started = asyncio.Event()
+    terminated: list[int] = []
+
+    class FakeProcess:
+        pid = 12346
+        returncode = None
+        stdout = None
+        stderr = None
+
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            started.set()
+            await asyncio.Event().wait()
+
+    async def fake_create_subprocess_exec(*argv: str, **kwargs: object) -> FakeProcess:
+        assert kwargs["start_new_session"] is True
+        return FakeProcess()
+
+    async def fake_terminate(proc: FakeProcess) -> tuple[bytes, bytes]:
+        terminated.append(proc.pid)
+        return b"", b""
+
+    monkeypatch.setattr(seatbelt_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        seatbelt_mod,
+        "_sandbox_exec_binary",
+        lambda binary=None: "/usr/bin/sandbox-exec",
+    )
+    monkeypatch.setattr(
+        seatbelt_mod.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(seatbelt_mod, "_terminate_process_group", fake_terminate)
+
+    running = asyncio.create_task(
+        SeatbeltBackend().run(_request(_policy(tmp_path), tmp_path))
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    running.cancel()
+    cancelled = await asyncio.gather(running, return_exceptions=True)
+    assert isinstance(cancelled[0], asyncio.CancelledError)
+
+    assert terminated == [12346]
+
+
+@pytest.mark.asyncio
 async def test_real_seatbelt_runs_python_when_available(tmp_path: Path) -> None:
     if not SeatbeltBackend().available():
         pytest.skip("requires macOS sandbox-exec")

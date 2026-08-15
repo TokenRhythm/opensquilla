@@ -826,6 +826,7 @@ _STREAM_IDLE_TIMEOUT_MESSAGE = "Session event stream idle before terminal event"
 _RESET_RUNTIME_SETTLE_SECONDS = 0.25
 _RESET_RUNTIME_CANCEL_DRAIN_SECONDS = 2.0
 _ABORT_RUNTIME_CANCEL_DRAIN_SECONDS = 2.0
+_ABORT_OWNED_CLEANUP_SECONDS = 30.0
 _ABORT_SESSION_LOOKUP_SECONDS = 0.05
 _ABORT_TREE_STABILIZATION_PASSES = 8
 _ACTIVE_TASK_STATUSES = frozenset({"queued", "running"})
@@ -853,8 +854,15 @@ async def _await_abort_operation(
     best-effort and may still settle after the RPC returns.
     """
 
+    if isinstance(awaitable, asyncio.Future) and awaitable.done():
+        return awaitable.result()
     remaining = max(0.0, deadline_at_monotonic - time.monotonic())
     if remaining <= 0:
+        if isinstance(awaitable, asyncio.Future):
+            awaitable.cancel()
+            awaitable.add_done_callback(_consume_abort_background_result)
+            log.warning("sessions.abort.operation_budget_exhausted", operation=operation)
+            return default
         close = getattr(awaitable, "close", None)
         if callable(close):
             close()
@@ -874,6 +882,36 @@ async def _await_abort_operation(
     task.cancel()
     task.add_done_callback(_consume_abort_background_result)
     log.warning("sessions.abort.operation_timed_out", operation=operation)
+    return default
+
+
+async def _await_abort_background_task(
+    task: asyncio.Task[Any],
+    *,
+    deadline_at_monotonic: float,
+    operation: str,
+    default: Any,
+) -> Any:
+    """Observe safety cleanup within the RPC budget without cancelling it.
+
+    Process-tree ownership has its own bounded cleanup deadline.  The Stop RPC
+    may return first, but it must never cancel a cleanup task that has already
+    discovered or started terminating exact task-owned descendants.
+    """
+
+    if task.done():
+        return task.result()
+    remaining = max(0.0, deadline_at_monotonic - time.monotonic())
+    if remaining > 0:
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            task.add_done_callback(_consume_abort_background_result)
+            raise
+        if task in done:
+            return task.result()
+    task.add_done_callback(_consume_abort_background_result)
+    log.warning("sessions.abort.cleanup_continuing", operation=operation)
     return default
 
 
@@ -897,6 +935,169 @@ async def _active_task_runtime_ids(task_runtime: Any, session_key: str) -> tuple
         if isinstance(task_id, str) and task_id and task_id not in task_ids:
             task_ids.append(task_id)
     return tuple(task_ids)
+
+
+def _task_record_session_key(row: Any) -> str | None:
+    session_key = getattr(row, "session_key", None)
+    if isinstance(session_key, str) and session_key:
+        return session_key
+    return None
+
+
+def _task_record_parent_identity(row: Any) -> tuple[str, str] | None:
+    """Return the exact parent task/session for one durable subagent task row."""
+
+    if str(getattr(row, "run_kind", "") or "") != "subagent":
+        return None
+    details = getattr(row, "details", None)
+    metadata = details.get("metadata") if isinstance(details, dict) else None
+    if not isinstance(metadata, dict):
+        return None
+    parent_task_id = metadata.get("parent_task_id")
+    parent_session_key = metadata.get("parent_session_key")
+    if not isinstance(parent_task_id, str) or not parent_task_id:
+        return None
+    if not isinstance(parent_session_key, str) or not parent_session_key:
+        return None
+    return parent_task_id, parent_session_key
+
+
+async def _task_runtime_rows(task_runtime: Any) -> tuple[Any, ...]:
+    """Read active/background-owner rows plus their bounded durable ancestry."""
+
+    list_tasks = getattr(task_runtime, "list", None)
+    if not callable(list_tasks):
+        return ()
+    try:
+        rows: list[Any] = []
+        for status_value in _ACTIVE_TASK_STATUSES:
+            rows.extend(await list_tasks(status=status_value))
+    except TypeError:
+        try:
+            rows = list(await list_tasks())
+        except (TypeError, NotImplementedError):
+            return ()
+        except Exception:
+            log.warning("sessions.abort.task_runtime_tree_list_failed")
+            return ()
+    except NotImplementedError:
+        return ()
+    except Exception:
+        log.warning("sessions.abort.task_runtime_tree_list_failed")
+        return ()
+
+    # A child may have already yielded after spawning a still-running
+    # grandchild. Hydrate only the parent chain of active rows instead of
+    # scanning the unbounded task ledger.
+    status = getattr(task_runtime, "status", None)
+    rows_by_id = {
+        str(task_id): row
+        for row in rows
+        if isinstance((task_id := getattr(row, "task_id", None)), str) and task_id
+    }
+    from opensquilla.tools.builtin.shell import active_background_process_task_owners
+
+    if callable(status):
+        for owner_session_key, owner_task_id in active_background_process_task_owners():
+            if owner_task_id in rows_by_id:
+                continue
+            try:
+                owner = await status(owner_task_id)
+            except (KeyError, NotImplementedError):
+                continue
+            except Exception:
+                log.warning(
+                    "sessions.abort.background_owner_status_failed",
+                    task_id=owner_task_id,
+                )
+                continue
+            if _task_record_session_key(owner) == owner_session_key:
+                rows_by_id[owner_task_id] = owner
+    pending_parent_ids = [
+        parent_task_id
+        for row in tuple(rows_by_id.values())
+        if (identity := _task_record_parent_identity(row)) is not None
+        for parent_task_id in (identity[0],)
+        if parent_task_id not in rows_by_id
+    ]
+    while callable(status) and pending_parent_ids:
+        parent_task_id = pending_parent_ids.pop()
+        if parent_task_id in rows_by_id:
+            continue
+        try:
+            parent = await status(parent_task_id)
+        except (KeyError, NotImplementedError):
+            continue
+        except Exception:
+            log.warning(
+                "sessions.abort.task_runtime_ancestor_status_failed",
+                task_id=parent_task_id,
+            )
+            continue
+        rows_by_id[parent_task_id] = parent
+        identity = _task_record_parent_identity(parent)
+        if identity is not None and identity[0] not in rows_by_id:
+            pending_parent_ids.append(identity[0])
+    return tuple(rows_by_id.values())
+
+
+async def _task_runtime_owns_session(
+    task_runtime: Any,
+    *,
+    task_id: str,
+    session_key: str,
+) -> bool:
+    """Verify a durable root identity before following child-supplied lineage."""
+
+    status = getattr(task_runtime, "status", None)
+    if not callable(status):
+        return False
+    try:
+        record = await status(task_id)
+    except (KeyError, NotImplementedError):
+        return False
+    except Exception:
+        log.warning(
+            "sessions.abort.task_runtime_status_failed",
+            session_key=session_key,
+            task_id=task_id,
+        )
+        return False
+    return _task_record_session_key(record) == session_key
+
+
+def _task_owned_descendant_rows(
+    rows: tuple[Any, ...],
+    *,
+    owned_tasks: dict[str, str],
+) -> tuple[Any, ...]:
+    """Expand exact task ancestry without widening to sibling session work."""
+
+    discovered: list[Any] = []
+    discovered_ids: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            task_id = getattr(row, "task_id", None)
+            session_key = _task_record_session_key(row)
+            parent_identity = _task_record_parent_identity(row)
+            if (
+                not isinstance(task_id, str)
+                or not task_id
+                or session_key is None
+                or parent_identity is None
+                or task_id in owned_tasks
+            ):
+                continue
+            parent_task_id, parent_session_key = parent_identity
+            if owned_tasks.get(parent_task_id) != parent_session_key:
+                continue
+            owned_tasks[task_id] = session_key
+            discovered_ids.add(task_id)
+            discovered.append(row)
+            changed = True
+    return tuple(row for row in discovered if getattr(row, "task_id", None) in discovered_ids)
 
 
 def _session_row_value(row: Any, name: str) -> Any:
@@ -1007,6 +1208,175 @@ async def _drain_cancelled_task_runtime(
         # Give cooperative waiters one loop turn to observe cancellation, but
         # never synchronously join a waiter that delays or suppresses it.
         await asyncio.sleep(0)
+
+
+async def _cancel_task_owned_auxiliary_work(
+    *,
+    session_key: str,
+    task_id: str,
+    deadline_at_monotonic: float,
+) -> int:
+    """Stop task-owned completion delivery and registered background processes."""
+
+    from opensquilla.gateway.subagent_announce import (
+        cancel_background_completion_for_task,
+    )
+    from opensquilla.tools.builtin.shell import cancel_background_processes_for_task
+
+    completion_task = asyncio.create_task(
+        cancel_background_completion_for_task(session_key, task_id)
+    )
+    process_task = asyncio.create_task(
+        cancel_background_processes_for_task(session_key, task_id)
+    )
+    cancelled_completions = await _await_abort_operation(
+        completion_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_background_completion",
+        default=0,
+    )
+    cancelled_processes = await _await_abort_background_task(
+        process_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_background_processes",
+        default=0,
+    )
+    return int(cancelled_completions) + int(cancelled_processes)
+
+
+async def _cancel_task_owned_descendants(
+    task_runtime: Any,
+    *,
+    root_session_key: str,
+    root_task_id: str,
+    source: str,
+    reason: str,
+    deadline_at_monotonic: float,
+) -> int:
+    """Cancel active subagent descendants proven to belong to one exact task."""
+
+    initial_rows_task = asyncio.create_task(_task_runtime_rows(task_runtime))
+    root_status_task = asyncio.create_task(
+        _task_runtime_owns_session(
+            task_runtime,
+            task_id=root_task_id,
+            session_key=root_session_key,
+        )
+    )
+    initial_rows = await _await_abort_operation(
+        initial_rows_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="initial_list_task_owned_descendants",
+        default=(),
+    )
+    root_verified = any(
+        getattr(row, "task_id", None) == root_task_id
+        and _task_record_session_key(row) == root_session_key
+        for row in initial_rows
+    )
+    root_verified = root_verified or bool(
+        await _await_abort_operation(
+            root_status_task,
+            deadline_at_monotonic=deadline_at_monotonic,
+            operation="verify_task_owned_descendant_root",
+            default=False,
+        )
+    )
+    if not root_verified:
+        return 0
+
+    owned_tasks = {root_task_id: root_session_key}
+    processed_task_ids = {root_task_id}
+    cancelled_task_ids: list[str] = []
+    stable_passes = 0
+
+    for pass_index in range(_ABORT_TREE_STABILIZATION_PASSES):
+        if time.monotonic() >= deadline_at_monotonic:
+            break
+        if pass_index == 0:
+            rows = initial_rows
+        else:
+            rows = await _await_abort_operation(
+                _task_runtime_rows(task_runtime),
+                deadline_at_monotonic=deadline_at_monotonic,
+                operation="list_task_owned_descendants",
+                default=(),
+            )
+        descendants = _task_owned_descendant_rows(rows, owned_tasks=owned_tasks)
+        new_rows = [
+            row
+            for row in descendants
+            if isinstance(getattr(row, "task_id", None), str)
+            and getattr(row, "task_id") not in processed_task_ids
+        ]
+        if not new_rows:
+            stable_passes += 1
+            if stable_passes >= 2:
+                break
+            await asyncio.sleep(0)
+            continue
+
+        stable_passes = 0
+        auxiliary_tasks: list[asyncio.Task[int]] = []
+        runtime_cancel_tasks: list[tuple[str, asyncio.Task[int]]] = []
+        for row in new_rows:
+            task_id = str(getattr(row, "task_id"))
+            session_key = _task_record_session_key(row)
+            if session_key is None:
+                continue
+            processed_task_ids.add(task_id)
+            auxiliary_tasks.append(
+                asyncio.create_task(
+                    _cancel_task_owned_auxiliary_work(
+                        session_key=session_key,
+                        task_id=task_id,
+                        deadline_at_monotonic=deadline_at_monotonic,
+                    )
+                )
+            )
+            if _task_status_value(getattr(row, "status", None)) not in _ACTIVE_TASK_STATUSES:
+                continue
+            runtime_cancel_tasks.append(
+                (
+                    task_id,
+                    asyncio.create_task(
+                        _cancel_task_runtime(
+                            task_runtime,
+                            session_key=session_key,
+                            task_id=task_id,
+                            source=source,
+                            reason=reason,
+                        )
+                    ),
+                )
+            )
+
+        for auxiliary_task in auxiliary_tasks:
+            await _await_abort_background_task(
+                auxiliary_task,
+                deadline_at_monotonic=deadline_at_monotonic,
+                operation="cancel_task_owned_descendant_auxiliary_work",
+                default=0,
+            )
+        for task_id, runtime_cancel_task in runtime_cancel_tasks:
+            cancelled = await _await_abort_operation(
+                runtime_cancel_task,
+                deadline_at_monotonic=deadline_at_monotonic,
+                operation="cancel_task_owned_descendant",
+                default=0,
+            )
+            if int(cancelled) > 0:
+                cancelled_task_ids.append(task_id)
+
+        if cancelled_task_ids:
+            await _drain_cancelled_task_runtime(
+                task_runtime,
+                session_key=root_session_key,
+                task_ids=tuple(cancelled_task_ids),
+                deadline_at_monotonic=deadline_at_monotonic,
+            )
+
+    return len(set(cancelled_task_ids))
 
 
 async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> None:
@@ -7482,6 +7852,56 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         # become observable immediately even when bookkeeping is congested.
         active_compaction_tasks = cancel_active_compactions(key)
 
+    task_runtime = getattr(ctx, "task_runtime", None)
+    exact_cancel_unknown = object()
+    exact_runtime_cleanup: asyncio.Task[Any] | None = None
+    exact_auxiliary_cleanup: asyncio.Task[int] | None = None
+    exact_descendant_cleanup: asyncio.Task[int] | None = None
+    exact_cancel_source = ""
+    if requested_task_id is not None and task_runtime is not None:
+        # Start every exact-identity safety operation before storage lookup or
+        # runtime admission can consume the response deadline. Their own
+        # cleanup deadline is independent from the bounded RPC observation.
+        exact_cancel_source = _cancel_source_from_params(params, "sessions_abort")
+        cleanup_deadline = time.monotonic() + _ABORT_OWNED_CLEANUP_SECONDS
+        exact_runtime_cleanup = asyncio.create_task(
+            _await_abort_operation(
+                _cancel_task_runtime(
+                    task_runtime,
+                    session_key=key,
+                    task_id=requested_task_id,
+                    source=exact_cancel_source,
+                    reason="user_abort",
+                ),
+                deadline_at_monotonic=cleanup_deadline,
+                operation="cancel_requested_runtime_task_cleanup",
+                default=exact_cancel_unknown,
+            )
+        )
+        exact_auxiliary_cleanup = asyncio.create_task(
+            _cancel_task_owned_auxiliary_work(
+                session_key=key,
+                task_id=requested_task_id,
+                deadline_at_monotonic=cleanup_deadline,
+            )
+        )
+        exact_descendant_cleanup = asyncio.create_task(
+            _cancel_task_owned_descendants(
+                task_runtime,
+                root_session_key=key,
+                root_task_id=requested_task_id,
+                source=exact_cancel_source,
+                reason="user_abort",
+                deadline_at_monotonic=cleanup_deadline,
+            )
+        )
+        for cleanup_task in (
+            exact_runtime_cleanup,
+            exact_auxiliary_cleanup,
+            exact_descendant_cleanup,
+        ):
+            cleanup_task.add_done_callback(_consume_abort_background_result)
+
     storage = get_session_storage(ctx.session_manager)
     if storage:
         lookup_deadline = min(
@@ -7522,36 +7942,58 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                         session_key=key,
                     )
 
-    task_runtime = getattr(ctx, "task_runtime", None)
     if task_runtime is not None:
         from opensquilla.gateway.approval_queue import get_approval_queue
         from opensquilla.gateway.subagent_announce import (
             cancel_background_completion_for_session,
-            cancel_background_completion_for_task,
         )
 
         if requested_task_id is not None:
-            cancel_unknown = object()
+            assert exact_runtime_cleanup is not None
+            assert exact_auxiliary_cleanup is not None
+            assert exact_descendant_cleanup is not None
             try:
-                cancelled_result = await _await_abort_operation(
-                    _cancel_task_runtime(
-                        task_runtime,
-                        session_key=key,
-                        task_id=requested_task_id,
-                        source=_cancel_source_from_params(params, "sessions_abort"),
-                        reason="user_abort",
-                    ),
+                cancelled_result = await _await_abort_background_task(
+                    exact_runtime_cleanup,
                     deadline_at_monotonic=abort_deadline,
                     operation="cancel_requested_runtime_task",
-                    default=cancel_unknown,
+                    default=exact_cancel_unknown,
                 )
             except _TaskScopedCancelUnsupportedError:
+                await _await_abort_background_task(
+                    exact_auxiliary_cleanup,
+                    deadline_at_monotonic=abort_deadline,
+                    operation="cancel_requested_task_auxiliary_work",
+                    default=0,
+                )
+                await _await_abort_background_task(
+                    exact_descendant_cleanup,
+                    deadline_at_monotonic=abort_deadline,
+                    operation="cancel_requested_task_descendants",
+                    default=0,
+                )
                 return {
                     "aborted": False,
                     "key": key,
                     "reason": "task_scope_unsupported",
                 }
-            if cancelled_result is cancel_unknown:
+            cancelled_auxiliary = int(
+                await _await_abort_background_task(
+                    exact_auxiliary_cleanup,
+                    deadline_at_monotonic=abort_deadline,
+                    operation="cancel_requested_task_auxiliary_work",
+                    default=0,
+                )
+            )
+            cancelled_descendants = int(
+                await _await_abort_background_task(
+                    exact_descendant_cleanup,
+                    deadline_at_monotonic=abort_deadline,
+                    operation="cancel_requested_task_descendants",
+                    default=0,
+                )
+            )
+            if cancelled_result is exact_cancel_unknown:
                 return {
                     "aborted": False,
                     "key": key,
@@ -7561,19 +8003,12 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     # exact identity.
                     "reason": "task_cancel_unknown",
                 }
-            cancelled_count = int(cancelled_result)
-            if cancelled_count > 0:
-                # Background completion groups have exact task identity. Do
-                # not clear every group or every approval in the session: a
-                # queued task may be cancelled while another task is running.
-                # TaskRuntime terminalization expires approvals only when this
-                # exact task owns the running lane.
-                await _await_abort_operation(
-                    cancel_background_completion_for_task(key, requested_task_id),
-                    deadline_at_monotonic=abort_deadline,
-                    operation="cancel_task_background_completion",
-                    default=0,
-                )
+            cancelled_count = (
+                int(cancelled_result)
+                + cancelled_auxiliary
+                + cancelled_descendants
+            )
+            if int(cancelled_result) > 0:
                 await _drain_cancelled_task_runtime(
                     task_runtime,
                     session_key=key,

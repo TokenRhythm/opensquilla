@@ -25,4 +25,27 @@ describe('useUsageSessionRows', () => {
     )
     expect(sortedRows.value[0].sessionKey).toBe('agent:main:webchat:private-id')
   })
+
+  it('keeps rows with multiple models expandable', () => {
+    const { sortedRows } = useUsageSessionRows({
+      visibleSessions: computed(() => [{
+        sessionKey: 'agent:main:webchat:multi-model',
+        modelBreakdown: [
+          { model: 'provider/primary-model' },
+          { model: 'provider/helper-model' },
+        ],
+      }]),
+      rangeHiddenHint: computed(() => ''),
+      sortCol: ref('updated_at'),
+      sortAsc: ref(false),
+      rowVal: (row, ...keys) => keys.map(key => row[key]).find(value => value != null),
+      numericRowVal: () => null,
+      sessionTimestamp: () => null,
+      relTime: () => '-',
+      sortVal: () => 0,
+      taskName: () => 'Multi-model task',
+    })
+
+    expect(sortedRows.value[0].hasModelBreakdown).toBe(true)
+  })
 })

@@ -1166,6 +1166,9 @@ class SeatbeltBackend(Backend):
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
                     proc.communicate(input=request.stdin), timeout=wall
                 )
+            except asyncio.CancelledError:
+                await asyncio.shield(_terminate_process_group(proc))
+                raise
             except TimeoutError:
                 timed_out = True
                 stdout_bytes, stderr_bytes = await _terminate_process_group(proc)
