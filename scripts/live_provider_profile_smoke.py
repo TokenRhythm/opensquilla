@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from opensquilla.engine.pricing import estimate_cost, resolve_model_price  # noqa: E402
+from opensquilla.provider.compat_policy import effective_reasoning_format  # noqa: E402
 from opensquilla.provider.model_catalog import ModelCatalog  # noqa: E402
 from opensquilla.provider.openai import _versioned_api_url  # noqa: E402
 from opensquilla.provider.reasoning_dialects import (  # noqa: E402
@@ -278,9 +279,14 @@ def _apply_direct_reasoning_off(
     if not caps.supports_reasoning:
         return
     spec = get_provider_spec(provider)
+    reasoning_format = effective_reasoning_format(
+        spec.compat,
+        caps.reasoning_format,
+        base_url,
+    )
     apply_reasoning_disable(
         payload,
-        caps.reasoning_format,
+        reasoning_format,
         ReasoningDisableArgs(
             model=model,
             disable_reasoning_by_default_models=(

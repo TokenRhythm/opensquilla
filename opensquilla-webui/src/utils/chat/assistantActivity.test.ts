@@ -1015,6 +1015,20 @@ describe('projectAssistantActivityTimeline', () => {
     expect(JSON.stringify(projection.statusSteps)).not.toContain('raw reasoning body')
   })
 
+  it('derives each phase duration from the next transition and terminal boundary', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'settled',
+      endedAt: 12_000,
+      statusHistory: [
+        { action: 'provider:requesting', label: 'Waiting', at: 1_000 },
+        { action: 'provider:reasoning', label: 'Reasoning', at: 4_000 },
+        { action: 'write:1', label: 'Writing', at: 9_000 },
+      ],
+    })
+
+    expect(projection.statusSteps.map(step => step.durationSeconds)).toEqual([3, 5, 3])
+  })
+
   it('counts down provider retry waits locally without changing other phases', () => {
     const statusStep = (
       overrides: Partial<AssistantActivityStatusStep>,
@@ -1233,6 +1247,21 @@ describe('isSemanticActivityStatusStep', () => {
     expect(isSemanticActivityStatusStep(statusStep({
       label: { code: 'chat.activity.lifecycle.answering', params: {} },
     }))).toBe(false)
+  })
+
+  it('rejects routine provider phases while preserving exceptional transitions', () => {
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.waiting', params: {} },
+    }))).toBe(false)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.reasoning', params: {} },
+    }))).toBe(false)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.fallback', params: {} },
+    }))).toBe(true)
+    expect(isSemanticActivityStatusStep(statusStep({
+      label: { code: 'chat.activity.provider.retryWait', params: { seconds: 3 } },
+    }))).toBe(true)
   })
 
   it('rejects maintenance rows so compaction does not inflate semantic step counts', () => {

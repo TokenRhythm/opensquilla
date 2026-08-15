@@ -130,6 +130,12 @@ export interface SessionsListResponse {
   /** Exact number of sessions visible to the caller, independent of page size. */
   totalCount?: number
   total_count?: number
+  /** Whether another stable session-list page is available. */
+  hasMore?: boolean
+  has_more?: boolean
+  /** Opaque keyset cursor for the next session-list page. */
+  nextCursor?: string | null
+  next_cursor?: string | null
 }
 
 export interface ProjectWorkspaceItem {
@@ -673,6 +679,16 @@ export interface ChatHistoryTurnOutcome {
   started_at?: string | number
   finished_at?: string | number
   outcome?: Record<string, unknown>
+  code?: string
+  error_class?: string
+  retryable?: boolean
+  retry_after_ms?: number
+  terminal_message?: string
+  activity_snapshot?: Record<string, unknown>
+  usage_call_index?: number
+  no_prior_provider_dispatch?: boolean
+  replay_safe?: boolean
+  user_message_id?: string
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {

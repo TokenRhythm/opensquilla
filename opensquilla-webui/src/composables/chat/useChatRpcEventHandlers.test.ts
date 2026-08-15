@@ -1444,6 +1444,56 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
     }
   })
 
+  it('records structured start, delta, and end frames without losing legacy text', () => {
+    const { api, stream, stop } = createHarness()
+    stream.useReducer.value = 'shadow'
+
+    try {
+      api.handlers.onAny('session.event.thinking_start', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        block_id: 'reasoning-1',
+        block_index: 0,
+        started_at: Date.now(),
+      })
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        block_id: 'reasoning-1',
+        block_index: 0,
+        text: 'inspect',
+        started_at: Date.now(),
+      })
+      api.handlers.onAny('session.event.thinking_end', {
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        block_id: 'reasoning-1',
+        block_index: 0,
+        status: 'completed',
+        ended_at: Date.now(),
+      })
+
+      expect(api.streamThinkingText.value).toBe('inspect')
+      expect(stream.appendFrame).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        kind: 'thinking-start',
+        blockId: 'reasoning-1',
+        blockIndex: 0,
+      }))
+      expect(stream.appendFrame).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        kind: 'thinking',
+        blockId: 'reasoning-1',
+        text: 'inspect',
+      }))
+      expect(stream.appendFrame).toHaveBeenNthCalledWith(3, expect.objectContaining({
+        kind: 'thinking-end',
+        blockId: 'reasoning-1',
+        status: 'completed',
+      }))
+    } finally {
+      stop()
+    }
+  })
+
   it('keeps elapsed time across A to B to A replay without leaking into B', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(105_000)
@@ -1580,6 +1630,96 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
     } finally {
       stop()
       vi.useRealTimers()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers terminal activity retention', () => {
+  it('reattaches structured reasoning blocks after canonical history replacement', () => {
+    const reasoningBlocks = [{
+      id: 'reasoning-1',
+      index: 0,
+      text: 'inspect',
+      status: 'completed' as const,
+      startedAt: 1_000,
+      endedAt: 3_000,
+      contentKind: 'reasoning' as const,
+    }]
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: 'answer',
+          ts: 'now',
+          reasoningBlocks,
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        turn_id: 'turn-reasoning-record',
+        text: 'answer',
+        reasoning_content: 'inspect',
+      })
+
+      messages.value = [{
+        role: 'assistant',
+        text: 'answer',
+        ts: 'now',
+        turnId: 'turn-reasoning-record',
+        reasoning: { text: 'inspect', seconds: 0 },
+        restoredFromHistory: true,
+      }]
+      api.attachTurnReasoning()
+
+      expect(messages.value[0]?.reasoningBlocks).toEqual(reasoningBlocks)
+    } finally {
+      stop()
+    }
+  })
+
+  it('reattaches safe phase history after canonical history replaces the local row', () => {
+    const phaseHistory = [
+      { action: 'Sending', label: 'Sending', at: 1_000 },
+      { action: 'provider:requesting', label: 'Waiting', at: 2_000 },
+      { action: 'provider:reasoning', label: 'Reasoning', at: 3_000 },
+      { action: 'write:1', label: 'Writing', at: 4_000 },
+    ]
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: 'answer',
+          ts: '2026-01-01T00:00:07.000Z',
+          statusHistory: phaseHistory,
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        turn_id: 'turn-phase-record',
+        text: 'answer',
+      })
+      expect(messages.value[0]?.statusHistory).toEqual(phaseHistory)
+
+      messages.value = [{
+        role: 'assistant',
+        text: 'answer',
+        ts: '2026-01-01T00:00:07.000Z',
+        turnId: 'turn-phase-record',
+        restoredFromHistory: true,
+      }]
+      api.attachTurnReasoning()
+
+      expect(messages.value[0]?.statusHistory).toEqual(phaseHistory)
+    } finally {
+      stop()
     }
   })
 })

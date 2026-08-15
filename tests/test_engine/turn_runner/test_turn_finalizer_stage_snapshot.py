@@ -134,7 +134,7 @@ class _Case:
     expected_memory_capture_calls: int = 0
     expected_persist_error_calls: int = 0
     expected_update_calls: int = 0
-    expected_done_present: bool = False
+    expected_done_present: bool | None = None
     expected_pending_error_code: str | None = None
     private_memory_allowed: bool = True
     memory_capture_raises: type[BaseException] | None = None
@@ -196,7 +196,7 @@ _CORPUS: list[_Case] = [
         expected_persist_error_calls=1,
         expected_pending_error_code="agent_error",
     ),
-    # 5. Heartbeat-only sentinel -> NO transcript, NO memory
+    # 5. Human sentinel-only reply -> explicit error, but Done usage still rolls up.
     _Case(
         case_id="heartbeat_sentinel_empty",
         events=[
@@ -205,8 +205,10 @@ _CORPUS: list[_Case] = [
         ],
         expected_transcript_append_count=0,
         expected_memory_capture_calls=0,
+        expected_persist_error_calls=1,
         expected_update_calls=1,
-        expected_done_present=True,
+        expected_done_present=False,
+        expected_pending_error_code="silent_reply_not_allowed",
     ),
     # 6. DeepSeek reasoning_content included
     _Case(
@@ -541,9 +543,9 @@ async def test_turn_finalizer_stage_snapshot(
         tail = next(e for e in reversed(yielded) if isinstance(e, ErrorEvent))
         assert tail.code == case.expected_pending_error_code
 
-    if case.expected_done_present:
-        assert any(isinstance(e, DoneEvent) for e in yielded), (
-            f"{case_id}: expected DoneEvent in yielded stream"
+    if case.expected_done_present is not None:
+        assert any(isinstance(e, DoneEvent) for e in yielded) is case.expected_done_present, (
+            f"{case_id}: DoneEvent presence diverged"
         )
 
     if session_manager is None:
@@ -575,7 +577,10 @@ async def test_turn_finalizer_stage_snapshot(
     # Pin the cost rollup arguments per-case when an update was made.
     if case.expected_update_calls == 1:
         upd = session_manager.update_calls[0]
-        done = next(e for e in yielded if isinstance(e, DoneEvent))
+        done = next(
+            (event for event in yielded if isinstance(event, DoneEvent)),
+            next(event for event in case.events if isinstance(event, DoneEvent)),
+        )
         # input_tokens / output_tokens / cache totals come straight from
         # the DoneEvent additive over the zero-baseline session row.
         assert upd["input_tokens"] == done.input_tokens

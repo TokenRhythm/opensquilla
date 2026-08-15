@@ -50,6 +50,36 @@ class UsageAccountingUnavailableError(RuntimeError):
     code = "usage_accounting_unavailable"
     retryable = True
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_ms: int | None = None,
+        usage_call_index: int | None = None,
+        no_prior_provider_dispatch: bool = False,
+        replay_safe: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_ms = retry_after_ms
+        self.usage_call_index = usage_call_index
+        self.no_prior_provider_dispatch = no_prior_provider_dispatch
+        self.replay_safe = replay_safe
+
+    def bind_usage_call(self, call: UsageCallStart) -> None:
+        """Attach fail-closed evidence from the rejected provider admission."""
+
+        call_index = max(1, int(call.call_index))
+        self.usage_call_index = call_index
+        self.no_prior_provider_dispatch = call_index == 1
+
+    def bind_replay_safety(self, *, no_prior_irreversible_effect: bool) -> None:
+        """Prove whole-turn replay safety without weakening retryability."""
+
+        self.replay_safe = (
+            self.no_prior_provider_dispatch
+            and no_prior_irreversible_effect
+        )
+
 
 class UsageAccountingBusyError(UsageAccountingUnavailableError):
     """A transient ledger lock remained busy after its bounded retry."""
@@ -247,6 +277,9 @@ async def start_usage_call(
     start_task = asyncio.create_task(scope.sink.start(call))
     try:
         await asyncio.shield(start_task)
+    except UsageAccountingUnavailableError as exc:
+        exc.bind_usage_call(call)
+        raise
     except asyncio.CancelledError:
         # Cancellation raced the fail-closed barrier.  Resolve the durable
         # decision before unwinding; a committed row is explicitly closed.

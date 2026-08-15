@@ -177,6 +177,7 @@ async def test_start_busy_retry_exhaustion_has_specific_error_code() -> None:
 
     assert len(storage.start_attempts) == 2
     assert caught.value.code == "usage_accounting_busy"
+    assert caught.value.retry_after_ms == 100
     assert isinstance(caught.value.__cause__, StorageBusyError)
     assert storage.started == []
 
@@ -230,6 +231,43 @@ async def test_start_retries_real_sqlite_write_lock(tmp_path) -> None:
         blocker.close()
         await sink.close()
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ledger_writers_fail_closed_under_real_sqlite_lock(tmp_path) -> None:
+    database = tmp_path / "sessions-concurrent.db"
+    first = await SessionStorage.open(str(database))
+    second = await SessionStorage.open(str(database))
+    first._busy_budget_seconds = 0.01
+    second._busy_budget_seconds = 0.01
+    blocker = sqlite3.connect(database, isolation_level=None)
+    blocker.execute("BEGIN IMMEDIATE")
+    sinks = [
+        SessionUsageEventSink(first, start_retry_delays=(0.0,)),
+        SessionUsageEventSink(second, start_retry_delays=(0.0,)),
+    ]
+    try:
+        results = await asyncio.gather(
+            sinks[0].start(_call(event_id="event-concurrent-1", execution_id="turn-1")),
+            sinks[1].start(_call(event_id="event-concurrent-2", execution_id="turn-2")),
+            return_exceptions=True,
+        )
+
+        assert all(isinstance(result, UsageAccountingBusyError) for result in results)
+        assert all(getattr(result, "retry_after_ms", None) == 100 for result in results)
+        blocker.rollback()
+        async with first.conn.execute("SELECT COUNT(*) AS n FROM usage_events") as cursor:
+            row = await cursor.fetchone()
+        assert row is not None
+        assert row["n"] == 0
+    finally:
+        if blocker.in_transaction:
+            blocker.rollback()
+        blocker.close()
+        for sink in sinks:
+            await sink.close()
+        await second.close()
+        await first.close()
 
 
 @pytest.mark.asyncio

@@ -63,6 +63,8 @@ export interface ChatPendingItem {
   text: string
   attachments: Attachment[]
   intent: string | null
+  /** Slash-prefixed text that a complete command catalog classified as ordinary input. */
+  confirmedPlainText?: boolean
   /** Generic non-v2 queue/hidden-control delivery lease. V2 Steer uses `steerAttempt`. */
   deliveryState?: 'steering' | 'retryable'
   /** Canonical transport identity/state for a not-yet-durable steer. */
@@ -103,6 +105,8 @@ export interface ChatPendingItem {
    * delete intent.
    */
   pendingMayHaveServerCopy?: boolean
+  /** A cancelling transport row must become a local editable draft after tombstoning. */
+  pendingRetainAfterCancel?: boolean
   /** Browser/server staging lifecycle. Unknown enqueue results remain `saving`. */
   pendingPersistenceState?:
     | 'saving'
@@ -262,6 +266,14 @@ export interface ChatTurnOutcome {
   startedAt?: number | string
   finishedAt?: number | string
   retryable?: boolean
+  errorClass?: string
+  terminalMessage?: string
+  retryAfterMs?: number
+  statusHistory?: import('./parts').StatusPart[]
+  usageCallIndex?: number
+  noPriorProviderDispatch?: boolean
+  replaySafe?: boolean
+  userMessageId?: string
 }
 
 export interface ChatRunTask {
@@ -474,6 +486,10 @@ export interface ChatMaintenanceEvent {
   reason?: string
   removedCount?: number
   keptCount?: number
+  /** This event marks a durable summary/archive boundary in canonical history. */
+  historyArchived?: boolean
+  /** Whether every original row remains available across that boundary. */
+  canonicalComplete?: boolean | null
 }
 
 export interface ChatMessage {
@@ -483,6 +499,10 @@ export interface ChatMessage {
   /** Stable client-only identity for optimistic rows before the backend assigns messageId. */
   clientId?: string
   reasoning?: ChatReasoning
+  /** Structured physical-call reasoning retained across live-to-history sync. */
+  reasoningBlocks?: import('./turnlog').ReasoningBlock[]
+  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
+  reasoningPresentationPending?: boolean
   routerDecision?: import('./rpc').RouterDecisionPayload | null
   artifacts?: ArtifactPayload[]
   tool_calls?: RawToolCallPayload[]
@@ -608,6 +628,10 @@ export interface ChatRenderedMessage {
   artifacts?: ArtifactPayload[]
   meta?: ChatMessageMeta
   reasoning?: ChatReasoning
+  /** Structured physical-call reasoning retained across live-to-history sync. */
+  reasoningBlocks?: import('./turnlog').ReasoningBlock[]
+  /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
+  reasoningPresentationPending?: boolean
   interrupted?: boolean
   /** The turn ended with a terminal error after this partial assistant output. */
   terminalFailure?: boolean

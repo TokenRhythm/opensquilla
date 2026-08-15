@@ -1672,6 +1672,24 @@ def _json_object_or_none(value: Any) -> dict[str, Any] | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+@dataclass(frozen=True, slots=True)
+class SessionListCursor:
+    """Stable descending sort position for a session-list page."""
+
+    activity_at: int
+    updated_at: int
+    session_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class SessionListPage:
+    """One keyset-paginated page of sessions."""
+
+    sessions: list[SessionNode]
+    next_cursor: SessionListCursor | None
+    has_more: bool
+
+
 class SessionStorage:
     """Low-level async SQLite operations for session persistence."""
 
@@ -4934,7 +4952,8 @@ class SessionStorage:
             {where}
             ORDER BY
                 max(sessions.updated_at, COALESCE(active_tasks.active_at, 0)) DESC,
-                sessions.updated_at DESC
+                sessions.updated_at DESC,
+                sessions.session_key DESC
             LIMIT ? OFFSET ?
         """
         query_params = [
@@ -4947,6 +4966,116 @@ class SessionStorage:
         async with self.conn.execute(sql, query_params) as cur:
             rows = await cur.fetchall()
         return [SessionNode(**_deserialize_row(dict(r))) for r in rows]
+
+    @_serialized_read
+    async def list_sessions_page(
+        self,
+        *,
+        limit: int,
+        cursor: SessionListCursor | None = None,
+        guest_owner_id: str | None = None,
+    ) -> SessionListPage:
+        """Return a stable keyset page in the same order as ``list_sessions``."""
+
+        page_limit = max(1, int(limit))
+        clauses: list[str] = []
+        params: list[Any] = []
+        if guest_owner_id is not None:
+            owner_id = str(guest_owner_id).strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", owner_id):
+                return SessionListPage(sessions=[], next_cursor=None, has_more=False)
+            clauses.append(
+                "sessions.session_key GLOB ? "
+                "AND (length(sessions.session_key) - "
+                "length(replace(sessions.session_key, ':', ''))) = 5"
+            )
+            params.append(f"agent:?*:webchat:guest:{owner_id}:?*")
+        source_where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        cursor_where = ""
+        cursor_params: list[Any] = []
+        if cursor is not None:
+            cursor_where = """
+                WHERE list_activity_at < ?
+                   OR (list_activity_at = ? AND updated_at < ?)
+                   OR (
+                       list_activity_at = ?
+                       AND updated_at = ?
+                       AND session_key < ?
+                   )
+            """
+            cursor_params = [
+                cursor.activity_at,
+                cursor.activity_at,
+                cursor.updated_at,
+                cursor.activity_at,
+                cursor.updated_at,
+                cursor.session_key,
+            ]
+
+        sql = f"""
+            WITH active_tasks AS (
+                SELECT
+                    session_key,
+                    MAX(
+                        max(
+                            max(COALESCE(updated_at, 0), COALESCE(started_at, 0)),
+                            COALESCE(created_at, 0)
+                        )
+                    ) AS active_at
+                FROM agent_tasks
+                WHERE status IN (?, ?)
+                GROUP BY session_key
+            ), ordered_sessions AS (
+                SELECT
+                    sessions.*,
+                    max(
+                        sessions.updated_at,
+                        COALESCE(active_tasks.active_at, 0)
+                    ) AS list_activity_at
+                FROM sessions
+                LEFT JOIN active_tasks
+                    ON active_tasks.session_key = sessions.session_key
+                {source_where}
+            )
+            SELECT *
+            FROM ordered_sessions
+            {cursor_where}
+            ORDER BY list_activity_at DESC, updated_at DESC, session_key DESC
+            LIMIT ?
+        """
+        query_params = [
+            AgentTaskStatus.QUEUED.value,
+            AgentTaskStatus.RUNNING.value,
+            *params,
+            *cursor_params,
+            page_limit + 1,
+        ]
+        async with self.conn.execute(sql, query_params) as cur:
+            rows = await cur.fetchall()
+
+        has_more = len(rows) > page_limit
+        page_rows = rows[:page_limit]
+        sessions: list[SessionNode] = []
+        positions: list[SessionListCursor] = []
+        for row in page_rows:
+            data = dict(row)
+            activity_at = int(data.pop("list_activity_at"))
+            session = SessionNode(**_deserialize_row(data))
+            sessions.append(session)
+            positions.append(
+                SessionListCursor(
+                    activity_at=activity_at,
+                    updated_at=int(session.updated_at),
+                    session_key=session.session_key,
+                )
+            )
+        next_cursor = positions[-1] if has_more and positions else None
+        return SessionListPage(
+            sessions=sessions,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
 
     async def _delete_session_rows(
         self,

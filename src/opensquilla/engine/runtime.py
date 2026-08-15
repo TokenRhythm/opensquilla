@@ -123,6 +123,7 @@ from opensquilla.engine.turn_policy import resolve_turn_policy
 from opensquilla.engine.turn_runner import (
     AgentBootstrapStage,
     AgentBootstrapStageInput,
+    AttachmentMaterializationStats,
     AttachmentStage,
     AttachmentStageInput,
     CompactionAndHistoryStage,
@@ -137,6 +138,7 @@ from opensquilla.engine.turn_runner import (
     StreamConsumerStageInput,
     TurnFinalizerStage,
     TurnFinalizerStageInput,
+    rebind_attachment_prompt,
 )
 from opensquilla.engine.turn_runner.harness import (
     _PromptReportBuilderAdapter,
@@ -171,7 +173,10 @@ from opensquilla.engine.turn_runner.harness import (
     _TurnRunnerTurnMemoryCaptureAdapter,
     _TurnRunnerUsageTelemetryAdapter,
 )
-from opensquilla.engine.turn_runner.stream_consumer_stage import _StreamState
+from opensquilla.engine.turn_runner.stream_consumer_stage import (
+    _could_be_human_silent_reply_prefix,
+    _StreamState,
+)
 from opensquilla.engine.types import (
     AgentConfig,
     AgentEvent,
@@ -2641,25 +2646,43 @@ class _SelectorFallbackProvider:
                     continue
 
                 if isinstance(event, ProviderReasoningDeltaEvent) and event.text:
-                    now_monotonic = time.monotonic()
-                    first_reasoning = primary_reasoning_started_at_ms == 0
-                    if first_reasoning:
-                        primary_reasoning_started_at_ms = time.time_ns() // 1_000_000
-                    if (
-                        first_reasoning
-                        or now_monotonic - primary_reasoning_last_pulse_at
-                        >= _SELECTOR_REASONING_PULSE_INTERVAL_SECONDS
-                    ):
-                        yield ProviderActivityEvent(
-                            activity_id=primary_activity_id,
-                            phase="reasoning",
-                            reason="initial",
-                            started_at=primary_reasoning_started_at_ms,
-                            heartbeat=not first_reasoning,
-                        )
-                        primary_reasoning_last_pulse_at = now_monotonic
-                    pre_text_buffer.append(event)
-                    continue
+                    if pre_text_buffer.has_incomplete_tool_call:
+                        # Reasoning is user-visible, but it cannot commit a leg
+                        # whose provisional tool lifecycle is still open. Doing
+                        # so would release an argument prefix that a later error
+                        # should discard before selector fallback.
+                        pre_text_buffer.drain(successful_leg=False)
+                        event = _selector_invalid_stream_order_error()
+                    else:
+                        now_monotonic = time.monotonic()
+                        first_reasoning = primary_reasoning_started_at_ms == 0
+                        if first_reasoning:
+                            primary_reasoning_started_at_ms = time.time_ns() // 1_000_000
+                        if (
+                            first_reasoning
+                            or now_monotonic - primary_reasoning_last_pulse_at
+                            >= _SELECTOR_REASONING_PULSE_INTERVAL_SECONDS
+                        ):
+                            yield ProviderActivityEvent(
+                                activity_id=primary_activity_id,
+                                phase="reasoning",
+                                reason="initial",
+                                started_at=primary_reasoning_started_at_ms,
+                                heartbeat=not first_reasoning,
+                            )
+                            primary_reasoning_last_pulse_at = now_monotonic
+                        # Reasoning is a live client surface, so its first non-empty
+                        # delta commits this physical leg exactly like answer text.
+                        # Keeping it provisional until text arrived made the selector
+                        # collapse an entire reasoning stream into one late event.
+                        # Once exposed, a later failure must stay on this leg rather
+                        # than silently mixing a fallback model into the same turn.
+                        for buffered_event in pre_text_buffer.drain(successful_leg=True):
+                            yield buffered_event
+                        emitted_user_visible_content = True
+                        self._record_health_success()
+                        yield event
+                        continue
 
                 if (
                     not isinstance(event, ProviderErrorEvent)
@@ -2874,6 +2897,14 @@ class _SelectorFallbackProvider:
                                 isinstance(fallback_event, ProviderReasoningDeltaEvent)
                                 and fallback_event.text
                             ):
+                                if fallback_buffer.has_incomplete_tool_call:
+                                    fallback_buffer.drain(successful_leg=False)
+                                    invalid_order_error = (
+                                        _selector_invalid_stream_order_error()
+                                    )
+                                    self._record_health_failure(invalid_order_error)
+                                    yield invalid_order_error
+                                    return
                                 now_monotonic = time.monotonic()
                                 first_reasoning = fallback_reasoning_started_at_ms == 0
                                 if first_reasoning:
@@ -2893,7 +2924,16 @@ class _SelectorFallbackProvider:
                                         heartbeat=not first_reasoning,
                                     )
                                     fallback_reasoning_last_pulse_at = now_monotonic
-                                fallback_buffer.append(fallback_event)
+                                # The fallback leg follows the same visible commit
+                                # boundary as the primary: reasoning streams live,
+                                # and no later leg may replace it invisibly.
+                                for buffered_event in fallback_buffer.drain(
+                                    successful_leg=True
+                                ):
+                                    yield buffered_event
+                                fallback_committed = True
+                                self._record_health_success()
+                                yield fallback_event
                                 continue
                             if (
                                 not isinstance(fallback_event, ProviderErrorEvent)
@@ -3171,7 +3211,12 @@ def _render_preview_only_attachment_text(
     )
 
 
-def _extract_pdf_attachment_text(raw_bytes: bytes, filename: str) -> str:
+def _extract_pdf_attachment_text(
+    raw_bytes: bytes,
+    filename: str,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> str:
     """Extract text from a PDF attachment before it reaches any provider.
 
     PDFs are converted into plain text context so provider-specific document
@@ -3190,6 +3235,8 @@ def _extract_pdf_attachment_text(raw_bytes: bytes, filename: str) -> str:
         page_texts: list[str] = []
         with pdfplumber.open(io.BytesIO(raw_bytes)) as doc:
             for index, page in enumerate(doc.pages, start=1):
+                if cancel_check is not None:
+                    cancel_check()
                 page_text = page.extract_text() or ""
                 if page_text.strip():
                     page_texts.append(f"--- Page {index} ---\n{page_text}")
@@ -3210,7 +3257,14 @@ _XLSX_MAX_ROWS_PER_SHEET = 1000
 _XLSX_MAX_COLS = 64
 
 
-def _office_zip_guard(raw_bytes: bytes, filename: str) -> None:
+def _office_zip_guard(
+    raw_bytes: bytes,
+    filename: str,
+    *,
+    decompressed_limit: int | None = None,
+    batch_decompressed_budget: list[int] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+) -> int:
     # Measure the *actual* inflated size by streaming each member, not the
     # central-directory ``file_size`` (which the uploader controls and can lie
     # about). Reads in bounded chunks and aborts as soon as the running total
@@ -3219,21 +3273,42 @@ def _office_zip_guard(raw_bytes: bytes, filename: str) -> None:
     import zipfile
 
     chunk_size = 1024 * 1024
+    effective_limit = (
+        decompressed_limit
+        if isinstance(decompressed_limit, int) and decompressed_limit > 0
+        else _OFFICE_DECOMPRESSED_LIMIT
+    )
     try:
         with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
             total = 0
             for info in archive.infolist():
+                if cancel_check is not None:
+                    cancel_check()
                 with archive.open(info) as member:
                     while True:
+                        if cancel_check is not None:
+                            cancel_check()
                         block = member.read(chunk_size)
                         if not block:
                             break
                         total += len(block)
-                        if total > _OFFICE_DECOMPRESSED_LIMIT:
+                        if batch_decompressed_budget is not None:
+                            batch_decompressed_budget[0] -= len(block)
+                        if total > effective_limit:
                             raise ValueError(
                                 f"office attachment {filename!r} decompresses beyond "
-                                f"the {_OFFICE_DECOMPRESSED_LIMIT} byte safety limit"
+                                f"the {effective_limit} byte remaining batch safety limit"
                             )
+                        if (
+                            batch_decompressed_budget is not None
+                            and batch_decompressed_budget[0] < 0
+                        ):
+                            raise ValueError(
+                                f"office attachment batch containing {filename!r} "
+                                f"decompresses beyond the {_OFFICE_DECOMPRESSED_LIMIT} "
+                                "byte safety limit"
+                            )
+            return total
     except ValueError:
         raise
     except Exception as exc:  # noqa: BLE001 - zipfile raises several error types
@@ -3326,7 +3401,13 @@ _OFFICE_EXTRACTORS: dict[str, Callable[[bytes], str]] = {
 
 
 def _extract_office_attachment_text(
-    raw_bytes: bytes, filename: str, media_type: str
+    raw_bytes: bytes,
+    filename: str,
+    media_type: str,
+    *,
+    decompressed_limit: int | None = None,
+    batch_decompressed_budget: list[int] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> str:
     """Extract text from an OOXML office attachment before it reaches any provider.
 
@@ -3337,7 +3418,15 @@ def _extract_office_attachment_text(
     extractor = _OFFICE_EXTRACTORS.get(media_type)
     if extractor is None:  # pragma: no cover - guarded by the allow-list
         raise ValueError(f"unsupported office media type {media_type!r}")
-    _office_zip_guard(raw_bytes, filename)
+    _office_zip_guard(
+        raw_bytes,
+        filename,
+        decompressed_limit=decompressed_limit,
+        batch_decompressed_budget=batch_decompressed_budget,
+        cancel_check=cancel_check,
+    )
+    if cancel_check is not None:
+        cancel_check()
     try:
         extracted = extractor(raw_bytes).strip()
     except ValueError:
@@ -3352,6 +3441,8 @@ def _extract_office_attachment_text(
         ) from exc
     if not extracted:
         raise ValueError(f"office attachment {filename!r} has no extractable text")
+    if cancel_check is not None:
+        cancel_check()
     return _truncate_attachment_text(extracted)
 
 
@@ -4514,6 +4605,7 @@ class TurnRunner:
         # Declared up-front so the CancelledError handler below can always
         # access them, even if cancellation fires before the stream loop.
         final_text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         turn_segments: list[dict] = []
         turn_artifacts: list[dict[str, Any]] = []
         artifact_delivery_failures: list[str] = []
@@ -4624,6 +4716,49 @@ class TurnRunner:
             tool_metadata = pt_out.tool_metadata
             skill_catalog = pt_out.skill_catalog
 
+            # Uploaded attachments have already crossed the controlled ingress
+            # boundary, so materialize their provider-visible form once before
+            # routing. Arbitrary workspace paths remain tool-mediated and are
+            # never discovered or read here.
+            attachment_materialization_session_id = (
+                pipeline_session_id if pipeline_session_id is not None else session_key
+            )
+            generated_normalization_attachment_count = 0
+            if isinstance(normalization_metadata, dict):
+                raw_generated_count = normalization_metadata.get(
+                    "generated_attachment_count"
+                )
+                if isinstance(raw_generated_count, int) and not isinstance(
+                    raw_generated_count, bool
+                ):
+                    generated_normalization_attachment_count = max(
+                        0, raw_generated_count
+                    )
+            attachment_timeout = (
+                float(timeout)
+                if isinstance(timeout, int | float)
+                and not isinstance(timeout, bool)
+                and timeout > 0
+                else None
+            )
+            att_outcome = await self._attachment_stage.run(
+                AttachmentStageInput(
+                    effective_runtime_message=runtime_message,
+                    attachments=attachments,
+                    workspace_dir=getattr(tool_context, "workspace_dir", None),
+                    session_id=(
+                        attachment_materialization_session_id
+                        if attachments
+                        else None
+                    ),
+                    generated_normalization_attachment_count=(
+                        generated_normalization_attachment_count
+                    ),
+                    timeout_seconds=attachment_timeout,
+                )
+            )
+            att_out = att_outcome.require_output()
+
             turn_usage_scope: UsageAccountingScope | None = None
             if self._usage_event_sink is not None:
                 pipeline_usage_context = UsageExecutionContext(
@@ -4655,6 +4790,7 @@ class TurnRunner:
                         agent_id=agent_id,
                         turn_id=turn_id,
                         attachments=attachments,
+                        attachment_materialization=att_out.stats,
                         bootstrap_context_mode=bootstrap_context_mode,
                         model=model,
                         history_has_persisted_user=history_has_persisted_user,
@@ -4682,6 +4818,13 @@ class TurnRunner:
             tool_defs_for_log = turn.tool_defs
             provider_for_log = provider
             effective_runtime_message = pa_out.effective_runtime_message
+            extra_msgs = rebind_attachment_prompt(
+                att_out.extra_messages,
+                effective_runtime_message,
+            )
+            attachment_turn_input = (
+                effective_runtime_message if extra_msgs is None else ""
+            )
             final_prompt = pa_out.final_prompt
             final_prompt_str = final_prompt
             cache_breakpoints = pa_out.cache_breakpoints
@@ -4842,27 +4985,6 @@ class TurnRunner:
                         "max_iterations_source": effective_max_iterations_source,
                     },
                 )
-
-            # Materialize attachments exactly once before durable compaction
-            # admission. Their extracted text and typed media blocks are fixed
-            # current-turn input and therefore must reduce the history budget.
-            attachment_materialization_session_id = None
-            if attachments:
-                attachment_materialization_session_id = await self._resolve_session_id_for_log(
-                    session_key
-                )
-                if attachment_materialization_session_id is None:
-                    attachment_materialization_session_id = session_key
-            att_outcome = await self._attachment_stage.run(
-                AttachmentStageInput(
-                    effective_runtime_message=effective_runtime_message,
-                    attachments=attachments,
-                    workspace_dir=agent_config.workspace_dir,
-                    session_id=attachment_materialization_session_id,
-                )
-            )
-            att_out = att_outcome.require_output()
-            extra_msgs = att_out.extra_messages
 
             # 6. Compaction (t3 + preflight) + history load + request-context
             # prepend. CompactionAndHistoryStage owns the four-call sequence
@@ -5336,18 +5458,19 @@ class TurnRunner:
             # 8. Stream events (final_text_parts/turn_segments are declared
             # up-front above so the CancelledError handler can read them).
             # StreamConsumerStage owns the slice. The four pre-stream
-            # accumulators (final_text_parts, turn_segments, turn_artifacts,
-            # artifact_delivery_failures) stay declared in this scope and
+            # accumulators (final_text_parts, reasoning_parts, turn_segments,
+            # turn_artifacts, artifact_delivery_failures) stay declared in this scope and
             # are PASSED BY REFERENCE into _StreamState so the
             # CancelledError handler below still sees them.
             error_message: str | None = None
             pending_error_event: ErrorEvent | None = None
             done_event: DoneEvent | None = None
-            turn_input = att_out.turn_input
+            turn_input = attachment_turn_input
 
             stream_state = _StreamState(
                 current_text_parts=current_text_parts,
                 final_text_parts=final_text_parts,
+                reasoning_parts=reasoning_parts,
                 turn_segments=turn_segments,
                 turn_artifacts=turn_artifacts,
                 artifact_delivery_failures=artifact_delivery_failures,
@@ -5428,7 +5551,7 @@ class TurnRunner:
                     yield replayed_event
                 return
             # Read terminal state off the shared _StreamState. The
-            # four pass-by-reference lists were mutated in place, so
+            # five pass-by-reference lists were mutated in place, so
             # this preserves the harness's read-after-stream
             # contract; only the four owned fields need explicit
             # writeback.
@@ -5626,7 +5749,8 @@ class TurnRunner:
                 sanitize_silent_reply_segments,
             )
 
-            raw_partial_text = "".join(final_text_parts).rstrip()
+            raw_partial_text_untrimmed = "".join(final_text_parts)
+            raw_partial_text = raw_partial_text_untrimmed.rstrip()
             partial_normalization = normalize_silent_reply(
                 raw_partial_text,
                 run_kind=run_kind,
@@ -5634,14 +5758,22 @@ class TurnRunner:
                 heartbeat_ack_max_chars=heartbeat_ack_max_chars,
             )
             partial_text = partial_normalization.text.rstrip()
+            human_prefix_was_withheld = (
+                input_mode != "system_event"
+                and bool(raw_partial_text_untrimmed)
+                and _could_be_human_silent_reply_prefix(raw_partial_text_untrimmed)
+            )
             if (
-                input_mode == "system_event"
-                and run_kind in {"goal", "heartbeat"}
-                and is_silent_reply_prefix(raw_partial_text)
+                (
+                    input_mode == "system_event"
+                    and run_kind in {"goal", "heartbeat"}
+                    and is_silent_reply_prefix(raw_partial_text)
+                )
+                or human_prefix_was_withheld
             ):
-                # The shared stream stage deliberately holds internal text.
-                # A Stop can therefore land between chunks of a control token;
-                # never persist that distinctive unfinished marker as prose.
+                # The shared stream stage deliberately holds control-token
+                # candidates. A Stop can land between chunks; never persist a
+                # fragment that was not presented to the user as prose.
                 partial_text = ""
 
             raw_segment_text = "".join(
@@ -5661,7 +5793,16 @@ class TurnRunner:
                 for segment in normalized_segments
                 if isinstance(segment, dict) and segment.get("type") == "text"
             ).rstrip()
-            if (
+            if human_prefix_was_withheld:
+                # These text carriers were never emitted. Remove them while
+                # retaining any tool, artifact, or activity records that were
+                # already presented before cancellation.
+                normalized_segments = [
+                    segment
+                    for segment in normalized_segments
+                    if segment.get("type") != "text"
+                ]
+            elif (
                 raw_segment_text == raw_partial_text
                 and segment_normalization.changed
                 and (
@@ -5693,6 +5834,7 @@ class TurnRunner:
                 normalized_segments = reconciled_segments
             turn_segments[:] = normalized_segments
             final_text_parts[:] = [partial_text] if partial_text else []
+            reasoning_content = "".join(reasoning_parts).strip()
             cancelled_turn_usage: dict[str, Any] | None = None
             if self._session_manager is not None and pipeline_usage_context is not None:
                 storage = getattr(self._session_manager, "storage", None)
@@ -5714,7 +5856,7 @@ class TurnRunner:
                             exc_info=True,
                         )
             if (
-                partial_text or turn_segments or turn_artifacts
+                partial_text or turn_segments or turn_artifacts or reasoning_content
             ) and self._session_manager is not None:
                 try:
                     body = _cancelled_partial_response_text(partial_text, turn_artifacts)
@@ -5727,6 +5869,7 @@ class TurnRunner:
                         "role": "assistant",
                         "content": body,
                         "tool_calls": turn_segments if turn_segments else None,
+                        "reasoning_content": reasoning_content or None,
                     }
                     append_message = self._session_manager.append_message
                     if _accepts_keyword_arg(append_message, "turn_usage"):
@@ -5748,6 +5891,7 @@ class TurnRunner:
                         session_key=session_key,
                         text_chars=len(partial_text),
                         segment_count=len(turn_segments),
+                        reasoning_chars=len(reasoning_content),
                     )
                 except Exception:  # pragma: no cover — defensive: don't swallow the cancel
                     log.warning(
@@ -5936,6 +6080,26 @@ class TurnRunner:
                 code=event_code,
                 error_id=error_id or "",
                 failure_kind=provider_boundary_failure_kind,
+                retry_after_ms=(
+                    getattr(exc, "retry_after_ms", None)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
+                usage_call_index=(
+                    getattr(exc, "usage_call_index", None)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
+                no_prior_provider_dispatch=(
+                    getattr(exc, "no_prior_provider_dispatch", False)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
+                replay_safe=(
+                    getattr(exc, "replay_safe", False)
+                    if isinstance(exc, UsageAccountingUnavailableError)
+                    else None
+                ),
             )
 
     @staticmethod
@@ -7860,6 +8024,7 @@ class TurnRunner:
         flags_text_override: str | None = None,
         tool_context: ToolContext | None = None,
         normalization_metadata: dict[str, Any] | None = None,
+        attachment_materialization: AttachmentMaterializationStats | None = None,
         input_provenance: dict[str, Any] | None = None,
         skill_catalog: Any | None = None,
         usage_execution_context: UsageExecutionContext | None = None,
@@ -8046,6 +8211,30 @@ class TurnRunner:
             material_tokens = normalization_metadata.get("material_estimated_tokens")
             if type(material_tokens) is int and material_tokens > 0:
                 initial_metadata["material_estimated_tokens"] = material_tokens
+        if attachment_materialization is not None:
+            initial_metadata["had_attachments"] = bool(
+                attachment_materialization.attachment_count
+            )
+            initial_metadata["attachment_count"] = int(
+                attachment_materialization.attachment_count
+            )
+            initial_metadata["attachment_material_estimated_tokens"] = int(
+                attachment_materialization.estimated_tokens
+            )
+            initial_metadata[
+                "attachment_generated_normalization_estimated_tokens"
+            ] = int(
+                attachment_materialization.generated_normalization_estimated_tokens
+            )
+            initial_metadata["attachment_parse_failure_count"] = int(
+                attachment_materialization.parse_failure_count
+            )
+            initial_metadata["attachment_provider_visible_text_chars"] = int(
+                attachment_materialization.provider_visible_text_chars
+            )
+            initial_metadata["attachment_image_count"] = int(
+                attachment_materialization.image_count
+            )
         if input_provenance:
             if isinstance(input_provenance, dict):
                 normalized_provenance = dict(input_provenance)
@@ -11395,6 +11584,7 @@ class TurnRunner:
         workspace_dir: str | Path | None = None,
         session_id: str | None = None,
         workspace_attachment_budget_bytes: int | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> list | None:
         """Build a multimodal user message that carries the attachments.
 
@@ -11411,6 +11601,8 @@ class TurnRunner:
 
         if not attachments:
             return None
+        if cancel_check is not None:
+            cancel_check()
         if len(attachments) > _MAX_ATTACHMENT_COUNT:
             raise ValueError(f"attachments supports at most {_MAX_ATTACHMENT_COUNT} items")
 
@@ -11422,6 +11614,7 @@ class TurnRunner:
 
         prompt_block = ContentBlockText(text=message)
         attachment_blocks: list[Any] = []
+        office_batch_decompressed_budget = [_OFFICE_DECOMPRESSED_LIMIT]
         turn_materializer: AttachmentWorkspaceMaterializer | None = None
         if workspace_dir:
             # One instance per turn so the attachment batch shares a single
@@ -11433,6 +11626,8 @@ class TurnRunner:
                 disk_budget_bytes=workspace_attachment_budget_bytes,
             )
         for index, att in enumerate(attachments, start=1):
+            if cancel_check is not None:
+                cancel_check()
             att_type = att.get("type")
             media_type: str | None = att_type if isinstance(att_type, str) else None
             if media_type is None or media_type not in _ALLOWED_ENGINE_MEDIA_TYPES:
@@ -11500,6 +11695,8 @@ class TurnRunner:
                         mime=media_type,
                         session_id=session_id,
                     )
+                if cancel_check is not None:
+                    cancel_check()
                 prefix = (
                     "attachment available"
                     if result.available
@@ -11520,7 +11717,11 @@ class TurnRunner:
                 attachment_blocks.append(ContentBlockImage(media_type=media_type, data=data))
             elif media_type == "application/pdf":
                 try:
-                    extracted_pdf_text = _extract_pdf_attachment_text(raw_bytes, filename)
+                    extracted_pdf_text = _extract_pdf_attachment_text(
+                        raw_bytes,
+                        filename,
+                        cancel_check=cancel_check,
+                    )
                 except ValueError as exc:
                     extracted_pdf_text = (
                         f"[attachment unavailable: PDF text could not be extracted: {exc}]"
@@ -11542,7 +11743,11 @@ class TurnRunner:
             elif media_type in _OFFICE_ATTACHMENT_MIMES:
                 try:
                     extracted_office_text = _extract_office_attachment_text(
-                        raw_bytes, filename, media_type
+                        raw_bytes,
+                        filename,
+                        media_type,
+                        batch_decompressed_budget=office_batch_decompressed_budget,
+                        cancel_check=cancel_check,
                     )
                 except ValueError as exc:
                     extracted_office_text = (
@@ -11617,6 +11822,9 @@ class TurnRunner:
                     details = "\n\n".join([details, material_marker])
                 wrapped = _render_file_context_block(filename, media_type, details)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
+
+            if cancel_check is not None:
+                cancel_check()
 
         return [
             Message(
