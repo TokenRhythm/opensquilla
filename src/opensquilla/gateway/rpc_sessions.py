@@ -32,6 +32,7 @@ from opensquilla.attachment_refs import (
     read_pending_chat_input_promotions,
     transcript_material_path,
 )
+from opensquilla.engine.action_completion import ActionCompletionIncompleteError
 from opensquilla.engine.cache_break_monitor import (
     cancel_active_compactions,
     compaction_terminal_status,
@@ -4091,6 +4092,10 @@ async def _handle_sessions_send_impl(
                     "details": mapped.details,
                 },
             )
+        except ActionCompletionIncompleteError:
+            # TurnRunner already finalized and emitted the durable incomplete
+            # terminal. Preserve the typed signal for TaskRuntime persistence.
+            raise
         except Exception as exc:
             error_code, error_message = sanitize_agent_error(
                 {

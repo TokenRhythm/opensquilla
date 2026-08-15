@@ -23,6 +23,7 @@ from opensquilla.engine import (
     ToolResult,
     WarningEvent,
 )
+from opensquilla.engine.action_completion import ACTION_COMPLETION_TOOL_NAME
 from opensquilla.engine.finalize_evidence_gate import FinalizeEvidenceTracker
 from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     _finalize_variant_challenge_from_env,
@@ -502,6 +503,21 @@ class _ScriptedProvider:
             )
             yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
             return
+        if entry[0] == "complete":
+            text = f"final attempt {call_number}"
+            tool_use_id = f"complete-{call_number}"
+            yield ProviderText(text=text)
+            yield ProviderToolUseStart(
+                tool_use_id=tool_use_id,
+                tool_name=ACTION_COMPLETION_TOOL_NAME,
+            )
+            yield ProviderToolUseEnd(
+                tool_use_id=tool_use_id,
+                tool_name=ACTION_COMPLETION_TOOL_NAME,
+                arguments={"summary": text},
+            )
+            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
+            return
         yield ProviderText(text=f"final attempt {call_number}")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
@@ -592,7 +608,7 @@ async def test_variant_challenge_fires_once_then_accepts(tmp_path) -> None:
             ("edit", "src.py"),
             ("final",),
             ("exec", "pytest tests/"),
-            ("final",),
+            ("complete",),
         ]
     )
     tool_context = ToolContext(workspace_dir=str(tmp_path))

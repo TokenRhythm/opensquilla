@@ -604,6 +604,7 @@ class _WarningHandler:
 
     def handle(self, event: WarningEvent, state: _StreamState) -> WarningEvent:
         if event.code in {
+            "action_completion_recovery",
             "workspace_diff_recovery",
             "plan_run_reconciliation",
         }:

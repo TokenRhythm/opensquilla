@@ -4581,6 +4581,14 @@ def _goal_edit_request_text(messages: list[Message]) -> str:
     return "\n".join(chunks)
 
 
+def _latest_goal_reminder_text(messages: list[Message]) -> str:
+    for message in reversed(messages):
+        text = _goal_edit_request_text([message])
+        if "[Current Goal objective reminder]" in text:
+            return text
+    raise AssertionError("Current Goal objective reminder was not provided")
+
+
 class _RunningGoalEditProvider:
     """Hold one real call while the owning Goal objective is edited."""
 
@@ -4625,13 +4633,13 @@ class _RunningGoalEditProvider:
             assert self.edited_objective in request_text
         elif call == 3:
             assert goal_tools <= set(tool_names)
-            tail_text = _goal_edit_request_text([messages[-1]])
+            tail_text = _latest_goal_reminder_text(messages)
             assert "[Current Goal objective reminder]" in tail_text
             assert self.edited_objective in tail_text
             assert self.initial_objective not in tail_text
         elif call == 4:
             assert tool_names == []
-            tail_text = _goal_edit_request_text([messages[-1]])
+            tail_text = _latest_goal_reminder_text(messages)
             assert "[Current Goal objective reminder]" in tail_text
             assert self.edited_objective in tail_text
             assert self.initial_objective not in tail_text

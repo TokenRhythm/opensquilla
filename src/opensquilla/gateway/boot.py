@@ -1776,6 +1776,8 @@ async def _emit_task_runtime_stream_events(
     error_code: str | None = None
     failure_kind: str | None = None
     terminal_reason: str | None = None
+    pending_done_event: dict[str, Any] | None = None
+    pending_done_sink_event: Any = None
     retry_after_ms: int | None = None
     activity_phases: list[dict[str, Any]] = []
     activity_snapshot: dict[str, Any] | None = None
@@ -1784,6 +1786,22 @@ async def _emit_task_runtime_stream_events(
         "replay_safe": False,
     }
     primary_user_message_id = safe_primary_user_message_id(user_message_id)
+
+    async def _emit_to_presentation_sink(event: Any, event_kind: str) -> None:
+        if stream_event_sink is None:
+            return
+        try:
+            result = stream_event_sink(event)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            log.debug(
+                "task_runtime.stream_event_sink_failed",
+                session_key=session_key,
+                event_kind=event_kind,
+                exc_info=True,
+            )
+
     async for event in wrap_stream(
         raw_stream,
         idle_timeout=idle_timeout,
@@ -1843,6 +1861,8 @@ async def _emit_task_runtime_stream_events(
                 terminal_reason = "timeout"
             elif is_output_truncated:
                 terminal_reason = "output_truncated"
+            elif code_text == "action_completion_incomplete":
+                terminal_reason = "action_completion_incomplete"
             elif code_text == "model_repetition_loop_detected":
                 terminal_reason = "model_repetition_loop_detected"
             else:
@@ -1913,7 +1933,7 @@ async def _emit_task_runtime_stream_events(
                         if activity_snapshot is not None:
                             event_dict["activity_snapshot"] = activity_snapshot
                 event_dict["turn_outcome"] = outcome
-        if stream_event_sink is not None:
+        if event_kind != "done":
             # Internal stream relays normally consume only text/done/artifact
             # events. Still, project provider failures through the same safe
             # Gateway boundary before invoking an arbitrary sink: a sink that
@@ -1922,17 +1942,7 @@ async def _emit_task_runtime_stream_events(
             sink_event: Any = event
             if event_kind == "error":
                 sink_event = {"kind": "error", **event_dict}
-            try:
-                result = stream_event_sink(sink_event)
-                if inspect.isawaitable(result):
-                    await result
-            except Exception:
-                log.debug(
-                    "task_runtime.stream_event_sink_failed",
-                    session_key=session_key,
-                    event_kind=event_kind,
-                    exc_info=True,
-                )
+            await _emit_to_presentation_sink(sink_event, event_kind)
         if task_id:
             event_dict["task_id"] = task_id
             event_dict["turn_id"] = task_id
@@ -1948,6 +1958,17 @@ async def _emit_task_runtime_stream_events(
             event_dict["input_mode"] = input_mode
         if run_kind:
             event_dict["run_kind"] = run_kind
+        if event_kind == "done":
+            # Provider/TurnRunner Done carries the authoritative usage receipt,
+            # but this sink is a presentation consumer (for example a channel
+            # relay), not the usage accountant. Delay it together with the wire
+            # event until the stream proves that no typed semantic error follows.
+            pending_done_event = event_dict
+            pending_done_sink_event = event
+            continue
+        if event_kind == "error":
+            pending_done_event = None
+            pending_done_sink_event = None
         await event_emitter(
             session_key,
             f"session.event.{event_kind}",
@@ -1956,6 +1977,13 @@ async def _emit_task_runtime_stream_events(
         if event_kind == "error":
             message = event_dict.get("error_message")
             error_message = message if isinstance(message, str) and message else "Agent error"
+    if error_message is None and pending_done_event is not None:
+        await _emit_to_presentation_sink(pending_done_sink_event, "done")
+        await event_emitter(
+            session_key,
+            "session.event.done",
+            pending_done_event,
+        )
     if error_message is not None:
         raise TaskRuntimeStreamError(
             error_message,

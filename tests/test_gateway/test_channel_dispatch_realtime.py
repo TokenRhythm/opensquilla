@@ -23,6 +23,7 @@ from opensquilla.channels.types import (
     IngressVerification,
     OutgoingMessage,
 )
+from opensquilla.engine.action_completion import ActionCompletionIncompleteError
 from opensquilla.engine.types import (
     ArtifactEvent,
     DoneEvent,
@@ -36,6 +37,7 @@ from opensquilla.gateway.attachment_ingest import (
     MAX_TOTAL_ATTACHMENT_BYTES,
     AttachmentTotalTooLargeError,
 )
+from opensquilla.gateway.boot import _emit_task_runtime_stream_events
 from opensquilla.gateway.channel_dispatch import (
     _artifact_fallback_lines,
     _build_reply_message,
@@ -784,6 +786,67 @@ async def test_runtime_untyped_stream_with_edit_but_no_handle_contract_buffers_s
 
     assert channel.chunks == expected_chunks
     assert channel.edits == []
+    assert channel.sent == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_channel_relay_never_delivers_done_before_action_incomplete() -> None:
+    class CustomStreamingChannel(_FakeChannel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.chunks: list[str] = []
+
+        async def send_streaming(self, chunks, **kwargs):
+            async for chunk in chunks:
+                self.chunks.append(chunk)
+            return None
+
+    class FakeTaskRuntime:
+        async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
+            return None
+
+    async def _stream():
+        yield TextDeltaEvent(text="claimed completion")
+        yield DoneEvent(
+            text="claimed completion",
+            text_snapshot="claimed completion",
+            input_tokens=7,
+            output_tokens=3,
+        )
+        yield ErrorEvent(
+            message="Action completion evidence was missing.",
+            code="action_completion_incomplete",
+        )
+        raise ActionCompletionIncompleteError()
+
+    async def _emitter(
+        _session_key: str,
+        _event_name: str,
+        _payload: dict[str, Any],
+    ) -> None:
+        return None
+
+    channel = CustomStreamingChannel()
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel,
+        _message(),
+        FakeTaskRuntime(),
+    )
+    assert relay is not None
+
+    with pytest.raises(ActionCompletionIncompleteError):
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            "agent:main:channel",
+            _emitter,
+            stream_event_sink=relay.emit,
+            idle_timeout=1.0,
+            heartbeat_interval=0.0,
+        )
+    await relay.close()
+
+    assert channel.chunks == ["The task failed before it could finish."]
+    assert "claimed completion" not in "".join(channel.chunks)
     assert channel.sent == []
 
 

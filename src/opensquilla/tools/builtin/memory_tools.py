@@ -651,6 +651,7 @@ def create_memory_tools(
         required=["query"],
         plan_access=PlanAccess.READ_ONLY,
         registry=registry,
+        builtin_completion_policy=True,
     )
     async def memory_search(
         query: str,
@@ -720,6 +721,7 @@ def create_memory_tools(
         required=["content"],
         exposed_by_default=False,
         registry=registry,
+        builtin_completion_policy=True,
     )
     async def memory_save(content: str, path: str = "", mode: str = "append") -> str:
         r = _resolve()
@@ -767,6 +769,7 @@ def create_memory_tools(
         required=["path"],
         plan_access=PlanAccess.READ_ONLY,
         registry=registry,
+        builtin_completion_policy=True,
     )
     async def memory_get(
         path: str,
@@ -823,6 +826,7 @@ def create_memory_tools(
         required=["path"],
         exposed_by_default=False,
         registry=registry,
+        builtin_completion_policy=True,
     )
     async def memory_delete(path: str) -> str:
         r = _resolve()
