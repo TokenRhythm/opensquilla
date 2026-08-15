@@ -119,6 +119,7 @@ jobs:
       tui_changed: ${{ steps.classify.outputs.tui_changed }}
       desktop_changed: ${{ steps.classify.outputs.desktop_changed }}
       python_changed: ${{ steps.classify.outputs.python_changed }}
+      python_full_required: ${{ steps.classify.outputs.python_full_required }}
       platform_sensitive_changed: ${{ steps.classify.outputs.platform_sensitive_changed }}
       build_wheel_required: ${{ steps.classify.outputs.build_wheel_required }}
       toolchain_artifact_changed: ${{ steps.classify.outputs.toolchain_artifact_changed }}
@@ -540,7 +541,7 @@ jobs:
         run: uv run mypy src/opensquilla --show-error-codes
 
       - name: Test targeted PR suite
-        if: ${{ needs.classify-changes.outputs.full_required != 'true' }}
+        if: ${{ needs.classify-changes.outputs.full_required != 'true' && needs.classify-changes.outputs.python_full_required != 'true' }}
         shell: bash
         env:
           TARGETED_PYTEST_TARGETS: ${{ needs.classify-changes.outputs.pytest_targets }}
@@ -617,7 +618,7 @@ jobs:
   ubuntu-full:
     name: Full offline tests (ubuntu-latest, ${{ matrix.shard }})
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.full_required == 'true' }}
+    if: ${{ needs.classify-changes.outputs.full_required == 'true' || needs.classify-changes.outputs.python_full_required == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -1536,6 +1537,7 @@ jobs:
           FLAG_TUI_CHANGED: ${{ needs.classify-changes.outputs.tui_changed }}
           FLAG_DESKTOP_CHANGED: ${{ needs.classify-changes.outputs.desktop_changed }}
           FLAG_PYTHON_CHANGED: ${{ needs.classify-changes.outputs.python_changed }}
+          FLAG_PYTHON_FULL_REQUIRED: ${{ needs.classify-changes.outputs.python_full_required }}
           FLAG_PLATFORM_SENSITIVE_CHANGED: ${{ needs.classify-changes.outputs.platform_sensitive_changed }}
           FLAG_BUILD_WHEEL_REQUIRED: ${{ needs.classify-changes.outputs.build_wheel_required }}
           FLAG_TOOLCHAIN_ARTIFACT_CHANGED: ${{ needs.classify-changes.outputs.toolchain_artifact_changed }}

@@ -117,14 +117,17 @@ def _expected_classifier_outputs(**overrides: str) -> dict[str, str]:
         "tui_changed": "false",
         "desktop_changed": "false",
         "python_changed": "false",
+        "python_full_required": "false",
         "platform_sensitive_changed": "false",
         "build_wheel_required": "false",
         "toolchain_artifact_changed": "false",
         "full_required": "false",
         "pytest_targets": "",
     }
-    if overrides.get("full_required") == "true" and "pytest_targets" not in overrides:
-        outputs["pytest_targets"] = "tests"
+    if overrides.get("full_required") == "true":
+        outputs["python_full_required"] = "true"
+        if "pytest_targets" not in overrides:
+            outputs["pytest_targets"] = "tests"
     outputs.update(overrides)
     return outputs
 
@@ -225,6 +228,7 @@ def test_default_ci_blocks_pull_requests_and_main_pushes() -> None:
     assert "tui_changed" in text
     assert "desktop_changed" in text
     assert "python_changed" in text
+    assert "python_full_required" in text
     assert "platform_sensitive_changed" in text
     assert "build_wheel_required" in text
     assert "full_required" in text
@@ -297,6 +301,29 @@ def test_ci_change_classifier_routes_platform_neutral_provider_changes(
             "tests/test_provider,tests/test_provider*.py,tests/test_*router*.py,"
             "tests/test_cross_provider_tiers.py"
         ),
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "src/opensquilla/engine/runtime.py",
+        "src/opensquilla/application/approval_rpc.py",
+        "src/opensquilla/agents/registry.py",
+        "src/opensquilla/safety/injection_guard.py",
+    ],
+)
+def test_ci_change_classifier_runs_all_python_shards_for_shared_core(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    outputs = _classify_changed_files(tmp_path, [path])
+
+    assert outputs == _expected_classifier_outputs(
+        runtime_changed="true",
+        python_changed="true",
+        python_full_required="true",
+        build_wheel_required="true",
     )
 
 
@@ -1350,6 +1377,7 @@ def test_default_ci_uses_layered_job_conditions() -> None:
     assert "desktop_changed == 'true'" in jobs["desktop-check"]["if"]
     assert "python_changed == 'true'" in jobs["ubuntu-quality"]["if"]
     assert "full_required == 'true'" in jobs["ubuntu-full"]["if"]
+    assert "python_full_required == 'true'" in jobs["ubuntu-full"]["if"]
     assert jobs["windows-compat"]["if"] == (
         "${{ (needs.classify-changes.outputs.python_changed == 'true' || "
         "needs.classify-changes.outputs.platform_sensitive_changed == 'true' || "
@@ -1432,6 +1460,7 @@ def test_ci_result_gate_covers_every_conditional_job_and_classifier_flag() -> No
         "FLAG_TUI_CHANGED",
         "FLAG_DESKTOP_CHANGED",
         "FLAG_PYTHON_CHANGED",
+        "FLAG_PYTHON_FULL_REQUIRED",
         "FLAG_PLATFORM_SENSITIVE_CHANGED",
         "FLAG_BUILD_WHEEL_REQUIRED",
         "FLAG_TOOLCHAIN_ARTIFACT_CHANGED",
@@ -1708,8 +1737,11 @@ def test_ubuntu_quality_keeps_targeted_pr_tests_and_full_ci_uses_balanced_matrix
         "${{ needs.classify-changes.outputs.full_required == 'true' }}"
     )
     assert test_step["if"] == (
-        "${{ needs.classify-changes.outputs.full_required != 'true' }}"
+        "${{ needs.classify-changes.outputs.full_required != 'true' && "
+        "needs.classify-changes.outputs.python_full_required != 'true' }}"
     )
+    assert "full_required == 'true'" in ubuntu_full["if"]
+    assert "python_full_required == 'true'" in ubuntu_full["if"]
     assert "uv run pytest" in test_step["run"]
     assert "tests/test_artifacts.py" not in test_step["run"]
     assert "--ignore=tests/test_ci/test_router_artifact_manifest.py" in test_step["run"]

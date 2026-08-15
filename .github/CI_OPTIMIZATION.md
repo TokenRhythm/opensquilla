@@ -6,7 +6,7 @@ the nightly run.
 
 | Stage | Target | Responsibility |
 | --- | --- | --- |
-| Pull request | 8–15 minutes for ordinary changes | Run always-on contracts plus tests selected from the changed product area. Unknown, dependency, CI-policy, release, and platform-sensitive paths fail closed to the full matrix. |
+| Pull request | 8–15 minutes for ordinary changes | Run always-on contracts plus tests selected from the changed product area. Shared Python core changes run every offline Python shard; unknown, dependency, CI-policy, release, and platform-sensitive paths fail closed to the full matrix. |
 | Merge queue | 1–3 minutes when evidence is reusable | Verify exact-tree, base, workflow-run, PR association, and policy attestations. Any mismatch runs the full queue matrix. |
 | `main` push | 3–8 minutes in `enforce` | Build the WebUI and wheel, install in a clean environment, import the gateway, run the CLI, and exercise an offline provider/gateway canary. |
 | Nightly | Full matrix | Exercise all supported test shards and platform contracts without change-based selection. |

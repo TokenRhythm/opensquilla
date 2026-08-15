@@ -15,6 +15,7 @@ frontend_changed=false
 tui_changed=false
 desktop_changed=false
 python_changed=false
+python_full_required=false
 platform_sensitive_changed=false
 build_wheel_required=false
 toolchain_artifact_changed=false
@@ -44,6 +45,11 @@ mark_runtime_changed() {
   runtime_changed=true
   python_changed=true
   build_wheel_required=true
+}
+
+mark_python_full_required() {
+  mark_runtime_changed
+  python_full_required=true
 }
 
 mark_test_changed() {
@@ -114,6 +120,7 @@ mark_full_required() {
   tui_changed=true
   desktop_changed=true
   python_changed=true
+  python_full_required=true
   platform_sensitive_changed=true
   build_wheel_required=true
   toolchain_artifact_changed=true
@@ -295,10 +302,11 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       add_pytest_target "tests/test_gateway*.py"
       add_pytest_target "tests/functional/test_gateway_*_e2e.py"
       ;;
-    src/opensquilla/engine/*)
-      mark_runtime_changed
-      add_pytest_target "tests/test_engine"
-      add_pytest_target "tests/test_engine*.py"
+    src/opensquilla/engine/* | src/opensquilla/agents/* | src/opensquilla/agent/* | src/opensquilla/application/* | src/opensquilla/safety/*)
+      # These shared-core surfaces fan out across gateway, channel, session,
+      # CLI, and tool contracts. Run every offline Python shard without waking
+      # unrelated frontend, Desktop, release, or toolchain matrices.
+      mark_python_full_required
       ;;
     src/opensquilla/channels/*)
       mark_runtime_changed
@@ -324,14 +332,6 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       add_pytest_target "tests/test_cli"
       add_pytest_target "tests/integration/cli"
       ;;
-    src/opensquilla/agents/* | src/opensquilla/agent/*)
-      mark_runtime_changed
-      add_pytest_target "tests/test_agents"
-      ;;
-    src/opensquilla/application/*)
-      mark_runtime_changed
-      add_pytest_target "tests/test_application"
-      ;;
     src/opensquilla/identity/templates/*)
       mark_runtime_changed
       mark_platform_sensitive_changed
@@ -356,10 +356,6 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
     src/opensquilla/search/*)
       mark_runtime_changed
       add_pytest_target "tests/test_search"
-      ;;
-    src/opensquilla/safety/*)
-      mark_runtime_changed
-      add_pytest_target "tests/test_safety"
       ;;
     migrations/*)
       mark_runtime_changed
@@ -404,6 +400,7 @@ fi
   printf 'tui_changed=%s\n' "${tui_changed}"
   printf 'desktop_changed=%s\n' "${desktop_changed}"
   printf 'python_changed=%s\n' "${python_changed}"
+  printf 'python_full_required=%s\n' "${python_full_required}"
   printf 'platform_sensitive_changed=%s\n' "${platform_sensitive_changed}"
   printf 'build_wheel_required=%s\n' "${build_wheel_required}"
   printf 'toolchain_artifact_changed=%s\n' "${toolchain_artifact_changed}"
