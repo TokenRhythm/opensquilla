@@ -51,7 +51,6 @@ def _merge_preview_repo(
     _write(repo, "src/example.py", "BASE = True\n")
     _git(repo, "add", ".")
     _git(repo, "commit", "-m", "base")
-    base_sha = _git(repo, "rev-parse", "HEAD")
 
     _git(repo, "switch", "-c", "feature")
     _write(repo, "src/example.py", "BASE = True\nFEATURE = True\n")
