@@ -1695,6 +1695,67 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     app.unmount()
   })
 
+  it('does not present a provider-resolution conflict as a configured provider', async () => {
+    mockProviderState(
+      {
+        hasConfig: false,
+        llmConfigured: false,
+        llmSource: 'none',
+        llmCredentialStatus: {
+          provider: 'openrouter',
+          available: true,
+          source: 'env',
+          envKey: 'OPENROUTER_API_KEY',
+        },
+        sectionDetails: {
+          llm: {
+            status: 'degraded',
+            blocking: true,
+            actionRequired: true,
+            providerResolution: {
+              status: 'conflict',
+              effectiveProvider: '',
+              source: 'conflicting_evidence',
+              reasonCode: 'providerless_provider_conflict',
+              actionRequired: true,
+            },
+          },
+        },
+      },
+      {
+        llm: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro' },
+        squilla_router: { enabled: true, cross_provider_tiers: false },
+        llm_ensemble: { enabled: false },
+      },
+      {
+        catalog: {
+          providers: [{
+            providerId: 'openrouter',
+            label: 'OpenRouter',
+            runtimeSupported: true,
+            fields: [{ name: 'model', label: 'Model' }],
+          }],
+        },
+        effective: {
+          fields: {
+            'llm.provider': { value: 'openrouter', source: 'config' },
+          },
+        },
+      },
+    )
+
+    const { api, app } = await mountCatalog()
+
+    expect(api.providerPanel.value.configuredProviders).toEqual([])
+    expect(api.providerPanel.value.providerSelected).toBe('')
+    expect(api.hasSavedProvider.value).toBe(false)
+    expect(api.sectionStatus('provider')).toEqual({
+      label: 'Needs action',
+      tone: 'is-warn',
+    })
+    app.unmount()
+  })
+
   it('re-enables an inline provider preset without leaking materialized OpenRouter tiers', async () => {
     mockProviderState(
       {

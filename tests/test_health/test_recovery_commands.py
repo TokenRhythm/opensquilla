@@ -683,31 +683,18 @@ def test_tier_managed_ensemble_health_explains_c3_activation_and_fallback() -> N
     assert "opensquilla config set llm_ensemble.enabled false" not in commands
 
 
-def test_deprecated_ensemble_error_policy_reports_effective_fixed_fallback() -> None:
+def test_supported_ensemble_error_policy_has_no_migration_warning() -> None:
     findings = evaluate_llm_ensemble(
         {
             "enabled": False,
             "selectionMode": "static_openrouter_b5",
             "configuredAllFailedPolicy": "error",
-            "effectiveAllFailedPolicy": "fallback_single",
-            "policyDeprecated": True,
+            "effectiveAllFailedPolicy": "error",
+            "policyDeprecated": False,
         }
     )
 
-    assert [finding.id for finding in findings] == [
-        "llm_ensemble.all_failed_policy.deprecated"
-    ]
-    finding = findings[0]
-    assert finding.severity == "warn"
-    assert finding.evidence == {
-        "configuredAllFailedPolicy": "error",
-        "effectiveAllFailedPolicy": "fallback_single",
-        "policyDeprecated": True,
-    }
-    assert "remains loadable" in finding.detail
-    assert "configured fixed/direct fallback model" in finding.detail
-    assert any(step.label == "Save the ensemble settings" for step in finding.fix_steps)
-    assert finding.restart_required is False
+    assert findings == []
 
     enabled = evaluate_llm_ensemble(
         {
@@ -715,11 +702,10 @@ def test_deprecated_ensemble_error_policy_reports_effective_fixed_fallback() -> 
             "selectionMode": "static_openrouter_b5",
             "credentialAvailable": True,
             "configuredAllFailedPolicy": "error",
-            "effectiveAllFailedPolicy": "fallback_single",
-            "policyDeprecated": True,
+            "effectiveAllFailedPolicy": "error",
+            "policyDeprecated": False,
         }
     )
     assert [finding.id for finding in enabled] == [
         "llm_ensemble.static_openrouter_b5.ready",
-        "llm_ensemble.all_failed_policy.deprecated",
     ]

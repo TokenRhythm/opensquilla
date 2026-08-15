@@ -1048,9 +1048,13 @@
       "runtimeStrategyTitle": "実行戦略",
       "runtimeStrategyDesc": "成功条件、失敗時の動作、制限時間",
       "successThresholdLabel": "最小成功条件",
-      "successThresholdValue": "少なくとも 1 つの提案モデルが正常に応答",
+      "successThresholdExact": "少なくとも {quorum}/{proposers} が正常に応答",
       "successThresholdDesc": "ほかの提案モデルも、それぞれ完了またはタイムアウトまで待機します。",
       "failurePolicyLabel": "集約を完了できない場合",
+      "failurePolicyErrorDesc": "固定フォールバックモデルを呼び出さず、停止して失敗を報告します。",
+      "proposerRetriesLabel": "提案モデルごとの再試行回数",
+      "proposerRetriesDesc": "再試行可能な失敗のみ。最初のリクエストは再試行に含みません。",
+      "proposerRetriesOption": "最初のリクエスト後に最大 {count} 回再試行",
       "runtimeLimitsLabel": "制限時間",
       "runtimeLimits": "提案モデルは合計 {proposerTimeout} 秒 · 集約モデルはプロバイダーイベント間のアイドル {aggregatorTimeout} 秒（設定値 {configuredAggregatorTimeout} 秒）· ターン全体の期限は別管理"
     },
@@ -1091,6 +1095,8 @@
       "tierUseEnsemble": "マルチモデル融合",
       "tierUseEnsembleDescription": "マルチモデル融合の現在のプランを使用",
       "tierEnsembleSummary": "マルチモデル融合の現在のプランを使用し、失敗時は「固定・フォールバックモデル」を使用します：{provider} · {model}。",
+      "tierEnsembleErrorSummary": "マルチモデル融合の現在のプランを使用し、完了できない場合はエラーを報告します。",
+      "tierEnsemblePolicyFacts": "有効な戦略：少なくとも {quorum}/{proposers} の提案が正常に応答 · 提案ごとに最大 {retries} 回再試行。",
       "tierEnsembleSummaryGeneric": "マルチモデル融合の現在のプランを使用し、失敗時は「固定・フォールバックモデル」を使用します。",
       "tierEnsembleFallbackMissingSummary": "マルチモデル融合の現在のプランを使用しますが、利用可能な「固定・フォールバックモデル」がまだ設定されていません。",
       "tierEnsemblePlanReady": "現在の融合プランは準備完了です",
@@ -1135,7 +1141,8 @@
     "ensemble": {
       "statusOn": "AI 集約ルーティングはオンです。複数のモデルが回答し、1つのモデルが最終応答を統合します。",
       "statusOff": "AI 集約ルーティングはオフです。",
-      "allFailedFallback": "単一モデルにフォールバック"
+      "allFailedFallback": "単一モデルにフォールバック",
+      "allFailedError": "停止してエラーを報告"
     },
     "channels": {
       "title": "チャンネル",

@@ -1,5 +1,7 @@
 /** OpenSquilla Web UI — WebSocket RPC client (TypeScript port). */
 
+const ANSWER_GENERATION_RESET_CAPABILITY = 'session.answer_generation_reset.v1';
+
 export interface RpcErrorDetail {
   code?: string;
   message?: string;
@@ -430,6 +432,7 @@ export class RpcClient {
               params: {
                 minProtocol: 3,
                 maxProtocol: 3,
+                caps: [ANSWER_GENERATION_RESET_CAPABILITY],
                 client: { name: 'opensquilla-web' },
                 ...authParams,
               },

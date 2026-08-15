@@ -475,6 +475,7 @@ class TurnErrorPersistPort(Protocol):
         *,
         session_key: str,
         event: ErrorEvent | None,
+        append_transcript: bool = True,
     ) -> None: ...
 
 
@@ -573,6 +574,10 @@ class TurnFinalizerStageInput:
     assistant_message_id: str | None = None
     execution_context: TurnExecutionContext | None = None
     publication_ledger: TurnPublicationLedger | None = None
+    # A terminal generation reset already persists its friendly canonical
+    # assistant snapshot. Keep the structured turn_errors row, but do not add
+    # the ordinary second system "Error:" transcript message on reload.
+    terminal_generation_reset: bool = False
 
 @dataclass(frozen=True)
 class TurnFinalizerStageOutput:
@@ -879,6 +884,7 @@ class TurnFinalizerStage:
             await self._turn_error_persist.persist_error(
                 session_key=inp.session_key,
                 event=inp.pending_error_event,
+                append_transcript=not inp.terminal_generation_reset,
             )
 
         # 5. Session totals rollup (only when DoneEvent present; the

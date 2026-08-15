@@ -451,6 +451,12 @@ describe('useSetupRouterForm - model strategy semantics', () => {
       blockedTierCandidates: [{ source: 'router_tier:c0', reason: 'cross_provider_veto' }],
       fixedFallbackReady: true,
       fixedFallbackBlockedReason: null,
+      proposerCount: 4,
+      configuredMinSuccessfulProposers: 1,
+      effectiveMinSuccessfulProposers: 1,
+      configuredProposerMaxRetries: 0,
+      effectiveProposerMaxRetries: 1,
+      proposerMaxRetriesSource: 'c3_default',
     })
 
     expect(f.tierEnsembleStatus.value).toEqual({
@@ -463,6 +469,12 @@ describe('useSetupRouterForm - model strategy semantics', () => {
       blockedTierCandidates: [{ source: 'router_tier:c0', reason: 'cross_provider_veto' }],
       fixedFallbackReady: true,
       fixedFallbackBlockedReason: '',
+      proposerCount: 4,
+      configuredMinSuccessfulProposers: 1,
+      effectiveMinSuccessfulProposers: 1,
+      configuredProposerMaxRetries: 0,
+      effectiveProposerMaxRetries: 1,
+      proposerMaxRetriesSource: 'c3_default',
     })
     expect(makePanel(f, true).value.tierEnsembleStatus?.runtimeStatus).toBe('conditional')
   })

@@ -1099,9 +1099,13 @@
       "runtimeStrategyTitle": "运行策略",
       "runtimeStrategyDesc": "正常返回阈值、失败处理与时限",
       "successThresholdLabel": "最低通过条件",
-      "successThresholdValue": "至少 1 个提案模型正常返回",
+      "successThresholdExact": "至少 {quorum}/{proposers} 正常返回",
       "successThresholdDesc": "其他提案模型仍会分别等待完成或超时。",
       "failurePolicyLabel": "无法完成融合时",
+      "failurePolicyErrorDesc": "停止并报告失败，不调用固定回退模型。",
+      "proposerRetriesLabel": "每个提案的重试次数",
+      "proposerRetriesDesc": "仅重试可恢复的失败；首次请求不计为重试。",
+      "proposerRetriesOption": "首次请求失败后最多重试 {count} 次",
       "runtimeLimitsLabel": "运行时限",
       "runtimeLimits": "每个提案总时限 {proposerTimeout} 秒 · 融合模型事件间空闲时限 {aggregatorTimeout} 秒（配置值 {configuredAggregatorTimeout} 秒）· 整轮总时限另行控制"
     },
@@ -1142,6 +1146,8 @@
       "tierUseEnsemble": "多模型融合",
       "tierUseEnsembleDescription": "使用“多模型融合”中的当前方案",
       "tierEnsembleSummary": "使用“多模型融合”中的当前方案；失败时使用“固定与回退模型”：{provider} · {model}。",
+      "tierEnsembleErrorSummary": "使用“多模型融合”中的当前方案；无法完成时报告错误。",
+      "tierEnsemblePolicyFacts": "有效策略：至少 {quorum}/{proposers} 个提案正常返回 · 每个提案最多重试 {retries} 次。",
       "tierEnsembleSummaryGeneric": "使用“多模型融合”中的当前方案；失败时使用“固定与回退模型”。",
       "tierEnsembleFallbackMissingSummary": "使用“多模型融合”中的当前方案；尚未配置可用的“固定与回退模型”。",
       "tierEnsemblePlanReady": "当前融合方案已就绪",
@@ -1186,7 +1192,8 @@
     "ensemble": {
       "statusOn": "AI 智能融合路由已开启——多个模型作答，由一个模型整合最终回复。",
       "statusOff": "AI 智能融合路由已关闭。",
-      "allFailedFallback": "回退到单一模型"
+      "allFailedFallback": "回退到单一模型",
+      "allFailedError": "停止并报告错误"
     },
     "channels": {
       "title": "渠道",

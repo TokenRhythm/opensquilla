@@ -177,6 +177,62 @@ def _positive_int(value: int | str, *, label: str) -> int:
     return parsed
 
 
+def _bounded_non_negative_int(
+    value: int | str,
+    *,
+    label: str,
+    maximum: int,
+) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} must be an integer between 0 and {maximum}") from None
+    if parsed < 0 or parsed > maximum:
+        raise ValueError(f"{label} must be between 0 and {maximum}")
+    return parsed
+
+
+_C3_ENSEMBLE_POLICY_DEFAULTS: dict[str, object] = {
+    "min_successful_proposers": 1,
+    "proposer_max_retries": 1,
+    "all_failed_policy": "fallback_single",
+}
+
+
+def _materialize_c3_ensemble_policy_defaults(config: GatewayConfig) -> tuple[str, ...]:
+    """Persist C3's shared-fusion defaults without overriding operator values."""
+
+    router = getattr(config, "squilla_router", None)
+    tiers = getattr(router, "tiers", {}) or {}
+    c3 = TierConfig.from_value(tiers.get(HIGHEST_TEXT_TIER))
+    if not bool(getattr(router, "enabled", False)) or c3.ensemble_enabled is not True:
+        return ()
+
+    ensemble = config.llm_ensemble
+    explicit_fields = set(getattr(ensemble, "model_fields_set", set()))
+    generated_fields = {
+        field_name
+        for field_name in _C3_ENSEMBLE_POLICY_DEFAULTS
+        if field_name not in explicit_fields
+    }
+    if not generated_fields:
+        return ()
+
+    payload = ensemble.model_dump(mode="python")
+    for field_name in generated_fields:
+        payload[field_name] = _C3_ENSEMBLE_POLICY_DEFAULTS[field_name]
+    materialized = LlmEnsembleConfig(**payload)
+    object.__setattr__(
+        materialized,
+        "__pydantic_fields_set__",
+        explicit_fields | generated_fields,
+    )
+    config.llm_ensemble = materialized
+    for field_name in generated_fields:
+        config.mark_force_persist(f"llm_ensemble.{field_name}")
+    return tuple(sorted(generated_fields))
+
+
 def _preset_tiers_with_model(preset: ProviderPreset, model: str) -> dict[str, dict]:
     tiers = preset.tier_defaults()
     for tier in tiers.values():
@@ -964,6 +1020,7 @@ def upsert_llm_provider(
         router_action=router_action,
         explicit_preset=preset,
     )
+    _materialize_c3_ensemble_policy_defaults(new_cfg)
     if api_key:
         clear_runtime_secret_paths(new_cfg, {"llm.api_key"})
     # Explicit endpoint/proxy values override any boot-time env resolution:
@@ -1240,6 +1297,8 @@ def upsert_router(
             new_cfg.llm_ensemble = materialized
             for field_name in generated_fields:
                 new_cfg.mark_force_persist(f"llm_ensemble.{field_name}")
+    if shared_tier_enabled:
+        _materialize_c3_ensemble_policy_defaults(new_cfg)
     # Otherwise this is ladder/settings maintenance on an already-enabled
     # router (the common Web UI tier-table save and CLI default-tier path).
     # Applying the mode patch here would silently escalate an operator's
@@ -1282,6 +1341,7 @@ def upsert_llm_ensemble(
     model_options: list[str] | None = None,
     candidates: list[dict[str, object]] | None = None,
     min_successful_proposers: int | str | None = None,
+    proposer_max_retries: int | str | None = None,
     all_failed_policy: str | None = None,
 ) -> MutationResult:
     """Update the ``[llm_ensemble]`` routing surface.
@@ -1359,9 +1419,13 @@ def upsert_llm_ensemble(
             min_successful_proposers, label="min_successful_proposers"
         )
         explicit_fields.add("min_successful_proposers")
-    deprecated_all_failed_policy = str(
-        current.get("all_failed_policy", "fallback_single") or "fallback_single"
-    ) == "error"
+    if proposer_max_retries is not None:
+        merged["proposer_max_retries"] = _bounded_non_negative_int(
+            proposer_max_retries,
+            label="proposer_max_retries",
+            maximum=10,
+        )
+        explicit_fields.add("proposer_max_retries")
     if all_failed_policy is not None:
         policy_clean = str(all_failed_policy).strip()
         if policy_clean not in _LLM_ENSEMBLE_ALL_FAILED_POLICIES:
@@ -1369,18 +1433,7 @@ def upsert_llm_ensemble(
                 "all_failed_policy must be one of: "
                 + ", ".join(_LLM_ENSEMBLE_ALL_FAILED_POLICIES)
             )
-        deprecated_all_failed_policy = deprecated_all_failed_policy or policy_clean == "error"
-        # ``error`` remains accepted on the wire so older clients do not
-        # break, but every new write canonicalizes the one supported runtime
-        # outcome: use the configured fixed/direct fallback deployment.
-        merged["all_failed_policy"] = "fallback_single"
-        explicit_fields.add("all_failed_policy")
-
-    # Saving any part of an old Ensemble section is also its compatibility
-    # migration point.  Config loading remains lossless; the next intentional
-    # write removes the deprecated execution policy.
-    if str(merged.get("all_failed_policy") or "fallback_single") == "error":
-        merged["all_failed_policy"] = "fallback_single"
+        merged["all_failed_policy"] = policy_clean
         explicit_fields.add("all_failed_policy")
 
     if (
@@ -1440,14 +1493,17 @@ def upsert_llm_ensemble(
         new_cfg.mark_force_persist("llm_ensemble.selection_mode")
     if candidates is not None or "candidates" in generated_fields:
         new_cfg.mark_force_persist("llm_ensemble.candidates")
-    if deprecated_all_failed_policy:
+    if all_failed_policy is not None:
         new_cfg.mark_force_persist("llm_ensemble.all_failed_policy")
+    if proposer_max_retries is not None:
+        new_cfg.mark_force_persist("llm_ensemble.proposer_max_retries")
 
     payload: dict[str, Any] = {
         "enabled": new_ensemble.enabled,
         "selection_mode": new_ensemble.selection_mode,
         "model_options": list(new_ensemble.model_options),
         "min_successful_proposers": new_ensemble.min_successful_proposers,
+        "proposer_max_retries": new_ensemble.proposer_max_retries,
         "all_failed_policy": new_ensemble.all_failed_policy,
     }
     if candidates is not None or new_ensemble.candidates:
@@ -1462,14 +1518,7 @@ def upsert_llm_ensemble(
             or bool(routing_changes)
         ),
         restart_required=False,
-        warnings=(
-            [
-                "llm_ensemble.all_failed_policy=error is deprecated; "
-                "fusion failures now use the configured fixed/direct model"
-            ]
-            if deprecated_all_failed_policy
-            else []
-        ),
+        warnings=[],
         public_payload=payload,
     )
 

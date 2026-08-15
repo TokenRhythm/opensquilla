@@ -1761,50 +1761,6 @@ def evaluate_sandbox(payload: dict[str, Any]) -> list[HealthFinding]:
     ]
 
 
-def _deprecated_ensemble_failure_policy(
-    payload: dict[str, Any],
-) -> HealthFinding | None:
-    configured_policy = str(
-        payload.get("configuredAllFailedPolicy")
-        or payload.get("allFailedPolicy")
-        or payload.get("all_failed_policy")
-        or "fallback_single"
-    ).strip()
-    effective_policy = str(
-        payload.get("effectiveAllFailedPolicy") or "fallback_single"
-    ).strip()
-    deprecated = bool(payload.get("policyDeprecated")) or configured_policy == "error"
-    if not deprecated:
-        return None
-    return HealthFinding(
-        id="llm_ensemble.all_failed_policy.deprecated",
-        severity="warn",
-        surface="llm_ensemble",
-        title="LLM ensemble failure policy is deprecated",
-        detail=(
-            "The configured all_failed_policy='error' remains loadable for upgrade "
-            "compatibility, but its effective behavior is fallback_single: if fusion "
-            "cannot complete, OpenSquilla uses the configured fixed/direct fallback "
-            "model. Save the ensemble settings to migrate the stored policy."
-        ),
-        evidence={
-            "configuredAllFailedPolicy": configured_policy,
-            "effectiveAllFailedPolicy": effective_policy,
-            "policyDeprecated": True,
-        },
-        fix_steps=[
-            FixStep(
-                label="Save the ensemble settings",
-                detail=(
-                    "Open Settings → Model routing, review the shared multi-model plan, "
-                    "and save it. OpenSquilla will persist fallback_single."
-                ),
-            )
-        ],
-        restart_required=False,
-    )
-
-
 def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
     tier_statuses = payload.get("tierEnsembleStatuses")
     if isinstance(tier_statuses, dict) and tier_statuses:
@@ -1817,21 +1773,12 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
         findings: list[HealthFinding] = []
         if bool(payload.get("globalEnabled")):
             findings.extend(evaluate_llm_ensemble(aggregate))
-        else:
-            deprecated = _deprecated_ensemble_failure_policy(aggregate)
-            if deprecated is not None:
-                findings.append(deprecated)
         for tier, raw_status in tier_statuses.items():
             if not isinstance(raw_status, dict):
                 continue
             tier_payload = dict(raw_status)
             tier_payload.setdefault("activationSource", "router_tier")
             tier_payload.setdefault("activationTiers", [str(tier)])
-            # The stored policy belongs to the one shared config and is
-            # diagnosed once above; suppress duplicate migration findings.
-            tier_payload["configuredAllFailedPolicy"] = "fallback_single"
-            tier_payload["effectiveAllFailedPolicy"] = "fallback_single"
-            tier_payload["policyDeprecated"] = False
             findings.extend(evaluate_llm_ensemble(tier_payload))
         return findings
 
@@ -1845,8 +1792,7 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
     ]
     tier_managed = activation_source == "router_tier"
     tier_label = ", ".join(activation_tiers) or "the configured router tier"
-    deprecated_policy = _deprecated_ensemble_failure_policy(payload)
-    policy_findings = [deprecated_policy] if deprecated_policy is not None else []
+    policy_findings: list[HealthFinding] = []
     if not enabled:
         return policy_findings
     # Every active plan has one physical safety net: the configured

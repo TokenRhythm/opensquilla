@@ -1048,9 +1048,13 @@
       "runtimeStrategyTitle": "Stratégie d'exécution",
       "runtimeStrategyDesc": "Seuil de réussite, repli et limites de temps",
       "successThresholdLabel": "Condition minimale de réussite",
-      "successThresholdValue": "Au moins 1 modèle proposant répond normalement",
+      "successThresholdExact": "Au moins {quorum} sur {proposers} répondent normalement",
       "successThresholdDesc": "Les autres modèles proposants attendent toujours leur propre fin ou expiration.",
       "failurePolicyLabel": "Si l'agrégation ne peut pas aboutir",
+      "failurePolicyErrorDesc": "Arrêter et signaler l'échec sans appeler le modèle de repli fixe.",
+      "proposerRetriesLabel": "Nouvelles tentatives par proposant",
+      "proposerRetriesDesc": "Uniquement les échecs réessayables ; la requête initiale ne compte pas comme nouvelle tentative.",
+      "proposerRetriesOption": "Au plus {count} nouvelles tentatives après la requête initiale",
       "runtimeLimitsLabel": "Limites de temps",
       "runtimeLimits": "Proposants {proposerTimeout}s au total · inactivité de l'agrégateur entre événements {aggregatorTimeout}s (configurée {configuredAggregatorTimeout}s) · délai total du tour séparé"
     },
@@ -1091,6 +1095,8 @@
       "tierUseEnsemble": "Fusion multimodèle",
       "tierUseEnsembleDescription": "Utiliser le plan actuel de Fusion multimodèle",
       "tierEnsembleSummary": "Utilise le plan actuel de fusion multimodèle ; en cas d’échec, utilise le modèle fixe et de repli : {provider} · {model}.",
+      "tierEnsembleErrorSummary": "Utilise le plan actuel de fusion multimodèle ; s’il ne peut pas aboutir, signale une erreur.",
+      "tierEnsemblePolicyFacts": "Stratégie effective : au moins {quorum}/{proposers} proposants répondent normalement · au plus {retries} nouvelles tentatives par proposant.",
       "tierEnsembleSummaryGeneric": "Utilise le plan actuel de fusion multimodèle ; en cas d’échec, utilise le modèle fixe et de repli.",
       "tierEnsembleFallbackMissingSummary": "Utilise le plan actuel de fusion multimodèle ; aucun modèle fixe et de repli utilisable n’est encore configuré.",
       "tierEnsemblePlanReady": "Le plan de fusion actuel est prêt",
@@ -1135,7 +1141,8 @@
     "ensemble": {
       "statusOn": "Le routage IA agrégé est actif : plusieurs modèles répondent et un modèle synthétise la réponse finale.",
       "statusOff": "Le routage IA agrégé est désactivé.",
-      "allFailedFallback": "Revenir à un modèle unique"
+      "allFailedFallback": "Revenir à un modèle unique",
+      "allFailedError": "Arrêter et signaler une erreur"
     },
     "channels": {
       "title": "Canaux",

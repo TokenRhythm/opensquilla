@@ -406,11 +406,8 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
         or "fallback_single"
     ).strip()
     payload.setdefault("configuredAllFailedPolicy", configured_policy)
-    payload.setdefault("effectiveAllFailedPolicy", "fallback_single")
-    payload.setdefault(
-        "policyDeprecated",
-        configured_policy != str(payload["effectiveAllFailedPolicy"]),
-    )
+    payload.setdefault("effectiveAllFailedPolicy", configured_policy)
+    payload.setdefault("policyDeprecated", False)
     payload["tierEnsembleStatuses"] = {
         tier: decorate(runtime)
         for tier, runtime in tier_ensemble_runtime_statuses(config).items()

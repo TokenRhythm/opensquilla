@@ -34,6 +34,7 @@ from opensquilla.gateway.protocol import (
     SnapshotInfo,
     make_error_res,
     make_event,
+    project_session_event_for_client,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcDispatcher
 from opensquilla.sandbox.legacy_codec import encode_payload_for_protocol
@@ -127,6 +128,7 @@ class WsConnection:
     conn_id: str
     ws: WebSocket
     protocol: int = PROTOCOL_VERSION
+    client_caps: frozenset[str] = field(default_factory=frozenset)
     principal: Principal = field(
         default_factory=lambda: Principal(
             role="operator",
@@ -308,6 +310,11 @@ class WsConnection:
     ) -> None:
         if self._closing:
             return
+        event, payload = project_session_event_for_client(
+            event,
+            payload,
+            client_caps=self.client_caps,
+        )
         # Atomic check + enqueue. The check and ``put_nowait`` are part of
         # one synchronous flow with no ``await`` between them, so
         # ``_force_close`` cannot flip ``_closing`` mid-flight (asyncio is
@@ -1031,6 +1038,14 @@ async def handle_ws_connection(
     # Assign principal
     conn.principal = principal
     conn.protocol = negotiated
+    requested_caps = params_raw.get("caps")
+    conn.client_caps = frozenset(
+        capability
+        for capability in (
+            requested_caps[:128] if isinstance(requested_caps, list) else ()
+        )
+        if isinstance(capability, str) and capability and len(capability) <= 128
+    )
 
     # Step 6: Send HelloOk
     hello = HelloOk(

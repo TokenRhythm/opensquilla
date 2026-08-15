@@ -17,7 +17,13 @@ from opensquilla.cli.agent_cmd import (
     run_agent_command,
     run_agent_once,
 )
-from opensquilla.engine.types import ArtifactEvent, DoneEvent, ThinkingEvent
+from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
+    ArtifactEvent,
+    DoneEvent,
+    TextDeltaEvent,
+    ThinkingEvent,
+)
 from opensquilla.gateway.config import AgentEntryConfig, GatewayConfig, PermissionsConfig
 from opensquilla.project_workspaces import (
     ProjectWorkspaceStateError,
@@ -280,6 +286,49 @@ async def test_run_agent_once_collects_artifact_events(
         }
     ]
     assert result.artifacts[0]["download_url"] == "/api/v1/artifacts/art-cli"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_once_terminal_reset_replaces_partial_and_returns_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    terminal_text = "The fixed model could not complete this answer."
+    drained = False
+
+    class FakeTurnRunner:
+        async def run(self, message: str, session_key: str, **kwargs: Any):
+            nonlocal drained
+            yield TextDeltaEvent(text="superseded partial")
+            yield AnswerGenerationResetEvent(
+                terminal=True,
+                terminal_text_snapshot=terminal_text,
+                terminal_error_message="The model provider rejected the request.",
+                terminal_error_code="provider_bad_request",
+                terminal_failure_kind="bad_request",
+            )
+            drained = True
+
+    async def fake_build_services(*, config: GatewayConfig, **kwargs: Any) -> _FakeServices:
+        return _FakeServices(config)
+
+    monkeypatch.setattr("opensquilla.gateway.build_services", fake_build_services)
+    monkeypatch.setattr(
+        "opensquilla.gateway.build_turn_runner_from_services",
+        lambda _services: FakeTurnRunner(),
+    )
+
+    result = await run_agent_once(message="hello", config=GatewayConfig())
+
+    assert drained is True
+    assert result.status == "error"
+    assert result.text == terminal_text
+    assert "superseded partial" not in result.text
+    assert result.errors == [
+        {
+            "message": "The model provider rejected the request.",
+            "code": "provider_bad_request",
+        }
+    ]
 
 
 @pytest.mark.asyncio

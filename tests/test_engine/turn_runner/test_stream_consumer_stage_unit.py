@@ -437,6 +437,9 @@ async def test_terminal_reset_is_only_public_outcome_and_keeps_accounting_done()
                     sequence=7,
                     terminal=True,
                     terminal_text_snapshot=terminal_text,
+                    terminal_error_message="The provider rejected the request.",
+                    terminal_error_code="provider_bad_request",
+                    terminal_failure_kind="bad_request",
                 ),
                 DoneEvent(
                     text="",
@@ -457,11 +460,79 @@ async def test_terminal_reset_is_only_public_outcome_and_keeps_accounting_done()
     ]
     assert not any(isinstance(event, (DoneEvent, ErrorEvent)) for event in events)
     assert state.final_text_parts == [terminal_text]
-    assert state.turn_segments == [{"type": "text", "text": terminal_text}]
+    assert state.current_text_parts == [terminal_text]
+    assert state.turn_segments == []
     assert state.done_event is not None
     assert state.done_event.text_snapshot == terminal_text
     assert state.done_event.input_tokens == 9
     assert state.done_event.output_tokens == 3
+    assert state.error_message == "The provider rejected the request."
+    assert state.pending_error_event is not None
+    assert state.pending_error_event.code == "provider_bad_request"
+    assert state.pending_error_event.failure_kind == "bad_request"
+    assert state.pending_error_event.generation_epoch == 2
+    public_reset = next(
+        event for event in events if isinstance(event, AnswerGenerationResetEvent)
+    )
+    assert public_reset.terminal_error_message == "The provider rejected the request."
+    assert public_reset.terminal_error_code == "provider_bad_request"
+    assert public_reset.terminal_failure_kind == "bad_request"
+
+
+@pytest.mark.asyncio
+async def test_non_reset_surface_projects_terminal_reset_to_one_legacy_error() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-terminal-legacy",
+            "assistant-terminal-legacy",
+            "agent:main:terminal-legacy",
+        ),
+        surface=SurfaceCapabilities(
+            supports_streaming=False,
+            supports_edit=False,
+            supports_generation_reset=False,
+        ),
+    )
+    state = _make_state()
+    terminal_text = "The model could not complete this answer."
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="superseded partial"),
+                AnswerGenerationResetEvent(
+                    turn_id="turn-terminal-legacy",
+                    assistant_message_id="assistant-terminal-legacy",
+                    old_generation_epoch=1,
+                    new_generation_epoch=2,
+                    safe_reason="fixed provider final failure",
+                    sequence=8,
+                    terminal=True,
+                    terminal_text_snapshot=terminal_text,
+                    terminal_error_message="internal provider detail",
+                    terminal_error_code="provider_bad_request",
+                    terminal_failure_kind="bad_request",
+                ),
+                DoneEvent(input_tokens=7, output_tokens=2, generation_epoch=2),
+            ]
+        )
+    )
+
+    events = await _drain(
+        stage,
+        _make_input(state=state, execution_context=context),
+    )
+
+    assert [type(event) for event in events] == [ErrorEvent]
+    assert events[0].message == terminal_text
+    assert events[0].code == "ensemble_fixed_error"
+    assert events[0].failure_kind == ""
+    assert state.error_message == "internal provider detail"
+    assert state.pending_error_event is not None
+    assert state.pending_error_event.code == "provider_bad_request"
+    assert state.done_event is not None
+    assert state.done_event.input_tokens == 7
+    assert state.done_event.output_tokens == 2
+    assert state.final_text_parts == [terminal_text]
 
 
 @pytest.mark.asyncio
@@ -513,6 +584,7 @@ async def test_non_editable_surface_hides_replaced_text_until_fixed_done() -> No
         isinstance(event, ThinkingEvent) and event.text == "old reasoning"
         for event in events
     )
+    assert not any(isinstance(event, AnswerGenerationResetEvent) for event in events)
     assert sum(isinstance(event, DoneEvent) for event in events) == 1
 
 

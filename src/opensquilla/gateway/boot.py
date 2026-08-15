@@ -1778,6 +1778,45 @@ async def _emit_task_runtime_stream_events(
                 if not key.startswith("_")
             }
         event_kind = event_dict.pop("kind", getattr(event, "kind", event.__class__.__name__))
+        if event_kind == "answer_generation_reset" and event_dict.get("terminal") is True:
+            # A terminal generation reset is the canonical visible outcome
+            # when the fixed provider also fails.  It intentionally replaces
+            # the speculative answer without emitting a second public Error,
+            # but TaskRuntime must still classify the turn as failed instead
+            # of treating a clean stream EOF as success.
+            raw_terminal_text = event_dict.get("terminal_text_snapshot")
+            raw_authoritative_text = event_dict.get("authoritative_text_snapshot")
+            error_message = (
+                raw_terminal_text
+                if isinstance(raw_terminal_text, str) and raw_terminal_text
+                else raw_authoritative_text
+                if isinstance(raw_authoritative_text, str) and raw_authoritative_text
+                else "The model could not complete this answer."
+            )
+            raw_terminal_code = event_dict.get("terminal_error_code")
+            error_code = (
+                str(raw_terminal_code)
+                if isinstance(raw_terminal_code, str) and raw_terminal_code
+                else "ensemble_fixed_error"
+            )
+            raw_terminal_failure_kind = event_dict.get("terminal_failure_kind")
+            failure_kind = (
+                str(raw_terminal_failure_kind)
+                if isinstance(raw_terminal_failure_kind, str)
+                and raw_terminal_failure_kind
+                else None
+            )
+            terminal_reason = "error"
+            event_dict.setdefault("terminal_reason", terminal_reason)
+        if event_kind == "answer_generation_reset":
+            # These fields exist only to carry a typed failed outcome through
+            # the in-process finalizer contract.  The reset snapshot is the
+            # complete public payload; never expose internal failure metadata
+            # through either the session-event emitter or a relay sink. Scrub
+            # normal and terminal resets alike.
+            event_dict.pop("terminal_error_message", None)
+            event_dict.pop("terminal_error_code", None)
+            event_dict.pop("terminal_failure_kind", None)
         if event_kind == "thinking" and not event_dict.get("block_id"):
             # Preserve the exact legacy payload for producers that still
             # construct an unscoped ThinkingEvent.
@@ -1860,8 +1899,8 @@ async def _emit_task_runtime_stream_events(
             # logs or persists its input must never receive a raw upstream
             # body from an ErrorEvent.
             sink_event: Any = event
-            if event_kind == "error":
-                sink_event = {"kind": "error", **event_dict}
+            if event_kind in {"error", "answer_generation_reset"}:
+                sink_event = {"kind": event_kind, **event_dict}
             try:
                 result = stream_event_sink(sink_event)
                 if inspect.isawaitable(result):

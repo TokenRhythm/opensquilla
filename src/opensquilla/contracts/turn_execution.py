@@ -846,6 +846,9 @@ class TurnExecutionContext:
         *,
         terminal: bool = False,
         terminal_text_snapshot: str | None = None,
+        terminal_error_message: str = "",
+        terminal_error_code: str = "",
+        terminal_failure_kind: str = "",
     ) -> AnswerGenerationResetEvent:
         """Advance the generation epoch while retaining the same message id."""
 
@@ -892,6 +895,9 @@ class TurnExecutionContext:
             sequence=sequence,
             terminal=terminal,
             terminal_text_snapshot=terminal_text_snapshot,
+            terminal_error_message=terminal_error_message,
+            terminal_error_code=terminal_error_code,
+            terminal_failure_kind=terminal_failure_kind,
         )
 
     def begin_control_terminal(self, reason: str) -> int | None:
@@ -1082,3 +1088,11 @@ class AnswerGenerationResetEvent:
     sequence: int = 0
     terminal: bool = False
     terminal_text_snapshot: str | None = None
+    # Safe, typed failure metadata for terminal replacements. These fields
+    # stay on the in-process event so the shared turn finalizer can persist a
+    # failed outcome without emitting a second public ErrorEvent. The public
+    # wire model deliberately ignores them; ``terminal_text_snapshot`` remains
+    # the sole user-visible failure payload.
+    terminal_error_message: str = ""
+    terminal_error_code: str = ""
+    terminal_failure_kind: str = ""

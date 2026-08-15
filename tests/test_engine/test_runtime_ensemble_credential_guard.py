@@ -929,11 +929,10 @@ async def test_shared_c3_all_failed_policy_keeps_the_global_fallback_contract(
 
     assert isinstance(provider, EnsembleProvider)
     assert provider.fallback_model == fixed_model
-    assert provider.all_failed_policy == "fallback_single"
+    assert provider.all_failed_policy == all_failed_policy
     assert selector.current_config.model == fixed_model
-    # Force the deterministic pre-proposer failure boundary.  The deprecated
-    # ``error`` value is accepted on load but has the same fixed fallback
-    # execution contract as ``fallback_single``.
+    # Force the deterministic pre-proposer failure boundary so each configured
+    # terminal policy can be observed without starting a proposer request.
     provider.proposers = []
     events = [
         event
@@ -942,26 +941,32 @@ async def test_shared_c3_all_failed_policy_keeps_the_global_fallback_contract(
         )
     ]
 
-    assert calls == [fixed_model]
-    assert isinstance(events[-1], DoneEvent)
-    done = events[-1]
-    assert done.provider == "tokenrhythm"
-    assert done.model == fixed_model
-    assert done.billed_cost == pytest.approx(0.0123)
-    assert done.cost_source == "provider"
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["fallback_used"] is True
-    assert done.ensemble_trace["fallback_reason"] == (
-        "llm ensemble profile has no proposers"
-    )
-    fallback_usage = next(
-        row
-        for row in done.model_usage_breakdown
-        if row["role"] == "fixed_direct"
-    )
-    assert fallback_usage["provider"] == "tokenrhythm"
-    assert fallback_usage["model"] == fixed_model
-    assert fallback_usage["billed_cost"] == pytest.approx(0.0123)
+    if all_failed_policy == "fallback_single":
+        assert calls == [fixed_model]
+        assert isinstance(events[-1], DoneEvent)
+        done = events[-1]
+        assert done.provider == "tokenrhythm"
+        assert done.model == fixed_model
+        assert done.billed_cost == pytest.approx(0.0123)
+        assert done.cost_source == "provider"
+        assert done.ensemble_trace is not None
+        assert done.ensemble_trace["fallback_used"] is True
+        assert done.ensemble_trace["fallback_reason"] == (
+            "llm ensemble profile has no proposers"
+        )
+        fallback_usage = next(
+            row
+            for row in done.model_usage_breakdown
+            if row["role"] == "fixed_direct"
+        )
+        assert fallback_usage["provider"] == "tokenrhythm"
+        assert fallback_usage["model"] == fixed_model
+        assert fallback_usage["billed_cost"] == pytest.approx(0.0123)
+    else:
+        assert calls == []
+        assert len(events) == 1
+        assert isinstance(events[0], ErrorEvent)
+        assert events[0].code == "ensemble_no_proposers"
     # Router telemetry keeps the dormant C3 decision, while physical execution
     # and fallback identity remain bound to the global fixed model.
     assert turn.metadata["routed_model"] == "glm-5.2"

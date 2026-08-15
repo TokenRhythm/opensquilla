@@ -58,6 +58,7 @@ from opensquilla.router_tiers import (
     LEGACY_OPENROUTER_MODEL_OPTIONS,
     ROUTER_DYNAMIC_SELECTION_MODE,
     STATIC_B5_SELECTION_MODE_PROVIDERS,
+    TierConfig,
     effective_ensemble_selection_mode,
     router_dynamic_tier_members_active,
     router_tier_provider_roles,
@@ -191,6 +192,11 @@ _ENSEMBLE_ONBOARDING_STATUS_KEYS = (
     "configuredAllFailedPolicy",
     "effectiveAllFailedPolicy",
     "policyDeprecated",
+    "configuredMinSuccessfulProposers",
+    "effectiveMinSuccessfulProposers",
+    "configuredProposerMaxRetries",
+    "effectiveProposerMaxRetries",
+    "proposerMaxRetriesSource",
     "fixedFallbackReady",
     "fixedFallbackBlockedReason",
     "fixedFallbackProvider",
@@ -211,6 +217,26 @@ def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
         getattr(getattr(cfg, "llm_ensemble", None), "all_failed_policy", "fallback_single")
         or "fallback_single"
     ).strip()
+    configured_min = max(
+        1,
+        int(getattr(getattr(cfg, "llm_ensemble", None), "min_successful_proposers", 1) or 1),
+    )
+    configured_retries = max(
+        0,
+        int(getattr(getattr(cfg, "llm_ensemble", None), "proposer_max_retries", 0) or 0),
+    )
+    ensemble_fields_set = set(
+        getattr(getattr(cfg, "llm_ensemble", None), "model_fields_set", set())
+    )
+    c3_config = TierConfig.from_value(
+        (getattr(getattr(cfg, "squilla_router", None), "tiers", {}) or {}).get("c3")
+    )
+    c3_default_retries = bool(
+        not globally_enabled
+        and bool(getattr(getattr(cfg, "squilla_router", None), "enabled", False))
+        and c3_config.ensemble_enabled is True
+        and "proposer_max_retries" not in ensemble_fields_set
+    )
     if not globally_enabled:
         llm = getattr(cfg, "llm", None)
         selection_mode = str(
@@ -229,8 +255,15 @@ def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
             "perTurnCallCountRange": None,
             "memberProviders": [],
             "configuredAllFailedPolicy": configured_policy,
-            "effectiveAllFailedPolicy": "fallback_single",
-            "policyDeprecated": configured_policy != "fallback_single",
+            "effectiveAllFailedPolicy": configured_policy,
+            "policyDeprecated": False,
+            "configuredMinSuccessfulProposers": configured_min,
+            "effectiveMinSuccessfulProposers": configured_min,
+            "configuredProposerMaxRetries": configured_retries,
+            "effectiveProposerMaxRetries": 1 if c3_default_retries else configured_retries,
+            "proposerMaxRetriesSource": (
+                "c3_default" if c3_default_retries else "configured"
+            ),
             # The global card is intentionally a top-level-toggle projection.
             # When it is disabled, readiness is not evaluated here; active
             # tier-local plans expose their truthful fallback status on the
@@ -249,11 +282,8 @@ def _ensemble_onboarding_status(cfg: GatewayConfig) -> dict[str, object]:
 
         runtime = ensemble_runtime_status(cfg)
         runtime.setdefault("configuredAllFailedPolicy", configured_policy)
-        runtime.setdefault("effectiveAllFailedPolicy", "fallback_single")
-        runtime.setdefault(
-            "policyDeprecated",
-            configured_policy != str(runtime["effectiveAllFailedPolicy"]),
-        )
+        runtime.setdefault("effectiveAllFailedPolicy", configured_policy)
+        runtime.setdefault("policyDeprecated", False)
     return {key: runtime.get(key) for key in _ENSEMBLE_ONBOARDING_STATUS_KEYS}
 
 
@@ -265,8 +295,17 @@ _TIER_ENSEMBLE_STATUS_KEYS = (
     "configurationReady",
     "blockedReason",
     "blockedTierCandidates",
+    "proposerCount",
+    "proposerCountRange",
     "fixedFallbackReady",
     "fixedFallbackBlockedReason",
+    "configuredAllFailedPolicy",
+    "effectiveAllFailedPolicy",
+    "configuredMinSuccessfulProposers",
+    "effectiveMinSuccessfulProposers",
+    "configuredProposerMaxRetries",
+    "effectiveProposerMaxRetries",
+    "proposerMaxRetriesSource",
 )
 
 

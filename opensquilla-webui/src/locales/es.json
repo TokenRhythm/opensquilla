@@ -1048,9 +1048,13 @@
       "runtimeStrategyTitle": "Estrategia de ejecución",
       "runtimeStrategyDesc": "Umbral de éxito, alternativa y límites de tiempo",
       "successThresholdLabel": "Condición mínima de éxito",
-      "successThresholdValue": "Al menos 1 modelo proponente responde correctamente",
+      "successThresholdExact": "Al menos {quorum} de {proposers} responden correctamente",
       "successThresholdDesc": "Los demás modelos proponentes siguen esperando hasta completar o agotar su propio tiempo.",
       "failurePolicyLabel": "Si no se puede completar la agregación",
+      "failurePolicyErrorDesc": "Detener e informar del fallo sin llamar al modelo de respaldo fijo.",
+      "proposerRetriesLabel": "Reintentos por proponente",
+      "proposerRetriesDesc": "Solo fallos reintentables; la solicitud inicial no cuenta como reintento.",
+      "proposerRetriesOption": "Como máximo {count} reintentos tras la solicitud inicial",
       "runtimeLimitsLabel": "Límites de tiempo",
       "runtimeLimits": "Proponentes {proposerTimeout}s en total · inactividad del agregador entre eventos {aggregatorTimeout}s (configurado {configuredAggregatorTimeout}s) · límite total del turno separado"
     },
@@ -1091,6 +1095,8 @@
       "tierUseEnsemble": "Fusión multimodelo",
       "tierUseEnsembleDescription": "Usar el plan actual de Fusión multimodelo",
       "tierEnsembleSummary": "Usa el plan actual de fusión multimodelo; si falla, usa el modelo fijo y de respaldo: {provider} · {model}.",
+      "tierEnsembleErrorSummary": "Usa el plan actual de fusión multimodelo; si no puede completarse, informa de un error.",
+      "tierEnsemblePolicyFacts": "Estrategia efectiva: al menos {quorum}/{proposers} proponentes responden correctamente · como máximo {retries} reintentos por proponente.",
       "tierEnsembleSummaryGeneric": "Usa el plan actual de fusión multimodelo; si falla, usa el modelo fijo y de respaldo.",
       "tierEnsembleFallbackMissingSummary": "Usa el plan actual de fusión multimodelo; todavía no hay un modelo fijo y de respaldo utilizable configurado.",
       "tierEnsemblePlanReady": "El plan de fusión actual está listo",
@@ -1135,7 +1141,8 @@
     "ensemble": {
       "statusOn": "El enrutamiento IA agregado está activo: varios modelos responden y un modelo sintetiza la respuesta final.",
       "statusOff": "El enrutamiento IA agregado está desactivado.",
-      "allFailedFallback": "Recurrir a un solo modelo"
+      "allFailedFallback": "Recurrir a un solo modelo",
+      "allFailedError": "Detener e informar de un error"
     },
     "channels": {
       "title": "Canales",

@@ -375,6 +375,46 @@ def _build_tokenrhythm_budget_provider(
     )
 
 
+@pytest.mark.parametrize(
+    ("routed_tier", "activation_source", "expected_retries", "expected_source"),
+    [
+        ("c3", "router_tier", 1, "c3_default"),
+        ("t3", "router_tier", 1, "c3_default"),
+        ("c3", "global", 0, "configured"),
+    ],
+)
+def test_builder_applies_implicit_retry_default_only_to_c3_tier_activation(
+    routed_tier: str,
+    activation_source: str,
+    expected_retries: int,
+    expected_source: str,
+) -> None:
+    config = _tokenrhythm_ensemble_config()
+
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="tokenrhythm",
+            model="kimi-k2.7-code",
+            api_key="fake",
+            base_url="https://tokenrhythm.example/v1",
+        ),
+        fallback_provider=None,
+        turn_metadata={
+            "routed_tier": routed_tier,
+            "ensemble_activation_source": activation_source,
+        },
+    )
+
+    assert config.llm_ensemble.proposer_max_retries == 0
+    assert "proposer_max_retries" not in config.llm_ensemble.model_fields_set
+    assert provider.configured_proposer_max_retries == 0
+    assert provider.proposer_max_retries == expected_retries
+    assert provider.selection_plan["configured_proposer_max_retries"] == 0
+    assert provider.selection_plan["effective_proposer_max_retries"] == expected_retries
+    assert provider.selection_plan["proposer_max_retries_source"] == expected_source
+
+
 @pytest.mark.asyncio
 async def test_ensemble_emits_heartbeat_while_waiting_for_slow_proposers(
     monkeypatch: pytest.MonkeyPatch,
@@ -674,7 +714,7 @@ async def test_tokenrhythm_b5_default_quorum_reconciles_five_physical_receipts(
 
 
 @pytest.mark.asyncio
-async def test_tokenrhythm_b5_partial_failure_still_aggregates_all_completed_drafts(
+async def test_tokenrhythm_b5_explicit_quorum_uses_fixed_fallback_when_unmet(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry(
@@ -737,26 +777,28 @@ async def test_tokenrhythm_b5_partial_failure_still_aggregates_all_completed_dra
         "p2",
         "p3",
         "p4",
-        "agg",
     ]
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.billing_receipt is None
     assert done.cost_source == "provider_billed"
-    assert done.usage_missing_count == 1
+    assert done.usage_missing_count == 0
     assert [row["role"] for row in done.model_usage_breakdown] == [
         "proposer",
         "proposer",
         "proposer",
-        "aggregator",
+        "fixed_aggregator",
     ]
     receipts = [row["billing_receipt"] for row in done.model_usage_breakdown]
-    assert sum(receipt.amount_nanos or 0 for receipt in receipts) == 306_900
-    assert done.input_tokens == 1_100
-    assert done.output_tokens == 110
-    assert done.reasoning_tokens == 33
-    assert done.cached_tokens == 220
-    assert done.cache_write_tokens == 11
-    assert done.billed_cost == pytest.approx(0.000044)
+    assert sum(receipt.amount_nanos or 0 for receipt in receipts) == 279_000
+    assert done.input_tokens == 1_000
+    assert done.output_tokens == 100
+    assert done.reasoning_tokens == 30
+    assert done.cached_tokens == 200
+    assert done.cache_write_tokens == 10
+    assert done.billed_cost == pytest.approx(0.00004)
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["fallback_code"] == "ensemble_insufficient_proposers"
+    assert done.ensemble_trace["effective_min_successful_proposers"] == 4
 
     result = normalize_provider_usage(
         done,
@@ -765,9 +807,9 @@ async def test_tokenrhythm_b5_partial_failure_still_aggregates_all_completed_dra
         completed_at_ms=1234,
     )
     assert len(result.items) == 4
-    assert result.missing_usage_entries == 1
+    assert result.missing_usage_entries == 0
     assert result.cost_source == "provider_billed"
-    assert result.billed_cost_nanos == 44_000
+    assert result.billed_cost_nanos == 40_000
     assert result.estimated_cost_nanos == 0
     assert result.billed_cost_nanos == sum(item.billed_cost_nanos for item in result.items)
     assert result.input_tokens == sum(item.input_tokens for item in result.items)
@@ -1228,12 +1270,11 @@ async def test_no_fallback_error_preserves_completed_proposer_and_primary_usage(
     assert usage_row["model"] == "p1"
     assert usage_row["input_tokens"] == 7
     assert usage_row["output_tokens"] == 3
-    primary_rows = [
+    aggregator_rows = [
         row for row in error.model_usage_breakdown if row["role"] == "aggregator"
     ]
-    assert len(primary_rows) == 1
-    assert [row["attempt_index"] for row in primary_rows] == [1]
-    assert error.usage_missing_count == 2
+    assert aggregator_rows == []
+    assert error.usage_missing_count == 1
 
 
 @pytest.mark.asyncio
@@ -1607,7 +1648,7 @@ async def test_context_fixed_takeover_is_activated_once_and_is_sticky(
 
 
 @pytest.mark.asyncio
-async def test_context_no_fixed_provider_emits_only_terminal_reset(
+async def test_context_error_policy_without_fixed_provider_emits_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry({"agg": _FakePlan([])})
@@ -1633,9 +1674,8 @@ async def test_context_no_fixed_provider_emits_only_terminal_reset(
     ]
 
     assert len(events) == 1
-    assert isinstance(events[0], ProviderGenerationResetEvent)
-    assert events[0].terminal is True
-    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert isinstance(events[0], ErrorEvent)
+    assert events[0].code == "ensemble_no_proposers"
 
 
 @pytest.mark.asyncio
@@ -2716,7 +2756,7 @@ async def test_cross_provider_zero_cap_member_preserves_fallback_policy(
 
 
 @pytest.mark.asyncio
-async def test_static_unavailable_proposers_do_not_block_one_ready_draft(
+async def test_static_unavailable_proposers_make_explicit_quorum_fall_back(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     unready = replace(
@@ -2798,13 +2838,16 @@ async def test_static_unavailable_proposers_do_not_block_one_ready_draft(
         )
     ]
 
-    assert [call["model"] for call in registry.calls] == ["billed-ready", "agg"]
+    assert [call["model"] for call in registry.calls] == ["fallback"]
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
     trace = done.ensemble_trace
-    assert trace["llm_request_count"] == 2
+    assert trace["fallback_used"] is True
+    assert trace["fallback_code"] == "ensemble_insufficient_proposers"
+    assert trace["effective_min_successful_proposers"] == 2
+    assert trace["llm_request_count"] == 1
     assert len(trace["candidates"]) == 5
-    assert sum(candidate["request_started"] for candidate in trace["candidates"]) == 1
+    assert sum(candidate["request_started"] for candidate in trace["candidates"]) == 0
     candidates_by_model = {
         candidate["model"]: candidate for candidate in trace["candidates"]
     }
@@ -2813,7 +2856,7 @@ async def test_static_unavailable_proposers_do_not_block_one_ready_draft(
         candidates_by_model["cross"]["error_code"]
         == "provider_request_budget_exhausted"
     )
-    assert "error_code" not in candidates_by_model["billed-ready"]
+    assert candidates_by_model["billed-ready"]["error_code"] == "quorum_unreachable"
 
 
 @pytest.mark.parametrize(
@@ -3362,7 +3405,7 @@ async def test_optional_candidates_cannot_crowd_out_an_admitted_quorum(
 
 
 @pytest.mark.asyncio
-async def test_ensemble_uses_fixed_aggregator_after_primary_failure_with_one_draft(
+async def test_ensemble_uses_fixed_aggregator_when_explicit_quorum_is_unmet(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry(
@@ -3411,7 +3454,7 @@ async def test_ensemble_uses_fixed_aggregator_after_primary_failure_with_one_dra
 
     events = await _collect(provider)
 
-    assert [call["model"] for call in registry.calls] == ["p1", "p2", "agg"]
+    assert [call["model"] for call in registry.calls] == ["p1", "p2"]
     assert any(isinstance(event, TextDeltaEvent) and event.text == "single" for event in events)
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.input_tokens == 8
@@ -3420,8 +3463,8 @@ async def test_ensemble_uses_fixed_aggregator_after_primary_failure_with_one_dra
     assert done.model_usage_breakdown[-1]["provider"] == "deepseek"
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["fallback_used"] is True
-    assert done.ensemble_trace["llm_request_count"] == 4
-    assert "aggregator failed" in done.ensemble_trace["fallback_reason"]
+    assert done.ensemble_trace["llm_request_count"] == 3
+    assert "requires 2" in done.ensemble_trace["fallback_reason"]
     assert done.ensemble_trace["final_request"]["role"] == "fixed_aggregator"
     assert done.ensemble_trace["final_request"]["request_started"] is True
     assert done.ensemble_trace["final_request"]["output"]["text"] == "single"
@@ -3642,11 +3685,10 @@ async def test_fallback_stream_without_done_returns_terminal_reset(
     assert terminal.terminal_text_snapshot == ENSEMBLE_FIXED_TERMINAL_MESSAGE
     assert [row["model"] for row in terminal.model_usage_breakdown] == [
         "p1",
-        "agg",
         "",
     ]
     assert terminal.model_usage_breakdown[0]["input_tokens"] == 7
-    assert terminal.usage_missing_count == 3  # failed proposer, primary, fixed
+    assert terminal.usage_missing_count == 2  # failed proposer and fixed
     assert not any(isinstance(event, (DoneEvent, ErrorEvent)) for event in events)
 
 
@@ -4949,7 +4991,7 @@ async def test_aggregator_partial_output_idle_timeout_is_replaced_by_fixed_aggre
 
 
 @pytest.mark.asyncio
-async def test_aggregator_timeout_ignores_legacy_error_policy_and_uses_fixed_aggregator(
+async def test_aggregator_timeout_honors_error_policy_without_fixed_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def stalled_aggregator() -> AsyncIterator[StreamEvent]:
@@ -4968,13 +5010,10 @@ async def test_aggregator_timeout_ignores_legacy_error_policy_and_uses_fixed_agg
 
     events = await _collect(provider)
 
-    assert fallback is not None and len(fallback.calls) == 1
-    assert not any(isinstance(event, ErrorEvent) for event in events)
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.usage_missing_count == 1
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["fallback_code"] == "ensemble_aggregator_timeout"
-    assert done.ensemble_trace["final_request_role"] == "fixed_aggregator"
+    assert fallback is not None and fallback.calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "ensemble_aggregator_timeout"
+    assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 @pytest.mark.asyncio
@@ -5347,13 +5386,13 @@ async def test_all_started_proposers_reach_terminal_before_aggregation(
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["successful_proposers"] == 4
     assert done.ensemble_trace["configured_min_successful_proposers"] == 3
-    assert done.ensemble_trace["min_successful_proposers"] == 1
+    assert done.ensemble_trace["min_successful_proposers"] == 3
     assert done.ensemble_trace["target_successful_proposers"] == 4
     assert done.ensemble_trace["selected_candidate_count"] == 4
 
 
 @pytest.mark.asyncio
-async def test_transient_partial_504_gets_one_retry_then_uses_other_drafts(
+async def test_transient_partial_504_honors_configured_retries_then_uses_other_drafts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _AttemptRegistry(
@@ -5397,25 +5436,26 @@ async def test_transient_partial_504_gets_one_retry_then_uses_other_drafts(
 
     events = await _collect(provider)
 
-    assert [call["model"] for call in registry.calls].count("glm") == 2
+    assert [call["model"] for call in registry.calls].count("glm") == 3
     assert [call["model"] for call in registry.calls][-1] == "agg"
     done = next(event for event in events if isinstance(event, DoneEvent))
-    assert done.usage_missing_count == 2
+    assert done.usage_missing_count == 3
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["successful_proposers"] == 3
     assert done.ensemble_trace["selected_candidate_count"] == 3
-    assert done.ensemble_trace["llm_request_count"] == 6
+    assert done.ensemble_trace["llm_request_count"] == 7
     assert done.ensemble_trace["configured_proposer_max_retries"] == 2
-    assert done.ensemble_trace["proposer_max_retries"] == 1
+    assert done.ensemble_trace["proposer_max_retries"] == 2
     glm_trace = next(
         row
         for row in done.ensemble_trace["candidates"]
         if row["model"] == "glm"
     )
     assert glm_trace["ok"] is False
-    assert glm_trace["content"]["text"] == "discard partial 2"
-    assert glm_trace["attempt_count"] == 2
+    assert glm_trace["content"]["text"] == "discard partial 3"
+    assert glm_trace["attempt_count"] == 3
     assert [attempt["retry_reason"] for attempt in glm_trace["attempts"]] == [
+        "transient_upstream",
         "transient_upstream",
         "transient_upstream",
     ]
@@ -5424,12 +5464,12 @@ async def test_transient_partial_504_gets_one_retry_then_uses_other_drafts(
         for row in done.model_usage_breakdown
         if row["model"] == "glm"
     ]
-    assert [row["attempt_index"] for row in glm_usage] == [1, 2]
+    assert [row["attempt_index"] for row in glm_usage] == [1, 2, 3]
     assert all(row["usage_receipt_missing"] is True for row in glm_usage)
 
 
 @pytest.mark.asyncio
-async def test_invalid_proposer_stops_after_one_retry_without_losing_usage(
+async def test_invalid_proposer_uses_configured_retries_without_losing_usage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     receipts = [
@@ -5524,18 +5564,17 @@ async def test_invalid_proposer_stops_after_one_retry_without_losing_usage(
 
     events = await _collect(provider)
 
-    assert [call["model"] for call in registry.calls] == ["kimi", "kimi"]
-    terminal = next(event for event in events if isinstance(event, ErrorEvent))
-    assert terminal.code == "ensemble_insufficient_proposers"
+    assert [call["model"] for call in registry.calls] == ["kimi", "kimi", "kimi", "agg"]
+    terminal = next(event for event in events if isinstance(event, DoneEvent))
     assert terminal.usage_missing_count == 0
     proposer_rows = [
         row
         for row in terminal.model_usage_breakdown
         if row["role"] == "proposer"
     ]
-    assert [row["attempt_index"] for row in proposer_rows] == [1, 2]
-    assert [row["output_tokens"] for row in proposer_rows] == [62, 8192]
-    assert [row["billing_receipt"] for row in proposer_rows] == receipts[:2]
+    assert [row["attempt_index"] for row in proposer_rows] == [1, 2, 3]
+    assert [row["output_tokens"] for row in proposer_rows] == [62, 8192, 40]
+    assert [row["billing_receipt"] for row in proposer_rows] == receipts
     assert all(row["usage_receipt_missing"] is False for row in proposer_rows)
 
 
@@ -5677,7 +5716,7 @@ async def test_visible_error_finish_retries_and_only_final_candidate_reaches_agg
 
 
 @pytest.mark.asyncio
-async def test_failed_proposer_keeps_attempt_usage_without_blocking_other_drafts(
+async def test_failed_proposer_honors_retry_and_quorum_before_erroring(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     receipts = [
@@ -5736,34 +5775,33 @@ async def test_failed_proposer_keeps_attempt_usage_without_blocking_other_drafts
 
     events = await _collect(provider)
 
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert [call["model"] for call in registry.calls].count("p1") == 2
-    assert [call["model"] for call in registry.calls][-1] == "agg"
-    assert done.usage_missing_count == 0
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["configured_min_successful_proposers"] == 4
-    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
-    assert done.ensemble_trace["successful_proposers"] == 3
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    assert terminal.code == "ensemble_insufficient_proposers"
+    assert [call["model"] for call in registry.calls].count("p1") == 3
+    assert "agg" not in [call["model"] for call in registry.calls]
+    assert terminal.usage_missing_count == 0
 
     p1_rows = [
         row
-        for row in done.model_usage_breakdown
+        for row in terminal.model_usage_breakdown
         if row["role"] == "proposer" and row["model"] == "p1"
     ]
-    assert [row["attempt_index"] for row in p1_rows] == [1, 2]
-    assert [row["input_tokens"] for row in p1_rows] == [11, 12]
-    assert [row["output_tokens"] for row in p1_rows] == [21, 22]
+    assert [row["attempt_index"] for row in p1_rows] == [1, 2, 3]
+    assert [row["input_tokens"] for row in p1_rows] == [11, 12, 13]
+    assert [row["output_tokens"] for row in p1_rows] == [21, 22, 23]
     assert [row["billed_cost"] for row in p1_rows] == pytest.approx(
-        [0.01, 0.02]
+        [0.01, 0.02, 0.03]
     )
-    assert [row["billing_receipt"] for row in p1_rows] == receipts[:2]
-    assert [row["attempt_ok"] for row in p1_rows] == [False, False]
-    assert [row["stop_reason"] for row in p1_rows] == ["error", "error"]
+    assert [row["billing_receipt"] for row in p1_rows] == receipts
+    assert [row["attempt_ok"] for row in p1_rows] == [False, False, False]
+    assert [row["stop_reason"] for row in p1_rows] == ["error", "error", "error"]
     assert [row["error_code"] for row in p1_rows] == [
+        "candidate_error_finish_reason",
         "candidate_error_finish_reason",
         "candidate_error_finish_reason",
     ]
     assert [row["retry_reason"] for row in p1_rows] == [
+        "error_finish_reason",
         "error_finish_reason",
         "error_finish_reason",
     ]
@@ -5771,7 +5809,7 @@ async def test_failed_proposer_keeps_attempt_usage_without_blocking_other_drafts
 
 
 @pytest.mark.asyncio
-async def test_configured_floor_is_diagnostic_when_two_proposers_succeed(
+async def test_configured_floor_blocks_aggregation_when_only_two_proposers_succeed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _AttemptRegistry(
@@ -5799,14 +5837,11 @@ async def test_configured_floor_is_diagnostic_when_two_proposers_succeed(
 
     events = await _collect(provider)
 
-    done = next(event for event in events if isinstance(event, DoneEvent))
-    assert [call["model"] for call in registry.calls][-1] == "agg"
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    assert terminal.code == "ensemble_insufficient_proposers"
+    assert "agg" not in [call["model"] for call in registry.calls]
     assert [call["model"] for call in registry.calls].count("p3") == 1
     assert [call["model"] for call in registry.calls].count("p4") == 1
-    assert done.ensemble_trace is not None
-    assert done.ensemble_trace["configured_min_successful_proposers"] == 3
-    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
-    assert done.ensemble_trace["successful_proposers"] == 2
 
 
 @pytest.mark.asyncio
@@ -6146,8 +6181,8 @@ async def test_configured_quorum_cannot_cancel_pending_successful_proposers(
     assert slow_gate.is_set() is True
     assert p3_closed.is_set() is True
     assert p4_closed.is_set() is True
-    assert [call["model"] for call in registry.calls][-1] == "agg"
-    assert fallback_started.is_set() is False
+    assert "agg" not in [call["model"] for call in registry.calls]
+    assert fallback_started.is_set() is True
     progress = [event for event in events if isinstance(event, EnsembleProgressEvent)]
     assert len([event for event in progress if event.event_type == "proposer_start"]) == 4
     assert len([event for event in progress if event.event_type == "proposer_finish"]) == 4
@@ -6157,7 +6192,7 @@ async def test_configured_quorum_cannot_cancel_pending_successful_proposers(
     assert done.ensemble_trace["total_candidates"] == 4
     assert done.ensemble_trace["llm_request_count"] == 5
     assert done.ensemble_trace["configured_min_successful_proposers"] == 3
-    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
+    assert done.ensemble_trace["effective_min_successful_proposers"] == 3
     candidates = done.ensemble_trace["candidates"]
     assert [candidate["error_code"] for candidate in candidates[:2]] == [
         "upstream",
@@ -6226,13 +6261,13 @@ async def test_configured_all_success_does_not_cancel_remaining_after_failure(
 
     assert slow_gate.is_set() is True
     assert slow_closed.is_set() is True
-    assert [call["model"] for call in registry.calls][-1] == "agg"
-    assert fallback_started.is_set() is False
+    assert "agg" not in [call["model"] for call in registry.calls]
+    assert fallback_started.is_set() is True
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["successful_proposers"] == 1
     assert done.ensemble_trace["configured_min_successful_proposers"] == 2
-    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
+    assert done.ensemble_trace["effective_min_successful_proposers"] == 2
     assert done.ensemble_trace["candidates"][1]["ok"] is True
 
 
@@ -7571,7 +7606,7 @@ async def test_step3_synthetic_heartbeat_alone_does_not_refresh_per_call_idle_bu
 
 
 @pytest.mark.asyncio
-async def test_step3_configured_minimum_is_diagnostic_and_effective_minimum_is_one(
+async def test_step3_configured_minimum_is_the_effective_runtime_floor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     registry = _FakeRegistry(
@@ -7600,9 +7635,9 @@ async def test_step3_configured_minimum_is_diagnostic_and_effective_minimum_is_o
     done = next(event for event in events if isinstance(event, DoneEvent))
 
     assert provider.configured_min_successful_proposers == 3
-    assert provider.min_successful_proposers == 1
+    assert provider.min_successful_proposers == 3
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["configured_min_successful_proposers"] == 3
-    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
-    assert done.ensemble_trace["min_successful_proposers"] == 1
+    assert done.ensemble_trace["effective_min_successful_proposers"] == 3
+    assert done.ensemble_trace["min_successful_proposers"] == 3
     assert done.ensemble_trace["successful_proposers"] == 4

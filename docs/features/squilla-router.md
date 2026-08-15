@@ -58,12 +58,24 @@ global provider/model configured under `[llm]` — the same fixed/direct fallbac
 model used by global fusion. The provider/model stored on C3 remains available
 only when C3 is switched back to single-model routing.
 
+For a newly configured C3 tier, the tier-local runtime-policy defaults are one
+successful proposer out of the four-member lineup, one retry after each
+proposer's initial attempt, and `all_failed_policy = "fallback_single"`. These
+defaults fill only fields that the operator has not set. Explicit
+`min_successful_proposers`, `proposer_max_retries`, and `all_failed_policy`
+values remain authoritative for both global/custom Ensemble use and C3. In
+particular, `all_failed_policy = "error"` is a valid terminal policy and does
+not start the fixed fallback. A global/custom configuration with no explicit
+retry field keeps the historical zero-retry default.
+
+Packaged static B5 lineups use a 120-second total budget per proposer and a
+180-second aggregator idle budget. Operator-authored `custom_b5` lineups use
+300 and 480 seconds respectively unless explicitly configured otherwise.
+
 C3 fusion itself is excluded from image routing, but the dedicated
 `image_model` tier remains eligible and is preferred for image requests. If it
 is unavailable, another non-C3 tier with `supports_image = true` may handle the
-request. Older configs with `llm_ensemble.all_failed_policy = "error"` remain
-loadable for upgrade compatibility, but their effective behavior is
-`fallback_single`; saving the ensemble settings normalizes the stored value.
+request.
 
 Disable routing and use the configured provider/model directly:
 

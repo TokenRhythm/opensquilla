@@ -564,19 +564,19 @@ def test_router_payload_ignores_global_fixed_lineup_draft_providers() -> None:
     assert payload["mismatchedTierProviders"] == {"image_model": "openai"}
 
 
-def test_llm_ensemble_payload_exposes_effective_failure_policy() -> None:
+def test_llm_ensemble_payload_exposes_configured_failure_policy_as_effective() -> None:
     import opensquilla.gateway.rpc_doctor as rpc_doctor
 
     payload = rpc_doctor._llm_ensemble_payload(
         RpcContext(
-            conn_id="deprecated-policy",
+            conn_id="explicit-policy",
             config=GatewayConfig(llm_ensemble={"all_failed_policy": "error"}),
         )
     )
 
     assert payload["configuredAllFailedPolicy"] == "error"
-    assert payload["effectiveAllFailedPolicy"] == "fallback_single"
-    assert payload["policyDeprecated"] is True
+    assert payload["effectiveAllFailedPolicy"] == "error"
+    assert payload["policyDeprecated"] is False
 
 
 def test_llm_ensemble_payload_exposes_missing_fixed_fallback() -> None:

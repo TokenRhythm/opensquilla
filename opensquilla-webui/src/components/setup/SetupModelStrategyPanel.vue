@@ -70,6 +70,7 @@ interface EnsemblePanelContract {
   fixedProfile: EnsembleFixedProfileView | null
   presetProviderMismatch?: boolean
   presetFacts: EnsembleEffectiveFacts
+  minSuccessfulProposers: number
   allFailedPolicy: string
   showCandidateEditor: boolean
   statusText: string
@@ -114,6 +115,9 @@ const emit = defineEmits<{
   requestProviderModels: [provider: string]
   importEnsembleTierCandidates: []
   migrateEnsembleLegacy: []
+  updateEnsembleMinSuccessful: [value: number]
+  updateEnsembleAllFailedPolicy: [value: string]
+  updateEnsembleProposerMaxRetries: [value: number]
   goToSection: [value: string]
 }>()
 
@@ -405,6 +409,15 @@ const activeFacts = computed(() => (
     ? props.panel.ensemble.presetFacts
     : customLineup.value.facts
 ))
+const quorumOptions = computed(() => Array.from(
+  { length: Math.max(1, activeFacts.value.proposerCount) },
+  (_, index) => index + 1,
+))
+const displayedMinSuccessful = computed(() => Math.min(
+  Math.max(1, Math.trunc(Number(props.panel.ensemble.minSuccessfulProposers) || 1)),
+  Math.max(1, activeFacts.value.proposerCount),
+))
+const proposerRetryOptions = Array.from({ length: 11 }, (_, index) => index)
 const c3FusionActive = computed(() => props.panel.router.tierRows.some(row => (
   row.name === 'c3'
   && (
@@ -423,6 +436,18 @@ const savedTierEnsembleStatus = computed(() => {
   if (scopedModes.length !== 1 || scopedModes[0] !== 'c3') return null
   return status
 })
+const displayedProposerMaxRetries = computed(() => {
+  if (!c3FusionActive.value) return activeFacts.value.proposerMaxRetries
+  return savedTierEnsembleStatus.value?.effectiveProposerMaxRetries ?? 1
+})
+const displayedC3ProposerCount = computed(() => (
+  savedTierEnsembleStatus.value?.proposerCount
+  ?? Math.max(1, activeFacts.value.proposerCount)
+))
+const displayedC3MinSuccessful = computed(() => (
+  savedTierEnsembleStatus.value?.effectiveMinSuccessfulProposers
+  ?? Math.min(displayedMinSuccessful.value, displayedC3ProposerCount.value)
+))
 const staleTierEnsembleStatus = computed(() => (
   c3FusionActive.value
   && Boolean(props.panel.router.tierEnsembleStatus)
@@ -785,6 +810,10 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           :models-by-provider="panel.router.discoveredModelsByProvider || {}"
           :fixed-fallback-provider="panel.single.providerLabel"
           :fixed-fallback-model="panel.single.model"
+          :ensemble-all-failed-policy="panel.ensemble.allFailedPolicy"
+          :ensemble-min-successful="displayedC3MinSuccessful"
+          :ensemble-proposer-count="displayedC3ProposerCount"
+          :ensemble-proposer-max-retries="displayedProposerMaxRetries"
           :ensemble-plan-status="ensemblePlanStatus"
           :ensemble-plan-blocked-reason="ensemblePlanBlockedReason"
           :ensemble-fixed-fallback-ready="savedTierEnsembleStatus?.fixedFallbackReady"
@@ -867,10 +896,12 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
         >
           <span>
             {{ t('setup.modelStrategy.legacyDynamicNotice') }}
-            {{ t('setup.modelStrategy.ensembleFailure', {
-              provider: panel.single.providerLabel,
-              model: panel.single.model,
-            }) }}
+            {{ panel.ensemble.allFailedPolicy === 'error'
+              ? t('setup.modelStrategy.failurePolicyErrorDesc')
+              : t('setup.modelStrategy.ensembleFailure', {
+                provider: panel.single.providerLabel,
+                model: panel.single.model,
+              }) }}
           </span>
           <button
             type="button"
@@ -1439,35 +1470,71 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             <Icon class="setup-model-strategy__runtime-chevron" name="chevronDown" :size="15" aria-hidden="true" />
           </summary>
           <div class="setup-model-strategy__runtime-body">
-            <div class="control-row">
+            <label class="control-row">
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.successThresholdLabel') }}</span>
-                <span class="control-row__desc">
-                  {{ t('setup.modelStrategy.successThresholdDesc') }}
-                </span>
+                <span class="control-row__desc">{{ t('setup.modelStrategy.successThresholdDesc') }}</span>
               </div>
               <div class="control-row__control">
-                <span
-                  class="setup-model-strategy__runtime-value"
+                <select
+                  class="control-input"
+                  :value="displayedMinSuccessful"
+                  name="setup_model_strategy_min_successful"
                   data-testid="ensemble-success-threshold"
-                >{{ t('setup.modelStrategy.successThresholdValue') }}</span>
+                  @change="emit('updateEnsembleMinSuccessful', Number(($event.target as HTMLSelectElement).value))"
+                >
+                  <option v-for="quorum in quorumOptions" :key="quorum" :value="quorum">
+                    {{ t('setup.modelStrategy.successThresholdExact', {
+                      quorum,
+                      proposers: activeFacts.proposerCount,
+                    }) }}
+                  </option>
+                </select>
               </div>
-            </div>
+            </label>
             <label class="control-row">
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.failurePolicyLabel') }}</span>
-                <span class="control-row__desc">
+                <span v-if="panel.ensemble.allFailedPolicy === 'fallback_single'" class="control-row__desc">
                   {{ t('setup.modelStrategy.ensembleFailure', {
                     provider: panel.single.providerLabel,
                     model: panel.single.model,
                   }) }}
                 </span>
+                <span v-else class="control-row__desc">
+                  {{ t('setup.modelStrategy.failurePolicyErrorDesc') }}
+                </span>
               </div>
               <div class="control-row__control">
-                <span
-                  class="setup-model-strategy__runtime-value"
-                  data-testid="ensemble-fixed-fallback"
-                >{{ panel.single.providerLabel }} · {{ panel.single.model }}</span>
+                <select
+                  class="control-input"
+                  :value="panel.ensemble.allFailedPolicy"
+                  name="setup_model_strategy_all_failed_policy"
+                  data-testid="ensemble-failure-policy"
+                  @change="emit('updateEnsembleAllFailedPolicy', ($event.target as HTMLSelectElement).value)"
+                >
+                  <option value="fallback_single">{{ t('setup.ensemble.allFailedFallback') }}</option>
+                  <option value="error">{{ t('setup.ensemble.allFailedError') }}</option>
+                </select>
+              </div>
+            </label>
+            <label class="control-row">
+              <div class="control-row__label-block">
+                <span class="control-row__label">{{ t('setup.modelStrategy.proposerRetriesLabel') }}</span>
+                <span class="control-row__desc">{{ t('setup.modelStrategy.proposerRetriesDesc') }}</span>
+              </div>
+              <div class="control-row__control">
+                <select
+                  class="control-input"
+                  :value="activeFacts.proposerMaxRetries"
+                  name="setup_model_strategy_proposer_max_retries"
+                  data-testid="ensemble-proposer-retries"
+                  @change="emit('updateEnsembleProposerMaxRetries', Number(($event.target as HTMLSelectElement).value))"
+                >
+                  <option v-for="retries in proposerRetryOptions" :key="retries" :value="retries">
+                    {{ t('setup.modelStrategy.proposerRetriesOption', { count: retries }) }}
+                  </option>
+                </select>
               </div>
             </label>
             <div class="setup-model-strategy__runtime-limits">

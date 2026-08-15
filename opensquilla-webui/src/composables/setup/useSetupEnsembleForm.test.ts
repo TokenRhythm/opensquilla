@@ -23,6 +23,7 @@ const SAVED = {
   model_options: ['custom/model-a', 'custom/model-b'],
   candidates: [{ provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true }],
   min_successful_proposers: 2,
+  proposer_max_retries: 2,
   all_failed_policy: 'error',
 } satisfies EnsembleConfigSlice
 
@@ -57,9 +58,10 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
       { provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true, role: '' },
     ])
     expect(f.minSuccessfulProposers.value).toBe(2)
+    expect(f.proposerMaxRetries.value).toBe(2)
     expect(f.configuredAllFailedPolicy.value).toBe('error')
-    expect(f.allFailedPolicy.value).toBe('fallback_single')
-    expect(f.policyDeprecated.value).toBe(true)
+    expect(f.allFailedPolicy.value).toBe('error')
+    expect(f.policyDeprecated.value).toBe(false)
   })
 
   it('keeps a stored legacy router_dynamic mode readable', () => {
@@ -128,12 +130,12 @@ describe('useSetupEnsembleForm — partial payload building', () => {
     expect(f.payload()).toEqual({})
   })
 
-  it('normalizes a retired error policy alongside the next ensemble save', () => {
+  it('does not rewrite an explicit failure policy alongside an unrelated save', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig(SAVED)
 
     f.setEnabled(true)
-    expect(f.payload()).toEqual({ enabled: true, allFailedPolicy: 'fallback_single' })
+    expect(f.payload()).toEqual({ enabled: true })
   })
 
   it('sends only the selection mode when only it changed', () => {
@@ -141,10 +143,7 @@ describe('useSetupEnsembleForm — partial payload building', () => {
     f.initFromConfig(SAVED)
 
     f.setSelectionMode('static_openrouter_b5')
-    expect(f.payload()).toEqual({
-      selectionMode: 'static_openrouter_b5',
-      allFailedPolicy: 'fallback_single',
-    })
+    expect(f.payload()).toEqual({ selectionMode: 'static_openrouter_b5' })
   })
 
   it('accumulates exactly the dirty keys across several edits', () => {
@@ -154,7 +153,6 @@ describe('useSetupEnsembleForm — partial payload building', () => {
     f.addModelOption('custom/model-c')
     expect(f.payload()).toEqual({
       modelOptions: ['custom/model-a', 'custom/model-b', 'custom/model-c'],
-      allFailedPolicy: 'fallback_single',
     })
   })
 
@@ -169,17 +167,25 @@ describe('useSetupEnsembleForm — partial payload building', () => {
         { provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true, role: '' },
         { provider: 'openrouter', model: 'qwen/qwen3.7-max', source: 'custom', enabled: true, role: 'critic' },
       ],
-      allFailedPolicy: 'fallback_single',
     })
   })
 
-  it('does not let a compatibility setter restore the retired error policy', () => {
+  it('saves the user-selected error policy exactly', () => {
     const f = useSetupEnsembleForm()
-    f.initFromConfig(SAVED)
+    f.initFromConfig({ ...SAVED, all_failed_policy: 'fallback_single' })
 
     f.setAllFailedPolicy('error')
-    expect(f.allFailedPolicy.value).toBe('fallback_single')
-    expect(f.payload()).toEqual({})
+    expect(f.allFailedPolicy.value).toBe('error')
+    expect(f.payload()).toEqual({ allFailedPolicy: 'error' })
+  })
+
+  it('saves the user-selected proposer retry limit exactly', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({ ...SAVED, proposer_max_retries: 0 })
+
+    f.setProposerMaxRetries(2)
+    expect(f.proposerMaxRetries.value).toBe(2)
+    expect(f.payload()).toEqual({ proposerMaxRetries: 2 })
   })
 
   it('never carries candidate editor state into a static preset save', () => {
@@ -953,9 +959,10 @@ describe('useSetupEnsembleForm — panel contract', () => {
     expect(facts).toEqual({
       perTurnCalls: 5,
       proposerCount: 4,
-      proposerTimeoutSeconds: 300,
+      proposerMaxRetries: 0,
+      proposerTimeoutSeconds: 120,
       configuredAggregatorTimeoutSeconds: 3600,
-      aggregatorTimeoutSeconds: 480,
+      aggregatorTimeoutSeconds: 180,
     })
   })
 
@@ -1028,17 +1035,17 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
       aggregator_timeout_seconds: 3600,
     })
     const legacyFacts = makePanel(explicitLegacy, 'openrouter').value.presetFacts
-    expect(legacyFacts.proposerTimeoutSeconds).toBe(300)
+    expect(legacyFacts.proposerTimeoutSeconds).toBe(120)
     expect(legacyFacts.configuredAggregatorTimeoutSeconds).toBe(3600)
-    expect(legacyFacts.aggregatorTimeoutSeconds).toBe(480)
+    expect(legacyFacts.aggregatorTimeoutSeconds).toBe(180)
 
     // Older gateways may omit the keys from the config slice entirely.
     const absent = useSetupEnsembleForm()
     absent.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
     const absentFacts = makePanel(absent, 'openrouter').value.presetFacts
-    expect(absentFacts.proposerTimeoutSeconds).toBe(300)
+    expect(absentFacts.proposerTimeoutSeconds).toBe(120)
     expect(absentFacts.configuredAggregatorTimeoutSeconds).toBe(3600)
-    expect(absentFacts.aggregatorTimeoutSeconds).toBe(480)
+    expect(absentFacts.aggregatorTimeoutSeconds).toBe(180)
   })
 
   it('applies a partial override to the custom lineup facts', () => {

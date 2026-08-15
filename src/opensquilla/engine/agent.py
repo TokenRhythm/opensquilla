@@ -8464,6 +8464,41 @@ class Agent:
                                     # authority.  A provider that emits a late
                                     # reset cannot create a second terminal.
                                     continue
+                                terminal_error_message = ""
+                                terminal_error_code = ""
+                                terminal_failure_kind = ""
+                                if raw_ev.terminal:
+                                    terminal_provider = str(
+                                        self.config.provider_id
+                                        or getattr(self.provider, "provider_id", "")
+                                        or getattr(self.provider, "provider_name", "")
+                                        or ""
+                                    )
+                                    raw_terminal_code = str(
+                                        raw_ev.terminal_error_code or "ensemble_fixed_error"
+                                    )
+                                    terminal_status_code = (
+                                        int(raw_terminal_code)
+                                        if raw_terminal_code.isdigit()
+                                        else None
+                                    )
+                                    classified_terminal_failure = classify_provider_error(
+                                        provider_name=terminal_provider,
+                                        status_code=terminal_status_code,
+                                        raw_code=raw_terminal_code,
+                                        message=raw_ev.terminal_error_message,
+                                    )
+                                    terminal_failure_kind = (
+                                        classified_terminal_failure.value
+                                    )
+                                    terminal_error_code = safe_provider_failure_code(
+                                        raw_terminal_code,
+                                        terminal_failure_kind,
+                                    )
+                                    terminal_error_message = _safe_provider_terminal_message(
+                                        classified_terminal_failure,
+                                        raw_terminal_code,
+                                    )
                                 if self._execution_context is not None:
                                     reset_event = (
                                         self._execution_context.begin_generation_reset(
@@ -8474,6 +8509,9 @@ class Agent:
                                             terminal_text_snapshot=(
                                                 raw_ev.terminal_text_snapshot
                                             ),
+                                            terminal_error_message=terminal_error_message,
+                                            terminal_error_code=terminal_error_code,
+                                            terminal_failure_kind=terminal_failure_kind,
                                         )
                                     )
                                 else:
@@ -8488,6 +8526,9 @@ class Agent:
                                         terminal_text_snapshot=(
                                             raw_ev.terminal_text_snapshot
                                         ),
+                                        terminal_error_message=terminal_error_message,
+                                        terminal_error_code=terminal_error_code,
+                                        terminal_failure_kind=terminal_failure_kind,
                                     )
                                 generation_epoch = reset_event.new_generation_epoch
                                 last_provider_sequence = reset_event.sequence
@@ -8512,12 +8553,6 @@ class Agent:
                                 yield reset_event
                                 if raw_ev.terminal:
                                     terminal_generation_reset_event = reset_event
-                                    terminal_provider = str(
-                                        self.config.provider_id
-                                        or getattr(self.provider, "provider_id", "")
-                                        or getattr(self.provider, "provider_name", "")
-                                        or ""
-                                    )
                                     terminal_model = str(self.config.model_id or "")
                                     terminal_usage = normalize_provider_usage(
                                         raw_ev,
@@ -9913,14 +9948,19 @@ class Agent:
                     if terminal_generation_reset_event is not None:
                         terminal_error = ErrorEvent(
                             message=(
-                                provider_error_for_log.message
-                                if provider_error_for_log is not None
-                                else "fixed provider final failure"
+                                terminal_generation_reset_event.terminal_error_message
+                                or "The model provider request failed."
                             ),
                             code=(
-                                provider_error_for_log.code
-                                if provider_error_for_log is not None
-                                else "ensemble_fixed_error"
+                                terminal_generation_reset_event.terminal_error_code
+                                or "ensemble_fixed_error"
+                            ),
+                            failure_kind=(
+                                terminal_generation_reset_event.terminal_failure_kind
+                                or ProviderFailureKind.UNKNOWN.value
+                            ),
+                            generation_epoch=(
+                                terminal_generation_reset_event.new_generation_epoch
                             ),
                         )
                         break
@@ -15145,9 +15185,7 @@ class Agent:
             or missing_cost_entries
             or total_provider_billed_entries
         )
-        if terminal_generation_reset_event is None and (
-            terminal_error is None or has_usage
-        ):
+        if terminal_error is None or has_usage:
             final_text = "".join(final_text_parts)
             total_codepoints = len(final_text)
             model_call_segments = [

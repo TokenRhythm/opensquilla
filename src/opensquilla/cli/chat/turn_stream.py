@@ -864,6 +864,7 @@ async def stream_response_gateway(
     cancelled = False
     artifacts: list[dict[str, Any]] = []
     model_after: str | None = None
+    terminal_reset_error: str | None = None
 
     approval_surface = _resolve_approval_surface(
         tui_output,
@@ -932,6 +933,39 @@ async def stream_response_gateway(
                             turn_id=session_key,
                             presentation=event.get("presentation", "answer"),
                         )
+                    elif event_name == "session.event.answer_generation_reset":
+                        await _finish_text_delta_stream(
+                            renderer,
+                            stream_deps,
+                            streaming_plane,
+                            source="gateway",
+                            turn_id=session_key,
+                        )
+                        authoritative_text = event.get("authoritative_text_snapshot")
+                        if not isinstance(authoritative_text, str):
+                            authoritative_text = event.get("authoritativeTextSnapshot")
+                        if not isinstance(authoritative_text, str):
+                            authoritative_text = ""
+                        terminal = event.get("terminal") is True
+                        if terminal:
+                            terminal_text = event.get("terminal_text_snapshot")
+                            if not isinstance(terminal_text, str):
+                                terminal_text = event.get("terminalTextSnapshot")
+                            if not isinstance(terminal_text, str) or not terminal_text:
+                                terminal_text = authoritative_text or (
+                                    "The model could not complete this answer."
+                                )
+                            await renderer_reconcile_final_text(renderer, terminal_text)
+                            _emit_tui_domain_event(
+                                stream_deps,
+                                kind=KIND_ERROR,
+                                source="gateway",
+                                payload={"message": terminal_text},
+                                turn_id=session_key,
+                            )
+                            terminal_reset_error = terminal_text
+                            continue
+                        await renderer_reconcile_final_text(renderer, authoritative_text)
                     elif event_name == "session.event.thinking":
                         # The agent re-emits reasoning as ThinkingEvent, which
                         # rpc_sessions broadcasts as session.event.thinking. The
@@ -1172,6 +1206,7 @@ async def stream_response_gateway(
         text=renderer.buffer,
         usage=usage,
         cancelled=cancelled,
+        error=terminal_reset_error,
         artifacts=artifacts,
         model_after=model_after,
     )
@@ -1230,6 +1265,7 @@ async def stream_response_turnrunner(
     """Stream a TurnRunner response into a renderer."""
     from opensquilla.engine.runtime import TurnRunner
     from opensquilla.engine.types import (
+        AnswerGenerationResetEvent,
         ArtifactEvent,
         DoneEvent,
         EnsembleProgressEvent,
@@ -1261,6 +1297,7 @@ async def stream_response_turnrunner(
     cancelled = False
     artifacts: list[dict[str, Any]] = []
     model_after: str | None = None
+    terminal_reset_error: str | None = None
 
     approval_surface = _resolve_approval_surface(
         tui_output,
@@ -1324,6 +1361,34 @@ async def stream_response_turnrunner(
                             turn_id=session_key,
                             presentation=getattr(event, "presentation", "answer"),
                         )
+                    elif isinstance(event, AnswerGenerationResetEvent):
+                        await _finish_text_delta_stream(
+                            renderer,
+                            stream_deps,
+                            streaming_plane,
+                            source="turn_runner",
+                            turn_id=session_key,
+                        )
+                        authoritative_text = str(
+                            event.authoritative_text_snapshot or ""
+                        )
+                        if event.terminal:
+                            terminal_text = str(
+                                event.terminal_text_snapshot
+                                or authoritative_text
+                                or "The model could not complete this answer."
+                            )
+                            await renderer_reconcile_final_text(renderer, terminal_text)
+                            _emit_tui_domain_event(
+                                stream_deps,
+                                kind=KIND_ERROR,
+                                source="turn_runner",
+                                payload={"message": terminal_text},
+                                turn_id=session_key,
+                            )
+                            terminal_reset_error = terminal_text
+                            continue
+                        await renderer_reconcile_final_text(renderer, authoritative_text)
                     elif isinstance(event, ThinkingEvent):
                         reasoning_mid_stream = True
                         await _append_reasoning_delta(
@@ -1573,6 +1638,7 @@ async def stream_response_turnrunner(
         text=renderer.buffer,
         usage=usage,
         cancelled=cancelled,
+        error=terminal_reset_error,
         artifacts=artifacts,
         model_after=model_after,
     )

@@ -13,6 +13,7 @@ from typing import Any, cast
 from urllib.parse import urlparse
 
 from opensquilla.contracts.gateway_transport import (
+    ANSWER_GENERATION_RESET_CAPABILITY,
     GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
     GATEWAY_CLIENT_MAX_QUEUE,
 )
@@ -450,6 +451,7 @@ class GatewayClient:
         params: dict[str, Any] = {
             "minProtocol": 1,
             "maxProtocol": 3,
+            "caps": [ANSWER_GENERATION_RESET_CAPABILITY],
             "role": "operator",
             "scopes": ["operator.admin"],
         }
@@ -1297,6 +1299,16 @@ def _advance_gateway_turn_event(
         payload = _normalize_session_error_payload(payload)
     if task_terminal := _task_terminal_as_session_event(event_name, payload):
         return task_terminal, not active_task_groups
+
+    # A terminal generation reset is already the canonical visible failure.
+    # Stop this turn subscription on that frame so the TaskRuntime's later
+    # task.failed bookkeeping event cannot be projected as a second generic
+    # session.error that overwrites the reset result.
+    if (
+        event_name == "session.event.answer_generation_reset"
+        and payload.get("terminal") is True
+    ):
+        return {"event": event_name, **payload}, True
 
     group_id = payload.get("group_id")
     active_group_event = event_name in {

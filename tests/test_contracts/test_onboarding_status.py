@@ -135,6 +135,11 @@ SECTION_EXTRA_KEYS = {
             "configuredAllFailedPolicy",
             "effectiveAllFailedPolicy",
             "policyDeprecated",
+            "configuredMinSuccessfulProposers",
+            "effectiveMinSuccessfulProposers",
+            "configuredProposerMaxRetries",
+            "effectiveProposerMaxRetries",
+            "proposerMaxRetriesSource",
             "fixedFallbackReady",
             "fixedFallbackBlockedReason",
             "fixedFallbackProvider",
@@ -476,8 +481,17 @@ async def test_router_status_projects_tier_managed_dynamic_readiness(tmp_path) -
                 "reason": "missing_credential",
             }
         ],
+        "proposerCount": None,
+        "proposerCountRange": [2, 4],
         "fixedFallbackReady": True,
         "fixedFallbackBlockedReason": None,
+        "configuredAllFailedPolicy": "fallback_single",
+        "effectiveAllFailedPolicy": "fallback_single",
+        "configuredMinSuccessfulProposers": 1,
+        "effectiveMinSuccessfulProposers": 1,
+        "configuredProposerMaxRetries": 0,
+        "effectiveProposerMaxRetries": 1,
+        "proposerMaxRetriesSource": "c3_default",
     }
     assert router["tierEnsembleStatuses"] == {"c3": tier_ensemble}
 
@@ -531,7 +545,9 @@ async def test_tier_ensemble_status_is_c3_specific_with_mixed_legacy_modes(
     assert router["tierEnsembleStatus"] == statuses["c3"]
 
 
-async def test_ensemble_status_exposes_effective_failure_policy(tmp_path) -> None:
+async def test_ensemble_status_exposes_configured_failure_policy_as_effective(
+    tmp_path,
+) -> None:
     cfg = _synthetic_config(
         tmp_path,
         llm_ensemble={"enabled": False, "all_failed_policy": "error"},
@@ -541,8 +557,8 @@ async def test_ensemble_status_exposes_effective_failure_policy(tmp_path) -> Non
     ensemble = payload["sectionDetails"]["ensemble"]
 
     assert ensemble["configuredAllFailedPolicy"] == "error"
-    assert ensemble["effectiveAllFailedPolicy"] == "fallback_single"
-    assert ensemble["policyDeprecated"] is True
+    assert ensemble["effectiveAllFailedPolicy"] == "error"
+    assert ensemble["policyDeprecated"] is False
     assert ensemble["fixedFallbackReady"] is None
 
 

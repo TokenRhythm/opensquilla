@@ -184,6 +184,14 @@ interface SectionDetail {
   configuredAllFailedPolicy?: string
   effectiveAllFailedPolicy?: string
   policyDeprecated?: boolean
+  providerResolution?: {
+    status?: string
+    effectiveProvider?: string
+    source?: string
+    reasonCode?: string
+    actionRequired?: boolean
+    actionRecommended?: boolean
+  }
 }
 
 interface OnboardingStatus {
@@ -380,6 +388,9 @@ interface ConfigData {
     configured_all_failed_policy?: string
     effective_all_failed_policy?: string
     policy_deprecated?: boolean
+    proposer_max_retries?: number
+    proposer_timeout_seconds?: number
+    aggregator_timeout_seconds?: number
   }
   naming?: {
     enabled?: boolean
@@ -515,6 +526,18 @@ function primaryProviderIsConfigured(
   effective: EffectiveConfigData,
 ): boolean {
   if (!normalizeProviderId(llm?.provider)) return false
+
+  // Config/effective may report a materialized provider default as coming from
+  // "config" even when provider resolution rejected it because multiple
+  // credential-shaped environment variables disagree. In that state the
+  // Gateway deliberately withholds every credential and cannot run a turn.
+  // Never turn that unresolved default into an Active/Configured provider card;
+  // doing so makes a successful read-only probe look like completed setup while
+  // the authoritative onboarding status remains blocking.
+  const resolution = onboardingStatus.sectionDetails?.llm?.providerResolution
+  if (String(resolution?.status || '').trim().toLowerCase() === 'conflict') {
+    return false
+  }
 
   // A config file can exist because the user changed an unrelated setting;
   // config.get still materializes llm defaults in that case. Prefer the
@@ -3080,6 +3103,10 @@ function setEnsembleAllFailedPolicy(value: string) {
   ensembleForm.setAllFailedPolicy(value)
 }
 
+function setEnsembleProposerMaxRetries(value: number) {
+  ensembleForm.setProposerMaxRetries(value)
+}
+
 // ---------------------------------------------------------------------------
 // Search / Memory / Image / Audio helpers
 // ---------------------------------------------------------------------------
@@ -3949,6 +3976,7 @@ async function copyConfigPath() {
     setEnsembleScheme,
     setEnsembleMinSuccessful,
     setEnsembleAllFailedPolicy,
+    setEnsembleProposerMaxRetries,
     updateProviderField,
     updateLlmTimeout,
     updateContextWindow,

@@ -53,10 +53,9 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
         "qwen/qwen3.7-max",
     ]
     assert provider.aggregator.provider_config.model == "z-ai/glm-5.2"
-    # Static profiles retain their legacy 3-of-4 target for diagnostics, but
-    # one completed draft is now sufficient to continue the fusion flow.
+    # The fresh/default shared policy is a one-draft admission floor.
     assert provider.min_successful_proposers == 1
-    assert provider.target_successful_proposers == 3
+    assert provider.target_successful_proposers == 1
     assert provider.proposer_max_retries == 0
     assert provider.proposer_timeout_seconds == 120.0
     assert provider.aggregator_timeout_seconds == 180.0
@@ -362,7 +361,9 @@ def test_router_dynamic_ensemble_uses_small_c0_slot_template() -> None:
         "deepseek/deepseek-v4-flash"
     )
     assert len(provider.proposers) == 2
-    assert provider.min_successful_proposers == 1
+    # A dynamic C0 plan only has two slots, so an otherwise-valid configured
+    # floor is bounded by the concrete lineup and both drafts are required.
+    assert provider.min_successful_proposers == 2
     assert provider.selection_plan["slot_template"] == ["anchor", "cheap_contrast"]
     assert provider.selection_plan["aggregator_slot"] == "aggregator_fast"
     assert provider.selection_plan["duplicate_policy"] == "selected_penalty"
@@ -455,7 +456,7 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "aggregator_model": "z-ai/glm-5.2",
             "proposer_count": 4,
             "configured_min_successful_proposers": 9,
-            "effective_min_successful_proposers": 1,
+            "effective_min_successful_proposers": 4,
             "configured_proposer_timeout_seconds": 3600.0,
             "effective_proposer_timeout_seconds": 120.0,
             "configured_aggregator_timeout_seconds": 3600.0,
@@ -467,8 +468,9 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "quorum_grace_seconds": 0.0,
             "configured_proposer_max_retries": 0,
             "effective_proposer_max_retries": 0,
+            "proposer_max_retries_source": "configured",
         }
-        assert provider.min_successful_proposers == 1
+        assert provider.min_successful_proposers == 4
         assert provider.proposer_timeout_seconds == 120.0
         assert provider.aggregator_timeout_seconds == 180.0
         assert provider.shuffle_candidates is False
@@ -539,7 +541,7 @@ def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> No
         fallback_provider=None,
     )
 
-    assert provider.min_successful_proposers == 1
+    assert provider.min_successful_proposers == 2
     assert provider.proposer_timeout_seconds == 180.0
     assert provider.aggregator_timeout_seconds == 900.0
     assert provider.shuffle_candidates is False
@@ -570,7 +572,7 @@ def test_legacy_total_timeout_is_readable_but_has_no_runtime_effect() -> None:
     assert "effective_total_timeout_seconds" not in provider.selection_plan
 
 
-def test_static_b5_supports_score_target_above_resilient_floor() -> None:
+def test_static_b5_honors_explicit_floor_target_retry_and_failure_policy() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
@@ -592,17 +594,15 @@ def test_static_b5_supports_score_target_above_resilient_floor() -> None:
         fallback_provider=None,
     )
 
-    assert provider.min_successful_proposers == 1
+    assert provider.min_successful_proposers == 3
     assert provider.target_successful_proposers == 4
-    assert provider.proposer_max_retries == 1
-    # Legacy ``error`` remains loadable, but runtime has one effective
-    # contract: fall back through the configured fixed deployment.
-    assert provider.all_failed_policy == "fallback_single"
+    assert provider.proposer_max_retries == 2
+    assert provider.all_failed_policy == "error"
     assert provider.selection_plan["configured_target_successful_proposers"] == 4
     assert provider.selection_plan["effective_target_successful_proposers"] == 4
     assert provider.selection_plan["configured_proposer_max_retries"] == 2
-    assert provider.selection_plan["effective_proposer_max_retries"] == 1
-    assert provider.selection_plan["proposer_max_retries"] == 1
+    assert provider.selection_plan["effective_proposer_max_retries"] == 2
+    assert provider.selection_plan["proposer_max_retries"] == 2
 
 
 def test_success_target_cannot_be_below_floor() -> None:
@@ -679,8 +679,7 @@ def test_custom_b5_uses_fixed_lineup_effective_defaults_with_auto_quorum() -> No
         fallback_provider=None,
     )
 
-    # Stored legacy defaults remain diagnostic-only. Runtime admission is one
-    # completed draft and there is no first-result grace-window cancellation.
+    # The visible default is the runtime admission floor.
     assert cfg.llm_ensemble.min_successful_proposers == 1
     assert provider.min_successful_proposers == 1
     assert provider.proposer_timeout_seconds == 300.0
@@ -701,7 +700,7 @@ def test_custom_b5_preserves_explicit_quorum_and_timeouts() -> None:
         fallback_provider=None,
     )
 
-    assert provider.min_successful_proposers == 1
+    assert provider.min_successful_proposers == 3
     assert provider.proposer_timeout_seconds == 120.0
     assert provider.aggregator_timeout_seconds == 600.0
 

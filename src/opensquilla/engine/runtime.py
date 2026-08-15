@@ -5719,6 +5719,7 @@ class TurnRunner:
                     assistant_message_id=execution_context.identity.assistant_message_id,
                     execution_context=execution_context,
                     publication_ledger=execution_context.publication_ledger,
+                    terminal_generation_reset=stream_state.terminal_generation_reset,
                 )
             )
             fin_out = fin_outcome.require_output()
@@ -5850,7 +5851,10 @@ class TurnRunner:
                 turn_obj=turn_obj,
                 message=message,
             )
-            if pending_error_event is not None:
+            if (
+                pending_error_event is not None
+                and not stream_state.terminal_generation_reset
+            ):
                 yield pending_error_event
 
         except asyncio.CancelledError as exc:
@@ -6465,6 +6469,8 @@ class TurnRunner:
         self,
         session_key: str,
         event: ErrorEvent | None,
+        *,
+        append_transcript: bool = True,
     ) -> None:
         """Best-effort durable transcript record for terminal turn errors."""
         if self._session_manager is None or event is None:
@@ -6500,6 +6506,13 @@ class TurnRunner:
                 model=None,
                 fallback_hops=0,
             )
+        if not append_transcript:
+            log.info(
+                "turn_runner.error_recorded_without_transcript_append",
+                session_key=session_key,
+                code=event_code,
+            )
+            return
         outcome_details = turn_outcome_details(
             outcome_from_error(
                 code=event_code,

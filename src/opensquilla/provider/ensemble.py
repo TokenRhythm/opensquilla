@@ -1282,6 +1282,7 @@ class EnsembleProvider:
         min_successful_proposers: int = 1,
         target_successful_proposers: int | None = None,
         proposer_max_retries: int = 0,
+        configured_proposer_max_retries: int | None = None,
         all_failed_policy: Literal["fallback_single", "error"] = "fallback_single",
         proposer_timeout_seconds: float = 3600.0,
         aggregator_timeout_seconds: float = 3600.0,
@@ -1306,15 +1307,11 @@ class EnsembleProvider:
         self.fallback_provider_name = str(fallback_provider_name or "")
         self.fallback_model = str(fallback_model or "")
         self._fallback_api_key = str(fallback_api_key or "")
-        # Legacy quorum values remain useful diagnostics, but they no longer
-        # control runtime admission or completion.  One successful draft is
-        # sufficient because every primary aggregator failure has a fixed
-        # aggregator fallback leg.
         self.configured_min_successful_proposers = max(
             1,
             int(min_successful_proposers or 1),
         )
-        self.min_successful_proposers = 1
+        self.min_successful_proposers = self.configured_min_successful_proposers
         self.configured_target_successful_proposers = max(
             1,
             int(target_successful_proposers or self.configured_min_successful_proposers),
@@ -1331,9 +1328,13 @@ class EnsembleProvider:
         )
         self.configured_proposer_max_retries = max(
             0,
-            int(proposer_max_retries or 0),
+            int(
+                proposer_max_retries
+                if configured_proposer_max_retries is None
+                else configured_proposer_max_retries
+            ),
         )
-        self.proposer_max_retries = min(1, self.configured_proposer_max_retries)
+        self.proposer_max_retries = max(0, int(proposer_max_retries or 0))
         self.all_failed_policy = all_failed_policy
         self.proposer_timeout_seconds = float(proposer_timeout_seconds or 3600.0)
         self.aggregator_timeout_seconds = float(aggregator_timeout_seconds or 3600.0)
@@ -4168,10 +4169,32 @@ class EnsembleProvider:
                 ),
             )
 
-        # A failed primary aggregator is never allowed to bypass the fixed
-        # deployment.  ``all_failed_policy`` remains a diagnostic legacy field;
-        # runtime recovery is deterministic whenever a fixed provider exists.
         request_budget_error = _uniform_request_budget_error(candidates)
+        if self.all_failed_policy != "fallback_single":
+            message_limit_proof = _uniform_message_limit_proof(candidates)
+            if request_budget_error is not None:
+                yield proposer_error(
+                    ErrorEvent(
+                        message=request_budget_error,
+                        code="provider_request_budget_exhausted",
+                    )
+                )
+            elif message_limit_proof is not None:
+                first_error = next(
+                    (candidate.error for candidate in candidates if candidate.error),
+                    reason,
+                )
+                yield proposer_error(
+                    ErrorEvent(
+                        message=first_error,
+                        code="400",
+                        message_limit_proof=message_limit_proof,
+                    )
+                )
+            else:
+                yield proposer_error(ErrorEvent(message=reason, code=code))
+            return
+
         immutable_bundle = list(
             candidate_bundle
             if candidate_bundle is not None
@@ -4811,14 +4834,10 @@ _DYNAMIC_AGGREGATOR_SLOT = {
     "c3": "aggregator_strong",
 }
 
-_LEGACY_ENSEMBLE_MIN_SUCCESSFUL_PROPOSERS = 1
 _LEGACY_ENSEMBLE_TIMEOUT_SECONDS = 3600.0
 _LEGACY_ENSEMBLE_SHUFFLE_CANDIDATES = True
 # Shared defaults for every static B5 profile (openrouter and tokenrhythm
-# lineups run the same aggregation logic). Legacy quorum values are retained
-# only in the selection trace; runtime admission is always one successful
-# proposer.
-_STATIC_B5_DEFAULT_MIN_SUCCESSFUL_PROPOSERS = 3
+# lineups run the same aggregation logic).
 _STATIC_B5_DEFAULT_PROPOSER_TIMEOUT_SECONDS = 120.0
 _STATIC_B5_DEFAULT_AGGREGATOR_TIMEOUT_SECONDS = 180.0
 # Preserve the established fixed-lineup defaults for operator-authored custom
@@ -6231,7 +6250,15 @@ def ensemble_runtime_status(
     configured_all_failed_policy = str(
         getattr(ensemble, "all_failed_policy", "fallback_single") or "fallback_single"
     )
-    policy_deprecated = configured_all_failed_policy != "fallback_single"
+    configured_min_successful_proposers = max(
+        1,
+        int(getattr(ensemble, "min_successful_proposers", 1) or 1),
+    )
+    configured_proposer_max_retries = max(
+        0,
+        int(getattr(ensemble, "proposer_max_retries", 0) or 0),
+    )
+    ensemble_fields_set = set(getattr(ensemble, "model_fields_set", set()))
     selection_mode = (
         str(_tier_selection_mode).strip()
         if _tier_selection_mode is not None
@@ -6239,6 +6266,14 @@ def ensemble_runtime_status(
     )
     if not globally_enabled and tier_selection_modes:
         selection_mode = next(iter(tier_selection_modes.values()))
+    c3_tier_default_applies = bool(
+        not globally_enabled
+        and "c3" in tier_selection_modes
+        and "proposer_max_retries" not in ensemble_fields_set
+    )
+    effective_proposer_max_retries = (
+        1 if c3_tier_default_applies else configured_proposer_max_retries
+    )
     fixed_provider_config, fixed_resolution, fixed_blocked_reason = (
         _configured_fixed_fallback_resolution(config)
     )
@@ -6264,8 +6299,15 @@ def ensemble_runtime_status(
         "perTurnCallCountRange": None,
         "memberProviders": [],
         "configuredAllFailedPolicy": configured_all_failed_policy,
-        "effectiveAllFailedPolicy": "fallback_single",
-        "policyDeprecated": policy_deprecated,
+        "effectiveAllFailedPolicy": configured_all_failed_policy,
+        "policyDeprecated": False,
+        "configuredMinSuccessfulProposers": configured_min_successful_proposers,
+        "effectiveMinSuccessfulProposers": configured_min_successful_proposers,
+        "configuredProposerMaxRetries": configured_proposer_max_retries,
+        "effectiveProposerMaxRetries": effective_proposer_max_retries,
+        "proposerMaxRetriesSource": (
+            "c3_default" if c3_tier_default_applies else "configured"
+        ),
         "fixedFallbackReady": fixed_fallback_ready,
         "fixedFallbackBlockedReason": fixed_blocked_reason or None,
         "fixedFallbackProvider": fixed_provider_config.provider,
@@ -6291,12 +6333,17 @@ def ensemble_runtime_status(
             else None
         )
         proposer_count = len(static_profile.proposer_models)
+        effective_min_successful_proposers = min(
+            configured_min_successful_proposers,
+            max(1, proposer_count),
+        )
         return {
             **base,
             "runtimeStatus": "ready" if ready else "blocked",
             "configurationReady": ready,
             "blockedReason": blocked_reason,
             "proposerCount": proposer_count,
+            "effectiveMinSuccessfulProposers": effective_min_successful_proposers,
             "aggregatorCount": 1,
             "perTurnCallCount": proposer_count + 1,
             "memberProviders": [static_profile.provider_id],
@@ -6328,6 +6375,10 @@ def ensemble_runtime_status(
             "configurationReady": ready,
             "blockedReason": blocked_reason,
             "proposerCount": len(proposers),
+            "effectiveMinSuccessfulProposers": min(
+                configured_min_successful_proposers,
+                max(1, len(proposers)),
+            ),
             "aggregatorCount": 1,
             "perTurnCallCount": len(proposers) + 1,
             "memberProviders": sorted(providers),
@@ -6627,30 +6678,19 @@ def build_ensemble_provider_from_config(
     # Packaged static profiles additionally use tighter per-call timeouts.
     is_static_b5 = static_profile is not None or is_custom_b5
     configured_min_success = int(getattr(ensemble_cfg, "min_successful_proposers", 1) or 1)
-    requested_min_success = configured_min_success
-    if (
-        is_static_b5
-        and configured_min_success == _LEGACY_ENSEMBLE_MIN_SUCCESSFUL_PROPOSERS
-    ):
-        requested_min_success = (
-            # Custom lineups size freely (2–6): quorum defaults to N-1, the
-            # same "all but one" shape the 3-of-4 static default encodes.
-            max(1, len(proposers) - 1)
-            if is_custom_b5
-            else _STATIC_B5_DEFAULT_MIN_SUCCESSFUL_PROPOSERS
-        )
-    # Keep the configured/legacy quorum calculation for diagnostics only. The
-    # runtime admission gate is deliberately fixed at one successful draft.
-    diagnostic_min_success = min(requested_min_success, max(1, len(proposers)))
+    min_successful_proposers = min(
+        configured_min_success,
+        max(1, len(proposers)),
+    )
     configured_target_success = getattr(
         ensemble_cfg,
         "target_successful_proposers",
         None,
     )
     requested_target_success = (
-        diagnostic_min_success
+        min_successful_proposers
         if configured_target_success is None
-        else max(diagnostic_min_success, int(configured_target_success))
+        else max(min_successful_proposers, int(configured_target_success))
     )
     target_successful_proposers = min(
         requested_target_success,
@@ -6660,7 +6700,16 @@ def build_ensemble_provider_from_config(
         0,
         int(getattr(ensemble_cfg, "proposer_max_retries", 0) or 0),
     )
-    proposer_max_retries = min(1, configured_proposer_max_retries)
+    ensemble_fields_set = set(getattr(ensemble_cfg, "model_fields_set", set()))
+    c3_tier_default_applies = bool(
+        str((turn_metadata or {}).get("ensemble_activation_source") or "")
+        == "router_tier"
+        and _normalize_dynamic_tier((turn_metadata or {}).get("routed_tier")) == "c3"
+        and "proposer_max_retries" not in ensemble_fields_set
+    )
+    proposer_max_retries = (
+        1 if c3_tier_default_applies else configured_proposer_max_retries
+    )
     configured_proposer_timeout_seconds = float(
         getattr(ensemble_cfg, "proposer_timeout_seconds", _LEGACY_ENSEMBLE_TIMEOUT_SECONDS)
     )
@@ -6702,8 +6751,8 @@ def build_ensemble_provider_from_config(
     # The grace value remains a compatibility/diagnostic field only. No
     # proposer task is cancelled or completed because of it.
     quorum_grace_seconds = configured_quorum_grace_seconds
-    selection_plan["configured_min_successful_proposers"] = requested_min_success
-    selection_plan["effective_min_successful_proposers"] = 1
+    selection_plan["configured_min_successful_proposers"] = configured_min_success
+    selection_plan["effective_min_successful_proposers"] = min_successful_proposers
     selection_plan["configured_proposer_timeout_seconds"] = configured_proposer_timeout_seconds
     selection_plan["effective_proposer_timeout_seconds"] = proposer_timeout_seconds
     selection_plan["configured_aggregator_timeout_seconds"] = configured_aggregator_timeout_seconds
@@ -6717,6 +6766,9 @@ def build_ensemble_provider_from_config(
         configured_proposer_max_retries
     )
     selection_plan["effective_proposer_max_retries"] = proposer_max_retries
+    selection_plan["proposer_max_retries_source"] = (
+        "c3_default" if c3_tier_default_applies else "configured"
+    )
     if configured_target_success is not None:
         selection_plan["configured_target_successful_proposers"] = int(
             configured_target_success
@@ -6786,16 +6838,11 @@ def build_ensemble_provider_from_config(
         fallback_provider_name=inherited_provider_config.provider,
         fallback_model=inherited_provider_config.model,
         fallback_api_key=inherited_provider_config.api_key,
-        # Pass the legacy value into the constructor so it remains visible in
-        # diagnostics; the constructor always normalizes the effective gate to
-        # one.
-        min_successful_proposers=requested_min_success,
+        min_successful_proposers=min_successful_proposers,
         target_successful_proposers=target_successful_proposers,
         proposer_max_retries=proposer_max_retries,
-        # ``error`` remains loadable for upgrade compatibility, but the
-        # product contract now has one deterministic outcome: every failed
-        # fusion attempt uses the configured fixed/direct deployment.
-        all_failed_policy="fallback_single",
+        configured_proposer_max_retries=configured_proposer_max_retries,
+        all_failed_policy=getattr(ensemble_cfg, "all_failed_policy", "fallback_single"),
         proposer_timeout_seconds=proposer_timeout_seconds,
         aggregator_timeout_seconds=aggregator_timeout_seconds,
         candidate_max_chars=int(getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0),

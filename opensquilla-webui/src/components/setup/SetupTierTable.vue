@@ -41,6 +41,10 @@ const props = withDefaults(defineProps<{
   // previews omit it and receive generic, still truthful shared-plan copy.
   fixedFallbackProvider?: string
   fixedFallbackModel?: string
+  ensembleAllFailedPolicy?: string
+  ensembleMinSuccessful?: number
+  ensembleProposerCount?: number
+  ensembleProposerMaxRetries?: number
   ensemblePlanStatus?: 'ready' | 'attention' | 'blocked'
   ensemblePlanBlockedReason?: string
   ensembleFixedFallbackReady?: boolean | null
@@ -266,6 +270,9 @@ const hasExactFallbackTarget = computed(() => Boolean(
 ))
 
 function ensembleSummary(row: SetupTierRow): string {
+  if (props.ensembleAllFailedPolicy === 'error') {
+    return t('setup.router.tierEnsembleErrorSummary')
+  }
   if (compatibilityTierEnsembleActive(row)) {
     const keyPrefix = legacyDynamicTierEnsembleActive(row)
       ? 'tierLegacyDynamicEnsemble'
@@ -291,6 +298,17 @@ function ensembleSummary(row: SetupTierRow): string {
     return t('setup.router.tierEnsembleFallbackMissingSummary')
   }
   return t('setup.router.tierEnsembleSummaryGeneric')
+}
+
+function ensemblePolicySummary(row: SetupTierRow): string {
+  if (!sharedTierEnsembleActive(row)) return ''
+  const proposers = Math.max(1, Math.trunc(Number(props.ensembleProposerCount) || 1))
+  const quorum = Math.min(
+    proposers,
+    Math.max(1, Math.trunc(Number(props.ensembleMinSuccessful) || 1)),
+  )
+  const retries = Math.max(0, Math.trunc(Number(props.ensembleProposerMaxRetries) || 0))
+  return t('setup.router.tierEnsemblePolicyFacts', { quorum, proposers, retries })
 }
 
 function showInlineEnsembleSummary(row: SetupTierRow): boolean {
@@ -705,6 +723,7 @@ const allowsFloatingContent = computed(() => (
                   <strong>{{ ensemblePlanStatusLabel() }}</strong>
                   <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
                   <span>{{ ensembleSummary(tier) }}</span>
+                  <span v-if="ensemblePolicySummary(tier)">{{ ensemblePolicySummary(tier) }}</span>
                   <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
                 </span>
               </Teleport>
@@ -715,7 +734,7 @@ const allowsFloatingContent = computed(() => (
             :id="ensembleSummaryId(tier)"
             class="setup-tier-table__model-note"
           >
-            {{ ensembleSummary(tier) }}
+            {{ ensembleSummary(tier) }} {{ ensemblePolicySummary(tier) }}
           </small>
           <small
             v-if="showInlinePlanStatus(tier)"
@@ -795,6 +814,7 @@ const allowsFloatingContent = computed(() => (
                   <strong>{{ ensemblePlanStatusLabel() }}</strong>
                   <span v-if="ensemblePlanBlockedReasonLabel">{{ ensemblePlanBlockedReasonLabel }}</span>
                   <span>{{ ensembleSummary(tier) }}</span>
+                  <span v-if="ensemblePolicySummary(tier)">{{ ensemblePolicySummary(tier) }}</span>
                   <span>{{ t('setup.router.tierEnsembleImageRouting') }}</span>
                 </span>
               </Teleport>
@@ -805,7 +825,7 @@ const allowsFloatingContent = computed(() => (
             :id="ensembleSummaryId(tier)"
             class="setup-tier-table__model-note"
           >
-            {{ ensembleSummary(tier) }}
+            {{ ensembleSummary(tier) }} {{ ensemblePolicySummary(tier) }}
           </small>
           <button
             v-if="legacyDynamicTierEnsembleActive(tier)"

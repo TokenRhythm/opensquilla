@@ -327,6 +327,17 @@ def _supports_realtime_generation(inp: StreamConsumerStageInput) -> bool:
     )
 
 
+def _supports_generation_reset(inp: StreamConsumerStageInput) -> bool:
+    """Return whether a direct stream consumer declared reset support."""
+
+    context = inp.execution_context
+    if context is None:
+        # Preserve the existing in-process API for callers that have not yet
+        # adopted explicit surface capability negotiation.
+        return True
+    return bool(context.surface.supports_generation_reset)
+
+
 def _control_reason_for_error_code(code: Any) -> Any | None:
     """Map only typed control/error codes; provider failures stay recoverable."""
 
@@ -371,6 +382,7 @@ def _reset_generation_stream_state(state: _StreamState) -> None:
     state.current_text_parts[:] = []
     state.final_text_parts[:] = []
     state.reasoning[:] = []
+    state.reasoning_parts[:] = []
     state.error_message = None
     state.pending_error_event = None
     state.done_event = None
@@ -1628,6 +1640,7 @@ class StreamConsumerStage:
         released_system_event_source_text: str | None = None
         released_suppressed_source_text: str | None = None
         realtime_generation = _supports_realtime_generation(inp)
+        supports_generation_reset = _supports_generation_reset(inp)
         deferred_generation_events: list[AgentEvent] = []
 
         def _is_deferred_generation_event(candidate: object) -> bool:
@@ -1664,16 +1677,52 @@ class StreamConsumerStage:
                 _reset_generation_stream_state(state)
                 if not realtime_generation:
                     _drop_speculative_text()
+                terminal_snapshot = ""
                 if event.terminal:
-                    terminal_snapshot = str(event.terminal_text_snapshot or "")
+                    terminal_snapshot = str(
+                        event.terminal_text_snapshot
+                        or event.authoritative_text_snapshot
+                        or "The model could not complete this answer."
+                    )
                     if terminal_snapshot:
                         state.current_text_parts.append(terminal_snapshot)
                         state.final_text_parts.append(terminal_snapshot)
-                        state.turn_segments.append(
-                            {"type": "text", "text": terminal_snapshot}
-                        )
                     state.terminal_generation_reset = True
-                transformed = event
+                    # A terminal replacement is the only public failure
+                    # payload, but finalization still needs the same typed
+                    # failure state as an ordinary ErrorEvent so it can write
+                    # turn_errors and a failed durable outcome.
+                    self._error_handler.handle(
+                        ErrorEvent(
+                            message=(
+                                event.terminal_error_message
+                                or "The model provider request failed."
+                            ),
+                            code=(
+                                event.terminal_error_code
+                                or "ensemble_fixed_error"
+                            ),
+                            failure_kind=(
+                                event.terminal_failure_kind or "unknown"
+                            ),
+                            generation_epoch=event.new_generation_epoch,
+                        ),
+                        state,
+                    )
+                if supports_generation_reset:
+                    # Keep the typed failure taxonomy on the trusted
+                    # in-process event until TaskRuntime has classified the
+                    # durable outcome. Gateway serializers scrub these fields
+                    # at the public transport boundary.
+                    transformed = event
+                elif event.terminal:
+                    transformed = ErrorEvent(
+                        message=terminal_snapshot,
+                        code="ensemble_fixed_error",
+                        generation_epoch=event.new_generation_epoch,
+                    )
+                else:
+                    transformed = _SUPPRESS
             elif isinstance(event, ControlTerminalEvent):
                 state.control_terminal_event = event
                 if not realtime_generation:

@@ -1099,9 +1099,13 @@
       "runtimeStrategyTitle": "Runtime strategy",
       "runtimeStrategyDesc": "Success threshold, fallback, and time limits",
       "successThresholdLabel": "Minimum success condition",
-      "successThresholdValue": "At least 1 proposer returns normally",
+      "successThresholdExact": "At least {quorum} of {proposers} return normally",
       "successThresholdDesc": "Other proposers still wait for their own completion or timeout.",
       "failurePolicyLabel": "If aggregation cannot complete",
+      "failurePolicyErrorDesc": "Stop and report a failure without calling the fixed fallback model.",
+      "proposerRetriesLabel": "Retries per proposer",
+      "proposerRetriesDesc": "Retryable failures only; the initial request is not counted as a retry.",
+      "proposerRetriesOption": "At most {count} retries after the initial request",
       "runtimeLimitsLabel": "Time limits",
       "runtimeLimits": "Proposers {proposerTimeout}s total · aggregator {aggregatorTimeout}s idle between provider events (configured {configuredAggregatorTimeout}s) · outer turn deadline separate"
     },
@@ -1143,6 +1147,8 @@
       "tierUseEnsemble": "Multi-model fusion",
       "tierUseEnsembleDescription": "Use the current plan from Multi-model fusion",
       "tierEnsembleSummary": "Uses the current Multi-model fusion plan; if it fails, uses the Fixed and fallback model: {provider} · {model}.",
+      "tierEnsembleErrorSummary": "Uses the current Multi-model fusion plan; if it cannot complete, reports an error.",
+      "tierEnsemblePolicyFacts": "Effective strategy: at least {quorum}/{proposers} proposers return normally · per-proposer retry limit {retries}.",
       "tierEnsembleSummaryGeneric": "Uses the current Multi-model fusion plan; if it fails, uses the Fixed and fallback model.",
       "tierEnsembleFallbackMissingSummary": "Uses the current Multi-model fusion plan; no usable Fixed and fallback model is configured yet.",
       "tierEnsemblePlanReady": "Current fusion plan is ready",
@@ -1186,7 +1192,8 @@
     "ensemble": {
       "statusOn": "AI ensemble routing is on — several models answer and one model synthesizes the final reply.",
       "statusOff": "AI ensemble routing is off.",
-      "allFailedFallback": "Fall back to a single model"
+      "allFailedFallback": "Fall back to a single model",
+      "allFailedError": "Stop and report an error"
     },
     "channels": {
       "title": "Channels",

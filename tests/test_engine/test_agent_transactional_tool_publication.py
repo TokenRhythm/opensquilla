@@ -362,7 +362,11 @@ async def test_terminal_generation_reset_carries_usage_without_second_terminal()
     usage = UsageTracker()
     agent = Agent(
         provider=provider,
-        config=AgentConfig(max_iterations=1, max_provider_retries=0),
+        config=AgentConfig(
+            max_iterations=1,
+            max_provider_retries=0,
+            provider_id="openrouter",
+        ),
         execution_context=context,
         usage_tracker=usage,
         session_key="agent:main:terminal-reset",
@@ -376,8 +380,15 @@ async def test_terminal_generation_reset_carries_usage_without_second_terminal()
         if isinstance(event, AnswerGenerationResetEvent) and event.terminal
     )
     assert terminal_reset.terminal_text_snapshot == terminal_text
+    assert terminal_reset.terminal_error_code == "401"
+    assert terminal_reset.terminal_failure_kind == "auth_invalid"
+    assert "credentials" in terminal_reset.terminal_error_message.lower()
     assert not any(isinstance(event, ErrorEvent) for event in events)
-    assert not any(isinstance(event, DoneEvent) for event in events)
+    accounting_done = next(event for event in events if isinstance(event, DoneEvent))
+    assert accounting_done.text_snapshot == ""
+    assert accounting_done.input_tokens == 4
+    assert accounting_done.output_tokens == 2
+    assert accounting_done.generation_epoch == terminal_reset.new_generation_epoch
     tracked = usage.get("agent:main:terminal-reset")
     assert tracked is not None
     assert tracked.input_tokens == 4

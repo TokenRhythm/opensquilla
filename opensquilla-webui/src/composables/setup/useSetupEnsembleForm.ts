@@ -60,12 +60,18 @@ export type EnsembleCandidateRole =
 const DEFAULT_SELECTION_MODE = DEFAULT_ENSEMBLE_SELECTION_MODE
 const DEFAULT_MIN_SUCCESSFUL_PROPOSERS = 1
 const DEFAULT_ALL_FAILED_POLICY = 'fallback_single'
+// The persisted/global Ensemble contract remains single-attempt by default.
+// Tier-local C3 activation projects its separate effective default (1) from
+// the Gateway's tier runtime status in SetupModelStrategyPanel.
+const DEFAULT_PROPOSER_MAX_RETRIES = 0
 
 // Runtime default replacements applied by the ensemble builder when the
 // stored value still equals the legacy default. The panel surfaces EFFECTIVE
 // values so what the user reads matches what actually runs.
-const STATIC_B5_PROPOSER_TIMEOUT_SECONDS = 300
-const STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS = 480
+const STATIC_B5_PROPOSER_TIMEOUT_SECONDS = 120
+const STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS = 180
+const CUSTOM_B5_PROPOSER_TIMEOUT_SECONDS = 300
+const CUSTOM_B5_AGGREGATOR_TIMEOUT_SECONDS = 480
 // The gateway builder substitutes the static-B5 timeout defaults above ONLY
 // when the stored value still equals this legacy default; an explicit
 // operator override (e.g. proposer_timeout_seconds = 600 in TOML) runs as
@@ -112,6 +118,7 @@ export interface EnsembleFixedProfileView {
 export interface EnsembleEffectiveFacts {
   perTurnCalls: number
   proposerCount: number
+  proposerMaxRetries: number
   proposerTimeoutSeconds: number
   configuredAggregatorTimeoutSeconds: number
   aggregatorTimeoutSeconds: number
@@ -153,6 +160,7 @@ export interface EnsembleConfigSlice {
   configured_all_failed_policy?: string
   effective_all_failed_policy?: string
   policy_deprecated?: boolean
+  proposer_max_retries?: number
   // Read-only in this form (no editor yet): consumed so effectiveFacts can
   // report an explicit operator override instead of the static default.
   proposer_timeout_seconds?: number
@@ -195,6 +203,11 @@ function normalizeMinSuccessful(value: unknown): number {
 function normalizeStoredTimeoutSeconds(value: unknown): number {
   const num = Number(value)
   return Number.isFinite(num) && num > 0 ? num : LEGACY_ENSEMBLE_TIMEOUT_SECONDS
+}
+
+function normalizeProposerMaxRetries(value: unknown): number {
+  const num = Math.trunc(Number(value))
+  return Number.isFinite(num) && num >= 0 ? Math.min(num, 10) : DEFAULT_PROPOSER_MAX_RETRIES
 }
 
 function normalizeModelOptions(value: unknown): string[] {
@@ -372,6 +385,7 @@ export function useSetupEnsembleForm() {
   const allFailedPolicy = ref(DEFAULT_ALL_FAILED_POLICY)
   const configuredAllFailedPolicy = ref(DEFAULT_ALL_FAILED_POLICY)
   const policyDeprecated = ref(false)
+  const proposerMaxRetries = ref(DEFAULT_PROPOSER_MAX_RETRIES)
   // Stored timeout values mirrored from config (read-only here — the panel
   // has no editor for them, but effectiveFacts must reflect explicit
   // operator overrides instead of always claiming the static defaults).
@@ -388,6 +402,7 @@ export function useSetupEnsembleForm() {
     candidates: JSON.stringify(candidates.value),
     minSuccessfulProposers: minSuccessfulProposers.value,
     allFailedPolicy: allFailedPolicy.value,
+    proposerMaxRetries: proposerMaxRetries.value,
   })
 
   const enabledDirty = computed(() => enabled.value !== baseline.value.enabled)
@@ -403,6 +418,9 @@ export function useSetupEnsembleForm() {
   const effectiveCandidatesDirty = computed(() => dynamicCandidateInputsActive.value && candidatesDirty.value)
   const minSuccessfulDirty = computed(() => minSuccessfulProposers.value !== baseline.value.minSuccessfulProposers)
   const allFailedPolicyDirty = computed(() => allFailedPolicy.value !== baseline.value.allFailedPolicy)
+  const proposerMaxRetriesDirty = computed(() => (
+    proposerMaxRetries.value !== baseline.value.proposerMaxRetries
+  ))
   const isDirty = computed(() => (
     enabledDirty.value
     || selectionModeDirty.value
@@ -410,6 +428,7 @@ export function useSetupEnsembleForm() {
     || effectiveCandidatesDirty.value
     || minSuccessfulDirty.value
     || allFailedPolicyDirty.value
+    || proposerMaxRetriesDirty.value
   ))
 
   const enabledProposerConfigs = computed(() => candidates.value.filter(candidate => (
@@ -424,6 +443,7 @@ export function useSetupEnsembleForm() {
       candidates: JSON.stringify(candidates.value),
       minSuccessfulProposers: minSuccessfulProposers.value,
       allFailedPolicy: allFailedPolicy.value,
+      proposerMaxRetries: proposerMaxRetries.value,
     }
   }
 
@@ -452,12 +472,16 @@ export function useSetupEnsembleForm() {
     configuredAllFailedPolicy.value = normalizeAllFailedPolicy(
       config.configured_all_failed_policy ?? config.all_failed_policy,
     )
-    // `error` remains readable for upgrades but is no longer an effective UI
-    // strategy: every ensemble failure converges on the fixed fallback model.
-    allFailedPolicy.value = DEFAULT_ALL_FAILED_POLICY
-    policyDeprecated.value = (
-      config.policy_deprecated === true
-      || configuredAllFailedPolicy.value !== DEFAULT_ALL_FAILED_POLICY
+    // Prefer the gateway's effective value when available. Once a policy is
+    // visible here it must be the policy the provider actually executes.
+    allFailedPolicy.value = normalizeAllFailedPolicy(
+      config.effective_all_failed_policy
+      ?? config.all_failed_policy
+      ?? config.configured_all_failed_policy,
+    )
+    policyDeprecated.value = config.policy_deprecated === true
+    proposerMaxRetries.value = normalizeProposerMaxRetries(
+      config.proposer_max_retries,
     )
     storedProposerTimeoutSeconds.value = normalizeStoredTimeoutSeconds(
       config.proposer_timeout_seconds,
@@ -500,9 +524,8 @@ export function useSetupEnsembleForm() {
     }
   }
 
-  // Keep the legacy configured threshold valid for older gateways and config
-  // diagnostics. Current runtime execution always uses an effective minimum
-  // of one successful proposer.
+  // Keep the configured threshold within the enabled lineup so the value the
+  // user sees and saves remains a valid authoritative runtime quorum.
   function clampQuorumToLineup() {
     const count = enabledProposerConfigs.value.length
     if (
@@ -823,10 +846,11 @@ export function useSetupEnsembleForm() {
   }
 
   function setAllFailedPolicy(value: string) {
-    // Kept as a compatibility method for older parents. New UI has no policy
-    // selector and never restores the retired error behavior.
-    void value
-    allFailedPolicy.value = DEFAULT_ALL_FAILED_POLICY
+    allFailedPolicy.value = normalizeAllFailedPolicy(value)
+  }
+
+  function setProposerMaxRetries(value: number) {
+    proposerMaxRetries.value = normalizeProposerMaxRetries(value)
   }
 
   // Partial by design: only user-changed keys are sent; the gateway keeps the
@@ -844,10 +868,8 @@ export function useSetupEnsembleForm() {
       role: normalizeCandidateRole(candidate.role),
     }))
     if (minSuccessfulDirty.value) params.minSuccessfulProposers = minSuccessfulProposers.value
-    if (
-      allFailedPolicyDirty.value
-      || (policyDeprecated.value && Object.keys(params).length > 0)
-    ) params.allFailedPolicy = DEFAULT_ALL_FAILED_POLICY
+    if (allFailedPolicyDirty.value) params.allFailedPolicy = allFailedPolicy.value
+    if (proposerMaxRetriesDirty.value) params.proposerMaxRetries = proposerMaxRetries.value
     return params
   }
 
@@ -864,14 +886,19 @@ export function useSetupEnsembleForm() {
     return {
       perTurnCalls: proposerCount + 1,
       proposerCount,
+      proposerMaxRetries: proposerMaxRetries.value,
       proposerTimeoutSeconds: substituteLegacy(
         storedProposerTimeoutSeconds.value,
-        STATIC_B5_PROPOSER_TIMEOUT_SECONDS,
+        isPreset
+          ? STATIC_B5_PROPOSER_TIMEOUT_SECONDS
+          : CUSTOM_B5_PROPOSER_TIMEOUT_SECONDS,
       ),
       configuredAggregatorTimeoutSeconds: storedAggregatorTimeoutSeconds.value,
       aggregatorTimeoutSeconds: substituteLegacy(
         storedAggregatorTimeoutSeconds.value,
-        STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS,
+        isPreset
+          ? STATIC_B5_AGGREGATOR_TIMEOUT_SECONDS
+          : CUSTOM_B5_AGGREGATOR_TIMEOUT_SECONDS,
       ),
     }
   }
@@ -1007,7 +1034,7 @@ export function useSetupEnsembleForm() {
         minSuccessfulProposers: minSuccessfulProposers.value,
         allFailedPolicy: allFailedPolicy.value,
         configuredAllFailedPolicy: configuredAllFailedPolicy.value,
-        effectiveAllFailedPolicy: DEFAULT_ALL_FAILED_POLICY,
+        effectiveAllFailedPolicy: allFailedPolicy.value,
         policyDeprecated: policyDeprecated.value,
         showModelOptions: scheme !== 'preset',
         showCandidateEditor: scheme === 'custom' || scheme === 'legacy',
@@ -1015,6 +1042,7 @@ export function useSetupEnsembleForm() {
         advancedOpen: (
           minSuccessfulProposers.value !== DEFAULT_MIN_SUCCESSFUL_PROPOSERS
           || allFailedPolicy.value !== DEFAULT_ALL_FAILED_POLICY
+          || proposerMaxRetries.value !== DEFAULT_PROPOSER_MAX_RETRIES
         ),
         statusText: context.statusText.value,
       }
@@ -1028,6 +1056,7 @@ export function useSetupEnsembleForm() {
     candidates,
     minSuccessfulProposers,
     allFailedPolicy,
+    proposerMaxRetries,
     configuredAllFailedPolicy,
     policyDeprecated,
     enabledDirty,
@@ -1036,6 +1065,7 @@ export function useSetupEnsembleForm() {
     candidatesDirty,
     minSuccessfulDirty,
     allFailedPolicyDirty,
+    proposerMaxRetriesDirty,
     isDirty,
     initFromConfig,
     setEnabled,
@@ -1054,6 +1084,7 @@ export function useSetupEnsembleForm() {
     migrateLegacyToCustom,
     setMinSuccessfulProposers,
     setAllFailedPolicy,
+    setProposerMaxRetries,
     payload,
     createPanel,
   }

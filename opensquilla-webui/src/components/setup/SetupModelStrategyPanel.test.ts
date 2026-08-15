@@ -8,6 +8,7 @@ import SetupModelStrategyPanel from './SetupModelStrategyPanel.vue'
 const FACTS = {
   perTurnCalls: 3,
   proposerCount: 2,
+  proposerMaxRetries: 0,
   proposerTimeoutSeconds: 300,
   configuredAggregatorTimeoutSeconds: 3600,
   aggregatorTimeoutSeconds: 480,
@@ -125,9 +126,10 @@ function panel(overrides: Record<string, unknown> = {}) {
       presetFacts: {
         perTurnCalls: 5,
         proposerCount: 4,
-        proposerTimeoutSeconds: 300,
+        proposerMaxRetries: 0,
+        proposerTimeoutSeconds: 120,
         configuredAggregatorTimeoutSeconds: 3600,
-        aggregatorTimeoutSeconds: 480,
+        aggregatorTimeoutSeconds: 180,
       },
       minSuccessfulProposers: 1,
       allFailedPolicy: 'fallback_single',
@@ -463,6 +465,17 @@ describe('SetupModelStrategyPanel', () => {
     const { app, el } = await mountPanel({
       router: {
         routerProviderRoles: { c3: 'dormant_draft' },
+        tierEnsembleStatusFresh: true,
+        tierEnsembleStatus: tierEnsembleStatus({
+          selectionMode: 'custom_b5',
+          tierSelectionModes: { c3: 'custom_b5' },
+          proposerCount: 4,
+          configuredMinSuccessfulProposers: 1,
+          effectiveMinSuccessfulProposers: 1,
+          configuredProposerMaxRetries: 0,
+          effectiveProposerMaxRetries: 1,
+          proposerMaxRetriesSource: 'c3_default',
+        }),
         tierRows: [{
           name: 'c3',
           provider: 'openrouter',
@@ -486,6 +499,10 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.querySelector('button[aria-label="Show C3 fusion details"]')).toBeTruthy()
     expect(el.querySelector('[role="tooltip"]')?.textContent)
       .toContain('Current fusion plan is ready')
+    expect(el.querySelector('[role="tooltip"]')?.textContent)
+      .toContain('at least 1/4 proposers return normally')
+    expect(el.querySelector('[role="tooltip"]')?.textContent)
+      .toContain('per-proposer retry limit 1')
     app.unmount()
   })
 
@@ -774,7 +791,7 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('uses the fixed fallback for shared C3 even when a retired error policy is loaded', async () => {
+  it('shows the explicit error policy for shared C3', async () => {
     const { app, el } = await mountPanel({
       router: {
         tierRows: [{
@@ -790,8 +807,8 @@ describe('SetupModelStrategyPanel', () => {
     })
 
     const summary = el.querySelector('.setup-tier-table__model-note')?.textContent || ''
-    expect(summary).toContain('uses the Fixed and fallback model')
-    expect(summary).not.toContain('returns an error')
+    expect(summary).toContain('reports an error')
+    expect(summary).not.toContain('uses the Fixed and fallback model')
     app.unmount()
   })
 
@@ -1376,10 +1393,17 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('shows the fixed one-proposer threshold and fixed fallback as read-only', async () => {
+  it('shows and emits the configured threshold and failure policy', async () => {
+    const onUpdateEnsembleMinSuccessful = vi.fn()
+    const onUpdateEnsembleAllFailedPolicy = vi.fn()
+    const onUpdateEnsembleProposerMaxRetries = vi.fn()
     const { app, el } = await mountPanel({
       activeStrategy: 'ensemble',
       ensemble: { enabled: true, scheme: 'custom' },
+    }, {
+      onUpdateEnsembleMinSuccessful,
+      onUpdateEnsembleAllFailedPolicy,
+      onUpdateEnsembleProposerMaxRetries,
     })
 
     const runtime = el.querySelector<HTMLDetailsElement>('[data-testid="ensemble-runtime-strategy"]')!
@@ -1391,39 +1415,86 @@ describe('SetupModelStrategyPanel', () => {
       'aggregator 480s idle between provider events (configured 3600s)',
     )
     expect(runtime.textContent).toContain('outer turn deadline separate')
-    expect(runtime.textContent).toContain('At least 1 proposer returns normally')
+    expect(runtime.textContent).toContain('At least 1 of 2 return normally')
     expect(runtime.textContent).toContain('Other proposers still wait for their own completion or timeout')
-    expect(el.querySelector('select[name="setup_model_strategy_min_successful"]')).toBeNull()
-    expect(el.querySelector('[data-testid="ensemble-success-threshold"]')?.textContent)
-      .toContain('At least 1 proposer returns normally')
+    const threshold = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_min_successful"]')!
+    expect(threshold.value).toBe('1')
+    expect(threshold.textContent).toContain('At least 1 of 2 return normally')
+    threshold.value = '2'
+    threshold.dispatchEvent(new Event('change', { bubbles: true }))
+    expect(onUpdateEnsembleMinSuccessful).toHaveBeenCalledWith(2)
 
-    expect(el.querySelector('select[name="setup_model_strategy_all_failed_policy"]')).toBeNull()
-    const fallback = el.querySelector<HTMLElement>('[data-testid="ensemble-fixed-fallback"]')
-    expect(fallback?.closest('label')?.textContent)
+    const policy = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_all_failed_policy"]')!
+    expect(policy.value).toBe('fallback_single')
+    expect(policy.closest('label')?.textContent)
       .toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
-    expect(fallback?.textContent).toContain('OpenRouter · deepseek/deepseek-v4-pro')
+    policy.value = 'error'
+    policy.dispatchEvent(new Event('change', { bubbles: true }))
+    expect(onUpdateEnsembleAllFailedPolicy).toHaveBeenCalledWith('error')
+    const retries = el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_proposer_max_retries"]',
+    )!
+    expect(retries.value).toBe('0')
+    expect(retries.textContent).toContain('At most 0 retries after the initial request')
+    retries.value = '2'
+    retries.dispatchEvent(new Event('change', { bubbles: true }))
+    expect(onUpdateEnsembleProposerMaxRetries).toHaveBeenCalledWith(2)
 
     app.unmount()
   })
 
-  it('reads a retired error policy as the fixed fallback contract', async () => {
+  it('displays an explicit error policy without fallback copy', async () => {
     const { app, el } = await mountPanel({
       activeStrategy: 'ensemble',
       ensemble: {
         enabled: true,
         scheme: 'custom',
         allFailedPolicy: 'error',
+        custom: customLineup({ facts: { ...FACTS, proposerMaxRetries: 2 } }),
       },
     })
 
-    expect(el.querySelector('select[name="setup_model_strategy_all_failed_policy"]')).toBeNull()
-    const copy = el.querySelector('[data-testid="ensemble-fixed-fallback"]')?.closest('label')?.textContent || ''
-    expect(copy).toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
-    expect(copy).not.toContain('return an error')
+    const policy = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_all_failed_policy"]')!
+    expect(policy.value).toBe('error')
+    const copy = policy.closest('label')?.textContent || ''
+    expect(copy).toContain('without calling the fixed fallback model')
+    expect(copy).not.toContain('Fixed and fallback model: OpenRouter')
+    expect(el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_proposer_max_retries"]',
+    )?.value).toBe('2')
     app.unmount()
   })
 
-  it('does not expose an oversized legacy threshold as an editable runtime rule', async () => {
+  it('renders an explicit 4-of-4, error, and two-retry policy unchanged', async () => {
+    const { app, el } = await mountPanel({
+      activeStrategy: 'ensemble',
+      ensemble: {
+        enabled: true,
+        scheme: 'preset',
+        minSuccessfulProposers: 4,
+        allFailedPolicy: 'error',
+        presetFacts: {
+          ...panel().ensemble.presetFacts,
+          proposerMaxRetries: 2,
+        },
+      },
+    })
+
+    const threshold = el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_min_successful"]',
+    )!
+    expect(threshold.value).toBe('4')
+    expect(threshold.selectedOptions[0]?.textContent).toContain('At least 4 of 4 return normally')
+    expect(el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_all_failed_policy"]',
+    )?.value).toBe('error')
+    expect(el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_proposer_max_retries"]',
+    )?.value).toBe('2')
+    app.unmount()
+  })
+
+  it('clamps an oversized stored threshold to the effective proposer count', async () => {
     const { app, el } = await mountPanel({
       activeStrategy: 'ensemble',
       ensemble: {
@@ -1437,9 +1508,9 @@ describe('SetupModelStrategyPanel', () => {
       },
     })
 
-    expect(el.querySelector('select[name="setup_model_strategy_min_successful"]')).toBeNull()
-    expect(el.querySelector('[data-testid="ensemble-success-threshold"]')?.textContent)
-      .toContain('At least 1 proposer returns normally')
+    const threshold = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_min_successful"]')!
+    expect(threshold.value).toBe('2')
+    expect(threshold.textContent).toContain('At least 2 of 2 return normally')
 
     app.unmount()
   })

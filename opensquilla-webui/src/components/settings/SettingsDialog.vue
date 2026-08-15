@@ -149,6 +149,9 @@
               @update-router-visual-mode="setRouterVisualMode"
               @update-tier-field="updateTierField"
               @update-ensemble-scheme="setEnsembleScheme"
+              @update-ensemble-min-successful="setEnsembleMinSuccessful"
+              @update-ensemble-all-failed-policy="setEnsembleAllFailedPolicy"
+              @update-ensemble-proposer-max-retries="setEnsembleProposerMaxRetries"
               @add-ensemble-candidate="addEnsembleCandidate"
               @remove-ensemble-candidate="removeEnsembleCandidate"
               @replace-ensemble-candidate="replaceEnsembleCandidate"
@@ -300,6 +303,9 @@ const {
   importEnsembleTierCandidates,
   migrateEnsembleLegacy,
   setEnsembleScheme,
+  setEnsembleMinSuccessful,
+  setEnsembleAllFailedPolicy,
+  setEnsembleProposerMaxRetries,
   applyProviderPreset,
   updateProviderField,
   updateLlmTimeout,

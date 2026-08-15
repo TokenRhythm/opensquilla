@@ -1549,7 +1549,30 @@ def test_upsert_router_materializes_the_shared_tokenrhythm_plan_without_global_e
     assert res.config.squilla_router.tiers["c3"]["ensemble_enabled"] is True
     assert res.config.llm_ensemble.enabled is False
     assert res.config.llm_ensemble.selection_mode == "static_tokenrhythm_b5"
+    assert res.config.llm_ensemble.min_successful_proposers == 1
+    assert res.config.llm_ensemble.proposer_max_retries == 1
+    assert res.config.llm_ensemble.all_failed_policy == "fallback_single"
     assert "llm_ensemble.selection_mode" in res.config.force_persist_paths()
+    assert "llm_ensemble.min_successful_proposers" in res.config.force_persist_paths()
+    assert "llm_ensemble.proposer_max_retries" in res.config.force_persist_paths()
+    assert "llm_ensemble.all_failed_policy" in res.config.force_persist_paths()
+
+
+def test_upsert_router_preserves_explicit_shared_ensemble_policy() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "min_successful_proposers": 4,
+            "proposer_max_retries": 2,
+            "all_failed_policy": "error",
+        }
+    )
+
+    res = upsert_router(cfg, mode="recommended")
+
+    assert res.config.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert res.config.llm_ensemble.min_successful_proposers == 4
+    assert res.config.llm_ensemble.proposer_max_retries == 2
+    assert res.config.llm_ensemble.all_failed_policy == "error"
 
 
 @pytest.mark.parametrize("tier", ["c0", "c1", "c2"])

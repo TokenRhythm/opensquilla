@@ -1816,8 +1816,13 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
         *,
         session_key: str,
         event: ErrorEvent | None,
+        append_transcript: bool = True,
     ) -> None:
-        await self._runner._persist_turn_error(session_key, event)
+        await self._runner._persist_turn_error(
+            session_key,
+            event,
+            append_transcript=append_transcript,
+        )
 
 
 class _TurnRunnerUsageTelemetryAdapter(UsageTelemetryPort):

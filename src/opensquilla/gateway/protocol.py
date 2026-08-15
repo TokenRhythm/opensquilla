@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import asdict
 from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
+from opensquilla.contracts.gateway_transport import ANSWER_GENERATION_RESET_CAPABILITY
 from opensquilla.contracts.turn_execution import StickyExecutionRole
 from opensquilla.engine.types import (
     AnswerGenerationResetEvent,
@@ -124,6 +125,16 @@ type PublicEvent = AnswerGenerationResetEvent | ControlTerminalEvent
 
 _PUBLIC_EVENT_ADAPTER: TypeAdapter[PublicEventPayload] = TypeAdapter(PublicEventPayload)
 
+_ANSWER_GENERATION_RESET_EVENT = "session.event.answer_generation_reset"
+_LEGACY_ERROR_EVENT = "session.event.error"
+_INTERNAL_TERMINAL_RESET_FIELDS = frozenset(
+    {
+        "terminal_error_message",
+        "terminal_error_code",
+        "terminal_failure_kind",
+    }
+)
+
 
 def is_public_event(event: object) -> bool:
     """Return whether an event is allowed on the public session-event plane."""
@@ -157,6 +168,56 @@ def deserialize_public_event(payload: Mapping[str, Any]) -> PublicEventPayload:
     """Validate a public typed event payload from a decoded wire frame."""
 
     return cast(PublicEventPayload, _PUBLIC_EVENT_ADAPTER.validate_python(dict(payload)))
+
+
+def project_session_event_for_client(
+    event_name: str,
+    payload: Any,
+    *,
+    client_caps: Collection[str] | None = None,
+) -> tuple[str, Any]:
+    """Project one public session event to a client's negotiated capabilities.
+
+    A terminal answer-generation reset is the runtime's sole visible failed
+    outcome.  Clients that explicitly understand replacement semantics receive
+    that event unchanged (apart from defense-in-depth metadata scrubbing).
+    Capability-less clients receive the equivalent legacy ``session.event.error``
+    frame instead, never both frames.
+    """
+
+    if event_name != _ANSWER_GENERATION_RESET_EVENT or not isinstance(payload, Mapping):
+        return event_name, payload
+
+    public_payload = dict(payload)
+    for field_name in _INTERNAL_TERMINAL_RESET_FIELDS:
+        public_payload.pop(field_name, None)
+
+    if (
+        public_payload.get("terminal") is not True
+        or ANSWER_GENERATION_RESET_CAPABILITY in (client_caps or ())
+    ):
+        return event_name, public_payload
+
+    terminal_snapshot = public_payload.get("terminal_text_snapshot")
+    authoritative_snapshot = public_payload.get("authoritative_text_snapshot")
+    if isinstance(terminal_snapshot, str) and terminal_snapshot.strip():
+        message = terminal_snapshot
+    elif isinstance(authoritative_snapshot, str) and authoritative_snapshot.strip():
+        message = authoritative_snapshot
+    else:
+        message = "The model could not complete this answer."
+
+    public_payload.pop("kind", None)
+    public_payload.update(
+        {
+            "message": message,
+            "terminal_message": message,
+            "terminal_reason": "error",
+            "error_message": message,
+            "code": "ensemble_fixed_error",
+        }
+    )
+    return _LEGACY_ERROR_EVENT, public_payload
 
 
 # ---------------------------------------------------------------------------

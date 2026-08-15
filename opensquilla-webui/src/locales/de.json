@@ -1048,9 +1048,13 @@
       "runtimeStrategyTitle": "Laufzeitstrategie",
       "runtimeStrategyDesc": "Erfolgsschwelle, Ausweichverhalten und Zeitlimits",
       "successThresholdLabel": "Mindesterfolgsbedingung",
-      "successThresholdValue": "Mindestens 1 Entwurfsmodell antwortet erfolgreich",
+      "successThresholdExact": "Mindestens {quorum} von {proposers} antworten erfolgreich",
       "successThresholdDesc": "Die anderen Entwurfsmodelle warten weiter auf ihren eigenen Abschluss oder ihr Zeitlimit.",
       "failurePolicyLabel": "Wenn die Aggregation nicht abgeschlossen werden kann",
+      "failurePolicyErrorDesc": "Beenden und einen Fehler melden, ohne das feste Ausweichmodell aufzurufen.",
+      "proposerRetriesLabel": "Wiederholungen pro Entwurfsmodell",
+      "proposerRetriesDesc": "Nur wiederholbare Fehler; die erste Anfrage zählt nicht als Wiederholung.",
+      "proposerRetriesOption": "Höchstens {count} Wiederholungen nach der ersten Anfrage",
       "runtimeLimitsLabel": "Zeitlimits",
       "runtimeLimits": "Entwürfe insgesamt {proposerTimeout}s · Aggregator-Leerlauf zwischen Anbieterereignissen {aggregatorTimeout}s (konfiguriert {configuredAggregatorTimeout}s) · separates Gesamtlimit der Runde"
     },
@@ -1091,6 +1095,8 @@
       "tierUseEnsemble": "Mehrmodell-Fusion",
       "tierUseEnsembleDescription": "Aktuellen Plan der Mehrmodell-Fusion verwenden",
       "tierEnsembleSummary": "Verwendet den aktuellen Plan der Mehrmodell-Fusion; bei Fehlern wird das feste und Fallback-Modell verwendet: {provider} · {model}.",
+      "tierEnsembleErrorSummary": "Verwendet den aktuellen Plan der Mehrmodell-Fusion; wenn er nicht abgeschlossen werden kann, wird ein Fehler gemeldet.",
+      "tierEnsemblePolicyFacts": "Effektive Strategie: Mindestens {quorum}/{proposers} Entwürfe antworten erfolgreich · höchstens {retries} Wiederholungen pro Entwurf.",
       "tierEnsembleSummaryGeneric": "Verwendet den aktuellen Plan der Mehrmodell-Fusion; bei Fehlern wird das feste und Fallback-Modell verwendet.",
       "tierEnsembleFallbackMissingSummary": "Verwendet den aktuellen Plan der Mehrmodell-Fusion; ein nutzbares festes und Fallback-Modell ist noch nicht konfiguriert.",
       "tierEnsemblePlanReady": "Der aktuelle Fusionsplan ist bereit",
@@ -1135,7 +1141,8 @@
     "ensemble": {
       "statusOn": "AI-Ensemble-Routing ist aktiv — mehrere Modelle antworten, und ein Modell fasst die endgültige Antwort zusammen.",
       "statusOff": "AI-Ensemble-Routing ist aus.",
-      "allFailedFallback": "Auf ein Einzelmodell zurückfallen"
+      "allFailedFallback": "Auf ein Einzelmodell zurückfallen",
+      "allFailedError": "Beenden und Fehler melden"
     },
     "channels": {
       "title": "Kanäle",

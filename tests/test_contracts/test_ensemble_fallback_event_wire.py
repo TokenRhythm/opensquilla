@@ -98,6 +98,9 @@ def test_generation_reset_round_trips_authoritative_same_message_snapshots() -> 
         authoritative_reasoning_snapshot="",
         sequence=17,
         terminal=False,
+        terminal_error_message="internal safe failure",
+        terminal_error_code="provider_error",
+        terminal_failure_kind="unknown",
     )
 
     payload = serialize_public_event(event)
@@ -110,6 +113,9 @@ def test_generation_reset_round_trips_authoritative_same_message_snapshots() -> 
     assert payload["new_generation_epoch"] == 1
     assert payload["preserve_completed_tools"] is True
     assert payload["terminal_text_snapshot"] is None
+    assert "terminal_error_message" not in payload
+    assert "terminal_error_code" not in payload
+    assert "terminal_failure_kind" not in payload
 
 
 @pytest.mark.parametrize("reason", list(ControlTerminalReason))

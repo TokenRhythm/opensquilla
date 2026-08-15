@@ -181,6 +181,7 @@ class SetupEngine:
                     else [dict(candidate) for candidate in candidates]
                 ),
                 min_successful_proposers=payload.get("minSuccessfulProposers"),
+                proposer_max_retries=payload.get("proposerMaxRetries"),
                 all_failed_policy=(
                     None if all_failed_policy is None else str(all_failed_policy)
                 ),

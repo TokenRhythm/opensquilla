@@ -39,6 +39,12 @@ export interface TierEnsembleRuntimeStatus {
   blockedTierCandidates: Array<Record<string, unknown>>
   fixedFallbackReady: boolean | null
   fixedFallbackBlockedReason: string
+  proposerCount: number | null
+  configuredMinSuccessfulProposers: number | null
+  effectiveMinSuccessfulProposers: number | null
+  configuredProposerMaxRetries: number | null
+  effectiveProposerMaxRetries: number | null
+  proposerMaxRetriesSource: string
 }
 
 export interface SetupTierRow extends SetupTierValue {
@@ -167,6 +173,19 @@ function normalizeTierEnsembleRuntimeStatus(value: unknown): TierEnsembleRuntime
   const fixedFallbackReady = raw.fixedFallbackReady ?? raw.fixed_fallback_ready
   const blockedTierCandidates = raw.blockedTierCandidates ?? raw.blocked_tier_candidates
   const activationTiers = raw.activationTiers ?? raw.activation_tiers
+  const configuredProposerMaxRetries = Number(
+    raw.configuredProposerMaxRetries ?? raw.configured_proposer_max_retries,
+  )
+  const effectiveProposerMaxRetries = Number(
+    raw.effectiveProposerMaxRetries ?? raw.effective_proposer_max_retries,
+  )
+  const proposerCount = Number(raw.proposerCount ?? raw.proposer_count)
+  const configuredMinSuccessfulProposers = Number(
+    raw.configuredMinSuccessfulProposers ?? raw.configured_min_successful_proposers,
+  )
+  const effectiveMinSuccessfulProposers = Number(
+    raw.effectiveMinSuccessfulProposers ?? raw.effective_min_successful_proposers,
+  )
   const rawTierSelectionModes = raw.tierSelectionModes ?? raw.tier_selection_modes
   const tierSelectionModes: Record<string, string> = {}
   if (rawTierSelectionModes && typeof rawTierSelectionModes === 'object' && !Array.isArray(rawTierSelectionModes)) {
@@ -191,6 +210,24 @@ function normalizeTierEnsembleRuntimeStatus(value: unknown): TierEnsembleRuntime
     fixedFallbackReady: typeof fixedFallbackReady === 'boolean' ? fixedFallbackReady : null,
     fixedFallbackBlockedReason: String(
       raw.fixedFallbackBlockedReason ?? raw.fixed_fallback_blocked_reason ?? '',
+    ).trim(),
+    proposerCount: Number.isFinite(proposerCount)
+      ? Math.max(1, Math.trunc(proposerCount))
+      : null,
+    configuredMinSuccessfulProposers: Number.isFinite(configuredMinSuccessfulProposers)
+      ? Math.max(1, Math.trunc(configuredMinSuccessfulProposers))
+      : null,
+    effectiveMinSuccessfulProposers: Number.isFinite(effectiveMinSuccessfulProposers)
+      ? Math.max(1, Math.trunc(effectiveMinSuccessfulProposers))
+      : null,
+    configuredProposerMaxRetries: Number.isFinite(configuredProposerMaxRetries)
+      ? Math.max(0, Math.trunc(configuredProposerMaxRetries))
+      : null,
+    effectiveProposerMaxRetries: Number.isFinite(effectiveProposerMaxRetries)
+      ? Math.max(0, Math.trunc(effectiveProposerMaxRetries))
+      : null,
+    proposerMaxRetriesSource: String(
+      raw.proposerMaxRetriesSource ?? raw.proposer_max_retries_source ?? '',
     ).trim(),
   }
 }
