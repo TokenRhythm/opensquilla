@@ -169,7 +169,10 @@ from opensquilla.engine.turn_runner.harness import (
     _TurnRunnerTurnMemoryCaptureAdapter,
     _TurnRunnerUsageTelemetryAdapter,
 )
-from opensquilla.engine.turn_runner.stream_consumer_stage import _StreamState
+from opensquilla.engine.turn_runner.stream_consumer_stage import (
+    _could_be_human_silent_reply_prefix,
+    _StreamState,
+)
 from opensquilla.engine.types import (
     AgentConfig,
     AgentEvent,
@@ -5736,7 +5739,8 @@ class TurnRunner:
                 sanitize_silent_reply_segments,
             )
 
-            raw_partial_text = "".join(final_text_parts).rstrip()
+            raw_partial_text_untrimmed = "".join(final_text_parts)
+            raw_partial_text = raw_partial_text_untrimmed.rstrip()
             partial_normalization = normalize_silent_reply(
                 raw_partial_text,
                 run_kind=run_kind,
@@ -5744,14 +5748,22 @@ class TurnRunner:
                 heartbeat_ack_max_chars=heartbeat_ack_max_chars,
             )
             partial_text = partial_normalization.text.rstrip()
+            human_prefix_was_withheld = (
+                input_mode != "system_event"
+                and bool(raw_partial_text_untrimmed)
+                and _could_be_human_silent_reply_prefix(raw_partial_text_untrimmed)
+            )
             if (
-                input_mode == "system_event"
-                and run_kind in {"goal", "heartbeat"}
-                and is_silent_reply_prefix(raw_partial_text)
+                (
+                    input_mode == "system_event"
+                    and run_kind in {"goal", "heartbeat"}
+                    and is_silent_reply_prefix(raw_partial_text)
+                )
+                or human_prefix_was_withheld
             ):
-                # The shared stream stage deliberately holds internal text.
-                # A Stop can therefore land between chunks of a control token;
-                # never persist that distinctive unfinished marker as prose.
+                # The shared stream stage deliberately holds control-token
+                # candidates. A Stop can land between chunks; never persist a
+                # fragment that was not presented to the user as prose.
                 partial_text = ""
 
             raw_segment_text = "".join(
@@ -5771,7 +5783,16 @@ class TurnRunner:
                 for segment in normalized_segments
                 if isinstance(segment, dict) and segment.get("type") == "text"
             ).rstrip()
-            if (
+            if human_prefix_was_withheld:
+                # These text carriers were never emitted. Remove them while
+                # retaining any tool, artifact, or activity records that were
+                # already presented before cancellation.
+                normalized_segments = [
+                    segment
+                    for segment in normalized_segments
+                    if segment.get("type") != "text"
+                ]
+            elif (
                 raw_segment_text == raw_partial_text
                 and segment_normalization.changed
                 and (

@@ -49,6 +49,10 @@ from opensquilla.engine.types import (
     WarningEvent,
 )
 from opensquilla.provider.types import EnsembleProgressEvent as ProviderEnsembleProgressEvent
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+)
 from opensquilla.tools.types import ToolContext
 
 # ---------------------------------------------------------------------------
@@ -1430,6 +1434,272 @@ async def test_outer_stage_yields_text_then_done_and_notifies_post_stream() -> N
     assert len(recs["memory_sync_notify"].calls) == 1
     assert recs["memory_sync_notify"].calls[0]["runtime_message"] == "hello there"
     assert recs["memory_sync_notify"].calls[0]["sync_manager_present"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("sentinel", "chunks"),
+    [
+        ("NO_REPLY", ["NO_REPLY"]),
+        ("NO_REPLY", list("NO_REPLY")),
+        ("HEARTBEAT_OK", ["HEARTBEAT_OK"]),
+        ("HEARTBEAT_OK", list("HEARTBEAT_OK")),
+        ("  NO_REPLY\n", ["  ", "NO_", "REPLY\n"]),
+        ("\tHEARTBEAT_OK  ", ["\tHEART", "BEAT_OK  "]),
+    ],
+)
+async def test_human_sentinel_only_done_becomes_pending_error_without_text_flash(
+    sentinel: str,
+    chunks: list[str],
+) -> None:
+    agent_run = _RecordingAgentRun(
+        events=[
+            *(TextDeltaEvent(text=chunk) for chunk in chunks),
+            DoneEvent(
+                text=sentinel,
+                text_snapshot=sentinel,
+                input_tokens=13,
+                output_tokens=2,
+            ),
+        ]
+    )
+    stage, _ = _make_stage(agent_run=agent_run)
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert yielded == []
+    assert inp.state.final_text_parts == []
+    assert inp.state.current_text_parts == []
+    assert inp.state.pending_error_event == ErrorEvent(
+        message=SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+        code=SILENT_REPLY_NOT_ALLOWED_CODE,
+    )
+    assert inp.state.error_message == SILENT_REPLY_NOT_ALLOWED_MESSAGE
+    assert inp.state.done_event is not None
+    assert inp.state.done_event.input_tokens == 13
+    assert inp.state.done_event.output_tokens == 2
+    assert inp.state.done_event.delivery == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_human_done_only_sentinel_becomes_pending_error() -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                DoneEvent(
+                    text="NO_REPLY",
+                    text_snapshot="NO_REPLY",
+                    input_tokens=5,
+                    output_tokens=1,
+                )
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert yielded == []
+    assert inp.state.pending_error_event is not None
+    assert inp.state.pending_error_event.code == SILENT_REPLY_NOT_ALLOWED_CODE
+    assert inp.state.done_event is not None
+    assert inp.state.done_event.input_tokens == 5
+
+
+@pytest.mark.asyncio
+async def test_human_short_normal_prefix_releases_at_done() -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO"),
+                DoneEvent(text="NO", text_snapshot="NO"),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[0].text == "NO"
+    assert yielded[1].text_snapshot == "NO"
+    assert inp.state.pending_error_event is None
+
+
+@pytest.mark.asyncio
+async def test_human_prefix_crossing_tool_boundary_keeps_live_and_history_order() -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO"),
+                ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+                ToolResultEvent(
+                    tool_use_id="tool-1",
+                    tool_name="lookup",
+                    result="ok",
+                ),
+                TextDeltaEvent(text=" results"),
+                DoneEvent(text="NO results", text_snapshot="NO results"),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[2].text == "NO results"
+    assert [segment["type"] for segment in inp.state.turn_segments] == [
+        "tool_use",
+        "tool_result",
+    ]
+    assert inp.state.current_text_parts == ["NO results"]
+
+
+@pytest.mark.asyncio
+async def test_human_short_prefix_done_after_tool_moves_text_to_history_tail() -> None:
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO"),
+                ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+                ToolResultEvent(
+                    tool_use_id="tool-1",
+                    tool_name="lookup",
+                    result="ok",
+                ),
+                DoneEvent(text="NO", text_snapshot="NO"),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[2].text == "NO"
+    assert [segment["type"] for segment in inp.state.turn_segments] == [
+        "tool_use",
+        "tool_result",
+    ]
+    assert inp.state.current_text_parts == ["NO"]
+
+
+@pytest.mark.asyncio
+async def test_human_usage_done_after_provider_error_keeps_original_error() -> None:
+    provider_error = ErrorEvent(message="provider failed", code="provider_error")
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_REP"),
+                provider_error,
+                DoneEvent(
+                    text="NO_REPLY",
+                    text_snapshot="NO_REPLY",
+                    input_tokens=8,
+                    output_tokens=1,
+                ),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert yielded == []
+    assert inp.state.pending_error_event is provider_error
+    assert inp.state.error_message == "provider failed"
+    assert inp.state.final_text_parts == []
+    assert inp.state.done_event is not None
+    assert inp.state.done_event.input_tokens == 8
+    assert inp.state.done_event.delivery == "suppressed"
+
+
+@pytest.mark.asyncio
+async def test_human_mixed_sentinel_prose_releases_once_and_completes() -> None:
+    body = "This is a normal human-facing reply."
+    source = f"NO_REPLY\n{body}"
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_"),
+                TextDeltaEvent(text="REPLY\n"),
+                TextDeltaEvent(text=body),
+                DoneEvent(text=source, text_snapshot=source),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "TextDeltaEvent",
+        "DoneEvent",
+    ]
+    assert yielded[0].text == source
+    assert yielded[1].text_snapshot == source
+    assert inp.state.pending_error_event is None
+
+
+@pytest.mark.asyncio
+async def test_human_sentinel_failure_keeps_tool_and_artifact_activity() -> None:
+    artifact = ArtifactEvent(name="report.txt", mime="text/plain", size=4)
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="NO_REPLY"),
+                ToolUseStartEvent(tool_use_id="tool-1", tool_name="lookup"),
+                ToolResultEvent(
+                    tool_use_id="tool-1",
+                    tool_name="lookup",
+                    result="ok",
+                ),
+                artifact,
+                DoneEvent(
+                    text="NO_REPLY",
+                    text_snapshot="NO_REPLY",
+                    input_tokens=7,
+                    output_tokens=1,
+                ),
+            ]
+        )
+    )
+    inp = _make_input(input_mode="user")
+
+    yielded = await _drain(stage, inp)
+
+    assert [type(event).__name__ for event in yielded] == [
+        "ToolUseStartEvent",
+        "ToolResultEvent",
+        "ArtifactEvent",
+    ]
+    assert [segment["type"] for segment in inp.state.turn_segments] == [
+        "tool_use",
+        "tool_result",
+    ]
+    assert len(inp.state.turn_artifacts) == 1
+    assert inp.state.turn_artifacts[0]["name"] == "report.txt"
+    assert inp.state.turn_artifacts[0]["mime"] == "text/plain"
+    assert inp.state.turn_artifacts[0]["size"] == 4
+    assert inp.state.pending_error_event is not None
+    assert inp.state.pending_error_event.code == SILENT_REPLY_NOT_ALLOWED_CODE
+    assert inp.state.done_event is not None
+    assert inp.state.done_event.input_tokens == 7
 
 
 @pytest.mark.asyncio

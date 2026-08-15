@@ -12,6 +12,10 @@ from opensquilla.session.terminal_reply import (
     safe_provider_failure_message,
     sanitize_agent_error,
 )
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+)
 
 RAW_INTERNAL_STRINGS = (
     "Gateway task timeout",
@@ -186,6 +190,18 @@ def test_ensemble_multimodal_reply_is_actionable_and_stable() -> None:
         "Ensemble does not support image input yet. "
         "Switch to a single-model routing mode and try again."
     )
+
+
+def test_human_silent_reply_failure_has_actionable_terminal_message() -> None:
+    reply = build_terminal_reply(
+        {
+            "status": "failed",
+            "terminal_reason": "error",
+            "error_class": SILENT_REPLY_NOT_ALLOWED_CODE,
+        }
+    )
+
+    assert reply == SILENT_REPLY_NOT_ALLOWED_MESSAGE
 
 
 @pytest.mark.parametrize(

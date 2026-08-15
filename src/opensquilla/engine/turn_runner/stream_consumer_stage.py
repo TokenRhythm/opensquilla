@@ -38,6 +38,11 @@ from opensquilla.engine.hooks.types import CompactionState
 from opensquilla.engine.route_plan import route_plan_snapshot
 from opensquilla.observability.decision_log import build_vision_followup_gate_reason_code
 from opensquilla.session.compaction_lifecycle import CompactionTimeoutError
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+    SILENT_REPLY_SENTINELS,
+)
 
 if TYPE_CHECKING:
     from opensquilla.engine.agent import Agent
@@ -66,6 +71,65 @@ _SUPPRESS: Final = object()
 _CURRENT_SILENT_REPLY_TEXT_MARKER: Final = (
     "_opensquilla_current_silent_reply_text"
 )
+_HUMAN_SILENT_REPLY_PREFIX_MAX_CHARS: Final = 64
+
+
+def _could_be_human_silent_reply_prefix(text: str) -> bool:
+    """Hold only a short initial payload that can still be a silent sentinel.
+
+    The character bound limits how much ordinary response text can be withheld.
+    """
+
+    if len(text) > _HUMAN_SILENT_REPLY_PREFIX_MAX_CHARS:
+        return False
+    candidate = text.strip()
+    if not candidate:
+        return True
+    return any(sentinel.startswith(candidate) for sentinel in SILENT_REPLY_SENTINELS)
+
+
+def _move_held_human_text_to_current_tail(
+    state: _StreamState,
+    held_text: str,
+) -> bool:
+    """Move withheld text after public non-text events in the durable timeline.
+
+    Tool and activity events remain live while the short prefix is withheld. If
+    the prefix later proves to be ordinary text, the client necessarily sees it
+    after those events. Reposition the matching text carriers so a history reload
+    preserves that same order. The rewrite is all-or-nothing and never changes
+    non-text segments.
+    """
+
+    remaining = held_text
+    rewritten_segments: list[dict[str, Any]] = []
+    for raw_segment in state.turn_segments:
+        segment = dict(raw_segment)
+        if segment.get("type") != "text" or not remaining:
+            rewritten_segments.append(segment)
+            continue
+        text = str(segment.get("text") or "")
+        if remaining.startswith(text):
+            remaining = remaining[len(text) :]
+            continue
+        if text.startswith(remaining):
+            suffix = text[len(remaining) :]
+            remaining = ""
+            if suffix:
+                segment["text"] = suffix
+                rewritten_segments.append(segment)
+            continue
+        return False
+
+    current_text = "".join(state.current_text_parts)
+    if remaining:
+        if not current_text.startswith(remaining):
+            return False
+        current_text = current_text[len(remaining) :]
+
+    state.turn_segments[:] = rewritten_segments
+    state.current_text_parts[:] = [held_text + current_text]
+    return True
 
 # ---------------------------------------------------------------------------
 # Ports -- five narrow Protocols + one callable
@@ -1549,6 +1613,10 @@ class StreamConsumerStage:
             inp.input_mode == "system_event"
             and inp.run_kind in {"goal", "heartbeat"}
         )
+        gate_human_silent_reply_prefix = inp.input_mode != "system_event"
+        human_silent_reply_prefix_open = gate_human_silent_reply_prefix
+        held_human_silent_reply_text = ""
+        human_prefix_crossed_public_boundary = False
         buffered_text_observed = False
         released_system_event_text: str | None = None
         released_system_event_source_text: str | None = None
@@ -1574,6 +1642,25 @@ class StreamConsumerStage:
                         )
                         buffered_text_observed = True
                     transformed = _SUPPRESS
+                elif human_silent_reply_prefix_open:
+                    held_human_silent_reply_text += transformed.text
+                    if _could_be_human_silent_reply_prefix(
+                        held_human_silent_reply_text
+                    ):
+                        transformed = _SUPPRESS
+                    else:
+                        if human_prefix_crossed_public_boundary:
+                            _move_held_human_text_to_current_tail(
+                                state,
+                                held_human_silent_reply_text,
+                            )
+                        transformed = replace(
+                            transformed,
+                            text=held_human_silent_reply_text,
+                        )
+                        held_human_silent_reply_text = ""
+                        human_silent_reply_prefix_open = False
+                        human_prefix_crossed_public_boundary = False
             elif isinstance(event, ThinkingEvent):
                 if event.text:
                     state.reasoning_parts.append(event.text)
@@ -1592,6 +1679,22 @@ class StreamConsumerStage:
                 transformed = self._artifact_handler.handle(event, state)
             elif isinstance(event, ErrorEvent):
                 transformed = self._error_handler.handle(event, state)
+                if (
+                    human_silent_reply_prefix_open
+                    and held_human_silent_reply_text
+                ):
+                    # A provider failure can terminate while a sentinel is only
+                    # partially streamed. Do not persist or reveal that control
+                    # prefix as a user-visible partial answer.
+                    _reconcile_done_text_snapshot(
+                        "",
+                        state,
+                        accumulated_text="".join(state.final_text_parts),
+                        authoritative=True,
+                    )
+                    held_human_silent_reply_text = ""
+                    human_silent_reply_prefix_open = False
+                    human_prefix_crossed_public_boundary = False
                 if buffer_system_event_text:
                     from opensquilla.engine.silent_reply import (
                         is_silent_reply_prefix,
@@ -1797,6 +1900,59 @@ class StreamConsumerStage:
                     if release_delta:
                         extra_yields.insert(0, TextDeltaEvent(text=release_delta))
                     released_system_event_text = canonical_text
+                elif (
+                    human_silent_reply_prefix_open
+                    and held_human_silent_reply_text
+                ):
+                    # A short initial candidate was withheld while it could
+                    # still be a control token. Once Done proves the payload is
+                    # visible, release one canonical delta and discard any
+                    # notice/reconciliation deltas that would duplicate it.
+                    extra_yields = [
+                        extra_event
+                        for extra_event in extra_yields
+                        if not isinstance(extra_event, TextDeltaEvent)
+                    ]
+                    snapshot_present, canonical_text = done_text_snapshot(transformed)
+                    if not snapshot_present:
+                        canonical_text = transformed.text
+                    if canonical_text and human_prefix_crossed_public_boundary:
+                        _move_held_human_text_to_current_tail(
+                            state,
+                            held_human_silent_reply_text,
+                        )
+                    if canonical_text:
+                        extra_yields.insert(0, TextDeltaEvent(text=canonical_text))
+                    held_human_silent_reply_text = ""
+                    human_silent_reply_prefix_open = False
+                    human_prefix_crossed_public_boundary = False
+
+                human_silent_reply_disallowed = (
+                    inp.input_mode != "system_event"
+                    and transformed.delivery == "suppressed"
+                    and transformed.suppression_reason
+                    in {"no_reply", "heartbeat_ack"}
+                    and not transformed.text.strip()
+                )
+                if human_silent_reply_disallowed:
+                    # Keep the usage-bearing DoneEvent in state for transcript
+                    # usage/session totals, but replace the public success
+                    # terminal with the existing error path. The outer runner
+                    # emits pending_error_event only after finalization.
+                    extra_yields = [
+                        extra_event
+                        for extra_event in extra_yields
+                        if not isinstance(extra_event, TextDeltaEvent)
+                    ]
+                    if state.pending_error_event is None:
+                        self._error_handler.handle(
+                            ErrorEvent(
+                                message=SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+                                code=SILENT_REPLY_NOT_ALLOWED_CODE,
+                            ),
+                            state,
+                        )
+                    transformed = _SUPPRESS
             elif isinstance(event, CompactionEvent):
                 await self._compaction_handler.handle(event, inp)
                 transformed = _SUPPRESS
@@ -1816,6 +1972,14 @@ class StreamConsumerStage:
                 )
             else:
                 transformed = event
+
+            if (
+                human_silent_reply_prefix_open
+                and bool(held_human_silent_reply_text)
+                and not isinstance(event, (TextDeltaEvent, ErrorEvent, DoneEvent))
+                and (bool(extra_yields) or transformed is not _SUPPRESS)
+            ):
+                human_prefix_crossed_public_boundary = True
 
             for extra_event in extra_yields:
                 yield extra_event

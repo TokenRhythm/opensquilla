@@ -6,6 +6,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from opensquilla.session.models import AgentTaskStatus
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+)
 
 CONTEXT_PAYLOAD_TOO_LARGE_CODE = "provider_request_too_large"
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE = "ensemble_multimodal_unsupported"
@@ -191,6 +195,11 @@ def build_terminal_reply(
             "The task was blocked because a tool it needed is not permitted by the "
             "current policy."
         )
+    if (
+        error_class == SILENT_REPLY_NOT_ALLOWED_CODE
+        or reason == SILENT_REPLY_NOT_ALLOWED_CODE
+    ):
+        return SILENT_REPLY_NOT_ALLOWED_MESSAGE
     if error_class in {
         "usage_accounting_busy",
         "usage_accounting_unavailable",
