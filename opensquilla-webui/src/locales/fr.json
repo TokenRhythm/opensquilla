@@ -3343,6 +3343,8 @@
     "subagentPrefix": "Sous-agent : ",
     "subagentCompletion": "Achèvement du sous-agent",
     "turnFailed": "Échec du tour",
+    "restartInterruptedTitle": "Le redémarrage d’OpenSquilla a interrompu cette tâche.",
+    "restartInterruptedGuidance": "Cette tâche ne reprendra pas automatiquement. Vérifiez les résultats existants ou les actions des outils, puis modifiez la demande d’origine ou poursuivez la conversation.",
     "usageAccountingBlockedTitle": "Comptabilisation de l’utilisation temporairement indisponible",
     "usageAccountingBlockedMessage": "La requête n’a pas été envoyée au fournisseur du modèle et aucune utilisation n’a été facturée. Vous pouvez réessayer ce tour en toute sécurité.",
     "usageAccountingBlockedUnsafeMessage": "Cette requête au modèle n’a pas été envoyée. Des opérations antérieures de ce tour ont peut-être déjà été exécutées ou facturées ; vérifiez-les avant de réessayer.",

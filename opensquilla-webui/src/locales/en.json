@@ -3396,6 +3396,8 @@
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent completion",
     "turnFailed": "Turn failed",
+    "restartInterruptedTitle": "OpenSquilla restarted and interrupted this task.",
+    "restartInterruptedGuidance": "This task won't continue automatically. Review any existing results or tool activity, then edit the original request or continue the conversation.",
     "usageAccountingBlockedTitle": "Usage accounting temporarily unavailable",
     "usageAccountingBlockedMessage": "The provider request was not sent and no usage was billed. You can safely retry this turn.",
     "usageAccountingBlockedUnsafeMessage": "This provider request was not sent. Earlier work in this turn may already have run or been billed, so review it before trying again.",

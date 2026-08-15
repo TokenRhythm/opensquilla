@@ -439,6 +439,43 @@ describe('AssistantMessage activity disclosure', () => {
     }
   })
 
+  it('keeps restart recovery guidance visible beside durable activity', async () => {
+    const el = mountMessage(baseMessage({
+      timelineItems: successfulTimeline(),
+      turnOutcome: {
+        turnId: 'turn-restart-activity',
+        status: 'abandoned',
+        kind: 'interrupted',
+        reason: 'process_restart',
+      },
+    }), true)
+    await nextTick()
+
+    expect(el.querySelector('.assistant-activity')).not.toBeNull()
+    expect(el.querySelector('.turn-outcome--process-restart')?.textContent)
+      .toContain("This task won't continue automatically")
+  })
+
+  it('keeps restart recovery guidance visible beside a Plan card', async () => {
+    const el = mountMessage(baseMessage({
+      text: '',
+      timelineItems: [],
+      parts: [planPart()],
+      statusHistory: [],
+      turnOutcome: {
+        turnId: 'turn-restart-plan',
+        status: 'abandoned',
+        kind: 'interrupted',
+        errorClass: 'process_restart',
+      },
+    }), true)
+    await nextTick()
+
+    expect(el.querySelector('.plan-card')).not.toBeNull()
+    expect(el.querySelector('.turn-outcome--process-restart')?.textContent)
+      .toContain('Review any existing results or tool activity')
+  })
+
   it('retains the legacy footer usage entry when history has no turn outcome', async () => {
     const el = mountMessage(baseMessage({
       timelineItems: [],

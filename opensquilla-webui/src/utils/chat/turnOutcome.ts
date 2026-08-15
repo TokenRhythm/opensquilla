@@ -260,6 +260,13 @@ export type TurnOutcomePresentation =
   | 'timeout'
   | 'failed'
 
+export function isProcessRestartOutcome(
+  outcome: ChatTurnOutcome | null | undefined,
+): boolean {
+  return outcome?.reason === 'process_restart'
+    || outcome?.errorClass === 'process_restart'
+}
+
 export function turnOutcomePresentation(
   outcome: ChatTurnOutcome | null | undefined,
 ): TurnOutcomePresentation {

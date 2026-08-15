@@ -3343,6 +3343,8 @@
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent-Abschluss",
     "turnFailed": "Durchlauf fehlgeschlagen",
+    "restartInterruptedTitle": "Ein Neustart von OpenSquilla hat diese Aufgabe unterbrochen.",
+    "restartInterruptedGuidance": "Diese Aufgabe wird nicht automatisch fortgesetzt. Prüfen Sie vorhandene Ergebnisse oder Werkzeugaktionen und bearbeiten Sie anschließend die ursprüngliche Anfrage oder setzen Sie die Unterhaltung fort.",
     "usageAccountingBlockedTitle": "Nutzungserfassung vorübergehend nicht verfügbar",
     "usageAccountingBlockedMessage": "Die Anfrage wurde nicht an den Modellanbieter gesendet und es wurden keine Kosten erfasst. Sie können diesen Durchlauf sicher erneut versuchen.",
     "usageAccountingBlockedUnsafeMessage": "Diese Modellanfrage wurde nicht gesendet. Frühere Arbeit in diesem Durchlauf könnte bereits ausgeführt oder abgerechnet worden sein. Prüfen Sie die Ergebnisse, bevor Sie es erneut versuchen.",

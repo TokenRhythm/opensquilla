@@ -3343,6 +3343,8 @@
     "subagentPrefix": "サブエージェント: ",
     "subagentCompletion": "サブエージェントの完了",
     "turnFailed": "ターンが失敗しました",
+    "restartInterruptedTitle": "OpenSquilla の再起動によりタスクが中断されました。",
+    "restartInterruptedGuidance": "このタスクは自動的には続行されません。既存の結果やツール操作を確認してから、元のリクエストを編集するか、会話を続けてください。",
     "usageAccountingBlockedTitle": "使用量の記録を一時的に利用できません",
     "usageAccountingBlockedMessage": "モデルプロバイダーにはリクエストが送信されておらず、料金も発生していません。このターンは安全に再試行できます。",
     "usageAccountingBlockedUnsafeMessage": "このモデルリクエストは送信されませんでした。ただし、このターンの以前の処理が実行済みまたは課金済みの可能性があります。再試行する前に結果を確認してください。",

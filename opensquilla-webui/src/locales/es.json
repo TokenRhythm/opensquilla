@@ -3343,6 +3343,8 @@
     "subagentPrefix": "Subagente: ",
     "subagentCompletion": "Finalización del subagente",
     "turnFailed": "El turno falló",
+    "restartInterruptedTitle": "El reinicio de OpenSquilla interrumpió esta tarea.",
+    "restartInterruptedGuidance": "Esta tarea no continuará automáticamente. Revisa los resultados existentes o las acciones de las herramientas y, después, edita la solicitud original o continúa la conversación.",
     "usageAccountingBlockedTitle": "La contabilidad de uso no está disponible temporalmente",
     "usageAccountingBlockedMessage": "La solicitud no se envió al proveedor del modelo y no se facturó ningún uso. Puedes reintentar este turno de forma segura.",
     "usageAccountingBlockedUnsafeMessage": "Esta solicitud al modelo no se envió. Es posible que el trabajo anterior de este turno ya se haya ejecutado o facturado; revísalo antes de volver a intentarlo.",

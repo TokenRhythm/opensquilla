@@ -200,6 +200,27 @@ describe('ChatMessageList fork targets', () => {
   })
 })
 
+describe('ChatMessageList restart outcome anchor', () => {
+  it('renders restart guidance once on the final visible message in the turn', () => {
+    const source = user('user-restart', 'turn:restart', 'turn-restart')
+    const partial = assistant('assistant-restart', 'turn:restart', 'turn-restart')
+    const outcome = {
+      turnId: 'turn-restart',
+      status: 'abandoned',
+      kind: 'interrupted',
+      reason: 'process_restart',
+    }
+    source.turnOutcome = outcome
+    partial.turnOutcome = outcome
+
+    const { host } = mountList([source, partial])
+    const notices = host.querySelectorAll('.turn-outcome--process-restart')
+
+    expect(notices).toHaveLength(1)
+    expect(notices[0]?.closest('.msg-ai')).not.toBeNull()
+  })
+})
+
 describe('ChatMessageList usage barrier retry anchor', () => {
   it('shows Retry when the durable same-turn user is loaded', () => {
     const { host } = mountList([

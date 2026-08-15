@@ -28,8 +28,10 @@
         v-if="
           showTurnOutcome
           && message.turnOutcome
-          && !showActivityDisclosure
-          && !hasPlan
+          && (
+            processRestart
+            || (!showActivityDisclosure && !hasPlan)
+          )
         "
         :outcome="message.turnOutcome"
       />
@@ -448,6 +450,7 @@ import {
 } from '@/utils/chat/activityDisclosureState'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
 import {
+  isProcessRestartOutcome,
   turnOutcomeDurationSeconds,
   turnOutcomePresentation,
 } from '@/utils/chat/turnOutcome'
@@ -612,6 +615,7 @@ const standaloneInterruptParts = computed(() =>
   )),
 )
 const outcomePresentation = computed(() => turnOutcomePresentation(props.message.turnOutcome))
+const processRestart = computed(() => isProcessRestartOutcome(props.message.turnOutcome))
 
 function epochMilliseconds(value: string | number | null | undefined): number {
   if (value == null) return 0
