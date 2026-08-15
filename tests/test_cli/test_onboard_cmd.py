@@ -2456,8 +2456,8 @@ def test_configure_ensemble_noninteractive(tmp_path, monkeypatch):
     assert ensemble["selection_mode"] == "router_dynamic"
     assert ensemble["model_options"] == ["prov/model-a", "prov/model-b"]
     assert ensemble["min_successful_proposers"] == 2
-    assert ensemble["all_failed_policy"] == "fallback_single"
-    assert "all_failed_policy=error is deprecated" in result.stdout
+    assert ensemble["all_failed_policy"] == "error"
+    assert "all_failed_policy=error is deprecated" not in result.stdout
 
 
 def test_onboard_configure_ensemble_alias_uses_setup_engine(tmp_path, monkeypatch):
@@ -2499,17 +2499,17 @@ def test_configure_ensemble_omitted_flags_keep_stored_values(tmp_path, monkeypat
     assert result.exit_code == 0, result.output
     data = tomllib.loads(target.read_text())
     ensemble = data["llm_ensemble"]
-    # The requested field changes and the old failure policy is migrated at
-    # this intentional write boundary.
+    # The requested field changes while unrelated stored policy remains
+    # authoritative at this intentional write boundary.
     assert ensemble["min_successful_proposers"] == 2
     assert ensemble["enabled"] is True
     assert ensemble["selection_mode"] == "router_dynamic"
     assert ensemble["model_options"] == ["stored/model-a", "stored/model-b"]
-    assert ensemble["all_failed_policy"] == "fallback_single"
-    assert "all_failed_policy=error is deprecated" in result.stdout
+    assert ensemble["all_failed_policy"] == "error"
+    assert "all_failed_policy=error is deprecated" not in result.stdout
 
 
-def test_configure_help_hides_retired_all_failed_policy() -> None:
+def test_configure_help_hides_legacy_all_failed_policy() -> None:
     result = runner.invoke(app, ["configure", "--help"])
 
     assert result.exit_code == 0, result.output

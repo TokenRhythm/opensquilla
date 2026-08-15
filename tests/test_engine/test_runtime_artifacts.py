@@ -3205,6 +3205,13 @@ class _GoalArtifactEnsembleProvider(_GoalPostPublishLoopProvider):
 
     provider_name = "ensemble"
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.replay_boundary_activations = 0
+
+    def activate_provider_state_replay_boundary(self) -> None:
+        self.replay_boundary_activations += 1
+
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         async for event in super()._stream(call_number):
             if isinstance(event, ProviderDone):
@@ -3303,6 +3310,7 @@ def _goal_artifact_topology_config(
 ) -> GatewayConfig:
     return GatewayConfig(
         attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+        llm={"model": "deepseek-v4-pro"},
         squilla_router=SquillaRouterConfig(enabled=router),
         llm_ensemble={
             "enabled": ensemble,
@@ -3414,6 +3422,7 @@ async def test_goal_post_publish_ensemble_runs_each_normal_decision_once(
     )
 
     assert len(ensemble_builds) == 1
+    assert provider.replay_boundary_activations == 1
     assert provider.calls == 4
     assert control_calls == ["progress:completed", "goal:complete"]
     assert qa_calls == []

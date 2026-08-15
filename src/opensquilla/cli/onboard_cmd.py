@@ -1481,11 +1481,11 @@ def configure_command(
     all_failed_policy: str = typer.Option(
         "",
         "--all-failed-policy",
-        # Kept as a hidden compatibility input for older automation.  The
-        # runtime has one supported failure outcome and the mutation layer
-        # canonicalizes legacy ``error`` writes with an explicit warning.
+        # Kept as a hidden compatibility input for older automation. Explicit
+        # values remain authoritative even though new C3 setups use the
+        # resilient fallback_single default.
         hidden=True,
-        help="Deprecated compatibility option; fusion failures use fallback_single.",
+        help="Compatibility option for the stored ensemble failure policy.",
         rich_help_panel="LLM ensemble",
     ),
     search_provider: str = typer.Option(
