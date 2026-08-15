@@ -110,10 +110,13 @@ async def test_dispatch_structures_container_inspection_failures() -> None:
 
     class BrokenSequence(Sequence[Any]):
         def __getitem__(self, index: int) -> Any:
-            raise RuntimeError("sensitive sequence failure")
+            raise IndexError("sensitive sequence failure")
 
         def __len__(self) -> int:
             return 1
+
+        def __iter__(self) -> Iterator[Any]:
+            raise RuntimeError("sensitive sequence failure")
 
     @dataclass
     class BrokenDataclass:
@@ -121,7 +124,7 @@ async def test_dispatch_structures_container_inspection_failures() -> None:
 
         def __getattribute__(self, name: str) -> Any:
             if name == "value":
-                raise RuntimeError("sensitive dataclass failure")
+                raise AttributeError("sensitive dataclass failure")
             return object.__getattribute__(self, name)
 
     for malformed in (BrokenMapping(), BrokenSequence(), BrokenDataclass()):
