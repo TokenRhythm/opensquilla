@@ -95,7 +95,10 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
 _DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"}).union(
     _CONCURRENT_OPTIONAL_READ_METHODS
 )
-_MAX_DETACHED_REQUESTS_PER_CONNECTION = 4
+# A fresh WebUI connection starts one draft read plus seven advertised optional
+# reads before the first responses can arrive. Keep that bootstrap fan-out
+# detached while retaining a finite per-connection bound.
+_MAX_DETACHED_REQUESTS_PER_CONNECTION = 8
 _DETACHED_REQUEST_DRAIN_SECONDS = 0.25
 
 
