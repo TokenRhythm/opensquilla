@@ -38,7 +38,7 @@ def test_audit_uses_inline_tokenrhythm_tiers_without_persisted_profile() -> None
     assert all(tier["provider"] == "tokenrhythm" for tier in tiers.values())
 
 
-def test_audit_normalizes_legacy_static_b5_quorums_to_one() -> None:
+def test_audit_preserves_default_and_explicit_strict_static_b5_quorums() -> None:
     common = {
         "api_key": "synthetic-rotated-key",
         "base_url": "https://tokenrhythm.studio/v1",
@@ -50,8 +50,8 @@ def test_audit_normalizes_legacy_static_b5_quorums_to_one() -> None:
 
     assert default.profile_name == "static_tokenrhythm_b5"
     assert default.min_successful_proposers == 1
-    assert strict.min_successful_proposers == 1
-    assert default.configured_min_successful_proposers == 3
+    assert strict.min_successful_proposers == 4
+    assert default.configured_min_successful_proposers == 1
     assert strict.configured_min_successful_proposers == 4
     assert len(default.proposers) == 4
     assert default.aggregator.provider_config.provider == "tokenrhythm"

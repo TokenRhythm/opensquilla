@@ -3,8 +3,9 @@
 
 The audit performs one direct call, one call for every curated inline router
 tier, and the static TokenRhythm B5 lineup with its default and legacy strict
-quorum configuration. Both configurations use the runtime one-draft gate; the
-second scenario only verifies upgrade compatibility.
+quorum configuration. The default scenario uses the C3 one-draft gate, while
+the strict scenario verifies that an explicit four-draft upgrade-compatibility
+policy remains authoritative.
 It never records response content or prompts. The only persistent artifact is a
 sanitized accounting report below an operating-system temporary directory.
 
