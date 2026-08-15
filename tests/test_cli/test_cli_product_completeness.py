@@ -1577,6 +1577,54 @@ def test_cost_json_returns_gateway_payload(monkeypatch):
     assert ("usage.cost", {}) in fake.calls
 
 
+def test_cost_by_model_uses_routed_model_breakdown(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:routed",
+                "model": "unknown",
+                "inputTokens": 30,
+                "outputTokens": 3,
+                "costUsd": 0.03,
+                "modelBreakdown": [
+                    {
+                        "model": "deepseek-v4-flash",
+                        "inputTokens": 10,
+                        "outputTokens": 1,
+                        "costUsd": 0.01,
+                    },
+                    {
+                        "model": "deepseek-v4-pro",
+                        "inputTokens": 20,
+                        "outputTokens": 2,
+                        "costUsd": 0.02,
+                    },
+                ],
+            }
+        ],
+        "totalCostUsd": 0.03,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["byModel"] == [
+        {
+            "model": "deepseek-v4-flash",
+            "inputTokens": 10,
+            "outputTokens": 1,
+            "costUsd": 0.01,
+        },
+        {
+            "model": "deepseek-v4-pro",
+            "inputTokens": 20,
+            "outputTokens": 2,
+            "costUsd": 0.02,
+        },
+    ]
+
+
 def test_provider_and_search_diagnostics_use_gateway_rpcs(monkeypatch):
     fake = _install_fake_gateway(monkeypatch)
     fake.rpc_payloads = {

@@ -33,12 +33,18 @@ def cost(
             lambda: {"input": 0, "output": 0, "cost": 0.0}
         )
         for row in rows:
-            model = row.get("model") or "unknown"
-            grouped[model]["input"] += int(row.get("input_tokens") or row.get("inputTokens") or 0)
-            grouped[model]["output"] += int(
-                row.get("output_tokens") or row.get("outputTokens") or 0
-            )
-            grouped[model]["cost"] += float(row.get("cost_usd") or row.get("costUsd") or 0.0)
+            model_rows = row.get("modelBreakdown") or row.get("model_breakdown") or [row]
+            for model_row in model_rows:
+                model = model_row.get("model") or "unknown"
+                grouped[model]["input"] += int(
+                    model_row.get("input_tokens") or model_row.get("inputTokens") or 0
+                )
+                grouped[model]["output"] += int(
+                    model_row.get("output_tokens") or model_row.get("outputTokens") or 0
+                )
+                grouped[model]["cost"] += float(
+                    model_row.get("cost_usd") or model_row.get("costUsd") or 0.0
+                )
         if json_output:
             print_json(
                 {
