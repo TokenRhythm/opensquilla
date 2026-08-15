@@ -113,6 +113,24 @@ class IncomingMessage(BaseModel):
     provenance: IngressProvenance = Field(default_factory=IngressProvenance)
 
 
+@dataclass(frozen=True, slots=True)
+class ChannelArtifactDeliveryRequest:
+    """Context required to deliver one generated artifact on a channel.
+
+    ``deliver_artifact`` is an optional adapter extension rather than part of
+    :class:`ManagedChannel`. Keeping the originating inbound message here lets
+    adapters select provider-native reply targets without weakening the legacy
+    ``send_file(channel_id, path)`` contract.
+    """
+
+    inbound: IncomingMessage
+    artifact_id: str
+    file_path: str
+    name: str
+    mime_type: str
+    size: int
+
+
 class OutgoingMessage(BaseModel):
     """Normalized outbound message to any channel."""
 

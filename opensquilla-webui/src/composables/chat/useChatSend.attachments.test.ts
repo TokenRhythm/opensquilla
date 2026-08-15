@@ -6374,6 +6374,25 @@ describe('useChatSend attachment payloads', () => {
     })
   })
 
+  it('targets the selected session for a group-only Stop when stream ownership is stale', () => {
+    const selectedSessionKey = 'agent:main:webchat:selected'
+    const previousSessionKey = 'agent:main:webchat:previous'
+    const { api, rpc, stream } = makeOptions({
+      sessionKey: ref(selectedSessionKey),
+      activeStreamTaskId: ref(''),
+      activeStreamSessionKey: ref(previousSessionKey),
+      canStop: () => true,
+    })
+    stream.isStreaming.value = false
+
+    api.onStop()
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.abort', {
+      sessionKey: selectedSessionKey,
+      source: 'webui_stop',
+    })
+  })
+
   it('does not mistake a completed send acceptance for a later group-only Stop', async () => {
     const rpc = {
       call: vi.fn(<T = unknown>(method: string) => {

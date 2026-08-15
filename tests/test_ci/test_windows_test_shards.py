@@ -108,6 +108,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_cron_result_payload.py",
     "tests/test_gateway/test_memory_repair_storage_gate.py",
     "tests/test_gateway/test_p1a_exact_abort_contract.py",
+    "tests/test_gateway/test_rpc_ingress_validation.py",
     "tests/test_gateway/test_rpc_llm_profiles.py",
     "tests/test_gateway/test_rpc_capability_reset.py",
     "tests/test_gateway/test_rpc_provider_credential_clear.py",

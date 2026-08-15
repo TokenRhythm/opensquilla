@@ -20,6 +20,10 @@ from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.task_runtime import SubagentCompletionEvent, TaskRuntime
 from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus
 from opensquilla.session.storage import SessionStorage
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+)
 
 
 def _make_envelope(
@@ -145,6 +149,63 @@ async def test_typed_provider_exception_is_sanitized_in_task_record_and_wire_eve
     assert terminal_event[2]["terminal_message"] == "The task failed before it could finish."
     assert record.details is not None
     assert record.details["turn_outcome"]["retryable"] is True
+
+
+@pytest.mark.asyncio
+async def test_human_silent_reply_error_marks_task_failed_without_retry_hint(
+    tmp_path: Any,
+) -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+    db_path = tmp_path / "silent-reply-task.sqlite"
+
+    async def _emitter(
+        session_key: str,
+        event_name: str,
+        payload: dict[str, Any],
+    ) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    async def _silent_reply_handler(_run: Any) -> None:
+        raise TaskRuntimeStreamError(
+            SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+            code=SILENT_REPLY_NOT_ALLOWED_CODE,
+            terminal_reason="error",
+        )
+
+    storage = await SessionStorage.open(str(db_path))
+    try:
+        runtime = _make_runtime(
+            _silent_reply_handler,
+            event_emitter=_emitter,
+            storage=storage,
+        )
+        handle = await runtime.enqueue(_make_envelope(), "hello")
+
+        record = await runtime.wait(handle.task_id, timeout=2.0)
+
+        assert record.status == AgentTaskStatus.FAILED
+        assert record.error_class == SILENT_REPLY_NOT_ALLOWED_CODE
+        assert record.error_message == SILENT_REPLY_NOT_ALLOWED_MESSAGE
+        assert record.details is not None
+        assert record.details["turn_outcome"]["retryable"] is False
+        terminal_event = next(event for event in emitted if event[1] == "task.failed")
+        assert terminal_event[2]["terminal_message"] == SILENT_REPLY_NOT_ALLOWED_MESSAGE
+        assert "retryable" not in terminal_event[2]
+        task_id = handle.task_id
+    finally:
+        await storage.close()
+
+    restarted = await SessionStorage.open(str(db_path))
+    try:
+        recovered = await restarted.get_agent_task(task_id)
+        assert recovered is not None
+        assert recovered.status == AgentTaskStatus.FAILED
+        assert recovered.error_class == SILENT_REPLY_NOT_ALLOWED_CODE
+        assert recovered.error_message == SILENT_REPLY_NOT_ALLOWED_MESSAGE
+        assert recovered.details is not None
+        assert recovered.details["turn_outcome"]["retryable"] is False
+    finally:
+        await restarted.close()
 
 
 @pytest.mark.asyncio

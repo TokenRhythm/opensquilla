@@ -3307,7 +3307,9 @@ export function useChatSend(options: UseChatSendOptions) {
         || acceptance?.requestSessionKey
         || options.activeStreamSessionKey.value
         || options.sessionKey.value
-      : options.activeStreamSessionKey.value || options.sessionKey.value
+      : stoppedTurnId
+        ? options.activeStreamSessionKey.value || options.sessionKey.value
+        : options.sessionKey.value
     if (acceptanceOwnsStop) {
       acceptanceStopPending.value = true
     }

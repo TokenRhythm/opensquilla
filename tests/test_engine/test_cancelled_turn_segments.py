@@ -462,6 +462,126 @@ async def test_cancelled_system_event_does_not_persist_partial_sentinel(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "partial_marker",
+    ["N", "NO_REP", "HEART", pytest.param("   ", id="whitespace-only")],
+)
+async def test_cancelled_human_turn_does_not_persist_withheld_sentinel_prefix(
+    tmp_path,
+    partial_marker: str,
+) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = f"agent:main:webchat:cancel-human-prefix-{partial_marker}"
+    await manager.create(session_key)
+    provider = _HangingSystemEventProvider(partial_marker)
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+
+    async def _consume() -> None:
+        async for _event in runner.run(
+            "ordinary human request",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            input_mode="user",
+            no_memory_capture=True,
+        ):
+            pass
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(provider.text_consumed.wait(), timeout=5.0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            _ = await task
+        assert task.cancelled()
+
+        transcript = await manager.get_transcript(session_key)
+        assert [entry for entry in transcript if entry.role == "assistant"] == []
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                _ = await task
+            assert task.cancelled()
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_human_turn_preserves_released_over_bound_prefix(tmp_path) -> None:
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    manager = SessionManager(storage)
+    session_key = "agent:main:webchat:cancel-human-released-prefix"
+    await manager.create(session_key)
+    released_text = "N" + (" " * 64)
+    provider = _HangingSystemEventProvider(released_text)
+    runner = TurnRunner(
+        provider_selector=_ProviderSelector(provider),
+        tool_registry=_registry(),
+        session_manager=manager,
+        config=GatewayConfig(
+            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    tool_context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(tmp_path),
+    )
+    visible_text: list[str] = []
+
+    async def _consume() -> None:
+        async for event in runner.run(
+            "ordinary human request",
+            session_key,
+            tool_context=tool_context,
+            history_has_persisted_user=False,
+            input_mode="user",
+            no_memory_capture=True,
+        ):
+            if isinstance(event, TextDeltaEvent):
+                visible_text.append(event.text)
+
+    task = asyncio.create_task(_consume())
+    try:
+        await asyncio.wait_for(provider.text_consumed.wait(), timeout=5.0)
+        assert "".join(visible_text) == released_text
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            _ = await task
+        assert task.cancelled()
+
+        transcript = await manager.get_transcript(session_key)
+        assistants = [entry for entry in transcript if entry.role == "assistant"]
+        assert len(assistants) == 1
+        assert assistants[0].content == "N"
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                _ = await task
+            assert task.cancelled()
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_cancelled_system_event_persists_body_without_sentinel(tmp_path) -> None:
     storage = SessionStorage(":memory:")
     await storage.connect()

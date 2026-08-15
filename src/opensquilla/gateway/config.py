@@ -1726,6 +1726,11 @@ class DingTalkChannelEntry(ConfiguredChannelEntry):
     type: Literal["dingtalk"] = "dingtalk"
     client_id: str
     client_secret: str
+    # Existing stream-only entries predate native artifact delivery, so these
+    # stay safely defaulted. The onboarding catalog requires robot_code for
+    # newly created entries while legacy TOML continues to load unchanged.
+    robot_code: str = ""
+    cool_app_code: str = ""
 
 
 class WeComChannelEntry(ConfiguredChannelEntry):

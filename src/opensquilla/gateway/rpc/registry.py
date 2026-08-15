@@ -33,12 +33,18 @@ from opensquilla import __version__
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, GuestRpcPolicyError
 from opensquilla.gateway.protocol import (
+    ERROR_INVALID_REQUEST,
     ERROR_METHOD_NOT_FOUND,
     ERROR_UNAUTHORIZED,
     ERROR_UNAVAILABLE,
     ResFrame,
     make_error_res,
     make_ok_res,
+)
+from opensquilla.gateway.rpc.ingress import (
+    RpcIngressValidationError,
+    is_utf8_encodable,
+    validate_rpc_ingress,
 )
 from opensquilla.gateway.scopes import (
     NODE_ROLE_METHODS,
@@ -235,6 +241,24 @@ class RpcRegistry:
         return self._methods.get(name)
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: RpcContext) -> ResFrame:
+        safe_req_id = req_id if isinstance(req_id, str) and is_utf8_encodable(req_id) else ""
+        if not isinstance(req_id, str) or not isinstance(method, str):
+            return make_error_res(
+                safe_req_id,
+                ERROR_INVALID_REQUEST,
+                "RPC request id and method must be strings",
+                details={"reason": "invalid_envelope"},
+            )
+        try:
+            validate_rpc_ingress(req_id, method, params)
+        except RpcIngressValidationError as exc:
+            return make_error_res(
+                safe_req_id,
+                ERROR_INVALID_REQUEST,
+                str(exc),
+                details={"reason": exc.reason},
+            )
+
         entry = self._methods.get(method)
         if entry is None:
             return make_error_res(req_id, ERROR_METHOD_NOT_FOUND, f"Method not found: {method}")

@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from opensquilla.engine.runtime import TurnRunner
-from opensquilla.engine.types import DoneEvent, TextDeltaEvent
+from opensquilla.engine.types import DoneEvent, ErrorEvent, TextDeltaEvent
 from opensquilla.gateway.config import AttachmentsConfig, GatewayConfig, SquillaRouterConfig
 from opensquilla.provider import ContentBlockText, Message, ModelInfo
 from opensquilla.provider import DoneEvent as ProviderDone
@@ -19,6 +19,10 @@ from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+)
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, ToolContext, ToolSpec
 
@@ -215,6 +219,88 @@ async def test_system_event_runtime_emits_only_canonical_terminal_text(
             assert [entry.content for entry in assistants] == [expected_text]
         else:
             assert assistants == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        list("NO_REPLY"),
+        ["HEARTBEAT_", "OK"],
+    ],
+)
+async def test_human_sentinel_runtime_emits_error_and_retains_usage(
+    tmp_path,
+    chunks: list[str],
+) -> None:
+    storage, manager, _provider, runner, context, session_key = await _runtime_stack(
+        tmp_path,
+        [chunks],
+    )
+    try:
+        events = [
+            event
+            async for event in runner.run(
+                "human request",
+                session_key,
+                tool_context=context,
+                history_has_persisted_user=False,
+                input_mode="user",
+                no_memory_capture=True,
+            )
+        ]
+
+        assert not any(isinstance(event, TextDeltaEvent) for event in events)
+        assert not any(isinstance(event, DoneEvent) for event in events)
+        errors = [event for event in events if isinstance(event, ErrorEvent)]
+        assert len(errors) == 1
+        assert errors[0].code == SILENT_REPLY_NOT_ALLOWED_CODE
+        assert errors[0].message == SILENT_REPLY_NOT_ALLOWED_MESSAGE
+
+        session = await manager.get_session(session_key)
+        assert session is not None
+        assert session.input_tokens == 3
+        assert session.output_tokens == 2
+        assert session.total_tokens == 5
+        transcript = await manager.get_transcript(session_key)
+        assert [entry for entry in transcript if entry.role == "assistant"] == []
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_human_mixed_sentinel_runtime_remains_visible(tmp_path) -> None:
+    body = "A normal human-facing reply."
+    source = f"NO_REPLY\n{body}"
+    storage, manager, _provider, runner, context, session_key = await _runtime_stack(
+        tmp_path,
+        [["NO_", "REPLY\n", body]],
+    )
+    try:
+        events = [
+            event
+            async for event in runner.run(
+                "human request",
+                session_key,
+                tool_context=context,
+                history_has_persisted_user=False,
+                input_mode="user",
+                no_memory_capture=True,
+            )
+        ]
+
+        assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+            source
+        ]
+        done = next(event for event in events if isinstance(event, DoneEvent))
+        assert done.text_snapshot == source
+        assert done.delivery == "visible"
+        assert not any(isinstance(event, ErrorEvent) for event in events)
+        transcript = await manager.get_transcript(session_key)
+        assistants = [entry for entry in transcript if entry.role == "assistant"]
+        assert [entry.content for entry in assistants] == [source]
     finally:
         await storage.close()
 

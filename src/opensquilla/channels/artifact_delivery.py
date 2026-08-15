@@ -19,7 +19,7 @@ from opensquilla.channels.contract import (
     channel_capability_profile,
     normalize_channel_send_result,
 )
-from opensquilla.channels.types import IncomingMessage
+from opensquilla.channels.types import ChannelArtifactDeliveryRequest, IncomingMessage
 from opensquilla.paths import media_root_from_config
 
 log = structlog.get_logger(__name__)
@@ -77,7 +77,7 @@ def artifact_fallback_lines(artifacts: list[dict[str, Any]]) -> list[str]:
         if target:
             lines.append(f"Generated file: {name} -> {target}")
         else:
-            lines.append(f"Generated file: {name} -> available in WebUI")
+            lines.append(f"Generated file: {name} -> available in the OpenSquilla task")
     return lines
 
 
@@ -120,12 +120,13 @@ def strip_delivered_artifact_image_references(
 
 
 def can_deliver_channel_files(channel: Any) -> bool:
+    deliver_artifact = getattr(channel, "deliver_artifact", None)
     send_file = getattr(channel, "send_file", None)
-    if not callable(send_file):
+    if not callable(deliver_artifact) and not callable(send_file):
         return False
     profile = channel_capability_profile(channel)
     if profile is not None:
-        return profile.native_file_upload or profile.media
+        return profile.artifact_delivery or profile.native_file_upload or profile.media
     capabilities = getattr(channel, "capabilities", None)
     if isinstance(capabilities, (set, frozenset, list, tuple)):
         capability_set = set(capabilities)
@@ -159,8 +160,11 @@ async def deliver_artifacts_as_channel_files(
 ) -> list[dict[str, Any]]:
     if not can_deliver_channel_files(channel):
         return artifacts
+    deliver_artifact = getattr(channel, "deliver_artifact", None)
     send_file = getattr(channel, "send_file", None)
-    if not callable(send_file) or not artifacts:
+    if not callable(deliver_artifact) and not callable(send_file):
+        return artifacts
+    if not artifacts:
         return artifacts
 
     store = ArtifactStore(media_root_from_config(config))
@@ -174,12 +178,26 @@ async def deliver_artifacts_as_channel_files(
         try:
             ref, path = store.resolve_for_download(artifact_id, session_id=session_id)
             with _named_artifact_delivery_path(path, ref.name) as delivery_path:
-                result = send_file(msg.channel_id, str(delivery_path))
+                if callable(deliver_artifact):
+                    request = ChannelArtifactDeliveryRequest(
+                        inbound=msg,
+                        artifact_id=ref.id,
+                        file_path=str(delivery_path),
+                        name=ref.name,
+                        mime_type=ref.mime,
+                        size=ref.size,
+                    )
+                    result = deliver_artifact(request)
+                    capability = ChannelCapabilities.ARTIFACT_DELIVERY
+                else:
+                    assert callable(send_file)
+                    result = send_file(msg.channel_id, str(delivery_path))
+                    capability = ChannelCapabilities.NATIVE_FILE_UPLOAD
                 if inspect.isawaitable(result):
                     result = await result
                 normalized = normalize_channel_send_result(
                     result,
-                    capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+                    capability=capability,
                     target_id=msg.channel_id,
                 )
                 if not normalized.is_delivered():
@@ -188,7 +206,11 @@ async def deliver_artifacts_as_channel_files(
                         artifact_id=artifact_id,
                         channel_type=type(channel).__name__,
                         status=normalized.status.value,
-                        reason=normalized.reason,
+                        reason=(
+                            ""
+                            if capability == ChannelCapabilities.ARTIFACT_DELIVERY
+                            else normalized.reason
+                        ),
                         retryable=normalized.retryable,
                     )
                     undelivered.append(artifact)
@@ -198,7 +220,6 @@ async def deliver_artifacts_as_channel_files(
                 artifact_id=artifact_id,
                 channel_type=type(channel).__name__,
                 error_type=type(exc).__name__,
-                error=str(exc),
             )
             undelivered.append(artifact)
     return undelivered
