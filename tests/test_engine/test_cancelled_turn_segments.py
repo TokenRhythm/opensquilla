@@ -506,8 +506,9 @@ async def test_cancelled_human_turn_does_not_persist_withheld_sentinel_prefix(
     try:
         await asyncio.wait_for(provider.text_consumed.wait(), timeout=5.0)
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError):
             await task
+        assert task.cancelled()
 
         transcript = await manager.get_transcript(session_key)
         assert [entry for entry in transcript if entry.role == "assistant"] == []
@@ -516,6 +517,7 @@ async def test_cancelled_human_turn_does_not_persist_withheld_sentinel_prefix(
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            assert task.cancelled()
         await storage.close()
 
 
@@ -562,8 +564,9 @@ async def test_cancelled_human_turn_preserves_released_over_bound_prefix(tmp_pat
         assert "".join(visible_text) == released_text
 
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
+        with contextlib.suppress(asyncio.CancelledError):
             await task
+        assert task.cancelled()
 
         transcript = await manager.get_transcript(session_key)
         assistants = [entry for entry in transcript if entry.role == "assistant"]
@@ -574,6 +577,7 @@ async def test_cancelled_human_turn_preserves_released_over_bound_prefix(tmp_pat
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            assert task.cancelled()
         await storage.close()
 
 
