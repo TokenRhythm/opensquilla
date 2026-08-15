@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="panel.css" />
+    <title>OpenSquilla Pet · 详情</title>
+  </head>
+  <body>
+    <div id="card">
+      <header id="titlebar">
+        <div class="brand">
+          <span class="logo">🐙</span>
+          <div>
+            <div class="brand-title">OpenSquilla Pet</div>
+            <div class="brand-sub" id="active-sub" data-i18n="panel.waitingSession">等待会话…</div>
+          </div>
+        </div>
+        <button id="close" data-i18n-title="panel.close" title="关闭">✕</button>
+      </header>
+
+      <section class="grid">
+        <div class="stat">
+          <div class="stat-label" data-i18n="panel.todayCost">Claude 今日 API 等价估算</div>
+          <div class="stat-value" id="today-cost">$0.000</div>
+          <div class="stat-foot" id="today-tokens">0 tokens</div>
+        </div>
+        <div class="stat">
+          <div class="stat-label" data-i18n="panel.last5h">Claude 本地滚动 5 小时</div>
+          <div class="stat-value" id="win-cost">$0.000</div>
+          <div class="stat-foot" id="win-reset" data-i18n="panel.windowIdle">窗口空闲</div>
+        </div>
+      </section>
+
+      <!-- Codex 套餐窗口用量（有 Codex 会话时显示；来自 rollout 的 rate_limits） -->
+      <section id="codex-wrap" class="budget hidden">
+        <div class="budget-head">
+          <span data-i18n="panel.codexQuota">🛰️ Codex 额度（5h 窗口）</span>
+          <span id="codex-pct">0%</span>
+        </div>
+        <div class="bar"><div id="codex-fill" class="bar-fill codex"></div></div>
+        <div class="stat-foot" id="codex-foot"></div>
+      </section>
+
+      <section id="codex-usage" class="grid hidden">
+        <div class="stat compact">
+          <div class="stat-label" data-i18n="panel.codexToday">Codex 今日 token</div>
+          <div class="stat-value" id="codex-today">0</div>
+          <div class="stat-foot" id="codex-today-detail"></div>
+        </div>
+        <div class="stat compact">
+          <div class="stat-label" data-i18n="panel.codexLifetime">Codex 本机累计 token</div>
+          <div class="stat-value" id="codex-lifetime">0</div>
+          <div class="stat-foot" id="codex-lifetime-detail"></div>
+        </div>
+      </section>
+
+      <section id="budget-wrap" class="budget hidden">
+        <div class="budget-head">
+          <span data-i18n="panel.budget5h">5h 预算</span>
+          <span id="budget-pct">0%</span>
+        </div>
+        <div class="bar"><div id="budget-fill" class="bar-fill"></div></div>
+      </section>
+
+      <section class="block" id="todo-block">
+        <div class="block-title">
+          <span><span data-i18n="panel.todoBlock">📋 待办清单</span> <span id="todo-proj" class="todo-proj"></span></span>
+          <span id="todo-prog" class="todo-prog"></span>
+        </div>
+        <div id="todo-list" class="todos"><div class="empty" data-i18n="panel.noTodo">当前没有待办</div></div>
+      </section>
+
+      <section class="block">
+        <div class="block-title">
+          <span data-i18n="panel.usageTrend">用量趋势</span>
+          <span class="trend-controls">
+            <span class="metric-tabs">
+              <button data-metric="tokens" class="mt active" data-i18n="panel.metricTokens">Token</button>
+              <button data-metric="cost" class="mt" data-i18n="panel.metricCost">费用</button>
+            </span>
+            <span class="view-tabs">
+              <button data-view="hours" class="vt active" data-i18n="panel.today24h">今日24h</button>
+              <button data-view="cal" class="vt" data-i18n="panel.calendar">日历</button>
+            </span>
+          </span>
+        </div>
+        <div id="view-hours" class="uview">
+          <div id="chart" class="chart"></div>
+          <div class="chart-axis"><span>0</span><span>6</span><span>12</span><span>18</span><span>23</span><span data-i18n="panel.hourUnit">点</span></div>
+          <div id="hours-readout" class="readout"></div>
+        </div>
+        <div id="view-cal" class="uview hidden">
+          <div id="cal" class="cal"></div>
+          <div class="cal-legend"><span data-i18n="panel.less">少</span> <i class="lv0"></i><i class="lv1"></i><i class="lv2"></i><i class="lv3"></i><i class="lv4"></i> <span data-i18n="panel.more">多</span></div>
+          <div id="cal-readout" class="readout"></div>
+        </div>
+        <div id="price-src" class="price-src" data-i18n-title="panel.priceSrcTitle" title="价目数据来源与更新时间"></div>
+        <div id="usage-diagnostics" class="usage-diagnostics"></div>
+      </section>
+
+      <div class="cols">
+        <section class="block">
+          <div class="block-title" data-i18n="panel.tokenDetail">Claude Token 明细（今日）</div>
+          <div class="rows" id="token-rows">
+            <div class="row"><span data-i18n="panel.tokIn">输入</span><b id="t-in">0</b></div>
+            <div class="row"><span data-i18n="panel.tokOut">输出</span><b id="t-out">0</b></div>
+            <div class="row"><span data-i18n="panel.tokCacheWrite5m">缓存写入（5m）</span><b id="t-cw5">0</b></div>
+            <div class="row"><span data-i18n="panel.tokCacheWrite1h">缓存写入（1h）</span><b id="t-cw1">0</b></div>
+            <div class="row"><span data-i18n="panel.tokCacheRead">缓存读取</span><b id="t-cr">0</b></div>
+            <div class="row total"><span data-i18n="panel.msgRounds">消息轮次</span><b id="t-msg">0</b></div>
+          </div>
+        </section>
+
+        <section class="block">
+          <div class="block-title" data-i18n="panel.activeTasks">进行中的任务</div>
+          <div id="sess-list" class="rows"><div class="empty" data-i18n="panel.noActiveSession">暂无活跃会话</div></div>
+        </section>
+
+        <section class="block">
+          <div class="block-title" data-i18n="panel.byModel">按模型（分）</div>
+          <div id="by-model" class="rows"><div class="empty" data-i18n="panel.noData">暂无数据</div></div>
+        </section>
+
+        <section class="block" id="bg-block">
+          <div id="bg-head" class="block-title" data-i18n="panel.bgTasks">后台任务</div>
+          <div id="bg-list" class="rows"><div class="empty" data-i18n="panel.bgClean">没有长跑的后台进程 — 干净</div></div>
+        </section>
+
+        <section class="block">
+          <div class="block-title" data-i18n="panel.liveOps">实时操作</div>
+          <ul id="ops" class="ops"><li class="empty" data-i18n="panel.waitingOps">等待操作…</li></ul>
+        </section>
+      </div>
+    </div>
+    <script src="shared/i18n.js"></script>
+    <script src="panel.js"></script>
+  </body>
+</html>

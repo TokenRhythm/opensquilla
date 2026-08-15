@@ -1,5 +1,100 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
+// ── Pet bridge (embedded desktop pet) ───────────────────────────────────────
+// Mirrors OpenSquilla pet's preload.js contract so the pet renderer (pet/pet.html) works
+// as-is. Channel names use pet:/panel: prefixes and never collide with the
+// opensquillaDesktop bridge below.
+contextBridge.exposeInMainWorld('pet', {
+  onEvent: (cb: (data: unknown) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, data: unknown) => cb(data)
+    ipcRenderer.on('pet:event', listener)
+    return () => ipcRenderer.removeListener('pet:event', listener)
+  },
+  onBubble: (cb: (data: unknown) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, data: unknown) => cb(data)
+    ipcRenderer.on('pet:bubble', listener)
+    return () => ipcRenderer.removeListener('pet:bubble', listener)
+  },
+  onStats: (cb: (data: unknown) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, data: unknown) => cb(data)
+    ipcRenderer.on('pet:stats', listener)
+    return () => ipcRenderer.removeListener('pet:stats', listener)
+  },
+  onMeme: (cb: (data: unknown) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, data: unknown) => cb(data)
+    ipcRenderer.on('pet:meme', listener)
+    return () => ipcRenderer.removeListener('pet:meme', listener)
+  },
+  onTravel: (cb: (data: unknown) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, data: unknown) => cb(data)
+    ipcRenderer.on('pet:travel', listener)
+    return () => ipcRenderer.removeListener('pet:travel', listener)
+  },
+  onMemeCatalogChanged: (cb: (data: unknown) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, data: unknown) => cb(data)
+    ipcRenderer.on('pet:meme-catalog-changed', listener)
+    return () => ipcRenderer.removeListener('pet:meme-catalog-changed', listener)
+  },
+  onPanelStats: (cb: (data: unknown) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, data: unknown) => cb(data)
+    ipcRenderer.on('panel:stats', listener)
+    return () => ipcRenderer.removeListener('panel:stats', listener)
+  },
+  onConfig: (cb: (data: unknown) => void) => {
+    const a = (_e: Electron.IpcRendererEvent, data: unknown) => cb(data)
+    ipcRenderer.on('pet:config', a)
+    ipcRenderer.on('panel:config', a)
+    return () => {
+      ipcRenderer.removeListener('pet:config', a)
+      ipcRenderer.removeListener('panel:config', a)
+    }
+  },
+  onPrice: (cb: (data: unknown) => void) => {
+    const listener = (_e: Electron.IpcRendererEvent, data: unknown) => cb(data)
+    ipcRenderer.on('panel:price', listener)
+    return () => ipcRenderer.removeListener('panel:price', listener)
+  },
+  getConfig: () => ipcRenderer.invoke('get-config'),
+  getStats: () => ipcRenderer.invoke('get-stats'),
+  openPanel: () => ipcRenderer.send('open-panel'),
+  closePanel: () => ipcRenderer.send('close-panel'),
+  setMode: (m: unknown) => ipcRenderer.send('set-mode', m),
+  setSkin: (s: unknown) => ipcRenderer.send('set-skin', s),
+  setBudget: (v: unknown) => ipcRenderer.send('set-budget', v),
+  toggleMute: () => ipcRenderer.send('toggle-mute'),
+  setSessionPrefs: (pinned: unknown, archived: unknown) => ipcRenderer.send('set-session-prefs', pinned, archived),
+  quit: () => ipcRenderer.send('quit-app'),
+  closePet: () => ipcRenderer.send('close-pet'),
+  getWinPos: () => ipcRenderer.invoke('get-win-pos'),
+  getWindowMetrics: () => ipcRenderer.invoke('get-window-metrics'),
+  setWinPos: (x: number, y: number) => ipcRenderer.send('set-win-pos', x, y),
+  newChat: () => ipcRenderer.send('new-chat'),
+  decidePermission: (permId: unknown, behavior: unknown) => ipcRenderer.send('permission-decide', permId, behavior),
+  focusSession: (sessionId: unknown) => ipcRenderer.send('focus-session', sessionId),
+  getMemeCatalog: () => ipcRenderer.invoke('meme-catalog'),
+  triggerMeme: (sessionId: unknown, memeId: unknown) => ipcRenderer.invoke('meme-trigger', sessionId, memeId),
+  getTravel: () => ipcRenderer.invoke('travel-get'),
+  getTravelPostcards: () => ipcRenderer.invoke('travel-postcards'),
+  startTravel: (sessionId: unknown, templateId: unknown, mission: unknown) => ipcRenderer.invoke('travel-start', sessionId, templateId, mission),
+  wanderTravel: () => ipcRenderer.invoke('travel-wander'),
+  cancelTravel: () => ipcRenderer.invoke('travel-cancel'),
+  primaryAction: () => ipcRenderer.send('primary-action'),
+  setIgnoreMouse: (ignore: unknown) => ipcRenderer.send('set-ignore-mouse', ignore),
+  setPetTall: (tall: unknown) => ipcRenderer.send('pet-tall', tall),
+  setPetBig: (on: unknown) => ipcRenderer.send('pet-big', on),
+  setPetSize: (w: unknown, h: unknown, anchor: unknown) => ipcRenderer.send('set-pet-size', w, h, anchor),
+  setPanelHeight: (h: unknown) => ipcRenderer.send('set-panel-height', h),
+  focusPet: () => ipcRenderer.send('pet-focus'),
+  blurPet: () => ipcRenderer.send('pet-blur'),
+  openLog: () => ipcRenderer.send('open-log'),
+  petLog: (tag: unknown, msg: unknown) => ipcRenderer.send('pet-log', tag, msg),
+  uiBusy: (on: unknown) => ipcRenderer.send('ui-busy', on),
+  petVisualBounds: (rect: unknown) => ipcRenderer.send('pet-visual-bounds', rect),
+  petDragging: (on: unknown) => ipcRenderer.send('pet-dragging', on),
+  anticsRunNow: () => ipcRenderer.send('antics-run-now'),
+  anticsToggle: () => ipcRenderer.send('antics-toggle'),
+})
+
 contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOsLocale: () => ipcRenderer.invoke('desktop:os-locale'),
   isAutoUpdateEnabled: () => ipcRenderer.invoke('desktop:update:supported'),
@@ -17,9 +112,6 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   resetDesktopSettings: () => ipcRenderer.invoke('desktop:settings:reset'),
   getDesktopPreferences: () => ipcRenderer.invoke('desktop:preferences:get'),
   saveDesktopPreferences: (payload: unknown) => ipcRenderer.invoke('desktop:preferences:save', payload),
-  reportSandboxUnavailable: (payload: unknown) => (
-    ipcRenderer.invoke('desktop:sandbox:unavailable', payload)
-  ),
   setNativeTheme: (payload: unknown) => ipcRenderer.invoke('desktop:theme:set', payload),
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   chooseProjectDirectory: (payload: unknown) => (

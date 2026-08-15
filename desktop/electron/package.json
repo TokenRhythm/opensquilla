@@ -93,6 +93,7 @@
     },
     "files": [
       "dist/**",
+      "pet/**",
       "assets/**",
       "package.json"
     ],

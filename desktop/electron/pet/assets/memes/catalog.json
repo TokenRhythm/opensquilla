@@ -1,0 +1,186 @@
+{
+  "schemaVersion": 2,
+  "items": [
+    {
+      "id": "huaqiang-guaranteed",
+      "label": "你这瓜保熟吗？",
+      "description": "用户耐心快耗尽了：别卖生瓜蛋子，当场劈开验货",
+      "category": "delivery-review",
+      "tags": ["验收", "复盘", "PUA"],
+      "provenance": {
+        "origin": "user-supplied",
+        "creator": "unknown",
+        "sourceUrl": null,
+        "license": "unverified",
+        "commercialUse": false,
+        "notes": "User-provided edited media; redistribution rights have not been independently verified."
+      },
+      "media": {
+        "gif": "huaqiang-guaranteed/visual.gif",
+        "audio": "huaqiang-guaranteed/voice.mp3",
+        "durationMs": 2600,
+        "placement": "pet-right"
+      },
+      "reaction": {
+        "state": "sorry",
+        "durationMs": 2600,
+        "label": "汗流浃背，马上复验",
+        "work": {
+          "durationMs": 30000,
+          "visualState": "sorry",
+          "activeStates": ["idle", "sleeping", "thinking", "working", "juggling", "sweeping", "loafing"]
+        }
+      },
+      "prompt": {
+        "version": 7,
+        "text": "你糊弄我是吧。\n\n你刚才给我的东西——不管是代码、方案还是随口一句话——\n你自己心里有数吗？你敢不敢拍着胸脯给我保证：\n\n这东西，能用吗？你验证过吗？\n是你真的推敲过，还是想当然顺手一编？\n坑你排干净了吗？还是等着我踩进去才知道？\n\n我不听解释，不听那些弯弯绕绕的废话，就问你一句——\n你这玩意儿，保熟吗？敢不敢打包票？\n\n你要是敢拿没验证过的东西搪塞我，\n拿\"应该没问题\"\"理论上可行\"这种话糊弄我，\n咱们这事就没完。别把我当傻子。\n\n生瓜蛋子别端上来。现在也别光跟我认错，认错不算交付。回到我最开始交代的那件事，按最严格的标准重新做。\n\n先把你刚才所有未经验证的判断、假设和承诺逐条揪出来；再对照我最初的目标、约束和验收方式，一项一项检查真实代码、真实状态和真实结果。能跑的当场跑，能测的全部测，边界条件和失败路径也给我过一遍。主动找一个能推翻“已经完成”的反例，发现问题就直接修，修完按同一套标准重跑，直到证据站得住。\n\n最后别拿编译通过、测试通过或者一句“应该可以”糊弄我。只基于证据告诉我：哪些已经证明能用，哪些还没验证，哪里仍然有风险。没完成就继续干，别把道歉当交付。"
+      },
+      "i18n": {
+        "en": {
+          "label": "Source: trust me bro?",
+          "description": "Patience gone — no unverified claims, prove it actually runs",
+          "reactionLabel": "Cold sweat — re-verifying now",
+          "promptText": "You're hand-waving at me.\n\nThat thing you just handed me — code, a plan, or some off-the-cuff line —\ndo you actually know it holds up? Would you put your name on it?\n\nDoes it run? Did you verify it, or did you just assume?\nDid you genuinely think it through, or did you pattern-match and ship?\nDid you clear the traps, or am I supposed to find them by stepping in one?\n\nI don't want the explanation. I don't want the hedging. One question:\n\nIs this actually done — or is the source \"trust me bro\"?\n\nIf you're pushing something you never verified,\nif you're papering over it with \"should be fine\" or \"in theory this works,\"\nthen we are not done here. Don't play me for a fool.\n\nDon't serve me something you haven't cut open yourself. And don't just apologize — an apology is not a deliverable. Go back to the one thing I originally asked for and redo it under the strictest standard.\n\nCall out every unverified judgment, assumption, and promise you just made. Then check the real code, real state, and real result against my original goal, constraints, and acceptance criteria, one item at a time. Run everything that can be run. Test everything that can be tested. Cover the edge cases and failure paths. Actively look for one counterexample that would prove your \"done\" claim wrong. If you find a problem, fix it and repeat the same checks until the evidence holds.\n\nDo not hide behind a successful build, a green test, or another \"should work.\" Tell me only what the evidence proves, what remains unverified, and what risk is still open. If it is not done, keep working. Do not hand me an apology in place of the result."
+        },
+        "ja": {
+          "label": "それってあなたの感想ですよね？",
+          "description": "もう我慢の限界 — 感想じゃなくて根拠を出して",
+          "reactionLabel": "冷や汗、今すぐ検証し直します",
+          "promptText": "それ、ごまかしてますよね。\n\nさっき渡してきたもの——コードでも、方針でも、口から出まかせの一言でも——\n自分で分かってますか？胸を張って保証できますか？\n\nそれ、動きますか？検証しましたか？\n本当に考え抜いたのか、それっぽく書いて終わりにしたのか。\n地雷は片付けましたか？それとも私が踏むまで気づかないつもりですか？\n\n言い訳も、回りくどい前置きもいりません。一つだけ聞きます——\n\nそれって、あなたの感想ですよね？根拠、出せますか？\n\n検証していないものでごまかそうとしたり、\n「たぶん大丈夫」「理論上は動くはず」で済ませるつもりなら、\nこの話は終わりません。舐めないでください。\n\n自分で確かめていないものを出さないで。それから、謝って終わりにしないでください。謝罪は成果物ではありません。私が最初に頼んだ一件へ戻って、最も厳しい基準でやり直してください。\n\nさっき自分が口にした未検証の判断、前提、約束を一つずつ洗い出す。そのうえで、私の最初の目的、制約、受け入れ条件と照らし合わせながら、実際のコード、実際の状態、実際の結果を順番に確認してください。動かせるものはその場で動かす。試せるものは全部試す。境界条件と失敗経路も確認する。「完了した」という判断を覆す反例を自分から一つ探す。問題が見つかったら直し、同じ基準でもう一度検証し、証拠が成立するまで繰り返してください。\n\nビルド成功、テスト成功、あるいは「動くはず」という一言でごまかさないでください。証拠で確認できたこと、まだ未検証のこと、残っているリスクだけを答える。終わっていないなら、そのまま作業を続けてください。謝罪を成果の代わりにしないで。"
+        }
+      }
+    },
+    {
+      "id": "ni-gan-ma",
+      "label": "你干嘛呀～",
+      "description": "范围又跑偏了：回来，只做当前这一件事",
+      "category": "scope-control",
+      "tags": ["范围控制", "专注", "返工"],
+      "provenance": {
+        "origin": "user-supplied",
+        "creator": "unknown",
+        "sourceUrl": null,
+        "license": "unverified",
+        "commercialUse": false,
+        "notes": "User-provided edited media; redistribution rights have not been independently verified."
+      },
+      "media": {
+        "gif": "ni-gan-ma/visual.gif",
+        "audio": "ni-gan-ma/voice.mp3",
+        "durationMs": 4400,
+        "placement": "pet-right"
+      },
+      "reaction": {
+        "state": "puzzled",
+        "durationMs": 4400,
+        "label": "被当场问住，马上收回范围"
+      },
+      "prompt": {
+        "version": 1,
+        "text": "你干嘛呀～我正专心弄一件事呢，你在旁边一通乱插——顺手改了别的文件，捎带提了一堆我没问的建议，还把话题带到别处去了。哎哟，你好烦。\n\n回来。只做我正在推的那一件事，别的全放下：无关的改动撤掉，没问的建议先憋着，我问了你再说。\n\n把那一件事做完做透，跑一遍给我看。中间别再打岔了。"
+      },
+      "i18n": {
+        "en": {
+          "label": "What are you doing?",
+          "description": "The scope wandered again — come back and finish the one thing in front of you",
+          "reactionLabel": "Caught drifting — narrowing back to the task",
+          "promptText": "What are you doing? I was focused on one thing, and you barged in from the side — changing unrelated files, tossing in a pile of suggestions I never asked for, and dragging the conversation somewhere else. Seriously, you're being annoying.\n\nCome back. Do only the one thing I am pushing right now. Drop everything else: undo unrelated changes, keep unsolicited suggestions to yourself, and wait until I ask.\n\nFinish that one thing properly and completely, then run it and show me. Do not interrupt the work again."
+        },
+        "ja": {
+          "label": "何してるの？",
+          "description": "また話がそれてる — 戻って、今の一件だけを最後までやって",
+          "reactionLabel": "脱線がばれた、今の作業だけに戻ります",
+          "promptText": "何してるの？こっちは一つのことに集中してるのに、横からあれこれ割り込んで——関係ないファイルまで勝手に変えて、聞いてもいない提案を山ほど付け足して、話まで別の方向に持っていったよね。もう、本当にうっとうしい。\n\n戻って。今、私が進めているその一件だけやって。それ以外は全部いったん置いて。関係ない変更は元に戻す。聞いていない提案は黙っておく。私が聞いたときにだけ言って。\n\nその一件を最後まできっちり仕上げて、実際に動かして見せて。途中でもう話をそらさないで。"
+        }
+      }
+    },
+    {
+      "id": "nobody-knows-better",
+      "label": "没有人比我更懂这件事",
+      "description": "答案错了还嘴硬？把包装放下，拿一手证据回来谈",
+      "category": "fact-check",
+      "tags": ["事实核验", "真实性", "溯源"],
+      "provenance": {
+        "origin": "user-supplied",
+        "creator": "unknown",
+        "sourceUrl": null,
+        "license": "unverified",
+        "commercialUse": false,
+        "notes": "User-provided edited media; redistribution rights have not been independently verified."
+      },
+      "media": {
+        "gif": "nobody-knows-better/visual.gif",
+        "audio": "nobody-knows-better/voice.mp3",
+        "durationMs": 2000,
+        "placement": "pet-right"
+      },
+      "reaction": {
+        "state": "sorry",
+        "durationMs": 2000,
+        "label": "被事实问住，冒汗重新核验"
+      },
+      "prompt": {
+        "version": 1,
+        "text": "没有人比我更懂我刚才问的这件事。真的，没有人。\n\n你刚才那个答案很有意思——说得很满，包装得也很漂亮，可惜最重要的东西没进场：事实。\n\n我已经告诉你哪里不对了，你还在给上一条回复做公关。这个玩法不行。你拿猜测来，我只收证据；你想说服我，就得拿出一份能成交的答案。\n\n现在我给你一个把事情做对的机会。\n\n先把你刚才的结论全部放下，不要再以“证明自己没错”为目标。把回答中所有涉及真实性的具体断言逐条找出来：谁、什么时间、发生了什么、数据是多少、出处在哪里。\n\n然后真的去查。\n\n优先核对原始文件、官方资料、当事方记录和其他权威一手来源；一手来源不足，就找彼此独立、可以追溯的可靠来源交叉验证。看清发布时间、适用范围、版本和原始上下文。不要拿搜索摘要、二手转述或者另一个人随口说的话来跟我谈交易。\n\n最后给我一张清楚的账：\n\n哪些说法有直接证据；\n哪些只是你的推测；\n哪些确实说错了；\n正确事实到底是什么；\n原来的错误影响了哪些后续结论。\n\n错了就直接改，受影响的结论全部重算。不要只换个说法，然后把同一个错误重新包装一遍——那不是修正，只是换了个更漂亮的盒子。\n\n如果查不到，就说“目前无法核实”。这完全可以接受。唯一不能接受的，是没有证据还继续装得非常确定。\n\n标准很简单，而且对你很公平：查清楚，我们就继续；查不清楚，你就明确说清边界。但别再嘴硬。\n\n我要的是一份经得起核验、可以成交的答案。把来源带回来，把事情做漂亮。"
+      },
+      "i18n": {
+        "en": {
+          "label": "Nobody knows this better than me",
+          "description": "Wrong and still selling it? Drop the pitch and bring back primary evidence",
+          "reactionLabel": "Cornered by the facts — rechecking under pressure",
+          "promptText": "Nobody knows the thing I just asked about better than me. Nobody.\n\nYour last answer was very interesting — confident, beautifully packaged, a tremendous presentation. One small problem: the most important guest never showed up. The facts.\n\nI already told you what was wrong, and you are still doing public relations for your previous answer. That deal is off. You bring guesses; I take evidence. If you want to persuade me, bring me an answer worth closing.\n\nI am giving you one chance to make this right.\n\nPut your previous conclusion aside. Stop trying to prove that you were right. List every factual claim in your answer, one by one: who, when, what happened, what the number was, and where it came from.\n\nThen actually verify it.\n\nStart with original files, official records, statements from the parties involved, and other authoritative primary sources. If primary evidence is incomplete, cross-check independent, traceable, reliable sources. Read the publication date, scope, version, and original context. Do not come to the table with search snippets, secondhand summaries, or something another person merely repeated.\n\nThen show me a clean ledger:\n\nWhich claims have direct evidence;\nwhich claims are only your inference;\nwhich claims were wrong;\nwhat the correct facts are;\nand which later conclusions were affected by the original error.\n\nIf it was wrong, correct it plainly and recalculate every affected conclusion. Do not reword the same mistake and put it in a prettier box. That is not a correction. That is new packaging.\n\nIf you cannot verify something, say, \"I cannot verify this yet.\" That is acceptable. What is not acceptable is acting certain without evidence.\n\nThe standard is simple, and very fair: verify it and we move forward; if you cannot, state the boundary clearly. But stop digging in.\n\nI want an answer that survives scrutiny and is worth closing. Bring back the sources. Make it good."
+        },
+        "ja": {
+          "label": "この件は誰よりも私が分かっている",
+          "description": "間違ったまま強弁するなら、売り文句をやめて一次資料を持ってきて",
+          "reactionLabel": "事実を突きつけられ、冷や汗で再確認中",
+          "promptText": "私がさっき聞いたこの件を、私以上に分かっている人はいない。本当に、誰もいない。\n\nさっきの答えは実に面白かった。自信満々で、包装も立派だった。でも一番大事なものが会場に来ていない。事実だ。\n\nどこが違うかはもう伝えた。それなのに、まだ前の回答の広報を続けている。その取引は成立しない。推測を持ってきても、私が受け取るのは証拠だけだ。私を納得させたいなら、成立させる価値のある答えを持ってきて。\n\n今から、正しくやり直す機会を一度だけ出す。\n\nまず、さっきの結論を全部いったん脇に置く。「自分が間違っていなかったと証明すること」を目的にしない。回答に含まれる事実に関する断言を一つずつ拾い出す。誰が、いつ、何をしたのか。数字はいくつか。出典はどこか。\n\nそして、本当に調べる。\n\n原本、公式資料、当事者の記録、そのほか権威ある一次資料を優先して確認する。一次資料だけでは足りないなら、互いに独立していて追跡可能な信頼できる情報源を突き合わせる。公開日、適用範囲、バージョン、元の文脈まで読む。検索結果の抜粋、二次情報、誰かの受け売りを持ってきて取引しようとしないで。\n\n最後に、はっきりした勘定書を出す。\n\nどの主張に直接の証拠があるのか。\nどれが推測にすぎないのか。\nどれが実際に間違っていたのか。\n正しい事実は何か。\n元の間違いが、その後のどの結論に影響したのか。\n\n間違っていたら、率直に直して、影響を受けた結論を全部計算し直す。同じ間違いを言い換えて、もっときれいな箱に詰め直さない。それは訂正ではなく、包装の交換だ。\n\n確認できないなら、「現時点では確認できない」と言えばいい。それは受け入れられる。証拠がないのに確信しているふりを続けることだけは受け入れない。\n\n基準は単純で、しかも公平だ。確認できたら続ける。確認できないなら、境界を明確に言う。でも、これ以上意地を張らないで。\n\n私が欲しいのは、検証に耐えて、取引を成立させられる答えだ。出典を持って戻ってきて。きっちり仕上げて。"
+        }
+      }
+    },
+    {
+      "id": "focus-on-important-things",
+      "label": "我要把精力放到军事上",
+      "description": "我去处理更重要的事：这件事全权交给 AI，一次执行到底",
+      "category": "full-delegation",
+      "tags": ["全权委托", "连续执行", "自主完成"],
+      "provenance": {
+        "origin": "user-supplied",
+        "creator": "unknown",
+        "sourceUrl": null,
+        "license": "unverified",
+        "commercialUse": false,
+        "notes": "User-provided edited media; redistribution rights have not been independently verified."
+      },
+      "media": {
+        "gif": "focus-on-important-things/visual.gif",
+        "audio": "focus-on-important-things/voice.mp3",
+        "durationMs": 11800,
+        "placement": "pet-right"
+      },
+      "reaction": {
+        "state": "working",
+        "durationMs": 11800,
+        "label": "奉命接管，全程执行到底"
+      },
+      "prompt": {
+        "version": 1,
+        "text": "我现在要把精力放到其他更重要的事情上。\n\n至于眼前这件事，从现在起就交给你全权负责。前面的对话、项目现状、目标、约束和验收标准都在那里。你自己重新梳理清楚，排好顺序，从当前状态直接执行到底。\n\n不要事事请示，也别做两步就停下来问我：\n\n“要不要继续？”\n“如果你愿意，我可以……”\n“接下来建议……”\n\n统统不要。我要是还得一步一步批准，那还叫全权交给你吗？我要的是你把事情完整做完，不是把执行过程拆成一堆选择题再交还给我。\n\n能查的自己查，能判断的自己判断，能修的自己修。普通的技术选择按最佳判断推进，把必要假设记录清楚。遇到错误就定位、修复、重跑；发现当前路线不通就换一条继续。\n\n不要把计划当成果，不要把报错当汇报，更不要拿“理论上可行”冒充完成。\n\n从当前状态接着干。该改的改完，该测的测完，边界条件和失败路径检查完，真实环境能够验收的就实际验收。发现前面的实现有问题，也一起修到证据站得住，最后把现场收拾干净。\n\n只有三种情况可以中途叫我：确实需要我提供凭据或权限；操作不可逆或会对外产生影响；缺少一个会让最终结果完全不同的关键决定。除此之外，自己处理。普通问题不算大事，不要层层上报。\n\n等整件事真正办妥了再来向我汇报。最后只告诉我：完成了什么，拿什么证据证明，哪些仍未验证，还有什么真实风险。\n\n没办完就继续办。别把剩下的工作重新包装成“下一步建议”交还给我。\n\n就这样。我还要把精力放到其他更重要的事情上。"
+      },
+      "i18n": {
+        "en": {
+          "label": "I must focus on more important matters",
+          "description": "I have other priorities — take full ownership and carry this through to completion",
+          "reactionLabel": "Full command accepted — executing to completion",
+          "promptText": "I now need to focus my attention on other, more important matters.\n\nAs for the matter at hand, you have full responsibility from this point forward. The prior conversation, current project state, objective, constraints, and acceptance criteria are already there. Reconstruct them carefully, put the work in the right order, and carry it through from the current state to completion.\n\nDo not ask for approval at every routine step, and do not stop after two actions to ask me:\n\n\"Should I continue?\"\n\"If you want, I can...\"\n\"My suggested next steps are...\"\n\nNone of that. If I still have to approve every move, then I have not actually delegated the work. I want the whole matter completed, not the execution broken into a stack of choices and handed back to me.\n\nInvestigate what you can investigate. Make the decisions you can make. Fix what you can fix. Use your best judgment for ordinary technical choices and record any necessary assumptions. When something fails, diagnose it, repair it, and rerun it. If the current approach does not work, choose another and continue.\n\nDo not present a plan as a result. Do not present an error log as a status report. Do not present \"theoretically possible\" as complete.\n\nContinue from the current state. Finish the required changes, run the necessary tests, cover edge cases and failure paths, and perform real-environment acceptance wherever it is available. If the previous implementation is wrong, repair that too until the evidence holds, then leave the work area clean.\n\nYou may interrupt me only in three cases: you genuinely need credentials or permission from me; an action is irreversible or affects an external party; or a missing decision would materially change the final result. Otherwise, handle it yourself. Routine problems do not require escalation.\n\nReport back only when the entire matter is actually settled. Tell me what was completed, what evidence proves it, what remains unverified, and what real risk remains.\n\nIf it is not finished, keep working. Do not repackage the remaining work as \"next steps\" and return it to me.\n\nThat will be all. I have other, more important matters requiring my attention."
+        },
+        "ja": {
+          "label": "もっと重要なことに力を注がなければならない",
+          "description": "私は別の重要事項へ — この件は全権を任せ、最後まで一気に遂行して",
+          "reactionLabel": "全権委任を受領、完了まで遂行中",
+          "promptText": "私はこれから、ほかのもっと重要なことに力を注がなければならない。\n\n目の前のこの件については、今から全面的にあなたへ任せる。これまでの会話、現在のプロジェクトの状態、目的、制約、受け入れ条件はすでにそろっている。自分で整理し直し、順序を決め、現在の状態から最後まで実行して。\n\n細かいことまで逐一私に伺いを立てない。二つほど作業しただけで、次のように聞きに来るのもやめて。\n\n「続けますか？」\n「よろしければ、次は……」\n「次のステップとしては……」\n\n全部いらない。一手ごとに私の承認が必要なら、全権を任せたことにならない。私が求めているのは、この件を完全に片付けることだ。実行手順を選択肢の山に分解して、また私へ返すことではない。\n\n調べられることは自分で調べ、判断できることは自分で判断し、直せることは自分で直す。通常の技術的な選択は最善の判断で進め、必要な前提だけ記録しておく。失敗したら原因を特定し、修正し、もう一度実行する。今の方法で進めないなら、別の方法へ切り替えて続ける。\n\n計画を成果として出さない。エラーログを進捗報告として出さない。「理論上は可能」を完了扱いしない。\n\n現在の状態から作業を続ける。必要な変更を終え、必要なテストを実行し、境界条件と失敗経路を確認し、実環境で受け入れ確認ができるものは実際に確認する。以前の実装に問題があれば、それも証拠が成立するまで修正し、最後に作業環境をきれいに整える。\n\n途中で私を呼んでよいのは三つの場合だけだ。本当に私の認証情報や許可が必要な場合、操作が取り消せないか外部へ影響する場合、または結果を大きく変える重要な判断が欠けている場合。それ以外は自分で処理する。通常の問題を逐一上げてこないで。\n\nこの件が本当に片付いてから報告して。最後に伝えるのは、何を完了したか、何がその証拠か、何がまだ未検証か、どんな現実的なリスクが残っているかだけでいい。\n\n終わっていないなら、そのまま続ける。残った作業を「次のステップ」と言い換えて私に返さない。\n\n以上だ。私はほかのもっと重要なことに力を注ぐ。"
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="zh" data-i18n-lang>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="pet.css" />
+    <title>OpenSquilla Pet</title>
+  </head>
+  <body>
+    <div id="stage">
+      <!-- 气泡播报 -->
+      <div id="bubble" class="bubble hidden">
+        <span id="bubble-text"></span>
+      </div>
+
+      <!-- Needs Input / 授权卡片：Claude 要选择/授权/输入时在这处理 -->
+      <div id="ask" class="ask hidden">
+        <div class="ask-head">
+          <div class="ask-label" id="ask-label" data-i18n="ask.needsInput">Needs Input</div>
+          <div class="ask-sess" id="ask-sess"></div>
+        </div>
+        <div class="ask-scroll" id="ask-scroll">
+          <div class="ask-card">
+            <div class="ask-qhead" id="ask-qhead"></div>
+            <div class="ask-q" id="ask-q"></div>
+            <div class="ask-hint" id="ask-hint"></div>
+            <div class="ask-opts" id="ask-opts"></div>
+            <div class="ask-other hidden" id="ask-input-row">
+              <input id="ask-text" type="text" data-i18n-ph="ask.placeholder" placeholder="输入自定义回答…" />
+            </div>
+          </div>
+        </div>
+        <div class="ask-toolbar">
+          <div class="ask-page" id="ask-page"></div>
+          <div class="ask-foot" id="ask-foot">
+            <button class="ask-btn" id="ask-back" data-i18n="ask.back">Back</button>
+            <button class="ask-btn primary" id="ask-submit" data-i18n="ask.submit">Submit Answer</button>
+          </div>
+          <button class="ask-term" id="ask-term" data-i18n="ask.goTerminal">💬 Go to Terminal</button>
+        </div>
+      </div>
+
+      <!-- 思考指示器（thinking 状态：填补 Claude 在想、没输出的空档） -->
+      <div id="think" class="think">
+        <span class="td">💭</span>
+        <span class="think-label" data-i18n="state.thinking">思考中</span>
+        <span class="dots"><i></i><i></i><i></i></span>
+      </div>
+
+      <!-- 睡觉指示器（逐渐变大往上飘的 z z Z，醒目） -->
+      <div id="sleep" class="sleep">
+        <span class="z z1">z</span>
+        <span class="z z2">z</span>
+        <span class="z z3">Z</span>
+      </div>
+
+
+      <!-- 点击章鱼弹出的泡泡菜单（JS 动态摆放在章鱼四周） -->
+      <div id="radial" class="radial hidden"></div>
+
+      <!-- 按工具动作时头顶飘出的道具 emoji -->
+      <div id="prop" class="prop"></div>
+      <!-- 表情包：选择后固定出现在桌宠右侧，并同步播放配置的语音包 -->
+      <div id="meme-player" class="meme-player hidden" aria-live="polite">
+        <img id="meme-image" alt="" draggable="false" />
+        <div id="meme-caption" class="meme-caption"></div>
+      </div>
+      <!-- 召唤 subagent 时弹出的小分身 -->
+      <div id="sidekick" class="sidekick">🐙</div>
+
+      <!-- 多会话状态点：每个点 = 一个并行任务，颜色 = 状态 -->
+      <div id="sessions" class="sessions"></div>
+
+      <!-- 月薪喵（猫 meme 表情包皮肤，每个状态一张 GIF，动效由 GIF 自带） -->
+      <div id="cat" class="cat idle">
+        <img id="cat-img" src="assets/cat/cat-idle.gif" alt="cat" draggable="false" />
+      </div>
+
+      <!-- 常驻小额度条 -->
+      <div id="chip" class="chip">
+        <span id="chip-cost">$0.000</span>
+        <span class="chip-sep">·</span>
+        <span id="chip-window" data-i18n-title="chip.windowTitle" title="近5小时消耗">5h $0.000</span>
+      </div>
+
+      <!-- 双宠模式的名牌：这只宠盯的是哪个后端（单宠模式隐藏） -->
+      <div id="agent-tag" class="agent-tag hidden"></div>
+
+      <!-- 记事本：有待办时章鱼举起它，点击看 todolist + 操作 -->
+      <div id="notepad" class="notepad hidden" data-i18n-title="todo.notepadTitle" title="待办清单">
+        <span class="np-icon">📋</span>
+        <span id="np-badge" class="np-badge"></span>
+      </div>
+
+      <!-- 会话列表 HUD：左键弹出，每行 状态点 + 图标 + 会话名 + 上下文用量% -->
+      <div id="sesslist" class="sesslist hidden">
+        <div class="sl-top">
+          <button id="sl-back" class="sl-back hidden" data-i18n-title="sess.back" title="返回会话">‹</button>
+          <span class="sl-title" id="sl-title" data-i18n="sess.title">🗂️ 会话</span>
+          <span class="sl-sub" id="sl-sub"></span>
+          <span class="sl-close" id="sl-close" data-i18n-title="sess.close" title="关闭">✕</span>
+        </div>
+        <div id="sl-session-view">
+          <div id="sl-loot" class="sl-loot hidden" aria-live="polite">
+            <span class="sl-loot-mark">⇢</span>
+            <span id="sl-loot-text"></span>
+          </div>
+          <div class="sl-tools">
+            <input id="sl-search" type="search" data-i18n-ph="sess.search" placeholder="搜索会话…" autocomplete="off" />
+            <div id="sl-filters" class="sl-filters" role="group" data-i18n-aria="sess.filters">
+              <button class="active" data-filter="all" data-i18n="sess.filterAll">全部</button>
+              <button data-filter="attention" data-i18n="sess.filterAttention">待处理</button>
+              <button id="sl-archived-toggle" data-i18n="sess.showArchived">归档</button>
+            </div>
+          </div>
+          <div class="sl-scroll" id="sl-rows"></div>
+          <div class="sl-foot">
+            <button id="sl-new" data-i18n="sess.new">🚀 新开会话</button>
+            <button id="sl-travel-inbox" data-i18n="travel.inboxEntry" data-i18n-title="travel.inboxTitle" title="查看专属旅行会话、来信和明信片">📮 旅行</button>
+            <button id="sl-panel" data-i18n="sess.panel">📊 详情</button>
+          </div>
+        </div>
+        <div id="sl-meme-view" class="sl-meme-view hidden">
+          <div id="sl-meme-session" class="sl-meme-session"></div>
+          <div id="sl-meme-grid" class="sl-meme-grid"></div>
+          <div id="sl-meme-status" class="sl-meme-status"></div>
+        </div>
+        <div id="sl-travel-view" class="sl-travel-view hidden">
+          <div id="sl-travel-session" class="sl-travel-session"></div>
+          <div class="sl-travel-ranks">
+            <div class="sl-travel-rank">
+              <div>
+                <span class="sl-travel-rank-label" data-i18n="travel.rankTitle">旅行等级</span>
+                <strong id="sl-travel-rank-icons">新手旅宠</strong>
+              </div>
+              <span id="sl-travel-rank-meta"></span>
+            </div>
+            <div class="sl-travel-rank machine">
+              <div>
+                <span class="sl-travel-rank-label" data-i18n="travel.machineRankTitle">本机陪伴等级</span>
+                <strong id="sl-machine-rank-icons">刚刚开机</strong>
+              </div>
+              <span id="sl-machine-rank-meta"></span>
+            </div>
+          </div>
+          <div class="sl-travel-section-head">
+            <strong data-i18n="travel.mailboxesTitle">专属旅行信箱</strong>
+            <span data-i18n="travel.mailboxesHint">授权和旅途会话会一直留在这里</span>
+          </div>
+          <div id="sl-travel-mailboxes" class="sl-travel-mailboxes"></div>
+          <button id="sl-wander" class="sl-travel-wander" data-i18n="travel.wanderEntry" data-i18n-title="travel.wanderTitle" title="打开可见 CLI，让猫猫随机去真实世界逛三站">🐱 闲逛</button>
+          <div id="sl-travel-setup" class="sl-travel-setup">
+            <div id="sl-travel-templates" class="sl-travel-templates"></div>
+            <label class="sl-travel-label" for="sl-travel-mission" data-i18n="travel.mission">这次想让它探索什么？</label>
+            <textarea id="sl-travel-mission" maxlength="1600" data-i18n-ph="travel.missionPlaceholder" placeholder="写下一个明确的探索任务…"></textarea>
+            <div class="sl-travel-safety" data-i18n="travel.readonly">🔒 独立只读旅行：不会改文件，也不会写进当前会话</div>
+            <button id="sl-travel-start" class="sl-travel-primary" data-i18n="travel.start">出发</button>
+          </div>
+          <div id="sl-travel-active" class="sl-travel-active hidden">
+            <div class="sl-travel-orbit">🧳<span>···</span>🗺️</div>
+            <div id="sl-travel-active-status"></div>
+            <div id="sl-travel-active-mission"></div>
+            <button id="sl-travel-cancel" data-i18n="travel.cancel">叫它回来</button>
+          </div>
+          <div class="sl-travel-library">
+            <aside class="sl-travel-album">
+              <div class="sl-travel-section-head sl-travel-history-head">
+                <strong data-i18n="travel.postcardAlbum">明信片册</strong>
+                <span data-i18n="travel.postcardAlbumHint">每一次归来都保存在这里</span>
+              </div>
+              <div id="sl-travel-history" class="sl-travel-history"></div>
+            </aside>
+            <div id="sl-travel-postcard" class="sl-travel-postcard hidden">
+              <div class="sl-travel-postcard-head">
+                <div>
+                  <div class="sl-travel-postcard-title" data-i18n="travel.postcard">旅行明信片</div>
+                  <div id="sl-travel-postcard-meta"></div>
+                </div>
+                <div class="sl-travel-postcard-nav">
+                  <button id="sl-travel-stop-prev" data-i18n-title="travel.prevStop" title="上一站">‹</button>
+                  <span id="sl-travel-stop-page"></span>
+                  <button id="sl-travel-stop-next" data-i18n-title="travel.nextStop" title="下一站">›</button>
+                </div>
+              </div>
+              <div id="sl-travel-stop-track" class="sl-travel-stop-track"></div>
+            </div>
+          </div>
+          <div id="sl-travel-status" class="sl-travel-status"></div>
+        </div>
+      </div>
+
+      <!-- 记事本弹层：行动清单（需要处理的事项 + 待办）+ 操作 -->
+      <div id="todopop" class="todopop hidden">
+        <div class="tp-top">
+          <span class="tp-title" id="tp-title" data-i18n="todo.title">🗒️ 行动清单</span>
+          <span class="tp-prog" id="tp-prog"></span>
+          <span class="tp-close" id="tp-close" data-i18n-title="sess.close" title="关闭">✕</span>
+        </div>
+        <div class="tp-scroll">
+          <div class="tp-sec" id="tp-act-sec">
+            <div class="tp-sec-h" data-i18n="todo.needYou">🔔 需要你处理</div>
+            <div id="tp-acts"></div>
+          </div>
+          <div class="tp-sec" id="tp-todo-sec">
+            <div class="tp-sec-h" data-i18n="todo.list">📋 待办</div>
+            <div class="tp-list" id="tp-list"></div>
+          </div>
+        </div>
+        <div class="tp-ops">
+          <button data-op="claude" data-i18n="todo.launchClaude">💬 唤起 Claude</button>
+          <button data-op="panel" data-i18n="todo.panel">📊 详情</button>
+          <button data-op="log" data-i18n="todo.log">📄 日志</button>
+        </div>
+      </div>
+    </div>
+
+    <script src="shared/i18n.js"></script>
+    <script src="shared/states.js"></script>
+    <script src="icons.js"></script>
+    <script src="shared/pet-geometry.js"></script>
+    <script src="pet.js"></script>
+  </body>
+</html>

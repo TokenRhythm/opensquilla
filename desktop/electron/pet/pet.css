@@ -1,0 +1,1403 @@
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body {
+  width: 100%;
+  height: 100%;
+  background: transparent;
+  overflow: hidden;
+  font-family: -apple-system, "PingFang SC", "Helvetica Neue", sans-serif;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+#stage {
+  position: relative;
+  width: 100%;
+  height: 100vh;      /* 填满窗口；选项面板需要时窗口会变高，形象始终贴底 */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+/* Screen-edge anchoring ----------------------------------------------------
+   The BrowserWindow stays fully inside the work area; the visible pet moves
+   to the relevant side *inside* that transparent window. This is what lets a
+   pet genuinely touch the top/left/right edge without sacrificing room for a
+   popup or circular menu. */
+#stage.edge-below { justify-content: flex-start; }
+#stage.edge-left { align-items: flex-start; }
+#stage.edge-right { align-items: flex-end; }
+
+#stage.edge-below #pixel,
+#stage.edge-below #mascot,
+#stage.edge-below #cat { order: 0; }
+#stage.edge-below .sessions { order: 1; margin-top: 3px; margin-bottom: 0; }
+#stage.edge-below .chip { order: 2; }
+#stage.edge-below .agent-tag { order: 3; }
+#stage.edge-below .bubble,
+#stage.edge-below .think { order: 4; margin-top: 8px; margin-bottom: 0; }
+
+#stage.edge-below .bubble::after {
+  top: -7px;
+  bottom: auto;
+  border-width: 0 7px 8px 7px;
+  border-color: transparent transparent rgba(255, 255, 255, 0.97) transparent;
+}
+
+/* ---------- 选项面板（点选答案） ---------- */
+.ask {
+  max-width: 290px;
+  margin-bottom: 10px;
+  padding: 11px 13px;
+  background: rgba(255, 255, 255, 0.98);
+  border: 1px solid rgba(217, 119, 87, 0.45);
+  border-radius: 15px;
+  box-shadow: 0 8px 24px rgba(120, 60, 35, 0.32);
+  -webkit-app-region: no-drag;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  animation: askIn 0.25s ease;
+}
+.ask.hidden { display: none; }
+@keyframes askIn { from { opacity: 0; transform: translateY(8px) scale(0.96); } to { opacity: 1; transform: none; } }
+.ask-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ask-proj { font-size: 10.5px; color: #b06a48; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ask-nav { font-size: 10.5px; color: #fff; background: #d97757; padding: 2px 8px; border-radius: 9px; cursor: pointer; flex-shrink: 0; }
+.ask-nav:hover { background: #c45f3f; }
+.ask-q { font-size: 12.5px; font-weight: 700; color: #3a2a22; line-height: 1.45; }
+.ask-opts { display: flex; flex-direction: column; gap: 6px; }
+.ask-opt {
+  display: flex; flex-direction: column; gap: 2px;
+  text-align: left;
+  padding: 7px 11px; border-radius: 10px;
+  border: 1px solid rgba(217, 119, 87, 0.35);
+  background: #fff7f2; color: #5a3a2a; cursor: pointer;
+  transition: background 0.12s ease, transform 0.1s ease;
+  -webkit-app-region: no-drag;
+}
+.ask-opt:hover { background: #d97757; transform: translateX(2px); }
+.ask-opt:hover .ao-l, .ask-opt:hover .ao-d { color: #fff; }
+.ask-opt.sel { background: #f3c8ac; border-color: #d97757; }
+.ao-l { font-size: 12.5px; font-weight: 600; }
+.ao-d { font-size: 10.5px; color: #9a7866; line-height: 1.35; }
+.ask-submit { text-align: center; font-weight: 700; background: #d97757; color: #fff; border: none; }
+.ask-submit:hover { background: #c45f3f; }
+.ask-submit.disabled { background: #c9bfb8; color: #fff; cursor: default; }
+.ask-submit.disabled:hover { background: #c9bfb8; }
+/* 对话类：只读选项 + 「去回复」按钮（桌宠不替你打字） */
+.ask-ro { padding: 6px 11px; border-radius: 9px; background: #f4efe9; color: #7a6658; cursor: default; }
+.ask-ro .ao-l { font-size: 12px; font-weight: 600; }
+.ask-ro .ao-d { font-size: 10.5px; color: #9a8576; line-height: 1.35; }
+.ask-go { text-align: center; align-items: center; font-weight: 700; background: #5a3a2a; color: #fff; border: none; }
+.ask-go:hover { background: #6f4734; transform: none; }
+.ask-input { display: flex; gap: 6px; }
+.ask-input input {
+  flex: 1; min-width: 0; font-size: 12px; padding: 7px 9px;
+  border: 1px solid rgba(217, 119, 87, 0.35); border-radius: 9px;
+  background: #fff; color: #3a2a22; -webkit-app-region: no-drag;
+}
+.ask-input input:focus { outline: none; border-color: #d97757; }
+.ask-input button {
+  font-size: 12px; padding: 7px 12px; border: none; border-radius: 9px;
+  background: #5a3a2a; color: #fff; cursor: pointer; flex-shrink: 0;
+}
+.ask-input button:hover { background: #3a2a22; }
+
+/* ---------- 记事本（待办入口） ---------- */
+.notepad {
+  position: absolute; right: 44px; bottom: 96px; z-index: 6;
+  width: 38px; height: 38px; cursor: pointer; -webkit-app-region: no-drag;
+  display: flex; align-items: center; justify-content: center;
+  background: #fff7f2; border: 1.5px solid #d97757; border-radius: 9px;
+  box-shadow: 0 4px 12px rgba(120, 60, 35, 0.3);
+  transform: rotate(-8deg); transition: transform 0.15s ease;
+  animation: npRaise 2.4s ease-in-out infinite;
+}
+.notepad:hover { transform: rotate(-8deg) scale(1.12); }
+.notepad.hidden { display: none; }
+.np-icon { font-size: 20px; line-height: 1; }
+.np-badge {
+  position: absolute; top: -7px; right: -7px; min-width: 17px; height: 17px;
+  padding: 0 4px; border-radius: 9px; background: #d97757; color: #fff;
+  font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center;
+}
+.np-badge.urgent { background: #e5484d; } /* 有「需处理」事项时红色 */
+@keyframes npRaise { 0%, 100% { transform: rotate(-8deg) translateY(0); } 50% { transform: rotate(-8deg) translateY(-4px); } }
+
+/* ---------- 记事本行动中心：占一大块，不挤在章鱼小范围 ---------- */
+.todopop {
+  position: absolute; top: 14px; left: 12px; right: 12px;
+  max-height: calc(100vh - 120px); z-index: 30; -webkit-app-region: no-drag;
+  background: rgba(255, 255, 255, 0.985); border: 1px solid rgba(217, 119, 87, 0.45);
+  border-radius: 15px; box-shadow: 0 10px 30px rgba(120, 60, 35, 0.38);
+  padding: 11px 13px; display: flex; flex-direction: column; gap: 8px;
+  animation: askIn 0.22s ease;
+}
+.todopop.hidden { display: none; }
+.tp-top { display: flex; align-items: center; gap: 8px; }
+.tp-title { font-size: 13px; font-weight: 700; color: #3a2a22; flex: 1; }
+.tp-prog { font-size: 11px; color: #b06a48; font-weight: 700; font-variant-numeric: tabular-nums; }
+.tp-close { cursor: pointer; color: #b06a48; font-size: 14px; padding: 0 4px; -webkit-app-region: no-drag; }
+.tp-close:hover { color: #d97757; }
+.tp-scroll { overflow-y: auto; display: flex; flex-direction: column; gap: 10px; }
+.tp-sec.hidden { display: none; }
+.tp-sec-h { font-size: 10.5px; color: #c79b86; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 5px; }
+/* 需要你处理的事项卡片 */
+.tp-act { background: #fff7f2; border: 1px solid rgba(217, 119, 87, 0.4); border-radius: 11px; padding: 8px 10px; margin-bottom: 7px; }
+.tp-act.travel-letter { background: #f5f1ff; border-color: rgba(121, 95, 190, 0.42); }
+.tp-act.travel-letter .tp-act-proj { color: #6d58a8; }
+.tp-act-proj { font-size: 10.5px; color: #b06a48; font-weight: 700; }
+.tp-act-q { font-size: 12.5px; color: #3a2a22; font-weight: 600; line-height: 1.4; margin: 3px 0 7px; white-space: pre-wrap; }
+.tp-act-opts { display: flex; flex-wrap: wrap; gap: 5px; }
+.tp-act-opts button {
+  font-size: 12px; padding: 6px 11px; border: 1px solid rgba(217, 119, 87, 0.4);
+  border-radius: 9px; background: #fff; color: #5a3a2a; cursor: pointer; -webkit-app-region: no-drag;
+}
+.tp-act-opts button:hover { background: #d97757; color: #fff; }
+.tp-act-input { display: flex; gap: 6px; margin-top: 6px; }
+.tp-act-input input { flex: 1; min-width: 0; font-size: 12px; padding: 6px 9px; border: 1px solid rgba(217,119,87,0.35); border-radius: 9px; background: #fff; color: #3a2a22; -webkit-app-region: no-drag; }
+.tp-act-input input:focus { outline: none; border-color: #d97757; }
+.tp-act-input button { font-size: 12px; padding: 6px 11px; border: none; border-radius: 9px; background: #5a3a2a; color: #fff; cursor: pointer; flex-shrink: 0; }
+/* 行动中心：对话类只读选项 + 「去回复」按钮 */
+.tp-act-ro { font-size: 12px; padding: 5px 10px; border-radius: 8px; background: #f4efe9; color: #7a6658; }
+.tp-act-opts .tp-act-go { font-size: 12px; padding: 6px 12px; border: none; border-radius: 9px; background: #5a3a2a; color: #fff; cursor: pointer; -webkit-app-region: no-drag; font-weight: 600; }
+.tp-act-opts .tp-act-go:hover { background: #6f4734; }
+/* 待办行 */
+.tp-list { display: flex; flex-direction: column; gap: 4px; }
+.tp-row { display: flex; gap: 7px; align-items: flex-start; font-size: 12.5px; padding: 6px 10px; background: #fff7f2; border-radius: 8px; line-height: 1.4; }
+.tp-row .ic { flex-shrink: 0; font-size: 12px; }
+.tp-row .tx { color: #5a3a2a; }
+.tp-row.done .tx { color: #a08a7c; text-decoration: line-through; }
+.tp-row.doing { background: rgba(217, 119, 87, 0.18); }
+.tp-row.doing .tx { color: #b0451e; font-weight: 600; }
+.tp-empty { font-size: 12px; color: #9a7866; padding: 6px 2px; }
+.tp-ops { display: flex; gap: 6px; border-top: 1px solid rgba(217, 119, 87, 0.25); padding-top: 8px; flex-shrink: 0; }
+.tp-ops button {
+  flex: 1; font-size: 11px; padding: 7px 4px; border: 1px solid rgba(217, 119, 87, 0.35);
+  border-radius: 8px; background: #fff7f2; color: #5a3a2a; cursor: pointer; -webkit-app-region: no-drag;
+}
+.tp-ops button:hover { background: #d97757; color: #fff; }
+
+/* ---------- 漂浮基线（pixel / mascot 共用的 keyframes） ---------- */
+.pixel.dragging { cursor: grabbing; }
+
+@keyframes bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-7px); }
+}
+
+@keyframes happyJump {
+  0%, 100% { transform: translateY(0) scale(1, 1); }
+  30% { transform: translateY(-22px) scale(0.94, 1.06); }
+  60% { transform: translateY(0) scale(1.08, 0.92); }
+}
+
+@keyframes breathe {
+  0%, 100% { transform: translateY(0) scale(1); }
+  50% { transform: translateY(2px) scale(1.015); }
+}
+
+/* ---------- 气泡 ---------- */
+.bubble {
+  position: relative;
+  max-width: 340px;
+  margin-bottom: 8px;
+  padding: 9px 13px;
+  background: rgba(255, 255, 255, 0.97);
+  color: #3a2a22;
+  font-size: 13px;
+  line-height: 1.45;
+  border-radius: 14px;
+  box-shadow: 0 6px 18px rgba(120, 60, 35, 0.22);
+  border: 1px solid rgba(217, 119, 87, 0.25);
+  -webkit-app-region: no-drag;
+  cursor: pointer;
+  transition: opacity 0.25s ease, transform 0.25s ease;
+  word-break: break-word;
+}
+.bubble::after {
+  content: "";
+  position: absolute;
+  bottom: -7px;
+  left: 50%;
+  transform: translateX(-50%);
+  border-width: 8px 7px 0 7px;
+  border-style: solid;
+  border-color: rgba(255, 255, 255, 0.97) transparent transparent transparent;
+}
+.bubble.hidden { opacity: 0; transform: translateY(8px) scale(0.96); pointer-events: none; }
+
+/* ---------- 额度小条 ---------- */
+.chip {
+  margin-top: 2px;
+  padding: 3px 10px;
+  background: rgba(61, 42, 32, 0.82);
+  color: #ffe9dc;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  border-radius: 11px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  -webkit-app-region: no-drag;
+  cursor: pointer;
+  opacity: 0.9;            /* 额度常驻可见，悬停时更清晰 */
+  transition: opacity 0.25s ease;
+}
+#stage:hover .chip { opacity: 1; }
+.chip.flash { animation: chipFlash 0.5s ease; }
+@keyframes chipFlash { 0% { background: #d97757; } 100% { background: rgba(61,42,32,0.82); } }
+.chip-sep { opacity: 0.5; }
+
+/* ---------- 双宠模式名牌：这只宠盯哪个后端（Claude 橙 / Codex 绿） ---------- */
+.agent-tag {
+  margin-top: 4px;
+  padding: 2px 9px 2px 6px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  border-radius: 10px;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  pointer-events: none; /* 纯标签：不能挡命中测试，否则会让身下的宠物点不到 */
+}
+.agent-tag.hidden { display: none; }
+.agent-tag .at-ic { width: 13px; height: 13px; display: inline-flex; }
+.agent-tag .at-ic svg { width: 100%; height: 100%; }
+.agent-tag.claude { background: rgba(217, 119, 87, 0.22); color: #ffb495; border: 1px solid rgba(217, 119, 87, 0.45); }
+.agent-tag.codex { background: rgba(59, 130, 246, 0.2); color: #9cc4ff; border: 1px solid rgba(59, 130, 246, 0.45); }
+
+/* ---------- 皮肤切换：默认图标款章鱼（mascot），可切像素怪兽（pixel）/ 月薪喵（cat） ---------- */
+#pixel { display: none; }
+#cat { display: none; }
+#mascot { display: flex; }
+body.skin-pixel #mascot { display: none; }
+body.skin-pixel #pixel { display: flex; }
+body.skin-cat #mascot { display: none; }
+body.skin-cat #cat { display: flex; }
+
+/* ---------- 形象二：Claude Code 像素小怪兽 ---------- */
+.pixel {
+  position: relative;
+  flex-direction: column;
+  align-items: center;
+  cursor: grab;
+  touch-action: none;
+}
+.pixel-sprite {
+  filter: drop-shadow(0 5px 7px rgba(120, 50, 30, 0.4));
+  animation: bob 3.2s ease-in-out infinite;
+}
+.pixel-sprite svg { display: block; image-rendering: pixelated; }
+
+/* 脚下虚线地面（呼应 CLI 里的那条点线） */
+.pixel-ground {
+  width: 200px;
+  margin-top: 5px;
+  border-top: 2px dotted rgba(225, 200, 210, 0.55);
+}
+
+/* 状态动画 */
+#pixel.working .pixel-sprite { animation: hop 0.46s ease-in-out infinite; }
+#pixel.roam .pixel-sprite { animation: travelWalk 1.15s ease-in-out infinite; }
+#pixel.happy .pixel-sprite { animation: happyJump 0.55s ease-in-out 3; }
+#pixel.sleeping .pixel-sprite { animation: bob 5s ease-in-out infinite; }
+@keyframes hop {
+  0%, 100% { transform: translateY(0); }
+  45% { transform: translateY(-12px); }
+}
+@keyframes travelWalk {
+  0%, 100% { transform: translateX(-12px) translateY(0) rotate(-2deg); }
+  50% { transform: translateX(12px) translateY(-8px) rotate(2deg); }
+}
+
+/* 旧的小 💤 已停用，睡觉改用 #sleep 的大号 z z Z */
+.pixel-zzz { display: none; }
+
+/* ====================================================================
+   等你处理（waiting）：抖动 + 发光，强提示
+   ==================================================================== */
+#pixel.waiting { animation: attn 0.55s ease-in-out infinite; }
+#pixel.waiting .pixel-sprite { filter: drop-shadow(0 0 9px rgba(255, 190, 80, 0.95)); animation: none; }
+@keyframes attn {
+  0%, 100% { transform: translateX(0) rotate(0); }
+  20% { transform: translateX(-4px) rotate(-4deg); }
+  60% { transform: translateX(4px) rotate(4deg); }
+}
+
+/* ====================================================================
+   多会话状态点
+   ==================================================================== */
+.sessions {
+  display: flex;
+  gap: 5px;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 3px;
+  min-height: 12px;
+}
+/* Keep the session dots centred on the visible pet, not on the transparent
+   BrowserWindow. At a left/right edge both boxes share the same outer edge,
+   so matching their widths also matches their centres. */
+body.skin-pixel .sessions { width: 200px; }
+body.skin-mascot .sessions { width: 252px; }
+body.skin-cat .sessions { width: 120px; }
+.sess-dot {
+  width: 9px; height: 9px;
+  border-radius: 50%;
+  background: #6f6f76;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.3);
+  transition: transform 0.15s ease;
+}
+/* 与会话列表 HUD 的 .sl-dot 同一套配色 */
+.sess-dot.working, .sess-dot.thinking, .sess-dot.juggling, .sess-dot.sweeping { background: #4a9eff; }
+.sess-dot.loafing { background: #8fb8e8; }
+.sess-dot.waiting { background: #ffb020; animation: dotPulse 0.9s ease-in-out infinite; }
+.sess-dot.needsinput { background: #ffb020; box-shadow: 0 0 0 2px rgba(255, 176, 32, 0.35); animation: dotPulse 1.4s ease-in-out infinite; }
+.sess-dot.error { background: #ff5a52; }
+.sess-dot.done { background: #34c759; }
+.sess-dot.idle, .sess-dot.sleeping { background: #6f6f76; }
+@keyframes dotPulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(255,176,46,0.6); }
+  50% { transform: scale(1.25); box-shadow: 0 0 0 4px rgba(255,176,46,0); }
+}
+
+/* ====================================================================
+   泡泡菜单（点击章鱼弹出，围绕四周）
+   ==================================================================== */
+.radial { position: absolute; inset: 0; z-index: 20; }  /* 打开时充当点击遮罩 */
+.radial.hidden { display: none; }
+.radial-item {
+  position: absolute;
+  width: 46px; height: 46px;
+  margin: -23px 0 0 -23px;            /* 以 left/top 为中心 */
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.97);
+  box-shadow: 0 5px 14px rgba(120, 60, 35, 0.32);
+  border: 1px solid rgba(217, 119, 87, 0.3);
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 1px;
+  cursor: pointer;
+  pointer-events: auto;
+  opacity: 0;
+  transform: scale(0.3);
+  transition: transform 0.26s cubic-bezier(0.34, 1.56, 0.64, 1), opacity 0.2s ease;
+}
+.radial:not(.hidden) .radial-item { opacity: 1; transform: scale(1); }
+.radial-item .ri-ic { font-size: 20px; line-height: 1; color: #5a3a2a; }
+.radial-item:hover .ri-ic { color: #d97757; }
+.radial-item .ri-lb {
+  font-size: 8px; color: #8a5a44; line-height: 1;
+  /* EN/JA labels are longer than the 2-char Chinese ones; clamp them to the
+     circle so a long word ellipsizes instead of overlapping its neighbours. */
+  max-width: 42px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.radial-item:hover { transform: scale(1.16); background: #fff; }
+.radial-item:active { transform: scale(0.95); }
+.radial-item .ri-badge {
+  position: absolute; top: -3px; right: -3px;
+  min-width: 15px; height: 15px; padding: 0 3px;
+  border-radius: 8px; background: #ff5f57; color: #fff;
+  font-size: 9px; line-height: 15px; text-align: center;
+  font-weight: 700;
+}
+
+/* ====================================================================
+   思考中（thinking）：填补 Claude 在想、没输出的空档
+   ==================================================================== */
+.think {
+  display: none;
+  align-items: center; gap: 5px;
+  margin-bottom: 8px;
+  padding: 6px 11px;
+  background: rgba(247, 240, 255, 0.97);
+  border: 1px solid rgba(150, 120, 210, 0.3);
+  border-radius: 14px;
+  box-shadow: 0 5px 14px rgba(90, 70, 140, 0.2);
+  font-size: 12.5px; color: #5b4a7a;
+  pointer-events: none;
+}
+.think.on { display: flex; animation: thinkIn 0.25s ease; }
+@keyframes thinkIn { from { opacity: 0; transform: translateY(6px) scale(0.96); } to { opacity: 1; transform: none; } }
+
+.think .td { font-size: 14px; animation: thinkBob 2.2s ease-in-out infinite; }
+@keyframes thinkBob { 0%,100% { transform: translateY(0) rotate(-4deg); } 50% { transform: translateY(-2px) rotate(4deg); } }
+.think .dots { display: inline-flex; gap: 3px; }
+.think .dots i {
+  width: 4px; height: 4px; border-radius: 50%; background: #8a6fc0; display: inline-block;
+  animation: thinkDots 1.4s ease-in-out infinite;
+}
+.think .dots i:nth-child(2) { animation-delay: 0.2s; }
+.think .dots i:nth-child(3) { animation-delay: 0.4s; }
+@keyframes thinkDots { 0%, 60%, 100% { opacity: 0.25; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-3px); } }
+
+/* 思考 ponder keyframe（mascot 共用） */
+@keyframes ponder {
+  0% { transform: translateY(0) rotate(-6deg); }
+  50% { transform: translateY(-5px) rotate(6deg); }
+  100% { transform: translateY(0) rotate(-6deg); }
+}
+
+/* 像素怪兽思考：缓慢悠悠地飘 */
+#pixel.thinking .pixel-sprite { animation: ponderPix 2.6s ease-in-out infinite; }
+@keyframes ponderPix {
+  0%, 100% { transform: translateY(0) rotate(-2deg); }
+  50% { transform: translateY(-4px) rotate(2deg); }
+}
+
+/* 会话点：思考态配色 */
+.sess-dot.thinking { background: #9a7fd6; animation: dotThink 1.6s ease-in-out infinite; }
+@keyframes dotThink { 0%,100% { opacity: 0.55; } 50% { opacity: 1; } }
+
+/* ====================================================================
+   睡觉：逐渐变大、往上飘的 z z Z（醒目）
+   ==================================================================== */
+.sleep {
+  position: absolute;
+  bottom: 122px;
+  left: 52%;
+  width: 84px;
+  height: 70px;
+  display: none;
+  pointer-events: none;
+  z-index: 15;
+}
+.sleep.on { display: block; }
+.sleep .z {
+  position: absolute;
+  bottom: 0;
+  font-family: -apple-system, "Helvetica Neue", sans-serif;
+  font-weight: 800;
+  color: #aac0f2;
+  text-shadow: 0 2px 4px rgba(40, 50, 90, 0.4);
+  opacity: 0;
+  animation: zRise 3s ease-in-out infinite;
+}
+.sleep .z1 { left: 0; font-size: 17px; animation-delay: 0s; }
+.sleep .z2 { left: 18px; font-size: 26px; animation-delay: 0.7s; }
+.sleep .z3 { left: 44px; font-size: 38px; animation-delay: 1.4s; }
+#stage.edge-below .sleep { top: 18px; bottom: auto; }
+@keyframes zRise {
+  0% { opacity: 0; transform: translateY(8px) rotate(-12deg); }
+  25% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { opacity: 0; transform: translateY(-40px) translateX(14px) rotate(10deg); }
+}
+
+/* ====================================================================
+   出错（error）：抖一下 + 泛红，短暂
+   ==================================================================== */
+#pixel.error { animation: errShake 0.42s ease-in-out 3; }
+@keyframes errShake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-5px) rotate(-2deg); }
+  75% { transform: translateX(5px) rotate(2deg); }
+}
+#pixel.error .pixel-sprite { filter: drop-shadow(0 0 9px rgba(232, 80, 55, 0.95)); }
+
+/* ====================================================================
+   空闲小动作：东张西望 / 蹦一下
+   ==================================================================== */
+@keyframes glance {
+  0%, 100% { transform: translateX(0); }
+  20% { transform: translateX(-4px); }
+  55% { transform: translateX(4px); }
+  80% { transform: translateX(0); }
+}
+.pixel.peek .pixel-sprite { animation: peekHop 0.62s ease; }
+@keyframes peekHop {
+  0%, 100% { transform: translateY(0); }
+  45% { transform: translateY(-9px); }
+}
+
+/* ====================================================================
+   打招呼（greet）：新会话时摇摆挥手
+   ==================================================================== */
+@keyframes greetWave {
+  0%, 100% { transform: rotate(0); }
+  25% { transform: rotate(-8deg); }
+  75% { transform: rotate(8deg); }
+}
+#pixel.greet .pixel-sprite { animation: greetBounce 0.5s ease-in-out 4; }
+@keyframes greetBounce {
+  0%, 100% { transform: translateY(0) rotate(0); }
+  50% { transform: translateY(-10px) rotate(5deg); }
+}
+
+/* ====================================================================
+   按工具的「干活」动作（放最后，覆盖通用状态动画）
+   ==================================================================== */
+/* 打字 Edit/Write：快速小幅点动 */
+#pixel.act-type .pixel-sprite { animation: actType 0.22s ease-in-out infinite; }
+@keyframes actType { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-4px); } }
+
+/* 阅读 Read：左右扫视慢摇 */
+#pixel.act-read .pixel-sprite { animation: actRead 1.2s ease-in-out infinite; }
+@keyframes actRead { 0%,100% { transform: translateX(-4px); } 50% { transform: translateX(4px); } }
+@keyframes actScan { 0%,100% { transform: translateX(-3px); } 50% { transform: translateX(3px); } }
+
+/* 找东西 Grep/Glob：歪头左右张望 */
+#pixel.act-search .pixel-sprite { animation: actSearch 0.55s ease-in-out infinite; }
+@keyframes actSearch { 0%,100% { transform: rotate(-6deg); } 50% { transform: rotate(6deg); } }
+
+/* 卖力摇杆 Bash：高频小抖 */
+#pixel.act-crank .pixel-sprite { animation: actCrank 0.14s linear infinite; }
+@keyframes actCrank {
+  0%,100% { transform: rotate(0) translateY(0); }
+  25% { transform: rotate(-3deg); }
+  50% { transform: translateY(-2px); }
+  75% { transform: rotate(3deg); }
+}
+
+/* 上网 WebSearch/Fetch：抬头上飘 */
+#pixel.act-web .pixel-sprite { animation: actWeb 1s ease-in-out infinite; }
+@keyframes actWeb { 0%,100% { transform: translateY(0); } 50% { transform: translateY(-7px); } }
+
+/* 召唤 Task/Agent：挤一下 */
+#pixel.act-summon .pixel-sprite { animation: actSummon 0.5s ease-in-out; }
+@keyframes actSummon {
+  0% { transform: scale(1, 1); }
+  30% { transform: scale(1.14, 0.86); }
+  60% { transform: scale(0.92, 1.08); }
+  100% { transform: scale(1, 1); }
+}
+
+/* 点头 TodoWrite */
+#pixel.act-check .pixel-sprite { animation: actNod 0.4s ease-in-out 2; }
+@keyframes actNod { 0%,100% { transform: rotate(0) translateY(0); } 50% { transform: rotate(6deg) translateY(2px); } }
+
+/* ---- 头顶道具 emoji ---- */
+.prop {
+  position: absolute;
+  bottom: 104px;
+  left: 15%;
+  font-size: 21px;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 16;
+  filter: drop-shadow(0 2px 3px rgba(80,50,30,0.4));
+}
+.prop.on { animation: propIn 0.3s ease forwards; }
+@keyframes propIn {
+  0% { opacity: 0; transform: translateY(8px) scale(0.4); }
+  60% { opacity: 1; transform: translateY(0) scale(1.15); }
+  100% { opacity: 1; transform: scale(1); }
+}
+.prop.spin.on { animation: propIn 0.3s ease forwards, propSpin 1.1s linear infinite 0.3s; }
+@keyframes propSpin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+.prop.hunt.on { animation: propIn 0.3s ease forwards, propHunt 0.7s ease-in-out infinite 0.3s; }
+@keyframes propHunt { 0%,100% { transform: translate(0,0); } 50% { transform: translate(6px,-3px); } }
+.prop.jit.on { animation: propIn 0.3s ease forwards, propJit 0.2s ease-in-out infinite 0.3s; }
+@keyframes propJit { 0%,100% { transform: rotate(-8deg); } 50% { transform: rotate(8deg); } }
+
+/* ---- 大任务完成彩带 ---- */
+.confetti {
+  position: absolute;
+  pointer-events: none;
+  z-index: 25;
+  opacity: 0;
+  animation: confettiFly 1.2s ease-out forwards;
+}
+@keyframes confettiFly {
+  0% { opacity: 0; transform: translate(0, 0) scale(0.4) rotate(0); }
+  20% { opacity: 1; }
+  100% { opacity: 0; transform: translate(var(--dx), var(--dy)) scale(1.1) rotate(50deg); }
+}
+
+/* ---- 被抓起来时的反应（更像活宠物） ---- */
+#pixel.dragging .pixel-sprite { animation: grabbed 0.45s ease-in-out infinite; }
+@keyframes grabbed {
+  0%, 100% { transform: scale(1.06) rotate(-3deg); }
+  50% { transform: scale(1.1) rotate(3deg); }
+}
+
+/* ====================================================================
+   图标款小章鱼（mascot）—— 复用已有 keyframes
+   ==================================================================== */
+#mascot {
+  width: 252px; height: 188px;   /* 跟统一画布 841×628 同比例；头显示 ~125px，与旧版一致 */
+  cursor: grab; touch-action: none;
+  flex-direction: column; align-items: center;
+  filter: drop-shadow(0 6px 10px rgba(150, 70, 40, 0.3));
+}
+#mascot img { width: 100%; height: 100%; object-fit: contain; -webkit-user-drag: none; }
+
+#mascot.idle { animation: bob 3.4s ease-in-out infinite; }
+#mascot.working { animation: bob 1.9s ease-in-out infinite; }
+#mascot.roam { animation: travelWalk 1.3s ease-in-out infinite; }
+#mascot.thinking { animation: ponder 2.6s ease-in-out infinite; }
+#mascot.thinking #teyes { transform: translateY(-3px); }
+#mascot.happy { animation: happyJump 0.55s ease-in-out 3; }
+#mascot.sleeping { animation: breathe 4.5s ease-in-out infinite; }
+#mascot.sleeping #teyes { transform: scaleY(0.12); transform-origin: center 84px; }
+#mascot.waiting { animation: attn 0.55s ease-in-out infinite; filter: drop-shadow(0 0 10px rgba(255,190,80,0.95)) drop-shadow(0 6px 10px rgba(150,70,40,0.3)); }
+#mascot.error { animation: errShake 0.42s ease-in-out 3; }
+#mascot.error #mascot-body { fill: #c9381a; }
+#mascot.greet { animation: greetWave 0.5s ease-in-out 4; transform-origin: bottom center; }
+#mascot.dragging { animation: grabbed 0.45s ease-in-out infinite; }
+#mascot.blink #teyes { transform: scaleY(0.12); transform-origin: center 84px; }
+#mascot.glance #teyes { animation: glance 1.6s ease-in-out; }
+#mascot.act-type { animation: actType 0.22s ease-in-out infinite; }
+#mascot.act-read { animation: actRead 1.2s ease-in-out infinite; }
+#mascot.act-read #teyes { animation: actScan 1.2s ease-in-out infinite; }
+#mascot.act-search { animation: actSearch 0.55s ease-in-out infinite; }
+#mascot.act-crank { animation: actCrank 0.14s linear infinite; }
+#mascot.act-web { animation: actWeb 1s ease-in-out infinite; }
+#mascot.act-summon { animation: actSummon 0.5s ease-in-out; }
+#mascot.act-check { animation: actNod 0.4s ease-in-out 2; }
+
+/* ====================================================================
+   月薪喵（cat）—— 猫 meme 表情包皮肤
+   每个状态一张 GIF，本体动效由 GIF 自带；这里只加轻微浮动 + 醒目态强调。
+   ==================================================================== */
+#cat {
+  width: 120px; height: 120px;   /* GIF 原生 120×120，1:1 显示最清晰，放大会糊 */
+  cursor: grab; touch-action: none;
+  flex-direction: column; align-items: center;
+  filter: drop-shadow(0 6px 9px rgba(120, 90, 60, 0.28));
+}
+#cat img { width: 100%; height: 100%; object-fit: contain; -webkit-user-drag: none; }
+
+/* 掠夺素材的原生朝向不一致：attention 朝右，飞踢/看战果朝左。
+   JS 按“素材原生朝向 → 目标方向”决定是否镜像；只翻 GIF，不动容器、
+   命中区、气泡和会话点。 */
+#cat.loot-action-mirrored img { transform: scaleX(-1); }
+
+/* GIF 自带动效，容器不加任何位移动画；只保留「需要你出手」的发光提示 */
+#cat.waiting,
+#cat.needsinput {
+  filter: drop-shadow(0 0 10px rgba(255, 190, 80, 0.95)) drop-shadow(0 6px 9px rgba(120, 90, 60, 0.28));
+}
+#cat.error {
+  filter: drop-shadow(0 0 9px rgba(232, 80, 55, 0.85)) drop-shadow(0 6px 9px rgba(120, 90, 60, 0.28));
+}
+
+/* ---- 召唤小分身 ---- */
+.sidekick {
+  position: absolute;
+  bottom: 70px;
+  left: 50%;
+  font-size: 24px;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 14;
+}
+.sidekick.on { animation: sidekickPop 1.1s ease-out; }
+@keyframes sidekickPop {
+  0% { opacity: 0; transform: translate(0, 0) scale(0.3); }
+  30% { opacity: 1; transform: translate(40px, -10px) scale(1); }
+  70% { opacity: 1; transform: translate(70px, -6px) scale(0.95); }
+  100% { opacity: 0; transform: translate(96px, 6px) scale(0.7); }
+}
+
+/* ── 会话列表 HUD（左键弹出）──────────────────────────────── */
+.sesslist {
+  position: absolute; top: 14px; left: 12px; right: 12px;
+  max-height: calc(100vh - 70px); z-index: 30; -webkit-app-region: no-drag;
+  overflow: hidden;
+  background: rgba(38, 38, 43, 0.97);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 16px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  padding: 8px;
+  display: flex; flex-direction: column;
+  color: #f2f2f5;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+}
+.sesslist.hidden { display: none; }
+.sesslist.session-list-mode {
+  box-sizing: border-box;
+  height: 310px;
+  max-height: 310px;
+}
+.sl-top { display: flex; align-items: center; gap: 8px; padding: 4px 8px 8px; }
+.sl-title { font-size: 12px; font-weight: 700; color: #fff; }
+.sl-sub { font-size: 10.5px; color: #9a9aa0; margin-left: 2px; flex: 1; }
+.sl-close { font-size: 12px; color: #9a9aa0; cursor: pointer; padding: 2px 6px; border-radius: 7px; }
+.sl-close:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+.sl-back {
+  width: 24px; height: 24px; flex: 0 0 24px; border: 0; border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08); color: #fff; cursor: pointer;
+  font-size: 22px; line-height: 20px;
+}
+.sl-back:hover { background: rgba(255, 255, 255, 0.15); }
+.sl-back.hidden { display: none; }
+#sl-session-view {
+  min-height: 0;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+.sl-loot {
+  flex: 0 0 auto; display: flex; align-items: center; gap: 8px;
+  margin: 0 2px 8px; padding: 8px 10px; border-radius: 10px;
+  color: #f4eaff; font-size: 11px; font-weight: 700;
+  border: 1px solid rgba(164, 123, 255, 0.38);
+  background: linear-gradient(90deg, rgba(116, 78, 190, 0.28), rgba(217, 119, 87, 0.18));
+  box-shadow: inset 0 0 16px rgba(139, 103, 230, 0.1);
+}
+.sl-loot.hidden { display: none; }
+.sl-loot-mark { color: #c8a8ff; font-size: 18px; animation: lootPulse 0.72s ease-in-out infinite alternate; }
+@keyframes lootPulse { from { transform: translateX(-2px); opacity: 0.55; } to { transform: translateX(4px); opacity: 1; } }
+.sl-row.loot-enter {
+  animation: lootSessionIn 0.56s cubic-bezier(.18,.85,.28,1.12) both;
+  border: 1px solid rgba(167, 129, 255, 0.48);
+  box-shadow: 0 0 18px rgba(125, 91, 210, 0.28);
+}
+@keyframes lootSessionIn {
+  0% { opacity: 0; transform: translateX(90px) scale(.86); filter: blur(5px); }
+  62% { opacity: 1; transform: translateX(-5px) scale(1.02); filter: blur(0); }
+  100% { opacity: 1; transform: translateX(0) scale(1); filter: blur(0); }
+}
+.sl-tools {
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 6px;
+  padding: 0 2px 8px;
+}
+#sl-search {
+  width: 100%; box-sizing: border-box; border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 9px; background: rgba(255, 255, 255, 0.055); color: #f5f5f7;
+  padding: 7px 9px; font-size: 11.5px; outline: none;
+}
+#sl-search:focus { border-color: rgba(74, 158, 255, 0.7); background: rgba(255, 255, 255, 0.08); }
+#sl-search::-webkit-search-cancel-button { filter: invert(1); opacity: 0.55; }
+.sl-filters { display: flex; gap: 4px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.sl-filters::-webkit-scrollbar { display: none; }
+.sl-filters button {
+  flex: 0 0 auto; border: 0; border-radius: 999px; padding: 4px 8px;
+  background: rgba(255, 255, 255, 0.06); color: #9d9da4; cursor: pointer;
+  font-size: 10px; font-weight: 650;
+}
+.sl-filters button:hover { color: #fff; background: rgba(255, 255, 255, 0.11); }
+.sl-filters button.active { color: #fff; background: rgba(74, 158, 255, 0.28); }
+#sl-archived-toggle.active { background: rgba(217, 119, 87, 0.27); }
+.sl-scroll {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.16) transparent;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.sl-scroll::-webkit-scrollbar { width: 5px; background: transparent; }
+.sl-scroll::-webkit-scrollbar-track,
+.sl-scroll::-webkit-scrollbar-corner {
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+}
+.sl-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border: 0;
+  border-radius: 999px;
+}
+
+.sl-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 10px; border-radius: 11px; cursor: pointer;
+}
+.sl-row:hover { background: rgba(255, 255, 255, 0.07); }
+.sl-row.travel-session {
+  background: linear-gradient(90deg, rgba(125, 102, 199, 0.12), rgba(217, 119, 87, 0.05));
+  border: 1px solid rgba(153, 128, 226, 0.16);
+}
+.sl-row.travel-session:hover {
+  background: linear-gradient(90deg, rgba(125, 102, 199, 0.2), rgba(217, 119, 87, 0.09));
+}
+.sl-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; background: #8a8a8e; }
+.sl-dot.working, .sl-dot.thinking, .sl-dot.juggling, .sl-dot.sweeping { background: #4a9eff; box-shadow: 0 0 7px rgba(74, 158, 255, 0.65); }
+.sl-dot.loafing { background: #8fb8e8; }
+.sl-dot.waiting, .sl-dot.needsinput { background: #ffb020; box-shadow: 0 0 7px rgba(255, 176, 32, 0.65); }
+.sl-dot.error { background: #ff5a52; box-shadow: 0 0 7px rgba(255, 90, 82, 0.6); }
+.sl-dot.done { background: #34c759; }
+.sl-dot.idle, .sl-dot.sleeping { background: #6f6f76; }
+
+.sl-icon { width: 22px; height: 22px; flex-shrink: 0; border-radius: 6px; background: rgba(217, 119, 87, 0.16);
+  display: flex; align-items: center; justify-content: center; }
+.sl-icon svg { width: 15px; height: 15px; display: block; }
+
+.sl-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.sl-name { font-size: 13px; font-weight: 600; color: #fff; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sl-meta { font-size: 10px; color: #8f8f96; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sl-meta.attn { color: #ffb84d; font-weight: 600; }
+
+.sl-ctx { flex-shrink: 0; font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 8px;
+  background: rgba(255, 255, 255, 0.1); color: #c2c2c8; }
+.sl-ctx.mid { background: rgba(255, 176, 32, 0.2); color: #ffc266; }
+.sl-ctx.high { background: rgba(255, 90, 82, 0.24); color: #ff7b73; }
+.sl-meme-entry {
+  flex: 0 0 auto; border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 9px; background: rgba(255, 255, 255, 0.07); color: #eeeef2;
+  padding: 6px 9px; font-size: 11px; font-weight: 700; cursor: pointer;
+}
+.sl-meme-entry:hover { border-color: rgba(217, 119, 87, 0.75); background: rgba(217, 119, 87, 0.18); }
+.sl-actions { flex: 0 0 auto; display: flex; gap: 3px; }
+.sl-action {
+  width: 25px; height: 25px; padding: 0; border: 0; border-radius: 7px;
+  background: transparent; color: #77777f; cursor: pointer; font-size: 12px;
+}
+.sl-action:hover { color: #fff; background: rgba(255, 255, 255, 0.1); }
+.sl-action.active { color: #ffd45c; background: rgba(255, 212, 92, 0.11); }
+.sl-action.archive.active { color: #d9a088; background: rgba(217, 119, 87, 0.12); }
+
+.sl-empty { text-align: center; color: #9a9aa0; font-size: 12px; padding: 18px 8px; }
+.sl-foot { flex: 0 0 auto; display: flex; gap: 6px; padding-top: 8px; margin-top: 6px; border-top: 1px solid rgba(255, 255, 255, 0.08); }
+.sl-foot button { flex: 1; font-size: 11.5px; font-weight: 600; color: #e8e8ec; background: rgba(255, 255, 255, 0.08);
+  border: none; border-radius: 9px; padding: 7px 0; cursor: pointer; }
+.sl-foot button:hover { background: rgba(255, 255, 255, 0.16); }
+#sl-travel-inbox { color: #ded5ff; background: rgba(126, 104, 195, 0.16); }
+#sl-travel-inbox:hover { color: #fff; background: rgba(126, 104, 195, 0.28); }
+#sl-travel-inbox.has-letter {
+  color: #fff3c4; background: rgba(194, 132, 52, 0.24);
+  box-shadow: inset 0 0 0 1px rgba(255, 201, 105, 0.24);
+}
+#sl-session-view.hidden { display: none; }
+.sl-meme-view {
+  min-height: 0;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+}
+.sl-meme-view.hidden { display: none; }
+.sl-meme-session {
+  margin: 0 4px 8px; padding: 8px 10px; border-radius: 10px;
+  background: rgba(217, 119, 87, 0.11); color: #dfb09a;
+  font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sl-meme-grid {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+  min-height: 0; flex: 1 1 auto;
+  overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
+  scrollbar-width: thin; padding: 1px 4px 4px;
+}
+.sl-meme-card {
+  min-width: 0; border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 12px;
+  padding: 8px; background: rgba(255, 255, 255, 0.035); color: #fff;
+  text-align: left; cursor: pointer;
+}
+.sl-meme-card:hover { border-color: rgba(217, 119, 87, 0.75); background: rgba(217, 119, 87, 0.1); }
+.sl-meme-card:disabled { opacity: 0.55; cursor: wait; }
+.sl-meme-thumb {
+  display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover;
+  border-radius: 8px; margin-bottom: 7px; background: rgba(0, 0, 0, 0.25);
+}
+.sl-meme-label { display: block; font-size: 12px; font-weight: 750; line-height: 1.3; }
+.sl-meme-desc { display: block; margin-top: 3px; color: #94949b; font-size: 10px; line-height: 1.35; }
+.sl-meme-status { min-height: 17px; padding: 7px 5px 0; font-size: 10.5px; color: #9a9aa0; }
+.sl-meme-status.ok { color: #5bd478; }
+.sl-meme-status.warn { color: #ffbd59; }
+.sl-meme-status.error { color: #ff7b73; }
+
+/* ── 青蛙旅行：从会话对应项目启动独立只读探索 ───────────────── */
+.sl-travel-entry {
+  flex: 0 0 auto; width: 30px; height: 30px; padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 9px;
+  background: rgba(217, 119, 87, 0.12); color: #f5d0c1;
+  font-size: 15px; cursor: pointer;
+}
+.sl-travel-entry:hover {
+  border-color: rgba(230, 145, 112, 0.76);
+  background: rgba(217, 119, 87, 0.22);
+}
+.sl-travel-mail {
+  flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; border-radius: 9px;
+  border: 1px solid rgba(159, 137, 226, 0.28);
+  background: rgba(126, 104, 195, 0.15); color: #ded5ff; font-size: 15px;
+}
+.sl-travel-view {
+  min-height: 0; display: flex; flex: 1 1 auto; flex-direction: column;
+  gap: 8px; overflow-y: auto; overflow-x: hidden;
+  overscroll-behavior: contain; scrollbar-width: thin; padding: 0 3px 3px;
+}
+.sl-travel-view.hidden { display: none; }
+.sl-travel-view > * { flex: 0 0 auto; }
+.sl-travel-view::-webkit-scrollbar { width: 7px; }
+.sl-travel-view::-webkit-scrollbar-track { background: transparent; }
+.sl-travel-view::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18); border-radius: 999px;
+}
+.sl-travel-view::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.3); }
+.sl-travel-session {
+  padding: 8px 10px; border-radius: 10px;
+  background: rgba(217, 119, 87, 0.13); color: #f2c2ae;
+  font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sl-travel-ranks {
+  display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px;
+}
+.sl-travel-rank {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  border: 1px solid rgba(255, 218, 104, 0.16); border-radius: 11px;
+  background: linear-gradient(135deg, rgba(255, 218, 104, 0.09), rgba(217, 119, 87, 0.07));
+  padding: 9px 10px;
+}
+.sl-travel-rank.machine {
+  border-color: rgba(177, 143, 255, 0.2);
+  background: linear-gradient(135deg, rgba(143, 111, 220, 0.12), rgba(217, 119, 87, 0.06));
+}
+.sl-travel-rank > div { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.sl-travel-rank-label { color: #96969e; font-size: 10px; }
+#sl-travel-rank-icons, #sl-machine-rank-icons {
+  color: #ffe184; font-size: 14px; letter-spacing: 1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+#sl-machine-rank-icons { color: #d9c8ff; }
+#sl-travel-rank-meta, #sl-machine-rank-meta {
+  color: #96969e; font-size: 9.5px; line-height: 1.35; text-align: right;
+  white-space: pre-line;
+}
+.sl-travel-section-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  padding: 2px 2px 0;
+}
+.sl-travel-section-head strong { color: #ececf2; font-size: 11px; }
+.sl-travel-section-head span { color: #7f7f88; font-size: 9px; text-align: right; }
+.sl-travel-mailboxes { display: flex; flex-direction: column; gap: 6px; }
+.sl-travel-mailbox {
+  display: flex; align-items: center; gap: 9px; min-width: 0;
+  padding: 9px; border: 1px solid rgba(159, 137, 226, 0.17); border-radius: 11px;
+  background: linear-gradient(105deg, rgba(126, 104, 195, 0.12), rgba(217, 119, 87, 0.045));
+}
+.sl-travel-mailbox.active { border-color: rgba(96, 161, 235, 0.38); }
+.sl-travel-mailbox.has-letter {
+  border-color: rgba(255, 191, 84, 0.42);
+  background: linear-gradient(105deg, rgba(126, 104, 195, 0.14), rgba(211, 145, 51, 0.12));
+}
+.sl-travel-mailbox-icon {
+  width: 29px; height: 29px; flex: 0 0 29px; display: inline-flex;
+  align-items: center; justify-content: center; border-radius: 9px;
+  background: rgba(255, 255, 255, 0.065); font-size: 15px;
+}
+.sl-travel-mailbox-main {
+  min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px;
+}
+.sl-travel-mailbox-main strong {
+  color: #f1f0f7; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sl-travel-mailbox-main span {
+  color: #93929c; font-size: 9.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sl-travel-letter-open,
+.sl-travel-terminal-open {
+  flex: 0 0 auto; border: 0; border-radius: 8px; padding: 6px 8px; cursor: pointer;
+  color: #eee9ff; background: rgba(139, 111, 215, 0.2); font-size: 9.5px; font-weight: 700;
+}
+.sl-travel-letter-open { color: #fff2c7; background: rgba(207, 141, 45, 0.23); }
+.sl-travel-letter-open:hover,
+.sl-travel-terminal-open:hover { filter: brightness(1.25); }
+.sl-travel-mailbox-new { flex: 0 0 auto; max-width: 105px; color: #777780; font-size: 8.8px; text-align: right; }
+.sl-travel-wander {
+  width: 100%; border: 1px solid rgba(230, 145, 112, 0.24); border-radius: 10px;
+  padding: 8px 10px; cursor: pointer; color: #f3cfbf;
+  background: rgba(217, 119, 87, 0.11); font-size: 11px; font-weight: 750;
+}
+.sl-travel-wander:hover { color: #fff; background: rgba(217, 119, 87, 0.21); }
+.sl-travel-wander:disabled { opacity: 0.48; cursor: wait; }
+.sl-travel-setup { display: flex; flex-direction: column; gap: 8px; }
+.sl-travel-setup.hidden { display: none; }
+.sl-travel-templates { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
+.sl-travel-template {
+  min-width: 0; padding: 8px 7px; border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 10px; background: rgba(255, 255, 255, 0.035); color: #e9e9ed;
+  cursor: pointer; text-align: left;
+}
+.sl-travel-template:hover { background: rgba(255, 255, 255, 0.07); }
+.sl-travel-template.active {
+  border-color: rgba(230, 145, 112, 0.82); background: rgba(217, 119, 87, 0.14);
+}
+.sl-travel-template strong { display: block; font-size: 11px; margin-bottom: 3px; }
+.sl-travel-template span {
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; color: #93939a; font-size: 9.5px; line-height: 1.35;
+}
+.sl-travel-label { color: #d4d4da; font-size: 11px; font-weight: 700; }
+#sl-travel-mission {
+  box-sizing: border-box; width: 100%; min-height: 78px; max-height: 128px; resize: vertical;
+  border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 10px;
+  background: rgba(255, 255, 255, 0.055); color: #f5f5f7;
+  padding: 9px 10px; font: 11px/1.45 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+  outline: none;
+}
+#sl-travel-mission:focus { border-color: rgba(230, 145, 112, 0.82); }
+.sl-travel-safety { color: #d9a088; font-size: 9.8px; line-height: 1.4; }
+.sl-travel-primary,
+#sl-travel-cancel {
+  border: 0; border-radius: 10px; padding: 9px 12px; cursor: pointer;
+  font-size: 12px; font-weight: 750;
+}
+.sl-travel-primary { background: #c96f4f; color: #fff; }
+.sl-travel-primary:hover { background: #df7e5d; }
+.sl-travel-primary:disabled { opacity: 0.48; cursor: wait; }
+.sl-travel-active {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 13px; border-radius: 12px; background: rgba(74, 158, 255, 0.08);
+  border: 1px solid rgba(74, 158, 255, 0.14); text-align: center;
+}
+.sl-travel-active.hidden { display: none; }
+.sl-travel-orbit { color: #b9d5ff; font-size: 20px; letter-spacing: 4px; }
+.sl-travel-orbit span { display: inline-block; animation: travelDots 1.1s ease-in-out infinite; }
+@keyframes travelDots { 0%,100% { opacity: 0.25; } 50% { opacity: 1; } }
+#sl-travel-active-status { color: #fff; font-size: 12px; font-weight: 750; }
+#sl-travel-active-mission {
+  max-width: 100%; color: #9da0aa; font-size: 10px; line-height: 1.4;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+#sl-travel-cancel { background: rgba(255, 255, 255, 0.08); color: #d6d6dc; }
+#sl-travel-cancel:hover { background: rgba(255, 90, 82, 0.16); color: #ff938d; }
+#sl-travel-cancel.hidden { display: none; }
+.sl-travel-library {
+  display: grid; grid-template-columns: 148px minmax(0, 1fr); gap: 8px;
+  min-width: 0; min-height: 310px; align-items: stretch;
+}
+.sl-travel-album {
+  min-width: 0; display: flex; flex-direction: column; gap: 7px;
+  padding: 9px; border: 1px solid rgba(159, 137, 226, 0.16); border-radius: 12px;
+  background: linear-gradient(160deg, rgba(126, 104, 195, 0.1), rgba(20, 20, 24, 0.16));
+}
+.sl-travel-postcard {
+  min-width: 0;
+  border: 1px solid rgba(255, 218, 104, 0.18); border-radius: 12px;
+  background: rgba(255, 248, 221, 0.07); padding: 10px;
+}
+.sl-travel-postcard.hidden { display: none; }
+.sl-travel-postcard-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.sl-travel-postcard-title { color: #ffe184; font-size: 12px; font-weight: 800; }
+#sl-travel-postcard-meta { margin-top: 3px; color: #888890; font-size: 9.5px; }
+.sl-travel-postcard-nav { flex: 0 0 auto; display: flex; align-items: center; gap: 5px; }
+.sl-travel-postcard-nav button {
+  width: 25px; height: 25px; border: 1px solid rgba(255, 218, 104, 0.18);
+  border-radius: 8px; padding: 0; cursor: pointer; color: #f7dc9d;
+  background: rgba(255, 218, 104, 0.08); font-size: 19px; line-height: 21px;
+}
+.sl-travel-postcard-nav button:hover { background: rgba(255, 218, 104, 0.16); }
+.sl-travel-postcard-nav button:disabled { opacity: 0.3; cursor: default; }
+#sl-travel-stop-page { min-width: 34px; color: #a79b82; font-size: 9px; text-align: center; }
+.sl-travel-stop-track {
+  width: 100%; margin-top: 9px; overflow: hidden;
+}
+.sl-travel-stop-card {
+  display: none; width: 100%; min-width: 0; box-sizing: border-box;
+  border: 1px solid rgba(255, 218, 104, 0.1); border-radius: 10px;
+  background:
+    linear-gradient(90deg, transparent 45%, rgba(145, 91, 58, 0.14) 45%, rgba(145, 91, 58, 0.14) calc(45% + 1px), transparent calc(45% + 1px)),
+    rgba(33, 31, 32, 0.2);
+  padding: 8px;
+}
+.sl-travel-stop-card.active { display: block; }
+.sl-travel-stop-title {
+  padding: 0 2px 7px; color: #f5dba5; font-size: 11px; font-weight: 760;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sl-travel-postcard-body {
+  display: grid; grid-template-columns: minmax(205px, 43%) minmax(0, 1fr);
+  gap: 14px; height: 236px; min-height: 0;
+}
+.sl-travel-postcard-art {
+  align-self: center; min-width: 0; max-width: 100%; margin: 0; padding: 8px 4px;
+  color: #f4d59e; text-align: center; white-space: pre; overflow: hidden;
+  font: 9px/1.22 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.sl-travel-postcard-text {
+  height: 236px; overflow: hidden; white-space: pre-wrap; word-break: break-word;
+  margin: 0; padding: 2px 2px 0 0; color: #e4e4e8;
+  font: 9.8px/1.45 -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+}
+.sl-travel-history-head {
+  flex-direction: column; align-items: flex-start; gap: 1px; margin: 0; padding: 0 1px 2px;
+}
+.sl-travel-history-head span { text-align: left; line-height: 1.25; }
+.sl-travel-history {
+  display: flex; flex: 1 1 auto; min-height: 0; flex-direction: column; gap: 5px;
+  max-height: 276px; overflow-y: auto; padding-right: 3px;
+}
+.sl-travel-history::-webkit-scrollbar { width: 6px; }
+.sl-travel-history::-webkit-scrollbar-track { background: transparent; }
+.sl-travel-history::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.18); border-radius: 999px;
+}
+.sl-travel-history::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+.sl-travel-history-card {
+  display: flex; align-items: center; gap: 7px; min-width: 0; text-align: left;
+  border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 9px;
+  background: rgba(255, 255, 255, 0.035); color: #dddde2; padding: 7px; cursor: pointer;
+}
+.sl-travel-history-card:hover { background: rgba(255, 255, 255, 0.07); }
+.sl-travel-history-card.active {
+  border-color: rgba(255, 210, 107, 0.35); background: rgba(255, 210, 107, 0.075);
+}
+.sl-travel-history-card > span { flex: 0 0 auto; font-size: 14px; }
+.sl-travel-history-card > div { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sl-travel-history-card strong,
+.sl-travel-history-card small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sl-travel-history-card strong { color: #ececf0; font-size: 9.8px; }
+.sl-travel-history-card small { color: #82828a; font-size: 8.5px; }
+.sl-travel-history-empty {
+  grid-column: 1 / -1; padding: 12px; border-radius: 9px;
+  background: rgba(255, 255, 255, 0.025); color: #85858c; font-size: 9.5px; text-align: center;
+}
+.sl-travel-status { min-height: 15px; color: #9a9aa0; font-size: 10px; }
+.sl-travel-status.error { color: #ff7b73; }
+.sl-travel-status.ok { color: #ffbd6a; }
+
+/* 表情包播放层只渲染媒体本身，不加卡片背景。
+   left/top/width 由 JS 按当前皮肤的真实 DOMRect 计算；固定 CSS 坐标会在
+   cat/mascot/pixel 三种尺寸之间漂移，也会在窗口被气泡重算时遭到裁切。 */
+.meme-player {
+  position: absolute; z-index: 22;
+  left: 0; top: 0; width: 260px; pointer-events: none;
+  opacity: 1; transform: translateX(0) scale(1);
+  animation: memeEnter 0.2s ease-out;
+}
+.meme-player.hidden { display: none; }
+.meme-player img {
+  display: block; width: 100%; height: auto; max-height: 180px; object-fit: contain;
+  background: transparent; border: 0; border-radius: 0;
+  filter: drop-shadow(0 7px 13px rgba(0, 0, 0, 0.35));
+}
+.meme-caption {
+  width: max-content; max-width: 250px; margin: 5px auto 0; padding: 4px 9px;
+  border-radius: 999px; background: rgba(25, 25, 28, 0.82); color: #fff;
+  font-size: 11px; font-weight: 700; text-align: center;
+}
+@keyframes memeEnter {
+  from { opacity: 0; transform: translateX(-14px) scale(0.92); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+/* ── Needs Input / 授权卡片（重做，深色，对齐参考项目）──────────── */
+.ask {
+  position: absolute; top: 12px; left: 12px; right: 12px;
+  max-width: none;
+  max-height: min(calc(100vh - 210px), 520px); overflow: hidden;
+  display: flex; flex-direction: column; gap: 0;
+  z-index: 32; -webkit-app-region: no-drag;
+  background: rgba(26, 26, 29, 0.985);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 18px;
+  /* This surface sits only 12px inside a transparent BrowserWindow. An outer
+     blur is clipped at the window edge and becomes a solid-looking side bar
+     on some GPU/display combinations. Keep the depth cue inside the surface. */
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  padding: 13px 13px 12px;
+  color: #f2f2f5;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif;
+  margin: 0;
+}
+.ask.hidden { display: none; }
+.ask.travel-letter {
+  background:
+    radial-gradient(circle at 92% 0%, rgba(155, 127, 225, 0.16), transparent 42%),
+    rgba(29, 27, 34, 0.99);
+  border-color: rgba(168, 143, 232, 0.34);
+}
+.ask.travel-letter .ask-head { border-bottom-color: rgba(174, 149, 236, 0.2); }
+.ask.travel-letter .ask-label { color: #e7ddff; }
+.ask.travel-letter .ask-card {
+  background: linear-gradient(145deg, rgba(126, 103, 191, 0.12), rgba(255, 255, 255, 0.035));
+  border-color: rgba(174, 149, 236, 0.2);
+}
+.ask.travel-letter .ask-opt.act.allow {
+  background: #7460b9;
+  border-color: #8c76d4;
+}
+.ask.travel-letter .ask-opt.act.allow:hover {
+  background: #846dcc;
+  border-color: #9a84df;
+}
+.ask.travel-letter .ask-opt.act.sugg {
+  background: rgba(126, 104, 195, 0.13);
+  border-color: rgba(166, 143, 229, 0.34);
+}
+.ask.travel-letter .ask-opt.act.sugg:hover {
+  background: rgba(126, 104, 195, 0.23);
+}
+.ask-scroll {
+  min-height: 0; overflow-y: auto; overflow-x: hidden;
+  padding-right: 3px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.28) transparent;
+}
+.ask-scroll::-webkit-scrollbar { width: 6px; height: 0; }
+.ask-scroll::-webkit-scrollbar-track, .ask-scroll::-webkit-scrollbar-corner { background: transparent; }
+.ask-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.24);
+  border: 1px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.ask-head {
+  display: flex; align-items: center; gap: 10px; flex: 0 0 auto;
+  padding: 1px 2px 9px; margin-bottom: 9px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.075);
+}
+.ask-label { font-size: 15.5px; font-weight: 700; color: #fff; letter-spacing: 0.1px; white-space: nowrap; }
+.ask-sess {
+  min-width: 0; margin-left: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11.5px; color: #8d8d94; font-family: ui-monospace, Menlo, monospace; text-align: right;
+}
+
+.ask-card { background: rgba(255, 255, 255, 0.035); border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 12px; padding: 11px; margin: 0; }
+.ask-qhead { font-size: 12.5px; font-weight: 700; color: #d7d7dd; margin-bottom: 4px; }
+.ask-qhead:empty { display: none; }
+.ask-q { font-size: 14px; font-weight: 700; color: #fff; line-height: 1.42; }
+.ask-hint { font-size: 11.5px; color: #86868c; margin: 4px 0 9px; }
+.ask-hint:empty { display: none; }
+.ask-q, .ask-ol, .ask-od { overflow-wrap: anywhere; word-break: break-word; }
+
+.ask-opts { display: flex; flex-direction: column; gap: 7px; }
+/* 单选卡片：左侧 radio + 标题 + 描述 */
+.ask-opt {
+  display: flex; flex-direction: row; gap: 9px; align-items: flex-start; text-align: left;
+  background: rgba(255, 255, 255, 0.025); border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 11px; padding: 10px 11px; cursor: pointer; width: 100%;
+  transition: border-color 0.12s, background 0.12s;
+}
+.ask-opt:hover { background: rgba(255, 255, 255, 0.06); }
+.ask-opt.sel { border-color: #d97757; background: rgba(217, 119, 87, 0.1); }
+.ask-radio { width: 17px; height: 17px; border-radius: 50%; border: 2px solid #6a6a72;
+  flex-shrink: 0; margin-top: 1px; position: relative; }
+.ask-opt.sel .ask-radio { border-color: #d97757; }
+.ask-opt.sel .ask-radio::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: #d97757; }
+.ask-ot { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.ask-ol { font-size: 13.5px; font-weight: 600; color: #fff; }
+.ask-od { font-size: 11.5px; color: #9a9aa0; line-height: 1.42; }
+
+/* 授权模式：allow/deny 作为强按钮 */
+.ask-opt.act { align-items: center; justify-content: flex-start; font-weight: 700; }
+.ask-opt.act .ask-ol { font-size: 14px; }
+.ask-opt.allow.sel, .ask-opt.allow:hover { border-color: #34c759; background: rgba(52, 199, 89, 0.12); }
+.ask-opt.deny.sel, .ask-opt.deny:hover { border-color: #ff5a52; background: rgba(255, 90, 82, 0.12); }
+
+.ask-other { margin-top: 8px; }
+.ask-other.hidden { display: none; }
+.ask-other input { width: 100%; box-sizing: border-box; background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.14); border-radius: 10px; padding: 9px 11px; color: #fff; font-size: 13px; }
+.ask-other input:focus { outline: none; border-color: #d97757; }
+.ask-other input.warn { border-color: #ff5a52; animation: askWarnShake 0.4s ease-in-out; }
+.ask-other input.warn::placeholder { color: #ff8079; }
+@keyframes askWarnShake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-4px); }
+  75% { transform: translateX(4px); }
+}
+
+.ask-toolbar {
+  display: flex; align-items: center; gap: 7px; flex: 0 0 auto;
+  padding-top: 9px; margin-top: 9px;
+  border-top: 1px solid rgba(255, 255, 255, 0.075);
+}
+.ask-page { min-width: 30px; text-align: center; font-size: 11px; color: #85858c; white-space: nowrap; }
+.ask-page:empty { display: none; }
+
+.ask-foot { display: flex; gap: 7px; flex: 1 1 auto; min-width: 0; }
+.ask-foot.hidden { display: none; }
+.ask-btn { flex: 1; min-width: 64px; font-size: 12px; font-weight: 700; border: none; border-radius: 9px; padding: 9px 10px; cursor: pointer; white-space: nowrap;
+  background: rgba(255, 255, 255, 0.08); color: #e8e8ec; }
+.ask-btn:hover { background: rgba(255, 255, 255, 0.15); }
+.ask-btn.primary { background: #c15f3f; color: #fff; }
+.ask-btn.primary:hover { background: #d06d4b; }
+.ask-btn.primary.disabled { background: rgba(193, 95, 63, 0.4); color: rgba(255, 255, 255, 0.6); cursor: default; }
+.ask-btn.hidden { display: none; }
+
+.ask-term { flex: 0 0 auto; width: auto; font-size: 11.5px; font-weight: 600; color: #c2c2c8; cursor: pointer; white-space: nowrap;
+  background: rgba(255, 255, 255, 0.045); border: 1px solid rgba(255, 255, 255, 0.09); border-radius: 9px; padding: 8px 10px; }
+.ask-term:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
+
+/* 授权按钮强化：允许=实心绿，拒绝=红边，并排 */
+.ask-opts.perm-row { flex-direction: row; gap: 10px; }
+.ask-opts.perm-row .ask-opt.act { flex: 1; justify-content: center; text-align: center; padding: 14px 8px; border-width: 1.5px; }
+.ask-opt.act { font-weight: 800; }
+.ask-opt.act.allow { background: #2ea043; border-color: #2ea043; }
+.ask-opt.act.allow .ask-ol { color: #fff; }
+.ask-opt.act.allow:hover { background: #36c14e; border-color: #36c14e; }
+.ask-opt.act.deny { background: rgba(255, 90, 82, 0.12); border-color: rgba(255, 90, 82, 0.6); }
+.ask-opt.act.deny .ask-ol { color: #ff8079; }
+.ask-opt.act.deny:hover { background: rgba(255, 90, 82, 0.2); }
+
+/* 装饰/非交互元素不拦截鼠标 → 命中测试看穿它们，透明区可点击穿透 */
+#bubble, #think, #sleep, #prop, #sidekick, #chip { pointer-events: none; }
+
+/* 弹层贴着 pet 上方：窗口底部对齐增高，pet(168px)+额度条占底部约 200px，
+   所以从 bottom:200 起向上展开，紧挨小章鱼，而不是钉在很远的顶部。 */
+.sesslist, .ask, .todopop {
+  top: auto;
+  bottom: 200px;
+  max-height: calc(100vh - 224px);
+}
+
+/* At the top edge, keep the visible pet at y=0 and grow every card downward.
+   POPUP_BOTTOM in pet.js reserves the same 200px pet stack on either side. */
+#stage.edge-below .sesslist,
+#stage.edge-below .ask,
+#stage.edge-below .todopop {
+  top: 200px;
+  bottom: auto;
+}
+
+#stage.edge-below .notepad { top: 84px; bottom: auto; }
+
+/* 动态定高配套：问答卡片单独封顶，避免长任务把桌面纵向占满。 */
+.sesslist, .todopop { max-height: calc(100vh - 210px); }
+.ask { max-height: min(calc(100vh - 210px), 520px); }
+/* 会话名换行（最多 2 行）而不是省略号截断 */
+.sl-name {
+  white-space: normal;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.3;
+}
+
+/* 大段文字：窗口按 fitPopup 的内容高度撑开就好，不要内滚条（太丑）。
+   极端情况（内容真的超屏）让 applyPetSize 的屏幕封顶兜着即可。 */
+#bubble-text {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 「始终允许」建议按钮：中性（区别于绿允许/红拒绝） */
+.ask-opt.act.sugg { background: rgba(255, 255, 255, 0.06); border-color: rgba(255, 255, 255, 0.14); }
+.ask-opt.act.sugg .ask-ol { color: #d7d7dd; font-weight: 700; }
+.ask-opt.act.sugg:hover { background: rgba(255, 255, 255, 0.12); }
+/* 多选题：把单选圆点变成方框勾选 */
+.ask-opt.multi .ask-radio { border-radius: 5px; }
+.ask-opt.multi.sel .ask-radio { border-color: #d97757; }
+.ask-opt.multi.sel .ask-radio::after { border-radius: 2px; inset: 3px; }
+
+/* 弹层标题栏可拖动整窗（内容长时可挪开），按钮/输入/选项/行不拖 */
+.ask-head, .sl-top, .tp-top { -webkit-app-region: drag; cursor: move; }
+.ask-opt, .ask-btn, .ask-term, .ask-other input, .sl-row, .sl-foot button, .sl-back, .sl-meme-entry, .sl-meme-card,
+.sl-travel-entry, .sl-travel-template, #sl-travel-mission, #sl-travel-start, #sl-travel-cancel,
+.sl-travel-wander, .sl-travel-letter-open, .sl-travel-terminal-open, .sl-travel-history-card,
+.sl-travel-postcard-nav button, .sl-travel-stop-track,
+.sl-close, .tp-close, .tp-ops button, .tp-act, #ask-text { -webkit-app-region: no-drag; }
+
+/* SVG icon (替代 emoji) 的内联样式：1em 大小、跟随文本颜色，垂直对齐文本 */
+.oi { display: inline-flex; align-items: center; justify-content: center; vertical-align: -0.18em; line-height: 1; }
+.oi svg { display: block; }
+
+/* ====================================================================
+   持续「忙碌基线」act-work —— 进入 working 即挂、贯穿整段干活，
+   mascot / pixel 都显得在埋头苦干；具体 tool 动作在其上叠加。
+   ==================================================================== */
+#mascot.act-work, #pixel.act-work .pixel-sprite {
+  animation: busyBob 0.85s ease-in-out infinite !important;
+}
+@keyframes busyBob {
+  0%, 100% { transform: translateY(0) rotate(-1.2deg); }
+  50% { transform: translateY(-5px) rotate(1.2deg); }
+}

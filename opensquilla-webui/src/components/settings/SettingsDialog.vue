@@ -83,6 +83,10 @@
                when the gateway is down and config never loaded. -->
           <DesktopRuntimePanel v-else-if="section === 'runtime' && isDesktop" />
 
+          <!-- Desktop pet lives in the Electron shell; its section only exists
+               in the desktop app (window.pet bridge). -->
+          <SettingsPetPanel v-else-if="section === 'pet' && isDesktop" />
+
           <!-- Memory import is an action flow with its own RPC capability gate,
                rather than a config-backed form. It remains usable even when
                readiness catalog loading is unavailable. -->
@@ -240,6 +244,7 @@ import SettingsPrivacyPanel from '@/components/settings/SettingsPrivacyPanel.vue
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
+import SettingsPetPanel from '@/components/settings/SettingsPetPanel.vue'
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
 import SandboxSettingsPanel from '@/components/settings/SandboxSettingsPanel.vue'
 import DesktopRuntimePanel from '@/components/settings/DesktopRuntimePanel.vue'

@@ -38,6 +38,10 @@ export const SETTINGS_SECTIONS = [
   { id: 'appearance', label: 'Appearance', icon: 'monitor', client: true, desktopOnly: false, group: 'preferences' },
   { id: 'keyboard', label: 'Keyboard', icon: 'keyboard', client: true, desktopOnly: false, group: 'preferences' },
   { id: 'advanced', label: 'Advanced', icon: 'gauge', client: true, desktopOnly: false, group: 'preferences' },
+  // Desktop pet is a local Electron-shell feature: the shell's pet preload
+  // bridge (window.pet) is only present in the desktop app, so this section
+  // is desktopOnly and never enters the readiness/dirty bar.
+  { id: 'pet', label: 'Pet', icon: 'chat', client: true, desktopOnly: true, group: 'preferences' },
 ] as const
 
 // Data maintenance is a nested Advanced destination rather than a first-level
