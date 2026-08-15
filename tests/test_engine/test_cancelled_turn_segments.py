@@ -507,7 +507,7 @@ async def test_cancelled_human_turn_does_not_persist_withheld_sentinel_prefix(
         await asyncio.wait_for(provider.text_consumed.wait(), timeout=5.0)
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await task
+            _ = await task
         assert task.cancelled()
 
         transcript = await manager.get_transcript(session_key)
@@ -516,7 +516,7 @@ async def test_cancelled_human_turn_does_not_persist_withheld_sentinel_prefix(
         if not task.done():
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await task
+                _ = await task
             assert task.cancelled()
         await storage.close()
 
@@ -565,7 +565,7 @@ async def test_cancelled_human_turn_preserves_released_over_bound_prefix(tmp_pat
 
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await task
+            _ = await task
         assert task.cancelled()
 
         transcript = await manager.get_transcript(session_key)
@@ -576,7 +576,7 @@ async def test_cancelled_human_turn_preserves_released_over_bound_prefix(tmp_pat
         if not task.done():
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await task
+                _ = await task
             assert task.cancelled()
         await storage.close()
 
