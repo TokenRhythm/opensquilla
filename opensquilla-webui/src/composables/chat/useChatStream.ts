@@ -21,6 +21,7 @@ import type {
   InterruptApprovalData,
   InterruptClarifyData,
   InterruptViewState,
+  StatusPart,
 } from '@/types/parts'
 import {
   isEmptyToolPreview,
@@ -36,7 +37,9 @@ import {
 import { segmentsToTimelineItems } from '@/utils/chat/segmentsToTimelineItems'
 import { reconcileTextSnapshot } from '@/utils/chat/foldTurn'
 import { useChatTurnLog } from '@/composables/chat/useChatTurnLog'
+import type { ReasoningBlock } from '@/types/turnlog'
 import { isLegacySilentSentinelOnly } from '@/utils/chat/silentSentinels'
+import { createClientMessageId } from '@/utils/chat/messageIdentity'
 
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 630_000
 const THINKING_DELAY_MS = 400
@@ -136,6 +139,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       const folded = foldedTurn.value
       return Boolean(
         folded.rawText
+        || folded.reasoningBlocks.some(block => block.text)
         || folded.toolCalls.length
         || folded.artifacts.length
         || folded.parts.some(part => part.type === 'interrupt'),
@@ -147,6 +151,10 @@ export function useChatStream(options: UseChatStreamOptions) {
   })
 
   const streamActivity = ref({ label: 'Sending', key: 'Sending', startedAt: 0 })
+  // Turn ownership is intentionally separate from the mutable phase clock.
+  // Provider/router transitions may restart the small phase timer, but the
+  // disclosure header must measure one uninterrupted user-visible run.
+  const streamTurnStartedAt = ref(0)
   const streamActivityTick = ref(0)
   let streamActivityTimer: ReturnType<typeof setInterval> | null = null
   const streamRound = ref(1)
@@ -231,6 +239,24 @@ export function useChatStream(options: UseChatStreamOptions) {
     foldedTurn,
   } = turnLog
 
+  const streamTurnElapsed = computed(() => {
+    streamActivityTick.value
+    if (options.runStatus?.value.status === 'queued') return ''
+    // Snapshot/reconnect replay can rebuild a reasoning block whose server
+    // start predates the fresh browser stream shell. Use that durable boundary
+    // so reloading never makes a long-running turn jump back to zero.
+    const replayStartedAt = foldedTurn.value.reasoningBlocks
+      .map(block => block.startedAt)
+      .filter(value => Number.isFinite(value) && value > 0)
+      .sort((left, right) => left - right)[0]
+    const localStartedAt = streamTurnStartedAt.value
+    const startedAt = replayStartedAt && localStartedAt
+      ? Math.min(replayStartedAt, localStartedAt)
+      : replayStartedAt || localStartedAt
+    if (!startedAt) return '0s'
+    return `${Math.max(0, Math.floor((Date.now() - startedAt) / 1000))}s`
+  })
+
   function currentStreamRaw(): string {
     return useReducer.value === true ? peekRawText() : streamRaw.value
   }
@@ -274,10 +300,13 @@ export function useChatStream(options: UseChatStreamOptions) {
   const MEDIUM_STREAM_CHARS = 8 * 1024
   const LARGE_STREAM_CHARS = 32 * 1024
   const HIDDEN_FLUSH_FALLBACK_MS = 250
+  const COARSE_REASONING_BURST_CHARS = 96
   let renderRaf: number | null = null
   let renderFallbackTimer: ReturnType<typeof setTimeout> | null = null
   let lastFlushAt = 0
   let renderDirty = false
+  let reasoningCharsSinceFlush = 0
+  const reasoningPresentationPending = ref(false)
 
   function resetStreamState() {
     streamRaw.value = ''
@@ -285,6 +314,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamToolCalls.value = []
     streamArtifacts.value = []
     toolTimes.value = new Map()
+    reasoningCharsSinceFlush = 0
+    reasoningPresentationPending.value = false
     // Clear the live-turn log alongside the legacy refs so the next turn's fold
     // starts empty. A steer checkpoint deliberately resets only the current
     // visible segment; checkpointedRaw remains available to de-duplicate an
@@ -309,8 +340,11 @@ export function useChatStream(options: UseChatStreamOptions) {
     const current = streamActivity.value
     let isNewPhase = false
     if (current.key === key) {
-      if (current.label !== label) {
-        streamActivity.value = { label, key, startedAt: current.startedAt || Date.now() }
+      if (!current.startedAt) {
+        streamActivity.value = { label, key, startedAt: Date.now() }
+        isNewPhase = true
+      } else if (current.label !== label) {
+        streamActivity.value = { label, key, startedAt: current.startedAt }
       }
     } else {
       streamActivity.value = { label, key, startedAt: Date.now() }
@@ -408,6 +442,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     openToolItems.value = new Set()
     streamToolGroupSeq = 0
     streamRound.value = 1
+    streamTurnStartedAt.value = Date.now()
     noteStreamSignal()
     streamBubble.value = true
     streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
@@ -419,7 +454,14 @@ export function useChatStream(options: UseChatStreamOptions) {
   function endStreaming(opts?: { reason?: string, suppressed?: boolean }) {
     // Running calls keep fragment chunks during the live phase. Materialize
     // them once before the canonical history row is detached.
-    if (useReducer.value === true) finalizeToolInputs()
+    if (useReducer.value === true) {
+      finalizeToolInputs()
+      // Done can arrive before the frame-clock publish that would expose the
+      // final reasoning delta/end. Materialize the canonical accumulator now
+      // so the settled row receives the complete structured blocks even when
+      // the live component never mounted for that batch.
+      publishTurnLog()
+    }
     const wasAborted = opts?.reason === 'aborted'
     const preReconcileText = options.stripDirectiveTags(
       options.stripGeneratedArtifactMarkers(currentStreamRaw()),
@@ -471,10 +513,20 @@ export function useChatStream(options: UseChatStreamOptions) {
       const terminalToolCalls = useReducer.value === true
         ? terminalFold.toolCalls
         : streamToolCalls.value
+      const terminalAt = Date.now()
+      const terminalReasoningBlocks: ReasoningBlock[] = terminalFold.reasoningBlocks.map(block => ({
+        ...block,
+        status: block.status === 'streaming'
+          ? wasAborted ? 'interrupted' : 'completed'
+          : block.status,
+        endedAt: block.endedAt ?? terminalAt,
+      }))
       const emptyStream = !cleanedText
+        && terminalReasoningBlocks.every(block => !block.text)
         && streamArtifacts.value.length === 0
         && terminalToolCalls.length === 0
         && foldedInterrupts.length === 0
+        && (suppressText || terminalFold.statusHistory.length === 0)
       if (emptyStream) {
         streamBubble.value = false
         isStreaming.value = false
@@ -482,11 +534,13 @@ export function useChatStream(options: UseChatStreamOptions) {
         checkpointedRaw = ''
         checkpointedAcrossToolBoundary = false
         activeStreamTurnId = ''
+        streamTurnStartedAt.value = 0
         return
       }
 
       options.messages.value.push({
         role: 'assistant',
+        clientId: createClientMessageId(),
         text: cleanedText,
         ts: new Date().toISOString(),
         turnId: activeStreamTurnId || undefined,
@@ -497,10 +551,11 @@ export function useChatStream(options: UseChatStreamOptions) {
           : streamTimelineSnapshot(cleanedText),
         interrupts: foldedInterrupts.map(part => ({ ...part })),
         // Detach the fold's activity history from the about-to-be-reset log. In
-        // OFF mode this is [], so the field is harmless. The empty/sentinel drop
-        // path above returns before this push, so a status-only ghost turn never
-        // persists an orphan history.
+        // OFF mode this is [], so the field is harmless. A status-only terminal
+        // turn remains visible because its activity is the useful result.
         statusHistory: terminalFold.statusHistory.slice(),
+        reasoningBlocks: terminalReasoningBlocks,
+        reasoningPresentationPending: reasoningPresentationPending.value || undefined,
         interrupted: wasAborted || undefined,
       })
       // Replacing the live block with canonical Markdown/KaTeX can change its
@@ -516,6 +571,38 @@ export function useChatStream(options: UseChatStreamOptions) {
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
+    streamTurnStartedAt.value = 0
+  }
+
+  function restoreStatusHistory(entries: readonly StatusPart[]) {
+    if (!entries.length || useReducer.value === false) return
+    if (!isStreaming.value) startStreaming()
+    // Consume matching live occurrences one-for-one. A Set would erase valid
+    // repeated retry_wait/retrying phases from the durable terminal trace.
+    const liveActionCounts = new Map<string, number>()
+    for (const entry of foldedTurn.value.statusHistory) {
+      liveActionCounts.set(entry.action, (liveActionCounts.get(entry.action) || 0) + 1)
+    }
+    const currentAction = streamActivity.value.key
+    if (currentAction && !liveActionCounts.has(currentAction)) {
+      liveActionCounts.set(currentAction, 1)
+    }
+    for (const entry of entries) {
+      if (!entry.action) continue
+      const liveCount = liveActionCounts.get(entry.action) || 0
+      if (liveCount > 0) {
+        liveActionCounts.set(entry.action, liveCount - 1)
+        continue
+      }
+      appendFrame({
+        kind: 'status',
+        action: entry.action,
+        label: entry.label,
+        at: entry.at,
+        ...(entry.durability ? { durability: entry.durability } : {}),
+      })
+    }
+    publishTurnLog()
   }
 
   function checkpointForUserMessage(turnId: string) {
@@ -573,6 +660,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
+    streamTurnStartedAt.value = 0
   }
 
   function normalizeIncomingTextDelta(text: string): string {
@@ -651,6 +739,17 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
   }
 
+  function noteReasoningPresentationDelta(text: string) {
+    reasoningCharsSinceFlush += text.length
+    if (reasoningCharsSinceFlush > COARSE_REASONING_BURST_CHARS) {
+      reasoningPresentationPending.value = true
+    }
+  }
+
+  function completeReasoningPresentation() {
+    reasoningPresentationPending.value = false
+  }
+
   function onRenderFrame() {
     renderRaf = null
     // Coalesce bursts to the frame clock but cap the heavy re-parse: if the last
@@ -691,6 +790,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     }
 
     publishTurnLog()
+    reasoningCharsSinceFlush = 0
     if (useReducer.value === 'shadow') {
       // Shadow mode still compares the legacy shape, but reuses the one
       // accumulator render instead of parsing identical Markdown twice.
@@ -1092,6 +1192,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   // the idle timer, so the fold-driven activity surface keeps rendering the part.
   function ensureInterruptBubble() {
     if (streamBubble.value) return
+    if (!streamTurnStartedAt.value) streamTurnStartedAt.value = Date.now()
     streamBubble.value = true
     streamShowHeader.value = options.lastHeaderRole.value !== 'assistant'
     isStreaming.value = true
@@ -1177,6 +1278,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     streamActivityStale,
     streamPhaseLabel,
     streamPhaseElapsed,
+    streamTurnElapsed,
     streamStepLabel,
     streamToolElapsedText,
     streamIdleTimeoutMs,
@@ -1200,6 +1302,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     setStreamConnectionAvailable,
     clearStreamIdleTimer,
     setStreamActivity,
+    restoreStatusHistory,
     recordCompactionActivity,
     showThinkingIndicator,
     hideThinkingIndicator,
@@ -1212,6 +1315,8 @@ export function useChatStream(options: UseChatStreamOptions) {
     // (which own the thinking ref) append their frame; assertLiveParity is run
     // from a DEV watchEffect; foldedTurn is the fold output (not rendered yet).
     appendFrame,
+    noteReasoningPresentationDelta,
+    completeReasoningPresentation,
     useReducer,
     foldedTurn,
     getThinkingText: () => foldedTurn.value.thinkingText,

@@ -41,6 +41,7 @@ function makeStream(): ChatRpcStreamApi {
     resetStreamIdleTimer: vi.fn(),
     clearStreamIdleTimer: vi.fn(),
     setStreamActivity: vi.fn(),
+    restoreStatusHistory: vi.fn(),
     showThinkingIndicator: vi.fn(),
     hideThinkingIndicator: vi.fn(),
     appendFrame: vi.fn(),
@@ -241,6 +242,130 @@ describe('issue #344 — live stream is bound to a single task', () => {
     })
     scope.stop()
     i18n.global.locale.value = 'en'
+  })
+
+  it('keeps a rich usage barrier error when task.failed follows it', () => {
+    const { api, stream, messages, scope } = makeHarness('task-B')
+    const activitySnapshot = {
+      version: 1,
+      task_id: 'task-B',
+      turn_id: 'task-B',
+      phases: [
+        { kind: 'router', phase: 'decided', at: 1_000 },
+        { kind: 'state', phase: 'thinking', at: 1_100 },
+      ],
+    }
+
+    api.handlers.onAny('session.event.error', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      code: 'usage_accounting_busy',
+      error_class: 'usage_accounting_busy',
+      terminal_message: 'server fallback',
+      retryable: true,
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      user_message_id: 'user-primary',
+      activity_snapshot: activitySnapshot,
+      turn_outcome: {
+        kind: 'blocked',
+        reason: 'usage_accounting_busy',
+        error_class: 'usage_accounting_busy',
+        retryable: true,
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+        user_message_id: 'user-primary',
+      },
+    })
+    api.handlers.onAny('task.failed', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      terminal_message: 'generic failure must not replace rich error',
+    })
+
+    expect(stream.restoreStatusHistory).toHaveBeenCalledWith([
+      expect.objectContaining({ action: 'router:decided', at: 1_000 }),
+      expect.objectContaining({ action: 'Planning next step', at: 1_100 }),
+    ])
+    expect(messages.value.filter(message => message.role === 'error')).toHaveLength(1)
+    expect(messages.value[messages.value.length - 1]).toMatchObject({
+      role: 'error',
+      errorCode: 'usage_accounting_busy',
+      text: 'The provider request was not sent and no usage was billed. You can safely retry this turn.',
+      turnOutcome: {
+        kind: 'blocked',
+        retryable: true,
+        replaySafe: true,
+        userMessageId: 'user-primary',
+      },
+    })
+    scope.stop()
+  })
+
+  it('drops a conflicting live primary-user identity', () => {
+    const { api, messages, scope } = makeHarness('task-B')
+
+    api.handlers.onAny('session.event.error', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      code: 'usage_accounting_busy',
+      usage_call_index: 1,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      user_message_id: 'user-primary',
+      turn_outcome: {
+        kind: 'blocked',
+        usage_call_index: 1,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+        user_message_id: 'user-steer',
+      },
+    })
+
+    expect(messages.value[messages.value.length - 1]?.turnOutcome).toMatchObject({
+      replaySafe: false,
+    })
+    expect(messages.value[messages.value.length - 1]?.turnOutcome?.userMessageId).toBeUndefined()
+    scope.stop()
+  })
+
+  it('keeps later-call barriers retryable without presenting them as replay safe', () => {
+    const { api, messages, scope } = makeHarness('task-B')
+
+    api.handlers.onAny('session.event.error', {
+      task_id: 'task-B',
+      session_key: SESSION,
+      code: 'usage_accounting_busy',
+      error_class: 'usage_accounting_busy',
+      retryable: true,
+      usage_call_index: 2,
+      no_prior_provider_dispatch: true,
+      replay_safe: true,
+      turn_outcome: {
+        kind: 'blocked',
+        reason: 'usage_accounting_busy',
+        error_class: 'usage_accounting_busy',
+        retryable: true,
+        usage_call_index: 2,
+        no_prior_provider_dispatch: true,
+        replay_safe: true,
+      },
+    })
+
+    expect(messages.value[messages.value.length - 1]).toMatchObject({
+      role: 'error',
+      errorCode: 'usage_accounting_busy',
+      text: 'This provider request was not sent. Earlier work in this turn may already have run or been billed, so review it before trying again.',
+      turnOutcome: {
+        retryable: true,
+        usageCallIndex: 2,
+        noPriorProviderDispatch: false,
+        replaySafe: false,
+      },
+    })
+    scope.stop()
   })
 
   it('binds activeStreamTaskId from task.running, then filters the prior task', () => {

@@ -80,6 +80,13 @@ class _BusySink(_RecordingSink):
         raise UsageAccountingBusyError("ledger remained busy")
 
 
+class _BusyOnSecondCallSink(_RecordingSink):
+    async def start(self, call: UsageCallStart) -> None:
+        self.started.append(call)
+        if call.call_index == 2:
+            raise UsageAccountingBusyError("ledger remained busy")
+
+
 class _InternalFailureSink(_RecordingSink):
     async def start(self, call: UsageCallStart) -> None:
         self.started.append(call)
@@ -1537,7 +1544,42 @@ async def test_turn_runner_preserves_retryable_ledger_start_error_code(
     errors = [event for event in events if isinstance(event, ErrorEvent)]
     assert len(errors) == 1
     assert errors[0].code == expected_code
+    assert errors[0].usage_call_index == 1
+    assert errors[0].no_prior_provider_dispatch is True
+    assert errors[0].replay_safe is True
     assert provider.calls == 0
     outcome = outcome_from_error(code=expected_code)
     assert outcome.kind == "blocked"
     assert outcome.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_second_provider_call_barrier_is_retryable_but_not_replay_safe() -> None:
+    sink = _BusyOnSecondCallSink()
+    provider = _SequenceProvider(
+        [
+            [ProviderDone(input_tokens=2, output_tokens=0)],
+            [ProviderText(text="must not dispatch"), ProviderDone()],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+        usage_event_sink=sink,
+        usage_execution_context=_context(),
+    )
+
+    with pytest.raises(UsageAccountingBusyError) as caught:
+        async for _ in agent.run_turn("hello"):
+            pass
+
+    assert provider.calls == 1
+    assert [call.call_index for call in sink.started] == [1, 2]
+    assert caught.value.usage_call_index == 2
+    assert caught.value.no_prior_provider_dispatch is False
+    assert caught.value.replay_safe is False

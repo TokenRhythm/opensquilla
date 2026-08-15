@@ -1020,26 +1020,15 @@
    "applied_model": "dummy-max-1",
    "baseline_model": "dummy-base-model",
    "large_context_floor_from_tier": "c2",
+   "large_context_floor_min_tier": "c3",
    "large_context_material_tokens": 85000,
+   "large_context_thinking_budget_tokens": 20000,
    "material_estimated_tokens": 85000,
    "prompt_policy": "P1",
    "rollout_phase": "full",
    "routed_model": "dummy-max-1",
    "routed_tier": "c3",
-   "router_fallback_chain": [
-    {
-     "model": "dummy-pro-1",
-     "tier": "c2"
-    },
-    {
-     "model": "dummy-mini-1",
-     "tier": "c1"
-    },
-    {
-     "model": "dummy-nano-1",
-     "tier": "c0"
-    }
-   ],
+   "router_fallback_chain": [],
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -1145,22 +1134,16 @@
   "metadata": {
    "applied_model": "dummy-pro-1",
    "baseline_model": "dummy-base-model",
+   "large_context_floor_min_tier": "c2",
+   "large_context_material_tokens": 26000,
+   "large_context_thinking_budget_tokens": 10000,
    "material_estimated_tokens": 26000,
    "prompt_policy": "P1",
    "rollout_phase": "full",
    "routed_model": "dummy-pro-1",
    "routed_provider": "otherprov",
    "routed_tier": "c2",
-   "router_fallback_chain": [
-    {
-     "model": "dummy-mini-1",
-     "tier": "c1"
-    },
-    {
-     "model": "dummy-nano-1",
-     "tier": "c0"
-    }
-   ],
+   "router_fallback_chain": [],
    "router_tier_provider_mismatch": "otherprov",
    "routing_applied": true,
    "routing_confidence": 0.9,
@@ -3622,22 +3605,15 @@
    "applied_model": "dummy-pro-1",
    "baseline_model": "dummy-base-model",
    "large_context_floor_from_tier": "c0",
+   "large_context_floor_min_tier": "c2",
    "large_context_material_tokens": 79999,
+   "large_context_thinking_budget_tokens": 10000,
    "material_estimated_tokens": 79999,
    "prompt_policy": "P1",
    "rollout_phase": "full",
    "routed_model": "dummy-pro-1",
    "routed_tier": "c2",
-   "router_fallback_chain": [
-    {
-     "model": "dummy-mini-1",
-     "tier": "c1"
-    },
-    {
-     "model": "dummy-nano-1",
-     "tier": "c0"
-    }
-   ],
+   "router_fallback_chain": [],
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3735,30 +3711,19 @@
   "message_len": 32,
   "message_tail": "please summarize this short note",
   "metadata": {
-   "applied_model": "dummy-base-model",
+   "applied_model": "dummy-max-1",
    "baseline_model": "dummy-base-model",
    "large_context_floor_from_tier": "c0",
+   "large_context_floor_min_tier": "c3",
    "large_context_material_tokens": 90000,
+   "large_context_thinking_budget_tokens": 20000,
    "material_estimated_tokens": 90000,
    "prompt_policy": "P1",
    "rollout_phase": "observe",
    "routed_model": "dummy-max-1",
    "routed_tier": "c3",
-   "router_fallback_chain": [
-    {
-     "model": "dummy-pro-1",
-     "tier": "c2"
-    },
-    {
-     "model": "dummy-mini-1",
-     "tier": "c1"
-    },
-    {
-     "model": "dummy-nano-1",
-     "tier": "c0"
-    }
-   ],
-   "routing_applied": false,
+   "router_fallback_chain": [],
+   "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
     "anti_downgrade_applied": false,
@@ -3848,7 +3813,7 @@
    "thinking_mode": "T3",
    "thinking_requested": true
   },
-  "model": "dummy-base-model"
+  "model": "dummy-max-1"
  },
  "large_context_floor_reconciles_thinking": {
   "error": null,
@@ -3858,26 +3823,15 @@
    "applied_model": "dummy-max-1",
    "baseline_model": "dummy-base-model",
    "large_context_floor_from_tier": "c0",
+   "large_context_floor_min_tier": "c3",
    "large_context_material_tokens": 85000,
+   "large_context_thinking_budget_tokens": 20000,
    "material_estimated_tokens": 85000,
    "prompt_policy": "P1",
    "rollout_phase": "full",
    "routed_model": "dummy-max-1",
    "routed_tier": "c3",
-   "router_fallback_chain": [
-    {
-     "model": "dummy-pro-1",
-     "tier": "c2"
-    },
-    {
-     "model": "dummy-mini-1",
-     "tier": "c1"
-    },
-    {
-     "model": "dummy-nano-1",
-     "tier": "c0"
-    }
-   ],
+   "router_fallback_chain": [],
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -3978,22 +3932,15 @@
    "applied_model": "dummy-pro-1",
    "baseline_model": "dummy-base-model",
    "large_context_floor_from_tier": "c0",
+   "large_context_floor_min_tier": "c2",
    "large_context_material_tokens": 25000,
+   "large_context_thinking_budget_tokens": 10000,
    "material_estimated_tokens": 25000,
    "prompt_policy": "P1",
    "rollout_phase": "full",
    "routed_model": "dummy-pro-1",
    "routed_tier": "c2",
-   "router_fallback_chain": [
-    {
-     "model": "dummy-mini-1",
-     "tier": "c1"
-    },
-    {
-     "model": "dummy-nano-1",
-     "tier": "c0"
-    }
-   ],
+   "router_fallback_chain": [],
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4094,26 +4041,15 @@
    "applied_model": "dummy-max-1",
    "baseline_model": "dummy-base-model",
    "large_context_floor_from_tier": "c0",
+   "large_context_floor_min_tier": "c3",
    "large_context_material_tokens": 80000,
+   "large_context_thinking_budget_tokens": 20000,
    "material_estimated_tokens": 80000,
    "prompt_policy": "P1",
    "rollout_phase": "full",
    "routed_model": "dummy-max-1",
    "routed_tier": "c3",
-   "router_fallback_chain": [
-    {
-     "model": "dummy-pro-1",
-     "tier": "c2"
-    },
-    {
-     "model": "dummy-mini-1",
-     "tier": "c1"
-    },
-    {
-     "model": "dummy-nano-1",
-     "tier": "c0"
-    }
-   ],
+   "router_fallback_chain": [],
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4217,21 +4153,14 @@
     "material_estimated_tokens": 26000
    },
    "large_context_floor_from_tier": "c0",
+   "large_context_floor_min_tier": "c2",
    "large_context_material_tokens": 26000,
+   "large_context_thinking_budget_tokens": 10000,
    "prompt_policy": "P1",
    "rollout_phase": "full",
    "routed_model": "dummy-pro-1",
    "routed_tier": "c2",
-   "router_fallback_chain": [
-    {
-     "model": "dummy-mini-1",
-     "tier": "c1"
-    },
-    {
-     "model": "dummy-nano-1",
-     "tier": "c0"
-    }
-   ],
+   "router_fallback_chain": [],
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {
@@ -4331,6 +4260,9 @@
   "metadata": {
    "applied_model": "dummy-max-1",
    "baseline_model": "dummy-base-model",
+   "large_context_floor_min_tier": "c2",
+   "large_context_material_tokens": 30000,
+   "large_context_thinking_budget_tokens": 20000,
    "material_estimated_tokens": 30000,
    "prompt_policy": "P1",
    "rollout_phase": "full",
@@ -4340,14 +4272,6 @@
     {
      "model": "dummy-pro-1",
      "tier": "c2"
-    },
-    {
-     "model": "dummy-mini-1",
-     "tier": "c1"
-    },
-    {
-     "model": "dummy-nano-1",
-     "tier": "c0"
     }
    ],
    "routing_applied": true,
@@ -4521,26 +4445,15 @@
    "applied_model": "dummy-max-1",
    "baseline_model": "dummy-base-model",
    "large_context_floor_from_tier": "c0",
+   "large_context_floor_min_tier": "c3",
    "large_context_material_tokens": 20000,
+   "large_context_thinking_budget_tokens": 20000,
    "material_estimated_tokens": 20000,
    "prompt_policy": "P1",
    "rollout_phase": "full",
    "routed_model": "dummy-max-1",
    "routed_tier": "c3",
-   "router_fallback_chain": [
-    {
-     "model": "dummy-pro-1",
-     "tier": "c2"
-    },
-    {
-     "model": "dummy-mini-1",
-     "tier": "c1"
-    },
-    {
-     "model": "dummy-nano-1",
-     "tier": "c0"
-    }
-   ],
+   "router_fallback_chain": [],
    "routing_applied": true,
    "routing_confidence": 0.9,
    "routing_extra": {

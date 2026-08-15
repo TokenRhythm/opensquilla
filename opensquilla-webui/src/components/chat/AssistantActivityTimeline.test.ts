@@ -67,6 +67,7 @@ async function mountTimeline(
   const projection = projectAssistantActivityTimeline(timelineItems, {
     lifecycle,
     statusHistory,
+    endedAt: (statusHistory[statusHistory.length - 1]?.at ?? 0) + 3_000,
   })
   const app = createApp({
     render: () => h(AssistantActivityTimeline, {
@@ -181,7 +182,7 @@ describe('AssistantActivityTimeline', () => {
     expect(batch?.open).toBe(true)
   })
 
-  it('keeps lifecycle phases out of the live action body', async () => {
+  it('shows only the current routine phase live and restores it with duration when settled', async () => {
     const statusHistory = [
       {
         action: 'Sending',
@@ -196,17 +197,34 @@ describe('AssistantActivityTimeline', () => {
     ]
     const liveRoot = await mountTimeline([], statusHistory, 'answering')
 
-    expect(liveRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(0)
-    expect(liveRoot.querySelector('.assistant-activity-timeline')).toBeNull()
+    expect(liveRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(1)
+    expect(liveRoot.textContent).toContain('Writing the answer')
+    expect(liveRoot.textContent).toContain('3s')
     expect(liveRoot.textContent).not.toContain('/private/customer')
     expect(liveRoot.textContent).not.toContain('secret')
 
     const settledRoot = await mountTimeline([], statusHistory, 'settled')
-    expect(settledRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(2)
-    expect(settledRoot.textContent).toContain('Working')
-    expect(settledRoot.textContent).toContain('Writing the answer')
+    expect(settledRoot.querySelectorAll('.assistant-activity-status__row')).toHaveLength(1)
+    expect(settledRoot.textContent).not.toContain('Working')
+    expect(settledRoot.textContent).toContain('Answer composition')
+    expect(settledRoot.textContent).toContain('3s')
     expect(settledRoot.textContent).not.toContain('/private/customer')
     expect(settledRoot.textContent).not.toContain('secret')
+  })
+
+  it('retains the waiting duration and exceptional provider transitions without a duplicate reasoning row', async () => {
+    const root = await mountTimeline([], [
+      { action: 'provider:requesting', label: 'Waiting', at: 1_000 },
+      { action: 'provider:reasoning', label: 'Reasoning', at: 2_000 },
+      { action: 'provider:fallback', label: 'Fallback', at: 3_000 },
+    ], 'settled')
+
+    const rows = root.querySelectorAll('.assistant-activity-status__row')
+    expect(rows).toHaveLength(2)
+    expect(root.textContent).toContain('Model response')
+    expect(root.textContent).toContain('1s')
+    expect(root.textContent).not.toContain('Thinking deeply')
+    expect(root.textContent).toContain('Switching to backup model')
   })
 
   it('shows prior semantic context but leaves the current action to the live header', async () => {

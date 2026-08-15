@@ -6,7 +6,7 @@
         <Icon name="info" :size="16" />
       </span>
       <div class="msg-error-card__body">
-        <span class="msg-error-card__heading">{{ t('chat.turnFailed') }}</span>
+        <span class="msg-error-card__heading">{{ errorHeading }}</span>
         <span v-if="message.text" class="msg-error-card__text">{{ message.text }}</span>
         <button
           v-if="showResume"
@@ -15,6 +15,13 @@
           :disabled="resolving"
           @click="onResume"
         >{{ t('chat.sandboxPausedResume') }}</button>
+        <button
+          v-if="showRetry"
+          type="button"
+          class="msg-error-card__resume"
+          :disabled="retryResolving"
+          @click="onRetry"
+        >{{ t('chat.retry') }}</button>
       </div>
       <time v-if="timeIso" class="msg-error-card__time" :datetime="timeIso" :title="timeFull">{{ timeAbs }}</time>
     </div>
@@ -44,6 +51,10 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { absoluteTime, fullTime, isoTime } from '@/utils/messageTime'
+import {
+  hasStrictUsageBarrierReplayProof,
+  isUsageAccountingBarrierMessage,
+} from '@/utils/chat/usageAccountingFailure'
 
 const { t } = useI18n()
 
@@ -51,24 +62,49 @@ const props = defineProps<{
   message: ChatRenderedMessage
   subagentSummary: (text: string) => string
   subagentBody: (text: string) => string
+  retryAvailable?: boolean
 }>()
 
 // Owner-driven recovery: a run paused by the sandbox denial ledger surfaces as a
 // terminal error carrying this code. Offer a Resume action that the parent wires
 // to the sandbox.resume RPC. Resume is idempotent, but we disable the button
 // after one click to avoid duplicate confirmations.
-const emit = defineEmits<{ resume: [] }>()
+const emit = defineEmits<{
+  resume: []
+  retry: [message: ChatRenderedMessage, settle: (accepted: boolean) => void]
+}>()
 const resolving = ref(false)
+const retryResolving = ref(false)
 const showResume = computed(
   () =>
     props.message.displayRole === 'error' &&
     props.message.errorCode === 'sandbox_threshold_exceeded',
+)
+const isUsageBarrier = computed(
+  () => props.message.displayRole === 'error'
+    && isUsageAccountingBarrierMessage(props.message),
+)
+const showRetry = computed(
+  () =>
+    isUsageBarrier.value
+    && hasStrictUsageBarrierReplayProof(props.message)
+    && props.retryAvailable === true,
+)
+const errorHeading = computed(() =>
+  isUsageBarrier.value ? t('chat.usageAccountingBlockedTitle') : t('chat.turnFailed'),
 )
 
 function onResume() {
   if (resolving.value) return
   resolving.value = true
   emit('resume')
+}
+
+function onRetry() {
+  if (retryResolving.value) return
+  emit('retry', props.message, (accepted) => {
+    retryResolving.value = accepted
+  })
 }
 
 const timeIso = computed(() => isoTime(props.message.ts))

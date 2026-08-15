@@ -639,6 +639,160 @@ async def test_chat_history_returns_typed_outcomes_for_explicit_page_turns(
 
 
 @pytest.mark.asyncio
+async def test_chat_history_projects_usage_barrier_retry_and_activity_snapshot(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-barrier.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-barrier"
+    await manager.create(session_key)
+    try:
+        with turn_context_scope({"turn_id": "turn-usage"}):
+            primary_user = await manager.append_message(
+                session_key, "user", "retry this"
+            )
+            steer_user = await manager.append_message(
+                session_key, "user", "same-turn steer"
+            )
+            await manager.append_message(
+                session_key,
+                "system",
+                "Error: usage ledger temporarily unavailable; provider request was not sent",
+            )
+        await storage.create_agent_task(
+            AgentTaskRecord(
+                task_id="turn-usage",
+                session_key=session_key,
+                agent_id="main",
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="session_turn",
+                status=AgentTaskStatus.FAILED,
+                terminal_reason="error",
+                error_class="usage_accounting_busy",
+                error_message="usage ledger temporarily unavailable; provider request was not sent",
+                details={
+                    "turn_id": "turn-usage",
+                    "turn_outcome": {
+                        "kind": "blocked",
+                        "reason": "usage_accounting_busy",
+                        "error_class": "usage_accounting_busy",
+                        "retryable": True,
+                        # The persisted primary id is authoritative over a
+                        # stale nested projection that points at a Steer.
+                        "user_message_id": steer_user.message_id,
+                    },
+                    "retry_after_ms": 100,
+                    "persisted_user_message_id": primary_user.message_id,
+                    "persisted_user_message_ids": [
+                        primary_user.message_id,
+                        steer_user.message_id,
+                    ],
+                    "usage_call_index": 1,
+                    "no_prior_provider_dispatch": True,
+                    "replay_safe": True,
+                    "activity_snapshot": {
+                        "version": 1,
+                        "task_id": "turn-usage",
+                        "turn_id": "turn-usage",
+                        "phases": [
+                            {"kind": "router", "phase": "decided", "at": 1_000},
+                            {"kind": "state", "phase": "thinking", "at": 1_100},
+                        ],
+                    },
+                },
+            )
+        )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        outcome = result["turn_outcomes"][0]
+        assert outcome["code"] == outcome["error_class"] == "usage_accounting_busy"
+        assert outcome["retryable"] is True
+        assert outcome["retry_after_ms"] == 100
+        assert outcome["usage_call_index"] == 1
+        assert outcome["no_prior_provider_dispatch"] is True
+        assert outcome["replay_safe"] is True
+        assert outcome["user_message_id"] == primary_user.message_id
+        assert outcome["outcome"]["user_message_id"] == primary_user.message_id
+        assert outcome["activity_snapshot"]["phases"] == [
+            {"kind": "router", "phase": "decided", "at": 1_000},
+            {"kind": "state", "phase": "thinking", "at": 1_100},
+        ]
+        assert "safe to retry" in outcome["terminal_message"].lower()
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_projects_later_usage_barrier_as_not_replay_safe(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-barrier-later-call.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-barrier-later-call"
+    await manager.create(session_key)
+    try:
+        with turn_context_scope({"turn_id": "turn-usage"}):
+            await manager.append_message(session_key, "user", "continue after tools")
+        await storage.create_agent_task(
+            AgentTaskRecord(
+                task_id="turn-usage",
+                session_key=session_key,
+                agent_id="main",
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="session_turn",
+                status=AgentTaskStatus.FAILED,
+                terminal_reason="error",
+                error_class="usage_accounting_busy",
+                error_message=(
+                    "usage ledger temporarily unavailable; provider request was not sent"
+                ),
+                details={
+                    "turn_id": "turn-usage",
+                    "turn_outcome": {
+                        "kind": "blocked",
+                        "reason": "usage_accounting_busy",
+                        "error_class": "usage_accounting_busy",
+                        "retryable": True,
+                        "usage_call_index": 2,
+                        "no_prior_provider_dispatch": False,
+                        "replay_safe": False,
+                    },
+                    "usage_call_index": 2,
+                    "no_prior_provider_dispatch": False,
+                    "replay_safe": False,
+                },
+            )
+        )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        outcome = result["turn_outcomes"][0]
+        assert outcome["retryable"] is True
+        assert outcome["usage_call_index"] == 2
+        assert outcome["no_prior_provider_dispatch"] is False
+        assert outcome["replay_safe"] is False
+        assert "earlier work" in outcome["terminal_message"].lower()
+        assert "safe to retry" not in outcome["terminal_message"].lower()
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_history_derives_legacy_outcomes_only_from_explicit_task_status(
     tmp_path,
 ) -> None:

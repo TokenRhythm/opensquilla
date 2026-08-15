@@ -97,6 +97,19 @@
         @open="openSession"
         @remove="removeSession"
       />
+
+      <div v-if="allSessions.length > 0" class="sessions-page-state" role="status">
+        <button
+          v-if="hasMore || loadMoreError"
+          type="button"
+          class="btn btn--ghost"
+          :disabled="isLoadingMore"
+          @click="loadMoreSessions"
+        >
+          {{ isLoadingMore ? t('sessions.loading') : t('sessions.loadMore') }}
+        </button>
+        <span v-else>{{ t('shared.sidebar.allLoaded') }}</span>
+      </div>
     </section>
 
     <SessionInspectDrawer
@@ -174,7 +187,17 @@ const { t } = useI18n()
 const router = useRouter()
 const rpc = useRpcStore()
 const { confirm } = useConfirm()
-const { sessionsList, allSessions, isLoading, sessionListError, loadSessions } = useSessions()
+const {
+  sessionsList,
+  allSessions,
+  isLoading,
+  isLoadingMore,
+  loadMoreError,
+  hasMore,
+  sessionListError,
+  loadSessions,
+  loadMoreSessions,
+} = useSessions()
 
 const filter = ref<FilterId>('all')
 const search = ref('')
@@ -359,6 +382,10 @@ function handleApprovalPush() {
   void refreshApprovals()
 }
 
+function handleConnectionState(state: unknown) {
+  if (state === 'connected') scheduleSessionRefresh()
+}
+
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
@@ -462,6 +489,7 @@ onActivated(() => {
     rpc.on('exec.approval.resolved', handleApprovalPush),
     rpc.on('plugin.approval.requested', handleApprovalPush),
     rpc.on('plugin.approval.resolved', handleApprovalPush),
+    rpc.on('_state', handleConnectionState),
   ]
   pollTimer = setInterval(loadAll, FALLBACK_POLL_MS)
 })
@@ -582,6 +610,15 @@ onUnmounted(teardownLive)
 
 .hub-search__input::placeholder {
   color: var(--text-dim);
+}
+
+.sessions-page-state {
+  align-items: center;
+  color: var(--text-dim);
+  display: flex;
+  font-size: var(--fs-sm);
+  justify-content: center;
+  min-height: 44px;
 }
 
 

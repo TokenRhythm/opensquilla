@@ -6,7 +6,8 @@ import {
   reconcileRunningHistoryMessages,
   rehomePromotedSteerRows,
 } from './historyMerge'
-import type { ChatMessage, ChatReasoning } from '@/types/chat'
+import type { ChatMessage, ChatReasoning, ChatRenderedMessage } from '@/types/chat'
+import { chatMessageKey } from './messageIdentity'
 
 function msg(overrides: Partial<ChatMessage>): ChatMessage {
   return { role: 'assistant', text: '', ts: null, ...overrides } as ChatMessage
@@ -47,12 +48,15 @@ describe('rehomePromotedSteerRows', () => {
 
 describe('mergeLiveOnlyFields', () => {
   it('keeps the optimistic identity across the first authoritative replacement', () => {
+    const optimistic = msg({ clientId: 'local-turn' })
     const merged = mergeLiveOnlyFields(
-      msg({ clientId: 'local-turn', messageId: 'server-turn' }),
+      optimistic,
       msg({ messageId: 'server-turn' }),
     )
 
     expect(merged.clientId).toBe('local-turn')
+    expect(chatMessageKey({ ...optimistic, id: 'assistant-0' } as ChatRenderedMessage, 0))
+      .toBe(chatMessageKey({ ...merged, id: 'assistant-0' } as ChatRenderedMessage, 0))
   })
 
   it('keeps live reasoning seconds when the server snapshot measured none', () => {
@@ -63,6 +67,25 @@ describe('mergeLiveOnlyFields', () => {
   it('lets the server win when it measured its own seconds', () => {
     const merged = mergeLiveOnlyFields(msg({ reasoning: reasoning(8) }), msg({ reasoning: reasoning(12) }))
     expect(merged.reasoning?.seconds).toBe(12)
+  })
+
+  it('keeps structured reasoning blocks when history only has flattened text', () => {
+    const reasoningBlocks = [{
+      id: 'reasoning-1',
+      index: 0,
+      text: 'inspect',
+      status: 'completed' as const,
+      startedAt: 1_000,
+      endedAt: 3_000,
+      contentKind: 'reasoning' as const,
+    }]
+    const merged = mergeLiveOnlyFields(
+      msg({ reasoning: { text: 'inspect', seconds: 2 }, reasoningBlocks }),
+      msg({ reasoning: { text: 'inspect', seconds: 0 } }),
+    )
+
+    expect(merged.reasoningBlocks).toEqual(reasoningBlocks)
+    expect(merged.reasoningBlocks).not.toBe(reasoningBlocks)
   })
 
   it('keeps the live activity snapshot when history has no persisted phases', () => {

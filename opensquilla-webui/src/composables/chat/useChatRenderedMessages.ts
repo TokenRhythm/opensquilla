@@ -472,6 +472,12 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         artifacts: msg.artifacts,
         meta: messageMeta(msg),
         reasoning: msg.role === 'assistant' ? msg.reasoning : undefined,
+        reasoningBlocks: msg.role === 'assistant'
+          ? msg.reasoningBlocks?.map(block => ({ ...block }))
+          : undefined,
+        reasoningPresentationPending: msg.role === 'assistant'
+          ? msg.reasoningPresentationPending
+          : undefined,
         interrupted: msg.interrupted,
         provenanceKind: msg.provenanceKind,
         provenanceSourceSessionKey: msg.provenanceSourceSessionKey,

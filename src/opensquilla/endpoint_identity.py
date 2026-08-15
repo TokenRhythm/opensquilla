@@ -59,6 +59,11 @@ def base_url_matches_official_api(
     candidate = str(candidate_base_url or "").strip() or official
     if not official or not candidate:
         return False
+    # ``urlsplit`` normalizes a present-but-empty query or fragment to an
+    # empty string. Preserve strict root identity by rejecting the raw URL
+    # delimiters themselves; percent-encoded path characters remain valid.
+    if "?" in official or "#" in official or "?" in candidate or "#" in candidate:
+        return False
     try:
         official_parts = urlsplit(official)
         candidate_parts = urlsplit(candidate)
