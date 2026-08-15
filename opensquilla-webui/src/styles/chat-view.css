@@ -228,12 +228,12 @@
   scrollbar-gutter: stable;
 }
 
-/* Floating composer (existing conversation, toggle on): the dock leaves the
-   document flow and pins to the chat container's bottom edge, so the last
-   messages can scroll underneath the glass panel and the backdrop blur reads
-   through them. ResizeObserver publishes the entire dock's natural height, so
-   attachments, a growing draft, and pending work cannot cover the live edge. */
-.chat.chat--composer-floating .chat-thread {
+/* Floating composer (existing conversation, toggle on): reserve the dock's
+   measured height in the body itself. This shortens the scroll viewport so no
+   visible transcript text can enter the glass panel, including while the
+   composer retracts or expands. The ResizeObserver-driven custom property is
+   intentionally not transitioned: clearance must track every layout frame. */
+.chat.chat--composer-floating .chat-body {
   padding-bottom: calc(var(--composer-dock-h, 12.5rem) + 0.5rem);
 }
 
@@ -1186,11 +1186,6 @@
 
   .chat-thread {
     padding: 0.75rem 0.75rem 1.5rem;
-  }
-
-  .chat.chat--composer-floating .chat-thread {
-    padding: 0.75rem;
-    padding-bottom: calc(var(--composer-dock-h, 12.5rem) + 0.5rem);
   }
 
 }

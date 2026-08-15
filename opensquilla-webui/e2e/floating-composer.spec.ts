@@ -3,6 +3,12 @@ import { expect, test, type Page } from '@playwright/test'
 const CONTROL_URL = '/control/'
 const SESSION_A = 'agent:main:webchat:e2e-floating-a'
 const SESSION_B = 'agent:main:webchat:e2e-floating-b'
+const SESSION_LONG = 'agent:main:webchat:e2e-floating-long'
+
+// The 1000-line geometry case deliberately keeps Chromium busy across several
+// animation frames. Keep this spec serial locally as it already is in CI, so
+// its mock WebSocket deadlines are not distorted by sibling browser workers.
+test.describe.configure({ mode: 'serial' })
 
 type RpcFrame = {
   id?: string | number
@@ -16,6 +22,16 @@ function response(id: string | number | undefined, payload: unknown) {
 }
 
 function historyFor(sessionKey: string) {
+  if (sessionKey === SESSION_LONG) {
+    return [{
+      role: 'assistant',
+      text: Array.from({ length: 1000 }, (_, index) => (
+        `Long answer line ${index + 1}: synthetic compositor clearance proof.`
+      )).join('\n'),
+      message_id: 'floating-long-answer',
+      timestamp: '2026-07-22T10:00:00Z',
+    }]
+  }
   const label = sessionKey === SESSION_B ? 'Session B' : 'Session A'
   return Array.from({ length: 48 }, (_, index) => ({
     role: index % 2 === 0 ? 'user' : 'assistant',
@@ -148,7 +164,12 @@ async function openChat(page: Page, sessionKey = SESSION_A, enabled = true) {
   await installMockGateway(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(sessionKey))
   await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10000 })
-  await expect(page.getByText('Session A message 48.', { exact: false })).toBeVisible()
+  const expectedText = sessionKey === SESSION_LONG
+    ? 'Long answer line 1000:'
+    : sessionKey === SESSION_B
+      ? 'Session B message 48.'
+      : 'Session A message 48.'
+  await expect(page.getByText(expectedText, { exact: false })).toBeVisible()
   await expect.poll(() => page.locator('.chat-thread').evaluate(el => (
     el.scrollHeight > el.clientHeight
   ))).toBe(true)
@@ -164,9 +185,50 @@ async function expectDockClearance(page: Page) {
   await expect.poll(() => page.evaluate(() => {
     const dock = document.querySelector<HTMLElement>('.chat-composer-dock')!
     const thread = document.querySelector<HTMLElement>('.chat-thread')!
-    return Number.parseFloat(getComputedStyle(thread).paddingBottom)
-      - dock.getBoundingClientRect().height
+    return dock.getBoundingClientRect().top - thread.getBoundingClientRect().bottom
   })).toBeGreaterThanOrEqual(0)
+}
+
+async function expectClearanceThroughout(
+  page: Page,
+  action: () => Promise<unknown>,
+) {
+  const worstSample = page.evaluate(() => new Promise<{
+    bodyPaddingBottom: string
+    dockHeight: number
+    elapsed: number
+    overlap: number
+  }>((resolve) => {
+    const startedAt = performance.now()
+    let worst = {
+      bodyPaddingBottom: '',
+      dockHeight: 0,
+      elapsed: 0,
+      overlap: Number.NEGATIVE_INFINITY,
+    }
+    const sample = () => {
+      const dock = document.querySelector<HTMLElement>('.chat-composer-dock')!
+      const thread = document.querySelector<HTMLElement>('.chat-thread')!
+      const overlap = thread.getBoundingClientRect().bottom - dock.getBoundingClientRect().top
+      if (overlap > worst.overlap) {
+        worst = {
+          bodyPaddingBottom: getComputedStyle(document.querySelector<HTMLElement>('.chat-body')!).paddingBottom,
+          dockHeight: dock.getBoundingClientRect().height,
+          elapsed: performance.now() - startedAt,
+          overlap,
+        }
+      }
+      if (performance.now() - startedAt >= 500) {
+        resolve(worst)
+        return
+      }
+      requestAnimationFrame(() => window.setTimeout(sample, 0))
+    }
+    requestAnimationFrame(() => window.setTimeout(sample, 0))
+  }))
+  await action()
+  const worst = await worstSample
+  expect(worst.overlap, JSON.stringify(worst)).toBeLessThanOrEqual(1)
 }
 
 test('floating composer reacts only to user scroll and resets across sessions', async ({ page }) => {
@@ -227,10 +289,49 @@ test('disabled preference restores the established docked layout', async ({ page
   expect(await dock.evaluate(el => getComputedStyle(el).position)).toBe('relative')
 })
 
+test.describe('long-answer viewport clearance', () => {
+  test.use({ viewport: { width: 1368, height: 546 } })
+
+  test('keeps every visible line above the composer while it retracts and expands', async ({ page }) => {
+    await page.addInitScript(() => localStorage.setItem('opensquilla-theme', 'dark'))
+    await openChat(page, SESSION_LONG)
+    const chat = page.locator('.chat')
+    const thread = page.locator('.chat-thread')
+    const composer = page.locator('.chat-composer')
+
+    await thread.evaluate(el => { el.scrollTop = el.scrollHeight })
+    await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+    await expectDockClearance(page)
+
+    await thread.hover({ position: { x: 120, y: 120 } })
+    await expectClearanceThroughout(page, () => page.mouse.wheel(0, -400))
+    await expect(chat).toHaveClass(/chat--composer-collapsed/)
+    await expect(composer).toHaveClass(/chat-composer--collapsed/)
+    await expect(page.locator('.chat-input-footer')).toBeHidden()
+    expect(await page.locator('.chat-textarea').evaluate(el => (
+      el.getBoundingClientRect().height
+    ))).toBeLessThanOrEqual(41)
+
+    await expectClearanceThroughout(page, () => page.mouse.wheel(0, 40))
+    await expect(chat).not.toHaveClass(/chat--composer-collapsed/)
+    await expectDockClearance(page)
+
+    await expectClearanceThroughout(page, () => page.mouse.wheel(0, -400))
+    await expect(chat).toHaveClass(/chat--composer-collapsed/)
+    const latest = page.locator('.chat-jump-latest')
+    await expect(latest).toBeVisible()
+    await expectClearanceThroughout(page, () => latest.click())
+    await expect(chat).not.toHaveClass(/chat--composer-collapsed/)
+    await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+    await expectDockClearance(page)
+  })
+})
+
 test.describe('mobile and reduced motion', () => {
   test.use({ viewport: { width: 390, height: 844 }, reducedMotion: 'reduce' })
 
   test('keeps the mobile dock legible, bounded, and motion-reduced', async ({ page }) => {
+    await page.addInitScript(() => localStorage.setItem('opensquilla-theme', 'light'))
     await page.emulateMedia({ reducedMotion: 'reduce' })
     await openChat(page)
     expect(await page.evaluate(() => matchMedia('(prefers-reduced-motion: reduce)').matches))
@@ -245,13 +346,17 @@ test.describe('mobile and reduced motion', () => {
     ].map(selector => getComputedStyle(document.querySelector<HTMLElement>(selector)!).transitionDuration))
     expect(durations).toEqual(['0s', '0s', '0s', '0s'])
 
-    // Leave the live edge while keeping the composer expanded. Messages now
-    // pass behind the floating dock, reproducing the layout where an
-    // unbacked disclaimer used to draw directly over transcript text.
-    await page.locator('.chat-thread').evaluate(el => {
-      el.scrollTop = Math.max(0, el.scrollHeight - el.clientHeight - 320)
-    })
+    // Leave the live edge with a real reader gesture, then focus the input to
+    // restore the expanded disclaimer. The viewport must stop above the
+    // floating surface in both states on the narrow layout.
+    const thread = page.locator('.chat-thread')
+    await thread.hover({ position: { x: 120, y: 120 } })
+    await page.mouse.wheel(0, -320)
     await expect(page.locator('.chat-jump-latest')).toBeVisible()
+    await expectDockClearance(page)
+    await page.locator('.chat-textarea').focus()
+    await expect(page.locator('.chat')).not.toHaveClass(/chat--composer-collapsed/)
+    await expectDockClearance(page)
 
     const mobileGeometry = await page.evaluate(() => {
       const dock = document.querySelector<HTMLElement>('.chat-composer-dock')!

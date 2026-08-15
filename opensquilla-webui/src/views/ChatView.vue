@@ -1,5 +1,6 @@
 <template>
   <div
+    ref="chatRootRef"
     class="chat"
     :class="{
       'chat--new-landing': isNewChatLanding,
@@ -1061,6 +1062,7 @@ const pendingAutoSendSessionKey = ref('')
 
 /* ── DOM refs ──────────────────────────────────────────────────────── */
 
+const chatRootRef = ref<HTMLElement | null>(null)
 const threadRef = ref<HTMLElement | null>(null)
 const messageListRef = ref<ChatMessageListVirtualizer | null>(null)
 const bottomSentinelRef = ref<HTMLElement | null>(null)
@@ -4974,8 +4976,15 @@ onMounted(async () => {
     const publishComposerDockHeight = () => {
       const height = Math.ceil(composerDock.getBoundingClientRect().height)
       if (height === lastComposerDockHeight) return
+      // Chromium applies a ResizeObserver-driven custom property on the next
+      // layout cycle. During expansion, reserve one measured growth step ahead
+      // so the dock cannot outgrow the viewport clearance before that cycle.
+      // During retraction the previously published (larger) height is safe.
+      const growth = lastComposerDockHeight < 0
+        ? 0
+        : Math.max(0, height - lastComposerDockHeight)
       lastComposerDockHeight = height
-      threadRef.value?.style.setProperty('--composer-dock-h', `${height}px`)
+      chatRootRef.value?.style.setProperty('--composer-dock-h', `${height + growth}px`)
       if (autoScroll.value && composerDockPinFrame === null) {
         composerDockPinFrame = requestAnimationFrame(() => {
           composerDockPinFrame = null
@@ -5079,7 +5088,7 @@ onUnmounted(() => {
     composerDockPinFrame = null
   }
   clearPendingComposerScrollIntent()
-  threadRef.value?.style.removeProperty('--composer-dock-h')
+  chatRootRef.value?.style.removeProperty('--composer-dock-h')
   // Drop any live share-preview object URL so the blob can be reclaimed.
   if (sharePreview.value) {
     URL.revokeObjectURL(sharePreview.value.url)
