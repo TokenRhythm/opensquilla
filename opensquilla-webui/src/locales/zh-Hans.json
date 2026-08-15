@@ -3116,8 +3116,7 @@
       "count": "{count} 个任务",
       "emptyTitle": "暂无用量数据",
       "emptyText": "运行任务后，Token 用量会自动显示在这里。",
-      "openChat": "打开任务“{task}”",
-      "autoModels": "自动 · {count} 个模型"
+      "openChat": "打开任务“{task}”"
     },
     "columns": {
       "session": "任务",

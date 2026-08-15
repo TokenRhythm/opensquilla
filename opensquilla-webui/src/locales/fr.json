@@ -3065,8 +3065,7 @@
       "count": "{count} tâches",
       "emptyTitle": "Aucune donnée d'utilisation pour l'instant",
       "emptyText": "Exécutez une tâche et son utilisation de jetons apparaîtra ici automatiquement.",
-      "openChat": "Ouvrir la tâche « {task} »",
-      "autoModels": "auto · {count} modèles"
+      "openChat": "Ouvrir la tâche « {task} »"
     },
     "columns": {
       "session": "Tâche",

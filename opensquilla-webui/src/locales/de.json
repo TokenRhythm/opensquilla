@@ -3065,8 +3065,7 @@
       "count": "{count} Aufgaben",
       "emptyTitle": "Noch keine Nutzungsdaten",
       "emptyText": "Nach dem Ausführen einer Aufgabe erscheint ihre Token-Nutzung hier automatisch.",
-      "openChat": "Aufgabe „{task}“ öffnen",
-      "autoModels": "auto · {count} Modelle"
+      "openChat": "Aufgabe „{task}“ öffnen"
     },
     "columns": {
       "session": "Aufgabe",

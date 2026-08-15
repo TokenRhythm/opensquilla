@@ -3065,8 +3065,7 @@
       "count": "{count} tareas",
       "emptyTitle": "Aún no hay datos de uso",
       "emptyText": "Ejecuta una tarea y su uso de tokens aparecerá aquí automáticamente.",
-      "openChat": "Abrir la tarea «{task}»",
-      "autoModels": "auto · {count} modelos"
+      "openChat": "Abrir la tarea «{task}»"
     },
     "columns": {
       "session": "Tarea",

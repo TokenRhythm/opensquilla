@@ -3116,8 +3116,7 @@
       "count": "{count} tasks",
       "emptyTitle": "No usage data yet",
       "emptyText": "Run a task and its token usage will appear here automatically.",
-      "openChat": "Open task “{task}”",
-      "autoModels": "auto · {count} models"
+      "openChat": "Open task “{task}”"
     },
     "columns": {
       "session": "Task",

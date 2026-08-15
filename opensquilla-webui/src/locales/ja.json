@@ -3065,8 +3065,7 @@
       "count": "{count} タスク",
       "emptyTitle": "使用量データはまだありません",
       "emptyText": "タスクを実行すると、トークン使用量がここに自動的に表示されます。",
-      "openChat": "タスク「{task}」を開く",
-      "autoModels": "自動 · {count} モデル"
+      "openChat": "タスク「{task}」を開く"
     },
     "columns": {
       "session": "タスク",
