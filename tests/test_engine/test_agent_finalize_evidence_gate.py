@@ -22,6 +22,7 @@ from opensquilla.engine import (
     ToolResult,
     WarningEvent,
 )
+from opensquilla.engine.action_completion import ACTION_COMPLETION_TOOL_NAME
 from opensquilla.provider import ChatConfig, Message
 from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import TextDeltaEvent as ProviderText
@@ -61,8 +62,9 @@ class _ScriptedProvider:
     """Replays a fixed per-call script of tool calls and final texts.
 
     Script entries are ``("exec", command)``, ``("edit", path)``,
-    ``("read", path)``, or ``("final",)``. Any call past the end of the
-    script yields a final text.
+    ``("read", path)``, ``("final",)``, or ``("complete",)``. A complete
+    entry emits final text together with action-completion evidence. Any call
+    past the end of the script yields a final text.
     """
 
     provider_name = "fake"
@@ -111,6 +113,21 @@ class _ScriptedProvider:
                 tool_use_id=tool_use_id,
                 tool_name="exec_command",
                 arguments={"command": entry[1]},
+            )
+            yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
+            return
+        if entry[0] == "complete":
+            text = f"final attempt {call_number}"
+            tool_use_id = f"complete-{call_number}"
+            yield ProviderText(text=text)
+            yield ProviderToolUseStart(
+                tool_use_id=tool_use_id,
+                tool_name=ACTION_COMPLETION_TOOL_NAME,
+            )
+            yield ProviderToolUseEnd(
+                tool_use_id=tool_use_id,
+                tool_name=ACTION_COMPLETION_TOOL_NAME,
+                arguments={"summary": text},
             )
             yield ProviderDone(stop_reason="tool_calls", input_tokens=1, output_tokens=1)
             return
@@ -229,7 +246,7 @@ async def test_gate_challenges_red_final_then_accepts_verified_final(tmp_path) -
             ("exec", "python /tmp/squilla-scratch/fail-run.py"),
             ("final",),
             ("exec", "python /tmp/squilla-scratch/rerun_fixed.py"),
-            ("final",),
+            ("complete",),
         ]
     )
     tool_context = ToolContext(workspace_dir=str(tmp_path))
@@ -354,7 +371,7 @@ async def test_gate_quiet_when_final_edit_is_verified_green(tmp_path) -> None:
         [
             ("edit", "src.py"),
             ("exec", "python /tmp/squilla-scratch/repro_check.py"),
-            ("final",),
+            ("complete",),
         ]
     )
     tool_context = ToolContext(workspace_dir=str(tmp_path))
@@ -543,7 +560,7 @@ async def test_gate_quiet_when_trailing_execution_was_denied(tmp_path) -> None:
             ("edit", "src.py"),
             ("exec", "pytest tests/test_src.py"),
             ("exec", f"python /tmp/{_DENIED_MARKER}.py"),
-            ("final",),
+            ("complete",),
         ]
     )
     tool_context = ToolContext(workspace_dir=str(tmp_path))
@@ -604,7 +621,7 @@ async def test_strict_gate_accepts_green_only_run(tmp_path) -> None:
         [
             ("edit", "src.py"),
             ("exec", "pytest tests/test_src.py"),
-            ("final",),
+            ("complete",),
         ]
     )
     tool_context = ToolContext(workspace_dir=str(tmp_path))
@@ -728,7 +745,7 @@ async def test_base_gate_without_strict_accepts_never_red_run(tmp_path) -> None:
         [
             ("edit", "src.py"),
             ("exec", "pytest tests/test_src.py"),
-            ("final",),
+            ("complete",),
         ]
     )
     tool_context = ToolContext(workspace_dir=str(tmp_path))
