@@ -6732,7 +6732,7 @@ describe('useChatSend Ensemble image guard', () => {
       pending.schedulePendingDrainAfterTerminal()
       stream.isStreaming.value = false
       await nextTick()
-      await vi.runAllTimersAsync()
+      await vi.advanceTimersByTimeAsync(50)
       await nextTick()
 
       expect(pending.pendingQueue.value).toEqual([])
@@ -7043,7 +7043,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
       expect(inputText.value).toBe('')
       stream.isStreaming.value = false
       pending.schedulePendingDrainAfterTerminal()
-      await vi.runAllTimersAsync()
+      await vi.advanceTimersByTimeAsync(50)
       await nextTick()
 
       expect(rpcCall).toHaveBeenCalledWith(
@@ -7169,7 +7169,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
       )
       stream.isStreaming.value = false
       pending.schedulePendingDrainAfterTerminal()
-      await vi.runAllTimersAsync()
+      await vi.advanceTimersByTimeAsync(50)
       await nextTick()
 
       expect(classifySlashCommand).not.toHaveBeenCalled()
@@ -7659,7 +7659,7 @@ describe('useChatSend slash-prefixed input fall-through', () => {
         })
 
         pending.schedulePendingDrainAfterTerminal()
-        await vi.runAllTimersAsync()
+        await vi.advanceTimersByTimeAsync(50)
         await nextTick()
 
         expect(classifySlashCommand).toHaveBeenCalledOnce()
