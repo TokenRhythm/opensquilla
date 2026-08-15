@@ -7510,12 +7510,18 @@ async def test_step3_first_success_does_not_cancel_slow_proposer(
 ) -> None:
     slow_gate = asyncio.Event()
     slow_closed = asyncio.Event()
+    fast_started = asyncio.Event()
+    slow_started = asyncio.Event()
     registry = _FakeRegistry(
         {
-            "p1": _FakePlan([TextDeltaEvent(text="fast"), DoneEvent(model="p1")]),
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="fast"), DoneEvent(model="p1")],
+                started=fast_started,
+            ),
             "p2": _FakePlan(
                 [TextDeltaEvent(text="slow"), DoneEvent(model="p2")],
                 gate=slow_gate,
+                started=slow_started,
                 closed=slow_closed,
             ),
             "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(model="agg")]),
@@ -7534,7 +7540,10 @@ async def test_step3_first_success_does_not_cancel_slow_proposer(
     )
 
     task = asyncio.create_task(_collect(provider))
-    await asyncio.sleep(0.03)
+    await asyncio.wait_for(
+        asyncio.gather(fast_started.wait(), slow_started.wait()),
+        timeout=1.0,
+    )
     assert [call["model"] for call in registry.calls] == ["p1", "p2"]
     assert "agg" not in [call["model"] for call in registry.calls]
     assert slow_closed.is_set() is False
