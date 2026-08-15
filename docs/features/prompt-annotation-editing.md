@@ -1,12 +1,16 @@
 # Prompt-Annotation Editing
 
 This page is the maintainer and operator guide for source-backed artifact
-annotations. The feature lets a user select an element in an HTML preview,
-attach an instruction to the next chat message, and have the active agent turn
-apply the requested edits as one reversible change set.
+annotations. The feature lets a user select an element in an HTML preview and
+attach trusted document context to the next chat message. The active agent may
+answer from that context without writing the document, or apply selected edits
+as one reversible change set when the request requires a mutation.
 
-The feature is release-gated and disabled by default. It is not a general
-comment system, a browser automation surface, or an Office editor.
+Versioned HTML resources are enabled by default. Source-backed DOM annotations
+default on only in Electron builds that synchronously expose the complete
+native protocol-v3 annotation bridge; browser-hosted Web UI and older or
+partial Desktop shells fail closed. This is not a general comment system, a
+browser automation surface, or an Office editor.
 
 ## Architecture and invariants
 
@@ -34,25 +38,29 @@ summary, adapter capabilities, and safe initial mutation grants.
 `document_read` provides paged source or a semantic structure view but never
 grants edit authority. `document_locate` asks the active format adapter to
 locate one selected semantic target and returns an opaque, turn-scoped grant.
-`document_apply` submits all required grants as one atomic mutation proposal.
+`document_apply` submits the grants chosen for mutation as one atomic proposal.
+An instruction may be answered without a mutation; every mutation that is
+submitted must still use a grant bound to its own selected context.
 The HTML adapter supports the semantic operations `replace_text`,
 `set_attribute`, `remove_attribute`, `set_style`, and `remove_node`.
 
 The model never calculates or submits source offsets and never receives a
 workspace path, anchor ID, DOM proof, internal document ID, or raw editable
-range. It describes a semantic operation and value; the server-side
-`DocumentFormatAdapter` derives and validates the exact source replacement.
+range. It asks `document_locate` for a semantic operation, then supplies only
+the opaque grant and the operation-specific `input` requested by that grant;
+the server-side `DocumentFormatAdapter` derives and validates the exact source
+replacement.
 `replace_text` is escaped as HTML text, opening-tag changes preserve unaffected
 source, and `remove_node` removes either a proven balanced element range or one
 proven HTML void element such as `img`. Unsupported or ambiguous structures
 fail closed instead of falling back to fuzzy matching or model-written source
 spans.
 
-The current opaque grant wire token remains a random 256-bit `hrg_` value for
-upgrade compatibility. A grant is bound to the current task, session epoch,
+The opaque grant wire token is a random 256-bit `hrg_` value. A grant is bound
+to the current task, session epoch,
 document, revision, source SHA, verified range hash, semantic operation, and
-annotation orders. Stale, expired, reused, duplicate, uncovered, mismatched,
-or overlapping grants reject the entire writer call before
+annotation orders. Stale, expired, reused, duplicate, selection-unbound,
+mismatched, or overlapping grants reject the entire writer call before
 candidate publication, ChangeSet creation, or Revision creation. ChangeSet
 audit data contains only hashes and character counts, never grant tokens or
 source fragments.
@@ -80,6 +88,10 @@ The following contracts must remain true:
 - The active turn receives the bounded instruction and source quote. Later
   turns receive only an inert historical marker, so an old instruction cannot
   silently run again.
+- A context-only answer does not arm the mutation ledger, create a mutation
+  outcome, reserve a summary round, or require a second provider request.
+- The mutation outcome and one `tools=[]` authoritative summary round are armed
+  only after the first valid `document_apply` intent is observed.
 - One agent turn can advance the document head once. A failed edit or validation
   leaves the head unchanged.
 - The HTML adapter validates the selected semantic operation, attribute or
@@ -91,49 +103,52 @@ The following contracts must remain true:
   download resolves to the current head. A whole agent change set can be
   reverted.
 
-## Capability and release gates
+## Capability defaults and runtime gates
 
-The Web UI has two independent release gates, both checked in as `false` in
+The renderer resolves two independent feature defaults in
 `opensquilla-webui/src/stores/app.ts`:
 
-- `documentWorkbenchResources` enables read-only resource discovery, uploaded
-  HTML preview, explicit copy import, versioned editing, and immutable publish;
-- `artifactPromptAnnotations` enables trusted DOM selection and annotation
-  turns. Enabling this second gate also implies the resource gate for
-  compatibility with existing development shells.
+- `documentWorkbenchResources` defaults to `true` and enables resource
+  discovery, uploaded HTML preview, explicit copy import, and versioned editing;
+- `artifactPromptAnnotations` defaults to `true` only when the client is
+  Electron Desktop and every native surface, preview-lease, screenshot, and
+  protocol-v3 annotation bridge method required by the flow is present at app
+  startup. Web and incomplete Desktop bridges default to `false`.
+
+The V1 UI does not expose a Publish action. Users edit the document head and
+can inspect Versions and Changes; immutable publication remains a separate
+service lifecycle rather than a promise of this editing surface.
 
 The annotation UI also requires all of the following runtime capabilities:
 
 - the application Artifact Workbench is enabled;
-- the current document advertises `capabilities.promptAnnotations = true`;
+- the current document independently advertises `selectionContext = true`,
+  `agentEdit = true`, and `promptAnnotations = true`;
 - the artifact is a supported single-file UTF-8 HTML document;
 - an Electron native workbench surface and the v3 artifact bridge are active;
 - selection resolution, focus, and trusted-overlay capabilities are available.
 
-Do not enable the release gate merely because the button renders. Enable it
-only after the offline, real Electron, and provider certification gates below
-pass for the exact build being shipped.
+Browser-hosted Web UI retains the HTML Workbench but does not offer DOM
+selection. Where annotation context is relevant it presents a Desktop-required
+hint instead of a non-functional picker.
 
-There is intentionally no supported user setting or environment variable for
-this pre-release gate. For a local development build, inject the following
-before the Web UI module starts, for example with a Playwright `addInitScript`
-or a temporary uncommitted script immediately before the module script in
-`opensquilla-webui/index.html`:
+There is intentionally no end-user setting for these safety boundaries. An
+operator or test may provide `window.OPENSQUILLA_FEATURES` before the app store
+is created. Overrides are applied last, so an explicit `false` is the emergency
+kill switch even on a complete Desktop bridge:
 
 ```html
 <script>
   window.OPENSQUILLA_FEATURES = {
     ...(window.OPENSQUILLA_FEATURES || {}),
-    documentWorkbenchResources: true,
-    artifactPromptAnnotations: true,
+    artifactPromptAnnotations: false,
   }
 </script>
 ```
 
 The value is read when the app store is created. Setting it in the console
-after the application has booted does not enable the feature. Never patch a
-packaged installation or commit this development override. For automated tests,
-prefer `addInitScript` so the repository remains unchanged.
+after the application has booted does not change the current store. The
+override is an operational/testing boundary, not a persisted user preference.
 
 ## Supported and unsupported inputs
 
@@ -162,8 +177,9 @@ The feature fails closed for:
 - JavaScript source grants or script editing. These remain unsupported until a
   bounded JavaScript parser and candidate validator are connected.
 
-Unsupported documents remain available through their existing preview and
-download behavior; the annotation capability is simply absent.
+Unsupported documents remain downloadable. A preview is available only when
+that format's independent `preview` capability is true; selection and edit
+capabilities are never inferred from preview support.
 
 ## Direct, Router, and Ensemble semantics
 
@@ -172,7 +188,7 @@ same context-bound tool implementations.
 
 | Mode | Model policy | Mutation policy |
 | --- | --- | --- |
-| Direct | Uses the user's fixed model. | The model must have authoritative tool-support metadata. Unknown or unsupported tool capability fails before the provider call; the runtime does not substitute another model. |
+| Direct | Uses the user's fixed model. | A verified tool-capable model may answer or mutate. For an unverified model, document tools are hidden and the model may only answer from the selected context; no mutation lifecycle starts. |
 | Router | Applies deterministic artifact floors after classification. | A selection edit has a minimum of `c2`; a multi-element/structural edit has a minimum of `c3`. Budget and fallback policy may move upward but cannot cross below the effective floor. Missing capable tiers fail closed. |
 | Ensemble | Runs the configured B5 lineup. | Proposers receive the annotation context but no executable tools. Only the Aggregator receives and may call artifact tools. For mutation turns, proposer tools are forced off, single-model fallback is removed, and an unverified Aggregator fails before provider execution. |
 
@@ -189,7 +205,7 @@ Four additive migrations provide the durable substrate:
   sets, anchors, writer leases, edit sessions, and audit events. It also adds
   immutability triggers and document/turn indexes.
 - `V037__artifact_prompt_annotations` creates durable annotation drafts with
-  `draft`, `sent`, and `discarded` states. It depends on V035 and enforces body,
+  `draft`, `sent`, and `discarded` states. It depends on V036 and enforces body,
   send-linkage, session, document, and revision indexes.
 - `V038__artifact_mutation_attempts` adds the durable, proposal-bound commit
   receipt used for idempotency and restart reconciliation.
@@ -302,9 +318,13 @@ closed before draft persistence.
 
 The offline document Workbench gate additionally composes an owned-Gateway
 WebSocket lifecycle (preview, import, EditSession save, exact-four agent edit,
-publication, and immutable-source checks) with the real Electron native surface
-suite. It is credential-free and requires the Electron application to obtain
-foreground focus; a locked or background-only macOS session fails the gate.
+backend publication-journal and immutable-source checks) with the real Electron
+native surface suite. Its V1 user-journey fixture starts the current Vue UI and
+owned Gateway, imports synthetic HTML through `Edit a copy`, selects through the
+native picker and trusted overlay, applies exactly one Agent change, observes
+Preview plus Versions/Changes refresh, and proves an answer-only follow-up adds
+no durable write. It is credential-free and requires Electron foreground focus;
+a locked or background-only macOS session fails the gate.
 
 ### Live provider certification
 
@@ -319,8 +339,8 @@ uv run python scripts/live_provider_profile_gateway_e2e.py \
 ```
 
 That script certifies provider transport and accounting; it is not by itself
-PromptAnnotation certification. Before changing the default gate, an isolated
-owned Gateway and Desktop build must additionally pass this live matrix:
+PromptAnnotation certification. For every release that changes this path, an
+isolated owned Gateway and Desktop build must additionally pass this live matrix:
 
 The dedicated certification boundary can be checked with:
 
@@ -336,14 +356,14 @@ Without `--execute-live-matrix`, the command is an intentional zero-call dry
 run that writes `certification=incomplete`. With the flag, the isolated worker
 runs the owned Gateway/provider path and requires the exact-four tool surface.
 It does not replace the separate real-Electron selection gate.
-Each successful Direct or Router case uses three physical requests: bounded
-inspection/location, the admitted commit proposal, and a final `tools=[]`
-outcome response. A B5 Ensemble case uses the corresponding three five-member
-rounds. The outcome-finalization round is required Agent work; it must not be
+Each successful mutation case in Direct or Router uses three physical
+requests: bounded inspection/location, the admitted commit proposal, and a
+final `tools=[]` outcome response. A B5 Ensemble case uses the corresponding
+three five-member rounds. The outcome-finalization round is required Agent work; it must not be
 removed or treated as a free call. The approved matrix therefore expects 42
 physical provider calls, allows a bounded worst-case budget of 63, and
-hard-stops at 64. Do not enable the feature gate
-until the following matrix is verified end to end:
+hard-stops at 64. A build is not release-ready until the following matrix is
+verified end to end:
 
 - Direct: one annotation and a two-annotation batch using a verified
   tool-capable fixed model;
@@ -359,33 +379,35 @@ until the following matrix is verified end to end:
 Store only case name, mode/tier/model, tool name and count, content hashes, and
 boolean results. Scan the report and temporary directory for credentials and
 delete the temporary data after review. If this feature-specific live matrix
-has not been completed, keep `artifactPromptAnnotations` disabled.
+has not been completed, set the release override for
+`artifactPromptAnnotations` to `false`.
 
-## Rollout, rollback, and maintenance
+## Release, rollback, and maintenance
 
-Roll out in this order:
+For each release:
 
-1. Ship the additive migrations with the UI gate off.
-2. Run the offline, packaged-wheel, Web UI, and real Electron suites against
+1. Run the offline, packaged-wheel, Web UI, and real Electron suites against
    the release candidate.
-3. Complete the live Direct/Router/Ensemble matrix with an isolated profile.
-4. Enable only for a small local canary population and watch sanitized audit
-   events, stale-selection rates, validation failures, and orphan cleanup.
-5. Expand only while the one-turn/one-change-set, zero-call rejection, and
-   Aggregator-only mutation invariants remain true.
+2. Complete the live Direct/Router/Ensemble matrix with an isolated profile.
+3. Canary the exact Desktop build and watch sanitized audit events,
+   stale-selection rates, validation failures, and orphan cleanup.
+4. Keep the default enabled only while the one-turn/one-change-set, zero-call
+   rejection, and Aggregator-only mutation invariants remain true.
 
-For an incident, disable the gate first, fence active annotation sessions, and
-restart the affected Desktop-managed Gateway. Existing document heads,
-revisions, downloads, and sent history remain readable. Restore a prior head
-through the revision/change-set service; do not overwrite artifact blobs or
-edit migration tables manually.
+For an incident, apply the explicit `artifactPromptAnnotations: false` override
+first, fence active annotation sessions, and restart the affected
+Desktop-managed Gateway. Existing document heads, revisions, downloads, and
+sent history remain readable. Restore a prior head through the
+revision/change-set service; do not overwrite artifact blobs or edit migration
+tables manually.
 
 Ongoing maintenance should include:
 
 - rerunning the DOM-path/parse5 golden corpus after Electron, Chromium, parse5,
   or Monaco upgrades;
-- requiring authoritative tool-capability metadata for every Direct model and
-  Ensemble Aggregator added to the catalog;
+- requiring authoritative tool-capability metadata before any Direct model or
+  Ensemble Aggregator may mutate a document; unverified models remain
+  answer-only with document tools hidden;
 - keeping every new test in the Windows shard assignments and duration data;
 - exercising migrations from released wheels and old profiles;
 - preserving opaque bridge handles and typed protocol methods when protocol v3

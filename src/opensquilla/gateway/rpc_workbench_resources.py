@@ -116,6 +116,9 @@ class _FormatProfile:
     adapter: DocumentFormatAdapter | None
     preview: bool
     editable: bool
+    agent_editable: bool
+    selection_context: bool
+    publishable: bool
     reason_code: str | None
 
 
@@ -507,6 +510,9 @@ def _format_profile(
                     adapter=adapter,
                     preview=False,
                     editable=False,
+                    agent_editable=False,
+                    selection_context=False,
+                    publishable=True,
                     reason_code="html_encoding_unsupported",
                 )
             try:
@@ -517,6 +523,9 @@ def _format_profile(
                     adapter=adapter,
                     preview=False,
                     editable=False,
+                    agent_editable=False,
+                    selection_context=False,
+                    publishable=True,
                     reason_code="html_validation_failed",
                 )
         return _FormatProfile(
@@ -524,6 +533,12 @@ def _format_profile(
             adapter=adapter,
             preview=capabilities.get("preview") is True,
             editable=capabilities.get("manualEdit") is True,
+            agent_editable=capabilities.get("agentEdit") is True,
+            selection_context=(
+                capabilities.get("selectionContext") is True
+                or capabilities.get("selection") is True
+            ),
+            publishable=True,
             reason_code=None,
         )
     suffix = Path(name).suffix.lower()
@@ -538,10 +553,28 @@ def _format_profile(
     if suffix in _OFFICE_SUFFIXES:
         # Office material remains discoverable and downloadable, but neither
         # preview nor edit is advertised until a real renderer+adapter exists.
-        return _FormatProfile(kind, None, False, False, "office_adapter_not_available")
+        return _FormatProfile(
+            kind=kind,
+            adapter=None,
+            preview=False,
+            editable=False,
+            agent_editable=False,
+            selection_context=False,
+            publishable=False,
+            reason_code="office_adapter_not_available",
+        )
     normalized_mime = mime.split(";", 1)[0].strip().lower()
     preview = normalized_mime.startswith("image/") or normalized_mime == "application/pdf"
-    return _FormatProfile(kind, None, preview, False, "format_edit_not_supported")
+    return _FormatProfile(
+        kind=kind,
+        adapter=None,
+        preview=preview,
+        editable=False,
+        agent_editable=False,
+        selection_context=False,
+        publishable=True,
+        reason_code="format_edit_not_supported",
+    )
 
 
 def _kind_for(name: str, mime: str) -> ArtifactKind:
@@ -665,6 +698,13 @@ def _attachment_payload(
         "capabilities": {
             "preview": preview,
             "download": True,
+            # Immutable sources must be copied into a Document before any
+            # selection-scoped or Agent mutation capability can exist.
+            "selectionContext": False,
+            "manualEdit": editable,
+            "agentEdit": False,
+            # Compatibility summary retained for clients predating the
+            # independent Workbench capability axes.
             "edit": editable,
             "publish": False,
             "previewReasonCode": preview_reason_code,
@@ -697,10 +737,13 @@ def _document_payload(
     *,
     binding: DocumentSourceBinding | None,
     publication: DocumentPublication | None,
-    editable: bool,
+    trusted_capabilities: bool,
 ) -> dict[str, Any]:
     profile = _format_profile(document.name, head.media_type)
-    effective_editable = editable and profile.editable
+    effective_editable = trusted_capabilities and profile.editable
+    effective_agent_editable = trusted_capabilities and profile.agent_editable
+    effective_selection_context = trusted_capabilities and profile.selection_context
+    legacy_edit = effective_editable or effective_agent_editable
     relations: dict[str, Any] = {
         "documentId": document.document_id,
         "headRevisionId": head.revision_id,
@@ -730,8 +773,13 @@ def _document_payload(
         "capabilities": {
             "preview": profile.preview,
             "download": True,
-            "edit": effective_editable,
-            "publish": True,
+            "selectionContext": effective_selection_context,
+            "manualEdit": effective_editable,
+            "agentEdit": effective_agent_editable,
+            # Compatibility summary retained for clients predating the
+            # independent Workbench capability axes.
+            "edit": legacy_edit,
+            "publish": profile.publishable,
             "editReasonCode": _effective_edit_reason(
                 profile,
                 editable=effective_editable,
@@ -772,6 +820,13 @@ def _deliverable_payload(
         "capabilities": {
             "preview": profile.preview,
             "download": True,
+            # Published artifacts remain immutable until copied into a
+            # Document; preview never grants selection or mutation authority.
+            "selectionContext": False,
+            "manualEdit": effective_importable,
+            "agentEdit": False,
+            # Compatibility summary retained for clients predating the
+            # independent Workbench capability axes.
             "edit": effective_importable,
             "publish": False,
             "editReasonCode": _effective_edit_reason(
@@ -868,8 +923,11 @@ async def _resource_inventory(
         head = await service.get_revision(document.head_revision_id)
         if head.document_id != document.document_id:
             raise RpcUnavailableError("document head integrity check failed")
-        editable = _format_profile(document.name, head.media_type).editable
-        if editable:
+        profile = _format_profile(document.name, head.media_type)
+        trusted_capabilities = (
+            profile.editable or profile.agent_editable or profile.selection_context
+        )
+        if trusted_capabilities:
             try:
                 manifest = await asyncio.to_thread(
                     store.describe_preview_bundle,
@@ -877,9 +935,9 @@ async def _resource_inventory(
                     session_id=session_id,
                 )
             except (ArtifactError, OSError):
-                editable = False
+                trusted_capabilities = False
             else:
-                editable = (
+                trusted_capabilities = (
                     manifest is None or is_complete_single_file_preview_bundle(manifest)
                 )
         document_resources.append(
@@ -888,7 +946,7 @@ async def _resource_inventory(
                 head,
                 binding=binding_by_document.get(document.document_id),
                 publication=latest_publication_by_document.get(document.document_id),
-                editable=editable,
+                trusted_capabilities=trusted_capabilities,
             )
         )
     attachment_resources = [
@@ -1728,6 +1786,15 @@ async def _handle_documents_publish(
             raise _not_found("revision", revision_id) from None
         if revision.document_id != document.document_id:
             raise _not_found("revision", revision_id)
+        profile = _format_profile(revision.filename, revision.media_type)
+        if not profile.publishable:
+            raise RpcHandlerError(
+                "DOCUMENT_PUBLISH_FORMAT_UNSUPPORTED",
+                "This document format cannot be published from the Workbench",
+                details={"reasonCode": profile.reason_code or "publish_not_supported"},
+                retryable=False,
+                accepted=False,
+            )
         candidate = ArtifactBlobRef(
             artifact_id=ArtifactStore.allocate_artifact_id(),
             sha256=revision.artifact_sha256,

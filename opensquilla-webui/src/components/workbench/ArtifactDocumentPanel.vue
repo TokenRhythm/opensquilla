@@ -42,20 +42,16 @@
         <Icon name="edit" :size="14" />
         <span>{{ t('workbench.resources.edit', { name: artifact.name || '' }) }}</span>
       </button>
-      <button
-        v-if="canPublishHead"
-        type="button"
-        class="artifact-document__publish"
-        data-artifact-action="publish-head"
-        :disabled="publishing || mutationBusy"
-        @click="publishHead"
-      >
-        <Icon name="share" :size="14" />
-        <span>{{ publishing
-          ? t('workbench.artifactDocument.publishing')
-          : t('workbench.artifactDocument.publishHead') }}</span>
-      </button>
     </nav>
+
+    <p
+      v-if="showDesktopElementEditingHint && activeTab === 'preview'"
+      class="artifact-document__desktop-editing-hint"
+      data-testid="artifact-document-desktop-editing-hint"
+      role="note"
+    >
+      {{ t('workbench.artifactAnnotation.desktopEditingOnly') }}
+    </p>
 
     <p v-if="mutationError" class="artifact-document__mutation-error" role="alert">
       {{ mutationError }}
@@ -448,11 +444,14 @@ const actionsAvailable = computed(() => Boolean(
   && props.sessionKey.trim()
   && workspace.value?.source === 'document-api',
 ))
-const canPublishHead = computed(() => Boolean(
-  props.sessionKey.trim()
+const showDesktopElementEditingHint = computed(() => Boolean(
+  documentFeatures.value
   && workspace.value?.source === 'document-api'
-  && documentModel.value?.documentId
-  && documentModel.value.headRevisionId,
+  && documentModel.value?.kind === 'html'
+  && documentModel.value.capabilities.agentEdit
+  && artifactWorkbenchPreviewKind(headArtifact.value) === 'html'
+  && !props.nativeHtml
+  && !downloadOnly.value,
 ))
 const downloadOnlyTitle = computed(() => isOfficeArtifact(headArtifact.value)
   ? t('workbench.artifactDocument.officeDownloadOnlyTitle')
@@ -524,18 +523,6 @@ function downloadHead() {
 function createEditableCopy() {
   if (!props.editableCopyAvailable || props.editableCopyBusy) return
   emit('workbench-event', { type: 'artifact-create-editable-copy' })
-}
-
-function publishHead() {
-  const document = documentModel.value
-  if (!document || !canPublishHead.value || props.publishing) return
-  emit('workbench-event', {
-    type: 'artifact-document-publish',
-    payload: {
-      documentId: document.documentId,
-      revisionId: document.headRevisionId,
-    },
-  })
 }
 
 function downloadRevision(revisionId: string) {
@@ -804,6 +791,17 @@ defineExpose({ beforeClose, reload })
   background: color-mix(in srgb, var(--danger) 8%, var(--bg));
   color: var(--danger);
   font-size: 12px;
+}
+
+.artifact-document__desktop-editing-hint {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--accent) 4%, var(--bg));
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 .artifact-document__panel {

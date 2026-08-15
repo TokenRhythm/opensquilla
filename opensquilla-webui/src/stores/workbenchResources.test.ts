@@ -10,7 +10,15 @@ const attachment: WorkbenchResource = {
   name: 'page.html',
   mime: 'text/html',
   sha256: 'a'.repeat(64),
-  capabilities: { preview: true, download: true, edit: true, publish: false },
+  capabilities: {
+    preview: true,
+    download: true,
+    selectionContext: false,
+    manualEdit: true,
+    agentEdit: false,
+    edit: true,
+    publish: false,
+  },
   relations: {},
 }
 
@@ -286,7 +294,7 @@ describe('workbench resources store', () => {
 
     await expect(store.importDocument('session-a', {
       ...attachment,
-      capabilities: { ...attachment.capabilities, edit: false },
+      capabilities: { ...attachment.capabilities, manualEdit: false, edit: false },
     })).rejects.toThrow('cannot be imported')
     expect(provider.importDocument).not.toHaveBeenCalled()
   })

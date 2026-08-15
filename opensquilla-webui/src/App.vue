@@ -211,11 +211,9 @@
           :copy-icon="chatRouteHeaderCopyIcon"
           :copy-live-text="chatRouteHeaderCopyLiveText"
           :deliverable-count="chatRouteHeaderDeliverableCount"
-          :workbench-resource-count="chatRouteHeaderWorkbenchResourceCount"
           :share-mode="chatRouteHeaderShareMode"
           :shareable-message-count="chatRouteHeaderShareableMessageCount"
           @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
-          @open-workbench="chatRouteHeader.invoke('openWorkbench')"
           @start-share="chatRouteHeader.invoke('startShare')"
           @copy-session-key="chatRouteHeader.invoke('copySessionKey')"
         />
@@ -551,7 +549,6 @@ const {
   copyIcon: chatRouteHeaderCopyIcon,
   copyLiveText: chatRouteHeaderCopyLiveText,
   deliverableCount: chatRouteHeaderDeliverableCount,
-  workbenchResourceCount: chatRouteHeaderWorkbenchResourceCount,
   shareMode: chatRouteHeaderShareMode,
   shareableMessageCount: chatRouteHeaderShareableMessageCount,
 } = chatRouteHeader.model

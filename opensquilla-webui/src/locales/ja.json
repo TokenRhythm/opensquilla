@@ -164,7 +164,7 @@
       "failedDetail": "隔離ブラウザーを再読み込みして続行してください。"
     },
     "artifactAnnotation": {
-      "start": "プレビューに注釈", "stop": "注釈を終了", "selectElement": "注釈するページ要素を選択", "selectElementShort": "要素を選択", "unavailable": "プレビュー注釈は利用できません。",
+      "start": "プレビューに注釈", "stop": "注釈を終了", "selectElement": "注釈するページ要素を選択", "selectElementShort": "要素を選択", "unavailable": "プレビュー注釈は利用できません。", "desktopEditingOnly": "ページ要素の選択と AI 編集はデスクトップアプリで利用できます。",
       "createFailed": "選択した要素を添付できませんでした。", "elementChanged": "添付前に選択した要素が変更されました。現在のプレビューでもう一度選択してください。", "rearmFailed": "要素ピッカーを再起動できなかったため、注釈モードを終了しました。もう一度有効にしてください。", "updateFailed": "注釈の下書きを保存できませんでした。", "discardFailed": "注釈を破棄できませんでした。再試行できるよう開いたままにします。", "closeFailed": "注釈エディターを閉じられませんでした。もう一度お試しください。", "replacementCleanupFailed": "新しい注釈は保持されましたが、以前の下書きを削除できませんでした。",
       "overlayFallback": "信頼済みエディターで編集を続けてください。",
       "fallbackTitle": "注釈を続ける", "fallbackDetail": "ネイティブエディターを利用できないためプレビューを非表示にしました。下書きは保存されています。", "frozenPreview": "選択したページ要素の固定プレビュー",
@@ -3275,7 +3275,7 @@
     "stopResponseEsc": "現在の応答を停止（Esc）",
     "messageToSend": "送信するメッセージ",
     "promptAnnotations": {
-      "draftLabel": "保留中の成果物指示", "sentLabel": "成果物指示", "element": "要素",
+      "label": "注釈", "draftLabel": "保留中の成果物指示", "sentLabel": "成果物指示", "element": "要素",
       "emptyDraft": "指示を追加", "stale": "要素を再選択",
       "editingBlocked": "編集中の注釈を追加またはキャンセルしてから送信してください。",
       "staleBlocked": "古い成果物指示の要素を再選択してください。",
@@ -3283,7 +3283,7 @@
       "removeLabel": "成果物指示を削除", "updateFailed": "成果物指示を保存できませんでした。",
       "discardFailed": "成果物指示を削除できませんでした。", "focusUnavailable": "この要素を安全に強調表示できませんでした。対応するプレビューを開いて再試行してください。",
       "reuseLabel": "新しい注釈としてコピー", "reuseDescription": "変更要求をコピーし、現在のバージョンで要素をもう一度選択します。", "reuseUnavailable": "この変更要求を新しい注釈としてコピーできませんでした。対応する成果物のプレビューを開き、現在のバージョンで要素をもう一度選択してください。", "applyPrompt": "添付された成果物指示を適用してください。",
-      "status": { "sending": "送信中", "accepted": "受付済み", "unknown": "編集状態は不明です", "not_attempted": "文書編集は試行されませんでした", "applied": "変更を適用済み", "appliedCorrected": "修正後に適用済み", "not_applied": "変更は適用されませんでした", "conflict": "文書が変更されました", "ambiguous": "編集結果を確認中" },
+      "status": { "unknown": "編集状態は不明です", "not_attempted": "文書編集は試行されませんでした", "applied": "変更を適用済み", "appliedCorrected": "修正後に適用済み", "not_applied": "変更は適用されませんでした", "conflict": "文書が変更されました", "ambiguous": "編集結果を確認中" },
       "statusDetail": { "unknown": "完了したこのターンには、検証可能な文書変更の受領結果がありません。", "not_attempted": "文書への書き込みが提案される前にターンが終了しました。", "applied": "文書リビジョンの受領結果で確認済みです。", "not_applied": "新しい文書リビジョンは作成されませんでした。", "conflict": "文書を更新して対象を選び直してください。", "ambiguous": "照合が終わるまで、この編集を再試行しないでください。" }
     },
     "placeholder": "メッセージを送信...",

@@ -1647,6 +1647,9 @@ describe('artifact Workbench provider', () => {
     }, item)
     expect(renderState.annotationAvailable).toBe(false)
     workspace.document.capabilities.promptAnnotations = true
+    workspace.document.capabilities.manualEdit = true
+    workspace.document.capabilities.selectionContext = true
+    workspace.document.capabilities.agentEdit = true
 
     await runtime.handleComponentEvent?.({ type: 'artifact-head-changed' }, item)
 
@@ -1951,6 +1954,9 @@ describe('artifact Workbench provider', () => {
 
     expect(renderState.annotationAvailable).toBe(false)
     workspace.document.capabilities.promptAnnotations = true
+    workspace.document.capabilities.manualEdit = true
+    workspace.document.capabilities.selectionContext = true
+    workspace.document.capabilities.agentEdit = true
     await runtime.resume?.(item)
     expect(renderState.annotationAvailable).toBe(true)
     await runtime.performAction?.('toggle-annotation-mode', item)

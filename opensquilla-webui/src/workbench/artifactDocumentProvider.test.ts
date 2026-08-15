@@ -27,6 +27,68 @@ const officeArtifact: ArtifactPayload = {
 }
 
 describe('artifact document provider', () => {
+  it('does not promote a preview-only format into selection or editing', () => {
+    const capabilities = normalizeArtifactEditCapabilities({
+      formats: {
+        docx: { preview: true, publish: false },
+        xlsx: { preview: false, publish: false },
+        pptx: { preview: false, publish: false },
+        html: { preview: true, manualEdit: true, agentEdit: true },
+      },
+    })
+
+    expect(capabilities.office).toMatchObject({
+      preview: true,
+      selectionContext: false,
+      manualEdit: false,
+      agentEdit: false,
+      edit: false,
+      publish: false,
+    })
+  })
+
+  it('preserves explicit false edit axes over legacy edit and enabled summaries', () => {
+    const capabilities = normalizeArtifactEditCapabilities({
+      formats: {
+        html: {
+          enabled: true,
+          preview: true,
+          edit: true,
+          manualEdit: false,
+          agentEdit: false,
+          publish: false,
+        },
+      },
+    })
+    const document = normalizeArtifactDocument({
+      id: 'doc-explicit-false',
+      sessionKey: 'session-a',
+      name: 'page.html',
+      format: 'html',
+      headRevisionId: 'rev-explicit-false',
+      capabilities: {
+        preview: true,
+        edit: true,
+        manualEdit: false,
+        agentEdit: false,
+        publish: false,
+      },
+    }, capabilities)
+
+    expect(capabilities.html).toMatchObject({
+      manualEdit: false,
+      agentEdit: false,
+      edit: false,
+      publish: false,
+    })
+    expect(document?.capabilities).toMatchObject({
+      manualEdit: false,
+      agentEdit: false,
+      edit: false,
+      publish: false,
+    })
+  })
+
   it('normalizes the stable document, revision, and change-set contracts', () => {
     const capabilities = normalizeArtifactEditCapabilities({
       available: true,
@@ -143,6 +205,10 @@ describe('artifact document provider', () => {
     expect(document?.capabilities).toEqual({
       download: true,
       preview: true,
+      selectionContext: false,
+      manualEdit: false,
+      agentEdit: false,
+      publish: false,
       edit: false,
       revisions: true,
       changeSets: false,

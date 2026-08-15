@@ -309,6 +309,7 @@ async def test_preview_prompt_annotations_are_exposed_only_with_desktop_bridge(
     )
     _ref, document = await _adopt_html(env)
     assert document["capabilities"]["sourceEdit"] is True
+    assert document["capabilities"]["selectionContext"] is False
     assert document["capabilities"]["promptAnnotations"] is False
 
     monkeypatch.setattr(
@@ -322,7 +323,30 @@ async def test_preview_prompt_annotations_are_exposed_only_with_desktop_bridge(
         {"sessionKey": SESSION_KEY, "documentId": document["id"]},
     )
     assert refreshed.error is None, refreshed.error
+    assert refreshed.payload["document"]["capabilities"]["selectionContext"] is True
     assert refreshed.payload["document"]["capabilities"]["promptAnnotations"] is True
+
+
+@pytest.mark.asyncio
+async def test_office_format_capabilities_are_independently_fail_closed(
+    artifact_editing_env,
+) -> None:
+    described = await _dispatch(
+        artifact_editing_env,
+        "artifacts.edit.capabilities",
+        {},
+    )
+    assert described.error is None, described.error
+
+    for artifact_format in ("docx", "xlsx", "pptx"):
+        capabilities = described.payload["formats"][artifact_format]
+        assert capabilities["download"] is True
+        assert capabilities["preview"] is False
+        assert capabilities["selectionContext"] is False
+        assert capabilities["manualEdit"] is False
+        assert capabilities["agentEdit"] is False
+        assert capabilities["publish"] is False
+        assert capabilities["unavailableReason"] == "office_adapter_not_available"
 
 
 @pytest.mark.asyncio
@@ -341,8 +365,10 @@ async def test_invalid_utf8_html_never_advertises_source_or_preview_annotations(
     assert document["capabilities"] == {
         "download": True,
         "versionHistory": True,
+        "publish": True,
         "promptAnnotations": False,
         "preview": True,
+        "selectionContext": False,
         "manualEdit": False,
         "agentEdit": False,
         "sourceEdit": False,
@@ -418,6 +444,7 @@ async def test_complete_single_entrypoint_bundle_supports_source_and_prompt_anno
     document = opened.payload["document"]
     assert document["capabilities"]["sourceEdit"] is True
     assert document["capabilities"]["agentEdit"] is True
+    assert document["capabilities"]["selectionContext"] is True
     assert document["capabilities"]["selection"] is True
     assert document["capabilities"]["promptAnnotations"] is True
     assert "unavailableReason" not in document["capabilities"]
@@ -797,6 +824,7 @@ async def test_incomplete_single_entrypoint_bundle_remains_preview_only(
     document = opened.payload["document"]
     capabilities = document["capabilities"]
     assert capabilities["preview"] is True
+    assert capabilities["selectionContext"] is False
     assert capabilities["sourceEdit"] is False
     assert capabilities["agentEdit"] is False
     assert capabilities["selection"] is False
@@ -849,6 +877,7 @@ async def test_html_preview_bundle_is_preview_only_and_source_tools_are_not_boun
     capabilities = document["capabilities"]
     assert document["editorState"] == "preview_ready"
     assert capabilities["preview"] is True
+    assert capabilities["selectionContext"] is False
     assert capabilities["promptAnnotations"] is False
     assert capabilities["sourceEdit"] is False
     assert capabilities["manualEdit"] is False

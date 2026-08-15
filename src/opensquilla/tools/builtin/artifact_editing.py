@@ -58,13 +58,17 @@ from opensquilla.artifacts import (
 from opensquilla.tools.builtin.artifact_range_grants import (
     ArtifactRangeBinding,
     ArtifactRangeGrantError,
+    DocumentGrantBinding,
     ResolvedRangeGrant,
+    document_grant_registry_for_context,
     registry_for_context,
 )
 from opensquilla.tools.builtin.document_format_adapters import (
     DocumentAdapterError,
     DocumentMutationError,
     DocumentMutationRetryPolicy,
+    GrantedMutationInput,
+    HtmlDocumentFormatAdapter,
     get_document_format_adapter,
     mutation_error_from_adapter,
 )
@@ -88,6 +92,8 @@ _MAX_HTML_SOURCE_BYTES = 2 * 1024 * 1024
 _MAX_HTML_PATCHES = 100
 _MAX_HTML_EXPECTED_BYTES = 2 * 1024 * 1024
 _MAX_HTML_REPLACEMENT_BYTES = 2 * 1024 * 1024
+_MAX_DOCUMENT_MUTATIONS = 100
+_MAX_DOCUMENT_INPUT_BYTES = 2 * 1024 * 1024
 _MAX_HTML_READ_CHUNK_CHARS = 16 * 1024
 _DEFAULT_HTML_READ_CHUNK_CHARS = 8 * 1024
 _MAX_HTML_RANGE_TEXT_BYTES = 16 * 1024
@@ -499,7 +505,13 @@ class _ElementCollector(HTMLParser):
         self.handle_starttag(tag, attrs)
 
 
-def _range_binding(scope: _ArtifactScope, source_sha256: str) -> ArtifactRangeBinding:
+def _range_binding(
+    scope: _ArtifactScope,
+    source_sha256: str,
+    *,
+    adapter_id: str = "html",
+    adapter_version: int = 1,
+) -> ArtifactRangeBinding:
     task_id = str(scope.ctx.task_id or "").strip()
     if not task_id:
         raise SafeToolError("Artifact source ranges require a durable turn identity.")
@@ -511,6 +523,31 @@ def _range_binding(scope: _ArtifactScope, source_sha256: str) -> ArtifactRangeBi
         document_id=scope.document.document_id,
         revision_id=scope.revision.revision_id,
         source_sha256=source_sha256,
+        adapter_id=adapter_id,
+        adapter_version=adapter_version,
+    )
+
+
+def _document_grant_binding(
+    scope: _ArtifactScope,
+    source_sha256: str,
+    *,
+    adapter_id: str,
+    adapter_version: int,
+) -> DocumentGrantBinding:
+    task_id = str(scope.ctx.task_id or "").strip()
+    if not task_id:
+        raise SafeToolError("Document mutation grants require a durable turn identity.")
+    return DocumentGrantBinding(
+        task_id=task_id,
+        session_key=scope.context.session_key,
+        session_id=scope.context.session_id,
+        session_epoch=scope.session_epoch,
+        document_id=scope.document.document_id,
+        revision_id=scope.revision.revision_id,
+        source_sha256=source_sha256,
+        adapter_id=adapter_id,
+        adapter_version=adapter_version,
     )
 
 
@@ -1536,20 +1573,25 @@ def _validate_patches(
 
 
 @dataclass(frozen=True, slots=True)
-class _PreparedHtmlEdit:
-    """Purely prepared document proposal with still-reserved range grants."""
+class PreparedDocumentMutation:
+    """Validated, side-effect-free candidate ready for the shared commit kernel."""
 
     scope: _ArtifactScope
     store: ArtifactStore
     ref: ArtifactRef
     turn_id: str
     summary: str
-    semantic_mutations: bool
-    audit_patches: list[dict[str, object]]
-    semantic_audit: list[dict[str, object]]
-    adapter_validation: dict[str, object]
-    validated_css_mutation: bool
-    updated_bytes: bytes
+    artifact_format: str
+    adapter_id: str
+    adapter_version: int
+    base_revision_id: str
+    source_sha256: str
+    candidate_bytes: bytes
+    candidate_sha256: str
+    operations: tuple[dict[str, object], ...]
+    validation_summary: dict[str, object]
+    mutation_kind: str
+    patch_count: int
     actor: Actor
     registry: Any
     reservation_id: str
@@ -1559,15 +1601,203 @@ class _PreparedHtmlEdit:
         self.registry.release_reservation(self.reservation_id)
 
 
-async def _prepare_html_document_mutation(
+def _prepare_semantic_document_mutation(
+    *,
+    scope: _ArtifactScope,
+    store: ArtifactStore,
+    ref: ArtifactRef,
+    raw: bytes,
+    turn_id: str,
+    summary: str,
+    mutations: list[dict[str, object]],
+    proposal_sha256: str | None,
+) -> PreparedDocumentMutation:
+    if not mutations or len(mutations) > _MAX_DOCUMENT_MUTATIONS:
+        raise DocumentMutationError(
+            "DOCUMENT_MUTATIONS_INVALID",
+            "Mutations must be a non-empty bounded array.",
+            retry_policy="correctable",
+        )
+    canonical: list[dict[str, object]] = []
+    tokens: list[str] = []
+    input_bytes = 0
+    for index, mutation in enumerate(mutations):
+        if not isinstance(mutation, dict) or not {"grant_token"} <= set(mutation) <= {
+            "grant_token",
+            "input",
+        }:
+            raise DocumentMutationError(
+                "DOCUMENT_MUTATION_INVALID",
+                f"Mutation {index} has an invalid shape.",
+                retry_policy="correctable",
+            )
+        token = mutation.get("grant_token")
+        if not isinstance(token, str):
+            raise DocumentMutationError(
+                "DOCUMENT_MUTATION_INVALID",
+                f"Mutation {index} has an invalid grant token.",
+                retry_policy="correctable",
+            )
+        item = dict(mutation)
+        if "input" in item:
+            try:
+                input_bytes += len(
+                    json.dumps(
+                        item["input"],
+                        ensure_ascii=False,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                )
+            except (TypeError, ValueError):
+                raise DocumentMutationError(
+                    "DOCUMENT_MUTATION_INPUT_INVALID",
+                    f"Mutation {index} input is not valid JSON.",
+                    retry_policy="correctable",
+                ) from None
+        if input_bytes > _MAX_DOCUMENT_INPUT_BYTES:
+            raise DocumentMutationError(
+                "DOCUMENT_MUTATION_INPUT_TOO_LARGE",
+                "Mutation input exceeds the turn limit.",
+                retry_policy="correctable",
+            )
+        canonical.append(item)
+        tokens.append(token)
+
+    try:
+        adapter = get_document_format_adapter(scope.context.artifact_format)
+    except DocumentAdapterError as exc:
+        raise mutation_error_from_adapter(exc) from None
+    registry = document_grant_registry_for_context(scope.ctx)
+    reservation_id = f"document-mutation:{secrets.token_urlsafe(16)}"
+    binding = _document_grant_binding(
+        scope,
+        ref.sha256,
+        adapter_id=adapter.format_id,
+        adapter_version=adapter.adapter_version,
+    )
+    try:
+        grants = registry.reserve_grants(
+            binding=binding,
+            tokens=tokens,
+            reservation_id=reservation_id,
+        )
+    except ArtifactRangeGrantError as exc:
+        raise _range_error(exc) from None
+    try:
+        valid_orders = set(range(len(scope.anchors)))
+        if any(
+            not grant.annotation_orders
+            or any(order not in valid_orders for order in grant.annotation_orders)
+            or grant.adapter_id != adapter.format_id
+            or grant.adapter_version != adapter.adapter_version
+            for grant in grants
+        ):
+            raise DocumentMutationError(
+                "DOCUMENT_MUTATION_GRANT_SCOPE_INVALID",
+                "Every mutation grant must be bound to a current document selection.",
+                retry_policy="forbidden",
+            )
+        granted_inputs = tuple(
+            GrantedMutationInput(
+                operation=grant.operation,
+                target_fingerprint=grant.target_fingerprint,
+                annotation_orders=grant.annotation_orders,
+                has_input="input" in mutation,
+                input_value=mutation.get("input"),
+                adapter_locator=grant.adapter_locator,
+            )
+            for grant, mutation in zip(grants, canonical, strict=True)
+        )
+        candidate = adapter.prepare_granted_mutations(
+            raw,
+            mutations=granted_inputs,
+        )
+    except DocumentAdapterError as exc:
+        registry.release_reservation(reservation_id)
+        raise mutation_error_from_adapter(exc) from None
+    except BaseException:
+        registry.release_reservation(reservation_id)
+        raise
+
+    candidate_sha256 = hashlib.sha256(candidate.candidate_bytes).hexdigest()
+    if proposal_sha256 is None:
+        proposal_sha256 = hashlib.sha256(
+            json.dumps(
+                {"mutations": canonical, "tool": "document_apply"},
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    else:
+        proposal_sha256 = str(proposal_sha256).strip().lower()
+        if _SHA256_RE.fullmatch(proposal_sha256) is None:
+            registry.release_reservation(reservation_id)
+            raise DocumentMutationError(
+                "DOCUMENT_MUTATION_PROPOSAL_INVALID",
+                "The mutation proposal digest is invalid.",
+                retry_policy="forbidden",
+            )
+    audit_facts = [dict(item) for item in candidate.audit_facts]
+    semantic_operations = [dict(item) for item in candidate.semantic_operations]
+    operations: tuple[dict[str, object], ...] = (
+        {
+            "op": "document_semantic_mutation",
+            "adapter": adapter.format_id,
+            "adapter_version": adapter.adapter_version,
+            "expected_source_sha256": ref.sha256,
+            "result_source_sha256": candidate_sha256,
+            "adapter_audit": audit_facts,
+            "semantic_operations": semantic_operations,
+        },
+    )
+    validation_summary: dict[str, object] = {
+        "format": adapter.format_id,
+        "source_sha256": candidate_sha256,
+        "mutation_count": len(canonical),
+        "range_grant_validation": "completed",
+        **candidate.validation_summary,
+        "status": "passed",
+    }
+    return PreparedDocumentMutation(
+        scope=scope,
+        store=store,
+        ref=ref,
+        turn_id=turn_id,
+        summary=summary,
+        artifact_format=adapter.format_id,
+        adapter_id=adapter.format_id,
+        adapter_version=adapter.adapter_version,
+        base_revision_id=scope.revision.revision_id,
+        source_sha256=ref.sha256,
+        candidate_bytes=candidate.candidate_bytes,
+        candidate_sha256=candidate_sha256,
+        operations=operations,
+        validation_summary=validation_summary,
+        mutation_kind="document_semantic",
+        patch_count=len(canonical),
+        actor=_actor(scope),
+        registry=registry,
+        reservation_id=reservation_id,
+        proposal_sha256=proposal_sha256,
+    )
+
+
+async def _prepare_document_mutation(
     expected_sha256: str,
     patches: list[dict[str, object]],
     summary: str,
     *,
     _tool_name: str = "document_apply",
     _semantic_operations: list[dict[str, object]] | None = None,
-) -> _PreparedHtmlEdit:
-    scope = await _current_scope(_tool_name, required_format="html")
+    _proposal_sha256: str | None = None,
+) -> PreparedDocumentMutation:
+    scope = await _current_scope(
+        _tool_name,
+        required_format=None if _semantic_operations is not None else "html",
+    )
     expected = str(expected_sha256 or "").strip().lower()
     if not _SHA256_RE.fullmatch(expected):
         raise SafeToolError(
@@ -1587,11 +1817,11 @@ async def _prepare_html_document_mutation(
         )
     turn_id = str(scope.ctx.task_id or "").strip()
     if not turn_id:
-        raise SafeToolError("Artifact HTML edits require a durable turn identity.")
+        raise SafeToolError("Artifact edits require a durable turn identity.")
 
     store, ref, raw = await _current_payload(scope)
-    await _require_single_file_html(scope, store, ref)
-    source = _decode_html(raw)
+    if _semantic_operations is None:
+        await _require_single_file_html(scope, store, ref)
     if expected != ref.sha256:
         if _semantic_operations is not None:
             raise DocumentMutationError(
@@ -1604,6 +1834,18 @@ async def _prepare_html_document_mutation(
             "ARTIFACT_SOURCE_STALE: The canonical source changed after ranges were read. "
             "Read and locate the current source again."
         )
+    if _semantic_operations is not None:
+        return _prepare_semantic_document_mutation(
+            scope=scope,
+            store=store,
+            ref=ref,
+            raw=raw,
+            turn_id=turn_id,
+            summary=summary,
+            mutations=_semantic_operations,
+            proposal_sha256=_proposal_sha256,
+        )
+    source = _decode_html(raw)
     semantic_mutations = _semantic_operations is not None
     requested_patches: object = _semantic_operations if semantic_mutations else patches
     if (
@@ -1629,28 +1871,44 @@ async def _prepare_html_document_mutation(
                     retry_policy="correctable",
                 )
             raise SafeToolError(f"ARTIFACT_PATCH_INVALID: Patch {index} is not an object.")
-        token = patch.get("range_token")
+        token = (
+            patch.get("grant_token") if semantic_mutations else patch.get("range_token")
+        )
         if semantic_mutations:
             keys = set(patch)
-            required_keys = {"range_token"}
-            allowed_keys = {*required_keys, "value"}
+            required_keys = {"grant_token"}
+            allowed_keys = {*required_keys, "input"}
             if not required_keys <= keys or not keys <= allowed_keys:
                 raise DocumentMutationError(
                     "DOCUMENT_MUTATION_INVALID",
                     f"Mutation {index} has an invalid shape.",
                     retry_policy="correctable",
                 )
-            value = patch.get("value")
-            if (
-                not isinstance(token, str)
-                or (value is not None and not isinstance(value, str))
-            ):
+            input_value = patch.get("input")
+            if not isinstance(token, str):
                 raise DocumentMutationError(
                     "DOCUMENT_MUTATION_INVALID",
                     f"Mutation {index} has invalid values.",
                     retry_policy="correctable",
                 )
-            replacement_bytes += len(value.encode("utf-8")) if isinstance(value, str) else 0
+            if isinstance(input_value, str):
+                replacement_bytes += len(input_value.encode("utf-8"))
+            elif input_value is not None:
+                try:
+                    replacement_bytes += len(
+                        json.dumps(
+                            input_value,
+                            ensure_ascii=False,
+                            allow_nan=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                    )
+                except (TypeError, ValueError):
+                    raise DocumentMutationError(
+                        "DOCUMENT_MUTATION_INPUT_INVALID",
+                        f"Mutation {index} input is not valid JSON.",
+                        retry_policy="correctable",
+                    ) from None
         else:
             if set(patch) != {"range_token", "action", "text"}:
                 raise SafeToolError(
@@ -1671,8 +1929,8 @@ async def _prepare_html_document_mutation(
         if replacement_bytes > _MAX_HTML_REPLACEMENT_BYTES:
             if semantic_mutations:
                 raise DocumentMutationError(
-                    "DOCUMENT_MUTATION_VALUE_TOO_LARGE",
-                    "Mutation values exceed the turn limit.",
+                    "DOCUMENT_MUTATION_INPUT_TOO_LARGE",
+                    "Mutation input exceeds the turn limit.",
                     retry_policy="correctable",
                 )
             raise SafeToolError(
@@ -1701,23 +1959,17 @@ async def _prepare_html_document_mutation(
         )
     except ArtifactRangeGrantError as exc:
         raise _range_error(exc) from None
-    expected_orders = (
-        set(range(len(scope.anchors)))
-        if hasattr(scope.context, "annotation_ids")
-        else set()
-    )
-    covered_orders = {
-        order for grant in resolved for order in grant.annotation_orders
-    }
-    if expected_orders and (
-        covered_orders != expected_orders
-        or any(not grant.annotation_orders for grant in resolved)
+    valid_orders = set(range(len(scope.anchors)))
+    if semantic_mutations and any(
+        not grant.annotation_orders
+        or any(order not in valid_orders for order in grant.annotation_orders)
+        for grant in resolved
     ):
         registry.release_reservation(reservation_id)
         raise DocumentMutationError(
-            "DOCUMENT_ANNOTATION_COVERAGE_INVALID",
-            "Every accepted annotation must be covered by one proven mutation grant.",
-            retry_policy="correctable",
+            "DOCUMENT_MUTATION_GRANT_SCOPE_INVALID",
+            "Every mutation grant must be bound to a current document selection.",
+            retry_policy="forbidden",
         )
     offset_patches: list[dict[str, object]] = []
     semantic_audit: list[dict[str, object]] = []
@@ -1730,40 +1982,48 @@ async def _prepare_html_document_mutation(
         grant = grant_by_token[token]
         expected_text = source[grant.start : grant.end]
         if semantic_mutations:
-            assert adapter is not None
-            grant_parts = grant.kind.split("|")
-            granted_operation = grant_parts[3] if len(grant_parts) == 7 else ""
-            has_value = "value" in patch
-            if granted_operation in {"remove_attribute", "remove_node"} and has_value:
+            assert isinstance(adapter, HtmlDocumentFormatAdapter)
+            if (
+                grant.adapter_id != adapter.format_id
+                or grant.adapter_version != adapter.adapter_version
+            ):
                 registry.release_reservation(reservation_id)
                 raise DocumentMutationError(
-                    "DOCUMENT_MUTATION_VALUE_UNEXPECTED",
-                    "This mutation grant does not accept a value. Copy its applyTemplate "
-                    "exactly and omit the value field entirely.",
+                    "DOCUMENT_MUTATION_GRANT_ADAPTER_MISMATCH",
+                    "The mutation grant is not valid for the active document adapter.",
+                    retry_policy="forbidden",
+                )
+            granted_operation = grant.operation
+            has_input = "input" in patch
+            if granted_operation in {"remove_attribute", "remove_node"} and has_input:
+                registry.release_reservation(reservation_id)
+                raise DocumentMutationError(
+                    "DOCUMENT_MUTATION_INPUT_UNEXPECTED",
+                    "This mutation grant does not accept input. Copy its applyTemplate "
+                    "exactly and omit the input field entirely.",
                     retry_policy="correctable",
                 )
-            value_required = granted_operation in {
+            input_required = granted_operation in {
                 "replace_text",
                 "set_attribute",
                 "set_style",
             }
-            if value_required and not has_value:
+            if input_required and not has_input:
                 registry.release_reservation(reservation_id)
                 raise DocumentMutationError(
-                    "DOCUMENT_MUTATION_VALUE_REQUIRED",
-                    "This mutation grant requires a string value. Copy its applyTemplate "
-                    "and replace the empty value placeholder.",
+                    "DOCUMENT_MUTATION_INPUT_REQUIRED",
+                    "This mutation grant requires input. Copy its applyTemplate and replace "
+                    "the placeholder with the requested value.",
                     retry_policy="correctable",
                 )
-            value = patch.get("value")
-            assert value is None or isinstance(value, str)
+            input_value = patch.get("input")
             try:
                 prepared = adapter.apply_grant(
                     source,
                     start=grant.start,
                     end=grant.end,
                     grant_kind=grant.kind,
-                    value=value,
+                    input_value=input_value,
                 )
             except DocumentAdapterError as exc:
                 registry.release_reservation(reservation_id)
@@ -1778,6 +2038,7 @@ async def _prepare_html_document_mutation(
                     "attribute_name": prepared.attribute_name,
                     "grant_kind": grant.kind,
                     "annotation_orders": list(grant.annotation_orders),
+                    "target_fingerprint": grant.target_fingerprint,
                 }
             )
         else:
@@ -1845,36 +2106,88 @@ async def _prepare_html_document_mutation(
         audit = audit_by_span[(grant.start, grant.end)]
         audit["grant_kind"] = grant.kind
         audit["annotation_orders"] = list(grant.annotation_orders)
-    updated_bytes = updated.encode("utf-8")
+    candidate_bytes = updated.encode("utf-8")
+    candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
     actor = _actor(scope)
-    proposal_sha256 = hashlib.sha256(
-        json.dumps(
-            {
-                "expected_sha256": expected,
-                "mutations": requested_patches,
-                "mutation_kind": (
-                    "document_semantic" if semantic_mutations else "html_source_patch"
-                ),
-                "summary": summary,
-                "tool": _tool_name,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
-    return _PreparedHtmlEdit(
+    if _proposal_sha256 is None:
+        proposal_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "expected_sha256": expected,
+                    "mutations": requested_patches,
+                    "mutation_kind": (
+                        "document_semantic" if semantic_mutations else "html_source_patch"
+                    ),
+                    "summary": summary,
+                    "tool": _tool_name,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+    else:
+        proposal_sha256 = str(_proposal_sha256).strip().lower()
+        if _SHA256_RE.fullmatch(proposal_sha256) is None:
+            registry.release_reservation(reservation_id)
+            raise DocumentMutationError(
+                "DOCUMENT_MUTATION_PROPOSAL_INVALID",
+                "The mutation proposal digest is invalid.",
+                retry_policy="forbidden",
+            )
+    mutation_kind = "document_semantic" if semantic_mutations else "html_source_patch"
+    adapter_id = adapter.format_id if adapter is not None else "html"
+    adapter_version = adapter.adapter_version if adapter is not None else 1
+    operations: tuple[dict[str, object], ...] = (
+        {
+            "op": (
+                "document_semantic_mutation"
+                if semantic_mutations
+                else "html_source_patch"
+            ),
+            "adapter": adapter_id if semantic_mutations else None,
+            "adapter_version": adapter_version if semantic_mutations else None,
+            "expected_source_sha256": ref.sha256,
+            "result_source_sha256": candidate_sha256,
+            "offset_encoding": _HTML_OFFSET_ENCODING,
+            "patches": audit_patches,
+            "semantic_operations": semantic_audit if semantic_mutations else None,
+        },
+    )
+    validation_summary: dict[str, object] = {
+        "format": "html",
+        "encoding": "utf-8",
+        "source_sha256": candidate_sha256,
+        "patch_count": len(audit_patches),
+        "range_grant_validation": "completed",
+        "semantic_adapter_validation": (
+            adapter_validation if semantic_mutations else "not_applicable"
+        ),
+        "css_validation": (
+            "modified_grants_completed"
+            if validated_css_mutation
+            else "not_performed"
+        ),
+        "script_validation": "not_applicable_no_script_grants",
+        "status": "passed",
+    }
+    return PreparedDocumentMutation(
         scope=scope,
         store=store,
         ref=ref,
         turn_id=turn_id,
         summary=summary,
-        semantic_mutations=semantic_mutations,
-        audit_patches=audit_patches,
-        semantic_audit=semantic_audit,
-        adapter_validation=adapter_validation,
-        validated_css_mutation=validated_css_mutation,
-        updated_bytes=updated_bytes,
+        artifact_format="html",
+        adapter_id=adapter_id,
+        adapter_version=adapter_version,
+        base_revision_id=scope.revision.revision_id,
+        source_sha256=ref.sha256,
+        candidate_bytes=candidate_bytes,
+        candidate_sha256=candidate_sha256,
+        operations=operations,
+        validation_summary=validation_summary,
+        mutation_kind=mutation_kind,
+        patch_count=len(audit_patches),
         actor=actor,
         registry=registry,
         reservation_id=reservation_id,
@@ -1882,7 +2195,9 @@ async def _prepare_html_document_mutation(
     )
 
 
-async def _commit_prepared_html_edit(prepared: _PreparedHtmlEdit) -> str:
+async def _commit_prepared_document_mutation(
+    prepared: PreparedDocumentMutation,
+) -> str:
     """Durably commit exactly one fully validated proposal."""
 
     scope = prepared.scope
@@ -1890,15 +2205,23 @@ async def _commit_prepared_html_edit(prepared: _PreparedHtmlEdit) -> str:
     ref = prepared.ref
     turn_id = prepared.turn_id
     summary = prepared.summary
-    semantic_mutations = prepared.semantic_mutations
-    audit_patches = prepared.audit_patches
-    semantic_audit = prepared.semantic_audit
-    adapter_validation = prepared.adapter_validation
-    validated_css_mutation = prepared.validated_css_mutation
-    updated_bytes = prepared.updated_bytes
+    artifact_format = prepared.artifact_format
+    candidate_bytes = prepared.candidate_bytes
     actor = prepared.actor
     registry = prepared.registry
     reservation_id = prepared.reservation_id
+
+    if (
+        prepared.base_revision_id != scope.revision.revision_id
+        or prepared.source_sha256 != ref.sha256
+        or hashlib.sha256(candidate_bytes).hexdigest() != prepared.candidate_sha256
+    ):
+        prepared.release_grants()
+        raise DocumentMutationError(
+            "DOCUMENT_MUTATION_PREPARED_STATE_INVALID",
+            "The prepared document mutation is inconsistent.",
+            retry_policy="forbidden",
+        )
 
     max_bytes = scope.ctx.artifact_max_bytes
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes <= 0:
@@ -1929,7 +2252,7 @@ async def _commit_prepared_html_edit(prepared: _PreparedHtmlEdit) -> str:
         ):
             raise ArtifactConflictError("document changed before the agent write lease")
         candidate_id = store.allocate_artifact_id()
-        candidate_sha256 = hashlib.sha256(updated_bytes).hexdigest()
+        candidate_sha256 = prepared.candidate_sha256
         if scope.ctx.artifact_mutation_attempt_controller is not None:
             await scope.service.register_mutation_candidate(
                 document_id=scope.document.document_id,
@@ -1941,12 +2264,12 @@ async def _commit_prepared_html_edit(prepared: _PreparedHtmlEdit) -> str:
         candidate_publish = asyncio.create_task(
             asyncio.to_thread(
                 store.publish_bytes,
-                updated_bytes,
+                candidate_bytes,
                 session_id=scope.context.session_id,
                 session_key=scope.context.session_key,
                 name=ref.name,
                 mime=ref.mime,
-                source="artifact_html_agent_edit",
+                source=f"document_{prepared.adapter_id}_agent_edit",
                 max_bytes=max_bytes,
                 disk_budget_bytes=disk_budget,
                 visibility="internal",
@@ -1956,30 +2279,15 @@ async def _commit_prepared_html_edit(prepared: _PreparedHtmlEdit) -> str:
         candidate = await asyncio.shield(candidate_publish)
         candidate_validation = await asyncio.to_thread(
             _validated_payload,
-            updated_bytes,
-            artifact_format="html",
+            candidate_bytes,
+            artifact_format=artifact_format,
             ref=candidate,
         )
         applied, committed_change = await scope.service.commit_change_set_atomically(
             document_id=scope.document.document_id,
             base_revision_id=scope.revision.revision_id,
             expected_document_state_revision=locked_document.state_revision,
-            operations=(
-                {
-                    "op": (
-                        "document_semantic_mutation"
-                        if semantic_mutations
-                        else "html_source_patch"
-                    ),
-                    "adapter": "html" if semantic_mutations else None,
-                    "adapter_version": 1 if semantic_mutations else None,
-                    "expected_source_sha256": ref.sha256,
-                    "result_source_sha256": candidate.sha256,
-                    "offset_encoding": _HTML_OFFSET_ENCODING,
-                    "patches": audit_patches,
-                    "semantic_operations": semantic_audit if semantic_mutations else None,
-                },
-            ),
+            operations=prepared.operations,
             actor=actor,
             turn_id=turn_id,
             summary=summary,
@@ -1992,21 +2300,8 @@ async def _commit_prepared_html_edit(prepared: _PreparedHtmlEdit) -> str:
             ),
             validation={
                 **candidate_validation,
-                "format": "html",
-                "encoding": "utf-8",
+                **prepared.validation_summary,
                 "source_sha256": candidate.sha256,
-                "patch_count": len(audit_patches),
-                "range_grant_validation": "completed",
-                "semantic_adapter_validation": (
-                    adapter_validation if semantic_mutations else "not_applicable"
-                ),
-                "css_validation": (
-                    "modified_grants_completed"
-                    if validated_css_mutation
-                    else candidate_validation.get("css_validation", "not_performed")
-                ),
-                "script_validation": "not_applicable_no_script_grants",
-                "status": "passed",
             },
             lease=lease,
             require_lease=True,
@@ -2114,7 +2409,8 @@ async def _commit_prepared_html_edit(prepared: _PreparedHtmlEdit) -> str:
                     retry_policy="refresh",
                 ) from None
             raise SafeToolError(
-                "The HTML edit could not be applied atomically. Refresh the artifact and retry."
+                "The document mutation could not be applied atomically. "
+                "Refresh the document and retry."
             ) from None
         if not isinstance(exc, Exception):
             raise
@@ -2141,13 +2437,11 @@ async def _commit_prepared_html_edit(prepared: _PreparedHtmlEdit) -> str:
             "change_set": {
                 "state": "applied",
                 "summary": committed_change.summary,
-                "patch_count": len(audit_patches),
+                "patch_count": prepared.patch_count,
                 "base_sha256": ref.sha256,
                 "candidate_sha256": candidate.sha256,
                 "candidate_bytes": candidate.size,
-                "mutation_kind": (
-                    "document_semantic" if semantic_mutations else "html_source_patch"
-                ),
+                "mutation_kind": prepared.mutation_kind,
             },
             "revision": {
                 "generation": applied.revision.generation,

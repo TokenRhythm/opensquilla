@@ -44,6 +44,10 @@
           aria-live="polite"
           data-testid="composer-prompt-annotations"
         >
+          <div class="chat-prompt-annotations__header" data-testid="composer-prompt-annotations-label">
+            <Icon name="chat" :size="13" aria-hidden="true" />
+            <span>{{ t('chat.promptAnnotations.label') }} · {{ promptAnnotations.length }}</span>
+          </div>
           <div
             v-for="annotation in promptAnnotations"
             :key="annotation.annotationId"
@@ -53,9 +57,7 @@
             :data-freshness="annotation.freshness"
             role="group"
           >
-            <span class="chat-prompt-annotation-chip__icon" aria-hidden="true">
-              <Icon name="fileCode" :size="14" />
-            </span>
+            <span class="chat-prompt-annotation-chip__rail" aria-hidden="true" />
             <form
               v-if="editingAnnotationId === annotation.annotationId"
               class="chat-prompt-annotation-chip__editor"
@@ -86,17 +88,9 @@
                 :title="annotation.body"
                 @click="emit('jumpPromptAnnotation', annotation.annotationId)"
               >
-                <span class="chat-prompt-annotation-chip__meta">
-                  {{ annotation.documentName }} ·
+                <code class="chat-prompt-annotation-chip__target">
                   {{ annotation.tagName ? `<${annotation.tagName}>` : t('chat.promptAnnotations.element') }}
-                </span>
-                <span
-                  class="chat-prompt-annotation-chip__status"
-                  data-state="ready"
-                  data-testid="prompt-annotation-ready-status"
-                >
-                  {{ t('chat.promptAnnotations.draftLabel') }}
-                </span>
+                </code>
                 <span class="chat-prompt-annotation-chip__text">
                   {{ annotation.body || t('chat.promptAnnotations.emptyDraft') }}
                 </span>
@@ -1093,43 +1087,61 @@ defineExpose<ChatComposerExpose>({
 }
 
 .chat-prompt-annotations {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem 0;
+  display: grid;
+  max-height: 8.75rem;
+  overflow-y: auto;
+  padding: 0.375rem 0.75rem 0;
+}
+
+.chat-prompt-annotations__header {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  min-height: 1.5rem;
+  margin-bottom: 0.25rem;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
 }
 
 .chat-prompt-annotation-chip {
-  display: flex;
+  display: grid;
+  grid-template-columns: 3px minmax(0, 1fr) auto auto;
   align-items: center;
-  min-width: min(18rem, 100%);
-  max-width: min(30rem, 100%);
-  min-height: 2.5rem;
-  padding: 0.25rem 0.375rem;
-  border: 1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
-  border-radius: var(--radius-card);
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
+  gap: 0.5rem;
+  min-width: 0;
+  min-height: 2.75rem;
+  padding: 0.375rem 0;
+  border-bottom: 1px solid var(--border);
   color: var(--text);
 }
 
-.chat-prompt-annotation-chip.is-stale {
-  border-color: color-mix(in srgb, var(--warn) 54%, var(--border));
-  background: color-mix(in srgb, var(--warn) 8%, var(--bg-surface));
+.chat-prompt-annotations__header + .chat-prompt-annotation-chip {
+  border-top: 1px solid var(--border);
 }
 
-.chat-prompt-annotation-chip__icon {
-  display: inline-flex;
-  flex: 0 0 auto;
-  margin-inline: 0.25rem;
-  color: var(--accent);
+.chat-prompt-annotation-chip.is-stale {
+  color: var(--warn);
+}
+
+.chat-prompt-annotation-chip__rail {
+  width: 3px;
+  align-self: stretch;
+  border-radius: var(--radius-full);
+  background: var(--accent);
+}
+
+.chat-prompt-annotation-chip.is-stale .chat-prompt-annotation-chip__rail {
+  background: var(--warn);
 }
 
 .chat-prompt-annotation-chip__main {
   display: grid;
-  flex: 1 1 auto;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
   min-width: 0;
-  gap: 0.125rem;
-  padding: 0.25rem;
+  gap: 0.5rem;
+  padding: 0.25rem 0;
   border: 0;
   background: transparent;
   color: inherit;
@@ -1140,44 +1152,39 @@ defineExpose<ChatComposerExpose>({
 .chat-prompt-annotation-chip__main:hover,
 .chat-prompt-annotation-chip__main:focus-visible {
   outline: 0;
-  background: color-mix(in srgb, var(--accent) 7%, transparent);
+  color: var(--accent);
 }
 
-.chat-prompt-annotation-chip__meta,
+.chat-prompt-annotation-chip__target,
 .chat-prompt-annotation-chip__text {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.chat-prompt-annotation-chip__meta {
-  color: var(--text-dim);
+.chat-prompt-annotation-chip__target {
+  padding: 0.125rem 0.375rem;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
   font-size: var(--fs-xs);
 }
 
 .chat-prompt-annotation-chip__text {
+  color: var(--text);
   font-size: var(--fs-sm);
 }
 
-.chat-prompt-annotation-chip__status {
-  justify-self: start;
-  padding: 0.0625rem 0.375rem;
-  border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  color: var(--accent);
-  font-size: var(--fs-xs);
-  font-weight: 600;
-  line-height: 1.45;
-}
-
 .chat-prompt-annotation-chip__stale {
+  grid-column: 2;
   color: var(--warn);
   font-size: var(--fs-xs);
 }
 
 .chat-prompt-annotation-chip__editor {
   display: grid;
-  flex: 1 1 auto;
+  grid-column: 2 / -1;
   grid-template-columns: minmax(8rem, 1fr) auto auto;
   gap: 0.25rem;
 }
@@ -1198,6 +1205,33 @@ defineExpose<ChatComposerExpose>({
   background: var(--bg-hover);
   color: var(--text-muted);
   cursor: pointer;
+}
+
+.chat-prompt-annotation-chip > .attachment-action {
+  width: 2rem;
+  height: 2rem;
+  flex-basis: 2rem;
+  border-radius: var(--radius-control);
+}
+
+.chat-prompt-annotation-chip > .attachment-action:hover,
+.chat-prompt-annotation-chip > .attachment-action:focus-visible {
+  outline: 0;
+  background: var(--bg-hover);
+}
+
+@media (max-width: 600px) {
+  .chat-prompt-annotation-chip__main {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chat-prompt-annotation-chip__target {
+    display: none;
+  }
+
+  .chat-prompt-annotation-chip__stale {
+    grid-column: 1;
+  }
 }
 
 .attachment-chip {

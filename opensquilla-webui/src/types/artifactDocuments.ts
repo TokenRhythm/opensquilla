@@ -35,6 +35,11 @@ export type ArtifactAnchorState = 'resolved' | 'orphaned'
 export interface ArtifactDocumentCapabilities {
   download: boolean
   preview: boolean
+  selectionContext: boolean
+  manualEdit: boolean
+  agentEdit: boolean
+  publish: boolean
+  /** Compatibility summary for clients predating the independent edit axes. */
   edit: boolean
   revisions: boolean
   changeSets: boolean
@@ -48,6 +53,11 @@ export interface ArtifactDocumentCapabilities {
 export interface ArtifactEditorCapability {
   enabled: boolean
   preview: boolean
+  selectionContext: boolean
+  manualEdit: boolean
+  agentEdit: boolean
+  publish: boolean
+  /** Compatibility summary for clients predating the independent edit axes. */
   edit: boolean
   comments: boolean
   source: boolean

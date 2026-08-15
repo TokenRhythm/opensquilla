@@ -164,7 +164,7 @@
       "failedDetail": "Reload the isolated browser to continue."
     },
     "artifactAnnotation": {
-      "start": "Annotate preview", "stop": "Stop annotating", "selectElement": "Select a page element to annotate", "selectElementShort": "Select element", "unavailable": "Preview annotation is unavailable.",
+      "start": "Annotate preview", "stop": "Stop annotating", "selectElement": "Select a page element to annotate", "selectElementShort": "Select element", "unavailable": "Preview annotation is unavailable.", "desktopEditingOnly": "Select and edit page elements with AI in the desktop app.",
       "createFailed": "The selected element could not be attached.", "elementChanged": "The selected element changed before it could be attached. Select it again in the current preview.", "rearmFailed": "Annotation mode stopped because the element picker could not be restarted. Turn annotation mode on to try again.", "updateFailed": "The annotation draft could not be saved.", "discardFailed": "The annotation could not be discarded. It remains open so you can try again.", "closeFailed": "The annotation editor could not be closed. Try again before selecting another element.", "replacementCleanupFailed": "The new annotation was kept, but the previous draft could not be removed.",
       "overlayFallback": "The native annotation editor closed. Continue in the trusted editor.",
       "fallbackTitle": "Continue annotation", "fallbackDetail": "The preview was hidden because its native editor became unavailable. Your draft is still saved.", "frozenPreview": "Frozen preview of the selected page element",
@@ -3334,7 +3334,7 @@
     "stopResponseEsc": "Stop current response (Esc)",
     "messageToSend": "Message to send",
     "promptAnnotations": {
-      "draftLabel": "Pending artifact instructions", "sentLabel": "Artifact instructions", "element": "element",
+      "label": "Annotations", "draftLabel": "Pending artifact instructions", "sentLabel": "Artifact instructions", "element": "element",
       "emptyDraft": "Add an instruction", "stale": "Select this element again",
       "editingBlocked": "Add or cancel the annotation you are editing before sending.",
       "staleBlocked": "One or more artifact instructions are stale. Select their elements again before sending.",
@@ -3342,7 +3342,7 @@
       "removeLabel": "Remove artifact instruction", "updateFailed": "The artifact instruction could not be saved.",
       "discardFailed": "The artifact instruction could not be removed.", "focusUnavailable": "This element could not be focused safely. Open its preview and try again.",
       "reuseLabel": "Copy as new annotation", "reuseDescription": "Copies the modification request; then select the element again in the current version.", "reuseUnavailable": "This modification request could not be copied as a new annotation. Open the matching artifact preview and select the element again in the current version.", "applyPrompt": "Apply the attached artifact instructions.",
-      "status": { "sending": "Sending", "accepted": "Accepted", "unknown": "Edit status unknown", "not_attempted": "No document edit attempted", "applied": "Change applied", "appliedCorrected": "Corrected and applied", "not_applied": "Change not applied", "conflict": "Document changed", "ambiguous": "Edit outcome pending" },
+      "status": { "unknown": "Edit status unknown", "not_attempted": "No document edit attempted", "applied": "Change applied", "appliedCorrected": "Corrected and applied", "not_applied": "Change not applied", "conflict": "Document changed", "ambiguous": "Edit outcome pending" },
       "statusDetail": { "unknown": "No authoritative mutation receipt is available for this completed turn.", "not_attempted": "The turn finished before a document write was proposed.", "applied": "Confirmed by the document revision receipt.", "not_applied": "No document revision was created.", "conflict": "Refresh the document and select the target again.", "ambiguous": "Wait for reconciliation; do not retry this edit yet." }
     },
     "placeholder": "Send a message...",

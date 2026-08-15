@@ -298,7 +298,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     idempotencyKey?: string,
   ): Promise<DocumentImportResponse> {
     const currentProvider = provider.value
-    if (!currentProvider || !resource.capabilities.edit) {
+    if (!currentProvider || !resource.capabilities.manualEdit) {
       throw new Error('This resource cannot be imported as an editable document.')
     }
     if (!resource.sha256) {

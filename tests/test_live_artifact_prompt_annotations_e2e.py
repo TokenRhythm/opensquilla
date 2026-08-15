@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -205,7 +206,7 @@ class _DeterministicArtifactProvider:
                 )
                 mutation = {
                     "grant_token": location["grantToken"],
-                    "value": "background-color: #ef4444",
+                    "input": "background-color: #ef4444",
                 }
             elif tag == "img":
                 location = next(
@@ -220,7 +221,7 @@ class _DeterministicArtifactProvider:
                 )
                 mutation = {
                     "grant_token": location["grantToken"],
-                    "value": e2e._TITLE_TEXT,
+                    "input": e2e._TITLE_TEXT,
                 }
             mutations.append(mutation)
         return self._tool_chunk(
@@ -237,7 +238,7 @@ def test_scenario_matrix_has_approved_42_63_64_budget() -> None:
     assert sum(row.expected_physical_calls for row in e2e.SCENARIOS) == 42
     assert e2e.WORST_CASE_PHYSICAL_CALLS == 63
     assert e2e.HARD_PHYSICAL_CALL_CAP == 64
-    assert sum(row.zero_call_preflight for row in e2e.SCENARIOS) == 4
+    assert sum(row.zero_call_preflight for row in e2e.SCENARIOS) == 3
     mutation_cases = [row for row in e2e.SCENARIOS if not row.zero_call_preflight]
     assert mutation_cases
     assert all(
@@ -310,33 +311,40 @@ def test_live_harness_checks_each_feature_default_independently(
         "artifactPromptAnnotations": False,
         "documentWorkbenchResources": True,
     }
-    assert e2e._feature_default_is_disabled() is False
+    app_store.write_text(
+        "artifactPromptAnnotations: hasNativeBridge(),\n"
+        "documentWorkbenchResources: true,\n",
+        encoding="utf-8",
+    )
+    assert e2e._feature_defaults() == {
+        "artifactPromptAnnotations": True,
+        "documentWorkbenchResources": True,
+    }
 
 
-def test_incomplete_report_is_explicit_safe_and_zero_call() -> None:
+def test_incomplete_report_is_explicit_safe_and_zero_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        e2e,
+        "_feature_defaults",
+        lambda: {
+            "artifactPromptAnnotations": True,
+            "documentWorkbenchResources": True,
+        },
+    )
     report = e2e._incomplete_report(hard_cap=64)
     e2e._assert_report_safe(report, {"TOKENRHYTHM_API_KEY": "secret-never-present"})
 
     assert report["certification"] == "incomplete"
-    assert report["featureDefaultEnabled"] is False
+    assert report["featureDefaultEnabled"] is True
     assert report["featureDefaults"] == {
-        "artifactPromptAnnotations": False,
-        "documentWorkbenchResources": False,
+        "artifactPromptAnnotations": True,
+        "documentWorkbenchResources": True,
     }
     assert report["physicalCallBudget"]["observed"] == 0
-    pending = {
-        row["case"]: row for row in report["cases"] if row["status"] != "not_run"
-    }
-    assert pending == {
-        "visual_selection_zero_call": next(
-            row for row in report["cases"] if row["case"] == "visual_selection_zero_call"
-        )
-    }
-    assert pending["visual_selection_zero_call"]["status"] == "unsupported"
-    assert (
-        pending["visual_selection_zero_call"]["reasonCode"]
-        == "unsupported_contract_pending"
-    )
+    assert all(row["status"] == "not_run" for row in report["cases"])
+    assert report["reasonCodes"] == ["live_gateway_executor_failed"]
     assert all(row["providerCalled"] is False for row in report["cases"])
 
 
@@ -372,7 +380,7 @@ def _passing_evidence(scenario) -> object:
     )
 
 
-def test_certification_reserves_each_case_before_driver_and_keeps_pending_contract_incomplete(
+def test_certification_reserves_each_case_and_completes_from_evidence_not_feature_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
@@ -383,6 +391,14 @@ def test_certification_reserves_each_case_before_driver_and_keeps_pending_contra
         return original_reserve(self, kind, count)
 
     monkeypatch.setattr(e2e.PhysicalCallBudget, "reserve", recording_reserve)
+    monkeypatch.setattr(
+        e2e,
+        "_feature_defaults",
+        lambda: {
+            "artifactPromptAnnotations": True,
+            "documentWorkbenchResources": True,
+        },
+    )
 
     class FakeDriver:
         async def start(self) -> None:
@@ -396,22 +412,20 @@ def test_certification_reserves_each_case_before_driver_and_keeps_pending_contra
             events.append("close")
 
     report = asyncio.run(e2e._run_certification(FakeDriver(), hard_cap=64))
+    e2e._assert_report_safe(report, {})
 
     for scenario in e2e.SCENARIOS:
         run = f"run:{scenario.case}"
-        if scenario.contract_pending:
-            assert run not in events
-            continue
         assert run in events
         if scenario.expected_physical_calls:
             reservation = f"reserve:baseline:{scenario.expected_physical_calls}"
             assert events.index(reservation) < events.index(run)
     assert events[-1] == "close"
-    assert report["certification"] == "incomplete"
+    assert report["certification"] == "complete"
+    assert report["featureDefaultEnabled"] is True
+    assert report["reasonCodes"] == []
     assert report["physicalCallBudget"]["observed"] == 42
-    visual = next(row for row in report["cases"] if row["case"] == "visual_selection_zero_call")
-    assert visual["status"] == "unsupported"
-    assert visual["providerCalled"] is False
+    assert all(row["status"] == "passed" for row in report["cases"])
 
 
 def test_certification_closes_driver_and_never_invents_report_after_executor_failure() -> None:
@@ -913,7 +927,6 @@ def test_report_guard_rejects_forged_passing_mutation_evidence() -> None:
     evidence = {
         scenario.case: _passing_evidence(scenario)
         for scenario in e2e.SCENARIOS
-        if not scenario.contract_pending
     }
     report = e2e._report(hard_cap=64, evidences=evidence)
     e2e._assert_report_safe(report, {})
@@ -957,6 +970,79 @@ def test_main_requires_both_attestations_before_worker(
     )
     assert e2e.main() == 2
     assert not output.exists()
+
+
+@pytest.mark.parametrize("matrix_timeout", [299, 901])
+def test_main_rejects_out_of_bounds_matrix_timeout_before_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    matrix_timeout: int,
+) -> None:
+    output = tmp_path / "report.json"
+    monkeypatch.setenv("TOKENRHYTHM_API_KEY", "synthetic-rotated-key")
+    monkeypatch.setattr(
+        e2e,
+        "_launch_worker",
+        lambda **_kwargs: pytest.fail("worker must not start with an invalid matrix timeout"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "e2e",
+            "--output",
+            str(output),
+            "--confirm-live-cost",
+            "--confirm-rotated-key",
+            "--matrix-timeout-seconds",
+            str(matrix_timeout),
+        ],
+    )
+
+    assert e2e.main() == 2
+    assert not output.exists()
+
+
+def test_launch_worker_keeps_case_and_matrix_timeouts_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        observed["command"] = command
+        observed["timeout"] = kwargs["timeout"]
+        kwargs["stdout"].write(
+            json.dumps(e2e._incomplete_report(hard_cap=e2e.HARD_PHYSICAL_CALL_CAP))
+        )
+        kwargs["stdout"].flush()
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(e2e.subprocess, "run", fake_run)
+
+    report = e2e._launch_worker(
+        api_key="synthetic-rotated-key",
+        hard_cap=e2e.HARD_PHYSICAL_CALL_CAP,
+        timeout_seconds=17.0,
+        matrix_timeout_seconds=444.0,
+    )
+
+    command = observed["command"]
+    assert isinstance(command, list)
+    case_timeout_index = command.index("--timeout-seconds") + 1
+    assert command[case_timeout_index] == "17.0"
+    assert "--matrix-timeout-seconds" not in command
+    assert observed["timeout"] == 444.0
+    assert report["certification"] == "incomplete"
+
+
+def test_launch_worker_rejects_unbounded_matrix_timeout() -> None:
+    with pytest.raises(ValueError, match="bounded certification window"):
+        e2e._launch_worker(
+            api_key="synthetic-rotated-key",
+            hard_cap=e2e.HARD_PHYSICAL_CALL_CAP,
+            timeout_seconds=17.0,
+            matrix_timeout_seconds=e2e.MAX_MATRIX_TIMEOUT_SECONDS + 1,
+        )
 
 
 def test_main_runs_real_isolated_scaffold_without_network_and_returns_incomplete(

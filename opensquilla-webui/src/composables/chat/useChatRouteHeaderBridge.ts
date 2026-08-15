@@ -11,7 +11,6 @@ import {
 import type { IconName } from '@/utils/icons'
 
 export type ChatRouteHeaderAction =
-  | 'workbench'
   | 'deliverables'
   | 'share'
   | 'copy-session-key'
@@ -23,13 +22,11 @@ export interface ChatRouteHeaderModel {
   copyIcon: Readonly<Ref<IconName>>
   copyLiveText: Readonly<Ref<string>>
   deliverableCount: Readonly<Ref<number>>
-  workbenchResourceCount: Readonly<Ref<number>>
   shareMode: Readonly<Ref<boolean>>
   shareableMessageCount: Readonly<Ref<number>>
 }
 
 export interface ChatRouteHeaderCommands {
-  openWorkbench: () => void
   openDeliverables: () => void
   startShare: () => void
   copySessionKey: () => void
@@ -55,7 +52,6 @@ export interface ChatRouteHeaderBridge {
     copyIcon: ComputedRef<IconName>
     copyLiveText: ComputedRef<string>
     deliverableCount: ComputedRef<number>
-    workbenchResourceCount: ComputedRef<number>
     shareMode: ComputedRef<boolean>
     shareableMessageCount: ComputedRef<number>
   }
@@ -131,7 +127,6 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
       copyIcon: computed(() => ownerValue('copyIcon', DEFAULT_COPY_ICON)),
       copyLiveText: computed(() => ownerValue('copyLiveText', '')),
       deliverableCount: computed(() => ownerValue('deliverableCount', 0)),
-      workbenchResourceCount: computed(() => ownerValue('workbenchResourceCount', 0)),
       shareMode: computed(() => ownerValue('shareMode', false)),
       shareableMessageCount: computed(() => ownerValue('shareableMessageCount', 0)),
     },

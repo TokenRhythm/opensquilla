@@ -166,19 +166,22 @@ def render_active_prompt_annotation_context(values: object) -> str | None:
     if not snapshots:
         return None
     protocol_guidance = (
-        "The user attached the following ordered modification instructions to the current "
-        "document. Inspect them with document_inspect, use document_read only when more "
-        "bounded context is necessary, and use document_locate to obtain opaque grants for "
-        "the required semantic operations. Submit all prepared mutations together with "
+        "The user attached the following ordered instructions and selected document context to "
+        "this request. Use them to answer the user directly when no document change is needed; "
+        "answering does not require a document tool call. When the request does require a change, "
+        "inspect the relevant selection with document_inspect, use document_read only when more "
+        "bounded context is necessary, and use document_locate to obtain opaque grants for the "
+        "semantic operations you will apply. Submit the prepared mutations together with "
         "document_apply. Never calculate or submit source offsets, paths, document identifiers, "
-        "or markup patches. Cover every ordered annotation in the apply proposal. Validation is "
-        "performed by the server adapter. Locate each annotation-operation pair at most once and "
-        "reuse its returned grant; after the required grants are ready, apply promptly instead of "
-        "re-reading or re-locating the same targets. A set_style value is only a CSS declaration "
-        "list such as 'color: #222; background-color: #fff;' and must not contain selectors, rule "
-        "braces, or a style= wrapper. Correct a rejected proposal only when the tool outcome "
-        "permits it; a stale or invalid grant must not create a revision. Do not claim success "
-        "without an applied tool receipt."
+        "or markup patches. An instruction may be answered without being included in the apply "
+        "proposal; every mutation that is included must use a valid grant for its own selection. "
+        "Validation is performed by the server adapter. Locate each annotation-operation pair at "
+        "most once and reuse its returned grant; after the needed grants are ready, apply promptly "
+        "instead of re-reading or re-locating the same targets. A set_style value is only a CSS "
+        "declaration list such as 'color: #222; background-color: #fff;' and must not contain "
+        "selectors, rule braces, or a style= wrapper. Correct a rejected proposal only when the "
+        "tool outcome permits it; a stale or invalid grant must not create a revision. Do not "
+        "claim a document change succeeded without an applied tool receipt."
     )
     lines = [
         "<artifact_prompt_annotations>",

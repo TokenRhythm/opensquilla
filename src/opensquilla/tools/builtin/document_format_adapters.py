@@ -13,6 +13,7 @@ import html
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from enum import StrEnum
 from html.parser import HTMLParser
 from typing import Literal
@@ -76,21 +77,45 @@ DOCUMENT_SEMANTIC_OPERATIONS = frozenset(item.value for item in DocumentSemantic
 
 
 @dataclass(frozen=True, slots=True)
-class DocumentSourceRange:
-    """Server-derived exact range eligible for one semantic operation."""
+class DocumentMutationTarget:
+    """Model-safe target preview plus one process-local adapter locator."""
 
-    start: int
-    end: int
-    kind: str
     operation: str
     annotation_orders: tuple[int, ...]
+    target_fingerprint: str
+    current: str
+    before: str
+    after: str
+    adapter_locator: object = dataclass_field(repr=False, compare=False)
     confidence: str = "exact"
     detail: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedDocumentMutation:
-    """Source replacement produced and validated by a format adapter."""
+class GrantedMutationInput:
+    """One reserved semantic grant passed into an adapter-owned batch prepare."""
+
+    operation: str
+    target_fingerprint: str
+    annotation_orders: tuple[int, ...]
+    has_input: bool
+    input_value: object | None
+    adapter_locator: object = dataclass_field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedAdapterCandidate:
+    """Pure candidate and bounded audit facts produced from opaque grants."""
+
+    candidate_bytes: bytes
+    semantic_operations: tuple[dict[str, object], ...]
+    audit_facts: tuple[dict[str, object], ...]
+    validation_summary: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedAdapterMutation:
+    """One adapter-private replacement inside a document proposal."""
 
     operation: str
     replacement: str
@@ -127,29 +152,23 @@ class DocumentFormatAdapter(ABC):
     @abstractmethod
     def locate(
         self,
-        source: str,
+        payload: bytes,
         *,
-        opening_start: int,
-        opening_end: int,
+        anchor_locator: object,
         annotation_order: int,
         operation: str,
         attribute_name: str | None = None,
-    ) -> tuple[DocumentSourceRange, ...]:
-        """Derive exact candidate ranges for one selected semantic operation."""
+    ) -> tuple[DocumentMutationTarget, ...]:
+        """Derive adapter-owned targets without exposing private coordinates."""
 
     @abstractmethod
-    def prepare_mutation(
+    def prepare_granted_mutations(
         self,
-        source: str,
+        payload: bytes,
         *,
-        start: int,
-        end: int,
-        grant_kind: str,
-        operation: str,
-        value: str | None,
-        attribute_name: str | None,
-    ) -> PreparedDocumentMutation:
-        """Validate a semantic request and return its exact source replacement."""
+        mutations: tuple[GrantedMutationInput, ...],
+    ) -> PreparedAdapterCandidate:
+        """Validate opaque locators and produce one atomic candidate in memory."""
 
     @abstractmethod
     def validate_candidate(self, source: str) -> dict[str, object]:
@@ -172,45 +191,6 @@ class DocumentFormatAdapter(ABC):
             "This document view is not supported by the active format adapter.",
         )
 
-    def apply(
-        self,
-        source: str,
-        *,
-        start: int,
-        end: int,
-        grant_kind: str,
-        operation: str,
-        value: str | None,
-        attribute_name: str | None,
-    ) -> PreparedDocumentMutation:
-        """Format-neutral alias for the source-preserving semantic writer."""
-
-        return self.prepare_mutation(
-            source,
-            start=start,
-            end=end,
-            grant_kind=grant_kind,
-            operation=operation,
-            value=value,
-            attribute_name=attribute_name,
-        )
-
-    def apply_grant(
-        self,
-        source: str,
-        *,
-        start: int,
-        end: int,
-        grant_kind: str,
-        value: str | None,
-    ) -> PreparedDocumentMutation:
-        """Apply a mutation whose operation and target are carried by the grant."""
-
-        raise DocumentAdapterError(
-            "DOCUMENT_GRANT_KIND_INVALID",
-            "The mutation grant is not valid for this document adapter.",
-        )
-
     def validate(self, source: str) -> dict[str, object]:
         """Format-neutral alias for full-candidate validation."""
 
@@ -227,6 +207,16 @@ _URL_ATTRIBUTE_NAMES = frozenset(
     {"action", "formaction", "href", "poster", "src", "xlink:href"}
 )
 _GRANT_PREFIX = "document|html|1|"
+_MAX_HTML_CANDIDATE_BYTES = 2 * 1024 * 1024
+_MAX_HTML_CONTEXT_CHARS = 160
+
+
+@dataclass(frozen=True, slots=True)
+class _HtmlMutationLocator:
+    start: int
+    end: int
+    grant_kind: str
+    expected_slice_sha256: str
 
 HTML_VOID_ELEMENTS = frozenset(
     {
@@ -651,6 +641,27 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
     adapter_version = 1
     supported_operations = DOCUMENT_SEMANTIC_OPERATIONS
 
+    @staticmethod
+    def _decode_payload(payload: bytes) -> str:
+        if not isinstance(payload, bytes) or len(payload) > _MAX_HTML_CANDIDATE_BYTES:
+            raise DocumentAdapterError(
+                "DOCUMENT_HTML_PAYLOAD_INVALID",
+                "The HTML document payload is invalid or too large.",
+            )
+        try:
+            source = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            raise DocumentAdapterError(
+                "DOCUMENT_HTML_ENCODING_INVALID",
+                "HTML semantic editing requires UTF-8 content.",
+            ) from None
+        if not source:
+            raise DocumentAdapterError(
+                "DOCUMENT_CANDIDATE_EMPTY",
+                "The HTML document must not be empty.",
+            )
+        return source
+
     def probe(
         self,
         *,
@@ -701,6 +712,22 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
         attribute = attribute_name or "-"
         return f"{_GRANT_PREFIX}{operation}|{target_kind}|{tag_name}|{attribute}"
 
+    def _target_fingerprint(
+        self,
+        source: str,
+        *,
+        start: int,
+        end: int,
+        grant_kind: str,
+    ) -> str:
+        """Bind a grant to one adapter-private HTML target without exposing offsets."""
+
+        digest = hashlib.sha256()
+        digest.update(f"{self.format_id}\0{self.adapter_version}\0".encode())
+        digest.update(f"{start}\0{end}\0{grant_kind}\0".encode())
+        digest.update(source[start:end].encode("utf-8"))
+        return digest.hexdigest()
+
     @staticmethod
     def _opening(source: str, start: int, end: int) -> _HtmlOpeningTag:
         if start < 0 or end <= start or end > len(source):
@@ -721,14 +748,38 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
 
     def locate(
         self,
-        source: str,
+        payload: bytes,
         *,
-        opening_start: int,
-        opening_end: int,
+        anchor_locator: object,
         annotation_order: int,
         operation: str,
         attribute_name: str | None = None,
-    ) -> tuple[DocumentSourceRange, ...]:
+    ) -> tuple[DocumentMutationTarget, ...]:
+        source = self._decode_payload(payload)
+        if not isinstance(anchor_locator, dict):
+            raise DocumentAdapterError(
+                "DOCUMENT_ANCHOR_INVALID",
+                "The selected HTML target is not source-backed.",
+            )
+        opening_start = anchor_locator.get("start_offset")
+        opening_end = anchor_locator.get(
+            "start_tag_end_offset",
+            anchor_locator.get("end_offset"),
+        )
+        source_sha256 = anchor_locator.get("source_sha256")
+        tag_name_hint = anchor_locator.get("tag_name")
+        if (
+            isinstance(opening_start, bool)
+            or not isinstance(opening_start, int)
+            or isinstance(opening_end, bool)
+            or not isinstance(opening_end, int)
+            or source_sha256 != hashlib.sha256(payload).hexdigest()
+            or not isinstance(tag_name_hint, str)
+        ):
+            raise DocumentAdapterError(
+                "DOCUMENT_ANCHOR_STALE",
+                "The selected HTML target no longer matches the current document.",
+            )
         try:
             semantic_operation = DocumentSemanticOperation(operation)
         except ValueError:
@@ -738,6 +789,11 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
             ) from None
         opening = self._opening(source, opening_start, opening_end)
         tag_name = opening.tag_name
+        if tag_name != tag_name_hint.lower():
+            raise DocumentAdapterError(
+                "DOCUMENT_ANCHOR_STALE",
+                "The selected HTML target no longer matches the current document.",
+            )
         if tag_name in _UNSUPPORTED_STRUCTURAL_ELEMENTS:
             return ()
 
@@ -804,13 +860,27 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
             tag_name=tag_name,
             attribute_name=normalized_attribute,
         )
+        target_fingerprint = self._target_fingerprint(
+            source,
+            start=target_start,
+            end=target_end,
+            grant_kind=kind,
+        )
+        current = source[target_start:target_end]
         return (
-            DocumentSourceRange(
-                start=target_start,
-                end=target_end,
-                kind=kind,
+            DocumentMutationTarget(
                 operation=semantic_operation.value,
                 annotation_orders=(annotation_order,),
+                target_fingerprint=target_fingerprint,
+                current=current,
+                before=source[max(0, target_start - _MAX_HTML_CONTEXT_CHARS) : target_start],
+                after=source[target_end : target_end + _MAX_HTML_CONTEXT_CHARS],
+                adapter_locator=_HtmlMutationLocator(
+                    start=target_start,
+                    end=target_end,
+                    grant_kind=kind,
+                    expected_slice_sha256=hashlib.sha256(current.encode("utf-8")).hexdigest(),
+                ),
                 detail=(
                     f"{tag_name}[{normalized_attribute}]"
                     if normalized_attribute is not None
@@ -819,7 +889,7 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
             ),
         )
 
-    def prepare_mutation(
+    def _prepare_html_mutation(
         self,
         source: str,
         *,
@@ -827,9 +897,9 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
         end: int,
         grant_kind: str,
         operation: str,
-        value: str | None,
+        input_value: object | None,
         attribute_name: str | None,
-    ) -> PreparedDocumentMutation:
+    ) -> PreparedAdapterMutation:
         if start < 0 or end <= start or end > len(source):
             raise DocumentAdapterError(
                 "DOCUMENT_RANGE_INVALID",
@@ -876,28 +946,36 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
 
         original = source[start:end]
         if semantic_operation is DocumentSemanticOperation.REPLACE_TEXT:
-            if target_kind != "text" or granted_attribute != "-" or value is None:
+            if (
+                target_kind != "text"
+                or granted_attribute != "-"
+                or not isinstance(input_value, str)
+            ):
                 raise DocumentAdapterError(
                     "DOCUMENT_TEXT_GRANT_INVALID",
                     "The mutation grant is not valid for text replacement.",
                 )
-            replacement = html.escape(value, quote=False)
+            replacement = html.escape(input_value, quote=False)
             if not replacement:
                 raise DocumentAdapterError(
                     "DOCUMENT_TEXT_VALUE_INVALID",
                     "Replacement text must not be empty.",
                 )
-            return PreparedDocumentMutation(
+            return PreparedAdapterMutation(
                 operation=semantic_operation.value,
                 replacement=replacement,
                 target_kind=target_kind,
             )
 
         if semantic_operation is DocumentSemanticOperation.REMOVE_NODE:
-            if value is not None or requested_attribute is not None or target_kind not in {
-                "element",
-                "void",
-            }:
+            if (
+                input_value is not None
+                or requested_attribute is not None
+                or target_kind not in {
+                    "element",
+                    "void",
+                }
+            ):
                 raise DocumentAdapterError(
                     "DOCUMENT_REMOVE_NODE_INVALID",
                     "The mutation grant is not valid for element removal.",
@@ -913,7 +991,7 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
                     "DOCUMENT_REMOVE_NODE_INVALID",
                     "Only a verified void element may use a void-element deletion grant.",
                 )
-            return PreparedDocumentMutation(
+            return PreparedAdapterMutation(
                 operation=semantic_operation.value,
                 replacement="",
                 target_kind=target_kind,
@@ -927,7 +1005,7 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
             )
         if semantic_operation is DocumentSemanticOperation.SET_ATTRIBUTE:
             assert requested_attribute is not None
-            if not isinstance(value, str):
+            if not isinstance(input_value, str):
                 raise DocumentAdapterError(
                     "DOCUMENT_ATTRIBUTE_VALUE_INVALID",
                     "Setting an attribute requires a string value.",
@@ -935,22 +1013,22 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
             replacement = _set_attribute(
                 original,
                 name=requested_attribute,
-                value=value,
+                value=input_value,
             )
-            return PreparedDocumentMutation(
+            return PreparedAdapterMutation(
                 operation=semantic_operation.value,
                 replacement=replacement,
                 target_kind=target_kind,
                 attribute_name=requested_attribute,
             )
         if semantic_operation is DocumentSemanticOperation.REMOVE_ATTRIBUTE:
-            if value is not None:
+            if input_value is not None:
                 raise DocumentAdapterError(
                     "DOCUMENT_ATTRIBUTE_VALUE_UNEXPECTED",
                     "Removing an attribute does not accept a value.",
                 )
             assert requested_attribute is not None
-            return PreparedDocumentMutation(
+            return PreparedAdapterMutation(
                 operation=semantic_operation.value,
                 replacement=_remove_attribute(original, name=requested_attribute),
                 target_kind=target_kind,
@@ -958,17 +1036,17 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
                 css_mutation=requested_attribute == "style",
             )
         if semantic_operation is DocumentSemanticOperation.SET_STYLE:
-            if not isinstance(value, str) or not _valid_css_declarations(value):
+            if not isinstance(input_value, str) or not _valid_css_declarations(input_value):
                 raise DocumentAdapterError(
                     "DOCUMENT_STYLE_INVALID",
                     "The style must be a validated CSS declaration list.",
                 )
-            return PreparedDocumentMutation(
+            return PreparedAdapterMutation(
                 operation=semantic_operation.value,
                 replacement=_set_attribute(
                     original,
                     name="style",
-                    value=value,
+                    value=input_value,
                     allow_style=True,
                 ),
                 target_kind=target_kind,
@@ -987,18 +1065,19 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
         start: int,
         end: int,
         grant_kind: str,
-        value: str | None,
-    ) -> PreparedDocumentMutation:
+        input_value: object | None,
+    ) -> PreparedAdapterMutation:
+        """Support the pre-existing source-range helper outside the exact4 path."""
+
         parts = grant_kind.split("|")
         if len(parts) != 7 or "|".join(parts[:3]) + "|" != _GRANT_PREFIX:
             raise DocumentAdapterError(
                 "DOCUMENT_GRANT_KIND_INVALID",
-                "The mutation grant is not valid for this document adapter.",
+                "The mutation grant is not valid for the HTML adapter.",
             )
         operation = parts[3]
-        granted_attribute = parts[6]
         attribute_name = (
-            granted_attribute
+            parts[6]
             if operation
             in {
                 DocumentSemanticOperation.SET_ATTRIBUTE.value,
@@ -1006,14 +1085,166 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
             }
             else None
         )
-        return self.prepare_mutation(
+        return self._prepare_html_mutation(
             source,
             start=start,
             end=end,
             grant_kind=grant_kind,
             operation=operation,
-            value=value,
+            input_value=input_value,
             attribute_name=attribute_name,
+        )
+
+    def prepare_granted_mutations(
+        self,
+        payload: bytes,
+        *,
+        mutations: tuple[GrantedMutationInput, ...],
+    ) -> PreparedAdapterCandidate:
+        source = self._decode_payload(payload)
+        if not mutations:
+            raise DocumentAdapterError(
+                "DOCUMENT_MUTATIONS_INVALID",
+                "Mutations must be a non-empty bounded array.",
+            )
+        prepared_rows: list[
+            tuple[int, int, str, PreparedAdapterMutation, GrantedMutationInput]
+        ] = []
+        validated_css_mutation = False
+        for mutation in mutations:
+            locator = mutation.adapter_locator
+            if not isinstance(locator, _HtmlMutationLocator):
+                raise DocumentAdapterError(
+                    "DOCUMENT_GRANT_LOCATOR_INVALID",
+                    "The mutation grant is not valid for the HTML adapter.",
+                )
+            if locator.start < 0 or locator.end <= locator.start or locator.end > len(source):
+                raise DocumentAdapterError(
+                    "DOCUMENT_GRANT_STALE",
+                    "The selected HTML target no longer matches the current document.",
+                )
+            current = source[locator.start : locator.end]
+            if (
+                hashlib.sha256(current.encode("utf-8")).hexdigest()
+                != locator.expected_slice_sha256
+                or self._target_fingerprint(
+                    source,
+                    start=locator.start,
+                    end=locator.end,
+                    grant_kind=locator.grant_kind,
+                )
+                != mutation.target_fingerprint
+            ):
+                raise DocumentAdapterError(
+                    "DOCUMENT_GRANT_STALE",
+                    "The selected HTML target no longer matches the current document.",
+                )
+            parts = locator.grant_kind.split("|")
+            if len(parts) != 7 or "|".join(parts[:3]) + "|" != _GRANT_PREFIX:
+                raise DocumentAdapterError(
+                    "DOCUMENT_GRANT_KIND_INVALID",
+                    "The mutation grant is not valid for the HTML adapter.",
+                )
+            granted_operation = parts[3]
+            if mutation.operation != granted_operation:
+                raise DocumentAdapterError(
+                    "DOCUMENT_GRANT_OPERATION_MISMATCH",
+                    "The mutation grant does not authorize this operation.",
+                )
+            if granted_operation in {"remove_attribute", "remove_node"}:
+                if mutation.has_input:
+                    raise DocumentAdapterError(
+                        "DOCUMENT_MUTATION_INPUT_UNEXPECTED",
+                        "This mutation grant does not accept input. Copy its applyTemplate "
+                        "exactly and omit the input field entirely.",
+                    )
+            elif not mutation.has_input:
+                raise DocumentAdapterError(
+                    "DOCUMENT_MUTATION_INPUT_REQUIRED",
+                    "This mutation grant requires input. Copy its applyTemplate and replace "
+                    "the placeholder with the requested value.",
+                )
+            granted_attribute = parts[6]
+            attribute_name = (
+                granted_attribute
+                if granted_operation
+                in {
+                    DocumentSemanticOperation.SET_ATTRIBUTE.value,
+                    DocumentSemanticOperation.REMOVE_ATTRIBUTE.value,
+                }
+                else None
+            )
+            prepared = self._prepare_html_mutation(
+                source,
+                start=locator.start,
+                end=locator.end,
+                grant_kind=locator.grant_kind,
+                operation=granted_operation,
+                input_value=mutation.input_value,
+                attribute_name=attribute_name,
+            )
+            validated_css_mutation = validated_css_mutation or prepared.css_mutation
+            prepared_rows.append(
+                (locator.start, locator.end, current, prepared, mutation)
+            )
+
+        ordered = sorted(prepared_rows, key=lambda row: (row[0], row[1]))
+        for previous, current_row in zip(ordered, ordered[1:], strict=False):
+            if current_row[0] < previous[1] or current_row[0] == previous[0]:
+                raise DocumentAdapterError(
+                    "DOCUMENT_MUTATION_OVERLAP",
+                    "Document mutation targets must not overlap.",
+                )
+        updated = source
+        for start, end, _current, prepared, _mutation in reversed(ordered):
+            updated = updated[:start] + prepared.replacement + updated[end:]
+        if updated == source:
+            raise DocumentAdapterError(
+                "DOCUMENT_MUTATION_NO_OP",
+                "The requested document mutation does not change the document.",
+            )
+        candidate_bytes = updated.encode("utf-8")
+        if not candidate_bytes or len(candidate_bytes) > _MAX_HTML_CANDIDATE_BYTES:
+            raise DocumentAdapterError(
+                "DOCUMENT_CANDIDATE_SIZE_INVALID",
+                "The edited HTML document is empty or too large.",
+            )
+        adapter_validation = self.validate_candidate(updated)
+        audit_facts: list[dict[str, object]] = []
+        semantic_operations: list[dict[str, object]] = []
+        for _start, _end, current, prepared, mutation in ordered:
+            audit_facts.append(
+                {
+                    "expected_chars": len(current),
+                    "expected_sha256": hashlib.sha256(current.encode("utf-8")).hexdigest(),
+                    "replacement_chars": len(prepared.replacement),
+                    "replacement_sha256": hashlib.sha256(
+                        prepared.replacement.encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+            semantic_operations.append(
+                {
+                    "operation": prepared.operation,
+                    "target_kind": prepared.target_kind,
+                    "attribute_name": prepared.attribute_name,
+                    "annotation_orders": list(mutation.annotation_orders),
+                    "target_fingerprint": mutation.target_fingerprint,
+                }
+            )
+        return PreparedAdapterCandidate(
+            candidate_bytes=candidate_bytes,
+            semantic_operations=tuple(semantic_operations),
+            audit_facts=tuple(audit_facts),
+            validation_summary={
+                "semantic_adapter_validation": adapter_validation,
+                "css_validation": (
+                    "modified_grants_completed"
+                    if validated_css_mutation
+                    else "not_performed"
+                ),
+                "script_validation": "not_applicable_no_script_grants",
+            },
         )
 
     def validate_candidate(self, source: str) -> dict[str, object]:
@@ -1094,10 +1325,12 @@ __all__ = [
     "DocumentAdapterError",
     "DocumentFormatAdapter",
     "DocumentSemanticOperation",
-    "DocumentSourceRange",
+    "DocumentMutationTarget",
+    "GrantedMutationInput",
     "HTML_VOID_ELEMENTS",
     "HtmlDocumentFormatAdapter",
-    "PreparedDocumentMutation",
+    "PreparedAdapterCandidate",
+    "PreparedAdapterMutation",
     "get_document_format_adapter",
     "probe_document_format_adapter",
 ]

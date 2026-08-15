@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from types import SimpleNamespace
@@ -78,6 +79,25 @@ class _ScriptedMutationProvider:
             if isinstance(event, BaseException):
                 raise event
             yield event
+
+
+class _DelayedAnswerProvider:
+    provider_name = "delayed-document-answer"
+
+    def __init__(self, delay: float) -> None:
+        self.delay = delay
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(
+        self,
+        messages: list[Any],
+        tools: list[Any] | None = None,
+        config: Any | None = None,
+    ) -> Any:
+        self.calls.append({"messages": list(messages), "tools": tools, "config": config})
+        await asyncio.sleep(self.delay)
+        yield ProviderTextDeltaEvent(text="The selected text is clear.")
+        yield ProviderDoneEvent(stop_reason="end_turn")
 
 
 class _CloseAwareStream:
@@ -181,6 +201,10 @@ def _agent(
     max_provider_retries: int = 2,
     tools_verified: bool = True,
     iteration_timeout: float = 1800.0,
+    timeout: float = 0.0,
+    max_turn_llm_calls: int = 8,
+    max_turn_input_tokens: int = 0,
+    max_turn_billed_cost_usd: float = 0.0,
 ) -> Agent:
     return Agent(
         provider=provider,
@@ -188,10 +212,13 @@ def _agent(
             metadata={"artifact_operation_class": "selection_edit", "locale": locale},
             model_capabilities=ModelCapabilities(supports_tools=True),
             model_tools_capability_verified=tools_verified,
-            max_turn_llm_calls=8,
+            max_turn_llm_calls=max_turn_llm_calls,
+            max_turn_input_tokens=max_turn_input_tokens,
+            max_turn_billed_cost_usd=max_turn_billed_cost_usd,
             max_iterations=max_iterations,
             max_provider_retries=max_provider_retries,
             iteration_timeout=iteration_timeout,
+            timeout=timeout,
         ),
         tool_definitions=[
             ToolDefinition(
@@ -217,6 +244,69 @@ def _agent(
 
 def _serialized_messages(call: dict[str, Any]) -> str:
     return json.dumps(call["messages"], default=lambda value: vars(value), sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_annotation_context_can_answer_without_starting_mutation_lifecycle() -> None:
+    provider = _ScriptedMutationProvider(
+        [
+            [
+                ProviderTextDeltaEvent(text="The selected heading is already concise."),
+                ProviderDoneEvent(stop_reason="end_turn"),
+            ]
+        ]
+    )
+    controller = _MutationController()
+
+    async def handler(_call: Any) -> ToolResult:
+        raise AssertionError("a direct answer must not dispatch document_apply")
+
+    events = [
+        event
+        async for event in _agent(
+            provider,
+            controller,
+            handler,
+            max_turn_llm_calls=1,
+        ).run_turn("Is this heading concise?")
+    ]
+    done = next(event for event in events if event.kind == "done")
+
+    assert len(provider.calls) == 1
+    assert provider.calls[0]["tools"] is not None
+    assert provider.calls[0]["config"].max_tokens == 16_384
+    assert done.text == "The selected heading is already concise."
+    assert done.document_mutation_outcome is None
+    assert controller.observed == []
+    assert controller.rejected == []
+    assert controller.active_id is None
+
+
+@pytest.mark.asyncio
+async def test_pure_answer_does_not_inherit_mutation_summary_deadline() -> None:
+    provider = _DelayedAnswerProvider(delay=0.02)
+    controller = _MutationController()
+
+    async def handler(_call: Any) -> ToolResult:
+        raise AssertionError("a direct answer must not dispatch document_apply")
+
+    events = [
+        event
+        async for event in _agent(
+            provider,
+            controller,
+            handler,
+            timeout=0.5,
+        ).run_turn("Explain the selected text")
+    ]
+    done = next(event for event in events if event.kind == "done")
+
+    # The mutation summary reserve has a one-second minimum and would already
+    # be expired for this synthetic turn if it were armed before document_apply.
+    assert len(provider.calls) == 1
+    assert done.text == "The selected text is clear."
+    assert done.document_mutation_outcome is None
+    assert controller.observed == []
 
 
 @pytest.mark.asyncio
@@ -249,7 +339,7 @@ async def test_committed_mutation_gets_real_outcome_only_tools_disabled_finaliza
 
     assert len(provider.calls) == 2
     assert provider.calls[1]["tools"] is None
-    assert provider.calls[0]["config"].max_tokens == 8_192
+    assert provider.calls[0]["config"].max_tokens == 16_384
     assert provider.calls[1]["config"].max_tokens == 256
     assert provider.calls[1]["config"].thinking is False
     assert provider.calls[1]["config"].system
@@ -259,6 +349,116 @@ async def test_committed_mutation_gets_real_outcome_only_tools_disabled_finaliza
         assert forbidden not in finalization_wire
     assert done.document_mutation_outcome["status"] == "applied"
     assert done.text.endswith("The document changes were applied.")
+    assert controller.observed == ["apply-1"]
+    assert controller.rejected == []
+
+
+@pytest.mark.asyncio
+async def test_apply_on_last_llm_call_uses_reserved_tools_disabled_finalizer() -> None:
+    provider = _ScriptedMutationProvider(
+        [
+            _tool_call_events("apply-last", {"mutations": []}),
+            [
+                ProviderTextDeltaEvent(text="Updated."),
+                ProviderDoneEvent(stop_reason="end_turn"),
+            ],
+        ]
+    )
+    controller = _MutationController()
+
+    async def handler(call: Any) -> ToolResult:
+        controller.committed_ids.add(call.tool_use_id)
+        return _effect_result(
+            call.tool_use_id,
+            status="applied",
+            effect_state="committed",
+            retry_policy="never",
+            loop_action="finalize_without_tools",
+            code="document_mutation_applied",
+            is_error=False,
+        )
+
+    events = [
+        event
+        async for event in _agent(
+            provider,
+            controller,
+            handler,
+            max_turn_llm_calls=1,
+        ).run_turn("edit")
+    ]
+    done = next(event for event in events if event.kind == "done")
+
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["tools"] is not None
+    assert provider.calls[1]["tools"] is None
+    assert provider.calls[1]["config"].max_tokens == 256
+    assert done.document_mutation_outcome["status"] == "applied"
+    assert not any(event.kind == "error" for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("budget_kwargs", "usage_kwargs"),
+    [
+        ({"max_turn_input_tokens": 1}, {"input_tokens": 2}),
+        (
+            {"max_turn_billed_cost_usd": 0.01},
+            {"billed_cost": 0.02, "cost_source": "provider_billed"},
+        ),
+    ],
+    ids=("input-token-boundary", "billed-cost-boundary"),
+)
+async def test_apply_response_over_budget_still_uses_reserved_finalizer(
+    budget_kwargs: dict[str, Any],
+    usage_kwargs: dict[str, Any],
+) -> None:
+    provider = _ScriptedMutationProvider(
+        [
+            [
+                *_tool_call_events("apply-budget", {"mutations": []})[:-1],
+                ProviderDoneEvent(stop_reason="tool_use", **usage_kwargs),
+            ],
+            [
+                ProviderTextDeltaEvent(text="Updated."),
+                ProviderDoneEvent(stop_reason="end_turn"),
+            ],
+        ]
+    )
+    controller = _MutationController()
+    handler_calls = 0
+
+    async def handler(call: Any) -> ToolResult:
+        nonlocal handler_calls
+        handler_calls += 1
+        controller.committed_ids.add(call.tool_use_id)
+        return _effect_result(
+            call.tool_use_id,
+            status="applied",
+            effect_state="committed",
+            retry_policy="never",
+            loop_action="finalize_without_tools",
+            code="document_mutation_applied",
+            is_error=False,
+        )
+
+    events = [
+        event
+        async for event in _agent(
+            provider,
+            controller,
+            handler,
+            **budget_kwargs,
+        ).run_turn("edit")
+    ]
+    done = next(event for event in events if event.kind == "done")
+
+    assert handler_calls == 1
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["tools"] is None
+    assert provider.calls[1]["config"].max_tokens == 256
+    assert done.document_mutation_outcome["status"] == "applied"
+    assert not any(event.kind == "error" for event in events)
 
 
 @pytest.mark.asyncio
@@ -349,7 +549,7 @@ async def test_iteration_cap_uses_outcome_only_finalization_without_grant_histor
 
 
 @pytest.mark.asyncio
-async def test_unverified_tool_model_still_gets_one_tools_disabled_outcome_summary() -> None:
+async def test_unverified_tool_model_answers_without_starting_mutation_lifecycle() -> None:
     provider = _ScriptedMutationProvider(
         [[ProviderTextDeltaEvent(text="No change."), ProviderDoneEvent(stop_reason="end_turn")]]
     )
@@ -371,12 +571,13 @@ async def test_unverified_tool_model_still_gets_one_tools_disabled_outcome_summa
 
     assert len(provider.calls) == 1
     assert provider.calls[0]["tools"] is None
-    assert done.document_mutation_outcome["status"] == "not_attempted"
-    assert done.document_mutation_outcome["code"] == "artifact_model_tools_unsupported"
+    assert done.text == "No change."
+    assert done.document_mutation_outcome is None
+    assert controller.observed == []
 
 
 @pytest.mark.asyncio
-async def test_terminal_provider_error_gets_one_outcome_only_finalization_attempt() -> None:
+async def test_terminal_provider_error_before_apply_uses_ordinary_error_path() -> None:
     provider = _ScriptedMutationProvider(
         [
             [ProviderErrorEvent(message="provider unavailable", code="fatal")],
@@ -397,18 +598,14 @@ async def test_terminal_provider_error_gets_one_outcome_only_finalization_attemp
             max_provider_retries=0,
         ).run_turn("edit")
     ]
-    done = next(event for event in events if event.kind == "done")
-
-    assert len(provider.calls) == 2
-    assert provider.calls[1]["tools"] is None
-    finalization_wire = _serialized_messages(provider.calls[1])
-    assert "provider unavailable" not in finalization_wire
-    assert done.document_mutation_outcome["status"] == "not_attempted"
-    assert done.document_mutation_outcome["code"] == "document_mutation_provider_failed"
+    assert len(provider.calls) == 1
+    assert any(event.kind == "error" for event in events)
+    assert not any(event.kind == "done" for event in events)
+    assert controller.observed == []
 
 
 @pytest.mark.asyncio
-async def test_raised_provider_stream_gets_one_safe_outcome_only_finalization() -> None:
+async def test_raised_provider_stream_before_apply_uses_ordinary_retry() -> None:
     provider = _ScriptedMutationProvider(
         [
             [RuntimeError("secret provider path /tmp/private-provider-state")],
@@ -424,16 +621,14 @@ async def test_raised_provider_stream_gets_one_safe_outcome_only_finalization() 
     done = next(event for event in events if event.kind == "done")
 
     assert len(provider.calls) == 2
-    assert provider.calls[1]["tools"] is None
-    finalization_wire = _serialized_messages(provider.calls[1])
-    assert "private-provider-state" not in finalization_wire
-    assert "/tmp" not in finalization_wire
-    assert done.document_mutation_outcome["status"] == "not_attempted"
-    assert done.document_mutation_outcome["code"] == "document_mutation_provider_exception"
+    assert all(call["tools"] is not None for call in provider.calls)
+    assert done.text == "No change."
+    assert done.document_mutation_outcome is None
+    assert controller.observed == []
 
 
 @pytest.mark.asyncio
-async def test_raised_provider_timeout_gets_one_safe_outcome_only_finalization() -> None:
+async def test_raised_provider_timeout_before_apply_uses_ordinary_retry() -> None:
     provider = _ScriptedMutationProvider(
         [
             [TimeoutError("private socket timeout /tmp/provider-state")],
@@ -449,13 +644,10 @@ async def test_raised_provider_timeout_gets_one_safe_outcome_only_finalization()
     done = next(event for event in events if event.kind == "done")
 
     assert len(provider.calls) == 2
-    assert provider.calls[1]["tools"] is None
-    finalization_wire = _serialized_messages(provider.calls[1])
-    assert "private socket timeout" not in finalization_wire
-    assert "/tmp" not in finalization_wire
-    assert done.document_mutation_outcome["status"] == "not_attempted"
-    assert done.document_mutation_outcome["retryPolicy"] == "new_turn"
-    assert done.document_mutation_outcome["code"] == "document_mutation_provider_timeout"
+    assert all(call["tools"] is not None for call in provider.calls)
+    assert done.text == "No change."
+    assert done.document_mutation_outcome is None
+    assert controller.observed == []
 
 
 @pytest.mark.asyncio
@@ -500,7 +692,14 @@ async def test_correctable_proposal_reenters_global_loop_then_reports_corrected_
     done = next(event for event in events if event.kind == "done")
 
     assert len(provider.calls) == 3
+    assert provider.calls[0]["tools"] is not None
+    assert provider.calls[1]["tools"] is not None
+    assert provider.calls[2]["tools"] is None
+    assert provider.calls[0]["config"].max_tokens == 16_384
+    assert provider.calls[1]["config"].max_tokens == 8_192
     assert handler_calls == 2
+    assert controller.observed == ["apply-bad", "apply-good"]
+    assert controller.rejected == ["apply-bad"]
     assert done.document_mutation_outcome["corrected"] is True
     assert done.document_mutation_outcome["proposalAttempts"] == 2
 
@@ -688,6 +887,49 @@ async def test_invalid_finalization_is_one_shot_and_uses_local_fallback(
         [
             _tool_call_events("apply-committed", {"mutations": []}),
             invalid_finalization,
+            [
+                ProviderTextDeltaEvent(text="A third provider call must not happen."),
+                ProviderDoneEvent(stop_reason="end_turn"),
+            ],
+        ]
+    )
+    controller = _MutationController()
+
+    async def handler(call: Any) -> ToolResult:
+        controller.committed_ids.add(call.tool_use_id)
+        return _effect_result(
+            call.tool_use_id,
+            status="applied",
+            effect_state="committed",
+            retry_policy="never",
+            loop_action="finalize_without_tools",
+            code="document_mutation_applied",
+            is_error=False,
+        )
+
+    events = [event async for event in _agent(provider, controller, handler).run_turn("edit")]
+    done = next(event for event in events if event.kind == "done")
+
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["tools"] is None
+    assert done.document_mutation_outcome["status"] == "applied"
+    assert done.text == "The document changes were applied."
+    assert any(
+        event.kind == "warning"
+        and event.code == "document_mutation_finalization_degraded"
+        for event in events
+    )
+
+
+@pytest.mark.asyncio
+async def test_silent_finalization_keeps_committed_outcome_and_uses_local_fallback() -> None:
+    provider = _ScriptedMutationProvider(
+        [
+            _tool_call_events("apply-committed", {"mutations": []}),
+            [
+                ProviderTextDeltaEvent(text="NO_REPLY"),
+                ProviderDoneEvent(stop_reason="end_turn"),
+            ],
             [
                 ProviderTextDeltaEvent(text="A third provider call must not happen."),
                 ProviderDoneEvent(stop_reason="end_turn"),

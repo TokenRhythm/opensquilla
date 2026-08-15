@@ -6,6 +6,51 @@ import {
 } from './workbenchResourceProvider'
 
 describe('workbench resource provider', () => {
+  it('keeps selection and Agent editing independent from preview and legacy edit', async () => {
+    const call = vi.fn(async () => ({
+      resources: [{
+        resource: { type: 'attachment', attachmentId: 'att-legacy' },
+        name: 'legacy.html',
+        mime: 'text/html',
+        capabilities: { preview: true, download: true, edit: true, publish: false },
+        relations: {},
+      }, {
+        resource: { type: 'document', documentId: 'doc-current' },
+        name: 'current.html',
+        mime: 'text/html',
+        capabilities: {
+          preview: true,
+          download: true,
+          selectionContext: true,
+          manualEdit: true,
+          agentEdit: true,
+          edit: true,
+          publish: true,
+        },
+        relations: {},
+      }],
+      totalCount: 2,
+    }))
+    const provider = createRpcWorkbenchResourceProvider({ call, supportsMethod: () => true })
+
+    const result = await provider.list('session-a')
+
+    expect(result.resources[0]?.capabilities).toMatchObject({
+      preview: true,
+      manualEdit: true,
+      agentEdit: false,
+      selectionContext: false,
+      publish: false,
+    })
+    expect(result.resources[1]?.capabilities).toMatchObject({
+      preview: true,
+      manualEdit: true,
+      agentEdit: true,
+      selectionContext: true,
+      publish: true,
+    })
+  })
+
   it('normalizes separate attachment, document and deliverable identities', async () => {
     const call = vi.fn(async () => ({
       resources: [

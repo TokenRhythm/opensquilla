@@ -14,6 +14,10 @@ import pytest
 
 import opensquilla.gateway.rpc_workbench_resources as resource_rpc
 from opensquilla.artifact_session import (
+    Actor,
+    ActorKind,
+    ArtifactBlobRef,
+    ArtifactKind,
     ArtifactSessionService,
     DocumentImportMode,
     DocumentSourceType,
@@ -36,6 +40,61 @@ def test_workbench_resource_method_scopes_are_fail_closed() -> None:
     assert METHOD_SCOPES["workbench.previews.create"] == READ_SCOPE
     assert METHOD_SCOPES["documents.import"] == WRITE_SCOPE
     assert METHOD_SCOPES["documents.publish"] == WRITE_SCOPE
+
+
+@pytest.mark.parametrize(
+    ("agent_editable", "selection_context", "expected_edit"),
+    ((False, True, False), (True, False, True)),
+)
+def test_document_resource_capability_axes_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+    agent_editable: bool,
+    selection_context: bool,
+    expected_edit: bool,
+) -> None:
+    monkeypatch.setattr(
+        resource_rpc,
+        "_format_profile",
+        lambda *_args, **_kwargs: resource_rpc._FormatProfile(
+            kind=ArtifactKind.HTML,
+            adapter=None,
+            preview=True,
+            editable=False,
+            agent_editable=agent_editable,
+            selection_context=selection_context,
+            publishable=True,
+            reason_code=None,
+        ),
+    )
+    payload = resource_rpc._document_payload(
+        SimpleNamespace(
+            document_id="doc-independent",
+            name="independent.html",
+            created_at=1,
+            updated_at=1,
+        ),
+        SimpleNamespace(
+            revision_id="rev-independent",
+            artifact_id="artifact-independent",
+            media_type="text/html",
+            byte_size=1,
+            artifact_sha256="a" * 64,
+        ),
+        binding=None,
+        publication=None,
+        trusted_capabilities=True,
+    )
+
+    assert payload["capabilities"] == {
+        "preview": True,
+        "download": True,
+        "selectionContext": selection_context,
+        "manualEdit": False,
+        "agentEdit": agent_editable,
+        "edit": expected_edit,
+        "publish": True,
+        "editReasonCode": None,
+    }
 
 
 @pytest.mark.parametrize(
@@ -114,6 +173,9 @@ async def test_multifile_deliverable_is_preview_only_and_never_truncated_on_impo
     )
     assert deliverable["capabilities"]["preview"] is True
     assert deliverable["capabilities"]["edit"] is False
+    assert deliverable["capabilities"]["manualEdit"] is False
+    assert deliverable["capabilities"]["agentEdit"] is False
+    assert deliverable["capabilities"]["selectionContext"] is False
 
     imported = await _dispatch(
         env,
@@ -134,7 +196,6 @@ async def test_multifile_deliverable_is_preview_only_and_never_truncated_on_impo
         session_id=env.session.session_id,
         limit=10,
     ) == ()
-
 
 @pytest.fixture
 async def resource_env(tmp_path: Path):
@@ -422,6 +483,9 @@ async def test_invalid_html_attachments_fail_closed_without_read_side_writes(res
         capabilities = resolved.payload["resource"]["capabilities"]
         assert capabilities["preview"] is False
         assert capabilities["edit"] is False
+        assert capabilities["manualEdit"] is False
+        assert capabilities["agentEdit"] is False
+        assert capabilities["selectionContext"] is False
         assert capabilities["editReasonCode"] == expected_reason
 
         preview = await _dispatch(
@@ -479,6 +543,9 @@ async def test_oversized_html_capabilities_fail_before_doomed_ui_actions(resourc
     assert editable_capabilities == {
         "preview": True,
         "download": True,
+        "selectionContext": False,
+        "manualEdit": False,
+        "agentEdit": False,
         "edit": False,
         "publish": False,
         "previewReasonCode": None,
@@ -501,6 +568,9 @@ async def test_oversized_html_capabilities_fail_before_doomed_ui_actions(resourc
     assert preview_capabilities == {
         "preview": False,
         "download": True,
+        "selectionContext": False,
+        "manualEdit": False,
+        "agentEdit": False,
         "edit": False,
         "publish": False,
         "previewReasonCode": "html_preview_size_unsupported",
@@ -577,6 +647,10 @@ async def test_resource_inventory_preserves_inline_and_staged_attachment_occurre
         "message-inline",
     }
     assert all(item["capabilities"]["edit"] is True for item in attachments)
+    assert all(item["capabilities"]["manualEdit"] is True for item in attachments)
+    assert all(item["capabilities"]["agentEdit"] is False for item in attachments)
+    assert all(item["capabilities"]["selectionContext"] is False for item in attachments)
+    assert all(item["capabilities"]["publish"] is False for item in attachments)
     assert all(
         "downloadUrl" in item for item in attachments if item["name"] != "inline.html"
     )
@@ -631,6 +705,12 @@ async def test_resource_inventory_preserves_inline_and_staged_attachment_occurre
     assert after.error is None, after.error
     assert len(after.payload["resources"]) == 2
     for document in after.payload["resources"]:
+        capabilities = document["capabilities"]
+        assert capabilities["preview"] is True
+        assert capabilities["manualEdit"] is True
+        assert capabilities["agentEdit"] is True
+        assert capabilities["selectionContext"] is True
+        assert capabilities["publish"] is True
         assert document["relations"]["headArtifactId"]
         assert document["relations"]["headRevisionId"]
         source_ref = document["relations"]["source"]
@@ -994,8 +1074,13 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
     )
     assert listed.error is None, listed.error
     capabilities = listed.payload["resource"]["capabilities"]
+    assert capabilities["download"] is True
     assert capabilities["preview"] is False
+    assert capabilities["selectionContext"] is False
+    assert capabilities["manualEdit"] is False
+    assert capabilities["agentEdit"] is False
     assert capabilities["edit"] is False
+    assert capabilities["publish"] is False
     assert capabilities["editReasonCode"] == "office_adapter_not_available"
 
     forged_import = await _dispatch(
@@ -1016,6 +1101,67 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
         session_key=SESSION_KEY,
         session_id=env.session.session_id,
         limit=10,
+    ) == ()
+
+    internal_ref = env.store.publish_bytes(
+        b"synthetic-office-document",
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name=filename,
+        mime=mime,
+        source="office-document-capability-test",
+        visibility="internal",
+    )
+    created = await service.create_document(
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        name=filename,
+        kind=resource_rpc._kind_for(filename, mime),
+        initial_artifact=ArtifactBlobRef(
+            artifact_id=internal_ref.id,
+            sha256=internal_ref.sha256,
+            filename=internal_ref.name,
+            media_type=internal_ref.mime,
+            byte_size=internal_ref.size,
+        ),
+        actor=Actor(ActorKind.SYSTEM, "office-document-capability-test"),
+    )
+    described = await _dispatch(
+        env,
+        "workbench.resources.get",
+        {
+            "sessionKey": SESSION_KEY,
+            "resource": {
+                "type": "document",
+                "id": created.document.document_id,
+            },
+        },
+    )
+    assert described.error is None, described.error
+    document_capabilities = described.payload["resource"]["capabilities"]
+    assert document_capabilities["download"] is True
+    assert document_capabilities["preview"] is False
+    assert document_capabilities["selectionContext"] is False
+    assert document_capabilities["manualEdit"] is False
+    assert document_capabilities["agentEdit"] is False
+    assert document_capabilities["edit"] is False
+    assert document_capabilities["publish"] is False
+
+    rejected_publish = await _dispatch(
+        env,
+        "documents.publish",
+        {
+            "sessionKey": SESSION_KEY,
+            "documentId": created.document.document_id,
+            "revisionId": created.revision.revision_id,
+            "idempotencyKey": f"office-publish-must-fail-closed-{filename}",
+        },
+    )
+    assert rejected_publish.error is not None
+    assert rejected_publish.error.code == "DOCUMENT_PUBLISH_FORMAT_UNSUPPORTED"
+    assert await service.list_document_publications(
+        session_id=env.session.session_id,
+        document_id=created.document.document_id,
     ) == ()
 
 

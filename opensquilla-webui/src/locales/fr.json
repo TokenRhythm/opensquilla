@@ -164,7 +164,7 @@
       "failedDetail": "Rechargez le navigateur isolé pour continuer."
     },
     "artifactAnnotation": {
-      "start": "Annoter l’aperçu", "stop": "Arrêter l’annotation", "selectElement": "Sélectionnez un élément de page à annoter", "selectElementShort": "Choisir un élément", "unavailable": "L’annotation de l’aperçu est indisponible.",
+      "start": "Annoter l’aperçu", "stop": "Arrêter l’annotation", "selectElement": "Sélectionnez un élément de page à annoter", "selectElementShort": "Choisir un élément", "unavailable": "L’annotation de l’aperçu est indisponible.", "desktopEditingOnly": "Sélectionnez et modifiez les éléments de la page avec l’IA dans l’application de bureau.",
       "createFailed": "L’élément sélectionné n’a pas pu être joint.", "elementChanged": "L’élément sélectionné a changé avant d’être joint. Sélectionnez-le à nouveau dans l’aperçu actuel.", "rearmFailed": "Le mode annotation s’est arrêté, car le sélecteur n’a pas pu redémarrer. Réactivez-le pour réessayer.", "updateFailed": "Le brouillon d’annotation n’a pas pu être enregistré.", "discardFailed": "L’annotation n’a pas pu être supprimée. Elle reste ouverte pour réessayer.", "closeFailed": "L’éditeur d’annotation n’a pas pu être fermé. Réessayez.", "replacementCleanupFailed": "La nouvelle annotation a été conservée, mais l’ancien brouillon n’a pas pu être supprimé.",
       "overlayFallback": "Continuez dans l’éditeur de confiance.",
       "fallbackTitle": "Continuer l’annotation", "fallbackDetail": "L’aperçu a été masqué car l’éditeur natif est indisponible. Votre brouillon reste enregistré.", "frozenPreview": "Aperçu figé de l’élément de page sélectionné",
@@ -3275,7 +3275,7 @@
     "stopResponseEsc": "Arrêter la réponse actuelle (Échap)",
     "messageToSend": "Message à envoyer",
     "promptAnnotations": {
-      "draftLabel": "Instructions d’artefact en attente", "sentLabel": "Instructions d’artefact", "element": "élément",
+      "label": "Annotations", "draftLabel": "Instructions d’artefact en attente", "sentLabel": "Instructions d’artefact", "element": "élément",
       "emptyDraft": "Ajouter une instruction", "stale": "Sélectionner à nouveau l’élément",
       "editingBlocked": "Ajoutez ou annulez l’annotation en cours de modification avant d’envoyer.",
       "staleBlocked": "Sélectionnez à nouveau les éléments des instructions obsolètes.",
@@ -3283,7 +3283,7 @@
       "removeLabel": "Supprimer l’instruction d’artefact", "updateFailed": "L’instruction d’artefact n’a pas pu être enregistrée.",
       "discardFailed": "L’instruction d’artefact n’a pas pu être supprimée.", "focusUnavailable": "Cet élément n’a pas pu être ciblé de façon sûre. Ouvrez son aperçu et réessayez.",
       "reuseLabel": "Copier comme nouvelle annotation", "reuseDescription": "Copie la demande de modification ; sélectionnez ensuite à nouveau l’élément dans la version actuelle.", "reuseUnavailable": "Cette demande de modification n’a pas pu être copiée comme nouvelle annotation. Ouvrez l’aperçu de l’artefact correspondant et sélectionnez à nouveau l’élément dans la version actuelle.", "applyPrompt": "Appliquez les instructions d’artefact jointes.",
-      "status": { "sending": "Envoi en cours", "accepted": "Acceptée", "unknown": "État de modification inconnu", "not_attempted": "Aucune modification du document tentée", "applied": "Modification appliquée", "appliedCorrected": "Corrigée et appliquée", "not_applied": "Modification non appliquée", "conflict": "Le document a changé", "ambiguous": "Résultat de modification en attente" },
+      "status": { "unknown": "État de modification inconnu", "not_attempted": "Aucune modification du document tentée", "applied": "Modification appliquée", "appliedCorrected": "Corrigée et appliquée", "not_applied": "Modification non appliquée", "conflict": "Le document a changé", "ambiguous": "Résultat de modification en attente" },
       "statusDetail": { "unknown": "Aucun reçu de modification vérifiable n’est disponible pour ce tour terminé.", "not_attempted": "Le tour s’est terminé avant qu’une écriture du document soit proposée.", "applied": "Confirmée par le reçu de révision du document.", "not_applied": "Aucune révision du document n’a été créée.", "conflict": "Actualisez le document et sélectionnez à nouveau la cible.", "ambiguous": "Attendez le rapprochement ; ne relancez pas encore cette modification." }
     },
     "placeholder": "Envoyer un message...",

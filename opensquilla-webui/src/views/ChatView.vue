@@ -730,7 +730,6 @@ import { useSandboxSetupStore } from '@/stores/sandboxSetup'
 import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
-import { createResourceCollectionWorkbenchItem } from '@/workbench/workbenchResourceItems'
 import { usePlatform } from '@/platform'
 import { createRpcArtifactPromptAnnotationProvider } from '@/workbench/artifactPromptAnnotationProvider'
 import {
@@ -4167,7 +4166,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
 async function editAttachmentResource(attachment: DisplayAttachment) {
   const resource = await attachmentWorkbenchResource(attachment)
   if (!resource || !sessionKey.value) return
-  if (!resource.capabilities.edit) {
+  if (!resource.capabilities.manualEdit) {
     pushToast(t(workbenchResourceUnavailableReasonKey(
       workbenchResourceActionReasonCode(resource.capabilities, 'edit'),
     )), { tone: 'warn' })
@@ -4253,14 +4252,6 @@ const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResou
       .map(resource => [workbenchResourceRefId(resource.resource), resource]),
   )
 ))
-const headerWorkbenchResourceCount = computed(() => (
-  workbenchResourcesEnabled.value
-  && workbenchEnabled.value
-  && workbenchResourceSnapshot.value.available
-    ? workbenchResourceSnapshot.value.totalCount
-    : 0
-))
-
 const deliverablesOpen = ref(false)
 
 function focusHeaderAction(
@@ -4298,23 +4289,6 @@ function openDeliverables() {
     }
   }
   deliverablesOpen.value = true
-}
-
-function openWorkbenchResources() {
-  if (!workbenchEnabled.value || !workbenchResourcesEnabled.value || !sessionKey.value) return
-  const snapshot = workbenchResourceSnapshot.value
-  if (!snapshot.available) {
-    openDeliverables()
-    return
-  }
-  const opened = workbenchStore.openItem(createResourceCollectionWorkbenchItem({
-    resources: snapshot.resources,
-    sessionKey: sessionKey.value,
-    title: t('workbench.resources.title'),
-  }))
-  if (!opened) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-  }
 }
 
 function focusInlineDeliverable(artifact: ArtifactPayload): boolean {
@@ -4668,11 +4642,9 @@ const chatRouteHeaderRegistration = chatRouteHeader.register({
   copyIcon: sessionCopyIcon,
   copyLiveText: sessionCopyLiveText,
   deliverableCount: headerDeliverableCount,
-  workbenchResourceCount: headerWorkbenchResourceCount,
   shareMode,
   shareableMessageCount,
 }, {
-  openWorkbench: openWorkbenchResources,
   openDeliverables,
   startShare: startShareMode,
   copySessionKey: onSessionCopyClick,

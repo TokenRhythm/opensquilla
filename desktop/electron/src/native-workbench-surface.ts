@@ -440,16 +440,25 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
       line-height: 1.4;
     }
     .annotation-card {
+      position: relative;
       display: grid;
-      grid-template-rows: 24px minmax(0, 1fr) 36px;
-      gap: 8px;
+      grid-template-rows: 22px minmax(0, 1fr) 32px;
+      gap: 6px;
       width: 100%;
       height: 100%;
-      padding: 12px;
+      padding: 10px 10px 9px 13px;
       border: 1px solid var(--border-strong);
-      border-radius: 14px;
+      border-radius: 12px;
       background: var(--bg-surface);
       box-shadow: var(--shadow);
+    }
+    .annotation-card::before {
+      position: absolute;
+      inset: 10px auto 10px 0;
+      width: 3px;
+      border-radius: 0 999px 999px 0;
+      background: var(--accent);
+      content: "";
     }
     .annotation-header {
       display: flex;
@@ -462,15 +471,15 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
       display: flex;
       min-width: 0;
       align-items: center;
-      gap: 7px;
+      gap: 6px;
       margin: 0;
       color: var(--text);
       font-size: 13px;
-      font-weight: 600;
-      line-height: 24px;
+      font-weight: 500;
+      line-height: 22px;
     }
     .annotation-target {
-      max-width: 126px;
+      max-width: 148px;
       overflow: hidden;
       padding: 2px 7px;
       border: 1px solid var(--border);
@@ -484,19 +493,21 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
       text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .annotation-shortcut {
-      flex: 0 0 auto;
+    .annotation-context {
+      overflow: hidden;
       color: var(--text-dim);
       font-size: 11px;
+      font-weight: 400;
+      text-overflow: ellipsis;
       white-space: nowrap;
     }
     textarea {
       width: 100%;
       height: 100%;
       resize: none;
-      padding: 10px 11px;
+      padding: 8px 9px;
       border: 1px solid var(--border-strong);
-      border-radius: 10px;
+      border-radius: 8px;
       outline: none;
       background: var(--bg-surface-2);
       color: var(--text);
@@ -521,11 +532,11 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
       gap: 8px;
     }
     button {
-      min-width: 64px;
-      height: 36px;
-      padding: 0 13px;
+      min-width: 56px;
+      height: 32px;
+      padding: 0 11px;
       border: 1px solid transparent;
-      border-radius: 10px;
+      border-radius: 8px;
       outline: none;
       font: inherit;
       font-weight: 600;
@@ -559,10 +570,9 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
   >
     <header class="annotation-header">
       <h1 id="annotation-title" class="annotation-title">
-        批注元素
         <code id="annotation-target" class="annotation-target" aria-label="当前选中的 HTML 元素">&lt;element&gt;</code>
+        <span class="annotation-context">当前选区</span>
       </h1>
-      <span class="annotation-shortcut" aria-hidden="true">Ctrl/⌘ ↵</span>
     </header>
     <textarea id="annotation-body" maxlength="16384" required aria-label="批注修改要求" placeholder="描述希望 AI 如何修改…"></textarea>
     <footer>
@@ -1953,7 +1963,7 @@ export class NativeWorkbenchSurfaceManager {
       width: candidate.selection.rect.width * scaleX,
       height: candidate.selection.rect.height * scaleY,
     }
-    const gap = 12
+    const gap = 8
     let x = selected.x + selected.width + gap
     let y = selected.y
     if (x + NATIVE_WORKBENCH_ANNOTATION_OVERLAY_WIDTH > surface.x + surface.width) {

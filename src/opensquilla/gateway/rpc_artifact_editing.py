@@ -830,13 +830,25 @@ def _kind_for(ref: ArtifactRef) -> ArtifactKind:
 
 
 def _capabilities(artifact_format: str) -> dict[str, Any]:
-    common = {"download": True, "versionHistory": True, "promptAnnotations": False}
+    # Every value here describes a Document. Immutable attachments and
+    # deliverables advertise publish=false in the Workbench resource RPC.
+    common = {
+        "download": True,
+        "versionHistory": True,
+        "publish": True,
+        "promptAnnotations": False,
+    }
     if artifact_format == "html":
         adapter = get_document_format_adapter(artifact_format)
         adapter_capabilities = adapter.capabilities()
+        selection_context = (
+            adapter_capabilities.get("selectionContext") is True
+            or adapter_capabilities.get("selection") is True
+        ) and adapter_capabilities.get("promptAnnotations") is True
         return {
             **common,
             "preview": adapter_capabilities["preview"],
+            "selectionContext": selection_context,
             "manualEdit": adapter_capabilities["manualEdit"],
             "agentEdit": adapter_capabilities["agentEdit"],
             "sourceEdit": adapter_capabilities["sourceEdit"],
@@ -852,11 +864,13 @@ def _capabilities(artifact_format: str) -> dict[str, Any]:
     if artifact_format in {"docx", "xlsx", "pptx"}:
         return {
             **common,
+            "publish": False,
             "preview": False,
             "manualEdit": False,
             "agentEdit": False,
             "sourceEdit": False,
             "browserUse": False,
+            "selectionContext": False,
             "selection": False,
             "engine": None,
             "unavailableReason": "office_adapter_not_available",
@@ -868,6 +882,7 @@ def _capabilities(artifact_format: str) -> dict[str, Any]:
         "agentEdit": False,
         "sourceEdit": False,
         "browserUse": False,
+        "selectionContext": False,
         "selection": False,
         "engine": None,
         "unavailableReason": "unsupported_format",
@@ -880,8 +895,10 @@ def _html_bundle_capabilities() -> dict[str, Any]:
     return {
         "download": True,
         "versionHistory": True,
+        "publish": True,
         "promptAnnotations": False,
         "preview": True,
+        "selectionContext": False,
         "manualEdit": False,
         "agentEdit": False,
         "sourceEdit": False,
@@ -898,8 +915,10 @@ def _html_integrity_failure_capabilities() -> dict[str, Any]:
     return {
         "download": True,
         "versionHistory": True,
+        "publish": True,
         "promptAnnotations": False,
         "preview": False,
+        "selectionContext": False,
         "manualEdit": False,
         "agentEdit": False,
         "sourceEdit": False,
@@ -916,8 +935,10 @@ def _html_source_unavailable_capabilities(reason: str) -> dict[str, Any]:
     return {
         "download": True,
         "versionHistory": True,
+        "publish": True,
         "promptAnnotations": False,
         "preview": True,
+        "selectionContext": False,
         "manualEdit": False,
         "agentEdit": False,
         "sourceEdit": False,
@@ -978,7 +999,11 @@ async def _revision_capabilities(
         # Preview annotations rely on a trusted Electron-owned CDP selection.
         # The ordinary Web UI keeps source editing, but must not expose a
         # button that can only fail after the user has entered an instruction.
-        return {**capabilities, "promptAnnotations": False}
+        return {
+            **capabilities,
+            "selectionContext": False,
+            "promptAnnotations": False,
+        }
     return capabilities
 
 

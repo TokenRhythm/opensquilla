@@ -164,7 +164,7 @@
       "failedDetail": "Lade den isolierten Browser neu, um fortzufahren."
     },
     "artifactAnnotation": {
-      "start": "Vorschau annotieren", "stop": "Annotieren beenden", "selectElement": "Seitenelement zum Annotieren auswählen", "selectElementShort": "Element wählen", "unavailable": "Vorschauannotation ist nicht verfügbar.",
+      "start": "Vorschau annotieren", "stop": "Annotieren beenden", "selectElement": "Seitenelement zum Annotieren auswählen", "selectElementShort": "Element wählen", "unavailable": "Vorschauannotation ist nicht verfügbar.", "desktopEditingOnly": "Seitenelemente können Sie in der Desktop-App auswählen und mit KI bearbeiten.",
       "createFailed": "Das ausgewählte Element konnte nicht angehängt werden.", "elementChanged": "Das ausgewählte Element wurde vor dem Anhängen geändert. Wählen Sie es in der aktuellen Vorschau erneut aus.", "rearmFailed": "Der Annotationsmodus wurde beendet, weil die Elementauswahl nicht neu gestartet werden konnte. Aktivieren Sie ihn erneut.", "updateFailed": "Der Annotationsentwurf konnte nicht gespeichert werden.", "discardFailed": "Die Annotation konnte nicht verworfen werden und bleibt für einen erneuten Versuch geöffnet.", "closeFailed": "Der Annotationseditor konnte nicht geschlossen werden. Versuchen Sie es erneut.", "replacementCleanupFailed": "Die neue Annotation wurde beibehalten, aber der vorherige Entwurf konnte nicht entfernt werden.",
       "overlayFallback": "Bearbeiten Sie den Entwurf im vertrauenswürdigen Editor weiter.",
       "fallbackTitle": "Annotation fortsetzen", "fallbackDetail": "Die Vorschau wurde ausgeblendet, da der native Editor nicht verfügbar ist. Ihr Entwurf bleibt gespeichert.", "frozenPreview": "Eingefrorene Vorschau des ausgewählten Seitenelements",
@@ -3275,7 +3275,7 @@
     "stopResponseEsc": "Aktuelle Antwort stoppen (Esc)",
     "messageToSend": "Zu sendende Nachricht",
     "promptAnnotations": {
-      "draftLabel": "Ausstehende Artefaktanweisungen", "sentLabel": "Artefaktanweisungen", "element": "Element",
+      "label": "Anmerkungen", "draftLabel": "Ausstehende Artefaktanweisungen", "sentLabel": "Artefaktanweisungen", "element": "Element",
       "emptyDraft": "Anweisung hinzufügen", "stale": "Element erneut auswählen",
       "editingBlocked": "Fügen Sie die gerade bearbeitete Anmerkung hinzu oder brechen Sie sie vor dem Senden ab.",
       "staleBlocked": "Veraltete Artefaktanweisungen müssen erneut ausgewählt werden.",
@@ -3283,7 +3283,7 @@
       "removeLabel": "Artefaktanweisung entfernen", "updateFailed": "Die Artefaktanweisung konnte nicht gespeichert werden.",
       "discardFailed": "Die Artefaktanweisung konnte nicht entfernt werden.", "focusUnavailable": "Dieses Element konnte nicht sicher hervorgehoben werden. Öffnen Sie die Vorschau und versuchen Sie es erneut.",
       "reuseLabel": "Als neue Annotation kopieren", "reuseDescription": "Kopiert die Änderungsanforderung; wählen Sie anschließend das Element in der aktuellen Version erneut aus.", "reuseUnavailable": "Diese Änderungsanforderung konnte nicht als neue Annotation kopiert werden. Öffnen Sie die passende Artefaktvorschau und wählen Sie das Element in der aktuellen Version erneut aus.", "applyPrompt": "Wenden Sie die angehängten Artefaktanweisungen an.",
-      "status": { "sending": "Wird gesendet", "accepted": "Angenommen", "unknown": "Bearbeitungsstatus unbekannt", "not_attempted": "Keine Dokumentänderung versucht", "applied": "Änderung angewendet", "appliedCorrected": "Korrigiert und angewendet", "not_applied": "Änderung nicht angewendet", "conflict": "Dokument wurde geändert", "ambiguous": "Änderungsergebnis ausstehend" },
+      "status": { "unknown": "Bearbeitungsstatus unbekannt", "not_attempted": "Keine Dokumentänderung versucht", "applied": "Änderung angewendet", "appliedCorrected": "Korrigiert und angewendet", "not_applied": "Änderung nicht angewendet", "conflict": "Dokument wurde geändert", "ambiguous": "Änderungsergebnis ausstehend" },
       "statusDetail": { "unknown": "Für diesen abgeschlossenen Durchlauf ist kein verlässlicher Änderungsbeleg verfügbar.", "not_attempted": "Der Durchlauf endete, bevor eine Dokumentänderung vorgeschlagen wurde.", "applied": "Durch den Dokumentversionsbeleg bestätigt.", "not_applied": "Es wurde keine neue Dokumentversion erstellt.", "conflict": "Aktualisieren Sie das Dokument und wählen Sie das Ziel erneut aus.", "ambiguous": "Warten Sie auf die Abstimmung und versuchen Sie diese Änderung noch nicht erneut." }
     },
     "placeholder": "Eine Nachricht senden...",

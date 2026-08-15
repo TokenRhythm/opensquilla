@@ -143,7 +143,17 @@ function serializeRef(value: WorkbenchResourceRef): Record<string, string> {
 function normalizeCapabilities(value: unknown): WorkbenchResourceCapabilities {
   const raw = record(value) || {}
   const preview = boolAt(raw, 'preview')
-  const edit = boolAt(raw, 'edit')
+  const legacyEdit = boolAt(raw, 'edit')
+  const hasManualEdit = valueAt(raw, 'manualEdit', 'manual_edit') !== undefined
+  const manualEdit = boolAt(raw, 'manualEdit', 'manual_edit')
+    || (!hasManualEdit && legacyEdit)
+  const agentEdit = boolAt(raw, 'agentEdit', 'agent_edit')
+  const selectionContext = boolAt(
+    raw,
+    'selectionContext',
+    'selection_context',
+  )
+  const edit = legacyEdit || manualEdit || agentEdit
   const legacyReason = stringAt(
     raw,
     'reasonCode',
@@ -164,6 +174,9 @@ function normalizeCapabilities(value: unknown): WorkbenchResourceCapabilities {
   return {
     preview,
     download: boolAt(raw, 'download'),
+    selectionContext,
+    manualEdit,
+    agentEdit,
     edit,
     publish: boolAt(raw, 'publish'),
     previewReasonCode,

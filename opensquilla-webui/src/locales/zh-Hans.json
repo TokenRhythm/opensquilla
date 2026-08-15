@@ -164,7 +164,7 @@
       "failedDetail": "重新加载隔离浏览器以继续。"
     },
     "artifactAnnotation": {
-      "start": "批注预览", "stop": "退出批注模式", "selectElement": "选择页面元素进行批注", "selectElementShort": "选择元素", "unavailable": "当前无法使用预览批注。",
+      "start": "批注预览", "stop": "退出批注模式", "selectElement": "选择页面元素进行批注", "selectElementShort": "选择元素", "unavailable": "当前无法使用预览批注。", "desktopEditingOnly": "请在桌面客户端中选择页面元素并让 AI 编辑。",
       "createFailed": "无法附加所选页面元素。", "elementChanged": "所选元素在附加前发生了变化，请在当前预览中重新选择。", "rearmFailed": "元素选择器无法重新启动，批注模式已退出。请重新开启批注模式后再试。", "updateFailed": "无法保存批注草稿。", "discardFailed": "无法丢弃该批注。编辑框将保持打开，请重试。", "closeFailed": "无法关闭批注编辑框。请重试后再选择其他元素。", "replacementCleanupFailed": "新批注已保留，但无法删除之前的草稿。",
       "overlayFallback": "原生批注输入框已关闭，请在可信输入框中继续编辑。",
       "fallbackTitle": "继续编辑批注", "fallbackDetail": "原生输入框不可用，预览已隐藏；你的批注草稿仍已保存。", "frozenPreview": "所选页面元素的冻结预览",
@@ -3334,7 +3334,7 @@
     "stopResponseEsc": "停止当前回复（Esc）",
     "messageToSend": "要发送的消息",
     "promptAnnotations": {
-      "draftLabel": "待发送的交付件修改要求", "sentLabel": "交付件修改要求", "element": "页面元素",
+      "label": "批注", "draftLabel": "待发送的交付件修改要求", "sentLabel": "交付件修改要求", "element": "页面元素",
       "emptyDraft": "输入修改要求", "stale": "需要重新选择元素",
       "editingBlocked": "请先添加或取消正在编辑的批注，再发送消息。",
       "staleBlocked": "部分交付件批注已过期，请重新选择对应元素后再发送。",
@@ -3342,7 +3342,7 @@
       "removeLabel": "删除交付件批注", "updateFailed": "无法保存交付件批注。",
       "discardFailed": "无法删除交付件批注。", "focusUnavailable": "无法安全定位这个页面元素，请确认对应预览已打开后重试。",
       "reuseLabel": "复制为新批注", "reuseDescription": "复制修改要求，并在当前版本重新选择元素。", "reuseUnavailable": "无法将这条修改要求复制为新批注。请先打开对应交付件预览，并在当前版本重新选择元素。", "applyPrompt": "请按照附带的交付件批注完成修改。",
-      "status": { "sending": "发送中", "accepted": "已接收", "unknown": "编辑状态未知", "not_attempted": "未尝试编辑文档", "applied": "变更已应用", "appliedCorrected": "修正后已应用", "not_applied": "变更未应用", "conflict": "文档已发生变化", "ambiguous": "编辑结果待确认" },
+      "status": { "unknown": "编辑状态未知", "not_attempted": "未尝试编辑文档", "applied": "变更已应用", "appliedCorrected": "修正后已应用", "not_applied": "变更未应用", "conflict": "文档已发生变化", "ambiguous": "编辑结果待确认" },
       "statusDetail": { "unknown": "本轮已结束，但当前没有可核验的文档修改回执。", "not_attempted": "本轮在提出文档写入前已结束。", "applied": "已由文档版本回执确认。", "not_applied": "没有创建新的文档版本。", "conflict": "请刷新文档并重新选择目标。", "ambiguous": "请等待系统核对，暂时不要重试此编辑。" }
     },
     "placeholder": "发送消息……",

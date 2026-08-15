@@ -16,6 +16,9 @@ function resource(type: WorkbenchResource['resource']['type'], reasonCode?: stri
     capabilities: {
       preview: reasonCode === undefined,
       download: true,
+      selectionContext: false,
+      manualEdit: reasonCode === undefined,
+      agentEdit: false,
       edit: reasonCode === undefined,
       publish: type === 'document',
       reasonCode,
@@ -56,6 +59,17 @@ afterEach(() => {
 })
 
 describe('WorkbenchResourceCollectionPanel', () => {
+  it('uses manualEdit rather than preview or the legacy edit summary for the edit action', () => {
+    const legacySummaryOnly = resource('attachment')
+    legacySummaryOnly.capabilities.manualEdit = false
+    legacySummaryOnly.capabilities.edit = true
+    const mounted = mount([legacySummaryOnly])
+
+    expect(mounted.element.querySelector('[aria-label="Edit attachment.html"]')).toBeNull()
+    expect(mounted.element.querySelector('[aria-label="Preview attachment.html"]')).not.toBeNull()
+    mounted.app.unmount()
+  })
+
   it('orders lifecycle groups and localizes capability reasons without leaking codes', () => {
     const mounted = mount([
       resource('url', 'future_adapter_missing'),

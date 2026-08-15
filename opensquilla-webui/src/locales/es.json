@@ -164,7 +164,7 @@
       "failedDetail": "Vuelve a cargar el navegador aislado para continuar."
     },
     "artifactAnnotation": {
-      "start": "Anotar vista previa", "stop": "Dejar de anotar", "selectElement": "Selecciona un elemento de la página para anotar", "selectElementShort": "Selecciona elemento", "unavailable": "La anotación de vista previa no está disponible.",
+      "start": "Anotar vista previa", "stop": "Dejar de anotar", "selectElement": "Selecciona un elemento de la página para anotar", "selectElementShort": "Selecciona elemento", "unavailable": "La anotación de vista previa no está disponible.", "desktopEditingOnly": "Selecciona y edita elementos de la página con IA en la aplicación de escritorio.",
       "createFailed": "No se pudo adjuntar el elemento seleccionado.", "elementChanged": "El elemento seleccionado cambió antes de adjuntarse. Vuelva a seleccionarlo en la vista previa actual.", "rearmFailed": "El modo de anotación se detuvo porque no se pudo reiniciar el selector. Vuelva a activarlo para intentarlo de nuevo.", "updateFailed": "No se pudo guardar el borrador de anotación.", "discardFailed": "No se pudo descartar la anotación. Seguirá abierta para volver a intentarlo.", "closeFailed": "No se pudo cerrar el editor de anotaciones. Inténtelo de nuevo.", "replacementCleanupFailed": "Se conservó la anotación nueva, pero no se pudo eliminar el borrador anterior.",
       "overlayFallback": "Continúa en el editor de confianza.",
       "fallbackTitle": "Continuar anotación", "fallbackDetail": "La vista previa se ocultó porque el editor nativo no está disponible. Tu borrador sigue guardado.", "frozenPreview": "Vista previa congelada del elemento seleccionado",
@@ -3275,7 +3275,7 @@
     "stopResponseEsc": "Detener respuesta actual (Esc)",
     "messageToSend": "Mensaje que enviar",
     "promptAnnotations": {
-      "draftLabel": "Instrucciones de artefacto pendientes", "sentLabel": "Instrucciones de artefacto", "element": "elemento",
+      "label": "Anotaciones", "draftLabel": "Instrucciones de artefacto pendientes", "sentLabel": "Instrucciones de artefacto", "element": "elemento",
       "emptyDraft": "Añadir una instrucción", "stale": "Volver a seleccionar el elemento",
       "editingBlocked": "Añade o cancela la anotación que estás editando antes de enviar.",
       "staleBlocked": "Vuelve a seleccionar los elementos de las instrucciones obsoletas.",
@@ -3283,7 +3283,7 @@
       "removeLabel": "Eliminar instrucción del artefacto", "updateFailed": "No se pudo guardar la instrucción del artefacto.",
       "discardFailed": "No se pudo eliminar la instrucción del artefacto.", "focusUnavailable": "No se pudo enfocar este elemento de forma segura. Abre su vista previa e inténtalo de nuevo.",
       "reuseLabel": "Copiar como anotación nueva", "reuseDescription": "Copia la solicitud de cambio; después, vuelve a seleccionar el elemento en la versión actual.", "reuseUnavailable": "No se pudo copiar esta solicitud de cambio como una anotación nueva. Abre la vista previa del artefacto correspondiente y vuelve a seleccionar el elemento en la versión actual.", "applyPrompt": "Aplica las instrucciones de artefacto adjuntas.",
-      "status": { "sending": "Enviando", "accepted": "Aceptada", "unknown": "Estado de edición desconocido", "not_attempted": "No se intentó editar el documento", "applied": "Cambio aplicado", "appliedCorrected": "Corregido y aplicado", "not_applied": "Cambio no aplicado", "conflict": "El documento cambió", "ambiguous": "Resultado de edición pendiente" },
+      "status": { "unknown": "Estado de edición desconocido", "not_attempted": "No se intentó editar el documento", "applied": "Cambio aplicado", "appliedCorrected": "Corregido y aplicado", "not_applied": "Cambio no aplicado", "conflict": "El documento cambió", "ambiguous": "Resultado de edición pendiente" },
       "statusDetail": { "unknown": "No hay un recibo de mutación verificable para este turno finalizado.", "not_attempted": "El turno terminó antes de proponer una escritura en el documento.", "applied": "Confirmado por el recibo de revisión del documento.", "not_applied": "No se creó ninguna revisión del documento.", "conflict": "Actualiza el documento y vuelve a seleccionar el objetivo.", "ambiguous": "Espera a la conciliación; no reintentes aún esta edición." }
     },
     "placeholder": "Envía un mensaje...",

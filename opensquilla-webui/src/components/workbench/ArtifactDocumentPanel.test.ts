@@ -105,7 +105,7 @@ describe('ArtifactDocumentPanel', () => {
     busy.unmount()
   })
 
-  it('offers an explicit publish action for the current document head', async () => {
+  it('keeps publishing out of the V1 document surface', async () => {
     const htmlArtifact: ArtifactPayload = {
       id: 'artifact-html',
       documentId: 'document-html',
@@ -140,19 +140,82 @@ describe('ArtifactDocumentPanel', () => {
     })
     await nextTick()
 
-    const publish = mounted.element.querySelector<HTMLButtonElement>(
-      '[data-artifact-action="publish-head"]',
-    )
-    expect(publish?.textContent).toContain('Publish current version')
-    publish?.click()
-    expect(onWorkbenchEvent).toHaveBeenCalledWith({
+    expect(mounted.element.querySelector('[data-artifact-action="publish-head"]')).toBeNull()
+    expect(mounted.element.textContent).not.toContain('Publish current version')
+    expect(onWorkbenchEvent).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'artifact-document-publish',
-      payload: {
-        documentId: 'document-html',
-        revisionId: 'revision-head',
-      },
-    })
+    }))
     mounted.unmount()
+  })
+
+  it('explains the desktop-only element editing boundary in Web HTML preview', async () => {
+    const htmlArtifact: ArtifactPayload = {
+      id: 'artifact-html',
+      documentId: 'document-html',
+      name: 'page.html',
+      mime: 'text/html',
+      download_url: '/api/v1/artifacts/artifact-html',
+    }
+    const legacy = createLegacyArtifactWorkspace(htmlArtifact, 'session-a')
+    const documentSnapshot: ArtifactDocumentWorkspaceSnapshot = {
+      key: 'fixture-prompt-annotations',
+      loading: false,
+      loaded: true,
+      stale: false,
+      error: null,
+      workspace: {
+        ...legacy,
+        source: 'document-api',
+        document: {
+          ...legacy.document,
+          documentId: 'document-html',
+          capabilities: {
+            ...legacy.document.capabilities,
+            preview: true,
+            selectionContext: false,
+            manualEdit: true,
+            agentEdit: true,
+            source: true,
+            promptAnnotations: false,
+          },
+        },
+      },
+    }
+
+    const web = mountPanel({
+      artifact: htmlArtifact,
+      documentSnapshot,
+      nativeHtml: false,
+      suspended: true,
+    })
+    await nextTick()
+    expect(web.element.querySelector('[data-testid="artifact-document-desktop-editing-hint"]')
+      ?.textContent).toContain('desktop app')
+    web.unmount()
+
+    const desktop = mountPanel({
+      artifact: htmlArtifact,
+      documentSnapshot,
+      nativeHtml: true,
+      suspended: true,
+    })
+    await nextTick()
+    expect(desktop.element.querySelector(
+      '[data-testid="artifact-document-desktop-editing-hint"]',
+    )).toBeNull()
+    desktop.unmount()
+
+    const downloadOnly = mountPanel({
+      artifact: officeArtifact,
+      documentSnapshot: snapshot(),
+      nativeHtml: false,
+      suspended: true,
+    })
+    await nextTick()
+    expect(downloadOnly.element.querySelector(
+      '[data-testid="artifact-document-desktop-editing-hint"]',
+    )).toBeNull()
+    downloadOnly.unmount()
   })
 
   it('does not mount the source editor while the document is only being previewed', async () => {

@@ -1532,7 +1532,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         resource
         && resource.resource.type === resourceRef.type
         && workbenchResourceRefId(resource.resource) === workbenchResourceRefId(resourceRef)
-        && resource.capabilities.edit
+        && resource.capabilities.manualEdit
         && resource.sha256,
       )
       this.editableCopyResource = matches ? resource : null
@@ -1617,7 +1617,9 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       || workspace.source !== 'document-api'
       || workspace.document.kind !== 'html'
       || !workspace.document.capabilities.source
-      || !workspace.document.capabilities.edit
+      || !workspace.document.capabilities.manualEdit
+      || !workspace.document.capabilities.agentEdit
+      || !workspace.document.capabilities.selectionContext
       || workspace.document.capabilities.promptAnnotations !== true
     ) return null
     return { artifact, document: workspace.document, sessionKey }

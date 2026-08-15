@@ -49,6 +49,11 @@ export function workbenchResourceRefId(resource: WorkbenchResourceRef): string {
 export interface WorkbenchResourceCapabilities {
   preview: boolean
   download: boolean
+  selectionContext: boolean
+  /** Legal user-facing edit entry; immutable sources use explicit copy-import. */
+  manualEdit: boolean
+  agentEdit: boolean
+  /** Compatibility summary for clients predating the independent edit axes. */
   edit: boolean
   publish: boolean
   previewReasonCode?: string | null

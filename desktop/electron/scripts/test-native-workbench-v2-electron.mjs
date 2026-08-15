@@ -611,6 +611,23 @@ try {
         throw new Error(`Timed out waiting for ${label}.`)
       }
 
+      async function closeAnnotationOverlayAndDrain(request, label) {
+        const record = manager.surfaces.get(request.surfaceId)
+        const candidate = record?.annotationCandidate ?? null
+        const result = manager.closeArtifactAnnotationOverlay(request)
+        if (record && candidate) {
+          // Closing stops the interval synchronously, but a geometry CDP call
+          // that already started may still finish through its stale-selection
+          // cleanup. Do not let that cleanup cancel the next picker rearm.
+          await waitFor(async () => {
+            if (candidate.geometryRefreshPending) return false
+            await record.cdpQueue
+            return !candidate.geometryRefreshPending && record.annotationCandidate === null
+          }, `${label} geometry cleanup`)
+        }
+        return result
+      }
+
       // WebContents.isFocused() is only meaningful while the Electron app owns
       // native foreground focus. Make that lifecycle precondition explicit so
       // the trusted child-view contract is not coupled to whichever host app
@@ -1063,26 +1080,29 @@ try {
           const bounds = annotationOverlay.view.getBounds()
           return bounds.y !== previousOverlayBounds.y ? bounds : null
         }, `trusted annotation overlay geometry refresh ${index + 1}`)
-        await waitFor(
-          async () => await annotationOverlay.view.webContents.executeJavaScript(
-            "document.activeElement?.id === 'annotation-body'",
-          ),
-          `trusted annotation textarea focus after geometry refresh ${index + 1}`,
+        const focusState = await waitFor(
+          async () => {
+            const editorFocused = await annotationOverlay.view.webContents.executeJavaScript(
+              "document.activeElement?.id === 'annotation-body'",
+            )
+            const ownerFocused = owner.isFocused()
+            const nativeFocused = annotationOverlay.view.webContents.isFocused()
+            return editorFocused && (!ownerFocused || nativeFocused)
+              ? { editorFocused, ownerFocused, nativeFocused }
+              : null
+          },
+          `trusted annotation native focus after geometry refresh ${index + 1}`,
         )
         annotationOverlayFocusCycles.push({
           bounds: movedBounds,
-          editorFocused: true,
-          nativeFocused: annotationOverlay.view.webContents.isFocused(),
+          ...focusState,
         })
         previousOverlayBounds = movedBounds
       }
       const annotationOverlayMovedBounds = annotationOverlayFocusCycles[0].bounds
       const annotationOverlayFocusedAfterGeometry =
-        annotationOverlayFocusCycles.every(cycle => cycle.editorFocused)
-        && (
-          !annotationNativeOwnerFocusAvailable
-          || annotationOverlayFocusCycles.every(cycle => cycle.nativeFocused)
-        )
+        annotationOverlayFocusCycles.every(cycle =>
+          cycle.editorFocused && (!cycle.ownerFocused || cycle.nativeFocused))
       await annotationOverlay.view.webContents.executeJavaScript(
         "document.getElementById('annotation-body').select()",
       )
@@ -1182,11 +1202,11 @@ try {
         const textarea = document.getElementById('annotation-body')
         textarea.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
       })()`)
-      const annotationOverlayAcknowledgement = manager.closeArtifactAnnotationOverlay({
+      const annotationOverlayAcknowledgement = await closeAnnotationOverlayAndDrain({
         version: 3,
         surfaceId: 'artifact:v3-bridge',
         annotationId: 'annotation_electron_fixture',
-      })
+      }, 'trusted annotation acknowledgement')
       const annotationOverlayClosedAfterAcknowledgement =
         !annotationOverlay.view.getVisible()
         && annotationOverlay.binding === null
@@ -1259,11 +1279,11 @@ try {
           && event.detail?.body === 'Rearmed input'),
         'reused trusted overlay IME state reset',
       )
-      const annotationRearmOverlayClose = manager.closeArtifactAnnotationOverlay({
+      const annotationRearmOverlayClose = await closeAnnotationOverlayAndDrain({
         version: 3,
         surfaceId: 'artifact:v3-bridge',
         annotationId: 'annotation_rearmed_fixture',
-      })
+      }, 'rearmed annotation acknowledgement')
       const annotationRearmFocusCycles = []
       for (let cycle = 0; cycle < 3; cycle += 1) {
         const cycleEventsBefore = events.length
@@ -1319,17 +1339,28 @@ try {
           },
           `annotation rearm IME input cycle ${cycle + 1}`,
         )
-        const cycleNativeFocused = annotationOverlay.view.webContents.isFocused()
-        const cycleClose = manager.closeArtifactAnnotationOverlay({
+        const cycleFocusState = await waitFor(
+          async () => {
+            const editorFocused = await annotationOverlay.view.webContents.executeJavaScript(
+              "document.activeElement?.id === 'annotation-body'",
+            )
+            const ownerFocused = owner.isFocused()
+            const nativeFocused = annotationOverlay.view.webContents.isFocused()
+            return editorFocused && (!ownerFocused || nativeFocused)
+              ? { editorFocused, ownerFocused, nativeFocused }
+              : null
+          },
+          `annotation rearm native focus cycle ${cycle + 1}`,
+        )
+        const cycleClose = await closeAnnotationOverlayAndDrain({
           version: 3,
           surfaceId: 'artifact:v3-bridge',
           annotationId: cycleAnnotationId,
-        })
+        }, `annotation rearm close cycle ${cycle + 1}`)
         annotationRearmFocusCycles.push({
           picker: cyclePicker.ok,
           overlay: cycleOverlayResult.ok,
-          editorFocused: true,
-          nativeFocused: cycleNativeFocused,
+          ...cycleFocusState,
           typedValue,
           closed: cycleClose.ok,
         })
@@ -2490,14 +2521,14 @@ try {
     targetText: '<div>',
     initialBody: 'Initial annotation',
     submitDisabled: false,
-    cardRadius: '14px',
-    textareaHeight: '82px',
-    submitHeight: '36px',
+    cardRadius: '12px',
+    textareaHeight: '73px',
+    submitHeight: '32px',
     tabOrder: ['annotation-body', 'annotation-cancel', 'annotation-submit'],
   })
   assert.equal(result.annotationOverlayDevToolsBlocked, true)
-  assert.ok(result.annotationOverlayBounds.width <= 320)
-  assert.ok(result.annotationOverlayBounds.height <= 184)
+  assert.ok(result.annotationOverlayBounds.width <= 304)
+  assert.ok(result.annotationOverlayBounds.height <= 160)
   assert.notEqual(
     result.annotationOverlayMovedBounds.y,
     result.annotationOverlayBounds.y,
@@ -2552,7 +2583,7 @@ try {
       && cycle.editorFocused
       && cycle.closed
       && cycle.typedValue.includes('中文输入')
-      && (!result.annotationNativeOwnerFocusAvailable || cycle.nativeFocused)),
+      && (!cycle.ownerFocused || cycle.nativeFocused)),
     true,
     'trusted annotation editor must survive repeated close/rearm/IME cycles',
   )

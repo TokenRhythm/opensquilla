@@ -24,6 +24,9 @@ function resource(
     capabilities: {
       preview: true,
       download: true,
+      selectionContext: false,
+      manualEdit: type !== 'document',
+      agentEdit: false,
       edit: type !== 'document',
       publish: type === 'document',
     },

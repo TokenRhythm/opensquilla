@@ -35,7 +35,7 @@
             </button>
             <span class="resource-collection__actions">
               <button
-                v-if="resource.capabilities.edit && resource.resource.type !== 'document'"
+                v-if="resource.capabilities.manualEdit && resource.resource.type !== 'document'"
                 type="button"
                 :disabled="isBusy(resource)"
                 :title="editLabel(resource)"

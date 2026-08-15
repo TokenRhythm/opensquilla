@@ -13,7 +13,7 @@ afterEach(() => {
 })
 
 describe('ChatMessageList history anchors', () => {
-  it('moves from unknown to applied only after an authoritative mutation outcome arrives', async () => {
+  it('adds an applied result only after an authoritative mutation outcome arrives', async () => {
     const userMessage: ChatRenderedMessage = {
       id: 'rendered-user-annotation',
       messageId: 'message-user-annotation',
@@ -68,8 +68,7 @@ describe('ChatMessageList history anchors', () => {
     app.mount(host)
     apps.push(app)
 
-    expect(host.querySelector('[data-testid="prompt-annotation-turn-status"]')
-      ?.getAttribute('data-status')).toBe('unknown')
+    expect(host.querySelector('[data-testid="prompt-annotation-turn-status"]')).toBeNull()
 
     messages.value = [{
       ...userMessage,

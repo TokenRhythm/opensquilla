@@ -18,13 +18,17 @@ function run(command, args, options = {}) {
   }
 }
 
-// The release gate deliberately composes two real boundaries instead of
-// coupling UI timing to Gateway persistence:
+// The release gate retains the focused boundary fixtures and adds one complete
+// user journey through the real Vue surface, native Electron selection, owned
+// Gateway, agent loop, and durable document commit:
 //   1. one owned-Gateway WebSocket lifecycle proves the durable resource,
 //      EditSession, exact4 agent mutation, and immutable publication contract;
 //   2. one real Electron process proves the native preview/selection/editor
 //      surface, including keyboard and IME input under an explicit foreground
-//      precondition.
+//      precondition;
+//   3. one real Vue-to-Electron-to-Gateway fixture proves those boundaries are
+//      wired together, with synthetic provider replies and a durable +1/+1
+//      commit followed by an answer-only 0-write turn.
 // Both fixtures are loopback-only and use synthetic bytes and model replies.
 const uv = process.platform === 'win32' ? 'uv.exe' : 'uv'
 run(
@@ -49,4 +53,16 @@ run(
   },
 )
 
-console.log('offline document Workbench owned-Gateway + real Electron gate passed')
+run(
+  process.execPath,
+  [join(scriptDir, 'test-v1-html-agent-edit-e2e.mjs')],
+  {
+    cwd: electronRoot,
+    env: {
+      ...process.env,
+      OPENSQUILLA_REQUIRE_ELECTRON_FOREGROUND: '1',
+    },
+  },
+)
+
+console.log('offline document Workbench full Electron user-journey gate passed')

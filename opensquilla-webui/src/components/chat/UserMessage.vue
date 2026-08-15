@@ -32,35 +32,34 @@
         class="msg-prompt-annotations"
         :aria-label="t('chat.promptAnnotations.sentLabel')"
       >
+        <div class="msg-prompt-annotations__label" data-testid="sent-prompt-annotations-label">
+          <Icon name="chat" :size="13" aria-hidden="true" />
+          <span>{{ t('chat.promptAnnotations.label') }} · {{ message.promptAnnotations.length }}</span>
+        </div>
         <article
           v-for="annotation in message.promptAnnotations"
           :key="annotation.annotationId"
           class="msg-prompt-annotation"
           data-testid="sent-prompt-annotation"
         >
-          <span class="msg-prompt-annotation__icon" aria-hidden="true">
-            <Icon name="fileCode" :size="14" />
-          </span>
+          <span class="msg-prompt-annotation__rail" aria-hidden="true" />
           <span class="msg-prompt-annotation__body">
             <span class="msg-prompt-annotation__meta">
               {{ annotation.documentName }} ·
               {{ annotation.tagName ? `<${annotation.tagName}>` : t('chat.promptAnnotations.element') }}
             </span>
-            <span>{{ annotation.body }}</span>
-            <code v-if="annotation.sourceExcerpt || annotation.quote">
-              {{ annotation.sourceExcerpt || annotation.quote }}
-            </code>
-            <button
-              v-if="canReusePromptAnnotations && !shareMode"
-              type="button"
-              class="msg-prompt-annotation__reuse"
-              :title="t('chat.promptAnnotations.reuseDescription')"
-              :aria-label="t('chat.promptAnnotations.reuseDescription')"
-              @click.stop="emit('reusePromptAnnotation', annotation)"
-            >
-              {{ t('chat.promptAnnotations.reuseLabel') }}
-            </button>
+            <span class="msg-prompt-annotation__text">{{ annotation.body }}</span>
           </span>
+          <button
+            v-if="canReusePromptAnnotations && !shareMode"
+            type="button"
+            class="msg-prompt-annotation__reuse"
+            :title="t('chat.promptAnnotations.reuseDescription')"
+            :aria-label="t('chat.promptAnnotations.reuseDescription')"
+            @click.stop="emit('reusePromptAnnotation', annotation)"
+          >
+            <Icon name="copy" :size="14" />
+          </button>
         </article>
         <span
           v-if="promptAnnotationStatus"
@@ -69,6 +68,7 @@
           :data-status="promptAnnotationStatus"
           data-testid="prompt-annotation-turn-status"
           :role="promptAnnotationStatusRole"
+          aria-live="polite"
         >
           <span class="msg-prompt-annotations__status-dot" aria-hidden="true" />
           <span class="msg-prompt-annotations__status-copy">
@@ -173,7 +173,7 @@
         {{ steerStatusLabel }}
       </span>
       <TurnOutcomeStatus
-        v-if="showTurnOutcome && message.turnOutcome && !message.promptAnnotations?.length"
+        v-if="showTurnOutcomeStatus && message.turnOutcome"
         :outcome="message.turnOutcome"
       />
     </div>
@@ -223,6 +223,10 @@ import type {
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { isImageDisplayAttachment } from '@/utils/chat/attachments'
+import {
+  isProcessRestartOutcome,
+  turnOutcomePresentation,
+} from '@/utils/chat/turnOutcome'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
 import {
   type WorkbenchResourceAction,
@@ -269,19 +273,24 @@ const timeAbs = computed(() => absoluteTime(props.message.ts))
 const timeRel = computed(() => relativeTime(props.message.ts, now.value, t))
 const timeFull = computed(() => fullTime(props.message.ts))
 
-type PromptAnnotationTurnStatus =
-  | 'sending'
-  | 'accepted'
-  | 'unknown'
-  | DocumentMutationStatus
+type PromptAnnotationTurnStatus = Exclude<DocumentMutationStatus, 'not_attempted'>
 
 const documentMutationOutcome = computed(() => props.message.turnOutcome?.documentMutationOutcome)
+const showTurnOutcomeStatus = computed(() => Boolean(
+  props.showTurnOutcome
+  && props.message.turnOutcome
+  && (
+    !props.message.promptAnnotations?.length
+    || isProcessRestartOutcome(props.message.turnOutcome)
+    || ['failed', 'timeout'].includes(turnOutcomePresentation(props.message.turnOutcome))
+    || props.message.turnOutcome.errorClass?.trim()
+  ),
+))
 
 const promptAnnotationStatus = computed<PromptAnnotationTurnStatus | null>(() => {
   if (!props.message.promptAnnotations?.length) return null
-  if (documentMutationOutcome.value) return documentMutationOutcome.value.status
-  if (props.message.turnOutcome) return 'unknown'
-  return props.message.messageId || props.message.turnId ? 'accepted' : 'sending'
+  const status = documentMutationOutcome.value?.status
+  return status && status !== 'not_attempted' ? status : null
 })
 
 const promptAnnotationStatusLabel = computed(() => {
@@ -294,14 +303,11 @@ const promptAnnotationStatusLabel = computed(() => {
   return t(`chat.promptAnnotations.status.${corrected ? 'appliedCorrected' : status}`)
 })
 const promptAnnotationStatusDetail = computed(() => {
-  if (promptAnnotationStatus.value === 'unknown') {
-    return t('chat.promptAnnotations.statusDetail.unknown')
-  }
   const status = documentMutationOutcome.value?.status
   return status ? t(`chat.promptAnnotations.statusDetail.${status}`) : ''
 })
 const promptAnnotationStatusRole = computed<'alert' | 'status'>(() => (
-  ['not_applied', 'conflict', 'ambiguous', 'unknown'].includes(
+  ['not_applied', 'conflict', 'ambiguous'].includes(
     promptAnnotationStatus.value || '',
   )
     ? 'alert'
@@ -414,7 +420,7 @@ function attachmentActionAvailable(
   const resource = workbenchAttachmentResource(attachment)
   return action === 'preview'
     ? resource?.capabilities.preview === true
-    : resource?.capabilities.edit === true
+    : resource?.capabilities.manualEdit === true
 }
 
 function attachmentActionReason(
@@ -594,37 +600,53 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
 
 .msg-prompt-annotations {
   display: grid;
-  justify-items: end;
+  justify-items: stretch;
+  width: min(88%, 32rem);
+}
+
+.msg-prompt-annotations__label {
+  display: inline-flex;
+  align-items: center;
+  justify-self: start;
   gap: 0.375rem;
-  width: min(82%, 34rem);
+  min-height: 1.5rem;
+  margin-bottom: 0.25rem;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  line-height: 1.3;
 }
 
 .msg-prompt-annotation {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 0.5rem;
+  grid-template-columns: 3px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.625rem;
   width: 100%;
   box-sizing: border-box;
-  padding: 0.625rem 0.75rem;
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
-  border-radius: var(--radius-card);
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
+  min-height: 3rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border);
   color: var(--text);
   text-align: left;
 }
 
-.msg-prompt-annotation__icon {
-  display: inline-flex;
-  color: var(--accent);
-  padding-top: 0.125rem;
+.msg-prompt-annotations__label + .msg-prompt-annotation {
+  border-top: 1px solid var(--border);
+}
+
+.msg-prompt-annotation__rail {
+  width: 3px;
+  align-self: stretch;
+  border-radius: var(--radius-full);
+  background: var(--accent);
 }
 
 .msg-prompt-annotation__body {
   display: grid;
   min-width: 0;
-  gap: 0.25rem;
+  gap: 0.125rem;
   font-size: var(--fs-sm);
-  line-height: 1.45;
+  line-height: 1.4;
 }
 
 .msg-prompt-annotation__meta {
@@ -635,30 +657,31 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
   white-space: nowrap;
 }
 
-.msg-prompt-annotation code {
+.msg-prompt-annotation__text {
   overflow: hidden;
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .msg-prompt-annotation__reuse {
-  justify-self: start;
-  min-height: 1.75rem;
-  padding: 0.25rem 0.5rem;
-  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 0;
   border-radius: var(--radius-control);
   background: transparent;
-  color: var(--accent);
-  font: inherit;
-  font-size: var(--fs-xs);
+  color: var(--text-muted);
   cursor: pointer;
 }
 
 .msg-prompt-annotation__reuse:hover,
 .msg-prompt-annotation__reuse:focus-visible {
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  outline: 0;
+  background: var(--bg-hover);
+  color: var(--accent);
 }
 
 .msg-prompt-annotations__status {
@@ -666,12 +689,10 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
   box-sizing: border-box;
   align-items: center;
   gap: 0.375rem;
-  width: 100%;
-  min-height: 2.25rem;
-  padding: 0.375rem 0.5rem;
-  border: 1px solid color-mix(in srgb, currentcolor 28%, var(--border));
-  border-radius: var(--radius-control);
-  background: color-mix(in srgb, currentcolor 6%, var(--bg-surface));
+  justify-self: start;
+  width: auto;
+  min-height: 1.25rem;
+  padding: 0.125rem 0;
   color: var(--text-dim);
   font-size: var(--fs-xs);
   line-height: 1.3;
@@ -679,9 +700,11 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
 }
 
 .msg-prompt-annotations__status-copy {
-  display: grid;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
   min-width: 0;
-  gap: 0.125rem;
+  gap: 0.375rem;
 }
 
 .msg-prompt-annotations__status-copy strong {
@@ -702,10 +725,6 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
   opacity: 0.72;
 }
 
-.msg-prompt-annotations__status--accepted {
-  color: var(--accent);
-}
-
 .msg-prompt-annotations__status--applied {
   color: var(--ok);
 }
@@ -714,7 +733,6 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
   color: var(--danger);
 }
 
-.msg-prompt-annotations__status--unknown,
 .msg-prompt-annotations__status--conflict,
 .msg-prompt-annotations__status--ambiguous {
   color: var(--warn);

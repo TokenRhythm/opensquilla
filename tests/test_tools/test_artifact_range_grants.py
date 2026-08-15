@@ -16,7 +16,10 @@ from opensquilla.tools.builtin.artifact_range_grants import (
     ArtifactRangeBinding,
     ArtifactRangeGrantError,
     ArtifactRangeGrantRegistry,
+    DocumentGrantBinding,
+    DocumentMutationGrantRegistry,
     clear_context_registry,
+    document_grant_registry_for_context,
     registry_for_context,
 )
 from opensquilla.tools.types import ToolContext
@@ -50,7 +53,13 @@ class _RangeLifecycleProvider:
         return []
 
 
-def _binding(*, task_id: str = "turn-1", sha256: str = "a" * 64) -> ArtifactRangeBinding:
+def _binding(
+    *,
+    task_id: str = "turn-1",
+    sha256: str = "a" * 64,
+    adapter_id: str = "html",
+    adapter_version: int = 1,
+) -> ArtifactRangeBinding:
     return ArtifactRangeBinding(
         task_id=task_id,
         session_key="agent:main:webchat:test",
@@ -59,6 +68,28 @@ def _binding(*, task_id: str = "turn-1", sha256: str = "a" * 64) -> ArtifactRang
         document_id="document-test",
         revision_id="revision-test",
         source_sha256=sha256,
+        adapter_id=adapter_id,
+        adapter_version=adapter_version,
+    )
+
+
+def _document_binding(
+    *,
+    task_id: str = "turn-1",
+    sha256: str = "a" * 64,
+    adapter_id: str = "html",
+    adapter_version: int = 1,
+) -> DocumentGrantBinding:
+    return DocumentGrantBinding(
+        task_id=task_id,
+        session_key="agent:main:webchat:test",
+        session_id="session-test",
+        session_epoch=4,
+        document_id="document-test",
+        revision_id="revision-test",
+        source_sha256=sha256,
+        adapter_id=adapter_id,
+        adapter_version=adapter_version,
     )
 
 
@@ -109,6 +140,13 @@ def test_registry_rejects_cross_turn_stale_duplicate_and_overlapping_grants() ->
             tokens=[token],
             reservation_id="wrong-turn",
         )
+    with pytest.raises(ArtifactRangeGrantError, match="ARTIFACT_RANGE_TOKEN_INVALID"):
+        registry.reserve_ranges(
+            binding=_binding(adapter_id="docx", adapter_version=1),
+            source=source,
+            tokens=[token],
+            reservation_id="wrong-adapter",
+        )
     with pytest.raises(ArtifactRangeGrantError, match="ARTIFACT_RANGE_STALE"):
         registry.reserve_ranges(
             binding=binding,
@@ -147,6 +185,101 @@ def test_registry_rejects_cross_turn_stale_duplicate_and_overlapping_grants() ->
             tokens=[token],
             reservation_id="reuse",
         )
+
+
+def test_document_grant_binds_adapter_operation_and_target_fingerprint() -> None:
+    registry = DocumentMutationGrantRegistry()
+    fingerprint = "f" * 64
+    locator = {"adapter-private": ("part", 7)}
+    token = registry.mint_grant(
+        binding=_document_binding(adapter_id="html", adapter_version=1),
+        annotation_orders=(0,),
+        operation="replace_text",
+        target_fingerprint=fingerprint,
+        adapter_locator=locator,
+    )
+
+    resolved = registry.reserve_grants(
+        binding=_document_binding(adapter_id="html", adapter_version=1),
+        tokens=[token],
+        reservation_id="document-mutation",
+    )
+
+    assert len(resolved) == 1
+    assert resolved[0].adapter_id == "html"
+    assert resolved[0].adapter_version == 1
+    assert resolved[0].operation == "replace_text"
+    assert resolved[0].target_fingerprint == fingerprint
+    assert resolved[0].annotation_orders == (0,)
+    assert resolved[0].adapter_locator is locator
+    assert not hasattr(resolved[0], "start")
+    assert not hasattr(resolved[0], "end")
+    assert not hasattr(resolved[0], "kind")
+
+
+def test_document_grant_rejects_cross_scope_adapter_revision_and_reuse() -> None:
+    registry = DocumentMutationGrantRegistry()
+    binding = _document_binding()
+    token = registry.mint_grant(
+        binding=binding,
+        operation="replace_text",
+        target_fingerprint="e" * 64,
+        annotation_orders=(1,),
+        adapter_locator=("opaque", 1),
+    )
+
+    for wrong_binding in (
+        _document_binding(task_id="turn-2"),
+        _document_binding(sha256="b" * 64),
+        _document_binding(adapter_id="docx"),
+        _document_binding(adapter_version=2),
+    ):
+        with pytest.raises(ArtifactRangeGrantError, match="ARTIFACT_RANGE_TOKEN_INVALID"):
+            registry.reserve_grants(
+                binding=wrong_binding,
+                tokens=[token],
+                reservation_id="wrong-scope",
+            )
+
+    resolved = registry.reserve_grants(
+        binding=binding,
+        tokens=[token],
+        reservation_id="valid",
+    )
+    assert resolved[0].annotation_orders == (1,)
+    registry.consume_reservation("valid")
+    with pytest.raises(ArtifactRangeGrantError, match="ARTIFACT_RANGE_TOKEN_INVALID"):
+        registry.reserve_grants(
+            binding=binding,
+            tokens=[token],
+            reservation_id="reused",
+        )
+
+
+def test_document_grant_releases_failed_proposal_for_relocation_or_retry() -> None:
+    registry = DocumentMutationGrantRegistry()
+    binding = _document_binding()
+    token = registry.mint_grant(
+        binding=binding,
+        operation="set_style",
+        target_fingerprint="d" * 64,
+        annotation_orders=(0,),
+        adapter_locator=object(),
+    )
+    registry.reserve_grants(
+        binding=binding,
+        tokens=[token],
+        reservation_id="proposal-1",
+    )
+    registry.release_reservation("proposal-1")
+
+    retried = registry.reserve_grants(
+        binding=binding,
+        tokens=[token],
+        reservation_id="proposal-2",
+    )
+
+    assert retried[0].operation == "set_style"
 
 
 def test_registry_ttl_cursor_single_use_and_shared_capacity() -> None:
@@ -217,6 +350,7 @@ def test_registry_reuses_budget_for_an_identical_query_without_broadening_author
 async def test_agent_turn_finally_clears_range_registry_after_success() -> None:
     ctx = ToolContext(is_owner=True, session_key="agent:main:webchat:range-cleanup")
     registry_for_context(ctx)
+    document_grant_registry_for_context(ctx)
     provider = _RangeLifecycleProvider()
     agent = Agent(
         provider=provider,
@@ -227,12 +361,14 @@ async def test_agent_turn_finally_clears_range_registry_after_success() -> None:
     _events = [event async for event in agent.run_turn("finish")]
 
     assert getattr(ctx, "_artifact_range_grant_registry", None) is None
+    assert getattr(ctx, "_document_mutation_grant_registry", None) is None
 
 
 @pytest.mark.asyncio
 async def test_agent_turn_finally_clears_range_registry_after_cancellation() -> None:
     ctx = ToolContext(is_owner=True, session_key="agent:main:webchat:range-cancel")
     registry_for_context(ctx)
+    document_grant_registry_for_context(ctx)
     provider = _RangeLifecycleProvider(block=True)
     agent = Agent(
         provider=provider,
@@ -250,3 +386,4 @@ async def test_agent_turn_finally_clears_range_registry_after_cancellation() -> 
         await task
 
     assert getattr(ctx, "_artifact_range_grant_registry", None) is None
+    assert getattr(ctx, "_document_mutation_grant_registry", None) is None

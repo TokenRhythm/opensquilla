@@ -11,7 +11,15 @@ const attachment: WorkbenchResource = {
   size: 64,
   sha256: 'a'.repeat(64),
   downloadUrl: '/api/v1/attachments/fixture',
-  capabilities: { preview: true, download: true, edit: true, publish: false },
+  capabilities: {
+    preview: true,
+    download: true,
+    selectionContext: false,
+    manualEdit: true,
+    agentEdit: false,
+    edit: true,
+    publish: false,
+  },
   relations: {},
 }
 

@@ -383,7 +383,7 @@ def test_restricted_document_toolset_is_exactly_four_tools() -> None:
     assert writer.spec.terminal_response_field is None
     assert set(writer.spec.parameters["properties"]) == {"mutations"}
     mutation_schema = writer.spec.parameters["properties"]["mutations"]["items"]
-    assert set(mutation_schema["properties"]) == {"grant_token", "value"}
+    assert set(mutation_schema["properties"]) == {"grant_token", "input"}
 
 
 @pytest.mark.parametrize(
@@ -430,22 +430,30 @@ async def test_document_removes_void_img_with_one_atomic_change_set(tmp_path: Pa
             item for item in locations if item["operation"] == "set_style"
         )
         assert remove_location["grantToken"].startswith("hrg_")
-        assert remove_location["expectsValue"] is False
-        assert remove_location["valueKind"] is None
+        assert remove_location["expectsInput"] is False
+        assert remove_location["inputKind"] is None
+        assert remove_location["inputSchema"] is None
         assert remove_location["applyTemplate"] == {
             "grant_token": remove_location["grantToken"]
         }
-        assert style_location["valueKind"] == "css_declarations"
-        assert style_location["valueConstraints"] == {
-            "format": "css_declaration_list",
-            "example": "color: #222; background-color: #fff;",
-            "forbidSelectors": True,
-            "forbidRuleBraces": True,
-            "forbidStyleWrapper": True,
+        assert style_location["inputKind"] == "css_declarations"
+        assert style_location["inputSchema"] == {
+            "type": "string",
+            "minLength": 1,
+            "format": "css-declaration-list",
+            "description": (
+                "A CSS declaration list without selectors, rule braces, or a style wrapper."
+            ),
+            "examples": ["color: #222; background-color: #fff;"],
+        }
+        assert style_location["applyTemplate"] == {
+            "grant_token": style_location["grantToken"],
+            "input": "",
         }
         projection = json.dumps(payload, sort_keys=True)
         assert "start_offset" not in projection
         assert "end_offset" not in projection
+        assert "target_fingerprint" not in projection
         assert created.document.document_id not in projection
         assert created.revision.revision_id not in projection
         assert anchor.anchor_id not in projection
@@ -511,7 +519,7 @@ async def test_document_removes_void_img_with_one_atomic_change_set(tmp_path: Pa
                 "mutations": [
                     {
                         "grant_token": remove_location["grantToken"],
-                        "value": "different proposal",
+                        "input": "different proposal",
                     }
                 ]
             },
@@ -536,7 +544,7 @@ async def test_document_removes_void_img_with_one_atomic_change_set(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_document_remove_grant_rejects_even_empty_value_before_commit(
+async def test_document_remove_grant_rejects_even_empty_input_before_commit(
     tmp_path: Path,
 ) -> None:
     service, _store, _source, _ref, created, _anchor, ctx = await _sent_img_context(
@@ -558,7 +566,7 @@ async def test_document_remove_grant_rejects_even_empty_value_before_commit(
                 "mutations": [
                     {
                         "grant_token": removal["grantToken"],
-                        "value": "",
+                        "input": "",
                     }
                 ],
             },
@@ -566,8 +574,8 @@ async def test_document_remove_grant_rejects_even_empty_value_before_commit(
         )
 
         assert result.is_error is True
-        assert "DOCUMENT_MUTATION_VALUE_UNEXPECTED" in result.content
-        assert "omit the value field entirely" in result.content
+        assert "DOCUMENT_MUTATION_INPUT_UNEXPECTED" in result.content
+        assert "omit the input field entirely" in result.content
         assert result.effect_outcome is not None
         assert result.effect_outcome.effect_state == "none"
         assert result.effect_outcome.retry_policy == "same_turn"
@@ -665,7 +673,7 @@ async def test_document_replaces_heading_and_removes_image_atomically(
                 "mutations": [
                     {
                         "grant_token": heading_location["grantToken"],
-                        "value": "Translated heading",
+                        "input": "Translated heading",
                     },
                     {
                         "grant_token": image_location["grantToken"],
@@ -692,6 +700,55 @@ async def test_document_replaces_heading_and_removes_image_atomically(
         change_sets = await service.list_change_sets(created.document.document_id)
         assert len(change_sets) == 1
         assert change_sets[0].status is ChangeSetStatus.APPLIED
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_document_apply_may_mutate_one_of_multiple_selections(
+    tmp_path: Path,
+) -> None:
+    service, store, source, _ref, created, ctx = await _sent_heading_and_img_context(tmp_path)
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        inspected = await _call(handler, "document_inspect", {})
+        annotations = json.loads(inspected.content)["annotations"]
+        heading_location = next(
+            item
+            for item in annotations[0]["initialLocations"]
+            if item["operation"] == "replace_text"
+        )
+
+        controller = ctx.artifact_mutation_attempt_controller
+        assert controller is not None
+        await controller.observe_intent("call-partial-selection")
+        applied = await _call(
+            handler,
+            "document_apply",
+            {
+                "mutations": [
+                    {
+                        "grant_token": heading_location["grantToken"],
+                        "input": "Only the heading changed",
+                    }
+                ]
+            },
+            tool_use_id="call-partial-selection",
+        )
+
+        assert applied.is_error is False, applied.content
+        document = await service.get_document(created.document.document_id)
+        revision = await service.get_revision(document.head_revision_id)
+        _new_ref, path = store.resolve_for_download(
+            revision.artifact_id,
+            session_id=SESSION_ID,
+        )
+        candidate = path.read_bytes()
+        assert b"Only the heading changed" in candidate
+        assert b'<img id="hero" src="photo.png">' in candidate
+        assert candidate != source
+        assert len(await service.list_revisions(created.document.document_id)) == 2
+        assert len(await service.list_change_sets(created.document.document_id)) == 1
     finally:
         await service.close()
 

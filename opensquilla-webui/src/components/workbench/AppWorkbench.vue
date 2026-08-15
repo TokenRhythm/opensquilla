@@ -417,7 +417,7 @@ for (const definition of createArtifactWorkbenchDefinitions({
       !resource
       || (resource.resource.type !== 'attachment'
         && resource.resource.type !== 'deliverable')
-      || !resource.capabilities.edit
+      || !resource.capabilities.manualEdit
       || !resource.sha256
     ) return null
     return resource
@@ -527,8 +527,11 @@ async function importWorkbenchResourceForSession(
     capabilities: {
       preview: imported.document.capabilities.preview,
       download: imported.document.capabilities.download,
+      selectionContext: imported.document.capabilities.selectionContext,
+      manualEdit: imported.document.capabilities.manualEdit,
+      agentEdit: imported.document.capabilities.agentEdit,
       edit: imported.document.capabilities.edit,
-      publish: true,
+      publish: imported.document.capabilities.publish,
       reasonCode: imported.document.capabilities.reason,
     },
     relations: {

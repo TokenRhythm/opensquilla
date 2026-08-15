@@ -117,6 +117,10 @@ const documentModel: ArtifactDocument = {
   capabilities: {
     download: true,
     preview: true,
+    selectionContext: true,
+    manualEdit: true,
+    agentEdit: true,
+    publish: true,
     edit: true,
     revisions: true,
     changeSets: true,

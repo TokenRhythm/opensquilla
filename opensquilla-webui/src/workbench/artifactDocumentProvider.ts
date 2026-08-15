@@ -236,6 +236,10 @@ function unavailableEditor(reason: string | null = 'not-supported') {
   return {
     enabled: false,
     preview: false,
+    selectionContext: false,
+    manualEdit: false,
+    agentEdit: false,
+    publish: false,
     edit: false,
     comments: false,
     source: false,
@@ -268,6 +272,10 @@ function editorCapability(
       ? {
           enabled: true,
           preview: true,
+          selectionContext: true,
+          manualEdit: true,
+          agentEdit: true,
+          publish: true,
           edit: true,
           comments: true,
           source: false,
@@ -278,26 +286,37 @@ function editorCapability(
   const raw = objectValue(value)
   if (!raw) return unavailableEditor(fallbackReason)
   const explicitlyEnabled = valueAt(raw, 'enabled', 'available') === true
-  const preview = explicitlyEnabled
-    ? valueAt(raw, 'preview', 'canPreview') !== false
-    : valueAt(raw, 'preview', 'canPreview') === true
-  const explicitEdit = valueAt(
+  const previewValue = valueAt(raw, 'preview', 'canPreview')
+  const preview = previewValue === true || (explicitlyEnabled && previewValue !== false)
+  const legacyEditValue = valueAt(raw, 'edit', 'canEdit')
+  const legacyEdit = legacyEditValue === true
+    || (explicitlyEnabled && legacyEditValue !== false)
+  const manualEditValue = valueAt(raw, 'manualEdit', 'manual_edit')
+  const agentEditValue = valueAt(raw, 'agentEdit', 'agent_edit')
+  const manualEdit = manualEditValue === undefined
+    ? legacyEdit
+    : manualEditValue === true
+  const agentEdit = agentEditValue === undefined
+    ? legacyEdit
+    : agentEditValue === true
+  const edit = manualEdit || agentEdit
+  const selectionContext = valueAt(
     raw,
-    'edit',
-    'canEdit',
-    'manualEdit',
-    'agentEdit',
+    'selectionContext',
+    'selection_context',
+    'selection',
+    'promptAnnotations',
   ) === true
-    || valueAt(raw, 'manualEdit') === true
-    || valueAt(raw, 'agentEdit') === true
-  const edit = explicitlyEnabled
-    ? valueAt(raw, 'edit', 'canEdit') !== false || explicitEdit
-    : explicitEdit
+  const publish = valueAt(raw, 'publish') === true
   const source = valueAt(raw, 'source', 'sourcePatch', 'sourceEdit', 'canPatchSource') === true
-  const enabled = explicitlyEnabled || preview || edit || source
+  const enabled = explicitlyEnabled || preview || edit || selectionContext || source
   return {
     enabled,
     preview,
+    selectionContext,
+    manualEdit,
+    agentEdit,
+    publish,
     edit,
     comments: explicitlyEnabled
       ? valueAt(raw, 'comments', 'canComment') !== false
@@ -318,6 +337,10 @@ export function normalizeArtifactEditCapabilities(value: unknown): ArtifactEditC
     const office = {
       enabled: officeFormats.some(capability => capability.enabled),
       preview: officeFormats.some(capability => capability.preview),
+      selectionContext: officeFormats.some(capability => capability.selectionContext),
+      manualEdit: officeFormats.some(capability => capability.manualEdit),
+      agentEdit: officeFormats.some(capability => capability.agentEdit),
+      publish: officeFormats.some(capability => capability.publish),
       edit: officeFormats.some(capability => capability.edit),
       comments: officeFormats.some(capability => capability.comments),
       source: officeFormats.some(capability => capability.source),
@@ -367,6 +390,10 @@ function documentCapabilities(
   return {
     download: true,
     preview: editor.preview,
+    selectionContext: editor.selectionContext,
+    manualEdit: editor.manualEdit,
+    agentEdit: editor.agentEdit,
+    publish: editor.publish,
     edit: editor.edit,
     revisions: capabilities.revisions,
     changeSets: capabilities.changeSets,
@@ -383,12 +410,31 @@ function documentCapabilitiesFromPayload(
 ): ArtifactDocumentCapabilities {
   const raw = objectValue(value)
   if (!raw) return fallback
+  const legacyEdit = valueAt(raw, 'edit') === true
+  const manualEditValue = valueAt(raw, 'manualEdit', 'manual_edit')
+  const agentEditValue = valueAt(raw, 'agentEdit', 'agent_edit')
+  const manualEdit = manualEditValue === undefined
+    ? legacyEdit
+    : manualEditValue === true
+  const agentEdit = agentEditValue === undefined
+    ? legacyEdit
+    : agentEditValue === true
   return {
     download: valueAt(raw, 'download') !== false,
     preview: valueAt(raw, 'preview') === true,
-    edit: valueAt(raw, 'edit', 'manualEdit', 'agentEdit') === true
-      || valueAt(raw, 'manualEdit') === true
-      || valueAt(raw, 'agentEdit') === true,
+    selectionContext: valueAt(
+      raw,
+      'selectionContext',
+      'selection_context',
+      'selection',
+      'promptAnnotations',
+    ) === true,
+    manualEdit,
+    agentEdit,
+    publish: valueAt(raw, 'publish') === undefined
+      ? fallback.publish
+      : valueAt(raw, 'publish') === true,
+    edit: manualEdit || agentEdit,
     revisions: valueAt(raw, 'revisions', 'versionHistory') === true,
     changeSets: valueAt(raw, 'changeSets', 'changes') === true
       || valueAt(raw, 'agentEdit') === true,
@@ -631,6 +677,10 @@ export function createLegacyArtifactWorkspace(
   const capabilities: ArtifactDocumentCapabilities = {
     download: true,
     preview: !office && legacyPreviewAvailable(artifact),
+    selectionContext: false,
+    manualEdit: false,
+    agentEdit: false,
+    publish: false,
     edit: false,
     revisions: false,
     changeSets: false,

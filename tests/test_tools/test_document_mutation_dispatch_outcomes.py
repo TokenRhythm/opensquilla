@@ -128,7 +128,7 @@ async def test_only_identical_correctable_proposal_digest_is_no_progress() -> No
 
     handler = build_tool_handler(_registry(writer), _context(controller))
     results = []
-    for index, mutations in enumerate(([], [{"value": "different"}], []), start=1):
+    for index, mutations in enumerate(([], [{"input": "different"}], []), start=1):
         call = ToolCall(
             tool_use_id=f"apply-{index}",
             tool_name="document_apply",

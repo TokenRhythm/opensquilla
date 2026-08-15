@@ -57,6 +57,9 @@ async function mountAnnotationMessage(
           capabilities: {
             preview: true,
             download: true,
+            selectionContext: false,
+            manualEdit: true,
+            agentEdit: false,
             edit: true,
             publish: false,
           },
@@ -147,7 +150,15 @@ describe('UserMessage prompt annotation snapshots', () => {
           name: attachment.name,
           mime: attachment.mime,
           size: attachment.size,
-          capabilities: { preview: true, download: true, edit: false, publish: false },
+          capabilities: {
+            preview: true,
+            download: true,
+            selectionContext: false,
+            manualEdit: false,
+            agentEdit: false,
+            edit: false,
+            publish: false,
+          },
           relations: {},
         } satisfies WorkbenchResource,
       ]]),
@@ -191,7 +202,15 @@ describe('UserMessage prompt annotation snapshots', () => {
           name: attachment.name,
           mime: attachment.mime,
           size: attachment.size,
-          capabilities: { preview: true, download: true, edit: true, publish: false },
+          capabilities: {
+            preview: true,
+            download: true,
+            selectionContext: false,
+            manualEdit: true,
+            agentEdit: false,
+            edit: true,
+            publish: false,
+          },
           relations: {},
         } satisfies WorkbenchResource,
       ]]),
@@ -224,6 +243,9 @@ describe('UserMessage prompt annotation snapshots', () => {
       capabilities: {
         preview: false,
         download: true,
+        selectionContext: false,
+        manualEdit: false,
+        agentEdit: false,
         edit: false,
         publish: false,
         previewReasonCode: 'html_encoding_unsupported',
@@ -273,6 +295,9 @@ describe('UserMessage prompt annotation snapshots', () => {
       capabilities: {
         preview: true,
         download: true,
+        selectionContext: false,
+        manualEdit: false,
+        agentEdit: false,
         edit: false,
         publish: false,
         editReasonCode: 'html_edit_size_unsupported',
@@ -309,11 +334,14 @@ describe('UserMessage prompt annotation snapshots', () => {
     expect(card?.textContent).toContain('page.html')
     expect(card?.textContent).toContain('<h1>')
     expect(card?.textContent).toContain('Make the heading concise.')
+    expect(card?.querySelector('.msg-prompt-annotation__rail')).not.toBeNull()
+    expect(card?.querySelector('code')).toBeNull()
+    expect(host.querySelector('[data-testid="sent-prompt-annotations-label"]')?.textContent)
+      .toContain('Annotations · 1')
     expect(host.querySelector('.msg-user-bubble')).toBeNull()
-    expect(host.querySelector('[data-testid="prompt-annotation-turn-status"]')
-      ?.getAttribute('data-status')).toBe('sending')
+    expect(host.querySelector('[data-testid="prompt-annotation-turn-status"]')).toBeNull()
     const copyButton = host.querySelector<HTMLButtonElement>('.msg-prompt-annotation__reuse')
-    expect(copyButton?.textContent).toContain('Copy as new annotation')
+    expect(copyButton?.textContent).not.toContain('Copy as new annotation')
     expect(copyButton?.getAttribute('aria-label')).toBe(
       'Copies the modification request; then select the element again in the current version.',
     )
@@ -326,33 +354,6 @@ describe('UserMessage prompt annotation snapshots', () => {
   })
 
   it.each([
-    {
-      name: 'accepted after the Gateway assigns the turn',
-      message: annotationMessage({ messageId: 'user-1', turnId: 'turn-1' }),
-      expected: 'accepted',
-    },
-    {
-      name: 'shows unknown when a terminal turn has no authoritative document evidence',
-      message: annotationMessage({
-        messageId: 'user-1',
-        turnId: 'turn-1',
-        turnOutcome: { turnId: 'turn-1', status: 'succeeded' },
-      }),
-      expected: 'unknown',
-    },
-    {
-      name: 'renders an authoritative not-attempted receipt',
-      message: annotationMessage({
-        messageId: 'user-1',
-        turnId: 'turn-1',
-        turnOutcome: {
-          turnId: 'turn-1',
-          status: 'succeeded',
-          documentMutationOutcome: { version: 1, status: 'not_attempted' },
-        },
-      }),
-      expected: 'not_attempted',
-    },
     {
       name: 'renders an authoritative applied receipt',
       message: annotationMessage({
@@ -416,6 +417,37 @@ describe('UserMessage prompt annotation snapshots', () => {
     expect(host.querySelector('[data-testid="prompt-annotation-turn-status"]')
       ?.getAttribute('data-status')).toBe(expected)
 
+    app.unmount()
+  })
+
+  it.each([
+    {
+      name: 'Gateway acceptance',
+      message: annotationMessage({ messageId: 'user-1', turnId: 'turn-1' }),
+    },
+    {
+      name: 'a terminal turn without a mutation receipt',
+      message: annotationMessage({
+        messageId: 'user-1',
+        turnId: 'turn-1',
+        turnOutcome: { turnId: 'turn-1', status: 'succeeded' },
+      }),
+    },
+    {
+      name: 'an authoritative not-attempted receipt',
+      message: annotationMessage({
+        messageId: 'user-1',
+        turnId: 'turn-1',
+        turnOutcome: {
+          turnId: 'turn-1',
+          status: 'succeeded',
+          documentMutationOutcome: { version: 1, status: 'not_attempted' },
+        },
+      }),
+    },
+  ])('does not render a standalone status for $name', async ({ message }) => {
+    const { app, host } = await mountAnnotationMessage(message)
+    expect(host.querySelector('[data-testid="prompt-annotation-turn-status"]')).toBeNull()
     app.unmount()
   })
 

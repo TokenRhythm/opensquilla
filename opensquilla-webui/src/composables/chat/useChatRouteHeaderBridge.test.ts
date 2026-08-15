@@ -45,12 +45,10 @@ function owner(title: string): {
       copyIcon: ref('copy'),
       copyLiveText: ref(''),
       deliverableCount: ref(0),
-      workbenchResourceCount: ref(0),
       shareMode: ref(false),
       shareableMessageCount: ref(1),
     },
     commands: {
-      openWorkbench: vi.fn(),
       openDeliverables: vi.fn(),
       startShare: vi.fn(),
       copySessionKey: vi.fn(),
@@ -74,9 +72,6 @@ describe('chat route header bridge', () => {
     bridge.invoke('startShare')
     expect(second.commands.startShare).toHaveBeenCalledOnce()
     expect(first.commands.startShare).not.toHaveBeenCalled()
-
-    bridge.invoke('openWorkbench')
-    expect(second.commands.openWorkbench).toHaveBeenCalledOnce()
   })
 
   it('closes host state and hides the model when the active owner clears', () => {

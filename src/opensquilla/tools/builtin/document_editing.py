@@ -17,16 +17,15 @@ from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools.builtin.artifact_editing import (
     _MAX_HTML_READ_CHUNK_CHARS,
     _NO_ARGUMENTS_SCHEMA,
-    _anchor_opening_range,
     _annotation_order,
     _bounded_anchor_text,
-    _commit_prepared_html_edit,
-    _consume_range_query,
+    _commit_prepared_document_mutation,
     _current_payload,
     _current_scope,
     _decode_html,
+    _document_grant_binding,
     _json,
-    _prepare_html_document_mutation,
+    _prepare_document_mutation,
     _range_binding,
     _range_error,
     _require_single_file_html,
@@ -35,13 +34,14 @@ from opensquilla.tools.builtin.artifact_editing import (
 from opensquilla.tools.builtin.artifact_range_grants import (
     ArtifactRangeGrantError,
     document_grant_registry_for_context,
+    registry_for_context,
 )
 from opensquilla.tools.builtin.document_format_adapters import (
     DOCUMENT_SEMANTIC_OPERATIONS,
     DocumentAdapterError,
     DocumentFormatAdapter,
     DocumentMutationError,
-    DocumentSourceRange,
+    DocumentMutationTarget,
     get_document_format_adapter,
     mutation_error_from_adapter,
 )
@@ -66,36 +66,37 @@ async def _html_adapter_scope(tool_name: str, *, require_anchor: bool = False):
     )
     store, ref, raw = await _current_payload(scope)
     await _require_single_file_html(scope, store, ref)
-    source = _decode_html(raw)
     try:
         adapter = get_document_format_adapter(scope.context.artifact_format)
     except DocumentAdapterError as exc:
         raise _adapter_error(exc) from None
-    return scope, ref, source, adapter
+    return scope, ref, raw, adapter
 
 
 def _grant_payload(
     *,
+    adapter: DocumentFormatAdapter,
     scope: Any,
-    source: str,
     source_sha256: str,
-    source_range: DocumentSourceRange,
+    target: DocumentMutationTarget,
 ) -> dict[str, object]:
     registry = document_grant_registry_for_context(scope.ctx)
     try:
-        token = registry.mint_range(
-            binding=_range_binding(scope, source_sha256),
-            source=source,
-            start=source_range.start,
-            end=source_range.end,
-            kind=source_range.kind,
-            annotation_orders=source_range.annotation_orders,
+        token = registry.mint_grant(
+            binding=_document_grant_binding(
+                scope,
+                source_sha256,
+                adapter_id=adapter.format_id,
+                adapter_version=adapter.adapter_version,
+            ),
+            operation=target.operation,
+            target_fingerprint=target.target_fingerprint,
+            annotation_orders=target.annotation_orders,
+            adapter_locator=target.adapter_locator,
         )
     except ArtifactRangeGrantError as exc:
         raise _range_error(exc) from None
-    before_start = max(0, source_range.start - 160)
-    after_end = min(len(source), source_range.end + 160)
-    current = source[source_range.start : source_range.end]
+    current = target.current
     current_end = len(current)
     while (
         current_end > 0
@@ -104,42 +105,48 @@ def _grant_payload(
     ):
         current_end -= max(1, current_end // 8)
     current_preview = current[:current_end]
-    expects_value = source_range.operation in {
+    expects_input = target.operation in {
         "replace_text",
         "set_attribute",
         "set_style",
     }
-    value_kind: str | None = {
+    input_kind: str | None = {
         "replace_text": "text",
         "set_attribute": "attribute_value",
         "set_style": "css_declarations",
         "remove_attribute": None,
         "remove_node": None,
-    }[source_range.operation]
+    }[target.operation]
     apply_template: dict[str, object] = {"grant_token": token}
-    if expects_value:
-        apply_template["value"] = ""
-    value_constraints: dict[str, object] | None = None
-    if source_range.operation == "set_style":
-        value_constraints = {
-            "format": "css_declaration_list",
-            "example": "color: #222; background-color: #fff;",
-            "forbidSelectors": True,
-            "forbidRuleBraces": True,
-            "forbidStyleWrapper": True,
-        }
+    input_schema: dict[str, object] | None = None
+    if expects_input:
+        apply_template["input"] = ""
+        input_schema = {"type": "string"}
+        if target.operation in {"replace_text", "set_style"}:
+            input_schema["minLength"] = 1
+    if target.operation == "set_style":
+        assert input_schema is not None
+        input_schema.update(
+            {
+                "format": "css-declaration-list",
+                "description": (
+                    "A CSS declaration list without selectors, rule braces, or a style wrapper."
+                ),
+                "examples": ["color: #222; background-color: #fff;"],
+            }
+        )
     return {
         "grantToken": token,
-        "operation": source_range.operation,
+        "operation": target.operation,
         "current": current_preview,
         "currentTruncated": current_end < len(current),
-        "before": source[before_start : source_range.start],
-        "after": source[source_range.end : after_end],
-        "confidence": source_range.confidence,
-        "detail": source_range.detail,
-        "expectsValue": expects_value,
-        "valueKind": value_kind,
-        "valueConstraints": value_constraints,
+        "before": target.before,
+        "after": target.after,
+        "confidence": target.confidence,
+        "detail": target.detail,
+        "expectsInput": expects_input,
+        "inputKind": input_kind,
+        "inputSchema": input_schema,
         "applyTemplate": apply_template,
     }
 
@@ -148,22 +155,16 @@ def _locations_for_operation(
     *,
     adapter: DocumentFormatAdapter,
     scope: Any,
-    source: str,
+    payload: bytes,
     source_sha256: str,
     annotation_order: int,
     operation: str,
     attribute_name: str | None = None,
 ) -> list[dict[str, object]]:
-    opening = _anchor_opening_range(
-        scope.anchors[annotation_order],
-        source,
-        source_sha256,
-    )
     try:
         ranges = adapter.locate(
-            source,
-            opening_start=opening.start,
-            opening_end=opening.end,
+            payload,
+            anchor_locator=scope.anchors[annotation_order].locator,
             annotation_order=annotation_order,
             operation=operation,
             attribute_name=attribute_name,
@@ -172,10 +173,10 @@ def _locations_for_operation(
         raise _adapter_error(exc) from None
     return [
         _grant_payload(
+            adapter=adapter,
             scope=scope,
-            source=source,
             source_sha256=source_sha256,
-            source_range=value,
+            target=value,
         )
         for value in ranges
     ]
@@ -196,7 +197,7 @@ def _locations_for_operation(
     sandbox=SandboxToolDescriptor.artifact(kind="document.inspect"),
 )
 async def document_inspect() -> str:
-    scope, ref, source, adapter = await _html_adapter_scope(
+    scope, ref, payload, adapter = await _html_adapter_scope(
         "document_inspect",
         require_anchor=True,
     )
@@ -216,7 +217,7 @@ async def document_inspect() -> str:
                 _locations_for_operation(
                     adapter=adapter,
                     scope=scope,
-                    source=source,
+                    payload=payload,
                     source_sha256=ref.sha256,
                     annotation_order=order,
                     operation=operation,
@@ -235,7 +236,7 @@ async def document_inspect() -> str:
             }
         )
     try:
-        structure = adapter.inspect(source)
+        structure = adapter.inspect(_decode_html(payload))
     except DocumentAdapterError as exc:
         raise _adapter_error(exc) from None
     return _json(
@@ -289,7 +290,8 @@ async def document_read(
     cursor: str | None = None,
     max_chars: int = _DEFAULT_DOCUMENT_READ_CHARS,
 ) -> str:
-    scope, ref, source, adapter = await _html_adapter_scope("document_read")
+    scope, ref, payload, adapter = await _html_adapter_scope("document_read")
+    source = _decode_html(payload)
     if view == "structure":
         if cursor is not None:
             raise SafeToolError("DOCUMENT_CURSOR_UNEXPECTED: Structure view has no cursor.")
@@ -314,8 +316,13 @@ async def document_read(
         or max_chars > _MAX_HTML_READ_CHUNK_CHARS
     ):
         raise SafeToolError("DOCUMENT_PAGE_INVALID: The source page size is invalid.")
-    registry = document_grant_registry_for_context(scope.ctx)
-    binding = _range_binding(scope, ref.sha256)
+    registry = registry_for_context(scope.ctx)
+    binding = _range_binding(
+        scope,
+        ref.sha256,
+        adapter_id=adapter.format_id,
+        adapter_version=adapter.adapter_version,
+    )
     start = 0
     if cursor is not None:
         try:
@@ -397,7 +404,7 @@ async def document_locate(
         raise SafeToolError(
             "DOCUMENT_ATTRIBUTE_UNEXPECTED: This operation does not accept an attribute name."
         )
-    scope, ref, source, adapter = await _html_adapter_scope(
+    scope, ref, payload, adapter = await _html_adapter_scope(
         "document_locate",
         require_anchor=True,
     )
@@ -413,11 +420,16 @@ async def document_locate(
         ensure_ascii=True,
         separators=(",", ":"),
     )
-    remaining_queries = _consume_range_query(scope, query_key=query_key)
+    try:
+        remaining_queries = document_grant_registry_for_context(
+            scope.ctx
+        ).consume_query_budget(query_key=query_key)
+    except ArtifactRangeGrantError as exc:
+        raise _range_error(exc) from None
     locations = _locations_for_operation(
         adapter=adapter,
         scope=scope,
-        source=source,
+        payload=payload,
         source_sha256=ref.sha256,
         annotation_order=order,
         operation=operation,
@@ -450,7 +462,7 @@ _DOCUMENT_APPLY_SCHEMA: dict[str, Any] = {
                         "type": "string",
                         "pattern": "^hrg_[A-Za-z0-9_-]{43}$",
                     },
-                    "value": {"type": "string"},
+                    "input": {},
                 },
                 "required": ["grant_token"],
                 "additionalProperties": False,
@@ -466,8 +478,8 @@ _DOCUMENT_APPLY_SCHEMA: dict[str, Any] = {
     name="document_apply",
     description=(
         "Apply one atomic set of semantic mutations using opaque grants. "
-        "Every accepted annotation must be covered. Validation, candidate creation, CAS, "
-        "revision, change set, and receipt are completed server-side."
+        "Each used grant must remain bound to a current selection. Validation, candidate "
+        "creation, CAS, revision, change set, and receipt are completed server-side."
     ),
     params=_DOCUMENT_APPLY_SCHEMA,
     owner_only=True,
@@ -480,7 +492,7 @@ async def document_apply(
     mutations: list[dict[str, object]],
     _tool_use_id: str | None = None,
 ) -> str:
-    projected: list[dict[str, object]] = []
+    canonical_mutations: list[dict[str, object]] = []
     if not isinstance(mutations, list):
         raise DocumentMutationError(
             "DOCUMENT_MUTATIONS_INVALID",
@@ -494,18 +506,22 @@ async def document_apply(
                 "Every mutation must be an object.",
                 retry_policy="correctable",
             )
-        item = dict(mutation)
-        token = item.pop("grant_token", None)
-        item["range_token"] = token
-        projected.append(item)
-    proposal_sha256 = hashlib.sha256(
-        json.dumps(
-            {"mutations": projected, "tool": "document_apply"},
+        canonical_mutations.append(dict(mutation))
+    try:
+        proposal_payload = json.dumps(
+            {"mutations": canonical_mutations, "tool": "document_apply"},
             ensure_ascii=False,
+            allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")
-    ).hexdigest()
+    except (TypeError, ValueError):
+        raise DocumentMutationError(
+            "DOCUMENT_MUTATION_INPUT_INVALID",
+            "Mutation input must be valid JSON.",
+            retry_policy="correctable",
+        ) from None
+    proposal_sha256 = hashlib.sha256(proposal_payload).hexdigest()
     tool_context = current_tool_context.get()
     controller = (
         tool_context.artifact_mutation_attempt_controller
@@ -532,19 +548,20 @@ async def document_apply(
         "document_apply",
         require_anchor=True,
     )
-    summary = f"Applied {len(projected)} document mutations"
+    summary = f"Applied {len(canonical_mutations)} document mutations"
     prepared = None
     try:
-        prepared = await _prepare_html_document_mutation(
+        prepared = await _prepare_document_mutation(
             ref.sha256,
             [],
             summary,
             _tool_name="document_apply",
-            _semantic_operations=projected,
+            _semantic_operations=canonical_mutations,
+            _proposal_sha256=proposal_sha256,
         )
         reservation = await controller.reserve_commit(
             _tool_use_id,
-            proposal_sha256,
+            prepared.proposal_sha256,
         )
         if not reservation.created:
             raise DocumentMutationError(
@@ -556,7 +573,7 @@ async def document_apply(
         if prepared is not None:
             prepared.release_grants()
         raise
-    return await _commit_prepared_html_edit(prepared)
+    return await _commit_prepared_document_mutation(prepared)
 
 
 __all__ = ["document_apply", "document_inspect", "document_locate", "document_read"]

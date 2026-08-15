@@ -26,19 +26,6 @@
 
     <div v-if="layout === 'wide'" class="chat-header__actions">
       <button
-        v-if="hasWorkbenchResources"
-        ref="wideWorkbenchRef"
-        type="button"
-        class="chat-header__action chat-share-btn"
-        :title="workbenchLabel"
-        :aria-label="workbenchLabel"
-        data-testid="chat-session-action-workbench"
-        @click="emit('open-workbench')"
-      >
-        <Icon name="folder" :size="14" />
-        <span class="chat-share-btn__label">{{ workbenchLabel }}</span>
-      </button>
-      <button
         v-if="deliverableCount > 0"
         ref="wideDeliverablesRef"
         type="button"
@@ -129,17 +116,6 @@
         @keydown="onMenuKeydown"
       >
         <button
-          v-if="menuActions.includes('workbench')"
-          type="button"
-          class="chat-header__menu-item"
-          role="menuitem"
-          data-testid="chat-session-action-workbench"
-          @click="invoke('workbench', true)"
-        >
-          <Icon name="folder" :size="16" />
-          <span>{{ workbenchLabel }}</span>
-        </button>
-        <button
           v-if="menuActions.includes('deliverables')"
           type="button"
           class="chat-header__menu-item topbar-state topbar-state--deliverables"
@@ -201,7 +177,7 @@ import {
 } from '@/utils/headerLayout'
 import type { IconName } from '@/utils/icons'
 
-type Action = 'workbench' | 'deliverables' | 'share' | 'copy-session-key'
+type Action = 'deliverables' | 'share' | 'copy-session-key'
 
 const COARSE_POINTER_QUERY = '(pointer: coarse)'
 
@@ -211,14 +187,12 @@ const props = defineProps<{
   copyIcon: IconName
   copyLiveText: string
   deliverableCount: number
-  workbenchResourceCount?: number
   shareMode: boolean
   shareableMessageCount: number
 }>()
 
 const emit = defineEmits<{
   'open-deliverables': []
-  'open-workbench': []
   'start-share': []
   'copy-session-key': []
 }>()
@@ -229,7 +203,6 @@ const compactActionsRef = ref<HTMLDivElement | null>(null)
 const menuTriggerRef = ref<HTMLButtonElement | null>(null)
 const menuRef = ref<HTMLDivElement | null>(null)
 const primaryActionRef = ref<HTMLButtonElement | null>(null)
-const wideWorkbenchRef = ref<HTMLButtonElement | null>(null)
 const wideDeliverablesRef = ref<HTMLButtonElement | null>(null)
 const wideShareRef = ref<HTMLButtonElement | null>(null)
 const wideCopyRef = ref<HTMLButtonElement | null>(null)
@@ -248,10 +221,6 @@ const deliverableBadge = computed(() => props.deliverableCount > 99
   ? '99+'
   : String(props.deliverableCount))
 const canShare = computed(() => props.shareableMessageCount > 0)
-const hasWorkbenchResources = computed(() => (props.workbenchResourceCount || 0) > 0)
-const workbenchLabel = computed(() => t('workbench.resources.count', {
-  count: props.workbenchResourceCount || 0,
-}))
 const shareLabel = computed(() => !canShare.value
   ? t('chat.shareSendFirst')
   : t('chat.shareSelectHint'))
@@ -261,26 +230,22 @@ const shareAriaLabel = computed(() => !canShare.value
 
 const primaryAction = computed<Action | null>(() => {
   if (layout.value === 'tight') return null
-  if (hasWorkbenchResources.value) return 'workbench'
   if (props.deliverableCount > 0) return 'deliverables'
   if (!props.shareMode && canShare.value) return 'share'
   return null
 })
 
 const primaryActionLabel = computed(() => {
-  if (primaryAction.value === 'workbench') return workbenchLabel.value
   if (primaryAction.value === 'deliverables') return deliverablesLabel.value
   return shareAriaLabel.value
 })
 const primaryActionIcon = computed<IconName>(() => {
-  if (primaryAction.value === 'workbench') return 'folder'
   if (primaryAction.value === 'deliverables') return 'fileText'
   return 'share'
 })
 
 const menuActions = computed<Action[]>(() => {
   const actions: Action[] = []
-  if (hasWorkbenchResources.value && primaryAction.value !== 'workbench') actions.push('workbench')
   if (props.deliverableCount > 0 && primaryAction.value !== 'deliverables') actions.push('deliverables')
   if (!props.shareMode && primaryAction.value !== 'share') actions.push('share')
   actions.push('copy-session-key')
@@ -292,14 +257,12 @@ function isVisible(element: HTMLElement | null): element is HTMLElement {
 }
 
 function actionForElement(element: Element | null): Action | null {
-  if (element === wideWorkbenchRef.value) return 'workbench'
   if (element === wideDeliverablesRef.value) return 'deliverables'
   if (element === wideShareRef.value) return 'share'
   if (element === wideCopyRef.value) return 'copy-session-key'
   if (element === primaryActionRef.value) return primaryAction.value
   if (!(element instanceof HTMLElement)) return null
   const testId = element.dataset.testid
-  if (testId === 'chat-session-action-workbench') return 'workbench'
   if (testId === 'chat-session-action-deliverables') return 'deliverables'
   if (testId === 'chat-session-action-share') return 'share'
   if (testId === 'chat-session-action-copy') return 'copy-session-key'
@@ -307,8 +270,7 @@ function actionForElement(element: Element | null): Action | null {
 }
 
 function focusWideFallback() {
-  const fallback = wideWorkbenchRef.value
-    || wideDeliverablesRef.value
+  const fallback = wideDeliverablesRef.value
     || wideShareRef.value
     || wideCopyRef.value
   fallback?.focus()
@@ -383,7 +345,6 @@ function invoke(action: Action, fromMenu = false) {
   // before the menu item is unmounted so close-focus never falls back to body.
   if (fromMenu) closeMenu(true)
   if (action === 'deliverables') emit('open-deliverables')
-  if (action === 'workbench') emit('open-workbench')
   if (action === 'share') emit('start-share')
   if (action === 'copy-session-key') emit('copy-session-key')
 }
@@ -412,10 +373,8 @@ function onMenuKeydown(event: KeyboardEvent) {
 }
 
 function focusAction(action: Action): boolean {
-  const direct = action === 'workbench'
-    ? wideWorkbenchRef.value
-    : action === 'deliverables'
-      ? wideDeliverablesRef.value
+  const direct = action === 'deliverables'
+    ? wideDeliverablesRef.value
     : action === 'share'
       ? wideShareRef.value
       : wideCopyRef.value
@@ -450,7 +409,6 @@ useDocumentEvent('keydown', (event) => {
 
 watch(() => [
   props.deliverableCount,
-  props.workbenchResourceCount,
   props.shareMode,
   props.shareableMessageCount,
 ], () => {

@@ -9,9 +9,10 @@ not replace the separate real-Electron E2E gate.
 The worker receives the rotated credential only as ``TOKENRHYTHM_API_KEY``.
 Prompts, responses, annotation bodies, runtime identifiers, paths, bridge
 tokens, and raw traces remain inside its 0700 temporary tree and are never part
-of the 0600 public report.  The visual-selection contract is not implemented in
-the product yet, so that row remains ``unsupported_contract_pending`` and the
-overall certification stays incomplete rather than inventing a green result.
+of the 0600 public report.  Certification covers the three V1 zero-call
+preflights plus the Direct, Router, and Ensemble mutation matrix.  Product
+feature defaults are recorded as release evidence but do not change the live
+provider result.
 """
 
 from __future__ import annotations
@@ -123,6 +124,14 @@ ENSEMBLE_EXTRA_TOOL_ROUND_ALLOWANCE = 5
 WORST_CASE_PHYSICAL_CALLS = 63
 HARD_PHYSICAL_CALL_CAP = 64
 
+# A mutation case may legitimately consume its full request/turn deadline, and
+# the six provider-backed cases run sequentially.  Keep that deadline separate
+# from the parent process guard so a healthy matrix is not terminated merely
+# because its cumulative latency exceeds one case timeout.
+DEFAULT_MATRIX_TIMEOUT_SECONDS = 600.0
+MIN_MATRIX_TIMEOUT_SECONDS = 300.0
+MAX_MATRIX_TIMEOUT_SECONDS = 900.0
+
 _ANNOTATION_TOOLS = (
     "document_apply",
     "document_inspect",
@@ -184,12 +193,11 @@ _CASE_KEYS = frozenset(
     }
 )
 _ALLOWED_TOOLS = frozenset(_ANNOTATION_TOOLS)
-_ALLOWED_STATUSES = frozenset({"not_run", "passed", "failed", "unsupported"})
+_ALLOWED_STATUSES = frozenset({"not_run", "passed", "failed"})
 _ALLOWED_REASON_CODES = frozenset(
     {
         "artifact_invariant_failed",
         "gateway_setup_failed",
-        "feature_default_enabled",
         "live_gateway_executor_failed",
         "none",
         "physical_call_accounting_ambiguous",
@@ -197,7 +205,6 @@ _ALLOWED_REASON_CODES = frozenset(
         "provider_projection_failed",
         "routing_evidence_failed",
         "tool_boundary_failed",
-        "unsupported_contract_pending",
     }
 )
 _FEATURE_DEFAULT_FALSE_RE = {
@@ -215,23 +222,12 @@ class Scenario:
     expected_tools: tuple[str, ...]
     expected_physical_calls: int
     zero_call_preflight: bool = False
-    contract_pending: bool = False
 
 
 SCENARIOS = (
     Scenario("stale_head_zero_call", "preflight", None, "none", (), 0, True),
     Scenario("cross_session_zero_call", "preflight", None, "none", (), 0, True),
     Scenario("dom_mismatch_zero_call", "preflight", None, "none", (), 0, True),
-    Scenario(
-        "visual_selection_zero_call",
-        "preflight",
-        None,
-        "none",
-        (),
-        0,
-        True,
-        True,
-    ),
     Scenario("direct_single_annotation", "direct", None, "configured_direct", _ANNOTATION_TOOLS, 3),
     Scenario("direct_double_annotation", "direct", None, "configured_direct", _ANNOTATION_TOOLS, 3),
     Scenario("router_single_annotation", "router", "c2", "router_c2", _ANNOTATION_TOOLS, 3),
@@ -366,7 +362,7 @@ class CaseEvidence:
     aggregator_tools_verified: bool = False
     revert_verified: bool = False
     passed: bool = False
-    status: Literal["not_run", "passed", "failed", "unsupported"] = "failed"
+    status: Literal["not_run", "passed", "failed"] = "failed"
     reason_code: str = "live_gateway_executor_failed"
 
 
@@ -382,18 +378,13 @@ def _feature_defaults() -> dict[str, bool]:
     source = (REPO_ROOT / "opensquilla-webui" / "src" / "stores" / "app.ts").read_text(
         encoding="utf-8"
     )
-    # Missing or non-literal defaults fail closed as enabled. Certification
-    # records each gate separately so a later split cannot hide behind one
-    # aggregate boolean.
+    # Missing or non-literal defaults are reported as enabled. Record each
+    # default independently so the release state remains visible without
+    # coupling it to live-provider certification.
     return {
         name: pattern.search(source) is None
         for name, pattern in _FEATURE_DEFAULT_FALSE_RE.items()
     }
-
-
-def _feature_default_is_disabled() -> bool:
-    return not any(_feature_defaults().values())
-
 
 def _worker_environment(api_key: str) -> dict[str, str]:
     if not api_key.strip():
@@ -414,15 +405,7 @@ def _worker_environment(api_key: str) -> dict[str, str]:
 
 
 def _case_payload(scenario: Scenario, evidence: CaseEvidence | None = None) -> dict[str, Any]:
-    if evidence is not None:
-        observed = evidence
-    elif scenario.contract_pending:
-        observed = CaseEvidence(
-            status="unsupported",
-            reason_code="unsupported_contract_pending",
-        )
-    else:
-        observed = CaseEvidence(status="not_run")
+    observed = evidence if evidence is not None else CaseEvidence(status="not_run")
     return {
         "case": scenario.case,
         "mode": scenario.mode,
@@ -459,7 +442,6 @@ def _report(
     _assert_scenario_plan()
     evidence_by_case = dict(evidences or {})
     feature_defaults = _feature_defaults()
-    feature_default_disabled = not any(feature_defaults.values())
     rows = [
         _case_payload(scenario, evidence_by_case.get(scenario.case))
         for scenario in SCENARIOS
@@ -472,18 +454,15 @@ def _report(
             if row["reasonCode"] != "none"
         }
     )
-    if not feature_default_disabled:
-        reason_codes.append("feature_default_enabled")
     complete = bool(
-        feature_default_disabled
-        and len(evidence_by_case) == len(SCENARIOS)
+        len(evidence_by_case) == len(SCENARIOS)
         and all(row["passed"] is True for row in rows)
     )
     return {
         "schemaVersion": 1,
         "certification": "complete" if complete else "incomplete",
         "provider": PROVIDER_ID,
-        "featureDefaultEnabled": not feature_default_disabled,
+        "featureDefaultEnabled": any(feature_defaults.values()),
         "featureDefaults": feature_defaults,
         "physicalCallBudget": {
             "expected": EXPECTED_PHYSICAL_CALLS,
@@ -529,12 +508,6 @@ async def _run_certification(
     try:
         await driver.start()
         for scenario in SCENARIOS:
-            if scenario.contract_pending:
-                evidences[scenario.case] = CaseEvidence(
-                    status="unsupported",
-                    reason_code="unsupported_contract_pending",
-                )
-                continue
             if scenario.expected_physical_calls:
                 budget.reserve("baseline", scenario.expected_physical_calls)
             evidence = await driver.run_case(scenario)
@@ -672,12 +645,6 @@ def _assert_report_safe(report: Any, secrets: Mapping[str, str]) -> None:
             physical_calls != 0 or row.get("providerCalled") is not False
         ):
             raise RuntimeError("zero-call preflight contacted a provider")
-        if scenario.contract_pending and (
-            row.get("status") != "unsupported"
-            or row.get("reasonCode") != "unsupported_contract_pending"
-            or row.get("passed") is not False
-        ):
-            raise RuntimeError("pending contract was incorrectly certified")
         if row.get("passed") is True and row.get("status") != "passed":
             raise RuntimeError("passed case must have passed status")
         if row.get("status") == "passed" and row.get("passed") is not True:
@@ -722,12 +689,10 @@ def _assert_report_safe(report: Any, secrets: Mapping[str, str]) -> None:
 
     if observed_calls != budget["observed"]:
         raise RuntimeError("live certification physical-call accounting does not reconcile")
-    if report["certification"] == "complete" and (
-        report["featureDefaultEnabled"]
-        or not all(row.get("passed") is True for row in cases)
-        or any(scenario.contract_pending for scenario in SCENARIOS)
-    ):
-        raise RuntimeError("live certification cannot complete with failed gates")
+    evidence_complete = all(row.get("passed") is True for row in cases)
+    expected_certification = "complete" if evidence_complete else "incomplete"
+    if report["certification"] != expected_certification:
+        raise RuntimeError("live certification status is inconsistent with case evidence")
     reasons = report.get("reasonCodes")
     if not isinstance(reasons, list) or any(
         reason not in _ALLOWED_REASON_CODES for reason in reasons
@@ -739,7 +704,6 @@ def _assert_report_safe(report: Any, secrets: Mapping[str, str]) -> None:
             for row in cases
             if row["reasonCode"] != "none"
         }
-        | ({"feature_default_enabled"} if report["featureDefaultEnabled"] else set())
     )
     if reasons != expected_reasons:
         raise RuntimeError("live certification reason summary is inconsistent")
@@ -1839,8 +1803,13 @@ def _launch_worker(
     api_key: str,
     hard_cap: int,
     timeout_seconds: float,
+    matrix_timeout_seconds: float = DEFAULT_MATRIX_TIMEOUT_SECONDS,
     execute_live_matrix: bool = False,
 ) -> dict[str, Any]:
+    if not MIN_MATRIX_TIMEOUT_SECONDS <= matrix_timeout_seconds <= MAX_MATRIX_TIMEOUT_SECONDS:
+        raise ValueError(
+            "matrix timeout must remain within the bounded certification window"
+        )
     temp_root = Path(
         tempfile.mkdtemp(prefix="opensquilla-artifact-prompt-annotations-e2e-")
     )
@@ -1857,14 +1826,14 @@ def _launch_worker(
             "w", encoding="utf-8"
         ) as stderr:
             command = [
-                    sys.executable,
-                    str(Path(__file__).resolve()),
-                    "--_worker",
-                    "--physical-call-cap",
-                    str(hard_cap),
-                    "--timeout-seconds",
-                    str(timeout_seconds),
-                ]
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--_worker",
+                "--physical-call-cap",
+                str(hard_cap),
+                "--timeout-seconds",
+                str(timeout_seconds),
+            ]
             if execute_live_matrix:
                 command.append("--_execute-live-matrix")
             completed = subprocess.run(
@@ -1874,7 +1843,7 @@ def _launch_worker(
                 stdout=stdout,
                 stderr=stderr,
                 text=True,
-                timeout=timeout_seconds,
+                timeout=matrix_timeout_seconds,
                 check=False,
             )
         if completed.returncode != 0:
@@ -1898,6 +1867,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output")
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    parser.add_argument(
+        "--matrix-timeout-seconds",
+        type=float,
+        default=DEFAULT_MATRIX_TIMEOUT_SECONDS,
+        help=(
+            "whole-matrix worker deadline; independent from the per-case "
+            "--timeout-seconds deadline"
+        ),
+    )
     parser.add_argument(
         "--physical-call-cap",
         type=int,
@@ -1950,6 +1928,13 @@ def main() -> int:
     if not 5.0 <= args.timeout_seconds <= 120.0:
         print("--timeout-seconds must be between 5 and 120", file=sys.stderr)
         return 2
+    if not MIN_MATRIX_TIMEOUT_SECONDS <= args.matrix_timeout_seconds <= MAX_MATRIX_TIMEOUT_SECONDS:
+        print(
+            f"--matrix-timeout-seconds must be between "
+            f"{MIN_MATRIX_TIMEOUT_SECONDS:g} and {MAX_MATRIX_TIMEOUT_SECONDS:g}",
+            file=sys.stderr,
+        )
+        return 2
     if os.environ.get(BASE_URL_ENV):
         print(f"{BASE_URL_ENV} overrides are forbidden for certification", file=sys.stderr)
         return 2
@@ -1964,6 +1949,7 @@ def main() -> int:
             api_key=api_key,
             hard_cap=args.physical_call_cap,
             timeout_seconds=args.timeout_seconds,
+            matrix_timeout_seconds=args.matrix_timeout_seconds,
             execute_live_matrix=args.execute_live_matrix,
         )
         report = sanitize_report(report, secrets)

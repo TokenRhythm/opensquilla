@@ -6927,6 +6927,12 @@ class Agent:
         document_mutation_finalization_attempted = False
         document_mutation_finalization_message: Message | None = None
         document_mutation_outcome: dict[str, Any] | None = None
+        # A prompt annotation is ordinary request context until the provider
+        # actually starts ``document_apply``.  Keeping this separate from the
+        # presence of a writer controller prevents read/answer-only turns from
+        # manufacturing a mutation outcome or spending a second provider call
+        # on the mutation-only finalizer.
+        document_mutation_attempted = False
 
         def _safe_annotation_instruction(value: object) -> str | None:
             if not isinstance(value, str):
@@ -7273,12 +7279,13 @@ class Agent:
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
         document_mutation_summary_deadline: float | None = None
+        document_mutation_summary_deadline_candidate: float | None = None
         if _total_deadline is not None and self._artifact_writer_controller() is not None:
             summary_reserve_seconds = min(
                 15.0,
                 max(1.0, float(self.config.timeout) * 0.1),
             )
-            document_mutation_summary_deadline = (
+            document_mutation_summary_deadline_candidate = (
                 _total_deadline - summary_reserve_seconds
             )
 
@@ -7399,32 +7406,21 @@ class Agent:
         ):
             self._write_turn_call_log(
                 "turn_policy_decision",
-                action="finalize_without_tools",
+                action="answer_without_tools",
                 reason="artifact_model_tools_unsupported",
                 code="artifact_model_tools_unsupported",
                 artifact_operation_class=artifact_operation,
             )
             if self._artifact_writer_controller() is not None:
-                document_mutation_outcome = {
-                    "version": 1,
-                    "status": "not_attempted",
-                    "phase": "proposal",
-                    "retryPolicy": "new_turn",
-                    "code": "artifact_model_tools_unsupported",
-                }
-                document_mutation_finalization_pending = True
-                document_mutation_finalization_message = Message(
-                    role="user",
-                    content=(
-                        "The selected model cannot call document tools. Summarize the "
-                        "authoritative no-change outcome without calling tools."
-                    ),
-                )
+                # Selection context is still useful to a text-only model. Hide
+                # document tools and let the ordinary answer path complete;
+                # no writer intent exists, so there is no mutation outcome.
+                tools_supported = False
                 yield WarningEvent(
                     code="artifact_model_tools_unsupported",
                     message=(
-                        "The selected model is not verified for tool calling; "
-                        "the document was left unchanged."
+                        "The selected model is not verified for document tool calling; "
+                        "it can still answer from the selected context."
                     ),
                 )
             else:
@@ -7971,6 +7967,7 @@ class Agent:
                         )
                     if (
                         self._artifact_writer_controller() is not None
+                        and document_mutation_attempted
                         and not document_mutation_finalization_attempted
                     ):
                         if not document_mutation_finalization_pending:
@@ -8050,6 +8047,7 @@ class Agent:
                     raise TimeoutError(f"Agent total timeout after {self.config.timeout}s")
                 if (
                     document_mutation_summary_deadline is not None
+                    and document_mutation_attempted
                     and _loop.time() >= document_mutation_summary_deadline
                     and not document_mutation_finalization_pending
                     and not document_mutation_finalization_attempted
@@ -8266,14 +8264,17 @@ class Agent:
                     )
                     if (
                         self._artifact_writer_controller() is not None
+                        and document_mutation_attempted
                         and not document_mutation_finalization_pending
                         and not document_mutation_finalization_attempted
                         and max_llm_calls is not None
                         and turn_llm_calls + 1 >= max_llm_calls
                     ):
-                        # Restricted mutation turns reserve their final global
-                        # provider-call slot for a tool-free summary. This does
-                        # not mint a separate budget or exceed the global cap.
+                        # Once mutation intent exists, reserve the final
+                        # ordinary provider-call slot for a tool-free summary.
+                        # If intent first appears in that last ordinary call,
+                        # the admission gate below still permits exactly one
+                        # mutation-only finalizer beyond the ordinary cap.
                         document_mutation_finalization_pending = True
                         document_mutation_outcome = {
                             "version": 1,
@@ -8570,7 +8571,33 @@ class Agent:
                         sanitize=request_sanitize_result,
                     )
 
-                    terminal_error = _turn_llm_call_budget_error(turn_llm_calls + 1)
+                    reserved_document_finalizer = bool(
+                        document_mutation_finalization_pending
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    )
+                    # The reserved call is outside the ordinary call budget
+                    # only when document_apply first appeared in its last
+                    # available call. ``document_mutation_finalization_attempted``
+                    # closes this exception before provider I/O, so it cannot
+                    # admit a retry or a second summary.
+                    next_call_budget_error = _turn_llm_call_budget_error(
+                        turn_llm_calls + 1
+                    )
+                    terminal_error = (
+                        None if reserved_document_finalizer else next_call_budget_error
+                    )
+                    if reserved_document_finalizer and next_call_budget_error is not None:
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="document_outcome_finalize",
+                            reason="reserved_finalization_call",
+                            code="document_mutation_finalization_reserved",
+                            sent_llm_calls=turn_llm_calls,
+                            admitted_llm_call=turn_llm_calls + 1,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                        )
                     if terminal_error is not None:
                         self._write_turn_call_log(
                             "turn_policy_decision",
@@ -8620,7 +8647,10 @@ class Agent:
                             workspace_edit_gate_recovery_reads_remaining
                         ),
                     )
-                    if self._artifact_writer_controller() is not None:
+                    if (
+                        self._artifact_writer_controller() is not None
+                        and document_mutation_attempted
+                    ):
                         call_chat_cfg = call_chat_cfg.model_copy(
                             update={
                                 "max_tokens": max(
@@ -8899,17 +8929,31 @@ class Agent:
                             else None
                         )
 
-                        def _pending_install_stream_deadline() -> float | None:
+                        def _active_stream_deadline() -> float | None:
                             pending_event = self._pending_durable_compaction_event
-                            return (
+                            pending_deadline = (
                                 pending_event.compaction_deadline_at_monotonic
                                 if pending_event is not None
                                 else None
                             )
+                            mutation_deadline = (
+                                document_mutation_summary_deadline
+                                if document_mutation_attempted
+                                and not document_mutation_finalization_pending
+                                and not document_mutation_finalization_attempted
+                                else None
+                            )
+                            deadlines = [
+                                deadline
+                                for deadline in (pending_deadline, mutation_deadline)
+                                if deadline is not None
+                            ]
+                            return min(deadlines) if deadlines else None
 
                         provider_stream_deadline = _total_deadline
                         if (
                             document_mutation_summary_deadline is not None
+                            and document_mutation_attempted
                             and not document_mutation_finalization_pending
                             and not document_mutation_finalization_attempted
                         ):
@@ -8918,7 +8962,7 @@ class Agent:
                             raw_stream,
                             loop=_loop,
                             total_deadline=provider_stream_deadline,
-                            deadline_provider=_pending_install_stream_deadline,
+                            deadline_provider=_active_stream_deadline,
                         ):
                             if not isinstance(raw_ev, ProviderErrorEvent):
                                 # Provider.chat commonly returns an async
@@ -9285,6 +9329,10 @@ class Agent:
                                     )
                                 )
                                 if writer_reservation is not None:
+                                    document_mutation_attempted = True
+                                    document_mutation_summary_deadline = (
+                                        document_mutation_summary_deadline_candidate
+                                    )
                                     if writer_reservation == "rejected":
                                         if guarded_writer_ids:
                                             # Keep consuming the response so the
@@ -9908,6 +9956,7 @@ class Agent:
                             break
                         if (
                             self._artifact_writer_controller() is not None
+                            and document_mutation_attempted
                             and not document_mutation_finalization_attempted
                         ):
                             await self._fail_artifact_writer_intent(
@@ -9993,6 +10042,7 @@ class Agent:
                             break
                         mutation_summary_timeout = (
                             document_mutation_summary_deadline is not None
+                            and document_mutation_attempted
                             and enforced_stream_deadline
                             == document_mutation_summary_deadline
                             and not document_mutation_finalization_pending
@@ -10032,6 +10082,7 @@ class Agent:
                         if (
                             enforced_stream_deadline is None
                             and self._artifact_writer_controller() is not None
+                            and document_mutation_attempted
                         ):
                             # Provider adapters may surface their own socket/read
                             # timeout as a bare TimeoutError.  Only timeouts minted
@@ -10208,6 +10259,7 @@ class Agent:
                             break
                         if (
                             self._artifact_writer_controller() is not None
+                            and document_mutation_attempted
                             and not document_mutation_finalization_attempted
                         ):
                             await self._fail_artifact_writer_intent(
@@ -10356,6 +10408,26 @@ class Agent:
                         if goal_terminal_final_response_pending
                         else _turn_budget_error()
                     )
+                    if (
+                        terminal_error is not None
+                        and document_mutation_attempted
+                        and not document_mutation_finalization_attempted
+                    ):
+                        # The provider has already started document_apply, but
+                        # its complete ToolCall has not crossed dispatch yet.
+                        # Defer token/cost enforcement through that dispatch so
+                        # the authoritative tool outcome can be finalized. The
+                        # post-tool gate below closes the tool loop and admits
+                        # only the reserved tools-disabled summary.
+                        self._write_turn_call_log(
+                            "turn_policy_decision",
+                            action="defer_budget_to_document_outcome",
+                            reason=terminal_error.message,
+                            code=terminal_error.code,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                        )
+                        terminal_error = None
                     if (
                         terminal_error is not None
                         and document_mutation_finalization_pending
@@ -12517,7 +12589,11 @@ class Agent:
                             provider_error.code != "provider_retry_after_deadline"
                             and _fallback.should_retry(kind, _retry_attempt)
                         )
-                        if should_retry and self._artifact_writer_controller() is not None:
+                        if (
+                            should_retry
+                            and self._artifact_writer_controller() is not None
+                            and document_mutation_attempted
+                        ):
                             # Restricted document turns reserve exactly one provider call
                             # after a terminal outcome for the tools-disabled summary. A
                             # generic provider retry here would consume that boundary and
@@ -12548,6 +12624,7 @@ class Agent:
                         if not should_retry:
                             if (
                                 self._artifact_writer_controller() is not None
+                                and document_mutation_attempted
                                 and not document_mutation_finalization_attempted
                             ):
                                 if (
@@ -12687,6 +12764,7 @@ class Agent:
                 if terminal_error is not None:
                     if (
                         self._artifact_writer_controller() is not None
+                        and document_mutation_attempted
                         and not document_mutation_finalization_attempted
                     ):
                         document_mutation_outcome = {
@@ -13131,29 +13209,6 @@ class Agent:
                         continue
                     if document_mutation_finalization_attempted:
                         break
-                    if (
-                        self._artifact_writer_controller() is not None
-                        and document_mutation_outcome is None
-                    ):
-                        document_mutation_outcome = {
-                            "version": 1,
-                            "status": "not_attempted",
-                            "phase": "proposal",
-                            "retryPolicy": "new_turn",
-                            "code": "document_mutation_not_proposed",
-                        }
-                        document_mutation_finalization_pending = True
-                        document_mutation_finalization_message = Message(
-                            role="user",
-                            content=(
-                                "Give one concise final response in the user's language "
-                                "from the authoritative document mutation outcome."
-                            ),
-                        )
-                        final_text_parts.clear()
-                        applied_model_call_boundaries.clear()
-                        yield self._transition(AgentState.THINKING)
-                        continue
                     if await _claim_pending_inputs_for_next_call():
                         # A plain response is also a safe same-turn boundary.
                         # Keep the assistant output already emitted above, then
@@ -15220,6 +15275,7 @@ class Agent:
                 if (
                     terminal_error is not None
                     and self._artifact_writer_controller() is not None
+                    and document_mutation_attempted
                     and not document_mutation_finalization_attempted
                 ):
                     if not document_mutation_finalization_pending:
@@ -15284,6 +15340,7 @@ class Agent:
                 ):
                     if (
                         self._artifact_writer_controller() is not None
+                        and document_mutation_attempted
                         and not document_mutation_finalization_attempted
                     ):
                         prior_outcome = dict(document_mutation_outcome or {})
@@ -15557,7 +15614,10 @@ class Agent:
                     reason=f"Agent turn timed out after {self.config.timeout}s",
                     code="agent_runtime_timeout",
                 )
-            elif self._artifact_writer_controller() is not None:
+            elif (
+                self._artifact_writer_controller() is not None
+                and document_mutation_attempted
+            ):
                 if document_mutation_outcome is None:
                     document_mutation_outcome = {
                         "version": 1,
@@ -15595,7 +15655,10 @@ class Agent:
                 item for item in turn_messages if item is not staged_pending_input_message
             ]
 
-        if self._artifact_writer_controller() is not None:
+        if (
+            self._artifact_writer_controller() is not None
+            and document_mutation_attempted
+        ):
             if document_mutation_outcome is None:
                 document_mutation_outcome = {
                     "version": 1,
@@ -15604,11 +15667,33 @@ class Agent:
                     "retryPolicy": "new_turn",
                     "code": "document_mutation_not_proposed",
                 }
+            current_final_text = "".join(final_text_parts)
+            if document_mutation_finalization_attempted:
+                from opensquilla.engine.silent_reply import normalize_silent_reply
+
+                silent_finalizer = normalize_silent_reply(
+                    current_final_text,
+                    run_kind="human",
+                )
+                if silent_finalizer.suppressed:
+                    # The shared TurnRunner withholds a short sentinel prefix
+                    # until Done. Replace the terminal snapshot without
+                    # emitting another text delta so the held control token is
+                    # discarded rather than combined with the fallback.
+                    current_final_text = _document_mutation_fallback_text()
+                    final_text_parts[:] = [current_final_text]
+                    applied_model_call_boundaries.clear()
+                    yield WarningEvent(
+                        code="document_mutation_finalization_degraded",
+                        message=(
+                            "The document outcome was preserved, but its generated "
+                            "summary used a deterministic localized fallback."
+                        ),
+                    )
             # The model may explain the outcome but cannot redefine it. Append
             # one runtime-owned, localized fact as the final sentence for CLI
             # and non-card channels, without exposing receipt identifiers.
             fact_footer = _document_mutation_fallback_text()
-            current_final_text = "".join(final_text_parts)
             if not current_final_text.rstrip().endswith(fact_footer):
                 fact_delta = ("\n\n" if current_final_text.strip() else "") + fact_footer
                 final_text_parts.append(fact_delta)
