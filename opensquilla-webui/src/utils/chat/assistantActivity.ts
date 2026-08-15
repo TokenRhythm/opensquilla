@@ -504,22 +504,40 @@ function terminalTimelineAnswerCandidate(
     break
   }
 
-  if (index < 0 || timeline[index]?.type !== 'text') return null
+  const terminalItem = timeline[index]
+  if (
+    index < 0
+    || !terminalItem
+    || terminalItem.type !== 'text'
+    || terminalItem.presentation === 'intermediate'
+  ) return null
 
   const indexes = new Set<number>()
   const chunks: string[] = []
   while (index >= 0) {
     const item = timeline[index]
-    if (!item || item.type !== 'text') break
+    if (!item || item.type !== 'text' || item.presentation === 'intermediate') break
     if (typeof item.rawText !== 'string') return null
     indexes.add(index)
     chunks.unshift(item.rawText)
     index -= 1
   }
+  // A gateway-owned intermediate marker is an explicit semantic boundary.
+  // It is stronger than the legacy adjacency heuristic and keeps immediately
+  // preceding work narration inside Activity even when no tool separates it
+  // from the final answer span.
+  const boundaryItem = timeline[index]
+  const crossedPresentationBoundary = index >= 0
+    && boundaryItem?.type === 'text'
+    && boundaryItem.presentation === 'intermediate'
   const crossedOrdinaryToolBoundary = index >= 0
     && timeline[index]?.type === 'tool-group'
     && !isSuccessfulAnswerTransparentControlGroup(timeline[index])
-  if (!crossedControlBoundary && !crossedOrdinaryToolBoundary) return null
+  if (
+    !crossedControlBoundary
+    && !crossedOrdinaryToolBoundary
+    && !crossedPresentationBoundary
+  ) return null
 
   const compact = chunks.join('')
   if (!compact.trim()) return null

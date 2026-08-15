@@ -531,6 +531,34 @@ describe('useChatRenderedMessages internal control turns', () => {
 })
 
 describe('useChatRenderedMessages silent sentinel compatibility', () => {
+  it('preserves presentation from explicit and legacy persisted timelines', () => {
+    const explicit = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'Working note.Final answer.',
+      ts: 1,
+      timeline: [
+        { type: 'text', raw: 'Working note.', presentation: 'intermediate' },
+        { type: 'text', raw: 'Final answer.', presentation: 'answer' },
+      ],
+    }]).renderedMessages.value[0]!
+    const legacy = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'Working note.Final answer.',
+      ts: 1,
+      tool_calls: [
+        { type: 'text', text: 'Working note.', presentation: 'intermediate' },
+        { type: 'text', text: 'Final answer.', presentation: 'answer' },
+      ],
+    }]).renderedMessages.value[0]!
+
+    expect(explicit.timelineItems?.map(item => (
+      item.type === 'text' ? item.presentation : item.type
+    ))).toEqual(['intermediate', 'answer'])
+    expect(legacy.timelineItems?.map(item => (
+      item.type === 'text' ? item.presentation : item.type
+    ))).toEqual(['intermediate', 'answer'])
+  })
+
   it('projects mixed legacy text and explicit timeline markers without mutating history', () => {
     const source: ChatMessage = {
       role: 'assistant',

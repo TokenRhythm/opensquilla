@@ -1281,7 +1281,7 @@ export function useChatStream(options: UseChatStreamOptions) {
       .flatMap((seg): ChatTimelineSegment[] => {
         if (seg.type === 'text') {
           const raw = String(seg.raw || '')
-          return raw ? [{ type: 'text', raw }] : []
+          return raw ? [{ type: 'text', raw, presentation: seg.presentation }] : []
         }
         if (seg.type === 'tool-group') {
           return [{
@@ -1292,7 +1292,9 @@ export function useChatStream(options: UseChatStreamOptions) {
         }
         return []
       })
-    if (segments.length === 0 && fallbackText) return [{ type: 'text', raw: fallbackText }]
+    if (segments.length === 0 && fallbackText) {
+      return [{ type: 'text', raw: fallbackText, presentation: 'answer' }]
+    }
     return segments
   }
 

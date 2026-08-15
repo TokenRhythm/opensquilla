@@ -62,11 +62,11 @@ export interface ReconciledTextSnapshot {
 /**
  * Apply an authoritative terminal text snapshot without losing tool history.
  *
- * A strict extension is still an ordinary suffix and therefore stays after the
- * last streamed segment. A conflicting snapshot supersedes every streamed text
- * segment, but keeps tool groups in arrival order and places the one canonical
- * text segment after them. An empty snapshot intentionally clears text while
- * retaining those tool groups.
+ * A strict extension is still an ordinary answer suffix and therefore stays
+ * after the last streamed answer segment. A conflicting snapshot supersedes
+ * streamed answer text, but keeps tool groups and intermediate commentary in
+ * arrival order before the canonical answer. An empty snapshot intentionally
+ * clears answer text while retaining that work history.
  */
 export function reconcileTextSnapshot(
   segments: ChatStreamSegment[],
@@ -81,7 +81,7 @@ export function reconcileTextSnapshot(
     const suffix = snapshot.slice(accumulatedText.length)
     const next = segments.slice()
     const last = next[next.length - 1]
-    if (last?.type === 'text') {
+    if (last?.type === 'text' && last.presentation !== 'intermediate') {
       next[next.length - 1] = {
         ...last,
         raw: `${last.raw || ''}${suffix}`,
@@ -93,7 +93,9 @@ export function reconcileTextSnapshot(
     return { rawText: snapshot, segments: next, changed: true }
   }
 
-  const next = segments.filter(segment => segment.type !== 'text')
+  const next = segments.filter(segment => (
+    segment.type !== 'text' || segment.presentation === 'intermediate'
+  ))
   if (snapshot) {
     next.push({ type: 'text', raw: snapshot, html: '', dirty: true, presentation: 'answer' })
   }
@@ -563,7 +565,7 @@ export class TurnAccumulator {
     const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
       if (segment.type === 'text') {
         const raw = String(segment.raw || '')
-        return raw ? [{ type: 'text', raw }] : []
+        return raw ? [{ type: 'text', raw, presentation: segment.presentation }] : []
       }
       if (segment.type === 'interrupt') {
         const approvalId = String(segment.approvalId || '')
@@ -909,7 +911,7 @@ export function foldTurn(
   const timelineSegments = segments.flatMap((segment): ChatTimelineSegment[] => {
     if (segment.type === 'text') {
       const raw = String(segment.raw || '')
-      return raw ? [{ type: 'text', raw }] : []
+      return raw ? [{ type: 'text', raw, presentation: segment.presentation }] : []
     }
     if (segment.type === 'interrupt') {
       const approvalId = String(segment.approvalId || '')

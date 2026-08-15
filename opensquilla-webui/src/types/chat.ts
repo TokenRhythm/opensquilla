@@ -205,12 +205,14 @@ export interface ChatToolCallGroup {
   status: '' | 'success' | 'error'
 }
 
+export type ChatTextPresentation = 'intermediate' | 'answer'
+
 export interface ChatStreamSegment {
   type: 'text' | 'tool-group' | 'interrupt'
   raw?: string
   html?: string
   dirty?: boolean
-  presentation?: 'intermediate' | 'answer'
+  presentation?: ChatTextPresentation
   groupId?: string
   operationKey?: string
   approvalId?: string
@@ -222,7 +224,7 @@ export type ChatStreamTimelineItem =
       key: string
       html: string
       rawText?: string
-      presentation?: 'intermediate' | 'answer'
+      presentation?: ChatTextPresentation
     }
   | { type: 'tool-group'; key: string; group: ChatToolCallGroup }
   | {
@@ -332,12 +334,14 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   execution_status?: { status?: string }
   groupId?: string
   group_id?: string
+  presentation?: ChatTextPresentation
 }
 
 export interface ChatTimelineSegment extends Record<string, unknown> {
   type?: string
   raw?: string
   text?: string
+  presentation?: ChatTextPresentation
   groupId?: string
   group_id?: string
   approvalId?: string

@@ -1091,7 +1091,17 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     return segments.flatMap((seg, idx): ChatStreamTimelineItem[] => {
       if (seg?.type === 'text') {
         const raw = String(seg.raw ?? seg.text ?? '')
-        return raw ? [{ type: 'text', key: `${ownerKey}:timeline:text:${idx}`, html: options.renderMarkdown(raw), rawText: raw }] : []
+        const presentation = seg.presentation === 'intermediate'
+          || seg.presentation === 'answer'
+          ? seg.presentation
+          : undefined
+        return raw ? [{
+          type: 'text',
+          key: `${ownerKey}:timeline:text:${idx}`,
+          html: options.renderMarkdown(raw),
+          rawText: raw,
+          presentation,
+        }] : []
       }
       if (seg?.type === 'tool-group') {
         const groupId = String(seg.groupId || seg.group_id || '')
@@ -1170,7 +1180,17 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       const type = String(segment?.type || '')
       if (type === 'text') {
         const raw = String(segment.text || segment.raw || '')
-        if (raw) items.push({ type: 'text', key: `${ownerKey}:timeline:text:${index}`, html: options.renderMarkdown(raw), rawText: raw })
+        const presentation = segment.presentation === 'intermediate'
+          || segment.presentation === 'answer'
+          ? segment.presentation
+          : undefined
+        if (raw) items.push({
+          type: 'text',
+          key: `${ownerKey}:timeline:text:${index}`,
+          html: options.renderMarkdown(raw),
+          rawText: raw,
+          presentation,
+        })
         return
       }
       if (type === 'tool_use') {

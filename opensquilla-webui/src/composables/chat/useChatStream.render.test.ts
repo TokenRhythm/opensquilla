@@ -537,9 +537,9 @@ describe('useChatStream render coalescing', () => {
 
     expect(messages.value[0]?.text).toBe(prefix + suffix)
     expect(messages.value[0]?.timeline).toEqual([
-      { type: 'text', raw: prefix },
+      { type: 'text', raw: prefix, presentation: 'answer' },
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
-      { type: 'text', raw: suffix },
+      { type: 'text', raw: suffix, presentation: 'answer' },
     ])
     api.cleanup()
   })
@@ -788,7 +788,7 @@ describe('useChatStream render coalescing', () => {
   })
 
   it('keeps intermediate and answer text in separate live segments', () => {
-    const { api } = makeStream()
+    const { api, messages } = makeStream()
 
     api.appendToolCall({ tool_use_id: 'tool-1', tool_name: 'web_search' })
     api.appendToolResult({ tool_use_id: 'tool-1', tool_name: 'web_search', result: 'ok' })
@@ -809,6 +809,14 @@ describe('useChatStream render coalescing', () => {
       presentation: item.type === 'text' ? item.presentation : undefined,
       rawText: item.type === 'text' ? item.rawText : undefined,
     })))
+
+    api.endStreaming()
+
+    expect(messages.value[0]?.timeline).toEqual([
+      expect.objectContaining({ type: 'tool-group' }),
+      { type: 'text', raw: 'Checking.', presentation: 'intermediate' },
+      { type: 'text', raw: 'Verified answer.', presentation: 'answer' },
+    ])
     api.cleanup()
   })
 
@@ -1014,7 +1022,7 @@ describe('useChatStream render coalescing', () => {
     expect(messages.value[0]?.text).toBe('Canonical answer')
     expect(messages.value[0]?.timeline).toEqual([
       { type: 'tool-group', groupId: 'stream:tool-group:web.search:0', operationKey: 'web.search' },
-      { type: 'text', raw: 'Canonical answer' },
+      { type: 'text', raw: 'Canonical answer', presentation: 'answer' },
     ])
     expect(messages.value[0]?.tool_calls?.[0]).toMatchObject({
       tool_use_id: 'tool-1',
@@ -1105,7 +1113,9 @@ describe('useChatStream render coalescing', () => {
     api.endStreaming()
 
     expect(messages.value[0]?.text).toBe('streamed fallback')
-    expect(messages.value[0]?.timeline).toEqual([{ type: 'text', raw: 'streamed fallback' }])
+    expect(messages.value[0]?.timeline).toEqual([
+      { type: 'text', raw: 'streamed fallback', presentation: 'answer' },
+    ])
     api.cleanup()
   })
 

@@ -64,6 +64,32 @@ function historyMessage(id: string): NonNullable<ChatHistoryResponse['messages']
 }
 
 describe('useChatHistory canonical pagination', () => {
+  it('preserves semantic text presentation from canonical history', async () => {
+    const { api, messages } = makeHistory(false, {
+      response: {
+        messages: [{
+          id: 'assistant-1',
+          message_id: 'assistant-1',
+          role: 'assistant',
+          text: 'Working note.Final answer.',
+          timestamp: '2026-07-06T00:00:00Z',
+          timeline: [
+            { type: 'text', raw: 'Working note.', presentation: 'intermediate' },
+            { type: 'text', raw: 'Final answer.', presentation: 'answer' },
+          ],
+        }],
+        has_more: false,
+      },
+    })
+
+    await api.loadHistory()
+
+    expect(messages.value[0]?.timeline).toEqual([
+      { type: 'text', raw: 'Working note.', presentation: 'intermediate' },
+      { type: 'text', raw: 'Final answer.', presentation: 'answer' },
+    ])
+  })
+
   it('does not expose an ordinary send disposition as same-turn steer status', async () => {
     const { api, messages } = makeHistory(false, {
       response: {
