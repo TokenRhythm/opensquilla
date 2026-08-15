@@ -18324,10 +18324,19 @@ class Agent:
             result.insert(runtime_idx, runtime_context_message)
         if (
             turn_objective_message is not None
-            and _message_has_tool_result(result[-1] if result else None)
             and not Agent._has_provider_context_marker_replay(result)
         ):
-            result.append(turn_objective_message)
+            reminder_insert_index = len(result)
+            if (
+                len(result) >= 2
+                and result[-1].role == "user"
+                and isinstance(result[-1].content, str)
+                and result[-1].content.startswith("[Action completion contract]")
+                and _message_has_tool_result(result[-2])
+            ):
+                reminder_insert_index -= 1
+            if _message_has_tool_result(result[reminder_insert_index - 1] if result else None):
+                result.insert(reminder_insert_index, turn_objective_message)
         return result
 
     @staticmethod
