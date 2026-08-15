@@ -182,6 +182,7 @@ from opensquilla.engine.turn_runner.harness import (
 )
 from opensquilla.engine.turn_runner.stream_consumer_stage import (
     _could_be_human_silent_reply_prefix,
+    _flush_current_text_segment,
     _StreamState,
 )
 from opensquilla.engine.types import (
@@ -4982,6 +4983,7 @@ class TurnRunner:
         # CancelledError handler can flush a trailing text segment the same way
         # the normal-completion path does.
         current_text_parts: list[str] = []
+        stream_state: _StreamState | None = None
         self._emit_turn_event(
             "turn_start",
             trace_context,
@@ -5947,9 +5949,7 @@ class TurnRunner:
             # Post-stage edge owned by the harness: flush remaining
             # text segment. The stage's post-stream notify already
             # fired (it is the last action of the stage body).
-            if current_text_parts:
-                turn_segments.append({"type": "text", "text": "".join(current_text_parts)})
-                current_text_parts.clear()
+            _flush_current_text_segment(stream_state)
 
             # 10. Persist assistant response (filter sentinel tokens).
             # TurnFinalizerStage owns the slice. The four side effects
@@ -6127,8 +6127,20 @@ class TurnRunner:
             # timeline) drops the visible partial answer.
             trailing = "".join(current_text_parts)
             if trailing:
-                turn_segments.append({"type": "text", "text": trailing})
-                current_text_parts.clear()
+                if stream_state is not None:
+                    _flush_current_text_segment(stream_state)
+                else:
+                    # Cancellation before the stream stage exists can only
+                    # observe legacy answer text. Keep the additive field
+                    # explicit for consistency with normal persistence.
+                    turn_segments.append(
+                        {
+                            "type": "text",
+                            "text": trailing,
+                            "presentation": "answer",
+                        }
+                    )
+                    current_text_parts.clear()
             from opensquilla.engine.silent_reply import (
                 is_silent_reply_prefix,
                 normalize_silent_reply,

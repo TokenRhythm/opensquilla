@@ -1395,6 +1395,53 @@ async def test_chat_history_exposes_stable_message_identity() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_history_preserves_text_segment_presentation_and_order() -> None:
+    segments = [
+        {
+            "type": "text",
+            "text": "I will inspect the source.",
+            "presentation": "intermediate",
+        },
+        {
+            "type": "tool_use",
+            "tool_use_id": "tool-1",
+            "name": "read_file",
+            "input": {"path": "README.md"},
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "tool-1",
+            "name": "read_file",
+            "content": "ok",
+        },
+        {
+            "type": "text",
+            "text": "The source is valid.",
+            "presentation": "answer",
+        },
+    ]
+    entry = TranscriptEntry(
+        id=124,
+        session_id="parent",
+        session_key="agent:main:webchat:test",
+        role="assistant",
+        content="The source is valid.",
+        tool_calls=segments,
+    )
+
+    result = await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test"},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=_FakeSessionManager([entry]),
+        ),
+    )
+
+    assert result["messages"][0]["tool_calls"] == segments
+
+
+@pytest.mark.asyncio
 async def test_chat_history_returns_requested_compaction_summaries() -> None:
     summary = SessionSummary(
         id=7,

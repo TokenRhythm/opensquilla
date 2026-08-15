@@ -755,6 +755,7 @@ def test_tool_use_start_handler_preserves_canonical_details_text_segment() -> No
     assert state.turn_segments[0] == {
         "type": "text",
         "text": expected,
+        "presentation": "answer",
     }
     assert "".join(state.final_text_parts) == expected
 
@@ -773,7 +774,7 @@ def test_tool_use_start_handler_flushes_text_and_appends_segment() -> None:
         state,
     )
     assert state.turn_segments == [
-        {"type": "text", "text": "pre"},
+        {"type": "text", "text": "pre", "presentation": "answer"},
         {"type": "tool_use", "tool_use_id": "t1", "name": "echo", "input": ""},
     ]
     assert state.current_text_parts == []
@@ -2050,7 +2051,11 @@ async def test_system_event_normalization_preserves_text_around_tool_boundary(
         "tool_use",
         "tool_result",
     ]
-    assert inp.state.turn_segments[0] == {"type": "text", "text": "Preparing."}
+    assert inp.state.turn_segments[0] == {
+        "type": "text",
+        "text": "Preparing.",
+        "presentation": "answer",
+    }
     assert inp.state.current_text_parts == ["Finished."]
     assert "NO_REPLY" not in str(inp.state.turn_segments)
 
@@ -2128,6 +2133,7 @@ async def test_system_event_removes_bare_marker_after_tool_without_newline() -> 
     assert inp.state.turn_segments[0] == {
         "type": "text",
         "text": "Visible body.",
+        "presentation": "answer",
     }
     assert inp.state.current_text_parts == []
     assert inp.state.final_text_parts == ["Visible body."]
@@ -2835,7 +2841,7 @@ async def test_outer_stage_persists_literal_text_before_native_tool_segment() ->
     await _drain(stage, _make_input(state=state))
 
     assert state.turn_segments[:2] == [
-        {"type": "text", "text": literal},
+        {"type": "text", "text": literal, "presentation": "answer"},
         {
             "type": "tool_use",
             "tool_use_id": "native-1",

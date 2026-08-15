@@ -750,7 +750,13 @@ class TurnFinalizerStage:
                     if not (isinstance(segment, dict) and segment.get("type") == "text")
                 ]
                 if final_text:
-                    turn_segments.append({"type": "text", "text": final_text})
+                    turn_segments.append(
+                        {
+                            "type": "text",
+                            "text": final_text,
+                            "presentation": "answer",
+                        }
+                    )
 
         final_text = with_unconfirmed_action_notice(final_text, turn_segments)
 
