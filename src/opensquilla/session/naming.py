@@ -4,14 +4,14 @@ After the first user message of an eligible session, :func:`generate_session_tit
 runs a single one-shot LLM call (mirroring the compaction summarizer's direct
 ``/chat/completions`` POST) and writes the result to ``SessionNode.derived_title``.
 
-Model selection deliberately does NOT reuse the session model. It resolves, in
-order: ``naming.model`` (explicit) → ``naming.tier`` model → the router's
-``default_tier`` model → the session/provider model as a last resort. A tier
-model is only eligible when the tier targets the active provider — matched on
-the configured provider id, with the wire kind accepted as an alias — or names
-no provider at all: tier model ids are spelled per provider catalog and are
-not portable across connections. Connection credentials (api_key / base_url)
-come from the same provider the compaction path resolves, so an
+Explicit ``naming.model`` and ``naming.tier`` settings always win. Without an
+explicit naming target, direct routing reuses the resolved session/provider
+model, while Router and Ensemble modes use the router's ``default_tier`` model.
+A tier model is only eligible when the tier targets the active provider —
+matched on the configured provider id, with the wire kind accepted as an alias
+— or names no provider at all: tier model ids are spelled per provider catalog
+and are not portable across connections. Connection credentials (api_key /
+base_url) come from the same provider the compaction path resolves, so an
 OpenRouter-backed gateway stays self-consistent.
 
 The title is written to ``derived_title`` (not ``display_name``) so it sits below
@@ -60,6 +60,7 @@ _MAX_INPUT_CHARS = 4000  # cap the untrusted first message fed to the namer
 # that off — the budget must cover thinking plus the title or the response
 # ends at length with empty content.
 _TITLE_MAX_TOKENS = 512
+_TOKENRHYTHM_TITLE_MAX_TOKENS = 1024
 _OPENROUTER_REASONING_DEFAULT_MODELS = frozenset(
     {
         "deepseek/deepseek-v4",
@@ -184,6 +185,8 @@ def resolve_naming_target(
     router_cfg: Any | None,
     provider: Any | None,
     fallback_model: str | None,
+    *,
+    use_router_default_tier: bool = True,
 ) -> NamingTarget | None:
     """Resolve ``(model, api_key, base_url, timeout)`` for the naming call.
 
@@ -198,9 +201,9 @@ def resolve_naming_target(
         if identity and identity.strip()
     )
 
-    tier_name = getattr(naming_cfg, "tier", None) or getattr(
-        router_cfg, "default_tier", DEFAULT_TEXT_TIER
-    )
+    tier_name = getattr(naming_cfg, "tier", None)
+    if not tier_name and use_router_default_tier:
+        tier_name = getattr(router_cfg, "default_tier", DEFAULT_TEXT_TIER)
     model = (
         getattr(naming_cfg, "model", None)
         or _tier_model(router_cfg, tier_name, provider_identities=provider_identities)
@@ -333,11 +336,16 @@ async def call_naming_llm(
     budget_provider = provider or (
         "openrouter" if "openrouter.ai" in url.lower() else "openai_compat"
     )
+    title_max_tokens = (
+        _TOKENRHYTHM_TITLE_MAX_TOKENS
+        if str(provider or "").strip().lower() == "tokenrhythm"
+        else _TITLE_MAX_TOKENS
+    )
     request_budget = resolve_auxiliary_request_budget(
         None,
         provider_id=budget_provider,
         model=model,
-        max_output_tokens=_TITLE_MAX_TOKENS,
+        max_output_tokens=title_max_tokens,
     )
     user_content = _fit_naming_user_content(
         first_message,
@@ -472,6 +480,7 @@ async def generate_session_title(
             return
 
         # Local imports avoid a module-load cycle (rpc_sessions imports this module).
+        from opensquilla.gateway.model_routing import model_routing_snapshot
         from opensquilla.gateway.rpc_chat import (
             _effective_compaction_model,
             _resolve_compaction_provider,
@@ -495,6 +504,9 @@ async def generate_session_title(
             getattr(config, "squilla_router", None),
             provider,
             _effective_compaction_model(session),
+            use_router_default_tier=(
+                model_routing_snapshot(config)["mode"] != "direct"
+            ),
         )
         if target is None:
             return

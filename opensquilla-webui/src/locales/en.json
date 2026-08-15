@@ -3150,8 +3150,7 @@
       "count": "{count} tasks",
       "emptyTitle": "No usage data yet",
       "emptyText": "Run a task and its token usage will appear here automatically.",
-      "openChat": "Open task “{task}”",
-      "autoModels": "auto · {count} models"
+      "openChat": "Open task “{task}”"
     },
     "columns": {
       "session": "Task",
@@ -3430,6 +3429,11 @@
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent completion",
     "turnFailed": "Turn failed",
+    "restartInterruptedTitle": "OpenSquilla restarted and interrupted this task.",
+    "restartInterruptedGuidance": "This task won't continue automatically. Review any existing results or tool activity, then edit the original request or continue the conversation.",
+    "usageAccountingBlockedTitle": "Usage accounting temporarily unavailable",
+    "usageAccountingBlockedMessage": "The provider request was not sent and no usage was billed. You can safely retry this turn.",
+    "usageAccountingBlockedUnsafeMessage": "This provider request was not sent. Earlier work in this turn may already have run or been billed, so review it before trying again.",
     "sandboxPausedResume": "Resume execution",
     "sandboxResumed": "Autonomous execution resumed. Resend your request to continue.",
     "sandboxResumeFailed": "Could not resume execution: {error}",

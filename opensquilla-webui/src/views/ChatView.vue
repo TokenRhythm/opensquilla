@@ -197,7 +197,7 @@
           :goal-elapsed="goalLastElapsed"
           @fork-conversation="forkConversation"
           @edit-message="editMessage"
-          @regenerate-message="regenerateMessage"
+          @regenerate-message="handleRegenerateMessage"
           @toggle-share-message="toggleShareMessage"
           @download-artifact="downloadArtifact"
           @open-artifact="openArtifact"
@@ -1412,6 +1412,10 @@ watch(
 
 let sendCurrentInput: () => void = () => {}
 let sendAutomaticInput: () => void = () => {}
+let sendUsageBarrierReplay: (payload: {
+  text: string
+  forkBeforeMessageId: string
+}) => Promise<boolean> = async () => false
 // Late-bound: dispatchHiddenSend is created below (useChatSend) but the /meta
 // slash handler (useChatSlashCommands, created earlier) needs it at call time.
 let dispatchHiddenForMeta: (
@@ -1525,6 +1529,7 @@ const {
   removePendingChip,
   beginPendingDelivery,
   settlePendingDelivery,
+  cancelDurableItem,
   clearPendingQueue,
   switchPendingQueue,
   adoptPendingQueue,
@@ -1905,6 +1910,7 @@ const chatMessageActions = useChatMessageActions({
   stripTimePrefix,
   autoResizeTextarea,
   sendCurrentInput: () => sendCurrentInput(),
+  sendUsageBarrierReplay: payload => sendUsageBarrierReplay(payload),
   focusComposer: () => composerRef.value?.focusTextarea(),
   pendingForkBeforeMessageId,
   aiGeneratedLabel: () => aiGeneratedLabel.value,
@@ -1922,6 +1928,14 @@ const {
   regenerateMessage,
   editMessage,
 } = chatMessageActions
+
+async function handleRegenerateMessage(
+  message: ChatRenderedMessage,
+  settle?: (accepted: boolean) => void,
+) {
+  const accepted = await regenerateMessage(message)
+  settle?.(accepted)
+}
 
 let applyPendingUserInputSnapshot: typeof chatPlans.applyBootstrap = () => {}
 let applyGoalSnapshot: (snapshot: SessionMessagesSubscribeResponse) => void = () => {}
@@ -2541,6 +2555,7 @@ const {
   closeSlashMenu,
   completeSlashCmd,
   activateSlashCmd,
+  classifySlashCommand,
   executeSlashCommand,
   restoreDurableMetaDrafts: restoreServerMetaDrafts,
 } = chatSlashCommands
@@ -2584,6 +2599,7 @@ const chatSend = useChatSend({
   messages,
   sessionKey,
   pendingQueueOwnerContext,
+  hasPendingQueueWork: () => pendingQueue.value.length > 0,
   pendingInputWal,
   busySendMode,
   modelRoutingMode,
@@ -2647,12 +2663,14 @@ const chatSend = useChatSend({
   prepareAttachmentsForSend,
   enqueuePendingInput,
   enqueuePendingPayload,
+  cancelDurablePendingItem: cancelDurableItem,
   enqueueHiddenControl,
   enqueuePendingSteerAttempt,
   steerDelivery,
   restoreSteerIntoComposer: text => appendComposerText(text),
   popAllPendingIntoComposer,
   reconcileTaskOwnership: () => retrySessionMetadata(),
+  classifySlashCommand,
   executeSlashCommand,
   closeSlashMenu,
   autoResizeTextarea,
@@ -2663,6 +2681,7 @@ const {
   onStop,
   sendQueuedSteer,
   sendQueuedFollowup,
+  sendUsageBarrierReplay: dispatchUsageBarrierReplay,
   dispatchComposerPrompt,
   dispatchHiddenSend,
   dispatchQueuedHiddenSend,
@@ -2673,6 +2692,7 @@ const {
   sendHiddenMetaPreflightConfirmation,
   recoverResponseHandoffs,
 } = chatSend
+sendUsageBarrierReplay = dispatchUsageBarrierReplay
 void recoverResponseHandoffs()
 watch(
   [() => rpc.state, sessionKey],

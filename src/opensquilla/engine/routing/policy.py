@@ -543,6 +543,25 @@ def large_context_min_tier(material_tokens: int, context_window_tokens: int) -> 
     return None
 
 
+def resolve_large_context_floor_tier(
+    minimum_tier: str | None,
+    valid_tiers: list[str],
+) -> str | None:
+    """Resolve a theoretical floor to the first configured canonical tier above it."""
+
+    minimum_index = tier_index(minimum_tier)
+    if minimum_index < 0:
+        return None
+    return next(
+        (
+            tier
+            for tier in _canonical_order(valid_tiers)
+            if tier_index(tier) >= minimum_index
+        ),
+        None,
+    )
+
+
 def large_context_floor(
     decision: RoutingDecision,
     *,
@@ -557,10 +576,11 @@ def large_context_floor(
     if decision.tier not in valid_tiers:
         return decision
 
-    min_tier = large_context_min_tier(material_tokens, context_window_tokens)
-    if min_tier is None:
+    required_tier = large_context_min_tier(material_tokens, context_window_tokens)
+    if required_tier is None:
         return decision
-    if min_tier not in valid_tiers:
+    min_tier = resolve_large_context_floor_tier(required_tier, valid_tiers)
+    if min_tier is None:
         return decision
     if _tier_index(decision.tier, valid_tiers) >= _tier_index(min_tier, valid_tiers):
         return decision
@@ -955,6 +975,22 @@ class RoutingPolicyEngine:
                 extra,
             )
 
+        required_context_tier = large_context_min_tier(
+            inputs.material_estimated_tokens,
+            inputs.context_window_tokens,
+        )
+        minimum_context_tier = resolve_large_context_floor_tier(
+            required_context_tier,
+            inputs.valid_tiers,
+        )
+        if required_context_tier is not None:
+            metadata_updates["large_context_floor_min_tier"] = (
+                minimum_context_tier or required_context_tier
+            )
+            metadata_updates["large_context_material_tokens"] = (
+                inputs.material_estimated_tokens
+            )
+
         decision = large_context_floor(
             decision,
             tiers=inputs.tiers,
@@ -975,9 +1011,17 @@ class RoutingPolicyEngine:
         # raise it. With ``budget is None`` (the default) the whole block is
         # skipped, so routing is byte-identical to the pre-gate pipeline.
         if inputs.budget is not None:
+            budget_tiers = inputs.valid_tiers
+            if required_context_tier is not None:
+                minimum_index = tier_index(required_context_tier)
+                budget_tiers = [
+                    tier
+                    for tier in inputs.valid_tiers
+                    if tier_index(tier) >= minimum_index
+                ]
             budget_result = budget_gate(
                 decision.tier,
-                valid_tiers=inputs.valid_tiers,
+                valid_tiers=budget_tiers,
                 budget=inputs.budget,
             )
             decision = apply_budget_gate(

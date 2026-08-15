@@ -97,8 +97,8 @@ async def test_windows_host_shell_runs_powershell_syntax_directly(monkeypatch) -
     async def fail_create_subprocess_shell(*_args, **_kwargs):
         raise AssertionError("Windows host execution must not use cmd.exe")
 
-    monkeypatch.setattr(shell.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
-    monkeypatch.setattr(shell.asyncio, "create_subprocess_shell", fail_create_subprocess_shell)
+    monkeypatch.setattr(shell, "create_owned_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(shell, "create_owned_subprocess_shell", fail_create_subprocess_shell)
     monkeypatch.setattr(shell, "_trusted_windows_powershell_path", lambda: "powershell.exe")
 
     await shell._create_host_shell_subprocess('Write-Output "ok"')
@@ -645,6 +645,7 @@ async def test_exact_elevation_background_process_runs_on_host_once(
             return b""
 
     class FakeProcess:
+        pid = 6101
         stdout = FakeStdout()
         returncode = 0
 
@@ -670,7 +671,7 @@ async def test_exact_elevation_background_process_runs_on_host_once(
 
     monkeypatch.setattr(shell, "get_runtime", lambda: runtime)
     monkeypatch.setattr(shell, "gate_action", fail_gate_action)
-    monkeypatch.setattr(shell.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(shell, "create_owned_subprocess_exec", fake_create_subprocess_exec)
     _allow_exact_elevation(monkeypatch, shell)
     monkeypatch.setattr(
         shell,
@@ -730,6 +731,7 @@ async def test_background_host_effect_batch_requires_one_exact_elevation(
             return b""
 
     class FakeProcess:
+        pid = 6102
         stdout = FakeStdout()
         returncode = 0
 
@@ -747,7 +749,7 @@ async def test_background_host_effect_batch_requires_one_exact_elevation(
         return FakeProcess()
 
     monkeypatch.setattr(shell, "get_runtime", lambda: runtime)
-    monkeypatch.setattr(shell.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(shell, "create_owned_subprocess_exec", fake_create_subprocess_exec)
     actions = _allow_exact_elevation(monkeypatch, shell)
     monkeypatch.setattr(
         shell,

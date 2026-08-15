@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,7 @@ from opensquilla.tools.types import ToolContext, current_tool_context
 
 class _FakeProcess:
     returncode = 0
+    pid = os.getpid()
 
     async def communicate(self) -> tuple[bytes, None]:
         return b"## main\n", None
@@ -46,7 +48,7 @@ async def test_git_status_run_mode_full_uses_host_subprocess(
         calls.append({"args": args, "kwargs": kwargs})
         return _FakeProcess()
 
-    monkeypatch.setattr(git.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(git, "create_owned_subprocess_exec", fake_create_subprocess_exec)
     token = current_tool_context.set(
         ToolContext(
             is_owner=True,
@@ -131,6 +133,7 @@ class _GbkProcess:
     """Emits GBK/CP936-encoded Chinese bytes (e.g. a filename in git status)."""
 
     returncode = 0
+    pid = os.getpid()
 
     async def communicate(self) -> tuple[bytes, None]:
         # "新建文件" (new file) encoded in GBK — invalid UTF-8, so a naive
@@ -161,7 +164,7 @@ async def test_git_host_output_decodes_via_centralized_decoder(
     async def fake_create_subprocess_exec(*args: str, **kwargs: Any) -> _GbkProcess:
         return _GbkProcess()
 
-    monkeypatch.setattr(git.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    monkeypatch.setattr(git, "create_owned_subprocess_exec", fake_create_subprocess_exec)
     token = current_tool_context.set(
         ToolContext(
             is_owner=True,

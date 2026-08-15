@@ -3150,8 +3150,7 @@
       "count": "{count} 个任务",
       "emptyTitle": "暂无用量数据",
       "emptyText": "运行任务后，Token 用量会自动显示在这里。",
-      "openChat": "打开任务“{task}”",
-      "autoModels": "自动 · {count} 个模型"
+      "openChat": "打开任务“{task}”"
     },
     "columns": {
       "session": "任务",
@@ -3430,6 +3429,11 @@
     "subagentPrefix": "子智能体：",
     "subagentCompletion": "子智能体完成",
     "turnFailed": "本轮失败",
+    "restartInterruptedTitle": "OpenSquilla 重启导致任务中断。",
+    "restartInterruptedGuidance": "任务不会自动继续。请检查已有结果或工具操作，然后编辑原请求或继续对话。",
+    "usageAccountingBlockedTitle": "用量记账暂时不可用",
+    "usageAccountingBlockedMessage": "请求尚未发送给模型服务，也没有产生计费。你可以安全地重试本轮。",
+    "usageAccountingBlockedUnsafeMessage": "本次模型请求尚未发送，但本轮更早的操作可能已经执行或产生计费。请检查已有结果后再决定是否重试。",
     "sandboxPausedResume": "恢复执行",
     "sandboxResumed": "已恢复自动执行。请重新发送你的请求以继续。",
     "sandboxResumeFailed": "无法恢复执行:{error}",

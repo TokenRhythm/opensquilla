@@ -42,6 +42,13 @@ from opensquilla.gateway.session_lifecycle import (
     TaskLifecycleEvent,
     TaskLifecycleListener,
 )
+from opensquilla.gateway.terminal_activity import (
+    is_usage_accounting_barrier,
+    safe_primary_user_message_id,
+    safe_retry_after_ms,
+    terminal_activity_snapshot,
+    usage_barrier_replay_proof,
+)
 from opensquilla.safety.injection_guard import xml_escape
 from opensquilla.session.goals import (
     GOAL_OBJECTIVE_UPDATE_DETAIL_KEY,
@@ -3674,6 +3681,13 @@ class TaskRuntime:
                 error_class=str(getattr(exc, "code", None) or type(exc).__name__),
                 error_message=str(exc),
                 failure_kind=failure_kind,
+                retry_after_ms=safe_retry_after_ms(getattr(exc, "retry_after_ms", None)),
+                activity_snapshot=getattr(exc, "activity_snapshot", None),
+                usage_call_index=getattr(exc, "usage_call_index", None),
+                no_prior_provider_dispatch=(
+                    getattr(exc, "no_prior_provider_dispatch", False) is True
+                ),
+                replay_safe=getattr(exc, "replay_safe", False) is True,
                 promote_pending_steers=True,
             )
         finally:
@@ -5142,6 +5156,11 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        retry_after_ms: int | None = None,
+        activity_snapshot: object = None,
+        usage_call_index: int | None = None,
+        no_prior_provider_dispatch: bool = False,
+        replay_safe: bool = False,
         promote_pending_steers: bool = False,
         activate_promoted_steers: bool = True,
     ) -> None:
@@ -5157,6 +5176,11 @@ class TaskRuntime:
                         error_class=error_class,
                         error_message=error_message,
                         failure_kind=failure_kind,
+                        retry_after_ms=retry_after_ms,
+                        activity_snapshot=activity_snapshot,
+                        usage_call_index=usage_call_index,
+                        no_prior_provider_dispatch=no_prior_provider_dispatch,
+                        replay_safe=replay_safe,
                         promote_pending_steers=promote_pending_steers,
                         activate_promoted_steers=activate_promoted_steers,
                     )
@@ -5175,6 +5199,11 @@ class TaskRuntime:
         error_class: str | None = None,
         error_message: str | None = None,
         failure_kind: str | None = None,
+        retry_after_ms: int | None = None,
+        activity_snapshot: object = None,
+        usage_call_index: int | None = None,
+        no_prior_provider_dispatch: bool = False,
+        replay_safe: bool = False,
         promote_pending_steers: bool = False,
         activate_promoted_steers: bool = True,
     ) -> None:
@@ -5270,6 +5299,11 @@ class TaskRuntime:
                     error_class=error_class,
                     error_message=error_message,
                     failure_kind=failure_kind,
+                    retry_after_ms=retry_after_ms,
+                    activity_snapshot=activity_snapshot,
+                    usage_call_index=usage_call_index,
+                    no_prior_provider_dispatch=no_prior_provider_dispatch,
+                    replay_safe=replay_safe,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - terminal feedback still matters.
@@ -5330,11 +5364,78 @@ class TaskRuntime:
             }
             if status != AgentTaskStatus.SUCCEEDED:
                 payload["terminal_message"] = build_terminal_reply(terminal_payload)
-            await _complete_terminal_settlement(
-                self._emit(task.envelope.session_key, f"task.{status.value}", payload)
-            )
-            async with self._state_lock:
-                task.terminal_emitted = True
+            if status != AgentTaskStatus.SUCCEEDED and is_usage_accounting_barrier(error_class):
+                details = terminal_update.get("details")
+                details = details if isinstance(details, dict) else {}
+                turn_outcome = details.get("turn_outcome")
+                snapshot = details.get("activity_snapshot")
+                payload.update(
+                    {
+                        "code": error_class,
+                        "error_class": error_class,
+                        "retryable": True,
+                    }
+                )
+                replay_proof = usage_barrier_replay_proof(
+                    usage_call_index=usage_call_index,
+                    no_prior_provider_dispatch=no_prior_provider_dispatch,
+                    replay_safe=replay_safe,
+                )
+                payload.update(replay_proof)
+                terminal_payload.update(replay_proof)
+                payload["terminal_message"] = build_terminal_reply(terminal_payload)
+                if not isinstance(turn_outcome, dict):
+                    turn_outcome = outcome_from_error(
+                        code=error_class,
+                        message=error_message,
+                        error_class=error_class,
+                        failure_kind=failure_kind,
+                    ).to_dict()
+                    if retry_after_ms is not None:
+                        turn_outcome["retry_after_ms"] = retry_after_ms
+                turn_outcome.update(replay_proof)
+                payload["turn_outcome"] = dict(turn_outcome)
+                if not isinstance(snapshot, dict):
+                    snapshot = terminal_activity_snapshot(
+                        activity_snapshot,
+                        task_id=task.task_id,
+                        turn_id=task.task_id,
+                    )
+                if snapshot is not None:
+                    payload["activity_snapshot"] = dict(snapshot)
+                safe_retry = safe_retry_after_ms(details.get("retry_after_ms"))
+                if safe_retry is None:
+                    safe_retry = safe_retry_after_ms(retry_after_ms)
+                if safe_retry is not None:
+                    payload["retry_after_ms"] = safe_retry
+            try:
+                await _complete_terminal_settlement(
+                    self._emit(task.envelope.session_key, f"task.{status.value}", payload)
+                )
+                async with self._state_lock:
+                    task.terminal_emitted = True
+            finally:
+                if not terminal_persisted:
+                    # The first write already exhausted the storage layer's bounded
+                    # busy budget.  Publish the terminal event before making one
+                    # more bounded, idempotent update of the same task row so a
+                    # lock released by an observer cannot leave startup recovery
+                    # looking at RUNNING.  This does not append transcript or usage
+                    # rows and remains part of the driver's shutdown/drain fence.
+                    terminal_persisted = await self._compensate_terminal_persistence(
+                        task,
+                        terminal_update=terminal_update,
+                        status=status,
+                        terminal_reason=terminal_reason,
+                        error_class=error_class,
+                        error_message=error_message,
+                        failure_kind=failure_kind,
+                        retry_after_ms=retry_after_ms,
+                        activity_snapshot=activity_snapshot,
+                        usage_call_index=usage_call_index,
+                        no_prior_provider_dispatch=no_prior_provider_dispatch,
+                        replay_safe=replay_safe,
+                    )
             await _complete_terminal_settlement(
                 self._notify_task_lifecycle(
                     TaskLifecycleEvent(
@@ -5738,6 +5839,11 @@ class TaskRuntime:
         error_class: str | None,
         error_message: str | None,
         failure_kind: str | None,
+        retry_after_ms: int | None,
+        activity_snapshot: object,
+        usage_call_index: int | None,
+        no_prior_provider_dispatch: bool,
+        replay_safe: bool,
     ) -> dict[str, Any]:
         outcome = _subagent_group_outcome_from_provenance(task.envelope.input_provenance)
         existing = await self._storage.get_agent_task(task.task_id)
@@ -5792,6 +5898,30 @@ class TaskRuntime:
             ).to_dict()
             if cancellation is not None:
                 turn_outcome["cancellation_source"] = cancellation["source"]
+            if is_usage_accounting_barrier(error_class):
+                replay_proof = usage_barrier_replay_proof(
+                    usage_call_index=usage_call_index,
+                    no_prior_provider_dispatch=no_prior_provider_dispatch,
+                    replay_safe=replay_safe,
+                )
+                turn_outcome.update(replay_proof)
+                details.update(replay_proof)
+                primary_user_message_id = safe_primary_user_message_id(
+                    task.persisted_user_message_id
+                )
+                if primary_user_message_id is not None:
+                    turn_outcome["user_message_id"] = primary_user_message_id
+                safe_retry = safe_retry_after_ms(retry_after_ms)
+                if safe_retry is not None:
+                    turn_outcome["retry_after_ms"] = safe_retry
+                    details["retry_after_ms"] = safe_retry
+                snapshot = terminal_activity_snapshot(
+                    activity_snapshot,
+                    task_id=task.task_id,
+                    turn_id=task.task_id,
+                )
+                if snapshot is not None:
+                    details["activity_snapshot"] = snapshot
             details["turn_outcome"] = turn_outcome
         if outcome is not None:
             details["subagent_group_outcome"] = outcome
@@ -5838,6 +5968,65 @@ class TaskRuntime:
             if hasattr(record, key):
                 setattr(record, key, value)
         self._terminal_fallback_records[task.task_id] = record
+
+    async def _compensate_terminal_persistence(
+        self,
+        task: _RuntimeTask,
+        *,
+        terminal_update: dict[str, Any],
+        status: AgentTaskStatus,
+        terminal_reason: str,
+        error_class: str | None,
+        error_message: str | None,
+        failure_kind: str | None,
+        retry_after_ms: int | None,
+        activity_snapshot: object,
+        usage_call_index: int | None,
+        no_prior_provider_dispatch: bool,
+        replay_safe: bool,
+    ) -> bool:
+        """Retry one terminal task-row update after its public fallback event."""
+
+        try:
+            terminal_update.update(
+                await self._terminal_details_update(
+                    task,
+                    status=status,
+                    terminal_reason=terminal_reason,
+                    error_class=error_class,
+                    error_message=error_message,
+                    failure_kind=failure_kind,
+                    retry_after_ms=retry_after_ms,
+                    activity_snapshot=activity_snapshot,
+                    usage_call_index=usage_call_index,
+                    no_prior_provider_dispatch=no_prior_provider_dispatch,
+                    replay_safe=replay_safe,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - retain any first-pass details.
+            log.warning(
+                "task_runtime.terminal_details_compensation_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                error=str(exc),
+            )
+        try:
+            await self._storage.update_agent_task(task.task_id, **terminal_update)
+        except Exception as exc:  # noqa: BLE001 - the in-memory terminal stays usable.
+            log.warning(
+                "task_runtime.terminal_persist_compensation_failed",
+                task_id=task.task_id,
+                session_key=task.envelope.session_key,
+                error=str(exc),
+            )
+            return False
+        self._terminal_fallback_records.pop(task.task_id, None)
+        log.info(
+            "task_runtime.terminal_persist_compensated",
+            task_id=task.task_id,
+            session_key=task.envelope.session_key,
+        )
+        return True
 
 
 def _subagent_group_outcome_from_provenance(

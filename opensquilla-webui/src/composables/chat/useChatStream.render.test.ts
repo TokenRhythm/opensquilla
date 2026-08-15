@@ -320,6 +320,51 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('persists a status-only turn when a terminal error ends the stream', () => {
+    const { api, messages } = makeStream()
+
+    api.startStreaming()
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+    api.endStreaming()
+
+    expect(messages.value).toEqual([
+      expect.objectContaining({
+        role: 'assistant',
+        text: '',
+        statusHistory: expect.arrayContaining([
+          expect.objectContaining({ action: 'provider:requesting' }),
+        ]),
+      }),
+    ])
+    api.cleanup()
+  })
+
+  it('merges durable activity occurrences without dropping repeated retry phases', () => {
+    const { api } = makeStream()
+
+    api.startStreaming()
+    api.setStreamActivity('Waiting for model', 'provider:requesting')
+    vi.advanceTimersByTime(50)
+    rafCbs[0](0)
+    api.restoreStatusHistory([
+      { action: 'provider:requesting', label: 'Waiting for model', at: 1_000 },
+      { action: 'provider:retry_wait:0', label: 'Waiting to retry', at: 2_000 },
+      { action: 'provider:retrying:0:0', label: 'Retrying', at: 3_000 },
+      { action: 'provider:retry_wait:0', label: 'Waiting to retry', at: 4_000 },
+    ])
+
+    expect(api.foldedTurn.value.statusHistory.map(entry => entry.action)).toEqual([
+      'Sending',
+      'provider:requesting',
+      'provider:retry_wait:0',
+      'provider:retrying:0:0',
+      'provider:retry_wait:0',
+    ])
+    api.cleanup()
+  })
+
   it('does not invalidate the activity surface for same-phase progress deltas', () => {
     const { api } = makeStream()
     let activityRuns = 0

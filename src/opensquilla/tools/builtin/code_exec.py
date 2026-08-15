@@ -16,6 +16,10 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse
 
+from opensquilla.process_tree import (
+    capture_process_tree_owner,
+    create_owned_subprocess_exec,
+)
 from opensquilla.sandbox.denial_attribution import is_likely_sandbox_denied
 from opensquilla.sandbox.elevation import (
     ApprovalDisplay,
@@ -1203,7 +1207,7 @@ async def execute_code(
                 )
 
     try:
-        proc = await asyncio.create_subprocess_exec(
+        proc = await create_owned_subprocess_exec(
             python_bin,
             "-c",
             code,
@@ -1212,11 +1216,18 @@ async def execute_code(
             cwd=str(workdir_path),
             env=safe_env,
         )
+        process_tree = capture_process_tree_owner(proc, isolated=True)
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.CancelledError:
+            from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
+
+            await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
+            raise
         except TimeoutError:
-            proc.kill()
-            await proc.communicate()
+            from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
+
+            await _terminate_exec_process_tree(proc, process_tree)
             elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
             return finish(
                 _execution_result_json(
@@ -1228,6 +1239,9 @@ async def execute_code(
                 )
             )
 
+        from opensquilla.tools.builtin.shell import _terminate_exec_process_tree
+
+        await _terminate_exec_process_tree(proc, process_tree)
         elapsed_ms = (time.monotonic_ns() - start_ns) // 1_000_000
         stdout = decode_subprocess_output(stdout_bytes)
         stderr = decode_subprocess_output(stderr_bytes)

@@ -738,7 +738,15 @@ async def test_warnlist_background_process_uses_sandbox_gate_when_runtime_enable
 
     async def fake_sandbox_spawn(*args: object, **kwargs: object) -> object:
         calls.append(("backend", kwargs.get("request")))
-        return shell._SpawnedBackgroundProcess(process=_FakeProcess())  # type: ignore[arg-type]
+        process = _FakeProcess()
+        return shell._SpawnedBackgroundProcess(
+            process=process,  # type: ignore[arg-type]
+            process_tree=shell.ProcessTreeOwner(
+                process=process,
+                pid=6401,
+                ownership_error="synthetic test process",
+            ),
+        )
 
     monkeypatch.setattr(shell, "gate_action", fake_gate_action)
     monkeypatch.setattr(shell, "_spawn_sandboxed_background_process", fake_sandbox_spawn)

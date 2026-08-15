@@ -28,8 +28,10 @@
         v-if="
           showTurnOutcome
           && message.turnOutcome
-          && !showActivityDisclosure
-          && !hasPlan
+          && (
+            processRestart
+            || (!showActivityDisclosure && !hasPlan)
+          )
         "
         :outcome="message.turnOutcome"
       />
@@ -330,7 +332,7 @@
             <Icon :name="copyIconName" :size="12" />
           </button>
           <span class="msg-copy-live" aria-live="polite">{{ copyLiveText }}</span>
-          <button type="button" class="msg-action" :title="t('chat.regenerate')" :aria-label="t('chat.regenerate')" @click="$emit('regenerate', message)">
+          <button v-if="regenerateAvailable !== false" type="button" class="msg-action" :title="t('chat.regenerate')" :aria-label="t('chat.regenerate')" @click="$emit('regenerate', message)">
             <Icon name="refresh" :size="12" />
           </button>
           <template v-if="feedbackDecisionId">
@@ -448,6 +450,7 @@ import {
 } from '@/utils/chat/activityDisclosureState'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
 import {
+  isProcessRestartOutcome,
   turnOutcomeDurationSeconds,
   turnOutcomePresentation,
 } from '@/utils/chat/turnOutcome'
@@ -467,6 +470,7 @@ const props = defineProps<{
   toolStatusText: (call: ChatToolCallRenderItem) => string
   toolSecondaryText: (call: ChatToolCallRenderItem) => string
   copyMessage: (message: ChatRenderedMessage) => Promise<boolean>
+  regenerateAvailable?: boolean
   artifactNavigationItems?: ArtifactPayload[]
   sessionKey?: string
   authToken?: string
@@ -611,6 +615,7 @@ const standaloneInterruptParts = computed(() =>
   )),
 )
 const outcomePresentation = computed(() => turnOutcomePresentation(props.message.turnOutcome))
+const processRestart = computed(() => isProcessRestartOutcome(props.message.turnOutcome))
 
 function epochMilliseconds(value: string | number | null | undefined): number {
   if (value == null) return 0

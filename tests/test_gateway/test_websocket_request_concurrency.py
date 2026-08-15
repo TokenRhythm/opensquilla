@@ -94,7 +94,7 @@ class _ConcurrentOptionalReadDispatcher:
         return ["sessions.list", "noop"]
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
-        if method == "sessions.list":
+        if req_id in self.held_request_ids:
             self.request_started[req_id].set()
             await self.release_request[req_id].wait()
         elif method == "noop":
@@ -283,10 +283,20 @@ async def test_slow_history_does_not_block_another_history_or_noop(
 
 
 @pytest.mark.parametrize("writer_queue_enabled", [False, True])
-async def test_four_slow_optional_reads_do_not_block_interactive_rpc(
+async def test_webui_bootstrap_optional_reads_do_not_reject_catalog_or_block_interactive_rpc(
     writer_queue_enabled: bool,
 ) -> None:
-    request_ids = tuple(f"session-{index}" for index in range(1, 5))
+    requests = (
+        ("drafts", "meta.drafts.list"),
+        ("workspaces", "workspaces.list"),
+        ("onboarding", "onboarding.status"),
+        ("run-mode", "sandbox.run_mode.preference.get"),
+        ("config", "config.get"),
+        ("commands", "commands.list_for_surface"),
+        ("agents", "agents.list"),
+        ("sessions", "sessions.list"),
+    )
+    request_ids = tuple(req_id for req_id, _method in requests)
     dispatcher = _ConcurrentOptionalReadDispatcher(set(request_ids))
     observed: dict[str, bool] = {}
 
@@ -305,11 +315,11 @@ async def test_four_slow_optional_reads_do_not_block_interactive_rpc(
             {
                 "type": "req",
                 "id": req_id,
-                "method": "sessions.list",
-                "params": {"sessionKey": req_id},
+                "method": method,
+                "params": {},
             }
         )
-        for req_id in request_ids
+        for req_id, method in requests
     )
     frames.append(json.dumps({"type": "req", "id": "quick", "method": "noop"}))
     ws = _HistoryWebSocket(

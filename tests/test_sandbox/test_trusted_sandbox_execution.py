@@ -565,6 +565,7 @@ async def test_full_host_access_code_exec_resolves_host_python(monkeypatch, tmp_
         workspace = tmp_path
 
     class _Proc:
+        pid = 6301
         returncode = 0
 
         async def communicate(self):
@@ -586,7 +587,7 @@ async def test_full_host_access_code_exec_resolves_host_python(monkeypatch, tmp_
     monkeypatch.setenv("TMP", str(tmp_path / "temp"))
     monkeypatch.setattr(code_exec, "get_runtime", lambda: _Runtime())
     monkeypatch.setattr(code_exec, "_resolve_python_bin", _fake_resolve_python_bin)
-    monkeypatch.setattr(code_exec.asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(code_exec, "create_owned_subprocess_exec", _fake_create_subprocess_exec)
 
     def fail_safety_preflight(*args, **kwargs):
         pytest.fail("Full Host Access code execution must skip safety preflight")
@@ -729,6 +730,7 @@ async def test_full_host_access_background_strips_managed_proxy_environment(
         effective = SimpleNamespace(sandbox_enabled=True)
 
     class _FakeProcess:
+        pid = 6302
         stdout = None
         stdin = None
         returncode = 0
@@ -744,7 +746,7 @@ async def test_full_host_access_background_strips_managed_proxy_environment(
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:48123")
     monkeypatch.setenv("OPENSQUILLA_SANDBOX_NETWORK", "proxy_allowlist")
     monkeypatch.setattr(shell, "get_runtime", lambda: _Runtime())
-    monkeypatch.setattr(shell.asyncio, "create_subprocess_shell", _fake_create_subprocess_shell)
+    monkeypatch.setattr(shell, "create_owned_subprocess_shell", _fake_create_subprocess_shell)
     monkeypatch.setattr(
         shell,
         "check_safe_bin",

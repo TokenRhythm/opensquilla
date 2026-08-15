@@ -22,6 +22,7 @@ import type {
   InterruptApprovalData,
   InterruptClarifyData,
   InterruptViewState,
+  StatusPart,
 } from '@/types/parts'
 import {
   isEmptyToolPreview,
@@ -528,6 +529,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         && streamArtifacts.value.length === 0
         && terminalToolCalls.length === 0
         && foldedInterrupts.length === 0
+        && (suppressText || terminalFold.statusHistory.length === 0)
       if (emptyStream) {
         streamBubble.value = false
         isStreaming.value = false
@@ -554,9 +556,8 @@ export function useChatStream(options: UseChatStreamOptions) {
           : streamTimelineSnapshot(cleanedText),
         interrupts: foldedInterrupts.map(part => ({ ...part })),
         // Detach the fold's activity history from the about-to-be-reset log. In
-        // OFF mode this is [], so the field is harmless. The empty/sentinel drop
-        // path above returns before this push, so a status-only ghost turn never
-        // persists an orphan history.
+        // OFF mode this is [], so the field is harmless. A status-only terminal
+        // turn remains visible because its activity is the useful result.
         statusHistory: terminalFold.statusHistory.slice(),
         reasoningBlocks: terminalReasoningBlocks,
         reasoningPresentationPending: reasoningPresentationPending.value || undefined,
@@ -577,6 +578,37 @@ export function useChatStream(options: UseChatStreamOptions) {
     activeStreamTurnId = ''
     streamTurnStartedAt.value = 0
     activeAssistantMessageId = ''
+  }
+
+  function restoreStatusHistory(entries: readonly StatusPart[]) {
+    if (!entries.length || useReducer.value === false) return
+    if (!isStreaming.value) startStreaming()
+    // Consume matching live occurrences one-for-one. A Set would erase valid
+    // repeated retry_wait/retrying phases from the durable terminal trace.
+    const liveActionCounts = new Map<string, number>()
+    for (const entry of foldedTurn.value.statusHistory) {
+      liveActionCounts.set(entry.action, (liveActionCounts.get(entry.action) || 0) + 1)
+    }
+    const currentAction = streamActivity.value.key
+    if (currentAction && !liveActionCounts.has(currentAction)) {
+      liveActionCounts.set(currentAction, 1)
+    }
+    for (const entry of entries) {
+      if (!entry.action) continue
+      const liveCount = liveActionCounts.get(entry.action) || 0
+      if (liveCount > 0) {
+        liveActionCounts.set(entry.action, liveCount - 1)
+        continue
+      }
+      appendFrame({
+        kind: 'status',
+        action: entry.action,
+        label: entry.label,
+        at: entry.at,
+        ...(entry.durability ? { durability: entry.durability } : {}),
+      })
+    }
+    publishTurnLog()
   }
 
   function checkpointForUserMessage(turnId: string) {
@@ -1366,6 +1398,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     setStreamConnectionAvailable,
     clearStreamIdleTimer,
     setStreamActivity,
+    restoreStatusHistory,
     recordCompactionActivity,
     showThinkingIndicator,
     hideThinkingIndicator,

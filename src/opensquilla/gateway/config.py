@@ -1468,9 +1468,10 @@ class SessionNamingConfig(BaseSettings):
     """LLM-generated session titles (auto-naming).
 
     After the first user message, a one-shot LLM call summarizes it into a short
-    title written to SessionNode.derived_title. Model selection mirrors compaction
-    but defaults to the router's default text tier rather than the session model:
-    ``model`` (explicit) > ``tier`` model > squilla_router.default_tier model.
+    title written to SessionNode.derived_title. Explicit ``model`` and ``tier``
+    settings override the mode-specific default: direct routing follows the
+    resolved session/provider model, while Router and Ensemble use the router's
+    default text tier.
     """
 
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_NAMING_")
@@ -1479,8 +1480,8 @@ class SessionNamingConfig(BaseSettings):
     # Surfaces eligible for auto-naming. webchat/cli are chat; channel covers
     # inbound channel conversations. cron/subagent intentionally excluded.
     surfaces: list[str] = Field(default_factory=lambda: ["webchat", "cli", "channel"])
-    tier: str | None = None  # None = use squilla_router.default_tier
-    model: str | None = None  # None = use the resolved tier's model
+    tier: str | None = None  # None = use the routing mode's default target
+    model: str | None = None  # None = use the explicit tier or mode default
     timeout_seconds: float = 30.0
     max_chars: int = Field(default=48, ge=8)
     language: str = "auto"  # follow the conversation language
@@ -1777,6 +1778,11 @@ class DingTalkChannelEntry(ConfiguredChannelEntry):
     type: Literal["dingtalk"] = "dingtalk"
     client_id: str
     client_secret: str
+    # Existing stream-only entries predate native artifact delivery, so these
+    # stay safely defaulted. The onboarding catalog requires robot_code for
+    # newly created entries while legacy TOML continues to load unchanged.
+    robot_code: str = ""
+    cool_app_code: str = ""
 
 
 class WeComChannelEntry(ConfiguredChannelEntry):
