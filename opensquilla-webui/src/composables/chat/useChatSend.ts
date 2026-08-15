@@ -23,12 +23,15 @@ import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandler
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import type {
   BusySendMode,
+  PendingCancelOptions,
   PendingQueueOwner,
   PendingQueueOwnerContext,
   PendingSteerPayload,
 } from '@/composables/chat/useChatPendingQueue'
 import type { ChatSteerDeliveryApi } from '@/composables/chat/useChatSteerDelivery'
+import type { SlashCommandClassification } from '@/composables/chat/useChatSlashCommands'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
+import { canonicalSessionKey } from '@/utils/chat/sessionKeys'
 import {
   hasSendableModelInputImageAttachment,
   isSendableAttachment,
@@ -38,7 +41,11 @@ import {
 } from '@/utils/chat/attachments'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
 import { isControlInput } from '@/utils/chat/inputSemantics'
-import { createClientMessageId, createClientRequestId } from '@/utils/chat/messageIdentity'
+import {
+  createClientMessageId,
+  createClientRequestId,
+  stableClientUuid,
+} from '@/utils/chat/messageIdentity'
 import {
   type HiddenControlStorage,
   listHiddenControls,
@@ -78,6 +85,10 @@ interface SendAttempt {
   initialCollaborationMode: CollaborationMode | null
   forkBeforeMessageId: string | null
   workspaceId: string | null
+  restoreComposerOnHandoffFailure?: boolean
+  handoffWalOwnerId?: string
+  handoffWalRevision?: number
+  replayCoordinationKey?: string
   params: ChatSendParams
   requiresIdempotentReplay?: boolean
   // A Stop issued before durable acceptance is known belongs to this exact
@@ -116,6 +127,7 @@ interface ComposerSnapshot {
   forkBeforeMessageId: string | null
   workspaceId: string | null
   initialCollaborationMode: CollaborationMode | null
+  queueOwnerRequestId: string | null
 }
 
 interface DispatchSendOptions {
@@ -128,6 +140,27 @@ interface DispatchSendOptions {
   retryAttempt?: SendAttempt | null
   rememberRetryableAttempt?: (attempt: SendAttempt) => void
   durablePendingItem?: ChatPendingItem
+  /** Delay branch truncation and optimistic rendering until ingress accepts. */
+  acceptedVisibleReplay?: { forkBeforeMessageId: string }
+  /** Protocol replays keep a rejected attempt on their own surface. */
+  suppressRejectedFailureMessage?: boolean
+  /** Preserve an explicit empty attachment list on the chat.send wire. */
+  includeEmptyAttachments?: boolean
+  /** Revalidate protocol-owned sends after every awaited pre-dispatch step. */
+  preDispatchGuard?: (stage: 'preflight' | 'before_rpc') => boolean
+  /** Require a non-replayable WAL preparation that is armed immediately before RPC. */
+  requirePreparedHandoff?: boolean
+  /** Stable cross-tab identity for one protocol-owned replay. */
+  replayCoordination?: {
+    key: string
+    clientRequestId: string
+    clientMessageId: string
+  }
+}
+
+export interface UsageBarrierReplayPayload {
+  text: string
+  forkBeforeMessageId: string
 }
 
 interface ResponseHandoffGate {
@@ -316,6 +349,7 @@ export interface UseChatSendOptions {
   messages: Ref<ChatMessage[]>
   sessionKey: Ref<string>
   pendingQueueOwnerContext: Ref<PendingQueueOwnerContext | null>
+  hasPendingQueueWork?: () => boolean
   pendingInputWal?: PendingInputWal | null
   busySendMode: Ref<BusySendMode>
   modelRoutingMode: Readonly<Ref<ModelRoutingMode>>
@@ -371,15 +405,21 @@ export interface UseChatSendOptions {
   enqueuePendingInput: (
     text: string,
     owner?: PendingQueueOwner,
+    enqueueOptions?: { confirmedPlainText?: boolean },
   ) => boolean | Promise<boolean>
   enqueuePendingPayload?: (
     payload: {
       text: string
       attachments?: Attachment[]
       intent?: string | null
+      confirmedPlainText?: boolean
     },
     owner?: PendingQueueOwner,
   ) => boolean | Promise<boolean>
+  cancelDurablePendingItem?: (
+    item: ChatPendingItem,
+    options?: PendingCancelOptions,
+  ) => Promise<boolean>
   enqueueHiddenControl?: (
     item: {
       text: string
@@ -401,7 +441,11 @@ export interface UseChatSendOptions {
   reconcileTaskOwnership?: () => void | Promise<unknown>
   hiddenControlStorage?: HiddenControlStorage | null
   metaDiscardStorage?: MetaDiscardStorage | null
-  executeSlashCommand: (text: string) => Promise<boolean>
+  classifySlashCommand: (text: string) => Promise<SlashCommandClassification>
+  executeSlashCommand: (
+    text: string,
+    knownClassification?: SlashCommandClassification,
+  ) => Promise<boolean>
   closeSlashMenu: () => void
   autoResizeTextarea: () => void
   scrollToBottom: () => void
@@ -416,6 +460,8 @@ export function useChatSend(options: UseChatSendOptions) {
   let activeResponseHandoff: ResponseHandoffGate | null = null
   let activeProjectPreflightToken: symbol | null = null
   let recoveredAttempt: SendAttempt | null = null
+  let usageBarrierReplayAttempt: SendAttempt | null = null
+  let usageBarrierReplayInFlight = false
   let handoffRecoveryPromise: Promise<void> | null = null
   const acceptanceRecoveryWorkers = new Map<string, Promise<void>>()
   const stoppedAcceptanceAttempts = new Map<string, SendAttempt>()
@@ -462,6 +508,7 @@ export function useChatSend(options: UseChatSendOptions) {
   function captureComposerSnapshot(): ComposerSnapshot {
     const intent = options.pendingSessionIntent.value
     const attachmentRefs = [...options.pendingAttachments.value]
+    const queueOwnerContext = options.pendingQueueOwnerContext.value
     return {
       revision: options.composerRevision?.value ?? null,
       inputText: options.inputText.value,
@@ -471,7 +518,24 @@ export function useChatSend(options: UseChatSendOptions) {
       forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       workspaceId: pendingWorkspaceForIntent(intent),
       initialCollaborationMode: initialModeForIntent(intent),
+      queueOwnerRequestId: queueOwnerContext?.sessionKey === options.sessionKey.value
+        ? queueOwnerContext.ownerRequestId
+        : null,
     }
+  }
+
+  function queueOwnerMatchesSnapshot(snapshot: ComposerSnapshot): boolean {
+    const context = options.pendingQueueOwnerContext.value
+    const currentOwnerRequestId = context?.sessionKey === options.sessionKey.value
+      ? context.ownerRequestId
+      : null
+    return currentOwnerRequestId === snapshot.queueOwnerRequestId
+  }
+
+  function queueOwnerFromSnapshot(snapshot: ComposerSnapshot): PendingQueueOwner | undefined {
+    return snapshot.queueOwnerRequestId
+      ? { ownerRequestId: snapshot.queueOwnerRequestId }
+      : undefined
   }
 
   function composerMatchesSnapshot(snapshot: ComposerSnapshot): boolean {
@@ -926,9 +990,17 @@ export function useChatSend(options: UseChatSendOptions) {
 
   async function persistResponseHandoff(
     attempt: SendAttempt,
+    requirePrepared = false,
   ): Promise<ResponseHandoffWalRecord | null> {
-    if (!options.pendingInputWal?.putHandoff) return null
+    const wal = options.pendingInputWal
+    if (!wal) return null
+    if (requirePrepared && (!wal.prepareHandoff || !wal.compareAndSwapHandoff)) return null
+    if (!requirePrepared && !wal.putHandoff) return null
     const now = Date.now()
+    if (requirePrepared) {
+      attempt.handoffWalOwnerId ||= createClientRequestId()
+      attempt.handoffWalRevision ||= 1
+    }
     const record: ResponseHandoffWalRecord = {
       schemaVersion: 1,
       ownerRequestId: attempt.clientRequestId,
@@ -938,15 +1010,167 @@ export function useChatSend(options: UseChatSendOptions) {
       params: structuredClone(attempt.params),
       composerText: attempt.composerText,
       recoveryAttachments: attempt.attachments.map(attachment => ({ ...attachment })),
-      state: 'submitting',
+      ...(attempt.restoreComposerOnHandoffFailure === false
+        ? { restoreComposerOnFailure: false }
+        : {}),
+      ...(attempt.replayCoordinationKey
+        ? { replayCoordinationKey: attempt.replayCoordinationKey }
+        : {}),
+      ...(requirePrepared
+        ? {
+            walOwnerId: attempt.handoffWalOwnerId!,
+            walRevision: attempt.handoffWalRevision!,
+          }
+        : {}),
+      state: requirePrepared ? 'preparing' : 'submitting',
       createdAt: now,
       updatedAt: now,
     }
     try {
-      await options.pendingInputWal.putHandoff(record)
+      if (requirePrepared) {
+        const prepared = await wal.prepareHandoff!(record)
+        if (prepared.applied) return prepared.record
+        const current = prepared.record
+        if (
+          current?.state === 'preparing'
+          && current.ownerRequestId === record.ownerRequestId
+          && current.clientMessageId === record.clientMessageId
+          && current.replayCoordinationKey === record.replayCoordinationKey
+          && current.walOwnerId === record.walOwnerId
+          && current.walRevision === record.walRevision
+        ) return current
+        return null
+      }
+      await wal.putHandoff!(record)
       return record
     } catch {
+      if (requirePrepared && record.walOwnerId && record.walRevision) {
+        // The create operation may report failure after its write became
+        // visible. A conditional delete cannot erase another tab's arm or
+        // acceptance, and a failed delete leaves only an unarmed record.
+        await wal.compareAndSwapHandoff?.(
+          record.ownerRequestId,
+          record.walOwnerId,
+          record.walRevision,
+          null,
+        ).catch(() => {})
+      } else {
+        await wal.deleteHandoff?.(record.ownerRequestId).catch(() => {})
+      }
       return null
+    }
+  }
+
+  async function armPreparedResponseHandoff(
+    record: ResponseHandoffWalRecord | null,
+    attempt: SendAttempt,
+  ): Promise<ResponseHandoffWalRecord | null> {
+    const wal = options.pendingInputWal
+    if (
+      !record
+      || record.state !== 'preparing'
+      || !record.walOwnerId
+      || !record.walRevision
+      || !wal?.compareAndSwapHandoff
+    ) return null
+    const armed: ResponseHandoffWalRecord = {
+      ...record,
+      state: 'submitting',
+      walRevision: record.walRevision + 1,
+      updatedAt: Date.now(),
+    }
+    try {
+      const transition = await wal.compareAndSwapHandoff(
+        record.ownerRequestId,
+        record.walOwnerId,
+        record.walRevision,
+        armed,
+      )
+      if (!transition.applied || !transition.record) return null
+      attempt.handoffWalRevision = transition.record.walRevision
+      return transition.record
+    } catch {
+      return null
+    }
+  }
+
+  async function disarmResponseHandoff(
+    record: ResponseHandoffWalRecord,
+    attempt: SendAttempt,
+  ): Promise<ResponseHandoffWalRecord | null> {
+    const wal = options.pendingInputWal
+    if (
+      record.state !== 'submitting'
+      || !record.walOwnerId
+      || !record.walRevision
+      || !wal?.compareAndSwapHandoff
+    ) return null
+    const preparing: ResponseHandoffWalRecord = {
+      ...record,
+      state: 'preparing',
+      walRevision: record.walRevision + 1,
+      updatedAt: Date.now(),
+    }
+    const transition = await wal.compareAndSwapHandoff(
+      record.ownerRequestId,
+      record.walOwnerId,
+      record.walRevision,
+      preparing,
+    ).catch(() => null)
+    if (!transition?.applied || !transition.record) return null
+    attempt.handoffWalRevision = transition.record.walRevision
+    return transition.record
+  }
+
+  async function discardUnsentResponseHandoff(
+    record: ResponseHandoffWalRecord | null,
+  ): Promise<void> {
+    if (!record) return
+    if (
+      record.walOwnerId
+      && record.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      await options.pendingInputWal.compareAndSwapHandoff(
+        record.ownerRequestId,
+        record.walOwnerId,
+        record.walRevision,
+        null,
+      ).catch(() => {})
+      return
+    }
+    const failed: ResponseHandoffWalRecord = {
+      ...record,
+      state: 'failed',
+      errorCode: 'client_pre_dispatch_guard',
+      updatedAt: Date.now(),
+    }
+    await options.pendingInputWal?.putHandoff?.(failed).catch(() => {})
+    await options.pendingInputWal?.deleteHandoff?.(record.ownerRequestId).catch(() => {})
+  }
+
+  async function deleteResponseHandoff(
+    record: ResponseHandoffWalRecord,
+  ): Promise<boolean> {
+    if (
+      record.walOwnerId
+      && record.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      const deletion = await options.pendingInputWal.compareAndSwapHandoff(
+        record.ownerRequestId,
+        record.walOwnerId,
+        record.walRevision,
+        null,
+      ).catch(() => null)
+      return deletion?.applied === true
+    }
+    if (!options.pendingInputWal?.deleteHandoff) return false
+    try {
+      await options.pendingInputWal.deleteHandoff(record.ownerRequestId)
+      return true
+    } catch {
+      return false
     }
   }
 
@@ -954,29 +1178,93 @@ export function useChatSend(options: UseChatSendOptions) {
     gate: ResponseHandoffGate,
     acceptedSessionKey: string,
   ): Promise<void> {
-    if (!gate.durableRecord || !options.pendingInputWal?.putHandoff) return
-    gate.durableRecord = {
-      ...gate.durableRecord,
+    const current = gate.durableRecord
+    if (!current) return
+    const accepted: ResponseHandoffWalRecord = {
+      ...current,
       state: 'accepted',
       acceptedSessionKey,
+      ...(current.walRevision ? { walRevision: current.walRevision + 1 } : {}),
       updatedAt: Date.now(),
     }
-    await options.pendingInputWal.putHandoff(gate.durableRecord).catch(() => {})
+    if (
+      current.walOwnerId
+      && current.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      const transition = await options.pendingInputWal.compareAndSwapHandoff(
+        current.ownerRequestId,
+        current.walOwnerId,
+        current.walRevision,
+        accepted,
+      ).catch(() => null)
+      if (transition?.applied && transition.record) gate.durableRecord = transition.record
+      return
+    }
+    if (!options.pendingInputWal?.putHandoff) return
+    gate.durableRecord = accepted
+    await options.pendingInputWal.putHandoff(accepted).catch(() => {})
   }
 
   async function markResponseHandoffFailed(
     gate: ResponseHandoffGate,
     error: unknown,
   ): Promise<void> {
-    if (!gate.durableRecord || !options.pendingInputWal?.putHandoff) return
-    gate.durableRecord = {
-      ...gate.durableRecord,
+    const current = gate.durableRecord
+    if (!current) return
+    const failed: ResponseHandoffWalRecord = {
+      ...current,
       state: 'failed',
       errorCode: errorCode(error),
+      ...(current.walRevision ? { walRevision: current.walRevision + 1 } : {}),
       updatedAt: Date.now(),
     }
-    await options.pendingInputWal.putHandoff(gate.durableRecord).catch(() => {})
+    if (
+      current.walOwnerId
+      && current.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      const transition = await options.pendingInputWal.compareAndSwapHandoff(
+        current.ownerRequestId,
+        current.walOwnerId,
+        current.walRevision,
+        failed,
+      ).catch(() => null)
+      if (transition?.applied && transition.record) gate.durableRecord = transition.record
+    } else if (options.pendingInputWal?.putHandoff) {
+      gate.durableRecord = failed
+      await options.pendingInputWal.putHandoff(failed).catch(() => {})
+    }
     await options.failPendingQueueHandoff?.(gate.ownerRequestId)
+  }
+
+  async function resetResponseHandoffForRetry(
+    gate: ResponseHandoffGate,
+    attempt: SendAttempt,
+  ): Promise<void> {
+    const current = gate.durableRecord
+    if (
+      !current?.walOwnerId
+      || !current.walRevision
+      || current.state !== 'submitting'
+      || !options.pendingInputWal?.compareAndSwapHandoff
+    ) return
+    const preparing: ResponseHandoffWalRecord = {
+      ...current,
+      state: 'preparing',
+      walRevision: current.walRevision + 1,
+      updatedAt: Date.now(),
+    }
+    const transition = await options.pendingInputWal.compareAndSwapHandoff(
+      current.ownerRequestId,
+      current.walOwnerId,
+      current.walRevision,
+      preparing,
+    ).catch(() => null)
+    if (transition?.applied && transition.record) {
+      gate.durableRecord = transition.record
+      attempt.handoffWalRevision = transition.record.walRevision
+    }
   }
 
   function responseHandoffBlocksCurrentSession(): boolean {
@@ -1005,8 +1293,7 @@ export function useChatSend(options: UseChatSendOptions) {
           gate.ownerRequestId,
         )
       : await options.adoptResponseSession(key, gate.ownerRequestId)
-    if (gate.durableRecord && options.pendingInputWal?.deleteHandoff) {
-      await options.pendingInputWal.deleteHandoff(gate.ownerRequestId).catch(() => {})
+    if (gate.durableRecord && await deleteResponseHandoff(gate.durableRecord)) {
       gate.durableRecord = null
     }
     gate.authoritativeIdle = adoption?.authoritativeIdle === true
@@ -1096,22 +1383,40 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       return
     }
-    await options.pendingInputWal?.putHandoff?.({
+    let acceptedRecord: ResponseHandoffWalRecord = {
       ...record,
       state: 'accepted',
       acceptedSessionKey: targetSessionKey,
+      ...(record.walRevision ? { walRevision: record.walRevision + 1 } : {}),
       updatedAt: Date.now(),
-    }).catch(() => {})
+    }
+    if (
+      record.walOwnerId
+      && record.walRevision
+      && options.pendingInputWal?.compareAndSwapHandoff
+    ) {
+      const transition = await options.pendingInputWal.compareAndSwapHandoff(
+        record.ownerRequestId,
+        record.walOwnerId,
+        record.walRevision,
+        acceptedRecord,
+      ).catch(() => null)
+      if (!transition?.applied || !transition.record) return
+      acceptedRecord = transition.record
+    } else {
+      await options.pendingInputWal?.putHandoff?.(acceptedRecord).catch(() => {})
+    }
     await options.recoverPendingQueueHandoff?.(
       record.requestSessionKey,
       targetSessionKey,
       record.ownerRequestId,
     )
-    await options.pendingInputWal?.deleteHandoff?.(record.ownerRequestId).catch(() => {})
+    await deleteResponseHandoff(acceptedRecord)
   }
 
   function restoreResponseHandoffDraft(record: ResponseHandoffWalRecord): boolean {
     if (options.sessionKey.value !== record.requestSessionKey) return false
+    if (record.restoreComposerOnFailure === false) return true
     const restoredText = record.composerText.trim()
     if (restoredText && options.inputText.value !== restoredText) {
       options.inputText.value = [restoredText, options.inputText.value]
@@ -1155,9 +1460,20 @@ export function useChatSend(options: UseChatSendOptions) {
         return
       }
       for (const record of records) {
+        if (record.state === 'preparing') {
+          if (record.walOwnerId && record.walRevision) {
+            await wal.compareAndSwapHandoff?.(
+              record.ownerRequestId,
+              record.walOwnerId,
+              record.walRevision,
+              null,
+            ).catch(() => {})
+          }
+          continue
+        }
         if (record.state === 'failed') {
           if (restoreResponseHandoffDraft(record)) {
-            await wal.deleteHandoff?.(record.ownerRequestId).catch(() => {})
+            await deleteResponseHandoff(record)
           }
           continue
         }
@@ -1605,6 +1921,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const bypassSlashCommand = invocation.bypassSlashCommand === true
     const composerText = invocation.composerText ?? options.inputText.value
     let text = (invocation.textOverride ?? options.inputText.value).trim()
+    let durableText = text
     let sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
     let hasPayload = text || sendableAttachments.length > 0
     let isLiteralSlash = false
@@ -1618,6 +1935,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!bypassSlashCommand && text.startsWith('//')) {
       isLiteralSlash = true
       text = text.slice(1)
+      durableText = `/${text}`
       sendableAttachments = options.pendingAttachments.value.filter(isSendableAttachment)
       hasPayload = text || sendableAttachments.length > 0
     }
@@ -1632,6 +1950,7 @@ export function useChatSend(options: UseChatSendOptions) {
         if (await refreshedActiveProjectBlocksSend()) return
       }
       if (options.sessionKey.value !== requestSessionKey) return
+      if (!queueOwnerMatchesSnapshot(composerSnapshot)) return
       if (options.sendBlockedReason?.value) return
       if (
         invocation.cancelIfComposerChanged
@@ -1682,61 +2001,112 @@ export function useChatSend(options: UseChatSendOptions) {
       return
     }
 
+    const slashClassification = !bypassSlashCommand
+      && !isLiteralSlash
+      && text.startsWith('/')
+      ? await options.classifySlashCommand(text)
+      : null
+    if (slashClassification !== null) {
+      if (
+        options.sessionKey.value !== requestSessionKey
+        || !composerMatchesSnapshot(composerSnapshot)
+        || !queueOwnerMatchesSnapshot(composerSnapshot)
+        || Boolean(options.sendBlockedReason?.value)
+        || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
+      ) return
+      if (
+        options.validateActiveProjectBeforeSend
+        && await refreshedActiveProjectBlocksSend()
+      ) return
+      if (
+        options.sessionKey.value !== requestSessionKey
+        || !composerMatchesSnapshot(composerSnapshot)
+        || !queueOwnerMatchesSnapshot(composerSnapshot)
+        || Boolean(options.sendBlockedReason?.value)
+        || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
+      ) return
+    }
+
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     if (
       options.stream.isStreaming.value
       || hasAuthoritativeWork()
       || compactInFlight
-      || handoffInFlight
+      || responseHandoffBlocksCurrentSession()
     ) {
-      if (!bypassSlashCommand && !isLiteralSlash && isControlInput(text)) {
-        // Slash and bang inputs are client control-plane commands. Running
-        // them later can target a different task/session, so keep the exact
-        // command editable in the composer while the current turn is busy.
-        return
-      }
-      if (!hasPayload) return
-      if (handoffInFlight && !activeResponseHandoff?.durableRecord) {
-        // The fork itself may proceed without IndexedDB, but a follow-up must
-        // stay editable until the target session is known. Otherwise refresh
-        // can strand an ownerless message on the parent session.
-        pushToast(i18n.global.t('chat.toast.queuePersistenceUnavailable'), { tone: 'info' })
-        return
-      }
-      if (
-        options.busySendMode.value === 'steer'
-        && canSteerPayload(
-          text,
-          composerSnapshot.payloadAttachments,
-          composerSnapshot.intent,
-          composerSnapshot.forkBeforeMessageId,
-        )
-      ) {
-        await dispatchSteerV2(text, { composerSnapshot })
-        return
-      }
-      // Surface a full queue instead of silently dropping the send: the draft is
-      // preserved (enqueue returns false before clearing the composer).
-      const composerChanged = !composerMatchesSnapshot(composerSnapshot)
-      if (invocation.cancelIfComposerChanged && composerChanged) return
-      const queued = await Promise.resolve(
-        composerChanged || invocation.textOverride !== undefined
-          ? options.enqueuePendingPayload?.({
+      const currentHandoffInFlight = responseHandoffBlocksCurrentSession()
+      const stillBusy = options.stream.isStreaming.value
+        || hasAuthoritativeWork()
+        || options.isCompactInFlightForCurrentSession()
+        || currentHandoffInFlight
+      if (stillBusy) {
+        if (
+          !bypassSlashCommand
+          && !isLiteralSlash
+          && isControlInput(text)
+          && slashClassification !== 'unknown'
+        ) {
+          // Registered slash commands and bang inputs are live controls. Running
+          // them later can target a different task/session, so keep the exact
+          // command editable while busy. Confirmed unknown slash input is plain
+          // text and continues into the ordinary follow-up queue below.
+          return
+        }
+        if (!hasPayload) return
+        if (currentHandoffInFlight && !activeResponseHandoff?.durableRecord) {
+          // The fork itself may proceed without IndexedDB, but a follow-up must
+          // stay editable until the target session is known. Otherwise refresh
+          // can strand an ownerless message on the parent session.
+          pushToast(i18n.global.t('chat.toast.queuePersistenceUnavailable'), { tone: 'info' })
+          return
+        }
+        if (
+          options.busySendMode.value === 'steer'
+          && !isLiteralSlash
+          && canSteerPayload(
             text,
-            attachments: composerSnapshot.payloadAttachments,
-            intent: composerSnapshot.intent,
-          }, pendingQueueOwner()) ?? false
-          : options.enqueuePendingInput(text, pendingQueueOwner()),
-      )
-      if (!queued) {
-        pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
+            composerSnapshot.payloadAttachments,
+            composerSnapshot.intent,
+            composerSnapshot.forkBeforeMessageId,
+          )
+        ) {
+          await dispatchSteerV2(text, { composerSnapshot })
+          return
+        }
+        // Surface a full queue instead of silently dropping the send: the draft is
+        // preserved (enqueue returns false before clearing the composer).
+        const composerChanged = !composerMatchesSnapshot(composerSnapshot)
+        if (invocation.cancelIfComposerChanged && composerChanged) return
+        const queued = await Promise.resolve(
+          composerChanged || invocation.textOverride !== undefined
+            ? options.enqueuePendingPayload?.({
+              text: durableText,
+              attachments: composerSnapshot.payloadAttachments,
+              intent: composerSnapshot.intent,
+              ...(slashClassification === 'unknown'
+                ? { confirmedPlainText: true }
+                : {}),
+            }, queueOwnerFromSnapshot(composerSnapshot)) ?? false
+            : slashClassification === 'unknown'
+              ? options.enqueuePendingInput(
+                durableText,
+                queueOwnerFromSnapshot(composerSnapshot),
+                { confirmedPlainText: true },
+              )
+              : options.enqueuePendingInput(
+                durableText,
+                queueOwnerFromSnapshot(composerSnapshot),
+              ),
+        )
+        if (!queued) {
+          pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
+        }
+        return
       }
-      return
     }
 
-    if (!bypassSlashCommand && !isLiteralSlash && text.startsWith('/')) {
-      if (!composerMatchesSnapshot(composerSnapshot)) return
-      const handled = await options.executeSlashCommand(text)
+    if (slashClassification !== null && slashClassification !== 'unknown') {
+      const handled = await options.executeSlashCommand(text, slashClassification)
       if (handled) return
     }
 
@@ -1772,6 +2142,9 @@ export function useChatSend(options: UseChatSendOptions) {
     expectedSessionKey?: string,
   ): Promise<ChatSendOutcome> {
     const text = item.text.trim()
+    const dispatchText = !item.hiddenControl && text.startsWith('//')
+      ? text.slice(1)
+      : text
     const ownerSessionKey = expectedSessionKey
       || item.ownerSessionKey
       || options.sessionKey.value
@@ -1816,7 +2189,6 @@ export function useChatSend(options: UseChatSendOptions) {
     if (
       delivery === 'followup'
       && !item.hiddenControl
-      && item.attachments.length === 0
       && item.text.trim().startsWith('/')
       && !item.text.trim().startsWith('//')
     ) {
@@ -1827,9 +2199,49 @@ export function useChatSend(options: UseChatSendOptions) {
       ) {
         return preserveRetryState('deferred')
       }
-      return await options.executeSlashCommand(item.text.trim())
-        ? 'accepted'
-        : preserveRetryState('not_sent')
+      const slashClassification = await options.classifySlashCommand(item.text.trim())
+      if (options.sessionKey.value !== ownerSessionKey) {
+        return preserveRetryState('not_sent')
+      }
+      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (
+        options.validateActiveProjectBeforeSend
+        && await refreshedActiveProjectBlocksSend()
+      ) return blockedOutcome()
+      if (options.sessionKey.value !== ownerSessionKey) {
+        return preserveRetryState('not_sent')
+      }
+      if (options.sendBlockedReason?.value) return blockedOutcome()
+      if (
+        options.stream.isStreaming.value
+        || hasAuthoritativeWork()
+        || options.isCompactInFlightForCurrentSession()
+        || responseHandoffBlocksCurrentSession()
+      ) {
+        return preserveRetryState('deferred')
+      }
+      if (slashClassification === 'unavailable') {
+        return preserveRetryState('retryable_failure')
+      }
+      if (slashClassification === 'registered') {
+        if (item.attachments.length > 0) {
+          return preserveRetryState('retryable_failure')
+        }
+        if (serverStagedItem) {
+          if (!await options.cancelDurablePendingItem?.(item, { retainAfterCancel: true })) {
+            return preserveRetryState('retryable_failure')
+          }
+        }
+        // A queued item was previously classified as ordinary text. If the
+        // catalog now recognizes it, never turn a background drain into an
+        // automatic control action. In particular, an idempotent cancel can
+        // report success in multiple tabs (or after a lost ACK), so it cannot
+        // grant exactly-once authority to execute /reset, /new, /goal, etc.
+        // Leave the detached item editable for an explicit user decision.
+        return preserveRetryState('not_sent')
+      }
+      // Confirmed unknown slash input falls through to the normal send path
+      // below, mirroring the primary onSend contract.
     }
     if (hasSendableModelInputImageAttachment(item.attachments)) {
       if (options.modelRoutingSettingsBusy.value) {
@@ -1851,9 +2263,10 @@ export function useChatSend(options: UseChatSendOptions) {
     }
 
     if (delivery === 'steer') {
+      if (text.startsWith('//')) return preserveRetryState('not_sent')
       return dispatchSteerV2(text, { queuedItem: item })
     }
-    const outcome = await dispatchSend(text, {
+    const outcome = await dispatchSend(dispatchText, {
       composerText: item.text,
       payload: {
         attachments: item.attachments,
@@ -1900,6 +2313,10 @@ export function useChatSend(options: UseChatSendOptions) {
     const requestSessionKey = options.sessionKey.value
     if (!requestSessionKey) return 'not_sent'
     if (options.sendBlockedReason?.value) return 'not_sent'
+    const preDispatchAllowed = (
+      stage: 'preflight' | 'before_rpc' = 'preflight',
+    ) => sendOpts.preDispatchGuard?.(stage) !== false
+    if (!preDispatchAllowed()) return 'not_sent'
     let preserveComposer = sendOpts.preserveComposer === true
     const sourceAttachments = sendOpts.payload?.attachments ?? options.pendingAttachments.value
     const intent = sendOpts.payload
@@ -1968,6 +2385,7 @@ export function useChatSend(options: UseChatSendOptions) {
       })
       if (!ready) return 'not_sent'
       if (options.sessionKey.value !== requestSessionKey) return 'not_sent'
+      if (!preDispatchAllowed()) return 'not_sent'
     }
     const composerChanged = sendOpts.composerSnapshot
       ? !composerMatchesSnapshot(sendOpts.composerSnapshot)
@@ -1999,22 +2417,50 @@ export function useChatSend(options: UseChatSendOptions) {
       return 'not_sent'
     }
 
-    options.aborted.value = false
-    if (!preserveComposer) options.closeSlashMenu()
-    recordSessionNavigationDiag('send.start', {
-      requestSession: requestSessionKey,
-      current: requestSessionKey,
-    })
-
     const userText = text
     let attempt = retryAttempt
+    let acceptedVisibleReplayCommitted = false
+    const commitAcceptedVisibleReplay = (accepted?: {
+      messageId?: string
+      turnId?: string
+    }): boolean => {
+      const replay = sendOpts.acceptedVisibleReplay
+      if (!replay || acceptedVisibleReplayCommitted || !attempt) return true
+      const anchorIndex = options.messages.value.findIndex(message => (
+        message.role === 'user'
+        && message.messageId === replay.forkBeforeMessageId
+      ))
+      if (anchorIndex < 0) return false
+      options.messages.value = options.messages.value.slice(0, anchorIndex)
+      options.messages.value.push({
+        role: 'user',
+        text: userText,
+        ts: new Date().toISOString(),
+        clientId: attempt.clientMessageId,
+        ...(accepted?.messageId ? { messageId: accepted.messageId } : {}),
+        ...(accepted?.turnId ? { turnId: accepted.turnId } : {}),
+      })
+      options.autoScroll.value = true
+      options.scrollToBottom()
+      acceptedVisibleReplayCommitted = true
+      return true
+    }
     let durableHandoffRecord: ResponseHandoffWalRecord | null = null
+    const rejectBeforeDispatch = async (): Promise<ChatSendOutcome> => {
+      if (attempt && sendOpts.acceptedVisibleReplay) {
+        sendOpts.rememberRetryableAttempt?.(attempt)
+      }
+      await discardUnsentResponseHandoff(durableHandoffRecord)
+      return 'not_sent'
+    }
     if (!attempt) {
       const durablePendingItem = sendOpts.durablePendingItem
       const clientMessageId = durablePendingItem?.pendingClientMessageId
+        || sendOpts.replayCoordination?.clientMessageId
         || createClientMessageId()
       const params: ChatSendParams = {
         clientRequestId: durablePendingItem?.pendingClientRequestId
+          || sendOpts.replayCoordination?.clientRequestId
           || createClientRequestId(),
         clientMessageId,
         message: text || 'Describe these attachments',
@@ -2031,7 +2477,7 @@ export function useChatSend(options: UseChatSendOptions) {
         params.collaborationMode = initialCollaborationMode
       }
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
-      if (attachmentsToSend.length > 0) {
+      if (attachmentsToSend.length > 0 || sendOpts.includeEmptyAttachments) {
         params.displayText = userText
         params.attachments = attachmentsToSend.map(serializeSendableAttachment)
       }
@@ -2047,26 +2493,54 @@ export function useChatSend(options: UseChatSendOptions) {
         initialCollaborationMode,
         forkBeforeMessageId,
         workspaceId,
+        ...(sendOpts.acceptedVisibleReplay
+          ? { restoreComposerOnHandoffFailure: false }
+          : {}),
+        ...(sendOpts.replayCoordination
+          ? { replayCoordinationKey: sendOpts.replayCoordination.key }
+          : {}),
         params,
       }
       if (attempt.forkBeforeMessageId) {
-        durableHandoffRecord = await persistResponseHandoff(attempt)
+        durableHandoffRecord = await persistResponseHandoff(
+          attempt,
+          sendOpts.requirePreparedHandoff,
+        )
+        if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
+          return rejectBeforeDispatch()
+        }
+        if (!preDispatchAllowed()) return rejectBeforeDispatch()
       }
-      const now = new Date().toISOString()
-      const displayAttachments = attachmentsToSend.map(serializeDisplayAttachment)
-      options.messages.value.push({
-        role: 'user',
-        text: userText,
-        ts: now,
-        clientId: clientMessageId,
-        ...(displayAttachments.length > 0 ? { attachments: displayAttachments } : {}),
-      })
-      options.autoScroll.value = true
-      options.scrollToBottom()
+      if (!sendOpts.acceptedVisibleReplay) {
+        const now = new Date().toISOString()
+        const displayAttachments = attachmentsToSend.map(serializeDisplayAttachment)
+        options.messages.value.push({
+          role: 'user',
+          text: userText,
+          ts: now,
+          clientId: clientMessageId,
+          ...(displayAttachments.length > 0 ? { attachments: displayAttachments } : {}),
+        })
+        options.autoScroll.value = true
+        options.scrollToBottom()
+      }
     }
     if (attempt.forkBeforeMessageId && !durableHandoffRecord) {
-      durableHandoffRecord = await persistResponseHandoff(attempt)
+      durableHandoffRecord = await persistResponseHandoff(
+        attempt,
+        sendOpts.requirePreparedHandoff,
+      )
+      if (sendOpts.requirePreparedHandoff && !durableHandoffRecord) {
+        return rejectBeforeDispatch()
+      }
+      if (!preDispatchAllowed()) return rejectBeforeDispatch()
     }
+    if (!preDispatchAllowed()) return rejectBeforeDispatch()
+    if (!preserveComposer) options.closeSlashMenu()
+    recordSessionNavigationDiag('send.start', {
+      requestSession: requestSessionKey,
+      current: requestSessionKey,
+    })
     if (!preserveComposer) {
       recoveredAttempt = null
       const composerTextBeforeSend = options.inputText.value
@@ -2090,9 +2564,43 @@ export function useChatSend(options: UseChatSendOptions) {
     // A steer send rides an already-active stream; restarting it would wipe
     // the partial output of the run being steered.
     const wasStreaming = options.stream.isStreaming.value
+    if (!preDispatchAllowed()) return rejectBeforeDispatch()
     const freshSendToken = wasStreaming
       ? null
       : beginFreshStream(requestSessionKey, attempt)
+    if (!preDispatchAllowed('before_rpc')) {
+      if (freshSendToken && activeFreshSendToken === freshSendToken) {
+        activeFreshSendToken = null
+        options.activeStreamTaskId.value = ''
+        options.activeStreamSessionKey.value = ''
+        options.stream.endStreaming()
+      }
+      return rejectBeforeDispatch()
+    }
+    if (sendOpts.requirePreparedHandoff) {
+      const armed = await armPreparedResponseHandoff(durableHandoffRecord, attempt)
+      if (!armed) {
+        if (freshSendToken && activeFreshSendToken === freshSendToken) {
+          activeFreshSendToken = null
+          options.activeStreamTaskId.value = ''
+          options.activeStreamSessionKey.value = ''
+          options.stream.endStreaming()
+        }
+        return rejectBeforeDispatch()
+      }
+      durableHandoffRecord = armed
+      if (!preDispatchAllowed('before_rpc')) {
+        durableHandoffRecord = await disarmResponseHandoff(armed, attempt) || armed
+        if (freshSendToken && activeFreshSendToken === freshSendToken) {
+          activeFreshSendToken = null
+          options.activeStreamTaskId.value = ''
+          options.activeStreamSessionKey.value = ''
+          options.stream.endStreaming()
+        }
+        return rejectBeforeDispatch()
+      }
+    }
+    options.aborted.value = false
     let responseHandoff = (
       attempt.forkBeforeMessageId
         ? beginResponseHandoff(
@@ -2132,6 +2640,12 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
+      if (!commitAcceptedVisibleReplay({
+        messageId: res?.user_message_id || res?.message_id || '',
+        turnId: acceptedTaskId(res),
+      })) {
+        options.scheduleHistorySync()
+      }
       if (recoveredAttempt?.clientRequestId === attempt.clientRequestId) {
         recoveredAttempt = null
       }
@@ -2277,6 +2791,11 @@ export function useChatSend(options: UseChatSendOptions) {
     } catch (err: unknown) {
       const rpcError = err as RpcClientError | null | undefined
       const acceptedError = acceptedErrorInfo(err)
+      if (acceptedError && !commitAcceptedVisibleReplay({
+        messageId: acceptedError.messageId,
+      })) {
+        options.scheduleHistorySync()
+      }
       if (
         acceptedError
         && recoveredAttempt?.clientRequestId === attempt.clientRequestId
@@ -2389,21 +2908,133 @@ export function useChatSend(options: UseChatSendOptions) {
         options.activeStreamSessionKey.value = ''
         options.stream.endStreaming()
       }
-      if (responseHandoff && rpcError?.accepted === false && rpcError.retryable === false) {
-        await markResponseHandoffFailed(responseHandoff, err)
+      if (responseHandoff && rpcError?.accepted === false) {
+        if (sendOpts.requirePreparedHandoff && rpcError.retryable !== false) {
+          await resetResponseHandoffForRetry(responseHandoff, attempt)
+        } else if (rpcError.retryable === false) {
+          await markResponseHandoffFailed(responseHandoff, err)
+        }
       }
       rememberRetryableAttempt(true)
-      options.messages.value.push({
-        role: 'error',
-        text: sendFailureMessage(err),
-        errorCode: errorCode(err),
-        ts: new Date().toISOString(),
-      })
+      if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
+        options.messages.value.push({
+          role: 'error',
+          text: sendFailureMessage(err),
+          errorCode: errorCode(err),
+          ts: new Date().toISOString(),
+        })
+      }
       return acceptedError ? 'accepted' : 'retryable_failure'
     } finally {
       attempt.acceptanceInFlight = false
       finishAcceptanceTransaction(acceptanceTransaction)
       finishResponseHandoff(responseHandoff)
+    }
+  }
+
+  async function sendUsageBarrierReplay(
+    payload: UsageBarrierReplayPayload,
+  ): Promise<boolean> {
+    const requestSessionKey = options.sessionKey.value
+    const text = payload.text
+    const forkBeforeMessageId = payload.forkBeforeMessageId.trim()
+    if (!requestSessionKey || !text || !forkBeforeMessageId || usageBarrierReplayInFlight) {
+      return false
+    }
+    const invalidCoordinationIdentity = (value: string) => (
+      value.length > 512 || /[\u0000-\u001f\u007f]/.test(value)
+    )
+    if (
+      invalidCoordinationIdentity(requestSessionKey)
+      || invalidCoordinationIdentity(forkBeforeMessageId)
+    ) return false
+    const replayCoordinationKey = await stableClientUuid(
+      `usage-barrier-coordinate\0${canonicalSessionKey(requestSessionKey)}\0${forkBeforeMessageId}`,
+    )
+    if (!replayCoordinationKey) return false
+    const stableClientRequestId = await stableClientUuid(
+      `usage-barrier-request\0${replayCoordinationKey}`,
+    )
+    const stableMessageUuid = await stableClientUuid(
+      `usage-barrier-message\0${replayCoordinationKey}`,
+    )
+    if (!stableClientRequestId || !stableMessageUuid) return false
+    const stableClientMessageId = `local-${stableMessageUuid}`
+    if (stableClientRequestId.length > 256 || stableClientMessageId.length > 256) return false
+    const replayAnchorIsCurrent = () => {
+      const anchor = options.messages.value.find(message => (
+        message.role === 'user'
+        && message.messageId === forkBeforeMessageId
+      ))
+      return Boolean(
+        anchor
+        && anchor.text === text
+        && (anchor.attachments?.length ?? 0) === 0,
+      )
+    }
+    const replayIsBlocked = (allowOwnedStream = false) => (
+      options.sessionKey.value !== requestSessionKey
+      || !replayAnchorIsCurrent()
+      || Boolean(options.sendBlockedReason?.value)
+      || Boolean(options.taskOwnership && !options.taskOwnership.hydrationResolved.value)
+      || (!allowOwnedStream && options.stream.isStreaming.value)
+      || hasAuthoritativeWork()
+      || options.isCompactInFlightForCurrentSession()
+      || responseHandoffBlocksCurrentSession()
+      || Boolean(handoffRecoveryPromise)
+      || options.hasPendingQueueWork?.() === true
+      || options.pendingQueueOwnerContext.value?.sessionKey === requestSessionKey
+    )
+    if (replayIsBlocked()) return false
+
+    if (options.validateActiveProjectBeforeSend) {
+      if (await refreshedActiveProjectBlocksSend()) return false
+    }
+    if (replayIsBlocked()) return false
+
+    if (usageBarrierReplayAttempt && !matchesRecoveredDraft(
+      usageBarrierReplayAttempt,
+      {
+        requestSessionKey,
+        text,
+        attachments: [],
+        intent: null,
+        initialCollaborationMode: null,
+        forkBeforeMessageId,
+        workspaceId: null,
+      },
+    )) return false
+
+    usageBarrierReplayInFlight = true
+    try {
+      const outcome = await dispatchSend(text, {
+        payload: {
+          attachments: [],
+          intent: null,
+          forkBeforeMessageId,
+          workspaceId: null,
+          initialCollaborationMode: null,
+        },
+        preserveComposer: true,
+        retryAttempt: usageBarrierReplayAttempt,
+        rememberRetryableAttempt: attempt => {
+          usageBarrierReplayAttempt = attempt
+        },
+        acceptedVisibleReplay: { forkBeforeMessageId },
+        suppressRejectedFailureMessage: true,
+        includeEmptyAttachments: true,
+        requirePreparedHandoff: true,
+        replayCoordination: {
+          key: replayCoordinationKey,
+          clientRequestId: stableClientRequestId,
+          clientMessageId: stableClientMessageId,
+        },
+        preDispatchGuard: stage => !replayIsBlocked(stage === 'before_rpc'),
+      })
+      if (outcome === 'accepted') usageBarrierReplayAttempt = null
+      return outcome === 'accepted'
+    } finally {
+      usageBarrierReplayInFlight = false
     }
   }
 
@@ -3182,6 +3813,7 @@ export function useChatSend(options: UseChatSendOptions) {
     restoreHiddenControls,
     recoverResponseHandoffs,
     sendHiddenMetaPreflightConfirmation,
+    sendUsageBarrierReplay,
     acceptanceRecoveryPendingForCurrentSession,
   }
 }

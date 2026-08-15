@@ -29,6 +29,9 @@ from opensquilla.provider.protocol import configured_provider_id
 from opensquilla.tools.types import is_goal_owned_main_default_turn
 
 if TYPE_CHECKING:
+    from opensquilla.engine.turn_runner.attachment_stage import (
+        AttachmentMaterializationStats,
+    )
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.observability.decision_log import PipelineStepRecord
     from opensquilla.observability.prompt_report import PromptReport
@@ -63,6 +66,7 @@ class RunPipelineRequest:
     tool_defs: list[Any]
     base_prompt: str | tuple[str, str]
     attachments: list[dict[str, Any]]
+    attachment_materialization: AttachmentMaterializationStats | None = None
     semantic_message: str | None = None
     # Process-local semantic hint used only by routing and skill retrieval.
     # It must never enter prompt text, metadata, transcripts, or wire payloads.
@@ -249,6 +253,7 @@ class PromptAssemblerStageInput:
     model: str | None
     history_has_persisted_user: bool
     persist_input: bool
+    attachment_materialization: AttachmentMaterializationStats | None = None
     fresh_user_session: bool = False
     bound_user_message_id: str | None = None
     ingress_pipeline_steps: list[PipelineStepRecord] | None = None
@@ -450,6 +455,7 @@ class PromptAssemblerStage:
             tool_defs=inp.tool_defs,
             base_prompt=base_prompt,
             attachments=inp.attachments,
+            attachment_materialization=inp.attachment_materialization,
             semantic_message=inp.semantic_input,
             routing_hint=routing_hint,
             ingress_pipeline_steps=inp.ingress_pipeline_steps,

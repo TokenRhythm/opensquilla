@@ -3,6 +3,8 @@
 from opensquilla.silent_reply import (
     HEARTBEAT_ACK_TOKEN,
     NO_REPLY_TOKEN,
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
     SILENT_REPLY_SENTINELS,
     HistoricalSilentReplySanitization,
     SilentReplyDelivery,
@@ -20,6 +22,8 @@ __all__ = [
     "HistoricalSilentReplySanitization",
     "NO_REPLY_TOKEN",
     "SILENT_REPLY_SENTINELS",
+    "SILENT_REPLY_NOT_ALLOWED_CODE",
+    "SILENT_REPLY_NOT_ALLOWED_MESSAGE",
     "SilentReplyDelivery",
     "SilentReplyNormalization",
     "SilentReplySegmentsNormalization",

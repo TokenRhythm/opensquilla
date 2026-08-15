@@ -149,6 +149,214 @@ def _assert_no_runtime_acceptance_state(runtime: TaskRuntime) -> None:
     assert runtime._running_by_session == {}
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "display_text"),
+    [("/coding", "//coding"), ("//usr/bin/env", "///usr/bin/env")],
+)
+async def test_pending_input_literal_slash_escape_dispatches_normalized_message(
+    tmp_path: Path,
+    message: str,
+    display_text: str,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-literal-slash.db") as stack:
+        staged = await get_dispatcher().dispatch(
+            "pending-literal-slash-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-literal-slash",
+                "clientRequestId": "pending-literal-slash-request",
+                "clientMessageId": "pending-literal-slash-message",
+                "message": message,
+                "displayText": display_text,
+            },
+            stack.context,
+        )
+        assert staged.ok is True
+        row = await stack.storage.get_pending_chat_input("pending-literal-slash")
+        assert row is not None
+        assert row.payload["message"] == message
+        assert row.payload["displayText"] == display_text
+
+        listed = await get_dispatcher().dispatch(
+            "pending-literal-slash-list",
+            "sessions.pending_inputs.list",
+            {"key": SESSION_KEY},
+            stack.context,
+        )
+        assert listed.ok is True
+        assert listed.payload["items"][0]["message"] == message
+        assert listed.payload["items"][0]["displayText"] == display_text
+
+        accepted = await get_dispatcher().dispatch(
+            "pending-literal-slash-dispatch",
+            "sessions.pending_inputs.dispatch",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-literal-slash",
+                "clientRequestId": "pending-literal-slash-request",
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            },
+            stack.context,
+        )
+        assert accepted.ok is True
+        transcript = await stack.storage.get_transcript(stack.session_id)
+        entry = next(
+            item
+            for item in transcript
+            if item.message_id == accepted.payload["message_id"]
+        )
+        persisted_content = json.loads(entry.content)
+        assert persisted_content["text"] == message
+        assert persisted_content["display_text"] == display_text
+
+
+@pytest.mark.asyncio
+async def test_pending_input_confirmed_plain_slash_survives_staging_and_dispatch(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-confirmed-plain.db") as stack:
+        staged = await get_dispatcher().dispatch(
+            "pending-confirmed-plain-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-confirmed-plain",
+                "clientRequestId": "pending-confirmed-plain-request",
+                "clientMessageId": "pending-confirmed-plain-message",
+                "message": "/gamemode creative",
+                "confirmedPlainText": True,
+            },
+            stack.context,
+        )
+        assert staged.ok is True
+        row = await stack.storage.get_pending_chat_input("pending-confirmed-plain")
+        assert row is not None
+        assert row.payload["message"] == "/gamemode creative"
+        assert row.payload["confirmedPlainText"] is True
+
+        listed = await get_dispatcher().dispatch(
+            "pending-confirmed-plain-list",
+            "sessions.pending_inputs.list",
+            {"key": SESSION_KEY},
+            stack.context,
+        )
+        assert listed.ok is True
+        assert listed.payload["items"][0]["confirmedPlainText"] is True
+
+        accepted = await get_dispatcher().dispatch(
+            "pending-confirmed-plain-dispatch",
+            "sessions.pending_inputs.dispatch",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-confirmed-plain",
+                "clientRequestId": "pending-confirmed-plain-request",
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            },
+            stack.context,
+        )
+        assert accepted.ok is True
+        transcript = await stack.storage.get_transcript(stack.session_id)
+        entry = next(
+            item
+            for item in transcript
+            if item.message_id == accepted.payload["message_id"]
+        )
+        assert entry.content == "/gamemode creative"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("display_text", [None, "//different"])
+async def test_pending_input_rejects_unmarked_control_commands(
+    tmp_path: Path,
+    display_text: str | None,
+) -> None:
+    suffix = "missing" if display_text is None else "mismatched"
+    async with _open_real_stack(tmp_path / f"pending-control-{suffix}.db") as stack:
+        params = {
+            "key": SESSION_KEY,
+            "pendingInputId": "pending-control",
+            "clientRequestId": "pending-control-request",
+            "clientMessageId": "pending-control-message",
+            "message": "/coding",
+        }
+        if display_text is not None:
+            params["displayText"] = display_text
+        rejected = await get_dispatcher().dispatch(
+            "pending-control-enqueue",
+            "sessions.pending_inputs.enqueue",
+            params,
+            stack.context,
+        )
+        assert rejected.ok is False
+        assert rejected.error is not None
+        assert rejected.error.code == "PENDING_CONTROL_COMMAND_UNSUPPORTED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    ["/coding", "/reset now", "/clear now", "/plan draft"],
+)
+async def test_pending_input_plain_marker_rejects_registered_web_controls(
+    tmp_path: Path,
+    message: str,
+) -> None:
+    suffix = message.split(maxsplit=1)[0].removeprefix("/")
+    async with _open_real_stack(tmp_path / f"pending-registered-{suffix}.db") as stack:
+        rejected = await get_dispatcher().dispatch(
+            "pending-registered-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-registered",
+                "clientRequestId": "pending-registered-request",
+                "clientMessageId": "pending-registered-message",
+                "message": message,
+                "confirmedPlainText": True,
+            },
+            stack.context,
+        )
+        assert rejected.ok is False
+        assert rejected.error is not None
+        assert rejected.error.code == "PENDING_CONTROL_COMMAND_UNSUPPORTED"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "display_text", "confirmed_plain_text"),
+    [
+        ("ordinary provider text", "/reset", False),
+        ("/gamemode creative", "/reset", True),
+    ],
+)
+async def test_pending_input_rejects_unpaired_display_text(
+    tmp_path: Path,
+    message: str,
+    display_text: str,
+    confirmed_plain_text: bool,
+) -> None:
+    async with _open_real_stack(tmp_path / "pending-display-mismatch.db") as stack:
+        rejected = await get_dispatcher().dispatch(
+            "pending-display-mismatch-enqueue",
+            "sessions.pending_inputs.enqueue",
+            {
+                "key": SESSION_KEY,
+                "pendingInputId": "pending-display-mismatch",
+                "clientRequestId": "pending-display-mismatch-request",
+                "clientMessageId": "pending-display-mismatch-message",
+                "message": message,
+                "displayText": display_text,
+                "confirmedPlainText": confirmed_plain_text,
+            },
+            stack.context,
+        )
+        assert rejected.ok is False
+        assert rejected.error is not None
+        assert rejected.error.code == "PENDING_DISPLAY_TEXT_MISMATCH"
+
+
 async def _seed_idle_active_goal(stack: _RealIngressStack) -> Any:
     """Create a settled active Goal without installing an execution lease."""
 

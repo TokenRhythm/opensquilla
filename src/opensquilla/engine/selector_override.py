@@ -10,6 +10,8 @@ cross-provider tier path (credential resolution + continuity gate).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from dataclasses import replace
 from typing import Any
 
 import structlog
@@ -21,6 +23,176 @@ _ROUTE_SAVINGS_KEYS = (
     "savings_max_price_per_m",
     "savings_routed_price_per_m",
 )
+
+
+def _metadata_nonnegative_int(turn_metadata: dict[str, Any], key: str) -> int:
+    value = turn_metadata.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        return 0
+    return max(0, value)
+
+
+def _large_context_capacity_required(turn_metadata: dict[str, Any]) -> bool:
+    return bool(turn_metadata.get("large_context_floor_min_tier")) and (
+        _metadata_nonnegative_int(
+            turn_metadata,
+            "large_context_material_tokens",
+        )
+        > 0
+    )
+
+
+def _provider_config_has_request_capacity(
+    config: Any,
+    turn_metadata: dict[str, Any],
+) -> bool:
+    """Validate one final physical deployment against the routed material."""
+
+    if not _large_context_capacity_required(turn_metadata):
+        return True
+    from opensquilla.engine.capacity_admission import (
+        MAX_THINKING_BUDGET_TOKENS,
+        model_has_request_capacity,
+    )
+
+    thinking_budget = turn_metadata.get("large_context_thinking_budget_tokens")
+    if not isinstance(thinking_budget, int) or isinstance(thinking_budget, bool):
+        thinking_budget = MAX_THINKING_BUDGET_TOKENS
+    return model_has_request_capacity(
+        provider=str(getattr(config, "provider", "") or "").strip(),
+        model=str(getattr(config, "model", "") or "").strip(),
+        material_tokens=_metadata_nonnegative_int(
+            turn_metadata,
+            "large_context_material_tokens",
+        ),
+        thinking_budget_tokens=max(0, thinking_budget),
+        context_window_override_tokens=_metadata_nonnegative_int(
+            turn_metadata,
+            "large_context_context_window_override_tokens",
+        ),
+        max_output_override_tokens=_metadata_nonnegative_int(
+            turn_metadata,
+            "large_context_max_output_override_tokens",
+        ),
+        provider_request_proof_max_chars=_metadata_nonnegative_int(
+            turn_metadata,
+            "large_context_provider_request_proof_max_chars",
+        ),
+        api_key=str(getattr(config, "api_key", "") or ""),
+        base_url=str(getattr(config, "base_url", "") or ""),
+        proxy=str(getattr(config, "proxy", "") or ""),
+    )
+
+
+def _require_provider_config_capacity(
+    config: Any,
+    turn_metadata: dict[str, Any],
+    *,
+    reason: str,
+) -> None:
+    if _provider_config_has_request_capacity(config, turn_metadata):
+        return
+    from opensquilla.engine.capacity_admission import LargeContextCapacityError
+
+    turn_metadata["large_context_capacity_blocked"] = True
+    turn_metadata["large_context_capacity_block_reason"] = reason
+    raise LargeContextCapacityError(reason)
+
+
+def _materialize_fallback_configs(
+    selector: Any,
+    entries: Sequence[object],
+) -> list[Any]:
+    """Resolve router identities to the exact configured deployment objects."""
+
+    current = getattr(selector, "current_config", None)
+    if current is None:
+        return []
+    remaining_chain = getattr(selector, "remaining_chain", None)
+    try:
+        configured_tail = (
+            list(remaining_chain())[1:] if callable(remaining_chain) else []
+        )
+    except Exception:  # noqa: BLE001 - opaque selectors fail closed
+        configured_tail = []
+
+    materialized: list[Any] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            if getattr(entry, "provider", None) and getattr(entry, "model", None):
+                materialized.append(entry)
+            continue
+        provider = str(
+            entry.get("provider") or getattr(current, "provider", "") or ""
+        ).strip()
+        model = str(entry.get("model") or "").strip()
+        if not provider or not model:
+            continue
+        matches = [
+            cfg
+            for cfg in configured_tail
+            if str(getattr(cfg, "provider", "") or "").strip() == provider
+            and str(getattr(cfg, "model", "") or "").strip() == model
+        ]
+        if matches:
+            materialized.extend(matches)
+            continue
+        if provider != str(getattr(current, "provider", "") or "").strip():
+            continue
+        try:
+            materialized.append(
+                replace(
+                    current,
+                    model=model,
+                    provider_routing=dict(
+                        getattr(current, "provider_routing", {}) or {}
+                    ),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return materialized
+
+
+def _capacity_approved_configured_fallbacks(
+    selector: Any,
+    turn_metadata: dict[str, Any],
+) -> list[Any]:
+    """Keep only configured fallbacks with definite request-budget capacity."""
+
+    remaining_chain = getattr(selector, "remaining_chain", None)
+    if not callable(remaining_chain):
+        return []
+    try:
+        # The current deployment becomes the first fallback after either a
+        # same-provider model override or a cross-provider head replacement.
+        # Admit it here when its exact endpoint is safe; the new head is
+        # validated independently before execution.
+        configured_tail = list(remaining_chain())
+    except Exception:  # noqa: BLE001 - an opaque selector fails closed
+        return []
+
+    return _capacity_approved_fallback_entries(
+        selector,
+        configured_tail,
+        turn_metadata,
+    )
+
+
+def _capacity_approved_fallback_entries(
+    selector: Any,
+    entries: Sequence[object],
+    turn_metadata: dict[str, Any],
+) -> list[Any]:
+    """Admit fallbacks only when catalog data proves the full input budget fits."""
+
+    if not _large_context_capacity_required(turn_metadata):
+        return []
+    return [
+        config
+        for config in _materialize_fallback_configs(selector, entries)
+        if _provider_config_has_request_capacity(config, turn_metadata)
+    ]
 
 
 def acquire_profile_credential(
@@ -341,8 +513,39 @@ def apply_model_override(
     full ProviderConfig; the router fallback chain is skipped in that case
     (its entries are same-provider models of the provider being left).
     """
+    if turn_metadata.get("large_context_capacity_blocked") is True:
+        from opensquilla.engine.capacity_admission import LargeContextCapacityError
+
+        reason = str(
+            turn_metadata.get("large_context_capacity_block_reason")
+            or "No deployment has proven capacity for this attachment request."
+        )
+        raise LargeContextCapacityError(reason)
+
     if tier_provider_config is not None and hasattr(selector, "override_provider_config"):
-        selector.override_provider_config(tier_provider_config)
+        _require_provider_config_capacity(
+            tier_provider_config,
+            turn_metadata,
+            reason=(
+                "The resolved cross-provider deployment does not have proven "
+                "capacity for this attachment request."
+            ),
+        )
+        bounded_provider_override = getattr(
+            selector,
+            "override_provider_config_with_bounded_fallbacks",
+            None,
+        )
+        if (
+            turn_metadata.get("large_context_floor_min_tier")
+            and callable(bounded_provider_override)
+        ):
+            bounded_provider_override(
+                tier_provider_config,
+                _capacity_approved_configured_fallbacks(selector, turn_metadata),
+            )
+        else:
+            selector.override_provider_config(tier_provider_config)
         turn_metadata["routed_provider_applied"] = tier_provider_config.provider
         turn_metadata["provider_state_replay_disabled"] = "cross_provider_route"
         _disable_selector_provider_state_replay(selector, turn_metadata)
@@ -358,6 +561,14 @@ def apply_model_override(
         restore_primary(model)
         _disable_selector_provider_state_replay(selector, turn_metadata)
         current_config = getattr(selector, "current_config", None)
+        _require_provider_config_capacity(
+            current_config,
+            turn_metadata,
+            reason=(
+                "The explicit model override does not have proven capacity "
+                "for this attachment request."
+            ),
+        )
         executed_provider = str(getattr(current_config, "provider", "") or "")
         turn_metadata["routed_provider_explicit_override_from"] = routed_provider
         turn_metadata["routed_provider_fallback_reason"] = "explicit_model_override"
@@ -388,6 +599,14 @@ def apply_model_override(
         and routed_provider != active_provider
     ):
         current_config = getattr(selector, "current_config", None)
+        _require_provider_config_capacity(
+            current_config,
+            turn_metadata,
+            reason=(
+                "The configured primary deployment does not have proven capacity "
+                "after the routed provider was blocked."
+            ),
+        )
         turn_metadata["routed_provider_fallback_provider"] = active_provider
         turn_metadata["routed_provider_fallback_model"] = str(
             getattr(current_config, "model", "") or ""
@@ -404,10 +623,40 @@ def apply_model_override(
         "override_model_with_fallback_chain",
         None,
     )
-    if callable(override_with_fallback_chain) and isinstance(router_fallback_chain, list):
+    override_with_bounded_fallback_chain = getattr(
+        selector,
+        "override_model_with_bounded_fallback_chain",
+        None,
+    )
+    if turn_metadata.get("large_context_floor_min_tier") and callable(
+        override_with_bounded_fallback_chain
+    ):
+        approved_router_fallbacks = _capacity_approved_fallback_entries(
+            selector,
+            router_fallback_chain if isinstance(router_fallback_chain, list) else [],
+            turn_metadata,
+        )
+        approved_configured_fallbacks = _capacity_approved_configured_fallbacks(
+            selector,
+            turn_metadata,
+        )
+        override_with_bounded_fallback_chain(
+            model,
+            approved_router_fallbacks,
+            approved_configured_fallbacks,
+        )
+    elif callable(override_with_fallback_chain) and isinstance(router_fallback_chain, list):
         override_with_fallback_chain(model, router_fallback_chain)
     else:
         selector.override_model(model)
+    _require_provider_config_capacity(
+        getattr(selector, "current_config", None),
+        turn_metadata,
+        reason=(
+            "The final model deployment does not have proven capacity for this "
+            "attachment request."
+        ),
+    )
     provider = _resolve_and_record_execution(selector, turn_metadata)
 
     if realign_routed_model and turn_metadata.get("routed_model") not in (None, model):

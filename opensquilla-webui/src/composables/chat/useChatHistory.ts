@@ -36,6 +36,8 @@ import {
 } from '@/composables/chat/sessionBootstrapContract'
 import type { RpcCallOptions, RpcConnectionWaitOptions } from '@/lib/rpc'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
+import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
 
 type RpcClient = {
@@ -359,16 +361,128 @@ function attachHistoryTurnOutcomes(
   messages: ChatMessage[],
   data: ChatHistoryResponse,
 ): ChatMessage[] {
-  const byTurnId = new Map(
+  const outcomes =
     (data.turn_outcomes || [])
       .map(normalizeTurnOutcome)
       .filter(outcome => outcome !== undefined)
-      .map(outcome => [outcome.turnId, outcome] as const),
-  )
+  const byTurnId = new Map(outcomes.map(outcome => [outcome.turnId, outcome] as const))
   if (byTurnId.size === 0) return messages
-  return messages.map(message => {
+  const enriched = messages.map(message => {
     const outcome = message.turnId ? byTurnId.get(message.turnId) : undefined
-    return outcome ? { ...message, turnOutcome: outcome } : message
+    if (!outcome) return message
+    const usageBarrier = isUsageAccountingBarrier(outcome.errorClass)
+    const durableUsageError = usageBarrier
+      && message.role === 'system'
+      && message.text.trimStart().startsWith('Error:')
+    return {
+      ...message,
+      ...(durableUsageError
+        ? {
+            role: 'error',
+            text: localizedChatErrorMessage(
+              outcome.errorClass,
+              outcome.terminalMessage || message.text,
+              outcome.replaySafe === true,
+            ),
+            errorCode: outcome.errorClass,
+            terminalNotice: true,
+          }
+        : {}),
+      ...(message.role === 'assistant' && outcome.statusHistory?.length
+        ? {
+            statusHistory: [
+              ...(message.statusHistory || []),
+              ...outcome.statusHistory.filter(entry =>
+                !(message.statusHistory || []).some(existing =>
+                  existing.action === entry.action && existing.at === entry.at,
+                ),
+              ),
+            ].map(entry => ({ ...entry })),
+          }
+        : {}),
+      turnOutcome: outcome,
+    }
+  })
+
+  // A pre-provider barrier may fail before an assistant transcript row exists.
+  // Materialize one status-only assistant row from the terminal task snapshot
+  // so refresh and reconnect show the completed route/activity trace.
+  for (const outcome of outcomes) {
+    if (!isUsageAccountingBarrier(outcome.errorClass) || !outcome.statusHistory?.length) continue
+    if (enriched.some(message => message.turnId === outcome.turnId && message.role === 'assistant')) continue
+    const turnIndexes = enriched.flatMap((message, index) =>
+      message.turnId === outcome.turnId ? [index] : [],
+    )
+    if (!turnIndexes.length) continue
+    const firstTerminalIndex = turnIndexes.find(index => enriched[index]?.role === 'error')
+    const insertionIndex = firstTerminalIndex ?? Math.max(...turnIndexes) + 1
+    enriched.splice(insertionIndex, 0, {
+      role: 'assistant',
+      text: '',
+      ts: outcome.finishedAt ?? null,
+      turnId: outcome.turnId,
+      turnOutcome: outcome,
+      statusHistory: outcome.statusHistory.map(entry => ({ ...entry })),
+      messageId: `terminal-activity:${outcome.taskId || outcome.turnId}`,
+      restoredFromHistory: true,
+    })
+  }
+
+  // The task outcome is the durable authority for a pre-provider usage
+  // barrier. Transcript error rows are best-effort and may be absent from a
+  // compacted or paginated window, so materialize the retry card whenever the
+  // outcome has no matching terminal row in this page.
+  for (const outcome of outcomes) {
+    if (!isUsageAccountingBarrier(outcome.errorClass)) continue
+    if (enriched.some(message =>
+      message.turnId === outcome.turnId && message.role === 'error',
+    )) continue
+    const turnIndexes = enriched.flatMap((message, index) =>
+      message.turnId === outcome.turnId ? [index] : [],
+    )
+    if (!turnIndexes.length) continue
+    enriched.splice(Math.max(...turnIndexes) + 1, 0, {
+      role: 'error',
+      text: localizedChatErrorMessage(
+        outcome.errorClass,
+        outcome.terminalMessage || '',
+        outcome.replaySafe === true,
+      ),
+      ts: outcome.finishedAt ?? null,
+      turnId: outcome.turnId,
+      turnOutcome: outcome,
+      messageId: `terminal-error:${outcome.taskId || outcome.turnId}`,
+      restoredFromHistory: true,
+      errorCode: outcome.errorClass,
+      terminalNotice: true,
+    })
+  }
+  return enriched
+}
+
+function dedupeSyntheticUsageBarrierErrors(messages: ChatMessage[]): ChatMessage[] {
+  const durableErrorTurns = new Set(
+    messages
+      .filter(message =>
+        message.role === 'error'
+        && Boolean(message.turnId)
+        && isUsageAccountingBarrier(message.errorCode)
+        && !message.messageId?.startsWith('terminal-error:'),
+      )
+      .map(message => message.turnId!),
+  )
+  const seenSynthetic = new Set<string>()
+  return messages.filter(message => {
+    if (
+      message.role !== 'error'
+      || !message.turnId
+      || !isUsageAccountingBarrier(message.errorCode)
+      || !message.messageId?.startsWith('terminal-error:')
+    ) return true
+    if (durableErrorTurns.has(message.turnId)) return false
+    if (seenSynthetic.has(message.messageId)) return false
+    seenSynthetic.add(message.messageId)
+    return true
   })
 }
 
@@ -897,10 +1011,12 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       if (params.prepend) {
         const existing = new Set(previousTranscript.map(messageKey))
         const transcript = interleaveHistoryModelCallSegments(
-          rehomePromotedSteerRows([
-            ...mapped.filter(msg => !existing.has(messageKey(msg))),
-            ...previousTranscript,
-          ]),
+          rehomePromotedSteerRows(
+            dedupeSyntheticUsageBarrierErrors([
+              ...mapped.filter(msg => !existing.has(messageKey(msg))),
+              ...previousTranscript,
+            ]),
+          ),
         )
         options.messages.value = mergeHistoryMaintenance(
           transcript,
@@ -916,7 +1032,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         }
         const transcript = interleaveHistoryModelCallSegments(
           rehomePromotedSteerRows(
-            reconcileClientTerminalNotices(previousTranscript, nextMessages),
+            dedupeSyntheticUsageBarrierErrors(
+              reconcileClientTerminalNotices(previousTranscript, nextMessages),
+            ),
           ),
         )
         options.messages.value = mergeHistoryMaintenance(

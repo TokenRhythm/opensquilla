@@ -239,6 +239,82 @@ def test_live_turn_snapshot_compacts_high_frequency_deltas_without_losing_state(
     assert snapshot.events[5].payload["text"] == "Hello world"
 
 
+def test_live_turn_snapshot_compacts_thinking_per_block_and_preserves_boundaries() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=5)
+    session_key = "agent:main:reasoning-blocks"
+    task_id = "task-reasoning"
+
+    for block_id, block_index, chunks in (
+        ("reasoning-a", 0, ("Plan", " first")),
+        ("reasoning-b", 1, ("Review", " result")),
+    ):
+        registry.record(
+            session_key,
+            "session.event.thinking_start",
+            {
+                "task_id": task_id,
+                "block_id": block_id,
+                "block_index": block_index,
+                "started_at": 1_000 + block_index,
+            },
+        )
+        for chunk in chunks:
+            registry.record(
+                session_key,
+                "session.event.thinking",
+                {
+                    "task_id": task_id,
+                    "block_id": block_id,
+                    "block_index": block_index,
+                    "text": chunk,
+                },
+            )
+        registry.record(
+            session_key,
+            "session.event.thinking_end",
+            {
+                "task_id": task_id,
+                "block_id": block_id,
+                "block_index": block_index,
+                "status": "completed",
+                "ended_at": 2_000 + block_index,
+            },
+        )
+
+    snapshot = registry.live_snapshot(session_key)
+
+    assert [event.event_name for event in snapshot.events] == [
+        "session.event.thinking_start",
+        "session.event.thinking",
+        "session.event.thinking_end",
+        "session.event.thinking_start",
+        "session.event.thinking",
+        "session.event.thinking_end",
+    ]
+    deltas = [
+        event for event in snapshot.events
+        if event.event_name == "session.event.thinking"
+    ]
+    assert [(event.payload["block_id"], event.payload["text"]) for event in deltas] == [
+        ("reasoning-a", "Plan first"),
+        ("reasoning-b", "Review result"),
+    ]
+
+
+def test_live_turn_snapshot_compacts_legacy_thinking_into_one_block() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=5)
+    session_key = "agent:main:legacy-reasoning"
+
+    registry.record(session_key, "session.event.thinking", {"text": "old"})
+    registry.record(session_key, "session.event.thinking", {"text": " client"})
+
+    snapshot = registry.live_snapshot(session_key)
+
+    assert len(snapshot.events) == 1
+    assert snapshot.events[0].payload["text"] == "old client"
+    assert "block_id" not in snapshot.events[0].payload
+
+
 def test_live_turn_snapshot_is_replaced_by_the_next_task_and_cleared_on_terminal() -> None:
     registry = SessionStreamRegistry(max_events_per_session=5)
     session_key = "agent:main:sequential-turns"

@@ -15,6 +15,10 @@ type SilentReplySuppressionReason = Literal["no_reply", "heartbeat_ack"]
 NO_REPLY_TOKEN = "NO_REPLY"
 HEARTBEAT_ACK_TOKEN = "HEARTBEAT_OK"
 SILENT_REPLY_SENTINELS = frozenset({NO_REPLY_TOKEN, HEARTBEAT_ACK_TOKEN})
+SILENT_REPLY_NOT_ALLOWED_CODE = "silent_reply_not_allowed"
+SILENT_REPLY_NOT_ALLOWED_MESSAGE = (
+    "The model did not produce a usable reply. Review the request and try again."
+)
 
 _HEARTBEAT_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 _HEARTBEAT_UNCLOSED_THINK_RE = re.compile(r"<think>.*\Z", re.DOTALL)
@@ -644,6 +648,8 @@ __all__ = [
     "HistoricalSilentReplySanitization",
     "NO_REPLY_TOKEN",
     "SILENT_REPLY_SENTINELS",
+    "SILENT_REPLY_NOT_ALLOWED_CODE",
+    "SILENT_REPLY_NOT_ALLOWED_MESSAGE",
     "SilentReplyDelivery",
     "SilentReplyNormalization",
     "SilentReplySegmentsNormalization",

@@ -319,9 +319,13 @@ def test_feishu_platform_manifest_derives_from_the_profile() -> None:
             DingTalkChannel(DingTalkChannelConfig()),
             {
                 ChannelPlatformCategories.FILES: (
-                    ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                    (),
-                    (),
+                    ChannelPlatformCapabilityStatus.CONFIG_REQUIRED,
+                    (
+                        "media/upload",
+                        "robot/groupMessages/send",
+                        "robot/oToMessages/batchSend",
+                    ),
+                    ("qyapi_base", "qyapi_robot_sendmsg"),
                 ),
                 ChannelPlatformCategories.CARDS: (
                     ChannelPlatformCapabilityStatus.SUPPORTED,
@@ -486,6 +490,29 @@ def test_dingtalk_profile_matches_current_stream_adapter_surface() -> None:
     assert not profile.supports(ChannelCapabilities.EDIT)
     assert not profile.supports(ChannelCapabilities.DELETE)
     assert not profile.supports(ChannelCapabilities.NATIVE_FILE_UPLOAD)
+
+    configured = DingTalkChannel(
+        DingTalkChannelConfig(
+            client_id="app-key",
+            client_secret="app-secret",
+            robot_code="robot-code",
+        )
+    )
+    configured_profile = configured.capability_profile
+    configured_manifest = configured.platform_capability_manifest
+
+    assert configured_profile.supports(ChannelCapabilities.ARTIFACT_DELIVERY)
+    assert configured_profile.supports(ChannelCapabilities.NATIVE_FILE_UPLOAD)
+    assert configured_profile.supports(ChannelCapabilities.MEDIA)
+    assert configured_manifest.get(ChannelPlatformCategories.FILES).status == (
+        ChannelPlatformCapabilityStatus.SUPPORTED
+    )
+    assert configured_manifest.get(ChannelPlatformCategories.MEDIA).status == (
+        ChannelPlatformCapabilityStatus.SUPPORTED
+    )
+    assert configured_manifest.get(ChannelPlatformCategories.ATTACHMENTS).status == (
+        ChannelPlatformCapabilityStatus.UNSUPPORTED
+    )
 
 
 def test_wecom_profile_matches_current_corp_app_adapter_surface() -> None:

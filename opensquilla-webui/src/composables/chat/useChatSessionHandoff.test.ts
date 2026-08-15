@@ -321,6 +321,7 @@ describe('chat send session handoff', () => {
       enqueuePendingSteerAttempt: pendingQueueRuntime.enqueuePendingSteerAttempt,
       steerDelivery,
       popAllPendingIntoComposer: pendingQueueRuntime.popAllPendingIntoComposer,
+      classifySlashCommand: vi.fn(async () => 'unknown' as const),
       executeSlashCommand: vi.fn(async () => false),
       closeSlashMenu: vi.fn(),
       autoResizeTextarea: vi.fn(),

@@ -21,6 +21,7 @@ from opensquilla.provider.types import (
     DoneEvent,
     Message,
     ReasoningDeltaEvent,
+    TextDeltaEvent,
 )
 
 
@@ -321,3 +322,47 @@ def test_openai_streams_reasoning_content_field_as_delta_events(monkeypatch) -> 
     done = next(ev for ev in events if isinstance(ev, DoneEvent))
     assert streamed == "Step one. Step two."
     assert done.reasoning_content == "Step one. Step two."
+
+
+def test_openai_emits_reasoning_before_text_from_the_same_delta(monkeypatch) -> None:
+    """JSON field order must not let answer text precede its thinking block."""
+    from opensquilla.provider.openai import OpenAIProvider
+
+    chunks = [
+        {
+            "model": "deepseek-reasoner",
+            "choices": [
+                {
+                    "delta": {
+                        "content": "answer",
+                        "reasoning_content": "thinking",
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "model": "deepseek-reasoner",
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        },
+    ]
+    _patch_openai_transport(monkeypatch, _openai_chunks_body(chunks))
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek-reasoner",
+        base_url="https://api.deepseek.com/v1",
+        provider_kind="deepseek",
+    )
+
+    visible_events = [
+        event
+        for event in _collect_openai(provider, _openai_reasoning_cfg())
+        if isinstance(event, (ReasoningDeltaEvent, TextDeltaEvent))
+    ]
+
+    assert [type(event) for event in visible_events] == [
+        ReasoningDeltaEvent,
+        TextDeltaEvent,
+    ]
+    assert [event.text for event in visible_events] == ["thinking", "answer"]
