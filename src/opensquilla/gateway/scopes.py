@@ -161,6 +161,7 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.capability.status": READ_SCOPE,  # OpenSquilla-only; real Safe capability.
     "sandbox.policy.get": READ_SCOPE,  # OpenSquilla-only; versioned Safe settings.
     "sandbox.policy.defaults": READ_SCOPE,  # OpenSquilla-only; immutable Safe rules.
+    "sandbox.runtime.status": READ_SCOPE,  # OpenSquilla-only; optional runtime inventory.
     "sandbox.tokens.list": READ_SCOPE,  # OpenSquilla-only; owner token metadata.
     "sandbox.explain": READ_SCOPE,  # OpenSquilla-only; deterministic sandbox explanation.
     "sandbox.run_context.get": READ_SCOPE,  # OpenSquilla-only; session sandbox mode.
@@ -340,6 +341,12 @@ METHOD_SCOPES: dict[str, str] = {
     "skills.uninstall": ADMIN_SCOPE,
     "skills.reload": ADMIN_SCOPE,
     "skills.deps.install": ADMIN_SCOPE,
+    # Optional developer runtimes execute native, catalog-pinned payloads and
+    # mutate profile-local managed state, so every lifecycle mutation remains
+    # authenticated admin in addition to the handlers' local-owner proof.
+    "sandbox.runtime.install": ADMIN_SCOPE,
+    "sandbox.runtime.cancel": ADMIN_SCOPE,
+    "sandbox.runtime.remove": ADMIN_SCOPE,
     "meta.setup.install": ADMIN_SCOPE,
     "meta.runs.show": ADMIN_SCOPE,
     "meta.runs.draft": ADMIN_SCOPE,

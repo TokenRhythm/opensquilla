@@ -225,12 +225,130 @@
       </article>
 
       <article v-if="activeView === 'runtimes'" class="sandbox-card">
-        <div class="sandbox-runtime-grid">
-          <label><span>Python <small>{{ runtimeVersions.python?.version ?? '—' }}</small></span><input v-model="draft.runtimes.python" type="checkbox" :disabled="!draft.runtimes.enabled" @change="void flushSectionSave('runtimes')" /></label>
-          <label><span>Node.js <small>{{ runtimeVersions.node?.version ?? '—' }}</small></span><input v-model="draft.runtimes.node" type="checkbox" :disabled="!draft.runtimes.enabled" @change="void flushSectionSave('runtimes')" /></label>
-          <label><span>Git Bash <small>{{ runtimeVersions.gitBash?.version ?? '—' }}</small></span><input v-model="draft.runtimes.gitBash" type="checkbox" :disabled="!draft.runtimes.enabled || !runtimeVersions.gitBash" @change="void flushSectionSave('runtimes')" /></label>
+        <div
+          v-if="runtimeStatusError && runtimeStatusSupported !== false"
+          class="sandbox-runtime-status-error"
+          role="alert"
+        >
+          <span>{{ t('settings.sandbox.runtimes.states.unknown') }}</span>
+          <button
+            type="button"
+            class="btn btn--ghost"
+            :disabled="runtimeStatusLoading"
+            data-testid="sandbox-runtime-status-retry"
+            @click="void loadRuntimeStatus()"
+          >
+            {{ t('settings.sandbox.runtimes.actions.retry') }}
+          </button>
         </div>
-        <p v-if="runtimeTarget" class="sandbox-detail">{{ t('settings.sandbox.runtimes.target') }}: <code>{{ runtimeTarget }}</code></p>
+        <div class="sandbox-runtime-list" data-testid="sandbox-runtime-list">
+          <section
+            v-for="runtime in runtimeRows"
+            :key="runtime.componentId"
+            class="sandbox-runtime-row"
+            :data-testid="`sandbox-runtime-${runtime.componentId}`"
+          >
+            <div class="sandbox-runtime-row__main">
+              <span class="sandbox-runtime-row__label">
+                <strong>{{ runtime.label }}</strong>
+                <small aria-live="polite">{{ runtimeStatusText(runtime) }}</small>
+              </span>
+              <label class="sandbox-switch">
+                <input
+                  v-model="draft.runtimes[runtime.componentId]"
+                  type="checkbox"
+                  :aria-label="t('settings.sandbox.runtimes.allowRuntime', { runtime: runtime.label })"
+                  :disabled="!draft.runtimes.enabled || runtime.status?.availability === 'unsupported'"
+                  :data-testid="`sandbox-runtime-toggle-${runtime.componentId}`"
+                  @change="void flushSectionSave('runtimes')"
+                />
+                <span aria-hidden="true"></span>
+              </label>
+            </div>
+
+            <div
+              v-if="runtime.status && runtimeStatus?.managementSupported"
+              class="sandbox-runtime-row__details"
+            >
+              <div
+                v-if="runtimeProgress(runtime.status) !== null"
+                class="sandbox-runtime-progress"
+                :aria-label="t('settings.sandbox.runtimes.progress', {
+                  runtime: runtime.label,
+                  progress: runtimeProgress(runtime.status),
+                })"
+                role="progressbar"
+                aria-valuemin="0"
+                aria-valuemax="100"
+                :aria-valuenow="runtimeProgress(runtime.status) ?? undefined"
+              >
+                <span :style="{ width: `${runtimeProgress(runtime.status) ?? 0}%` }"></span>
+              </div>
+              <p
+                v-if="runtimeActionError[runtime.componentId]
+                  || runtime.status.operation?.error?.message
+                  || runtime.status.lastError?.message"
+                class="sandbox-runtime-error"
+                role="alert"
+              >
+                {{ runtimeActionError[runtime.componentId]
+                  || runtime.status.operation?.error?.message
+                  || runtime.status.lastError?.message }}
+              </p>
+              <div class="sandbox-runtime-actions">
+                <small
+                  v-if="runtime.status.availability === 'ready'
+                    && runtime.status.installedBytes !== null"
+                >
+                  {{ formatBytes(runtime.status.installedBytes) }}
+                </small>
+                <small v-else-if="runtime.status.operation?.source">
+                  {{ runtimeSourceLabel(runtime.status.operation.source) }}
+                </small>
+                <span></span>
+                <button
+                  v-if="canCancelRuntime(runtime.status)"
+                  type="button"
+                  class="btn btn--ghost"
+                  :disabled="runtimeActionPending[runtime.componentId]"
+                  :data-testid="`sandbox-runtime-cancel-${runtime.componentId}`"
+                  @click="void cancelRuntime(
+                    runtime.componentId,
+                    runtime.status.operation?.operationId ?? '',
+                  )"
+                >
+                  {{ t('settings.sandbox.runtimes.actions.cancel') }}
+                </button>
+                <template v-else>
+                  <button
+                    v-if="canInstallRuntime(runtime.status)"
+                    type="button"
+                    class="btn"
+                    :disabled="runtimeActionPending[runtime.componentId]"
+                    :data-testid="`sandbox-runtime-install-${runtime.componentId}`"
+                    @click="void installRuntime(runtime.componentId)"
+                  >
+                    {{ runtimeInstallLabel(runtime.status) }}
+                  </button>
+                  <button
+                    v-if="runtime.status.removable"
+                    type="button"
+                    class="btn btn--ghost"
+                    :disabled="runtimeActionPending[runtime.componentId]"
+                    :data-testid="`sandbox-runtime-remove-${runtime.componentId}`"
+                    @click="void removeRuntime(runtime.componentId)"
+                  >
+                    {{ t('settings.sandbox.runtimes.actions.remove') }}
+                  </button>
+                </template>
+              </div>
+            </div>
+          </section>
+        </div>
+        <p v-if="effectiveRuntimeTarget" class="sandbox-detail">
+          {{ t('settings.sandbox.runtimes.target') }}:
+          <code>{{ effectiveRuntimeTarget }}</code>
+        </p>
       </article>
 
     </template>
@@ -247,7 +365,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, defineComponent, h, onMounted, ref } from 'vue'
+import { computed, defineComponent, h, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { storeToRefs } from 'pinia'
 
@@ -257,6 +375,11 @@ import {
   type SandboxPolicySection,
 } from '@/composables/settings/useSandboxSettings'
 import { useSandboxSetupStore } from '@/stores/sandboxSetup'
+import type {
+  SandboxRuntimeComponentId,
+  SandboxRuntimeComponentStatus,
+  SandboxRuntimeSource,
+} from '@/types/sandbox'
 
 const { t } = useI18n()
 const {
@@ -270,8 +393,19 @@ const {
   builtinDenyWritePaths,
   runtimeTarget,
   runtimeVersions,
+  runtimeStatus,
+  runtimeStatusLoading,
+  runtimeStatusSupported,
+  runtimeStatusError,
+  runtimeActionPending,
+  runtimeActionError,
   defaultRunMode,
   load,
+  loadRuntimeStatus,
+  setRuntimeViewActive,
+  installRuntime,
+  cancelRuntime,
+  removeRuntime,
   setDefaultRunMode,
   adoptSavedDefaultRunMode,
   scheduleSectionSave,
@@ -292,6 +426,134 @@ const denyDomain = ref('')
 type SandboxView = 'overview' | 'files' | 'commands' | 'network' | 'runtimes'
 const activeView = ref<SandboxView>('overview')
 const sandboxSetupConfirmOpen = ref(false)
+
+interface RuntimeRow {
+  componentId: SandboxRuntimeComponentId
+  label: string
+  status: SandboxRuntimeComponentStatus | null
+  legacyVersion: string | null
+}
+
+const effectiveRuntimeTarget = computed(() => runtimeStatus.value?.target ?? runtimeTarget.value)
+const runtimeRows = computed<RuntimeRow[]>(() => {
+  const target = effectiveRuntimeTarget.value
+  const isWindows = target?.startsWith('windows-') === true
+  const ids: SandboxRuntimeComponentId[] = ['python', 'node']
+  if (isWindows || (!target && runtimeVersions.value.gitBash)) ids.push('gitBash')
+  return ids.map(componentId => ({
+    componentId,
+    label: componentId === 'python'
+      ? 'Python'
+      : componentId === 'node'
+        ? 'Node.js'
+        : 'Git Bash',
+    status: runtimeStatus.value?.components.find(
+      component => component.componentId === componentId,
+    ) ?? null,
+    legacyVersion: runtimeVersions.value[componentId]?.version ?? null,
+  }))
+})
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`
+  const units = ['KiB', 'MiB', 'GiB']
+  let amount = value
+  let unit = ''
+  for (const candidate of units) {
+    amount /= 1024
+    unit = candidate
+    if (amount < 1024 || candidate === units[units.length - 1]) break
+  }
+  return `${amount >= 10 ? amount.toFixed(0) : amount.toFixed(1)} ${unit}`
+}
+
+function runtimeProgress(status: SandboxRuntimeComponentStatus): number | null {
+  const operation = status.operation
+  if (!operation || operation.state !== 'downloading' || !operation.totalBytes) return null
+  return Math.min(100, Math.max(0, Math.round(
+    (operation.downloadedBytes / operation.totalBytes) * 100,
+  )))
+}
+
+function runtimeSourceLabel(source: SandboxRuntimeSource): string {
+  return source === 'oss'
+    ? t('settings.sandbox.runtimes.sources.oss')
+    : t('settings.sandbox.runtimes.sources.github')
+}
+
+function runtimeStatusText(runtime: RuntimeRow): string {
+  const status = runtime.status
+  if (!status) return runtime.legacyVersion ?? t('settings.sandbox.runtimes.states.unknown')
+  const operation = status.operation
+  if (operation && [
+    'queued',
+    'downloading',
+    'verifying',
+    'extracting',
+    'probing',
+    'activating',
+    'cancelling',
+    'removing',
+  ].includes(operation.state)) {
+    if (operation.state === 'downloading') {
+      const progress = runtimeProgress(status)
+      return progress === null
+        ? t('settings.sandbox.runtimes.states.downloading')
+        : t('settings.sandbox.runtimes.states.downloadingProgress', { progress })
+    }
+    return t(`settings.sandbox.runtimes.states.${operation.state}`)
+  }
+  if (status.availability === 'ready') {
+    return status.activeVersion
+      ? t('settings.sandbox.runtimes.states.installedVersion', {
+          version: status.activeVersion,
+        })
+      : t('settings.sandbox.runtimes.states.installed')
+  }
+  if (status.availability === 'unsupported') {
+    return t('settings.sandbox.runtimes.states.unsupported')
+  }
+  if (status.availability === 'corrupt') return t('settings.sandbox.runtimes.states.corrupt')
+  if (operation?.state === 'cancelled') return t('settings.sandbox.runtimes.states.cancelled')
+  if (operation?.state === 'failed') return t('settings.sandbox.runtimes.states.failed')
+  if (operation?.state === 'interrupted' || status.resumeAvailable) {
+    return t('settings.sandbox.runtimes.states.interrupted')
+  }
+  return t('settings.sandbox.runtimes.states.notInstalled')
+}
+
+function canCancelRuntime(status: SandboxRuntimeComponentStatus): boolean {
+  return Boolean(status.operation?.operationId) && [
+    'queued',
+    'downloading',
+    'verifying',
+    'extracting',
+    'probing',
+  ].includes(status.operation?.state ?? '')
+}
+
+function canInstallRuntime(status: SandboxRuntimeComponentStatus): boolean {
+  if (status.availability === 'unsupported') return false
+  if (status.availability === 'ready' && (!status.operation || [
+    'completed',
+    'cancelled',
+  ].includes(status.operation.state))) return false
+  return !status.operation || [
+    'completed',
+    'cancelled',
+    'failed',
+    'interrupted',
+  ].includes(status.operation.state)
+}
+
+function runtimeInstallLabel(status: SandboxRuntimeComponentStatus): string {
+  if (status.availability === 'corrupt') return t('settings.sandbox.runtimes.actions.repair')
+  if (status.resumeAvailable || status.operation?.state === 'interrupted') {
+    return t('settings.sandbox.runtimes.actions.resume')
+  }
+  if (status.operation?.state === 'failed') return t('settings.sandbox.runtimes.actions.retry')
+  return t('settings.sandbox.runtimes.actions.download')
+}
 
 const sandboxSetupOutcomeMessage = computed(() => {
   if (sandboxSetupOutcome.value === 'cancelled') return t('settings.sandbox.setup.cancelled')
@@ -367,10 +629,11 @@ const networkSummary = computed(() => {
 
 const runtimeSummary = computed(() => {
   if (!draft.value?.runtimes.enabled) return t('settings.sandbox.commands.systemToolsDisabled')
+  const showGitBash = effectiveRuntimeTarget.value?.startsWith('windows-') === true
   return [
     draft.value.runtimes.python && 'Python',
     draft.value.runtimes.node && 'Node.js',
-    draft.value.runtimes.gitBash && 'Git Bash',
+    showGitBash && draft.value.runtimes.gitBash && 'Git Bash',
   ].filter(Boolean).join(' · ')
 })
 
@@ -389,6 +652,8 @@ const activeViewDescription = computed(() => ({
   network: t('settings.sandbox.network.description'),
   runtimes: t('settings.sandbox.runtimes.description'),
 })[activeView.value])
+
+watch(activeView, view => setRuntimeViewActive(view === 'runtimes'))
 
 function createLineIcon(paths: string[]) {
   return defineComponent({
@@ -559,7 +824,7 @@ onMounted(() => void load())
   white-space: nowrap;
 }
 
-.sandbox-runtime-grid small {
+.sandbox-runtime-row small {
   color: var(--text-muted);
   font-weight: 400;
 }
@@ -848,8 +1113,7 @@ onMounted(() => void load())
 .sandbox-inline-form,
 .sandbox-token-create,
 .sandbox-token-secret,
-.sandbox-field,
-.sandbox-runtime-grid {
+.sandbox-field {
   display: flex;
   align-items: center;
   gap: 0.6rem;
@@ -921,18 +1185,93 @@ onMounted(() => void load())
   line-height: 1.45;
 }
 
-.sandbox-runtime-grid {
+.sandbox-runtime-list {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-}
-
-.sandbox-runtime-grid label {
-  display: flex;
-  justify-content: space-between;
-  gap: 0.5rem;
-  padding: 0.7rem;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
+}
+
+.sandbox-runtime-status-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-block-end: 0.6rem;
+  color: var(--danger);
+  font-size: 0.74rem;
+}
+
+.sandbox-runtime-row {
+  display: grid;
+  gap: 0.6rem;
+  padding: 0.75rem;
+}
+
+.sandbox-runtime-row:not(:last-child) {
+  border-bottom: 1px solid var(--border);
+}
+
+.sandbox-runtime-row__main,
+.sandbox-runtime-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.sandbox-runtime-row__label {
+  display: grid;
+  min-width: 0;
+  gap: 0.15rem;
+}
+
+.sandbox-runtime-row__label small {
+  overflow: hidden;
+  font-size: 0.73rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sandbox-runtime-row__details {
+  display: grid;
+  gap: 0.45rem;
+  padding-inline-start: 0.1rem;
+}
+
+.sandbox-runtime-progress {
+  overflow: hidden;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--bg-hover);
+}
+
+.sandbox-runtime-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width var(--dur-fast) var(--ease-standard);
+}
+
+.sandbox-runtime-error {
+  color: var(--danger);
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+
+.sandbox-runtime-actions {
+  min-height: 30px;
+}
+
+.sandbox-runtime-actions > span {
+  flex: 1;
+}
+
+.sandbox-runtime-actions .btn {
+  min-height: 30px;
+  padding-block: 0.25rem;
+  font-size: 0.74rem;
 }
 
 .sandbox-lan-rules p {
@@ -976,10 +1315,6 @@ onMounted(() => void load())
   .sandbox-card__head,
   .sandbox-option {
     align-items: flex-start;
-  }
-
-  .sandbox-runtime-grid {
-    grid-template-columns: 1fr;
   }
 
   .sandbox-token-create,

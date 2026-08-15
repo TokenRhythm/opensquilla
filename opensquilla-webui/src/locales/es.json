@@ -493,7 +493,18 @@
         "title": "Seguridad de red", "description": "La red pública se permite por defecto y se mantienen las protecciones SSRF y de metadatos.",
         "blockAll": "Bloquear toda la red", "blockAllDescription": "Los dominios permitidos siguen siendo excepciones.", "allowDomains": "Dominios permitidos", "denyDomains": "Dominios rechazados"
       },
-      "runtimes": { "title": "Runtimes incluidos", "description": "Seguro prioriza las herramientas incluidas; Acceso completo prioriza las del host.", "target": "Destino del paquete" },
+      "runtimes": {
+        "title": "Paquetes de ejecución", "description": "Seguro prioriza los paquetes instalados; Acceso completo prioriza las herramientas del host.", "target": "Destino de ejecución",
+        "allowRuntime": "Permitir {runtime}", "progress": "Descarga de {runtime}: {progress}%",
+        "states": {
+          "unknown": "Estado no disponible", "notInstalled": "No instalado", "installed": "Instalado", "installedVersion": "Instalado · {version}",
+          "unsupported": "No disponible para este sistema", "corrupt": "Requiere reparación", "queued": "Esperando la descarga", "downloading": "Descargando", "downloadingProgress": "Descargando · {progress}%",
+          "verifying": "Verificando la descarga", "extracting": "Instalando", "probing": "Comprobando el entorno", "activating": "Finalizando la instalación", "cancelling": "Cancelando", "removing": "Eliminando",
+          "cancelled": "Descarga cancelada", "failed": "Error de descarga", "interrupted": "Descarga pausada"
+        },
+        "actions": { "download": "Descargar", "cancel": "Cancelar", "resume": "Continuar", "retry": "Reintentar", "repair": "Reparar", "remove": "Eliminar" },
+        "sources": { "oss": "OSS de Pekín", "github": "Versiones de GitHub" }
+      },
       "lan": {
         "listen": "Escuchar en la red local", "listenDescription": "Se enlaza a todas las interfaces locales tras reiniciar; los pares públicos siguen bloqueados.",
         "allowedCidrs": "CIDR de clientes permitidos", "cidrDescription": "Opcional. Vacío permite loopback, RFC1918 e IPv6 ULA; solo se puede restringir ese rango.",

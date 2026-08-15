@@ -531,9 +531,43 @@
         "denyDomains": "拒绝域名"
       },
       "runtimes": {
-        "title": "随包运行时",
-        "description": "安全模式优先使用随包工具；完全访问优先使用宿主机工具。",
-        "target": "打包目标"
+        "title": "运行环境",
+        "description": "安全模式优先使用已安装的运行环境；完全访问优先使用宿主机工具。",
+        "target": "运行目标",
+        "allowRuntime": "允许使用 {runtime}",
+        "progress": "{runtime} 下载进度：{progress}%",
+        "states": {
+          "unknown": "状态暂不可用",
+          "notInstalled": "未安装",
+          "installed": "已安装",
+          "installedVersion": "已安装 · {version}",
+          "unsupported": "当前系统不可用",
+          "corrupt": "需要修复",
+          "queued": "等待下载",
+          "downloading": "正在下载",
+          "downloadingProgress": "正在下载 · {progress}%",
+          "verifying": "正在校验下载",
+          "extracting": "正在安装",
+          "probing": "正在检查运行环境",
+          "activating": "正在完成安装",
+          "cancelling": "正在取消",
+          "removing": "正在删除",
+          "cancelled": "下载已取消",
+          "failed": "下载失败",
+          "interrupted": "下载已暂停"
+        },
+        "actions": {
+          "download": "下载",
+          "cancel": "取消",
+          "resume": "继续下载",
+          "retry": "重试",
+          "repair": "修复",
+          "remove": "删除"
+        },
+        "sources": {
+          "oss": "北京 OSS",
+          "github": "GitHub 发布页"
+        }
       },
       "lan": {
         "title": "Web 访问与具名 Token",

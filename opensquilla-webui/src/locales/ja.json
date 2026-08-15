@@ -493,7 +493,18 @@
         "title": "ネットワーク保護", "description": "公開ネットワークは既定で許可し、SSRF とメタデータ保護を維持します。",
         "blockAll": "すべてのネットワークを遮断", "blockAllDescription": "許可ドメインだけを例外にします。", "allowDomains": "許可ドメイン", "denyDomains": "拒否ドメイン"
       },
-      "runtimes": { "title": "同梱ランタイム", "description": "安全モードは同梱ツールを優先し、フルアクセスはホストツールを優先します。", "target": "パッケージ対象" },
+      "runtimes": {
+        "title": "ランタイムパック", "description": "安全モードはインストール済みパックを優先し、フルアクセスはホストツールを優先します。", "target": "ランタイム対象",
+        "allowRuntime": "{runtime} を許可", "progress": "{runtime} のダウンロード：{progress}%",
+        "states": {
+          "unknown": "状態を取得できません", "notInstalled": "未インストール", "installed": "インストール済み", "installedVersion": "インストール済み · {version}",
+          "unsupported": "このシステムでは利用できません", "corrupt": "修復が必要です", "queued": "ダウンロード待ち", "downloading": "ダウンロード中", "downloadingProgress": "ダウンロード中 · {progress}%",
+          "verifying": "ダウンロードを検証中", "extracting": "インストール中", "probing": "ランタイムを確認中", "activating": "インストールを完了中", "cancelling": "キャンセル中", "removing": "削除中",
+          "cancelled": "ダウンロードをキャンセルしました", "failed": "ダウンロードに失敗しました", "interrupted": "ダウンロードを一時停止しました"
+        },
+        "actions": { "download": "ダウンロード", "cancel": "キャンセル", "resume": "再開", "retry": "再試行", "repair": "修復", "remove": "削除" },
+        "sources": { "oss": "北京 OSS", "github": "GitHub リリース" }
+      },
       "lan": {
         "listen": "ローカルネットワークで待ち受ける", "listenDescription": "再起動後に全ローカルインターフェイスへバインドします。公開ピアは引き続き拒否されます。",
         "allowedCidrs": "許可するクライアント CIDR", "cidrDescription": "任意。空欄では loopback、RFC1918、IPv6 ULA を許可し、指定時は範囲を狭めることだけができます。",

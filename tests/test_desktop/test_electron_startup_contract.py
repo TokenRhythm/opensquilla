@@ -1205,14 +1205,25 @@ def test_desktop_local_web_build_installs_locked_dependencies_first() -> None:
     )
 
 
-def test_desktop_local_packaging_hydrates_and_verifies_bundled_runtimes() -> None:
-    scripts = json.loads(_read("desktop/electron/package.json"))["scripts"]
+def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> None:
+    package_json = json.loads(_read("desktop/electron/package.json"))
+    scripts = package_json["scripts"]
 
     for local_script in ("dist:local", "pack:local"):
         commands = scripts[local_script].split(" && ")
-        assert commands.index("npm run fetch:runtimes") < commands.index(
-            "npm run build:gateway"
-        )
+        assert "npm run fetch:runtimes" not in commands
+        assert commands.index("npm run build:web") < commands.index("npm run build:gateway")
+
+    runtime_resources = {
+        (entry["from"], entry["to"])
+        for entry in package_json["build"]["extraResources"]
+        if entry["to"].startswith("runtime")
+    }
+    assert runtime_resources == {
+        ("runtime/gateway", "runtime/gateway"),
+        ("runtime/runtime-manifest.json", "runtime/runtime-manifest.json"),
+        ("runtime/runtime-pack-catalog.json", "runtime/runtime-pack-catalog.json"),
+    }
 
     assert scripts["dist"].endswith(" && npm run verify:package")
     assert scripts["pack"].endswith(" && npm run verify:package")
@@ -1495,7 +1506,7 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
     assert "if (result.status === 'exited') throw new Error(result.message)" in wait
 
 
-def test_start_gateway_enriches_child_path_for_code_task_builds() -> None:
+def test_start_gateway_preserves_host_path_without_static_runtime_injection() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     start = _section(
         main_ts,
@@ -1504,9 +1515,10 @@ def test_start_gateway_enriches_child_path_for_code_task_builds() -> None:
     )
 
     assert "function desktopChildPath" in main_ts
-    assert "function desktopNodeBinCandidates" in main_ts
-    assert "packagedRuntimeRoot(), 'node', 'bin'" in main_ts
-    assert "OPENSQUILLA_NODE_BIN_DIR" in start
+    assert "function desktopNodeBinCandidates" not in main_ts
+    assert "packagedRuntimeRoot(), 'node', 'bin'" not in main_ts
+    assert "OPENSQUILLA_NODE_BIN_DIR" not in start
+    assert "optional Runtime Packs are resolved inside Gateway" in main_ts
     assert "PATH: childPath" in start
 
 
@@ -2228,6 +2240,8 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
         "does not prefer the onboarding window when focusing",
         "app.asar package.json version is not npm semver",
         "prereleases must use 0.5.0-rc2 style, not 0.5.0rc2",
+        "must not contain bundled developer runtimes",
+        "runtime-pack catalog must declare a boolean finalized flag",
         "process.exit(1)",
     ]:
         assert expected in verifier
@@ -2288,6 +2302,8 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "codesign" in build_gateway
     assert "'--force', '--sign', '-'" in build_gateway
     assert "@loader_path/libomp.dylib" in build_gateway
+    assert "assertRuntimeSetReady" not in build_gateway
+    assert "fetch-bundled-runtimes.mjs" not in build_gateway
     assert "verifyMacLightgbmRuntime" in verifier
     assert "lightgbm/lib/lib_lightgbm.dylib" in verifier
     assert "bundled libomp.dylib" in verifier

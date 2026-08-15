@@ -285,10 +285,14 @@ class RpcRegistry:
             )
 
         try:
+            from opensquilla.runtime_packs import runtime_pack_state_scope
             from opensquilla.skills.toolchains.manager import managed_toolchain_state_scope
 
             configured_state_dir = getattr(ctx.config, "state_dir", None)
-            with managed_toolchain_state_scope(configured_state_dir):
+            with (
+                managed_toolchain_state_scope(configured_state_dir),
+                runtime_pack_state_scope(configured_state_dir),
+            ):
                 result = await entry.handler(params, ctx)
             return make_ok_res(req_id, result)
         except RpcHandlerError as exc:

@@ -475,10 +475,37 @@ _BASH_KIND_WSL = "wsl"
 _BASH_KIND_UNUSABLE = "unusable"
 # Exit code the probe script reserves for "real bash, but Linux userland".
 _BASH_PROBE_WSL_EXIT = 42
-# Process-level cache: bash location is stable for the gateway's lifetime.
-# Tuple form (resolved, path) so a cached "not found" doesn't keep re-probing.
+# Process-level cache keyed by the candidate inventory. Installing/removing a
+# Runtime Pack changes that inventory, so CodeTask can adopt it without a
+# Gateway restart while stable calls still avoid repeated probes.
 _BASH_RESOLVED: bool = False
 _BASH_CACHED: str | None = None
+_BASH_CANDIDATE_FINGERPRINT: tuple[str, ...] | None = None
+
+
+def _runtime_pack_precedes_host() -> bool:
+    try:
+        from opensquilla.run_mode import RunMode, normalize_run_mode
+        from opensquilla.tools.run_mode import current_run_mode
+
+        mode = current_run_mode()
+        return mode is not None and normalize_run_mode(mode) is not RunMode.FULL
+    except (ImportError, RuntimeError, ValueError):
+        return False
+
+
+def _runtime_pack_bash_binary() -> str | None:
+    try:
+        from opensquilla.runtime_packs import resolve_component_binary
+        from opensquilla.sandbox.integration import active_sandbox_policy
+
+        policy = active_sandbox_policy().runtimes
+        if not policy.enabled or not policy.git_bash:
+            return None
+        path = resolve_component_binary("gitBash", "bash", allow_host=False)
+        return str(path) if path is not None else None
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _windows_bash_candidates() -> list[str]:
@@ -501,6 +528,10 @@ def _windows_bash_candidates() -> list[str]:
             return
         seen.add(key)
         out.append(p)
+
+    managed_bash = _runtime_pack_bash_binary()
+    if _runtime_pack_precedes_host():
+        _add(managed_bash)
 
     _add(os.environ.get("OPENSQUILLA_BASH"))
 
@@ -531,6 +562,8 @@ def _windows_bash_candidates() -> list[str]:
             cand = os.path.join(base, rel)
             if os.path.isfile(cand):
                 _add(cand)
+    if not _runtime_pack_precedes_host():
+        _add(managed_bash)
     return out
 
 
@@ -595,15 +628,18 @@ def _resolve_bash() -> str | None:
     """
     if os.name != "nt":
         return shutil.which("bash")
-    global _BASH_RESOLVED, _BASH_CACHED
-    if _BASH_RESOLVED:
+    global _BASH_CANDIDATE_FINGERPRINT, _BASH_RESOLVED, _BASH_CACHED
+    candidates = _windows_bash_candidates()
+    fingerprint = tuple(os.path.normcase(os.path.abspath(path)) for path in candidates)
+    if _BASH_RESOLVED and fingerprint == _BASH_CANDIDATE_FINGERPRINT:
         return _BASH_CACHED
     wsl_fallback: str | None = None
-    for cand in _windows_bash_candidates():
+    for cand in candidates:
         kind = _probe_bash_kind(cand)
         if kind == _BASH_KIND_NATIVE:
             _BASH_CACHED = cand
             _BASH_RESOLVED = True
+            _BASH_CANDIDATE_FINGERPRINT = fingerprint
             return cand
         if kind == _BASH_KIND_WSL and wsl_fallback is None:
             wsl_fallback = cand
@@ -618,14 +654,16 @@ def _resolve_bash() -> str | None:
         )
     _BASH_CACHED = wsl_fallback
     _BASH_RESOLVED = True
+    _BASH_CANDIDATE_FINGERPRINT = fingerprint
     return _BASH_CACHED
 
 
 def _reset_bash_cache() -> None:
     """Test helper: drop the memoized bash resolution."""
-    global _BASH_RESOLVED, _BASH_CACHED
+    global _BASH_CANDIDATE_FINGERPRINT, _BASH_RESOLVED, _BASH_CACHED
     _BASH_RESOLVED = False
     _BASH_CACHED = None
+    _BASH_CANDIDATE_FINGERPRINT = None
 
 
 def _repo_venv_python_candidates(repo: Path) -> tuple[Path, ...]:

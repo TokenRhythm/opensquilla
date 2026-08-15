@@ -289,6 +289,7 @@ from opensquilla.router_tiers import (
     tier_index,
 )
 from opensquilla.run_mode import RunMode, display_name, execution_target, normalize_run_mode
+from opensquilla.runtime_packs import runtime_pack_state_scope
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
@@ -4786,7 +4787,10 @@ class TurnRunner:
         if _caller_holds_lock:
             # Same call chain already serializes this turn.
             try:
-                with managed_toolchain_state_scope(configured_state_dir):
+                with (
+                    managed_toolchain_state_scope(configured_state_dir),
+                    runtime_pack_state_scope(configured_state_dir),
+                ):
                     async for event in self._run_turn(
                         message,
                         session_key,
@@ -4835,7 +4839,10 @@ class TurnRunner:
                     _map[id(lock)] = current_task
                 _token = _SESSION_LOCK_OWNER.set(_map)
                 try:
-                    with managed_toolchain_state_scope(configured_state_dir):
+                    with (
+                        managed_toolchain_state_scope(configured_state_dir),
+                        runtime_pack_state_scope(configured_state_dir),
+                    ):
                         async for event in self._run_turn(
                             message,
                             session_key,

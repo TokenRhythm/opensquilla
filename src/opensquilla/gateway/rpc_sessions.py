@@ -7,7 +7,6 @@ import base64
 import contextlib
 import inspect
 import json
-import os
 import re
 import sqlite3
 import threading
@@ -714,12 +713,34 @@ def _guest_profile_for_principal(
     if has_capability("guest.safe") and not principal_has_host_execute(principal):
         runtime_roots: tuple[Path, ...] = ()
         runtime_path: tuple[Path, ...] = ()
-        if os.name != "nt":
-            from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+        try:
+            from opensquilla.runtime_packs import (
+                RuntimePackResolver,
+                get_runtime_pack_service,
+            )
+            from opensquilla.sandbox.policy_store import SandboxPolicyStore
 
-            resolver = bundled_runtime_resolver()
-            runtime_roots = resolver.runtime_roots() if resolver is not None else ()
-            runtime_path = resolver.bundled_path() if resolver is not None else ()
+            runtime_policy = SandboxPolicyStore(Path(state_dir) / "sessions.db").read().runtimes
+            service = get_runtime_pack_service(state_dir)
+            if service.management_supported:
+                resolver = RuntimePackResolver(service)
+                runtime_roots = resolver.runtime_roots(runtime_policy)
+                runtime_path = resolver.managed_path(runtime_policy)
+            else:
+                from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+
+                legacy = bundled_runtime_resolver()
+                runtime_roots = (
+                    legacy.runtime_roots(runtime_policy) if legacy is not None else ()
+                )
+                runtime_path = (
+                    legacy.bundled_path(runtime_policy) if legacy is not None else ()
+                )
+        except (OSError, RuntimeError, ValueError):
+            # Guest remains strictly managed with an empty PATH. Runtime state
+            # corruption must not make session creation or Gateway boot fail.
+            runtime_roots = ()
+            runtime_path = ()
         return GuestProfileFactory.create(
             task_id,
             state_dir=state_dir,

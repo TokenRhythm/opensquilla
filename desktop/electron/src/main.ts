@@ -6347,34 +6347,29 @@ function splitPathValue(value?: string): string[] {
   return (value || '').split(pathDelimiter()).filter(Boolean)
 }
 
-function desktopNodeBinCandidates(): string[] {
-  const candidates = process.platform === 'win32'
+function desktopChildPath(): string {
+  const currentPath = process.env.PATH || process.env.Path || ''
+  const currentParts = splitPathValue(currentPath)
+  // GUI-launched processes can have a sparse PATH. Keep host directories after
+  // the inherited PATH; optional Runtime Packs are resolved inside Gateway per
+  // Safe/Full/Guest policy and are never injected statically by Electron.
+  const hostFallbackParts = process.platform === 'win32'
     ? [
-        join(packagedRuntimeRoot(), 'node'),
         process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Programs', 'nodejs') : '',
         process.env.ProgramFiles ? join(process.env.ProgramFiles, 'nodejs') : '',
         process.env['ProgramFiles(x86)'] ? join(process.env['ProgramFiles(x86)'], 'nodejs') : '',
       ]
     : [
-        join(packagedRuntimeRoot(), 'node', 'bin'),
         join(app.getPath('home'), '.local', 'bin'),
         join(app.getPath('home'), '.npm-global', 'bin'),
         '/opt/homebrew/bin',
         '/usr/local/bin',
+        '/usr/bin',
+        '/bin',
+        '/usr/sbin',
+        '/sbin',
       ]
-  const seen = new Set<string>()
-  return candidates.filter((candidate) => {
-    if (!candidate || seen.has(candidate) || !existsSync(candidate)) return false
-    seen.add(candidate)
-    return true
-  })
-}
-
-function desktopChildPath(nodeBinCandidates = desktopNodeBinCandidates()): string {
-  const currentPath = process.env.PATH || process.env.Path || ''
-  const currentParts = splitPathValue(currentPath)
-  const systemParts = process.platform === 'win32' ? [] : ['/usr/bin', '/bin', '/usr/sbin', '/sbin']
-  const orderedParts = [...nodeBinCandidates, ...currentParts, ...systemParts]
+  const orderedParts = [...currentParts, ...hostFallbackParts]
   const seen = new Set<string>()
   const merged = orderedParts.filter((part) => {
     if (!part || seen.has(part)) return false
@@ -8066,8 +8061,7 @@ async function startGateway(): Promise<GatewayState> {
   gatewayState.status = 'starting'
   gatewayState.logPath = logPath
 
-  const nodeBinCandidates = desktopNodeBinCandidates()
-  const childPath = desktopChildPath(nodeBinCandidates)
+  const childPath = desktopChildPath()
   const gatewayInstanceNonce = createDesktopGatewayInstanceNonce()
   const gatewayOwnershipDir = desktopGatewayOwnershipDir(activeProfile)
   const gatewayProfileFingerprint = desktopProfileFingerprint(activeProfile.home)
@@ -8076,7 +8070,6 @@ async function startGateway(): Promise<GatewayState> {
     ...(process.platform === 'win32' ? { Path: childPath } : {}),
     ...(connection.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
     ...(connection.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
-    OPENSQUILLA_NODE_BIN_DIR: nodeBinCandidates.join(pathDelimiter()),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python

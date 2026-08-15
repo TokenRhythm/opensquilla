@@ -724,51 +724,160 @@ async def _handle_sandbox_policy_get(params: dict | None, ctx: RpcContext) -> di
 async def _handle_sandbox_policy_defaults(params: dict | None, ctx: RpcContext) -> dict:
     if params is not None and not isinstance(params, dict):
         raise ValueError("params must be an object")
+    from opensquilla.runtime_packs import load_default_catalog
     from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
-    from opensquilla.sandbox.runtime_manifest import RuntimeManifest
+    from opensquilla.sandbox.runtime_manifest import (
+        BundledRuntimeResolver,
+        RuntimeManifest,
+        RuntimeManifestError,
+        runtime_target,
+    )
 
-    resolver = bundled_runtime_resolver()
-    if resolver is None:
-        # Source checkouts do not have a packaged developer/ directory.  The
-        # checked-in manifest is still authoritative for the package being
-        # built and lets Settings show the pinned versions during development.
-        candidate = (
-            Path(__file__).resolve().parents[3]
-            / "desktop"
-            / "electron"
-            / "runtime"
-            / "runtime-manifest.json"
-        )
-        if candidate.is_file():
-            try:
-                from opensquilla.sandbox.runtime_manifest import BundledRuntimeResolver
-
-                resolver = BundledRuntimeResolver(
-                    RuntimeManifest.from_path(candidate),
-                    resource_root=candidate.parent / "developer",
-                )
-            except ValueError:
-                resolver = None
     runtime_versions: dict[str, dict[str, object]] = {}
-    if resolver is not None:
-        assets = resolver.manifest.assets.get(resolver.target, {})
-        executable_paths = resolver.executable_paths()
-        for key, asset in assets.items():
-            executable_names = tuple(asset.executables)
+    detected_runtime_target: str | None = None
+
+    # This legacy projection must stay cheap: new clients load installation and
+    # integrity state independently through sandbox.runtime.status. In
+    # particular, policy.defaults must never hash installed Runtime Pack
+    # payloads while the rest of the Settings page is waiting for its response.
+    try:
+        detected_runtime_target = runtime_target()
+        catalog = load_default_catalog(require_complete=True)
+        for key in ("python", "node", "gitBash"):
+            descriptor = catalog.descriptor(detected_runtime_target, key)
+            if descriptor is None:
+                continue
             runtime_versions[key] = {
-                "version": asset.version,
-                "available": any(
-                    executable_paths.get(name, Path()).is_file()
-                    for name in executable_names
-                ),
+                "version": descriptor.version,
+                "available": False,
             }
+    except (OSError, RuntimeManifestError, ValueError):
+        runtime_versions = {}
+
+    resolver = None
+    if not runtime_versions:
+        try:
+            resolver = bundled_runtime_resolver()
+            if resolver is None:
+                # Source checkouts intentionally omit developer/. The checked-in
+                # layout remains authoritative for legacy version display.
+                candidate = (
+                    Path(__file__).resolve().parents[3]
+                    / "desktop"
+                    / "electron"
+                    / "runtime"
+                    / "runtime-manifest.json"
+                )
+                if candidate.is_file():
+                    resolver = BundledRuntimeResolver(
+                        RuntimeManifest.from_path(candidate),
+                        resource_root=candidate.parent / "developer",
+                    )
+            if resolver is not None:
+                detected_runtime_target = resolver.target
+                assets = resolver.manifest.assets.get(resolver.target, {})
+                executable_paths = resolver.executable_paths()
+                for key, asset in assets.items():
+                    executable_names = tuple(asset.executables)
+                    runtime_versions[key] = {
+                        "version": asset.version,
+                        "available": bool(executable_names)
+                        and all(
+                            executable_paths.get(name, Path()).is_file()
+                            for name in executable_names
+                        ),
+                    }
+        except (OSError, RuntimeManifestError, ValueError):
+            resolver = None
+            detected_runtime_target = None
+            runtime_versions = {}
+
     return {
-        "builtinDenyWritePaths": [
-            str(path) for path in builtin_deny_write_paths()
-        ],
-        "runtimeTarget": resolver.target if resolver is not None else None,
+        "builtinDenyWritePaths": [str(path) for path in builtin_deny_write_paths()],
+        "runtimeTarget": detected_runtime_target,
         "runtimeVersions": runtime_versions,
     }
+
+
+def _runtime_component_param(params: dict | None) -> str:
+    values = _require_params(params)
+    component_id = values.get("componentId")
+    if component_id not in {"python", "node", "gitBash"}:
+        raise ValueError("params.componentId must be python, node, or gitBash")
+    return str(component_id)
+
+
+def _runtime_state_dir(ctx: RpcContext) -> str | Path | None:
+    value = getattr(ctx.config, "state_dir", None)
+    return value if value and str(value).strip() else None
+
+
+async def _runtime_status_payload(ctx: RpcContext) -> dict[str, object]:
+    from opensquilla.runtime_packs import status_snapshot
+
+    status = await asyncio.to_thread(status_snapshot, _runtime_state_dir(ctx))
+    return status.to_public_dict()
+
+
+@_d.method("sandbox.runtime.status", scope="operator.read")
+async def _handle_sandbox_runtime_status(params: dict | None, ctx: RpcContext) -> dict:
+    if params is not None and not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    return await _runtime_status_payload(ctx)
+
+
+@_d.method("sandbox.runtime.install", scope="operator.admin")
+async def _handle_sandbox_runtime_install(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.runtime_packs import start_install
+
+    _require_owner(ctx, "sandbox.runtime.install")
+    component_id = _runtime_component_param(params)
+    operation = await asyncio.to_thread(
+        start_install,
+        component_id,
+        _runtime_state_dir(ctx),
+    )
+    return {"operation": operation.to_public_dict()}
+
+
+@_d.method("sandbox.runtime.cancel", scope="operator.admin")
+async def _handle_sandbox_runtime_cancel(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.runtime_packs import RuntimePackError, cancel_install
+
+    _require_owner(ctx, "sandbox.runtime.cancel")
+    component_id = _runtime_component_param(params)
+    operation_id = _require_string_param(
+        _require_params(params),
+        "operationId",
+        "params.operationId is required",
+    ).strip()
+    try:
+        operation = await asyncio.to_thread(
+            cancel_install,
+            component_id,
+            operation_id,
+            _runtime_state_dir(ctx),
+        )
+    except RuntimePackError as exc:
+        raise RpcHandlerError(
+            "RUNTIME_JOB_CONFLICT",
+            "The Runtime Pack operation changed; refresh its status and try again.",
+        ) from exc
+    return {"operation": operation.to_public_dict()}
+
+
+@_d.method("sandbox.runtime.remove", scope="operator.admin")
+async def _handle_sandbox_runtime_remove(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.runtime_packs import remove_component
+
+    _require_owner(ctx, "sandbox.runtime.remove")
+    component_id = _runtime_component_param(params)
+    operation = await asyncio.to_thread(
+        remove_component,
+        component_id,
+        _runtime_state_dir(ctx),
+    )
+    return {"operation": operation.to_public_dict()}
 
 
 @_d.method("sandbox.policy.update", scope="operator.write")

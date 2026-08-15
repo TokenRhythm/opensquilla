@@ -727,6 +727,52 @@ def test_resolve_bash_memoizes(tmp_path, monkeypatch):
     assert calls["n"] == 0, "cached resolution must not re-probe"
 
 
+def test_windows_bash_candidates_follow_runtime_pack_precedence(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "name", "nt")
+    managed = str(tmp_path / "managed" / "bash.exe")
+    explicit = str(tmp_path / "host" / "bash.exe")
+    monkeypatch.setattr(verification, "_runtime_pack_bash_binary", lambda: managed)
+    monkeypatch.setenv("OPENSQUILLA_BASH", explicit)
+    monkeypatch.setenv("PATH", "")
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        monkeypatch.setenv(env_var, str(tmp_path / "missing"))
+
+    monkeypatch.setattr(verification, "_runtime_pack_precedes_host", lambda: True)
+    assert verification._windows_bash_candidates()[:2] == [managed, explicit]
+
+    monkeypatch.setattr(verification, "_runtime_pack_precedes_host", lambda: False)
+    candidates = verification._windows_bash_candidates()
+    assert candidates[0] == explicit
+    assert candidates[-1] == managed
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    (("safe", True), ("full", False), (None, False)),
+)
+def test_runtime_pack_precedence_normalizes_tool_run_mode(monkeypatch, mode, expected):
+    from opensquilla.tools import run_mode as tool_run_mode
+
+    monkeypatch.setattr(tool_run_mode, "current_run_mode", lambda: mode)
+
+    assert verification._runtime_pack_precedes_host() is expected
+
+
+def test_resolve_bash_rechecks_when_runtime_pack_inventory_changes(monkeypatch):
+    monkeypatch.setattr(os, "name", "nt")
+    candidates: list[str] = []
+    monkeypatch.setattr(verification, "_windows_bash_candidates", lambda: list(candidates))
+    monkeypatch.setattr(
+        verification,
+        "_probe_bash_kind",
+        lambda _path: verification._BASH_KIND_NATIVE,
+    )
+
+    assert verification._resolve_bash() is None
+    candidates.append(r"C:\managed-runtime\bash.exe")
+    assert verification._resolve_bash() == candidates[0]
+
+
 # The WSL-fallback tests below drive `_resolve_bash`'s Windows arm on any host
 # OS: `os.name` is pinned to "nt" and candidate enumeration + probing are
 # replaced with canned results, so they are offline and platform-neutral.

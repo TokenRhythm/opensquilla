@@ -15,8 +15,8 @@
     "fetch:runtimes": "node scripts/fetch-bundled-runtimes.mjs",
     "build:web": "cd ../../opensquilla-webui && npm ci && npm run build",
     "dev": "npm run build && electron .",
-    "dist:local": "npm run build:web && npm run fetch:runtimes && npm run build:gateway && npm run dist",
-    "pack:local": "npm run build:web && npm run fetch:runtimes && npm run build:gateway && npm run pack",
+    "dist:local": "npm run build:web && npm run build:gateway && npm run dist",
+    "pack:local": "npm run build:web && npm run build:gateway && npm run pack",
     "verify:icons": "node scripts/verify-icon-config.mjs",
     "verify:package": "npm run verify:icons && node scripts/verify-package.mjs",
     "verify:gateway-smoke": "node scripts/smoke-gateway.mjs",
@@ -101,11 +101,19 @@
         "to": "boot.html"
       },
       {
-        "from": "runtime",
-        "to": "runtime",
+        "from": "runtime/gateway",
+        "to": "runtime/gateway",
         "filter": [
           "**/*"
         ]
+      },
+      {
+        "from": "runtime/runtime-manifest.json",
+        "to": "runtime/runtime-manifest.json"
+      },
+      {
+        "from": "runtime/runtime-pack-catalog.json",
+        "to": "runtime/runtime-pack-catalog.json"
       }
     ],
     "mac": {

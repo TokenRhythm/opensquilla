@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import lzma
 import os
 import re
 import shutil
@@ -194,7 +195,14 @@ def _release_file_lock(handle: Any) -> None:
     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-class _ComponentInstallLock:
+class ManagedArtifactInstallLock:
+    """Serialize one managed component across threads and Gateway processes.
+
+    The lock intentionally owns no package-registry behavior.  Runtime Packs and
+    skill toolchains can therefore share the same proven file-lock primitive
+    while retaining separate catalogs, storage roots, and activation state.
+    """
+
     def __init__(self, root: Path, component_id: str, timeout: float) -> None:
         self.root = root
         self.component_id = component_id
@@ -202,7 +210,7 @@ class _ComponentInstallLock:
         self.handle: Any = None
         self.thread_lock: threading.Lock | None = None
 
-    def __enter__(self) -> _ComponentInstallLock:
+    def __enter__(self) -> ManagedArtifactInstallLock:
         key = f"{self.root.absolute()}::{self.component_id}"
         with _component_thread_locks_guard:
             self.thread_lock = _component_thread_locks.setdefault(key, threading.Lock())
@@ -248,6 +256,11 @@ class _ComponentInstallLock:
             if self.thread_lock is not None:
                 self.thread_lock.release()
                 self.thread_lock = None
+
+
+# Compatibility for existing in-module callers and focused regression tests.
+# New managed-artifact integrations must use the public name above.
+_ComponentInstallLock = ManagedArtifactInstallLock
 
 
 def _notify(progress_cb: ProgressCallback | None, current: int, total: int) -> None:
@@ -346,9 +359,17 @@ def _safe_archive_name(name: str) -> PurePosixPath:
     return PurePosixPath(*parts)
 
 
-def _extraction_limit(compressed_size: int) -> int:
+def _extraction_limit(
+    compressed_size: int,
+    max_extracted_bytes: int | None = None,
+) -> int:
     ratio_limit = max(compressed_size, compressed_size * _MAX_EXPANSION_RATIO)
-    return min(_MAX_EXTRACTED_BYTES, ratio_limit)
+    limit = min(_MAX_EXTRACTED_BYTES, ratio_limit)
+    if max_extracted_bytes is not None:
+        if max_extracted_bytes <= 0:
+            raise UnsafeArchiveError("Archive extracted-size limit must be positive")
+        limit = min(limit, max_extracted_bytes)
+    return limit
 
 
 def _claim_destination(
@@ -397,6 +418,7 @@ def _validate_tar_members(
     archive: Path,
     destination: Path,
     compressed_size: int,
+    max_extracted_bytes: int | None = None,
 ) -> tuple[
     list[tarfile.TarInfo],
     dict[PurePosixPath, PurePosixPath],
@@ -404,7 +426,7 @@ def _validate_tar_members(
 ]:
     total_size = 0
     seen: set[str] = set()
-    limit = _extraction_limit(compressed_size)
+    limit = _extraction_limit(compressed_size, max_extracted_bytes)
     members: list[tarfile.TarInfo] = []
     paths: dict[PurePosixPath, tarfile.TarInfo] = {}
     with tarfile.open(archive, mode="r|xz") as source:
@@ -470,9 +492,17 @@ def _validate_tar_members(
     return members, link_targets, final_targets
 
 
-def _extract_tar_xz(archive: Path, destination: Path, compressed_size: int) -> None:
+def _extract_tar_xz(
+    archive: Path,
+    destination: Path,
+    compressed_size: int,
+    max_extracted_bytes: int | None = None,
+) -> None:
     members, _link_targets, final_targets = _validate_tar_members(
-        archive, destination, compressed_size
+        archive,
+        destination,
+        compressed_size,
+        max_extracted_bytes,
     )
     expected = iter(members)
     with tarfile.open(archive, mode="r|xz") as source:
@@ -545,10 +575,15 @@ def _zip_entry_kind(info: zipfile.ZipInfo) -> str:
     return "file"
 
 
-def _extract_zip(archive: Path, destination: Path, compressed_size: int) -> None:
+def _extract_zip(
+    archive: Path,
+    destination: Path,
+    compressed_size: int,
+    max_extracted_bytes: int | None = None,
+) -> None:
     total_size = 0
     seen: set[str] = set()
-    limit = _extraction_limit(compressed_size)
+    limit = _extraction_limit(compressed_size, max_extracted_bytes)
     with zipfile.ZipFile(archive) as source:
         infos = source.infolist()
         if len(infos) > _MAX_ARCHIVE_MEMBERS:
@@ -588,15 +623,62 @@ def _extract_archive(
     destination: Path,
     archive_type: str,
     compressed_size: int,
+    max_extracted_bytes: int | None = None,
 ) -> None:
     destination.mkdir(mode=0o700, parents=True, exist_ok=False)
     if archive_type == "tar.xz":
-        _extract_tar_xz(archive, destination, compressed_size)
+        _extract_tar_xz(
+            archive,
+            destination,
+            compressed_size,
+            max_extracted_bytes,
+        )
         return
     if archive_type == "zip":
-        _extract_zip(archive, destination, compressed_size)
+        _extract_zip(
+            archive,
+            destination,
+            compressed_size,
+            max_extracted_bytes,
+        )
         return
     raise UnsupportedToolchainError(f"Unsupported managed archive type: {archive_type}")
+
+
+def extract_managed_archive(
+    archive: str | Path,
+    destination: str | Path,
+    *,
+    archive_type: str,
+    compressed_size: int,
+    max_extracted_bytes: int | None = None,
+) -> None:
+    """Safely extract a previously verified managed archive.
+
+    This public wrapper lets other code-owned managed-package catalogs reuse the
+    toolchain manager's traversal, link, special-file, member-count, and expansion
+    limits without entering the skill toolchain registry or activation state.
+    """
+
+    archive_path = Path(archive)
+    try:
+        actual_size = archive_path.stat().st_size
+    except OSError as exc:
+        raise DownloadVerificationError("Managed archive is unavailable") from exc
+    if actual_size != compressed_size:
+        raise DownloadVerificationError(
+            f"Managed archive size mismatch: expected {compressed_size}, received {actual_size}"
+        )
+    try:
+        _extract_archive(
+            archive_path,
+            Path(destination),
+            archive_type,
+            compressed_size,
+            max_extracted_bytes,
+        )
+    except (EOFError, lzma.LZMAError, tarfile.TarError, zipfile.BadZipFile) as exc:
+        raise UnsafeArchiveError("Managed archive is malformed or truncated") from exc
 
 
 def _relocate_cataloged_archive_member(

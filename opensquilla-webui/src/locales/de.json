@@ -493,7 +493,18 @@
         "title": "Netzwerksicherheit", "description": "Öffentlicher Netzwerkzugriff ist standardmäßig erlaubt; SSRF- und Metadatenschutz bleiben aktiv.",
         "blockAll": "Gesamten Netzwerkzugriff sperren", "blockAllDescription": "Erlaubte Domains bleiben Ausnahmen.", "allowDomains": "Erlaubte Domains", "denyDomains": "Gesperrte Domains"
       },
-      "runtimes": { "title": "Mitgelieferte Laufzeiten", "description": "Sicher nutzt zuerst mitgelieferte Werkzeuge; Vollzugriff zuerst Host-Werkzeuge.", "target": "Paket-Ziel" },
+      "runtimes": {
+        "title": "Laufzeitpakete", "description": "Sicher bevorzugt installierte Laufzeitpakete; Vollzugriff bevorzugt Host-Werkzeuge.", "target": "Laufzeitziel",
+        "allowRuntime": "{runtime} erlauben", "progress": "{runtime}-Download: {progress}%",
+        "states": {
+          "unknown": "Status nicht verfügbar", "notInstalled": "Nicht installiert", "installed": "Installiert", "installedVersion": "Installiert · {version}",
+          "unsupported": "Für dieses System nicht verfügbar", "corrupt": "Reparatur erforderlich", "queued": "Wartet auf Download", "downloading": "Wird heruntergeladen", "downloadingProgress": "Download · {progress}%",
+          "verifying": "Download wird geprüft", "extracting": "Wird installiert", "probing": "Laufzeit wird geprüft", "activating": "Installation wird abgeschlossen", "cancelling": "Wird abgebrochen", "removing": "Wird entfernt",
+          "cancelled": "Download abgebrochen", "failed": "Download fehlgeschlagen", "interrupted": "Download pausiert"
+        },
+        "actions": { "download": "Herunterladen", "cancel": "Abbrechen", "resume": "Fortsetzen", "retry": "Erneut versuchen", "repair": "Reparieren", "remove": "Entfernen" },
+        "sources": { "oss": "OSS Peking", "github": "GitHub-Veröffentlichungen" }
+      },
       "lan": {
         "listen": "Im lokalen Netzwerk lauschen", "listenDescription": "Nach einem Neustart an alle lokalen Schnittstellen binden; öffentliche Peers bleiben gesperrt.",
         "allowedCidrs": "Erlaubte Client-CIDRs", "cidrDescription": "Optional. Leer erlaubt Loopback, RFC1918 und IPv6 ULA; Einträge können den Bereich nur einschränken.",

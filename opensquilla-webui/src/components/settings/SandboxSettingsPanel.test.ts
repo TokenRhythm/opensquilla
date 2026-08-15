@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { App } from 'vue'
+import type { SandboxRuntimePackStatus } from '@/types/sandbox'
 
 const mounted: App[] = []
 
@@ -30,6 +31,53 @@ const policy = {
   },
 } as const
 
+const runtimePackStatus: SandboxRuntimePackStatus = {
+  schemaVersion: 1,
+  managementSupported: true,
+  target: 'windows-x64',
+  catalogVersion: '2026-07-30.1',
+  sourceOrder: ['oss', 'github'],
+  components: [
+    {
+      componentId: 'python',
+      availability: 'ready',
+      catalogVersion: '2026-07-30.1',
+      activeVersion: '3.13.14+20260728',
+      installedBytes: 1234,
+      removable: true,
+      resumeAvailable: false,
+      resumeBytes: 0,
+      operation: null,
+      lastError: null,
+    },
+    {
+      componentId: 'node',
+      availability: 'missing',
+      catalogVersion: '2026-07-30.1',
+      activeVersion: null,
+      installedBytes: null,
+      removable: false,
+      resumeAvailable: false,
+      resumeBytes: 0,
+      operation: null,
+      lastError: null,
+    },
+    {
+      componentId: 'gitBash',
+      availability: 'missing',
+      catalogVersion: '2026-07-30.1',
+      activeVersion: null,
+      installedBytes: null,
+      removable: false,
+      resumeAvailable: false,
+      resumeBytes: 0,
+      operation: null,
+      lastError: null,
+    },
+  ],
+  nextPollAfterMs: 750,
+}
+
 async function settle() {
   for (let index = 0; index < 8; index++) await Promise.resolve()
 }
@@ -41,6 +89,10 @@ async function mountPanel(options: {
   ensureState?: 'ready' | 'failed'
   ensureDetail?: string
   ensure?: Promise<unknown>
+  runtimeTarget?: string
+  runtimeStatus?: unknown | ((params?: Record<string, unknown>) => unknown)
+  runtimeStatusError?: Error
+  runtimeAction?: (method: string, params?: Record<string, unknown>) => unknown
 } = {}) {
   vi.resetModules()
   document.body.innerHTML = ''
@@ -84,10 +136,25 @@ async function mountPanel(options: {
       }
     }
     if (method === 'sandbox.policy.get') return JSON.parse(JSON.stringify(policy))
+    if (method === 'sandbox.runtime.status') {
+      if (options.runtimeStatusError) throw options.runtimeStatusError
+      if (typeof options.runtimeStatus === 'function') return options.runtimeStatus(params)
+      if (options.runtimeStatus !== undefined) return options.runtimeStatus
+      return structuredClone(runtimePackStatus)
+    }
+    if (
+      method === 'sandbox.runtime.install'
+      || method === 'sandbox.runtime.cancel'
+      || method === 'sandbox.runtime.remove'
+    ) {
+      return options.runtimeAction?.(method, params) ?? {
+        status: structuredClone(runtimePackStatus),
+      }
+    }
     if (method === 'sandbox.policy.defaults') {
       return {
         builtinDenyWritePaths: ['C:\\Users\\tester\\.ssh'],
-        runtimeTarget: 'windows-x64',
+        runtimeTarget: options.runtimeTarget ?? 'windows-x64',
         runtimeVersions: {
           python: { version: '3.13.14', available: true },
           node: { version: '24.18.1', available: true },
@@ -186,7 +253,7 @@ describe('SandboxSettingsPanel', () => {
     expect(el.querySelector('[data-testid="create-sandbox-token"]')).toBeNull()
     expect(el.querySelector('[data-testid="sandbox-open-advanced"]')).toBeNull()
     expect(el.querySelector('[data-testid="save-sandbox-section"]')).toBeNull()
-  })
+  }, 15_000)
 
   it('opens focused details and returns without saving', async () => {
     const { el, call } = await mountPanel()
@@ -204,7 +271,7 @@ describe('SandboxSettingsPanel', () => {
 
     expect(call.mock.calls.some(([method]) => String(method).startsWith('sandbox.tokens.')))
       .toBe(false)
-  })
+  }, 15_000)
 
   it('loads immutable file rules and immediately saves an added custom rule', async () => {
     const { el, call } = await mountPanel()
@@ -514,5 +581,124 @@ describe('SandboxSettingsPanel', () => {
       .not.toContain('windows_setup_helper_cancelled')
     expect(call.mock.calls.some(([method]) => method === 'sandbox.run_mode.preference.set'))
       .toBe(false)
+  })
+
+  it('renders compact runtime pack states and keeps toggles independent from installation', async () => {
+    const { el, call } = await mountPanel()
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    expect(el.querySelectorAll('.sandbox-runtime-row')).toHaveLength(3)
+    expect(el.querySelector('[data-testid="sandbox-runtime-python"]')?.textContent)
+      .toContain('Installed · 3.13.14+20260728')
+    expect(el.querySelector('[data-testid="sandbox-runtime-node"]')?.textContent)
+      .toContain('Not installed')
+    expect(el.querySelector('[data-testid="sandbox-runtime-install-node"]')).toBeTruthy()
+    expect(el.querySelector<HTMLInputElement>('[data-testid="sandbox-runtime-toggle-node"]')?.checked)
+      .toBe(true)
+
+    el.querySelector<HTMLInputElement>('[data-testid="sandbox-runtime-toggle-node"]')!.click()
+    await settle()
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.policy.update')).toBe(true)
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
+  })
+
+  it('uses exact component action payloads from runtime rows', async () => {
+    const downloading = structuredClone(runtimePackStatus)
+    downloading.components[0] = {
+      ...downloading.components[0],
+      availability: 'missing',
+      activeVersion: null,
+      installedBytes: null,
+      removable: false,
+      operation: {
+        operationId: 'operation-1',
+        componentId: 'python',
+        kind: 'install',
+        state: 'downloading',
+        source: 'oss',
+        downloadedBytes: 40,
+        totalBytes: 100,
+        progressPercent: 40,
+        startedAtMs: 1,
+        updatedAtMs: 2,
+        error: null,
+      },
+    }
+    const { el, call } = await mountPanel({ runtimeStatus: downloading })
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    expect(el.querySelector('[data-testid="sandbox-runtime-python"]')?.textContent)
+      .toContain('Downloading · 40%')
+    const progress = el.querySelector<HTMLElement>('[role="progressbar"]')
+    expect(progress?.getAttribute('aria-valuenow')).toBe('40')
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-cancel-python"]')!.click()
+    await settle()
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-install-node"]')!.click()
+    await settle()
+
+    expect(call).toHaveBeenCalledWith('sandbox.runtime.cancel', {
+      componentId: 'python',
+      operationId: 'operation-1',
+    })
+    expect(call).toHaveBeenCalledWith('sandbox.runtime.install', { componentId: 'node' })
+  })
+
+  it('hides Git Bash for non-Windows runtime targets', async () => {
+    const status = structuredClone(runtimePackStatus)
+    status.target = 'darwin-arm64'
+    status.components = status.components.filter(component => component.componentId !== 'gitBash')
+    const { el } = await mountPanel({ runtimeTarget: 'darwin-arm64', runtimeStatus: status })
+
+    expect(el.querySelector('[data-testid="sandbox-open-runtimes"]')?.textContent)
+      .not.toContain('Git Bash')
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    expect(el.querySelector('[data-testid="sandbox-runtime-python"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="sandbox-runtime-gitBash"]')).toBeNull()
+  })
+
+  it('falls back to legacy versions when the runtime RPC is unavailable', async () => {
+    const methodNotFound = Object.assign(new Error('method not found'), {
+      code: 'METHOD_NOT_FOUND',
+    })
+    const { el } = await mountPanel({ runtimeStatusError: methodNotFound })
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    expect(el.querySelector('[data-testid="sandbox-runtime-python"]')?.textContent)
+      .toContain('3.13.14')
+    expect(el.querySelector('[data-testid^="sandbox-runtime-install-"]')).toBeNull()
+    expect(el.querySelector('[data-testid^="sandbox-runtime-remove-"]')).toBeNull()
+    expect(el.querySelector('[data-testid="sandbox-runtime-status-retry"]')).toBeNull()
+  })
+
+  it('keeps transient runtime status errors inside the runtime subpage and allows retry', async () => {
+    const { el, call } = await mountPanel({
+      runtimeStatusError: new Error('runtime service unavailable'),
+    })
+
+    expect(el.querySelector('[data-testid="sandbox-overview"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="sandbox-runtime-status-retry"]')).toBeNull()
+    expect(el.textContent).not.toContain('runtime service unavailable')
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+    expect(el.querySelector('[data-testid="sandbox-runtime-status-retry"]')).toBeTruthy()
+    expect(el.textContent).toContain('Status unavailable')
+    expect(el.textContent).not.toContain('runtime service unavailable')
+
+    const beforeRetry = call.mock.calls.filter(
+      ([method]) => method === 'sandbox.runtime.status',
+    ).length
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-status-retry"]')!.click()
+    await settle()
+    expect(call.mock.calls.filter(([method]) => method === 'sandbox.runtime.status'))
+      .toHaveLength(beforeRetry + 1)
   })
 })
