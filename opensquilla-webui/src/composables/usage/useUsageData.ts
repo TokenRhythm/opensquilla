@@ -543,7 +543,7 @@ function modelDisplayLabel(row: SessionRow): string {
   const bd = row.modelBreakdown
   if (Array.isArray(bd) && bd.length > 0) {
     return bd.length > 1
-      ? t('usageLogs.sessions.autoModels', { count: bd.length })
+      ? t('usageLogs.breakdown.modelCount', { count: bd.length })
       : (bd[0].model || row.model || '—')
   }
   return row.model || '—'

@@ -154,6 +154,7 @@ async def run_agent_once(
     from opensquilla.agents.scope import resolve_agent_workspace_dir
     from opensquilla.artifacts import artifact_payload
     from opensquilla.engine.types import (
+        AnswerGenerationResetEvent,
         ArtifactEvent,
         DoneEvent,
         ErrorEvent,
@@ -398,6 +399,28 @@ async def run_agent_once(
 
             if isinstance(event, TextDeltaEvent):
                 text_parts.append(event.text)
+            elif isinstance(event, AnswerGenerationResetEvent):
+                authoritative_text = str(event.authoritative_text_snapshot or "")
+                text_parts[:] = [authoritative_text] if authoritative_text else []
+                if event.terminal:
+                    terminal_text = str(
+                        event.terminal_text_snapshot
+                        or authoritative_text
+                        or "The model could not complete this answer."
+                    )
+                    text_parts[:] = [terminal_text]
+                    errors.append(
+                        {
+                            "message": (
+                                event.terminal_error_message
+                                or "The model provider request failed."
+                            ),
+                            "code": (
+                                event.terminal_error_code
+                                or "ensemble_fixed_error"
+                            ),
+                        }
+                    )
             elif isinstance(event, ErrorEvent):
                 errors.append({"message": event.message, "code": event.code})
             elif isinstance(event, ArtifactEvent):

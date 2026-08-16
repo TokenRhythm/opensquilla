@@ -932,6 +932,20 @@ pre {
   padding: 4px 8px 8px;
 }
 
+.sidebar-history-page-state {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  justify-content: center;
+  color: var(--sidebar-text-soft);
+  font-size: var(--fs-xs);
+  text-align: center;
+}
+
+.sidebar-history-page-state .sidebar-history-retry {
+  margin-top: 0;
+}
+
 /* Active agent-filter chip, dismissible, shown at the top of Recents */
 .sidebar-filter-row {
   display: flex;

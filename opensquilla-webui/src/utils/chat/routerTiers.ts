@@ -1,13 +1,11 @@
-export const TEXT_TIERS = ['c0', 'c1', 'c2', 'c3'] as const
-export const DEFAULT_TEXT_TIER = 'c1'
-export const IMAGE_TIER = 'image_model'
+import {
+  DEFAULT_TEXT_TIER,
+  IMAGE_TIER,
+  LEGACY_TEXT_TIER_ALIASES,
+  TEXT_TIERS,
+} from '@/types/generated/router_tier_contract'
 
-const LEGACY_TEXT_TIER_ALIASES: Record<string, string> = {
-  t0: 'c0',
-  t1: 'c1',
-  t2: 'c2',
-  t3: 'c3',
-}
+export { DEFAULT_TEXT_TIER, IMAGE_TIER, TEXT_TIERS } from '@/types/generated/router_tier_contract'
 
 export function normalizeRouterTextTier(value: unknown): string {
   const raw = String(value || '').trim().toLowerCase()

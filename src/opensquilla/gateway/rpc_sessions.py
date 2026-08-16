@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import inspect
 import json
@@ -37,6 +38,7 @@ from opensquilla.engine.cache_break_monitor import (
     notify_compaction,
     register_active_compaction,
 )
+from opensquilla.engine.commands import DEFAULT_REGISTRY, Surface
 from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
 from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
@@ -168,6 +170,7 @@ from opensquilla.session.storage import (
     PendingChatInputConflictError,
     PendingChatInputNotFoundError,
     PlanImplementationSessionBusyError,
+    SessionListCursor,
     SessionStorage,
     StaleEpochError,
     StorageBusyError,
@@ -773,6 +776,7 @@ _STREAM_IDLE_TIMEOUT_MESSAGE = "Session event stream idle before terminal event"
 _RESET_RUNTIME_SETTLE_SECONDS = 0.25
 _RESET_RUNTIME_CANCEL_DRAIN_SECONDS = 2.0
 _ABORT_RUNTIME_CANCEL_DRAIN_SECONDS = 2.0
+_ABORT_OWNED_CLEANUP_SECONDS = 30.0
 _ABORT_SESSION_LOOKUP_SECONDS = 0.05
 _ABORT_TREE_STABILIZATION_PASSES = 8
 _ACTIVE_TASK_STATUSES = frozenset({"queued", "running"})
@@ -800,8 +804,15 @@ async def _await_abort_operation(
     best-effort and may still settle after the RPC returns.
     """
 
+    if isinstance(awaitable, asyncio.Future) and awaitable.done():
+        return awaitable.result()
     remaining = max(0.0, deadline_at_monotonic - time.monotonic())
     if remaining <= 0:
+        if isinstance(awaitable, asyncio.Future):
+            awaitable.cancel()
+            awaitable.add_done_callback(_consume_abort_background_result)
+            log.warning("sessions.abort.operation_budget_exhausted", operation=operation)
+            return default
         close = getattr(awaitable, "close", None)
         if callable(close):
             close()
@@ -821,6 +832,36 @@ async def _await_abort_operation(
     task.cancel()
     task.add_done_callback(_consume_abort_background_result)
     log.warning("sessions.abort.operation_timed_out", operation=operation)
+    return default
+
+
+async def _await_abort_background_task(
+    task: asyncio.Task[Any],
+    *,
+    deadline_at_monotonic: float,
+    operation: str,
+    default: Any,
+) -> Any:
+    """Observe safety cleanup within the RPC budget without cancelling it.
+
+    Process-tree ownership has its own bounded cleanup deadline.  The Stop RPC
+    may return first, but it must never cancel a cleanup task that has already
+    discovered or started terminating exact task-owned descendants.
+    """
+
+    if task.done():
+        return task.result()
+    remaining = max(0.0, deadline_at_monotonic - time.monotonic())
+    if remaining > 0:
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            task.add_done_callback(_consume_abort_background_result)
+            raise
+        if task in done:
+            return task.result()
+    task.add_done_callback(_consume_abort_background_result)
+    log.warning("sessions.abort.cleanup_continuing", operation=operation)
     return default
 
 
@@ -844,6 +885,169 @@ async def _active_task_runtime_ids(task_runtime: Any, session_key: str) -> tuple
         if isinstance(task_id, str) and task_id and task_id not in task_ids:
             task_ids.append(task_id)
     return tuple(task_ids)
+
+
+def _task_record_session_key(row: Any) -> str | None:
+    session_key = getattr(row, "session_key", None)
+    if isinstance(session_key, str) and session_key:
+        return session_key
+    return None
+
+
+def _task_record_parent_identity(row: Any) -> tuple[str, str] | None:
+    """Return the exact parent task/session for one durable subagent task row."""
+
+    if str(getattr(row, "run_kind", "") or "") != "subagent":
+        return None
+    details = getattr(row, "details", None)
+    metadata = details.get("metadata") if isinstance(details, dict) else None
+    if not isinstance(metadata, dict):
+        return None
+    parent_task_id = metadata.get("parent_task_id")
+    parent_session_key = metadata.get("parent_session_key")
+    if not isinstance(parent_task_id, str) or not parent_task_id:
+        return None
+    if not isinstance(parent_session_key, str) or not parent_session_key:
+        return None
+    return parent_task_id, parent_session_key
+
+
+async def _task_runtime_rows(task_runtime: Any) -> tuple[Any, ...]:
+    """Read active/background-owner rows plus their bounded durable ancestry."""
+
+    list_tasks = getattr(task_runtime, "list", None)
+    if not callable(list_tasks):
+        return ()
+    try:
+        rows: list[Any] = []
+        for status_value in _ACTIVE_TASK_STATUSES:
+            rows.extend(await list_tasks(status=status_value))
+    except TypeError:
+        try:
+            rows = list(await list_tasks())
+        except (TypeError, NotImplementedError):
+            return ()
+        except Exception:
+            log.warning("sessions.abort.task_runtime_tree_list_failed")
+            return ()
+    except NotImplementedError:
+        return ()
+    except Exception:
+        log.warning("sessions.abort.task_runtime_tree_list_failed")
+        return ()
+
+    # A child may have already yielded after spawning a still-running
+    # grandchild. Hydrate only the parent chain of active rows instead of
+    # scanning the unbounded task ledger.
+    status = getattr(task_runtime, "status", None)
+    rows_by_id = {
+        str(task_id): row
+        for row in rows
+        if isinstance((task_id := getattr(row, "task_id", None)), str) and task_id
+    }
+    from opensquilla.tools.builtin.shell import active_background_process_task_owners
+
+    if callable(status):
+        for owner_session_key, owner_task_id in active_background_process_task_owners():
+            if owner_task_id in rows_by_id:
+                continue
+            try:
+                owner = await status(owner_task_id)
+            except (KeyError, NotImplementedError):
+                continue
+            except Exception:
+                log.warning(
+                    "sessions.abort.background_owner_status_failed",
+                    task_id=owner_task_id,
+                )
+                continue
+            if _task_record_session_key(owner) == owner_session_key:
+                rows_by_id[owner_task_id] = owner
+    pending_parent_ids = [
+        parent_task_id
+        for row in tuple(rows_by_id.values())
+        if (identity := _task_record_parent_identity(row)) is not None
+        for parent_task_id in (identity[0],)
+        if parent_task_id not in rows_by_id
+    ]
+    while callable(status) and pending_parent_ids:
+        parent_task_id = pending_parent_ids.pop()
+        if parent_task_id in rows_by_id:
+            continue
+        try:
+            parent = await status(parent_task_id)
+        except (KeyError, NotImplementedError):
+            continue
+        except Exception:
+            log.warning(
+                "sessions.abort.task_runtime_ancestor_status_failed",
+                task_id=parent_task_id,
+            )
+            continue
+        rows_by_id[parent_task_id] = parent
+        identity = _task_record_parent_identity(parent)
+        if identity is not None and identity[0] not in rows_by_id:
+            pending_parent_ids.append(identity[0])
+    return tuple(rows_by_id.values())
+
+
+async def _task_runtime_owns_session(
+    task_runtime: Any,
+    *,
+    task_id: str,
+    session_key: str,
+) -> bool:
+    """Verify a durable root identity before following child-supplied lineage."""
+
+    status = getattr(task_runtime, "status", None)
+    if not callable(status):
+        return False
+    try:
+        record = await status(task_id)
+    except (KeyError, NotImplementedError):
+        return False
+    except Exception:
+        log.warning(
+            "sessions.abort.task_runtime_status_failed",
+            session_key=session_key,
+            task_id=task_id,
+        )
+        return False
+    return _task_record_session_key(record) == session_key
+
+
+def _task_owned_descendant_rows(
+    rows: tuple[Any, ...],
+    *,
+    owned_tasks: dict[str, str],
+) -> tuple[Any, ...]:
+    """Expand exact task ancestry without widening to sibling session work."""
+
+    discovered: list[Any] = []
+    discovered_ids: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            task_id = getattr(row, "task_id", None)
+            session_key = _task_record_session_key(row)
+            parent_identity = _task_record_parent_identity(row)
+            if (
+                not isinstance(task_id, str)
+                or not task_id
+                or session_key is None
+                or parent_identity is None
+                or task_id in owned_tasks
+            ):
+                continue
+            parent_task_id, parent_session_key = parent_identity
+            if owned_tasks.get(parent_task_id) != parent_session_key:
+                continue
+            owned_tasks[task_id] = session_key
+            discovered_ids.add(task_id)
+            discovered.append(row)
+            changed = True
+    return tuple(row for row in discovered if getattr(row, "task_id", None) in discovered_ids)
 
 
 def _session_row_value(row: Any, name: str) -> Any:
@@ -954,6 +1158,175 @@ async def _drain_cancelled_task_runtime(
         # Give cooperative waiters one loop turn to observe cancellation, but
         # never synchronously join a waiter that delays or suppresses it.
         await asyncio.sleep(0)
+
+
+async def _cancel_task_owned_auxiliary_work(
+    *,
+    session_key: str,
+    task_id: str,
+    deadline_at_monotonic: float,
+) -> int:
+    """Stop task-owned completion delivery and registered background processes."""
+
+    from opensquilla.gateway.subagent_announce import (
+        cancel_background_completion_for_task,
+    )
+    from opensquilla.tools.builtin.shell import cancel_background_processes_for_task
+
+    completion_task = asyncio.create_task(
+        cancel_background_completion_for_task(session_key, task_id)
+    )
+    process_task = asyncio.create_task(
+        cancel_background_processes_for_task(session_key, task_id)
+    )
+    cancelled_completions = await _await_abort_operation(
+        completion_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_background_completion",
+        default=0,
+    )
+    cancelled_processes = await _await_abort_background_task(
+        process_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="cancel_task_background_processes",
+        default=0,
+    )
+    return int(cancelled_completions) + int(cancelled_processes)
+
+
+async def _cancel_task_owned_descendants(
+    task_runtime: Any,
+    *,
+    root_session_key: str,
+    root_task_id: str,
+    source: str,
+    reason: str,
+    deadline_at_monotonic: float,
+) -> int:
+    """Cancel active subagent descendants proven to belong to one exact task."""
+
+    initial_rows_task = asyncio.create_task(_task_runtime_rows(task_runtime))
+    root_status_task = asyncio.create_task(
+        _task_runtime_owns_session(
+            task_runtime,
+            task_id=root_task_id,
+            session_key=root_session_key,
+        )
+    )
+    initial_rows = await _await_abort_operation(
+        initial_rows_task,
+        deadline_at_monotonic=deadline_at_monotonic,
+        operation="initial_list_task_owned_descendants",
+        default=(),
+    )
+    root_verified = any(
+        getattr(row, "task_id", None) == root_task_id
+        and _task_record_session_key(row) == root_session_key
+        for row in initial_rows
+    )
+    root_verified = root_verified or bool(
+        await _await_abort_operation(
+            root_status_task,
+            deadline_at_monotonic=deadline_at_monotonic,
+            operation="verify_task_owned_descendant_root",
+            default=False,
+        )
+    )
+    if not root_verified:
+        return 0
+
+    owned_tasks = {root_task_id: root_session_key}
+    processed_task_ids = {root_task_id}
+    cancelled_task_ids: list[str] = []
+    stable_passes = 0
+
+    for pass_index in range(_ABORT_TREE_STABILIZATION_PASSES):
+        if time.monotonic() >= deadline_at_monotonic:
+            break
+        if pass_index == 0:
+            rows = initial_rows
+        else:
+            rows = await _await_abort_operation(
+                _task_runtime_rows(task_runtime),
+                deadline_at_monotonic=deadline_at_monotonic,
+                operation="list_task_owned_descendants",
+                default=(),
+            )
+        descendants = _task_owned_descendant_rows(rows, owned_tasks=owned_tasks)
+        new_rows = [
+            row
+            for row in descendants
+            if isinstance(getattr(row, "task_id", None), str)
+            and getattr(row, "task_id") not in processed_task_ids
+        ]
+        if not new_rows:
+            stable_passes += 1
+            if stable_passes >= 2:
+                break
+            await asyncio.sleep(0)
+            continue
+
+        stable_passes = 0
+        auxiliary_tasks: list[asyncio.Task[int]] = []
+        runtime_cancel_tasks: list[tuple[str, asyncio.Task[int]]] = []
+        for row in new_rows:
+            task_id = str(getattr(row, "task_id"))
+            session_key = _task_record_session_key(row)
+            if session_key is None:
+                continue
+            processed_task_ids.add(task_id)
+            auxiliary_tasks.append(
+                asyncio.create_task(
+                    _cancel_task_owned_auxiliary_work(
+                        session_key=session_key,
+                        task_id=task_id,
+                        deadline_at_monotonic=deadline_at_monotonic,
+                    )
+                )
+            )
+            if _task_status_value(getattr(row, "status", None)) not in _ACTIVE_TASK_STATUSES:
+                continue
+            runtime_cancel_tasks.append(
+                (
+                    task_id,
+                    asyncio.create_task(
+                        _cancel_task_runtime(
+                            task_runtime,
+                            session_key=session_key,
+                            task_id=task_id,
+                            source=source,
+                            reason=reason,
+                        )
+                    ),
+                )
+            )
+
+        for auxiliary_task in auxiliary_tasks:
+            await _await_abort_background_task(
+                auxiliary_task,
+                deadline_at_monotonic=deadline_at_monotonic,
+                operation="cancel_task_owned_descendant_auxiliary_work",
+                default=0,
+            )
+        for task_id, runtime_cancel_task in runtime_cancel_tasks:
+            cancelled = await _await_abort_operation(
+                runtime_cancel_task,
+                deadline_at_monotonic=deadline_at_monotonic,
+                operation="cancel_task_owned_descendant",
+                default=0,
+            )
+            if int(cancelled) > 0:
+                cancelled_task_ids.append(task_id)
+
+        if cancelled_task_ids:
+            await _drain_cancelled_task_runtime(
+                task_runtime,
+                session_key=root_session_key,
+                task_ids=tuple(cancelled_task_ids),
+                deadline_at_monotonic=deadline_at_monotonic,
+            )
+
+    return len(set(cancelled_task_ids))
 
 
 async def _drain_task_runtime_for_reset(task_runtime: Any, session_key: str) -> None:
@@ -2043,6 +2416,83 @@ async def _resolve_session_node(storage: Any, key: str) -> Any:
 
 
 _SESSION_COUNT_VIEW = "session-count-v1"
+_SESSION_LIST_VIEW = "session-list-v1"
+_SESSION_LIST_CURSOR_VERSION = 1
+_SESSION_LIST_CURSOR_MAX_CHARS = 8192
+_MAX_SQLITE_INTEGER = (1 << 63) - 1
+
+
+def _encode_session_list_cursor(cursor: SessionListCursor | None) -> str | None:
+    if cursor is None:
+        return None
+    payload = json.dumps(
+        {
+            "v": _SESSION_LIST_CURSOR_VERSION,
+            "a": cursor.activity_at,
+            "u": cursor.updated_at,
+            "k": cursor.session_key,
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_session_list_cursor(value: Any) -> SessionListCursor | None:
+    if value is None:
+        return None
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _SESSION_LIST_CURSOR_MAX_CHARS
+    ):
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        )
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(base64.b64decode(value + padding, altchars=b"-_", validate=True))
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        ) from exc
+    if not isinstance(payload, dict) or payload.get("v") != _SESSION_LIST_CURSOR_VERSION:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        )
+    activity_at = payload.get("a")
+    updated_at = payload.get("u")
+    session_key = payload.get("k")
+    if (
+        isinstance(activity_at, bool)
+        or not isinstance(activity_at, int)
+        or not 0 <= activity_at <= _MAX_SQLITE_INTEGER
+        or isinstance(updated_at, bool)
+        or not isinstance(updated_at, int)
+        or not 0 <= updated_at <= _MAX_SQLITE_INTEGER
+        or not isinstance(session_key, str)
+        or not session_key
+        or len(session_key) > 512
+    ):
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        )
+    try:
+        session_key.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor must be a valid sessions.list cursor",
+        ) from exc
+    return SessionListCursor(
+        activity_at=activity_at,
+        updated_at=updated_at,
+        session_key=session_key,
+    )
 
 
 @_d.method("sessions.list", scope="operator.read")
@@ -2051,11 +2501,21 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
     now_ms = int(time.time() * 1000)
     request = params or {}
     count_only = request.get("view") == _SESSION_COUNT_VIEW
+    paginated = request.get("view") == _SESSION_LIST_VIEW
 
     def empty_payload() -> dict[str, Any]:
         payload: dict[str, Any] = {"sessions": [], "count": 0, "ts": now_ms}
         if count_only:
             payload.update({"totalCount": 0, "total_count": 0})
+        if paginated:
+            payload.update(
+                {
+                    "has_more": False,
+                    "hasMore": False,
+                    "next_cursor": None,
+                    "nextCursor": None,
+                }
+            )
         return payload
 
     if ctx.session_manager is None:
@@ -2066,6 +2526,12 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         return empty_payload()
 
     limit = request.get("limit", 50)
+    cursor = _decode_session_list_cursor(request.get("cursor")) if paginated else None
+    if request.get("cursor") is not None and not paginated:
+        raise RpcHandlerError(
+            code="INVALID_PARAMS",
+            message="params.cursor requires view=session-list-v1",
+        )
     from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, guest_owns_session_key
 
     is_guest = GuestRpcPolicy.is_guest(ctx)
@@ -2094,20 +2560,50 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
                     "ts": now_ms,
                 }
 
-    if is_guest:
+    if paginated:
+        try:
+            page_limit = int(limit)
+        except (TypeError, ValueError):
+            page_limit = 50
+        page_limit = max(1, page_limit)
+        if is_guest:
+            page_limit = min(page_limit, 100)
+        list_page = getattr(storage, "list_sessions_page", None)
+        if callable(list_page):
+            page = await list_page(
+                limit=page_limit,
+                cursor=cursor,
+                guest_owner_id=owner_id if is_guest else None,
+            )
+            sessions = page.sessions
+            has_more = bool(page.has_more)
+            next_cursor = _encode_session_list_cursor(page.next_cursor)
+        else:
+            # Additive compatibility for older storage adapters and test
+            # doubles: return one legacy page and mark it terminal so a newer
+            # client never loops over the same first page.
+            legacy_kwargs: dict[str, Any] = {"limit": page_limit}
+            if is_guest:
+                legacy_kwargs["guest_owner_id"] = owner_id
+            sessions = await storage.list_sessions(**legacy_kwargs)
+            has_more = False
+            next_cursor = None
+    elif is_guest:
         try:
             guest_limit = int(limit)
         except (TypeError, ValueError):
             guest_limit = 50
         limit = max(1, min(guest_limit, 100))
         sessions = await storage.list_sessions(limit=limit, guest_owner_id=owner_id)
+    else:
+        sessions = await storage.list_sessions(limit=limit)
+
+    if is_guest:
         sessions = [
             session
             for session in sessions
             if guest_owns_session_key(owner_id, getattr(session, "session_key", None))
         ]
-    else:
-        sessions = await storage.list_sessions(limit=limit)
     task_rows_by_session = await _list_task_rows_by_session(
         ctx,
         storage,
@@ -2196,7 +2692,17 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         row.update(_workspace_metadata_for_session(s, ctx.config))
         result.append(row)
 
-    return {"sessions": result, "count": len(result), "ts": now_ms}
+    payload = {"sessions": result, "count": len(result), "ts": now_ms}
+    if paginated:
+        payload.update(
+            {
+                "has_more": has_more,
+                "hasMore": has_more,
+                "next_cursor": next_cursor,
+                "nextCursor": next_cursor,
+            }
+        )
+    return payload
 
 
 async def _titles_for_keys(
@@ -3757,7 +4263,8 @@ async def _handle_sessions_send_impl(
     def _turn_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(payload)
         enriched.setdefault("session_id", session_id)
-        enriched.setdefault("turn_id", turn_id)
+        if not enriched.get("turn_id"):
+            enriched["turn_id"] = turn_id
         enriched.setdefault("client_message_id", client_message_id)
         if user_message_id:
             enriched.setdefault("user_message_id", user_message_id)
@@ -3816,7 +4323,12 @@ async def _handle_sessions_send_impl(
                 )
                 return
 
-            from opensquilla.engine.stream_wrappers import wrap_stream
+            from opensquilla.engine.stream_wrappers import (
+                is_context_bound_owner,
+                wrap_stream,
+            )
+            from opensquilla.engine.types import AnswerGenerationResetEvent
+            from opensquilla.gateway.protocol import serialize_public_event
             from opensquilla.gateway.routing import tool_context_from_envelope
             from opensquilla.permissions import configured_default_elevated
 
@@ -3890,12 +4402,22 @@ async def _handle_sessions_send_impl(
                 idle_timeout=stream_idle_timeout,
                 heartbeat_interval=heartbeat_interval,
                 heartbeat_message="Agent run is still active",
+                context_bound=is_context_bound_owner(ctx.turn_runner),
             ):
-                event_dict = asdict(event)
+                if isinstance(event, AnswerGenerationResetEvent):
+                    event_dict = serialize_public_event(event)
+                else:
+                    event_dict = asdict(event)
                 event_kind = event_dict.pop("kind", event.__class__.__name__)
+                if event_kind == "thinking" and not event_dict.get("block_id"):
+                    event_dict.pop("block_id", None)
+                    event_dict.pop("block_index", None)
                 if event_kind == "artifact":
                     event_dict = enrich_artifact_event_dict(event_dict)
-                if event_kind in ("done", "error"):
+                if event_kind in ("done", "error") or (
+                    event_kind == "answer_generation_reset"
+                    and event_dict.get("terminal") is True
+                ):
                     await _emit_terminal_once(f"session.event.{event_kind}", event_dict)
                 else:
                     await _emit_to_subscribers(
@@ -5335,7 +5857,7 @@ def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> 
                 "size": attachment.get("size"),
             }
         )
-    return {
+    result = {
         "pendingInputId": row.pending_input_id,
         "pending_input_id": row.pending_input_id,
         "sessionKey": row.session_key,
@@ -5356,6 +5878,12 @@ def _pending_input_payload(row: PendingChatInput, *, replayed: bool = False) -> 
         "replayed": replayed,
         "schemaVersion": row.schema_version,
     }
+    display_text = payload.get("displayText")
+    if isinstance(display_text, str):
+        result["displayText"] = display_text
+    if payload.get("confirmedPlainText") is True:
+        result["confirmedPlainText"] = True
+    return result
 
 
 def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str, Any]:
@@ -5363,12 +5891,52 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
     if not isinstance(message, str) or not message.strip():
         raise ValueError("params.message must be a non-empty string")
     control = message.strip()
+    display_text = _optional_string_param(params, "displayText", "display_text")
+    confirmed_plain_text = params.get(
+        "confirmedPlainText",
+        params.get("confirmed_plain_text", False),
+    )
+    if not isinstance(confirmed_plain_text, bool):
+        raise ValueError("params.confirmedPlainText must be a boolean")
+    if confirmed_plain_text:
+        command_head = control.split(maxsplit=1)[0].casefold()
+        registered_heads = {"/plan"}
+        for command in DEFAULT_REGISTRY.for_surface(Surface.WEB_CHAT):
+            registered_heads.add(command.name.casefold())
+            registered_heads.update(alias.casefold() for alias in command.aliases)
+        if command_head in registered_heads:
+            raise RpcHandlerError(
+                "PENDING_CONTROL_COMMAND_UNSUPPORTED",
+                "Registered client control commands cannot be staged for later dispatch",
+                retryable=False,
+                accepted=False,
+            )
+    display_control = display_text.strip() if display_text is not None else ""
+    literal_slash_escape = (
+        control.startswith("/")
+        and display_control.startswith("//")
+        and display_control[1:] == control
+    )
     if control.startswith("!") or (
-        control.startswith("/") and not control.startswith("//")
+        control.startswith("/")
+        and not control.startswith("//")
+        and not literal_slash_escape
+        and not confirmed_plain_text
     ):
         raise RpcHandlerError(
             "PENDING_CONTROL_COMMAND_UNSUPPORTED",
             "Client control commands cannot be staged for later dispatch",
+            retryable=False,
+            accepted=False,
+        )
+    if (
+        display_text is not None
+        and display_control != control
+        and not literal_slash_escape
+    ):
+        raise RpcHandlerError(
+            "PENDING_DISPLAY_TEXT_MISMATCH",
+            "Pending display text must match the provider message or an exact literal slash escape",
             retryable=False,
             accepted=False,
         )
@@ -5399,11 +5967,14 @@ def _pending_input_send_payload(params: dict[str, Any], *, key: str) -> dict[str
         (("intent",), "intent"),
         (("workspaceId", "workspace_id"), "workspaceId"),
         (("collaborationMode", "collaboration_mode"), "collaborationMode"),
-        (("displayText", "display_text"), "displayText"),
     ):
         value = _optional_string_param(params, *source_names)
         if value is not None:
             payload[target] = value
+    if display_text is not None:
+        payload["displayText"] = display_text
+    if confirmed_plain_text:
+        payload["confirmedPlainText"] = True
     return payload
 
 
@@ -6944,6 +7515,56 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
         # become observable immediately even when bookkeeping is congested.
         active_compaction_tasks = cancel_active_compactions(key)
 
+    task_runtime = getattr(ctx, "task_runtime", None)
+    exact_cancel_unknown = object()
+    exact_runtime_cleanup: asyncio.Task[Any] | None = None
+    exact_auxiliary_cleanup: asyncio.Task[int] | None = None
+    exact_descendant_cleanup: asyncio.Task[int] | None = None
+    exact_cancel_source = ""
+    if requested_task_id is not None and task_runtime is not None:
+        # Start every exact-identity safety operation before storage lookup or
+        # runtime admission can consume the response deadline. Their own
+        # cleanup deadline is independent from the bounded RPC observation.
+        exact_cancel_source = _cancel_source_from_params(params, "sessions_abort")
+        cleanup_deadline = time.monotonic() + _ABORT_OWNED_CLEANUP_SECONDS
+        exact_runtime_cleanup = asyncio.create_task(
+            _await_abort_operation(
+                _cancel_task_runtime(
+                    task_runtime,
+                    session_key=key,
+                    task_id=requested_task_id,
+                    source=exact_cancel_source,
+                    reason="user_abort",
+                ),
+                deadline_at_monotonic=cleanup_deadline,
+                operation="cancel_requested_runtime_task_cleanup",
+                default=exact_cancel_unknown,
+            )
+        )
+        exact_auxiliary_cleanup = asyncio.create_task(
+            _cancel_task_owned_auxiliary_work(
+                session_key=key,
+                task_id=requested_task_id,
+                deadline_at_monotonic=cleanup_deadline,
+            )
+        )
+        exact_descendant_cleanup = asyncio.create_task(
+            _cancel_task_owned_descendants(
+                task_runtime,
+                root_session_key=key,
+                root_task_id=requested_task_id,
+                source=exact_cancel_source,
+                reason="user_abort",
+                deadline_at_monotonic=cleanup_deadline,
+            )
+        )
+        for cleanup_task in (
+            exact_runtime_cleanup,
+            exact_auxiliary_cleanup,
+            exact_descendant_cleanup,
+        ):
+            cleanup_task.add_done_callback(_consume_abort_background_result)
+
     storage = get_session_storage(ctx.session_manager)
     if storage:
         lookup_deadline = min(
@@ -6984,36 +7605,58 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                         session_key=key,
                     )
 
-    task_runtime = getattr(ctx, "task_runtime", None)
     if task_runtime is not None:
         from opensquilla.gateway.approval_queue import get_approval_queue
         from opensquilla.gateway.subagent_announce import (
             cancel_background_completion_for_session,
-            cancel_background_completion_for_task,
         )
 
         if requested_task_id is not None:
-            cancel_unknown = object()
+            assert exact_runtime_cleanup is not None
+            assert exact_auxiliary_cleanup is not None
+            assert exact_descendant_cleanup is not None
             try:
-                cancelled_result = await _await_abort_operation(
-                    _cancel_task_runtime(
-                        task_runtime,
-                        session_key=key,
-                        task_id=requested_task_id,
-                        source=_cancel_source_from_params(params, "sessions_abort"),
-                        reason="user_abort",
-                    ),
+                cancelled_result = await _await_abort_background_task(
+                    exact_runtime_cleanup,
                     deadline_at_monotonic=abort_deadline,
                     operation="cancel_requested_runtime_task",
-                    default=cancel_unknown,
+                    default=exact_cancel_unknown,
                 )
             except _TaskScopedCancelUnsupportedError:
+                await _await_abort_background_task(
+                    exact_auxiliary_cleanup,
+                    deadline_at_monotonic=abort_deadline,
+                    operation="cancel_requested_task_auxiliary_work",
+                    default=0,
+                )
+                await _await_abort_background_task(
+                    exact_descendant_cleanup,
+                    deadline_at_monotonic=abort_deadline,
+                    operation="cancel_requested_task_descendants",
+                    default=0,
+                )
                 return {
                     "aborted": False,
                     "key": key,
                     "reason": "task_scope_unsupported",
                 }
-            if cancelled_result is cancel_unknown:
+            cancelled_auxiliary = int(
+                await _await_abort_background_task(
+                    exact_auxiliary_cleanup,
+                    deadline_at_monotonic=abort_deadline,
+                    operation="cancel_requested_task_auxiliary_work",
+                    default=0,
+                )
+            )
+            cancelled_descendants = int(
+                await _await_abort_background_task(
+                    exact_descendant_cleanup,
+                    deadline_at_monotonic=abort_deadline,
+                    operation="cancel_requested_task_descendants",
+                    default=0,
+                )
+            )
+            if cancelled_result is exact_cancel_unknown:
                 return {
                     "aborted": False,
                     "key": key,
@@ -7023,19 +7666,12 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     # exact identity.
                     "reason": "task_cancel_unknown",
                 }
-            cancelled_count = int(cancelled_result)
-            if cancelled_count > 0:
-                # Background completion groups have exact task identity. Do
-                # not clear every group or every approval in the session: a
-                # queued task may be cancelled while another task is running.
-                # TaskRuntime terminalization expires approvals only when this
-                # exact task owns the running lane.
-                await _await_abort_operation(
-                    cancel_background_completion_for_task(key, requested_task_id),
-                    deadline_at_monotonic=abort_deadline,
-                    operation="cancel_task_background_completion",
-                    default=0,
-                )
+            cancelled_count = (
+                int(cancelled_result)
+                + cancelled_auxiliary
+                + cancelled_descendants
+            )
+            if int(cancelled_result) > 0:
                 await _drain_cancelled_task_runtime(
                     task_runtime,
                     session_key=key,
@@ -9264,19 +9900,37 @@ async def _handle_sessions_messages_hydrate(params: dict | None, ctx: RpcContext
 async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContext) -> dict:
     """Return a compact active-turn base before a client subscribes for deltas."""
 
+    from opensquilla.gateway.protocol import project_session_event_for_client
+    from opensquilla.gateway.websocket import get_registry
+
     key = _require_key(params)
     snapshot = get_session_streams().live_snapshot(key)
+    connection = get_registry().get(ctx.conn_id)
+    client_caps: frozenset[str] = getattr(connection, "client_caps", frozenset())
+    projected_events = [
+        project_session_event_for_client(
+            event.event_name,
+            event.payload,
+            client_caps=client_caps,
+        )
+        for event in snapshot.events
+    ]
+    projected_terminal = any(
+        event_payload.get("terminal") is True
+        for _event_name, event_payload in projected_events
+        if isinstance(event_payload, dict)
+    )
     return {
         "key": key,
-        "task_id": snapshot.task_id,
+        "task_id": None if projected_terminal else snapshot.task_id,
         "stream_generation": snapshot.stream_generation,
         "current_stream_seq": snapshot.current_stream_seq,
         "events": [
             {
-                "event": event.event_name,
-                "payload": dict(event.payload),
+                "event": event_name,
+                "payload": dict(event_payload),
             }
-            for event in snapshot.events
+            for event_name, event_payload in projected_events
         ],
     }
 

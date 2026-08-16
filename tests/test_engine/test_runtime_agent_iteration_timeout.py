@@ -225,7 +225,7 @@ async def test_stream_iteration_timeout_does_not_double_close_provider_stream(
         ):
             pass
 
-    assert close_calls == 0
+    assert close_calls == 1
 
 
 @pytest.mark.asyncio

@@ -21,10 +21,12 @@ from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     TimeoutBudgetPort,
 )
 from opensquilla.engine.turn_runner.attachment_stage import (
+    AttachmentMaterializationStats,
     AttachmentMessageBuilderPort,
     AttachmentStage,
     AttachmentStageInput,
     AttachmentStageOutput,
+    rebind_attachment_prompt,
 )
 from opensquilla.engine.turn_runner.compaction_and_history_stage import (
     CompactionAndHistoryStage,
@@ -35,7 +37,7 @@ from opensquilla.engine.turn_runner.compaction_and_history_stage import (
     RequestContextPrependPort,
     T3UpgradeCompactionPort,
 )
-from opensquilla.engine.turn_runner.context import TurnContext
+from opensquilla.engine.turn_runner.context import TurnContext, TurnExecutionContext
 from opensquilla.engine.turn_runner.input_stage import (
     ExtraContextResolver,
     InputStage,
@@ -94,6 +96,7 @@ __all__ = [
     "AgentConfigBuilderPort",
     "AgentFactoryPort",
     "AgentRunPort",
+    "AttachmentMaterializationStats",
     "AttachmentMessageBuilderPort",
     "AttachmentStage",
     "AttachmentStageInput",
@@ -129,6 +132,7 @@ __all__ = [
     "RequestContextPrependPort",
     "RouterContextPort",
     "RunPipelineRequest",
+    "rebind_attachment_prompt",
     "SessionAppendPort",
     "SessionIdResolverPort",
     "SessionTotalsPort",
@@ -142,6 +146,7 @@ __all__ = [
     "TranscriptAppendPort",
     "TranscriptAppendResult",
     "TurnContext",
+    "TurnExecutionContext",
     "TurnErrorPersistPort",
     "TurnFinalizerStage",
     "TurnFinalizerStageInput",

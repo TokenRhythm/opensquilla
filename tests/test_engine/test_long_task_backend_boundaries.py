@@ -246,12 +246,12 @@ async def test_invalid_multi_tool_primary_falls_back_without_leaking_failed_leg(
     raw_marker = "FAILED_LEG_PRIVATE_ARGUMENT"
     primary = _SequenceProvider(
         [
-            ReasoningDeltaEvent(text="failed private reasoning"),
             ToolUseStartEvent(tool_use_id="a", tool_name="echo"),
             ToolUseStartEvent(tool_use_id="b", tool_name="echo"),
             ToolUseDeltaEvent(tool_use_id="a", json_fragment=raw_marker),
             ToolUseEndEvent(tool_use_id="a", tool_name="echo", arguments={}),
             ToolUseDeltaEvent(tool_use_id="a", json_fragment="late"),
+            ReasoningDeltaEvent(text="failed private reasoning"),
             DoneEvent(stop_reason="tool_use"),
         ]
     )
@@ -751,7 +751,7 @@ async def test_agent_does_not_replay_after_user_visible_text_then_raised_excepti
 
 
 @pytest.mark.asyncio
-async def test_agent_does_not_replay_after_visible_tool_lifecycle_starts() -> None:
+async def test_agent_retries_after_uncommitted_tool_lifecycle_fails() -> None:
     class _PartialToolThenSuccessProvider:
         provider_name = "openai"
 
@@ -772,7 +772,7 @@ async def test_agent_does_not_replay_after_visible_tool_lifecycle_starts() -> No
             if attempt == 1:
                 yield ToolUseStartEvent(tool_use_id="partial", tool_name="echo")
                 raise RuntimeError("partial tool stream")
-            yield TextDeltaEvent(text="must not replay")
+            yield TextDeltaEvent(text="retry response")
             yield DoneEvent(stop_reason="stop")
 
     provider = _PartialToolThenSuccessProvider()
@@ -787,13 +787,13 @@ async def test_agent_does_not_replay_after_visible_tool_lifecycle_starts() -> No
 
     events = [event async for event in agent.run_turn("hello")]
 
-    assert provider.calls == 1
-    assert len(
-        [event for event in events if getattr(event, "kind", "") == "tool_use_start"]
-    ) == 1
-    terminal = next(event for event in events if isinstance(event, EngineErrorEvent))
-    assert terminal.code == "response_incomplete"
-    assert not any("must not replay" in repr(event) for event in events)
+    assert provider.calls == 2
+    assert not any(
+        getattr(event, "kind", "").startswith("tool_use_") for event in events
+    )
+    assert any(getattr(event, "text", "") == "retry response" for event in events)
+    assert any(isinstance(event, EngineDoneEvent) for event in events)
+    assert not any(isinstance(event, EngineErrorEvent) for event in events)
 
 
 @pytest.mark.asyncio
@@ -850,8 +850,8 @@ async def test_agent_does_not_replay_after_visible_reasoning_then_raised_excepti
 
 
 @pytest.mark.asyncio
-async def test_selector_can_fallback_after_uncommitted_reasoning_then_exception() -> None:
-    raw_marker = "FAILED_REASONING_MUST_NOT_ESCAPE"
+async def test_selector_does_not_fallback_after_visible_reasoning_then_exception() -> None:
+    raw_marker = "VISIBLE_REASONING_COMMITS_LEG"
     primary = _SequenceProvider(
         [ReasoningDeltaEvent(text=raw_marker)],
         raised=RuntimeError("stream reset after reasoning"),
@@ -873,13 +873,14 @@ async def test_selector_can_fallback_after_uncommitted_reasoning_then_exception(
         async for event in wrapper.chat([Message(role="user", content="hello")])
     ]
 
-    assert primary.calls == fallback.calls == 1
-    assert raw_marker not in repr(events)
-    assert not any(isinstance(event, ReasoningDeltaEvent) for event in events)
+    assert primary.calls == 1
+    assert fallback.calls == 0
     assert any(
-        isinstance(event, TextDeltaEvent) and event.text == "safe fallback"
+        isinstance(event, ReasoningDeltaEvent) and event.text == raw_marker
         for event in events
     )
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    assert terminal.code == "response_incomplete"
 
 
 @pytest.mark.asyncio

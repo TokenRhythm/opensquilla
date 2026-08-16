@@ -40,6 +40,7 @@ from .compat_policy import (
     OpenAICompatPolicy,
     ReasoningModelRule,
     compat_policy_for_kind,
+    effective_reasoning_format,
 )
 from .context_capabilities import supports_openrouter_explicit_prompt_cache
 from .error_redaction import (
@@ -1527,6 +1528,10 @@ _MAX_MONEY_NANOS = (1 << 63) - 1
 _TOKENRHYTHM_CNY_PER_USD = TOKENRHYTHM_CNY_PER_USD
 _TOKENRHYTHM_FX_NANOS = TOKENRHYTHM_CNY_PER_USD_NANOS
 _USD_FX_NANOS = _MONEY_NANO_SCALE
+_TOKENRHYTHM_MONEY_STRING_MAX_CHARS = 128
+_TOKENRHYTHM_MONEY_STRING_RE = re.compile(
+    r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z"
+)
 
 
 @dataclass
@@ -1580,6 +1585,31 @@ def _decimal_json_number(value: Any) -> Decimal | None:
         return None
     try:
         parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite() or parsed < 0:
+        return None
+    return parsed
+
+
+def _decimal_tokenrhythm_amount(value: Any) -> Decimal | None:
+    """Parse TokenRhythm's native amount without widening its trust boundary.
+
+    TokenRhythm normally emits ``cost_cny`` as a JSON number, but its live
+    streaming API also emits the same finite non-negative decimal as a JSON
+    string. Accept only strings whose complete contents use JSON number
+    syntax. This deliberately rejects whitespace, signs on positive values,
+    leading zeroes, separators, non-finite spellings, and structured values.
+    """
+
+    if not isinstance(value, str):
+        return _decimal_json_number(value)
+    if not 0 < len(value) <= _TOKENRHYTHM_MONEY_STRING_MAX_CHARS:
+        return None
+    if _TOKENRHYTHM_MONEY_STRING_RE.fullmatch(value) is None:
+        return None
+    try:
+        parsed = Decimal(value)
     except (InvalidOperation, ValueError):
         return None
     if not parsed.is_finite() or parsed < 0:
@@ -1680,7 +1710,7 @@ def _billing_result(
         return 0.0, "none", None
 
     amount = (
-        _decimal_json_number(billing.tokenrhythm_cost_cny)
+        _decimal_tokenrhythm_amount(billing.tokenrhythm_cost_cny)
         if billing.tokenrhythm_cost_present
         else None
     )
@@ -3434,7 +3464,7 @@ class OpenAIProvider:
         if (caps and caps.supports_reasoning and cfg.thinking) or (
             thinking_toggle_model and cfg.thinking
         ):
-            reasoning_format = (
+            resolved_reasoning_format = (
                 reasoning_rule.reasoning_format
                 if reasoning_rule and reasoning_rule.reasoning_format
                 else (
@@ -3442,6 +3472,11 @@ class OpenAIProvider:
                     if caps is not None
                     else self._compat.default_reasoning_format
                 )
+            )
+            reasoning_format = effective_reasoning_format(
+                self._compat,
+                resolved_reasoning_format,
+                self._base_url,
             )
             reasoning_effort_override: str | None = None
             if reasoning_rule and reasoning_rule.reasoning_format:
@@ -3494,9 +3529,14 @@ class OpenAIProvider:
                     "none",
                     "off",
                 }:
+                    reasoning_format = effective_reasoning_format(
+                        self._compat,
+                        reasoning_rule.reasoning_format,
+                        self._base_url,
+                    )
                     apply_reasoning_disable(
                         payload,
-                        reasoning_rule.reasoning_format,
+                        reasoning_format,
                         ReasoningDisableArgs(model=self._model),
                     )
             else:
@@ -3504,7 +3544,9 @@ class OpenAIProvider:
         elif caps and caps.supports_reasoning:
             apply_reasoning_disable(
                 payload,
-                caps.reasoning_format,
+                effective_reasoning_format(
+                    self._compat, caps.reasoning_format, self._base_url
+                ),
                 ReasoningDisableArgs(
                     model=self._model,
                     disable_reasoning_by_default_models=(
@@ -3604,18 +3646,23 @@ class OpenAIProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
+        # A coordinator-issued physical attempt is already the one upstream
+        # request for this adapter call.  Keep the legacy compatibility
+        # fallbacks available for unbounded direct calls, but never turn a
+        # coordinator-owned attempt into a hidden stream/non-stream resend.
+        coordinator_owns_retry = cfg.physical_attempt_limit == 1
         non_stream_fallback_allowed = (
             self._provider_kind != "dashscope"
             or _dashscope_non_stream_fallback_from_env()
         )
         stream_timeout_fallback = (
             self._compat.stream_timeout_fallback
-            and cfg.physical_attempt_limit != 1
+            and not coordinator_owns_retry
             and non_stream_fallback_allowed
         )
         empty_stream_fallback = (
             self._compat.empty_stream_fallback
-            and cfg.physical_attempt_limit != 1
+            and not coordinator_owns_retry
             and non_stream_fallback_allowed
         )
         (
@@ -4323,7 +4370,41 @@ class OpenAIProvider:
                                 )
                                 return
 
-                            # Text content
+                            # Reasoning content (always parsed, not gated on thinking).
+                            # Streamed in real time as ReasoningDeltaEvent; the
+                            # accumulator also retains the joined text for DoneEvent.
+                            # Counts as an emitted stream event: once the caller
+                            # has received reasoning deltas, an empty-stream or
+                            # timeout fallback retry would deliver (and bill)
+                            # the turn twice.
+                            for fragment in _openai_reasoning_fragments(delta):
+                                reasoning_event = reasoning.emit(fragment)
+                                if reasoning_event is None:
+                                    continue
+                                emitted_stream_event = True
+                                if text_tool_normalizer.native_lifecycle_deferred:
+                                    _append_coalesced_stream_event(
+                                        deferred_post_native_events,
+                                        reasoning_event,
+                                    )
+                                    if deferred_queue_is_oversized():
+                                        for release_event in release_deferred_queue():
+                                            if isinstance(
+                                                release_event,
+                                                TextDeltaEvent,
+                                            ):
+                                                visible_assistant_text_parts.append(
+                                                    release_event.text
+                                                )
+                                            yield release_event
+                                else:
+                                    yield reasoning_event
+
+                            # Text content follows reasoning when an
+                            # OpenAI-compatible gateway puts both fields in the
+                            # same delta. The wire object has no meaningful JSON
+                            # key order, but our semantic lifecycle does: a
+                            # thinking block must open before visible answer text.
                             text = delta.get("content")
                             if text:
                                 emitted_stream_event = True
@@ -4355,36 +4436,6 @@ class OpenAIProvider:
                                                 release_event.text
                                             )
                                         yield release_event
-
-                            # Reasoning content (always parsed, not gated on thinking).
-                            # Streamed in real time as ReasoningDeltaEvent; the
-                            # accumulator also retains the joined text for DoneEvent.
-                            # Counts as an emitted stream event: once the caller
-                            # has received reasoning deltas, an empty-stream or
-                            # timeout fallback retry would deliver (and bill)
-                            # the turn twice.
-                            for fragment in _openai_reasoning_fragments(delta):
-                                reasoning_event = reasoning.emit(fragment)
-                                if reasoning_event is None:
-                                    continue
-                                emitted_stream_event = True
-                                if text_tool_normalizer.native_lifecycle_deferred:
-                                    _append_coalesced_stream_event(
-                                        deferred_post_native_events,
-                                        reasoning_event,
-                                    )
-                                    if deferred_queue_is_oversized():
-                                        for release_event in release_deferred_queue():
-                                            if isinstance(
-                                                release_event,
-                                                TextDeltaEvent,
-                                            ):
-                                                visible_assistant_text_parts.append(
-                                                    release_event.text
-                                                )
-                                            yield release_event
-                                else:
-                                    yield reasoning_event
 
                             # Gemini thought_signature on non-FC deltas
                             # (streamed thinking path): Gemini sends it on

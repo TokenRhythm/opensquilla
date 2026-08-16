@@ -15,11 +15,17 @@ from __future__ import annotations
 import asyncio
 import inspect
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from opensquilla.attachment_workspace import (
     workspace_attachment_budget_from_config,
+)
+from opensquilla.contracts.turn_execution import (
+    SurfaceCapabilities,
+    TurnExecutionContext,
+    TurnIdentity,
 )
 from opensquilla.engine.turn_runner.agent_bootstrap_stage import (
     AgentConfigBuilderPort,
@@ -92,6 +98,40 @@ if TYPE_CHECKING:
 
 def _coerce_flush_triggers(value: Any) -> list[str]:
     return list(normalize_flush_triggers_strict(value))
+
+
+def create_turn_execution_context(
+    *,
+    turn_id: str,
+    session_key: str,
+    channel_id: str | None = None,
+    assistant_message_id: str | None = None,
+    turn_start_sequence: int = 0,
+    control: Any = None,
+    deadline: float | None = None,
+    surface: SurfaceCapabilities | dict[str, Any] | None = None,
+) -> TurnExecutionContext:
+    """Build the identity-aware context before a provider stream begins.
+
+    The caller may provide the message identity (for example after a
+    publication reservation); otherwise this helper creates exactly one id for
+    the turn and keeps it on the immutable ``TurnIdentity``.
+    """
+
+    resolved_message_id = assistant_message_id or uuid.uuid4().hex
+    identity = TurnIdentity(
+        turn_id=turn_id,
+        assistant_message_id=resolved_message_id,
+        session_key=session_key,
+        channel_id=channel_id,
+        turn_start_sequence=turn_start_sequence,
+    )
+    return TurnExecutionContext.create(
+        identity,
+        control=control,
+        deadline=deadline,
+        surface=surface,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +298,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "flags_text_override": request.flags_text_override,
             "tool_context": request.tool_context,
             "normalization_metadata": request.normalization_metadata,
+            "attachment_materialization": request.attachment_materialization,
             "input_provenance": request.input_provenance,
             "skill_catalog": request.skill_catalog,
             "usage_execution_context": request.usage_execution_context,
@@ -873,6 +914,7 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
         agent_id: str = "",
         run_kind: str = "agent",
         provider_request_correlation: Any | None = None,
+        execution_context: TurnExecutionContext | None = None,
     ) -> Agent:
         from opensquilla.engine.agent import Agent
 
@@ -924,6 +966,7 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
             usage_event_sink=usage_event_sink,
             usage_execution_context=usage_execution_context,
             provider_request_correlation=provider_request_correlation,
+            execution_context=execution_context,
         )
 
 
@@ -1428,6 +1471,28 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
             ),
         )
 
+    def build_cancellable(
+        self,
+        message: str,
+        attachments: list[dict],
+        *,
+        workspace_dir: str | Path | None = None,
+        session_id: str | None = None,
+        cancel_check: Callable[[], None],
+    ) -> list[Any] | None:
+        return self._runner._build_attachment_messages(
+            message,
+            attachments,
+            media_root=self._runner._attachment_media_root(),
+            workspace_dir=workspace_dir
+            or getattr(self._runner._config, "workspace_dir", None),
+            session_id=session_id,
+            workspace_attachment_budget_bytes=(
+                workspace_attachment_budget_from_config(self._runner._config)
+            ),
+            cancel_check=cancel_check,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Turn finalizer stage adapters
@@ -1464,6 +1529,7 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
+        assistant_message_id: str | None = None,
     ) -> TranscriptAppendResult:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
@@ -1475,6 +1541,8 @@ class _TurnRunnerTranscriptAppendAdapter(TranscriptAppendPort):
             "content": content,
             "tool_calls": tool_calls,
         }
+        if assistant_message_id is not None:
+            append_kwargs["message_id"] = assistant_message_id
         if reasoning_content is not None:
             append_kwargs["reasoning_content"] = reasoning_content
         if (
@@ -1772,8 +1840,13 @@ class _TurnRunnerTurnErrorPersistAdapter(TurnErrorPersistPort):
         *,
         session_key: str,
         event: ErrorEvent | None,
+        append_transcript: bool = True,
     ) -> None:
-        await self._runner._persist_turn_error(session_key, event)
+        await self._runner._persist_turn_error(
+            session_key,
+            event,
+            append_transcript=append_transcript,
+        )
 
 
 class _TurnRunnerUsageTelemetryAdapter(UsageTelemetryPort):

@@ -283,6 +283,62 @@ async def test_reasoning_only_prefill_recovery_cleans_synthetic_history(tmp_path
     assert recovery_event["injected_to_model"] is True
 
 
+@pytest.mark.parametrize(
+    ("reasoning_format", "warning_code"),
+    [
+        ("openrouter", "provider_reasoning_prefill_continue"),
+        ("dashscope", "provider_reasoning_continuation"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_length_capped_reasoning_recovery_disables_thinking_on_next_call(
+    tmp_path,
+    reasoning_format: str,
+    warning_code: str,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="length",
+                    input_tokens=35_858,
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal reasoning",
+                    model="test-reasoning",
+                )
+            ],
+            [
+                ProviderText(text="ok"),
+                ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=1),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_capabilities=ModelCapabilities(
+                supports_reasoning=True,
+                supports_tools=True,
+                reasoning_format=reasoning_format,
+            ),
+            reasoning_prefill_recovery_mode="recover",
+            runtime_events_path=str(tmp_path / "runtime_events.jsonl"),
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["config"].thinking is False
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
+    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert any(event.kind == "warning" and event.code == warning_code for event in events)
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
+
+
 @pytest.mark.asyncio
 async def test_tool_loop_observer_logs_reasoning_only_runtime_event(tmp_path) -> None:
     provider = _SequenceProvider(
@@ -871,6 +927,47 @@ async def test_large_reasoning_only_uses_fallback_before_same_model_retry() -> N
     assert any(event.kind == "done" and event.text == "ok" for event in events)
 
 
+@pytest.mark.parametrize("thinking", [False, ThinkingLevel.MEDIUM])
+@pytest.mark.asyncio
+async def test_large_length_capped_reasoning_only_fallback_disables_thinking(
+    thinking: bool | ThinkingLevel,
+) -> None:
+    provider = _FallbackSequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="length",
+                    input_tokens=35_858,
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal reasoning",
+                )
+            ],
+            [
+                ProviderText(text="ok"),
+                ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=1),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            thinking=thinking,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert provider.fallback_reasons == ["reasoning_only"]
+    assert len(provider.calls) == 2
+    assert provider.calls[1]["config"].thinking is False
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
+    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert any(event.kind == "done" and event.text == "ok" for event in events)
+
+
 @pytest.mark.asyncio
 async def test_large_reasoning_only_without_fallback_keeps_thinking_by_default() -> None:
     provider = _SequenceProvider(
@@ -924,6 +1021,64 @@ async def test_large_reasoning_only_without_fallback_keeps_thinking_by_default()
     assert done.input_tokens == 35_004
     assert done.output_tokens == 3
     assert done.reasoning_tokens == 2
+
+
+@pytest.mark.asyncio
+async def test_large_length_capped_reasoning_only_retry_disables_thinking() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderDone(
+                    stop_reason="length",
+                    input_tokens=35_858,
+                    output_tokens=16_384,
+                    reasoning_tokens=16_384,
+                    reasoning_content="internal reasoning",
+                    model="deepseek-v4-flash-0731",
+                )
+            ],
+            [
+                ProviderText(text="visible answer"),
+                ProviderDone(
+                    stop_reason="stop",
+                    input_tokens=35_858,
+                    output_tokens=2,
+                    model="deepseek-v4-flash-0731",
+                ),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            model_id="deepseek-v4-flash-0731",
+            max_tokens=16_384,
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert provider.calls[0]["config"].thinking is False
+    assert provider.calls[0]["config"].thinking_level is None
+    assert provider.calls[0]["config"].max_tokens == 16_384
+    assert provider.calls[1]["config"].thinking is False
+    assert provider.calls[1]["config"].thinking_level == ThinkingLevel.OFF
+    assert provider.calls[1]["config"].thinking_budget_tokens == 0
+    assert provider.calls[1]["config"].max_tokens == 16_384
+    visible_retry = next(
+        event
+        for event in events
+        if event.kind == "warning"
+        and event.code == "provider_large_context_visible_retry"
+    )
+    assert "thinking disabled" in visible_retry.message
+    assert not any(event.kind == "error" for event in events)
+    done = next(event for event in events if event.kind == "done")
+    assert done.text == "visible answer"
 
 
 @pytest.mark.asyncio
@@ -1101,6 +1256,30 @@ async def test_large_empty_response_without_fallback_surfaces_clear_error() -> N
 
 
 @pytest.mark.asyncio
+async def test_large_empty_response_with_attachment_does_not_recommend_uploading_again() -> None:
+    provider = _SequenceProvider(
+        [[ProviderDone(stop_reason="stop", input_tokens=35_000, output_tokens=0)]]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+            metadata={"had_attachments": True},
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    error = next(event for event in events if event.kind == "error")
+    assert error.code == "empty_response"
+    assert "Send the material as an attachment" not in error.message
+    assert "attached material" in error.message
+    assert "split" in error.message.lower()
+
+
+@pytest.mark.asyncio
 async def test_incomplete_tool_stream_errors_without_running_tool() -> None:
     provider = _SequenceProvider(
         [
@@ -1133,7 +1312,7 @@ async def test_incomplete_tool_stream_errors_without_running_tool() -> None:
     events = [event async for event in agent.run_turn("hello")]
 
     assert called is False
-    assert any(event.kind == "tool_use_start" for event in events)
+    assert not any(event.kind == "tool_use_start" for event in events)
     assert any(event.kind == "error" and event.code == "incomplete_tool_stream" for event in events)
     done = next(event for event in events if event.kind == "done")
     assert done.input_tokens == 5
@@ -1515,7 +1694,7 @@ async def test_length_capped_tool_call_is_not_executed() -> None:
     events = [event async for event in agent.run_turn("hello")]
 
     assert called is False
-    assert any(event.kind == "tool_use_start" for event in events)
+    assert not any(event.kind == "tool_use_start" for event in events)
     assert any(
         event.kind == "error" and event.code == "provider_output_truncated"
         for event in events

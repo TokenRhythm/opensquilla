@@ -130,6 +130,12 @@ export interface SessionsListResponse {
   /** Exact number of sessions visible to the caller, independent of page size. */
   totalCount?: number
   total_count?: number
+  /** Whether another stable session-list page is available. */
+  hasMore?: boolean
+  has_more?: boolean
+  /** Opaque keyset cursor for the next session-list page. */
+  nextCursor?: string | null
+  next_cursor?: string | null
 }
 
 export interface ProjectWorkspaceItem {
@@ -204,6 +210,8 @@ export interface ArtifactPayload {
   session_key?: string
   sessionKey?: string
   epoch?: number
+  generation_epoch?: number
+  generationEpoch?: number
   stream_seq?: number
   name?: string
   mime?: string
@@ -242,6 +250,10 @@ export interface StreamEventEnvelope {
   epoch?: number
   stream_generation?: string
   streamGeneration?: string
+  generation_epoch?: number
+  generationEpoch?: number
+  assistant_message_id?: string
+  assistantMessageId?: string
   stream_seq?: number
   [key: string]: unknown
 }
@@ -267,6 +279,24 @@ export interface SessionEventPayload extends StreamEventEnvelope {
   active_task?: RawSessionTask | null
   last_task?: RawSessionTask | null
   [key: string]: unknown
+}
+
+export interface AnswerGenerationResetPayload extends SessionEventPayload {
+  kind?: 'answer_generation_reset'
+  old_generation_epoch?: number
+  oldGenerationEpoch?: number
+  new_generation_epoch?: number
+  newGenerationEpoch?: number
+  preserve_completed_tools?: boolean
+  preserveCompletedTools?: boolean
+  authoritative_text_snapshot?: string
+  authoritativeTextSnapshot?: string
+  authoritative_reasoning_snapshot?: string
+  authoritativeReasoningSnapshot?: string
+  sequence?: number
+  terminal?: boolean
+  terminal_text_snapshot?: string | null
+  terminalTextSnapshot?: string | null
 }
 
 export interface WarningPayload extends SessionEventPayload {
@@ -395,6 +425,11 @@ export interface ToolUsePayload extends SessionEventPayload {
 export interface ToolDeltaPayload extends ToolUsePayload {
   delta?: string
   input_delta?: string
+}
+
+export interface ToolEndPayload extends ToolUsePayload {
+  arguments?: Record<string, unknown>
+  synthetic_from_text?: boolean
 }
 
 export interface ToolResultPayload extends ToolUsePayload {
@@ -673,6 +708,16 @@ export interface ChatHistoryTurnOutcome {
   started_at?: string | number
   finished_at?: string | number
   outcome?: Record<string, unknown>
+  code?: string
+  error_class?: string
+  retryable?: boolean
+  retry_after_ms?: number
+  terminal_message?: string
+  activity_snapshot?: Record<string, unknown>
+  usage_call_index?: number
+  no_prior_provider_dispatch?: boolean
+  replay_safe?: boolean
+  user_message_id?: string
 }
 
 export interface RouterDecisionPayload extends SessionEventPayload {
@@ -829,9 +874,11 @@ export interface MetaRunCompletedPayload extends SessionEventPayload {
 }
 
 export interface RpcEventMap {
+  'session.event.answer_generation_reset': AnswerGenerationResetPayload
   'session.event.text_delta': TextDeltaPayload
   'session.event.tool_use_start': ToolUsePayload
   'session.event.tool_use_delta': ToolDeltaPayload
+  'session.event.tool_use_end': ToolEndPayload
   'session.event.tool_result': ToolResultPayload
   'session.event.artifact': ArtifactPayload
   'session.event.router_decision': RouterDecisionPayload

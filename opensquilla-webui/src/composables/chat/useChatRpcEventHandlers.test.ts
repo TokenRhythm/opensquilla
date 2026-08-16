@@ -27,6 +27,7 @@ function createHarness(options: {
   loadCurrentSessionUsage?: () => void
   refreshRunModePreference?: () => void | Promise<void>
   pendingQueue?: ChatPendingItem[]
+  stream?: ChatRpcStreamApi
   restoreSteerIntoComposer?: (text: string) => void
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (payload: unknown) => boolean
@@ -38,7 +39,7 @@ function createHarness(options: {
   const activeStreamTaskId = ref('')
   const pendingQueue = ref<ChatPendingItem[]>(options.pendingQueue ?? [])
   const applySessionRunState = vi.fn()
-  const stream: ChatRpcStreamApi = {
+  const stream: ChatRpcStreamApi = options.stream || {
     isStreaming: ref(true),
     streamBubble: ref(true),
     streamHasVisibleOutput: ref(false),
@@ -48,10 +49,13 @@ function createHarness(options: {
     scheduleRender: vi.fn(),
     appendToolCall: vi.fn(),
     appendToolDelta: vi.fn(),
+    appendToolEnd: vi.fn(),
     appendToolResult: vi.fn(),
     appendArtifact: vi.fn(),
     reconcileFinalText: vi.fn(),
     resetLiveTurnState: vi.fn(),
+    resetAnswerGeneration: vi.fn(),
+    setAssistantMessageId: vi.fn(),
     resetStreamIdleTimer: vi.fn(),
     clearStreamIdleTimer: vi.fn(),
     setStreamActivity: vi.fn(),
@@ -146,6 +150,249 @@ function createHarness(options: {
 }
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it('replays a committed tool timeline including its authoritative end', () => {
+    const { api, stream, stop } = createHarness()
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-tool-timeline',
+        current_stream_seq: 3,
+        events: [
+          {
+            event: 'session.event.tool_use_start',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-tool-timeline',
+              generation_epoch: 0,
+              tool_use_id: 'tool-1',
+              tool_name: 'lookup',
+              stream_seq: 1,
+            },
+          },
+          {
+            event: 'session.event.tool_use_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-tool-timeline',
+              generation_epoch: 0,
+              tool_use_id: 'tool-1',
+              json_fragment: '{"query":"answer"}',
+              stream_seq: 2,
+            },
+          },
+          {
+            event: 'session.event.tool_use_end',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-tool-timeline',
+              generation_epoch: 0,
+              tool_use_id: 'tool-1',
+              tool_name: 'lookup',
+              arguments: { query: 'answer' },
+              stream_seq: 3,
+            },
+          },
+        ],
+      })
+
+      expect(stream.appendToolCall).toHaveBeenCalledTimes(1)
+      expect(stream.appendToolDelta).toHaveBeenCalledTimes(1)
+      expect(stream.appendToolEnd).toHaveBeenCalledWith(expect.objectContaining({
+        tool_use_id: 'tool-1',
+        arguments: { query: 'answer' },
+      }))
+    } finally {
+      stop()
+    }
+  })
+
+  it('replays a generation reset and drops late old-generation text', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      stop,
+    } = createHarness()
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 5,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              generation_epoch: 0,
+              text: 'partial old',
+              stream_seq: 1,
+            },
+          },
+          {
+            event: 'session.event.answer_generation_reset',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              assistant_message_id: 'assistant-1',
+              old_generation_epoch: 0,
+              new_generation_epoch: 1,
+              authoritative_text_snapshot: '',
+              authoritative_reasoning_snapshot: '',
+              preserve_completed_tools: true,
+              stream_seq: 2,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              generation_epoch: 0,
+              text: 'late old',
+              stream_seq: 3,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              generation_epoch: 1,
+              text: 'fixed',
+              stream_seq: 4,
+            },
+          },
+        ],
+      })
+
+      expect(activeStreamTaskId.value).toBe('task-live')
+      expect(stream.resetAnswerGeneration).toHaveBeenCalledWith({
+        textSnapshot: '',
+        preserveCompletedTools: true,
+      })
+      expect(stream.appendDelta).toHaveBeenCalledTimes(2)
+      expect(stream.appendDelta).toHaveBeenNthCalledWith(1, 'partial old')
+      expect(stream.appendDelta).toHaveBeenNthCalledWith(2, 'fixed')
+      expect(stream.setAssistantMessageId).toHaveBeenCalledWith('assistant-1')
+    } finally {
+      stop()
+    }
+  })
+
+  it('rejects old-generation delta and done after an in-flight reset', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = 'task-live'
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 0,
+        text: 'partial old',
+        stream_seq: 1,
+      })
+      api.handlers.onAnswerGenerationReset({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        assistant_message_id: 'assistant-1',
+        old_generation_epoch: 0,
+        new_generation_epoch: 1,
+        authoritative_text_snapshot: '',
+        authoritative_reasoning_snapshot: '',
+        preserve_completed_tools: true,
+        stream_seq: 2,
+      })
+
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 0,
+        text: 'late old',
+        stream_seq: 3,
+      })
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 0,
+        stream_seq: 4,
+        text_snapshot: 'old final',
+      })
+
+      expect(stream.appendDelta).toHaveBeenCalledTimes(1)
+      expect(stream.reconcileFinalText).not.toHaveBeenCalled()
+      expect(stream.endStreaming).not.toHaveBeenCalled()
+
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 1,
+        text: 'fixed',
+        stream_seq: 5,
+      })
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 1,
+        stream_seq: 6,
+        text_snapshot: 'fixed',
+      })
+
+      expect(stream.appendDelta).toHaveBeenCalledTimes(2)
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+    } finally {
+      stop()
+    }
+  })
+
+  it('finishes a terminal reset in the same assistant message and suppresses a late error', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      messages,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = 'task-live'
+      api.handlers.onAnswerGenerationReset({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        assistant_message_id: 'assistant-1',
+        old_generation_epoch: 0,
+        new_generation_epoch: 1,
+        authoritative_text_snapshot: '',
+        authoritative_reasoning_snapshot: '',
+        terminal: true,
+        terminal_text_snapshot: 'The fixed model could not complete this answer.',
+        stream_seq: 1,
+      })
+
+      expect(stream.reconcileFinalText).toHaveBeenCalledWith(
+        'The fixed model could not complete this answer.',
+      )
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+      expect(stream.setAssistantMessageId).toHaveBeenCalledWith('assistant-1')
+      expect(activeStreamTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+
+      api.handlers.onAny('session.event.error', {
+        session_key: 'agent:main:test',
+        generation_epoch: 1,
+        stream_seq: 2,
+        code: 'fixed_model_failed',
+        message: 'late duplicate error',
+      })
+
+      expect(messages.value.some(message => message.role === 'error')).toBe(false)
+    } finally {
+      stop()
+    }
+  })
+
   it('does not replace live task state for a recents-only session change', () => {
     const {
       api,
@@ -1444,6 +1691,56 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
     }
   })
 
+  it('records structured start, delta, and end frames without losing legacy text', () => {
+    const { api, stream, stop } = createHarness()
+    stream.useReducer.value = 'shadow'
+
+    try {
+      api.handlers.onAny('session.event.thinking_start', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        block_id: 'reasoning-1',
+        block_index: 0,
+        started_at: Date.now(),
+      })
+      api.handlers.onAny('session.event.thinking', {
+        session_key: 'agent:main:test',
+        stream_seq: 2,
+        block_id: 'reasoning-1',
+        block_index: 0,
+        text: 'inspect',
+        started_at: Date.now(),
+      })
+      api.handlers.onAny('session.event.thinking_end', {
+        session_key: 'agent:main:test',
+        stream_seq: 3,
+        block_id: 'reasoning-1',
+        block_index: 0,
+        status: 'completed',
+        ended_at: Date.now(),
+      })
+
+      expect(api.streamThinkingText.value).toBe('inspect')
+      expect(stream.appendFrame).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        kind: 'thinking-start',
+        blockId: 'reasoning-1',
+        blockIndex: 0,
+      }))
+      expect(stream.appendFrame).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        kind: 'thinking',
+        blockId: 'reasoning-1',
+        text: 'inspect',
+      }))
+      expect(stream.appendFrame).toHaveBeenNthCalledWith(3, expect.objectContaining({
+        kind: 'thinking-end',
+        blockId: 'reasoning-1',
+        status: 'completed',
+      }))
+    } finally {
+      stop()
+    }
+  })
+
   it('keeps elapsed time across A to B to A replay without leaking into B', async () => {
     vi.useFakeTimers()
     vi.setSystemTime(105_000)
@@ -1580,6 +1877,96 @@ describe('useChatRpcEventHandlers reasoning timer replay', () => {
     } finally {
       stop()
       vi.useRealTimers()
+    }
+  })
+})
+
+describe('useChatRpcEventHandlers terminal activity retention', () => {
+  it('reattaches structured reasoning blocks after canonical history replacement', () => {
+    const reasoningBlocks = [{
+      id: 'reasoning-1',
+      index: 0,
+      text: 'inspect',
+      status: 'completed' as const,
+      startedAt: 1_000,
+      endedAt: 3_000,
+      contentKind: 'reasoning' as const,
+    }]
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: 'answer',
+          ts: 'now',
+          reasoningBlocks,
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        turn_id: 'turn-reasoning-record',
+        text: 'answer',
+        reasoning_content: 'inspect',
+      })
+
+      messages.value = [{
+        role: 'assistant',
+        text: 'answer',
+        ts: 'now',
+        turnId: 'turn-reasoning-record',
+        reasoning: { text: 'inspect', seconds: 0 },
+        restoredFromHistory: true,
+      }]
+      api.attachTurnReasoning()
+
+      expect(messages.value[0]?.reasoningBlocks).toEqual(reasoningBlocks)
+    } finally {
+      stop()
+    }
+  })
+
+  it('reattaches safe phase history after canonical history replaces the local row', () => {
+    const phaseHistory = [
+      { action: 'Sending', label: 'Sending', at: 1_000 },
+      { action: 'provider:requesting', label: 'Waiting', at: 2_000 },
+      { action: 'provider:reasoning', label: 'Reasoning', at: 3_000 },
+      { action: 'write:1', label: 'Writing', at: 4_000 },
+    ]
+    const { api, messages, stop } = createHarness({
+      endStreaming(list) {
+        list.push({
+          role: 'assistant',
+          text: 'answer',
+          ts: '2026-01-01T00:00:07.000Z',
+          statusHistory: phaseHistory,
+        })
+      },
+    })
+
+    try {
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        stream_seq: 1,
+        turn_id: 'turn-phase-record',
+        text: 'answer',
+      })
+      expect(messages.value[0]?.statusHistory).toEqual(phaseHistory)
+
+      messages.value = [{
+        role: 'assistant',
+        text: 'answer',
+        ts: '2026-01-01T00:00:07.000Z',
+        turnId: 'turn-phase-record',
+        restoredFromHistory: true,
+      }]
+      api.attachTurnReasoning()
+
+      expect(messages.value[0]?.statusHistory).toEqual(phaseHistory)
+    } finally {
+      stop()
     }
   })
 })

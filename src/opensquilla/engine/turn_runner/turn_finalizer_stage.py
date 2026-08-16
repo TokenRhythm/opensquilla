@@ -39,6 +39,10 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 
 import structlog
 
+from opensquilla.contracts.turn_execution import (
+    TurnExecutionContext,
+    TurnPublicationLedger,
+)
 from opensquilla.observability.decision_log import build_vision_followup_gate_reason_code
 from opensquilla.skills.meta.types import MetaPaused
 
@@ -203,6 +207,7 @@ class TranscriptAppendPort(Protocol):
         reasoning_content: str | None,
         turn_usage: dict[str, Any] | None,
         token_count: int | None,
+        assistant_message_id: str | None = None,
     ) -> TranscriptAppendResult | bool: ...
 
 @runtime_checkable
@@ -470,6 +475,7 @@ class TurnErrorPersistPort(Protocol):
         *,
         session_key: str,
         event: ErrorEvent | None,
+        append_transcript: bool = True,
     ) -> None: ...
 
 
@@ -562,6 +568,16 @@ class TurnFinalizerStageInput:
     run_kind: str
     heartbeat_ack_max_chars: int
     no_memory_capture: bool
+
+    # Additive identity path.  ``None`` preserves direct/legacy stage callers;
+    # an identity-aware TurnRunner supplies one id before streaming starts.
+    assistant_message_id: str | None = None
+    execution_context: TurnExecutionContext | None = None
+    publication_ledger: TurnPublicationLedger | None = None
+    # A terminal generation reset already persists its friendly canonical
+    # assistant snapshot. Keep the structured turn_errors row, but do not add
+    # the ordinary second system "Error:" transcript message on reload.
+    terminal_generation_reset: bool = False
 
 @dataclass(frozen=True)
 class TurnFinalizerStageOutput:
@@ -757,7 +773,9 @@ class TurnFinalizerStage:
             )
 
         transcript_appended = False
-        assistant_message_id: str | None = None
+        assistant_message_id = inp.assistant_message_id
+        if assistant_message_id is None and inp.execution_context is not None:
+            assistant_message_id = inp.execution_context.identity.assistant_message_id
         assistant_message_content: str | None = None
         memory_captured = False
 
@@ -793,28 +811,46 @@ class TurnFinalizerStage:
                     if message_output_tokens is not None
                     else done_event.output_tokens
                 )
-            append_result = await self._transcript_append.append_message(
-                inp.session_key,
-                role="assistant",
-                content=persisted_content,
-                tool_calls=turn_segments if turn_segments else None,
-                reasoning_content=reasoning_content,
-                turn_usage=_turn_usage_payload(
+            append_kwargs: dict[str, Any] = {
+                "role": "assistant",
+                "content": persisted_content,
+                "tool_calls": turn_segments if turn_segments else None,
+                "reasoning_content": reasoning_content,
+                "turn_usage": _turn_usage_payload(
                     done_event,
                     resolved_model=inp.resolved_model,
                     persisted_text=final_text,
                 ),
-                token_count=token_count,
+                "token_count": token_count,
+            }
+            if assistant_message_id is not None:
+                append_kwargs["assistant_message_id"] = assistant_message_id
+            append_result = await self._transcript_append.append_message(
+                inp.session_key,
+                **append_kwargs,
             )
             if isinstance(append_result, TranscriptAppendResult):
                 transcript_appended = append_result.appended
-                assistant_message_id = append_result.message_id
+                if assistant_message_id is None:
+                    assistant_message_id = append_result.message_id
             else:
                 # Backward compatibility for third-party/direct stage adapters
                 # that implement the original boolean port contract.
                 transcript_appended = bool(append_result)
             if transcript_appended:
                 assistant_message_content = persisted_content
+                if inp.execution_context is not None:
+                    inp.execution_context.publish_visible(
+                        text=persisted_content,
+                        generation_epoch=inp.execution_context.generation_epoch,
+                    )
+                elif inp.publication_ledger is not None:
+                    next_sequence = inp.publication_ledger.last_sequence + 1
+                    inp.publication_ledger.accept(
+                        generation_epoch=inp.publication_ledger.generation_epoch,
+                        sequence=next_sequence,
+                        text=persisted_content,
+                    )
             if transcript_appended and not inp.no_memory_capture:
                 try:
                     await self._turn_memory_capture.capture_turn(
@@ -837,6 +873,10 @@ class TurnFinalizerStage:
                         error=str(exc),
                     )
 
+        if not (final_text or turn_segments or inp.turn_artifacts):
+            if inp.execution_context is not None:
+                inp.execution_context.release_reserved_unpublished("no_visible_output")
+
         # 4. Error persist (only when error_message is truthy; the
         # adapter folds the session-manager-None guard, and the helper
         # also guards event-is-None internally).
@@ -844,6 +884,7 @@ class TurnFinalizerStage:
             await self._turn_error_persist.persist_error(
                 session_key=inp.session_key,
                 event=inp.pending_error_event,
+                append_transcript=not inp.terminal_generation_reset,
             )
 
         # 5. Session totals rollup (only when DoneEvent present; the

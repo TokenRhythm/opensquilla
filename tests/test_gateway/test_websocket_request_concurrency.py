@@ -83,6 +83,32 @@ class _ConcurrentHistoryDispatcher:
             self.release_history[req_id].set()
 
 
+class _ConcurrentOptionalReadDispatcher:
+    def __init__(self, held_request_ids: set[str]) -> None:
+        self.held_request_ids = frozenset(held_request_ids)
+        self.request_started = {req_id: asyncio.Event() for req_id in self.held_request_ids}
+        self.release_request = {req_id: asyncio.Event() for req_id in self.held_request_ids}
+        self.quick_dispatched = asyncio.Event()
+
+    def list_methods(self) -> list[str]:
+        return ["sessions.list", "noop"]
+
+    async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+        if req_id in self.held_request_ids:
+            self.request_started[req_id].set()
+            await self.release_request[req_id].wait()
+        elif method == "noop":
+            self.quick_dispatched.set()
+        return make_ok_res(req_id, {"method": method})
+
+    async def wait_for_requests(self, *req_ids: str) -> None:
+        await asyncio.gather(*(self.request_started[req_id].wait() for req_id in req_ids))
+
+    def release(self, *req_ids: str) -> None:
+        for req_id in req_ids:
+            self.release_request[req_id].set()
+
+
 class _HistoryWebSocket:
     client_state = WebSocketState.CONNECTED
     client = SimpleNamespace(host="127.0.0.1", port=12345)
@@ -253,6 +279,78 @@ async def test_slow_history_does_not_block_another_history_or_noop(
     assert observed["history_a_still_pending"]
     assert response_indexes["history-b"] < response_indexes["history-a"]
     assert response_indexes["quick"] < response_indexes["history-a"]
+    assert ws.close_codes == []
+
+
+@pytest.mark.parametrize("writer_queue_enabled", [False, True])
+async def test_webui_bootstrap_optional_reads_do_not_reject_catalog_or_block_interactive_rpc(
+    writer_queue_enabled: bool,
+) -> None:
+    requests = (
+        ("drafts", "meta.drafts.list"),
+        ("workspaces", "workspaces.list"),
+        ("onboarding", "onboarding.status"),
+        ("run-mode", "sandbox.run_mode.preference.get"),
+        ("config", "config.get"),
+        ("commands", "commands.list_for_surface"),
+        ("agents", "agents.list"),
+        ("sessions", "sessions.list"),
+    )
+    request_ids = tuple(req_id for req_id, _method in requests)
+    dispatcher = _ConcurrentOptionalReadDispatcher(set(request_ids))
+    observed: dict[str, bool] = {}
+
+    async def finish_after_quick_response(socket: _HistoryWebSocket) -> None:
+        await dispatcher.wait_for_requests(*request_ids)
+        await socket.wait_for_response("quick")
+        observed["reads_still_pending"] = all(
+            not socket.has_response(req_id) for req_id in request_ids
+        )
+        dispatcher.release(*request_ids)
+        await asyncio.gather(*(socket.wait_for_response(req_id) for req_id in request_ids))
+
+    frames = [_CONNECT_FRAME]
+    frames.extend(
+        json.dumps(
+            {
+                "type": "req",
+                "id": req_id,
+                "method": method,
+                "params": {},
+            }
+        )
+        for req_id, method in requests
+    )
+    frames.append(json.dumps({"type": "req", "id": "quick", "method": "noop"}))
+    ws = _HistoryWebSocket(
+        frames,
+        dispatcher,
+        after_frames=finish_after_quick_response,
+    )
+
+    await asyncio.wait_for(
+        handle_ws_connection(
+            ws,
+            GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
+            dispatcher=dispatcher,
+        ),
+        timeout=2,
+    )
+
+    assert observed["reads_still_pending"]
+    assert dispatcher.quick_dispatched.is_set()
+    assert ws.hello()["policy"]["concurrent_optional_read_methods"] == [
+        "agents.list",
+        "artifacts.list",
+        "commands.list_for_surface",
+        "config.get",
+        "models.routing.get",
+        "onboarding.status",
+        "sandbox.run_mode.preference.get",
+        "sessions.list",
+        "usage.status",
+        "workspaces.list",
+    ]
     assert ws.close_codes == []
 
 

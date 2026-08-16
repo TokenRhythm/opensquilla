@@ -33,6 +33,7 @@ from opensquilla.tools.write_policy import validate_workspace_write_deny_env
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from opensquilla.contracts.turn_execution import TurnExecutionContext
     from opensquilla.engine.agent import Agent, ToolHandler
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.engine.types import AgentConfig, ThinkingLevel
@@ -616,6 +617,7 @@ class AgentFactoryPort(Protocol):
         agent_id: str = "",
         run_kind: str = "agent",
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        execution_context: TurnExecutionContext | None = None,
     ) -> Agent: ...
 
 
@@ -665,6 +667,10 @@ class AgentBootstrapStageInput:
     run_kind: str = "agent"
     session_epoch: int = 0
     provider_request_correlation: ProviderRequestCorrelation | None = field(
+        default=None,
+        repr=False,
+    )
+    execution_context: TurnExecutionContext | None = field(
         default=None,
         repr=False,
     )
@@ -810,6 +816,14 @@ class AgentBootstrapStage:
                 inp.resolved_model,
                 inp.active_provider_id,
             )
+
+        # Capacity diagnostics contain resolved numeric limits only. They are
+        # safe for turn metadata and make catalog-vs-provider failures
+        # distinguishable without exposing attachment names or contents.
+        inp.turn.metadata["resolved_output_cap_tokens"] = int(catalog.max_tokens)
+        inp.turn.metadata["resolved_context_window_tokens"] = int(
+            catalog.context_window
+        )
 
         # 3. Build AgentConfig auxiliaries (thinking, projection, store, mem cfg)
         aux = self._agent_config_builder.build_auxiliaries(
@@ -1221,6 +1235,7 @@ class AgentBootstrapStage:
             agent_id=inp.agent_id,
             run_kind=inp.run_kind,
             provider_request_correlation=inp.provider_request_correlation,
+            execution_context=inp.execution_context,
         )
 
         return StageOutcome.success(

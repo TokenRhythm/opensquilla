@@ -60,7 +60,10 @@ async def test_effective_envelope_and_provenance(cfg: GatewayConfig) -> None:
     assert set(result) == {"fields"}
     fields = result["fields"]
     assert fields["llm.provider"] == {"value": "tokenrhythm", "source": "default"}
-    assert fields["llm.model"] == {"value": "deepseek-v4-pro", "source": "default"}
+    assert fields["llm.model"] == {
+        "value": "deepseek-v4-flash-0731",
+        "source": "default",
+    }
     assert fields["squilla_router.tiers.c1.model"]["source"] == "preset"
     for record in fields.values():
         assert set(record) == {"value", "source"}

@@ -69,6 +69,33 @@ def test_squilla_router_defaults_match_runtime_router_config() -> None:
     assert cfg.tiers["image_model"]["image_only"] is True
 
 
+def test_squilla_router_rejects_unknown_tier_ensemble_selection_mode() -> None:
+    squilla_router_config_cls = _squilla_router_config_cls()
+    tiers = squilla_router_config_cls().tiers
+    tiers["c3"] = {
+        **tiers["c3"],
+        "ensemble_selection_mode": "static_tokenrhythm_typo",
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"squilla_router\.tiers\.c3\.ensemble_selection_mode must be one of",
+    ):
+        squilla_router_config_cls(tiers=tiers)
+
+
+def test_squilla_router_rejects_non_boolean_tier_ensemble_enabled() -> None:
+    squilla_router_config_cls = _squilla_router_config_cls()
+    tiers = squilla_router_config_cls().tiers
+    tiers["c3"] = {**tiers["c3"], "ensemble_enabled": "true"}
+
+    with pytest.raises(
+        ValueError,
+        match=r"squilla_router\.tiers\.c3\.ensemble_enabled must be a boolean",
+    ):
+        squilla_router_config_cls(tiers=tiers)
+
+
 def test_squilla_router_explicit_openrouter_profile_matches_default_tiers() -> None:
     squilla_router_config_cls = _squilla_router_config_cls()
 
@@ -170,9 +197,9 @@ def test_direct_legacy_openrouter_router_defaults_are_migrated(provider_id: str)
 
 
 TOKENRHYTHM_EXPECTED_TIER_MODELS = {
-    "c0": "deepseek-v4-flash",
-    "c1": "deepseek-v4-pro",
-    "c2": "kimi-k2.7-code",
+    "c0": "qwen3.7-flash",
+    "c1": "deepseek-v4-flash-0731",
+    "c2": "glm-5.2",
     "c3": "glm-5.2",
 }
 
@@ -188,7 +215,34 @@ def test_unset_tier_profile_seeds_tokenrhythm_curated_inline_tiers() -> None:
     for tier, model in TOKENRHYTHM_EXPECTED_TIER_MODELS.items():
         assert cfg.squilla_router.tiers[tier]["provider"] == "tokenrhythm"
         assert cfg.squilla_router.tiers[tier]["model"] == model
+    assert cfg.squilla_router.tiers["c0"]["supports_image"] is True
+    assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in cfg.squilla_router.tiers["c3"]
     assert cfg.squilla_router.tiers["image_model"]["model"] == "kimi-k2.6"
+
+
+def test_tokenrhythm_follow_primary_binding_refreshes_managed_inline_tiers() -> None:
+    gateway_config_cls = _gateway_config_cls()
+    legacy_tiers = {
+        "c0": {"provider": "tokenrhythm", "model": "deepseek-v4-flash"},
+        "c1": {"provider": "tokenrhythm", "model": "deepseek-v4-pro"},
+        "c2": {"provider": "tokenrhythm", "model": "kimi-k2.7-code"},
+        "c3": {"provider": "tokenrhythm", "model": "glm-5.2"},
+    }
+
+    cfg = gateway_config_cls(
+        llm={"provider": "tokenrhythm", "model": "deepseek-v4-pro"},
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "follow_primary",
+            "tiers": legacy_tiers,
+        },
+    )
+
+    for tier, model in TOKENRHYTHM_EXPECTED_TIER_MODELS.items():
+        assert cfg.squilla_router.tiers[tier]["model"] == model
+    assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in cfg.squilla_router.tiers["c3"]
 
 
 def test_tokenrhythm_direct_legacy_openrouter_router_defaults_are_migrated() -> None:
@@ -385,7 +439,9 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
     squilla_router = data["squilla_router"]
 
     assert data["llm"]["provider"] == "tokenrhythm"
-    assert data["llm"]["model"] == "deepseek-v4-pro"
+    assert data["llm"]["model"] == "deepseek-v4-flash-0731"
+    assert data["llm_ensemble"]["enabled"] is False
+    assert data["llm_ensemble"]["selection_mode"] == "static_tokenrhythm_b5"
     assert squilla_router["enabled"] is True
     assert squilla_router["auto_thinking"] is True
     assert squilla_router["rollout_phase"] == "full"
@@ -407,10 +463,13 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
     for name in ("c0", "c1", "c2", "c3", "image_model"):
         assert tiers[name]["provider"] == "tokenrhythm"
         assert "thinking_level" not in tiers[name]
-    assert tiers["c0"]["model"] == "deepseek-v4-flash"
-    assert tiers["c1"]["model"] == "deepseek-v4-pro"
-    assert tiers["c2"]["model"] == "kimi-k2.7-code"
+    assert tiers["c0"]["model"] == "qwen3.7-flash"
+    assert tiers["c0"]["supports_image"] is True
+    assert tiers["c1"]["model"] == "deepseek-v4-flash-0731"
+    assert tiers["c2"]["model"] == "glm-5.2"
     assert tiers["c3"]["model"] == "glm-5.2"
+    assert tiers["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in tiers["c3"]
     assert tiers["image_model"]["model"] == "kimi-k2.6"
     assert tiers["image_model"]["supports_image"] is True
     assert tiers["image_model"]["image_only"] is True

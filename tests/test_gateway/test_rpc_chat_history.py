@@ -104,6 +104,373 @@ async def test_chat_history_returns_pagination_metadata_with_legacy_messages() -
 
 
 @pytest.mark.asyncio
+async def test_chat_history_projects_parallel_legacy_activity_on_incomplete_page() -> None:
+    tool_entry = TranscriptEntry(
+        id=10,
+        session_id="parent",
+        session_key="agent:main:webchat:test",
+        role="assistant",
+        content=(
+            "Inspect the source.\n"
+            "[Used tool: read_file]\n"
+            "Compare the directory.\n"
+            "[Used tool: list_dir]"
+        ),
+        created_at=10,
+        message_id="legacy-tools",
+    )
+    result_entry = TranscriptEntry(
+        id=11,
+        session_id="parent",
+        session_key="agent:main:webchat:test",
+        role="user",
+        content=(
+            "[Tool result (call-read): source payload]\n"
+            "[Tool result (call-list): directory payload]"
+        ),
+        created_at=11,
+        message_id="legacy-results",
+    )
+    manager = _FakePagedSessionManager(
+        [tool_entry, result_entry],
+        page={
+            "entries": [tool_entry, result_entry],
+            "has_more": False,
+            "canonical_complete": False,
+        },
+    )
+
+    result = await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test", "limit": 2},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=manager,
+        ),
+    )
+
+    assert result["loaded_count"] == 2
+    assert result["canonical_complete"] is False
+    assert len(result["messages"]) == 1
+    assert result["messages"][0]["message_id"] == "legacy-tools"
+    assert [segment.get("tool_use_id") for segment in result["messages"][0]["tool_calls"]] == [
+        None,
+        "call-read",
+        None,
+        "call-list",
+        "call-read",
+        "call-list",
+    ]
+    assert "[Used tool:" not in str(result["messages"])
+    assert "[Tool result" not in str(result["messages"])
+
+
+@pytest.mark.asyncio
+async def test_chat_history_projects_legacy_tool_pair_split_by_page_boundary(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-legacy-boundary.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:legacy-boundary"
+    await manager.create(session_key)
+    try:
+        await manager.append_message(session_key, "user", "earlier request")
+        await manager.append_message(
+            session_key,
+            "assistant",
+            "[Used tool: read_file]",
+        )
+        await manager.append_message(
+            session_key,
+            "user",
+            "[Tool result (call-boundary): private payload]",
+        )
+        await manager.append_message(session_key, "user", "continue")
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 2},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        earlier = await _handle_chat_history(
+            {
+                "sessionKey": session_key,
+                "limit": 2,
+                "before": result["oldest_cursor"],
+            },
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        forward = await _handle_chat_history(
+            {
+                "sessionKey": session_key,
+                "limit": 2,
+                "after": earlier["newest_cursor"],
+            },
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        refreshed = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 2},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+    finally:
+        await storage.close()
+
+    assert result["loaded_count"] == 2
+    assert result["has_more"] is True
+    assert [message["role"] for message in result["messages"]] == [
+        "assistant",
+        "user",
+    ]
+    assert [message["text"] for message in result["messages"]] == ["", "continue"]
+    assert result["messages"][0]["tool_calls"] == [
+        {
+            "type": "tool_use",
+            "tool_use_id": "call-boundary",
+            "name": "read_file",
+            "input": {},
+            "legacy_projection": True,
+        },
+        {
+            "type": "tool_result",
+            "tool_use_id": "call-boundary",
+            "name": "read_file",
+            "result": "private payload",
+            "legacy_projection": True,
+        },
+    ]
+    assert "[Tool result" not in str(result["messages"])
+    assert [message["text"] for message in earlier["messages"]] == ["earlier request"]
+    assert earlier["loaded_count"] == 2
+    assert forward["messages"] == result["messages"]
+    assert forward["loaded_count"] == 2
+    assert refreshed["messages"] == result["messages"]
+    assert refreshed["oldest_cursor"] == result["oldest_cursor"]
+    assert refreshed["newest_cursor"] == result["newest_cursor"]
+
+
+@pytest.mark.asyncio
+async def test_chat_history_preserves_ambiguous_result_suffix_same_page_and_cross_page(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-legacy-ambiguous.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:legacy-ambiguous"
+    await manager.create(session_key)
+    ambiguous = "[Tool result (call-boundary): [\"a\"]\nsecond payload line]"
+    try:
+        await manager.append_message(session_key, "assistant", "[Used tool: read_file]")
+        await manager.append_message(session_key, "user", ambiguous)
+        await manager.append_message(session_key, "user", "continue")
+
+        same_page = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 3},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        cross_page = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 2},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+    finally:
+        await storage.close()
+
+    same_activity = same_page["messages"][0]
+    cross_activity = cross_page["messages"][0]
+    assert same_activity["message_id"] == cross_activity["message_id"]
+    assert same_activity["tool_calls"] == cross_activity["tool_calls"]
+    assert cross_activity["tool_calls"][1]["result"] == '["a"]\nsecond payload line'
+    assert cross_page["loaded_count"] == 2
+    assert cross_page["messages"][1]["text"] == "continue"
+
+
+@pytest.mark.asyncio
+async def test_chat_history_fails_safe_for_result_line_with_untrusted_trailing_text(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-legacy-trailing-text.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:legacy-trailing-text"
+    await manager.create(session_key)
+    ambiguous = "[Tool result (call-boundary): ok]\nPlease also update README.md"
+    try:
+        await manager.append_message(session_key, "assistant", "[Used tool: read_file]")
+        await manager.append_message(session_key, "user", ambiguous)
+        await manager.append_message(session_key, "user", "continue")
+        same_page = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 3},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+        cross_page = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 2},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+    finally:
+        await storage.close()
+
+    assert [message["text"] for message in same_page["messages"]] == [
+        "[Used tool: read_file]",
+        ambiguous,
+        "continue",
+    ]
+    assert [message["text"] for message in cross_page["messages"]] == [
+        ambiguous,
+        "continue",
+    ]
+    assert all("tool_calls" not in message for message in same_page["messages"])
+    assert all("tool_calls" not in message for message in cross_page["messages"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "auxiliary_failure",
+    [OSError("transient lookbehind failure"), TypeError("legacy manager signature")],
+)
+async def test_chat_history_auxiliary_lookbehind_failure_preserves_main_page(
+    auxiliary_failure: Exception,
+) -> None:
+    result_entry = _entry(11)
+    result_entry.content = "[Tool result (call-1): payload]"
+
+    class _AuxiliaryFailureManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__([result_entry], canonical_entries=[result_entry])
+            self.page_calls = 0
+
+        async def get_canonical_transcript_page(self, session_key, **kwargs):
+            self.page_calls += 1
+            if self.page_calls == 1:
+                return {
+                    "entries": [result_entry],
+                    "has_more": True,
+                    "canonical_complete": False,
+                }
+            raise auxiliary_failure
+
+    manager = _AuxiliaryFailureManager()
+    result = await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test", "limit": 1},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=manager,
+        ),
+    )
+
+    assert [message["text"] for message in result["messages"]] == [result_entry.content]
+    assert result["loaded_count"] == 1
+    assert result["oldest_cursor"] == "11|11"
+    assert result["newest_cursor"] == "11|11"
+    assert result["has_more"] is True
+    assert result["canonical_complete"] is False
+
+
+@pytest.mark.asyncio
+async def test_chat_history_malformed_auxiliary_lookahead_preserves_main_page() -> None:
+    tool_entry = _entry(12, role="assistant")
+    tool_entry.content = "[Used tool: read_file]"
+
+    class _MalformedLookaheadManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__([tool_entry], canonical_entries=[tool_entry])
+            self.page_calls = 0
+
+        async def get_canonical_transcript_page(self, session_key, **kwargs):
+            self.page_calls += 1
+            if self.page_calls == 1:
+                return {
+                    "entries": [tool_entry],
+                    "has_more": False,
+                    "canonical_complete": True,
+                }
+            return {"has_more": False, "canonical_complete": True}
+
+    result = await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test", "limit": 1},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=_MalformedLookaheadManager(),
+        ),
+    )
+
+    assert [message["text"] for message in result["messages"]] == [tool_entry.content]
+    assert result["loaded_count"] == 1
+    assert result["oldest_cursor"] == "12|12"
+    assert result["newest_cursor"] == "12|12"
+
+
+@pytest.mark.asyncio
+async def test_chat_history_auxiliary_storage_busy_remains_retryable() -> None:
+    result_entry = _entry(13)
+    result_entry.content = "[Tool result (call-1): payload]"
+    busy = StorageBusyError(
+        "get_canonical_transcript_page",
+        waited_ms=50,
+        retry_after_ms=100,
+    )
+
+    class _BusyLookbehindManager(_FakeSessionManager):
+        def __init__(self) -> None:
+            super().__init__([result_entry], canonical_entries=[result_entry])
+            self.page_calls = 0
+
+        async def get_canonical_transcript_page(self, session_key, **kwargs):
+            self.page_calls += 1
+            if self.page_calls == 1:
+                return {
+                    "entries": [result_entry],
+                    "has_more": True,
+                    "canonical_complete": True,
+                }
+            raise busy
+
+    with pytest.raises(StorageBusyError) as caught:
+        await _handle_chat_history(
+            {"sessionKey": "agent:main:webchat:test", "limit": 1},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=_BusyLookbehindManager(),
+            ),
+        )
+
+    assert caught.value is busy
+
+
+@pytest.mark.asyncio
 async def test_chat_history_batch_projects_missing_turn_usage_from_ledger(tmp_path) -> None:
     storage = SessionStorage(str(tmp_path / "history-usage-projection.db"))
     await storage.connect()
@@ -267,6 +634,160 @@ async def test_chat_history_returns_typed_outcomes_for_explicit_page_turns(
             }
         ]
         assert result["messages"][0]["turn_context"]["turn_id"] == "turn-stopped"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_projects_usage_barrier_retry_and_activity_snapshot(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-barrier.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-barrier"
+    await manager.create(session_key)
+    try:
+        with turn_context_scope({"turn_id": "turn-usage"}):
+            primary_user = await manager.append_message(
+                session_key, "user", "retry this"
+            )
+            steer_user = await manager.append_message(
+                session_key, "user", "same-turn steer"
+            )
+            await manager.append_message(
+                session_key,
+                "system",
+                "Error: usage ledger temporarily unavailable; provider request was not sent",
+            )
+        await storage.create_agent_task(
+            AgentTaskRecord(
+                task_id="turn-usage",
+                session_key=session_key,
+                agent_id="main",
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="session_turn",
+                status=AgentTaskStatus.FAILED,
+                terminal_reason="error",
+                error_class="usage_accounting_busy",
+                error_message="usage ledger temporarily unavailable; provider request was not sent",
+                details={
+                    "turn_id": "turn-usage",
+                    "turn_outcome": {
+                        "kind": "blocked",
+                        "reason": "usage_accounting_busy",
+                        "error_class": "usage_accounting_busy",
+                        "retryable": True,
+                        # The persisted primary id is authoritative over a
+                        # stale nested projection that points at a Steer.
+                        "user_message_id": steer_user.message_id,
+                    },
+                    "retry_after_ms": 100,
+                    "persisted_user_message_id": primary_user.message_id,
+                    "persisted_user_message_ids": [
+                        primary_user.message_id,
+                        steer_user.message_id,
+                    ],
+                    "usage_call_index": 1,
+                    "no_prior_provider_dispatch": True,
+                    "replay_safe": True,
+                    "activity_snapshot": {
+                        "version": 1,
+                        "task_id": "turn-usage",
+                        "turn_id": "turn-usage",
+                        "phases": [
+                            {"kind": "router", "phase": "decided", "at": 1_000},
+                            {"kind": "state", "phase": "thinking", "at": 1_100},
+                        ],
+                    },
+                },
+            )
+        )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        outcome = result["turn_outcomes"][0]
+        assert outcome["code"] == outcome["error_class"] == "usage_accounting_busy"
+        assert outcome["retryable"] is True
+        assert outcome["retry_after_ms"] == 100
+        assert outcome["usage_call_index"] == 1
+        assert outcome["no_prior_provider_dispatch"] is True
+        assert outcome["replay_safe"] is True
+        assert outcome["user_message_id"] == primary_user.message_id
+        assert outcome["outcome"]["user_message_id"] == primary_user.message_id
+        assert outcome["activity_snapshot"]["phases"] == [
+            {"kind": "router", "phase": "decided", "at": 1_000},
+            {"kind": "state", "phase": "thinking", "at": 1_100},
+        ]
+        assert "safe to retry" in outcome["terminal_message"].lower()
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_projects_later_usage_barrier_as_not_replay_safe(tmp_path) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-barrier-later-call.db"))
+    await storage.connect()
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-barrier-later-call"
+    await manager.create(session_key)
+    try:
+        with turn_context_scope({"turn_id": "turn-usage"}):
+            await manager.append_message(session_key, "user", "continue after tools")
+        await storage.create_agent_task(
+            AgentTaskRecord(
+                task_id="turn-usage",
+                session_key=session_key,
+                agent_id="main",
+                source_kind="webui",
+                queue_mode="followup",
+                run_kind="session_turn",
+                status=AgentTaskStatus.FAILED,
+                terminal_reason="error",
+                error_class="usage_accounting_busy",
+                error_message=(
+                    "usage ledger temporarily unavailable; provider request was not sent"
+                ),
+                details={
+                    "turn_id": "turn-usage",
+                    "turn_outcome": {
+                        "kind": "blocked",
+                        "reason": "usage_accounting_busy",
+                        "error_class": "usage_accounting_busy",
+                        "retryable": True,
+                        "usage_call_index": 2,
+                        "no_prior_provider_dispatch": False,
+                        "replay_safe": False,
+                    },
+                    "usage_call_index": 2,
+                    "no_prior_provider_dispatch": False,
+                    "replay_safe": False,
+                },
+            )
+        )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        outcome = result["turn_outcomes"][0]
+        assert outcome["retryable"] is True
+        assert outcome["usage_call_index"] == 2
+        assert outcome["no_prior_provider_dispatch"] is False
+        assert outcome["replay_safe"] is False
+        assert "earlier work" in outcome["terminal_message"].lower()
+        assert "safe to retry" not in outcome["terminal_message"].lower()
     finally:
         await storage.close()
 

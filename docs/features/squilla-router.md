@@ -39,6 +39,44 @@ Use the OpenRouter mixed defaults:
 opensquilla configure router --router openrouter-mix
 ```
 
+When the primary provider is TokenRhythm, the recommended preset uses this
+ladder:
+
+| Tier | Route |
+| --- | --- |
+| C0 | `qwen3.7-flash` |
+| C1 | `deepseek-v4-flash-0731` |
+| C2 | `glm-5.2` |
+| C3 | static TokenRhythm B5 multi-model fusion |
+
+C3 reuses the plan configured under `llm_ensemble`: four proposer models
+produce candidates and GLM 5.2 aggregates the final answer in the recommended
+TokenRhythm setup. The plan is activated only for C3; C0–C2 stay single-model
+routes. Editing the shared plan also changes what C3 uses, without a second
+tier-specific profile. If the shared plan cannot start or complete, C3 uses the
+global provider/model configured under `[llm]` — the same fixed/direct fallback
+model used by global fusion. The provider/model stored on C3 remains available
+only when C3 is switched back to single-model routing.
+
+For a newly configured C3 tier, the tier-local runtime-policy defaults are one
+successful proposer out of the four-member lineup, one retry after each
+proposer's initial attempt, and `all_failed_policy = "fallback_single"`. These
+defaults fill only fields that the operator has not set. Explicit
+`min_successful_proposers`, `proposer_max_retries`, and `all_failed_policy`
+values remain authoritative for both global/custom Ensemble use and C3. In
+particular, `all_failed_policy = "error"` is a valid terminal policy and does
+not start the fixed fallback. A global/custom configuration with no explicit
+retry field keeps the historical zero-retry default.
+
+Packaged static B5 lineups use a 120-second total budget per proposer and a
+180-second aggregator idle budget. Operator-authored `custom_b5` lineups use
+300 and 480 seconds respectively unless explicitly configured otherwise.
+
+C3 fusion itself is excluded from image routing, but the dedicated
+`image_model` tier remains eligible and is preferred for image requests. If it
+is unavailable, another non-C3 tier with `supports_image = true` may handle the
+request.
+
 Disable routing and use the configured provider/model directly:
 
 ```sh

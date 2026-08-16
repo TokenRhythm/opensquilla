@@ -20,6 +20,7 @@ BOOLEAN_FLAGS: Final[tuple[str, ...]] = (
     "tui_changed",
     "desktop_changed",
     "python_changed",
+    "python_full_required",
     "platform_sensitive_changed",
     "build_wheel_required",
     "toolchain_artifact_changed",
@@ -96,7 +97,11 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         ("RESULT_TUI", "OpenTUI package tests", flags["tui_changed"] or full),
         ("RESULT_DESKTOP", "Desktop Electron unit tests", flags["desktop_changed"] or full),
         ("RESULT_UBUNTU", "Ubuntu quality gate", flags["python_changed"] or full),
-        ("RESULT_UBUNTU_FULL", "Ubuntu full test matrix", full),
+        (
+            "RESULT_UBUNTU_FULL",
+            "Ubuntu full test matrix",
+            flags["python_full_required"] or full,
+        ),
         (
             "RESULT_WINDOWS_SMOKE",
             "Windows compatibility smoke tests",
@@ -115,8 +120,7 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
         (
             "RESULT_DESKTOP_RECOVERY_E2E",
             "Desktop recovery E2E matrix",
-            flags["frontend_changed"]
-            or flags["platform_sensitive_changed"]
+            flags["platform_sensitive_changed"]
             or flags["desktop_changed"]
             or full,
         ),
@@ -136,6 +140,9 @@ def check_ci_results(env: Mapping[str, str]) -> list[str]:
 
     if flags["platform_sensitive_changed"] and not flags["windows_full_required"]:
         errors.append("Platform-sensitive changes must require the Windows high-risk matrix.")
+
+    if flags["python_full_required"] and not flags["python_changed"]:
+        errors.append("Python full-matrix changes must also be classified as Python changes.")
 
     if full:
         if flags["docs_only"]:

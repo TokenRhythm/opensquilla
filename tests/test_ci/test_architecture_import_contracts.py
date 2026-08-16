@@ -127,6 +127,11 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("project_workspaces.py", "agents"),
     ("project_workspaces.py", "sandbox"),
     ("project_workspaces.py", "session"),
+    # Provider, session, and tools share the import-cycle-safe turn execution
+    # contract. Contracts remains a lower-level leaf and imports none of them.
+    ("provider", "contracts"),
+    ("session", "contracts"),
+    ("tools", "contracts"),
     ("memory", "gateway"),
     ("memory", "identity"),
     ("memory", "provider"),

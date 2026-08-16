@@ -139,11 +139,13 @@ class _RecordingTurnErrorPersist:
         *,
         session_key: str,
         event: ErrorEvent | None,
+        append_transcript: bool = True,
     ) -> None:
         self.calls.append(
             {
                 "session_key": session_key,
                 "event": event,
+                "append_transcript": append_transcript,
             }
         )
 
@@ -196,6 +198,7 @@ def _make_input(
     run_kind: str = "default",
     heartbeat_ack_max_chars: int = 300,
     no_memory_capture: bool = False,
+    terminal_generation_reset: bool = False,
 ) -> TurnFinalizerStageInput:
     return TurnFinalizerStageInput(
         final_text_parts=final_text_parts if final_text_parts is not None else [],
@@ -214,6 +217,7 @@ def _make_input(
         run_kind=run_kind,
         heartbeat_ack_max_chars=heartbeat_ack_max_chars,
         no_memory_capture=no_memory_capture,
+        terminal_generation_reset=terminal_generation_reset,
     )
 
 
@@ -473,6 +477,128 @@ async def test_turn_usage_persists_ensemble_breakdown_and_trace() -> None:
     assert usage["model_usage_breakdown"][1]["role"] == "aggregator"
     assert usage["ensemble_trace"]["profile"] == "default"
     assert usage["ensemble_trace"]["llm_request_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_timeout_fallback_persists_one_completed_turn_without_error_record() -> None:
+    stage, recs = _make_stage()
+    done = DoneEvent(
+        text="fallback answer",
+        input_tokens=18,
+        output_tokens=8,
+        model="fallback-model",
+        model_usage_breakdown=[
+            {
+                "role": "proposer",
+                "provider": "openrouter",
+                "model": "draft-model",
+                "input_tokens": 7,
+                "output_tokens": 3,
+            },
+            {
+                "role": "fallback_single",
+                "provider": "openrouter",
+                "model": "fallback-model",
+                "input_tokens": 11,
+                "output_tokens": 5,
+            },
+        ],
+        ensemble_trace={
+            "profile": "static_openrouter_b5",
+            "fallback_used": True,
+            "fallback_code": "ensemble_aggregator_timeout",
+            "aggregator_timeout_mode": "idle",
+            "llm_request_count": 3,
+            "prior_final_request": {
+                "role": "aggregator",
+                "terminal_code": "ensemble_aggregator_timeout",
+            },
+        },
+    )
+
+    await stage.run(
+        _make_input(final_text_parts=["fallback answer"], done_event=done)
+    )
+
+    assert len(recs["transcript_append"].calls) == 1
+    assert len(recs["session_totals"].calls) == 1
+    assert recs["turn_error_persist"].calls == []
+    usage = recs["transcript_append"].calls[0]["turn_usage"]
+    assert [row["role"] for row in usage["model_usage_breakdown"]] == [
+        "proposer",
+        "fallback_single",
+    ]
+    assert usage["ensemble_trace"]["fallback_code"] == "ensemble_aggregator_timeout"
+    assert usage["ensemble_trace"]["llm_request_count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_partial_aggregator_timeout_persists_output_and_error_once() -> None:
+    stage, recs = _make_stage()
+    error = ErrorEvent(
+        message="ensemble aggregator stalled: no stream events for 480s",
+        code="ensemble_aggregator_timeout",
+    )
+
+    await stage.run(
+        _make_input(
+            final_text_parts=["partial answer"],
+            error_message=error.message,
+            pending_error_event=error,
+        )
+    )
+
+    assert len(recs["transcript_append"].calls) == 1
+    assert recs["transcript_append"].calls[0]["content"] == "partial answer"
+    assert len(recs["turn_error_persist"].calls) == 1
+    assert recs["turn_error_persist"].calls[0]["event"] is error
+    assert recs["session_totals"].calls == []
+
+
+@pytest.mark.asyncio
+async def test_terminal_reset_persists_failure_snapshot_and_accounting() -> None:
+    stage, recs = _make_stage()
+    terminal_text = "The fixed model could not complete this answer."
+    error = ErrorEvent(
+        message="The model provider rejected the configured credentials.",
+        code="401",
+        failure_kind="auth_invalid",
+        generation_epoch=2,
+    )
+    done = DoneEvent(
+        text=terminal_text,
+        text_snapshot=terminal_text,
+        input_tokens=9,
+        output_tokens=3,
+        model="fixed-model",
+        provider="openrouter",
+        generation_epoch=2,
+    )
+
+    await stage.run(
+        _make_input(
+            final_text_parts=[terminal_text],
+            turn_segments=[{"type": "text", "text": terminal_text}],
+            error_message=error.message,
+            pending_error_event=error,
+            done_event=done,
+            terminal_generation_reset=True,
+        )
+    )
+
+    assert recs["transcript_append"].calls[0]["content"] == terminal_text
+    usage = recs["transcript_append"].calls[0]["turn_usage"]
+    assert usage["input_tokens"] == 9
+    assert usage["output_tokens"] == 3
+    assert usage["provider"] == "openrouter"
+    assert recs["turn_error_persist"].calls == [
+        {
+            "session_key": "agent:main:s1",
+            "event": error,
+            "append_transcript": False,
+        }
+    ]
+    assert recs["session_totals"].calls[0]["done_event"] is done
 
 
 @pytest.mark.asyncio

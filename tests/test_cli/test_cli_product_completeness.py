@@ -1577,6 +1577,174 @@ def test_cost_json_returns_gateway_payload(monkeypatch):
     assert ("usage.cost", {}) in fake.calls
 
 
+def test_cost_by_model_uses_routed_model_breakdown(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:routed",
+                "model": "unknown",
+                "inputTokens": 30,
+                "outputTokens": 3,
+                "costUsd": 0.03,
+                "modelBreakdown": [
+                    {
+                        "model": "deepseek-v4-flash",
+                        "inputTokens": 10,
+                        "outputTokens": 1,
+                        "costUsd": 0.01,
+                    },
+                    {
+                        "model": "deepseek-v4-pro",
+                        "inputTokens": 20,
+                        "outputTokens": 2,
+                        "costUsd": 0.02,
+                    },
+                ],
+            }
+        ],
+        "totalCostUsd": 0.03,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["byModel"] == [
+        {
+            "model": "deepseek-v4-flash",
+            "inputTokens": 10,
+            "outputTokens": 1,
+            "costUsd": 0.01,
+        },
+        {
+            "model": "deepseek-v4-pro",
+            "inputTokens": 20,
+            "outputTokens": 2,
+            "costUsd": 0.02,
+        },
+    ]
+
+
+def test_cost_by_model_prefers_deployment_breakdown(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:multi-provider",
+                "model": "gpt-4o",
+                "inputTokens": 2_000_000,
+                "outputTokens": 0,
+                "costUsd": 2.5,
+                "modelBreakdown": [
+                    {
+                        "model": "gpt-4o",
+                        "inputTokens": 2_000_000,
+                        "outputTokens": 0,
+                        "costUsd": 0.0,
+                    }
+                ],
+                "deploymentBreakdown": [
+                    {
+                        "provider": "openai",
+                        "model": "gpt-4o",
+                        "inputTokens": 1_000_000,
+                        "outputTokens": 0,
+                        "costUsd": 2.5,
+                    },
+                    {
+                        "provider": "ollama",
+                        "model": "gpt-4o",
+                        "inputTokens": 1_000_000,
+                        "outputTokens": 0,
+                        "costUsd": 0.0,
+                    },
+                ],
+            }
+        ],
+        "totalCostUsd": 2.5,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["byModel"] == [
+        {
+            "model": "gpt-4o",
+            "inputTokens": 2_000_000,
+            "outputTokens": 0,
+            "costUsd": 2.5,
+        }
+    ]
+
+
+def test_cost_by_model_falls_back_when_breakdown_is_partial(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:resumed",
+                "model": "post-restart-model",
+                "inputTokens": 1_010,
+                "outputTokens": 101,
+                "costUsd": 0.11,
+                "deploymentBreakdown": [
+                    {
+                        "provider": "openai",
+                        "model": "post-restart-model",
+                        "inputTokens": 10,
+                        "outputTokens": 1,
+                        "costUsd": 0.01,
+                    }
+                ],
+            }
+        ],
+        "totalCostUsd": 0.11,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout) == {
+        "byModel": [
+            {
+                "model": "unknown",
+                "inputTokens": 1_010,
+                "outputTokens": 101,
+                "costUsd": 0.11,
+            }
+        ],
+        "totalCostUsd": 0.11,
+    }
+
+
+def test_cost_by_model_preserves_legacy_row_fallback(monkeypatch):
+    fake = _install_fake_gateway(monkeypatch)
+    fake.cost_payload = {
+        "breakdown": [
+            {
+                "session": "agent:webchat:legacy",
+                "model": "legacy-model",
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cost_usd": 0.1,
+            }
+        ],
+        "totalCostUsd": 0.1,
+    }
+
+    result = runner.invoke(app, ["cost", "--by-model", "--json"])
+
+    assert result.exit_code == 0, result.stdout
+    assert json.loads(result.stdout)["byModel"] == [
+        {
+            "model": "legacy-model",
+            "inputTokens": 10,
+            "outputTokens": 2,
+            "costUsd": 0.1,
+        }
+    ]
+
+
 def test_provider_and_search_diagnostics_use_gateway_rpcs(monkeypatch):
     fake = _install_fake_gateway(monkeypatch)
     fake.rpc_payloads = {

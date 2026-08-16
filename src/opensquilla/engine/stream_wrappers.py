@@ -167,8 +167,15 @@ async def repair_json_stream(
 async def idle_timeout_stream(
     stream: AsyncIterator[AgentEvent],
     timeout: float = 30.0,
+    *,
+    context_bound: bool | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Raise ``TimeoutError`` if no event arrives within *timeout* seconds.
+
+    Context-bound turns have a canonical owner for inactivity, fallback, and
+    control terminal transitions. The legacy wrapper remains available for
+    older streams, but it cannot create a competing timeout transition for a
+    context-bound stream.
 
     The upstream is advanced by a driver task and the deadline is applied to a
     queue read, which is always safe to cancel. Awaiting ``__anext__`` directly
@@ -187,6 +194,11 @@ async def idle_timeout_stream(
     asked, so the upstream advances one event per consumed event exactly as it
     did when this wrapper awaited ``__anext__`` inline.
     """
+    if _is_context_bound_stream(stream, context_bound):
+        async for event in stream:
+            yield event
+        return
+
     requests: asyncio.Queue[object] = asyncio.Queue()
     results: asyncio.Queue[AgentEvent | _StreamFailure | object] = asyncio.Queue()
     stop_requested = asyncio.Event()
@@ -365,6 +377,7 @@ def wrap_stream(
     heartbeat_phase: str = "agent",
     heartbeat_message: str = "Still working",
     trim_names: bool = True,
+    context_bound: bool | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """Compose stream wrappers around *stream*.
 
@@ -375,13 +388,18 @@ def wrap_stream(
         heartbeat_interval: Seconds between quiet-stream heartbeat events;
             None disables.
         trim_names:   Enable tool-name trim wrapper (default True).
+        context_bound: If true, leave timeout ownership to the turn context.
+            ``None`` also recognizes streams carrying an explicit
+            ``context_bound`` or ``execution_context`` marker.  The default
+            legacy stream behavior remains timeout-enforced.
     """
+    context_bound = _is_context_bound_stream(stream, context_bound)
     if repair_json:
         stream = repair_json_stream(stream)
     if trim_names:
         stream = trim_tool_names_stream(stream)
-    if idle_timeout is not None:
-        stream = idle_timeout_stream(stream, idle_timeout)
+    if idle_timeout is not None and not context_bound:
+        stream = idle_timeout_stream(stream, idle_timeout, context_bound=False)
     if heartbeat_interval is not None:
         stream = heartbeat_stream(
             stream,
@@ -390,3 +408,34 @@ def wrap_stream(
             message=heartbeat_message,
         )
     return stream
+
+
+def _is_context_bound_stream(
+    stream: object,
+    context_bound: bool | None,
+) -> bool:
+    """Resolve the explicit context marker without changing legacy callers."""
+    if context_bound is not None:
+        return context_bound
+    return bool(
+        getattr(stream, "context_bound", False)
+        or getattr(stream, "execution_context", None) is not None
+    )
+
+
+def is_context_bound_owner(owner: object | None) -> bool:
+    """Recognize the built-in turn owner without changing legacy runners.
+
+    ``TurnRunner.run`` is an async generator, so its execution context is
+    created only when the stream is iterated and cannot be attached to the
+    generator object at the gateway boundary.  The built-in runner exposes
+    the two lifecycle methods below; injected legacy runners generally do not.
+    Explicit markers remain the preferred extension seam for other owners.
+    """
+    if owner is None:
+        return False
+    if _is_context_bound_stream(owner, None):
+        return True
+    return callable(getattr(owner, "_run_turn", None)) and callable(
+        getattr(owner, "get_session_lock", None)
+    )

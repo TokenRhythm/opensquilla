@@ -836,7 +836,7 @@ def test_tokenrhythm_accepts_only_inert_choice_usage_epilogue(
                 ],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 2},
                 "billing_pending": False,
-                "cost_cny": 0.000001,
+                "cost_cny": "0.000001",
                 "reasoning_available": True,
                 "trace_id": "trace-synthetic",
             },

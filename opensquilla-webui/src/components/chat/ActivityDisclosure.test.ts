@@ -96,6 +96,7 @@ describe('ActivityDisclosure lifecycle transitions', () => {
 
     const elapsedRule = cssRule('.assistant-activity__live-elapsed')
     expect(elapsedRule).toContain('color: var(--text-muted);')
+    expect(elapsedRule).toContain('font-size: inherit;')
 
     // The pulsing dot is the single "working" signal: the shimmer treatment
     // (gradient text + keyframes + its reduced-motion undo) must stay gone.
@@ -307,6 +308,15 @@ describe('ActivityDisclosure resting affordance', () => {
 })
 
 describe('ActivityDisclosure summary label', () => {
+  it('makes the completed outcome larger than its supporting phase rows', () => {
+    expect(cssRule('.assistant-activity--settled > .assistant-activity__summary'))
+      .toContain('font-size: 0.875rem;')
+    expect(activityDisclosureSource).toContain(
+      '.assistant-activity--settled :deep(.assistant-activity-status__row)',
+    )
+    expect(activityDisclosureSource).toContain('font-size: 0.75rem;')
+  })
+
   it('prefers a supplied summaryLabel without surfacing failure metadata', async () => {
     const host = mountDisclosure({
       lifecycle: 'settled',

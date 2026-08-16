@@ -336,6 +336,35 @@ describe('useChatFeatureToggles model routing mode', () => {
     expect(api.llmEnsembleEnabled.value).toBe(ensembleActive)
   })
 
+  it('maps tier-scoped ensemble execution independently from the global mode', async () => {
+    const { api } = createHarness({
+      configGetResults: [{
+        squilla_router: {
+          enabled: true,
+          rollout_phase: 'full',
+          tiers: {
+            c2: {
+              model: 'z-ai/glm-5.2',
+              ensemble_selection_mode: 'router_dynamic',
+            },
+            c3: {
+              model: 'anthropic/claude-opus-4.8',
+              ensemble_enabled: false,
+              ensemble_selection_mode: 'router_dynamic',
+            },
+          },
+        },
+        llm_ensemble: { enabled: false },
+      }],
+    })
+
+    await api.loadFeatureToggles()
+
+    expect(api.modelRoutingMode.value).toBe('squilla_router')
+    expect(api.routerTierConfigs.value.c2?.ensembleEnabled).toBe(true)
+    expect(api.routerTierConfigs.value.c3?.ensembleEnabled).toBe(false)
+  })
+
   it.each<[ModelRoutingMode, string]>([
     ['off', 'direct'],
     ['squilla_router', 'router'],

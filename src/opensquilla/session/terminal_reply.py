@@ -6,6 +6,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from opensquilla.session.models import AgentTaskStatus
+from opensquilla.silent_reply import (
+    SILENT_REPLY_NOT_ALLOWED_CODE,
+    SILENT_REPLY_NOT_ALLOWED_MESSAGE,
+)
 
 CONTEXT_PAYLOAD_TOO_LARGE_CODE = "provider_request_too_large"
 ENSEMBLE_MULTIMODAL_UNSUPPORTED_CODE = "ensemble_multimodal_unsupported"
@@ -61,6 +65,7 @@ _SAFE_PROVIDER_TERMINAL_CODES = frozenset(
         "invalid_response_status",
         "invalid_stream_frame",
         "invalid_stream_order",
+        "model_repetition_loop_detected",
         "provider_protocol_error",
         "provider_output_truncated",
         "provider_pretext_buffer_exhausted",
@@ -154,6 +159,11 @@ def build_terminal_reply(
         )
     if reason == "output_truncated" or error_class == "provider_output_truncated":
         return "The provider stopped because the output limit was reached before the task finished."
+    if (
+        reason == "model_repetition_loop_detected"
+        or error_class == "model_repetition_loop_detected"
+    ):
+        return "The model began repeating the same output, so OpenSquilla stopped the task."
     if status == AgentTaskStatus.CANCELLED.value or reason.startswith("cancelled"):
         return "The task was cancelled before it finished."
     if status == AgentTaskStatus.ABANDONED.value or reason == "shutdown_timeout":
@@ -184,6 +194,35 @@ def build_terminal_reply(
         return (
             "The task was blocked because a tool it needed is not permitted by the "
             "current policy."
+        )
+    if (
+        error_class == SILENT_REPLY_NOT_ALLOWED_CODE
+        or reason == SILENT_REPLY_NOT_ALLOWED_CODE
+    ):
+        return SILENT_REPLY_NOT_ALLOWED_MESSAGE
+    if error_class in {
+        "usage_accounting_busy",
+        "usage_accounting_unavailable",
+    } or reason in {
+        "usage_accounting_busy",
+        "usage_accounting_unavailable",
+    }:
+        usage_call_index = _read_value(record_or_payload, "usage_call_index")
+        replay_safe = (
+            isinstance(usage_call_index, int)
+            and not isinstance(usage_call_index, bool)
+            and usage_call_index == 1
+            and _read_value(record_or_payload, "no_prior_provider_dispatch") is True
+            and _read_value(record_or_payload, "replay_safe") is True
+        )
+        if replay_safe:
+            return (
+                "Usage accounting is temporarily unavailable. The provider request was not "
+                "sent and no usage was billed, so it is safe to retry this turn."
+            )
+        return (
+            "Usage accounting is temporarily unavailable. This provider request was not "
+            "sent. Earlier work in this turn may already have run or been billed."
         )
     if status == AgentTaskStatus.FAILED.value or reason in {"error", "tool_error"}:
         return "The task failed before it could finish."

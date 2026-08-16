@@ -23,6 +23,7 @@ from opensquilla.onboarding.mutations import (
     validate_channel_entry,
 )
 from opensquilla.onboarding.redaction import REDACTED_PLACEHOLDER
+from opensquilla.router_tiers import tier_ensemble_execution
 
 
 def test_upsert_provider_persists_fields():
@@ -500,13 +501,13 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
         api_key="sk-test",
     )
     assert res.config.llm.provider == "tokenrhythm"
-    assert res.config.llm.model == "deepseek-v4-pro"
+    assert res.config.llm.model == "deepseek-v4-flash-0731"
     assert res.config.squilla_router.enabled is True
     assert res.config.squilla_router.tier_profile is None
     expected = {
-        "c0": "deepseek-v4-flash",
-        "c1": "deepseek-v4-pro",
-        "c2": "kimi-k2.7-code",
+        "c0": "qwen3.7-flash",
+        "c1": "deepseek-v4-flash-0731",
+        "c2": "glm-5.2",
         "c3": "glm-5.2",
         "image_model": "kimi-k2.6",
     }
@@ -516,6 +517,8 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
     persisted = res.config.to_toml_dict()["squilla_router"]
     assert "tier_profile" not in persisted
     assert persisted["tiers"]["c3"]["model"] == "glm-5.2"
+    assert persisted["tiers"]["c3"]["ensemble_enabled"] is True
+    assert "ensemble_selection_mode" not in persisted["tiers"]["c3"]
 
 
 def test_provider_default_direct_model_does_not_follow_existing_router_tier():
@@ -1538,6 +1541,119 @@ def test_upsert_router_recommended_writes_profile_without_expanded_tiers():
     assert res.public_payload["mode"] == "recommended"
 
 
+def test_upsert_router_materializes_the_shared_tokenrhythm_plan_without_global_enable():
+    cfg = GatewayConfig()
+
+    res = upsert_router(cfg, mode="recommended")
+
+    assert res.config.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert res.config.llm_ensemble.enabled is False
+    assert res.config.llm_ensemble.selection_mode == "static_tokenrhythm_b5"
+    assert res.config.llm_ensemble.min_successful_proposers == 1
+    assert res.config.llm_ensemble.proposer_max_retries == 1
+    assert res.config.llm_ensemble.all_failed_policy == "fallback_single"
+    assert "llm_ensemble.selection_mode" in res.config.force_persist_paths()
+    assert "llm_ensemble.min_successful_proposers" in res.config.force_persist_paths()
+    assert "llm_ensemble.proposer_max_retries" in res.config.force_persist_paths()
+    assert "llm_ensemble.all_failed_policy" in res.config.force_persist_paths()
+
+
+def test_upsert_router_preserves_explicit_shared_ensemble_policy() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "min_successful_proposers": 4,
+            "proposer_max_retries": 2,
+            "all_failed_policy": "error",
+        }
+    )
+
+    res = upsert_router(cfg, mode="recommended")
+
+    assert res.config.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert res.config.llm_ensemble.min_successful_proposers == 4
+    assert res.config.llm_ensemble.proposer_max_retries == 2
+    assert res.config.llm_ensemble.all_failed_policy == "error"
+
+
+@pytest.mark.parametrize("tier", ["c0", "c1", "c2"])
+def test_upsert_router_rejects_shared_ensemble_flag_outside_c3(tier: str):
+    cfg = GatewayConfig()
+
+    with pytest.raises(
+        ValueError,
+        match=rf"router tier {tier!r} ensembleEnabled is only supported for c3",
+    ):
+        upsert_router(
+            cfg,
+            mode="custom",
+            tiers={tier: {"ensembleEnabled": True}},
+        )
+
+
+def test_upsert_router_disabled_does_not_materialize_a_dormant_shared_tier():
+    cfg = GatewayConfig()
+
+    res = upsert_router(cfg, mode="disabled")
+
+    assert res.config.squilla_router.enabled is False
+    assert res.config.llm_ensemble.selection_mode == "static_openrouter_b5"
+    assert "llm_ensemble.selection_mode" not in res.config.force_persist_paths()
+
+
+def test_upsert_router_legacy_mode_does_not_inherit_the_shared_preset_flag():
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": False,
+            "selection_mode": "static_openrouter_b5",
+        }
+    )
+
+    res = upsert_router(
+        cfg,
+        mode="custom",
+        tiers={
+            "c3": {
+                "provider": "tokenrhythm",
+                "model": "glm-5.2",
+                "ensembleSelectionMode": "static_tokenrhythm_b5",
+            }
+        },
+    )
+
+    c3 = res.config.squilla_router.tiers["c3"]
+    assert "ensemble_enabled" not in c3
+    assert c3["ensemble_selection_mode"] == "static_tokenrhythm_b5"
+    assert tier_ensemble_execution(
+        res.config.squilla_router.tiers,
+        "c3",
+        shared_selection_mode=res.config.llm_ensemble.selection_mode,
+    ) == ("static_tokenrhythm_b5", "legacy")
+
+
+def test_upsert_router_persists_explicit_single_model_over_the_recommended_c3_default():
+    cfg = GatewayConfig()
+
+    res = upsert_router(
+        cfg,
+        mode="custom",
+        tiers={
+            "c3": {
+                "provider": "tokenrhythm",
+                "model": "glm-5.2",
+                "ensembleEnabled": False,
+                "ensembleSelectionMode": "",
+            }
+        },
+    )
+
+    c3 = res.config.squilla_router.tiers["c3"]
+    assert c3["ensemble_enabled"] is False
+    assert c3["ensemble_selection_mode"] == ""
+    persisted = res.config.to_toml_dict()["squilla_router"]["tiers"]["c3"]
+    assert persisted["ensemble_enabled"] is False
+    assert res.public_payload["mode"] == "custom"
+
+
 def test_upsert_router_forces_image_model_role_invariants():
     cfg = GatewayConfig(llm={"provider": "openrouter", "model": "z-ai/glm-5.1"})
 
@@ -1611,6 +1727,23 @@ def test_upsert_router_custom_merges_provided_tiers_over_preset():
     assert res.config.squilla_router.tiers["c3"]["model"] == "anthropic/claude-opus-4.8"
     # Unoverridden tiers keep the openrouter preset values.
     assert res.config.squilla_router.tiers["c0"]["provider"] == "openrouter"
+
+
+def test_upsert_router_rejects_unknown_tier_ensemble_selection_mode():
+    cfg = GatewayConfig(llm={"provider": "openrouter", "model": "z-ai/glm-5.1"})
+
+    with pytest.raises(ValueError, match="ensembleSelectionMode must be one of"):
+        upsert_router(
+            cfg,
+            mode="custom",
+            tiers={
+                "c3": {
+                    "provider": "openrouter",
+                    "model": "z-ai/glm-5.2",
+                    "ensembleSelectionMode": "static_openrouter_typo",
+                }
+            },
+        )
 
 
 def test_upsert_router_can_enable_cross_provider_tiers():

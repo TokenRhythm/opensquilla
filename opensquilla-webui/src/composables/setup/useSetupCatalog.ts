@@ -15,18 +15,25 @@ import {
   type EffectiveMaxTokens,
   type ProviderCredentialPanelState,
 } from '@/composables/setup/useSetupProviderForm'
-import { useSetupRouterForm, type SetupTierRow } from '@/composables/setup/useSetupRouterForm'
 import {
-  CUSTOM_B5_SELECTION_MODE,
-  LEGACY_OPENROUTER_MODEL_OPTIONS,
-  STATIC_B5_PROFILES,
-  staticB5ModeForProvider,
+  routerTierProviderParticipates,
+  useSetupRouterForm,
+  type SetupTierRow,
+} from '@/composables/setup/useSetupRouterForm'
+import {
   useSetupEnsembleForm,
   type EnsembleCandidateConfig,
   type EnsembleCandidateRole,
   type EnsembleCandidateView,
   type EnsembleCredentialStatus,
 } from '@/composables/setup/useSetupEnsembleForm'
+import {
+  CUSTOM_B5_SELECTION_MODE,
+  LEGACY_OPENROUTER_MODEL_OPTIONS,
+  ROUTER_DYNAMIC_SELECTION_MODE,
+  STATIC_B5_PROFILES,
+  staticB5ModeForProvider,
+} from '@/types/generated/router_tier_contract'
 import { useSetupModelStrategyForm } from '@/composables/setup/useSetupModelStrategyForm'
 import { invalidateReadiness } from '@/composables/setup/useReadinessSummary'
 import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composables/setup/useSettingsPromotedForm'
@@ -147,6 +154,10 @@ interface TierConfig {
   thinking_level?: string
   supportsImage?: boolean
   supports_image?: boolean
+  ensembleEnabled?: boolean
+  ensemble_enabled?: boolean
+  ensembleSelectionMode?: string
+  ensemble_selection_mode?: string
 }
 
 interface SectionDetail {
@@ -162,6 +173,25 @@ interface SectionDetail {
   // Server-owned routing intent. Older gateways omit this field and are
   // treated conservatively as legacy/preserve by the WebUI.
   routerBinding?: 'follow_primary' | 'custom' | 'legacy'
+  // Additive mode-aware ownership returned by newer Gateways. The composable
+  // accepts both this map and richer per-tier role objects.
+  routerProviderRoles?: unknown
+  router_provider_roles?: unknown
+  tierEnsembleStatuses?: unknown
+  tier_ensemble_statuses?: unknown
+  tierEnsembleStatus?: unknown
+  tier_ensemble_status?: unknown
+  configuredAllFailedPolicy?: string
+  effectiveAllFailedPolicy?: string
+  policyDeprecated?: boolean
+  providerResolution?: {
+    status?: string
+    effectiveProvider?: string
+    source?: string
+    reasonCode?: string
+    actionRequired?: boolean
+    actionRecommended?: boolean
+  }
 }
 
 interface OnboardingStatus {
@@ -253,6 +283,22 @@ interface OnboardingStatus {
   }>
 }
 
+function c3TierEnsembleStatus(detail: SectionDetail): unknown {
+  const perTier = detail.tierEnsembleStatuses ?? detail.tier_ensemble_statuses
+  if (perTier && typeof perTier === 'object' && !Array.isArray(perTier)) {
+    const statuses = perTier as Record<string, unknown>
+    const entry = Object.entries(statuses).find(([name]) => (
+      (normalizeRouterTier(name) || name.trim().toLowerCase()) === 'c3'
+    ))
+    // A present per-tier projection is authoritative. In particular, never
+    // borrow the compatibility singleton when this map says C3 is inactive.
+    return entry?.[1] ?? null
+  }
+  // Older Gateways only exposed the compatibility singleton. It remains safe
+  // to consume because the panel independently validates exact C3 scope.
+  return detail.tierEnsembleStatus ?? detail.tier_ensemble_status ?? null
+}
+
 export interface LastProbeStatus {
   ok: boolean
   at: string
@@ -339,6 +385,12 @@ interface ConfigData {
     candidates?: EnsembleCandidateConfig[]
     min_successful_proposers?: number
     all_failed_policy?: string
+    configured_all_failed_policy?: string
+    effective_all_failed_policy?: string
+    policy_deprecated?: boolean
+    proposer_max_retries?: number
+    proposer_timeout_seconds?: number
+    aggregator_timeout_seconds?: number
   }
   naming?: {
     enabled?: boolean
@@ -441,7 +493,10 @@ const providerImageGenerationOptIn = ref(true)
 // the provider dialog belong to its verify-then-save flow until the user
 // explicitly opens Model Routing.
 const providerOwnsFixedModelDraft = ref(false)
-const providerFixedModelDraftSnapshot = ref<string | null>(null)
+const providerFixedModelDraftSnapshot = ref<{
+  provider: string
+  model: string
+} | null>(null)
 const behaviorForm = useSetupBehaviorForm()
 const routerForm = useSetupRouterForm()
 const ensembleForm = useSetupEnsembleForm()
@@ -471,6 +526,18 @@ function primaryProviderIsConfigured(
   effective: EffectiveConfigData,
 ): boolean {
   if (!normalizeProviderId(llm?.provider)) return false
+
+  // Config/effective may report a materialized provider default as coming from
+  // "config" even when provider resolution rejected it because multiple
+  // credential-shaped environment variables disagree. In that state the
+  // Gateway deliberately withholds every credential and cannot run a turn.
+  // Never turn that unresolved default into an Active/Configured provider card;
+  // doing so makes a successful read-only probe look like completed setup while
+  // the authoritative onboarding status remains blocking.
+  const resolution = onboardingStatus.sectionDetails?.llm?.providerResolution
+  if (String(resolution?.status || '').trim().toLowerCase() === 'conflict') {
+    return false
+  }
 
   // A config file can exist because the user changed an unrelated setting;
   // config.get still materializes llm defaults in that case. Prefer the
@@ -703,7 +770,10 @@ function maybeDiscoverProviderModels(): Promise<void> {
 }
 
 watch(section, value => {
-  if (value === 'modelStrategy') providerOwnsFixedModelDraft.value = false
+  if (value === 'modelStrategy') {
+    providerOwnsFixedModelDraft.value = false
+    providerFixedModelDraftSnapshot.value = null
+  }
   void maybeDiscoverProviderModels()
   void maybeDiscoverModelsForStrategy()
   void maybeDiscoverImageGenerationModels()
@@ -727,6 +797,8 @@ onUnmounted(() => {
 
 async function loadData(options: {
   preserveFormDrafts?: boolean
+  preserveDirtySectionDrafts?: boolean
+  forceResetModelStrategy?: boolean
   resetProviderConnection?: boolean
   throwOnError?: boolean
 } = {}) {
@@ -740,6 +812,27 @@ async function loadData(options: {
       // settings surface or provider saves.
       rpc.call<EffectiveConfigData>('config.effective').catch(() => ({ fields: {} })),
     ])
+    // A Provider save owns only the Provider editor. Snapshot every other form
+    // after the network round trip but before replacing the config refs. This
+    // also catches a draft created in another section while the save was in
+    // flight, while clean forms still consume the new config and status.
+    const preserve = options.preserveDirtySectionDrafts
+      ? {
+          behavior: behaviorForm.isDirty.value,
+          privacy: privacyDirty.value,
+          memoryCapture: promotedForm.captureDirty.value,
+          modelStrategy: !options.forceResetModelStrategy && (
+            routerForm.isDirty.value
+            || ensembleForm.isDirty.value
+            || modelStrategyForm.fixedProviderDirty.value
+            || modelStrategyForm.fixedModelDirty.value
+          ),
+          search: capabilitiesForm.searchDirty.value,
+          memory: capabilitiesForm.memoryDirty.value,
+          image: capabilitiesForm.imageDirty.value,
+          audio: promotedForm.audioDirty.value,
+        }
+      : null
     catalog.value = cat || {}
     status.value = st || {}
     config.value = cfg || {}
@@ -763,34 +856,68 @@ async function loadData(options: {
         primaryProviderIsConfigured(config.value.llm, status.value, effectiveConfig.value),
       )
       providerImageGenerationOptIn.value = true
-      modelStrategyForm.initFixedModel(config.value.llm?.model || '')
-      providerOwnsFixedModelDraft.value = false
-      providerFixedModelDraftSnapshot.value = null
+      if (!preserve?.modelStrategy) {
+        modelStrategyForm.initFixedModel(config.value.llm?.model || '')
+        providerOwnsFixedModelDraft.value = false
+        providerFixedModelDraftSnapshot.value = null
+      }
       providerSelectionKind.value = 'primary'
       // Model discovery is a read-only UI accelerator. Populate the active
       // provider's combobox as soon as the saved editor opens, independently of
       // connection probing. Failure and source=none intentionally leave the
       // free-form model input available.
       if (providerForm.selectedProvider.value) void providerForm.discoverModels()
-      behaviorForm.initFromConfig(config.value)
+      if (!preserve?.behavior) behaviorForm.initFromConfig(config.value)
+      // Timeout and per-model context are Provider-owned controls. A Provider
+      // save must always rebase them from the persisted response even while
+      // drafts in Privacy or Capabilities stay untouched.
+      promotedForm.initProviderFromConfig(config.value)
       const routerDetail = (status.value.sectionDetails || {}).router || {}
-      const binding = String(
-        routerDetail.routerBinding
-        || config.value.squilla_router?.preset_binding
-        || '',
-      ).trim().toLowerCase()
-      routerForm.initFromConfig(
-        config.value.squilla_router || {},
-        currentRouterProfile.value?.tiers || {},
-        currentProvider.value,
-        binding === 'follow_primary' || binding === 'custom' ? binding : 'legacy',
-      )
-      ensembleForm.initFromConfig(config.value.llm_ensemble || {})
-      capabilitiesForm.initSearchFromConfig(config.value, searchProviders.value)
-      capabilitiesForm.initMemoryFromConfig(config.value)
-      capabilitiesForm.initImageFromConfig(config.value, status.value, imageProviders.value)
-      promotedForm.initFromConfig(config.value)
-      disableNetworkObservability.value = currentDisableNetworkObservability.value
+      if (!preserve?.modelStrategy) {
+        const ensembleDetail = (status.value.sectionDetails || {}).ensemble || {}
+        ensembleForm.initFromConfig({
+          ...(config.value.llm_ensemble || {}),
+          configured_all_failed_policy: ensembleDetail.configuredAllFailedPolicy,
+          effective_all_failed_policy: ensembleDetail.effectiveAllFailedPolicy,
+          policy_deprecated: ensembleDetail.policyDeprecated,
+        })
+      }
+      if (!preserve?.modelStrategy) {
+        const binding = String(
+          routerDetail.routerBinding
+          || config.value.squilla_router?.preset_binding
+          || '',
+        ).trim().toLowerCase()
+        routerForm.initFromConfig(
+          config.value.squilla_router || {},
+          currentRouterProfile.value?.tiers || {},
+          currentProvider.value,
+          binding === 'follow_primary' || binding === 'custom' ? binding : 'legacy',
+          routerDetail.routerProviderRoles || routerDetail.router_provider_roles,
+          ensembleForm.selectionMode.value,
+          ensembleForm.enabled.value,
+          c3TierEnsembleStatus(routerDetail),
+        )
+      } else {
+        // Provider saves keep a dirty Router's values and baselines, while
+        // readiness and provider ownership reflect the fresh Gateway status.
+        routerForm.refreshRuntimeMetadata(
+          routerDetail.routerProviderRoles || routerDetail.router_provider_roles,
+          c3TierEnsembleStatus(routerDetail),
+        )
+      }
+      if (!preserve?.search) {
+        capabilitiesForm.initSearchFromConfig(config.value, searchProviders.value)
+      }
+      if (!preserve?.memory) capabilitiesForm.initMemoryFromConfig(config.value)
+      if (!preserve?.image) {
+        capabilitiesForm.initImageFromConfig(config.value, status.value, imageProviders.value)
+      }
+      if (!preserve?.memoryCapture) promotedForm.initMemoryCaptureFromConfig(config.value)
+      if (!preserve?.audio) promotedForm.initAudioFromConfig(config.value)
+      if (!preserve?.privacy) {
+        disableNetworkObservability.value = currentDisableNetworkObservability.value
+      }
     }
     // Model listing is an optional UI accelerator and may involve an external
     // provider. Start it after core state is ready, but never hold settings
@@ -1587,7 +1714,7 @@ const ensembleProviderIds = computed(() => {
   // unknown explicit modes fail closed instead of advertising a capability
   // the runtime would reject.
   const legacyDynamic = !selectionMode && (ensemble.model_options || []).length > 0
-  if (selectionMode === 'router_dynamic' || legacyDynamic) {
+  if (selectionMode === ROUTER_DYNAMIC_SELECTION_MODE || legacyDynamic) {
     for (const candidate of ensemble.candidates || []) {
       if (candidate.enabled === false) continue
       add(candidate.provider || currentProvider.value)
@@ -1596,7 +1723,7 @@ const ensembleProviderIds = computed(() => {
       add(tier.provider || currentProvider.value)
     }
     const modelOptions = ensemble.model_options || []
-    const isCurrentRuntimeLegacyDefault = selectionMode === 'router_dynamic'
+    const isCurrentRuntimeLegacyDefault = selectionMode === ROUTER_DYNAMIC_SELECTION_MODE
       && modelOptions.length === LEGACY_OPENROUTER_MODEL_OPTIONS.length
       && modelOptions.every((model, index) => model === LEGACY_OPENROUTER_MODEL_OPTIONS[index])
     for (const model of isCurrentRuntimeLegacyDefault ? [] : modelOptions) {
@@ -1646,7 +1773,17 @@ function routerConflictsWithTarget(value: string): boolean {
     || routerBinding.value === 'follow_primary'
     || crossProviderRoutingEnabled.value
   ) return false
-  return Object.values(config.value.squilla_router?.tiers || {}).some(tier => {
+  return Object.entries(config.value.squilla_router?.tiers || {}).some(([name, tier]) => {
+    if (!routerTierProviderParticipates(name, {
+      provider: tier.provider || '',
+      model: tier.model || '',
+      thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
+      supportsImage: tier.supportsImage || tier.supports_image || false,
+      ensembleEnabled: typeof tier.ensembleEnabled === 'boolean'
+        ? tier.ensembleEnabled
+        : tier.ensemble_enabled,
+      ensembleSelectionMode: tier.ensembleSelectionMode || tier.ensemble_selection_mode || '',
+    }, routerForm.routerProviderRoles.value)) return false
     const provider = normalizeProviderId(tier.provider)
     return Boolean(provider && provider !== target)
   })
@@ -1808,7 +1945,10 @@ const routerPanel = routerForm.createPanel({
 })
 
 const ensembleTierCandidates = computed(() => routerPanel.value.tierRows
-  .filter(row => configuredProviderIds.value.has(normalizeProviderId(row.provider)))
+  .filter(row => (
+    (TEXT_TIERS as readonly string[]).includes(row.name)
+    && configuredProviderIds.value.has(normalizeProviderId(row.provider))
+  ))
   .map(row => ({
     provider: row.provider,
     model: row.model,
@@ -1848,6 +1988,11 @@ function presetTierRows(preset: ProviderPresetSpec | null): SetupTierRow[] {
       model: tier.model || '',
       thinkingLevel: tier.thinkingLevel || tier.thinking_level || '',
       supportsImage: tier.supportsImage || tier.supports_image || false,
+      ensembleEnabled: typeof tier.ensembleEnabled === 'boolean'
+        ? tier.ensembleEnabled
+        : tier.ensemble_enabled,
+      ensembleSelectionMode:
+        tier.ensembleSelectionMode || tier.ensemble_selection_mode || '',
     }))
 }
 
@@ -1891,6 +2036,7 @@ const fixedModelCatalog = computed<DiscoveredModelCatalog>(() => {
 
 const modelStrategyPanel = modelStrategyForm.createPanel({
   hasSavedProvider,
+  profileSaveSupported,
   providerLabel: providerSummary,
   routerPanel,
   ensemblePanel,
@@ -2328,7 +2474,12 @@ async function requestSelectConfiguredProvider(value: string) {
   if (providerInteractionLocked()) return
   const next = normalizeProviderId(value)
   if (!next) return
-  providerFixedModelDraftSnapshot.value = modelStrategyForm.fixedModel.value
+  if (providerFixedModelDraftSnapshot.value == null) {
+    providerFixedModelDraftSnapshot.value = {
+      provider: modelStrategyForm.fixedProvider.value,
+      model: modelStrategyForm.fixedModel.value,
+    }
+  }
   if (next === normalizeProviderId(providerForm.selectedProvider.value)) {
     // Re-clicking the current row is not a navigation. In particular, do not
     // rehydrate from saved config and silently discard the editor's draft.
@@ -2349,7 +2500,8 @@ async function requestAddProvider(value: string) {
 function cancelProviderEdit() {
   if (providerInteractionLocked()) return
   if (providerOwnsFixedModelDraft.value && providerFixedModelDraftSnapshot.value != null) {
-    modelStrategyForm.setFixedModel(providerFixedModelDraftSnapshot.value)
+    modelStrategyForm.setFixedProvider(providerFixedModelDraftSnapshot.value.provider)
+    modelStrategyForm.setFixedModel(providerFixedModelDraftSnapshot.value.model)
     providerOwnsFixedModelDraft.value = false
   }
   providerFixedModelDraftSnapshot.value = null
@@ -2577,6 +2729,7 @@ function currentFormModelValue(): string {
 
 function setFixedModel(value: string) {
   providerOwnsFixedModelDraft.value = false
+  providerFixedModelDraftSnapshot.value = null
   updateFixedModel(value)
 }
 
@@ -2585,6 +2738,7 @@ function setFixedProvider(value: string) {
   if (!provider || !configuredProviderIds.value.has(provider)) return
   if (provider === modelStrategyForm.fixedProvider.value) return
   providerOwnsFixedModelDraft.value = false
+  providerFixedModelDraftSnapshot.value = null
   modelStrategyForm.setFixedProvider(provider)
   modelStrategyForm.setFixedModel(
     provider === normalizeProviderId(currentProvider.value)
@@ -2611,6 +2765,12 @@ function updateFixedModel(value: string) {
 function updateProviderField(name: string, value: unknown) {
   if (providerInteractionLocked()) return
   if (name === 'model' && editingPrimaryProvider.value && hasConfiguredPrimaryProvider.value) {
+    if (providerFixedModelDraftSnapshot.value == null) {
+      providerFixedModelDraftSnapshot.value = {
+        provider: modelStrategyForm.fixedProvider.value,
+        model: modelStrategyForm.fixedModel.value,
+      }
+    }
     providerOwnsFixedModelDraft.value = true
     modelStrategyForm.setFixedProvider(currentProvider.value)
     updateFixedModel(String(value ?? ''))
@@ -2862,7 +3022,7 @@ function setRouterVisualMode(value: string) {
 
 function updateTierField(
   name: string,
-  key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage',
+  key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleEnabled' | 'ensembleSelectionMode',
   value: string | boolean,
 ) {
   routerForm.updateTierField(name, key, value)
@@ -2877,10 +3037,12 @@ function updateTierField(
 
 function setEnsembleEnabled(value: boolean) {
   ensembleForm.setEnabled(value)
+  routerForm.setEnsembleContext(ensembleForm.selectionMode.value, ensembleForm.enabled.value)
 }
 
 function setEnsembleSelectionMode(value: string) {
   ensembleForm.setSelectionMode(value)
+  routerForm.setEnsembleContext(ensembleForm.selectionMode.value, ensembleForm.enabled.value)
 }
 
 function addEnsembleModelOption(value: string) {
@@ -2921,6 +3083,7 @@ function discoverModelStrategyProviderModels(provider: string) {
 
 function migrateEnsembleLegacy() {
   ensembleForm.migrateLegacyToCustom(ensembleTierCandidates.value, currentProvider.value)
+  routerForm.setEnsembleContext(ensembleForm.selectionMode.value, ensembleForm.enabled.value)
 }
 
 function resetEnsembleCandidates() {
@@ -2929,6 +3092,7 @@ function resetEnsembleCandidates() {
 
 function setEnsembleScheme(scheme: 'preset' | 'custom') {
   ensembleForm.setScheme(scheme, staticB5ModeForProvider(currentProvider.value))
+  routerForm.setEnsembleContext(ensembleForm.selectionMode.value, ensembleForm.enabled.value)
 }
 
 function setEnsembleMinSuccessful(value: number) {
@@ -2937,6 +3101,10 @@ function setEnsembleMinSuccessful(value: number) {
 
 function setEnsembleAllFailedPolicy(value: string) {
   ensembleForm.setAllFailedPolicy(value)
+}
+
+function setEnsembleProposerMaxRetries(value: number) {
+  ensembleForm.setProposerMaxRetries(value)
 }
 
 // ---------------------------------------------------------------------------
@@ -3332,18 +3500,40 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     pushToast(t('setup.provider.currentSettingsNotTested'), { tone: 'danger' })
     return false
   }
-  const fixedProviderDraft = modelStrategyForm.fixedProvider.value
-  const fixedModelDraft = modelStrategyForm.fixedModel.value
-  const preserveFixedModelDraft = (
-    modelStrategyForm.fixedProviderDirty.value
-    || modelStrategyForm.fixedModelDirty.value
-  )
-  const reloadProviderData = async () => {
-    await loadData()
-    if (preserveFixedModelDraft) {
-      modelStrategyForm.setFixedProvider(fixedProviderDraft)
-      modelStrategyForm.setFixedModel(fixedModelDraft)
+  const providerOwnedFixedModelDraft = providerOwnsFixedModelDraft.value
+  const providerModelDraftWasSubmitted = options.includeProviderModelDraft === true
+  const reloadProviderData = async (
+    preserveDirtySectionDrafts = false,
+    forceResetModelStrategy = false,
+  ) => {
+    await loadData({ preserveDirtySectionDrafts, forceResetModelStrategy })
+    if (providerOwnedFixedModelDraft && !replacesPrimaryOnLegacyGateway) {
+      providerOwnsFixedModelDraft.value = false
+      providerFixedModelDraftSnapshot.value = null
+      if (providerModelDraftWasSubmitted) {
+        modelStrategyForm.initFixedModel(config.value.llm?.model || '')
+      }
+      // When the provider save intentionally did not submit llm.model, retain
+      // that draft under Model Routing ownership instead of silently dropping
+      // it or leaving the Provider editor dirty.
     }
+    if (
+      !replacesPrimaryOnLegacyGateway
+      && normalizeProviderId(modelStrategyForm.fixedProvider.value)
+        === normalizeProviderId(currentProvider.value)
+    ) {
+      // The Provider editor always renders the canonical fixed model while the
+      // active Provider owns that identity. Rebase its per-model context from
+      // the fresh config even when the retained draft originated in Model
+      // Routing rather than in this Provider editor. A foreign fixed-Provider
+      // draft intentionally keeps the active Provider's persisted context.
+      promotedForm.reseedContextWindow(
+        config.value,
+        modelStrategyForm.fixedProvider.value,
+        modelStrategyForm.fixedModel.value,
+      )
+    }
+    providerFixedModelDraftSnapshot.value = null
   }
   providerSavePending.value = true
   try {
@@ -3369,8 +3559,14 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       payload.keepCurrentSecret = selectedStoredProfile.value && !replacesCredential
       await rpc.call('onboarding.llmProfile.upsert', payload)
       if (options.reload !== false) {
-        await reloadProviderData()
-        selectConfiguredProvider(selectedProviderId)
+        // Saving a routing-only profile refreshes its persisted status without
+        // discarding drafts in any other Settings section. Provider-owned
+        // fields still reinitialize from config.
+        await reloadProviderData(true)
+        // This is the trusted completion of the in-flight save. The public
+        // selection handler intentionally rejects clicks while that save lock
+        // is held, so restore the saved profile through the internal helper.
+        applyConfiguredProviderSelection(selectedProviderId)
       }
       pushToast(t('setup.toast.providerProfileSaved', {
         provider: providerCatalogLabel(selectedProviderId),
@@ -3393,7 +3589,12 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       const contextPatch = promotedForm.contextWindowPatch(providerForm.selectedProvider.value, contextModel)
       if (contextPatch) await deepPatchConfig(contextPatch)
     }
-    if (options.reload !== false) await reloadProviderData()
+    if (options.reload !== false) {
+      // Replacing the primary deployment on a legacy Gateway changes the
+      // identity that Router and the fixed fallback are based on. Rebuild that
+      // whole section, but retain dirty drafts in unrelated Settings sections.
+      await reloadProviderData(true, replacesPrimaryOnLegacyGateway)
+    }
     if (options.reload !== false && providerEnvMissing.value) {
       pushToast(t('setup.toast.envNotVisibleGateway', { envKey: providerEnvKey.value }), { tone: 'danger' })
       return true
@@ -3775,6 +3976,7 @@ async function copyConfigPath() {
     setEnsembleScheme,
     setEnsembleMinSuccessful,
     setEnsembleAllFailedPolicy,
+    setEnsembleProposerMaxRetries,
     updateProviderField,
     updateLlmTimeout,
     updateContextWindow,

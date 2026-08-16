@@ -15,11 +15,26 @@ frontend_changed=false
 tui_changed=false
 desktop_changed=false
 python_changed=false
+python_full_required=false
 platform_sensitive_changed=false
 build_wheel_required=false
 toolchain_artifact_changed=false
 full_required=false
+pytest_targets=""
 seen_file=false
+
+add_pytest_target() {
+  local target="${1:?pytest target is required}"
+  case ",${pytest_targets}," in
+    *",${target},"*) ;;
+    *)
+      if [[ -n "${pytest_targets}" ]]; then
+        pytest_targets+=","
+      fi
+      pytest_targets+="${target}"
+      ;;
+  esac
+}
 
 mark_non_docs_changed() {
   docs_only=false
@@ -30,6 +45,11 @@ mark_runtime_changed() {
   runtime_changed=true
   python_changed=true
   build_wheel_required=true
+}
+
+mark_python_full_required() {
+  mark_runtime_changed
+  python_full_required=true
 }
 
 mark_test_changed() {
@@ -100,10 +120,12 @@ mark_full_required() {
   tui_changed=true
   desktop_changed=true
   python_changed=true
+  python_full_required=true
   platform_sensitive_changed=true
   build_wheel_required=true
   toolchain_artifact_changed=true
   full_required=true
+  pytest_targets="tests"
 }
 
 while IFS= read -r path || [[ -n "${path}" ]]; do
@@ -177,13 +199,50 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       mark_test_changed
       mark_platform_sensitive_changed
       ;;
-    tests/test_onboarding/* | tests/test_provider/* | tests/test_provider*.py)
+    tests/test_onboarding/*)
       mark_test_changed
-      mark_platform_sensitive_changed
+      add_pytest_target "tests/test_onboarding"
+      ;;
+    tests/test_provider/* | tests/test_provider*.py)
+      mark_test_changed
+      add_pytest_target "tests/test_provider"
+      add_pytest_target "tests/test_provider*.py"
+      ;;
+    tests/test_gateway/*)
+      mark_test_changed
+      add_pytest_target "tests/test_gateway"
+      add_pytest_target "tests/test_gateway*.py"
+      add_pytest_target "tests/functional/test_gateway_*_e2e.py"
+      ;;
+    tests/test_engine/* | tests/test_engine*.py)
+      mark_test_changed
+      add_pytest_target "tests/test_engine"
+      add_pytest_target "tests/test_engine*.py"
+      ;;
+    tests/test_channels/*)
+      mark_test_changed
+      add_pytest_target "tests/test_channels"
+      ;;
+    tests/test_memory/* | tests/test_memory*.py)
+      mark_test_changed
+      add_pytest_target "tests/test_memory"
+      add_pytest_target "tests/test_memory*.py"
+      ;;
+    tests/test_skills/* | tests/test_skills*.py)
+      mark_test_changed
+      add_pytest_target "tests/test_skills"
+      add_pytest_target "tests/test_skills*.py"
+      add_pytest_target "tests/test_meta_skill*.py"
+      ;;
+    tests/test_cli/* | tests/integration/cli/*)
+      mark_test_changed
+      add_pytest_target "tests/test_cli"
+      add_pytest_target "tests/integration/cli"
       ;;
     tests/functional/test_gateway_*_e2e.py)
       mark_test_changed
       mark_platform_sensitive_changed
+      add_pytest_target "tests/functional"
       ;;
     tests/*)
       # New or unclassified tests fail closed to the Windows high-risk suite.
@@ -210,13 +269,93 @@ while IFS= read -r path || [[ -n "${path}" ]]; do
       mark_runtime_changed
       mark_release_changed
       ;;
-    src/opensquilla/recovery/* | src/opensquilla/migration/* | src/opensquilla/persistence/* | src/opensquilla/memory/* | src/opensquilla/session/* | src/opensquilla/scheduler/* | src/opensquilla/sandbox/* | src/opensquilla/tools/boundary.py | src/opensquilla/tools/builtin/code_exec.py | src/opensquilla/tools/builtin/filesystem.py | src/opensquilla/tools/builtin/git.py | src/opensquilla/tools/builtin/shell.py | src/opensquilla/tools/builtin/shell_policy.py | src/opensquilla/tools/path_* | src/opensquilla/tools/policy* | src/opensquilla/tools/write_*)
+    src/opensquilla/recovery/* | src/opensquilla/migration/* | src/opensquilla/persistence/* | src/opensquilla/session/* | src/opensquilla/sandbox/* | src/opensquilla/tools/boundary.py | src/opensquilla/tools/builtin/code_exec.py | src/opensquilla/tools/builtin/filesystem.py | src/opensquilla/tools/builtin/git.py | src/opensquilla/tools/builtin/shell.py | src/opensquilla/tools/builtin/shell_policy.py | src/opensquilla/tools/path_* | src/opensquilla/tools/policy* | src/opensquilla/tools/write_*)
+      mark_runtime_changed
+      mark_platform_sensitive_changed
+      add_pytest_target "tests/test_recovery"
+      add_pytest_target "tests/test_migration"
+      add_pytest_target "tests/test_migrations"
+      add_pytest_target "tests/test_persistence"
+      add_pytest_target "tests/test_session"
+      add_pytest_target "tests/test_sandbox"
+      add_pytest_target "tests/test_tools"
+      ;;
+    src/opensquilla/onboarding/*)
+      mark_runtime_changed
+      mark_platform_sensitive_changed
+      add_pytest_target "tests/test_onboarding"
+      ;;
+    src/opensquilla/provider/* | src/opensquilla/router_tiers.py)
+      mark_runtime_changed
+      add_pytest_target "tests/test_provider"
+      add_pytest_target "tests/test_provider*.py"
+      add_pytest_target "tests/test_*router*.py"
+      add_pytest_target "tests/test_cross_provider_tiers.py"
+      ;;
+    src/opensquilla/squilla_router/*)
       mark_runtime_changed
       mark_platform_sensitive_changed
       ;;
-    src/opensquilla/onboarding/* | src/opensquilla/provider/*)
+    src/opensquilla/gateway/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_gateway"
+      add_pytest_target "tests/test_gateway*.py"
+      add_pytest_target "tests/functional/test_gateway_*_e2e.py"
+      ;;
+    src/opensquilla/engine/* | src/opensquilla/agents/* | src/opensquilla/agent/* | src/opensquilla/application/* | src/opensquilla/safety/*)
+      # These shared-core surfaces fan out across gateway, channel, session,
+      # CLI, and tool contracts. Run every offline Python shard without waking
+      # unrelated frontend, Desktop, release, or toolchain matrices.
+      mark_python_full_required
+      ;;
+    src/opensquilla/channels/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_channels"
+      ;;
+    src/opensquilla/memory/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_memory"
+      add_pytest_target "tests/test_memory*.py"
+      ;;
+    src/opensquilla/scheduler/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_scheduler"
+      ;;
+    src/opensquilla/skills/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_skills"
+      add_pytest_target "tests/test_skills*.py"
+      add_pytest_target "tests/test_meta_skill*.py"
+      ;;
+    src/opensquilla/cli/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_cli"
+      add_pytest_target "tests/integration/cli"
+      ;;
+    src/opensquilla/identity/templates/*)
       mark_runtime_changed
       mark_platform_sensitive_changed
+      ;;
+    src/opensquilla/identity/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_identity"
+      ;;
+    src/opensquilla/mcp/* | src/opensquilla/mcp_server/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_mcp"
+      add_pytest_target "tests/test_mcp_server"
+      ;;
+    src/opensquilla/health/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_health"
+      ;;
+    src/opensquilla/observability/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_observability"
+      ;;
+    src/opensquilla/search/*)
+      mark_runtime_changed
+      add_pytest_target "tests/test_search"
       ;;
     migrations/*)
       mark_runtime_changed
@@ -241,6 +380,14 @@ if [[ "${seen_file}" == "false" ]]; then
   mark_full_required
 fi
 
+# High-risk changes already run the exhaustive Windows matrix. Keep the targeted
+# Ubuntu lane compact; full CI still owns the complete cross-platform suite.
+if [[ "${full_required}" == "true" ]]; then
+  pytest_targets="tests"
+elif [[ "${platform_sensitive_changed}" == "true" ]]; then
+  pytest_targets=""
+fi
+
 {
   printf 'docs_only=%s\n' "${docs_only}"
   printf 'runtime_changed=%s\n' "${runtime_changed}"
@@ -253,8 +400,10 @@ fi
   printf 'tui_changed=%s\n' "${tui_changed}"
   printf 'desktop_changed=%s\n' "${desktop_changed}"
   printf 'python_changed=%s\n' "${python_changed}"
+  printf 'python_full_required=%s\n' "${python_full_required}"
   printf 'platform_sensitive_changed=%s\n' "${platform_sensitive_changed}"
   printf 'build_wheel_required=%s\n' "${build_wheel_required}"
   printf 'toolchain_artifact_changed=%s\n' "${toolchain_artifact_changed}"
   printf 'full_required=%s\n' "${full_required}"
+  printf 'pytest_targets=%s\n' "${pytest_targets}"
 } >> "${output_file}"

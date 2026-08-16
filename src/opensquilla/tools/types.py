@@ -9,6 +9,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 
 
@@ -236,6 +237,37 @@ def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
         }
         and int(getattr(ctx, "subagent_depth", 0) or 0) == 0
     )
+
+
+def surface_capabilities_for_tool_context(
+    tool_context: ToolContext | None,
+) -> SurfaceCapabilities:
+    """Resolve publication capabilities from the authenticated entry surface.
+
+    ``caller_kind`` is the canonical route classification.  In particular,
+    ``channel_id`` is deliberately not used as a proxy: WebUI routes also have
+    a channel id, but WebUI can replace a generation in place.  External
+    channel delivery cannot retract speculative text, so it receives a fully
+    buffered surface contract.
+    """
+
+    if tool_context is None:
+        return SurfaceCapabilities()
+
+    raw_caller_kind = getattr(tool_context, "caller_kind", CallerKind.AGENT)
+    try:
+        caller_kind = CallerKind(raw_caller_kind)
+    except (TypeError, ValueError):
+        caller_kind = CallerKind.AGENT
+
+    if caller_kind is CallerKind.CHANNEL:
+        return SurfaceCapabilities(
+            supports_streaming=False,
+            supports_edit=False,
+            supports_generation_reset=False,
+        )
+
+    return SurfaceCapabilities()
 
 
 # Request-scoped context — set by build_tool_handler before each dispatch.

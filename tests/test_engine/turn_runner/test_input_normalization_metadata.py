@@ -7,6 +7,9 @@ from typing import Any, cast
 import pytest
 
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.turn_runner.attachment_stage import (
+    AttachmentMaterializationStats,
+)
 from opensquilla.engine.turn_runner.harness import _TurnRunnerPipelineExecutionAdapter
 from opensquilla.engine.turn_runner.input_stage import (
     ExtraContextResolver,
@@ -134,6 +137,55 @@ async def test_pipeline_execution_adapter_forwards_normalization_metadata() -> N
     )
 
     assert runner.calls[0]["normalization_metadata"] == normalization_metadata
+
+
+@pytest.mark.asyncio
+async def test_attachment_materialization_threads_into_sanitized_pipeline_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def fake_run_pipeline(ctx, steps):  # noqa: ANN001, ARG001
+        captured["metadata"] = ctx.metadata
+        return ctx
+
+    monkeypatch.setattr("opensquilla.engine.pipeline.run_pipeline", fake_run_pipeline)
+    runner = TurnRunner(
+        provider_selector=None,
+        config=SimpleNamespace(
+            squilla_router=SimpleNamespace(routing_timeout_seconds=5.0)
+        ),
+    )
+    stats = AttachmentMaterializationStats(
+        attachment_count=3,
+        estimated_tokens=45_123,
+        generated_normalization_estimated_tokens=2_000,
+        parse_failure_count=1,
+        provider_visible_text_chars=180_000,
+        image_count=1,
+    )
+
+    await runner._run_pipeline(
+        message="runtime",
+        session_key="agent:main:s1",
+        provider=None,
+        cloned_selector=None,
+        tool_defs=[],
+        base_prompt="base",
+        attachments=[],
+        attachment_materialization=stats,
+    )
+
+    assert captured["metadata"] | {
+        "had_attachments": True,
+        "attachment_count": 3,
+        "attachment_material_estimated_tokens": 45_123,
+        "attachment_generated_normalization_estimated_tokens": 2_000,
+        "attachment_parse_failure_count": 1,
+        "attachment_provider_visible_text_chars": 180_000,
+        "attachment_image_count": 1,
+    } == captured["metadata"]
+    assert not any("name" in key or "content" in key for key in captured["metadata"])
 
 
 @pytest.mark.asyncio

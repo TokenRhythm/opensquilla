@@ -831,6 +831,16 @@ input_cost_per_mtok = 0.8602150537634409
 output_cost_per_mtok = 2.5806451612903225
 cache_read_cost_per_mtok = 0.17204301075268819
 
+[tokenrhythm."qwen3.7-flash"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "none"
+input_cost_per_mtok = 0.03
+output_cost_per_mtok = 0.13
+
 [tokenrhythm."qwen3.8-max"]
 context_window = 1000000
 max_output_tokens = 131072

@@ -244,6 +244,8 @@ def _render_tier_overrides(tiers: dict[str, dict[str, Any]] | None) -> str:
             "thinking_level",
             "thinking",
             "supports_thinking",
+            "ensemble_enabled",
+            "ensemble_selection_mode",
         ):
             if key in cfg and cfg[key] is not None:
                 lines.append(f"{key} = {_toml_value(cfg[key])}")

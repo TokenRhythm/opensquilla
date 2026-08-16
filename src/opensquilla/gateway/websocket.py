@@ -34,8 +34,14 @@ from opensquilla.gateway.protocol import (
     SnapshotInfo,
     make_error_res,
     make_event,
+    project_session_event_for_client,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcDispatcher
+from opensquilla.gateway.rpc.ingress import (
+    RpcIngressValidationError,
+    is_utf8_encodable,
+    validate_rpc_ingress,
+)
 from opensquilla.sandbox.legacy_codec import encode_payload_for_protocol
 
 log = structlog.get_logger(__name__)
@@ -71,8 +77,29 @@ _DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
 # Sentinel pushed into the outbox by ``_stop_writer`` to wake a writer
 # blocked in ``await self._outbox.get()`` and exit cleanly.
 _SENTINEL_STOP: Any = object()
-_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"})
-_MAX_DETACHED_REQUESTS_PER_CONNECTION = 4
+# Keep this list side-effect free: the Web UI uses the advertised methods to
+# turn a reconnect-on-timeout fallback into a request-local rejection.
+_CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
+    {
+        "agents.list",
+        "artifacts.list",
+        "commands.list_for_surface",
+        "config.get",
+        "models.routing.get",
+        "onboarding.status",
+        "sandbox.run_mode.preference.get",
+        "sessions.list",
+        "usage.status",
+        "workspaces.list",
+    }
+)
+_DETACHED_RPC_METHODS: frozenset[str] = frozenset({"meta.drafts.list"}).union(
+    _CONCURRENT_OPTIONAL_READ_METHODS
+)
+# A fresh WebUI connection starts one draft read plus seven advertised optional
+# reads before the first responses can arrive. Keep that bootstrap fan-out
+# detached while retaining a finite per-connection bound.
+_MAX_DETACHED_REQUESTS_PER_CONNECTION = 8
 _DETACHED_REQUEST_DRAIN_SECONDS = 0.25
 
 
@@ -109,6 +136,7 @@ class WsConnection:
     conn_id: str
     ws: WebSocket
     protocol: int = PROTOCOL_VERSION
+    client_caps: frozenset[str] = field(default_factory=frozenset)
     principal: Principal = field(
         default_factory=lambda: Principal(
             role="operator",
@@ -290,6 +318,11 @@ class WsConnection:
     ) -> None:
         if self._closing:
             return
+        event, payload = project_session_event_for_client(
+            event,
+            payload,
+            client_caps=self.client_caps,
+        )
         # Atomic check + enqueue. The check and ``put_nowait`` are part of
         # one synchronous flow with no ``await`` between them, so
         # ``_force_close`` cannot flip ``_closing`` mid-flight (asyncio is
@@ -835,11 +868,7 @@ def _is_wire_text(value: str) -> bool:
     into a response frame makes ``model_dump_json`` raise at send time, long
     after the handler ran.
     """
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
+    return is_utf8_encodable(value)
 
 
 def _wire_frame_id(raw_id: Any, fallback: str = "") -> str:
@@ -938,6 +967,20 @@ async def handle_ws_connection(
         await conn.close()
         return
 
+    try:
+        validate_rpc_ingress(data)
+    except RpcIngressValidationError as exc:
+        await conn.send_res(
+            make_error_res(
+                _wire_frame_id(data.get("id"), "handshake"),
+                "INVALID_REQUEST",
+                str(exc),
+                details={"reason": exc.reason},
+            )
+        )
+        await conn.close()
+        return
+
     if data.get("type") != "req" or data.get("method") != "connect":
         await conn.send_res(
             make_error_res(
@@ -1013,6 +1056,14 @@ async def handle_ws_connection(
     # Assign principal
     conn.principal = principal
     conn.protocol = negotiated
+    requested_caps = params_raw.get("caps")
+    conn.client_caps = frozenset(
+        capability
+        for capability in (
+            requested_caps[:128] if isinstance(requested_caps, list) else ()
+        )
+        if isinstance(capability, str) and capability and len(capability) <= 128
+    )
 
     # Step 6: Send HelloOk
     hello = HelloOk(
@@ -1027,6 +1078,7 @@ async def handle_ws_connection(
         ),
         policy=PolicyInfo(
             concurrent_history_reads=True,
+            concurrent_optional_read_methods=sorted(_CONCURRENT_OPTIONAL_READ_METHODS),
             agent_stream_heartbeat_interval_ms=int(
                 max(0.0, float(getattr(config, "agent_stream_heartbeat_interval_seconds", 15.0)))
                 * 1000
@@ -1223,6 +1275,19 @@ async def _message_loop(
         if not isinstance(data, dict):
             await conn.send_res(
                 make_error_res("", "INVALID_REQUEST", "Frame must be a JSON object")
+            )
+            continue
+
+        try:
+            validate_rpc_ingress(data)
+        except RpcIngressValidationError as exc:
+            await conn.send_res(
+                make_error_res(
+                    _wire_frame_id(data.get("id")),
+                    "INVALID_REQUEST",
+                    str(exc),
+                    details={"reason": exc.reason},
+                )
             )
             continue
 

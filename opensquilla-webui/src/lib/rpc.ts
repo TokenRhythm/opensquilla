@@ -1,5 +1,7 @@
 /** OpenSquilla Web UI — WebSocket RPC client (TypeScript port). */
 
+const ANSWER_GENERATION_RESET_CAPABILITY = 'session.answer_generation_reset.v1';
+
 export interface RpcErrorDetail {
   code?: string;
   message?: string;
@@ -80,6 +82,8 @@ export type RpcEventHandler = {
 }['bivarianceHack'];
 
 const RECONNECT_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000] as const;
+const WAKE_DEBOUNCE_MS = 100;
+const WAKE_PROBE_TIMEOUT_MS = 3_000;
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -147,12 +151,28 @@ export class RpcClient {
   private _lastFrameAt = 0;
   private _tickWatchTimer: ReturnType<typeof setInterval> | null = null;
   private _tickTimeoutMs = 60000;
+  private _wakeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private _wakeProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  private _wakeProbeGeneration: number | null = null;
+  private _lifecycleWatchStarted = false;
+
+  private readonly _handleWakeSignal = (event: Event): void => {
+    if (
+      event.type === 'visibilitychange'
+      && typeof document !== 'undefined'
+      && document.visibilityState === 'hidden'
+    ) {
+      return;
+    }
+    this._scheduleWakeProbe();
+  };
 
   connect(url: string, token?: string): void {
     this._url = url;
     this._token = token || null;
     this._guestSessionKey = this._guestSessionKey || loadGuestSessionKey();
     this._autoReconnect = true;
+    this._startLifecycleWatch();
     this._clearReconnectTimer();
     if (this._ws) {
       this._retireCurrentSocket(new Error('Connection replaced'), false);
@@ -162,6 +182,7 @@ export class RpcClient {
 
   disconnect(): void {
     this._autoReconnect = false;
+    this._stopLifecycleWatch();
     this._clearReconnectTimer();
     this._retireCurrentSocket(new Error('Disconnected'), false);
     this._rejectAllPending(new Error('Disconnected'));
@@ -199,7 +220,7 @@ export class RpcClient {
 
       const terminate = (error: Error, action: RpcTerminationAction): void => {
         if (!this._rejectPending(id, error, generation)) return;
-        if (action === 'reconnect') {
+        if (this._terminationAction(method, action) === 'reconnect') {
           this._recycleConnection(
             generation,
             new Error(`Connection recycled after ${method} terminated`)
@@ -411,6 +432,7 @@ export class RpcClient {
               params: {
                 minProtocol: 3,
                 maxProtocol: 3,
+                caps: [ANSWER_GENERATION_RESET_CAPABILITY],
                 client: { name: 'opensquilla-web' },
                 ...authParams,
               },
@@ -427,6 +449,10 @@ export class RpcClient {
 
       // Handshake: HelloOk frame
       if (data.protocol !== undefined && this._state === 'connecting') {
+        // The authenticated Hello is a liveness proof for this exact socket.
+        // onmessage is generation/socket fenced above, and _clearWakeProbe
+        // refuses to clear a deadline owned by any replacement generation.
+        this._clearWakeProbe(generation);
         this._policy = data.policy || null;
         const serverGuestSessionKey = data.auth?.guestSessionKey;
         if (
@@ -485,6 +511,7 @@ export class RpcClient {
       if (!this._isCurrentSocket(socket, generation)) return;
       this._ws = null;
       ++this._socketGeneration;
+      this._clearWakeProbe(generation);
       this._stopPing();
       this._stopTickWatch();
       this._rejectPendingForGeneration(generation, new Error('Connection closed'));
@@ -497,6 +524,24 @@ export class RpcClient {
 
   private _isCurrentSocket(socket: WebSocket, generation: number): boolean {
     return this._ws === socket && this._socketGeneration === generation;
+  }
+
+  private _terminationAction(
+    method: string,
+    requested: RpcTerminationAction
+  ): RpcTerminationAction {
+    if (requested !== 'reconnect') return requested;
+    // A current Gateway advertises only reads that it dispatches outside the
+    // serialized request loop. Their local timeout can therefore reject in
+    // isolation; older Gateways retain the reconnect escape hatch.
+    const concurrentMethods = this._policy?.concurrent_optional_read_methods;
+    if (
+      Array.isArray(concurrentMethods)
+      && concurrentMethods.some((candidate) => candidate === method)
+    ) {
+      return 'reject';
+    }
+    return requested;
   }
 
   private _takePending(id: string, generation?: number): PendingRequest | undefined {
@@ -547,6 +592,7 @@ export class RpcClient {
   private _retireCurrentSocket(error: Error, reconnect: boolean): void {
     const socket = this._ws;
     const generation = this._socketGeneration;
+    this._clearWakeProbe(generation);
     if (!socket) {
       this._stopPing();
       this._stopTickWatch();
@@ -595,8 +641,110 @@ export class RpcClient {
     }
   }
 
+  private _startLifecycleWatch(): void {
+    if (
+      this._lifecycleWatchStarted
+      || typeof window === 'undefined'
+      || typeof document === 'undefined'
+    ) {
+      return;
+    }
+    this._lifecycleWatchStarted = true;
+    window.addEventListener('online', this._handleWakeSignal);
+    window.addEventListener('pageshow', this._handleWakeSignal);
+    document.addEventListener('visibilitychange', this._handleWakeSignal);
+  }
+
+  private _stopLifecycleWatch(): void {
+    if (
+      this._lifecycleWatchStarted
+      && typeof window !== 'undefined'
+      && typeof document !== 'undefined'
+    ) {
+      window.removeEventListener('online', this._handleWakeSignal);
+      window.removeEventListener('pageshow', this._handleWakeSignal);
+      document.removeEventListener('visibilitychange', this._handleWakeSignal);
+    }
+    this._lifecycleWatchStarted = false;
+    if (this._wakeDebounceTimer !== null) {
+      clearTimeout(this._wakeDebounceTimer);
+      this._wakeDebounceTimer = null;
+    }
+    this._clearWakeProbe();
+  }
+
+  private _scheduleWakeProbe(): void {
+    if (!this._autoReconnect) return;
+    if (this._wakeDebounceTimer !== null) {
+      clearTimeout(this._wakeDebounceTimer);
+    }
+    this._wakeDebounceTimer = setTimeout(() => {
+      this._wakeDebounceTimer = null;
+      this._runWakeProbe();
+    }, WAKE_DEBOUNCE_MS);
+  }
+
+  private _runWakeProbe(): void {
+    if (!this._autoReconnect) return;
+    this._reconnectAttempt = 0;
+
+    let socket = this._ws;
+    if (!socket) {
+      this._clearReconnectTimer();
+      this._doConnect();
+      socket = this._ws;
+      if (!socket) return;
+    }
+
+    const generation = this._socketGeneration;
+    if (this._wakeProbeGeneration === generation) return;
+    if (socket.readyState === WebSocket.OPEN) {
+      try {
+        socket.send('{"type":"ping"}');
+      } catch (error) {
+        this._recycleConnection(
+          generation,
+          error instanceof Error ? error : new Error('Wake probe send failed')
+        );
+        return;
+      }
+    } else if (socket.readyState !== WebSocket.CONNECTING) {
+      this._recycleConnection(generation, new Error('Connection stale after wake'));
+      return;
+    }
+    this._armWakeProbe(socket, generation);
+  }
+
+  private _armWakeProbe(socket: WebSocket, generation: number): void {
+    this._clearWakeProbe();
+    this._wakeProbeGeneration = generation;
+    this._wakeProbeTimer = setTimeout(() => {
+      if (!this._isCurrentSocket(socket, generation)) return;
+      this._clearWakeProbe(generation);
+      const handlers = this._listeners.get('_gap');
+      if (handlers) handlers.forEach((h) => h({ reason: 'wake_probe_timeout' }));
+      this._retireCurrentSocket(new Error('Wake probe timed out'), true);
+    }, WAKE_PROBE_TIMEOUT_MS);
+  }
+
+  private _clearWakeProbe(generation?: number): void {
+    if (
+      generation !== undefined
+      && this._wakeProbeGeneration !== null
+      && this._wakeProbeGeneration !== generation
+    ) {
+      return;
+    }
+    if (this._wakeProbeTimer !== null) {
+      clearTimeout(this._wakeProbeTimer);
+      this._wakeProbeTimer = null;
+    }
+    this._wakeProbeGeneration = null;
+  }
+
   private _noteIncomingFrame(data: RpcFrame): boolean {
     this._lastFrameAt = Date.now();
+    if (data?.type === 'pong') this._clearWakeProbe(this._socketGeneration);
     if (!data || data.type !== 'event' || typeof data.seq !== 'number') return true;
 
     const seq = data.seq;

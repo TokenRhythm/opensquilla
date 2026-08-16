@@ -120,24 +120,13 @@ def test_bubblewrap_proxy_allowlist_without_proxy_fails_closed(
 @pytest.mark.asyncio
 async def test_noop_backend_passes_request_proxy_env_to_child(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from opensquilla.safety.sandbox import SandboxResult as SafetySandboxResult
     from opensquilla.sandbox.backend import noop as noop_mod
 
     policy = dataclasses.replace(
         _policy(tmp_path, network_proxy=_proxy_spec()),
         env_allowlist=("PATH", "HTTP_PROXY"),
     )
-    seen: dict[str, object] = {}
-
-    def _fake_run_sandboxed(cmd, limits=None, *, stdin=None, env=None):
-        seen["cmd"] = tuple(cmd)
-        seen["stdin"] = stdin
-        seen["env"] = dict(env or {})
-        return SafetySandboxResult(returncode=0, stdout="ok\n", stderr="")
-
-    monkeypatch.setattr(noop_mod, "run_sandboxed", _fake_run_sandboxed)
     request = SandboxRequest(
         argv=(
             sys.executable,
@@ -156,11 +145,7 @@ async def test_noop_backend_passes_request_proxy_env_to_child(
     result = await noop_mod.NoopBackend().run(request)
 
     assert result.returncode == 0
-    assert seen["stdin"] is None
-    assert seen["env"] == {
-        "PATH": "/bin",
-        "HTTP_PROXY": "http://127.0.0.1:18080",
-    }
+    assert result.stdout.strip() == "http://127.0.0.1:18080"
 
 
 def test_seatbelt_proxy_allowlist_without_proxy_fails_closed(
@@ -774,6 +759,51 @@ async def test_linux_helper_payload_times_out_outer_helper(
         await bubblewrap_mod._run_linux_helper_payload(payload)
 
     assert terminated == [12345]
+
+
+@pytest.mark.asyncio
+async def test_linux_helper_payload_caller_cancel_terminates_outer_process_group(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = bubblewrap_mod.build_process_helper_payload(
+        _request(_policy(tmp_path, network=NetworkMode.NONE, network_proxy=None), tmp_path)
+    )
+    started = asyncio.Event()
+    terminated: list[int] = []
+
+    class _Proc:
+        pid = 12346
+        returncode = None
+        stdout = None
+        stderr = None
+
+        async def communicate(self):
+            started.set()
+            await asyncio.Event().wait()
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        assert kwargs["start_new_session"] is True
+        return _Proc()
+
+    async def fake_terminate(proc):
+        terminated.append(proc.pid)
+        return b"", b""
+
+    monkeypatch.setattr(
+        bubblewrap_mod.asyncio,
+        "create_subprocess_exec",
+        fake_create_subprocess_exec,
+    )
+    monkeypatch.setattr(bubblewrap_mod, "_terminate_process_group", fake_terminate)
+
+    running = asyncio.create_task(bubblewrap_mod._run_linux_helper_payload(payload))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    running.cancel()
+    cancelled = await asyncio.gather(running, return_exceptions=True)
+    assert isinstance(cancelled[0], asyncio.CancelledError)
+
+    assert terminated == [12346]
 
 
 @_BWRAP_PROXY_BRIDGE_LINUX_ONLY

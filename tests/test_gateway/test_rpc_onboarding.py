@@ -552,6 +552,7 @@ async def test_ensemble_configure_accepts_full_camel_case_payload(
             "selectionMode": "router_dynamic",
             "modelOptions": ["custom/model-a", "custom/model-b"],
             "minSuccessfulProposers": 2,
+            "proposerMaxRetries": 2,
             "allFailedPolicy": "error",
         },
         _admin_ctx(),
@@ -563,12 +564,31 @@ async def test_ensemble_configure_accepts_full_camel_case_payload(
         "selection_mode": "router_dynamic",
         "model_options": ["custom/model-a", "custom/model-b"],
         "min_successful_proposers": 2,
+        "proposer_max_retries": 2,
         "all_failed_policy": "error",
     }
     persisted = tomllib.loads((tmp_path / "c.toml").read_text())
     assert persisted["llm_ensemble"]["selection_mode"] == "router_dynamic"
     assert persisted["llm_ensemble"]["min_successful_proposers"] == 2
+    assert persisted["llm_ensemble"]["proposer_max_retries"] == 2
     assert persisted["llm_ensemble"]["all_failed_policy"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_ensemble_configure_rejects_out_of_range_proposer_retries(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.ensemble.configure",
+        {"proposerMaxRetries": 11},
+        _admin_ctx(),
+    )
+
+    assert res.error is not None
+    assert res.error.code == "onboarding.ensemble.invalid"
+    assert "proposer_max_retries must be between 0 and 10" in res.error.message
 
 
 @pytest.mark.asyncio
