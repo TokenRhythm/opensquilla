@@ -316,7 +316,6 @@ def test_isolated_home_environment_supports_windows_acl_hardening(tmp_path: Path
     env = e2e._worker_environment("synthetic-rotated-key")
     e2e._apply_isolated_home_environment(env, isolated_home)
     env["PYTHONPATH"] = str(e2e.SRC_DIR)
-    env["OPENSQUILLA_UPGRADE_ACL_DIAGNOSTICS"] = "1"
     code = (
         "from pathlib import Path; import sys; "
         "from opensquilla.sandbox.upgrade_migration import "

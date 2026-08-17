@@ -37,16 +37,12 @@ $ErrorActionPreference = "Stop"
 $target = $env:OPENSQUILLA_UPGRADE_ACL_TARGET
 $userSid = $env:OPENSQUILLA_UPGRADE_ACL_USER_SID
 $isDirectory = $env:OPENSQUILLA_UPGRADE_ACL_IS_DIRECTORY -eq "1"
-$diagnostics = $env:OPENSQUILLA_UPGRADE_ACL_DIAGNOSTICS -eq "1"
-if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:start") }
 $acl = if ($isDirectory) {
     [System.Security.AccessControl.DirectorySecurity]::new()
 } else {
     [System.Security.AccessControl.FileSecurity]::new()
 }
-if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:security-object") }
 $acl.SetAccessRuleProtection($true, $false)
-if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rules-protected") }
 $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
 if ($isDirectory) {
     $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
@@ -60,7 +56,6 @@ foreach ($trustedSid in @("S-1-5-18", "S-1-5-32-544")) {
         $allowed += $trustedSid
     }
 }
-if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rule-inputs") }
 foreach ($sidText in $allowed) {
     $sid = [System.Security.Principal.SecurityIdentifier]::new($sidText)
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
@@ -72,17 +67,13 @@ foreach ($sidText in $allowed) {
     )
     [void]$acl.AddAccessRule($rule)
 }
-if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rules-ready") }
 if ($isDirectory) {
     [System.IO.Directory]::SetAccessControl($target, $acl)
-    if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:access-set") }
     $verified = [System.IO.Directory]::GetAccessControl($target)
 } else {
     [System.IO.File]::SetAccessControl($target, $acl)
-    if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:access-set") }
     $verified = [System.IO.File]::GetAccessControl($target)
 }
-if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:access-read") }
 if (-not $verified.AreAccessRulesProtected) {
     throw "DACL inheritance remains enabled"
 }
@@ -117,7 +108,6 @@ foreach ($sidText in $allowed) {
         throw "DACL principal verification failed"
     }
 }
-if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:verified") }
 """
 _WINDOWS_PRIVATE_ACL_ENCODED = base64.b64encode(
     _WINDOWS_PRIVATE_ACL_SCRIPT.encode("utf-16-le")
