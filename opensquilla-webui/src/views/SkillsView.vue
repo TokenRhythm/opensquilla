@@ -1109,6 +1109,10 @@ async function uninstallSkillAndClose(name: string, installId: string) {
   border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
   color: var(--accent);
 }
+.sk-chip--tool {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
 .sk-chip--trigger {
   font-family: var(--font-mono);
   font-size: 12px;

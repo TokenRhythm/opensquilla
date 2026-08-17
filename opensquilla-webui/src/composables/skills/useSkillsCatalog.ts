@@ -10,6 +10,7 @@ import type {
   SkillInstall,
   SkillLayerGroup,
   SkillStatTile,
+  SkillToolDependency,
 } from '@/types/skills'
 
 interface SkillsListData {
@@ -214,12 +215,29 @@ function normalizeDependencySummary(
   return summary
 }
 
+function normalizeToolDependencies(raw: unknown): SkillToolDependency[] {
+  if (!Array.isArray(raw)) return []
+  return raw.map((item) => {
+    const dependency = asRecord(item)
+    const name = text(dependency.name).trim()
+    if (!name) return null
+    return {
+      name,
+      registered: typeof dependency.registered === 'boolean'
+        ? dependency.registered
+        : null,
+    }
+  }).filter((item): item is SkillToolDependency => item !== null)
+}
+
 export function normalizeSkill(skill: Skill): Skill {
   return {
     ...skill,
     missing_bins: stringList(skill.missing_bins),
     missing_env: stringList(skill.missing_env),
     missing_env_any: stringGroups(skill.missing_env_any),
+    required_tools: stringList(skill.required_tools),
+    tool_dependencies: normalizeToolDependencies(skill.tool_dependencies),
     dependency_summary: normalizeDependencySummary(skill.dependency_summary, skill),
   }
 }

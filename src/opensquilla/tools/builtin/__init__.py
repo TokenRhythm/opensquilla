@@ -22,6 +22,7 @@ _NAMES = [
     "nodes",
     "patch",
     "plan_control",
+    "ptc_run",
     "router_control",
     "sessions",
     "session_search",
