@@ -799,7 +799,7 @@ function pickTheme(mode: ThemeMode) {
 function openMoreThemes() {
   themeMenuOpen.value = false
   handleNavClick()
-  router.push('/settings/appearance')
+  router.push('/settings/interface')
 }
 
 useDocumentEvent('click', (e) => {
@@ -1377,14 +1377,28 @@ async function createProjectWorkspace(payload: { name: string; path: string }) {
     return
   }
   projectCreateBusy.value = true
+  const existingWorkspaceIds = new Set(
+    projectWorkspaces.workspaces.value.map(workspace => workspace.id),
+  )
   try {
     const workspace = await projectWorkspaces.openWorkspace(path)
     if (!workspace) throw new Error('Gateway returned an empty project.')
+    const alreadyExists = existingWorkspaceIds.has(workspace.id)
+    const renamedExisting = alreadyExists && workspace.name !== name
     if (workspace.name !== name) {
       await projectWorkspaces.renameWorkspace(workspace.id, name)
     }
     resetProjectCreator()
-    pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
+    if (alreadyExists) {
+      pushToast(t(
+        renamedExisting
+          ? 'workspaces.projectExistingRenamed'
+          : 'workspaces.projectAlreadyExists',
+        { name },
+      ), { tone: 'info' })
+    } else {
+      pushToast(t('workspaces.projectCreated', { name }), { tone: 'ok' })
+    }
   } catch (err) {
     projectCreateBusy.value = false
     projectCreateConfirming.value = false
@@ -1651,13 +1665,13 @@ function openSettings() {
 // Topbar connection pill (web): jump straight to the Connection section so the
 // gateway link can be inspected or re-pointed.
 function openConnectionSettings() {
-  router.push('/settings/connection')
+  router.push('/settings/gateway#connection')
 }
 
 // Compact chat headers hand off to the complete Desktop update workflow rather
 // than recreating update actions inside the status summary.
 function openDesktopRuntimeSettings() {
-  router.push('/settings/runtime')
+  router.push('/settings/gateway#runtime')
 }
 
 function scheduleSessionRefresh() {

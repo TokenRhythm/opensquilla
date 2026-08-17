@@ -221,6 +221,41 @@ describe('projectAssistantActivity', () => {
     ])
   })
 
+  it('keeps an explicit intermediate span out of the adjacent final answer', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting.Working note.Final answer.',
+        timelineItems: [
+          { type: 'text', key: 'opening', html: 'Inspecting.', rawText: 'Inspecting.' },
+          toolGroup([call('inspect', { name: 'read_file' })], 'inspect'),
+          {
+            type: 'text',
+            key: 'work',
+            html: 'Working note.',
+            rawText: 'Working note.',
+            presentation: 'intermediate',
+          },
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'Final answer.',
+            rawText: 'Final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => text,
+    )
+
+    expect(projection.answerSource).toBe('terminal-timeline-boundary')
+    expect(projection.answerPart?.rawText).toBe('Final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'opening',
+      'inspect',
+      'work',
+    ])
+  })
+
   it.each([
     ['dash thematic break', 'Summary before.\n\n---\n\nSummary after.'],
     ['asterisk thematic break', 'Summary before.\n\n***\n\nSummary after.'],

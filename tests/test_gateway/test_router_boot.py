@@ -242,6 +242,55 @@ def test_gateway_server_close_releases_pid_lock_when_shutdown_step_fails() -> No
     asyncio.run(run_case())
 
 
+def test_gateway_server_incomplete_runtime_keeps_services_and_pid_lock_open() -> None:
+    from opensquilla.gateway import boot
+    from opensquilla.gateway.task_runtime import TaskRuntimeShutdownResult
+
+    released: list[str] = []
+    services_closed: list[str] = []
+    expected = TaskRuntimeShutdownResult(
+        clean=False,
+        elapsed_ms=25,
+        abandoned_task_count=1,
+        remaining_driver_count=1,
+        remaining_reservation_count=0,
+        remaining_auxiliary_count=0,
+    )
+
+    class FakePidLock:
+        def release(self) -> None:
+            released.append("released")
+
+    class FakeRuntime:
+        async def shutdown(self, **_kwargs: Any) -> Any:
+            return expected
+
+    class FakeServices:
+        task_runtime = FakeRuntime()
+        goal_service = None
+
+        async def close(self) -> None:
+            services_closed.append("closed")
+
+    pid_lock = FakePidLock()
+    server = boot.GatewayServer(
+        app=SimpleNamespace(),
+        config=GatewayConfig(),
+        _services=FakeServices(),  # type: ignore[arg-type]
+        _pid_lock=pid_lock,
+    )
+
+    async def run_case() -> None:
+        result = await server.close()
+
+        assert result is expected
+        assert services_closed == []
+        assert released == []
+        assert server._pid_lock is pid_lock
+
+    asyncio.run(run_case())
+
+
 def test_start_gateway_server_releases_pid_lock_when_build_services_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

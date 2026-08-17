@@ -21,7 +21,7 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -737,7 +737,10 @@ async def run_channel_dispatch(
         await status_reactor.received(msg)
 
         if task_runtime is not None:
-            from opensquilla.gateway.task_runtime import TaskQueueFullError
+            from opensquilla.gateway.task_runtime import (
+                TaskQueueFullError,
+                TaskRuntimeShuttingDownError,
+            )
 
             # Cap check BEFORE enqueue/append: reject early so no transcript
             # entry is written and no runtime turn is started when the channel
@@ -896,6 +899,17 @@ async def run_channel_dispatch(
                     await channel.send(
                         _route_envelope_reply_message(
                             workspace_message,
+                            route_envelope,
+                        )
+                    )
+                    if delivery_store is not None:
+                        delivery_store.fail_inbound(ingress_claim, exc)
+                    continue
+                if isinstance(exc, TaskRuntimeShuttingDownError):
+                    await status_reactor.failed(msg)
+                    await channel.send(
+                        _route_envelope_reply_message(
+                            "The Gateway is shutting down. Please retry after it restarts.",
                             route_envelope,
                         )
                     )
@@ -1588,7 +1602,10 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     status_reactor = _status_reactor(channel)
     await status_reactor.received(msg)
     raw_content = getattr(combined, "raw_content", None) or msg.content
-    from opensquilla.gateway.task_runtime import TaskQueueFullError
+    from opensquilla.gateway.task_runtime import (
+        TaskQueueFullError,
+        TaskRuntimeShuttingDownError,
+    )
 
     # Cap check BEFORE enqueue/append: reject early so no transcript entry is
     # written and no runtime turn is started (accept-then-drop fix).
@@ -1693,6 +1710,15 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
             await channel.send(
                 _route_envelope_reply_message(
                     workspace_message,
+                    route_envelope,
+                )
+            )
+            return
+        if isinstance(exc, TaskRuntimeShuttingDownError):
+            await status_reactor.failed(msg)
+            await channel.send(
+                _route_envelope_reply_message(
+                    "The Gateway is shutting down. Please retry after it restarts.",
                     route_envelope,
                 )
             )
@@ -2594,6 +2620,14 @@ def _text_delta_from_event(event: Any) -> str:
         text = event.get("text", "")
         return text if isinstance(text, str) else ""
     return ""
+
+
+def _text_delta_event_payload(event: TextDeltaEvent) -> dict[str, Any]:
+    """Serialize a channel-origin text delta through the full public contract."""
+
+    payload = asdict(event)
+    payload.pop("kind", None)
+    return payload
 
 
 def _generation_reset_snapshot(event: Any) -> tuple[bool, str] | None:
@@ -4096,10 +4130,7 @@ async def _run_turn_batch_path(
                     await event_bridge.emit(
                         session_key,
                         "session.event.text_delta",
-                        {
-                            "text": event.text,
-                            "presentation": getattr(event, "presentation", "answer"),
-                        },
+                        _text_delta_event_payload(event),
                     )
             elif isinstance(event, DoneEvent):
                 snapshot_present, snapshot_text = done_text_snapshot(event)
@@ -4334,10 +4365,7 @@ async def _run_turn_streaming_path(
                     await event_bridge.emit(
                         session_key,
                         "session.event.text_delta",
-                        {
-                            "text": event.text,
-                            "presentation": getattr(event, "presentation", "answer"),
-                        },
+                        _text_delta_event_payload(event),
                     )
             elif isinstance(event, DoneEvent):
                 snapshot_present, snapshot_text = done_text_snapshot(event)

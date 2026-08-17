@@ -1,22 +1,14 @@
 import { spawnSync } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { lstat, readdir, readFile, stat } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
-import {
-  assertRuntimeSetReady,
-  currentRuntimeTarget,
-  loadRuntimeManifest,
-  packagedRuntimeTarget,
-} from './fetch-bundled-runtimes.mjs'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '..', '..')
 const runtimeGatewayDir = join(packageRoot, 'runtime', 'gateway')
-const runtimeDeveloperDir = join(packageRoot, 'runtime', 'developer')
-const runtimeManifestPath = join(packageRoot, 'runtime', 'runtime-manifest.json')
 const sourceMainPath = join(packageRoot, 'src', 'main.ts')
 const compiledMainPath = join(packageRoot, 'dist', 'main.js')
 const packageJsonPath = join(packageRoot, 'package.json')
@@ -33,6 +25,56 @@ function pathIsFileSync(path) {
     return statSync(path).isFile()
   } catch {
     return false
+  }
+}
+
+async function pathExists(path) {
+  return (await lstat(path).catch(() => null)) !== null
+}
+
+async function readJsonFile(path, label) {
+  try {
+    return JSON.parse(await readFile(path, 'utf8'))
+  } catch (error) {
+    fail(`${label} could not be read as JSON: ${error instanceof Error ? error.message : String(error)}`)
+    return null
+  }
+}
+
+async function verifyRuntimeMetadata(runtimeRoot, label) {
+  const manifestPath = join(runtimeRoot, 'runtime-manifest.json')
+  const catalogPath = join(runtimeRoot, 'runtime-pack-catalog.json')
+  const manifest = await readJsonFile(manifestPath, `${label} runtime manifest`)
+  const catalog = await readJsonFile(catalogPath, `${label} runtime-pack catalog`)
+
+  if (manifest && manifest.schemaVersion !== 1) {
+    fail(`${label} runtime manifest must use schemaVersion 1`)
+  }
+  if (catalog) {
+    if (catalog.schemaVersion !== 1) {
+      fail(`${label} runtime-pack catalog must use schemaVersion 1`)
+    }
+    if (typeof catalog.catalogVersion !== 'string' || !catalog.catalogVersion.trim()) {
+      fail(`${label} runtime-pack catalog is missing catalogVersion`)
+    }
+    if (typeof catalog.releaseTag !== 'string' || !/^v[A-Za-z0-9._-]+$/.test(catalog.releaseTag)) {
+      fail(`${label} runtime-pack catalog has an invalid releaseTag`)
+    }
+    if (!catalog.targets || typeof catalog.targets !== 'object' || Array.isArray(catalog.targets)) {
+      fail(`${label} runtime-pack catalog is missing targets`)
+    }
+    if (catalog.finalized !== true && catalog.finalized !== false) {
+      fail(`${label} runtime-pack catalog must declare a boolean finalized flag`)
+    } else if (catalog.finalized === false && Object.keys(catalog.targets).length !== 0) {
+      fail(`${label} runtime-pack catalog must not carry partial targets while finalized=false`)
+    }
+  }
+}
+
+async function verifyDeveloperRuntimeAbsent(runtimeRoot, label) {
+  const developerRoot = join(runtimeRoot, 'developer')
+  if (await pathExists(developerRoot)) {
+    fail(`${label} must not contain bundled developer runtimes: ${developerRoot}`)
   }
 }
 
@@ -311,6 +353,13 @@ async function verifyInstallerDataPolicy() {
   if (packageJson.build?.nsis?.deleteAppDataOnUninstall !== false) {
     fail('NSIS uninstall must preserve Desktop profile data (deleteAppDataOnUninstall=false)')
   }
+  if (packageJson.build?.nsis?.include !== undefined) {
+    fail('NSIS must use electron-builder managed upgrade cleanup without a custom recursive delete')
+  }
+  const unsafeInstallerInclude = join(packageRoot, 'build', 'installer.nsh')
+  if (await pathExists(unsafeInstallerInclude)) {
+    fail('NSIS custom installer cleanup must not be present')
+  }
   const protocols = packageJson.build?.protocols
   if (
     !Array.isArray(protocols)
@@ -321,6 +370,32 @@ async function verifyInstallerDataPolicy() {
     || protocols[0].schemes[0] !== 'opensquilla'
   ) {
     fail('electron-builder must register only the opensquilla URL protocol')
+  }
+
+  const extraResources = packageJson.build?.extraResources
+  const expectedRuntimeResources = new Map([
+    ['runtime/gateway', 'runtime/gateway'],
+    ['runtime/runtime-manifest.json', 'runtime/runtime-manifest.json'],
+    ['runtime/runtime-pack-catalog.json', 'runtime/runtime-pack-catalog.json'],
+  ])
+  if (!Array.isArray(extraResources)) {
+    fail('electron-builder extraResources must be an explicit allowlist')
+    return
+  }
+  for (const [from, to] of expectedRuntimeResources) {
+    if (!extraResources.some((entry) => entry?.from === from && entry?.to === to)) {
+      fail(`electron-builder extraResources is missing ${from}`)
+    }
+  }
+  for (const entry of extraResources) {
+    const from = typeof entry?.from === 'string' ? entry.from.replaceAll('\\', '/') : ''
+    const to = typeof entry?.to === 'string' ? entry.to.replaceAll('\\', '/') : ''
+    if (from === 'runtime' || to === 'runtime') {
+      fail('electron-builder must not copy the entire runtime directory')
+    }
+    if (to.startsWith('runtime/') && expectedRuntimeResources.get(from) !== to) {
+      fail(`electron-builder has an unexpected runtime resource mapping: ${from} -> ${to}`)
+    }
   }
 }
 
@@ -397,28 +472,13 @@ async function verifyAsarPackageVersion(asarPath, label) {
 }
 
 async function verifyGeneratedBundle({ label, resourcesDir, platform }) {
-  await verifyRuntime(join(resourcesDir, 'runtime', 'gateway'), label, {
+  const runtimeRoot = join(resourcesDir, 'runtime')
+  await verifyRuntime(join(runtimeRoot, 'gateway'), label, {
     platform,
     executeCommands: platform === process.platform,
   })
-  try {
-    const manifest = await loadRuntimeManifest(
-      join(resourcesDir, 'runtime', 'runtime-manifest.json'),
-    )
-    const target = packagedRuntimeTarget(resourcesDir, platform)
-    if (!(target in manifest.assets)) {
-      fail(`${label} runtime manifest has no target for ${platform}`)
-    } else {
-      await assertRuntimeSetReady({
-        manifest,
-        runtimeRoot: join(resourcesDir, 'runtime', 'developer'),
-        target,
-        executeCommands: platform === process.platform,
-      })
-    }
-  } catch (error) {
-    fail(`${label} bundled runtimes failed verification: ${error instanceof Error ? error.message : String(error)}`)
-  }
+  await verifyRuntimeMetadata(runtimeRoot, label)
+  await verifyDeveloperRuntimeAbsent(runtimeRoot, label)
 
   const asarPath = join(resourcesDir, 'app.asar')
   if (!existsSync(asarPath)) {
@@ -435,16 +495,7 @@ async function verifyGeneratedBundle({ label, resourcesDir, platform }) {
 }
 
 await verifyRuntime(runtimeGatewayDir, 'source', { platform: process.platform, executeCommands: true })
-try {
-  await assertRuntimeSetReady({
-    manifest: await loadRuntimeManifest(runtimeManifestPath),
-    runtimeRoot: runtimeDeveloperDir,
-    target: currentRuntimeTarget(),
-    executeCommands: true,
-  })
-} catch (error) {
-  fail(`source bundled runtimes failed verification: ${error instanceof Error ? error.message : String(error)}`)
-}
+await verifyRuntimeMetadata(join(packageRoot, 'runtime'), 'source')
 await verifyInstallerDataPolicy()
 await verifySourceMain()
 await verifyCompiledMain()

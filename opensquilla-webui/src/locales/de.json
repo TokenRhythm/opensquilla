@@ -7,6 +7,8 @@
     "addSourceFolder": "Einen Ordner hinzufügen, den OpenSquilla lesen und bearbeiten kann",
     "creatingProject": "Wird erstellt…",
     "projectCreated": "Projekt „{name}“ erstellt",
+    "projectAlreadyExists": "Projekt „{name}“ ist bereits vorhanden. Das vorhandene Projekt wird verwendet",
+    "projectExistingRenamed": "Das Projekt war bereits vorhanden und wurde in „{name}“ umbenannt",
     "createProjectFailed": "Projekt konnte nicht erstellt werden: {error}",
     "noTasks": "Keine Aufgaben",
     "chooseProject": "Projekt auswählen",
@@ -347,8 +349,8 @@
   },
   "settings": {
     "appearance": {
-      "title": "Darstellung",
-      "desc": "Design, Sprache und lokale Oberflächeneinstellungen für diesen Browser. Voreinstellungen werden sofort übernommen; eine benutzerdefinierte Breite wird mit Anwenden bestätigt.",
+      "title": "Oberfläche",
+      "desc": "Design und lokale Oberflächeneinstellungen für diesen Browser. Voreinstellungen werden sofort übernommen; eine benutzerdefinierte Breite wird mit Anwenden bestätigt.",
       "themeLabel": "Design",
       "themeDesc": "Dem System folgen oder hell bzw. dunkel erzwingen. Der Schalter in der Seitenleiste ist eine Verknüpfung zu dieser Einstellung.",
       "languageLabel": "Sprache",
@@ -426,21 +428,25 @@
       }
     },
     "memoryImport": {
-      "title": "Gedächtnis und Profil",
-      "description": "Importieren Sie ein Profil aus einer anderen KI in OpenSquilla. Das aktuelle Standardmodell führt es mit dem lokalen Gedächtnis zusammen; vor Bestätigung des Datei-Diffs wird nichts geändert.",
-      "helper": "Benötigen Sie ein Profil aus einer anderen KI?",
-      "copyPrompt": "Export-Prompt kopieren",
+      "title": "Erinnerungen aus einer anderen KI importieren",
+      "description": "Übertragen Sie, was eine andere KI über Ihre Vorlieben, Ihren Hintergrund und Ihre Projekte weiß, nach OpenSquilla. Folgen Sie den zwei Schritten; Ihre Erinnerungen werden erst geändert, nachdem Sie die Vorschau geprüft und bestätigt haben.",
+      "stepsLabel": "Schritte zum Importieren von Erinnerungen",
+      "sourceStepTitle": "Prompt kopieren und an die andere KI senden",
+      "sourceStepDescription": "Öffnen Sie einen Chat mit der KI, die Sie bereits kennt, fügen Sie diesen Prompt ein, senden Sie ihn und warten Sie auf die vollständige Antwort.",
+      "pasteStepTitle": "Vollständige Antwort der KI einfügen",
+      "pasteStepDescription": "Kopieren Sie die gesamte Antwort hierher. OpenSquilla erstellt eine prüfbare Vorschau, bevor Erinnerungen geändert werden.",
+      "copyPrompt": "Prompt kopieren",
       "copiedPrompt": "Kopiert",
       "showPrompt": "Prompt anzeigen",
       "hidePrompt": "Prompt ausblenden",
       "exportPrompt": "Erstellen Sie ein übertragbares Benutzerprofil für den Import in einen anderen KI-Assistenten. Prüfen Sie alle tatsächlich zugänglichen relevanten Quellen: sämtliche gespeicherten oder langfristigen Erinnerungen, zugängliche frühere Gespräche und den aktuellen Gesprächskontext. Der Zugriff unterscheidet sich je nach Produkt; überspringen Sie nicht verfügbare Quellen ohne zu raten und prüfen Sie alle zugänglichen Langzeiterinnerungen, nicht nur den neuesten oder auffälligsten Eintrag. Gespräche dienen als Beleg, gelten aber nicht automatisch als Erinnerung. Nehmen Sie nur Tatsachen auf, die der Benutzer klar als real angegeben hat und die die Dauerhaftigkeitsregel ihrer Kategorie erfüllen. Behandeln Sie diese Exportanfrage oder ihre Formatvorgaben, die aktuelle Aufgabe, System-/Entwickler-/App-Anweisungen, einmalige Anforderungen oder Formatwahlen, Beispiele, Hypothesen, Rollenspiele, zitierte oder eingefügte Inhalte, Brainstorming-Optionen und vom Assistenten erzeugte Inhalte niemals als dauerhafte Benutzertatsachen. Bewahren Sie möglichst den Wortlaut des Benutzers.\n\nVerwenden Sie alle folgenden Abschnitte in genau dieser Reihenfolge, auch wenn einer leer ist:\n1. Anweisungen — nur ausdrückliche dauerhafte Regeln, Korrekturen, „immer X tun“ und „niemals Y tun“, die bereits in gespeicherten oder langfristigen Erinnerungen vorhanden sind. Schließen Sie nur im Gespräch vorkommende und einmalige Anforderungen aus.\n2. Identität — bevorzugter Name, allgemeiner Wohnort, Sprachen, Ausbildung und dauerhafte Interessen, die freiwillig als echte persönliche Informationen mitgeteilt wurden.\n3. Beruf — bestätigte aktuelle und frühere Rollen, Organisationen und wichtigste Fähigkeiten.\n4. Projekte — ein Eintrag je tatsächlichem Projekt, an dem der Benutzer wirklich baut oder dauerhaft arbeitet, mit Zweck, aktuellem Stand und wichtigen Entscheidungen. Schließen Sie einmalige Aufgaben, Beispiele und Projekte anderer aus.\n5. Vorlieben — stabile, allgemein anwendbare Ansichten, Geschmäcker und Arbeitspräferenzen. Schließen Sie Entscheidungen aus, die nur für die aktuelle Antwort oder Aufgabe gelten.\n6. Beziehungen — nur bestätigte und dauerhafte Beziehungen des Benutzers selbst.\n7. Datierte Ereignisse und Pläne — bestätigte bedeutende Aktivitäten, Meilensteine und Pläne des Benutzers. Schließen Sie Hypothesen und Schritte der Aufgabenausführung aus.\n\nVerwenden Sie für jeden Eintrag:\n- [YYYY-MM-DD] Neutral formulierte Tatsache.\n  - Beleg: „Kurzer wörtlicher Auszug, der die Tatsache stützt.“\nWenn eine geeignete gespeicherte Erinnerung vorliegt, der genaue ursprüngliche Wortlaut aber nicht zugänglich ist, verwenden Sie: Beleg: gespeicherte Erinnerung; genauer Wortlaut nicht verfügbar. Verwenden Sie [unknown], wenn kein Datum vorliegt, und verwerfen Sie eine ansonsten geeignete dauerhafte Tatsache nicht allein wegen eines fehlenden Datums oder Zitats. Leiten Sie keine fehlenden Tatsachen, Daten, Motive oder Beziehungen ab. Nehmen Sie nur direkt belegte Informationen auf und kennzeichnen Sie Unsicherheiten oder Widersprüche, statt sie aufzulösen. Schließen Sie Passwörter, Zugangsdaten, Konto-IDs, Kontaktdaten, amtliche Kennungen, Finanz- und Gesundheitsdaten sowie andere vertrauliche Geheimnisse aus. Geben Sie nur die angeforderten Markdown-Abschnitte ohne Einleitung oder Abschluss aus.\n\nDie absolut letzte Zeile muss lauten:\nImported from: <Name des KI-Assistenten>",
-      "textareaLabel": "Profiltext",
-      "textareaPlaceholder": "Das von der anderen KI gelieferte Profil einfügen…",
+      "textareaLabel": "Antwort der KI",
+      "textareaPlaceholder": "Die vollständige Antwort der anderen KI einfügen…",
       "inputSize": "{size} von {limit}",
-      "inputRequired": "Fügen Sie vor der Vorschau ein Profil ein.",
-      "inputTooLarge": "Dieses Profil ist {size} groß; die Grenze liegt bei {limit}.",
-      "privacyRemote": "Der eingefügte Text, das aktuelle Profil und frühere Importaufzeichnungen werden an {provider} / {model} gesendet. Chatverläufe sind ausgeschlossen und das Modell erhält keine Werkzeuge. Das Erzeugen oder erneute Erzeugen einer Vorschau benötigt normalerweise einen Modellaufruf; besteht das Ergebnis die Validierung nicht, kann OpenSquilla einmal mit demselben Modell wiederholen, also höchstens zwei Aufrufe ausführen.",
-      "privacyLocal": "Der eingefügte Text, das aktuelle Profil und frühere Importaufzeichnungen werden mit dem lokalen Endpunkt {provider} / {model} verarbeitet. Chatverläufe sind ausgeschlossen und das Modell erhält keine Werkzeuge. Das Erzeugen oder erneute Erzeugen einer Vorschau benötigt normalerweise einen Modellaufruf; besteht das Ergebnis die Validierung nicht, kann OpenSquilla einmal mit demselben Modell wiederholen, also höchstens zwei Aufrufe ausführen.",
+      "inputRequired": "Fügen Sie vor der Importvorschau die Antwort der KI ein.",
+      "inputTooLarge": "Diese Antwort ist {size} groß; die Grenze liegt bei {limit}.",
+      "privacyRemote": "Für die Vorschau sendet OpenSquilla den eingefügten Text, das aktuelle Profil und frühere Importaufzeichnungen an {provider} / {model}. Chatverläufe sind ausgeschlossen und das Modell erhält keine Werkzeuge.",
+      "privacyLocal": "Für die Vorschau verarbeitet OpenSquilla den eingefügten Text, das aktuelle Profil und frühere Importaufzeichnungen mit dem lokalen Endpunkt {provider} / {model}. Chatverläufe sind ausgeschlossen und das Modell erhält keine Werkzeuge.",
       "previewAction": "Importvorschau",
       "upgradeTitle": "OpenSquilla aktualisieren, um ein Profil zu importieren",
       "upgradeDescription": "Dieses Gateway kündigt die private Profilimport-API noch nicht an. Aktualisieren Sie den Host, verbinden Sie sich neu und kehren Sie zu dieser Seite zurück.",
@@ -553,7 +559,18 @@
         "title": "Netzwerksicherheit", "description": "Öffentlicher Netzwerkzugriff ist standardmäßig erlaubt; SSRF- und Metadatenschutz bleiben aktiv.",
         "blockAll": "Gesamten Netzwerkzugriff sperren", "blockAllDescription": "Erlaubte Domains bleiben Ausnahmen.", "allowDomains": "Erlaubte Domains", "denyDomains": "Gesperrte Domains"
       },
-      "runtimes": { "title": "Mitgelieferte Laufzeiten", "description": "Sicher nutzt zuerst mitgelieferte Werkzeuge; Vollzugriff zuerst Host-Werkzeuge.", "target": "Paket-Ziel" },
+      "runtimes": {
+        "title": "Laufzeitpakete", "description": "Downloads werden automatisch aktiviert. Sicher bevorzugt installierte Laufzeitpakete; Vollzugriff priorisiert Host-Werkzeuge.", "target": "Laufzeitziel",
+        "allowRuntime": "{runtime} erlauben", "progress": "{runtime}-Download: {progress}%",
+        "states": {
+          "unknown": "Status nicht verfügbar", "notInstalled": "Nicht installiert", "disabled": "Nicht aktiviert", "installed": "Installiert", "installedVersion": "Installiert · {version}",
+          "unsupported": "Für dieses System nicht verfügbar", "corrupt": "Reparatur erforderlich", "queued": "Wartet auf Download", "downloading": "Wird heruntergeladen", "downloadingProgress": "Download · {progress}%",
+          "verifying": "Download wird geprüft", "extracting": "Wird installiert", "probing": "Laufzeit wird geprüft", "activating": "Installation wird abgeschlossen", "cancelling": "Wird abgebrochen", "queuedRemoval": "Wartet auf Entfernung", "removing": "Wird entfernt",
+          "cancelled": "Download abgebrochen", "failed": "Download fehlgeschlagen", "removeFailed": "Entfernen fehlgeschlagen", "removeInterrupted": "Entfernen unterbrochen", "interrupted": "Download pausiert"
+        },
+        "actions": { "enable": "Aktivieren", "download": "Herunterladen", "cancel": "Abbrechen", "resume": "Fortsetzen", "retry": "Erneut versuchen", "repair": "Reparieren", "remove": "Entfernen", "retryRemove": "Entfernen wiederholen" },
+        "sources": { "oss": "OSS Peking", "github": "GitHub-Veröffentlichungen" }
+      },
       "lan": {
         "listen": "Im lokalen Netzwerk lauschen", "listenDescription": "Nach einem Neustart an alle lokalen Schnittstellen binden; öffentliche Peers bleiben gesperrt.",
         "allowedCidrs": "Erlaubte Client-CIDRs", "cidrDescription": "Optional. Leer erlaubt Loopback, RFC1918 und IPv6 ULA; Einträge können den Bereich nur einschränken.",
@@ -589,30 +606,49 @@
       "moreOptionsIn": "Weitere Optionen finden sich in",
       "copyConfigPath": "Konfigurationspfad kopieren",
       "applyLiveNote": "Die meisten Änderungen werden sofort übernommen; einige erfordern einen Neustart des Gateways",
-      "discardTitle": "Ungespeicherte Änderungen verwerfen?",
-      "discardBody": "Es gibt ungespeicherte Änderungen. Beim Schließen gehen sie verloren.",
+      "discardTitle": "Nicht gespeicherte Änderungen",
+      "discardBody": "Speichern Sie die Änderungen vor dem Schließen oder verwerfen Sie sie.",
+      "saveAndClose": "Speichern und schließen",
       "discardConfirmPrimary": "Änderungen verwerfen"
     },
+    "gateway": {
+      "title": "Gateway",
+      "desc": "Mit dem Gateway verbinden und auf dem Desktop die lokale Laufzeit verwalten."
+    },
+    "general": {
+      "title": "Allgemein",
+      "desc": "App-weite Sprache, Sitzungs- und Desktop-Fensterstandards festlegen."
+    },
+    "securityPrivacy": {
+      "title": "Sicherheit & Datenschutz",
+      "desc": "Diagnoseeinstellungen, Desktop-Vorschauen und Werkzeugisolierung verwalten."
+    },
+    "memoryOverview": {
+      "title": "Speicher",
+      "desc": "Festlegen, was OpenSquilla speichert, und optionale Lernfunktionen verwalten.",
+      "autoCaptureLabel": "Automatisches Speichern",
+      "autoCaptureDesc": "OpenSquilla darf nützliche Gesprächsinhalte im Langzeitspeicher sichern.",
+      "learningSummary": "Speicher und Selbstlernen (erweitert)",
+      "learningDesc": "Optionale Lernfunktionen können zusätzliche Modell-Tokens verwenden und einen Neustart erfordern.",
+      "profileImportLabel": "Profilimport",
+      "profileImportDesc": "Kompatible Identitäts- und Speicherdaten prüfen und importieren.",
+      "profileImportAction": "Öffnen"
+    },
     "rail": {
-      "connection": "Verbindung",
-      "runtime": "Laufzeit",
+      "gateway": "Gateway",
       "provider": "Modelldienst",
       "modelStrategy": "Modellrouting",
-      "behavior": "Verhalten",
-      "privacy": "Datenschutz",
-      "sandbox": "Sandbox",
-      "memory": "Gedächtnis und Profil",
-      "router": "Router",
-      "ensemble": "Ensemble",
       "capabilities": "Fähigkeiten",
-      "appearance": "Darstellung",
-      "keyboard": "Tastatur",
+      "general": "Allgemein",
+      "interface": "Oberfläche",
+      "shortcuts": "Tastenkürzel",
+      "securityPrivacy": "Sicherheit & Datenschutz",
+      "memory": "Speicher",
       "advanced": "Erweitert",
       "groups": {
-        "gateway": "Gateway",
         "ai": "AI-Konfiguration",
         "preferences": "Einstellungen",
-        "capabilities": "Fähigkeiten"
+        "safetyData": "Sicherheit & Daten"
       }
     }
   },
@@ -645,7 +681,7 @@
       "advancedTitle": "Erweitert · integrierte CLI",
       "hintBundled": "Diese Befehle verwenden die in der App integrierte CLI; zum Ausführen in ein Terminal einfügen.",
       "hintDev": "Dev-Modus: Befehle laufen über uv aus dem Quell-Checkout.",
-      "restartHint": "Zum Anwenden Einstellungen → Runtime → Neu starten der App verwenden."
+      "restartHint": "Zum Anwenden Einstellungen → Gateway → Neu starten verwenden."
     },
     "common": {
       "apiKey": "API-Schlüssel",
@@ -1088,13 +1124,6 @@
       "presetReadOnlyHint": "Diese voreingestellte Aufstellung wird vom Anbieter verwaltet.",
       "presetProviderMismatchNotice": "Die Durchläufe verwenden weiterhin die gespeicherte {presetProvider}-Voreinstellung, nicht die von {activeProvider} — wählen Sie „Voreinstellung“ erneut, um zu {activeProvider} zu wechseln.",
       "importTierCandidates": "Aus Modellstufen importieren",
-      "roleSelectAria": "Rolle für {model}",
-      "roleUnassigned": "Keine Rolle",
-      "role_primary": "Primär",
-      "role_contrast": "Kontrast",
-      "role_fast_check": "Schnellprüfung",
-      "role_critic": "Kritiker",
-      "role_aggregator": "Aggregator",
       "addCandidateRoleLabel": "Kandidatenrolle",
       "candidateActionsAria": "Aktionen für {model}",
       "replaceModel": "Modell ersetzen",
@@ -1580,7 +1609,7 @@
       "migrationCompleteDismiss": "Ausblenden"
     },
     "keyboard": {
-      "title": "Tastatur",
+      "title": "Tastenkürzel",
       "desc": "Globale Tastenkürzel für diesen Browser. Änderungen werden sofort übernommen — kein Speichern nötig.",
       "addModifier": "{modifier} (und optional ⇧ / ⌥) zur Taste hinzufügen.",
       "conflict": "Bereits verwendet von „{label}“.",
@@ -1594,6 +1623,8 @@
       "desc": "Experimentelle Client-Einstellungen für diesen Browser. Sie werden sofort übernommen — kein Speichern nötig. Markierte Elemente",
       "reload": "neu laden",
       "descReloadSuffix": "werden nach einer Seitenaktualisierung wirksam.",
+      "experimentsGroup": "Experimente",
+      "managementGroup": "Verwaltung",
       "foldLabel": "Neue Live-Turn-Darstellung",
       "foldDesc": "Erstellt die gestreamte Arbeitskarte aus einem geordneten Ereignisprotokoll. Nur zur vorübergehenden Rückkehr zur kompatiblen Darstellung ausschalten.",
       "foldAria": "Neue Live-Turn-Darstellung (wird nach dem Neuladen wirksam)",
@@ -1620,15 +1651,9 @@
       "runTraceAria": "Run-Trace-Schublade in Protokollen (wird nach dem Neuladen wirksam)"
     },
     "privacy": {
-      "title": "Datenschutz",
-      "statusEnabled": "Netzwerkberichte sind eingeschaltet.",
-      "statusDisabled": "Netzwerkberichte sind ausgeschaltet.",
-      "statusDisabledByEnv": "Netzwerkberichte sind ausgeschaltet, weil eine Umgebungsvariable sie deaktiviert.",
-      "disableNetworkObservabilityLabel": "Netzwerkberichte ausschalten",
-      "disableNetworkObservabilityDesc": "Stoppt Installations- und tägliche Nutzungstelemetrie, Updateprüfungen im Hintergrund sowie pseudonyme Sitzungskennungen und den standardmäßig gesendeten optionalen sitzungsübergreifenden Header X-OpenSquilla-Install-Id, die ausschließlich an die offizielle TokenRhythm-HTTPS-API gesendet werden. Die persistierte Installationskennung kann aus lokalen MAC-/IP-Daten abgeleitet werden; Rohadressen werden nie gesendet. CI/Tests und der alte Telemetrie-Opt-out unterdrücken sie ebenfalls, der reine Update-Opt-out dagegen nicht. Ihre eigenen Modellanfragen funktionieren weiterhin.",
-      "memoryAutoCaptureLabel": "Automatisches Speichern",
-      "memoryAutoCaptureDesc": "OpenSquilla darf nützliche Gesprächsinhalte im Langzeitspeicher sichern.",
-      "save": "Datenschutz speichern"
+      "statusDisabledByEnv": "Durch eine Umgebungseinstellung deaktiviert.",
+      "networkReportingLabel": "Diagnose und Updates",
+      "networkReportingDesc": "Begrenzte Produktdiagnosedaten senden und nach Updates suchen. Gesprächsinhalte, Dateien und Inhalte von Modellanfragen werden nicht hochgeladen."
     },
     "toast": {
       "loadFailed": "Einstellungen konnten nicht geladen werden: {error}",
@@ -2944,12 +2969,17 @@
       "queueTitle": "Installationsaktivität",
       "sourceInstalling": "Installation von {name} läuft",
       "sourceFailures": "{count} fehlgeschlagen",
+      "cancelInstall": "Installation abbrechen",
+      "cancellingInstall": "Wird abgebrochen…",
+      "cancelInstallFailed": "Abbruch konnte nicht bestätigt werden: {error}",
       "clearActivity": "Aktivität löschen",
       "expandActivity": "Installationsaktivität erweitern",
       "collapseActivity": "Installationsaktivität einklappen",
       "queueStatus": {
         "queued": "Wartend",
         "installing": "Wird installiert",
+        "cancelling": "Wird abgebrochen",
+        "cancelled": "Abgebrochen",
         "installed": "Installiert",
         "unchanged": "Bereits aktuell",
         "deferred": "Nicht versucht",
@@ -2964,6 +2994,7 @@
       "queueFailed": "{count} fehlgeschlagen",
       "queueDeferred": "{count} nicht versucht",
       "queueUnknown": "{count} Ergebnis unbekannt",
+      "queueCancelled": "{count} abgebrochen",
       "rateLimitDeferred": "Nicht versucht, da GitHub eine vorherige Referenz begrenzt hat. Diese Referenz bleibt für einen späteren Stapel im Eingabefeld.",
       "retryAfter": "Erneut versuchen nach: {value}",
       "installResultUnknown": "Installationsergebnis unbekannt",
@@ -3307,6 +3338,7 @@
     "sendQueuesUntilCompaction": "Senden (in Warteschlange, bis die Verdichtung abgeschlossen ist)",
     "stopResponse": "Aktuelle Antwort stoppen",
     "stopResponseEsc": "Aktuelle Antwort stoppen (Esc)",
+    "stoppingResponse": "Wird sicher beendet… Neue Nachrichten werden eingereiht.",
     "messageToSend": "Zu sendende Nachricht",
     "promptAnnotations": {
       "label": "Anmerkungen", "draftLabel": "Ausstehende Artefaktanweisungen", "sentLabel": "Artefaktanweisungen", "element": "Element",
@@ -3851,14 +3883,14 @@
       "routerAnimationOn": "Router-Animation ein",
       "routerAnimationOff": "Router-Animation aus",
       "modelRouting": "Modell-Routing",
-      "ensembleImageUnsupported": "Ensemble unterstützt derzeit keine Bildeingaben. Wechseln Sie zum Einzelmodell-Routing und versuchen Sie es erneut.",
+      "ensembleImageUnsupported": "Ensemble unterstützt derzeit keine Bildeingaben. Wählen Sie unter „Modell-Routing“ „AI-gestützter Einzelmodell-Router“ mit konfiguriertem Bildmodell oder „Aus“ mit einem bildfähigen Modell.",
       "routingUpdateImageBlocked": "Das Modell-Routing wird aktualisiert. Warten Sie, bevor Sie Bilder senden.",
       "modelRoutingOff": "Aus",
       "modelRoutingOffDesc": "Jeden Durchlauf an das ausgewählte Modell senden.",
       "modelRoutingSquillaRouter": "AI-gestützter Einzelmodell-Router",
       "modelRoutingSquillaRouterDesc": "AI wählt pro Durchlauf ein passendes Modell, um Kosten zu senken.",
       "modelRoutingEnsemble": "AI-gestützter Ensemble-Router",
-      "modelRoutingEnsembleDesc": "AI koordiniert mehrere Modelle, um die Leistungsfähigkeit bei komplexen Aufgaben zu erhöhen.",
+      "modelRoutingEnsembleDesc": "AI koordiniert mehrere Modelle, um die Leistungsfähigkeit bei komplexen Aufgaben zu erhöhen. Bildeingaben werden derzeit nicht unterstützt.",
       "runMode": "Ausführungsmodus",
       "runModeSafe": "Sicher",
       "runModeSafeDesc": "Verwendet die Sandbox und Ihre Datei-, Befehls- und Netzwerkregeln.",

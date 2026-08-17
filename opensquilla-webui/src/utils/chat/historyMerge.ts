@@ -175,6 +175,17 @@ export function mergeLiveOnlyFields(
   }
   if (prev.steerRestored) merged.steerRestored = true
 
+  // Older gateways may return the canonical answer without the ordered local
+  // timeline. Keep the just-finished snapshot so intermediate/answer roles and
+  // their grouped call ids survive the immediate history replacement. A
+  // non-empty server timeline remains authoritative.
+  if ((server.timeline?.length ?? 0) === 0 && (prev.timeline?.length ?? 0) > 0) {
+    merged.timeline = prev.timeline?.map(segment => ({ ...segment }))
+    if ((prev.tool_calls?.length ?? 0) > 0) {
+      merged.tool_calls = prev.tool_calls?.map(call => ({ ...call }))
+    }
+  }
+
   // Approval/clarify interrupts are live event metadata. Canonical transcript
   // rows currently persist the surrounding text/tools but not these decisions,
   // so carry the in-flow timeline snapshot across the immediate history sync.

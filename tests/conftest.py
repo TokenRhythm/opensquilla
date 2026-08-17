@@ -244,6 +244,9 @@ def isolated_core_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "pyproject.toml",
     ):
         shutil.copy2(_REPO_ROOT / filename, build_root / filename)
+    runtime_catalog = Path("desktop/electron/runtime/runtime-pack-catalog.json")
+    (build_root / runtime_catalog).parent.mkdir(parents=True)
+    shutil.copy2(_REPO_ROOT / runtime_catalog, build_root / runtime_catalog)
 
     dist = build_root / "src" / "opensquilla" / "gateway" / "static" / "dist"
     assets = dist / "assets"

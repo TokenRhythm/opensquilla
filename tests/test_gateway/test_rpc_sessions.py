@@ -1217,13 +1217,13 @@ class TestSessionsList:
         assert res.payload["totalCount"] == 201
 
     @pytest.mark.asyncio
-    async def test_session_list_view_pages_beyond_200_without_gaps(
+    async def test_session_list_view_pages_all_401_rows_without_gaps(
         self, dispatcher, tmp_path
     ):
         storage = SessionStorage(str(tmp_path / "sessions-page.db"))
         await storage.connect()
         try:
-            for index in range(201):
+            for index in range(401):
                 await storage.upsert_session(
                     SessionNode(
                         session_key=f"agent:main:webchat:session-{index:03d}",
@@ -1248,26 +1248,38 @@ class TestSessionsList:
             assert first.payload["hasMore"] is True
             assert first.payload["next_cursor"] == first.payload["nextCursor"]
 
-            second = await dispatcher.dispatch(
-                "page-2",
-                "sessions.list",
-                {
-                    "limit": 200,
-                    "view": "session-list-v1",
-                    "cursor": first.payload["next_cursor"],
-                },
-                ctx,
-            )
+            pages = [first]
+            cursor = first.payload["next_cursor"]
+            for page_number in (2, 3):
+                page = await dispatcher.dispatch(
+                    f"page-{page_number}",
+                    "sessions.list",
+                    {
+                        "limit": 200,
+                        "view": "session-list-v1",
+                        "cursor": cursor,
+                    },
+                    ctx,
+                )
+                assert page.ok is True
+                pages.append(page)
+                cursor = page.payload["next_cursor"]
+
+            second, third = pages[1:]
             assert second.ok is True
-            assert second.payload["count"] == 1
-            assert second.payload["has_more"] is False
-            assert second.payload["next_cursor"] is None
+            assert second.payload["count"] == 200
+            assert second.payload["has_more"] is True
+            assert second.payload["next_cursor"] is not None
+            assert third.payload["count"] == 1
+            assert third.payload["has_more"] is False
+            assert third.payload["next_cursor"] is None
 
             keys = [
                 row["key"]
-                for row in [*first.payload["sessions"], *second.payload["sessions"]]
+                for page in pages
+                for row in page.payload["sessions"]
             ]
-            assert len(keys) == len(set(keys)) == 201
+            assert len(keys) == len(set(keys)) == 401
             assert keys == sorted(keys, reverse=True)
         finally:
             await storage.close()
@@ -4667,6 +4679,26 @@ class TestSessionsSteer:
             assert replay.payload["user_message_id"] == accepted.payload["user_message_id"]
             assert await store.list_pending_chat_inputs(key) == []
 
+            # A stale client may still try to drain the identity it hydrated
+            # before steer acceptance. The receipt is a completion tombstone:
+            # replay it instead of admitting a second session turn.
+            stale_dispatch = await dispatcher.dispatch(
+                "r-pending-steer-stale-dispatch",
+                "sessions.pending_inputs.dispatch",
+                {
+                    "key": key,
+                    "pendingInputId": row.pending_input_id,
+                    "clientRequestId": row.client_request_id,
+                    "requestFingerprint": row.request_fingerprint,
+                    "_source": {"caller_kind": "web", "channel_kind": "web"},
+                },
+                ctx,
+            )
+            assert stale_dispatch.ok is True
+            assert stale_dispatch.payload["accepted"] is True
+            assert stale_dispatch.payload["replayed"] is True
+            assert stale_dispatch.payload["task_id"] == handle.task_id
+
             receipt = await store.get_pending_chat_input_dispatch_receipt(
                 row.pending_input_id
             )
@@ -5032,7 +5064,37 @@ class TestSessionsAbort:
         ]
 
     @pytest.mark.asyncio
-    async def test_abort_with_task_id_cancels_only_that_runtime_task(self, dispatcher, session):
+    async def test_abort_with_task_id_returns_without_waiting_for_terminal(
+        self,
+        dispatcher,
+        session,
+        monkeypatch,
+    ):
+        auxiliary_started = asyncio.Event()
+        descendant_started = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        async def blocked_auxiliary_cleanup(**_kwargs: Any) -> int:
+            auxiliary_started.set()
+            await release_cleanup.wait()
+            return 0
+
+        async def blocked_descendant_cleanup(*_args: Any, **_kwargs: Any) -> int:
+            descendant_started.set()
+            await release_cleanup.wait()
+            return 0
+
+        monkeypatch.setattr(
+            rpc_sessions,
+            "_cancel_task_owned_auxiliary_work",
+            blocked_auxiliary_cleanup,
+        )
+        monkeypatch.setattr(
+            rpc_sessions,
+            "_cancel_task_owned_descendants",
+            blocked_descendant_cleanup,
+        )
+
         class Runtime:
             def __init__(self) -> None:
                 self.cancel_calls: list[dict[str, Any]] = []
@@ -5064,17 +5126,26 @@ class TestSessionsAbort:
 
             async def wait(self, task_id: str):
                 self.wait_calls.append(task_id)
-                return SimpleNamespace(task_id=task_id, status="cancelled")
+                await asyncio.Event().wait()
 
         runtime = Runtime()
         ctx = make_ctx(session_manager=FakeSessionManager([session]), task_runtime=runtime)
 
-        res = await dispatcher.dispatch(
-            "r1",
-            "sessions.abort",
-            {"key": session.session_key, "task_id": "task-old", "source": "webui_stop"},
-            ctx,
+        response_task = asyncio.create_task(
+            dispatcher.dispatch(
+                "r1",
+                "sessions.abort",
+                {
+                    "key": session.session_key,
+                    "task_id": "task-old",
+                    "source": "webui_stop",
+                },
+                ctx,
+            )
         )
+        await asyncio.wait_for(auxiliary_started.wait(), timeout=0.2)
+        await asyncio.wait_for(descendant_started.wait(), timeout=0.2)
+        res = await asyncio.wait_for(response_task, timeout=0.2)
 
         assert res.ok is True
         assert runtime.cancel_calls == [
@@ -5085,7 +5156,9 @@ class TestSessionsAbort:
                 "reason": "user_abort",
             }
         ]
-        assert runtime.wait_calls == ["task-old"]
+        assert runtime.wait_calls == []
+        release_cleanup.set()
+        await asyncio.sleep(0)
 
     @pytest.mark.asyncio
     async def test_guest_chat_abort_binds_task_id_to_owned_session(self, dispatcher):
@@ -5290,7 +5363,7 @@ class TestSessionsAbort:
                 "reason": "user_abort",
             }
         ]
-        assert runtime.wait_calls == ["task-current"]
+        assert runtime.wait_calls == []
 
     @pytest.mark.asyncio
     async def test_cancel_queued_task_preserves_running_task_session_registries(
@@ -5362,7 +5435,7 @@ class TestSessionsAbort:
                 "reason": "user_abort",
             }
         ]
-        assert runtime.wait_calls == ["task-queued"]
+        assert runtime.wait_calls == []
         assert task_background_cancel_calls == [(session.session_key, "task-queued")]
         assert approval_cancel_calls == []
 
@@ -5695,6 +5768,7 @@ class TestSessionsAbort:
 
         completion_calls: list[tuple[str, str]] = []
         process_calls: list[tuple[str, str]] = []
+        owned_cleanup_complete = asyncio.Event()
 
         async def cancel_completion(session_key: str, task_id: str) -> int:
             completion_calls.append((session_key, task_id))
@@ -5702,6 +5776,11 @@ class TestSessionsAbort:
 
         async def cancel_processes(session_key: str, task_id: str) -> int:
             process_calls.append((session_key, task_id))
+            if (session_key, task_id) == (
+                finished_child_key,
+                "task-finished-child",
+            ):
+                owned_cleanup_complete.set()
             return 0
 
         monkeypatch.setattr(
@@ -5735,6 +5814,9 @@ class TestSessionsAbort:
 
         assert response.ok is True
         assert response.payload["aborted"] is True
+        # Exact Stop acknowledges once the root cancellation is accepted;
+        # task-owned descendant and process cleanup continues in the background.
+        await asyncio.wait_for(owned_cleanup_complete.wait(), timeout=0.2)
         assert runtime.cancel_calls == [
             (root_key, "task-root"),
             (child_key, "task-child"),
@@ -9094,7 +9176,12 @@ class TestSessionsMessagesSubscribe:
                 started_at=110,
                 finished_at=None,
                 terminal_reason=None,
-                details={},
+                details={
+                    "cancellation_requested": {
+                        "source": "webui_stop",
+                        "reason": "user_abort",
+                    }
+                },
             )
         ]
         subscriptions = SubscriptionManager()
@@ -9129,11 +9216,13 @@ class TestSessionsMessagesSubscribe:
         assert response.payload["projectWorkspace"] is None
         assert response.payload["projectWorkspaceDeferred"] is True
         assert response.payload["active_task"]["task_id"] == "task-hydrate"
+        assert response.payload["active_task"]["cancel_requested"] is True
         assert (
             response.payload["active_task"]["steer_capability"]
             == steer_capability
         )
         assert response.payload["tasks"][0]["steer_capability"] == steer_capability
+        assert response.payload["tasks"][0]["cancel_requested"] is True
         assert response.payload["run_status"] == "running"
         assert response.payload["pendingUserInputs"] == pending
         assert response.payload["epoch"] == 7

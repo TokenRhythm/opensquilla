@@ -11,7 +11,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import structlog
 
@@ -387,8 +387,9 @@ class ToolRegistry:
         visible_tools = self._iter_visible_tools(active_ctx, sort=True)
         visible_tool_names = frozenset(rt.spec.name for rt in visible_tools)
         self._record_description_override_event(active_ctx, visible_tools)
-        return [
-            ToolDefinition(
+        definitions: list[ToolDefinition] = []
+        for rt in visible_tools:
+            definition = ToolDefinition(
                 name=rt.spec.name,
                 description=self._description_for(
                     rt,
@@ -403,9 +404,19 @@ class ToolRegistry:
                 execution_timeout_seconds=rt.spec.execution_timeout_seconds,
                 execution_timeout_argument=rt.spec.execution_timeout_argument,
                 execution_timeout_padding=rt.spec.execution_timeout_padding,
+                cancellation_policy=(
+                    rt.spec.cancellation_policy
+                    or (
+                        "must_settle"
+                        if rt.spec.sandbox.kind in {"fs.write", "fs.edit"}
+                        else "bounded"
+                    )
+                ),
             )
-            for rt in visible_tools
-        ]
+            if rt.spec.allow_string_item_schema_projection:
+                definition._enable_string_item_schema_projection()
+            definitions.append(definition)
+        return definitions
 
     async def list_tools(
         self,
@@ -588,6 +599,7 @@ def tool(
     execution_timeout_seconds: float | None = None,
     execution_timeout_argument: str | None = None,
     execution_timeout_padding: float = 0.0,
+    cancellation_policy: Literal["bounded", "must_settle"] | None = None,
     result_budget_class: str | None = None,
     sandbox: SandboxToolDescriptor | None = None,
     registry: ToolRegistry | None = None,
@@ -596,6 +608,7 @@ def tool(
     terminates_turn: bool = False,
     terminal_response_field: str | None = None,
     runtime_only_arguments: frozenset[str] | set[str] | tuple[str, ...] = (),
+    allow_string_item_schema_projection: bool = False,
 ) -> Any:
     """Decorator to register an async function as a tool.
 
@@ -617,11 +630,13 @@ def tool(
             execution_timeout_seconds=execution_timeout_seconds,
             execution_timeout_argument=execution_timeout_argument,
             execution_timeout_padding=execution_timeout_padding,
+            cancellation_policy=cancellation_policy,
             result_budget_class=result_budget_class,
             sandbox=sandbox or SandboxToolDescriptor.custom(kind=name),
             plan_access=plan_access,
             terminates_turn=terminates_turn,
             terminal_response_field=terminal_response_field,
+            allow_string_item_schema_projection=allow_string_item_schema_projection,
         )
         target = registry if registry is not None else _default_registry
         target.register(spec, fn)

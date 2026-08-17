@@ -7,7 +7,6 @@ import base64
 import contextlib
 import inspect
 import json
-import os
 import re
 import sqlite3
 import threading
@@ -764,12 +763,34 @@ def _guest_profile_for_principal(
     if has_capability("guest.safe") and not principal_has_host_execute(principal):
         runtime_roots: tuple[Path, ...] = ()
         runtime_path: tuple[Path, ...] = ()
-        if os.name != "nt":
-            from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+        try:
+            from opensquilla.runtime_packs import (
+                RuntimePackResolver,
+                get_runtime_pack_service,
+            )
+            from opensquilla.sandbox.policy_store import SandboxPolicyStore
 
-            resolver = bundled_runtime_resolver()
-            runtime_roots = resolver.runtime_roots() if resolver is not None else ()
-            runtime_path = resolver.bundled_path() if resolver is not None else ()
+            runtime_policy = SandboxPolicyStore(Path(state_dir) / "sessions.db").read().runtimes
+            service = get_runtime_pack_service(state_dir)
+            if service.management_supported:
+                resolver = RuntimePackResolver(service)
+                runtime_roots = resolver.runtime_roots(runtime_policy)
+                runtime_path = resolver.managed_path(runtime_policy)
+            else:
+                from opensquilla.sandbox.runtime_launcher import bundled_runtime_resolver
+
+                legacy = bundled_runtime_resolver()
+                runtime_roots = (
+                    legacy.runtime_roots(runtime_policy) if legacy is not None else ()
+                )
+                runtime_path = (
+                    legacy.bundled_path(runtime_policy) if legacy is not None else ()
+                )
+        except (OSError, RuntimeError, ValueError):
+            # Guest remains strictly managed with an empty PATH. Runtime state
+            # corruption must not make session creation or Gateway boot fail.
+            runtime_roots = ()
+            runtime_path = ()
         return GuestProfileFactory.create(
             task_id,
             state_dir=state_dir,
@@ -1932,6 +1953,8 @@ def _task_summary(row: Any) -> dict[str, Any]:
         steer_capability = details.get("steer_capability")
         if isinstance(steer_capability, dict):
             summary["steer_capability"] = dict(steer_capability)
+        if isinstance(details.get("cancellation_requested"), dict):
+            summary["cancel_requested"] = True
     finished_at = getattr(row, "finished_at", None)
     if finished_at is not None:
         summary["finished_at"] = finished_at
@@ -2136,6 +2159,12 @@ async def _overlay_runtime_task_snapshot(
                 and task_id not in queued_task_ids
             ):
                 queued_task_ids.append(task_id)
+    raw_cancel_requested_ids = getattr(snapshot, "cancel_requested_task_ids", ())
+    cancel_requested_task_ids = {
+        value.strip()
+        for value in raw_cancel_requested_ids
+        if isinstance(value, str) and value.strip()
+    }
 
     active_task_id = running_task_id or (queued_task_ids[0] if queued_task_ids else None)
     durable_active = task_state.get("active_task")
@@ -2185,6 +2214,8 @@ async def _overlay_runtime_task_snapshot(
         if active_task is None:
             active_task = {"task_id": active_task_id}
         active_task["status"] = active_status
+        if active_task_id in cancel_requested_task_ids:
+            active_task["cancel_requested"] = True
 
     task_state["active_task"] = active_task
     task_state["queued_task_ids"] = queued_task_ids
@@ -4962,7 +4993,10 @@ async def _handle_sessions_send_impl(
         assert persisted_entry is not None
         atomic_task_runtime = task_runtime
 
-        from opensquilla.gateway.task_runtime import TaskQueueFullError
+        from opensquilla.gateway.task_runtime import (
+            TaskQueueFullError,
+            TaskRuntimeShuttingDownError,
+        )
 
         meta_launch_promotion: str | None = None
 
@@ -5261,8 +5295,16 @@ async def _handle_sessions_send_impl(
                 retryable=False,
                 accepted=False,
             ) from exc
+        except TaskRuntimeShuttingDownError as exc:
+            _cleanup_rejected_guest_profile()
+            raise RpcHandlerError(
+                "UNAVAILABLE",
+                "The Gateway is shutting down. Retry after it restarts.",
+                details={"session_key": exc.session_key},
+                retryable=True,
+                accepted=False,
+            ) from exc
         except TaskQueueFullError as exc:
-            _consumed_file_uuids = []
             _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "QUEUE_FULL",
@@ -5275,7 +5317,6 @@ async def _handle_sessions_send_impl(
                 accepted=False,
             ) from exc
         except StorageBusyError as exc:
-            _consumed_file_uuids = []
             _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "STORAGE_BUSY",
@@ -5966,9 +6007,15 @@ async def _handle_sessions_send_impl(
             # the user can retry against the same uuid.
             _consumed_file_uuids = []  # noqa: F841 – explicit no-evict marker
             _cleanup_rejected_guest_profile()
-            from opensquilla.gateway.task_runtime import TaskQueueFullError
+            from opensquilla.gateway.task_runtime import (
+                TaskQueueFullError,
+                TaskRuntimeShuttingDownError,
+            )
 
-            if not isinstance(exc, TaskQueueFullError):
+            if not isinstance(
+                exc,
+                (TaskQueueFullError, TaskRuntimeShuttingDownError),
+            ):
                 if legacy_meta_launch_promotion == "promoted":
                     from opensquilla.engine.steps.meta_command import (
                         pending_meta_launch_restage,
@@ -5985,7 +6032,9 @@ async def _handle_sessions_send_impl(
             # storage error under load), surface a non-retryable error and
             # hand the orphan message_id to the client as an idempotency
             # token — clients must dedup before retrying.
-            orphan_id, rollback_ok = await _rollback_persisted_user_message("queue_full")
+            shutting_down = isinstance(exc, TaskRuntimeShuttingDownError)
+            rollback_reason = "runtime_shutting_down" if shutting_down else "queue_full"
+            orphan_id, rollback_ok = await _rollback_persisted_user_message(rollback_reason)
 
             if rollback_ok:
                 if legacy_meta_launch_promotion == "promoted":
@@ -5997,6 +6046,18 @@ async def _handle_sessions_send_impl(
                         key,
                         client_request_id=ingress_identity.client_request_id,
                     )
+                if shutting_down:
+                    raise RpcHandlerError(
+                        "UNAVAILABLE",
+                        "The Gateway is shutting down. Retry after it restarts.",
+                        details={
+                            "session_key": exc.session_key,
+                            "rollback_message_id": orphan_id,
+                        },
+                        retryable=True,
+                        accepted=False,
+                    ) from exc
+                assert isinstance(exc, TaskQueueFullError)
                 raise RpcHandlerError(
                     "QUEUE_FULL",
                     "The session task queue is full. Try again after queued work completes.",
@@ -6017,6 +6078,22 @@ async def _handle_sessions_send_impl(
                     key,
                     client_request_id=ingress_identity.client_request_id,
                 )
+            if shutting_down:
+                raise RpcHandlerError(
+                    "UNAVAILABLE",
+                    (
+                        "The Gateway is shutting down and the accepted transcript "
+                        "entry could not be rolled back."
+                    ),
+                    details={
+                        "session_key": exc.session_key,
+                        "orphan_message_id": orphan_id,
+                        "remediation": "client must dedup by message_id before retry",
+                    },
+                    retryable=False,
+                    accepted=True,
+                ) from exc
+            assert isinstance(exc, TaskQueueFullError)
             raise RpcHandlerError(
                 "QUEUE_FULL_DIRTY",
                 (
@@ -8194,6 +8271,22 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     "key": key,
                     "reason": "task_scope_unsupported",
                 }
+            if cancelled_result is exact_cancel_unknown:
+                return {
+                    "aborted": False,
+                    "key": key,
+                    # The request may already have crossed TaskRuntime's
+                    # cancellation boundary.  Do not claim the task is
+                    # terminal; the client must reconcile and retry the same
+                    # exact identity.
+                    "reason": "task_cancel_unknown",
+                }
+            if int(cancelled_result) > 0:
+                # The exact runtime cancellation boundary is authoritative.
+                # Auxiliary and descendant cleanup started alongside it and
+                # continues under its own deadline; do not make Stop wait for
+                # those safety drains or for the task's terminal event.
+                return {"aborted": True, "key": key}
             cancelled_auxiliary = int(
                 await _await_abort_background_task(
                     exact_auxiliary_cleanup,
@@ -8210,28 +8303,11 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     default=0,
                 )
             )
-            if cancelled_result is exact_cancel_unknown:
-                return {
-                    "aborted": False,
-                    "key": key,
-                    # The request may already have crossed TaskRuntime's
-                    # cancellation boundary.  Do not claim the task is
-                    # terminal; the client must reconcile and retry the same
-                    # exact identity.
-                    "reason": "task_cancel_unknown",
-                }
             cancelled_count = (
                 int(cancelled_result)
                 + cancelled_auxiliary
                 + cancelled_descendants
             )
-            if int(cancelled_result) > 0:
-                await _drain_cancelled_task_runtime(
-                    task_runtime,
-                    session_key=key,
-                    task_ids=(requested_task_id,),
-                    deadline_at_monotonic=abort_deadline,
-                )
             reason = "task_not_active"
             if cancelled_count <= 0:
                 # Classification is diagnostic only.  The exact cancel above

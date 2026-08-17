@@ -1514,7 +1514,7 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Ensemble doesn't support image input yet. Switch to single-model routing and try again.",
+      text: "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
     })
   })
 
@@ -1811,7 +1811,10 @@ describe('useChatSend attachment payloads', () => {
     })
     expect(rpc.call).not.toHaveBeenCalledWith('chat.send', expect.anything())
     expect(rpc.call).not.toHaveBeenCalledWith('chat.abort', expect.anything())
-    expect(stream.checkpointForUserMessage).toHaveBeenCalledWith('turn-current')
+    expect(stream.checkpointForUserMessage).toHaveBeenCalledWith(
+      'turn-current',
+      expect.any(String),
+    )
     expect(options.messages.value).toContainEqual(expect.objectContaining({
       role: 'user',
       text: 'hello',
@@ -1819,6 +1822,23 @@ describe('useChatSend attachment payloads', () => {
       turnId: 'turn-current',
       inputDisposition: 'steering',
     }))
+  })
+
+  it('queues the next message instead of steering after Stop is requested', async () => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('turn-current')
+    expect(taskOwnership.beginStop()).toBe('turn-current')
+    const { api, options, rpc, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      taskOwnership,
+      busySendMode: ref<BusySendMode>('steer'),
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(rpc.call).not.toHaveBeenCalledWith('sessions.steer.v2', expect.anything())
+    expect(options.enqueuePendingInput).toHaveBeenCalledWith('hello', undefined)
   })
 
   it.each([
@@ -6868,7 +6888,7 @@ describe('useChatSend Ensemble image guard', () => {
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Ensemble doesn't support image input yet. Switch to single-model routing and try again.",
+      text: "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
     })
   })
 
@@ -6885,7 +6905,7 @@ describe('useChatSend Ensemble image guard', () => {
     await known.api.onSend()
     expect(known.options.messages.value[known.options.messages.value.length - 1]).toMatchObject({
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Ensemble doesn't support image input yet. Switch to single-model routing and try again.",
+      text: "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
     })
 
     const unknownRpc = {

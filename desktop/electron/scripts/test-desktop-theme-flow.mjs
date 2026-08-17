@@ -212,10 +212,10 @@ try {
   await page.waitForURL(url => url.pathname.includes('/control/settings'), {
     timeout: 20_000,
   })
-  const appearanceTab = page.locator('#settings-rail-appearance')
-  await appearanceTab.waitFor({ state: 'visible', timeout: 20_000 })
-  await appearanceTab.click()
-  await page.waitForURL(url => url.pathname.endsWith('/control/settings/appearance'), {
+  const interfaceTab = page.locator('#settings-rail-interface')
+  await interfaceTab.waitFor({ state: 'visible', timeout: 20_000 })
+  await interfaceTab.click()
+  await page.waitForURL(url => url.pathname.endsWith('/control/settings/interface'), {
     timeout: 20_000,
   })
   await page.waitForSelector('input[name="appearance-theme"][value="system"]', {

@@ -284,6 +284,18 @@ export class RpcClient {
     return () => this._listeners.get(event)?.delete(handler);
   }
 
+  private _emit(event: string, ...args: unknown[]): void {
+    const handlers = this._listeners.get(event);
+    if (!handlers) return;
+    for (const handler of handlers) {
+      try {
+        handler(...args);
+      } catch (error) {
+        console.error(`[rpc] "${event}" listener failed`, error);
+      }
+    }
+  }
+
   get state(): ConnectionState {
     return this._state;
   }
@@ -471,8 +483,7 @@ export class RpcClient {
         // before connect completes.
         this._reconnectAttempt = 0;
         this._setState('connected');
-        const helloHandlers = this._listeners.get('_hello');
-        if (helloHandlers) helloHandlers.forEach((h) => h(data));
+        this._emit('_hello', data);
         this._startPing();
         this._startTickWatch();
         return;
@@ -500,10 +511,8 @@ export class RpcClient {
         }
       } else if (data.type === 'event') {
         const meta = data.meta || {};
-        const handlers = this._listeners.get(data.event ?? '');
-        if (handlers) handlers.forEach((h) => h(data.payload, meta));
-        const wild = this._listeners.get('*');
-        if (wild) wild.forEach((h) => h(data.event, data.payload, meta));
+        this._emit(data.event ?? '', data.payload, meta);
+        this._emit('*', data.event, data.payload, meta);
       }
     };
 
@@ -721,8 +730,7 @@ export class RpcClient {
     this._wakeProbeTimer = setTimeout(() => {
       if (!this._isCurrentSocket(socket, generation)) return;
       this._clearWakeProbe(generation);
-      const handlers = this._listeners.get('_gap');
-      if (handlers) handlers.forEach((h) => h({ reason: 'wake_probe_timeout' }));
+      this._emit('_gap', { reason: 'wake_probe_timeout' });
       this._retireCurrentSocket(new Error('Wake probe timed out'), true);
     }, WAKE_PROBE_TIMEOUT_MS);
   }
@@ -750,8 +758,7 @@ export class RpcClient {
     const seq = data.seq;
     if (this._lastSeq > 0 && seq !== this._lastSeq + 1) {
       const detail = { expected: this._lastSeq + 1, actual: seq, event: data.event };
-      const handlers = this._listeners.get('_gap');
-      if (handlers) handlers.forEach((h) => h(detail));
+      this._emit('_gap', detail);
       try {
         this._ws?.close();
       } catch {}
@@ -770,8 +777,7 @@ export class RpcClient {
       if (!this._ws || this._ws.readyState !== WebSocket.OPEN) return;
       const idleMs = Date.now() - this._lastFrameAt;
       if (idleMs <= this._tickTimeoutMs) return;
-      const handlers = this._listeners.get('_gap');
-      if (handlers) handlers.forEach((h) => h({ reason: 'tick_timeout', idleMs }));
+      this._emit('_gap', { reason: 'tick_timeout', idleMs });
       try {
         this._ws.close();
       } catch {}
@@ -805,7 +811,6 @@ export class RpcClient {
   private _setState(s: ConnectionState): void {
     if (this._state === s) return;
     this._state = s;
-    const handlers = this._listeners.get('_state');
-    if (handlers) handlers.forEach((h) => h(s));
+    this._emit('_state', s);
   }
 }

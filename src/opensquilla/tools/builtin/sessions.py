@@ -362,6 +362,10 @@ async def sessions_send(session_key: str, message: str) -> str:
                         f"Session '{session_key}' task queue is full. "
                         "Try again after queued work completes."
                     ) from exc
+                if type(exc).__name__ == "TaskRuntimeShuttingDownError":
+                    raise SafeToolError(
+                        "The Gateway is shutting down. Retry after it restarts."
+                    ) from exc
                 raise
             return json.dumps(
                 {

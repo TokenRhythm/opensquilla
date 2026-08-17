@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Stop now acknowledges immediately for provider and ordinary tool work while
+  safely settling in-flight filesystem mutations before publishing a terminal
+  turn. Late provider or tool results are discarded, timed-out writes retain
+  their timeout outcome, and committed file changes are recorded before the
+  next turn can run.
+
 ## [0.5.3] - 2026-08-13
 
 ### Added

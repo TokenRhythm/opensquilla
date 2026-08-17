@@ -22,14 +22,19 @@ function desktopApi(overrides: Record<string, unknown> = {}) {
   }
 }
 
-async function mountPanel(api: ReturnType<typeof desktopApi>) {
+async function mountPanel(
+  api: ReturnType<typeof desktopApi>,
+  kind: 'close' | 'preview' = 'close',
+) {
   vi.resetModules()
   document.body.innerHTML = ''
   setDesktopApi(api)
   const { createApp, nextTick } = await import('vue')
   const i18n = (await import('@/i18n')).default
   i18n.global.locale.value = 'en'
-  const Component = (await import('./DesktopRuntimePanel.vue')).default
+  const Component = kind === 'close'
+    ? (await import('./DesktopCloseBehaviorSetting.vue')).default
+    : (await import('./DesktopPreviewModeSetting.vue')).default
   const el = document.createElement('div')
   document.body.appendChild(el)
   const app = createApp(Component)
@@ -246,7 +251,7 @@ describe('DesktopRuntimePanel close behavior preference', () => {
         workbenchPreviewForcedOffline: false,
       }),
       saveDesktopPreferences,
-    }))
+    }), 'preview')
     const select = findPreviewModeSelect(el)
 
     expect(select.value).toBe('offline')
@@ -274,7 +279,7 @@ describe('DesktopRuntimePanel close behavior preference', () => {
         workbenchPreviewForcedOffline: true,
       }),
       saveDesktopPreferences: vi.fn(),
-    }))
+    }), 'preview')
 
     expect(findPreviewModeSelect(el).value).toBe('full')
     const warning = el.querySelector<HTMLElement>('[data-testid="desktop-preview-mode-forced"]')

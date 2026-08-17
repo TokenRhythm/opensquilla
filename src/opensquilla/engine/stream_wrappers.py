@@ -19,6 +19,7 @@ import time
 from collections.abc import AsyncIterator
 from typing import cast
 
+from .cancellation import CANCEL_GRACE_SECONDS, ORPHANED_TASKS, cancel_task
 from .types import AgentEvent, RunHeartbeatEvent, ToolUseStartEvent
 
 _STREAM_DONE = object()
@@ -35,25 +36,11 @@ class _StreamFailure:
 # awaits a dead socket, a retry loop that swallows ``CancelledError`` — would
 # otherwise hold the timeout open forever, which is the exact stall the timeout
 # exists to end.
-_CANCEL_GRACE_SECONDS = 5.0
+_CANCEL_GRACE_SECONDS = CANCEL_GRACE_SECONDS
 
 # Abandoned tasks are parked here so the event loop keeps a strong reference and
 # cannot destroy them while they are still pending.
-_ORPHANED_TASKS: set[asyncio.Task[object]] = set()
-
-
-def _forget_orphan(task: asyncio.Task[object]) -> None:
-    _ORPHANED_TASKS.discard(task)
-    # Retrieve whatever it ended with so asyncio does not log it as never retrieved.
-    with contextlib.suppress(BaseException):
-        task.exception()
-
-
-def _park_orphan(task: asyncio.Task[object]) -> None:
-    if task in _ORPHANED_TASKS:
-        return
-    _ORPHANED_TASKS.add(task)
-    task.add_done_callback(_forget_orphan)
+_ORPHANED_TASKS = ORPHANED_TASKS
 
 
 async def _settle_or_abandon(
@@ -68,27 +55,13 @@ async def _settle_or_abandon(
     deadline real. The task is left running rather than awaited: it is already
     unresponsive, and the turn it belonged to is failing regardless.
     """
-    # If the upstream ignores cancellation and later yields, its driver must
-    # exit instead of parking forever for another pull from a consumer that has
-    # already left.
     stop_requested.set()
-    task.cancel()
-    try:
-        done, _pending = await asyncio.wait({task}, timeout=_CANCEL_GRACE_SECONDS)
-    except asyncio.CancelledError:
-        # A second caller cancellation must still propagate, but it must not
-        # drop the only strong reference to an upstream that remains pending.
-        if task.done():
-            with contextlib.suppress(BaseException):
-                task.exception()
-        else:
-            _park_orphan(task)
-        raise
-    if done:
-        with contextlib.suppress(BaseException):
-            task.exception()
-        return
-    _park_orphan(task)
+    await cancel_task(
+        task,
+        policy="bounded",
+        operation="stream_wrapper_driver",
+        grace_seconds=_CANCEL_GRACE_SECONDS,
+    )
 
 
 # ---------------------------------------------------------------------------

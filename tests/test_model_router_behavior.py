@@ -4,7 +4,10 @@ import pytest
 
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.steps import squilla_router as squilla_router_step
-from opensquilla.engine.steps.squilla_router import apply_squilla_router
+from opensquilla.engine.steps.squilla_router import (
+    apply_squilla_router,
+    finalize_squilla_router_capacity,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.provider.model_catalog import ModelCatalog
 from opensquilla.squilla_router.v4_phase3 import V4Phase3Strategy
@@ -486,6 +489,30 @@ async def test_large_material_estimate_floors_low_router_tier(
     assert routed.metadata["routing_extra"]["final_tier"] == "c2"
 
 
+@pytest.mark.parametrize(
+    ("character_count", "expected_tier", "expected_floor"),
+    [
+        (99_996, "c0", None),
+        (100_000, "c2", "c2"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_plain_text_large_context_floor_boundary_keeps_legacy_parity(
+    monkeypatch: pytest.MonkeyPatch,
+    character_count: int,
+    expected_tier: str,
+    expected_floor: str | None,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    ctx = make_context("a" * character_count)
+
+    routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routed_tier"] == expected_tier
+    assert routed.metadata.get("large_context_floor_min_tier") == expected_floor
+    assert "large_context_capacity_required" not in routed.metadata
+
+
 @pytest.mark.asyncio
 async def test_large_material_ratio_floors_low_router_tier_to_t3(
     monkeypatch: pytest.MonkeyPatch,
@@ -522,6 +549,326 @@ async def test_large_material_head_honors_global_context_override(
     assert routed.metadata["large_context_context_window_override_tokens"] == 80_000
     assert routed.metadata["large_context_max_output_override_tokens"] == 10_000
     assert "routed_tier" not in routed.metadata
+
+
+@pytest.mark.asyncio
+async def test_attachment_below_large_floor_uses_effective_request_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Attachment admission must use usable input, not the raw context window."""
+
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/text-tight": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            },
+            "openrouter/text-safe": {
+                "context_window": 64_000,
+                "max_output_tokens": 4_000,
+            },
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context(
+        "Summarize the attachment.",
+        attachments=[{"type": "application/pdf"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "openrouter",
+            "model": "text-tight",
+            "thinking_level": "off",
+        },
+        "c1": {
+            "provider": "openrouter",
+            "model": "text-safe",
+            "thinking_level": "off",
+        },
+    }
+    ctx.metadata["attachment_material_estimated_tokens"] = 20_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 5_000
+    ctx.metadata["routing_history_capacity_message_count"] = 4
+
+    routed = await apply_squilla_router(ctx)
+    routed = await finalize_squilla_router_capacity(routed)
+
+    assert "large_context_floor_min_tier" not in routed.metadata
+    assert routed.metadata["routed_tier"] == "c1"
+    assert routed.model == "text-safe"
+
+
+@pytest.mark.asyncio
+async def test_complete_estimate_replaces_legacy_fixed_headroom_at_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c2", 0.91, {"route_class": "R2"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/boundary-safe": {
+                "context_window": 80_000,
+                "max_output_tokens": 4_000,
+            }
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context(
+        "Use the attachment.",
+        attachments=[{"type": "text/plain"}],
+    )
+    ctx.config.squilla_router.auto_thinking = False
+    ctx.config.squilla_router.tiers = {
+        "c2": {
+            "provider": "openrouter",
+            "model": "boundary-safe",
+            "thinking_level": "off",
+        }
+    }
+    ctx.metadata["attachment_material_estimated_tokens"] = 40_000
+
+    routed = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx)
+    )
+
+    assert routed.metadata["routed_tier"] == "c2"
+    assert routed.metadata["large_context_request_input_tokens"] < 47_600
+
+
+@pytest.mark.asyncio
+async def test_same_attachment_fits_short_history_but_long_history_is_filtered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/text-tight": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            },
+            "openrouter/text-safe": {
+                "context_window": 64_000,
+                "max_output_tokens": 4_000,
+            },
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+
+    async def route(history_tokens: int) -> TurnContext:
+        ctx = make_context(
+            "Use the supplied material.",
+            attachments=[{"type": "text/plain"}],
+        )
+        ctx.config.squilla_router.tiers = {
+            "c0": {
+                "provider": "openrouter",
+                "model": "text-tight",
+                "thinking_level": "off",
+            },
+            "c1": {
+                "provider": "openrouter",
+                "model": "text-safe",
+                "thinking_level": "off",
+            },
+        }
+        ctx.metadata["attachment_material_estimated_tokens"] = 4_000
+        ctx.metadata["routing_history_capacity_estimated_tokens"] = history_tokens
+        ctx.metadata["routing_history_capacity_message_count"] = 8
+        return await finalize_squilla_router_capacity(
+            await apply_squilla_router(ctx)
+        )
+
+    short_history = await route(1_000)
+    long_history = await route(21_000)
+
+    assert short_history.metadata["routed_tier"] == "c0"
+    assert long_history.metadata["routed_tier"] == "c1"
+    assert (
+        long_history.metadata["large_context_request_input_tokens"]
+        > short_history.metadata["large_context_request_input_tokens"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_catalog_unknown_custom_attachment_config_has_actionable_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog._shared_catalog",
+        ModelCatalog(),
+    )
+    ctx = make_context(
+        "Read the synthetic attachment.",
+        attachments=[{"type": "text/plain"}],
+    )
+    ctx.config.llm.provider = "custom"
+    ctx.config.llm.model = "private-model"
+    ctx.config.llm.context_window_tokens = 0
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "custom",
+            "model": "private-model",
+            "thinking_level": "off",
+        }
+    }
+    ctx.metadata["attachment_material_estimated_tokens"] = 1_000
+
+    routed = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx)
+    )
+
+    assert routed.metadata["large_context_capacity_blocked"] is True
+    assert "llm.context_window_tokens" in routed.metadata[
+        "large_context_capacity_block_reason"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_catalog_unknown_custom_plain_text_keeps_existing_routing_behavior(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    monkeypatch.setattr(
+        "opensquilla.provider.model_catalog._shared_catalog",
+        ModelCatalog(),
+    )
+    ctx = make_context("No attachment on this turn.")
+    ctx.config.llm.provider = "custom"
+    ctx.config.llm.model = "private-model"
+    ctx.config.llm.context_window_tokens = 0
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "custom",
+            "model": "private-model",
+            "thinking_level": "off",
+        }
+    }
+
+    routed = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx)
+    )
+
+    assert routed.model == "private-model"
+    assert routed.metadata["routing_applied"] is True
+    assert "large_context_capacity_blocked" not in routed.metadata
+
+
+@pytest.mark.asyncio
+async def test_long_user_history_system_tools_and_attachment_share_one_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/text-tight": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            },
+            "openrouter/text-safe": {
+                "context_window": 64_000,
+                "max_output_tokens": 4_000,
+            },
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context(
+        "u" * 12_000,
+        attachments=[{"type": "application/pdf"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "openrouter",
+            "model": "text-tight",
+            "thinking_level": "off",
+        },
+        "c1": {
+            "provider": "openrouter",
+            "model": "text-safe",
+            "thinking_level": "off",
+        },
+    }
+    ctx.system_prompt = "s" * 8_000
+    ctx.tool_defs = [
+        {
+            "name": "synthetic_tool",
+            "description": "d" * 8_000,
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    ]
+    ctx.metadata["attachment_material_estimated_tokens"] = 4_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 12_000
+    ctx.metadata["routing_history_capacity_message_count"] = 12
+
+    routed = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx)
+    )
+
+    assert routed.metadata["routed_tier"] == "c1"
+    assert routed.metadata["large_context_material_tokens"] >= 7_000
+    assert routed.metadata["large_context_history_tokens"] == 12_000
+    assert routed.metadata["large_context_system_tools_tokens"] > 3_000
+    assert routed.metadata["large_context_structural_tokens"] > 0
+
+
+@pytest.mark.asyncio
+async def test_capacity_revalidation_never_downgrades_semantic_tier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_strategy(monkeypatch, "c2", 0.91, {"route_class": "R2"})
+    catalog = ModelCatalog()
+    catalog.set_user_overrides(
+        {
+            "openrouter/lower-large-window": {
+                "context_window": 128_000,
+                "max_output_tokens": 4_000,
+            },
+            "openrouter/selected-tight": {
+                "context_window": 32_000,
+                "max_output_tokens": 4_000,
+            },
+            "openrouter/higher-safe": {
+                "context_window": 64_000,
+                "max_output_tokens": 4_000,
+            },
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context(
+        "Analyze the attachment.",
+        attachments=[{"type": "text/plain"}],
+    )
+    ctx.config.squilla_router.tiers = {
+        "c0": {
+            "provider": "openrouter",
+            "model": "lower-large-window",
+            "thinking_level": "off",
+        },
+        "c2": {
+            "provider": "openrouter",
+            "model": "selected-tight",
+            "thinking_level": "off",
+        },
+        "c3": {
+            "provider": "openrouter",
+            "model": "higher-safe",
+            "thinking_level": "off",
+        },
+    }
+    ctx.metadata["attachment_material_estimated_tokens"] = 4_000
+    ctx.metadata["routing_history_capacity_estimated_tokens"] = 21_000
+    ctx.metadata["routing_history_capacity_message_count"] = 8
+
+    routed = await finalize_squilla_router_capacity(
+        await apply_squilla_router(ctx)
+    )
+
+    assert routed.metadata["routed_tier"] == "c3"
+    assert routed.metadata["large_context_final_route_from_tier"] == "c2"
 
 
 @pytest.mark.asyncio

@@ -180,6 +180,7 @@
               </button>
               <ChatComposerAddMenu
                 v-if="addMenuOpen"
+                :avoid-element="addMenuAvoidElement"
                 :attachments-disabled="replanActive"
                 :goal-mode-active="goalDraftArmed"
                 :goal-mode-available="goalModeAvailable === true"
@@ -492,6 +493,7 @@ const props = withDefaults(defineProps<{
   modelRoutingSettingsBusy: boolean
   codingModeEnabled?: boolean
   codingModeSettingsBusy?: boolean
+  addMenuAvoidElement?: HTMLElement | null
   goalDraftArmed?: boolean
   goalModeAvailable?: boolean
   goalModeBusy?: boolean

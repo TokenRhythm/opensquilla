@@ -72,7 +72,7 @@ afterEach(() => {
 })
 
 describe('useSetupCatalog privacy settings', () => {
-  it('moves automatic memory capture into the privacy dirty/save flow', async () => {
+  it('tracks and saves automatic memory capture from the Memory section', async () => {
     mockConfigSequence([
       {
         privacy: { disable_network_observability: false },
@@ -87,16 +87,15 @@ describe('useSetupCatalog privacy settings', () => {
 
     api.setMemoryAutoCapture(false)
 
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('memory')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(false)
     await api.saveDirtySections()
     expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
       patches: {
-        'privacy.disable_network_observability': false,
         'memory.auto_capture_enabled': false,
       },
     })
-    expect(api.sectionDirty('privacy')).toBe(false)
+    expect(api.sectionDirty('memory')).toBe(false)
     app.unmount()
   })
 
@@ -108,14 +107,14 @@ describe('useSetupCatalog privacy settings', () => {
     const { api, app } = await mountCatalog()
 
     api.setDisableNetworkObservability(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
 
     await api.savePrivacy()
 
     expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
       patches: { 'privacy.disable_network_observability': true },
     })
-    expect(api.sectionDirty('privacy')).toBe(false)
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
     expect(pushToast).toHaveBeenCalledWith('Privacy saved.')
     app.unmount()
   })
@@ -143,16 +142,16 @@ describe('useSetupCatalog privacy settings', () => {
 
     api.setDisableNetworkObservability(true)
     api.setAutoSessionTitles(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
-    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
 
     await api.saveDirtySections()
 
     expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
       patches: { 'privacy.disable_network_observability': true },
     })
-    expect(api.privacyPanel.value.disableNetworkObservability).toBe(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.privacyPanel.value.networkReportingEnabled).toBe(false)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
     app.unmount()
   })
 
@@ -167,11 +166,11 @@ describe('useSetupCatalog privacy settings', () => {
     ])
     const { api, app } = await mountCatalog()
 
-    expect(api.privacyPanel.value.disableNetworkObservability).toBe(false)
-    expect(api.privacyPanel.value.statusText).toBe(
-      'Network reporting is off because an environment setting disables it.',
-    )
-    expect(api.sectionDirty('privacy')).toBe(false)
+    expect(api.privacyPanel.value).toMatchObject({
+      networkReportingEnabled: false,
+      networkReportingForcedOff: true,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
     app.unmount()
   })
 
@@ -188,10 +187,11 @@ describe('useSetupCatalog privacy settings', () => {
 
     api.setDisableNetworkObservability(false)
 
-    expect(api.privacyPanel.value.statusText).toBe(
-      'Network reporting is on.',
-    )
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.privacyPanel.value).toMatchObject({
+      networkReportingEnabled: true,
+      networkReportingForcedOff: false,
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
     app.unmount()
   })
 })
@@ -252,7 +252,7 @@ describe('useSetupCatalog capability reset', () => {
     api.setAutoSessionTitles(true)
     api.updateCapabilityField('image', 'apiKey', 'test-inline-key')
 
-    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
     await api.resetCapability('image_generation')
 
@@ -263,7 +263,7 @@ describe('useSetupCatalog capability reset', () => {
       capabilityId: 'image_generation',
     })
     expect(api.sectionDirty('capabilities')).toBe(false)
-    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
     app.unmount()
   })
 
@@ -3296,8 +3296,9 @@ describe('useSetupCatalog configured provider management', () => {
     api.updateCapabilityField('search', 'maxResults', 25)
     api.updateCapabilityField('image', 'size', '512x512')
     api.updateCapabilityField('audio', 'ttsVoice', 'draft-voice')
-    expect(api.sectionDirty('behavior')).toBe(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(api.sectionDirty('memory')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
 
     await api.requestSelectConfiguredProvider('deepseek')
@@ -3305,18 +3306,17 @@ describe('useSetupCatalog configured provider management', () => {
     await expect(api.saveProvider()).resolves.toBe(true)
 
     expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
-    expect(api.privacyPanel.value).toMatchObject({
-      disableNetworkObservability: true,
-      memoryAutoCapture: false,
-    })
+    expect(api.privacyPanel.value.networkReportingEnabled).toBe(false)
+    expect(api.memoryPanel.value.autoCapture).toBe(false)
     expect(api.capabilitiesPanel.value.form).toMatchObject({
       searchMaxResults: 25,
       memoryModel: 'server-refreshed-model',
       imageSize: '512x512',
       audioTtsVoice: 'draft-voice',
     })
-    expect(api.sectionDirty('behavior')).toBe(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(api.sectionDirty('memory')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
     expect(api.providerDraftDirty.value).toBe(false)
     expect(api.providerPanel.value.providerSelected).toBe('deepseek')
@@ -3539,7 +3539,7 @@ describe('useSetupCatalog configured provider management', () => {
     await expect(save).resolves.toBe(true)
 
     expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
-    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
     expect(api.providerDraftDirty.value).toBe(false)
     app.unmount()
   })
@@ -3914,18 +3914,17 @@ describe('useSetupCatalog configured provider management', () => {
     })
     expect(api.sectionDirty('modelStrategy')).toBe(false)
     expect(api.behaviorPanel.value.autoSessionTitles).toBe(true)
-    expect(api.privacyPanel.value).toMatchObject({
-      disableNetworkObservability: true,
-      memoryAutoCapture: false,
-    })
+    expect(api.privacyPanel.value.networkReportingEnabled).toBe(false)
+    expect(api.memoryPanel.value.autoCapture).toBe(false)
     expect(api.capabilitiesPanel.value.form).toMatchObject({
       searchMaxResults: 25,
       memoryModel: 'server-refreshed-model',
       imageSize: '512x512',
       audioTtsVoice: 'draft-voice',
     })
-    expect(api.sectionDirty('behavior')).toBe(true)
-    expect(api.sectionDirty('privacy')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(api.sectionDirty('memory')).toBe(true)
     expect(api.sectionDirty('capabilities')).toBe(true)
     app.unmount()
   })
@@ -5075,7 +5074,7 @@ describe('useSetupCatalog configured provider management', () => {
     expect(api.providerPanel.value.llmTimeoutSeconds).toBe(321)
     expect(api.modelStrategyPanel.value.single.model).toBe('gpt-4.1')
     expect(api.providerDraftDirty.value).toBe(true)
-    expect(api.sectionDirty('behavior')).toBe(true)
+    expect(api.sectionDirty('general')).toBe(true)
     expect(api.sectionDirty('modelStrategy')).toBe(true)
     app.unmount()
   })

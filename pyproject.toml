@@ -128,6 +128,7 @@ exclude = [
 
 [tool.hatch.build.targets.wheel.force-include]
 "migrations/" = "opensquilla/_migrations/"
+"desktop/electron/runtime/runtime-pack-catalog.json" = "opensquilla/runtime_packs/runtime-pack-catalog.json"
 "src/opensquilla/skills/bundled/html-coder/references/add-css-style.md" = "opensquilla/skills/bundled/html-coder/references/add-css-style.md"
 "src/opensquilla/skills/bundled/html-coder/references/add-javascript.md" = "opensquilla/skills/bundled/html-coder/references/add-javascript.md"
 "src/opensquilla/skills/bundled/html-coder/references/attributes.md" = "opensquilla/skills/bundled/html-coder/references/attributes.md"
@@ -145,6 +146,9 @@ exclude = [
 # source-archive build cannot leak private or copyrighted audio. Developers who
 # need a private customized artifact can build a direct local wheel instead.
 artifacts = ["src/opensquilla/gateway/static/dist/**"]
+
+[tool.hatch.build.targets.sdist.force-include]
+"desktop/electron/runtime/runtime-pack-catalog.json" = "desktop/electron/runtime/runtime-pack-catalog.json"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

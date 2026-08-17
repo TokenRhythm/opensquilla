@@ -27,6 +27,7 @@ import {
   desktopProfileFingerprint,
   loadDesktopGatewayOwnershipRecord,
   requestVerifiedDesktopGatewayShutdown,
+  verifyDesktopGatewayLaunchOwnership,
   waitForDesktopGatewayOwnershipRelease,
   type DesktopGatewayOwnershipRecord,
 } from './desktop-gateway-ownership.js'
@@ -36,7 +37,13 @@ import {
 import {
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
+  waitForGatewayReadiness,
 } from './gateway-lifecycle.js'
+import {
+  OnboardingFlowCoordinator,
+  type CoordinatedOnboardingFlow,
+} from './onboarding-flow-coordinator.js'
+import { OnboardingSaveTelemetry } from './onboarding-save-telemetry.js'
 import { buildCliInvocation } from './cli-invocation.js'
 import {
   cleanupSelectorArgs,
@@ -237,6 +244,25 @@ interface OnboardingProbeResult {
   failureKind: string
   message: string
   latencyMs: number
+}
+
+type OnboardingSaveErrorCode =
+  | 'onboarding_inactive'
+  | 'save_in_progress'
+  | 'recovery_required'
+  | 'lifecycle_deferred'
+
+type OnboardingSaveResult =
+  | { ok: true }
+  | { ok: false; code: OnboardingSaveErrorCode; error: string }
+
+interface OnboardingFlow extends CoordinatedOnboardingFlow<
+  OnboardingPayload,
+  OnboardingSaveResult
+> {
+  window: BrowserWindow | null
+  resolve: ((credential: DesktopConnection) => void) | null
+  reject: ((error: Error) => void) | null
 }
 
 interface DesktopSettingsPayload extends OnboardingPayload {}
@@ -478,8 +504,12 @@ function nativeWorkbenchFailureReason(event: NativeWorkbenchSurfaceEvent): strin
 }
 
 let gatewayStartPromise: Promise<GatewayState> | null = null
-let resolveOnboarding: ((credential: DesktopConnection) => void) | null = null
-let rejectOnboarding: ((error: Error) => void) | null = null
+let onboardingSaveTelemetryAttempt = 0
+const onboardingFlows = new OnboardingFlowCoordinator<
+  OnboardingPayload,
+  OnboardingSaveResult,
+  OnboardingFlow
+>()
 let secretStorageBackendCache: SecretEncryption | null = null
 const decryptedSecretCache = new SecretDecryptionCache()
 let macCodeSignatureDiagnosticCache: string | null = null
@@ -505,10 +535,17 @@ const gatewayProcessTreeChildren = new WeakSet<ChildProcessWithoutNullStreams>()
 const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
 let desktopOpenFlowPromise: Promise<void> | null = null
+let bootResumePromise: Promise<{ ok: boolean; error?: string }> | null = null
 
 function invalidateDesktopOpenFlow(): number {
   desktopOpenFlowRevision += 1
   return desktopOpenFlowRevision
+}
+
+function desktopOpenAuthorityIsCurrent(revision: number, profileKey: string): boolean {
+  return !isQuitting
+    && revision === desktopOpenFlowRevision
+    && profileKey === desktopProfileKey()
 }
 
 function beginDesktopWriterOperation(label: string): () => void {
@@ -1808,15 +1845,14 @@ function ensembleConfigTomlLines(credential: DesktopConnection): string[] {
     throw new Error(`LLM Ensemble is not supported for provider ${credential.provider}.`)
   }
   const profile = DESKTOP_ENSEMBLE_PROFILES[selectionMode]
-  const roles = ['primary', 'contrast', 'fast_check', 'critic']
-  const candidates = profile.proposers.flatMap((model, index) => [
+  const candidates = profile.proposers.flatMap(model => [
     '',
     '[[llm_ensemble.candidates]]',
     `provider = ${tomlString(profile.provider)}`,
     `model = ${tomlString(model)}`,
     'source = "custom"',
     'enabled = true',
-    `role = ${tomlString(roles[index] || '')}`,
+    'role = "proposer"',
   ])
   candidates.push(
     '',
@@ -3964,6 +4000,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDirect: 'Direct model is required for Direct single model mode.',
     defaultTierRequiresModel: 'Default router tier requires a model.',
     searchApiKeyRequired: '{label} search API key is required.',
+    savingSetup: 'Saving setup…',
+    setupTakingLonger: 'First-time setup usually takes 10–20 seconds. Please keep this window open.',
     stepLabel: 'Step {n}',
   },
   'zh-Hans': {
@@ -4010,6 +4048,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDirect: '直连单模型模式需要直连模型。',
     defaultTierRequiresModel: '默认路由层级需要一个模型。',
     searchApiKeyRequired: '需要 {label} 搜索 API 密钥。',
+    savingSetup: '正在保存设置…',
+    setupTakingLonger: '首次设置通常需要 10–20 秒，请保持此窗口打开。',
     stepLabel: '步骤 {n}',
   },
   ja: {
@@ -4056,6 +4096,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Smart Router を無効にする場合は直接モデルが必要です。',
     defaultTierRequiresModel: 'デフォルトのルーターティアにはモデルが必要です。',
     searchApiKeyRequired: '{label} の検索 API キーが必要です。',
+    savingSetup: '設定を保存しています…',
+    setupTakingLonger: '初回セットアップには通常10～20秒かかります。このウィンドウを開いたままお待ちください。',
     stepLabel: 'ステップ {n}',
   },
   fr: {
@@ -4102,6 +4144,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Un modèle direct est requis lorsque Smart Router est désactivé.',
     defaultTierRequiresModel: 'Le niveau de routeur par défaut nécessite un modèle.',
     searchApiKeyRequired: 'La clé API de recherche {label} est requise.',
+    savingSetup: 'Enregistrement…',
+    setupTakingLonger: 'La configuration initiale prend généralement 10 à 20 secondes. Gardez cette fenêtre ouverte.',
     stepLabel: 'Étape {n}',
   },
   de: {
@@ -4148,6 +4192,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Ein direktes Modell ist erforderlich, wenn Smart Router deaktiviert ist.',
     defaultTierRequiresModel: 'Die Standard-Routerstufe erfordert ein Modell.',
     searchApiKeyRequired: 'Der Such-API-Schlüssel für {label} ist erforderlich.',
+    savingSetup: 'Einrichtung wird gespeichert…',
+    setupTakingLonger: 'Die Ersteinrichtung dauert normalerweise 10–20 Sekunden. Lassen Sie dieses Fenster geöffnet.',
     stepLabel: 'Schritt {n}',
   },
   es: {
@@ -4194,6 +4240,8 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     directModelRequiredDisabled: 'Se requiere un modelo directo cuando Smart Router está desactivado.',
     defaultTierRequiresModel: 'El nivel de enrutador predeterminado requiere un modelo.',
     searchApiKeyRequired: 'Se requiere la clave API de búsqueda de {label}.',
+    savingSetup: 'Guardando la configuración…',
+    setupTakingLonger: 'La configuración inicial suele tardar entre 10 y 20 segundos. Mantén esta ventana abierta.',
     stepLabel: 'Paso {n}',
   },
 }
@@ -5690,6 +5738,16 @@ function onboardingHtml(
       border-top: 1px solid var(--line);
       padding-top: 16px;
     }
+    .actions > button { flex: 0 0 auto; }
+    .submit-status {
+      flex: 1 1 auto;
+      min-width: 0;
+      padding: 0 8px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+      text-align: center;
+    }
     button {
       min-height: 36px;
       border: 1px solid transparent;
@@ -5704,6 +5762,10 @@ function onboardingHtml(
     }
     .secondary:hover { color: var(--ink); }
     .primary {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
       background: var(--primary);
       border-radius: 8px;
       color: #fff;
@@ -5714,6 +5776,19 @@ function onboardingHtml(
       background: var(--primary-hover);
     }
     .primary:disabled { opacity: 0.55; cursor: not-allowed; }
+    .primary.is-loading::before {
+      width: 12px;
+      height: 12px;
+      flex: 0 0 auto;
+      border: 2px solid rgba(255, 255, 255, 0.45);
+      border-top-color: #fff;
+      border-radius: 50%;
+      content: "";
+      animation: onboarding-submit-spin 700ms linear infinite;
+    }
+    @keyframes onboarding-submit-spin {
+      to { transform: rotate(360deg); }
+    }
     .error {
       min-height: 18px;
       color: #b42318;
@@ -5756,6 +5831,9 @@ function onboardingHtml(
         transition-duration: 0.01ms !important;
         animation-duration: 0.01ms !important;
         animation-iteration-count: 1 !important;
+      }
+      .primary.is-loading::before {
+        animation: none !important;
       }
     }
   </style>
@@ -5848,10 +5926,11 @@ function onboardingHtml(
         </div>
         <footer class="actions">
           <button class="secondary" type="button" id="cancel" data-i18n="onboarding.step1.quit">${ot('onboarding.step1.quit')}</button>
+          <span class="submit-status" id="submitStatus" role="status" aria-live="polite" aria-atomic="true"></span>
           <button class="primary" type="button" id="finish" data-i18n="onboarding.step5.finish">${ot('onboarding.step5.finish')}</button>
         </footer>
       </section>
-      <div class="error" id="error" role="alert" aria-live="assertive"></div>
+      <div class="error" id="error" role="alert" aria-live="assertive" tabindex="-1"></div>
     </form>
   </main>
   <script>
@@ -5879,6 +5958,11 @@ function onboardingHtml(
     let searchSectionOpen = false;
     let routerTiers = clone(routerProfiles.openrouter);
     let modelEditorOpen = false;
+    let submitting = false;
+    const SUBMIT_SLOW_FEEDBACK_MS = 8_000;
+    let submitSlowTimer = null;
+    const setupForm = document.getElementById('setup-form');
+    const cardBody = document.querySelector('.card-body');
     const provider = document.getElementById('provider');
     const baseUrl = document.getElementById('baseUrl');
     const model = document.getElementById('model');
@@ -5899,6 +5983,7 @@ function onboardingHtml(
     const searchApiKey = document.getElementById('searchApiKey');
     const searchApiKeyError = document.getElementById('searchApiKeyError');
     const finish = document.getElementById('finish');
+    const submitStatus = document.getElementById('submitStatus');
     const searchProvider = document.getElementById('searchProvider');
 	    const searchProviderGrid = document.getElementById('searchProviderGrid');
 	    const searchKeyLabel = document.getElementById('searchKeyLabel');
@@ -5914,6 +5999,26 @@ function onboardingHtml(
     const providerOptions = document.getElementById('providerOptions');
     function clone(value) {
       return JSON.parse(JSON.stringify(value || {}));
+    }
+    function deepFreeze(value) {
+      if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+      Object.values(value).forEach((item) => deepFreeze(item));
+      return Object.freeze(value);
+    }
+    function onboardingPayloadSnapshot() {
+      return deepFreeze({
+        provider: provider.value,
+        apiKey: apiKey.value,
+        baseUrl: baseUrl.value,
+        model: model.value,
+        modelRoutingMode: modelRoutingMode.value,
+        routerMode: routerMode.value,
+        routerDefaultTier: 'c1',
+        routerTiers: clone(routerTiers),
+        searchProvider: searchProvider.value,
+        searchApiKey: searchApiKey.value,
+        locale: activeLocale,
+      });
     }
     function currentProvider() {
       return providers.find((item) => item.id === provider.value) || providers[0];
@@ -6138,6 +6243,33 @@ function onboardingHtml(
       syncProviderDefaults(false);
       syncSearchProviderControls();
     }
+    function clearSubmitSlowTimer() {
+      if (submitSlowTimer !== null) clearTimeout(submitSlowTimer);
+      submitSlowTimer = null;
+    }
+    function setSubmitting(next) {
+      clearSubmitSlowTimer();
+      submitting = Boolean(next);
+      if (submitting) setProviderPickerOpen(false);
+      setupForm.setAttribute('aria-busy', String(submitting));
+      finish.setAttribute('aria-busy', String(submitting));
+      finish.disabled = submitting;
+      finish.classList.toggle('is-loading', submitting);
+      cardBody.inert = submitting;
+      onboardingLocale.disabled = submitting;
+      if (submitting) {
+        finish.textContent = t.savingSetup;
+        submitStatus.textContent = desktopMessage(activeLocale, 'boot.profile');
+        submitSlowTimer = setTimeout(() => {
+          submitSlowTimer = null;
+          if (submitting) submitStatus.textContent = t.setupTakingLonger;
+        }, SUBMIT_SLOW_FEEDBACK_MS);
+      } else {
+        finish.textContent = desktopMessage(activeLocale, 'onboarding.step5.finish');
+        submitStatus.textContent = '';
+      }
+    }
+    window.addEventListener('pagehide', clearSubmitSlowTimer);
 	    onboardingLocale.addEventListener('change', () => {
 	      applyLocale(onboardingLocale.value);
 	    });
@@ -6213,28 +6345,34 @@ function onboardingHtml(
       window.opensquillaDesktop.cancelOnboarding();
     });
     finish.addEventListener('click', async () => {
+      if (submitting) return;
       clearValidationErrors();
       const issue = validateStep();
       if (issue) {
         presentValidationIssue(issue);
         return;
       }
+      const payload = onboardingPayloadSnapshot();
+      setSubmitting(true);
+      let succeeded = false;
       try {
-        await window.opensquillaDesktop.saveOnboarding({
-          provider: provider.value,
-          apiKey: apiKey.value,
-          baseUrl: baseUrl.value,
-          model: model.value,
-          modelRoutingMode: modelRoutingMode.value,
-          routerMode: routerMode.value,
-          routerDefaultTier: 'c1',
-          routerTiers,
-          searchProvider: searchProvider.value,
-          searchApiKey: searchApiKey.value,
-          locale: activeLocale,
-        });
+        const result = await window.opensquillaDesktop.saveOnboarding(payload);
+        if (!result || result.ok !== true) {
+          throw new Error(
+            result && result.error
+              ? String(result.error)
+              : 'OpenSquilla setup could not be saved.',
+          );
+        }
+        succeeded = true;
+        clearSubmitSlowTimer();
       } catch (error) {
         errorBox.textContent = error && error.message ? error.message : String(error);
+      } finally {
+        if (!succeeded) {
+          setSubmitting(false);
+          errorBox.focus({ preventScroll: false });
+        }
       }
     });
     function applyMigrationPrefill(prefill) {
@@ -6264,7 +6402,24 @@ function onboardingHtml(
 </html>`
 }
 
+function abandonOnboardingFlow(
+  flow: OnboardingFlow,
+  error: Error,
+  closeWindow: boolean,
+): void {
+  if (!onboardingFlows.abandon(flow)) return
+  const reject = flow.reject
+  flow.resolve = null
+  flow.reject = null
+  const window = flow.window
+  if (closeWindow && window && !window.isDestroyed()) window.close()
+  reject?.(error)
+}
+
 async function runOnboarding(): Promise<DesktopConnection> {
+  // A detached save retains coordinator ownership until it settles, preventing
+  // Retry from opening a replacement flow that the old completion could affect.
+  await onboardingFlows.waitForAbandonedSave()
   const pendingProviderSetup = await loadPendingMigrationProviderSetup()
   const existing = await loadDesktopCredential()
   // A saved credential encrypted with the OS keychain that this session cannot
@@ -6297,10 +6452,13 @@ async function runOnboarding(): Promise<DesktopConnection> {
   }
 
   return new Promise((resolveCredential, rejectCredential) => {
-    resolveOnboarding = resolveCredential
-    rejectOnboarding = rejectCredential
+    if (onboardingFlows.active) {
+      focusOnboardingWindow()
+      rejectCredential(new Error('OpenSquilla setup is already in progress.'))
+      return
+    }
     const parentWindow = currentMainWindow()
-    onboardingWindow = new BrowserWindow({
+    const window = new BrowserWindow({
       width: 1040,
       height: 820,
       minWidth: 900,
@@ -6320,9 +6478,24 @@ async function runOnboarding(): Promise<DesktopConnection> {
         sandbox: true,
       },
     })
-    installEditingContextMenu(onboardingWindow)
+    const flow: OnboardingFlow = {
+      window,
+      state: 'editing',
+      resolve: resolveCredential,
+      reject: rejectCredential,
+      savePayload: null,
+      savePromise: null,
+    }
+    if (!onboardingFlows.activate(flow)) {
+      window.destroy()
+      focusOnboardingWindow()
+      rejectCredential(new Error('OpenSquilla setup is already in progress.'))
+      return
+    }
+    onboardingWindow = window
+    installEditingContextMenu(window)
 
-    onboardingWindow.webContents.setWindowOpenHandler(({ url }) => {
+    window.webContents.setWindowOpenHandler(({ url }) => {
       if (url === TOKENRHYTHM_REGISTER_URL) {
         void shell.openExternal(TOKENRHYTHM_REGISTER_URL)
       }
@@ -6338,32 +6511,34 @@ async function runOnboarding(): Promise<DesktopConnection> {
         void shell.openExternal(TOKENRHYTHM_REGISTER_URL)
       }
     }
-    onboardingWindow.webContents.on('will-navigate', guardOnboardingNavigation)
-    onboardingWindow.webContents.on('will-redirect', guardOnboardingNavigation)
+    window.webContents.on('will-navigate', guardOnboardingNavigation)
+    window.webContents.on('will-redirect', guardOnboardingNavigation)
     // Rebuild the app menu so View → Reload is disabled while onboarding is open.
     createApplicationMenu()
 
-    onboardingWindow.once('ready-to-show', () => {
-      if (!onboardingWindow || onboardingWindow.isDestroyed()) return
-      onboardingWindow.show()
-      onboardingWindow?.focus()
+    window.once('ready-to-show', () => {
+      if (flow.window !== window || window.isDestroyed() || flow.state === 'abandoned') return
+      window.show()
+      window.focus()
     })
-    onboardingWindow.on('closed', () => {
-      onboardingWindow = null
+    window.on('closed', () => {
+      if (onboardingWindow === window) onboardingWindow = null
+      if (flow.window === window) flow.window = null
       // Re-enable View → Reload now that the wizard is gone.
       createApplicationMenu()
-      if (rejectOnboarding) {
-        const reject = rejectOnboarding
-        resolveOnboarding = null
-        rejectOnboarding = null
-        reject(new Error('OpenSquilla setup was closed.'))
+      if (flow.state !== 'completed' && flow.state !== 'abandoned') {
+        abandonOnboardingFlow(flow, new Error('OpenSquilla setup was closed.'), false)
       }
     })
 
-    onboardingWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(onboardingHtml(
+    window.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(onboardingHtml(
       pendingProviderSetup,
     ))}`).catch((error) => {
-      rejectCredential(error instanceof Error ? error : new Error(String(error)))
+      abandonOnboardingFlow(
+        flow,
+        error instanceof Error ? error : new Error(String(error)),
+        true,
+      )
     })
   })
 }
@@ -6411,34 +6586,29 @@ function splitPathValue(value?: string): string[] {
   return (value || '').split(pathDelimiter()).filter(Boolean)
 }
 
-function desktopNodeBinCandidates(): string[] {
-  const candidates = process.platform === 'win32'
+function desktopChildPath(): string {
+  const currentPath = process.env.PATH || process.env.Path || ''
+  const currentParts = splitPathValue(currentPath)
+  // GUI-launched processes can have a sparse PATH. Keep host directories after
+  // the inherited PATH; optional Runtime Packs are resolved inside Gateway per
+  // Safe/Full/Guest policy and are never injected statically by Electron.
+  const hostFallbackParts = process.platform === 'win32'
     ? [
-        join(packagedRuntimeRoot(), 'node'),
         process.env.LOCALAPPDATA ? join(process.env.LOCALAPPDATA, 'Programs', 'nodejs') : '',
         process.env.ProgramFiles ? join(process.env.ProgramFiles, 'nodejs') : '',
         process.env['ProgramFiles(x86)'] ? join(process.env['ProgramFiles(x86)'], 'nodejs') : '',
       ]
     : [
-        join(packagedRuntimeRoot(), 'node', 'bin'),
         join(app.getPath('home'), '.local', 'bin'),
         join(app.getPath('home'), '.npm-global', 'bin'),
         '/opt/homebrew/bin',
         '/usr/local/bin',
+        '/usr/bin',
+        '/bin',
+        '/usr/sbin',
+        '/sbin',
       ]
-  const seen = new Set<string>()
-  return candidates.filter((candidate) => {
-    if (!candidate || seen.has(candidate) || !existsSync(candidate)) return false
-    seen.add(candidate)
-    return true
-  })
-}
-
-function desktopChildPath(nodeBinCandidates = desktopNodeBinCandidates()): string {
-  const currentPath = process.env.PATH || process.env.Path || ''
-  const currentParts = splitPathValue(currentPath)
-  const systemParts = process.platform === 'win32' ? [] : ['/usr/bin', '/bin', '/usr/sbin', '/sbin']
-  const orderedParts = [...nodeBinCandidates, ...currentParts, ...systemParts]
+  const orderedParts = [...currentParts, ...hostFallbackParts]
   const seen = new Set<string>()
   const merged = orderedParts.filter((part) => {
     if (!part || seen.has(part)) return false
@@ -7671,9 +7841,12 @@ async function findGatewayPort(): Promise<number> {
   throw new Error('No free OpenSquilla desktop gateway port found in 18791-18830.')
 }
 
-async function healthCheck(url: string): Promise<boolean> {
+async function healthCheck(url: string, timeoutMs = 1000): Promise<boolean> {
   try {
-    const response = await fetch(`${url}/healthz`, { signal: AbortSignal.timeout(1000) })
+    const boundedTimeoutMs = Math.max(1, Math.min(1000, Math.floor(timeoutMs)))
+    const response = await fetch(`${url}/healthz`, {
+      signal: AbortSignal.timeout(boundedTimeoutMs),
+    })
     if (!response.ok) return false
     const payload = await response.json().catch(() => null)
     return Boolean(payload && payload.ok === true)
@@ -7744,15 +7917,20 @@ function classifyGatewayExitMessage(message: string, outputTail: string): string
 }
 
 async function waitForGateway(url: string, earlyExitMessage?: () => string | null): Promise<void> {
-  const startedAt = Date.now()
-  while (Date.now() - startedAt < 45_000) {
-    const earlyExit = earlyExitMessage?.()
-    if (earlyExit) throw new Error(earlyExit)
-    if (await healthCheck(url)) return
-    await new Promise((resolveWait) => setTimeout(resolveWait, 500))
+  const result = await waitForGatewayReadiness({
+    probe: (remainingMs) => healthCheck(url, remainingMs),
+    exitMessage: earlyExitMessage,
+    primaryTimeoutMs: 45_000,
+    lateGraceMs: 15_000,
+    pollIntervalMs: 500,
+  })
+  if (result.status === 'ready') {
+    if (result.late) {
+      desktopLog('gateway_health_ready_after_primary_deadline', { port: gatewayState.port })
+    }
+    return
   }
-  const earlyExit = earlyExitMessage?.()
-  if (earlyExit) throw new Error(earlyExit)
+  if (result.status === 'exited') throw new Error(result.message)
   throw new Error(`Gateway did not become healthy at ${url}`)
 }
 
@@ -7794,12 +7972,19 @@ function liveLifecycleOwnedGatewayProcesses(): ChildProcessWithoutNullStreams[] 
   return [...children].filter((child) => !hasGatewayProcessExited(child))
 }
 
-async function reuseHealthyGatewayState(): Promise<GatewayState | null> {
+async function reuseHealthyGatewayState(
+  isCurrent: () => boolean,
+): Promise<GatewayState | null> {
   if (gatewayProfileKey !== desktopProfileKey()) return null
   if (!gatewayState.url) return null
   if (gatewayState.status !== 'ready' && !gatewayProcess) return null
+  // A live owned child must pass the exact-child and profile checks in
+  // resumeOwnedGatewayStartup; a healthy port alone is not ownership proof.
+  if (gatewayProcess && gatewayState.owned) return null
 
-  if (await healthCheck(gatewayState.url)) {
+  const healthy = await healthCheck(gatewayState.url)
+  if (!isCurrent()) return null
+  if (healthy) {
     gatewayState.status = 'ready'
     gatewayState.error = undefined
     sendBootStatus('control')
@@ -7811,6 +7996,97 @@ async function reuseHealthyGatewayState(): Promise<GatewayState | null> {
     gatewayState.status = 'stopped'
   }
   return null
+}
+
+async function verifyOwnedGatewayLaunch(
+  child: ChildProcessWithoutNullStreams,
+): Promise<boolean> {
+  const context = gatewayProcessOwnershipContexts.get(child)
+  if (!context) return false
+  return await verifyDesktopGatewayLaunchOwnership(context.ownershipDir, {
+    instanceNonce: context.nonce,
+    profileFingerprint: context.profileFingerprint,
+    port: context.port,
+  })
+}
+
+async function discardUnverifiedOwnedGatewayChild(
+  child: ChildProcessWithoutNullStreams,
+): Promise<boolean> {
+  if (gatewayProcess !== child) return false
+  trackStoppingGatewayProcess(child)
+  gatewayProcess = null
+  gatewayState.status = 'stopped'
+  gatewayState.error = undefined
+  // Do not issue any URL-based shutdown request: the listener just failed the
+  // exact launch proof. Signal only the ChildProcess tree created by Electron.
+  hardTerminateGatewayProcess(child)
+  const exited = await waitForGatewayProcessExit(child, 10_000)
+  if (!exited) {
+    // Restore the exact handle as current authority so the caller can surface
+    // the failed stop and a later retry can join it. The stopping-set admission
+    // gate prevents a successor from being spawned while this child is live.
+    if (!gatewayProcess) gatewayProcess = child
+    throw new Error(desktopGatewayStillRunningMessage())
+  }
+  return true
+}
+
+async function resumeOwnedGatewayStartup(
+  isCurrent: () => boolean,
+): Promise<GatewayState | null> {
+  if (!isCurrent()) throw new Error('Desktop startup was superseded by a newer lifecycle operation.')
+  const child = gatewayProcess
+  if (
+    !child
+    || !gatewayState.owned
+    || !gatewayState.url
+    || gatewayProfileKey !== desktopProfileKey()
+    || hasGatewayProcessExited(child)
+  ) return null
+
+  const url = gatewayState.url
+  const childExitMessage = (): string | null => {
+    if (gatewayProcess === child && !hasGatewayProcessExited(child)) return null
+    return gatewayState.error || 'gateway exited before becoming healthy'
+  }
+  gatewayState.status = 'starting'
+  gatewayState.error = undefined
+  sendBootStatus('gateway-health')
+  await waitForGateway(url, childExitMessage)
+  if (!isCurrent()) throw new Error('Desktop startup was superseded during health verification.')
+  await waitForControlUi(url, childExitMessage)
+
+  // Health alone never grants ownership. The same exact child and profile that
+  // entered this resume path must still be current after both asynchronous
+  // probes, otherwise a concurrent restart or profile switch won the race.
+  if (
+    gatewayProcess !== child
+    || hasGatewayProcessExited(child)
+    || gatewayProfileKey !== desktopProfileKey()
+    || !isCurrent()
+  ) {
+    throw new Error(childExitMessage() || 'Desktop gateway changed while startup resumed.')
+  }
+  if (!await verifyOwnedGatewayLaunch(child)) {
+    if (!await discardUnverifiedOwnedGatewayChild(child)) {
+      throw new Error('Desktop gateway changed during ownership verification.')
+    }
+    return null
+  }
+  if (
+    gatewayProcess !== child
+    || hasGatewayProcessExited(child)
+    || gatewayProfileKey !== desktopProfileKey()
+    || !isCurrent()
+  ) {
+    throw new Error(childExitMessage() || 'Desktop gateway changed during ownership verification.')
+  }
+
+  gatewayState.status = 'ready'
+  gatewayState.error = undefined
+  sendBootStatus('control')
+  return gatewayState
 }
 
 const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000
@@ -7898,8 +8174,14 @@ async function recoverVerifiedOrphanGatewayBeforeSpawn(
 }
 
 async function startGateway(): Promise<GatewayState> {
-  const reusableGateway = forceOnboardingOnNextStartup ? null : await reuseHealthyGatewayState()
+  const startupRevision = desktopOpenFlowRevision
+  const startupProfileKey = desktopProfileKey()
+  const isCurrent = () => desktopOpenAuthorityIsCurrent(startupRevision, startupProfileKey)
+  const reusableGateway = forceOnboardingOnNextStartup
+    ? null
+    : await reuseHealthyGatewayState(isCurrent)
   if (reusableGateway) return reusableGateway
+  if (!isCurrent()) throw new Error('Desktop startup was superseded by a newer open request.')
   artifactPreviewLeaseBroker.clear()
 
   assertSupportedMacInstallLocation()
@@ -7918,6 +8200,11 @@ async function startGateway(): Promise<GatewayState> {
     })
     throw new Error(desktopGatewayStillRunningMessage())
   }
+
+  const resumedGateway = forceOnboardingOnNextStartup
+    ? null
+    : await resumeOwnedGatewayStartup(isCurrent)
+  if (resumedGateway) return resumedGateway
 
   if (gatewayProcess && gatewayState.owned) {
     if (hasGatewayProcessExited(gatewayProcess)) {
@@ -7942,12 +8229,15 @@ async function startGateway(): Promise<GatewayState> {
   const activeProfile = activeDesktopProfile()
   const overrideUrl = process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
   if (overrideUrl) {
+    if (!isCurrent()) throw new Error('Desktop startup was superseded before Gateway override validation.')
     sendBootStatus('gateway-health')
     gatewayState.url = overrideUrl.replace(/\/$/, '')
     gatewayState.port = Number(new URL(gatewayState.url).port || 0)
     gatewayState.owned = false
     gatewayProfileKey = desktopProfileKey(activeProfile)
-    gatewayState.status = (await healthCheck(gatewayState.url)) ? 'ready' : 'error'
+    const overrideReady = await healthCheck(gatewayState.url)
+    if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway override validation.')
+    gatewayState.status = overrideReady ? 'ready' : 'error'
     if (gatewayState.status !== 'ready') {
       throw new Error(`Configured gateway is not healthy: ${gatewayState.url}`)
     }
@@ -7956,9 +8246,11 @@ async function startGateway(): Promise<GatewayState> {
 
   sendBootStatus('gateway-health')
   await recoverVerifiedOrphanGatewayBeforeSpawn()
+  if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway recovery.')
 
   sendBootStatus('profile')
   const connection = await runOnboarding()
+  if (!isCurrent()) throw new Error('Desktop startup was superseded during profile setup.')
   forceOnboardingOnNextStartup = false
   const apiKey = decryptApiKey(connection)
   // Keyless providers (e.g. Ollama) ship requiresApiKey=false and are accepted
@@ -8003,6 +8295,7 @@ async function startGateway(): Promise<GatewayState> {
     }
     throw new Error('Gateway startup was cancelled by an active lifecycle or profile operation.')
   }
+  if (!isCurrent()) throw new Error('Desktop startup was superseded before Gateway spawn.')
   const url = `http://127.0.0.1:${port}`
   const logDir = desktopLogsDir()
   mkdirSync(logDir, { recursive: true })
@@ -8028,8 +8321,7 @@ async function startGateway(): Promise<GatewayState> {
   gatewayState.status = 'starting'
   gatewayState.logPath = logPath
 
-  const nodeBinCandidates = desktopNodeBinCandidates()
-  const childPath = desktopChildPath(nodeBinCandidates)
+  const childPath = desktopChildPath()
   const gatewayInstanceNonce = createDesktopGatewayInstanceNonce()
   const gatewayOwnershipDir = desktopGatewayOwnershipDir(activeProfile)
   const gatewayProfileFingerprint = desktopProfileFingerprint(activeProfile.home)
@@ -8038,7 +8330,6 @@ async function startGateway(): Promise<GatewayState> {
     ...(process.platform === 'win32' ? { Path: childPath } : {}),
     ...(connection.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
     ...(connection.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
-    OPENSQUILLA_NODE_BIN_DIR: nodeBinCandidates.join(pathDelimiter()),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
     ...artifactBridgeEnvironment,
@@ -8148,9 +8439,22 @@ async function startGateway(): Promise<GatewayState> {
   // endpoint belongs to someone else (e.g. a CLI `opensquilla gateway run` on the
   // same port). Surface it as a port conflict so recovery advances to the next
   // port instead of silently attaching the window to the wrong profile.
-  if (hasGatewayProcessExited(child) || gatewayProcess !== child) {
+  if (hasGatewayProcessExited(child) || gatewayProcess !== child || !isCurrent()) {
     throw new Error(childExitMessage
       || 'OPENSQUILLA_GATEWAY_PORT_IN_USE: desktop gateway did not keep the port bind.')
+  }
+  if (!await verifyOwnedGatewayLaunch(child)) {
+    // Never send a shutdown request to the unverified listener. Terminate only
+    // the exact child handle we spawned, then let port recovery choose another
+    // loopback port once that child has released its profile writer lease.
+    await discardUnverifiedOwnedGatewayChild(child)
+    throw new Error(
+      'OPENSQUILLA_GATEWAY_PORT_IN_USE: Gateway port is already in use by an unverified listener.',
+    )
+  }
+  if (hasGatewayProcessExited(child) || gatewayProcess !== child || !isCurrent()) {
+    throw new Error(childExitMessage
+      || 'OPENSQUILLA_GATEWAY_PORT_IN_USE: desktop gateway changed during ownership verification.')
   }
   sendBootStatus('control')
   gatewayState.status = 'ready'
@@ -8420,23 +8724,30 @@ function ensureGatewayStarted(): Promise<GatewayState> {
   return gatewayStartPromise
 }
 
-async function loadControlUiIntoCurrentWindow(gatewayUrl: string): Promise<void> {
+async function loadControlUiIntoCurrentWindow(
+  gatewayUrl: string,
+  isCurrent: () => boolean,
+): Promise<boolean> {
+  if (!isCurrent()) return false
   const window = currentMainWindow()
-  if (!window) return
+  if (!window) return false
 
   sendBootStatus('control')
   if (isCurrentWindowAtControlUi(window, gatewayUrl)) {
+    if (!isCurrent()) return false
     sendBootStatus('ready')
-    return
+    return true
   }
 
   try {
     await loadControlUi(window, gatewayUrl)
   } catch (error) {
-    if (window.isDestroyed()) return
+    if (window.isDestroyed()) return false
     throw error
   }
+  if (!isCurrent()) return false
   sendBootStatus('ready')
+  return true
 }
 
 // Bring the main window back to the boot splash when a gateway failure happens
@@ -8637,6 +8948,9 @@ async function openOrResumeDesktopApp(): Promise<void> {
     while (!isQuitting) {
       const revision = desktopOpenFlowRevision
       const requestedProfileKey = desktopProfileKey()
+      let operationIsCurrent = () => (
+        desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)
+      )
       await createMainWindow()
       focusMainWindow()
 
@@ -8645,27 +8959,54 @@ async function openOrResumeDesktopApp(): Promise<void> {
           if (revision === desktopOpenFlowRevision && requestedProfileKey === desktopProfileKey()) {
             const reusableGateway = forceOnboardingOnNextStartup
               ? null
-              : await reuseHealthyGatewayState()
+              : await reuseHealthyGatewayState(
+                operationIsCurrent,
+              )
+            if (!operationIsCurrent()) {
+              throw new Error('Desktop startup was superseded by a newer open request.')
+            }
             const gateway = reusableGateway ?? await ensureGatewayStarted()
-            if (revision === desktopOpenFlowRevision && requestedProfileKey === desktopProfileKey()) {
-              await loadControlUiIntoCurrentWindow(gateway.url)
+            const gatewayUrl = gateway.url
+            const expectedOwned = gateway.owned
+            const expectedChild = expectedOwned ? gatewayProcess : null
+            operationIsCurrent = () => (
+              desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)
+              && gatewayState.url === gatewayUrl
+              && gatewayState.owned === expectedOwned
+              && (
+                !expectedOwned
+                || (
+                  expectedChild !== null
+                  && gatewayProcess === expectedChild
+                  && !hasGatewayProcessExited(expectedChild)
+                )
+              )
+            )
+            if (operationIsCurrent()) {
+              await loadControlUiIntoCurrentWindow(
+                gatewayUrl,
+                operationIsCurrent,
+              )
             }
           }
         }
       } catch (error) {
-        if (gatewayState.status !== 'ready') {
-          gatewayState.status = 'error'
-          gatewayState.error = error instanceof Error ? error.message : String(error)
+        const authoritative = operationIsCurrent()
+        if (authoritative) {
+          if (gatewayState.status !== 'ready') {
+            gatewayState.status = 'error'
+            gatewayState.error = error instanceof Error ? error.message : String(error)
+          }
+          desktopLog('desktop_open_failed', {
+            profileKind: 'primary',
+            gatewayPid: gatewayProcess?.pid,
+            gatewayStatus: gatewayState.status,
+            error: error instanceof Error ? error.message : String(error),
+          })
+          if (currentMainWindow()) sendBootError(error)
         }
-        desktopLog('desktop_open_failed', {
-          profileKind: 'primary',
-          gatewayPid: gatewayProcess?.pid,
-          gatewayStatus: gatewayState.status,
-          error: error instanceof Error ? error.message : String(error),
-        })
-        if (currentMainWindow()) sendBootError(error)
       }
-      if (revision === desktopOpenFlowRevision) return
+      if (desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) return
       if (gatewayProfileKey && gatewayProfileKey !== desktopProfileKey()) {
         if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
         else clearReusableGatewayState()
@@ -8730,9 +9071,11 @@ async function requestOwnedGatewayShutdown(
   ) {
     if (await requestVerifiedDesktopGatewayShutdown(loaded.record)) return true
   }
-  // Backward compatibility for a child from an older runtime that predates the
-  // Desktop ownership protocol. Failure falls back to signaling this exact
-  // ChildProcess handle, never to PID-file or port-based process discovery.
+  // A known launch context that cannot prove its listener must never send an
+  // unauthenticated shutdown request to that URL. The caller will signal only
+  // the exact ChildProcess handle. Keep the legacy URL path solely for handles
+  // created before this Electron process could attach a launch context.
+  if (context) return false
   return await requestGatewayShutdown(url)
 }
 
@@ -12357,10 +12700,150 @@ function trustedControlUiIpc(event: Electron.IpcMainInvokeEvent): boolean {
   return gatewayState.owned && trustedMainWindowControlIpc(event)
 }
 
-function trustedOnboardingIpc(event: Electron.IpcMainInvokeEvent): boolean {
-  const window = currentOnboardingWindow()
-  if (!window || event.sender !== window.webContents) return false
+function trustedOnboardingIpc(
+  event: Electron.IpcMainInvokeEvent,
+  flow = onboardingFlows.active,
+): boolean {
+  const window = flow?.window
+  if (!flow || !onboardingFlows.isCurrent(flow) || !window || window.isDestroyed()) return false
+  if (event.sender !== window.webContents) return false
   return (event.senderFrame?.url || event.sender.getURL()).startsWith('data:text/html')
+}
+
+function onboardingSaveFailure(
+  code: OnboardingSaveErrorCode,
+  error: string,
+): OnboardingSaveResult {
+  return { ok: false, code, error }
+}
+
+function completeOnboardingFlow(flow: OnboardingFlow, credential: DesktopConnection): boolean {
+  const window = flow.window
+  if (
+    !window
+    || window.isDestroyed()
+    || !onboardingFlows.complete(flow)
+  ) return false
+
+  const resolve = flow.resolve
+  flow.resolve = null
+  flow.reject = null
+  window.close()
+  resolve?.(credential)
+  return true
+}
+
+async function performOnboardingSave(
+  flow: OnboardingFlow,
+  payload: OnboardingPayload,
+): Promise<OnboardingSaveResult> {
+  const telemetry = new OnboardingSaveTelemetry(
+    ++onboardingSaveTelemetryAttempt,
+    app.isPackaged,
+    (event, detail) => desktopLog(event, detail),
+  )
+  try {
+    // Keep the existing writer-admission boundary: lifecycle drains do not need
+    // to wait for an inspect that has not begun a settings write.
+    let recoveryRequired: boolean
+    try {
+      recoveryRequired = await telemetry.stage(
+        'primary_recovery_inspect',
+        () => refreshPrimaryRecoveryAfterImportAttempt(),
+      )
+    } catch (error) {
+      if (flow.state === 'saving') flow.state = 'editing'
+      throw error
+    }
+    if (recoveryRequired) {
+      if (flow.state === 'saving') flow.state = 'editing'
+      return telemetry.recordReturned(onboardingSaveFailure(
+        'recovery_required',
+        'The primary profile requires recovery before setup can write to it.',
+      ))
+    }
+    if (!onboardingFlows.canComplete(flow)) {
+      return telemetry.recordReturned(onboardingSaveFailure(
+        'onboarding_inactive',
+        'OpenSquilla setup is no longer active.',
+      ))
+    }
+
+    let finishWriter: (() => void) | null = null
+    try {
+      finishWriter = beginDesktopWriterOperation('complete desktop onboarding')
+      telemetry.markWriterAdmitted()
+    } catch {
+      if (flow.state === 'saving') flow.state = 'editing'
+      return telemetry.recordReturned(onboardingSaveFailure(
+        'lifecycle_deferred',
+        'OpenSquilla is finishing another profile or lifecycle operation.',
+      ))
+    }
+
+    let credential: DesktopConnection
+    try {
+      // Re-read the marker only after reserving the writer. Credential/config,
+      // locale, and marker removal then converge as one lifecycle operation that
+      // update/quit must drain. Imported .env bytes are deliberately untouched.
+      const pendingMigration = await telemetry.stage(
+        'pending_setup_read',
+        () => readPendingMigrationProviderSetup(),
+      )
+      credential = await telemetry.stage('settings_persist', async () => {
+        if (pendingMigration?.phase === 'needs-setup' && pendingMigration.provider) {
+          return await saveImportedDesktopCredential(
+            pendingMigration,
+            pendingMigration.committedTransactionId,
+            String(payload.apiKey || ''),
+            true,
+          )
+        }
+        return await saveDesktopCredential(payload, true)
+      })
+      telemetry.markSettingsPersistedConfirmed()
+      await telemetry.stage('local_finalize', async () => {
+        applyDesktopLocaleChoice(payload.locale)
+        await clearPendingMigrationProviderSetup()
+      })
+    } catch (error) {
+      if (flow.state === 'saving') flow.state = 'editing'
+      throw error
+    } finally {
+      finishWriter()
+    }
+
+    return telemetry.stageSync('flow_handoff', () => {
+      if (!onboardingFlows.canComplete(flow)) {
+        return telemetry.recordReturned(onboardingSaveFailure(
+          'onboarding_inactive',
+          'OpenSquilla setup is no longer active.',
+        ))
+      }
+      // Quit deferral deliberately leaves isQuitting=false while it drains writers,
+      // so admission/exit phase are authoritative alongside the boolean latch.
+      if (desktopWriters.closed || isQuitting || appExitPhase !== 'running') {
+        abandonOnboardingFlow(
+          flow,
+          new Error('OpenSquilla setup completed, but startup was deferred by an active lifecycle operation.'),
+          true,
+        )
+        return telemetry.recordReturned(onboardingSaveFailure(
+          'lifecycle_deferred',
+          'Setup was saved; startup was deferred by an active lifecycle operation.',
+        ))
+      }
+      if (!completeOnboardingFlow(flow, credential)) {
+        return telemetry.recordReturned(onboardingSaveFailure(
+          'onboarding_inactive',
+          'OpenSquilla setup is no longer active.',
+        ))
+      }
+      return telemetry.recordReturned({ ok: true })
+    })
+  } finally {
+    telemetry.finish()
+  }
 }
 
 async function withRecoveryOperation<T>(
@@ -12601,11 +13084,100 @@ ipcMain.handle('desktop:boot:state', () => ({
   gateway: { ...gatewayState },
   recovery: recoveryStateSnapshot(),
 }))
+
+interface BootResumeAuthority {
+  child: ChildProcessWithoutNullStreams
+  profileKey: string
+  openFlowRevision: number
+}
+
+function currentBootResumeAuthority(): BootResumeAuthority | null {
+  if (
+    !gatewayProcess
+    || !gatewayState.owned
+    || !gatewayProfileKey
+    || hasGatewayProcessExited(gatewayProcess)
+  ) return null
+  return {
+    child: gatewayProcess,
+    profileKey: gatewayProfileKey,
+    openFlowRevision: desktopOpenFlowRevision,
+  }
+}
+
+function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
+  return !isQuitting
+    && gatewayProcess === authority.child
+    && !hasGatewayProcessExited(authority.child)
+    && gatewayState.owned
+    && gatewayProfileKey === authority.profileKey
+    && desktopProfileKey() === authority.profileKey
+    && desktopOpenFlowRevision === authority.openFlowRevision
+}
+
+async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
+  const pendingStart = gatewayStartPromise
+  const initialAuthority = pendingStart ? null : currentBootResumeAuthority()
+  bootError = null
+  await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
+  if (initialAuthority && !bootResumeAuthorityIsCurrent(initialAuthority)) return { ok: true }
+  try {
+    const gateway = pendingStart
+      ? await pendingStart
+      : initialAuthority
+        ? await resumeOwnedGatewayStartup(
+          () => bootResumeAuthorityIsCurrent(initialAuthority),
+        )
+        : null
+    if (!gateway) {
+      // With no exact live child to resume, use the normal open flow so profile
+      // inspection and recovery gates still run before any replacement spawn.
+      void openOrResumeDesktopApp()
+      return { ok: true }
+    }
+    const authority = pendingStart ? currentBootResumeAuthority() : initialAuthority
+    if (!authority || !bootResumeAuthorityIsCurrent(authority)) return { ok: true }
+    await loadControlUiIntoCurrentWindow(
+      gateway.url,
+      () => bootResumeAuthorityIsCurrent(authority),
+    )
+    return { ok: true }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    // The original open flow owns errors from a pending initial start. For a
+    // direct resume, an exit handler or a newer quit/reset/restart owns any
+    // state after this exact child/profile/revision loses authority.
+    if (pendingStart || !initialAuthority || !bootResumeAuthorityIsCurrent(initialAuthority)) {
+      return { ok: false, error: message }
+    }
+    if (gatewayState.status !== 'ready') {
+      gatewayState.status = 'error'
+      gatewayState.error = message
+    }
+    desktopLog('gateway_start_resume_failed', {
+      gatewayPid: gatewayProcess?.pid,
+      gatewayStatus: gatewayState.status,
+      error: message,
+    })
+    sendBootError(message)
+    return { ok: false, error: message }
+  }
+}
+
+ipcMain.handle('desktop:boot:resume', async () => {
+  if (bootResumePromise) return await bootResumePromise
+  const promise = resumeBootStartup()
+  bootResumePromise = promise
+  try {
+    return await promise
+  } finally {
+    if (bootResumePromise === promise) bootResumePromise = null
+  }
+})
 ipcMain.handle('desktop:boot:retry', async () => {
-  // Backs both the boot-error "Retry" button and the Control UI "Restart
-  // runtime" action. If a start attempt is already in flight, join it and clear
-  // the stale bootError so the reloaded splash shows live progress instead of
-  // instantly re-rendering the previous error panel.
+  // The Control UI "Restart runtime" action intentionally forces a new child.
+  // The boot page uses desktop:boot:resume instead so a slow owned child can be
+  // accepted after it becomes healthy instead of being torn down first.
   if (gatewayStartPromise) {
     bootError = null
     void openOrResumeDesktopApp()
@@ -12653,7 +13225,8 @@ ipcMain.handle('desktop:onboarding:defaults', () => ({
   },
 }))
 ipcMain.handle('desktop:onboarding:probe', async (event, payload: OnboardingProbePayload) => {
-  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
+  const flow = onboardingFlows.active
+  if (!flow || flow.state !== 'editing' || !trustedOnboardingIpc(event, flow)) {
     return {
       ok: false,
       failureKind: 'unavailable',
@@ -12677,50 +13250,36 @@ ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPaylo
   // same preload bridge is attached to the Control UI window, so without this
   // guard any script on the gateway-served page could rewrite the credential and
   // regenerate config.toml outside onboarding.
-  if (!resolveOnboarding || !trustedOnboardingIpc(event)) {
-    return { ok: false, error: 'No trusted onboarding is in progress.' }
+  const flow = onboardingFlows.active
+  if (!flow || !trustedOnboardingIpc(event, flow)) {
+    return onboardingSaveFailure('onboarding_inactive', 'No trusted onboarding is in progress.')
   }
-  if (await refreshPrimaryRecoveryAfterImportAttempt()) {
-    return {
-      ok: false,
-      error: 'The primary profile requires recovery before setup can write to it.',
-    }
+  const requestPayload = payload && typeof payload === 'object' ? payload : {}
+  const request = onboardingFlows.requestSave(
+    flow,
+    requestPayload,
+    () => performOnboardingSave(flow, requestPayload),
+  )
+  if (request.kind === 'conflict') {
+    return onboardingSaveFailure(
+      'save_in_progress',
+      'OpenSquilla is already saving a different setup request.',
+    )
   }
-  let credential: DesktopConnection
-  const finishWriter = beginDesktopWriterOperation('complete desktop onboarding')
-  try {
-    // Re-read the marker only after reserving the writer. Credential/config,
-    // locale, and marker removal then converge as one lifecycle operation that
-    // update/quit must drain. Imported .env bytes are deliberately untouched.
-    const pendingMigration = await readPendingMigrationProviderSetup()
-    if (pendingMigration?.phase === 'needs-setup' && pendingMigration.provider) {
-      credential = await saveImportedDesktopCredential(
-        pendingMigration,
-        pendingMigration.committedTransactionId,
-        String(payload.apiKey || ''),
-        true,
-      )
-    } else {
-      credential = await saveDesktopCredential(payload, true)
-    }
-    applyDesktopLocaleChoice(payload.locale)
-    await clearPendingMigrationProviderSetup()
-  } finally {
-    finishWriter()
+  if (request.kind === 'inactive') {
+    return onboardingSaveFailure('onboarding_inactive', 'OpenSquilla setup is no longer active.')
   }
-  const resolve = resolveOnboarding
-  resolveOnboarding = null
-  rejectOnboarding = null
-  onboardingWindow?.close()
-  resolve?.(credential)
-  return { ok: true }
+  return await request.promise
 })
-ipcMain.handle('desktop:onboarding:cancel', () => {
-  const reject = rejectOnboarding
-  resolveOnboarding = null
-  rejectOnboarding = null
-  onboardingWindow?.close()
-  reject?.(new Error('OpenSquilla setup was cancelled.'))
+ipcMain.handle('desktop:onboarding:cancel', (event) => {
+  const flow = onboardingFlows.active
+  if (!flow || !trustedOnboardingIpc(event, flow)) {
+    return onboardingSaveFailure('onboarding_inactive', 'No trusted onboarding is in progress.')
+  }
+  // An admitted atomic save cannot be cancelled safely. Mark this flow
+  // abandoned so its late completion cannot resolve a replacement onboarding
+  // window; before-quit drains its writer before Electron exits.
+  abandonOnboardingFlow(flow, new Error('OpenSquilla setup was cancelled.'), true)
   // The onboarding "Quit" button routes here; it is a deliberate exit, so quit
   // the app instead of surfacing the cancellation as a boot failure panel.
   app.quit()

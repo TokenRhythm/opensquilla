@@ -585,6 +585,8 @@ def test_desktop_ci_runs_primary_profile_substrate_unit_tests() -> None:
 
     assert "node scripts/test-desktop-profile-substrate.mjs" in unit_step["run"]
     assert "node scripts/test-desktop-profile-consolidation.mjs" in unit_step["run"]
+    assert "node scripts/test-onboarding-flow-coordinator.mjs" in unit_step["run"]
+    assert "node scripts/test-onboarding-save-telemetry.mjs" in unit_step["run"]
 
 
 def test_pr_target_validator_allows_main_pull_requests(tmp_path: Path) -> None:
@@ -1519,6 +1521,8 @@ def test_desktop_recovery_e2e_runs_compiled_flows_on_all_release_platforms() -> 
     assert "test-profile-consolidation-flow.mjs" in run["run"]
     assert "test-primary-repair-accessibility.mjs" in run["run"]
     assert "test-profile-import-flow.mjs" in run["run"]
+    assert run["run"].count("'onboarding-flow:scripts/test-onboarding-flow.mjs'") == 2
+    assert 'if [[ "${RUNNER_OS}" == "macOS" ]]' in run["run"]
     assert "test-desktop-cleanup-flow.mjs" in run["run"]
     assert "test-desktop-gateway-ownership.mjs" in run["run"]
     assert "test-unsafe-legacy-recovery-no-write.mjs" in run["run"]

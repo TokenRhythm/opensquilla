@@ -149,6 +149,7 @@ async function readDesktopLogSummary(userDataDir) {
     if (error?.code !== 'ENOENT') throw error
   }
   const eventCounts = {}
+  const rendererErrors = []
   let malformedRecords = 0
   let forbiddenErrorCount = 0
   for (const line of source.split(/\r?\n/)) {
@@ -158,6 +159,14 @@ async function readDesktopLogSummary(userDataDir) {
       const record = JSON.parse(line)
       const event = typeof record?.event === 'string' ? record.event : 'unknown'
       eventCounts[event] = (eventCounts[event] || 0) + 1
+      if (event === 'renderer_console' && rendererErrors.length < 10) {
+        rendererErrors.push({
+          level: record?.level,
+          message: record?.message,
+          source: record?.source,
+          line: record?.line,
+        })
+      }
     } catch {
       malformedRecords += 1
     }
@@ -165,6 +174,7 @@ async function readDesktopLogSummary(userDataDir) {
   return {
     bytes: Buffer.byteLength(source, 'utf8'),
     eventCounts,
+    rendererErrors,
     forbiddenErrorCount,
     malformedRecords,
   }
@@ -461,7 +471,11 @@ if (runError) {
     iterations,
     completedChatSends: rpcSendCounts.size,
     provider: provider?.counts(),
-    renderer: { pageErrors: pageErrors.length, consoleErrors: consoleErrors.length },
+    renderer: {
+      pageErrors: pageErrors.length,
+      consoleErrors: consoleErrors.length,
+      consoleErrorMessages: consoleErrors.slice(0, 10),
+    },
     externalRendererRequests: outboundNetwork.length,
     desktopLog: desktopLogSummary,
   }, null, 2))

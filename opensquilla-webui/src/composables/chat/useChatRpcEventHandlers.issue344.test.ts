@@ -239,7 +239,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(messages.value[messages.value.length - 1]).toMatchObject({
       role: 'error',
       errorCode: 'ensemble_multimodal_unsupported',
-      text: 'Ensemble 暂不支持图片输入，请切换到单模型路由后重试。',
+      text: '多模型融合暂不支持图片输入。请在“模型路由”中选择已配置图片模型的“AI 智能单模型路由”，或选择“关”并使用支持图片的模型。',
     })
     scope.stop()
     i18n.global.locale.value = 'en'

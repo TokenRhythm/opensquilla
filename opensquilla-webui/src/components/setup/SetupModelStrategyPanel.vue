@@ -546,7 +546,7 @@ function submitCandidate() {
   const provider = newCandidateProvider.value
   const model = newCandidateModel.value.trim()
   if (!provider || !isConfiguredProvider(provider) || !model) return
-  emit('addEnsembleCandidate', provider, model, '')
+  emit('addEnsembleCandidate', provider, model, 'proposer')
   closeLineupEditors()
 }
 

@@ -24,6 +24,12 @@ the capacity floor became a hard lower bound for physical fallback. Their
 goldens therefore include the sanitized floor tier and omit fallback models
 below it; the remaining corpus still pins the original extraction parity.
 
+The image-bypass cases were intentionally recaptured for the #1195 reopen
+after attachment capacity became mandatory for every attachment turn. Those
+entries include the capacity-required marker, material estimate, thinking
+reserve, and capacity-filtered fallback chain. Non-attachment cases retain
+their prior byte-identical behavior.
+
 Classifier outputs are injected through a fake strategy: the corpus never
 loads the LightGBM/ONNX bundle, touches the network, or needs credentials.
 All tier/model/provider names and messages are synthetic dummy data; tier

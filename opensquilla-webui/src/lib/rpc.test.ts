@@ -73,6 +73,7 @@ describe('RpcClient', () => {
     vi.clearAllTimers()
     vi.useRealTimers()
     vi.unstubAllGlobals()
+    vi.restoreAllMocks()
   })
 
   it('persists one random guest session key and sends it in every handshake', () => {
@@ -528,6 +529,113 @@ describe('RpcClient', () => {
     expect(retrySocket).toBeDefined()
     establishConnection(retrySocket)
     await expect(client.waitForConnection(25)).resolves.toBeUndefined()
+    client.disconnect()
+  })
+
+  it('isolates _hello listener failures and continues connection maintenance', async () => {
+    const client = new RpcClient()
+    const error = new Error('hello listener failed')
+    const throwingListener = vi.fn(() => { throw error })
+    const siblingListener = vi.fn()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    client.on('_hello', throwingListener)
+    client.on('_hello', siblingListener)
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+
+    expect(() => establishConnection(socket)).not.toThrow()
+    expect(throwingListener).toHaveBeenCalledOnce()
+    expect(siblingListener).toHaveBeenCalledOnce()
+    expect(consoleError).toHaveBeenCalledWith('[rpc] "_hello" listener failed', error)
+
+    await vi.advanceTimersByTimeAsync(55_000)
+    expect(socket.sent).toContain('{"type":"ping"}')
+    socket.close()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    client.disconnect()
+  })
+
+  it('isolates event listener failures and still notifies siblings and wildcard listeners', () => {
+    const client = new RpcClient()
+    const error = new Error('event listener failed')
+    const wildcardError = new Error('wildcard listener failed')
+    const siblingListener = vi.fn()
+    const wildcardListener = vi.fn()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    client.on('demo.event', () => { throw error })
+    client.on('demo.event', siblingListener)
+    client.on('*', () => { throw wildcardError })
+    client.on('*', wildcardListener)
+
+    expect(() => socket.receive({
+      type: 'event',
+      event: 'demo.event',
+      payload: { ok: true },
+      meta: { source: 'test' },
+    })).not.toThrow()
+    expect(siblingListener).toHaveBeenCalledWith({ ok: true }, { source: 'test' })
+    expect(wildcardListener).toHaveBeenCalledWith(
+      'demo.event',
+      { ok: true },
+      { source: 'test' },
+    )
+    expect(consoleError).toHaveBeenCalledWith('[rpc] "demo.event" listener failed', error)
+    expect(consoleError).toHaveBeenCalledWith('[rpc] "*" listener failed', wildcardError)
+    client.disconnect()
+  })
+
+  it('isolates _state listener failures so normal close still reconnects', async () => {
+    const client = new RpcClient()
+    const error = new Error('state listener failed')
+    const siblingListener = vi.fn()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    client.on('_state', () => { throw error })
+    client.on('_state', siblingListener)
+
+    expect(() => socket.close()).not.toThrow()
+    expect(client.state).toBe('disconnected')
+    expect(siblingListener).toHaveBeenCalledWith('disconnected')
+    expect(consoleError).toHaveBeenCalledWith('[rpc] "_state" listener failed', error)
+
+    await vi.advanceTimersByTimeAsync(999)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    client.disconnect()
+  })
+
+  it('isolates _gap listener failures so sequence gaps still close and reconnect', async () => {
+    const client = new RpcClient()
+    const error = new Error('gap listener failed')
+    const siblingListener = vi.fn()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    client.on('_gap', () => { throw error })
+    client.on('_gap', siblingListener)
+    socket.receive({ type: 'event', event: 'demo.event', seq: 1 })
+
+    expect(() => socket.receive({ type: 'event', event: 'demo.event', seq: 3 })).not.toThrow()
+    expect(siblingListener).toHaveBeenCalledWith({
+      expected: 2,
+      actual: 3,
+      event: 'demo.event',
+    })
+    expect(consoleError).toHaveBeenCalledWith('[rpc] "_gap" listener failed', error)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+
+    await vi.advanceTimersByTimeAsync(999)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(MockWebSocket.instances).toHaveLength(2)
     client.disconnect()
   })
 

@@ -251,6 +251,47 @@ def test_guest_profile_projects_managed_rw_and_bundled_runtime_roots(
     profile.cleanup()
 
 
+def test_guest_profile_uses_only_managed_runtime_pack_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.runtime_packs as runtime_packs
+
+    state_dir = tmp_path / "state"
+    python_root = tmp_path / "runtime-packs" / "python"
+    python_bin = python_root / "bin"
+    python_bin.mkdir(parents=True)
+
+    class _Service:
+        management_supported = True
+
+    class _Resolver:
+        def __init__(self, service) -> None:
+            assert service.management_supported is True
+
+        def runtime_roots(self, policy):
+            assert policy.python is True
+            return (python_root,)
+
+        def managed_path(self, policy):
+            assert policy.python is True
+            return (python_bin,)
+
+    monkeypatch.setattr(runtime_packs, "get_runtime_pack_service", lambda _state: _Service())
+    monkeypatch.setattr(runtime_packs, "RuntimePackResolver", _Resolver)
+
+    profile = _guest_profile_for_principal(
+        _guest_principal(),
+        "turn",
+        state_dir=state_dir,
+    )
+
+    assert profile is not None
+    assert profile.environment["PATH"] == str(python_bin)
+    assert any(mount.path == python_root and mount.access == "ro" for mount in profile.mounts)
+    profile.cleanup()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows guest runtime policy")
 def test_windows_guest_profile_does_not_project_process_runtimes(
     tmp_path: Path,

@@ -38,6 +38,14 @@ from opensquilla.engine.cache_break_monitor import (
     notify_compaction,
     record_prompt_state,
 )
+from opensquilla.engine.cancellation import (
+    STOP_CANCEL_GRACE_SECONDS,
+    TIMEOUT_CANCEL_GRACE_SECONDS,
+    CancellationPolicy,
+    cancel_task,
+    cancel_tasks,
+    defer_async_cleanup,
+)
 from opensquilla.engine.elevation_triage import RuleAssessment, local_elevation_assessment
 from opensquilla.engine.fallback import FallbackPolicy, backoff_sleep
 from opensquilla.engine.final_diff_contract import (
@@ -4067,6 +4075,18 @@ class Agent:
             timeout = max(timeout, argument_timeout)
         return timeout
 
+    def _tool_cancellation_policy(self, tool_call: ToolCall) -> CancellationPolicy:
+        tool_def = self._tool_definition_by_name.get(tool_call.tool_name)
+        policy = getattr(tool_def, "cancellation_policy", "bounded")
+        return "must_settle" if policy == "must_settle" else "bounded"
+
+    def _tool_effect_observation(self) -> tuple[int, int, int]:
+        return (
+            len(self._workspace_mutation_receipts()),
+            len(self._workspace_write_records()),
+            len(self._scratch_write_records()),
+        )
+
     def _tool_activity_heartbeat_interval(self) -> float:
         raw_interval = self.config.metadata.get("tool_activity_heartbeat_interval", 15.0)
         try:
@@ -6981,6 +7001,8 @@ class Agent:
         terminal_generation_reset_event: AnswerGenerationResetEvent | None = None
         final_text_parts: list[str] = []
         applied_model_call_boundaries: list[dict[str, Any]] = []
+        router_model_call_id = ""
+        router_iteration = 0
         final_reasoning_parts: list[str] = []
         artifact_delivery_final_response_pending = False
         artifact_delivery_degraded_final_response = False
@@ -9370,6 +9392,9 @@ class Agent:
                                 )
 
                             elif isinstance(raw_ev, ProviderTextDelta):
+                                if raw_ev.text and not router_model_call_id:
+                                    router_model_call_id = call_id
+                                    router_iteration = iterations
                                 if raw_ev.text:
                                     reasoning_end = _finish_reasoning_block("completed")
                                     if reasoning_end is not None:
@@ -9385,6 +9410,8 @@ class Agent:
                                         text=raw_ev.text,
                                         presentation="intermediate",
                                         generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
                                 else:
                                     # No tool has appeared yet. Stream the text live,
@@ -9401,6 +9428,8 @@ class Agent:
                                         text=raw_ev.text,
                                         presentation="answer",
                                         generation_epoch=generation_epoch,
+                                        model_call_id=call_id,
+                                        iteration=iterations,
                                     )
 
                             elif isinstance(raw_ev, ProviderReasoningDelta):
@@ -9410,6 +9439,9 @@ class Agent:
                                 # still arrives via DoneEvent.reasoning_content.
                                 if not raw_ev.text:
                                     continue
+                                if not router_model_call_id:
+                                    router_model_call_id = call_id
+                                    router_iteration = iterations
                                 if not reasoning_block_id:
                                     reasoning_started_at_ms = time.time_ns() // 1_000_000
                                     active_reasoning_block_index = reasoning_block_index
@@ -9457,6 +9489,8 @@ class Agent:
                                     block_id=reasoning_block_id,
                                     block_index=active_reasoning_block_index,
                                     generation_epoch=generation_epoch,
+                                    model_call_id=call_id,
+                                    iteration=iterations,
                                 )
                                 if (
                                     wrapup_margin_seconds > 0
@@ -14387,6 +14421,8 @@ class Agent:
                 results_by_id: dict[str, ToolResult] = {}
                 executed_tool_calls_by_id: dict[str, ToolCall] = {}
                 path_patch_snapshots_by_id: dict[str, ToolCall] = {}
+                tool_effect_observations_by_id: dict[str, tuple[int, int, int]] = {}
+                tool_cancellation_grace_by_id: dict[str, float] = {}
 
                 def _cap_timeout_by_deadlines(timeout: float) -> float:
                     remaining = min(timeout, max(0.0, tool_deadline - _loop.time()))
@@ -14421,6 +14457,14 @@ class Agent:
                             arguments=execution_arguments,
                         )
                     executed_tool_calls_by_id[tc.tool_use_id] = execution_tc
+                    cancellation_policy = self._tool_cancellation_policy(execution_tc)
+                    tool_cancellation_grace_by_id.setdefault(
+                        tc.tool_use_id,
+                        STOP_CANCEL_GRACE_SECONDS,
+                    )
+                    tool_effect_observations_by_id[tc.tool_use_id] = (
+                        self._tool_effect_observation()
+                    )
                     tool_timeout = _cap_timeout_by_deadlines(
                         self._tool_execution_timeout(execution_tc)
                     )
@@ -14494,16 +14538,75 @@ class Agent:
                     elif preflight_result is not None:
                         res = preflight_result
                     else:
+                        execution_task: asyncio.Task[ToolResult] | None = None
+                        cancellation_started = False
                         try:
                             turn_irreversible_effect_started = True
-                            res = await asyncio.wait_for(
-                                self._execute_tool(execution_tc), timeout=tool_timeout
+                            execution_task = asyncio.create_task(
+                                self._execute_tool(execution_tc)
                             )
+                            done, _pending = await asyncio.wait(
+                                {execution_task},
+                                timeout=tool_timeout,
+                            )
+                            if done:
+                                res = execution_task.result()
+                            else:
+                                cancellation_started = True
+                                await cancel_task(
+                                    execution_task,
+                                    policy=cancellation_policy,
+                                    operation=f"tool:{tc.tool_name}",
+                                    grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS,
+                                )
+                                settlement_note = ""
+                                if (
+                                    cancellation_policy == "must_settle"
+                                    and self._tool_effect_observation()
+                                    != tool_effect_observations_by_id[tc.tool_use_id]
+                                ):
+                                    settlement_note = (
+                                        " The filesystem operation exceeded its deadline, "
+                                        "but its effects settled and were recorded before "
+                                        "the turn ended."
+                                    )
+                                res = ToolResult(
+                                    tool_use_id=tc.tool_use_id,
+                                    tool_name=tc.tool_name,
+                                    content=(
+                                        f"Tool '{tc.tool_name}' timed out after "
+                                        f"{tool_timeout}s.{settlement_note}"
+                                    ),
+                                    is_error=True,
+                                    execution_status=runtime_execution_status(
+                                        "timeout",
+                                        reason="runtime_timeout",
+                                        timed_out=True,
+                                    ),
+                                )
+                        except asyncio.CancelledError:
+                            if (
+                                execution_task is not None
+                                and not execution_task.done()
+                                and not cancellation_started
+                            ):
+                                await cancel_task(
+                                    execution_task,
+                                    policy=cancellation_policy,
+                                    operation=f"tool:{tc.tool_name}",
+                                    grace_seconds=tool_cancellation_grace_by_id.get(
+                                        tc.tool_use_id,
+                                        STOP_CANCEL_GRACE_SECONDS,
+                                    ),
+                                )
+                            raise
                         except TimeoutError:
+                            # A TimeoutError raised by the tool itself remains a
+                            # runtime timeout, matching the historical boundary.
                             res = ToolResult(
                                 tool_use_id=tc.tool_use_id,
                                 tool_name=tc.tool_name,
-                                content=(f"Tool '{tc.tool_name}' timed out after {tool_timeout}s"),
+                                content=f"Tool '{tc.tool_name}' timed out after {tool_timeout}s",
                                 is_error=True,
                                 execution_status=runtime_execution_status(
                                     "timeout",
@@ -14589,6 +14692,7 @@ class Agent:
                     interval = self._tool_activity_heartbeat_interval()
                     started = time.monotonic()
                     last_event_at = started
+                    cleanup_grace_seconds = TIMEOUT_CANCEL_GRACE_SECONDS
                     try:
                         while pending:
                             remaining = max(0.0, tool_deadline - _loop.time())
@@ -14600,7 +14704,9 @@ class Agent:
                             if remaining <= 0:
                                 for task, tc in list(task_to_tool_call.items()):
                                     if task in pending:
-                                        task.cancel()
+                                        tool_cancellation_grace_by_id[tc.tool_use_id] = (
+                                            TIMEOUT_CANCEL_GRACE_SECONDS
+                                        )
                                         results_by_id[tc.tool_use_id] = ToolResult(
                                             tool_use_id=tc.tool_use_id,
                                             tool_name=tc.tool_name,
@@ -14628,7 +14734,9 @@ class Agent:
                                 ):
                                     for task, tc in list(task_to_tool_call.items()):
                                         if task in pending:
-                                            task.cancel()
+                                            tool_cancellation_grace_by_id[tc.tool_use_id] = (
+                                                TIMEOUT_CANCEL_GRACE_SECONDS
+                                            )
                                             results_by_id[tc.tool_use_id] = ToolResult(
                                                 tool_use_id=tc.tool_use_id,
                                                 tool_name=tc.tool_name,
@@ -14682,13 +14790,51 @@ class Agent:
                                         ),
                                     )
                                 results_by_id[tc.tool_use_id] = outcome
+                    except (asyncio.CancelledError, GeneratorExit):
+                        cleanup_grace_seconds = STOP_CANCEL_GRACE_SECONDS
+                        raise
                     finally:
-                        for task in pending:
-                            if not task.done():
-                                task.cancel()
-                        for task in pending:
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await task
+                        cleanup_tasks = {
+                            task: self._tool_cancellation_policy(
+                                task_to_tool_call[task]
+                            )
+                            for task in pending
+                        }
+                        try:
+                            await cancel_tasks(
+                                cleanup_tasks,
+                                operation="agent_tool_batch",
+                                grace_seconds=cleanup_grace_seconds,
+                            )
+                        finally:
+                            for task in pending:
+                                tc = task_to_tool_call[task]
+                                result = results_by_id.get(tc.tool_use_id)
+                                if (
+                                    result is None
+                                    or self._tool_cancellation_policy(tc)
+                                    != "must_settle"
+                                    or result.execution_status is None
+                                    or result.execution_status.get("status") != "timeout"
+                                ):
+                                    continue
+                                before = tool_effect_observations_by_id.get(
+                                    tc.tool_use_id
+                                )
+                                if (
+                                    before is not None
+                                    and self._tool_effect_observation() != before
+                                    and "effects settled" not in result.content
+                                ):
+                                    results_by_id[tc.tool_use_id] = replace(
+                                        result,
+                                        content=(
+                                            f"{result.content}. The filesystem operation "
+                                            "exceeded its deadline, but its effects "
+                                            "settled and were recorded before the turn "
+                                            "ended."
+                                        ),
+                                    )
 
                 # Dispatch preserving original order: accumulate consecutive
                 # concurrent/keyed tools into a batch and flush before each
@@ -16605,6 +16751,8 @@ class Agent:
                     else None
                 ),
                 generation_epoch=generation_epoch,
+                router_model_call_id=router_model_call_id,
+                router_iteration=router_iteration,
             )
             yield done_event
         # Reset for next turn
@@ -18768,16 +18916,19 @@ class Agent:
             raise
         except Exception as exc:  # noqa: BLE001 - provider boundary
             raise _RaisedProviderBoundaryError(timeout=isinstance(exc, TimeoutError)) from None
+        close_state = {"deferred": False}
         try:
             async for event in self._stream_provider_events_with_deadline_unclosed(
                 stream_iter,
                 loop=loop,
                 total_deadline=total_deadline,
                 deadline_provider=deadline_provider,
+                close_state=close_state,
             ):
                 yield event
         finally:
-            await self._close_provider_stream(stream_iter)
+            if not close_state["deferred"]:
+                await self._close_provider_stream(stream_iter)
 
     async def _stream_provider_events_with_deadline_unclosed(
         self,
@@ -18786,92 +18937,104 @@ class Agent:
         loop: asyncio.AbstractEventLoop,
         total_deadline: float | None,
         deadline_provider: Callable[[], float | None] | None = None,
+        close_state: dict[str, bool] | None = None,
     ) -> AsyncIterator[Any]:
-        next_event: asyncio.Future[Any] | None = None
-        try:
-            while True:
-                dynamic_deadline = (
-                    deadline_provider()
-                    if deadline_provider is not None
-                    else None
+        while True:
+            dynamic_deadline = (
+                deadline_provider()
+                if deadline_provider is not None
+                else None
+            )
+            active_deadline = total_deadline
+            if dynamic_deadline is not None:
+                active_deadline = (
+                    min(active_deadline, dynamic_deadline)
+                    if active_deadline is not None
+                    else dynamic_deadline
                 )
-                active_deadline = total_deadline
-                if dynamic_deadline is not None:
-                    active_deadline = (
-                        min(active_deadline, dynamic_deadline)
-                        if active_deadline is not None
-                        else dynamic_deadline
-                    )
-                # Execution-context-aware composite providers (currently Ensemble)
-                # own streaming inactivity through TurnExecutionContext. Applying
-                # the legacy per-iteration read timeout here would create a second,
-                # earlier timeout owner and could kill a healthy long fusion run.
-                wait_budget: float | None = (
-                    None
-                    if (
-                        getattr(self, "_execution_context", None) is not None
-                        and getattr(self.provider, "execution_context_aware", False)
-                    )
-                    else max(0.001, self.config.iteration_timeout)
+            # Execution-context-aware composite providers (currently Ensemble)
+            # own streaming inactivity through TurnExecutionContext. Applying
+            # the legacy per-iteration read timeout here would create a second,
+            # earlier timeout owner and could kill a healthy long fusion run.
+            wait_budget: float | None = (
+                None
+                if (
+                    getattr(self, "_execution_context", None) is not None
+                    and getattr(self.provider, "execution_context_aware", False)
                 )
-                total_deadline_limits_wait = False
-                if active_deadline is not None:
-                    remaining_total = active_deadline - loop.time()
-                    if remaining_total <= 0:
-                        raise _provider_stream_deadline_timeout(
-                            timeout_seconds=self.config.timeout,
-                            deadline_at_monotonic=active_deadline,
-                        )
-                    if wait_budget is None or remaining_total <= wait_budget:
-                        wait_budget = remaining_total
-                        total_deadline_limits_wait = True
+                else max(0.001, self.config.iteration_timeout)
+            )
+            total_deadline_limits_wait = False
+            if active_deadline is not None:
+                remaining_total = active_deadline - loop.time()
+                if remaining_total <= 0:
+                    raise _provider_stream_deadline_timeout(
+                        timeout_seconds=self.config.timeout,
+                        deadline_at_monotonic=active_deadline,
+                    )
+                if wait_budget is None or remaining_total <= wait_budget:
+                    wait_budget = remaining_total
+                    total_deadline_limits_wait = True
 
-                next_event = asyncio.ensure_future(stream_iter.__anext__())
+            next_event: asyncio.Future[Any] = asyncio.ensure_future(stream_iter.__anext__())
+
+            async def _cancel_provider_pull(*, grace_seconds: float) -> None:
+                settled = False
                 try:
-                    done, _ = await asyncio.wait({next_event}, timeout=wait_budget)
-                except (asyncio.CancelledError, GeneratorExit):
-                    next_event.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                        await next_event
-                    raise
-                if not done:
-                    next_event.cancel()
-                    with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                        await next_event
-                    if total_deadline_limits_wait or (
-                        active_deadline is not None
-                        and loop.time() >= active_deadline
-                    ):
-                        assert active_deadline is not None
-                        raise _provider_stream_deadline_timeout(
-                            timeout_seconds=self.config.timeout,
-                            deadline_at_monotonic=active_deadline,
-                        )
-                    raise _IterationStreamTimeoutError
-                try:
-                    event = next_event.result()
-                except StopAsyncIteration:
-                    return
-                except (
-                    asyncio.CancelledError,
-                    UsageAccountingUnavailableError,
-                    ModelRepetitionLoopError,
-                ):
-                    raise
-                except Exception as exc:  # noqa: BLE001 - provider boundary
-                    # TimeoutError raised *by the provider* is different from
-                    # the deadline timeouts raised above by this wrapper.
-                    raise _RaisedProviderBoundaryError(
-                        timeout=isinstance(exc, TimeoutError)
-                    ) from None
+                    settled = await cancel_task(
+                        next_event,
+                        policy="bounded",
+                        operation="provider_stream_pull",
+                        grace_seconds=grace_seconds,
+                    )
                 finally:
-                    next_event = None
-                yield event
-        finally:
-            if next_event is not None and not next_event.done():
-                next_event.cancel()
-                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
-                    await next_event
+                    if (
+                        not settled
+                        and not next_event.done()
+                        and close_state is not None
+                        and not close_state["deferred"]
+                    ):
+                        close_state["deferred"] = True
+                        defer_async_cleanup(
+                            next_event,
+                            lambda: self._close_provider_stream(stream_iter),
+                            operation="provider_stream_deferred_close",
+                        )
+
+            try:
+                done, _ = await asyncio.wait({next_event}, timeout=wait_budget)
+            except (asyncio.CancelledError, GeneratorExit):
+                await _cancel_provider_pull(grace_seconds=STOP_CANCEL_GRACE_SECONDS)
+                raise
+            if not done:
+                await _cancel_provider_pull(grace_seconds=TIMEOUT_CANCEL_GRACE_SECONDS)
+                if total_deadline_limits_wait or (
+                    active_deadline is not None
+                    and loop.time() >= active_deadline
+                ):
+                    assert active_deadline is not None
+                    raise _provider_stream_deadline_timeout(
+                        timeout_seconds=self.config.timeout,
+                        deadline_at_monotonic=active_deadline,
+                    )
+                raise _IterationStreamTimeoutError
+            try:
+                event = next_event.result()
+            except StopAsyncIteration:
+                return
+            except (
+                asyncio.CancelledError,
+                UsageAccountingUnavailableError,
+                ModelRepetitionLoopError,
+            ):
+                raise
+            except Exception as exc:  # noqa: BLE001 - provider boundary
+                # TimeoutError raised *by the provider* is different from
+                # the deadline timeouts raised above by this wrapper.
+                raise _RaisedProviderBoundaryError(
+                    timeout=isinstance(exc, TimeoutError)
+                ) from None
+            yield event
 
     @staticmethod
     async def _close_provider_stream(stream_iter: AsyncIterator[Any]) -> None:

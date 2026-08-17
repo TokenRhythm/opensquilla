@@ -135,6 +135,24 @@ function makeHarness() {
 }
 
 describe('task ownership event races', () => {
+  it('drops stopped-task text deltas while retaining terminal ownership', () => {
+    const { api, stream, taskOwnership, scope } = makeHarness()
+    expect(taskOwnership.beginStop()).toBe('task-A')
+
+    api.handlers.onTextDelta({
+      task_id: 'task-A',
+      session_key: SESSION,
+      stream_seq: 1,
+      text: 'late provider text',
+    })
+
+    expect(stream.appendDelta).not.toHaveBeenCalled()
+    expect(stream.resetStreamIdleTimer).toHaveBeenCalled()
+    expect(taskOwnership.runningTaskId.value).toBe('task-A')
+    expect(taskOwnership.stopRequestedTaskId.value).toBe('task-A')
+    scope.stop()
+  })
+
   it.each([
     ['session.event.done', { reason: 'completed', text: 'answer A' }, undefined],
     ['task.failed', { terminal_message: 'A failed' }, undefined],

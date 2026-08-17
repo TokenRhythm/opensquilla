@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
@@ -382,6 +382,9 @@ class ToolSpec:
     execution_timeout_seconds: float | None = None
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
+    # Internal cancellation semantics. ``None`` lets the registry infer
+    # must-settle behavior for filesystem mutation descriptors.
+    cancellation_policy: Literal["bounded", "must_settle"] | None = None
     result_budget_class: str | None = None
     sandbox: SandboxToolDescriptor = field(
         default_factory=lambda: SandboxToolDescriptor.custom(kind="")
@@ -400,6 +403,9 @@ class ToolSpec:
     # string carried in one top-level JSON result field. The dispatcher, not
     # the model or Agent, extracts and bounds this text.
     terminal_response_field: str | None = None
+    # Trusted declaration that itemless arrays have textual wire semantics.
+    # Provider policy still decides whether a request needs the projection.
+    allow_string_item_schema_projection: bool = False
 
 
 # Registered tool implementation: async fn that accepts keyword args and returns str.

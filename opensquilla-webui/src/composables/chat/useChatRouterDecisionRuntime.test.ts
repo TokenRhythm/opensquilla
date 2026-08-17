@@ -29,7 +29,70 @@ function makeRuntime(
   return { runtime, messagesRef, scrollToBottom }
 }
 
+describe('router decision identity', () => {
+  it('keeps emitted same-turn cards immutable and binds each physical call', () => {
+    const { runtime, messagesRef } = makeRuntime([{
+      role: 'user',
+      text: 'q',
+      ts: 0,
+      turnId: 'turn-1',
+    }], true, 'squilla_router')
+
+    runtime.queueRouterDecision({
+      stream_seq: 10,
+      turn_id: 'turn-1',
+      tier: 'c1',
+      model: 'provider/first',
+      source: 'squilla_router',
+    })
+    runtime.bindRouterDecisionToModelCall('1.0', 1, 'turn-1')
+    runtime.queueRouterDecision({
+      stream_seq: 20,
+      turn_id: 'turn-1',
+      tier: 'c2',
+      model: 'provider/replay',
+      source: 'squilla_router',
+    })
+    runtime.bindRouterDecisionToModelCall('2.0', 2, 'turn-1')
+    runtime.flushPendingRouterDecision()
+
+    const routers = messagesRef.value.filter(message => message.role === 'router')
+    expect(routers).toHaveLength(2)
+    expect(routers.map(message => [
+      message.messageId,
+      message.routerDecision?.model,
+      message.routerModelCallId,
+      message.routerIteration,
+    ])).toEqual([
+      ['router-sess-10', 'provider/first', '1.0', 1],
+      ['router-sess-20', 'provider/replay', '2.0', 2],
+    ])
+  })
+})
+
 describe('appendEnsembleProgress', () => {
+  it('normalizes every internal candidate label to the public Proposer role', () => {
+    const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
+
+    for (const [index, label] of ['primary', 'contrast', 'fast_check', 'critic'].entries()) {
+      runtime.appendEnsembleProgress({
+        event_type: 'proposer_start',
+        proposer_index: index,
+        proposer_label: label,
+        proposer_provider: 'tokenrhythm',
+        proposer_model: `model-${index + 1}`,
+      })
+    }
+
+    const models = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models
+    expect(models?.map(model => ({ role: model.role, label: model.label }))).toEqual([
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+    ])
+  })
+
   it('synthesizes a router message and reveals members with running → done status', () => {
     const { runtime, messagesRef } = makeRuntime([{ role: 'user', text: 'q', ts: 0 }])
 
@@ -105,8 +168,8 @@ describe('appendEnsembleProgress', () => {
     const models = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models
     expect(models).toHaveLength(2)
     expect(models?.[0]).toMatchObject({
-      role: 'critic',
-      label: 'critic',
+      role: 'proposer',
+      label: 'proposer',
       status: 'failed',
       elapsedMs: 118_000,
       error: 'provider timed out',
@@ -148,7 +211,7 @@ describe('appendEnsembleProgress', () => {
 
     const model = messagesRef.value.find(message => message.role === 'router')?.ensemble?.models[0]
     expect(model).toMatchObject({
-      role: 'critic',
+      role: 'proposer',
       status: 'skipped',
       elapsedMs: 21_000,
       errorCode: 'quorum_cancelled',

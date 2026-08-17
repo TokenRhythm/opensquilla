@@ -91,6 +91,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_ci/test_dockerignore_context.py",
     "tests/test_ci/test_migration_v022.py",
     "tests/test_ci/test_session_storage_connection_contract.py",
+    "tests/test_desktop/test_onboarding_main_process_flow_contract.py",
     "tests/test_channels/test_stream_terminal_routing.py",
     "tests/test_engine/test_agent_canonical_text_contract.py",
     "tests/test_engine/test_agent_transactional_tool_publication.py",

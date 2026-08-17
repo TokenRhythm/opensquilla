@@ -405,8 +405,19 @@
           @interrupt="onStop"
         />
 
+        <!-- Stop is acknowledged locally before the Gateway reaches terminal.
+             Keep the composer usable while making that settlement phase explicit. -->
+        <div v-if="isStopPending && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
+          <div class="msg-ai-main">
+            <div class="thinking-status">
+              <span class="stream-activity-dot" aria-hidden="true" />
+              <span class="thinking-elapsed">{{ t('chat.stoppingResponse') }}</span>
+            </div>
+          </div>
+        </div>
+
         <!-- Thinking indicator -->
-        <div v-if="thinkingVisible && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
+        <div v-else-if="thinkingVisible && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
           <div class="msg-ai-main">
             <div class="thinking-status">
               <span class="stream-activity-dot" aria-hidden="true" />
@@ -495,7 +506,7 @@
     <!-- Long-running goal progress lives in the same dock as plan execution so
          the active objective stays visible above the composer across turns. -->
     <Transition name="goal-run-dock">
-      <div v-if="activeGoalRun" class="goal-run-dock">
+      <div v-if="activeGoalRun" ref="goalRunDockRef" class="goal-run-dock">
         <GoalRibbon
           :goal="activeGoalRun"
           :elapsed="goalElapsed"
@@ -604,6 +615,7 @@
       :goal-mode-available="goalUiAvailable"
       :goal-mode-busy="goalBusy || planModeBusy || replanActive"
       :goal-mode-existing="goalComposerExisting"
+      :add-menu-avoid-element="goalRunDockRef"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -1107,6 +1119,7 @@ const pendingAutoSendSessionKey = ref('')
 
 const chatRootRef = ref<HTMLElement | null>(null)
 const threadRef = ref<HTMLElement | null>(null)
+const goalRunDockRef = ref<HTMLElement | null>(null)
 const messageListRef = ref<ChatMessageListVirtualizer | null>(null)
 const bottomSentinelRef = ref<HTMLElement | null>(null)
 let bottomIntersectionObserver: IntersectionObserver | null = null
@@ -1436,6 +1449,11 @@ const activeStreamSessionKey = ref<string>('')
 const acceptanceStopPending = ref(false)
 const acceptanceRecoveryPending = ref(false)
 const taskOwnership = useChatTaskOwnership()
+const isStopPending = computed(() => (
+  Boolean(taskOwnership.stopRequestedTaskId.value)
+  || acceptanceStopPending.value
+  || acceptanceRecoveryPending.value
+))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
 let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
 
@@ -1531,6 +1549,7 @@ const {
   thinkingVisible,
   thinkingText,
   startStreaming,
+  reconcileStreamTaskClock,
   resetStreamForRouterReplay,
   resetLiveTurnState: resetStreamLiveTurnState,
   resetStreamIdleTimer,
@@ -1888,6 +1907,7 @@ const {
   markEnsembleHandoff,
   flushPendingRouterDecision,
   clearPendingRouterDecision,
+  bindRouterDecisionToModelCall,
 } = chatRouterDecisionRuntime
 
 // Gate the live answer's reveal to a [MIN,MAX] window so the model-router panel
@@ -2015,9 +2035,14 @@ const {
 planMutationAccepted = () => scheduleHistorySync()
 
 const steerDelivery = useChatSteerDelivery({
+  sessionKey,
+  activeTurnId: activeStreamTaskId,
   messages,
   pendingQueue,
-  checkpointForUserMessage: turnId => chatStream.checkpointForUserMessage?.(turnId),
+  checkpointForUserMessage: (turnId, boundaryKey) =>
+    chatStream.checkpointForUserMessage?.(turnId, boundaryKey),
+  acknowledgeSteerBoundary: (boundaryKey, modelCallId, iteration) =>
+    chatStream.acknowledgeSteerBoundary?.(boundaryKey, modelCallId, iteration),
   scheduleHistorySync,
   removePendingItem: item => settlePendingDelivery(item, 'accepted'),
   restoreSteerIntoComposer: text => appendComposerText(text),
@@ -2116,6 +2141,7 @@ const chatSessionSubscription = useChatSessionSubscription({
   acceptanceStopPending,
   sessionRunStatus,
   startStreaming,
+  reconcileStreamTaskClock,
   loadHistory,
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
@@ -3062,6 +3088,7 @@ const sameTurnSteerUnavailableMessage = computed(() => {
 
 const composerSameTurnSteerAvailable = computed(() => (
   sameTurnSteerAvailable.value
+  && !isStopPending.value
   && pendingAttachments.value.length === 0
   && !pendingSessionIntent.value
   && !pendingForkBeforeMessageId.value
@@ -3204,6 +3231,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
   sessionRunStatus,
   applySessionRunState,
   queueRouterDecision,
+  bindRouterDecisionToModelCall,
   appendEnsembleProgress,
   markEnsembleHandoff,
   flushPendingRouterDecision,

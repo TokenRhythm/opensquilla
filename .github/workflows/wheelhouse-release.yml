@@ -21,6 +21,9 @@ concurrency:
 env:
   RELEASE_PROFILE: recommended
   RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+  OSSUTIL_VERSION: "2.3.0"
+  OSSUTIL_ZIP: ossutil-2.3.0-linux-amd64.zip
+  OSSUTIL_SHA256: 3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a
 
 jobs:
   build-control-ui:
@@ -351,6 +354,10 @@ jobs:
         working-directory: desktop/electron
         run: npm ci
 
+      - name: Verify finalized runtime-pack catalog
+        working-directory: desktop/electron
+        run: node ../../.github/scripts/verify-sandbox-package.mjs --release-source
+
       - name: Build signed macOS installer
         working-directory: desktop/electron
         env:
@@ -360,7 +367,6 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          npm run fetch:runtimes
           npm run build:gateway
           npm run build
           npx electron-builder --mac --publish never
@@ -368,6 +374,12 @@ jobs:
       - name: Verify Electron package
         working-directory: desktop/electron
         run: npm run verify:package
+
+      - name: Enforce slim macOS artifact size budgets
+        run: >-
+          python .github/scripts/verify_desktop_slim_size.py
+          --root dist/desktop-electron
+          --platform macos
 
       - name: Smoke packaged gateway
         working-directory: desktop/electron
@@ -393,7 +405,7 @@ jobs:
             --executable "${candidates[0]}" \
             --user-data-dir "${user_data}"
 
-      - name: Verify RC3-to-candidate macOS upgrade and uninstall preserve profile data
+      - name: Verify v0.5.3-to-candidate macOS upgrade and uninstall preserve profile data
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -424,7 +436,7 @@ jobs:
   build-desktop-windows:
     name: Build unsigned Windows Electron installer
     needs: build-control-ui
-    # Keep the v0.5.0rc3 upgrade baseline on the OS generation it shipped on.
+    # Keep the v0.5.3 upgrade baseline on the OS generation it shipped on.
     # The legacy NSIS installer can crash with 0xC0000005 on Windows Server 2025
     # before the candidate installer or profile-preservation checks run.
     runs-on: windows-2022
@@ -468,6 +480,10 @@ jobs:
         working-directory: desktop/electron
         run: npm ci
 
+      - name: Verify finalized runtime-pack catalog
+        working-directory: desktop/electron
+        run: node ../../.github/scripts/verify-sandbox-package.mjs --release-source
+
       - name: Build unsigned Windows installer
         working-directory: desktop/electron
         shell: bash
@@ -475,7 +491,6 @@ jobs:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: |
           set -euo pipefail
-          npm run fetch:runtimes
           npm run build:gateway
           npm run build
           npx electron-builder --win --publish never
@@ -483,6 +498,12 @@ jobs:
       - name: Verify Electron package
         working-directory: desktop/electron
         run: npm run verify:package
+
+      - name: Enforce slim Windows artifact size budget
+        run: >-
+          python .github/scripts/verify_desktop_slim_size.py
+          --root dist/desktop-electron
+          --platform windows
 
       - name: Smoke packaged gateway
         working-directory: desktop/electron
@@ -508,7 +529,7 @@ jobs:
             throw "Packaged first-send renderer gate failed with exit code $LASTEXITCODE"
           }
 
-      - name: Verify RC3-to-candidate Windows upgrade and uninstall preserve profile data
+      - name: Verify v0.5.3-to-candidate Windows upgrade and uninstall preserve profile data
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -841,14 +862,216 @@ jobs:
               raise SystemExit(1)
           PY
 
+  prestage-draft-updater-assets:
+    name: Prestage immutable Draft updater assets to OSS
+    if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
+    needs: publish-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: desktop-release-oss-prestage
+    permissions:
+      contents: read
+    outputs:
+      prerelease: ${{ steps.draft-metadata.outputs.prerelease }}
+    env:
+      ALIYUN_OSS_BUCKET: ${{ vars.ALIYUN_OSS_BUCKET }}
+      ALIYUN_OSS_PREFIX: ${{ vars.ALIYUN_OSS_PREFIX }}
+      OSS_ACCESS_KEY_ID: ${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_SECRET }}
+      OSS_REGION: ${{ vars.ALIYUN_OSS_REGION }}
+      OSS_ENDPOINT: ${{ vars.ALIYUN_OSS_ENDPOINT }}
+      OSS_ADDRESSING_STYLE: ${{ vars.ALIYUN_OSS_ADDRESSING_STYLE }}
+      TAG: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+    steps:
+      - name: Checkout immutable prestage tooling
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Validate Draft and OSS prestage configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          [[ -n "${ALIYUN_OSS_BUCKET}" ]] || missing+=("vars.ALIYUN_OSS_BUCKET")
+          [[ -n "${OSS_REGION}" ]] || missing+=("vars.ALIYUN_OSS_REGION")
+          [[ -n "${OSS_ACCESS_KEY_ID}" ]] || missing+=("secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_ID")
+          [[ -n "${OSS_ACCESS_KEY_SECRET}" ]] || missing+=("secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_SECRET")
+          if (( ${#missing[@]} )); then
+            printf 'Missing required OSS prestage configuration:\n' >&2
+            printf '  - %s\n' "${missing[@]}" >&2
+            exit 1
+          fi
+          [[ "${ALIYUN_OSS_BUCKET}" == "opensquilla-releases" ]] || {
+            echo "Draft updater prestage requires the reviewed opensquilla-releases bucket" >&2
+            exit 1
+          }
+          [[ "${OSS_REGION}" == "cn-beijing" ]] || {
+            echo "Draft updater prestage requires the reviewed cn-beijing region" >&2
+            exit 1
+          }
+          prefix="${ALIYUN_OSS_PREFIX:-releases}"
+          prefix="${prefix#/}"
+          prefix="${prefix%/}"
+          if [[ "${prefix}" != "releases" ]]; then
+            echo "Draft updater prestage requires the canonical releases prefix" >&2
+            exit 1
+          fi
+          echo "ALIYUN_OSS_PREFIX_NORMALIZED=releases" >> "${GITHUB_ENV}"
+
+          endpoint_host="${OSS_ENDPOINT#http://}"
+          endpoint_host="${endpoint_host#https://}"
+          endpoint_host="${endpoint_host%%/*}"
+          addressing_style="${OSS_ADDRESSING_STYLE:-}"
+          if [[ -z "${addressing_style}" ]]; then
+            if [[ -n "${endpoint_host}" && ! "${endpoint_host}" =~ (^|[.])aliyuncs[.]com$ ]]; then
+              addressing_style="cname"
+            else
+              addressing_style="virtual"
+            fi
+          fi
+          case "${addressing_style}" in
+            virtual|path|cname) ;;
+            *)
+              echo "ALIYUN_OSS_ADDRESSING_STYLE must be virtual, path, or cname" >&2
+              exit 1
+              ;;
+          esac
+          echo "OSS_ADDRESSING_STYLE_NORMALIZED=${addressing_style}" >> "${GITHUB_ENV}"
+
+      - name: Download and audit exact GitHub Draft assets
+        id: draft-metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p draft-release
+          gh release view "${TAG}" \
+            --json tagName,isDraft,isPrerelease,url > draft-release/release.json
+          python3 - <<'PY'
+          import json
+          from datetime import UTC, datetime
+          from pathlib import Path
+
+          path = Path("draft-release/release.json")
+          release = json.loads(path.read_text(encoding="utf-8"))
+          assert release["isDraft"] is True, "prestage requires a Draft GitHub Release"
+          release["publishedAt"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+          path.write_text(json.dumps(release, indent=2) + "\n", encoding="utf-8")
+          PY
+          prerelease="$(python3 -c 'import json; print(str(json.load(open("draft-release/release.json"))["isPrerelease"]).lower())')"
+          echo "prerelease=${prerelease}" >> "${GITHUB_OUTPUT}"
+          gh release download "${TAG}" --dir draft-release/assets
+          python3 scripts/release_channel_manifest.py build-draft-rehearsal \
+            --release-json draft-release/release.json \
+            --assets-dir draft-release/assets \
+            --output draft-release/channel-manifest.json
+
+      - name: Install pinned ossutil
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSLO "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
+          echo "${OSSUTIL_SHA256}  ${OSSUTIL_ZIP}" | sha256sum -c -
+          unzip -q "${OSSUTIL_ZIP}"
+          sudo install -m 0755 "ossutil-${OSSUTIL_VERSION}-linux-amd64/ossutil" /usr/local/bin/ossutil
+
+      - name: Require overwrite-safe OSS bucket versioning state
+        shell: bash
+        run: |
+          set -euo pipefail
+          versioning_endpoint="oss-${OSS_REGION}.aliyuncs.com"
+          ossutil api get-bucket-versioning \
+            --addressing-style virtual \
+            --endpoint "${versioning_endpoint}" \
+            --bucket "${ALIYUN_OSS_BUCKET}" \
+            --output-format json > bucket-versioning.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("bucket-versioning.json")
+          try:
+              raw = path.read_text(encoding="utf-8")
+          except (OSError, UnicodeError) as exc:
+              raise SystemExit(f"Unable to verify OSS bucket versioning state: {exc}") from exc
+
+          # ossutil may append a trailer or additional metadata documents. Use
+          # the same leading multi-document parser as the mirror workflow.
+          decoder = json.JSONDecoder()
+          documents = []
+          index = 0
+          while index < len(raw):
+              while index < len(raw) and raw[index].isspace():
+                  index += 1
+              if index >= len(raw):
+                  break
+              try:
+                  document, index = decoder.raw_decode(raw, index)
+              except json.JSONDecodeError:
+                  break
+              documents.append(document)
+
+          if not documents:
+              snippet = " ".join(raw.split())[:300]
+              raise SystemExit(
+                  "Unable to verify OSS bucket versioning state: no JSON document "
+                  f"in ossutil output: {snippet!r}"
+              )
+
+          def statuses(value):
+              if isinstance(value, dict):
+                  for key, nested in value.items():
+                      if isinstance(key, str) and key.casefold() == "status":
+                          yield nested
+                      yield from statuses(nested)
+              elif isinstance(value, list):
+                  for nested in value:
+                      yield from statuses(nested)
+
+          # Response envelopes may contain unrelated HTTP status fields. Only
+          # the two OSS versioning states are relevant, and prestage requires
+          # the bucket to be genuinely unconfigured.
+          active = [
+              value
+              for document in documents
+              for value in statuses(document)
+              if isinstance(value, str) and value.casefold() in {"enabled", "suspended"}
+          ]
+          if active:
+              raise SystemExit(
+                  "OSS bucket versioning must be unconfigured because PutObject "
+                  f"forbid-overwrite is not immutable with versioning enabled or suspended: {active}"
+              )
+          print("OSS bucket versioning is not configured.")
+          PY
+
+      - name: Prestage version-scoped immutable assets only
+        shell: bash
+        run: >-
+          bash .github/scripts/prestage-release-to-oss.sh
+          draft-release/assets
+          "${TAG}"
+
+      - name: Upload loopback-only updater rehearsal manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: opensquilla-draft-updater-rehearsal
+          path: draft-release/channel-manifest.json
+          if-no-files-found: error
+          overwrite: true
+
   audit-downloaded-macos-release:
     name: Audit downloaded macOS draft assets
     if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
-    needs: publish-release
+    needs: prestage-draft-updater-assets
     runs-on: macos-latest
     timeout-minutes: 75
     permissions:
-      contents: write
+      contents: read
     steps:
       - name: Checkout release verification helpers
         uses: actions/checkout@v4
@@ -872,6 +1095,12 @@ jobs:
       - name: Install Electron release verification dependencies
         working-directory: desktop/electron
         run: npm ci
+
+      - name: Download loopback-only updater rehearsal manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-draft-updater-rehearsal
+          path: updater-rehearsal
 
       - name: Download actual draft release assets
         env:
@@ -981,7 +1210,18 @@ jobs:
           validate_app "${mounted}/OpenSquilla.app"
           hdiutil detach "${mounted}" -quiet
 
-      - name: Verify downloaded RC3-to-candidate macOS upgrade and uninstall
+      - name: Verify official v0.5.3 macOS updater discovery, download, apply, and relaunch
+        if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          .github/scripts/verify-release-macos-real-update.sh \
+            updater-rehearsal/channel-manifest.json downloaded-asset
+
+      - name: Verify preview macOS installer replacement compatibility
+        if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -993,17 +1233,21 @@ jobs:
             exit 1
           fi
           .github/scripts/verify-release-macos-upgrade.sh \
-            "${candidates[0]}" downloaded-asset
+            "${candidates[0]}" downloaded-preview-asset
 
   audit-downloaded-windows-release:
-    name: Audit downloaded Windows draft asset
+    name: Audit downloaded Windows Draft (${{ matrix.install-mode }} install)
     if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
-    needs: publish-release
-    # Match the build-time upgrade gate while v0.5.0rc3 is the baseline.
+    needs: prestage-draft-updater-assets
+    # Match the build-time upgrade gate while v0.5.3 is the baseline.
     runs-on: windows-2022
-    timeout-minutes: 75
+    timeout-minutes: 120
     permissions:
-      contents: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        install-mode: [default, custom]
     steps:
       - name: Checkout release verification helpers
         uses: actions/checkout@v4
@@ -1027,6 +1271,12 @@ jobs:
       - name: Install Electron release verification dependencies
         working-directory: desktop/electron
         run: npm ci
+
+      - name: Download loopback-only updater rehearsal manifest
+        uses: actions/download-artifact@v4
+        with:
+          name: opensquilla-draft-updater-rehearsal
+          path: updater-rehearsal
 
       - name: Download actual draft release assets
         shell: pwsh
@@ -1063,10 +1313,32 @@ jobs:
             }
           }
 
-      - name: Verify downloaded RC3-to-candidate Windows upgrade and uninstall
+      - name: Verify official v0.5.3 Windows updater download and installer handoff
+        if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'false' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          INSTALL_MODE: ${{ matrix.install-mode }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # This gate covers pre-handoff failure isolation and a successful normal NSIS
+          # handoff. It does not claim transactional rollback after the old uninstaller starts.
+          $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
+          if ($candidates.Count -ne 1) {
+            throw "Expected exactly one downloaded Windows installer; got $($candidates.Count)."
+          }
+          .github/scripts/verify-release-windows-upgrade.ps1 `
+            -CandidateInstaller $candidates[0].FullName `
+            -Label "downloaded-asset-$env:INSTALL_MODE" `
+            -RealUpdateChannelManifest updater-rehearsal/channel-manifest.json `
+            -InstallMode $env:INSTALL_MODE
+
+      - name: Verify preview Windows installer replacement compatibility
+        if: ${{ needs.prestage-draft-updater-assets.outputs.prerelease == 'true' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INSTALL_MODE: ${{ matrix.install-mode }}
         run: |
           $ErrorActionPreference = 'Stop'
           $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
@@ -1075,4 +1347,5 @@ jobs:
           }
           .github/scripts/verify-release-windows-upgrade.ps1 `
             -CandidateInstaller $candidates[0].FullName `
-            -Label downloaded-asset
+            -Label "downloaded-preview-$env:INSTALL_MODE" `
+            -InstallMode $env:INSTALL_MODE

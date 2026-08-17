@@ -63,6 +63,30 @@ describe('ActivityToolDetails interaction affordances', () => {
   })
 })
 
+describe('ActivityToolDetails bounded window treatment', () => {
+  it('uses one borderless shadow container instead of nested cards', () => {
+    const window = ruleBody('.activity-tool-details--bounded')
+    expect(window).toContain('max-height: min(20rem, 52vh);')
+    expect(window).toContain('border: 0;')
+    expect(window).toContain('box-shadow: var(--shadow-md);')
+    expect(window).toContain('overflow: hidden;')
+
+    const section = ruleBody('.activity-tool-details__section')
+    expect(section).toContain('border: 0;')
+    expect(section).toContain('background: transparent;')
+    const preview = ruleBody('.activity-tool-details__preview')
+    expect(preview).toContain('border: 0;')
+    expect(preview).toContain('background: transparent;')
+  })
+
+  it('keeps the duplicate category title out and provides a bottom fade', () => {
+    expect(activityToolDetailsSource).not.toContain('activity-tool-details__title')
+    expect(ruleBody('.activity-tool-details__fade')).toContain(
+      'background: linear-gradient(to bottom, transparent, var(--bg-elevated));',
+    )
+  })
+})
+
 describe('ActivityToolDetails byte units', () => {
   it('labels 1024-based sizes with binary units', () => {
     expect(activityToolDetailsSource).toContain("['KiB', 'MiB', 'GiB']")

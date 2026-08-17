@@ -208,12 +208,14 @@ export interface ChatToolCallGroup {
   status: '' | 'success' | 'error'
 }
 
+export type ChatTextPresentation = 'intermediate' | 'answer'
+
 export interface ChatStreamSegment {
   type: 'text' | 'tool-group' | 'interrupt'
   raw?: string
   html?: string
   dirty?: boolean
-  presentation?: 'intermediate' | 'answer'
+  presentation?: ChatTextPresentation
   groupId?: string
   operationKey?: string
   approvalId?: string
@@ -225,7 +227,7 @@ export type ChatStreamTimelineItem =
       key: string
       html: string
       rawText?: string
-      presentation?: 'intermediate' | 'answer'
+      presentation?: ChatTextPresentation
     }
   | { type: 'tool-group'; key: string; group: ChatToolCallGroup }
   | {
@@ -317,6 +319,8 @@ export interface ChatTurnOutcome {
 
 export interface ChatRunTask {
   status?: string
+  cancel_requested?: boolean
+  cancelRequested?: boolean
   task_id?: string
   taskId?: string
   started_at?: number | string
@@ -371,12 +375,14 @@ export interface RawToolCallPayload extends Record<string, unknown> {
   execution_status?: { status?: string }
   groupId?: string
   group_id?: string
+  presentation?: ChatTextPresentation
 }
 
 export interface ChatTimelineSegment extends Record<string, unknown> {
   type?: string
   raw?: string
   text?: string
+  presentation?: ChatTextPresentation
   groupId?: string
   group_id?: string
   approvalId?: string
@@ -422,6 +428,11 @@ export interface ChatUsagePayload {
   routePlan?: Record<string, unknown>
   model_call_segments?: ChatModelCallSegment[]
   modelCallSegments?: ChatModelCallSegment[]
+  /** Physical provider call whose visible output owns the route card. */
+  router_model_call_id?: string
+  routerModelCallId?: string
+  router_iteration?: number
+  routerIteration?: number
   /** Per-turn ledger coverage. Older gateways omit these additive fields. */
   coverage_status?: string
   coverageStatus?: string
@@ -545,6 +556,10 @@ export interface ChatMessage {
   /** Ephemeral handoff when a coarse live burst still needs visual reveal. */
   reasoningPresentationPending?: boolean
   routerDecision?: import('./rpc').RouterDecisionPayload | null
+  /** Routing-only usage projection for a split historical answer segment. */
+  routerUsage?: ChatUsagePayload
+  routerModelCallId?: string
+  routerIteration?: number
   artifacts?: ArtifactPayload[]
   tool_calls?: RawToolCallPayload[]
   planRevisions?: import('./plans').PlanRevisionSnapshot[]
@@ -684,9 +699,10 @@ export interface ChatRenderedMessage {
   daySeparator?: boolean
   dayLabel?: string
   isRouterStrip?: boolean
-  /** Stable per-turn render identity. Unlike the router event message id, this
-   *  does not change when a live strip is replaced by its settled trace. */
+  /** Stable per-card render identity; preserved during terminal reconciliation. */
   routerTurnKey?: string
+  routerModelCallId?: string
+  routerIteration?: number
   routerState?: string
   routerSource?: string
   routerObserve?: boolean

@@ -15,6 +15,14 @@ import type {
   SandboxPolicy,
   SandboxPolicyDefaults,
   SandboxRunMode,
+  SandboxRuntimeAvailability,
+  SandboxRuntimeComponentId,
+  SandboxRuntimeComponentStatus,
+  SandboxRuntimeError,
+  SandboxRuntimeOperation,
+  SandboxRuntimeOperationState,
+  SandboxRuntimePackStatus,
+  SandboxRuntimeSource,
   SandboxSetupStatusPayload,
 } from '@/types/sandbox'
 
@@ -22,6 +30,161 @@ export type SandboxPolicySection = 'files' | 'commands' | 'network' | 'runtimes'
 export type { SandboxSetupOutcome } from '@/composables/sandboxSetupCoordinator'
 
 const SECTION_SAVE_DELAY_MS = 500
+const RUNTIME_STATUS_POLL_MS = 750
+const RUNTIME_STATUS_RETRY_MS = 5_000
+const RUNTIME_COMPONENT_IDS = ['python', 'node', 'gitBash'] as const
+const RUNTIME_AVAILABILITY = new Set<SandboxRuntimeAvailability>([
+  'unsupported',
+  'missing',
+  'ready',
+  'corrupt',
+])
+const RUNTIME_OPERATION_STATES = new Set<SandboxRuntimeOperationState>([
+  'queued',
+  'downloading',
+  'verifying',
+  'extracting',
+  'probing',
+  'activating',
+  'cancelling',
+  'removing',
+  'completed',
+  'cancelled',
+  'failed',
+  'interrupted',
+])
+const ACTIVE_RUNTIME_OPERATION_STATES = new Set<SandboxRuntimeOperationState>([
+  'queued',
+  'downloading',
+  'verifying',
+  'extracting',
+  'probing',
+  'activating',
+  'cancelling',
+  'removing',
+])
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function finiteNonNegative(value: unknown, fallback = 0): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : fallback
+}
+
+function isRuntimeComponentId(value: unknown): value is SandboxRuntimeComponentId {
+  return RUNTIME_COMPONENT_IDS.some(componentId => componentId === value)
+}
+
+function normalizeRuntimeError(value: unknown): SandboxRuntimeError | null {
+  if (typeof value === 'string' && value) return { message: value }
+  if (!isRecord(value) || typeof value.message !== 'string' || !value.message) return null
+  return {
+    ...(typeof value.code === 'string' ? { code: value.code } : {}),
+    message: value.message,
+    ...(typeof value.retryable === 'boolean' ? { retryable: value.retryable } : {}),
+    ...(value.source === 'oss' || value.source === 'github'
+      ? { source: value.source as SandboxRuntimeSource }
+      : {}),
+  }
+}
+
+function normalizeRuntimeOperation(
+  value: unknown,
+  componentId: SandboxRuntimeComponentId,
+): SandboxRuntimeOperation | null {
+  if (!isRecord(value)) return null
+  const state = typeof value.state === 'string' ? value.state : value.phase
+  if (typeof state !== 'string' || !RUNTIME_OPERATION_STATES.has(
+    state as SandboxRuntimeOperationState,
+  )) return null
+  const operationId = typeof value.operationId === 'string'
+    ? value.operationId
+    : typeof value.id === 'string'
+      ? value.id
+      : ''
+  const source = value.source === 'oss' || value.source === 'github'
+    ? value.source as SandboxRuntimeSource
+    : null
+  return {
+    operationId,
+    componentId,
+    kind: value.kind === 'remove' ? 'remove' : 'install',
+    state: state as SandboxRuntimeOperationState,
+    source,
+    downloadedBytes: finiteNonNegative(value.downloadedBytes),
+    totalBytes: typeof value.totalBytes === 'number'
+      ? finiteNonNegative(value.totalBytes)
+      : null,
+    progressPercent: finiteNonNegative(value.progressPercent),
+    startedAtMs: finiteNonNegative(value.startedAtMs),
+    updatedAtMs: finiteNonNegative(value.updatedAtMs),
+    error: normalizeRuntimeError(value.error),
+  }
+}
+
+function normalizeRuntimeComponent(value: unknown): SandboxRuntimeComponentStatus | null {
+  if (!isRecord(value) || !isRuntimeComponentId(value.componentId)) return null
+  const availability = typeof value.availability === 'string'
+    && RUNTIME_AVAILABILITY.has(value.availability as SandboxRuntimeAvailability)
+    ? value.availability as SandboxRuntimeAvailability
+    : 'missing'
+  return {
+    componentId: value.componentId,
+    availability,
+    catalogVersion: typeof value.catalogVersion === 'string' ? value.catalogVersion : null,
+    activeVersion: typeof value.activeVersion === 'string' ? value.activeVersion : null,
+    installedBytes: typeof value.installedBytes === 'number'
+      ? finiteNonNegative(value.installedBytes)
+      : null,
+    removable: value.removable === true,
+    resumeAvailable: value.resumeAvailable === true,
+    resumeBytes: finiteNonNegative(value.resumeBytes),
+    operation: normalizeRuntimeOperation(value.operation, value.componentId),
+    lastError: normalizeRuntimeError(value.lastError),
+  }
+}
+
+function normalizeRuntimeStatus(value: unknown): SandboxRuntimePackStatus | null {
+  if (!isRecord(value) || value.schemaVersion !== 1 || !Array.isArray(value.components)) return null
+  const sourceOrder = Array.isArray(value.sourceOrder)
+    ? value.sourceOrder.filter(
+        (source): source is SandboxRuntimeSource => source === 'oss' || source === 'github',
+      )
+    : []
+  const components = value.components
+    .map(normalizeRuntimeComponent)
+    .filter((component): component is SandboxRuntimeComponentStatus => component !== null)
+  return {
+    schemaVersion: 1,
+    managementSupported: value.managementSupported === true,
+    target: typeof value.target === 'string' ? value.target : null,
+    catalogVersion: typeof value.catalogVersion === 'string' ? value.catalogVersion : null,
+    sourceOrder,
+    components,
+    nextPollAfterMs: finiteNonNegative(value.nextPollAfterMs, RUNTIME_STATUS_POLL_MS),
+  }
+}
+
+function normalizeRuntimeStatusResponse(value: unknown): SandboxRuntimePackStatus | null {
+  const direct = normalizeRuntimeStatus(value)
+  if (direct) return direct
+  if (!isRecord(value)) return null
+  return normalizeRuntimeStatus(value.status) ?? normalizeRuntimeStatus(value.runtimeStatus)
+}
+
+function isMethodNotFound(error: unknown): boolean {
+  return (error as RpcClientError | null | undefined)?.code === 'METHOD_NOT_FOUND'
+}
+
+function hasActiveRuntimeOperation(status: SandboxRuntimePackStatus | null): boolean {
+  return status?.components.some(component => (
+    component.operation !== null
+    && ACTIVE_RUNTIME_OPERATION_STATES.has(component.operation.state)
+  )) === true
+}
 
 function clonePolicy(policy: SandboxPolicy): SandboxPolicy {
   return JSON.parse(JSON.stringify(policy)) as SandboxPolicy
@@ -57,6 +220,20 @@ export function useSandboxSettings() {
   const builtinDenyWritePaths = ref<string[]>([])
   const runtimeTarget = ref<string | null>(null)
   const runtimeVersions = ref<SandboxPolicyDefaults['runtimeVersions']>({})
+  const runtimeStatus = ref<SandboxRuntimePackStatus | null>(null)
+  const runtimeStatusLoading = ref(false)
+  const runtimeStatusSupported = ref<boolean | null>(null)
+  const runtimeStatusError = ref('')
+  const runtimeActionPending = reactive<Record<SandboxRuntimeComponentId, boolean>>({
+    python: false,
+    node: false,
+    gitBash: false,
+  })
+  const runtimeActionError = reactive<Record<SandboxRuntimeComponentId, string>>({
+    python: '',
+    node: '',
+    gitBash: '',
+  })
   const defaultRunModeBaseline = ref<SandboxRunMode>('full')
   const defaultRunMode = ref<SandboxRunMode>('full')
   const defaultRunModePending = ref(false)
@@ -81,6 +258,9 @@ export function useSandboxSettings() {
   const sectionSaveTimers: Partial<Record<SandboxPolicySection, ReturnType<typeof setTimeout>>> = {}
   let disposed = false
   let capabilityRequestGeneration = 0
+  let runtimeStatusRequestGeneration = 0
+  let runtimeViewActive = false
+  let runtimePollTimer: ReturnType<typeof setTimeout> | null = null
 
   const ready = computed(() => Boolean(baseline.value && draft.value))
   const canRequestSandboxSetup = computed(() => (
@@ -119,6 +299,7 @@ export function useSandboxSettings() {
       const loadedRunMode: SandboxRunMode = runModePayload.runMode === 'full' ? 'full' : 'safe'
       defaultRunModeBaseline.value = loadedRunMode
       defaultRunMode.value = loadedRunMode
+      void loadRuntimeStatus()
       void loadSandboxReadiness()
       void loadDesktopPreference()
     } catch (error) {
@@ -197,10 +378,181 @@ export function useSandboxSettings() {
   onScopeDispose(() => {
     disposed = true
     capabilityRequestGeneration += 1
+    runtimeStatusRequestGeneration += 1
+    if (runtimePollTimer) clearTimeout(runtimePollTimer)
     for (const timer of Object.values(sectionSaveTimers)) {
       if (timer) clearTimeout(timer)
     }
   })
+
+  function clearRuntimePoll(): void {
+    if (runtimePollTimer) clearTimeout(runtimePollTimer)
+    runtimePollTimer = null
+  }
+
+  function scheduleRuntimePoll(): void {
+    clearRuntimePoll()
+    const activeOperation = hasActiveRuntimeOperation(runtimeStatus.value)
+    const retryStatus = Boolean(
+      runtimeStatusError.value && runtimeStatusSupported.value !== false,
+    )
+    if (
+      disposed
+      || !runtimeViewActive
+      || (!activeOperation && !retryStatus)
+    ) return
+    runtimePollTimer = setTimeout(() => {
+      runtimePollTimer = null
+      void loadRuntimeStatus()
+    }, activeOperation ? RUNTIME_STATUS_POLL_MS : RUNTIME_STATUS_RETRY_MS)
+  }
+
+  async function loadRuntimeStatus(): Promise<SandboxRuntimePackStatus | null> {
+    if (disposed || runtimeStatusSupported.value === false) return null
+    clearRuntimePoll()
+    const requestGeneration = ++runtimeStatusRequestGeneration
+    runtimeStatusLoading.value = true
+    runtimeStatusError.value = ''
+    try {
+      await rpc.waitForConnection()
+      const status = normalizeRuntimeStatusResponse(
+        await rpc.call<unknown>('sandbox.runtime.status'),
+      )
+      if (disposed || requestGeneration !== runtimeStatusRequestGeneration) return null
+      if (!status) throw new Error('Invalid runtime status response')
+      runtimeStatus.value = status
+      runtimeStatusSupported.value = true
+      return status
+    } catch (error) {
+      if (disposed || requestGeneration !== runtimeStatusRequestGeneration) return null
+      if (isMethodNotFound(error)) {
+        runtimeStatus.value = null
+        runtimeStatusSupported.value = false
+        runtimeStatusError.value = ''
+      } else {
+        runtimeStatusError.value = errorMessage(error)
+      }
+      return null
+    } finally {
+      if (!disposed && requestGeneration === runtimeStatusRequestGeneration) {
+        runtimeStatusLoading.value = false
+        scheduleRuntimePoll()
+      }
+    }
+  }
+
+  function setRuntimeViewActive(active: boolean): void {
+    runtimeViewActive = active
+    clearRuntimePoll()
+    if (active) void loadRuntimeStatus()
+  }
+
+  function applyRuntimeOperation(operation: SandboxRuntimeOperation): boolean {
+    const status = runtimeStatus.value
+    if (!status) return false
+    const componentIndex = status.components.findIndex(
+      component => component.componentId === operation.componentId,
+    )
+    if (componentIndex < 0) return false
+    const components = [...status.components]
+    const current = components[componentIndex]
+    if (!current) return false
+    components[componentIndex] = {
+      ...current,
+      operation,
+    }
+    runtimeStatus.value = { ...status, components }
+    return true
+  }
+
+  async function runRuntimeAction(
+    method: 'sandbox.runtime.install' | 'sandbox.runtime.cancel' | 'sandbox.runtime.remove',
+    componentId: SandboxRuntimeComponentId,
+    params: Record<string, unknown>,
+    prepare?: () => Promise<boolean>,
+  ): Promise<boolean> {
+    if (runtimeActionPending[componentId] || runtimeStatusSupported.value === false) return false
+    runtimeActionPending[componentId] = true
+    runtimeActionError[componentId] = ''
+    try {
+      if (prepare && !(await prepare())) {
+        runtimeActionError[componentId] = i18n.global.t('errors.saveFailed')
+        return false
+      }
+      await rpc.waitForConnection()
+      const response = await rpc.call<unknown>(method, params)
+      clearRuntimePoll()
+      runtimeStatusRequestGeneration += 1
+      runtimeStatusLoading.value = false
+      const status = normalizeRuntimeStatusResponse(response)
+      if (status) {
+        runtimeStatus.value = status
+        runtimeStatusSupported.value = true
+      } else {
+        const operationPayload = isRecord(response) && isRecord(response.operation)
+          ? response.operation
+          : response
+        const operation = normalizeRuntimeOperation(operationPayload, componentId)
+        if (!operation || !applyRuntimeOperation(operation)) await loadRuntimeStatus()
+      }
+      scheduleRuntimePoll()
+      return true
+    } catch (error) {
+      runtimeActionError[componentId] = errorMessage(error)
+      return false
+    } finally {
+      runtimeActionPending[componentId] = false
+    }
+  }
+
+  function ensureRuntimeEnabled(componentId: SandboxRuntimeComponentId): Promise<boolean> {
+    if (!draft.value) return Promise.resolve(false)
+    if (!draft.value.runtimes.enabled) {
+      draft.value.runtimes.python = false
+      draft.value.runtimes.node = false
+      draft.value.runtimes.gitBash = false
+    }
+    draft.value.runtimes.enabled = true
+    draft.value.runtimes[componentId] = true
+    return flushSectionSave('runtimes')
+  }
+
+  async function enableRuntime(componentId: SandboxRuntimeComponentId): Promise<boolean> {
+    if (runtimeActionPending[componentId]) return false
+    runtimeActionPending[componentId] = true
+    runtimeActionError[componentId] = ''
+    try {
+      const enabled = await ensureRuntimeEnabled(componentId)
+      if (!enabled) runtimeActionError[componentId] = i18n.global.t('errors.saveFailed')
+      return enabled
+    } finally {
+      runtimeActionPending[componentId] = false
+    }
+  }
+
+  function installRuntime(componentId: SandboxRuntimeComponentId): Promise<boolean> {
+    return runRuntimeAction(
+      'sandbox.runtime.install',
+      componentId,
+      { componentId },
+      () => ensureRuntimeEnabled(componentId),
+    )
+  }
+
+  function cancelRuntime(
+    componentId: SandboxRuntimeComponentId,
+    operationId: string,
+  ): Promise<boolean> {
+    if (!operationId) return Promise.resolve(false)
+    return runRuntimeAction('sandbox.runtime.cancel', componentId, {
+      componentId,
+      operationId,
+    })
+  }
+
+  function removeRuntime(componentId: SandboxRuntimeComponentId): Promise<boolean> {
+    return runRuntimeAction('sandbox.runtime.remove', componentId, { componentId })
+  }
 
   async function loadDesktopPreference(): Promise<void> {
     const desktop = platform.settings
@@ -402,6 +754,12 @@ export function useSandboxSettings() {
     builtinDenyWritePaths,
     runtimeTarget,
     runtimeVersions,
+    runtimeStatus,
+    runtimeStatusLoading,
+    runtimeStatusSupported,
+    runtimeStatusError,
+    runtimeActionPending,
+    runtimeActionError,
     defaultRunMode,
     defaultRunModeBaseline,
     defaultRunModePending,
@@ -413,6 +771,12 @@ export function useSandboxSettings() {
     sectionError,
     sectionDirty,
     load,
+    loadRuntimeStatus,
+    setRuntimeViewActive,
+    enableRuntime,
+    installRuntime,
+    cancelRuntime,
+    removeRuntime,
     loadCapability,
     loadSetupStatus,
     ensureSandboxSetupForSafeMode,

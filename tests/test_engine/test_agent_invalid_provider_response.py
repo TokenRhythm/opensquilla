@@ -196,6 +196,11 @@ async def test_reasoning_only_first_turn_retries_without_disabling_thinking() ->
     assert "thinking disabled" not in warning.message
     done = next(event for event in events if event.kind == "done")
     assert done.text == "ok"
+    # Terminal-only reasoning is classified before it crosses the public
+    # presentation boundary, so the discarded attempt must not own the route
+    # card. The first retained visible output comes from the retry.
+    assert done.router_model_call_id == "1.1"
+    assert done.router_iteration == 1
     assert done.input_tokens == 21
     assert done.output_tokens == 6
     assert done.reasoning_tokens == 5
@@ -1740,6 +1745,8 @@ async def test_discarded_empty_attempt_counts_usage_but_skips_cache_check(
     done = next(event for event in events if event.kind == "done")
     assert done.input_tokens == 7
     assert done.output_tokens == 1
+    assert done.router_model_call_id == "1.1"
+    assert done.router_iteration == 1
     tracked = usage.get("agent:test:empty-retry")
     assert tracked is not None
     assert tracked.input_tokens == 7

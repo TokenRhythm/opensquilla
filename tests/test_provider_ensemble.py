@@ -2062,6 +2062,414 @@ async def test_aggregator_native_tool_lifecycle_remains_executable(
 
 
 @pytest.mark.asyncio
+async def test_tool_continuation_keeps_one_public_aggregator_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _AttemptRegistry(
+        {
+            "p1": [
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="draft"),
+                        DoneEvent(input_tokens=5, output_tokens=1, model="p1"),
+                    ]
+                )
+            ],
+            "agg": [
+                _FakePlan(
+                    [
+                        ToolUseStartEvent(
+                            tool_use_id="aggregator-call",
+                            tool_name="lookup",
+                        ),
+                        ToolUseEndEvent(
+                            tool_use_id="aggregator-call",
+                            tool_name="lookup",
+                            arguments={"q": "Shanghai"},
+                        ),
+                        DoneEvent(
+                            stop_reason="tool_use",
+                            input_tokens=10,
+                            output_tokens=2,
+                            model="agg",
+                        ),
+                    ]
+                ),
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="final"),
+                        DoneEvent(input_tokens=12, output_tokens=3, model="agg"),
+                    ]
+                ),
+            ],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="aggregator-tool-continuation",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+
+    first_events = await _collect(provider)
+    continuation_events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="tool result")],
+            tools=[_tool()],
+            config=ChatConfig(max_tokens=99, thinking=False),
+        )
+    ]
+
+    first_done = next(event for event in first_events if isinstance(event, DoneEvent))
+    continuation_done = next(
+        event for event in continuation_events if isinstance(event, DoneEvent)
+    )
+    assert first_done.stop_reason == "tool_use"
+    assert continuation_done.ensemble_trace is not None
+    assert continuation_done.ensemble_trace["final_request_role"] == "aggregator"
+    assert continuation_done.ensemble_trace["final_request"]["role"] == "aggregator"
+    assert [row["role"] for row in continuation_done.model_usage_breakdown] == [
+        "proposer",
+        "aggregator",
+        "aggregator",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_provider_restores_all_continuation_usage_without_replaying_proposers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A router-control rebuild must keep the whole logical turn receipt."""
+
+    registry = _AttemptRegistry(
+        {
+            "p1": [
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="draft one"),
+                        DoneEvent(
+                            input_tokens=11,
+                            output_tokens=2,
+                            model="p1",
+                            billed_cost=0.11,
+                            cost_source="provider_billed",
+                        ),
+                    ]
+                )
+            ],
+            "p2": [
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="draft two"),
+                        DoneEvent(
+                            input_tokens=12,
+                            output_tokens=3,
+                            model="p2",
+                            billed_cost=0.12,
+                            cost_source="provider_billed",
+                        ),
+                    ]
+                )
+            ],
+            "agg": [
+                _FakePlan(
+                    [
+                        ToolUseStartEvent(
+                            tool_use_id="aggregator-call-1",
+                            tool_name="lookup",
+                        ),
+                        ToolUseEndEvent(
+                            tool_use_id="aggregator-call-1",
+                            tool_name="lookup",
+                            arguments={"q": "Shanghai"},
+                        ),
+                        DoneEvent(
+                            stop_reason="tool_use",
+                            input_tokens=30,
+                            output_tokens=4,
+                            model="agg",
+                            billed_cost=0.30,
+                            cost_source="provider_billed",
+                        ),
+                    ]
+                ),
+                _FakePlan(
+                    [
+                        ToolUseStartEvent(
+                            tool_use_id="aggregator-call-2",
+                            tool_name="lookup",
+                        ),
+                        ToolUseEndEvent(
+                            tool_use_id="aggregator-call-2",
+                            tool_name="lookup",
+                            arguments={"q": "Hangzhou"},
+                        ),
+                        DoneEvent(
+                            stop_reason="tool_use",
+                            input_tokens=40,
+                            output_tokens=5,
+                            model="agg",
+                            billed_cost=0.40,
+                            cost_source="provider_billed",
+                        ),
+                    ]
+                ),
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="final answer"),
+                        DoneEvent(
+                            input_tokens=50,
+                            output_tokens=6,
+                            model="agg",
+                            billed_cost=0.50,
+                            cost_source="provider_billed",
+                        ),
+                    ]
+                ),
+            ],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-rebuilt-ensemble",
+            "assistant-rebuilt-ensemble",
+            "agent:main:rebuilt-ensemble",
+        )
+    )
+    tools = [_tool()]
+    config = ChatConfig(max_tokens=99, thinking=False)
+    provider = EnsembleProvider(
+        profile_name="rebuilt-ensemble",
+        proposers=[_member("p1"), _member("p2")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+
+    first_events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer this")],
+            tools=tools,
+            config=config,
+            execution_context=context,
+        )
+    ]
+    first_done = next(event for event in first_events if isinstance(event, DoneEvent))
+    assert first_done.stop_reason == "tool_use"
+    snapshot = context.ensemble_continuation_snapshot
+    assert snapshot is not None
+    assert snapshot.request_started is True
+    assert snapshot.physical_request_count == 3
+    assert len(snapshot.prior_rows) == 3
+    assert snapshot.missing_cost_entries == 0
+
+    # Simulate router-control replay rebuilding the wrapper between tool rounds.
+    rebuilt = EnsembleProvider(
+        profile_name="rebuilt-ensemble",
+        proposers=[_member("p1"), _member("p2")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+    second_events = [
+        event
+        async for event in rebuilt.chat(
+            [Message(role="user", content="tool result one")],
+            tools=tools,
+            config=config,
+            execution_context=context,
+        )
+    ]
+    second_done = next(event for event in second_events if isinstance(event, DoneEvent))
+    assert second_done.stop_reason == "tool_use"
+
+    rebuilt_again = EnsembleProvider(
+        profile_name="rebuilt-ensemble",
+        proposers=[_member("p1"), _member("p2")],
+        aggregator=_member("agg"),
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+    third_events = [
+        event
+        async for event in rebuilt_again.chat(
+            [Message(role="user", content="tool result two")],
+            tools=tools,
+            config=config,
+            execution_context=context,
+        )
+    ]
+    final_done = next(event for event in third_events if isinstance(event, DoneEvent))
+
+    assert [call["model"] for call in registry.calls].count("p1") == 1
+    assert [call["model"] for call in registry.calls].count("p2") == 1
+    assert [call["model"] for call in registry.calls].count("agg") == 3
+    assert [row["role"] for row in final_done.model_usage_breakdown] == [
+        "proposer",
+        "proposer",
+        "aggregator",
+        "aggregator",
+        "aggregator",
+    ]
+    assert final_done.input_tokens == 143
+    assert final_done.output_tokens == 20
+    assert final_done.billed_cost == pytest.approx(1.43)
+    assert final_done.usage_missing_count == 0
+    assert final_done.ensemble_trace is not None
+    assert final_done.ensemble_trace["llm_request_count"] == 5
+
+
+@pytest.mark.asyncio
+async def test_rebuilt_provider_restores_fixed_fallback_continuation_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rebuilt fixed fallback must retain proposer and prior fixed rows."""
+
+    registry = _AttemptRegistry(
+        {
+            "p1": [
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="draft"),
+                        DoneEvent(
+                            input_tokens=11,
+                            output_tokens=2,
+                            model="p1",
+                            billed_cost=0.11,
+                            cost_source="provider_billed",
+                        ),
+                    ]
+                )
+            ],
+            "agg": [
+                _FakePlan([ErrorEvent(message="unauthorized", code="401")])
+            ],
+            "fixed": [
+                _FakePlan(
+                    [
+                        ToolUseStartEvent(
+                            tool_use_id="fixed-call-1",
+                            tool_name="lookup",
+                        ),
+                        ToolUseEndEvent(
+                            tool_use_id="fixed-call-1",
+                            tool_name="lookup",
+                            arguments={"q": "Shanghai"},
+                        ),
+                        DoneEvent(
+                            stop_reason="tool_use",
+                            input_tokens=30,
+                            output_tokens=4,
+                            model="fixed",
+                            billed_cost=0.30,
+                            cost_source="provider_billed",
+                        ),
+                    ]
+                ),
+                _FakePlan(
+                    [
+                        TextDeltaEvent(text="fixed final"),
+                        DoneEvent(
+                            input_tokens=40,
+                            output_tokens=5,
+                            model="fixed",
+                            billed_cost=0.40,
+                            cost_source="provider_billed",
+                        ),
+                    ]
+                ),
+            ],
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    fixed = registry.provider_for(ProviderConfig(provider="fake", model="fixed"))
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-rebuilt-fixed",
+            "assistant-rebuilt-fixed",
+            "agent:main:rebuilt-fixed",
+        )
+    )
+    tools = [_tool()]
+    config = ChatConfig(max_tokens=99, thinking=False)
+    provider = EnsembleProvider(
+        profile_name="rebuilt-fixed",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=fixed,
+        fallback_provider_name="fake",
+        fallback_model="fixed",
+        all_failed_policy="fallback_single",
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+
+    first_events = [
+        event
+        async for event in provider.chat(
+            [Message(role="user", content="answer this")],
+            tools=tools,
+            config=config,
+            execution_context=context,
+        )
+    ]
+    first_done = next(event for event in first_events if isinstance(event, DoneEvent))
+    assert first_done.stop_reason == "tool_use"
+    snapshot = context.ensemble_continuation_snapshot
+    assert snapshot is not None
+    assert snapshot.request_started is True
+    assert snapshot.physical_request_count == 3
+    assert len(snapshot.prior_rows) == 3
+    assert snapshot.missing_cost_entries == 1
+
+    rebuilt = EnsembleProvider(
+        profile_name="rebuilt-fixed",
+        proposers=[_member("p1")],
+        aggregator=_member("agg"),
+        fallback_provider=fixed,
+        fallback_provider_name="fake",
+        fallback_model="fixed",
+        all_failed_policy="fallback_single",
+        min_successful_proposers=1,
+        shuffle_candidates=False,
+    )
+    second_events = [
+        event
+        async for event in rebuilt.chat(
+            [Message(role="user", content="tool result")],
+            tools=tools,
+            config=config,
+            execution_context=context,
+        )
+    ]
+    final_done = next(event for event in second_events if isinstance(event, DoneEvent))
+
+    assert [call["model"] for call in registry.calls] == [
+        "p1",
+        "agg",
+        "fixed",
+        "fixed",
+    ]
+    assert [row["role"] for row in final_done.model_usage_breakdown] == [
+        "proposer",
+        "aggregator",
+        "fixed_aggregator",
+        "fixed_aggregator",
+    ]
+    assert final_done.input_tokens == 81
+    assert final_done.output_tokens == 11
+    assert final_done.billed_cost == pytest.approx(0.81)
+    assert final_done.usage_missing_count == 1
+    assert final_done.ensemble_trace is not None
+    assert final_done.ensemble_trace["llm_request_count"] == 4
+
+
+@pytest.mark.asyncio
 async def test_proposer_tools_only_expose_schemas_and_remain_inert(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6310,6 +6718,76 @@ async def test_default_ensemble_waits_for_all_proposers_without_quorum(
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["successful_proposers"] == 2
     assert done.ensemble_trace["quorum_grace_seconds"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_default_quorum_allows_one_successful_proposer_in_four_to_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([ErrorEvent(message="p1 failed", code="500")]),
+            "p2": _FakePlan([ErrorEvent(message="p2 failed", code="500")]),
+            "p3": _FakePlan([ErrorEvent(message="p3 failed", code="500")]),
+            "p4": _FakePlan([TextDeltaEvent(text="one usable draft"), DoneEvent(model="p4")]),
+            "agg": _FakePlan([TextDeltaEvent(text="fused"), DoneEvent(model="agg")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="default-one-of-four",
+        proposers=[_member("p1"), _member("p2"), _member("p3"), _member("p4")],
+        aggregator=_member("agg"),
+        all_failed_policy="error",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    assert {call["model"] for call in registry.calls} == {"p1", "p2", "p3", "p4", "agg"}
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["successful_proposers"] == 1
+    assert done.ensemble_trace["effective_min_successful_proposers"] == 1
+
+
+@pytest.mark.asyncio
+async def test_default_quorum_with_zero_successful_proposers_uses_all_failed_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p1": _FakePlan([ErrorEvent(message="p1 failed", code="500")]),
+            "p2": _FakePlan([ErrorEvent(message="p2 failed", code="500")]),
+            "p3": _FakePlan([ErrorEvent(message="p3 failed", code="500")]),
+            "p4": _FakePlan([ErrorEvent(message="p4 failed", code="500")]),
+            "fallback": _FakePlan([TextDeltaEvent(text="single"), DoneEvent(model="fallback")]),
+            "agg": _FakePlan([DoneEvent(model="should-not-run")]),
+        }
+    )
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    fallback = registry.provider_for(ProviderConfig(provider="fake", model="fallback"))
+    provider = EnsembleProvider(
+        profile_name="default-zero-of-four",
+        proposers=[_member("p1"), _member("p2"), _member("p3"), _member("p4")],
+        aggregator=_member("agg"),
+        fallback_provider=fallback,
+        fallback_provider_name="fake",
+        fallback_model="fallback",
+        all_failed_policy="fallback_single",
+        proposer_timeout_seconds=1,
+        aggregator_timeout_seconds=1,
+        shuffle_candidates=False,
+    )
+
+    events = await _collect(provider)
+
+    called_models = [call["model"] for call in registry.calls]
+    assert called_models.count("fallback") == 1
+    assert "agg" not in called_models
+    assert isinstance(next(event for event in events if isinstance(event, DoneEvent)), DoneEvent)
 
 
 def test_runtime_wrap_is_after_selector_resolution() -> None:

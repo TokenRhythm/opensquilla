@@ -545,12 +545,13 @@ describe('useChatSessionSubscription', () => {
     const runStatus = ref<ChatRunStatus>({ status: 'idle', label: '', task: null })
     const activeStreamTaskId = ref('')
     const startStreaming = vi.fn(() => { isStreaming.value = true })
+    const reconcileStreamTaskClock = vi.fn()
     const rpc = {
       waitForConnection: vi.fn(async () => {}),
       call: async <T = unknown>() => ({
           subscribed: true,
           run_status: 'running',
-          active_task: { task_id: 'task-live', status: 'running' },
+          active_task: { task_id: 'task-live', status: 'running', started_at: 90_000 },
           current_stream_seq: 12,
         }) as T,
     }
@@ -572,6 +573,7 @@ describe('useChatSessionSubscription', () => {
         task: source?.active_task || null,
       }),
       startStreaming,
+      reconcileStreamTaskClock,
       loadHistory: vi.fn(),
       resetStreamIdleTimer: vi.fn(),
       resetStreamLiveTurnState: vi.fn(),
@@ -582,7 +584,64 @@ describe('useChatSessionSubscription', () => {
     expect(runStatus.value.status).toBe('running')
     expect(startStreaming).toHaveBeenCalledOnce()
     expect(activeStreamTaskId.value).toBe('task-live')
+    expect(reconcileStreamTaskClock).toHaveBeenCalledWith({
+      sessionKey: 'agent:main:webchat:test',
+      taskId: 'task-live',
+      startedAt: 90_000,
+    })
     expect(outcome).toEqual({ authoritative: true, live: true, backgroundOnly: false })
+  })
+
+  it('reconciles task timing when replay already rebuilt the live bubble', async () => {
+    const isStreaming = ref(true)
+    const runStatus = ref<ChatRunStatus>({ status: 'idle', label: '', task: null })
+    const activeStreamTaskId = ref('task-live')
+    const startStreaming = vi.fn()
+    const reconcileStreamTaskClock = vi.fn()
+    const subscription = useChatSessionSubscription({
+      rpc: {
+        waitForConnection: vi.fn(async () => {}),
+        call: async <T = unknown>() => ({
+          subscribed: true,
+          run_status: 'running',
+          active_task: {
+            task_id: 'task-live',
+            status: 'running',
+            started_at: '90000',
+          },
+          current_stream_seq: 12,
+        }) as T,
+      },
+      sessionKey: ref('agent:main:webchat:replayed-live'),
+      lastStreamSeq: ref(0),
+      runStatus,
+      isStreaming,
+      hasActiveInterrupt: ref(false),
+      activeStreamTaskId,
+      activeTaskGroups: ref(new Set<string>()),
+      sessionRunStatus: source => ({
+        status: String(
+          source?.run_status || source?.active_task?.status || 'idle',
+        ) as ChatRunStatusState,
+        label: '',
+        task: source?.active_task || null,
+      }),
+      startStreaming,
+      reconcileStreamTaskClock,
+      loadHistory: vi.fn(),
+      resetStreamIdleTimer: vi.fn(),
+      resetStreamLiveTurnState: vi.fn(),
+    })
+
+    await subscription.subscribeSession()
+
+    expect(startStreaming).not.toHaveBeenCalled()
+    expect(activeStreamTaskId.value).toBe('task-live')
+    expect(reconcileStreamTaskClock).toHaveBeenCalledWith({
+      sessionKey: 'agent:main:webchat:replayed-live',
+      taskId: 'task-live',
+      startedAt: '90000',
+    })
   })
 
   it('preserves the authoritative steer capability when hydration starts a live bubble', async () => {
