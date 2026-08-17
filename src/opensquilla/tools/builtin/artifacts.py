@@ -234,15 +234,32 @@ def _publish_artifact_metadata(
 def _plan_run_steps_ready_for_delivery(run: Any) -> bool:
     current_step_id = str(getattr(run, "current_step_id", "") or "")
     step_states = list(getattr(run, "step_states", []) or [])
-    return (
-        not current_step_id
-        and bool(step_states)
-        and all(
-            isinstance(state, dict)
-            and str(state.get("status") or "") in {"completed", "skipped"}
-            for state in step_states
+    if not step_states or not all(
+        isinstance(state, dict)
+        and str(state.get("status") or "") in PLAN_STEP_TERMINAL_STATUSES
+        for state in step_states
+    ):
+        return False
+    if current_step_id:
+        # The final checkpoint (or a user cancellation) can leave a stale
+        # current_step_id pointing at an already-terminal step. A stale
+        # pointer must not block delivery when every bounded step is done
+        # (issue #1112).
+        current = next(
+            (
+                state
+                for state in step_states
+                if isinstance(state, dict)
+                and str(state.get("step_id") or "") == current_step_id
+            ),
+            None,
         )
-    )
+        if (
+            current is None
+            or str(current.get("status") or "") not in PLAN_STEP_TERMINAL_STATUSES
+        ):
+            return False
+    return True
 
 
 def _plan_run_allows_delivery(ctx: ToolContext, run: Any) -> bool:
@@ -250,6 +267,12 @@ def _plan_run_allows_delivery(ctx: ToolContext, run: Any) -> bool:
 
     status = str(getattr(run, "status", "") or "")
     if status == "completed":
+        return True
+    if status == "cancelled" and _plan_run_steps_ready_for_delivery(run):
+        # A cancelled run whose bounded steps are all terminal can still
+        # finalize artifact delivery: the user stopped the implementation,
+        # not the already-finished work, and the workflow output must not be
+        # sealed (issue #1112).
         return True
     if status != "running":
         return False
