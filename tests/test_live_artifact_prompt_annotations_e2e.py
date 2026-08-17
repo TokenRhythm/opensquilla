@@ -535,6 +535,7 @@ async def test_owned_gateway_preflights_use_real_rpc_bridge_and_zero_provider_ca
         # Any accidental provider request fails immediately.  The three
         # preflights must be rejected by ingress/selection before that point.
         provider_endpoint="http://127.0.0.1:9/v1",
+        preload_router=False,
     )
     try:
         await driver.start()
@@ -561,6 +562,7 @@ async def test_owned_gateway_html_workbench_lifecycle_is_offline_and_immutable(
         timeout_seconds=20.0,
         provider_endpoint=provider.endpoint,
         allow_local_test_model_overrides=True,
+        preload_router=False,
     )
     storage: SessionStorage | None = None
     try:
@@ -936,7 +938,10 @@ async def test_owned_gateway_mutations_use_real_rpc_and_local_provider(
     driver = e2e.GatewayCertificationDriver(
         temp_root=tmp_path,
         api_key="synthetic-key-for-local-provider-only",
-        timeout_seconds=20.0,
+        # The first routed case cold-loads the recommended local router model.
+        # Keep this below the live harness default while allowing that one-time
+        # startup cost on slower CI hosts.
+        timeout_seconds=45.0,
         provider_endpoint=provider.endpoint,
         allow_local_test_model_overrides=True,
     )

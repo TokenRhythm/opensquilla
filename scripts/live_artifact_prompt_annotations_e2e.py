@@ -477,6 +477,35 @@ def _apply_isolated_home_environment(env: dict[str, str], home: Path) -> None:
         env["PSModulePath"] = os.pathsep.join(path for path in module_roots if path)
 
 
+def _wait_for_router_preload(
+    process: subprocess.Popen[str],
+    stdout_path: Path,
+    *,
+    timeout_seconds: float,
+) -> str | None:
+    """Wait for the owned Gateway's process-local router runtime to be ready."""
+
+    deadline = time.monotonic() + timeout_seconds
+    failure_markers = (
+        "gateway.squilla_router_preload_failed",
+        "gateway.squilla_router_preload_unavailable",
+    )
+    while time.monotonic() < deadline:
+        try:
+            output = stdout_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            output = ""
+        if "gateway.squilla_router_preloaded" in output:
+            return None
+        if any(marker in output for marker in failure_markers):
+            return "owned Gateway could not preload the router runtime"
+        return_code = process.poll()
+        if return_code is not None:
+            return f"owned Gateway exited before router preload (exit={return_code})"
+        time.sleep(0.1)
+    return "owned Gateway router preload did not finish before timeout"
+
+
 def _case_payload(scenario: Scenario, evidence: CaseEvidence | None = None) -> dict[str, Any]:
     observed = evidence if evidence is not None else CaseEvidence(status="not_run")
     return {
@@ -1191,6 +1220,7 @@ def _write_gateway_config(
     provider_endpoint: str,
     media_root: Path,
     allow_local_test_model_overrides: bool = False,
+    preload_router: bool = True,
 ) -> None:
     """Write the finite live-gate profile without embedding credentials."""
 
@@ -1244,7 +1274,7 @@ def _write_gateway_config(
         'thinking = "off"',
         "",
         "[squilla_router]",
-        "enabled = false",
+        f"enabled = {'true' if preload_router else 'false'}",
         'rollout_phase = "full"',
         'strategy = "v4_phase3"',
         'default_tier = "c0"',
@@ -1324,6 +1354,7 @@ class GatewayCertificationDriver:
         timeout_seconds: float,
         provider_endpoint: str,
         allow_local_test_model_overrides: bool = False,
+        preload_router: bool = True,
     ) -> None:
         if allow_local_test_model_overrides and not provider_endpoint.startswith(
             ("http://127.0.0.1:", "http://localhost:")
@@ -1334,6 +1365,7 @@ class GatewayCertificationDriver:
         self.timeout_seconds = timeout_seconds
         self.provider_endpoint = provider_endpoint
         self.allow_local_test_model_overrides = allow_local_test_model_overrides
+        self.preload_router = preload_router
         self.state_dir = temp_root / "state"
         self.user_state_dir = temp_root / "user-state"
         self.media_root = temp_root / "media"
@@ -1368,11 +1400,14 @@ class GatewayCertificationDriver:
             provider_endpoint=self.provider_endpoint,
             media_root=self.media_root,
             allow_local_test_model_overrides=self.allow_local_test_model_overrides,
+            preload_router=self.preload_router,
         )
         env = _worker_environment(self.api_key)
         _apply_isolated_home_environment(env, self.user_state_dir)
         env.update(bridge_environment)
         env["OPENSQUILLA_DESKTOP"] = "1"
+        if self.preload_router:
+            env["OPENSQUILLA_DESKTOP_PRELOAD_ROUTER"] = "1"
         env["PYTHONPATH"] = str(SRC_DIR)
         env["OPENSQUILLA_GATEWAY_CONFIG_PATH"] = str(self.config_path)
         env["OPENSQUILLA_STATE_DIR"] = str(self.state_dir)
@@ -1434,6 +1469,16 @@ class GatewayCertificationDriver:
                     diagnostic = diagnostic.replace(secret, "<redacted>")
             diagnostic = diagnostic.replace(str(self.temp_root), "<temp-root>")
             raise RuntimeError(f"owned Gateway did not become ready: {diagnostic}")
+        if self.preload_router:
+            assert self.process is not None
+            preload_error = await asyncio.to_thread(
+                _wait_for_router_preload,
+                self.process,
+                self.stdout_path,
+                timeout_seconds=self.timeout_seconds,
+            )
+            if preload_error is not None:
+                raise RuntimeError(preload_error)
         await self.client.connect(f"ws://127.0.0.1:{self.port}/ws")
 
     async def close(self) -> None:
