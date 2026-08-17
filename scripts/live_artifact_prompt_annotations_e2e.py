@@ -407,8 +407,6 @@ def _worker_environment(api_key: str) -> dict[str, str]:
     # Startup diagnostics must reach the private log before a health timeout,
     # including when Windows cannot flush a still-running child process.
     env["PYTHONUNBUFFERED"] = "1"
-    if os.name == "nt":
-        env["PYTHONPROFILEIMPORTTIME"] = "1"
     return env
 
 
@@ -421,6 +419,12 @@ def _apply_isolated_home_environment(env: dict[str, str], home: Path) -> None:
     # intentionally inherits neither from the host.
     env["HOME"] = isolated_home
     env["USERPROFILE"] = isolated_home
+
+
+def _gateway_startup_timeout_seconds(platform_name: str | None = None) -> float:
+    """Allow Windows first-boot ACL hardening without weakening other startup gates."""
+
+    return 120.0 if (platform_name or os.name) == "nt" else 45.0
 
 
 def _case_payload(scenario: Scenario, evidence: CaseEvidence | None = None) -> dict[str, Any]:
@@ -1355,6 +1359,7 @@ class GatewayCertificationDriver:
             _wait_for_gateway_health,
             self.process,
             self.port,
+            timeout_seconds=_gateway_startup_timeout_seconds(),
         )
         if error is not None:
             for stream in (self._stdout, self._stderr):

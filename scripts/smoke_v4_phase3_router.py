@@ -1172,8 +1172,10 @@ def _usage_from_llm_responses(records: list[dict[str, Any]]) -> dict[str, Any]:
 def _wait_for_gateway_health(
     proc: subprocess.Popen,
     port: int,
+    *,
+    timeout_seconds: float = 45.0,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    deadline = time.monotonic() + 45
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             stdout, stderr = proc.communicate(timeout=1)

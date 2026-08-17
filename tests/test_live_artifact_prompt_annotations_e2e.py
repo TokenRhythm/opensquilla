@@ -307,6 +307,11 @@ def test_isolated_home_environment_supports_path_home_in_child(tmp_path: Path) -
     assert env["USERPROFILE"] == str(isolated_home.resolve())
 
 
+def test_owned_gateway_startup_budget_covers_windows_first_boot_acl_hardening() -> None:
+    assert e2e._gateway_startup_timeout_seconds("nt") == 120.0
+    assert e2e._gateway_startup_timeout_seconds("posix") == 45.0
+
+
 def test_live_harness_checks_each_feature_default_independently(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
