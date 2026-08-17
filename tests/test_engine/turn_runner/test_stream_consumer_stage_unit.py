@@ -22,6 +22,11 @@ from typing import Any
 
 import pytest
 
+from opensquilla.contracts.turn_execution import (
+    SurfaceCapabilities,
+    TurnExecutionContext,
+    TurnIdentity,
+)
 from opensquilla.engine.agent_injection import ListPendingInputProvider
 from opensquilla.engine.turn_runner.stream_consumer_stage import (
     _SUPPRESS,
@@ -38,12 +43,14 @@ from opensquilla.engine.turn_runner.stream_consumer_stage import (
     _WarningHandler,
 )
 from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
     ArtifactEvent,
     CompactionEvent,
     DoneEvent,
     EnsembleProgressEvent,
     ErrorEvent,
     TextDeltaEvent,
+    ThinkingEvent,
     ToolResultEvent,
     ToolUseStartEvent,
     WarningEvent,
@@ -248,6 +255,7 @@ def _make_input(
     compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None,
     compaction_source_boundary_message_id: str | None = None,
     compaction_source_boundary_entry_id: int | None = None,
+    execution_context: TurnExecutionContext | None = None,
 ) -> StreamConsumerStageInput:
     return StreamConsumerStageInput(
         agent=SimpleNamespace(),
@@ -277,6 +285,7 @@ def _make_input(
         ),
         compaction_source_boundary_entry_id=compaction_source_boundary_entry_id,
         input_mode=input_mode,
+        execution_context=execution_context,
     )
 
 
@@ -373,6 +382,214 @@ async def test_stream_consumer_normalizes_provider_ensemble_progress_events() ->
     assert events[0].output_tokens == 4
     assert events[0].cost_usd == 0.005
     assert events[0].error == ""
+
+
+@pytest.mark.asyncio
+async def test_stream_consumer_reset_clears_answer_and_keeps_completed_tool_timeline() -> None:
+    state = _make_state()
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="old answer"),
+                ToolUseStartEvent(tool_use_id="done-call", tool_name="record"),
+                ToolResultEvent(
+                    tool_use_id="done-call",
+                    tool_name="record",
+                    result="completed",
+                ),
+                TextDeltaEvent(text="old suffix"),
+                AnswerGenerationResetEvent(
+                    turn_id="turn-reset",
+                    assistant_message_id="assistant-reset",
+                    old_generation_epoch=0,
+                    new_generation_epoch=1,
+                    safe_reason="takeover",
+                    sequence=5,
+                ),
+                TextDeltaEvent(text="new answer", generation_epoch=1),
+                ThinkingEvent(text="new reasoning", generation_epoch=1),
+                DoneEvent(text="new answer", generation_epoch=1),
+            ],
+        )
+    )
+
+    events = await _drain(stage, _make_input(state=state))
+
+    assert any(isinstance(event, AnswerGenerationResetEvent) for event in events)
+    assert state.final_text_parts == ["new answer"]
+    assert state.reasoning == ["new reasoning"]
+    assert [segment["type"] for segment in state.turn_segments] == [
+        "tool_use",
+        "tool_result",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_terminal_reset_is_only_public_outcome_and_keeps_accounting_done() -> None:
+    state = _make_state()
+    terminal_text = "The fixed model could not complete this answer."
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="partial fixed answer"),
+                AnswerGenerationResetEvent(
+                    turn_id="turn-terminal-reset",
+                    assistant_message_id="assistant-terminal-reset",
+                    old_generation_epoch=1,
+                    new_generation_epoch=2,
+                    safe_reason="fixed provider final failure",
+                    sequence=7,
+                    terminal=True,
+                    terminal_text_snapshot=terminal_text,
+                    terminal_error_message="The provider rejected the request.",
+                    terminal_error_code="provider_bad_request",
+                    terminal_failure_kind="bad_request",
+                ),
+                DoneEvent(
+                    text="",
+                    text_snapshot="",
+                    input_tokens=9,
+                    output_tokens=3,
+                    generation_epoch=2,
+                ),
+            ]
+        )
+    )
+
+    events = await _drain(stage, _make_input(state=state))
+
+    assert [type(event) for event in events] == [
+        TextDeltaEvent,
+        AnswerGenerationResetEvent,
+    ]
+    assert not any(isinstance(event, (DoneEvent, ErrorEvent)) for event in events)
+    assert state.final_text_parts == [terminal_text]
+    assert state.current_text_parts == [terminal_text]
+    assert state.turn_segments == []
+    assert state.done_event is not None
+    assert state.done_event.text_snapshot == terminal_text
+    assert state.done_event.input_tokens == 9
+    assert state.done_event.output_tokens == 3
+    assert state.error_message == "The provider rejected the request."
+    assert state.pending_error_event is not None
+    assert state.pending_error_event.code == "provider_bad_request"
+    assert state.pending_error_event.failure_kind == "bad_request"
+    assert state.pending_error_event.generation_epoch == 2
+    public_reset = next(
+        event for event in events if isinstance(event, AnswerGenerationResetEvent)
+    )
+    assert public_reset.terminal_error_message == "The provider rejected the request."
+    assert public_reset.terminal_error_code == "provider_bad_request"
+    assert public_reset.terminal_failure_kind == "bad_request"
+
+
+@pytest.mark.asyncio
+async def test_non_reset_surface_projects_terminal_reset_to_one_legacy_error() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-terminal-legacy",
+            "assistant-terminal-legacy",
+            "agent:main:terminal-legacy",
+        ),
+        surface=SurfaceCapabilities(
+            supports_streaming=False,
+            supports_edit=False,
+            supports_generation_reset=False,
+        ),
+    )
+    state = _make_state()
+    terminal_text = "The model could not complete this answer."
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="superseded partial"),
+                AnswerGenerationResetEvent(
+                    turn_id="turn-terminal-legacy",
+                    assistant_message_id="assistant-terminal-legacy",
+                    old_generation_epoch=1,
+                    new_generation_epoch=2,
+                    safe_reason="fixed provider final failure",
+                    sequence=8,
+                    terminal=True,
+                    terminal_text_snapshot=terminal_text,
+                    terminal_error_message="internal provider detail",
+                    terminal_error_code="provider_bad_request",
+                    terminal_failure_kind="bad_request",
+                ),
+                DoneEvent(input_tokens=7, output_tokens=2, generation_epoch=2),
+            ]
+        )
+    )
+
+    events = await _drain(
+        stage,
+        _make_input(state=state, execution_context=context),
+    )
+
+    assert [type(event) for event in events] == [ErrorEvent]
+    assert events[0].message == terminal_text
+    assert events[0].code == "ensemble_fixed_error"
+    assert events[0].failure_kind == ""
+    assert state.error_message == "internal provider detail"
+    assert state.pending_error_event is not None
+    assert state.pending_error_event.code == "provider_bad_request"
+    assert state.done_event is not None
+    assert state.done_event.input_tokens == 7
+    assert state.done_event.output_tokens == 2
+    assert state.final_text_parts == [terminal_text]
+
+
+@pytest.mark.asyncio
+async def test_non_editable_surface_hides_replaced_text_until_fixed_done() -> None:
+    context = TurnExecutionContext.create(
+        TurnIdentity(
+            "turn-non-edit",
+            "assistant-non-edit",
+            "agent:main:non-edit",
+        ),
+        surface=SurfaceCapabilities(
+            supports_streaming=False,
+            supports_edit=False,
+            supports_generation_reset=False,
+        ),
+    )
+    stage, _recordings = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="old answer", generation_epoch=0),
+                ThinkingEvent(text="old reasoning", generation_epoch=0),
+                AnswerGenerationResetEvent(
+                    turn_id="turn-non-edit",
+                    assistant_message_id="assistant-non-edit",
+                    old_generation_epoch=0,
+                    new_generation_epoch=1,
+                    safe_reason="fixed takeover",
+                    sequence=3,
+                ),
+                TextDeltaEvent(text="fixed answer", generation_epoch=1),
+                DoneEvent(
+                    text="fixed answer",
+                    text_snapshot="fixed answer",
+                    generation_epoch=1,
+                ),
+            ],
+        )
+    )
+
+    events = await _drain(
+        stage,
+        _make_input(execution_context=context),
+    )
+
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "fixed answer"
+    ]
+    assert not any(
+        isinstance(event, ThinkingEvent) and event.text == "old reasoning"
+        for event in events
+    )
+    assert not any(isinstance(event, AnswerGenerationResetEvent) for event in events)
+    assert sum(isinstance(event, DoneEvent) for event in events) == 1
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import ast
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,17 +14,97 @@ from opensquilla.engine.capacity_admission import (
     LargeContextCapacityError,
     model_has_request_capacity,
 )
+from opensquilla.engine.routing import RoutingDecision
 from opensquilla.engine.selector_override import apply_model_override
-from opensquilla.engine.steps.squilla_router import _flag_tier_provider_mismatch
+from opensquilla.engine.steps.squilla_router import (
+    _apply_provider_mismatch_veto,
+    _flag_tier_provider_mismatch,
+)
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.onboarding.mutations import _cross_provider_tier_warnings, upsert_router
+from opensquilla.onboarding.mutations import (
+    _cross_provider_tier_warnings,
+    _router_provider_conflicts,
+    upsert_router,
+)
 from opensquilla.provider.model_catalog import DeploymentModelLimits, ModelCatalog
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
-from opensquilla.router_tiers import TierConfig
+from opensquilla.router_tiers import (
+    STATIC_B5_PROFILES,
+    TierConfig,
+    router_dynamic_tier_members_active,
+    router_tier_provider_roles,
+    selection_fingerprint,
+    selection_fingerprint_payload,
+    static_b5_profile,
+    tier_ensemble_active,
+    tier_ensemble_execution,
+    tier_provider_role,
+)
 
 # ---------------------------------------------------------------------------
 # TierConfig
 # ---------------------------------------------------------------------------
+
+
+def test_selection_mode_metadata_has_one_canonical_profile_owner() -> None:
+    openrouter = static_b5_profile("static_openrouter_b5")
+    tokenrhythm = static_b5_profile("static_tokenrhythm_b5")
+    assert openrouter is STATIC_B5_PROFILES["static_openrouter_b5"]
+    assert tokenrhythm is STATIC_B5_PROFILES["static_tokenrhythm_b5"]
+    assert openrouter is not None and openrouter.provider_id == "openrouter"
+    assert tokenrhythm is not None and tokenrhythm.provider_id == "tokenrhythm"
+    assert openrouter.ownership_role == "static_profile"
+    assert tokenrhythm.api_key_env == "TOKENRHYTHM_API_KEY"
+
+
+def test_selection_fingerprint_is_stable_and_sensitive_to_owned_inputs() -> None:
+    base = {
+        "mode": "static_openrouter_b5",
+        "provider": "openrouter",
+        "model": "z-ai/glm-5.2",
+        "profile": "static_openrouter_b5",
+        "ownership": "static_profile",
+    }
+    assert selection_fingerprint(**base) == selection_fingerprint(**base)
+    assert selection_fingerprint_payload(**base) == {
+        "mode": "static_openrouter_b5",
+        "provider": "openrouter",
+        "model": "z-ai/glm-5.2",
+        "profile": "static_openrouter_b5",
+        "ownership": "static_profile",
+    }
+    for field in ("provider", "model", "profile", "ownership"):
+        changed = {**base, field: f"changed-{field}"}
+        assert selection_fingerprint(**changed) != selection_fingerprint(**base)
+
+
+def test_ensemble_plan_is_forwarding_only_and_generator_is_current() -> None:
+    plan_path = Path(__file__).parents[1] / "src/opensquilla/ensemble_plan.py"
+    tree = ast.parse(plan_path.read_text(encoding="utf-8"))
+    imported_modules = {
+        node.module or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+    imported_modules.update(
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    )
+    assert all(
+        not module.startswith(("opensquilla.provider", "opensquilla.engine"))
+        for module in imported_modules
+    )
+    generator = Path(__file__).parents[1] / "scripts/generate_router_tier_contract.py"
+    result = subprocess.run(
+        [sys.executable, str(generator), "--check"],
+        cwd=generator.parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_tier_config_from_dict() -> None:
@@ -46,6 +130,248 @@ def test_tier_config_from_object_and_none() -> None:
     assert tier.image_only is True
     assert TierConfig.from_value(None) == TierConfig()
     assert TierConfig.from_value({}) == TierConfig()
+
+
+def test_shared_tier_execution_follows_the_current_plan() -> None:
+    tiers = {
+        "c3": {
+            "ensemble_enabled": True,
+            # Retained downgrade metadata cannot override the new contract.
+            "ensemble_selection_mode": "static_tokenrhythm_b5",
+        }
+    }
+
+    assert tier_ensemble_execution(
+        tiers,
+        "c3",
+        shared_selection_mode="custom_b5",
+    ) == ("custom_b5", "shared")
+
+
+@pytest.mark.parametrize("tier", ["c0", "c1", "c2"])
+def test_shared_ensemble_flag_is_c3_only(tier: str) -> None:
+    tiers = {tier: {"ensemble_enabled": True}}
+
+    assert tier_ensemble_execution(
+        tiers,
+        tier,
+        shared_selection_mode="custom_b5",
+    ) == ("", "single")
+    assert tier_ensemble_active(tiers, tier) is False
+
+
+def test_explicit_single_model_wins_over_a_legacy_tier_mode() -> None:
+    tiers = {
+        "c3": {
+            "ensemble_enabled": False,
+            "ensemble_selection_mode": "static_tokenrhythm_b5",
+        }
+    }
+
+    assert tier_ensemble_execution(
+        tiers,
+        "c3",
+        shared_selection_mode="custom_b5",
+    ) == ("", "single")
+
+
+def test_missing_shared_flag_preserves_legacy_tier_mode() -> None:
+    tiers = {"c3": {"ensemble_selection_mode": "static_tokenrhythm_b5"}}
+
+    assert tier_ensemble_execution(
+        tiers,
+        "c3",
+        shared_selection_mode="custom_b5",
+    ) == ("static_tokenrhythm_b5", "legacy")
+
+
+def test_tier_provider_role_is_mode_aware_for_shared_c3() -> None:
+    shared_c3 = {
+        "provider": "openrouter",
+        "model": "synthetic/model",
+        "ensemble_enabled": True,
+    }
+
+    assert (
+        tier_provider_role(
+            "c3",
+            shared_c3,
+            shared_selection_mode="static_openrouter_b5",
+        )
+        == "dormant_draft"
+    )
+    assert (
+        tier_provider_role(
+            "c3",
+            shared_c3,
+            shared_selection_mode="custom_b5",
+        )
+        == "dormant_draft"
+    )
+    assert (
+        tier_provider_role(
+            "c3",
+            shared_c3,
+            shared_selection_mode="router_dynamic",
+        )
+        == "dynamic_member"
+    )
+    assert (
+        tier_provider_role("c3", shared_c3, shared_selection_mode="unknown")
+        == "blocked"
+    )
+
+
+def test_tier_provider_role_keeps_single_and_legacy_tiers_direct() -> None:
+    assert (
+        tier_provider_role(
+            "c3",
+            {"ensemble_enabled": False},
+            shared_selection_mode="router_dynamic",
+        )
+        == "direct"
+    )
+    assert (
+        tier_provider_role(
+            "c3",
+            {"ensemble_selection_mode": "router_dynamic"},
+            shared_selection_mode="static_openrouter_b5",
+        )
+        == "direct"
+    )
+    assert (
+        tier_provider_role(
+            "c2",
+            {"ensemble_enabled": True},
+            shared_selection_mode="router_dynamic",
+        )
+        == "direct"
+    )
+
+
+def test_router_tier_provider_roles_normalizes_legacy_keys() -> None:
+    roles = router_tier_provider_roles(
+        {
+            "c0": {"provider": "openrouter", "model": "fast"},
+            "t3": {
+                "provider": "openrouter",
+                "model": "quality",
+                "ensemble_enabled": True,
+            },
+            "image_model": {"provider": "openrouter", "model": "vision"},
+        },
+        shared_selection_mode="router_dynamic",
+    )
+
+    assert roles == {
+        "c0": "dynamic_member",
+        "c3": "dynamic_member",
+        "image_model": "direct",
+    }
+
+
+def test_router_tier_provider_roles_marks_all_text_tiers_for_global_dynamic_plan() -> None:
+    roles = router_tier_provider_roles(
+        {
+            "c0": {"provider": "openrouter", "model": "fast"},
+            "c1": {"provider": "openrouter", "model": "balanced"},
+            "image_model": {"provider": "openrouter", "model": "vision"},
+        },
+        shared_selection_mode="router_dynamic",
+        ensemble_globally_enabled=True,
+    )
+
+    assert roles == {
+        "c0": "dynamic_member",
+        "c1": "dynamic_member",
+        "image_model": "direct",
+    }
+
+
+def test_global_fixed_lineup_preserves_legacy_dynamic_and_direct_image_roles() -> None:
+    tiers = {
+        "c0": {"provider": "openai", "model": "fast"},
+        "c1": {"provider": "deepseek", "model": "balanced"},
+        "c2": {"provider": "deepseek", "model": "reasoning"},
+        "c3": {
+            "provider": "openrouter",
+            "model": "quality",
+            "ensemble_selection_mode": "router_dynamic",
+        },
+        "image_model": {"provider": "openrouter", "model": "vision"},
+    }
+
+    for selection_mode in (
+        "static_openrouter_b5",
+        "static_tokenrhythm_b5",
+        "custom_b5",
+    ):
+        roles = router_tier_provider_roles(
+            tiers,
+            shared_selection_mode=selection_mode,
+            ensemble_globally_enabled=True,
+        )
+        assert roles == {
+            "c0": "dynamic_member",
+            "c1": "dynamic_member",
+            "c2": "dynamic_member",
+            "c3": "dynamic_member",
+            "image_model": "direct",
+        }
+        assert tier_provider_role(
+            "c0",
+            tiers["c0"],
+            shared_selection_mode=selection_mode,
+            router_dynamic_members_active=True,
+            ensemble_globally_enabled=True,
+        ) == "dynamic_member"
+
+
+def test_explicit_single_model_suppresses_retained_legacy_dynamic_membership() -> None:
+    tiers = {
+        "c0": {"provider": "deepseek", "model": "fast"},
+        "c3": {
+            "provider": "openrouter",
+            "model": "quality",
+            "ensemble_enabled": False,
+            "ensemble_selection_mode": "router_dynamic",
+        },
+    }
+
+    assert tier_ensemble_execution(
+        tiers,
+        "c3",
+        shared_selection_mode="custom_b5",
+    ) == ("", "single")
+    assert router_tier_provider_roles(
+        tiers,
+        shared_selection_mode="custom_b5",
+    ) == {"c0": "direct", "c3": "direct"}
+
+
+def test_ignored_non_c3_shared_flag_does_not_hide_legacy_dynamic_mode() -> None:
+    tiers = {
+        "c0": {
+            "provider": "deepseek",
+            "model": "fast",
+            "ensemble_enabled": True,
+            "ensemble_selection_mode": "router_dynamic",
+        },
+        "c1": {"provider": "openrouter", "model": "balanced"},
+    }
+
+    assert tier_ensemble_execution(
+        tiers,
+        "c0",
+        shared_selection_mode="custom_b5",
+    ) == ("router_dynamic", "legacy")
+    assert (
+        router_dynamic_tier_members_active(
+            tiers,
+            shared_selection_mode="custom_b5",
+        )
+        is True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +406,103 @@ def test_observe_phase_does_not_flag() -> None:
     tiers = {"c2": {"provider": "openai", "model": "gpt-5.5"}}
     _flag_tier_provider_mismatch(ctx, tiers, "c2", routing_applied=False)
     assert "router_tier_provider_mismatch" not in ctx.metadata
+
+
+def test_global_fixed_lineup_suppresses_tier_mismatch_and_veto() -> None:
+    tiers = {
+        "c0": {"provider": "openai", "model": "gpt-fast"},
+        "c1": {"provider": "deepseek", "model": "deepseek-balanced"},
+        "image_model": {"provider": "openai", "model": "gpt-vision"},
+    }
+    decision = RoutingDecision(
+        tier="c0",
+        model="gpt-fast",
+        confidence=0.9,
+        source="test",
+    )
+
+    for selection_mode in (
+        "static_openrouter_b5",
+        "static_tokenrhythm_b5",
+        "custom_b5",
+    ):
+        router = SimpleNamespace(
+            cross_provider_tiers=False,
+            tier_provider_mismatch="veto",
+            default_tier="c1",
+        )
+        config = SimpleNamespace(
+            llm=SimpleNamespace(provider="deepseek"),
+            llm_ensemble=SimpleNamespace(
+                enabled=True,
+                selection_mode=selection_mode,
+                model_fields_set={"selection_mode"},
+            ),
+            squilla_router=router,
+        )
+        ctx = SimpleNamespace(metadata={}, config=config, session_key=selection_mode)
+
+        _flag_tier_provider_mismatch(ctx, tiers, "c0", routing_applied=True)
+        assert ctx.metadata == {"router_tier_provider_role": "dormant_draft"}
+
+        ctx.metadata = {}
+        _flag_tier_provider_mismatch(
+            ctx,
+            tiers,
+            "image_model",
+            routing_applied=True,
+        )
+        assert ctx.metadata == {
+            "router_tier_provider_role": "direct",
+            "router_tier_provider_mismatch": "openai",
+            "routed_provider": "openai",
+        }
+
+        rebound, thinking_mode, prompt_policy = _apply_provider_mismatch_veto(
+            ctx,
+            router,
+            tiers,
+            ["c0", "c1"],
+            decision,
+            "T0",
+            "P0",
+            routing_applied=True,
+        )
+        assert rebound == decision
+        assert thinking_mode == "T0"
+        assert prompt_policy == "P0"
+        assert "provider_mismatch_veto_applied" not in ctx.metadata
+
+
+def test_global_fixed_lineup_suppresses_provider_switch_conflicts_and_warnings() -> None:
+    tiers = {
+        "c0": {"provider": "openai", "model": "gpt-fast"},
+        "c1": {"provider": "deepseek", "model": "deepseek-balanced"},
+        "image_model": {"provider": "openai", "model": "gpt-vision"},
+    }
+    config = GatewayConfig(
+        llm={"provider": "deepseek", "model": "deepseek-chat"},
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "static_openrouter_b5",
+        },
+        squilla_router={
+            "enabled": True,
+            "cross_provider_tiers": False,
+            "tiers": tiers,
+        },
+    )
+
+    assert _router_provider_conflicts(config, "tokenrhythm") == ("openai",)
+    warnings = _cross_provider_tier_warnings(
+        tiers,
+        "deepseek",
+        shared_selection_mode="static_openrouter_b5",
+        ensemble_globally_enabled=True,
+    )
+    assert len(warnings) == 1
+    assert "image_model" in warnings[0]
+    assert "openai" in warnings[0]
 
 
 # ---------------------------------------------------------------------------
@@ -927,6 +1350,40 @@ def test_cross_provider_tier_warning_preserves_legacy_route_semantics() -> None:
     assert len(warnings) == 1
     assert "model will be requested from 'openrouter'" in warnings[0]
     assert "choice is vetoed" not in warnings[0]
+
+
+def test_cross_provider_warning_uses_shared_c3_provider_role() -> None:
+    tiers = {
+        "c3": {
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "ensemble_enabled": True,
+        }
+    }
+
+    assert (
+        _cross_provider_tier_warnings(
+            tiers,
+            "openrouter",
+            shared_selection_mode="custom_b5",
+        )
+        == []
+    )
+    dynamic_warnings = _cross_provider_tier_warnings(
+        tiers,
+        "openrouter",
+        shared_selection_mode="router_dynamic",
+    )
+    assert len(dynamic_warnings) == 1
+    assert "model will be requested from 'openrouter'" in dynamic_warnings[0]
+
+    blocked_warnings = _cross_provider_tier_warnings(
+        tiers,
+        "openrouter",
+        shared_selection_mode="unknown",
+    )
+    assert len(blocked_warnings) == 1
+    assert "shared multi-model plan" in blocked_warnings[0]
 
 
 def test_cross_provider_warning_flips_to_credential_check_when_enabled(monkeypatch) -> None:

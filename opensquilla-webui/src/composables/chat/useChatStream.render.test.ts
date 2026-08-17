@@ -590,6 +590,61 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('replaces one answer generation while preserving completed tools and artifacts', () => {
+    const { api, messages } = makeStream()
+
+    api.startStreaming()
+    api.setAssistantMessageId('assistant-1')
+    api.appendDelta('partial old')
+    api.appendFrame({ kind: 'thinking', text: 'old reasoning', at: 1 })
+    api.appendToolCall({ tool_use_id: 'tool-completed', tool_name: 'web_search' })
+    api.appendToolResult({
+      tool_use_id: 'tool-completed',
+      tool_name: 'web_search',
+      result: 'completed result',
+    })
+    api.appendToolCall({ tool_use_id: 'tool-pending', tool_name: 'exec_command' })
+    api.appendArtifact({ id: 'artifact-1', name: 'kept.txt' })
+
+    api.resetAnswerGeneration({
+      textSnapshot: '',
+      preserveCompletedTools: true,
+    })
+
+    expect(api.isStreaming.value).toBe(true)
+    expect(api.foldedTurn.value.rawText).toBe('')
+    expect(api.foldedTurn.value.thinkingText).toBe('')
+    expect(api.foldedTurn.value.toolCalls).toEqual([
+      expect.objectContaining({
+        toolId: 'tool-completed',
+        isRunning: false,
+        result: 'completed result',
+      }),
+    ])
+    expect(api.foldedTurn.value.toolCalls.some(call => call.toolId === 'tool-pending')).toBe(false)
+    expect(api.foldedTurn.value.artifacts).toEqual([
+      expect.objectContaining({ id: 'artifact-1' }),
+    ])
+
+    api.appendDelta('fixed text')
+    api.reconcileFinalText('fixed text')
+    api.endStreaming()
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'assistant',
+      messageId: 'assistant-1',
+      text: 'fixed text',
+      artifacts: [expect.objectContaining({ id: 'artifact-1' })],
+      tool_calls: [expect.objectContaining({
+        tool_use_id: 'tool-completed',
+        result: 'completed result',
+      })],
+    })
+    expect(messages.value[0]?.tool_calls?.some(call => call.tool_use_id === 'tool-pending')).toBe(false)
+    api.cleanup()
+  })
+
   it('keeps additive post-tool text deltas unchanged', () => {
     const { api, messages } = makeStream()
 

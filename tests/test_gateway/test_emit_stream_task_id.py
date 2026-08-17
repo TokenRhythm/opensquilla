@@ -10,12 +10,14 @@ when no task id is supplied (old-client compatibility).
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
     DoneEvent,
     ErrorEvent,
     TextDeltaEvent,
@@ -114,7 +116,7 @@ async def test_emit_preserves_thinking_start_time() -> None:
         (
             SESSION,
             "session.event.thinking",
-            {"text": "checking", "started_at": 1_234_567},
+            {"text": "checking", "started_at": 1_234_567, "generation_epoch": 0},
         )
     ]
 
@@ -158,18 +160,25 @@ async def test_emit_preserves_reasoning_block_lifecycle() -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
 
     async def _stream():
-        yield ThinkingStartEvent(block_id="reasoning-1", block_index=0, started_at=1_000)
+        yield ThinkingStartEvent(
+            block_id="reasoning-1",
+            block_index=0,
+            started_at=1_000,
+            generation_epoch=2,
+        )
         yield ThinkingEvent(
             text="checking",
             started_at=1_000,
             block_id="reasoning-1",
             block_index=0,
+            generation_epoch=2,
         )
         yield ThinkingEndEvent(
             block_id="reasoning-1",
             block_index=0,
             status="completed",
             ended_at=2_000,
+            generation_epoch=2,
         )
 
     async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
@@ -192,6 +201,32 @@ async def test_emit_preserves_reasoning_block_lifecycle() -> None:
         "reasoning-1",
         "reasoning-1",
         "reasoning-1",
+    ]
+    assert emitted[1][2]["generation_epoch"] == 2
+    assert emitted[0][2]["generation_epoch"] == 2
+    assert emitted[2][2]["generation_epoch"] == 2
+
+
+@pytest.mark.asyncio
+async def test_emit_legacy_ordinary_event_without_generation_epoch_keeps_shape() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield SimpleNamespace(kind="thinking", text="legacy", started_at=123)
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    await _emit_task_runtime_stream_events(
+        _stream(),
+        SESSION,
+        _emitter,
+        idle_timeout=5.0,
+        heartbeat_interval=0.0,
+    )
+
+    assert emitted == [
+        (SESSION, "session.event.thinking", {"text": "legacy", "started_at": 123})
     ]
 
 
@@ -274,6 +309,137 @@ async def test_emit_without_task_id_omits_field_for_old_clients() -> None:
 
     assert emitted
     assert "task_id" not in emitted[0][2]
+
+
+@pytest.mark.asyncio
+async def test_emit_generation_reset_keeps_typed_identity_and_wire_name() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        yield AnswerGenerationResetEvent(
+            turn_id="engine-turn-1",
+            assistant_message_id="assistant-message-1",
+            old_generation_epoch=0,
+            new_generation_epoch=1,
+            safe_reason="aggregator fallback",
+            sequence=17,
+            authoritative_text_snapshot="authoritative answer",
+            terminal_error_message="INTERNAL_ONLY_MESSAGE",
+            terminal_error_code="INTERNAL_ONLY_CODE",
+            terminal_failure_kind="INTERNAL_ONLY_KIND",
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    await _emit_task_runtime_stream_events(
+        _stream(),
+        SESSION,
+        _emitter,
+        idle_timeout=5.0,
+        heartbeat_interval=0.0,
+        task_id="task-1",
+    )
+
+    assert len(emitted) == 1
+    session_key, event_name, payload = emitted[0]
+    assert session_key == SESSION
+    assert event_name == "session.event.answer_generation_reset"
+    assert payload["task_id"] == "task-1"
+    assert payload["turn_id"] == "engine-turn-1"
+    assert payload["assistant_message_id"] == "assistant-message-1"
+    assert payload["old_generation_epoch"] == 0
+    assert payload["new_generation_epoch"] == 1
+    assert payload["sequence"] == 17
+    assert payload["authoritative_text_snapshot"] == "authoritative answer"
+    assert "terminal_error_message" not in payload
+    assert "terminal_error_code" not in payload
+    assert "terminal_failure_kind" not in payload
+
+
+@pytest.mark.asyncio
+async def test_emit_terminal_generation_reset_marks_task_failed_without_public_error() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+    terminal_text = "The fixed model could not complete this answer."
+
+    async def _stream():
+        yield TextDeltaEvent(text="superseded partial")
+        yield AnswerGenerationResetEvent(
+            turn_id="engine-turn-terminal-reset",
+            assistant_message_id="assistant-terminal-reset",
+            old_generation_epoch=1,
+            new_generation_epoch=2,
+            safe_reason="fixed provider final failure",
+            sequence=8,
+            terminal=True,
+            terminal_text_snapshot=terminal_text,
+            terminal_error_message="safe internal failure",
+            terminal_error_code="provider_unavailable",
+            terminal_failure_kind="upstream_unavailable",
+        )
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    with pytest.raises(TaskRuntimeStreamError) as exc_info:
+        await _emit_task_runtime_stream_events(
+            _stream(),
+            SESSION,
+            _emitter,
+            idle_timeout=5.0,
+            heartbeat_interval=0.0,
+            task_id="task-terminal-reset",
+        )
+
+    assert str(exc_info.value) == terminal_text
+    assert exc_info.value.code == "provider_unavailable"
+    assert exc_info.value.terminal_reason == "error"
+    assert exc_info.value.failure_kind == "upstream_unavailable"
+    assert [name for _session, name, _payload in emitted] == [
+        "session.event.text_delta",
+        "session.event.answer_generation_reset",
+    ]
+    assert emitted[-1][2]["terminal"] is True
+    assert emitted[-1][2]["terminal_reason"] == "error"
+    assert "terminal_error_message" not in emitted[-1][2]
+    assert "terminal_error_code" not in emitted[-1][2]
+    assert "terminal_failure_kind" not in emitted[-1][2]
+
+
+@pytest.mark.asyncio
+async def test_context_bound_timeout_cannot_emit_second_terminal_error() -> None:
+    emitted: list[tuple[str, str, dict[str, Any]]] = []
+
+    async def _stream():
+        await asyncio.sleep(0.04)
+        yield AnswerGenerationResetEvent(
+            turn_id="engine-turn-context-bound",
+            assistant_message_id="assistant-context-bound",
+            old_generation_epoch=0,
+            new_generation_epoch=1,
+            safe_reason="canonical ensemble takeover",
+            sequence=9,
+        )
+        yield DoneEvent(text="fixed answer")
+
+    async def _emitter(session_key: str, event_name: str, payload: dict[str, Any]) -> None:
+        emitted.append((session_key, event_name, payload))
+
+    await _emit_task_runtime_stream_events(
+        _stream(),
+        SESSION,
+        _emitter,
+        idle_timeout=0.001,
+        heartbeat_interval=0.0,
+        context_bound=True,
+        task_id="task-context-bound",
+    )
+
+    assert [event_name for _session_key, event_name, _payload in emitted] == [
+        "session.event.answer_generation_reset",
+        "session.event.done",
+    ]
+    assert not any(event_name == "session.event.error" for _, event_name, _ in emitted)
 
 
 @pytest.mark.asyncio

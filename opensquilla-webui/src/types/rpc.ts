@@ -212,6 +212,8 @@ export interface ArtifactPayload {
   session_key?: string
   sessionKey?: string
   epoch?: number
+  generation_epoch?: number
+  generationEpoch?: number
   stream_seq?: number
   name?: string
   mime?: string
@@ -250,6 +252,10 @@ export interface StreamEventEnvelope {
   epoch?: number
   stream_generation?: string
   streamGeneration?: string
+  generation_epoch?: number
+  generationEpoch?: number
+  assistant_message_id?: string
+  assistantMessageId?: string
   stream_seq?: number
   [key: string]: unknown
 }
@@ -275,6 +281,24 @@ export interface SessionEventPayload extends StreamEventEnvelope {
   active_task?: RawSessionTask | null
   last_task?: RawSessionTask | null
   [key: string]: unknown
+}
+
+export interface AnswerGenerationResetPayload extends SessionEventPayload {
+  kind?: 'answer_generation_reset'
+  old_generation_epoch?: number
+  oldGenerationEpoch?: number
+  new_generation_epoch?: number
+  newGenerationEpoch?: number
+  preserve_completed_tools?: boolean
+  preserveCompletedTools?: boolean
+  authoritative_text_snapshot?: string
+  authoritativeTextSnapshot?: string
+  authoritative_reasoning_snapshot?: string
+  authoritativeReasoningSnapshot?: string
+  sequence?: number
+  terminal?: boolean
+  terminal_text_snapshot?: string | null
+  terminalTextSnapshot?: string | null
 }
 
 export interface WarningPayload extends SessionEventPayload {
@@ -412,6 +436,11 @@ export interface ToolUsePayload extends SessionEventPayload {
 export interface ToolDeltaPayload extends ToolUsePayload {
   delta?: string
   input_delta?: string
+}
+
+export interface ToolEndPayload extends ToolUsePayload {
+  arguments?: Record<string, unknown>
+  synthetic_from_text?: boolean
 }
 
 export interface ToolResultPayload extends ToolUsePayload {
@@ -866,9 +895,11 @@ export interface MetaRunCompletedPayload extends SessionEventPayload {
 }
 
 export interface RpcEventMap {
+  'session.event.answer_generation_reset': AnswerGenerationResetPayload
   'session.event.text_delta': TextDeltaPayload
   'session.event.tool_use_start': ToolUsePayload
   'session.event.tool_use_delta': ToolDeltaPayload
+  'session.event.tool_use_end': ToolEndPayload
   'session.event.tool_result': ToolResultPayload
   'session.event.artifact': ArtifactPayload
   'session.event.artifact_state': ArtifactStateEventPayload

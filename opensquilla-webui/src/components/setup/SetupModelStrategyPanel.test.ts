@@ -7,12 +7,11 @@ import SetupModelStrategyPanel from './SetupModelStrategyPanel.vue'
 
 const FACTS = {
   perTurnCalls: 3,
-  quorum: 1,
   proposerCount: 2,
+  proposerMaxRetries: 0,
   proposerTimeoutSeconds: 300,
   configuredAggregatorTimeoutSeconds: 3600,
   aggregatorTimeoutSeconds: 480,
-  quorumGraceSeconds: 10,
 }
 
 function customLineup(overrides: Record<string, unknown> = {}) {
@@ -36,10 +35,26 @@ function customLineup(overrides: Record<string, unknown> = {}) {
   }
 }
 
+function tierEnsembleStatus(overrides: Record<string, unknown> = {}) {
+  return {
+    selectionMode: 'router_dynamic',
+    activationTiers: ['c3'],
+    tierSelectionModes: { c3: 'router_dynamic' },
+    runtimeStatus: 'conditional',
+    configurationReady: null,
+    blockedReason: '',
+    blockedTierCandidates: [],
+    fixedFallbackReady: true,
+    fixedFallbackBlockedReason: '',
+    ...overrides,
+  }
+}
+
 function panel(overrides: Record<string, unknown> = {}) {
   const base = {
     activeStrategy: 'router',
     hasSavedProvider: true,
+    profileSaveSupported: true,
     providerLabel: 'OpenRouter',
     routerTemplateState: 'recommended',
     cards: [
@@ -67,6 +82,7 @@ function panel(overrides: Record<string, unknown> = {}) {
       providerCredentialStatus: [],
       discoveredModelsByProvider: {},
       hasMixedTierProviders: false,
+      routerProviderRoles: {},
     },
     single: {
       providerId: 'openrouter',
@@ -109,12 +125,11 @@ function panel(overrides: Record<string, unknown> = {}) {
       fixedProfile: null,
       presetFacts: {
         perTurnCalls: 5,
-        quorum: 3,
         proposerCount: 4,
-        proposerTimeoutSeconds: 300,
+        proposerMaxRetries: 0,
+        proposerTimeoutSeconds: 120,
         configuredAggregatorTimeoutSeconds: 3600,
-        aggregatorTimeoutSeconds: 480,
-        quorumGraceSeconds: 10,
+        aggregatorTimeoutSeconds: 180,
       },
       minSuccessfulProposers: 1,
       allFailedPolicy: 'fallback_single',
@@ -265,6 +280,60 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
+  it('offers a compact provider shortcut when only one provider is available', async () => {
+    const onGoToSection = vi.fn()
+    const { app, el } = await mountPanel({
+      activeStrategy: 'router',
+      router: {
+        providerOptions: [
+          { providerId: 'openrouter', label: 'OpenRouter' },
+          { providerId: 'retired-provider', label: 'Retired provider', disabled: true },
+        ],
+      },
+    }, { onGoToSection })
+
+    const shortcut = el.querySelector<HTMLButtonElement>('[data-testid="router-add-provider"]')
+    const hint = 'Add another model provider to choose a different provider for each tier.'
+    expect(shortcut?.textContent?.trim()).toBe('Add provider')
+    expect(shortcut?.hasAttribute('aria-label')).toBe(false)
+    expect(shortcut?.getAttribute('title')).toBe(hint)
+    expect(shortcut?.getAttribute('aria-describedby')).toBe('router-add-provider-hint')
+    const description = el.querySelector<HTMLElement>('#router-add-provider-hint')
+    expect(description?.textContent?.trim()).toBe(hint)
+    expect(description?.classList.contains('setup-model-strategy__sr-only')).toBe(true)
+    expect(el.querySelector('[aria-label="c0 request entry"]')).toBeNull()
+
+    shortcut?.click()
+    await nextTick()
+
+    expect(onGoToSection).toHaveBeenCalledWith('provider')
+    app.unmount()
+  })
+
+  it('removes the provider shortcut once tier provider choices are available', async () => {
+    const { app, el } = await mountPanel({ activeStrategy: 'router' })
+
+    expect(el.querySelector('[data-testid="router-add-provider"]')).toBeNull()
+    expect(el.querySelector('[aria-label="c0 request entry"]')).toBeTruthy()
+    expect(el.querySelector('.setup-tier-table__row.is-head')?.textContent)
+      .toContain('Request entry')
+
+    app.unmount()
+  })
+
+  it('does not offer an add-provider shortcut on a legacy Gateway', async () => {
+    const { app, el } = await mountPanel({
+      activeStrategy: 'router',
+      profileSaveSupported: false,
+      router: {
+        providerOptions: [{ providerId: 'openrouter', label: 'OpenRouter' }],
+      },
+    })
+
+    expect(el.querySelector('[data-testid="router-add-provider"]')).toBeNull()
+    app.unmount()
+  })
+
   it('lets a router tier choose a discovered model from the model input', async () => {
     const onUpdateTierField = vi.fn()
     const discoveredModels = [
@@ -345,6 +414,401 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.textContent).toContain('One provider can supply every level.')
     expect(el.textContent).not.toContain('provider default model')
 
+    app.unmount()
+  })
+
+  it('binds shared C3 fusion to the global fixed and fallback target', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dormant_draft' },
+        tierRows: [{
+          name: 'c3',
+          provider: 'tokenrhythm',
+          model: 'sleeping-c3-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      single: {
+        providerId: 'deepseek',
+        providerLabel: 'DeepSeek',
+        model: 'deepseek-chat',
+      },
+      ensemble: { allFailedPolicy: 'fallback_single' },
+    })
+
+    const picker = el.querySelector<HTMLInputElement>(
+      'input[aria-label="C3 processing mode or model"]',
+    )
+    expect(picker?.value).toBe('Multi-model fusion')
+    expect(picker?.getAttribute('aria-describedby'))
+      .toContain('setup-tier-c3-ensemble-summary')
+    const summary = el.querySelector('.setup-tier-table__model-note')?.textContent || ''
+    expect(summary).toContain('Fixed and fallback model: DeepSeek · deepseek-chat')
+    expect(summary).not.toContain('sleeping-c3-model')
+    expect(el.textContent).toContain('Determined by Multi-model fusion')
+    expect(el.textContent).toContain('Current fusion plan needs attention')
+    app.unmount()
+  })
+
+  it('shows a compact ready state for a healthy shared C3 plan', async () => {
+    const readyCandidate = {
+      key: 'custom:proposer:openrouter:ready-model',
+      provider: 'openrouter',
+      model: 'ready-model',
+      source: 'custom',
+      enabled: true,
+      role: '',
+      credential: { provider: 'openrouter', available: true, source: 'env' },
+    }
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dormant_draft' },
+        tierEnsembleStatusFresh: true,
+        tierEnsembleStatus: tierEnsembleStatus({
+          selectionMode: 'custom_b5',
+          tierSelectionModes: { c3: 'custom_b5' },
+          proposerCount: 4,
+          configuredMinSuccessfulProposers: 1,
+          effectiveMinSuccessfulProposers: 1,
+          configuredProposerMaxRetries: 0,
+          effectiveProposerMaxRetries: 1,
+          proposerMaxRetriesSource: 'c3_default',
+        }),
+        tierRows: [{
+          name: 'c3',
+          provider: 'openrouter',
+          model: 'sleeping-c3-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        custom: customLineup({
+          proposers: [readyCandidate, { ...readyCandidate, key: 'custom:proposer:openrouter:ready-model-2', model: 'ready-model-2' }],
+          proposerCount: 2,
+          belowMinimum: false,
+        }),
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__model-note')).toBeNull()
+    expect(el.querySelector('.setup-tier-table__plan-status')).toBeNull()
+    expect(el.querySelector('button[aria-label="Show C3 fusion details"]')).toBeTruthy()
+    expect(el.querySelector('[role="tooltip"]')?.textContent)
+      .toContain('Current fusion plan is ready')
+    expect(el.querySelector('[role="tooltip"]')?.textContent)
+      .toContain('at least 1/4 proposers return normally')
+    expect(el.querySelector('[role="tooltip"]')?.textContent)
+      .toContain('per-proposer retry limit 1')
+    app.unmount()
+  })
+
+  it('evaluates a legacy dynamic shared plan from router tier candidates', async () => {
+    const onMigrateEnsembleLegacy = vi.fn()
+    const tierCandidate = {
+      key: 'tier:openrouter:dynamic-member',
+      provider: 'openrouter',
+      model: 'dynamic-member',
+      source: 'tier',
+      enabled: true,
+      role: '',
+      credential: { provider: 'openrouter', available: true, source: 'env' },
+    }
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dynamic_member' },
+        tierRows: [{
+          name: 'c3',
+          provider: 'openrouter',
+          model: 'dynamic-member',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        selectionMode: 'router_dynamic',
+        scheme: 'legacy',
+        tierCandidates: [tierCandidate],
+        customCandidates: [],
+      },
+    }, { onMigrateEnsembleLegacy })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')).toBeNull()
+    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
+      .toContain('previously saved tier-following fusion plan')
+    expect(el.querySelector('[data-testid="tier-ensemble-migrate-legacy"]')).toBeTruthy()
+    el.querySelector<HTMLButtonElement>('[data-testid="tier-ensemble-migrate-legacy"]')?.click()
+    expect(onMigrateEnsembleLegacy).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
+  it.each([
+    {
+      name: 'route mode through the fixed provider',
+      credentialAvailable: false,
+      status: tierEnsembleStatus(),
+    },
+    {
+      name: 'veto mode with a foreign tier excluded',
+      credentialAvailable: false,
+      status: tierEnsembleStatus({
+        blockedTierCandidates: [{
+          source: 'router_tier:c0',
+          provider: 'foreign-provider',
+          model: 'foreign-model',
+          reason: 'cross_provider_veto',
+        }],
+      }),
+    },
+    {
+      name: 'ready cross-provider deployment',
+      credentialAvailable: true,
+      status: tierEnsembleStatus(),
+    },
+  ])('trusts saved dynamic runtime status for $name', async ({ credentialAvailable, status }) => {
+    const tierCandidate = {
+      key: 'tier:foreign-provider:foreign-model',
+      provider: 'foreign-provider',
+      model: 'foreign-model',
+      source: 'tier',
+      enabled: true,
+      role: '',
+      credential: {
+        provider: 'foreign-provider',
+        available: credentialAvailable,
+        source: credentialAvailable ? 'env' : 'none',
+      },
+    }
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dynamic_member' },
+        tierEnsembleStatus: status,
+        tierEnsembleStatusFresh: true,
+        tierRows: [{
+          name: 'c3',
+          provider: 'foreign-provider',
+          model: 'foreign-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        selectionMode: 'router_dynamic',
+        scheme: 'legacy',
+        tierCandidates: [tierCandidate],
+        customCandidates: [],
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')).toBeNull()
+    expect(el.querySelector('.setup-tier-table__model-note')?.textContent)
+      .toContain('previously saved tier-following fusion plan')
+    expect(el.querySelector('[data-testid="tier-ensemble-migrate-legacy"]')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('shows a saved unready dynamic deployment as an actionable inline error', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dynamic_member' },
+        tierEnsembleStatus: tierEnsembleStatus({
+          runtimeStatus: 'blocked',
+          configurationReady: false,
+          blockedReason: 'router_dynamic_not_ready:missing_credential',
+        }),
+        tierEnsembleStatusFresh: true,
+        tierRows: [{
+          name: 'c3',
+          provider: 'foreign-provider',
+          model: 'foreign-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        selectionMode: 'router_dynamic',
+        scheme: 'legacy',
+        tierCandidates: [],
+        customCandidates: [],
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')?.textContent)
+      .toContain('Current fusion plan is unavailable')
+    expect(el.querySelector('.setup-tier-table__blocked-reason')?.textContent)
+      .toContain('One or more models in this fusion plan are not ready')
+    expect(el.querySelector('.setup-tier-table__model-note')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('falls back to conservative local validation when saved tier status is null or stale', async () => {
+    const tierCandidate = {
+      key: 'tier:foreign-provider:foreign-model',
+      provider: 'foreign-provider',
+      model: 'foreign-model',
+      source: 'tier',
+      enabled: true,
+      role: '',
+      credential: { provider: 'foreign-provider', available: false, source: 'none' },
+    }
+    for (const routerStatus of [
+      { tierEnsembleStatus: null, tierEnsembleStatusFresh: true },
+      { tierEnsembleStatus: tierEnsembleStatus(), tierEnsembleStatusFresh: false },
+    ]) {
+      const { app, el } = await mountPanel({
+        router: {
+          routerProviderRoles: { c3: 'dynamic_member' },
+          ...routerStatus,
+          tierRows: [{
+            name: 'c3',
+            provider: 'foreign-provider',
+            model: 'foreign-model',
+            thinkingLevel: 'high',
+            supportsImage: false,
+            ensembleEnabled: true,
+          }],
+        },
+        ensemble: {
+          selectionMode: 'router_dynamic',
+          scheme: 'legacy',
+          tierCandidates: [tierCandidate],
+          customCandidates: [],
+        },
+      })
+
+      expect(el.querySelector('.setup-tier-table__plan-status')?.textContent)
+        .toContain('Current fusion plan needs attention')
+      app.unmount()
+    }
+  })
+
+  it('never upgrades an invalidated saved blocker to ready after an unrelated local edit', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dormant_draft' },
+        tierEnsembleStatus: tierEnsembleStatus({
+          selectionMode: 'static_tokenrhythm_b5',
+          tierSelectionModes: { c3: 'static_tokenrhythm_b5' },
+          runtimeStatus: 'blocked',
+          configurationReady: false,
+          blockedReason: 'fixed_fallback:missing_credential:tokenrhythm',
+          fixedFallbackReady: false,
+          fixedFallbackBlockedReason: 'fixed_fallback:missing_credential:tokenrhythm',
+        }),
+        tierEnsembleStatusFresh: false,
+        tierRows: [{
+          name: 'c3',
+          provider: 'tokenrhythm',
+          model: 'quality-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        selectionMode: 'static_tokenrhythm_b5',
+        scheme: 'preset',
+        fixedProfile: {
+          provider: 'tokenrhythm',
+          providerLabel: 'TokenRhythm',
+          proposers: [],
+          aggregator: null,
+        },
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')?.textContent)
+      .toContain('Current fusion plan needs attention')
+    app.unmount()
+  })
+
+  it('rejects an ambiguous mixed-tier runtime aggregate instead of borrowing it for C3', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'dynamic_member' },
+        tierEnsembleStatus: tierEnsembleStatus({
+          activationTiers: ['c0', 'c3'],
+          tierSelectionModes: {
+            c0: 'static_openrouter_b5',
+            c3: 'router_dynamic',
+          },
+        }),
+        tierEnsembleStatusFresh: true,
+        tierRows: [{
+          name: 'c3',
+          provider: 'foreign-provider',
+          model: 'foreign-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: {
+        selectionMode: 'router_dynamic',
+        scheme: 'legacy',
+        tierCandidates: [{
+          key: 'tier:foreign-provider:foreign-model',
+          provider: 'foreign-provider',
+          model: 'foreign-model',
+          source: 'tier',
+          enabled: true,
+          role: '',
+          credential: { provider: 'foreign-provider', available: false, source: 'none' },
+        }],
+        customCandidates: [],
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')?.textContent)
+      .toContain('Current fusion plan needs attention')
+    app.unmount()
+  })
+
+  it('surfaces a blocked shared-provider role inline', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        routerProviderRoles: { c3: 'blocked' },
+        tierRows: [{
+          name: 'c3',
+          provider: 'openrouter',
+          model: 'saved-draft',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+    })
+
+    expect(el.querySelector('.setup-tier-table__plan-status')?.textContent)
+      .toContain('Current fusion plan is unavailable')
+    expect(el.querySelector('.setup-tier-table__model-note')).toBeTruthy()
+    app.unmount()
+  })
+
+  it('shows the explicit error policy for shared C3', async () => {
+    const { app, el } = await mountPanel({
+      router: {
+        tierRows: [{
+          name: 'c3',
+          provider: 'openrouter',
+          model: 'sleeping-c3-model',
+          thinkingLevel: 'high',
+          supportsImage: false,
+          ensembleEnabled: true,
+        }],
+      },
+      ensemble: { allFailedPolicy: 'error' },
+    })
+
+    const summary = el.querySelector('.setup-tier-table__model-note')?.textContent || ''
+    expect(summary).toContain('reports an error')
+    expect(summary).not.toContain('uses the Fixed and fallback model')
     app.unmount()
   })
 
@@ -929,16 +1393,18 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('updates the success threshold and failure policy from runtime strategy', async () => {
+  it('shows and emits the configured threshold and failure policy', async () => {
     const onUpdateEnsembleMinSuccessful = vi.fn()
     const onUpdateEnsembleAllFailedPolicy = vi.fn()
-    const { app, el } = await mountPanel(
-      {
-        activeStrategy: 'ensemble',
-        ensemble: { enabled: true, scheme: 'custom' },
-      },
-      { onUpdateEnsembleMinSuccessful, onUpdateEnsembleAllFailedPolicy },
-    )
+    const onUpdateEnsembleProposerMaxRetries = vi.fn()
+    const { app, el } = await mountPanel({
+      activeStrategy: 'ensemble',
+      ensemble: { enabled: true, scheme: 'custom' },
+    }, {
+      onUpdateEnsembleMinSuccessful,
+      onUpdateEnsembleAllFailedPolicy,
+      onUpdateEnsembleProposerMaxRetries,
+    })
 
     const runtime = el.querySelector<HTMLDetailsElement>('[data-testid="ensemble-runtime-strategy"]')!
     expect(runtime.open).toBe(false)
@@ -949,23 +1415,86 @@ describe('SetupModelStrategyPanel', () => {
       'aggregator 480s idle between provider events (configured 3600s)',
     )
     expect(runtime.textContent).toContain('outer turn deadline separate')
-
+    expect(runtime.textContent).toContain('At least 1 of 2 return normally')
+    expect(runtime.textContent).toContain('Other proposers still wait for their own completion or timeout')
     const threshold = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_min_successful"]')!
+    expect(threshold.value).toBe('1')
+    expect(threshold.textContent).toContain('At least 1 of 2 return normally')
     threshold.value = '2'
     threshold.dispatchEvent(new Event('change', { bubbles: true }))
-    await nextTick()
     expect(onUpdateEnsembleMinSuccessful).toHaveBeenCalledWith(2)
 
-    const failure = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_all_failed_policy"]')
-    failure!.value = 'error'
-    failure!.dispatchEvent(new Event('change', { bubbles: true }))
-    await nextTick()
+    const policy = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_all_failed_policy"]')!
+    expect(policy.value).toBe('fallback_single')
+    expect(policy.closest('label')?.textContent)
+      .toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
+    policy.value = 'error'
+    policy.dispatchEvent(new Event('change', { bubbles: true }))
     expect(onUpdateEnsembleAllFailedPolicy).toHaveBeenCalledWith('error')
+    const retries = el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_proposer_max_retries"]',
+    )!
+    expect(retries.value).toBe('0')
+    expect(retries.textContent).toContain('At most 0 retries after the initial request')
+    retries.value = '2'
+    retries.dispatchEvent(new Event('change', { bubbles: true }))
+    expect(onUpdateEnsembleProposerMaxRetries).toHaveBeenCalledWith(2)
 
     app.unmount()
   })
 
-  it('clamps an oversized stored threshold to the displayed proposer count', async () => {
+  it('displays an explicit error policy without fallback copy', async () => {
+    const { app, el } = await mountPanel({
+      activeStrategy: 'ensemble',
+      ensemble: {
+        enabled: true,
+        scheme: 'custom',
+        allFailedPolicy: 'error',
+        custom: customLineup({ facts: { ...FACTS, proposerMaxRetries: 2 } }),
+      },
+    })
+
+    const policy = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_all_failed_policy"]')!
+    expect(policy.value).toBe('error')
+    const copy = policy.closest('label')?.textContent || ''
+    expect(copy).toContain('without calling the fixed fallback model')
+    expect(copy).not.toContain('Fixed and fallback model: OpenRouter')
+    expect(el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_proposer_max_retries"]',
+    )?.value).toBe('2')
+    app.unmount()
+  })
+
+  it('renders an explicit 4-of-4, error, and two-retry policy unchanged', async () => {
+    const { app, el } = await mountPanel({
+      activeStrategy: 'ensemble',
+      ensemble: {
+        enabled: true,
+        scheme: 'preset',
+        minSuccessfulProposers: 4,
+        allFailedPolicy: 'error',
+        presetFacts: {
+          ...panel().ensemble.presetFacts,
+          proposerMaxRetries: 2,
+        },
+      },
+    })
+
+    const threshold = el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_min_successful"]',
+    )!
+    expect(threshold.value).toBe('4')
+    expect(threshold.selectedOptions[0]?.textContent).toContain('At least 4 of 4 return normally')
+    expect(el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_all_failed_policy"]',
+    )?.value).toBe('error')
+    expect(el.querySelector<HTMLSelectElement>(
+      'select[name="setup_model_strategy_proposer_max_retries"]',
+    )?.value).toBe('2')
+    app.unmount()
+  })
+
+  it('clamps an oversized stored threshold to the effective proposer count', async () => {
     const { app, el } = await mountPanel({
       activeStrategy: 'ensemble',
       ensemble: {
@@ -974,16 +1503,14 @@ describe('SetupModelStrategyPanel', () => {
         minSuccessfulProposers: 5,
         custom: customLineup({
           proposerCount: 2,
-          facts: { ...FACTS, proposerCount: 2, quorum: 2 },
+          facts: { ...FACTS, proposerCount: 2 },
         }),
       },
     })
 
-    const threshold = el.querySelector<HTMLSelectElement>(
-      'select[name="setup_model_strategy_min_successful"]',
-    )!
+    const threshold = el.querySelector<HTMLSelectElement>('select[name="setup_model_strategy_min_successful"]')!
     expect(threshold.value).toBe('2')
-    expect(threshold.selectedOptions[0]?.textContent).toContain('2 of 2')
+    expect(threshold.textContent).toContain('At least 2 of 2 return normally')
 
     app.unmount()
   })
@@ -1000,7 +1527,7 @@ describe('SetupModelStrategyPanel', () => {
           canAddProposer: false,
           belowMinimum: false,
           diversityWarning: true,
-          facts: { ...FACTS, perTurnCalls: 7, proposerCount: 6, quorum: 5 },
+          facts: { ...FACTS, perTurnCalls: 7, proposerCount: 6 },
         }),
       },
     })
@@ -1013,7 +1540,7 @@ describe('SetupModelStrategyPanel', () => {
     app.unmount()
   })
 
-  it('migrates a saved preset directly into the single custom editing path', async () => {
+  it('keeps a saved preset until the user explicitly chooses the custom editor', async () => {
     const onUpdateEnsembleScheme = vi.fn()
     const { app, el } = await mountPanel({
       activeStrategy: 'ensemble',
@@ -1052,8 +1579,12 @@ describe('SetupModelStrategyPanel', () => {
     expect(preset.querySelector('[data-testid="setup-model-strategy-add-candidate-trigger"]')).toBeNull()
     expect(preset.querySelector('[data-testid="ensemble-replace-aggregator"]')).toBeNull()
     expect(el.querySelector('[data-testid="ensemble-effective-summary"]')?.textContent).toContain('5 model calls')
-    expect(el.querySelector('[data-testid="ensemble-scheme-preset"]')).toBeNull()
-    expect(el.querySelector('[data-testid="ensemble-scheme-custom"]')).toBeNull()
+    const presetScheme = el.querySelector<HTMLButtonElement>('[data-testid="ensemble-scheme-preset"]')!
+    const customScheme = el.querySelector<HTMLButtonElement>('[data-testid="ensemble-scheme-custom"]')!
+    expect(presetScheme.getAttribute('aria-pressed')).toBe('true')
+    expect(customScheme.getAttribute('aria-pressed')).toBe('false')
+    expect(onUpdateEnsembleScheme).not.toHaveBeenCalled()
+    customScheme.click()
     expect(onUpdateEnsembleScheme).toHaveBeenCalledWith('custom')
     expect(preset.querySelector('.setup-model-strategy__step-role')).toBeNull()
     expect(steps[1]?.querySelector('.setup-model-strategy__step-role')).toBeNull()
@@ -1138,6 +1669,9 @@ describe('SetupModelStrategyPanel', () => {
 
     const banner = el.querySelector('[data-testid="ensemble-legacy-banner"]')
     expect(banner).toBeTruthy()
+    expect(banner?.textContent).toContain('follows the saved model tiers')
+    expect(banner?.textContent).toContain('Fixed and fallback model: OpenRouter · deepseek/deepseek-v4-pro')
+    expect(banner?.textContent).not.toContain('router_dynamic')
     // Legacy dynamic selection has different runtime semantics, so it stays
     // read-only until the user explicitly migrates to a custom lineup.
     expect(el.querySelector('[data-testid="ensemble-scheme-preset"]')).toBeNull()

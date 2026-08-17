@@ -7,9 +7,11 @@ import SetupTierTable from '@/components/setup/SetupTierTable.vue'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { ModelStrategy } from '@/composables/setup/useSetupModelStrategyForm'
 import type {
+  RouterProviderRoles,
   SetupProviderCredentialStatus,
   SetupProviderOption,
   SetupTierRow,
+  TierEnsembleRuntimeStatus,
 } from '@/composables/setup/useSetupRouterForm'
 import type {
   DiscoveredModelCatalog,
@@ -48,6 +50,9 @@ interface RouterPanelContract {
   providerCredentialStatus: readonly SetupProviderCredentialStatus[]
   discoveredModelsByProvider?: DiscoveredModelsByProvider
   hasMixedTierProviders: boolean
+  routerProviderRoles?: RouterProviderRoles
+  tierEnsembleStatus?: TierEnsembleRuntimeStatus | null
+  tierEnsembleStatusFresh?: boolean
 }
 
 interface EnsemblePanelContract {
@@ -82,6 +87,7 @@ interface SinglePanelContract {
 interface ModelStrategyPanelContract {
   activeStrategy: ModelStrategy
   hasSavedProvider: boolean
+  profileSaveSupported: boolean
   providerLabel: string
   routerTemplateState: string
   cards: readonly StrategyCard[]
@@ -100,7 +106,7 @@ const emit = defineEmits<{
   updateFixedModel: [value: string]
   updateRouterDefaultTier: [value: string]
   updateRouterVisualMode: [value: string]
-  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage', value: string | boolean]
+  updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'supportsImage' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
   updateEnsembleScheme: [value: 'preset' | 'custom']
   addEnsembleCandidate: [provider: string, model: string, role: EnsembleCandidateRole]
   removeEnsembleCandidate: [candidate: EnsembleCandidateView]
@@ -111,6 +117,7 @@ const emit = defineEmits<{
   migrateEnsembleLegacy: []
   updateEnsembleMinSuccessful: [value: number]
   updateEnsembleAllFailedPolicy: [value: string]
+  updateEnsembleProposerMaxRetries: [value: number]
   goToSection: [value: string]
 }>()
 
@@ -194,6 +201,10 @@ const configuredProviderIds = computed(() => new Set(
     .filter(option => option.disabled !== true)
     .map(option => String(option.providerId || '').trim().toLowerCase())
     .filter(Boolean),
+))
+const showAddProviderShortcut = computed(() => (
+  props.panel.profileSaveSupported
+  && configuredProviderIds.value.size === 1
 ))
 const fixedProviderOptions = computed(() => providerOptionsFor(props.panel.single.providerId))
 const selectedFixedProviderOption = computed(() => (
@@ -398,22 +409,103 @@ const activeFacts = computed(() => (
     ? props.panel.ensemble.presetFacts
     : customLineup.value.facts
 ))
+const quorumOptions = computed(() => Array.from(
+  { length: Math.max(1, activeFacts.value.proposerCount) },
+  (_, index) => index + 1,
+))
+const displayedMinSuccessful = computed(() => Math.min(
+  Math.max(1, Math.trunc(Number(props.panel.ensemble.minSuccessfulProposers) || 1)),
+  Math.max(1, activeFacts.value.proposerCount),
+))
+const proposerRetryOptions = Array.from({ length: 11 }, (_, index) => index)
+const c3FusionActive = computed(() => props.panel.router.tierRows.some(row => (
+  row.name === 'c3'
+  && (
+    row.ensembleEnabled === true
+    || (row.ensembleEnabled === undefined && Boolean(row.ensembleSelectionMode))
+  )
+)))
+const savedTierEnsembleStatus = computed(() => {
+  if (!c3FusionActive.value || props.panel.router.tierEnsembleStatusFresh !== true) return null
+  const status = props.panel.router.tierEnsembleStatus
+  if (!status || !['ready', 'conditional', 'blocked'].includes(status.runtimeStatus)) return null
+  // New Gateways project this status per tier. Require an exact C3 scope so a
+  // mixed legacy profile can never show another tier's plan as C3 readiness.
+  if (status.activationTiers.length !== 1 || status.activationTiers[0] !== 'c3') return null
+  const scopedModes = Object.keys(status.tierSelectionModes)
+  if (scopedModes.length !== 1 || scopedModes[0] !== 'c3') return null
+  return status
+})
+const displayedProposerMaxRetries = computed(() => {
+  if (!c3FusionActive.value) return activeFacts.value.proposerMaxRetries
+  return savedTierEnsembleStatus.value?.effectiveProposerMaxRetries ?? 1
+})
+const displayedC3ProposerCount = computed(() => (
+  savedTierEnsembleStatus.value?.proposerCount
+  ?? Math.max(1, activeFacts.value.proposerCount)
+))
+const displayedC3MinSuccessful = computed(() => (
+  savedTierEnsembleStatus.value?.effectiveMinSuccessfulProposers
+  ?? Math.min(displayedMinSuccessful.value, displayedC3ProposerCount.value)
+))
+const staleTierEnsembleStatus = computed(() => (
+  c3FusionActive.value
+  && Boolean(props.panel.router.tierEnsembleStatus)
+  && props.panel.router.tierEnsembleStatusFresh === false
+))
+const savedTierEnsembleBlocked = computed(() => {
+  const status = savedTierEnsembleStatus.value
+  if (!status) return false
+  return status.runtimeStatus === 'blocked'
+    || status.configurationReady === false
+    || status.fixedFallbackReady === false
+    || Boolean(status.blockedReason)
+})
+const ensemblePlanNeedsAttention = computed(() => {
+  const credentialUnavailable = (candidate: EnsembleCandidateView | undefined | null) => (
+    candidate?.credential?.available === false
+  )
+  if (!props.panel.single.providerId || !props.panel.single.model.trim()) return true
+  // A local edit invalidates the server snapshot. Do not upgrade a previously
+  // blocked/conditional saved plan to ready using a less complete heuristic;
+  // retain an attention state until the edited configuration is saved.
+  if (staleTierEnsembleStatus.value) return true
+  if (savedTierEnsembleStatus.value) return savedTierEnsembleBlocked.value
+  if (ensembleScheme.value === 'preset') {
+    const profile = props.panel.ensemble.fixedProfile
+    return !profile
+      || props.panel.ensemble.presetProviderMismatch === true
+      || profile.proposers.some(credentialUnavailable)
+      || credentialUnavailable(profile.aggregator)
+  }
+  if (ensembleScheme.value === 'legacy') {
+    return props.panel.ensemble.tierCandidates.length === 0
+      || props.panel.ensemble.tierCandidates.some(credentialUnavailable)
+  }
+  return customLineup.value.belowMinimum
+    || customLineup.value.proposers.some(credentialUnavailable)
+    || credentialUnavailable(customLineup.value.aggregator)
+    || (!customLineup.value.aggregator && !customLineup.value.inheritedAggregatorModel)
+})
+const ensemblePlanStatus = computed<'ready' | 'attention' | 'blocked'>(() => {
+  if (props.panel.router.routerProviderRoles?.c3 === 'blocked') return 'blocked'
+  if (savedTierEnsembleBlocked.value) return 'blocked'
+  return ensemblePlanNeedsAttention.value ? 'attention' : 'ready'
+})
+const ensemblePlanBlockedReason = computed(() => (
+  savedTierEnsembleBlocked.value
+    ? savedTierEnsembleStatus.value?.blockedReason
+      || (savedTierEnsembleStatus.value?.fixedFallbackReady === false
+        ? savedTierEnsembleStatus.value.fixedFallbackBlockedReason || 'missing_fixed_fallback'
+        : 'configuration_unavailable')
+    : ''
+))
 const legacyProposers = computed(() => (
   props.panel.ensemble.customCandidates.filter(candidate => candidate.role !== 'aggregator')
 ))
 const legacyAggregators = computed(() => (
   props.panel.ensemble.customCandidates.filter(candidate => candidate.role === 'aggregator')
 ))
-const quorumOptions = computed(() => Array.from(
-  { length: Math.max(0, activeFacts.value.proposerCount - 1) },
-  (_, index) => index + 2,
-))
-const displayedMinSuccessful = computed(() => {
-  const configured = Math.max(1, Math.trunc(Number(props.panel.ensemble.minSuccessfulProposers)))
-  if (configured === 1) return 1
-  return Math.min(configured, Math.max(1, activeFacts.value.proposerCount))
-})
-
 function closeLineupEditors() {
   newCandidateProvider.value = ''
   newCandidateModel.value = ''
@@ -449,19 +541,6 @@ onBeforeUnmount(() => {
 })
 watch(ensembleScheme, closeLineupEditors)
 watch(() => props.panel.activeStrategy, closeLineupEditors)
-watch(
-  [() => props.panel.activeStrategy, ensembleScheme],
-  ([strategy, scheme]) => {
-    // The editor now has one ensemble path: a directly editable custom lineup.
-    // Existing saved static profiles are expanded by the form into an
-    // equivalent custom draft; the normal dirty bar keeps that migration
-    // explicit until the user saves it.
-    if (strategy === 'ensemble' && scheme === 'preset') {
-      emit('updateEnsembleScheme', 'custom')
-    }
-  },
-  { immediate: true },
-)
 
 function submitCandidate() {
   const provider = newCandidateProvider.value
@@ -701,6 +780,25 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
         <div class="setup-model-strategy__roles-head">
           <h5>{{ t('setup.modelStrategy.modelRolesTitle') }}</h5>
+          <button
+            v-if="showAddProviderShortcut"
+            type="button"
+            class="setup-inline-link setup-model-strategy__add-provider"
+            data-testid="router-add-provider"
+            aria-describedby="router-add-provider-hint"
+            :title="t('setup.modelStrategy.addProviderHint')"
+            @click="emit('goToSection', 'provider')"
+          >
+            <Icon name="plus" :size="13" aria-hidden="true" />
+            {{ t('setup.provider.addProvider') }}
+          </button>
+          <span
+            v-if="showAddProviderShortcut"
+            id="router-add-provider-hint"
+            class="setup-model-strategy__sr-only"
+          >
+            {{ t('setup.modelStrategy.addProviderHint') }}
+          </span>
         </div>
 
         <SetupTierTable
@@ -710,7 +808,19 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           :provider-options="panel.router.providerOptions"
           :provider-credential-status="panel.router.providerCredentialStatus"
           :models-by-provider="panel.router.discoveredModelsByProvider || {}"
+          :fixed-fallback-provider="panel.single.providerLabel"
+          :fixed-fallback-model="panel.single.model"
+          :ensemble-all-failed-policy="panel.ensemble.allFailedPolicy"
+          :ensemble-min-successful="displayedC3MinSuccessful"
+          :ensemble-proposer-count="displayedC3ProposerCount"
+          :ensemble-proposer-max-retries="displayedProposerMaxRetries"
+          :ensemble-plan-status="ensemblePlanStatus"
+          :ensemble-plan-blocked-reason="ensemblePlanBlockedReason"
+          :ensemble-fixed-fallback-ready="savedTierEnsembleStatus?.fixedFallbackReady"
+          :router-provider-roles="panel.router.routerProviderRoles || {}"
+          :effective-ensemble-selection-mode="panel.ensemble.selectionMode"
           @update-tier-field="(name, key, value) => emit('updateTierField', name, key, value)"
+          @migrate-legacy-ensemble="emit('migrateEnsembleLegacy')"
         />
 
         <details
@@ -752,11 +862,47 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
         data-testid="ensemble-panel"
       >
         <div
+          v-if="panel.ensemble.schemeCardsAvailable && ensembleScheme !== 'legacy'"
+          class="setup-model-strategy__schemes"
+          role="group"
+          :aria-label="t('setup.modelStrategy.schemeLabel')"
+        >
+          <button
+            type="button"
+            class="setup-model-strategy__scheme"
+            :class="{ 'is-active': ensembleScheme === 'preset' }"
+            data-testid="ensemble-scheme-preset"
+            :aria-pressed="ensembleScheme === 'preset' ? 'true' : 'false'"
+            @click="emit('updateEnsembleScheme', 'preset')"
+          >
+            {{ t('setup.modelStrategy.schemePresetTitle') }}
+          </button>
+          <button
+            type="button"
+            class="setup-model-strategy__scheme"
+            :class="{ 'is-active': ensembleScheme === 'custom' }"
+            data-testid="ensemble-scheme-custom"
+            :aria-pressed="ensembleScheme === 'custom' ? 'true' : 'false'"
+            @click="emit('updateEnsembleScheme', 'custom')"
+          >
+            {{ t('setup.modelStrategy.schemeCustomTitle') }}
+          </button>
+        </div>
+
+        <div
           v-if="ensembleScheme === 'legacy'"
           class="setup-model-strategy__notice setup-model-strategy__notice--legacy"
           data-testid="ensemble-legacy-banner"
         >
-          <span>{{ t('setup.modelStrategy.legacyDynamicNotice') }}</span>
+          <span>
+            {{ t('setup.modelStrategy.legacyDynamicNotice') }}
+            {{ panel.ensemble.allFailedPolicy === 'error'
+              ? t('setup.modelStrategy.failurePolicyErrorDesc')
+              : t('setup.modelStrategy.ensembleFailure', {
+                provider: panel.single.providerLabel,
+                model: panel.single.model,
+              }) }}
+          </span>
           <button
             type="button"
             class="btn"
@@ -1327,20 +1473,16 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             <label class="control-row">
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.successThresholdLabel') }}</span>
+                <span class="control-row__desc">{{ t('setup.modelStrategy.successThresholdDesc') }}</span>
               </div>
               <div class="control-row__control">
                 <select
                   class="control-input"
                   :value="displayedMinSuccessful"
                   name="setup_model_strategy_min_successful"
+                  data-testid="ensemble-success-threshold"
                   @change="emit('updateEnsembleMinSuccessful', Number(($event.target as HTMLSelectElement).value))"
                 >
-                  <option value="1">
-                    {{ t('setup.modelStrategy.successThresholdAuto', {
-                      quorum: activeFacts.quorum,
-                      proposers: activeFacts.proposerCount,
-                    }) }}
-                  </option>
                   <option v-for="quorum in quorumOptions" :key="quorum" :value="quorum">
                     {{ t('setup.modelStrategy.successThresholdExact', {
                       quorum,
@@ -1353,8 +1495,14 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             <label class="control-row">
               <div class="control-row__label-block">
                 <span class="control-row__label">{{ t('setup.modelStrategy.failurePolicyLabel') }}</span>
-                <span class="control-row__desc">
-                  {{ t('setup.modelStrategy.ensembleFailure', { provider: currentProvider, model: currentModel }) }}
+                <span v-if="panel.ensemble.allFailedPolicy === 'fallback_single'" class="control-row__desc">
+                  {{ t('setup.modelStrategy.ensembleFailure', {
+                    provider: panel.single.providerLabel,
+                    model: panel.single.model,
+                  }) }}
+                </span>
+                <span v-else class="control-row__desc">
+                  {{ t('setup.modelStrategy.failurePolicyErrorDesc') }}
                 </span>
               </div>
               <div class="control-row__control">
@@ -1362,10 +1510,30 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                   class="control-input"
                   :value="panel.ensemble.allFailedPolicy"
                   name="setup_model_strategy_all_failed_policy"
+                  data-testid="ensemble-failure-policy"
                   @change="emit('updateEnsembleAllFailedPolicy', ($event.target as HTMLSelectElement).value)"
                 >
                   <option value="fallback_single">{{ t('setup.ensemble.allFailedFallback') }}</option>
                   <option value="error">{{ t('setup.ensemble.allFailedError') }}</option>
+                </select>
+              </div>
+            </label>
+            <label class="control-row">
+              <div class="control-row__label-block">
+                <span class="control-row__label">{{ t('setup.modelStrategy.proposerRetriesLabel') }}</span>
+                <span class="control-row__desc">{{ t('setup.modelStrategy.proposerRetriesDesc') }}</span>
+              </div>
+              <div class="control-row__control">
+                <select
+                  class="control-input"
+                  :value="activeFacts.proposerMaxRetries"
+                  name="setup_model_strategy_proposer_max_retries"
+                  data-testid="ensemble-proposer-retries"
+                  @change="emit('updateEnsembleProposerMaxRetries', Number(($event.target as HTMLSelectElement).value))"
+                >
+                  <option v-for="retries in proposerRetryOptions" :key="retries" :value="retries">
+                    {{ t('setup.modelStrategy.proposerRetriesOption', { count: retries }) }}
+                  </option>
                 </select>
               </div>
             </label>
@@ -1376,7 +1544,6 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                   proposerTimeout: activeFacts.proposerTimeoutSeconds,
                   configuredAggregatorTimeout: activeFacts.configuredAggregatorTimeoutSeconds,
                   aggregatorTimeout: activeFacts.aggregatorTimeoutSeconds,
-                  grace: activeFacts.quorumGraceSeconds,
                 }) }}
               </span>
             </div>
@@ -1876,8 +2043,11 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 }
 
 .setup-model-strategy__roles-head {
-  display: grid;
-  gap: 3px;
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  justify-content: space-between;
   margin-top: var(--sp-1);
 }
 
@@ -1890,6 +2060,22 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
   color: var(--text-muted);
   font-size: var(--fs-xs);
   line-height: 1.45;
+}
+
+.setup-inline-link.setup-model-strategy__add-provider {
+  flex: 0 0 auto;
+  font-size: var(--fs-xs);
+}
+
+.setup-model-strategy__sr-only {
+  clip: rect(0, 0, 0, 0);
+  height: 1px;
+  margin: -1px;
+  overflow: hidden;
+  padding: 0;
+  position: absolute;
+  white-space: nowrap;
+  width: 1px;
 }
 
 .setup-model-strategy__candidate-list {
@@ -2631,6 +2817,14 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 .setup-model-strategy__runtime-body .control-row {
   padding-left: 0;
   padding-right: 0;
+}
+
+.setup-model-strategy__runtime-value {
+  color: var(--text);
+  display: block;
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+  padding: var(--sp-2) 0;
 }
 
 .setup-model-strategy__runtime-limits {

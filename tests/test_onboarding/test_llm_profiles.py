@@ -710,6 +710,151 @@ def test_profile_activation_custom_or_legacy_conflict_is_fail_closed(binding) ->
     assert cfg.squilla_router.model_dump(mode="python") == router_before
 
 
+def test_profile_activation_ignores_dormant_shared_c3_provider() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-test", "api_key": "old-secret"},
+        llm_profiles={"deepseek": {"api_key": "new-secret"}},
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": False,
+            "tiers": {
+                "c0": {"provider": "deepseek", "model": "deepseek-chat"},
+                "c1": {"provider": "deepseek", "model": "deepseek-chat"},
+                "c2": {"provider": "deepseek", "model": "deepseek-reasoner"},
+                "c3": {
+                    "provider": "openai",
+                    "model": "gpt-test",
+                    "ensemble_enabled": True,
+                },
+            },
+        },
+    )
+
+    activated = activate_llm_profile(
+        cfg,
+        provider_id="deepseek",
+        model="deepseek-chat",
+    ).config
+
+    assert activated.llm.provider == "deepseek"
+    assert activated.squilla_router.tiers["c3"] == {
+        "provider": "openai",
+        "model": "gpt-test",
+        "ensemble_enabled": True,
+    }
+
+
+def test_profile_activation_keeps_dynamic_shared_c3_provider_conflict() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-test", "api_key": "old-secret"},
+        llm_profiles={"deepseek": {"api_key": "new-secret"}},
+        llm_ensemble={"selection_mode": "router_dynamic"},
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": False,
+            "tiers": {
+                "c0": {"provider": "deepseek", "model": "deepseek-chat"},
+                "c1": {"provider": "deepseek", "model": "deepseek-chat"},
+                "c2": {"provider": "deepseek", "model": "deepseek-reasoner"},
+                "c3": {
+                    "provider": "openai",
+                    "model": "gpt-test",
+                    "ensemble_enabled": True,
+                },
+            },
+        },
+    )
+
+    with pytest.raises(LlmProfileActivationError) as error:
+        activate_llm_profile(
+            cfg,
+            provider_id="deepseek",
+            model="deepseek-chat",
+        )
+
+    assert error.value.reason == "router_provider_conflict"
+    assert error.value.details["conflictProviders"] == ["openai"]
+
+
+@pytest.mark.parametrize(
+    "c3_execution",
+    [
+        {"ensemble_enabled": False},
+        {"ensemble_selection_mode": "static_openrouter_b5"},
+    ],
+    ids=["single", "legacy-tier-fusion"],
+)
+def test_profile_activation_keeps_c3_provider_conflict_when_it_can_execute(
+    c3_execution,
+) -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-test", "api_key": "old-secret"},
+        llm_profiles={"deepseek": {"api_key": "new-secret"}},
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": False,
+            "tiers": {
+                "c0": {"provider": "deepseek", "model": "deepseek-chat"},
+                "c1": {"provider": "deepseek", "model": "deepseek-chat"},
+                "c2": {"provider": "deepseek", "model": "deepseek-reasoner"},
+                "c3": {
+                    "provider": "openai",
+                    "model": "gpt-test",
+                    **c3_execution,
+                },
+            },
+        },
+    )
+
+    with pytest.raises(LlmProfileActivationError) as error:
+        activate_llm_profile(
+            cfg,
+            provider_id="deepseek",
+            model="deepseek-chat",
+        )
+
+    assert error.value.reason == "router_provider_conflict"
+    assert error.value.details["conflictProviders"] == ["openai"]
+
+
+@pytest.mark.parametrize("tier_name", ["c0", "c1", "c2"])
+def test_profile_activation_keeps_lower_tier_provider_conflicts(tier_name) -> None:
+    tiers = {
+        "c0": {"provider": "deepseek", "model": "deepseek-chat"},
+        "c1": {"provider": "deepseek", "model": "deepseek-chat"},
+        "c2": {"provider": "deepseek", "model": "deepseek-reasoner"},
+        "c3": {
+            "provider": "openai",
+            "model": "gpt-test",
+            "ensemble_enabled": True,
+        },
+    }
+    tiers[tier_name] = {"provider": "openrouter", "model": "synthetic/model"}
+    cfg = GatewayConfig(
+        llm={"provider": "openai", "model": "gpt-test", "api_key": "old-secret"},
+        llm_profiles={"deepseek": {"api_key": "new-secret"}},
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": False,
+            "tiers": tiers,
+        },
+    )
+
+    with pytest.raises(LlmProfileActivationError) as error:
+        activate_llm_profile(
+            cfg,
+            provider_id="deepseek",
+            model="deepseek-chat",
+        )
+
+    assert error.value.reason == "router_provider_conflict"
+    assert error.value.details["conflictProviders"] == ["openrouter"]
+
+
 @pytest.mark.parametrize(
     ("router_action", "expected_binding", "expected_enabled", "expected_cross"),
     [

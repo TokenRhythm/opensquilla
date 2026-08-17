@@ -128,10 +128,10 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
   function appendFrame(frame: FrameInput) {
     const accepted = { ...frame, seq: appendIndex++ } as Frame
     accumulator.append(accepted)
-    // Production renders directly from the accumulator and checkpoints it in
-    // place. Retaining a parallel frame log duplicated every growing text,
-    // reasoning and tool-input string for no consumer.
-    if (useReducer.value !== true) coalesceAcceptedFrame(accepted)
+    // The published frame stream is diagnostic-only in production, but the
+    // compact accepted log is needed to rebuild the accumulator after an answer
+    // generation reset.
+    coalesceAcceptedFrame(accepted)
     snapshotDirty = true
     publishPending = true
   }
@@ -178,6 +178,52 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     for (const frame of acceptedFrames) accumulator.append(frame)
     snapshotDirty = true
     publishPending = true
+    publish()
+  }
+
+  /**
+   * Replace only the current answer generation. Completed tool frames and
+   * artifacts belong to the same live bubble; old text, reasoning, terminal
+   * snapshots, and pending tool frames belong to the generation being replaced.
+   */
+  function resetGeneration(optionsArg: {
+    textSnapshot?: string
+    preserveCompletedTools?: boolean
+  } = {}) {
+    const preserveCompletedTools = optionsArg.preserveCompletedTools !== false
+    const completedToolIds = new Set(
+      acceptedFrames
+        .filter((frame): frame is Extract<Frame, { kind: 'tool-result' }> => frame.kind === 'tool-result')
+        .map(frame => frame.toolId),
+    )
+
+    acceptedFrames = acceptedFrames.filter((frame) => {
+      if (frame.kind === 'text' || frame.kind === 'thinking' || frame.kind === 'final-text') {
+        return false
+      }
+      if (
+        frame.kind === 'tool-start'
+        || frame.kind === 'tool-delta'
+        || frame.kind === 'tool-result'
+      ) {
+        return preserveCompletedTools && completedToolIds.has(frame.toolId)
+      }
+      return true
+    })
+
+    accumulator.reset()
+    for (const frame of acceptedFrames) accumulator.append(frame)
+    snapshotDirty = true
+    publishPending = true
+
+    if (typeof optionsArg.textSnapshot === 'string' && optionsArg.textSnapshot) {
+      appendFrame({
+        kind: 'text',
+        text: optionsArg.textSnapshot,
+        presentation: 'answer',
+      })
+    }
+
     publish()
   }
 
@@ -242,6 +288,7 @@ export function useChatTurnLog(options: UseChatTurnLogOptions) {
     checkpointText,
     peekRawText,
     finalizeToolInputs,
+    resetGeneration,
     foldedTurn,
     assertParity,
   }

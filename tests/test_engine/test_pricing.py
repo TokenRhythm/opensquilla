@@ -8,6 +8,7 @@ from opensquilla.engine.pricing import (
     PricingCache,
     lookup_price,
     reset_live_price_cache_for_tests,
+    resolve_model_price,
     seed_live_price_cache_for_tests,
 )
 
@@ -17,6 +18,22 @@ def reset_pricing_cache() -> Iterator[None]:
     reset_live_price_cache_for_tests()
     yield
     reset_live_price_cache_for_tests()
+
+
+def test_default_test_session_disables_live_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_fetch(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("default tests must not fetch live OpenRouter pricing")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.pricing._fetch_live_openrouter_price",
+        unexpected_fetch,
+    )
+
+    resolved = resolve_model_price("vendor/synthetic-model", provider="openrouter")
+
+    assert resolved.source == "default"
 
 
 def test_deepseek_v4_pro_static_price_matches_current_official(
@@ -117,8 +134,11 @@ def test_price_entry_cache_fields_default_none() -> None:
         ("deepseek-chat", 0.14, 0.28),
         ("deepseek-reasoner", 0.26, 0.38),
         ("glm-5.2", 1.40, 4.40),
+        ("qwen/qwen3.7-flash", 0.03, 0.13),
+        ("qwen3.7-flash", 0.03, 0.13),
         ("qwen3.7-max", 1.25, 3.75),
         ("qwen3.7-plus", 0.40, 1.60),
+        ("deepseek-v4-flash-0731", 0.14, 0.28),
     ],
 )
 def test_previously_missing_ids_now_have_static_entries(
@@ -224,9 +244,11 @@ def test_provider_profile_models_do_not_use_default_pricing(
     default = PriceEntry(3.0, 15.0)
     models = [
         "qwen3.6-flash",
+        "qwen3.7-flash",
         "qwen3.7-plus",
         "qwen3.7-max",
         "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
         "deepseek-v4-pro",
         "gemini-3.1-flash-lite",
         "gemini-3.5-flash",

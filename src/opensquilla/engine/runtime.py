@@ -99,6 +99,7 @@ from opensquilla.contracts.attachments import (
 from opensquilla.contracts.attachments import (
     normalize_attachment_mime as _normalize_attachment_mime,
 )
+from opensquilla.contracts.turn_execution import TurnExecutionContext
 from opensquilla.engine.agent import Agent, ToolHandler
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import notify_compaction
@@ -136,6 +137,10 @@ from opensquilla.engine.turn_runner import (
     TurnFinalizerStageInput,
     rebind_attachment_prompt,
 )
+from opensquilla.engine.turn_runner.context import (
+    control_terminal_event_for_context,
+    set_execution_deadline_if_missing,
+)
 from opensquilla.engine.turn_runner.harness import (
     _PromptReportBuilderAdapter,
     _RequestContextPrependAdapter,
@@ -168,6 +173,7 @@ from opensquilla.engine.turn_runner.harness import (
     _TurnRunnerTurnErrorPersistAdapter,
     _TurnRunnerTurnMemoryCaptureAdapter,
     _TurnRunnerUsageTelemetryAdapter,
+    create_turn_execution_context,
 )
 from opensquilla.engine.turn_runner.stream_consumer_stage import (
     _could_be_human_silent_reply_prefix,
@@ -176,6 +182,7 @@ from opensquilla.engine.turn_runner.stream_consumer_stage import (
 from opensquilla.engine.types import (
     AgentConfig,
     AgentEvent,
+    ControlTerminalReason,
     DoneEvent,
     ErrorEvent,
     RouterControlReplayEvent,
@@ -250,6 +257,7 @@ from opensquilla.provider.types import (
     EnsembleProgressEvent as ProviderEnsembleProgressEvent,
 )
 from opensquilla.provider.types import (
+    ProviderGenerationResetEvent,
     ProviderRequestCorrelation,
     derive_provider_request_correlation,
 )
@@ -257,7 +265,16 @@ from opensquilla.router_control import (
     RouterControlHoldStore,
     render_router_control_prompt_block,
 )
-from opensquilla.router_tiers import HIGHEST_TEXT_TIER, normalize_text_tier, tier_index
+from opensquilla.router_tiers import (
+    CUSTOM_B5_SELECTION_MODE,
+    HIGHEST_TEXT_TIER,
+    ROUTER_DYNAMIC_SELECTION_MODE,
+    effective_ensemble_selection_mode,
+    normalize_text_tier,
+    static_b5_profile,
+    tier_ensemble_execution,
+    tier_index,
+)
 from opensquilla.run_mode import RunMode, display_name, execution_target, normalize_run_mode
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
 from opensquilla.session.compaction_lifecycle import (
@@ -309,6 +326,7 @@ from opensquilla.tools.types import (
     InteractionMode,
     ToolContext,
     is_goal_owned_main_default_turn,
+    surface_capabilities_for_tool_context,
 )
 
 if TYPE_CHECKING:
@@ -379,6 +397,129 @@ _ARTIFACT_DELIVERY_TOOL_NAMES: Final[frozenset[str]] = frozenset(
 )
 _ARTIFACT_DELIVERY_FAILURE_MAX_CHARS: Final[int] = 360
 _HOOKS_FEATURE_ENV: Final[str] = "OPENSQUILLA_HOOKS"
+
+
+def _deadline_from_timeout(timeout: float | None) -> float | None:
+    """Convert an explicit positive turn timeout to a monotonic deadline."""
+
+    if timeout is None or isinstance(timeout, bool):
+        return None
+    try:
+        duration = float(timeout)
+    except (TypeError, ValueError):
+        return None
+    return time.monotonic() + duration if duration > 0 else None
+
+
+_CONTROL_REASON_ALIASES: dict[str, ControlTerminalReason] = {
+    "cancel": ControlTerminalReason.CANCEL,
+    "cancelled": ControlTerminalReason.CANCEL,
+    "canceled": ControlTerminalReason.CANCEL,
+    "user_abort": ControlTerminalReason.CANCEL,
+    "user_cancel": ControlTerminalReason.CANCEL,
+    "sessions_abort": ControlTerminalReason.CANCEL,
+    "shutdown": ControlTerminalReason.SHUTDOWN,
+    "gateway_shutdown": ControlTerminalReason.SHUTDOWN,
+    "hard_deadline": ControlTerminalReason.HARD_DEADLINE,
+    "hard_deadline_exceeded": ControlTerminalReason.HARD_DEADLINE,
+    "agent_runtime_timeout": ControlTerminalReason.HARD_DEADLINE,
+    "platform_validation": ControlTerminalReason.PLATFORM_VALIDATION,
+    "platform_safety": ControlTerminalReason.PLATFORM_SAFETY,
+    "safety_control": ControlTerminalReason.PLATFORM_SAFETY,
+}
+
+
+def _control_terminal_reason_value(value: Any) -> ControlTerminalReason | None:
+    if isinstance(value, ControlTerminalReason):
+        return value
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return _CONTROL_REASON_ALIASES.get(normalized)
+
+
+def _control_terminal_reason_for_exception(
+    exc: BaseException,
+    execution_context: TurnExecutionContext | None,
+    tool_context: ToolContext | None,
+    input_provenance: Mapping[str, Any] | None,
+) -> ControlTerminalReason | None:
+    """Classify only explicit control signals, keeping provider failures retryable."""
+
+    if (
+        execution_context is not None
+        and execution_context.deadline is not None
+        and time.monotonic() >= execution_context.deadline
+    ):
+        return ControlTerminalReason.HARD_DEADLINE
+
+    if isinstance(exc, TimeoutError):
+        tagged_deadline = getattr(
+            exc,
+            "_opensquilla_stream_deadline_at_monotonic",
+            None,
+        )
+        if (
+            isinstance(tagged_deadline, int | float)
+            and not isinstance(tagged_deadline, bool)
+            and time.monotonic() >= float(tagged_deadline)
+        ):
+            return ControlTerminalReason.HARD_DEADLINE
+        if (
+            execution_context is not None
+            and execution_context.deadline is not None
+            and time.monotonic() >= execution_context.deadline
+        ):
+            return ControlTerminalReason.HARD_DEADLINE
+
+    candidates: list[Any] = [
+        getattr(exc, "control_terminal_reason", None),
+        getattr(exc, "terminal_reason", None),
+        getattr(exc, "code", None),
+    ]
+    if isinstance(input_provenance, Mapping):
+        candidates.extend(
+            input_provenance.get(key)
+            for key in ("control_terminal_reason", "terminal_reason", "cancel_source")
+        )
+    for owner in (
+        execution_context.control if execution_context is not None else None,
+        getattr(tool_context, "turn_control", None),
+        getattr(tool_context, "control", None),
+    ):
+        if owner is None:
+            continue
+        if callable(owner):
+            try:
+                if bool(owner()):
+                    return ControlTerminalReason.CANCEL
+            except Exception:  # noqa: BLE001 - classification must stay fail-closed
+                return ControlTerminalReason.CANCEL
+        candidates.extend(
+            getattr(owner, key, None)
+            for key in (
+                "control_terminal_reason",
+                "terminal_reason",
+                "cancel_source",
+                "source",
+                "code",
+            )
+        )
+        for key, reason in (
+            ("shutdown", ControlTerminalReason.SHUTDOWN),
+            ("platform_validation", ControlTerminalReason.PLATFORM_VALIDATION),
+            ("platform_safety", ControlTerminalReason.PLATFORM_SAFETY),
+        ):
+            if getattr(owner, key, False) is True:
+                return reason
+    for candidate in candidates:
+        classified_reason = _control_terminal_reason_value(candidate)
+        if classified_reason is not None:
+            return classified_reason
+
+    if isinstance(exc, asyncio.CancelledError):
+        return ControlTerminalReason.CANCEL
+    return None
 
 
 def _durable_compaction_window_tokens(
@@ -2602,14 +2743,23 @@ class _SelectorFallbackProvider:
         messages: list[Any],
         tools: Any = None,
         config: Any = None,
+        *,
+        execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[Any]:
-        return self._chat(messages, tools=tools, config=config)
+        return self._chat(
+            messages,
+            tools=tools,
+            config=config,
+            execution_context=execution_context,
+        )
 
     async def _chat(
         self,
         messages: list[Any],
         tools: Any = None,
         config: Any = None,
+        *,
+        execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[Any]:
         validation_error = validate_provider_chat_request(self._provider, messages)
         if validation_error is not None:
@@ -2636,13 +2786,15 @@ class _SelectorFallbackProvider:
             0,
             int(getattr(active_config, "physical_attempt_limit", 0) or 0),
         )
+        primary_chat_kwargs: dict[str, Any] = {
+            "tools": tools,
+            "config": active_config,
+        }
+        if getattr(active_provider, "execution_context_aware", False):
+            primary_chat_kwargs["execution_context"] = execution_context
         primary_stream = account_provider_stream(
             lambda: _selector_safe_stream(
-                lambda: active_provider.chat(
-                    messages,
-                    tools=tools,
-                    config=active_config,
-                ),
+                lambda: active_provider.chat(messages, **primary_chat_kwargs),
                 content_started=lambda: emitted_user_visible_content,
             ),
             provider=active_provider_id,
@@ -2660,8 +2812,15 @@ class _SelectorFallbackProvider:
                         ProviderActivityEvent,
                         ProviderHeartbeatEvent,
                         ProviderEnsembleProgressEvent,
+                        ProviderGenerationResetEvent,
                     ),
                 ):
+                    # A generation reset is an ordering barrier, not ordinary
+                    # pre-text metadata.  Yield it before pulling the next
+                    # upstream item so TurnExecutionContext advances epochs
+                    # before the replacement provider can stamp its first
+                    # text chunk.  Buffering it until that first chunk loses
+                    # the chunk as a late event from the old generation.
                     yield event
                     continue
                 if isinstance(event, ProviderErrorEvent):
@@ -2885,6 +3044,15 @@ class _SelectorFallbackProvider:
                                 messages,
                                 tools=tools,
                                 config=fallback_config,
+                                **(
+                                    {"execution_context": execution_context}
+                                    if getattr(
+                                        fallback_provider,
+                                        "execution_context_aware",
+                                        False,
+                                    )
+                                    else {}
+                                ),
                             ),
                             content_started=lambda: fallback_committed,
                         ),
@@ -4422,6 +4590,7 @@ class TurnRunner:
         document_mutation_outcome_sink: Callable[[dict[str, Any]], None] | None = None,
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        assistant_message_id: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run one agent turn with full orchestration.
 
@@ -4461,6 +4630,23 @@ class TurnRunner:
             ),
         )
         configured_state_dir = getattr(self._turn_config(), "state_dir", None)
+        logical_turn_id = (
+            root_turn_id.strip()
+            if isinstance(root_turn_id, str) and root_turn_id.strip()
+            else uuid.uuid4().hex
+        )
+        execution_context = create_turn_execution_context(
+            turn_id=logical_turn_id,
+            session_key=session_key,
+            channel_id=getattr(effective_tool_context, "channel_id", None),
+            assistant_message_id=assistant_message_id,
+            control=(
+                getattr(effective_tool_context, "turn_control", None)
+                or getattr(effective_tool_context, "control", None)
+            ),
+            deadline=_deadline_from_timeout(timeout),
+            surface=surface_capabilities_for_tool_context(effective_tool_context),
+        )
         # Planning is deliberately ephemeral analysis: it may inspect durable
         # memory, but the planning conversation itself must not be harvested
         # into long-lived memory. The frozen collaboration mode is authoritative
@@ -4511,12 +4697,15 @@ class TurnRunner:
                         bound_user_message_id=bound_user_message_id,
                         assistant_message_sink=assistant_message_sink,
                         document_mutation_outcome_sink=document_mutation_outcome_sink,
-                        root_turn_id=root_turn_id,
+                        root_turn_id=logical_turn_id,
                         provider_request_correlation=provider_request_correlation,
+                        assistant_message_id=assistant_message_id,
+                        execution_context=execution_context,
                     ):
                         yield event
             finally:
                 self.clear_compaction_turn_state(session_key)
+                await execution_context.close()
         else:
             async with lock:
                 # Record this Task as the lock owner in the ContextVar so that
@@ -4558,13 +4747,16 @@ class TurnRunner:
                             bound_user_message_id=bound_user_message_id,
                             assistant_message_sink=assistant_message_sink,
                             document_mutation_outcome_sink=document_mutation_outcome_sink,
-                            root_turn_id=root_turn_id,
+                            root_turn_id=logical_turn_id,
                             provider_request_correlation=provider_request_correlation,
+                            assistant_message_id=assistant_message_id,
+                            execution_context=execution_context,
                         ):
                             yield event
                 finally:
                     self.clear_compaction_turn_state(session_key)
                     _SESSION_LOCK_OWNER.reset(_token)
+                    await execution_context.close()
 
     async def _run_turn(
         self,
@@ -4601,15 +4793,32 @@ class TurnRunner:
         document_mutation_outcome_sink: Callable[[dict[str, Any]], None] | None = None,
         root_turn_id: str | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        assistant_message_id: str | None = None,
+        execution_context: TurnExecutionContext | None = None,
     ) -> AsyncIterator[AgentEvent]:
         # Observability: bracket turn setup + stream loop with monotonic clock
         # so latency_ms reflects the full turn.
         turn_started_at = time.monotonic()
-        turn_id = (
-            root_turn_id.strip()
-            if isinstance(root_turn_id, str) and root_turn_id.strip()
-            else uuid.uuid4().hex
-        )
+        if execution_context is None:
+            turn_id = (
+                root_turn_id.strip()
+                if isinstance(root_turn_id, str) and root_turn_id.strip()
+                else uuid.uuid4().hex
+            )
+            execution_context = create_turn_execution_context(
+                turn_id=turn_id,
+                session_key=session_key,
+                channel_id=getattr(tool_context, "channel_id", None),
+                assistant_message_id=assistant_message_id,
+                control=(
+                    getattr(tool_context, "turn_control", None)
+                    or getattr(tool_context, "control", None)
+                ),
+                deadline=_deadline_from_timeout(timeout),
+                surface=surface_capabilities_for_tool_context(tool_context),
+            )
+        else:
+            turn_id = execution_context.identity.turn_id
         correlation_seed = provider_request_correlation
         is_subagent_run = str(run_kind or "").strip().lower() == "subagent"
         root_call_kind = "subagent.chat" if is_subagent_run else "agent.chat"
@@ -4964,6 +5173,7 @@ class TurnRunner:
                     run_kind=run_kind,
                     session_epoch=self._usage_session_epoch_by_key.get(session_key, 0),
                     provider_request_correlation=provider_request_correlation,
+                    execution_context=execution_context,
                 )
             )
             ab_out = ab_outcome.require_output()
@@ -5008,6 +5218,10 @@ class TurnRunner:
             # These locals are read by the test_agent_bootstrap_stage_snapshot
             # frame-walking probe. Do not remove.
             effective_runtime_timeout = ab_out.effective_runtime_timeout  # noqa: F841
+            set_execution_deadline_if_missing(
+                execution_context,
+                effective_runtime_timeout,
+            )
             effective_max_iterations = ab_out.effective_max_iterations  # noqa: F841
             effective_max_iterations_source = ab_out.effective_max_iterations_source  # noqa: F841
             effective_iteration_timeout = ab_out.effective_iteration_timeout  # noqa: F841
@@ -5553,6 +5767,7 @@ class TurnRunner:
                     compaction_source_boundary_entry_id
                 ),
                 input_mode=input_mode,
+                execution_context=execution_context,
             )
             router_control_replay_event: RouterControlReplayEvent | None = None
             with bind_usage_accounting_scope(turn_usage_scope):
@@ -5596,6 +5811,8 @@ class TurnRunner:
                     document_mutation_outcome_sink=document_mutation_outcome_sink,
                     root_turn_id=turn_id,
                     provider_request_correlation=provider_request_correlation,
+                    assistant_message_id=assistant_message_id,
+                    execution_context=execution_context,
                 ):
                     yield replayed_event
                 return
@@ -5653,6 +5870,10 @@ class TurnRunner:
                     run_kind=run_kind,
                     heartbeat_ack_max_chars=heartbeat_ack_max_chars,
                     no_memory_capture=no_memory_capture,
+                    assistant_message_id=execution_context.identity.assistant_message_id,
+                    execution_context=execution_context,
+                    publication_ledger=execution_context.publication_ledger,
+                    terminal_generation_reset=stream_state.terminal_generation_reset,
                 )
             )
             fin_out = fin_outcome.require_output()
@@ -5784,10 +6005,13 @@ class TurnRunner:
                 turn_obj=turn_obj,
                 message=message,
             )
-            if pending_error_event is not None:
+            if (
+                pending_error_event is not None
+                and not stream_state.terminal_generation_reset
+            ):
                 yield pending_error_event
 
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             # Preserve whatever assistant text has already streamed back. The
             # typed turn outcome is the sole source of cancellation state; do
             # not synthesize an assistant interruption marker into transcript
@@ -5928,6 +6152,9 @@ class TurnRunner:
                         "content": body,
                         "tool_calls": turn_segments if turn_segments else None,
                         "reasoning_content": reasoning_content or None,
+                        "assistant_message_id": (
+                            execution_context.identity.assistant_message_id
+                        ),
                     }
                     append_message = self._session_manager.append_message
                     if _accepts_keyword_arg(append_message, "turn_usage"):
@@ -5943,6 +6170,10 @@ class TurnRunner:
                             session_key,
                             **append_kwargs,
                         )
+                    )
+                    execution_context.publish_visible(
+                        text=body,
+                        generation_epoch=execution_context.generation_epoch,
                     )
                     log.info(
                         "turn_runner.cancelled_partial_persisted",
@@ -6007,12 +6238,38 @@ class TurnRunner:
                     seq=2,
                     payload={"partial_text_chars": len(partial_text)},
                 )
+            control_reason = _control_terminal_reason_for_exception(
+                exc,
+                execution_context,
+                tool_context,
+                input_provenance,
+            )
+            control_event = control_terminal_event_for_context(
+                execution_context,
+                control_reason or ControlTerminalReason.CANCEL,
+            )
+            if control_event is not None:
+                yield control_event
             raise
 
         except Exception as exc:
             provider_boundary_failure_kind = str(
                 getattr(exc, "failure_kind", "") or ""
             ).strip()
+            control_reason = _control_terminal_reason_for_exception(
+                exc,
+                execution_context,
+                tool_context,
+                input_provenance,
+            )
+            if control_reason is not None:
+                control_event = control_terminal_event_for_context(
+                    execution_context,
+                    control_reason,
+                )
+                if control_event is not None:
+                    yield control_event
+                return
             error_code, error_message = sanitize_agent_error(
                 {
                     "status": "failed",
@@ -6404,6 +6661,8 @@ class TurnRunner:
         self,
         session_key: str,
         event: ErrorEvent | None,
+        *,
+        append_transcript: bool = True,
     ) -> None:
         """Best-effort durable transcript record for terminal turn errors."""
         if self._session_manager is None or event is None:
@@ -6439,6 +6698,13 @@ class TurnRunner:
                 model=None,
                 fallback_hops=0,
             )
+        if not append_transcript:
+            log.info(
+                "turn_runner.error_recorded_without_transcript_append",
+                session_key=session_key,
+                code=event_code,
+            )
+            return
         outcome_details = turn_outcome_details(
             outcome_from_error(
                 code=event_code,
@@ -8509,8 +8775,242 @@ class TurnRunner:
             pipeline_steps.insert(-4, meta_command_launch)
         turn = await run_pipeline(turn, pipeline_steps)
 
-        # Apply routed model back to cloned selector (local, not shared)
-        if turn.model and cloned_selector is not None:
+        # Image routing is a capability boundary, not an Ensemble activation.
+        # This applies to the dedicated image row and to any text tier selected
+        # as the image-capable fallback.  Resolve that deployment through the
+        # normal selector path before touching fixed-fallback or fusion state.
+        if (
+            turn.metadata.get("routing_applied") is True
+            and str(turn.metadata.get("routing_source") or "") == "image_route"
+        ):
+            if turn.model and cloned_selector is not None:
+                from opensquilla.engine.selector_override import (
+                    apply_model_override,
+                    cross_provider_tier_config,
+                )
+
+                provider = apply_model_override(
+                    cloned_selector,
+                    turn.model,
+                    turn_metadata=turn.metadata,
+                    realign_routed_model=False,
+                    tier_provider_config=cross_provider_tier_config(
+                        self._turn_config(),
+                        turn.metadata,
+                        turn.model,
+                        active_provider_id=getattr(
+                            cloned_selector,
+                            "active_provider_id",
+                            "",
+                        ),
+                        session_key=turn.session_key,
+                    ),
+                )
+            return turn, provider
+
+        ensemble_cfg = getattr(self._turn_config(), "llm_ensemble", None)
+        # Resolve the tier's execution contract before changing the selector.
+        # A shared tier uses C3 only as the logical trigger for the one global
+        # ``llm_ensemble`` plan. Its physical baseline remains the configured
+        # direct/fallback deployment, so wrapper skips and Ensemble's internal
+        # single-model fallback cannot accidentally run the tier-local model.
+        tier_ensemble_mode = ""
+        tier_ensemble_binding = "single"
+        configured_selection_mode = effective_ensemble_selection_mode(
+            self._turn_config()
+        )
+        if bool(turn.metadata.get("routing_applied", False)):
+            tier_ensemble_mode, tier_ensemble_binding = tier_ensemble_execution(
+                getattr(router_cfg, "tiers", None),
+                turn.metadata.get("routed_tier"),
+                shared_selection_mode=configured_selection_mode,
+            )
+        ensemble_globally_enabled = bool(getattr(ensemble_cfg, "enabled", False))
+        # Retained pre-boolean tier modes remain authoritative for upgrade
+        # compatibility.  ``tier_ensemble_execution`` already makes either
+        # explicit boolean value win over that legacy field.
+        selection_mode = tier_ensemble_mode or configured_selection_mode
+        # Every active Ensemble uses the configured fixed/direct deployment as
+        # its physical baseline and all-failed fallback. Legacy tier-local
+        # selection modes remain readable and still choose their historical
+        # plan/lineup, but they no longer own a second hidden fallback model.
+        fixed_baseline_ensemble = bool(
+            ensemble_globally_enabled or tier_ensemble_mode
+        )
+        if fixed_baseline_ensemble:
+            fixed_provider = str(
+                getattr(initial_provider_config, "provider", "") or ""
+            ).strip()
+            fixed_model = str(
+                getattr(initial_provider_config, "model", "") or ""
+            ).strip()
+            if not fixed_provider or not fixed_model:
+                log.error(
+                    "llm_ensemble.missing_fixed_fallback",
+                    provider=fixed_provider,
+                    model_configured=bool(fixed_model),
+                )
+                turn.metadata["ensemble_wrap_skipped_reason"] = "missing_fixed_fallback"
+                raise RuntimeError(
+                    "missing_fixed_fallback: configure a non-empty fixed/direct "
+                    "provider and model before enabling multi-model fusion"
+                )
+            turn.metadata["ensemble_fallback_provider"] = fixed_provider
+            turn.metadata["ensemble_fallback_model"] = fixed_model
+
+            # Static/custom plans own their members' reasoning policy.  The
+            # tier value remains stored as the reversible single-model draft,
+            # but must not leak into the shared plan.  Legacy router_dynamic
+            # continues to derive per-member thinking from its tier rows.
+            if (
+                selection_mode != ROUTER_DYNAMIC_SELECTION_MODE
+                and turn.metadata.get("thinking_source") == "squilla_router_tier"
+            ):
+                turn.metadata.pop("thinking_requested", None)
+                turn.metadata.pop("thinking_level", None)
+                turn.metadata.pop("thinking_source", None)
+
+        routed_plan_provider_config = None
+        routed_plan_blocked_reason = ""
+
+        def _record_fixed_ensemble_execution(reason: str) -> None:
+            """Stamp a wrapper skip as an actual fixed-model execution."""
+
+            if not fixed_baseline_ensemble or initial_provider_config is None:
+                return
+            provider_id = str(
+                getattr(initial_provider_config, "provider", "") or ""
+            )
+            model_id = str(getattr(initial_provider_config, "model", "") or "")
+            turn.metadata["executed_provider"] = provider_id
+            turn.metadata["executed_model"] = model_id
+            turn.metadata["ensemble_fallback_provider"] = provider_id
+            turn.metadata["ensemble_fallback_model"] = model_id
+            turn.metadata["ensemble_fallback_reason"] = reason
+            turn.metadata["routed_provider_fallback_provider"] = provider_id
+            turn.metadata["routed_provider_fallback_model"] = model_id
+            turn.metadata["routed_provider_fallback_reason"] = reason
+            for key in (
+                "savings_pct",
+                "savings_max_price_per_m",
+                "savings_routed_price_per_m",
+            ):
+                if key in turn.metadata:
+                    turn.metadata[key] = 0.0
+        routed_plan_owns_tier = (
+            selection_mode == ROUTER_DYNAMIC_SELECTION_MODE
+            or tier_ensemble_binding == "legacy"
+        )
+        if (
+            fixed_baseline_ensemble
+            and routed_plan_owns_tier
+            and turn.metadata.get("routing_applied") is True
+            and turn.model
+            and initial_provider_config is not None
+            and cloned_selector is not None
+        ):
+            from opensquilla.engine.selector_override import (
+                cross_provider_tier_config,
+            )
+
+            routed_plan_config = cross_provider_tier_config(
+                self._turn_config(),
+                turn.metadata,
+                turn.model,
+                active_provider_id=getattr(cloned_selector, "active_provider_id", ""),
+                session_key=turn.session_key,
+            )
+            if turn.metadata.get("routed_provider_blocked"):
+                # A blocked foreign route is not a fixed-model dynamic anchor.
+                # Skip this turn's wrapper and execute the fixed deployment
+                # directly; otherwise the trace would claim a dynamic plan ran
+                # even though its Router-selected member was unavailable.
+                routed_plan_blocked_reason = str(
+                    turn.metadata.get("routed_provider_blocked")
+                    or "routed_plan_provider_blocked"
+                )
+                turn.metadata["ensemble_anchor_blocked_reason"] = (
+                    routed_plan_blocked_reason
+                )
+                turn.metadata["ensemble_anchor_provider_resolution"] = (
+                    turn.metadata.get("routed_provider_resolution")
+                    or {
+                        "provider": str(
+                            turn.metadata.get("routed_provider") or ""
+                        ),
+                        "model": str(turn.model or ""),
+                        "ready": False,
+                        "reason": routed_plan_blocked_reason,
+                    }
+                )
+                turn.metadata["routed_provider_fallback_provider"] = str(
+                    getattr(initial_provider_config, "provider", "") or ""
+                )
+                turn.metadata["routed_provider_fallback_model"] = str(
+                    getattr(initial_provider_config, "model", "") or ""
+                )
+            elif routed_plan_config is not None:
+                routed_plan_provider_config = routed_plan_config
+            else:
+                # Same-provider and the default cross-provider flag-only
+                # policy execute the final routed model on the active
+                # deployment. Build that plan identity without mutating the
+                # selector, whose head remains the global fixed fallback.
+                routed_plan_provider_config = replace(
+                    initial_provider_config,
+                    model=str(turn.model),
+                    provider_routing=dict(initial_provider_config.provider_routing),
+                )
+            if routed_plan_provider_config is not None:
+                turn.metadata["ensemble_anchor_provider"] = str(
+                    getattr(routed_plan_provider_config, "provider", "") or ""
+                )
+                turn.metadata["ensemble_anchor_model"] = str(
+                    getattr(routed_plan_provider_config, "model", "") or ""
+                )
+                if turn.metadata.get("routed_provider_resolution") is not None:
+                    turn.metadata["ensemble_anchor_provider_resolution"] = (
+                        turn.metadata.get("routed_provider_resolution")
+                    )
+                else:
+                    routed_provider = str(
+                        turn.metadata.get("routed_provider") or ""
+                    ).strip().lower()
+                    active_provider = str(
+                        getattr(initial_provider_config, "provider", "") or ""
+                    ).strip().lower()
+                    turn.metadata["ensemble_anchor_provider_resolution"] = {
+                        "provider": str(
+                            getattr(routed_plan_provider_config, "provider", "") or ""
+                        ),
+                        "model": str(
+                            getattr(routed_plan_provider_config, "model", "") or ""
+                        ),
+                        "ready": True,
+                        "reason": (
+                            "same_provider"
+                            if not routed_provider or routed_provider == active_provider
+                            else "active_provider_route"
+                        ),
+                    }
+        if fixed_baseline_ensemble:
+            routed_model = str(turn.model or "").strip()
+            if routed_model:
+                turn.metadata.setdefault("routed_model", routed_model)
+                turn.metadata["routed_model_before_ensemble"] = routed_model
+            if initial_provider_config is not None:
+                # ``turn.model`` feeds AgentConfig and request-budget/catalog
+                # resolution after this method returns. Keep that physical
+                # identity aligned with the selector/provider that will really
+                # serve the direct fallback; ``routed_model`` above preserves
+                # the logical Router decision for RouterDecisionEvent.
+                turn.model = str(getattr(initial_provider_config, "model", "") or "")
+
+        # Apply a routed model back to the cloned selector only when the tier
+        # owns a physical single-model deployment. Shared and globally enabled
+        # Ensemble turns leave the configured global head and fallback chain
+        # untouched.
+        if turn.model and cloned_selector is not None and not fixed_baseline_ensemble:
             from opensquilla.engine.selector_override import (
                 apply_model_override,
                 cross_provider_tier_config,
@@ -8530,7 +9030,6 @@ class TurnRunner:
                 ),
             )
 
-        ensemble_cfg = getattr(self._turn_config(), "llm_ensemble", None)
         artifact_ensemble_bypass = _artifact_ensemble_bypass_reason(turn.metadata)
         artifact_requires_aggregator_ensemble = (
             _artifact_requires_aggregator_only_ensemble(turn.metadata)
@@ -8538,11 +9037,12 @@ class TurnRunner:
 
         def record_ensemble_unavailable(reason: str) -> None:
             turn.metadata["ensemble_wrap_skipped_reason"] = reason
+            _record_fixed_ensemble_execution(reason)
             if artifact_requires_aggregator_ensemble:
                 raise RuntimeError(f"artifact_ensemble_unavailable:{reason}")
 
         if artifact_ensemble_bypass is not None:
-            turn.metadata["ensemble_wrap_skipped_reason"] = artifact_ensemble_bypass
+            record_ensemble_unavailable(artifact_ensemble_bypass)
         if (
             provider is None
             and getattr(ensemble_cfg, "enabled", False)
@@ -8551,7 +9051,7 @@ class TurnRunner:
             record_ensemble_unavailable("missing_primary_provider")
         if (
             provider is not None
-            and getattr(ensemble_cfg, "enabled", False)
+            and (ensemble_globally_enabled or tier_ensemble_mode)
             and artifact_ensemble_bypass is None
         ):
             from opensquilla.engine.selector_override import (
@@ -8559,10 +9059,9 @@ class TurnRunner:
                 report_profile_credential_failure,
             )
             from opensquilla.provider.ensemble import (
-                CUSTOM_B5_SELECTION_MODE,
                 build_ensemble_provider_from_config,
+                custom_b5_lineup_ready,
                 static_b5_credential_available,
-                static_b5_profile,
             )
 
             current_provider_config = (
@@ -8570,22 +9069,59 @@ class TurnRunner:
                 if cloned_selector is not None
                 else None
             )
-            selection_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
-            # The shared deployment resolver marks an unexecutable member
-            # unavailable before any network call. Keep the ensemble wrapper so
-            # custom lineups can retain quorum semantics when only one provider
-            # is unavailable; only a structurally empty lineup is rejected here.
-            custom_has_proposer = (
-                any(
-                    getattr(candidate, "enabled", True) is not False
-                    and str(getattr(candidate, "provider", "") or "").strip()
-                    and str(getattr(candidate, "model", "") or "").strip()
-                    and str(getattr(candidate, "role", "") or "").strip().lower()
-                    != "aggregator"
-                    for candidate in (getattr(ensemble_cfg, "candidates", None) or [])
+            plan_provider_config = (
+                initial_provider_config
+                if tier_ensemble_binding == "shared"
+                and initial_provider_config is not None
+                else current_provider_config
+            )
+            if routed_plan_provider_config is not None:
+                plan_provider_config = routed_plan_provider_config
+            if static_b5_profile(selection_mode) is None and selection_mode not in {
+                CUSTOM_B5_SELECTION_MODE,
+                ROUTER_DYNAMIC_SELECTION_MODE,
+            }:
+                log.warning(
+                    "llm_ensemble.wrap_skipped",
+                    reason=f"unsupported_tier_selection_mode:{selection_mode}",
+                )
+                turn.metadata["ensemble_wrap_skipped_reason"] = (
+                    f"unsupported_tier_selection_mode:{selection_mode}"
+                )
+                _record_fixed_ensemble_execution(
+                    str(turn.metadata["ensemble_wrap_skipped_reason"])
+                )
+                return turn, provider
+            if routed_plan_blocked_reason:
+                blocked_prefix = (
+                    "router_dynamic_not_ready"
+                    if selection_mode == ROUTER_DYNAMIC_SELECTION_MODE
+                    else "tier_ensemble_not_ready"
+                )
+                log.warning(
+                    "llm_ensemble.wrap_skipped",
+                    reason=f"{blocked_prefix}:{routed_plan_blocked_reason}",
+                )
+                turn.metadata["ensemble_wrap_skipped_reason"] = (
+                    f"{blocked_prefix}:{routed_plan_blocked_reason}"
+                )
+                _record_fixed_ensemble_execution(
+                    str(turn.metadata["ensemble_wrap_skipped_reason"])
+                )
+                return turn, provider
+            # A custom plan is one saved lineup.  Preflight every deployment
+            # with the same session credential resolver used by construction;
+            # a partial saved lineup must fall back before any member call,
+            # matching the configuration/runtime status contract.
+            custom_lineup_ready, custom_lineup_blocked_reason = (
+                custom_b5_lineup_ready(
+                    self._turn_config(),
+                    plan_provider_config,
+                    credential_pool_acquirer=acquire_profile_credential,
+                    session_key=turn.session_key,
                 )
                 if selection_mode == CUSTOM_B5_SELECTION_MODE
-                else True
+                else (True, "")
             )
             if current_provider_config is None:
                 log.warning(
@@ -8610,7 +9146,7 @@ class TurnRunner:
             elif static_b5_profile(selection_mode) is not None and not (
                 static_b5_credential_available(
                     self._turn_config(),
-                    current_provider_config,
+                    plan_provider_config,
                     selection_mode,
                 )
             ):
@@ -8629,23 +9165,39 @@ class TurnRunner:
                     f"{selection_mode}_no_credential"
                 )
                 record_ensemble_unavailable(f"{selection_mode}_no_credential")
-            elif not custom_has_proposer:
+            elif not custom_lineup_ready:
                 log.warning(
                     "llm_ensemble.wrap_skipped",
-                    reason=f"{selection_mode}_not_ready:no_proposers",
+                    reason=(
+                        f"{selection_mode}_not_ready:"
+                        f"{custom_lineup_blocked_reason or 'deployment_unavailable'}"
+                    ),
                 )
                 turn.metadata["ensemble_wrap_skipped_reason"] = (
-                    f"{selection_mode}_not_ready:no_proposers"
+                    f"{selection_mode}_not_ready:"
+                    f"{custom_lineup_blocked_reason or 'deployment_unavailable'}"
                 )
                 record_ensemble_unavailable(
-                    f"{selection_mode}_not_ready:no_proposers"
+                    str(turn.metadata["ensemble_wrap_skipped_reason"])
                 )
             else:
                 turn.metadata["ensemble_enabled"] = True
-                turn.metadata["routed_model_before_ensemble"] = (
-                    turn.model or getattr(current_provider_config, "model", "")
+                tier_scoped_ensemble = bool(tier_ensemble_mode) and (
+                    not ensemble_globally_enabled
+                    or tier_ensemble_binding == "legacy"
                 )
-                provider = build_ensemble_provider_from_config(
+                turn.metadata["ensemble_activation_source"] = (
+                    "router_tier" if tier_scoped_ensemble else "global"
+                )
+                if tier_scoped_ensemble:
+                    turn.metadata["ensemble_tier_binding"] = tier_ensemble_binding
+                turn.metadata["ensemble_selection_mode"] = selection_mode
+                turn.metadata.setdefault(
+                    "routed_model_before_ensemble",
+                    turn.model or getattr(current_provider_config, "model", ""),
+                )
+                fixed_provider = provider
+                ensemble_provider = build_ensemble_provider_from_config(
                     config=self._turn_config(),
                     inherited_provider_config=current_provider_config,
                     fallback_provider=provider,
@@ -8662,7 +9214,50 @@ class TurnRunner:
                     _session_key=turn.session_key,
                     _fallback_selector=cloned_selector,
                     _artifact_mutation=artifact_requires_aggregator_ensemble,
+                    _selection_mode_override=selection_mode,
+                    _plan_provider_config=plan_provider_config,
+                    _dynamic_baseline_provider_config=initial_provider_config,
+                    _defer_provider_state_replay_activation=True,
                 )
+                blocked_dynamic_candidates = (
+                    list(
+                        getattr(ensemble_provider, "selection_plan", {}).get(
+                            "blocked_tier_candidates",
+                            [],
+                        )
+                    )
+                    if selection_mode == ROUTER_DYNAMIC_SELECTION_MODE
+                    else []
+                )
+                unavailable_dynamic_candidates = [
+                    row
+                    for row in blocked_dynamic_candidates
+                    if isinstance(row, dict)
+                    and str(row.get("reason") or "") != "cross_provider_veto"
+                ]
+                if unavailable_dynamic_candidates:
+                    blocked_reason = str(
+                        unavailable_dynamic_candidates[0].get("reason")
+                        or "dynamic_member_unavailable"
+                    )
+                    skip_reason = f"router_dynamic_not_ready:{blocked_reason}"
+                    log.warning(
+                        "llm_ensemble.wrap_skipped",
+                        reason=skip_reason,
+                    )
+                    turn.metadata["ensemble_dynamic_blocked_reason"] = blocked_reason
+                    turn.metadata["ensemble_dynamic_blocked_candidates"] = (
+                        unavailable_dynamic_candidates
+                    )
+                    turn.metadata["ensemble_wrap_skipped_reason"] = skip_reason
+                    turn.metadata.pop("ensemble_enabled", None)
+                    turn.metadata.pop("ensemble_activation_source", None)
+                    turn.metadata.pop("ensemble_tier_binding", None)
+                    _record_fixed_ensemble_execution(skip_reason)
+                    provider = fixed_provider
+                else:
+                    ensemble_provider.activate_provider_state_replay_boundary()
+                    provider = ensemble_provider
 
         return turn, provider
 

@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from collections.abc import Collection, Mapping
+from dataclasses import asdict
+from typing import Annotated, Any, Literal, cast
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
+
+from opensquilla.contracts.gateway_transport import ANSWER_GENERATION_RESET_CAPABILITY
+from opensquilla.contracts.turn_execution import StickyExecutionRole
+from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
+    ControlTerminalEvent,
+    ControlTerminalReason,
+)
+from opensquilla.provider.types import ProviderAttemptFailure
+from opensquilla.redaction import redact_error_text
 
 # Protocol version negotiated during handshake
 PROTOCOL_VERSION = 4
@@ -23,6 +35,189 @@ DEDUPE_MAX_ENTRIES = 1000
 
 # Graceful shutdown WS close code
 WS_CLOSE_SERVICE_RESTART = 1012
+
+
+# ---------------------------------------------------------------------------
+# Typed session-event payloads
+# ---------------------------------------------------------------------------
+
+
+class ProviderAttemptFailureWire(BaseModel):
+    """Trusted/internal serialization shape for one provider attempt failure.
+
+    This model is intentionally not included in ``PublicEventPayload``.  It
+    exists so trusted coordinators can persist or inspect a redacted failure
+    without making provider diagnostics a public session event by default.
+    Unknown fields are ignored so a newer internal producer cannot accidentally
+    widen the wire shape with a raw provider payload.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    kind: Literal["provider_attempt_failure"] = "provider_attempt_failure"
+    turn_id: str = ""
+    assistant_message_id: str = ""
+    role: StickyExecutionRole = StickyExecutionRole.PRIMARY_AGGREGATOR
+    logical_call_index: int = Field(default=0, ge=0)
+    attempt_index: int = Field(default=0, ge=0)
+    lease_id: str = ""
+    provider: str = ""
+    model: str = ""
+    failure_kind: str = "unknown"
+    retryable: bool = False
+    request_started: bool = False
+    safe_message: str = ""
+    generation_epoch: int = Field(default=0, ge=0)
+    sequence: int = Field(default=0, ge=0)
+
+    @field_validator("safe_message")
+    @classmethod
+    def _keep_message_safe(cls, value: str) -> str:
+        return redact_error_text(value)
+
+
+class AnswerGenerationResetWire(BaseModel):
+    """Public same-message generation replacement payload."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    kind: Literal["answer_generation_reset"] = "answer_generation_reset"
+    turn_id: str = ""
+    assistant_message_id: str = ""
+    old_generation_epoch: int = Field(default=0, ge=0)
+    new_generation_epoch: int = Field(default=0, ge=0)
+    from_role: StickyExecutionRole = StickyExecutionRole.PRIMARY_AGGREGATOR
+    to_role: StickyExecutionRole = StickyExecutionRole.PRIMARY_AGGREGATOR
+    safe_reason: str = ""
+    preserve_completed_tools: bool = True
+    authoritative_text_snapshot: str = ""
+    authoritative_reasoning_snapshot: str = ""
+    sequence: int = Field(default=0, ge=0)
+    terminal: bool = False
+    terminal_text_snapshot: str | None = None
+
+
+class ControlTerminalWire(BaseModel):
+    """Public control-owned terminal payload."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    kind: Literal["control_terminal"] = "control_terminal"
+    turn_id: str = ""
+    assistant_message_id: str = ""
+    sequence: int = Field(default=0, ge=0)
+    reason: ControlTerminalReason = ControlTerminalReason.CANCEL
+    preserve_completed_tools: Literal[True] = True
+    terminal: Literal[True] = True
+
+
+# Naming aliases keep the event-payload terminology available to callers while
+# retaining the explicit ``Wire`` names used by this module's frame types.
+ProviderAttemptFailurePayload = ProviderAttemptFailureWire
+AnswerGenerationResetPayload = AnswerGenerationResetWire
+ControlTerminalPayload = ControlTerminalWire
+
+type PublicEventPayload = Annotated[
+    AnswerGenerationResetWire | ControlTerminalWire,
+    Field(discriminator="kind"),
+]
+type PublicEvent = AnswerGenerationResetEvent | ControlTerminalEvent
+
+_PUBLIC_EVENT_ADAPTER: TypeAdapter[PublicEventPayload] = TypeAdapter(PublicEventPayload)
+
+_ANSWER_GENERATION_RESET_EVENT = "session.event.answer_generation_reset"
+_LEGACY_ERROR_EVENT = "session.event.error"
+_INTERNAL_TERMINAL_RESET_FIELDS = frozenset(
+    {
+        "terminal_error_message",
+        "terminal_error_code",
+        "terminal_failure_kind",
+    }
+)
+
+
+def is_public_event(event: object) -> bool:
+    """Return whether an event is allowed on the public session-event plane."""
+
+    return isinstance(event, (AnswerGenerationResetEvent, ControlTerminalEvent))
+
+
+def serialize_public_event(event: PublicEvent) -> dict[str, Any]:
+    """Serialize a public typed event without exposing provider diagnostics."""
+
+    if isinstance(event, AnswerGenerationResetEvent):
+        return AnswerGenerationResetWire.model_validate(asdict(event)).model_dump(mode="json")
+    if isinstance(event, ControlTerminalEvent):
+        return ControlTerminalWire.model_validate(asdict(event)).model_dump(mode="json")
+    raise TypeError(f"event is not public: {type(event).__name__}")
+
+
+def serialize_provider_attempt_failure(event: ProviderAttemptFailure) -> dict[str, Any]:
+    """Serialize an internal failure for trusted diagnostics only.
+
+    This is deliberately separate from :func:`serialize_public_event`; a
+    caller must opt into the internal shape explicitly.
+    """
+
+    if not isinstance(event, ProviderAttemptFailure):
+        raise TypeError(f"event is not a ProviderAttemptFailure: {type(event).__name__}")
+    return ProviderAttemptFailureWire.model_validate(asdict(event)).model_dump(mode="json")
+
+
+def deserialize_public_event(payload: Mapping[str, Any]) -> PublicEventPayload:
+    """Validate a public typed event payload from a decoded wire frame."""
+
+    return cast(PublicEventPayload, _PUBLIC_EVENT_ADAPTER.validate_python(dict(payload)))
+
+
+def project_session_event_for_client(
+    event_name: str,
+    payload: Any,
+    *,
+    client_caps: Collection[str] | None = None,
+) -> tuple[str, Any]:
+    """Project one public session event to a client's negotiated capabilities.
+
+    A terminal answer-generation reset is the runtime's sole visible failed
+    outcome.  Clients that explicitly understand replacement semantics receive
+    that event unchanged (apart from defense-in-depth metadata scrubbing).
+    Capability-less clients receive the equivalent legacy ``session.event.error``
+    frame instead, never both frames.
+    """
+
+    if event_name != _ANSWER_GENERATION_RESET_EVENT or not isinstance(payload, Mapping):
+        return event_name, payload
+
+    public_payload = dict(payload)
+    for field_name in _INTERNAL_TERMINAL_RESET_FIELDS:
+        public_payload.pop(field_name, None)
+
+    if (
+        public_payload.get("terminal") is not True
+        or ANSWER_GENERATION_RESET_CAPABILITY in (client_caps or ())
+    ):
+        return event_name, public_payload
+
+    terminal_snapshot = public_payload.get("terminal_text_snapshot")
+    authoritative_snapshot = public_payload.get("authoritative_text_snapshot")
+    if isinstance(terminal_snapshot, str) and terminal_snapshot.strip():
+        message = terminal_snapshot
+    elif isinstance(authoritative_snapshot, str) and authoritative_snapshot.strip():
+        message = authoritative_snapshot
+    else:
+        message = "The model could not complete this answer."
+
+    public_payload.pop("kind", None)
+    public_payload.update(
+        {
+            "message": message,
+            "terminal_message": message,
+            "terminal_reason": "error",
+            "error_message": message,
+            "code": "ensemble_fixed_error",
+        }
+    )
+    return _LEGACY_ERROR_EVENT, public_payload
 
 
 # ---------------------------------------------------------------------------

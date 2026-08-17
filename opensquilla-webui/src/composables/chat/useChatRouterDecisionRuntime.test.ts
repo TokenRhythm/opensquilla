@@ -208,8 +208,9 @@ describe('appendEnsembleProgress', () => {
     const routers = messagesRef.value.filter(m => m.role === 'router')
     expect(routers).toHaveLength(1)
     expect(routers[0].ensemble?.models).toHaveLength(1)
-    // The strip is upgraded onto the ensemble branch.
-    expect(routers[0].routerDecision?.source).toBe('llm_ensemble')
+    // Preserve the tier decision so the renderer can play routing first and
+    // then continue into the attached ensemble stage.
+    expect(routers[0].routerDecision?.source).toBe('squilla_router')
   })
 
   it('ignores deltas with no model and no aggregator role', () => {

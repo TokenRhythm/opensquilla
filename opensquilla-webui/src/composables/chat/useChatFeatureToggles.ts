@@ -48,6 +48,10 @@ interface ChatFeatureConfig {
       supportsImage?: boolean
       image_only?: boolean
       imageOnly?: boolean
+      ensemble_enabled?: boolean
+      ensembleEnabled?: boolean
+      ensemble_selection_mode?: string
+      ensembleSelectionMode?: string
     }>
   }
   permissions?: {
@@ -131,14 +135,29 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
         if (!lower) return
         tierKeys.push(lower)
         const rawTier = tiers[tier] || {}
+        const rawTierRecord = rawTier as Record<string, unknown>
         const model = rawTier.model
         if (typeof model === 'string' && model.trim()) {
           tierModels[lower] = model.trim()
         }
+        const explicitEnsembleEnabled = typeof rawTierRecord.ensemble_enabled === 'boolean'
+          ? rawTierRecord.ensemble_enabled
+          : typeof rawTierRecord.ensembleEnabled === 'boolean'
+            ? rawTierRecord.ensembleEnabled
+            : undefined
+        const legacyEnsembleMode = String(
+          rawTierRecord.ensemble_selection_mode
+          ?? rawTierRecord.ensembleSelectionMode
+          ?? '',
+        ).trim()
         tierConfigs[lower] = {
           model: typeof model === 'string' ? model.trim() : '',
-          supportsImage: (rawTier as Record<string, unknown>).supports_image === true || (rawTier as Record<string, unknown>).supportsImage === true,
-          imageOnly: (rawTier as Record<string, unknown>).image_only === true || (rawTier as Record<string, unknown>).imageOnly === true,
+          supportsImage: rawTierRecord.supports_image === true || rawTierRecord.supportsImage === true,
+          imageOnly: rawTierRecord.image_only === true || rawTierRecord.imageOnly === true,
+          // New Gateways expose the explicit execution switch. Older PR
+          // snapshots only expose the legacy selection mode, which still
+          // means this tier runs the shared ensemble pipeline.
+          ensembleEnabled: explicitEnsembleEnabled ?? Boolean(legacyEnsembleMode),
         }
       })
     }

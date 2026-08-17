@@ -34,8 +34,12 @@ def _patch_transport(
     monkeypatch: Any,
     captured: dict[str, Any],
     response: httpx.Response,
+    *,
+    calls: list[httpx.Request] | None = None,
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
+        if calls is not None:
+            calls.append(request)
         captured["url"] = str(request.url)
         captured["headers"] = request.headers
         captured["payload"] = (
@@ -216,6 +220,29 @@ def test_openai_responses_provider_posts_responses_payload_and_usage(
     assert done.output_tokens == 2
     assert done.reasoning_tokens == 0
     assert done.model == "gpt-5.4"
+
+
+def test_openai_responses_auth_failure_uses_one_physical_request(
+    monkeypatch: Any,
+) -> None:
+    captured: dict[str, Any] = {}
+    calls: list[httpx.Request] = []
+    _patch_transport(
+        monkeypatch,
+        captured,
+        httpx.Response(401, json={"error": {"message": "expired"}}),
+        calls=calls,
+    )
+    provider = OpenAIResponsesProvider(api_key="test", model="gpt-5.4")
+
+    events = _collect_events(
+        provider,
+        config=ChatConfig(physical_attempt_limit=1),
+    )
+
+    assert len(calls) == 1
+    assert any(isinstance(event, ErrorEvent) and event.code == "401" for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
 
 
 def test_openai_responses_candidate_mode_demotes_oversized_function_call(

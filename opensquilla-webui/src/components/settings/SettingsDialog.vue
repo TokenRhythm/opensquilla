@@ -149,6 +149,9 @@
               @update-router-visual-mode="setRouterVisualMode"
               @update-tier-field="updateTierField"
               @update-ensemble-scheme="setEnsembleScheme"
+              @update-ensemble-min-successful="setEnsembleMinSuccessful"
+              @update-ensemble-all-failed-policy="setEnsembleAllFailedPolicy"
+              @update-ensemble-proposer-max-retries="setEnsembleProposerMaxRetries"
               @add-ensemble-candidate="addEnsembleCandidate"
               @remove-ensemble-candidate="removeEnsembleCandidate"
               @replace-ensemble-candidate="replaceEnsembleCandidate"
@@ -156,8 +159,6 @@
               @request-provider-models="discoverModelStrategyProviderModels"
               @import-ensemble-tier-candidates="importEnsembleTierCandidates"
               @migrate-ensemble-legacy="migrateEnsembleLegacy"
-              @update-ensemble-min-successful="setEnsembleMinSuccessful"
-              @update-ensemble-all-failed-policy="setEnsembleAllFailedPolicy"
               @go-to-section="selectSection"
             />
             <SetupCapabilitiesPanel
@@ -304,6 +305,7 @@ const {
   setEnsembleScheme,
   setEnsembleMinSuccessful,
   setEnsembleAllFailedPolicy,
+  setEnsembleProposerMaxRetries,
   applyProviderPreset,
   updateProviderField,
   updateLlmTimeout,

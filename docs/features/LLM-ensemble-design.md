@@ -176,24 +176,38 @@ whose provider requires a key but resolves none). This mirrors the static-preset
 gate — a member with an empty bearer token would post the conversation upstream
 unauthenticated, so the wrap is skipped.
 
-## 1.3 Shared fixed-lineup defaults
+## 1.3 Runtime policy and lineup defaults
 
-Both static families set `is_static_b5 = True` in
-`build_ensemble_provider_from_config`, which applies the fixed-lineup family
-defaults. For the configurable rows below, replacement is **only** applied when
-the stored value still equals its legacy default (`_static_default_if_legacy`),
-so operator overrides are preserved. Quorum grace is a runtime family policy,
-not a public configuration field:
+C3 tier activation has source-aware defaults. When a newly configured C3 tier
+activates the shared four-proposer plan and the corresponding fields are
+absent, its effective policy is:
 
-| Parameter | Legacy (`router_dynamic`) | Fixed-lineup default |
-|-----------|---------------------------|----------------------|
-| `min_successful_proposers` | 1 | 3 (presets) / `N-1` (custom, "all but one") |
+| Parameter | C3 tier-local default | Global/custom default |
+|-----------|-----------------------|-----------------------|
+| `min_successful_proposers` | 1 (one of four) | 1 |
 | `target_successful_proposers` | unset (same as minimum) | unset (same as minimum) |
-| `proposer_max_retries` | 0 | 0 |
-| `proposer_timeout_seconds` | 3600 | 300 |
-| `aggregator_timeout_seconds` | 3600 | 480 |
-| `shuffle_candidates` | `True` | `False` |
-| `quorum_grace_seconds` | 0 (wait for every proposer) | 10 |
+| `proposer_max_retries` | 1 | 0 |
+| `all_failed_policy` | `fallback_single` | `fallback_single` |
+
+The C3 defaults fill only missing fields. Explicit global/custom values are
+authoritative, including `min_successful_proposers = 4`,
+`proposer_max_retries = 0` or `2`, and `all_failed_policy = "error"`. The
+`error` policy returns a terminal Ensemble error and does not start the fixed
+provider; only `fallback_single` does. Existing global/custom configurations
+without an explicit retry field retain the historical zero-retry behavior.
+
+Timeout defaults depend on the lineup family rather than the C3 policy source:
+
+| Lineup family | Proposer total timeout | Aggregator idle timeout |
+|---------------|------------------------|-------------------------|
+| Packaged static B5 | 120 seconds | 180 seconds |
+| Operator-authored `custom_b5` | 300 seconds | 480 seconds |
+| Legacy `router_dynamic` | 3600 seconds | 3600 seconds |
+
+Packaged and custom fixed lineups default to deterministic candidate ordering
+(`shuffle_candidates = false`). Explicit runtime-policy values and timeout
+overrides are recorded alongside their effective values in the selection plan
+for diagnostics.
 
 The two timeout fields have intentionally different streaming semantics.
 `proposer_timeout_seconds` bounds each proposer's total execution time.
@@ -206,21 +220,17 @@ turn. A completed aggregator idle budget is terminal for that attempt and is
 never retried as another full-budget aggregator request.
 
 `min_successful_proposers` is additionally clamped down to the actual proposer
-count. Both the configured and effective values (min-success, timeouts, shuffle)
-are recorded in the selection plan for debugging.
-
-The legacy value `0` disables quorum early-exit and waits for every proposer; it
-does not mean an immediate, zero-delay cutoff. Fixed lineups instead allow ten
-seconds after reaching quorum so a nearly complete final draft can still join
-the fusion without waiting for the full proposer timeout.
+count. The historical ten-second fixed-lineup quorum-grace value remains in
+diagnostics for compatibility, but it no longer cancels or completes proposer
+work early; its effective runtime value is zero.
 
 For score-oriented runs, `target_successful_proposers` separates the preferred
 draft count from the minimum acceptance floor. For example, `target = 4` and
 `min = 3` waits for all four fixed B5 proposers. If one proposer exhausts its
 configured retries, the remaining three may still be aggregated; two or fewer
-still follow `all_failed_policy`. The fixed-lineup grace starts only after the
-target is reached. A target above the fixed four-member lineup, or above a
-custom lineup's proposer count, is rejected as a configuration error.
+still follow `all_failed_policy`. A target above the fixed four-member lineup,
+or above a custom lineup's proposer count, is rejected as a configuration
+error.
 
 `proposer_max_retries` is the number of in-place attempts after the initial
 request. When non-zero, transient 429/5xx/transport failures, blank completed
@@ -296,10 +306,12 @@ role = "aggregator"
 
 Static presets expose no lineup tuning — the models are fixed in code. Custom
 lineups are tuned entirely through the `candidates` list (subject to the bounds
-above). Both share the fixed-lineup runtime defaults, which an operator may
-still override explicitly (`min_successful_proposers`,
-`target_successful_proposers`, `proposer_max_retries`,
-`proposer_timeout_seconds`, `aggregator_timeout_seconds`, `shuffle_candidates`).
+above). They share the same runtime mechanism, while packaged static profiles
+use 120/180-second proposer/aggregator defaults and custom lineups use 300/480
+seconds. Operators may explicitly configure `min_successful_proposers`,
+`target_successful_proposers`, `proposer_max_retries`, `all_failed_policy`,
+`proposer_timeout_seconds`, `aggregator_timeout_seconds`, and
+`shuffle_candidates`.
 
 A resilient score-oriented fixed-lineup posture is:
 
@@ -310,11 +322,13 @@ selection_mode = "static_openrouter_b5"
 min_successful_proposers = 3
 target_successful_proposers = 4
 proposer_max_retries = 2
-all_failed_policy = "error"
 ```
 
-This never falls back to a single model: four successful drafts are preferred,
-three are accepted after retries, and two or fewer terminate the ensemble turn.
+Four successful drafts are preferred and three are accepted after retries. If
+the lineup cannot reach quorum, or if the aggregator cannot complete, the turn
+uses the provider and model configured in `[llm]` as the fixed fallback when
+`all_failed_policy = "fallback_single"`. With `all_failed_policy = "error"`,
+the same failure is terminal and the fixed provider is not called.
 
 ---
 
@@ -523,11 +537,15 @@ What operators can tune:
 - `llm_ensemble.target_successful_proposers` — preferred successful proposer
   count above the minimum floor (clamped per-turn for dynamic templates).
 - `llm_ensemble.proposer_max_retries` — opt-in per-proposer retries; zero keeps
-  the historical single-attempt behavior.
+  the historical single-attempt behavior for global/custom activation. When a
+  C3 tier activates the plan and this field is absent, its tier-local default
+  is one retry.
 - `squilla_router.tiers[*].model` — indirectly expands the candidate pool and
   determines which model becomes the anchor for a given tier.
 
 There is no operator control over slot templates, weights, or the model
 catalog priors — those are fixed in code. Unlike the static families,
 `router_dynamic` keeps the legacy runtime defaults (timeouts 3600s,
-`shuffle_candidates=True`, `min_successful_proposers=1`).
+`shuffle_candidates=True`, `min_successful_proposers=1`) for global activation.
+The source-aware C3 retry default described above still applies when C3 is what
+activates the plan.

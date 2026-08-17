@@ -212,6 +212,9 @@ class TranscriptEntry(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     session_id: str = Field(index=True)
     session_key: str = Field(index=True)
+    # Callers may supply a stable identity for streamed assistant publication;
+    # storage treats that identity as an upsert key without requiring a schema
+    # or migration change.
     message_id: str = Field(default_factory=_new_uuid)
     role: str  # user | assistant | system | tool
     content: str | None = None

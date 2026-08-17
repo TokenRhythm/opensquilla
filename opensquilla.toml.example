@@ -100,7 +100,7 @@
 
 [llm]
 provider = "tokenrhythm"
-model = "deepseek-v4-pro"
+model = "deepseek-v4-flash-0731"
 # api_key = ""          # TokenRhythm API key; env TOKENRHYTHM_API_KEY also works
 base_url = "https://tokenrhythm.studio/v1"
 # proxy = ""            # e.g. http://127.0.0.1:7890
@@ -147,7 +147,7 @@ base_url = "https://tokenrhythm.studio/v1"
 # reasoning_content, and reasoning tokens count against max_tokens — keep
 # max_tokens = 0 (auto) rather than setting small caps:
 # provider = "tokenrhythm"
-# model = "deepseek-v4-pro"
+# model = "deepseek-v4-flash-0731"
 # api_key = ""          # env TOKENRHYTHM_API_KEY also works
 # base_url = "https://tokenrhythm.studio/v1"
 #
@@ -183,36 +183,25 @@ base_url = "https://tokenrhythm.studio/v1"
 "z-ai/glm-5.1" = "z-ai"
 "z-ai/glm-5.2" = "z-ai"
 
-# LLM ensemble routing — the DEFAULT routing surface.
-# A fresh install ships enabled = true with selection_mode =
-# "static_openrouter_b5": each turn fans out to a fixed five-member
-# OpenRouter proposer set and fuses their candidates into one answer.
-#
-# Upgrade note (0.5.0rc1 → current):
-#   * static_openrouter_b5 is the default for FRESH installs only. Configs
-#     saved by earlier versions keep their stored `enabled` value.
-#   * Enabling the ensemble now selects "static_openrouter_b5", where
-#     0.5.0rc1's enable toggle gave "router_dynamic". Set
-#     selection_mode = "router_dynamic" to restore the rc1 behavior.
-#
-# Credential requirement: static_openrouter_b5 runs its members on
-# OpenRouter, so it needs a resolvable OpenRouter credential — the [llm]
-# api_key when the active provider is "openrouter", or OPENROUTER_API_KEY
-# in the environment otherwise. Without one the ensemble is inactive and
-# every turn falls back to the single configured provider —
-# `opensquilla doctor` reports this as the llm_ensemble finding
-# "LLM ensemble is enabled but cannot run".
-# "static_tokenrhythm_b5" is the TokenRhythm mirror of the same lineup
+# LLM ensemble routing. The recommended TokenRhythm router lets C3 reuse this
+# shared plan through squilla_router.tiers.c3.ensemble_enabled below. Keep this
+# global switch off when C0-C2 should remain single-model routes. Enabling it
+# applies the same plan to every request; C3 never stores a second plan.
+# C3 fusion itself does not handle images. The dedicated image_model route stays
+# enabled and is preferred; another non-C3 tier with supports_image=true is used
+# only when the dedicated image route is unavailable.
+# The static_tokenrhythm_b5 profile is the TokenRhythm mirror of B5
 # (deepseek-v4-pro, glm-5.2, kimi-k2.7-code, qwen3.7-max + glm-5.2
-# aggregator) and needs a TokenRhythm credential the same way (the [llm]
-# api_key when the active provider is "tokenrhythm", or
-# TOKENRHYTHM_API_KEY in the environment).
+# aggregator). It needs a TokenRhythm credential: the [llm] api_key when
+# TokenRhythm is active, or TOKENRHYTHM_API_KEY in the environment. Without
+# one, or whenever fusion cannot complete, requests use the fixed/direct
+# provider and model configured under [llm].
 #
 # The keys below are also writable at runtime via the Web UI / the
 # `onboarding.ensemble.configure` RPC; omitted keys keep their current
 # values. Changes take effect on the next turn without a gateway restart.
 [llm_ensemble]
-enabled = true
+enabled = false
 # "static_openrouter_b5": fixed five-member OpenRouter proposer set (default).
 # "static_tokenrhythm_b5": the same lineup served through TokenRhythm.
 # "custom_b5": an explicit user-authored lineup from [[llm_ensemble.candidates]]
@@ -224,7 +213,7 @@ enabled = true
 #   run and appear in the settings panel as Proposer.
 # "router_dynamic": legacy automatic selection; kept readable for existing
 #   configs but no longer offered in the Web UI.
-selection_mode = "static_openrouter_b5"
+selection_mode = "static_tokenrhythm_b5"
 # Explicit lineup for custom_b5 (ignored by the static profiles):
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"
@@ -251,7 +240,10 @@ model_options = [
 # with their own quorum at runtime: 3-of-4 for the static profiles, N-1 for a
 # custom lineup of N proposers.
 min_successful_proposers = 1
-# When aggregation cannot proceed: "fallback_single" (single-provider turn) or "error".
+# When aggregation cannot proceed, the effective policy is always
+# "fallback_single": use the fixed/direct provider and model under [llm]. Legacy
+# "error" values remain loadable but are deprecated, behave as fallback_single,
+# and are normalized the next time the ensemble settings are saved.
 all_failed_policy = "fallback_single"
 
 # Advanced knobs — TOML-only (not on the configure RPC surface). Defaults:
@@ -439,27 +431,28 @@ upgrade_to_c3_compaction_enabled = true
 # thinking-toggle request fields, so these tiers set no thinking_level.
 [squilla_router.tiers.c0]
 provider = "tokenrhythm"
-model = "deepseek-v4-flash"
-description = "Fast DeepSeek V4 Flash route for trivial chat, short rewrites, extraction, and low-risk simple Q&A"
-supports_image = false
+model = "qwen3.7-flash"
+description = "Fast Qwen 3.7 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight vision"
+supports_image = true
 
 [squilla_router.tiers.c1]
 provider = "tokenrhythm"
-model = "deepseek-v4-pro"
-description = "Default balanced text model for normal agent work, coding assistance, debugging, and moderate analysis"
+model = "deepseek-v4-flash-0731"
+description = "Default DeepSeek V4 Flash 0731 route for normal agent work, coding assistance, debugging, and moderate analysis"
 supports_image = false
 
 [squilla_router.tiers.c2]
 provider = "tokenrhythm"
-model = "kimi-k2.7-code"
-description = "Stronger Kimi K2.7 Code route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
+model = "glm-5.2"
+description = "Stronger GLM 5.2 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
 supports_image = false
 
 [squilla_router.tiers.c3]
 provider = "tokenrhythm"
 model = "glm-5.2"
-description = "Highest-tier GLM 5.2 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
+description = "Highest tier: shared static TokenRhythm B5 fusion; this provider/model is retained for single-model C3 mode"
 supports_image = false
+ensemble_enabled = true
 
 [squilla_router.tiers.image_model]
 provider = "tokenrhythm"

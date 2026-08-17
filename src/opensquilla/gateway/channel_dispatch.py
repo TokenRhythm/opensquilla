@@ -71,6 +71,7 @@ from opensquilla.channels.system_messages import render_channel_message
 from opensquilla.channels.types import IncomingMessage, OutgoingMessage
 from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
 from opensquilla.engine.types import (
+    AnswerGenerationResetEvent,
     ArtifactEvent,
     DoneEvent,
     EnsembleProgressEvent,
@@ -79,6 +80,8 @@ from opensquilla.engine.types import (
     RunHeartbeatEvent,
     TextDeltaEvent,
     ToolResultEvent,
+    ToolUseDeltaEvent,
+    ToolUseEndEvent,
     ToolUseStartEvent,
     done_text_snapshot,
 )
@@ -1909,7 +1912,12 @@ def _optional_positive_config_float(config: Any, attr: str, default: float) -> f
     return value if value > 0 else None
 
 
-def _wrap_channel_turn_stream(stream: Any, config: Any) -> Any:
+def _wrap_channel_turn_stream(
+    stream: Any,
+    config: Any,
+    *,
+    context_bound: bool | None = None,
+) -> Any:
     from opensquilla.engine.stream_wrappers import wrap_stream
 
     raw_stream_idle_timeout = effective_agent_stream_idle_timeout_seconds(config)
@@ -1926,6 +1934,7 @@ def _wrap_channel_turn_stream(stream: Any, config: Any) -> Any:
         ),
         heartbeat_phase="channel",
         heartbeat_message="Still working",
+        context_bound=context_bound,
     )
 
 
@@ -2246,6 +2255,7 @@ class _RuntimeChannelStreamRelay:
         self._text_deltas: list[str] = []
         self._done_snapshot_present = False
         self._done_snapshot_text = ""
+        self._terminal_generation_reset = False
         self._stream_handle: _StreamedMessageHandle | None = None
         self.text_emitted = False
         self.stream_error: BaseException | None = None
@@ -2383,6 +2393,18 @@ class _RuntimeChannelStreamRelay:
         if artifact is not None:
             self._artifacts.append(artifact)
             return
+        generation_reset = _generation_reset_snapshot(event)
+        if generation_reset is not None:
+            terminal, snapshot_text = generation_reset
+            # A reset invalidates every delta from the previous generation.
+            # Keep only the authoritative replacement as the baseline for a
+            # later generation or as the terminal snapshot for final failure.
+            self._text_deltas[:] = [snapshot_text] if snapshot_text else []
+            if terminal:
+                self._done_snapshot_present = True
+                self._done_snapshot_text = snapshot_text
+                self._terminal_generation_reset = True
+            return
         snapshot_present, snapshot_text = done_text_snapshot(event)
         if snapshot_present and (
             isinstance(event, DoneEvent)
@@ -2426,6 +2448,10 @@ class _RuntimeChannelStreamRelay:
     def has_terminal_snapshot(self) -> bool:
         return self._done_snapshot_present
 
+    @property
+    def has_terminal_generation_reset(self) -> bool:
+        return self._terminal_generation_reset
+
     def attempted_artifact(self, artifact: dict[str, Any]) -> bool:
         artifact_id = artifact.get("id")
         if isinstance(artifact_id, str) and artifact_id in self._attempted_artifact_ids:
@@ -2445,7 +2471,10 @@ class _RuntimeChannelStreamRelay:
         terminal_text = (
             self._done_snapshot_text if self._done_snapshot_present else "".join(self._text_deltas)
         )
-        if not self._live_preview and terminal_text:
+        if (
+            not self._live_preview
+            or (self._terminal_generation_reset and not self.text_emitted)
+        ) and terminal_text:
             await self._queue.put(terminal_text)
             self.text_emitted = True
         if artifact_lines:
@@ -2567,6 +2596,35 @@ def _text_delta_from_event(event: Any) -> str:
     return ""
 
 
+def _generation_reset_snapshot(event: Any) -> tuple[bool, str] | None:
+    """Return the public reset terminal flag and authoritative replacement."""
+
+    terminal_text: object = None
+    authoritative_text: object = ""
+    if isinstance(event, AnswerGenerationResetEvent):
+        terminal = bool(event.terminal)
+        terminal_text = event.terminal_text_snapshot
+        authoritative_text = event.authoritative_text_snapshot
+    elif isinstance(event, dict) and event.get("kind") == "answer_generation_reset":
+        terminal = bool(event.get("terminal", False))
+        terminal_text = event.get("terminal_text_snapshot")
+        authoritative_text = event.get("authoritative_text_snapshot")
+    elif getattr(event, "kind", None) == "answer_generation_reset":
+        terminal = bool(getattr(event, "terminal", False))
+        terminal_text = getattr(event, "terminal_text_snapshot", None)
+        authoritative_text = getattr(event, "authoritative_text_snapshot", "")
+    else:
+        return None
+
+    if terminal and isinstance(terminal_text, str) and terminal_text:
+        return True, terminal_text
+    if isinstance(authoritative_text, str) and authoritative_text:
+        return terminal, authoritative_text
+    if terminal:
+        return True, "The model could not complete this answer."
+    return False, ""
+
+
 def _artifact_event_payload(event: Any) -> dict[str, Any] | None:
     if isinstance(event, ArtifactEvent):
         return artifact_payload(event)
@@ -2596,6 +2654,37 @@ def _router_decision_payload(event: RouterDecisionEvent) -> dict[str, Any]:
     }
 
 
+def _terminal_generation_reset_text(event: AnswerGenerationResetEvent) -> str:
+    """Return the one safe user-visible terminal replacement for a reset."""
+
+    terminal_text = event.terminal_text_snapshot
+    if isinstance(terminal_text, str) and terminal_text:
+        return terminal_text
+    if event.authoritative_text_snapshot:
+        return event.authoritative_text_snapshot
+    return "The model could not complete this answer."
+
+
+async def _emit_generation_reset(
+    event_bridge: EventBridge | None,
+    session_key: str,
+    event: AnswerGenerationResetEvent,
+) -> None:
+    if event_bridge is None:
+        return
+    # Serialize through the public wire boundary so the internal terminal
+    # failure metadata used for persistence never reaches subscribers.
+    from opensquilla.gateway.protocol import serialize_public_event
+
+    payload = serialize_public_event(event)
+    payload.pop("kind", None)
+    await event_bridge.emit(
+        session_key,
+        "session.event.answer_generation_reset",
+        payload,
+    )
+
+
 def _ensemble_progress_payload(event: EnsembleProgressEvent) -> dict[str, Any]:
     return {
         "event_type": event.event_type,
@@ -2617,6 +2706,24 @@ def _tool_use_start_payload(event: ToolUseStartEvent) -> dict[str, Any]:
         "tool_use_id": event.tool_use_id,
         "tool_name": event.tool_name,
         "name": event.tool_name,
+        "synthetic_from_text": event.synthetic_from_text,
+    }
+
+
+def _tool_use_delta_payload(event: ToolUseDeltaEvent) -> dict[str, Any]:
+    return {
+        "tool_use_id": event.tool_use_id,
+        "json_fragment": event.json_fragment,
+    }
+
+
+def _tool_use_end_payload(event: ToolUseEndEvent) -> dict[str, Any]:
+    return {
+        "tool_use_id": event.tool_use_id,
+        "tool_name": event.tool_name,
+        "name": event.tool_name,
+        "arguments": event.arguments,
+        "input": event.arguments,
         "synthetic_from_text": event.synthetic_from_text,
     }
 
@@ -3832,6 +3939,15 @@ async def _deliver_runtime_channel_reply(
         ):
             return
     else:
+        if (
+            stream_relay is not None
+            and stream_relay.has_terminal_generation_reset
+            and stream_relay.text_emitted
+            and stream_relay.stream_error is None
+        ):
+            # The reset snapshot is the one visible terminal outcome.  close()
+            # has already reconciled any speculative preview to that value.
+            return
         content = build_terminal_reply(record)
         if (
             stream_relay is not None
@@ -3945,6 +4061,7 @@ async def _run_turn_batch_path(
     done_snapshot_text = ""
     artifacts: list[dict[str, Any]] = []
     error_occurred = False
+    terminal_generation_reset_text: str | None = None
     clarify_card_sent = False
 
     run_kwargs: dict[str, Any] = {
@@ -3964,7 +4081,13 @@ async def _run_turn_batch_path(
             session_key,
             **run_kwargs,
         )
-        async for event in _wrap_channel_turn_stream(stream, config):
+        from opensquilla.engine.stream_wrappers import is_context_bound_owner
+
+        async for event in _wrap_channel_turn_stream(
+            stream,
+            config,
+            context_bound=is_context_bound_owner(turn_runner),
+        ):
             if isinstance(event, TextDeltaEvent):
                 if clarify_card_sent:
                     continue
@@ -3983,6 +4106,25 @@ async def _run_turn_batch_path(
                 if snapshot_present:
                     done_snapshot_present = True
                     done_snapshot_text = snapshot_text
+            elif isinstance(event, AnswerGenerationResetEvent):
+                await _emit_generation_reset(event_bridge, session_key, event)
+                text_parts.clear()
+                done_snapshot_present = bool(event.authoritative_text_snapshot)
+                done_snapshot_text = event.authoritative_text_snapshot
+                if event.terminal:
+                    log.error(
+                        "channel_dispatch.agent_terminal_generation_reset",
+                        session_key=session_key,
+                        failure_kind=event.terminal_failure_kind or None,
+                    )
+                    terminal_generation_reset_text = _terminal_generation_reset_text(
+                        event
+                    )
+                    error_occurred = True
+                    # Keep draining the shared TurnRunner. Its accounting-only
+                    # Done is hidden from this public stream, but reaching EOF
+                    # is what lets the finalizer persist usage and the error.
+                    continue
             elif artifact := _artifact_event_payload(event):
                 artifacts.append(artifact)
                 if event_bridge is not None:
@@ -4014,6 +4156,20 @@ async def _run_turn_batch_path(
                         "session.event.tool_use_start",
                         _tool_use_start_payload(event),
                     )
+            elif isinstance(event, ToolUseDeltaEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_delta",
+                        _tool_use_delta_payload(event),
+                    )
+            elif isinstance(event, ToolUseEndEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_end",
+                        _tool_use_end_payload(event),
+                    )
             elif isinstance(event, ToolResultEvent):
                 if event_bridge is not None:
                     await event_bridge.emit(
@@ -4024,6 +4180,8 @@ async def _run_turn_batch_path(
                 if await _maybe_send_clarify_channel_card(channel, msg, event):
                     clarify_card_sent = True
             elif isinstance(event, ErrorEvent):
+                if terminal_generation_reset_text is not None:
+                    continue
                 log.error(
                     "channel_dispatch.agent_error",
                     session_key=session_key,
@@ -4045,17 +4203,22 @@ async def _run_turn_batch_path(
                 break
     except TimeoutError as exc:
         log.error("channel_dispatch.agent_stream_timeout", session_key=session_key)
-        await channel.send(
-            _build_reply_message(
-                channel,
-                build_terminal_reply(_terminal_payload_from_exception(exc)),
-                msg,
+        if terminal_generation_reset_text is None:
+            await channel.send(
+                _build_reply_message(
+                    channel,
+                    build_terminal_reply(_terminal_payload_from_exception(exc)),
+                    msg,
+                )
             )
-        )
         text_parts.clear()
         error_occurred = True
 
-    if not error_occurred:
+    if terminal_generation_reset_text is not None:
+        await channel.send(
+            _build_reply_message(channel, terminal_generation_reset_text, msg)
+        )
+    elif not error_occurred:
         content = done_snapshot_text if done_snapshot_present else "".join(text_parts)
         content = _strip_artifact_markers_from_channel_text(content)
         content = _strip_delivered_artifact_image_references(content, artifacts)
@@ -4097,6 +4260,7 @@ async def _run_turn_streaming_path(
     done_snapshot_present = False
     done_snapshot_text = ""
     stream_error: str | None = None
+    terminal_generation_reset = False
     stream_task_error: BaseException | None = None
     stream_handle: _StreamedMessageHandle | None = None
     terminal_reconcile_fallback = ""
@@ -4150,7 +4314,13 @@ async def _run_turn_streaming_path(
             session_key,
             **run_kwargs,
         )
-        async for event in _wrap_channel_turn_stream(stream, config):
+        from opensquilla.engine.stream_wrappers import is_context_bound_owner
+
+        async for event in _wrap_channel_turn_stream(
+            stream,
+            config,
+            context_bound=is_context_bound_owner(turn_runner),
+        ):
             if isinstance(event, TextDeltaEvent):
                 if clarify_card_sent:
                     continue
@@ -4174,6 +4344,23 @@ async def _run_turn_streaming_path(
                 if snapshot_present:
                     done_snapshot_present = True
                     done_snapshot_text = snapshot_text
+            elif isinstance(event, AnswerGenerationResetEvent):
+                await _emit_generation_reset(event_bridge, session_key, event)
+                text_parts.clear()
+                done_snapshot_present = bool(event.authoritative_text_snapshot)
+                done_snapshot_text = event.authoritative_text_snapshot
+                if event.terminal:
+                    log.error(
+                        "channel_dispatch.agent_terminal_generation_reset",
+                        session_key=session_key,
+                        failure_kind=event.terminal_failure_kind or None,
+                    )
+                    terminal_generation_reset = True
+                    done_snapshot_present = True
+                    done_snapshot_text = _terminal_generation_reset_text(event)
+                    # Drain through finalization before closing the wrapper;
+                    # stopping here can cancel DB/accounting work in progress.
+                    continue
             elif artifact := _artifact_event_payload(event):
                 artifacts.append(artifact)
                 if event_bridge is not None:
@@ -4205,6 +4392,20 @@ async def _run_turn_streaming_path(
                         "session.event.tool_use_start",
                         _tool_use_start_payload(event),
                     )
+            elif isinstance(event, ToolUseDeltaEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_delta",
+                        _tool_use_delta_payload(event),
+                    )
+            elif isinstance(event, ToolUseEndEvent):
+                if event_bridge is not None:
+                    await event_bridge.emit(
+                        session_key,
+                        "session.event.tool_use_end",
+                        _tool_use_end_payload(event),
+                    )
             elif isinstance(event, ToolResultEvent):
                 if event_bridge is not None:
                     await event_bridge.emit(
@@ -4215,6 +4416,8 @@ async def _run_turn_streaming_path(
                 if await _maybe_send_clarify_channel_card(channel, msg, event):
                     clarify_card_sent = True
             elif isinstance(event, ErrorEvent):
+                if terminal_generation_reset:
+                    continue
                 log.error(
                     "channel_dispatch.agent_error",
                     session_key=session_key,
@@ -4228,7 +4431,8 @@ async def _run_turn_streaming_path(
                 break
     except TimeoutError as exc:
         log.error("channel_dispatch.agent_stream_timeout", session_key=session_key)
-        stream_error = build_terminal_reply(_terminal_payload_from_exception(exc))
+        if not terminal_generation_reset:
+            stream_error = build_terminal_reply(_terminal_payload_from_exception(exc))
     finally:
         if not live_preview:
             terminal_text = done_snapshot_text if done_snapshot_present else "".join(text_parts)
@@ -4333,7 +4537,7 @@ async def _run_turn_streaming_path(
             await channel.send(
                 _build_reply_message(channel, stream_error, msg),
             )
-    elif artifacts:
+    elif artifacts and not terminal_generation_reset:
         if _can_deliver_channel_files(channel):
             undelivered = await _deliver_artifacts_as_channel_files(channel, msg, artifacts, config)
         else:

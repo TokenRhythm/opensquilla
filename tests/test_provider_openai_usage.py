@@ -363,6 +363,17 @@ def test_tokenrhythm_confirmed_receipt_preserves_cny_and_normalizes_usd() -> Non
     assert receipt.fx_native_per_usd_nanos == 6_975_000_000
 
 
+def test_tokenrhythm_confirmed_numeric_string_preserves_exact_native_amount() -> None:
+    billed_cost, cost_source, receipt = _tokenrhythm_billing_result(cost="0.000021")
+
+    assert billed_cost == 0.000003011
+    assert cost_source == "provider_billed"
+    assert receipt is not None
+    assert receipt.status == "confirmed"
+    assert receipt.amount_nanos == 21_000
+    assert receipt.usd_equivalent_nanos == 3_011
+
+
 def test_tokenrhythm_native_money_is_reparsed_without_float_rounding() -> None:
     raw = '{"cost_cny":0.123456789499999999,"billing_pending":false}'
     payload = _exact_provider_billing_payload(
@@ -414,6 +425,20 @@ def test_tokenrhythm_pending_receipt_is_not_added_to_billed_cost(
     assert receipt.usd_equivalent_nanos is None
 
 
+def test_tokenrhythm_pending_numeric_string_keeps_only_provisional_native_amount() -> None:
+    billed_cost, cost_source, receipt = _tokenrhythm_billing_result(
+        pending=True,
+        cost="0.000021",
+    )
+
+    assert billed_cost == 0.0
+    assert cost_source == "none"
+    assert receipt is not None
+    assert receipt.status == "pending"
+    assert receipt.amount_nanos == 21_000
+    assert receipt.usd_equivalent_nanos is None
+
+
 def test_tokenrhythm_pending_receipt_discards_malformed_provisional_amount() -> None:
     billed_cost, cost_source, receipt = _tokenrhythm_billing_result(
         pending=True,
@@ -451,7 +476,17 @@ def test_tokenrhythm_pending_receipt_discards_out_of_range_provisional_amount() 
         (False, float("nan"), True, True),
         (False, float("inf"), True, True),
         (False, True, True, True),
-        (False, "0.1", True, True),
+        (False, " 0.1", True, True),
+        (False, "+0.1", True, True),
+        (False, "01", True, True),
+        (False, "0_1", True, True),
+        (False, "NaN", True, True),
+        (False, "Infinity", True, True),
+        (False, "-0.1", True, True),
+        (False, "1" * 129, True, True),
+        (False, "1e9999", True, True),
+        (False, {}, True, True),
+        (False, [], True, True),
         (False, 10_000_000_000, True, True),
         (False, 1e20, True, True),
         (False, 0.1, True, False),

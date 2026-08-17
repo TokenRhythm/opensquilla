@@ -90,6 +90,17 @@ def test_ci_result_gate_rejects_required_windows_matrix_skip() -> None:
     assert any("Windows high-risk matrix" in error and "skipped" in error for error in errors)
 
 
+def test_ci_result_gate_rejects_python_full_without_python_change() -> None:
+    env = _base_env()
+    env[_flag_env("docs_only")] = "false"
+    env[_flag_env("python_full_required")] = "true"
+    env["RESULT_UBUNTU_FULL"] = "success"
+
+    errors = check_ci_results(env)
+
+    assert any("must also be classified as Python changes" in error for error in errors)
+
+
 def test_ci_result_gate_accepts_windows_full_in_place_of_duplicate_smoke() -> None:
     env = _base_env()
     env[_flag_env("docs_only")] = "false"
@@ -121,7 +132,7 @@ def test_ci_result_gate_requires_smoke_for_targeted_python_without_full_matrix()
     assert any("Windows compatibility smoke tests" in error for error in errors)
 
 
-def test_ci_result_gate_requires_ubuntu_full_matrix_only_for_full_ci() -> None:
+def test_ci_result_gate_requires_ubuntu_full_matrix_for_shared_core_or_full_ci() -> None:
     targeted = _base_env()
     targeted[_flag_env("docs_only")] = "false"
     targeted[_flag_env("runtime_changed")] = "true"
@@ -131,6 +142,20 @@ def test_ci_result_gate_requires_ubuntu_full_matrix_only_for_full_ci() -> None:
     targeted["RESULT_UBUNTU"] = "success"
     targeted["RESULT_WINDOWS_SMOKE"] = "success"
     assert check_ci_results(targeted) == []
+
+    for result in ("skipped", "failure", "cancelled", ""):
+        env = dict(targeted)
+        env[_flag_env("python_full_required")] = "true"
+        env["RESULT_UBUNTU_FULL"] = result
+
+        errors = check_ci_results(env)
+
+        assert any("Ubuntu full test matrix" in error for error in errors)
+
+    python_full = dict(targeted)
+    python_full[_flag_env("python_full_required")] = "true"
+    python_full["RESULT_UBUNTU_FULL"] = "success"
+    assert check_ci_results(python_full) == []
 
     for result in ("skipped", "failure", "cancelled", ""):
         env = _full_env()
@@ -253,7 +278,7 @@ def test_ci_result_gate_requires_desktop_recovery_e2e_for_desktop_changes() -> N
     assert any("Desktop recovery E2E matrix" in error and "skipped" in error for error in errors)
 
 
-def test_ci_result_gate_requires_desktop_recovery_e2e_for_frontend_changes() -> None:
+def test_ci_result_gate_uses_focused_browser_checks_for_frontend_changes() -> None:
     env = _base_env()
     env[_flag_env("docs_only")] = "false"
     env[_flag_env("runtime_changed")] = "true"
@@ -264,9 +289,7 @@ def test_ci_result_gate_requires_desktop_recovery_e2e_for_frontend_changes() -> 
     env["RESULT_UBUNTU"] = "success"
     env["RESULT_WINDOWS_SMOKE"] = "success"
 
-    errors = check_ci_results(env)
-
-    assert any("Desktop recovery E2E matrix" in error and "skipped" in error for error in errors)
+    assert check_ci_results(env) == []
 
 
 def test_ci_result_gate_rejects_failed_or_missing_desktop_recovery_e2e() -> None:

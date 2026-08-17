@@ -56,6 +56,51 @@ function routerStrip(overrides: Partial<ChatRenderedMessage> = {}): ChatRendered
   }
 }
 
+function combinedStrip(overrides: Partial<ChatRenderedMessage> = {}): ChatRenderedMessage {
+  return routerStrip({
+    routerPanel: 'router-ensemble-sequence',
+    routerMode: 'squilla_router',
+    routerSource: 'squilla_router',
+    gridCells: [
+      { kind: 'real', tier: 'c0', tiers: ['c0'], displayName: 'qwen3.7-flash' },
+      { kind: 'real', tier: 'c1', tiers: ['c1'], displayName: 'deepseek-v4-flash' },
+      { kind: 'real', tier: 'c2', tiers: ['c2'], displayName: 'glm-5.2' },
+      {
+        kind: 'real',
+        tier: 'c3',
+        tiers: ['c3'],
+        displayName: 'claude-opus-4.8',
+        executionKind: 'ensemble',
+      },
+    ],
+    winnerIdx: 3,
+    messageId: 'router-c3-ensemble',
+    ensemble: {
+      profile: 'default',
+      modelCount: 1,
+      totalCandidates: 4,
+      requestCount: 1,
+      fallbackUsed: false,
+      fallbackReason: '',
+      costUsd: 0,
+      savedUsd: 0,
+      savedPct: 0,
+      models: [{
+        role: 'anchor',
+        label: 'anchor',
+        provider: 'openrouter',
+        model: 'qwen/qwen3.7-plus',
+        modelShort: 'qwen3.7-plus',
+        input: 0,
+        output: 0,
+        costUsd: 0,
+        status: 'running',
+      }],
+    },
+    ...overrides,
+  })
+}
+
 function mockReducedMotion(matches: boolean) {
   Object.defineProperty(window, 'matchMedia', {
     configurable: true,
@@ -99,6 +144,28 @@ afterEach(() => {
 })
 
 describe('RouterFxStrip model selection motion', () => {
+  it('shows an ensemble tier as a logical fusion target instead of its backing model', async () => {
+    const { app, el } = await mountStrip(routerStrip({
+      routerStatic: true,
+      gridCells: [
+        {
+          kind: 'real',
+          tier: 'c3',
+          tiers: ['c3'],
+          displayName: 'claude-opus-4.8',
+          model: 'anthropic/claude-opus-4.8',
+          executionKind: 'ensemble',
+        },
+        { kind: 'real', tier: 'c2', tiers: ['c2'], displayName: 'glm-5.2' },
+      ],
+      winnerIdx: 1,
+    }))
+
+    expect(el.textContent).toContain('Multi-model fusion')
+    expect(el.textContent).not.toContain('claude-opus-4.8')
+    app.unmount()
+  })
+
   it('scans real candidates, locks the winner, and announces only the result', async () => {
     vi.useFakeTimers()
     const { app, el } = await mountStrip(routerStrip())
@@ -188,6 +255,43 @@ describe('RouterFxStrip model selection motion', () => {
     app.unmount()
     expect(vi.getTimerCount()).toBe(0)
   })
+
+  it('plays the tier router first, then reveals the existing ensemble animation', async () => {
+    vi.useFakeTimers()
+    const { app, el } = await mountStrip(combinedStrip())
+    const root = el.querySelector<HTMLElement>('.router-fx')
+
+    expect(root?.dataset.panel).toBe('router-ensemble-sequence')
+    expect(root?.dataset.phase).toBe('scanning')
+    expect(el.querySelector('[data-testid="router-ensemble-stage"]')).toBeFalsy()
+
+    await vi.advanceTimersByTimeAsync(599)
+    await nextTick()
+    expect(el.querySelector('[data-testid="router-ensemble-stage"]')).toBeFalsy()
+
+    await vi.advanceTimersByTimeAsync(1)
+    await nextTick()
+
+    expect(root?.dataset.phase).toBe('locked')
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.textContent).toContain('Multi-model fusion')
+    expect(el.querySelector('[data-testid="router-ensemble-handoff"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="router-ensemble-stage"]')).toBeTruthy()
+    expect(el.querySelector('.router-fx-ensemble__dot')).toBeTruthy()
+    expect(el.textContent).toContain('4 candidates synthesizing')
+    app.unmount()
+  })
+
+  it('shows both stages immediately for reduced motion', async () => {
+    vi.useFakeTimers()
+    mockReducedMotion(true)
+    const { app, el } = await mountStrip(combinedStrip())
+
+    expect(el.querySelector<HTMLElement>('.router-fx')?.dataset.phase).toBe('static')
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.textContent).toContain('Multi-model fusion')
+    expect(el.querySelector('[data-testid="router-ensemble-stage"]')).toBeTruthy()
+    expect(vi.getTimerCount()).toBe(0)
+    app.unmount()
+  })
 })
 
 describe('RouterFxStrip ensemble panel', () => {
@@ -197,6 +301,7 @@ describe('RouterFxStrip ensemble panel', () => {
     const button = el.querySelector<HTMLButtonElement>('[data-testid="router-ensemble-toggle"]')
     expect(button).toBeTruthy()
     expect(button?.disabled).toBe(false)
+    expect(el.querySelector('.router-fx-ensemble__dot.pending')).toBeTruthy()
 
     button?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await nextTick()
@@ -227,7 +332,7 @@ describe('RouterFxStrip ensemble panel', () => {
     app.unmount()
   })
 
-  it('shows candidate failures and waits for the aggregator before completing', async () => {
+  it('shows candidate failures and waits for the whole turn before completing', async () => {
     const message = reactive(ensembleStrip({
       ensemble: {
         profile: 'llm_ensemble',
@@ -294,6 +399,7 @@ describe('RouterFxStrip ensemble panel', () => {
       .toBe('provider timed out')
     expect(el.querySelector('.router-fx-ensemble__scan')).toBeTruthy()
     expect(el.textContent).toContain('2 candidates synthesizing')
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeFalsy()
 
     const aggregator = message.ensemble?.models.find(model => model.role === 'aggregator')
     if (!aggregator) throw new Error('expected aggregator row')
@@ -304,9 +410,75 @@ describe('RouterFxStrip ensemble panel', () => {
     await nextTick()
 
     expect(el.textContent).toContain('240 tok · 12s')
+    expect(el.textContent).toContain('2 candidates synthesizing')
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeFalsy()
+    expect(el.querySelector('.router-fx-ensemble__scan')).toBeTruthy()
+    expect(el.querySelector('[data-testid="router-ensemble-toggle"]')?.getAttribute('aria-busy')).toBe('true')
+
+    message.routerSettled = true
+    await nextTick()
+
     expect(el.textContent).toContain('2 candidates synthesized')
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeTruthy()
     expect(el.querySelector('.router-fx-ensemble__scan')).toBeFalsy()
     expect(el.querySelector('[data-testid="router-ensemble-toggle"]')?.getAttribute('aria-busy')).toBe('false')
+    app.unmount()
+  })
+
+  it('keeps the fusion animation busy while the fixed fallback is still generating', async () => {
+    const message = reactive(ensembleStrip({
+      ensemble: {
+        profile: 'llm_ensemble',
+        modelCount: 1,
+        totalCandidates: 1,
+        requestCount: 2,
+        fallbackUsed: true,
+        fallbackReason: 'aggregator failed',
+        costUsd: 0,
+        savedUsd: 0,
+        savedPct: 0,
+        models: [
+          {
+            role: 'proposer',
+            label: 'anchor',
+            provider: 'openrouter',
+            model: 'qwen/qwen3.7-plus',
+            modelShort: 'qwen3.7-plus',
+            input: 100,
+            output: 20,
+            costUsd: 0,
+            status: 'done',
+          },
+          {
+            role: 'aggregator',
+            label: 'aggregator',
+            provider: 'openrouter',
+            model: 'anthropic/claude-sonnet',
+            modelShort: 'claude-sonnet',
+            input: 0,
+            output: 0,
+            costUsd: 0,
+            status: 'failed',
+            error: 'provider authentication failed',
+          },
+        ],
+      },
+    }))
+    const { app, el } = await mountStrip(message)
+    const toggle = el.querySelector('[data-testid="router-ensemble-toggle"]')
+
+    expect(el.textContent).toContain('1 candidates synthesizing')
+    expect(toggle?.getAttribute('aria-busy')).toBe('true')
+    expect(el.querySelector('.router-fx-ensemble__scan')).toBeTruthy()
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeFalsy()
+
+    message.routerSettled = true
+    await nextTick()
+
+    expect(el.textContent).toContain('1 candidates synthesized')
+    expect(toggle?.getAttribute('aria-busy')).toBe('false')
+    expect(el.querySelector('.router-fx-ensemble__scan')).toBeFalsy()
+    expect(el.querySelector('.router-fx-ensemble__dot.done')).toBeTruthy()
     app.unmount()
   })
 

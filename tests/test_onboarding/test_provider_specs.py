@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from opensquilla.provider.registry import get_provider_spec
+from opensquilla.provider.registry import get_provider_spec, list_provider_specs
 
 
 def test_provider_spec_requires_api_key_for_openrouter():
@@ -48,6 +48,15 @@ def test_provider_spec_does_not_require_base_url_for_openrouter():
     assert spec.requires_base_url() is False
 
 
+def test_every_runtime_provider_requires_a_non_empty_fixed_model() -> None:
+    """The universal Ensemble fallback may never rely on a model-optional provider."""
+
+    runtime_specs = [spec for spec in list_provider_specs() if spec.runtime_supported]
+
+    assert runtime_specs
+    assert all("model" in spec.required_fields for spec in runtime_specs)
+
+
 # --------------- ProviderSetupSpec catalog ---------------
 
 from opensquilla.onboarding.provider_specs import (  # noqa: E402
@@ -56,6 +65,7 @@ from opensquilla.onboarding.provider_specs import (  # noqa: E402
     list_provider_setup_specs,
     provider_catalog_payload,
 )
+from opensquilla.onboarding.router_specs import _tier_payload  # noqa: E402
 
 # Verified: the full agent stack has been exercised against these providers.
 EXPECTED_VERIFIED = {
@@ -78,6 +88,28 @@ EXPECTED_EXPERIMENTAL = {
     "tencent_token_plan", "tencent_token_plan_anthropic",
 }
 EXPECTED_SUPPORTED = EXPECTED_VERIFIED | EXPECTED_EXPERIMENTAL
+
+
+def test_tokenrhythm_preset_wire_exposes_the_shared_c3_binding():
+    row = next(
+        item
+        for item in provider_catalog_payload()
+        if item["providerId"] == "tokenrhythm"
+    )
+
+    c3 = row["presets"][0]["tiers"]["c3"]
+    assert c3["ensembleEnabled"] is True
+    assert "configured direct/fallback model" in c3["description"]
+
+
+def test_tier_payload_preserves_a_legacy_ensemble_selection_mode():
+    assert _tier_payload(
+        {
+            "provider": "tokenrhythm",
+            "model": "glm-5.2",
+            "ensemble_selection_mode": "static_tokenrhythm_b5",
+        }
+    )["ensembleSelectionMode"] == "static_tokenrhythm_b5"
 # No runtime support at all: never configurable.
 EXPECTED_DISABLED = {
     "github_copilot",

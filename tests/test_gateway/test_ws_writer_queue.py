@@ -20,6 +20,8 @@ import structlog
 from starlette.websockets import WebSocketState
 
 import opensquilla.gateway.websocket as websocket_module
+from opensquilla.contracts.gateway_transport import ANSWER_GENERATION_RESET_CAPABILITY
+from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.protocol import make_event, make_ok_res
 from opensquilla.gateway.websocket import (
     _LOSSY_EVENTS,
@@ -73,6 +75,84 @@ async def _flush_writer(conn: WsConnection, *, deadline: float = 1.0) -> None:
             await asyncio.sleep(0)
             return
         await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("writer_enabled", [False, True])
+@pytest.mark.parametrize(
+    ("client_capable", "principal_capable", "expected_event"),
+    [
+        (False, True, "session.event.error"),
+        (True, False, "session.event.answer_generation_reset"),
+    ],
+)
+async def test_terminal_reset_projection_uses_connect_caps_at_send_boundary(
+    writer_enabled: bool,
+    client_capable: bool,
+    principal_capable: bool,
+    expected_event: str,
+) -> None:
+    fake = _FakeWebSocket()
+    conn = WsConnection(
+        conn_id="cx-reset-projection",
+        ws=fake,  # type: ignore[arg-type]
+        client_caps=(
+            frozenset({ANSWER_GENERATION_RESET_CAPABILITY})
+            if client_capable
+            else frozenset()
+        ),
+        principal=Principal(
+            role="operator",
+            scopes=frozenset({"operator.read"}),
+            is_owner=False,
+            authenticated=True,
+            capabilities=(
+                frozenset({ANSWER_GENERATION_RESET_CAPABILITY})
+                if principal_capable
+                else frozenset({"host.execute"})
+            ),
+        ),
+    )
+    conn._start_writer(maxsize=8, enabled=writer_enabled)
+    original = {
+        "kind": "answer_generation_reset",
+        "turn_id": "turn-reset",
+        "assistant_message_id": "assistant-reset",
+        "authoritative_text_snapshot": "partial fallback",
+        "terminal": True,
+        "terminal_text_snapshot": "The model could not complete this answer.",
+        "terminal_error_message": "INTERNAL_MESSAGE",
+        "terminal_error_code": "INTERNAL_CODE",
+        "terminal_failure_kind": "INTERNAL_KIND",
+        "session_key": "agent:main:reset",
+        "stream_seq": 17,
+    }
+    payload = dict(original)
+    try:
+        await conn.send_event(
+            "session.event.answer_generation_reset",
+            payload,
+            meta={"replayed": True},
+        )
+        if writer_enabled:
+            await _flush_writer(conn)
+        assert len(fake.sent) == 1
+        frame = json.loads(fake.sent[0])
+        assert frame["event"] == expected_event
+        assert frame["payload"]["stream_seq"] == 17
+        assert frame["meta"] == {"replayed": True}
+        assert "terminal_error_message" not in frame["payload"]
+        assert "terminal_error_code" not in frame["payload"]
+        assert "terminal_failure_kind" not in frame["payload"]
+        if expected_event == "session.event.error":
+            assert frame["payload"]["message"] == original["terminal_text_snapshot"]
+            assert frame["payload"]["code"] == "ensemble_fixed_error"
+        else:
+            assert "message" not in frame["payload"]
+        # Per-client projection must never rewrite the canonical replay payload.
+        assert payload == original
+    finally:
+        await conn._stop_writer()
 
 
 # ---------------------------------------------------------------------------

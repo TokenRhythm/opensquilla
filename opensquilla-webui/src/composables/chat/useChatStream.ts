@@ -14,6 +14,7 @@ import type {
   ArtifactPayload,
   CompactionPayload,
   ToolDeltaPayload,
+  ToolEndPayload,
   ToolResultPayload,
   ToolUsePayload,
 } from '@/types/rpc'
@@ -131,6 +132,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   let checkpointedRaw = ''
   let checkpointedAcrossToolBoundary = false
   let activeStreamTurnId = ''
+  let activeAssistantMessageId = ''
   const streamBubble = ref(false)
   const streamShowHeader = ref(false)
 
@@ -234,6 +236,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     finalizeToolInputs,
     peekRawText,
     publish: publishTurnLog,
+    resetGeneration,
     resetLog,
     useReducer,
     foldedTurn,
@@ -535,6 +538,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         checkpointedAcrossToolBoundary = false
         activeStreamTurnId = ''
         streamTurnStartedAt.value = 0
+        activeAssistantMessageId = ''
         return
       }
 
@@ -543,6 +547,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         clientId: createClientMessageId(),
         text: cleanedText,
         ts: new Date().toISOString(),
+        messageId: activeAssistantMessageId || undefined,
         turnId: activeStreamTurnId || undefined,
         artifacts: streamArtifacts.value.slice(),
         tool_calls: terminalToolCalls.map(streamToolCallToHistoryCall),
@@ -572,6 +577,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
     streamTurnStartedAt.value = 0
+    activeAssistantMessageId = ''
   }
 
   function restoreStatusHistory(entries: readonly StatusPart[]) {
@@ -661,6 +667,77 @@ export function useChatStream(options: UseChatStreamOptions) {
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
     streamTurnStartedAt.value = 0
+    activeAssistantMessageId = ''
+  }
+
+  function setAssistantMessageId(messageId: string) {
+    activeAssistantMessageId = typeof messageId === 'string' ? messageId.trim() : ''
+  }
+
+  /**
+   * Reset only the answer generation inside the existing live bubble. This is
+   * deliberately separate from resetLiveTurnState(): completed tool results
+   * and artifacts remain visible while pending tool calls and old text/reasoning
+   * are replaced by the authoritative new-generation snapshot.
+   */
+  function resetAnswerGeneration(optionsArg: {
+    textSnapshot?: string
+    preserveCompletedTools?: boolean
+  } = {}) {
+    const preserveCompletedTools = optionsArg.preserveCompletedTools !== false
+    const completedToolIds = new Set(
+      streamToolCalls.value.filter(call => !call.isRunning).map(call => call.toolId),
+    )
+    const keptToolCalls = preserveCompletedTools
+      ? streamToolCalls.value.filter(call => completedToolIds.has(call.toolId))
+      : []
+    const keptToolIds = new Set(keptToolCalls.map(call => call.toolId))
+    const keptGroupIds = new Set(
+      keptToolCalls.flatMap(call => call.groupId ? [call.groupId] : []),
+    )
+
+    clearRenderTimer()
+    streamRaw.value = typeof optionsArg.textSnapshot === 'string'
+      ? optionsArg.textSnapshot
+      : ''
+    streamSegments.value = streamSegments.value.filter((segment) => {
+      if (segment.type === 'text') return false
+      if (segment.type === 'tool-group') return keptGroupIds.has(segment.groupId || '')
+      return true
+    })
+    streamToolCalls.value = keptToolCalls
+    toolTimes.value = new Map(
+      [...toolTimes.value.entries()].filter(([toolId]) => keptToolIds.has(toolId)),
+    )
+    openToolGroups.value = new Set(
+      [...openToolGroups.value].filter(groupId => keptGroupIds.has(groupId)),
+    )
+    openToolItems.value = new Set(
+      [...openToolItems.value].filter(toolId => keptToolIds.has(toolId)),
+    )
+    checkpointedRaw = ''
+    checkpointedAcrossToolBoundary = false
+    reasoningCharsSinceFlush = 0
+    reasoningPresentationPending.value = false
+    streamRound.value = 1
+    isStreaming.value = true
+    streamBubble.value = true
+    noteStreamSignal()
+
+    if (streamRaw.value) {
+      streamSegments.value.push({
+        type: 'text',
+        raw: streamRaw.value,
+        html: '',
+        dirty: true,
+        presentation: 'answer',
+      })
+    }
+    resetGeneration({
+      textSnapshot: streamRaw.value,
+      preserveCompletedTools,
+    })
+    scheduleRender()
   }
 
   function normalizeIncomingTextDelta(text: string): string {
@@ -1066,6 +1143,22 @@ export function useChatStream(options: UseChatStreamOptions) {
     scheduleRender()
   }
 
+  function appendToolEnd(payload: ToolEndPayload) {
+    if (!payload || options.aborted.value) return
+    const toolId = payload.tool_use_id || payload.toolUseId || payload.id || ''
+    if (!toolId) return
+    const tc = streamToolCalls.value.find(t => t.toolId === toolId)
+      || ensureStreamToolCall(payload, { running: true })
+    if (!tc) return
+    if (payload.arguments && typeof payload.arguments === 'object') {
+      const input = JSON.stringify(payload.arguments)
+      tc.inputRaw = input
+      tc.inputPreview = truncateToolPreview(input, 200)
+      tc.displayName = toolDisplayName(tc.name, input)
+    }
+    scheduleRender()
+  }
+
   function appendToolResult(payload: ToolResultPayload) {
     if (!payload) return
     const name = normalizeToolName(payload)
@@ -1289,10 +1382,13 @@ export function useChatStream(options: UseChatStreamOptions) {
     checkpointForUserMessage,
     resetStreamForRouterReplay,
     resetLiveTurnState,
+    resetAnswerGeneration,
+    setAssistantMessageId,
     appendDelta,
     scheduleRender,
     appendToolCall,
     appendToolDelta,
+    appendToolEnd,
     appendToolResult,
     appendArtifact,
     appendInterruptFrame,

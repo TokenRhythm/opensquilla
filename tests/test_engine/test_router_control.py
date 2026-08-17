@@ -335,9 +335,62 @@ def test_prompt_block_contains_canonical_targets_not_aliases() -> None:
 
     assert "router_control" in block
     assert "tier:c3" in block
-    assert '"target_id":"tier:c3","label":"claude-opus-4.8"' in block
+    assert (
+        '"target_id":"tier:c3","label":"claude-opus-4.8",'
+        '"execution_kind":"single_model"'
+    ) in block
     assert "tier:t3" not in block
     assert "model:z-ai/glm-5.2" not in block
     assert "description" not in block
     assert "Use labels only to map explicit model-name requests" in block
     assert "must choose one target_id exactly" in block
+
+
+def test_ensemble_tier_is_presented_as_virtual_model_without_changing_anchor() -> None:
+    cfg = _router_cfg(
+        {
+            "c0": {
+                "provider": "openrouter",
+                "model": "deepseek/deepseek-v4-flash",
+                "supports_image": False,
+            },
+            "c3": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-opus-4.8",
+                "supports_image": False,
+                "ensemble_enabled": True,
+            },
+        }
+    )
+
+    target = resolve_router_control_target(cfg, "tier:c3")
+    block = render_router_control_prompt_block(cfg)
+
+    assert target.model == "anthropic/claude-opus-4.8"
+    assert target.provider == "openrouter"
+    assert target.display_label == "multi-model fusion"
+    assert target.execution_kind == "ensemble"
+    assert (
+        '"target_id":"tier:c3","label":"multi-model fusion",'
+        '"execution_kind":"ensemble"'
+    ) in block
+    assert "describe the selected route as multi-model fusion" in block
+    assert "internal anchor model" in block
+
+
+def test_explicit_single_model_c3_keeps_physical_model_label() -> None:
+    cfg = _router_cfg(
+        {
+            "c3": {
+                "provider": "openrouter",
+                "model": "anthropic/claude-opus-4.8",
+                "supports_image": False,
+                "ensemble_enabled": False,
+            }
+        }
+    )
+
+    target = resolve_router_control_target(cfg, "tier:c3")
+
+    assert target.display_label == "claude-opus-4.8"
+    assert target.execution_kind == "single_model"

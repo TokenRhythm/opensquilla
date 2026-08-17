@@ -82,9 +82,10 @@ describe('RpcClient', () => {
     firstSocket.receive({ type: 'event', event: 'connect.challenge' })
 
     const firstFrame = JSON.parse(firstSocket.sent[0]) as {
-      params: { auth: { guestSessionKey: string } }
+      params: { auth: { guestSessionKey: string }; caps: string[] }
     }
     const guestSessionKey = firstFrame.params.auth.guestSessionKey
+    expect(firstFrame.params.caps).toEqual(['session.answer_generation_reset.v1'])
     expect(guestSessionKey).toMatch(/^osqg_[A-Za-z0-9_-]{43}$/)
     expect(localStorage.getItem('opensquilla.guestSessionKey')).toBe(guestSessionKey)
 

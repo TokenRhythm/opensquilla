@@ -4571,7 +4571,8 @@ async def _handle_sessions_send_impl(
     def _turn_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
         enriched = dict(payload)
         enriched.setdefault("session_id", session_id)
-        enriched.setdefault("turn_id", turn_id)
+        if not enriched.get("turn_id"):
+            enriched["turn_id"] = turn_id
         enriched.setdefault("client_message_id", client_message_id)
         if user_message_id:
             enriched.setdefault("user_message_id", user_message_id)
@@ -4630,7 +4631,12 @@ async def _handle_sessions_send_impl(
                 )
                 return
 
-            from opensquilla.engine.stream_wrappers import wrap_stream
+            from opensquilla.engine.stream_wrappers import (
+                is_context_bound_owner,
+                wrap_stream,
+            )
+            from opensquilla.engine.types import AnswerGenerationResetEvent
+            from opensquilla.gateway.protocol import serialize_public_event
             from opensquilla.gateway.routing import tool_context_from_envelope
             from opensquilla.permissions import configured_default_elevated
 
@@ -4704,15 +4710,22 @@ async def _handle_sessions_send_impl(
                 idle_timeout=stream_idle_timeout,
                 heartbeat_interval=heartbeat_interval,
                 heartbeat_message="Agent run is still active",
+                context_bound=is_context_bound_owner(ctx.turn_runner),
             ):
-                event_dict = asdict(event)
+                if isinstance(event, AnswerGenerationResetEvent):
+                    event_dict = serialize_public_event(event)
+                else:
+                    event_dict = asdict(event)
                 event_kind = event_dict.pop("kind", event.__class__.__name__)
                 if event_kind == "thinking" and not event_dict.get("block_id"):
                     event_dict.pop("block_id", None)
                     event_dict.pop("block_index", None)
                 if event_kind == "artifact":
                     event_dict = enrich_artifact_event_dict(event_dict)
-                if event_kind in ("done", "error"):
+                if event_kind in ("done", "error") or (
+                    event_kind == "answer_generation_reset"
+                    and event_dict.get("terminal") is True
+                ):
                     await _emit_terminal_once(f"session.event.{event_kind}", event_dict)
                 else:
                     await _emit_to_subscribers(
@@ -10237,19 +10250,37 @@ async def _handle_sessions_messages_hydrate(params: dict | None, ctx: RpcContext
 async def _handle_sessions_messages_snapshot(params: dict | None, ctx: RpcContext) -> dict:
     """Return a compact active-turn base before a client subscribes for deltas."""
 
+    from opensquilla.gateway.protocol import project_session_event_for_client
+    from opensquilla.gateway.websocket import get_registry
+
     key = _require_key(params)
     snapshot = get_session_streams().live_snapshot(key)
+    connection = get_registry().get(ctx.conn_id)
+    client_caps: frozenset[str] = getattr(connection, "client_caps", frozenset())
+    projected_events = [
+        project_session_event_for_client(
+            event.event_name,
+            event.payload,
+            client_caps=client_caps,
+        )
+        for event in snapshot.events
+    ]
+    projected_terminal = any(
+        event_payload.get("terminal") is True
+        for _event_name, event_payload in projected_events
+        if isinstance(event_payload, dict)
+    )
     return {
         "key": key,
-        "task_id": snapshot.task_id,
+        "task_id": None if projected_terminal else snapshot.task_id,
         "stream_generation": snapshot.stream_generation,
         "current_stream_seq": snapshot.current_stream_seq,
         "events": [
             {
-                "event": event.event_name,
-                "payload": dict(event.payload),
+                "event": event_name,
+                "payload": dict(event_payload),
             }
-            for event in snapshot.events
+            for event_name, event_payload in projected_events
         ],
     }
 

@@ -36,6 +36,29 @@ def test_provider_scoped_corrections_budget_outranks_snapshot_merge() -> None:
         "deepseek-v4-flash", provider="tokenrhythm"
     ) == (1_000_000, "catalog")
     assert catalog.resolve_max_tokens("deepseek-v4-flash", provider="tokenrhythm") == 384_000
+    assert catalog.resolve_context_window_with_source(
+        "deepseek-v4-flash-0731", provider="tokenrhythm"
+    ) == (1_000_000, "catalog")
+    assert (
+        catalog.resolve_max_tokens(
+            "deepseek-v4-flash-0731", provider="tokenrhythm"
+        )
+        == 384_000
+    )
+    assert catalog.resolve_context_window_with_source(
+        "qwen3.7-flash", provider="tokenrhythm"
+    ) == (1_000_000, "catalog")
+    assert catalog.resolve_max_tokens("qwen3.7-flash", provider="tokenrhythm") == 65_536
+    qwen_flash_caps = catalog.get_capabilities(
+        "qwen3.7-flash", provider_name="tokenrhythm"
+    )
+    # TokenRhythm streams reasoning content but rejects thinking-toggle
+    # request fields, so the effective capability intentionally keeps the
+    # injectable reasoning dialect disabled.
+    assert qwen_flash_caps.supports_reasoning is False
+    assert qwen_flash_caps.reasoning_format == "none"
+    assert qwen_flash_caps.supports_tools is True
+    assert qwen_flash_caps.supports_vision is True
     # Discriminating rows — the bare-id merge would report the origin
     # providers' windows here, not the relay's published ones.
     assert catalog.resolve_context_window("glm-5", provider="tokenrhythm") == 1_000_000

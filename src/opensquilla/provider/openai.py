@@ -1528,6 +1528,10 @@ _MAX_MONEY_NANOS = (1 << 63) - 1
 _TOKENRHYTHM_CNY_PER_USD = TOKENRHYTHM_CNY_PER_USD
 _TOKENRHYTHM_FX_NANOS = TOKENRHYTHM_CNY_PER_USD_NANOS
 _USD_FX_NANOS = _MONEY_NANO_SCALE
+_TOKENRHYTHM_MONEY_STRING_MAX_CHARS = 128
+_TOKENRHYTHM_MONEY_STRING_RE = re.compile(
+    r"(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z"
+)
 
 
 @dataclass
@@ -1581,6 +1585,31 @@ def _decimal_json_number(value: Any) -> Decimal | None:
         return None
     try:
         parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not parsed.is_finite() or parsed < 0:
+        return None
+    return parsed
+
+
+def _decimal_tokenrhythm_amount(value: Any) -> Decimal | None:
+    """Parse TokenRhythm's native amount without widening its trust boundary.
+
+    TokenRhythm normally emits ``cost_cny`` as a JSON number, but its live
+    streaming API also emits the same finite non-negative decimal as a JSON
+    string. Accept only strings whose complete contents use JSON number
+    syntax. This deliberately rejects whitespace, signs on positive values,
+    leading zeroes, separators, non-finite spellings, and structured values.
+    """
+
+    if not isinstance(value, str):
+        return _decimal_json_number(value)
+    if not 0 < len(value) <= _TOKENRHYTHM_MONEY_STRING_MAX_CHARS:
+        return None
+    if _TOKENRHYTHM_MONEY_STRING_RE.fullmatch(value) is None:
+        return None
+    try:
+        parsed = Decimal(value)
     except (InvalidOperation, ValueError):
         return None
     if not parsed.is_finite() or parsed < 0:
@@ -1681,7 +1710,7 @@ def _billing_result(
         return 0.0, "none", None
 
     amount = (
-        _decimal_json_number(billing.tokenrhythm_cost_cny)
+        _decimal_tokenrhythm_amount(billing.tokenrhythm_cost_cny)
         if billing.tokenrhythm_cost_present
         else None
     )
@@ -3631,18 +3660,23 @@ class OpenAIProvider:
         tools: list[ToolDefinition] | None,
         cfg: ChatConfig,
     ) -> AsyncIterator[StreamEvent]:
+        # A coordinator-issued physical attempt is already the one upstream
+        # request for this adapter call.  Keep the legacy compatibility
+        # fallbacks available for unbounded direct calls, but never turn a
+        # coordinator-owned attempt into a hidden stream/non-stream resend.
+        coordinator_owns_retry = cfg.physical_attempt_limit == 1
         non_stream_fallback_allowed = (
             self._provider_kind != "dashscope"
             or _dashscope_non_stream_fallback_from_env()
         )
         stream_timeout_fallback = (
             self._compat.stream_timeout_fallback
-            and cfg.physical_attempt_limit != 1
+            and not coordinator_owns_retry
             and non_stream_fallback_allowed
         )
         empty_stream_fallback = (
             self._compat.empty_stream_fallback
-            and cfg.physical_attempt_limit != 1
+            and not coordinator_owns_retry
             and non_stream_fallback_allowed
         )
         (

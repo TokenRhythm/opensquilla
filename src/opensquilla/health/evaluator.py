@@ -14,6 +14,14 @@ from opensquilla.router_runtime_diagnostics import (
     classify_router_runtime_error,
     router_runtime_hint,
 )
+from opensquilla.router_tiers import (
+    CUSTOM_B5_SELECTION_MODE,
+    ROUTER_DYNAMIC_SELECTION_MODE,
+    static_b5_profile,
+)
+from opensquilla.router_tiers import (
+    ROUTER_TIER_ENSEMBLE_SELECTION_MODES as _ENSEMBLE_SELECTION_MODES,
+)
 
 _LEGACY_PROVIDER_REPLACEMENTS = {
     "zai": "zhipu",
@@ -1753,28 +1761,201 @@ def evaluate_sandbox(payload: dict[str, Any]) -> list[HealthFinding]:
     ]
 
 
-# selection_mode → (member-provider label, env-key fallback) for the static
-# B5 profiles. Payload-driven mirror of the gateway's static-B5 mode table.
-_STATIC_B5_MODE_DETAILS = {
-    "static_openrouter_b5": ("OpenRouter", "OPENROUTER_API_KEY"),
-    "static_tokenrhythm_b5": ("TokenRhythm", "TOKENRHYTHM_API_KEY"),
-}
-
-
 def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
+    tier_statuses = payload.get("tierEnsembleStatuses")
+    if isinstance(tier_statuses, dict) and tier_statuses:
+        # The aggregate row describes the global plan, while retained legacy
+        # tier plans can choose a different profile at runtime. Diagnose those
+        # rows independently so a healthy global lineup cannot hide the plan
+        # that a routed C3 turn will actually execute.
+        aggregate = dict(payload)
+        aggregate.pop("tierEnsembleStatuses", None)
+        findings: list[HealthFinding] = []
+        if bool(payload.get("globalEnabled")):
+            findings.extend(evaluate_llm_ensemble(aggregate))
+        for tier, raw_status in tier_statuses.items():
+            if not isinstance(raw_status, dict):
+                continue
+            tier_payload = dict(raw_status)
+            tier_payload.setdefault("activationSource", "router_tier")
+            tier_payload.setdefault("activationTiers", [str(tier)])
+            findings.extend(evaluate_llm_ensemble(tier_payload))
+        return findings
+
     enabled = bool(payload.get("enabled"))
     selection_mode = str(payload.get("selectionMode") or "")
-    if enabled and selection_mode == "custom_b5":
-        return _evaluate_custom_b5_ensemble(payload)
-    mode_details = _STATIC_B5_MODE_DETAILS.get(selection_mode)
-    if not enabled or mode_details is None:
-        return []
-    provider_label, env_key_fallback = mode_details
+    activation_source = str(payload.get("activationSource") or "global")
+    activation_tiers = [
+        str(tier).upper()
+        for tier in payload.get("activationTiers", [])
+        if str(tier).strip()
+    ]
+    tier_managed = activation_source == "router_tier"
+    tier_label = ", ".join(activation_tiers) or "the configured router tier"
+    policy_findings: list[HealthFinding] = []
+    if not enabled:
+        return policy_findings
+    # Every active plan has one physical safety net: the configured
+    # fixed/direct deployment. Diagnose that boundary before lineup-specific
+    # checks so a missing fixed model is never misreported as a member API-key
+    # problem (and never described as a safe fallback).
+    if payload.get("fixedFallbackReady") is False:
+        fixed_provider = str(payload.get("fixedFallbackProvider") or "")
+        fixed_model = str(payload.get("fixedFallbackModel") or "")
+        reason = str(
+            payload.get("fixedFallbackBlockedReason")
+            or payload.get("blockedReason")
+            or "missing_fixed_fallback"
+        )
+        return [
+            HealthFinding(
+                id="llm_ensemble.fixed_fallback.not_ready",
+                severity="error",
+                surface="llm_ensemble",
+                title="LLM ensemble fixed fallback is not ready",
+                detail=(
+                    f"Multi-model fusion for router tier {tier_label} requires a "
+                    "runnable fixed/direct provider and model for wrapper skips and "
+                    "all-failed fallback. Configure that deployment before sending "
+                    "requests; the runtime otherwise blocks the turn before fusion starts."
+                    if tier_managed
+                    else "Multi-model fusion requires a runnable fixed/direct provider "
+                    "and model for wrapper skips and all-failed fallback. Configure that "
+                    "deployment before sending requests; the runtime otherwise blocks "
+                    "the turn before fusion starts."
+                ),
+                evidence={
+                    "enabled": True,
+                    "globalEnabled": bool(payload.get("globalEnabled", enabled)),
+                    "selectionMode": selection_mode,
+                    "activationSource": activation_source,
+                    "activationTiers": activation_tiers,
+                    "fixedFallbackReady": False,
+                    "fixedFallbackProvider": fixed_provider,
+                    "fixedFallbackModel": fixed_model,
+                    "fixedFallbackBlockedReason": reason,
+                },
+                fix_steps=[
+                    FixStep(
+                        label="Configure the fixed model",
+                        detail=(
+                            "Open Settings → Model services and configure a provider, "
+                            "credential, and non-empty fixed/direct model."
+                        ),
+                    ),
+                    (
+                        FixStep(
+                            label="Review the router tier",
+                            detail=(
+                                "Open Settings → Model routing and switch the affected "
+                                "tier to a single model, or repair its shared fusion plan."
+                            ),
+                        )
+                        if tier_managed
+                        else FixStep(
+                            label="Disable the ensemble",
+                            command="opensquilla config set llm_ensemble.enabled false",
+                        )
+                    ),
+                ],
+                restart_required=False,
+            ),
+            *policy_findings,
+        ]
+    if selection_mode not in _ENSEMBLE_SELECTION_MODES:
+        return [
+            HealthFinding(
+                id="llm_ensemble.unknown_selection_mode",
+                severity="warn",
+                surface="llm_ensemble",
+                title="LLM ensemble selection mode is unsupported",
+                detail=(
+                    f"The configured selection mode {selection_mode or '<empty>'!r} "
+                    "is not supported, so ensemble execution is blocked and OpenSquilla "
+                    "uses the configured fixed/direct fallback model. Choose a supported "
+                    "mode or disable the ensemble."
+                ),
+                evidence={
+                    "enabled": True,
+                    "selectionMode": selection_mode,
+                    "blockedReason": payload.get("blockedReason")
+                    or "unknown_selection_mode",
+                },
+                fix_steps=[
+                    FixStep(
+                        label="Choose a supported selection mode",
+                        detail=(
+                            "Use custom_b5, router_dynamic, static_openrouter_b5, "
+                            "or static_tokenrhythm_b5."
+                        ),
+                    ),
+                    FixStep(
+                        label="Disable the ensemble",
+                        command="opensquilla config set llm_ensemble.enabled false",
+                    ),
+                ],
+            ),
+            *policy_findings,
+        ]
+    if enabled and selection_mode == CUSTOM_B5_SELECTION_MODE:
+        return [*_evaluate_custom_b5_ensemble(payload), *policy_findings]
+    if (
+        selection_mode == ROUTER_DYNAMIC_SELECTION_MODE
+        and str(payload.get("runtimeStatus") or "") == "blocked"
+    ):
+        reason = str(payload.get("blockedReason") or "dynamic_member_unavailable")
+        return [
+            HealthFinding(
+                id=f"llm_ensemble.{ROUTER_DYNAMIC_SELECTION_MODE}.not_ready",
+                severity="warn",
+                surface="llm_ensemble",
+                title="Dynamic LLM ensemble is not ready",
+                detail=(
+                    "At least one required Router member deployment is unavailable, so "
+                    "the dynamic wrapper is skipped and requests use the configured "
+                    "fixed/direct fallback. Repair the affected tier deployment or "
+                    "choose a fixed lineup."
+                ),
+                evidence={
+                    "enabled": True,
+                    "selectionMode": selection_mode,
+                    "runtimeStatus": "blocked",
+                    "blockedReason": reason,
+                    "blockedTierCandidates": payload.get("blockedTierCandidates") or [],
+                },
+                fix_steps=[
+                    FixStep(
+                        label="Repair Router member deployments",
+                        detail=(
+                            "Open Settings → Model routing and verify each tier's "
+                            "provider credential and endpoint."
+                        ),
+                    ),
+                    FixStep(
+                        label="Choose a fixed lineup",
+                        detail=(
+                            "Open Settings → Multi-model fusion and choose a static "
+                            "or custom lineup whose providers are configured."
+                        ),
+                    ),
+                ],
+                restart_required=False,
+            ),
+            *policy_findings,
+        ]
+    static_profile = static_b5_profile(selection_mode)
+    if static_profile is None:
+        return policy_findings
+    provider_label = static_profile.label
+    env_key_fallback = static_profile.api_key_env
     api_key_env = str(payload.get("apiKeyEnv") or env_key_fallback)
     credential_available = bool(payload.get("credentialAvailable"))
     evidence = {
         "enabled": enabled,
+        "globalEnabled": bool(payload.get("globalEnabled", enabled)),
         "selectionMode": selection_mode,
+        "activationSource": activation_source,
+        "activationTiers": activation_tiers,
         "activeProvider": payload.get("activeProvider"),
         "apiKeyEnv": api_key_env,
         "credentialAvailable": credential_available,
@@ -1788,24 +1969,49 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
                 title="LLM ensemble ready",
                 detail=(
                     f"The static {provider_label} B5 ensemble resolves a "
+                    f"{provider_label} credential and is active for router tier "
+                    f"{tier_label}."
+                    if tier_managed
+                    else f"The static {provider_label} B5 ensemble resolves a "
                     f"{provider_label} credential and is active for turns."
                 ),
                 evidence=evidence,
-            )
+            ),
+            *policy_findings,
         ]
+    if tier_managed:
+        detail = (
+            f"The static {provider_label} B5 ensemble configured for router tier "
+            f"{tier_label} cannot resolve a {provider_label} credential. Those "
+            "requests safely use the configured fixed/direct fallback model. Set "
+            f"{api_key_env}, or repair the shared multi-model plan."
+        )
+        disable_step = FixStep(
+            label="Review the router tier",
+            detail=(
+                "Open Settings → Model routing and switch the affected tier to "
+                "a single model, or configure the shared multi-model plan."
+            ),
+        )
+    else:
+        detail = (
+            f"LLM ensemble (static {provider_label} B5) is enabled but no "
+            f"{provider_label} credential resolves — the ensemble is inactive and "
+            "every turn uses the configured fixed/direct fallback model. Set "
+            f"{api_key_env}, switch llm_ensemble.selection_mode, or disable the "
+            "ensemble."
+        )
+        disable_step = FixStep(
+            label="Disable the ensemble",
+            command="opensquilla config set llm_ensemble.enabled false",
+        )
     return [
         HealthFinding(
             id=f"llm_ensemble.{selection_mode}.credentials.missing",
             severity="warn",
             surface="llm_ensemble",
             title="LLM ensemble is enabled but cannot run",
-            detail=(
-                f"LLM ensemble (static {provider_label} B5) is enabled but no "
-                f"{provider_label} credential resolves — the ensemble is inactive and "
-                f"every turn falls back to the single configured provider. Set "
-                f"{api_key_env}, switch llm_ensemble.selection_mode, or disable the "
-                "ensemble."
-            ),
+            detail=detail,
             evidence=evidence,
             fix_steps=[
                 FixStep(
@@ -1815,14 +2021,12 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
                         "the gateway."
                     ),
                 ),
-                FixStep(
-                    label="Disable the ensemble",
-                    command="opensquilla config set llm_ensemble.enabled false",
-                ),
+                disable_step,
                 FixStep(label="Restart gateway", command="opensquilla gateway restart"),
             ],
             restart_required=True,
-        )
+        ),
+        *policy_findings,
     ]
 
 
@@ -1838,7 +2042,7 @@ def _evaluate_custom_b5_ensemble(payload: dict[str, Any]) -> list[HealthFinding]
     reason = str(payload.get("lineupBlockedReason") or "")
     evidence = {
         "enabled": True,
-        "selectionMode": "custom_b5",
+        "selectionMode": CUSTOM_B5_SELECTION_MODE,
         "activeProvider": payload.get("activeProvider"),
         "lineupReady": ready,
         "lineupBlockedReason": reason,
@@ -1846,7 +2050,7 @@ def _evaluate_custom_b5_ensemble(payload: dict[str, Any]) -> list[HealthFinding]
     if ready:
         return [
             HealthFinding(
-                id="llm_ensemble.custom_b5.ready",
+                id=f"llm_ensemble.{CUSTOM_B5_SELECTION_MODE}.ready",
                 severity="ok",
                 surface="llm_ensemble",
                 title="LLM ensemble ready",
@@ -1862,24 +2066,24 @@ def _evaluate_custom_b5_ensemble(payload: dict[str, Any]) -> list[HealthFinding]
         detail = (
             "LLM ensemble (custom lineup) is enabled but the "
             f"{provider_id} member resolves no API key — the ensemble is "
-            "inactive and every turn falls back to the single configured "
-            "provider. Set the provider key, remove the member, or disable "
-            "the ensemble."
+            "inactive and every turn uses the configured fixed/direct fallback "
+            "model. Set the provider key, remove the member, or disable the ensemble."
         )
     elif reason == "no_proposers":
         detail = (
             "LLM ensemble (custom lineup) is enabled but has no enabled "
-            "proposer candidates — add candidates or disable the ensemble."
+            "proposer candidates, so requests use the configured fixed/direct "
+            "fallback model. Add candidates or disable the ensemble."
         )
     else:
         detail = (
             "LLM ensemble (custom lineup) is enabled but cannot run "
-            f"({reason or 'unknown reason'}) — every turn falls back to the "
-            "single configured provider."
+            f"({reason or 'unknown reason'}) — every turn uses the configured "
+            "fixed/direct fallback model."
         )
     return [
         HealthFinding(
-            id="llm_ensemble.custom_b5.not_ready",
+            id=f"llm_ensemble.{CUSTOM_B5_SELECTION_MODE}.not_ready",
             severity="warn",
             surface="llm_ensemble",
             title="LLM ensemble is enabled but cannot run",

@@ -27,6 +27,7 @@ function createHarness(options: {
   loadCurrentSessionUsage?: () => void
   refreshRunModePreference?: () => void | Promise<void>
   pendingQueue?: ChatPendingItem[]
+  stream?: ChatRpcStreamApi
   restoreSteerIntoComposer?: (text: string) => void
   getCompactionPlacement?: (compactionId: string) => 'activity' | 'standalone' | undefined
   observeStreamGeneration?: (payload: unknown) => boolean
@@ -38,7 +39,7 @@ function createHarness(options: {
   const activeStreamTaskId = ref('')
   const pendingQueue = ref<ChatPendingItem[]>(options.pendingQueue ?? [])
   const applySessionRunState = vi.fn()
-  const stream: ChatRpcStreamApi = {
+  const stream: ChatRpcStreamApi = options.stream || {
     isStreaming: ref(true),
     streamBubble: ref(true),
     streamHasVisibleOutput: ref(false),
@@ -48,10 +49,13 @@ function createHarness(options: {
     scheduleRender: vi.fn(),
     appendToolCall: vi.fn(),
     appendToolDelta: vi.fn(),
+    appendToolEnd: vi.fn(),
     appendToolResult: vi.fn(),
     appendArtifact: vi.fn(),
     reconcileFinalText: vi.fn(),
     resetLiveTurnState: vi.fn(),
+    resetAnswerGeneration: vi.fn(),
+    setAssistantMessageId: vi.fn(),
     resetStreamIdleTimer: vi.fn(),
     clearStreamIdleTimer: vi.fn(),
     setStreamActivity: vi.fn(),
@@ -146,6 +150,249 @@ function createHarness(options: {
 }
 
 describe('useChatRpcEventHandlers live snapshot restoration', () => {
+  it('replays a committed tool timeline including its authoritative end', () => {
+    const { api, stream, stop } = createHarness()
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-tool-timeline',
+        current_stream_seq: 3,
+        events: [
+          {
+            event: 'session.event.tool_use_start',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-tool-timeline',
+              generation_epoch: 0,
+              tool_use_id: 'tool-1',
+              tool_name: 'lookup',
+              stream_seq: 1,
+            },
+          },
+          {
+            event: 'session.event.tool_use_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-tool-timeline',
+              generation_epoch: 0,
+              tool_use_id: 'tool-1',
+              json_fragment: '{"query":"answer"}',
+              stream_seq: 2,
+            },
+          },
+          {
+            event: 'session.event.tool_use_end',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-tool-timeline',
+              generation_epoch: 0,
+              tool_use_id: 'tool-1',
+              tool_name: 'lookup',
+              arguments: { query: 'answer' },
+              stream_seq: 3,
+            },
+          },
+        ],
+      })
+
+      expect(stream.appendToolCall).toHaveBeenCalledTimes(1)
+      expect(stream.appendToolDelta).toHaveBeenCalledTimes(1)
+      expect(stream.appendToolEnd).toHaveBeenCalledWith(expect.objectContaining({
+        tool_use_id: 'tool-1',
+        arguments: { query: 'answer' },
+      }))
+    } finally {
+      stop()
+    }
+  })
+
+  it('replays a generation reset and drops late old-generation text', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      stop,
+    } = createHarness()
+    try {
+      api.restoreLiveTurnSnapshot({
+        key: 'agent:main:test',
+        task_id: 'task-live',
+        current_stream_seq: 5,
+        events: [
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              generation_epoch: 0,
+              text: 'partial old',
+              stream_seq: 1,
+            },
+          },
+          {
+            event: 'session.event.answer_generation_reset',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              assistant_message_id: 'assistant-1',
+              old_generation_epoch: 0,
+              new_generation_epoch: 1,
+              authoritative_text_snapshot: '',
+              authoritative_reasoning_snapshot: '',
+              preserve_completed_tools: true,
+              stream_seq: 2,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              generation_epoch: 0,
+              text: 'late old',
+              stream_seq: 3,
+            },
+          },
+          {
+            event: 'session.event.text_delta',
+            payload: {
+              session_key: 'agent:main:test',
+              task_id: 'task-live',
+              generation_epoch: 1,
+              text: 'fixed',
+              stream_seq: 4,
+            },
+          },
+        ],
+      })
+
+      expect(activeStreamTaskId.value).toBe('task-live')
+      expect(stream.resetAnswerGeneration).toHaveBeenCalledWith({
+        textSnapshot: '',
+        preserveCompletedTools: true,
+      })
+      expect(stream.appendDelta).toHaveBeenCalledTimes(2)
+      expect(stream.appendDelta).toHaveBeenNthCalledWith(1, 'partial old')
+      expect(stream.appendDelta).toHaveBeenNthCalledWith(2, 'fixed')
+      expect(stream.setAssistantMessageId).toHaveBeenCalledWith('assistant-1')
+    } finally {
+      stop()
+    }
+  })
+
+  it('rejects old-generation delta and done after an in-flight reset', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = 'task-live'
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 0,
+        text: 'partial old',
+        stream_seq: 1,
+      })
+      api.handlers.onAnswerGenerationReset({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        assistant_message_id: 'assistant-1',
+        old_generation_epoch: 0,
+        new_generation_epoch: 1,
+        authoritative_text_snapshot: '',
+        authoritative_reasoning_snapshot: '',
+        preserve_completed_tools: true,
+        stream_seq: 2,
+      })
+
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 0,
+        text: 'late old',
+        stream_seq: 3,
+      })
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 0,
+        stream_seq: 4,
+        text_snapshot: 'old final',
+      })
+
+      expect(stream.appendDelta).toHaveBeenCalledTimes(1)
+      expect(stream.reconcileFinalText).not.toHaveBeenCalled()
+      expect(stream.endStreaming).not.toHaveBeenCalled()
+
+      api.handlers.onTextDelta({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 1,
+        text: 'fixed',
+        stream_seq: 5,
+      })
+      api.handlers.onAny('session.event.done', {
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        generation_epoch: 1,
+        stream_seq: 6,
+        text_snapshot: 'fixed',
+      })
+
+      expect(stream.appendDelta).toHaveBeenCalledTimes(2)
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+    } finally {
+      stop()
+    }
+  })
+
+  it('finishes a terminal reset in the same assistant message and suppresses a late error', () => {
+    const {
+      api,
+      stream,
+      activeStreamTaskId,
+      messages,
+      stop,
+    } = createHarness()
+    try {
+      activeStreamTaskId.value = 'task-live'
+      api.handlers.onAnswerGenerationReset({
+        session_key: 'agent:main:test',
+        task_id: 'task-live',
+        assistant_message_id: 'assistant-1',
+        old_generation_epoch: 0,
+        new_generation_epoch: 1,
+        authoritative_text_snapshot: '',
+        authoritative_reasoning_snapshot: '',
+        terminal: true,
+        terminal_text_snapshot: 'The fixed model could not complete this answer.',
+        stream_seq: 1,
+      })
+
+      expect(stream.reconcileFinalText).toHaveBeenCalledWith(
+        'The fixed model could not complete this answer.',
+      )
+      expect(stream.endStreaming).toHaveBeenCalledOnce()
+      expect(stream.setAssistantMessageId).toHaveBeenCalledWith('assistant-1')
+      expect(activeStreamTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
+
+      api.handlers.onAny('session.event.error', {
+        session_key: 'agent:main:test',
+        generation_epoch: 1,
+        stream_seq: 2,
+        code: 'fixed_model_failed',
+        message: 'late duplicate error',
+      })
+
+      expect(messages.value.some(message => message.role === 'error')).toBe(false)
+    } finally {
+      stop()
+    }
+  })
+
   it('does not replace live task state for a recents-only session change', () => {
     const {
       api,

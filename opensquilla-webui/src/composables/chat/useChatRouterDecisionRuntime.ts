@@ -255,9 +255,9 @@ export function useChatRouterDecisionRuntime(options: UseChatRouterDecisionRunti
       target = options.messages.value[options.messages.value.length - 1]
     }
 
-    // Keep the strip on the ensemble branch even if a prior squilla-router
-    // decision stamped a non-ensemble source on this same turn's message.
-    if (target.routerDecision) target.routerDecision.source = 'llm_ensemble'
+    // Keep the original router decision intact. When Squilla Router selected an
+    // ensemble-enabled tier, the renderer needs both that decision and these
+    // member deltas to play the route stage before the ensemble stage.
     if (!target.ensemble) target.ensemble = emptyEnsemble()
     upsertEnsembleMember(target.ensemble, member)
     scrollToBottomIfFollowing()

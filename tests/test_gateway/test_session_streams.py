@@ -346,6 +346,231 @@ def test_live_turn_snapshot_is_replaced_by_the_next_task_and_cleared_on_terminal
     assert terminal_snapshot.current_stream_seq == registry.current_seq(session_key)
 
 
+def test_generation_reset_is_a_compression_boundary_and_keeps_completed_outputs() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=20)
+    session_key = "agent:main:generation-reset-boundary"
+    identity = {
+        "task_id": "task-reset",
+        "turn_id": "turn-reset",
+        "assistant_message_id": "assistant-reset",
+    }
+
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {**identity, "text": "old ", "generation_epoch": 0, "sequence": 1},
+    )
+    registry.record(
+        session_key,
+        "session.event.thinking",
+        {**identity, "text": "old reasoning", "generation_epoch": 0, "sequence": 2},
+    )
+    registry.record(
+        session_key,
+        "session.event.tool_use_delta",
+        {
+            **identity,
+            "tool_use_id": "old-tool",
+            "json_fragment": "old-arguments",
+            "generation_epoch": 0,
+            "sequence": 3,
+        },
+    )
+    registry.record(
+        session_key,
+        "session.event.tool_result",
+        {
+            **identity,
+            "tool_use_id": "old-tool",
+            "result": "completed before reset",
+            "generation_epoch": 0,
+            "sequence": 4,
+        },
+    )
+    registry.record(
+        session_key,
+        "session.event.artifact",
+        {**identity, "id": "artifact-before-reset", "generation_epoch": 0, "sequence": 5},
+    )
+    reset = registry.record(
+        session_key,
+        "session.event.answer_generation_reset",
+        {
+            **identity,
+            "old_generation_epoch": 0,
+            "new_generation_epoch": 1,
+            "safe_reason": "provider fallback",
+            "preserve_completed_tools": True,
+            "authoritative_text_snapshot": "new answer",
+            "sequence": 6,
+        },
+    )
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {**identity, "text": "new ", "generation_epoch": 1, "sequence": 7},
+    )
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {**identity, "text": "answer", "generation_epoch": 1, "sequence": 8},
+    )
+    registry.record(
+        session_key,
+        "session.event.thinking",
+        {**identity, "text": "new reasoning", "generation_epoch": 1, "sequence": 9},
+    )
+    registry.record(
+        session_key,
+        "session.event.tool_use_delta",
+        {
+            **identity,
+            "tool_use_id": "new-tool",
+            "json_fragment": "new-arguments",
+            "generation_epoch": 1,
+            "sequence": 10,
+        },
+    )
+    registry.record(
+        session_key,
+        "session.event.text_delta",
+        {**identity, "text": "late old", "generation_epoch": 0, "sequence": 11},
+    )
+
+    snapshot = registry.live_snapshot(session_key)
+    snapshot_names = [event.event_name for event in snapshot.events]
+    assert snapshot_names == [
+        "session.event.tool_result",
+        "session.event.artifact",
+        "session.event.answer_generation_reset",
+        "session.event.text_delta",
+        "session.event.thinking",
+        "session.event.tool_use_delta",
+    ]
+    assert snapshot.events[0].payload["result"] == "completed before reset"
+    assert snapshot.events[1].payload["id"] == "artifact-before-reset"
+    assert snapshot.events[2].payload["new_generation_epoch"] == 1
+    assert snapshot.events[2].payload["sequence"] == 6
+    assert snapshot.events[3].payload["text"] == "new answer"
+    assert snapshot.events[4].payload["text"] == "new reasoning"
+    assert snapshot.events[5].payload["json_fragment"] == "new-arguments"
+    assert all(
+        event.payload.get("assistant_message_id") == "assistant-reset"
+        for event in snapshot.events
+    )
+    assert all(
+        event.stream_seq == sorted(item.stream_seq for item in snapshot.events)[index]
+        for index, event in enumerate(snapshot.events)
+    )
+
+    replay = registry.replay(session_key, 0)
+    assert replay.replay_complete is True
+    assert replay.gap_reason is None
+    assert [event.event_name for event in replay.events] == [
+        "session.event.tool_result",
+        "session.event.artifact",
+        "session.event.answer_generation_reset",
+        "session.event.text_delta",
+        "session.event.text_delta",
+        "session.event.thinking",
+        "session.event.tool_use_delta",
+    ]
+    assert not any(
+        event.payload.get("text") in {"old ", "old reasoning", "late old"}
+        or event.payload.get("json_fragment") == "old-arguments"
+        for event in replay.events
+    )
+    assert replay.events[2].payload["stream_seq"] == reset["stream_seq"]
+
+    replay_after_reset = registry.replay(session_key, reset["stream_seq"])
+    assert replay_after_reset.replay_complete is True
+    assert not any(
+        event.payload.get("text") == "late old" for event in replay_after_reset.events
+    )
+
+
+def test_generation_reset_preserves_only_closed_tool_timeline() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=20)
+    session_key = "agent:main:generation-reset-tools"
+    identity = {
+        "task_id": "task-tools",
+        "turn_id": "turn-tools",
+        "assistant_message_id": "assistant-tools",
+    }
+
+    for event_name, payload in (
+        (
+            "session.event.tool_use_start",
+            {"tool_use_id": "closed", "tool_name": "lookup"},
+        ),
+        (
+            "session.event.tool_use_delta",
+            {"tool_use_id": "closed", "json_fragment": '{"q":"ok"}'},
+        ),
+        (
+            "session.event.tool_use_end",
+            {"tool_use_id": "closed", "arguments": {"q": "ok"}},
+        ),
+        (
+            "session.event.tool_use_start",
+            {"tool_use_id": "pending", "tool_name": "lookup"},
+        ),
+        (
+            "session.event.tool_use_delta",
+            {"tool_use_id": "pending", "json_fragment": '{"q":'},
+        ),
+    ):
+        registry.record(
+            session_key,
+            event_name,
+            {**identity, **payload, "generation_epoch": 0},
+        )
+
+    registry.record(
+        session_key,
+        "session.event.answer_generation_reset",
+        {
+            **identity,
+            "old_generation_epoch": 0,
+            "new_generation_epoch": 1,
+            "safe_reason": "provider takeover",
+        },
+    )
+
+    snapshot = registry.live_snapshot(session_key)
+    tool_events = [
+        event
+        for event in snapshot.events
+        if event.event_name.startswith("session.event.tool_use_")
+    ]
+    assert [event.event_name for event in tool_events] == [
+        "session.event.tool_use_start",
+        "session.event.tool_use_delta",
+        "session.event.tool_use_end",
+    ]
+    assert {event.payload["tool_use_id"] for event in tool_events} == {"closed"}
+
+def test_replay_reports_when_the_reset_boundary_is_outside_the_buffer() -> None:
+    registry = SessionStreamRegistry(max_events_per_session=1)
+    session_key = "agent:main:reset-gap"
+    registry.record(
+        session_key,
+        "session.event.answer_generation_reset",
+        {"old_generation_epoch": 0, "new_generation_epoch": 1, "sequence": 1},
+    )
+    registry.record(
+        session_key,
+        "session.event.answer_generation_reset",
+        {"old_generation_epoch": 1, "new_generation_epoch": 2, "sequence": 2},
+    )
+    registry.record(session_key, "session.event.state_change", {"to_state": "done"})
+
+    replay = registry.replay(session_key, 0)
+
+    assert replay.replay_complete is False
+    assert replay.gap_reason == "generation_reset_boundary_missed"
+
+
 def test_session_stream_registry_preserves_compaction_boundaries_over_heartbeats() -> None:
     registry = SessionStreamRegistry(max_events_per_session=2)
     session_key = "agent:main:compaction-lifecycle"

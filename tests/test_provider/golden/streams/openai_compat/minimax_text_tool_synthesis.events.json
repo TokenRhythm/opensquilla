@@ -1,5 +1,6 @@
 [
   {
+    "generation_epoch": null,
     "synthetic_from_text": true,
     "tool_name": "lookup",
     "tool_use_id": "minimax_compat_000000000000",
@@ -9,6 +10,7 @@
     "arguments": {
       "q": "cache status"
     },
+    "generation_epoch": null,
     "synthetic_from_text": true,
     "tool_name": "lookup",
     "tool_use_id": "minimax_compat_000000000000",
@@ -20,6 +22,7 @@
     "cached_tokens": 0,
     "cost_source": "none",
     "ensemble_trace": null,
+    "generation_epoch": null,
     "input_tokens": 14,
     "model": "minimax-test-1",
     "model_usage_breakdown": [],

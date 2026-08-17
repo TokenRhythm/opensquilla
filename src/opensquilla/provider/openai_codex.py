@@ -4,7 +4,8 @@ Speaks the ``chatgpt.com/backend-api/codex/responses`` protocol — an OpenAI
 Responses-flavored SSE endpoint authenticated with the operator's ChatGPT
 subscription (Bearer access token + ``chatgpt-account-id`` header) instead
 of a platform API key. Credentials come from the Codex CLI's auth file via
-``codex_auth``; a 401 triggers one token refresh + retry.
+``codex_auth``; legacy unbounded calls may refresh once and retry on a 401,
+while coordinator-bound calls surface the failure without an adapter resend.
 
 Wire facts mirror the reference implementation in codex-rs: flat function
 tools (``{type, name, description, strict, parameters}``), Responses input
@@ -342,6 +343,11 @@ class OpenAICodexProvider:
             )
             return
 
+        # A coordinator-issued physical attempt owns its retry decision.  Do
+        # not refresh credentials and resend from inside that attempt; the
+        # legacy direct-call path keeps its historical one-refresh
+        # compatibility behavior.
+        coordinator_owns_retry = cfg.physical_attempt_limit == 1
         try:
             async with httpx.AsyncClient(
                 timeout=cfg.timeout,
@@ -359,7 +365,7 @@ class OpenAICodexProvider:
                         if (
                             response.status_code == 401
                             and not refreshed
-                            and cfg.physical_attempt_limit != 1
+                            and not coordinator_owns_retry
                         ):
                             refreshed = True
                             try:

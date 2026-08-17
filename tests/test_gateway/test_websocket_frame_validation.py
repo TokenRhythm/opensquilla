@@ -16,9 +16,10 @@ from typing import Any
 
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
+from opensquilla.contracts.gateway_transport import ANSWER_GENERATION_RESET_CAPABILITY
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.protocol import make_ok_res
-from opensquilla.gateway.websocket import WsConnection, handle_ws_connection
+from opensquilla.gateway.websocket import WsConnection, get_registry, handle_ws_connection
 
 _CONNECT_FRAME = json.dumps(
     {
@@ -64,6 +65,21 @@ class _EchoDispatcher:
 
     async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
         return make_ok_res(req_id, {"method": method, "params": params})
+
+
+class _CapabilityDispatcher:
+    def list_methods(self) -> list[str]:
+        return ["connection.capabilities"]
+
+    async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+        connection = get_registry().get(ctx.conn_id)
+        return make_ok_res(
+            req_id,
+            {
+                "method": method,
+                "client_caps": sorted(connection.client_caps),
+            },
+        )
 
 
 class _BlockingMetaDispatcher:
@@ -131,6 +147,40 @@ async def _run(frames: list[str]) -> _ScriptedWebSocket:
     ws = _ScriptedWebSocket(frames)
     await handle_ws_connection(ws, _config(), dispatcher=_EchoDispatcher())
     return ws
+
+
+async def test_handshake_persists_connect_capabilities_on_connection() -> None:
+    connect = json.dumps(
+        {
+            "type": "req",
+            "id": "h",
+            "method": "connect",
+            "params": {
+                "minProtocol": 1,
+                "role": "operator",
+                "auth": {},
+                "caps": [ANSWER_GENERATION_RESET_CAPABILITY, 7, ""],
+            },
+        }
+    )
+    ws = _ScriptedWebSocket(
+        [
+            connect,
+            json.dumps(
+                {
+                    "type": "req",
+                    "id": "caps",
+                    "method": "connection.capabilities",
+                    "params": {},
+                }
+            ),
+        ]
+    )
+
+    await handle_ws_connection(ws, _config(), dispatcher=_CapabilityDispatcher())
+
+    response = next(frame for frame in ws.responses() if frame["id"] == "caps")
+    assert response["payload"]["client_caps"] == [ANSWER_GENERATION_RESET_CAPABILITY]
 
 
 async def test_non_string_req_id_gets_error_res_and_connection_survives() -> None:

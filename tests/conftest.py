@@ -85,9 +85,10 @@ def _isolate_provider_credentials(
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
 ) -> None:
-    """Keep default tests offline even when local env files have API keys."""
+    """Keep default tests offline despite local credentials or live-pricing settings."""
     if any(request.node.get_closest_marker(marker) for marker in _LIVE_MARKERS):
         return
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
     for env_key in _PROVIDER_ENV_KEYS:
         # An explicit empty value prevents build_services.load_env() from
         # rehydrating credentials from a repository or profile .env file.

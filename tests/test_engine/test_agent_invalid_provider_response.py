@@ -1312,7 +1312,7 @@ async def test_incomplete_tool_stream_errors_without_running_tool() -> None:
     events = [event async for event in agent.run_turn("hello")]
 
     assert called is False
-    assert any(event.kind == "tool_use_start" for event in events)
+    assert not any(event.kind == "tool_use_start" for event in events)
     assert any(event.kind == "error" and event.code == "incomplete_tool_stream" for event in events)
     done = next(event for event in events if event.kind == "done")
     assert done.input_tokens == 5
@@ -1694,7 +1694,7 @@ async def test_length_capped_tool_call_is_not_executed() -> None:
     events = [event async for event in agent.run_turn("hello")]
 
     assert called is False
-    assert any(event.kind == "tool_use_start" for event in events)
+    assert not any(event.kind == "tool_use_start" for event in events)
     assert any(
         event.kind == "error" and event.code == "provider_output_truncated"
         for event in events

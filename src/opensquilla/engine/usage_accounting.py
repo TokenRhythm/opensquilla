@@ -503,7 +503,11 @@ def _row_value(
 def _breakdown_reconciles(event: object, rows: list[dict[str, Any]]) -> bool:
     """Return whether every additive Done envelope field equals its rows."""
 
-    is_error = str(getattr(event, "kind", "") or "") == "error"
+    event_kind = str(getattr(event, "kind", "") or "")
+    is_error = event_kind == "error" or (
+        event_kind == "provider_generation_reset"
+        and bool(getattr(event, "terminal", False))
+    )
     additive_keys = (
         ("input_tokens", ("input_tokens", "inputTokens")),
         ("output_tokens", ("output_tokens", "outputTokens")),

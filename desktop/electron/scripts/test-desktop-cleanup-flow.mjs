@@ -98,7 +98,21 @@ const consolidationBackupMarker = join(
   'archived-recovery-data.txt',
 )
 const cleanupJournal = join(userData, '.opensquilla.profile-cleanup.json')
+const deleteAllHelperTimeoutMs = process.platform === 'win32' ? 90_000 : 30_000
 let desktopApp
+
+async function pendingDeleteAllTargets() {
+  const targets = [
+    ['primary-home', primaryHome],
+    ['consolidation-backup', consolidationBackupRoot],
+    ['desktop-logs', join(userData, 'logs')],
+  ]
+  const states = await Promise.all(targets.map(async ([name, path]) => ({
+    name,
+    exists: await exists(path),
+  })))
+  return states.filter((state) => state.exists).map((state) => state.name)
+}
 
 async function seedProfileContext(updatedAt) {
   await writeFile(join(userData, 'desktop-locale'), 'en', 'utf8')
@@ -263,11 +277,19 @@ try {
       throw new Error('Desktop did not exit before the delete-all helper handoff.')
     }),
   ])
-  await waitFor(async () => (
-    !await exists(primaryHome)
-    && !await exists(consolidationBackupRoot)
-    && !await exists(join(userData, 'logs'))
-  ), 'post-exit delete-all helper completion', 30_000)
+  try {
+    await waitFor(async () => (
+      !await exists(primaryHome)
+      && !await exists(consolidationBackupRoot)
+      && !await exists(join(userData, 'logs'))
+    ), 'post-exit delete-all helper completion', deleteAllHelperTimeoutMs)
+  } catch (error) {
+    const pendingTargets = await pendingDeleteAllTargets()
+    throw new Error(
+      `${error.message}; pending synthetic targets: ${pendingTargets.join(', ') || 'none'}`,
+      { cause: error },
+    )
+  }
 
   console.log(JSON.stringify({
     ok: true,

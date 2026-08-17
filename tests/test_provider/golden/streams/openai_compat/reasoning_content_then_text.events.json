@@ -1,13 +1,16 @@
 [
   {
+    "generation_epoch": null,
     "text": "Weigh the",
     "type": "ReasoningDeltaEvent"
   },
   {
+    "generation_epoch": null,
     "text": " options.",
     "type": "ReasoningDeltaEvent"
   },
   {
+    "generation_epoch": null,
     "text": "Take the train.",
     "type": "TextDeltaEvent"
   },
@@ -17,6 +20,7 @@
     "cached_tokens": 0,
     "cost_source": "none",
     "ensemble_trace": null,
+    "generation_epoch": null,
     "input_tokens": 18,
     "model": "gpt-test-1",
     "model_usage_breakdown": [],

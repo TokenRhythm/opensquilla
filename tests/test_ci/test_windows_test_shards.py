@@ -93,6 +93,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_ci/test_session_storage_connection_contract.py",
     "tests/test_channels/test_stream_terminal_routing.py",
     "tests/test_engine/test_agent_canonical_text_contract.py",
+    "tests/test_engine/test_agent_transactional_tool_publication.py",
     "tests/test_engine/test_attachment_aware_routing.py",
     "tests/test_engine/test_done_text_snapshot_consumers.py",
     "tests/test_engine/test_provider_request_correlation.py",
@@ -101,6 +102,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_engine/test_route_plan.py",
     "tests/test_engine/test_stream_repetition_guard.py",
     "tests/test_engine/turn_runner/test_canonical_text_contract.py",
+    "tests/test_engine/turn_runner/test_turn_identity_finalizer.py",
     "tests/test_gateway/test_api_chat.py",
     "tests/test_gateway/test_channel_turn_ingress.py",
     "tests/test_gateway/test_config_persist_corruption.py",
@@ -166,6 +168,7 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_session/test_meta_launch_drafts.py",
     "tests/test_session/test_pending_chat_inputs.py",
     "tests/test_session/test_turn_acceptance_storage.py",
+    "tests/test_session/test_assistant_message_identity.py",
     "tests/test_skills/test_hub_deps_subprocess.py",
     "tests/test_skills/test_managed_toolchains.py",
     "tests/test_skills/test_meta_readiness.py",
@@ -217,6 +220,9 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_migrations/test_v034_goal_message_anchor.py",
     "tests/test_session/test_goal_storage.py",
     "tests/test_session/test_goals.py",
+    "tests/test_contracts/test_ensemble_fallback_event_wire.py",
+    "tests/test_contracts/test_turn_execution.py",
+    "tests/test_engine/test_turn_control_terminal.py",
 }
 
 

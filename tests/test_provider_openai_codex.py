@@ -757,6 +757,40 @@ def test_401_refreshes_and_retries_once(tmp_path: Path, monkeypatch) -> None:
     assert json.loads(auth.read_text())["tokens"]["access_token"] == "tok-new"
 
 
+def test_401_does_not_refresh_or_resend_coordinator_attempt(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    auth = _write_auth(tmp_path / "auth.json")
+    calls = {"stream": 0, "refresh": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if "auth.openai.com" in str(request.url):
+            calls["refresh"] += 1
+            return httpx.Response(200, json={"access_token": "tok-new"})
+        calls["stream"] += 1
+        return httpx.Response(401, json={"error": {"message": "expired"}})
+
+    _patch_codex_transport(monkeypatch, handler)
+    transport = httpx.MockTransport(handler)
+    real = httpx.AsyncClient
+    monkeypatch.setattr(
+        "opensquilla.provider.codex_auth.httpx.AsyncClient",
+        lambda *a, **kw: real(*a, **{**kw, "transport": transport}),
+    )
+
+    provider = OpenAICodexProvider(auth_path=str(auth))
+    events = _collect(
+        provider,
+        cfg=ChatConfig(physical_attempt_limit=1),
+    )
+
+    assert calls["stream"] == 1
+    assert calls["refresh"] == 0
+    assert any(isinstance(event, ErrorEvent) and event.code == "401" for event in events)
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
 def test_response_failed_yields_error_event(tmp_path: Path, monkeypatch) -> None:
     auth = _write_auth(tmp_path / "auth.json")
     body = _sse(

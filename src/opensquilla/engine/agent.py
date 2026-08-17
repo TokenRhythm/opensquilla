@@ -31,6 +31,7 @@ import structlog
 
 from opensquilla.artifacts import artifact_payload
 from opensquilla.context_budget import ContextBudgetClass, ContextBudgetGovernor
+from opensquilla.contracts.turn_execution import TurnExecutionContext
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import (
     check_response_for_cache_break,
@@ -164,6 +165,7 @@ from opensquilla.provider import (
     ContentBlockToolUse,
     LLMProvider,
     Message,
+    ProviderGenerationResetEvent,
     ProviderHeartbeatEvent,
     ToolDefinition,
     ToolUseEndEvent,
@@ -288,6 +290,7 @@ from .types import (
     AgentConfig,
     AgentEvent,
     AgentState,
+    AnswerGenerationResetEvent,
     ArtifactEvent,
     CompactionEvent,
     CompactionOutcome,
@@ -309,6 +312,9 @@ from .types import (
     ToolUseDeltaEvent,
     ToolUseStartEvent,
     WarningEvent,
+)
+from .types import (
+    ToolUseEndEvent as EngineToolUseEndEvent,
 )
 
 logger = structlog.get_logger("opensquilla.engine.agent")
@@ -2866,6 +2872,7 @@ class Agent:
         usage_event_sink: UsageEventSink | None = None,
         usage_execution_context: UsageExecutionContext | None = None,
         provider_request_correlation: ProviderRequestCorrelation | None = None,
+        execution_context: TurnExecutionContext | None = None,
     ) -> None:
         self.provider = provider
         self.config = config or AgentConfig()
@@ -2935,6 +2942,7 @@ class Agent:
         self._usage_event_sink = usage_event_sink
         self._usage_execution_context = usage_execution_context
         self._provider_request_correlation = provider_request_correlation
+        self._execution_context = execution_context
         # Populated only by a successful real provider stream.  TurnRunner
         # publishes it after durable finalization, so failed/cancelled turns
         # can never arm a gateway keepalive probe.
@@ -6571,6 +6579,13 @@ class Agent:
         _meta_invoke_turn_count.set(0)
         usage_scope = current_usage_accounting_scope()
         reasoning_block_index = 0
+        reasoning_started_at_ms = 0
+        generation_epoch = (
+            self._execution_context.generation_epoch
+            if self._execution_context is not None
+            else 0
+        )
+        last_provider_sequence = -1
 
         # ------ IDLE → THINKING ------
         yield self._transition(AgentState.THINKING)
@@ -6909,6 +6924,7 @@ class Agent:
         last_ensemble_trace: dict[str, Any] | None = None
         turn_ensemble_request_count = 0
         terminal_error: ErrorEvent | None = None
+        terminal_generation_reset_event: AnswerGenerationResetEvent | None = None
         final_text_parts: list[str] = []
         applied_model_call_boundaries: list[dict[str, Any]] = []
         final_reasoning_parts: list[str] = []
@@ -8180,6 +8196,9 @@ class Agent:
                 assistant_text_parts: list[str] = []
                 tool_calls: list[ToolCall] = []
                 pending_tools: dict[str, _StreamAccumulator] = {}
+                pending_tool_events: list[
+                    ToolUseStartEvent | ToolUseDeltaEvent | EngineToolUseEndEvent
+                ] = []
                 tool_argument_heartbeat_chars: dict[str, int] = {}
                 iter_input_tokens = 0
                 iter_output_tokens = 0
@@ -8217,6 +8236,9 @@ class Agent:
                     assistant_text_parts = []
                     tool_calls = []
                     pending_tools = {}
+                    pending_tool_events = []
+                    if self._execution_context is not None:
+                        self._execution_context.drop_pending_tool_buffers("provider_retry")
                     seen_tool_use_ids: set[str] = set()
                     guarded_writer_intent_id = None
                     guarded_writer_stream_failure = None
@@ -8254,6 +8276,7 @@ class Agent:
                             block_index=active_reasoning_block_index,
                             status=status,
                             ended_at=time.time_ns() // 1_000_000,
+                            generation_epoch=generation_epoch,
                         )
                         reasoning_block_id = ""
                         return event
@@ -8896,10 +8919,22 @@ class Agent:
                     try:
                         try:
                             if self._failure_injector is None:
-                                raw_stream = self.provider.chat(
+                                provider_chat: Any = getattr(self.provider, "chat")
+                                provider_chat_kwargs: dict[str, Any] = {
+                                    "tools": provider_tools_for_call,
+                                    "config": call_chat_cfg,
+                                }
+                                if getattr(
+                                    self.provider,
+                                    "execution_context_aware",
+                                    False,
+                                ):
+                                    provider_chat_kwargs["execution_context"] = (
+                                        self._execution_context
+                                    )
+                                raw_stream = provider_chat(
                                     request_messages,
-                                    tools=provider_tools_for_call,
-                                    config=call_chat_cfg,
+                                    **provider_chat_kwargs,
                                 )
                             else:
                                 # Test-only seam: the injector either delegates this
@@ -8910,6 +8945,7 @@ class Agent:
                                     request_messages,
                                     tools=provider_tools_for_call,
                                     config=call_chat_cfg,
+                                    execution_context=self._execution_context,
                                 )
                         except (asyncio.CancelledError, UsageAccountingUnavailableError):
                             raise
@@ -8964,6 +9000,257 @@ class Agent:
                             total_deadline=provider_stream_deadline,
                             deadline_provider=_active_stream_deadline,
                         ):
+                            if isinstance(raw_ev, ProviderGenerationResetEvent):
+                                if (
+                                    self._execution_context is not None
+                                    and self._execution_context.terminal
+                                ):
+                                    # A terminal reset closes the generation
+                                    # authority.  A provider that emits a late
+                                    # reset cannot create a second terminal.
+                                    continue
+                                terminal_error_message = ""
+                                terminal_error_code = ""
+                                terminal_failure_kind = ""
+                                if raw_ev.terminal:
+                                    terminal_provider = str(
+                                        self.config.provider_id
+                                        or getattr(self.provider, "provider_id", "")
+                                        or getattr(self.provider, "provider_name", "")
+                                        or ""
+                                    )
+                                    raw_terminal_code = str(
+                                        raw_ev.terminal_error_code or "ensemble_fixed_error"
+                                    )
+                                    terminal_status_code = (
+                                        int(raw_terminal_code)
+                                        if raw_terminal_code.isdigit()
+                                        else None
+                                    )
+                                    classified_terminal_failure = classify_provider_error(
+                                        provider_name=terminal_provider,
+                                        status_code=terminal_status_code,
+                                        raw_code=raw_terminal_code,
+                                        message=raw_ev.terminal_error_message,
+                                    )
+                                    terminal_failure_kind = (
+                                        classified_terminal_failure.value
+                                    )
+                                    terminal_error_code = safe_provider_failure_code(
+                                        raw_terminal_code,
+                                        terminal_failure_kind,
+                                    )
+                                    terminal_error_message = _safe_provider_terminal_message(
+                                        classified_terminal_failure,
+                                        raw_terminal_code,
+                                    )
+                                if self._execution_context is not None:
+                                    reset_event = (
+                                        self._execution_context.begin_generation_reset(
+                                            raw_ev.from_role,
+                                            raw_ev.to_role,
+                                            raw_ev.safe_reason,
+                                            terminal=raw_ev.terminal,
+                                            terminal_text_snapshot=(
+                                                raw_ev.terminal_text_snapshot
+                                            ),
+                                            terminal_error_message=terminal_error_message,
+                                            terminal_error_code=terminal_error_code,
+                                            terminal_failure_kind=terminal_failure_kind,
+                                        )
+                                    )
+                                else:
+                                    reset_event = AnswerGenerationResetEvent(
+                                        old_generation_epoch=generation_epoch,
+                                        new_generation_epoch=generation_epoch + 1,
+                                        from_role=raw_ev.from_role,
+                                        to_role=raw_ev.to_role,
+                                        safe_reason=raw_ev.safe_reason,
+                                        sequence=last_provider_sequence + 1,
+                                        terminal=raw_ev.terminal,
+                                        terminal_text_snapshot=(
+                                            raw_ev.terminal_text_snapshot
+                                        ),
+                                        terminal_error_message=terminal_error_message,
+                                        terminal_error_code=terminal_error_code,
+                                        terminal_failure_kind=terminal_failure_kind,
+                                    )
+                                generation_epoch = reset_event.new_generation_epoch
+                                last_provider_sequence = reset_event.sequence
+                                assistant_text_parts.clear()
+                                final_text_parts.clear()
+                                tool_calls.clear()
+                                pending_tools.clear()
+                                pending_tool_events.clear()
+                                seen_tool_use_ids.clear()
+                                tool_argument_heartbeat_chars.clear()
+                                final_reasoning_parts.clear()
+                                iter_reasoning_content = None
+                                iter_reasoning_tokens = 0
+                                iter_thinking_signature = None
+                                reasoning_started_at_ms = 0
+                                attempt_user_visible_emitted = False
+                                text_presentation_decided = False
+                                _got_done_event = False
+                                provider_done_for_log = None
+                                provider_error = None
+                                provider_error_for_log = None
+                                yield reset_event
+                                if raw_ev.terminal:
+                                    terminal_generation_reset_event = reset_event
+                                    terminal_model = str(self.config.model_id or "")
+                                    terminal_usage = normalize_provider_usage(
+                                        raw_ev,
+                                        default_provider=terminal_provider,
+                                        default_model=terminal_model,
+                                        completed_at_ms=0,
+                                    )
+                                    total_input_tokens += terminal_usage.input_tokens
+                                    total_output_tokens += terminal_usage.output_tokens
+                                    total_reasoning_tokens += terminal_usage.reasoning_tokens
+                                    total_cached_tokens += terminal_usage.cache_read_tokens
+                                    total_cache_write_tokens += (
+                                        terminal_usage.cache_write_tokens
+                                    )
+                                    total_billed_cost += (
+                                        terminal_usage.billed_cost_nanos / 1_000_000_000
+                                    )
+                                    total_missing_cost_entries += (
+                                        terminal_usage.missing_usage_entries
+                                    )
+                                    terminal_rows = [
+                                        dict(row)
+                                        for row in raw_ev.model_usage_breakdown
+                                        if isinstance(row, dict)
+                                    ]
+                                    turn_model_usage_breakdown.extend(terminal_rows)
+                                    for item in terminal_usage.items:
+                                        if (
+                                            item.cost_source == "provider_billed"
+                                            or item.billed_cost_nanos > 0
+                                        ):
+                                            total_provider_billed_entries += 1
+                                        else:
+                                            total_unbilled_entries += 1
+                                        if self._usage_tracker and self._session_key:
+                                            self._usage_tracker.add(
+                                                self._session_key,
+                                                input_tokens=item.input_tokens,
+                                                output_tokens=item.output_tokens,
+                                                model_id=item.model,
+                                                cache_read_tokens=item.cache_read_tokens,
+                                                cache_write_tokens=item.cache_write_tokens,
+                                                billed_cost=(
+                                                    item.billed_cost_nanos
+                                                    / 1_000_000_000
+                                                ),
+                                                provider=item.provider,
+                                                cost_source=item.cost_source,
+                                            )
+                                    _accumulate_turn_cost(
+                                        raw_ev,
+                                        default_provider=terminal_provider,
+                                        default_model=terminal_model,
+                                    )
+                                    cost_receipt_counted = True
+                                    if terminal_usage.items:
+                                        last_item = terminal_usage.items[-1]
+                                        last_actual_provider = last_item.provider
+                                        last_actual_model = last_item.model
+                                    if isinstance(raw_ev.ensemble_trace, dict):
+                                        last_ensemble_trace = dict(raw_ev.ensemble_trace)
+                                        turn_ensemble_request_count += _usage_int(
+                                            raw_ev.ensemble_trace.get(
+                                                "llm_request_count"
+                                            )
+                                            or 0
+                                        )
+                                    provider_error_for_log = ProviderErrorEvent(
+                                        message=(
+                                            raw_ev.terminal_error_message
+                                            or "fixed provider final failure"
+                                        ),
+                                        code=(
+                                            raw_ev.terminal_error_code
+                                            or "ensemble_fixed_error"
+                                        ),
+                                        model_usage_breakdown=terminal_rows,
+                                        usage_missing_count=(
+                                            raw_ev.usage_missing_count
+                                        ),
+                                    )
+                                    usage_unknown_reason = provider_error_usage_reason(
+                                        provider_error_for_log.code
+                                    )
+                                    if usage_call is not None and not usage_call_terminal:
+                                        usage_call_terminal = True
+                                        await self._usage_call_finalize(
+                                            usage_call,
+                                            raw_ev,
+                                        )
+                                continue
+
+                            raw_generation_epoch = getattr(raw_ev, "generation_epoch", None)
+                            if raw_generation_epoch is not None:
+                                try:
+                                    raw_generation_epoch = int(raw_generation_epoch)
+                                except (TypeError, ValueError):
+                                    continue
+                                if raw_generation_epoch != generation_epoch:
+                                    # A late event from a replaced provider
+                                    # generation must never repopulate the
+                                    # current answer or tool transaction.
+                                    continue
+
+                            raw_sequence = getattr(
+                                raw_ev,
+                                "_turn_execution_sequence",
+                                getattr(raw_ev, "sequence", None),
+                            )
+                            if raw_sequence is None:
+                                if self._execution_context is not None:
+                                    event_sequence = self._execution_context.next_sequence()
+                                else:
+                                    last_provider_sequence += 1
+                                    event_sequence = last_provider_sequence
+                            else:
+                                try:
+                                    event_sequence = int(raw_sequence)
+                                except (TypeError, ValueError):
+                                    continue
+                                if event_sequence <= last_provider_sequence:
+                                    continue
+                                last_provider_sequence = event_sequence
+                            if (
+                                self._execution_context is not None
+                                and not bool(
+                                    getattr(
+                                        raw_ev,
+                                        "_turn_execution_accepted",
+                                        False,
+                                    )
+                                )
+                            ):
+                                if isinstance(raw_ev, ProviderHeartbeatEvent):
+                                    meaningful = bool(raw_ev.upstream_activity)
+                                    provenance: Any = {
+                                        "upstream_activity": meaningful,
+                                        "synthetic": not meaningful,
+                                    }
+                                elif isinstance(raw_ev, ProviderEnsembleProgressEvent):
+                                    meaningful = False
+                                    provenance = {"synthetic": True}
+                                else:
+                                    meaningful = True
+                                    provenance = "upstream"
+                                if not self._execution_context.accept_event(
+                                    generation_epoch,
+                                    event_sequence,
+                                    meaningful,
+                                    provenance,
+                                ):
+                                    continue
+
                             if not isinstance(raw_ev, ProviderErrorEvent):
                                 # Provider.chat commonly returns an async
                                 # generator before it performs network I/O.
@@ -9019,7 +9306,9 @@ class Agent:
                                     # A tool already appeared this call, so all
                                     # text here is intermediate narration.
                                     yield TextDeltaEvent(
-                                        text=raw_ev.text, presentation="intermediate"
+                                        text=raw_ev.text,
+                                        presentation="intermediate",
+                                        generation_epoch=generation_epoch,
                                     )
                                 else:
                                     # No tool has appeared yet. Stream the text live,
@@ -9033,7 +9322,9 @@ class Agent:
                                     # already shown as answer are a deliberate,
                                     # harmless trade for live output.
                                     yield TextDeltaEvent(
-                                        text=raw_ev.text, presentation="answer"
+                                        text=raw_ev.text,
+                                        presentation="answer",
+                                        generation_epoch=generation_epoch,
                                     )
 
                             elif isinstance(raw_ev, ProviderReasoningDelta):
@@ -9055,6 +9346,7 @@ class Agent:
                                         block_id=reasoning_block_id,
                                         block_index=active_reasoning_block_index,
                                         started_at=reasoning_started_at_ms,
+                                        generation_epoch=generation_epoch,
                                     )
                                 # Bare providers reach Agent without the
                                 # selector's pre-text buffer. This thinking
@@ -9088,6 +9380,7 @@ class Agent:
                                     started_at=reasoning_started_at_ms,
                                     block_id=reasoning_block_id,
                                     block_index=active_reasoning_block_index,
+                                    generation_epoch=generation_epoch,
                                 )
                                 if (
                                     wrapup_margin_seconds > 0
@@ -9320,6 +9613,7 @@ class Agent:
                                     _got_error = True
                                     pending_tools.clear()
                                     tool_calls.clear()
+                                    pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
                                 writer_reservation = (
@@ -9358,14 +9652,19 @@ class Agent:
                                     synthetic_from_text=raw_ev.synthetic_from_text,
                                 )
                                 tool_argument_heartbeat_chars[raw_ev.tool_use_id] = 0
-                                attempt_user_visible_emitted = True
-                                attempt_irreversible_output_emitted = True
-                                yield ToolUseStartEvent(
-                                    tool_use_id=raw_ev.tool_use_id,
-                                    tool_name=raw_ev.tool_name,
-                                    synthetic_from_text=raw_ev.synthetic_from_text,
-                                    started_at=int(time.time() * 1000),
+                                pending_tool_events.append(
+                                    ToolUseStartEvent(
+                                        tool_use_id=raw_ev.tool_use_id,
+                                        tool_name=raw_ev.tool_name,
+                                        synthetic_from_text=raw_ev.synthetic_from_text,
+                                        started_at=int(time.time() * 1000),
+                                        generation_epoch=generation_epoch,
+                                    )
                                 )
+                                if self._execution_context is not None:
+                                    self._execution_context.open_tool_buffer(
+                                        raw_ev.tool_use_id
+                                    ).append(pending_tool_events[-1])
 
                             elif isinstance(raw_ev, ProviderToolUseDelta):
                                 reasoning_end = _finish_reasoning_block("completed")
@@ -9392,16 +9691,24 @@ class Agent:
                                     _got_error = True
                                     pending_tools.clear()
                                     tool_calls.clear()
+                                    pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
                                 json_fragment = raw_ev.json_fragment
                                 acc.json_buf.append(json_fragment)
                                 acc.json_chars += len(json_fragment)
                                 if json_fragment:
-                                    yield ToolUseDeltaEvent(
-                                        tool_use_id=raw_ev.tool_use_id,
-                                        json_fragment=json_fragment,
+                                    pending_tool_events.append(
+                                        ToolUseDeltaEvent(
+                                            tool_use_id=raw_ev.tool_use_id,
+                                            json_fragment=json_fragment,
+                                            generation_epoch=generation_epoch,
+                                        )
                                     )
+                                    if self._execution_context is not None:
+                                        self._execution_context.open_tool_buffer(
+                                            raw_ev.tool_use_id
+                                        ).append(pending_tool_events[-1])
                                 last_heartbeat_chars = tool_argument_heartbeat_chars.get(
                                     raw_ev.tool_use_id, 0
                                 )
@@ -9418,7 +9725,12 @@ class Agent:
                                             (time.monotonic() - call_started_at) * 1000
                                         ),
                                         idle_ms=0,
-                                        message=(f"Receiving {acc.tool_name} arguments"),
+                                        # Keep the pending tool identity private
+                                        # until a legal DoneEvent commits the
+                                        # generation. This remains a transport
+                                        # liveness signal only.
+                                        message="Receiving tool arguments",
+                                        generation_epoch=generation_epoch,
                                     )
 
                             elif isinstance(raw_ev, ToolUseEndEvent):
@@ -9456,6 +9768,7 @@ class Agent:
                                     _got_error = True
                                     pending_tools.clear()
                                     tool_calls.clear()
+                                    pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
                                 invalid_arguments = not isinstance(raw_ev.arguments, dict)
@@ -9481,6 +9794,7 @@ class Agent:
                                     _got_error = True
                                     pending_tools.clear()
                                     tool_calls.clear()
+                                    pending_tool_events.clear()
                                     tool_argument_heartbeat_chars.clear()
                                     break
                                 # ToolUseEndEvent is the provider boundary's
@@ -9503,6 +9817,19 @@ class Agent:
                                         synthetic_from_text=synthetic_from_text,
                                     )
                                 )
+                                pending_tool_events.append(
+                                    EngineToolUseEndEvent(
+                                        tool_use_id=raw_ev.tool_use_id,
+                                        tool_name=raw_ev.tool_name,
+                                        arguments=dict(arguments),
+                                        synthetic_from_text=synthetic_from_text,
+                                        generation_epoch=generation_epoch,
+                                    )
+                                )
+                                if self._execution_context is not None:
+                                    self._execution_context.open_tool_buffer(
+                                        raw_ev.tool_use_id
+                                    ).append(pending_tool_events[-1])
 
                             elif isinstance(raw_ev, ProviderDoneEvent):
                                 # Call ended. All text was already streamed live as
@@ -9758,6 +10085,7 @@ class Agent:
 
                             elif isinstance(raw_ev, ProviderErrorEvent):
                                 provider_error_for_log = raw_ev
+                                pending_tool_events.clear()
                                 usage_unknown_reason = provider_error_usage_reason(
                                     raw_ev.code
                                 )
@@ -9884,6 +10212,7 @@ class Agent:
                                 yield RunHeartbeatEvent(
                                     phase=raw_ev.phase,
                                     message=raw_ev.message,
+                                    generation_epoch=generation_epoch,
                                 )
                             elif isinstance(raw_ev, ProviderEnsembleProgressEvent):
                                 yield EnsembleProgressEvent(
@@ -9898,6 +10227,7 @@ class Agent:
                                     output_tokens=raw_ev.output_tokens,
                                     cost_usd=raw_ev.cost_usd,
                                     error=raw_ev.error,
+                                    generation_epoch=generation_epoch,
                                 )
                         reasoning_end = _finish_reasoning_block(
                             "completed"
@@ -10403,6 +10733,42 @@ class Agent:
                         self._write_turn_call_log("llm_response", **response_payload)
 
                     # -- after async for (retry loop level) --
+                    if (
+                        provider_error_for_log is not None
+                        and self._execution_context is not None
+                    ):
+                        # A provider/protocol failure invalidates every tool
+                        # fragment from this attempt, including the terminal
+                        # attempt where no retry will run.
+                        self._execution_context.drop_pending_tool_buffers(
+                            "provider_error"
+                        )
+                    elif (
+                        not _got_done_event
+                        and self._execution_context is not None
+                    ):
+                        self._execution_context.drop_pending_tool_buffers(
+                            "stream_without_done"
+                        )
+                    if terminal_generation_reset_event is not None:
+                        terminal_error = ErrorEvent(
+                            message=(
+                                terminal_generation_reset_event.terminal_error_message
+                                or "The model provider request failed."
+                            ),
+                            code=(
+                                terminal_generation_reset_event.terminal_error_code
+                                or "ensemble_fixed_error"
+                            ),
+                            failure_kind=(
+                                terminal_generation_reset_event.terminal_failure_kind
+                                or ProviderFailureKind.UNKNOWN.value
+                            ),
+                            generation_epoch=(
+                                terminal_generation_reset_event.new_generation_epoch
+                            ),
+                        )
+                        break
                     terminal_error = (
                         None
                         if goal_terminal_final_response_pending
@@ -10486,7 +10852,10 @@ class Agent:
                             assistant_text_parts.append(response_text)
                             attempt_user_visible_emitted = True
                             attempt_irreversible_output_emitted = True
-                            yield TextDeltaEvent(text=response_text)
+                            yield TextDeltaEvent(
+                                text=response_text,
+                                generation_epoch=generation_epoch,
+                            )
                     post_tool_turn = _tail_has_tool_result(request_messages)
                     if (
                         not post_tool_turn
@@ -11649,7 +12018,10 @@ class Agent:
                                 code="max_iterations",
                                 provider_error_code=safe_provider_error_code,
                             )
-                            yield TextDeltaEvent(text=response_text)
+                            yield TextDeltaEvent(
+                                text=response_text,
+                                generation_epoch=generation_epoch,
+                            )
                             break
                         if post_write_convergence_finalization_pending:
                             response_text = (
@@ -11669,7 +12041,10 @@ class Agent:
                                 code="post_write_convergence",
                                 provider_error_code=safe_provider_error_code,
                             )
-                            yield TextDeltaEvent(text=response_text)
+                            yield TextDeltaEvent(
+                                text=response_text,
+                                generation_epoch=generation_epoch,
+                            )
                             break
                         if (
                             failure_kind == ProviderFailureKind.EMPTY_RESPONSE
@@ -12825,6 +13200,10 @@ class Agent:
                     user_visible_emitted=attempt_user_visible_emitted,
                 )
                 if final_classification.kind != _ProviderAttemptKind.OK:
+                    if self._execution_context is not None:
+                        self._execution_context.drop_pending_tool_buffers(
+                            "invalid_provider_attempt"
+                        )
                     if text_only_tool_recovery_pending:
                         text_only_mode = getattr(
                             self.config,
@@ -12907,6 +13286,21 @@ class Agent:
                     )
                     yield terminal_error
                     break
+
+                # Tool events are transactional with the provider attempt. The
+                # final classification has already established that a DoneEvent
+                # was received and that every tool sequence was closed and
+                # validated. Only now can the buffered public events be
+                # committed; any retry/error path above discards them.
+                if self._execution_context is not None and provider_done_for_log is not None:
+                    for tool_call in tool_calls:
+                        await self._execution_context.commit_tool_round(
+                            tool_call.tool_use_id,
+                            provider_done_for_log,
+                        )
+                for pending_tool_event in pending_tool_events:
+                    yield pending_tool_event
+                pending_tool_events.clear()
 
                 if iter_reasoning_content:
                     final_reasoning_parts.append(iter_reasoning_content)
@@ -14180,6 +14574,7 @@ class Agent:
                                     elapsed_ms=int((now - started) * 1000),
                                     idle_ms=int((now - last_event_at) * 1000),
                                     message="Tool still running",
+                                    generation_epoch=generation_epoch,
                                 )
                                 continue
 
@@ -14572,6 +14967,7 @@ class Agent:
                             arguments=tc.arguments,
                             execution_status=projected_pending.execution_status,
                             effect_outcome=projected_pending.effect_outcome,
+                            generation_epoch=generation_epoch,
                         )
                         try:
                             answers = await user_input_provider.wait_for_response(
@@ -14607,6 +15003,7 @@ class Agent:
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
                             effect_outcome=projected_result.effect_outcome,
+                            generation_epoch=generation_epoch,
                         )
                         deferred_user_input_handled = True
                     pending_approval = (
@@ -14639,6 +15036,7 @@ class Agent:
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
                                     effect_outcome=projected_result.effect_outcome,
+                                    generation_epoch=generation_epoch,
                                 )
                             approval_wait_started = _loop.time()
                             await _wait_for_pending_approval_resolution(pending_approval)
@@ -14723,6 +15121,7 @@ class Agent:
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
                                     effect_outcome=projected_result.effect_outcome,
+                                    generation_epoch=generation_epoch,
                                 )
                                 # Only a deliberate human refusal is terminal. An
                                 # expired record or an internal rule decision must
@@ -14753,6 +15152,7 @@ class Agent:
                                     arguments=tc.arguments,
                                     execution_status=projected_result.execution_status,
                                     effect_outcome=projected_result.effect_outcome,
+                                    generation_epoch=generation_epoch,
                                 )
                                 replay_event = router_control_replay_event_from_payload(
                                     result.content
@@ -14768,6 +15168,7 @@ class Agent:
                             arguments=tc.arguments,
                             execution_status=projected_result.execution_status,
                             effect_outcome=projected_result.effect_outcome,
+                            generation_epoch=generation_epoch,
                         )
                         replay_event = router_control_replay_event_from_payload(
                             result.content
@@ -16127,6 +16528,7 @@ class Agent:
                     if document_mutation_outcome is not None
                     else None
                 ),
+                generation_epoch=generation_epoch,
             )
             yield done_event
         # Reset for next turn
@@ -18324,7 +18726,18 @@ class Agent:
                         if active_deadline is not None
                         else dynamic_deadline
                     )
-                wait_budget = max(0.001, self.config.iteration_timeout)
+                # Execution-context-aware composite providers (currently Ensemble)
+                # own streaming inactivity through TurnExecutionContext. Applying
+                # the legacy per-iteration read timeout here would create a second,
+                # earlier timeout owner and could kill a healthy long fusion run.
+                wait_budget: float | None = (
+                    None
+                    if (
+                        getattr(self, "_execution_context", None) is not None
+                        and getattr(self.provider, "execution_context_aware", False)
+                    )
+                    else max(0.001, self.config.iteration_timeout)
+                )
                 total_deadline_limits_wait = False
                 if active_deadline is not None:
                     remaining_total = active_deadline - loop.time()
@@ -18333,7 +18746,7 @@ class Agent:
                             timeout_seconds=self.config.timeout,
                             deadline_at_monotonic=active_deadline,
                         )
-                    if remaining_total <= wait_budget:
+                    if wait_budget is None or remaining_total <= wait_budget:
                         wait_budget = remaining_total
                         total_deadline_limits_wait = True
 

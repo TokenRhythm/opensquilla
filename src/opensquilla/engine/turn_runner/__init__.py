@@ -37,7 +37,7 @@ from opensquilla.engine.turn_runner.compaction_and_history_stage import (
     RequestContextPrependPort,
     T3UpgradeCompactionPort,
 )
-from opensquilla.engine.turn_runner.context import TurnContext
+from opensquilla.engine.turn_runner.context import TurnContext, TurnExecutionContext
 from opensquilla.engine.turn_runner.input_stage import (
     ExtraContextResolver,
     InputStage,
@@ -146,6 +146,7 @@ __all__ = [
     "TranscriptAppendPort",
     "TranscriptAppendResult",
     "TurnContext",
+    "TurnExecutionContext",
     "TurnErrorPersistPort",
     "TurnFinalizerStage",
     "TurnFinalizerStageInput",
