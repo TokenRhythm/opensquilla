@@ -220,6 +220,7 @@ import {
   artifactPayloadFromWorkbenchResource,
   createResourceCollectionWorkbenchItem,
   resourceFromPreparedPreview,
+  resourceUsesNativeHtmlPreview,
   resourceCollectionWorkbenchItemId,
   workbenchResourceKey,
 } from '@/workbench/workbenchResourceItems'
@@ -463,20 +464,16 @@ function openResourceArtifact(
   sessionKey: string,
   preparedPreview?: WorkbenchPreviewDescriptor,
 ) {
-  const nativeDocument = Boolean(
-    resource.resource.type === 'document'
-    && resource.relations.documentId
-    && resource.relations.headArtifactId,
-  )
+  const nativeArtifact = resourceUsesNativeHtmlPreview(resource)
   const opened = store.openItem(createArtifactPreviewWorkbenchItem({
     artifact,
     nativeHtml: Boolean(
-      nativeDocument
+      nativeArtifact
       && platform.capabilities.hasNativeWorkbenchSurfaces
       && platform.workbench.native,
     ),
     ...(preparedPreview ? { preparedPreview } : {}),
-    previewLeaseEligible: nativeDocument,
+    previewLeaseEligible: nativeArtifact,
     resourceIdentity: workbenchResourceKey(resource.resource),
     sessionKey,
   }))
@@ -488,6 +485,18 @@ function openResourceArtifact(
 async function openWorkbenchResource(resource: WorkbenchResource, item: WorkbenchItem) {
   const sessionKey = resourceSessionKey(item)
   if (!sessionKey || !resource.capabilities.preview) return
+  if (
+    resourceUsesNativeHtmlPreview(resource)
+    && platform.capabilities.hasNativeWorkbenchSurfaces
+    && platform.workbench.native
+  ) {
+    openResourceArtifact(
+      resource,
+      artifactPayloadFromWorkbenchResource(resource),
+      sessionKey,
+    )
+    return
+  }
   const preview = await workbenchResources.preview(sessionKey, resource.resource)
   const resolved = preview ? resourceFromPreparedPreview(preview) : resource
   openResourceArtifact(

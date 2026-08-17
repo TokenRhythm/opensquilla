@@ -5,6 +5,7 @@ import type {
   WorkbenchResourceRef,
 } from '@/types/workbenchResources'
 import { workbenchResourceRefId } from '@/types/workbenchResources'
+import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import type { WorkbenchItem } from './types'
 
 function identityToken(value: string): string {
@@ -89,6 +90,23 @@ export function artifactPayloadFromWorkbenchResource(
     workbenchResourceType: resource.resource.type,
     workbenchResourceId: workbenchResourceRefId(resource.resource),
   }
+}
+
+/**
+ * Desktop can give artifact-backed HTML resources a full/offline preview
+ * switch without exposing host credentials, files, Node, or Electron APIs.
+ * Attachments have no ArtifactStore preview lease and stay on the prepared
+ * opaque-offline path.
+ */
+export function resourceUsesNativeHtmlPreview(resource: WorkbenchResource): boolean {
+  const artifactBacked = resource.resource.type === 'deliverable'
+    || Boolean(
+      resource.resource.type === 'document'
+      && resource.relations.documentId
+      && resource.relations.headArtifactId,
+    )
+  return artifactBacked
+    && artifactWorkbenchPreviewKind(artifactPayloadFromWorkbenchResource(resource)) === 'html'
 }
 
 /**

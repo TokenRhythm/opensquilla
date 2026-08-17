@@ -1667,7 +1667,7 @@ describe('artifact Workbench provider', () => {
     await runtime.dispose?.('closed')
   })
 
-  it('keeps continuous annotation mode aligned across submit, rejection, and rearm failure', async () => {
+  it('ends a submitted annotation picker and aligns retries with native state', async () => {
     const legacy = createLegacyArtifactWorkspace(artifact, 'session-a')
     const workspace = {
       ...legacy,
@@ -2057,7 +2057,7 @@ describe('artifact Workbench provider', () => {
     )
 
     // After persistence succeeds, explicit close acknowledges the intent and
-    // the one-shot picker rearms while the toolbar stays pressed.
+    // the one-shot picker releases the toolbar instead of silently rearming.
     await runtime.handleNativeSurfaceEvent?.({
       version: 3,
       surfaceId: item.id,
@@ -2069,14 +2069,17 @@ describe('artifact Workbench provider', () => {
       surfaceId: item.id,
       annotationId,
     })
-    expect(setMode.mock.calls.map(([request]) => request.enabled)).toEqual([true, true])
+    expect(setMode.mock.calls.map(([request]) => request.enabled)).toEqual([true])
     expect(setMode).not.toHaveBeenCalledWith(expect.objectContaining({ enabled: false }))
-    expect(renderState.annotationMode).toBe(true)
+    expect(renderState.annotationMode).toBe(false)
     expect(completeOverlayEdit).toHaveBeenCalledWith(annotationId)
     expect(releaseOverlayEdit).toHaveBeenCalledWith(annotationId)
 
     // A typed, recoverable selection rejection stays visible and actionable;
-    // it must not open an editor or silently release continuous mode.
+    // it must not open an editor or silently release the explicitly restarted
+    // one-shot mode.
+    await runtime.performAction?.('toggle-annotation-mode', item)
+    expect(renderState.annotationMode).toBe(true)
     rejectNextCreate = Object.assign(new Error('selected element changed'), {
       code: 'ARTIFACT_ELEMENT_CHANGED',
     })

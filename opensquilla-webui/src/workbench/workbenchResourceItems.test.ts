@@ -5,6 +5,7 @@ import {
   artifactPayloadFromWorkbenchResource,
   createResourceCollectionWorkbenchItem,
   resourceFromPreparedPreview,
+  resourceUsesNativeHtmlPreview,
   resourcesFromWorkbenchItem,
   workbenchResourceKey,
 } from './workbenchResourceItems'
@@ -82,6 +83,21 @@ describe('workbench resource items', () => {
     })
     expect(artifact.documentId).toBeUndefined()
     expect(artifact.revisionId).toBeUndefined()
+  })
+
+  it('uses native isolated HTML preview only for artifact-backed resources', () => {
+    expect(resourceUsesNativeHtmlPreview(resource('deliverable', 'art_1'))).toBe(true)
+    expect(resourceUsesNativeHtmlPreview(resource('document', 'doc_1', {
+      documentId: 'doc_1',
+      headRevisionId: 'rev_1',
+      headArtifactId: 'art_internal_1',
+    }))).toBe(true)
+    expect(resourceUsesNativeHtmlPreview(resource('attachment', 'att_1'))).toBe(false)
+
+    const textDeliverable = resource('deliverable', 'art_text')
+    textDeliverable.name = 'notes.txt'
+    textDeliverable.mime = 'text/plain'
+    expect(resourceUsesNativeHtmlPreview(textDeliverable)).toBe(false)
   })
 
   it('binds a document preview to its exact head identities', () => {

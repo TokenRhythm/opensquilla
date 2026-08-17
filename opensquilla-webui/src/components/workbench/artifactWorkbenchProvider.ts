@@ -1350,7 +1350,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       }
       this.options.promptAnnotations?.completeOverlayEdit?.(annotationId)
       if (!this.clearAnnotationOverlayState(fence)) return
-      await this.rearmAnnotationPickerIfNeeded()
+      // Native inspection is a one-shot picker. A submitted instruction is a
+      // completed interaction, so release the pressed toolbar state instead
+      // of silently starting another inspection session.
+      this.updateAnnotationModeState(false)
     } finally {
       if (this.annotationOverlayOperation === operation) {
         this.annotationOverlayOperation = null

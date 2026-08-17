@@ -160,16 +160,31 @@ class ArtifactPreviewLeaseService:
             entrypoint = str(getattr(manifest, "entrypoint", "") or "")
             if not entrypoint:
                 raise ArtifactIntegrityError("artifact bundle entrypoint is missing")
+            collection_status = str(
+                getattr(manifest, "collection_status", "complete") or "complete"
+            )
+            warning_codes = [
+                str(code) for code in (getattr(manifest, "warning_codes", ()) or ())
+            ]
+            if (
+                collection_status == "partial"
+                and warning_codes == ["missing_dependency"]
+                and store.supports_single_file_editing(
+                    artifact_id,
+                    session_id=session_id,
+                )
+            ):
+                # Old collectors could treat a remote CSS @import as a missing
+                # local dependency. Keep the immutable manifest unchanged, but
+                # expose the integrity-checked effective preview state.
+                collection_status = "complete"
+                warning_codes = []
             source = {
                 "kind": "bundle",
-                "collection_status": str(
-                    getattr(manifest, "collection_status", "complete") or "complete"
-                ),
+                "collection_status": collection_status,
                 "file_count": int(getattr(manifest, "file_count", 0) or 0),
                 "total_bytes": int(getattr(manifest, "total_size", 0) or 0),
-                "warning_codes": [
-                    str(code) for code in (getattr(manifest, "warning_codes", ()) or ())
-                ],
+                "warning_codes": warning_codes,
             }
 
         if manifest is None:
