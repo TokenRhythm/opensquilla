@@ -4140,6 +4140,7 @@
       "taskRunning": "Task running",
       "taskCompletedUnread": "Task completed, result not viewed",
       "taskUnfinishedUnread": "Task unfinished, details not viewed",
+      "subagentGroupLabel": "{title}: {count} subagents",
       "contractGap": "Backend session-list-v1 contract fields are missing",
       "contractGapBadge": "Gap",
       "rowActions": "Actions for {title}",

@@ -4087,6 +4087,7 @@
       "taskRunning": "Tâche en cours",
       "taskCompletedUnread": "Tâche terminée, résultat non consulté",
       "taskUnfinishedUnread": "Tâche inachevée, détails non consultés",
+      "subagentGroupLabel": "{title} : {count} sous-agents",
       "contractGap": "Des champs du contrat backend session-list-v1 sont manquants",
       "contractGapBadge": "Lacune",
       "rowActions": "Actions pour {title}",

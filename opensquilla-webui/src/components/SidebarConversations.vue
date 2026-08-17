@@ -139,6 +139,16 @@ function taskAttentionLabel(attention: SessionTaskAttention | undefined): string
   return key ? t(key) : ''
 }
 
+function subagentGroupLabel(row: SidebarConversationItem): string {
+  if (!row.subagentGroup) return ''
+  const base = t('shared.sidebar.subagentGroupLabel', {
+    title: row.title,
+    count: row.subagentGroup.count,
+  })
+  const attention = taskAttentionLabel(row.subagentGroup.attention)
+  return attention ? `${base} — ${attention}` : base
+}
+
 /* ── Agent filter (lives within the Chats section) ─────────────────── */
 
 const agentFilter = ref('')
@@ -252,6 +262,43 @@ function filterCollapsedProjectRows<T extends SidebarConversationItem>(rows: T[]
   return result
 }
 
+/* ── Subagent group expansion ─────────────────────────────────────── */
+
+// Parent keys whose folded subagent group is expanded by the user. Kept in
+// memory only: the collapsed-by-default state is the stable presentation, and
+// an expansion is a temporary inspection choice like any other disclosure.
+const expandedSubagentGroups = ref<Set<string>>(new Set())
+
+function isSubagentGroupExpanded(row: SidebarConversationItem): boolean {
+  return Boolean(row.subagentGroup && expandedSubagentGroups.value.has(row.key))
+}
+
+function toggleSubagentGroup(row: SidebarConversationItem) {
+  if (!row.subagentGroup) return
+  const next = new Set(expandedSubagentGroups.value)
+  if (next.has(row.key)) next.delete(row.key)
+  else next.add(row.key)
+  expandedSubagentGroups.value = next
+}
+
+/** Flatten a row list, expanding any user-opened subagent groups. */
+function expandSubagentGroups<T extends SidebarDisplayRow>(rows: T[]): T[] {
+  const out: T[] = []
+  for (const row of rows) {
+    out.push(row)
+    if (!isSubagentGroupExpanded(row) || !row.subagentGroup) continue
+    for (const child of row.subagentGroup.children) {
+      out.push({
+        ...child,
+        displayZone: row.displayZone,
+        displayFamily: row.displayFamily,
+        displayProjectName: row.displayProjectName,
+      } as T)
+    }
+  }
+  return out
+}
+
 // Sections with at least one row, honoring the agent filter inside Chats.
 const filteredSections = computed(() => {
   return props.sections
@@ -292,7 +339,7 @@ const displayBlocks = computed<SidebarDisplayBlock[]>(() => {
       zone: 'pinned',
       label: t('shared.sidebar.pinned'),
       count: projection.pinned.length,
-      rows: projection.pinned,
+      rows: expandSubagentGroups(projection.pinned),
       showHeading: true,
     })
   }
@@ -302,7 +349,7 @@ const displayBlocks = computed<SidebarDisplayBlock[]>(() => {
       zone: 'projects',
       label: t('workspaces.projects'),
       count: projection.projectCount,
-      rows: filterCollapsedProjectRows(projection.projects),
+      rows: expandSubagentGroups(filterCollapsedProjectRows(projection.projects)),
       showHeading: true,
     })
   }
@@ -322,7 +369,7 @@ const displayBlocks = computed<SidebarDisplayBlock[]>(() => {
         zone: 'recents',
         label: t('shared.sidebar.recents'),
         count: projection.recentCount,
-        rows: section.rows,
+        rows: expandSubagentGroups(section.rows),
         showHeading: index === 0,
         family: section.family,
         familyLabel: section.label,
@@ -1117,6 +1164,39 @@ function onSelectRow(row: SidebarConversationItem) {
               @keydown.esc.prevent="cancelRename"
               @blur="onRenameBlur"
             />
+
+            <button
+              v-else-if="row.rowKind === 'session' && row.subagentGroup"
+              type="button"
+              class="sidebar-history-item sidebar-subagent-group-head"
+              :class="{ 'is-expanded': isSubagentGroupExpanded(row) }"
+              :aria-expanded="isSubagentGroupExpanded(row)"
+              :aria-label="subagentGroupLabel(row)"
+              :title="subagentGroupLabel(row)"
+              @click="toggleSubagentGroup(row)"
+            >
+              <Icon
+                class="sidebar-subagent-group-chevron"
+                name="chevronRight"
+                :size="12"
+                aria-hidden="true"
+              />
+              <span class="sidebar-history-title">{{ row.title }}</span>
+              <span
+                class="sidebar-subagent-group-count"
+                data-testid="sidebar-subagent-group-count"
+                aria-hidden="true"
+              >{{ row.subagentGroup.count }}</span>
+              <span
+                v-if="!selectionMode && row.subagentGroup.attention !== 'none'"
+                class="sidebar-task-attention"
+                :class="`sidebar-task-attention--${row.subagentGroup.attention}`"
+                role="img"
+                :aria-label="taskAttentionLabel(row.subagentGroup.attention) || undefined"
+                :title="taskAttentionLabel(row.subagentGroup.attention) || undefined"
+                data-testid="sidebar-task-attention"
+              />
+            </button>
 
             <button
               v-else-if="row.rowKind === 'session'"

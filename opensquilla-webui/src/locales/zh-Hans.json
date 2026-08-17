@@ -4140,6 +4140,7 @@
       "taskRunning": "任务运行中",
       "taskCompletedUnread": "任务已完成，结果未查看",
       "taskUnfinishedUnread": "任务未完成，详情未查看",
+      "subagentGroupLabel": "{title}：{count} 个子代理",
       "contractGap": "缺少后端 session-list-v1 契约字段",
       "contractGapBadge": "缺失",
       "rowActions": "{title} 的操作",
