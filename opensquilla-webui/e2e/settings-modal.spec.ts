@@ -108,7 +108,9 @@ test.describe('Settings modal', () => {
 
     await expect(memoryTab).toHaveAttribute('aria-selected', 'true')
     await expect(page).toHaveURL(/\/settings\/memory$/)
-    await expect(dialog(page).getByRole('heading', { name: 'Memory & Profile' })).toBeVisible()
+    await expect(
+      dialog(page).getByRole('heading', { name: 'Import memory from another AI' }),
+    ).toBeVisible()
     await expect(dialog(page).locator('[data-testid="settings-memory-panel"]')).toBeVisible()
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
   })
