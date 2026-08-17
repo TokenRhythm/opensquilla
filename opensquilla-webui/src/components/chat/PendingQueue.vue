@@ -536,6 +536,7 @@ onBeforeUnmount(() => {
   position: relative;
   display: flex;
   align-items: center;
+  min-width: 0;
   min-height: 50px;
   gap: 10px;
   padding: 9px 10px 9px 15px;
