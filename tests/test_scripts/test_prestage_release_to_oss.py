@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -118,6 +119,21 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
     return fake_bin, remote_root, call_log
 
 
+def _bash_executable() -> str:
+    if os.name != "nt":
+        return shutil.which("bash") or "bash"
+    git = shutil.which("git")
+    if git is not None:
+        candidate = Path(git).resolve().parent.parent / "bin" / "bash.exe"
+        if candidate.is_file():
+            return str(candidate)
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    candidate = Path(program_files) / "Git" / "bin" / "bash.exe"
+    if candidate.is_file():
+        return str(candidate)
+    raise RuntimeError("Git for Windows Bash is required for the OSS prestage contract test")
+
+
 def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
     fake_bin, remote_root, call_log = (
         _install_fake_ossutil(tmp_path)
@@ -139,7 +155,12 @@ def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
         }
     )
     return subprocess.run(
-        ["bash", ".github/scripts/prestage-release-to-oss.sh", str(assets), _TAG],
+        [
+            _bash_executable(),
+            ".github/scripts/prestage-release-to-oss.sh",
+            str(assets),
+            _TAG,
+        ],
         cwd=Path.cwd(),
         env=env,
         capture_output=True,
