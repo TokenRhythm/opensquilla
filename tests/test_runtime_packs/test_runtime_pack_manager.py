@@ -649,7 +649,7 @@ def test_unknown_linux_libc_is_not_supported(monkeypatch: Any) -> None:
     monkeypatch.setattr(runtime_pack_manager, "sys_platform_is_linux", lambda: True)
     monkeypatch.setattr(runtime_pack_manager.Path, "exists", lambda _path: False)
     monkeypatch.setattr(runtime_pack_manager.platform_module, "libc_ver", lambda: ("", ""))
-    monkeypatch.setattr(runtime_pack_manager.os, "confstr", lambda _name: None)
+    monkeypatch.delattr(runtime_pack_manager.os, "confstr", raising=False)
 
     assert runtime_pack_manager._host_is_supported_linux_libc() is False
 
