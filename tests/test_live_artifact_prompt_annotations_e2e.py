@@ -320,8 +320,12 @@ def test_isolated_home_environment_supports_windows_acl_hardening(tmp_path: Path
         "from pathlib import Path; import sys; "
         "from opensquilla.sandbox.upgrade_migration import "
         "_current_windows_user_sid, _protect_private_path; "
+        "print('acl-child-imported', flush=True); "
+        "sid = _current_windows_user_sid(); "
+        "print(f'acl-child-sid={sid}', flush=True); "
         "_protect_private_path(Path(sys.argv[1]), directory=True, "
-        "windows_user_sid=_current_windows_user_sid())"
+        "windows_user_sid=sid); "
+        "print('acl-child-protected', flush=True)"
     )
 
     try:
