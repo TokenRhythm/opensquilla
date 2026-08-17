@@ -39,7 +39,9 @@ from opensquilla.engine.steps.meta_command import (
 )
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.artifact_contexts import (
+    DOCUMENT_CONTEXT_TOOL_NAMES,
     PROMPT_ANNOTATION_TOOL_NAMES,
+    BoundDocumentContext,
 )
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
@@ -490,6 +492,203 @@ async def _create_html_prompt_annotation(
         body="Change this heading to Accepted.",
     )
     return service, draft
+
+
+async def _create_html_document(
+    stack: _RealIngressStack,
+    *,
+    session_key: str = SESSION_KEY,
+    session_id: str | None = None,
+) -> tuple[ArtifactSessionService, Any]:
+    service = await ArtifactSessionService.from_session_storage(stack.storage)
+    created = await service.create_document(
+        session_key=session_key,
+        session_id=session_id or stack.session_id,
+        name="page.html",
+        kind=ArtifactKind.HTML,
+        initial_artifact=ArtifactBlobRef(
+            artifact_id=f"artifact-{session_key}-{session_id or stack.session_id}",
+            sha256="c" * 64,
+            filename="page.html",
+            media_type="text/html",
+            byte_size=32,
+        ),
+        actor=Actor(ActorKind.USER, "user-1"),
+    )
+    return service, created
+
+
+@pytest.mark.asyncio
+async def test_chat_send_binds_current_document_head_as_additive_runtime_context(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "document-context.db") as stack:
+        _service, created = await _create_html_document(stack)
+        params = {
+            "sessionKey": SESSION_KEY,
+            "message": "Update the open document heading.",
+            "clientRequestId": "document-context-ingress-1",
+            "documentContext": {
+                "documentId": created.document.document_id,
+                "headRevisionId": created.revision.revision_id,
+            },
+        }
+
+        response = await get_dispatcher().dispatch(
+            "rpc-document-context-ingress",
+            "chat.send",
+            params,
+            stack.context,
+        )
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        bound = runtime_task.envelope.runtime_services["artifact_context"]
+        assert isinstance(bound, BoundDocumentContext)
+        assert bound.document_id == created.document.document_id
+        assert bound.revision_id == created.revision.revision_id
+        assert bound.tool_names == DOCUMENT_CONTEXT_TOOL_NAMES
+        assert "document_read" in bound.request_context_prompt
+        assert "document_patch" in bound.request_context_prompt
+
+        from opensquilla.gateway.routing import tool_context_from_envelope
+
+        tool_context = tool_context_from_envelope(
+            runtime_task.envelope,
+            is_owner=True,
+        )
+        assert tool_context.surfaced_tools == set(DOCUMENT_CONTEXT_TOOL_NAMES)
+        assert tool_context.exclusive_tools is None
+        assert tool_context.allowed_tools is None
+
+        replay_params = {key: value for key, value in params.items() if key != "documentContext"}
+        replay_params["document_context"] = {
+            "document_id": created.document.document_id,
+            "head_revision_id": created.revision.revision_id,
+        }
+        replay = await get_dispatcher().dispatch(
+            "rpc-document-context-ingress-replay",
+            "chat.send",
+            replay_params,
+            stack.context,
+        )
+        assert replay.error is None, replay.error
+        assert replay.payload["replayed"] is True
+
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_owner_web_turn_receives_narrow_generated_artifact_adopter(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdopter
+    from opensquilla.gateway.routing import tool_context_from_envelope
+
+    async with _open_real_stack(tmp_path / "generated-artifact-adopter.db") as stack:
+        response = await get_dispatcher().dispatch(
+            "rpc-generated-artifact-adopter",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Generate a small HTML page.",
+                "clientRequestId": "generated-artifact-adopter-1",
+            },
+            stack.context,
+        )
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        adopter = runtime_task.envelope.runtime_services.get(
+            "generated_artifact_adopter"
+        )
+        assert isinstance(adopter, GeneratedArtifactAdopter)
+        assert adopter.session_key == SESSION_KEY
+        assert adopter.session_id == stack.session_id
+        context = tool_context_from_envelope(runtime_task.envelope, is_owner=True)
+        assert context.generated_artifact_adopter is adopter
+
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["stale", "cross_session"])
+async def test_chat_send_rejects_unbound_document_context_before_acceptance(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    async with _open_real_stack(tmp_path / f"document-context-{failure}.db") as stack:
+        if failure == "cross_session":
+            _service, created = await _create_html_document(
+                stack,
+                session_key="agent:main:webchat:another-session",
+                session_id="another-session-id",
+            )
+            revision_id = created.revision.revision_id
+        else:
+            _service, created = await _create_html_document(stack)
+            revision_id = "missing-head-revision"
+
+        response = await get_dispatcher().dispatch(
+            f"rpc-document-context-{failure}",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Edit this document.",
+                "clientRequestId": f"document-context-{failure}",
+                "documentContext": {
+                    "documentId": created.document.document_id,
+                    "headRevisionId": revision_id,
+                },
+            },
+            stack.context,
+        )
+
+        assert response.error is not None
+        assert response.error.code == "DOCUMENT_CONTEXT_STALE"
+        assert response.error.accepted is False
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        _assert_no_runtime_acceptance_state(stack.runtime)
+
+
+@pytest.mark.asyncio
+async def test_chat_send_rejects_document_context_for_non_owner(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "document-context-guest.db") as stack:
+        _service, created = await _create_html_document(stack)
+        stack.context.principal = Principal(
+            role="operator",
+            scopes=frozenset({"operator.write"}),
+            is_owner=False,
+            authenticated=True,
+        )
+        response = await get_dispatcher().dispatch(
+            "rpc-document-context-guest",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Edit this document.",
+                "clientRequestId": "document-context-guest",
+                "documentContext": {
+                    "documentId": created.document.document_id,
+                    "headRevisionId": created.revision.revision_id,
+                },
+            },
+            stack.context,
+        )
+
+        assert response.error is not None
+        assert response.error.code == "DOCUMENT_CONTEXT_FORBIDDEN"
+        assert response.error.accepted is False
 
 
 @pytest.mark.asyncio

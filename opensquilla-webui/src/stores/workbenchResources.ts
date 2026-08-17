@@ -6,10 +6,12 @@ import type {
   DocumentPublishResponse,
   WorkbenchPreviewResponse,
   WorkbenchResource,
+  WorkbenchResourceOpenResponse,
   WorkbenchResourceRef,
 } from '@/types/workbenchResources'
 import { workbenchResourceRefId } from '@/types/workbenchResources'
 import type { WorkbenchResourceProvider } from '@/workbench/workbenchResourceProvider'
+import { canonicalWorkbenchResources } from '@/workbench/workbenchResourceItems'
 
 export interface WorkbenchResourceSnapshot {
   sessionKey: string
@@ -66,6 +68,19 @@ function stableImportIdempotencyKey(
     resource.sha256 || '',
     resource.name,
     'copy',
+  ].join('\u0000'))}`
+}
+
+function stableOpenIdempotencyKey(
+  sessionKey: string,
+  resource: WorkbenchResource,
+): string {
+  return `open-${identityToken([
+    sessionKey,
+    resource.resource.type,
+    workbenchResourceRefId(resource.resource),
+    resource.sha256 || '',
+    'edit-current',
   ].join('\u0000'))}`
 }
 
@@ -150,10 +165,15 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     provider: WorkbenchResourceProvider
     promise: Promise<DocumentImportResponse>
   }>()
+  const opens = new Map<string, {
+    provider: WorkbenchResourceProvider
+    promise: Promise<WorkbenchResourceOpenResponse | null>
+  }>()
 
   function setProvider(next: WorkbenchResourceProvider | null) {
     if (provider.value === next) return
     abortAll()
+    opens.clear()
     provider.value = next ? markRaw(next) : null
   }
 
@@ -232,6 +252,10 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     ) || null
   }
 
+  function navigationResources(sessionKey: string): WorkbenchResource[] {
+    return canonicalWorkbenchResources(snapshot(sessionKey).resources)
+  }
+
   function upsertResource(sessionKey: string, resolved: WorkbenchResource) {
     const existing = snapshot(sessionKey)
     const key = workbenchResourceKey(resolved.resource)
@@ -290,6 +314,46 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
         })()
     if (result) upsertResource(sessionKey, result.resource)
     return result
+  }
+
+  async function openCurrent(
+    sessionKey: string,
+    resource: WorkbenchResource,
+  ): Promise<WorkbenchResourceOpenResponse | null> {
+    const currentProvider = provider.value
+    if (!currentProvider?.open) return null
+    const operationKey = JSON.stringify([
+      sessionKey,
+      resource.resource.type,
+      workbenchResourceRefId(resource.resource),
+      'open-current',
+    ])
+    const pending = opens.get(operationKey)
+    if (pending?.provider === currentProvider) return pending.promise
+
+    const promise = (async () => {
+      const result = await currentProvider.open!(
+        sessionKey,
+        resource.resource,
+        {
+          intent: 'edit-current',
+          ...(resource.sha256 ? { expectedSha256: resource.sha256 } : {}),
+          idempotencyKey: stableOpenIdempotencyKey(sessionKey, resource),
+        },
+      )
+      if (!result) return null
+      upsertResource(sessionKey, result.resource)
+      if (result.disposition === 'document' && result.materialized) {
+        await load(sessionKey, true)
+      }
+      return result
+    })()
+    opens.set(operationKey, { provider: currentProvider, promise })
+    try {
+      return await promise
+    } finally {
+      if (opens.get(operationKey)?.promise === promise) opens.delete(operationKey)
+    }
   }
 
   async function importDocument(
@@ -364,6 +428,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
 
   function reset() {
     abortAll()
+    opens.clear()
     snapshots.value = {}
   }
 
@@ -373,8 +438,10 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     snapshot,
     load,
     find,
+    navigationResources,
     resolve,
     preview,
+    openCurrent,
     importDocument,
     publishDocument,
     clearSession,

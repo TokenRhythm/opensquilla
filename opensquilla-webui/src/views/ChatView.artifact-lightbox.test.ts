@@ -15,7 +15,7 @@ describe('ChatView artifact preview routing', () => {
     expect(openArtifactSource).toContain('artifactImageLightbox.open({')
   })
 
-  it('opens generated deliverables through the typed isolated preview when available', () => {
+  it('resolves generated deliverables to the current head before opening Source', () => {
     const typedStart = chatViewSource.indexOf('async function openDeliverableWorkbenchResource(')
     const openStart = chatViewSource.indexOf('function openArtifact(')
     const end = chatViewSource.indexOf('\nfunction closeDeliverables', openStart)
@@ -24,10 +24,39 @@ describe('ChatView artifact preview routing', () => {
     expect(typedStart).toBeGreaterThan(-1)
     expect(source).toContain("createWorkbenchResourceRef('deliverable', artifactId)")
     expect(source).toContain('workbenchResourcesStore.resolve(sessionKey.value, ref)')
-    expect(source).toContain('workbenchResourcesStore.preview(sessionKey.value, ref)')
+    expect(source).toContain('workbenchResourcesStore.openCurrent(sessionKey.value, resource)')
+    expect(source).toContain("current?.disposition === 'document'")
+    expect(source).toContain('artifactPayloadFromRevision(current.revision)')
+    expect(source).toContain("initialSection: 'source'")
+    expect(source).toContain('workbenchResourcesStore.preview(')
     expect(source).toContain('preparedPreview: preview.preview')
     expect(source).toContain('previewLeaseEligible: false')
     expect(source).toContain('openLegacyArtifactWorkbench(artifact)')
+  })
+
+  it('does not disguise a current-head resolution error as an old artifact preview', () => {
+    const start = chatViewSource.indexOf('async function openDeliverableWorkbenchResource(')
+    const end = chatViewSource.indexOf('\nfunction openArtifact(', start)
+    const source = chatViewSource.slice(start, end)
+    const catchStart = source.lastIndexOf('} catch (error) {')
+    const catchSource = source.slice(catchStart)
+
+    expect(catchStart).toBeGreaterThan(-1)
+    expect(catchSource).toContain("t('workbench.resources.actionFailed')")
+    expect(catchSource).toContain("{ tone: 'danger', duration: 9000 }")
+    expect(catchSource).not.toContain('openLegacyArtifactWorkbench')
+  })
+
+  it('keeps the card download bound to the original immutable artifact', () => {
+    const start = chatViewSource.indexOf('async function downloadArtifact(')
+    const end = chatViewSource.indexOf('\nfunction artifactUsesDocumentWorkbench', start)
+    const source = chatViewSource.slice(start, end)
+
+    expect(start).toBeGreaterThan(-1)
+    expect(source).toContain('artifactDownloadUrl(artifact, window.location.origin')
+    expect(source).toContain("downloadBlob(blob, artifact.name || 'artifact')")
+    expect(source).not.toContain('openCurrent')
+    expect(source).not.toContain('headArtifact')
   })
 
   it('refreshes the typed resource inventory when a new deliverable appears', () => {

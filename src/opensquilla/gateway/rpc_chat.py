@@ -1045,6 +1045,10 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
         "promptAnnotationIds",
         params.get("prompt_annotation_ids"),
     )
+    document_context = params.get(
+        "documentContext",
+        params.get("document_context"),
+    )
     if prompt_annotation_ids is not None:
         if not isinstance(prompt_annotation_ids, list):
             raise ValueError("params.promptAnnotationIds must be an array")
@@ -1057,7 +1061,7 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
     # turn. This matches the roundtrip the WebUI observes on first paint
     # before the sessions engine is attached.
     if ctx.session_manager is None:
-        if prompt_annotation_ids:
+        if prompt_annotation_ids or document_context is not None:
             raise RpcUnavailableError("Artifact context requires durable session storage")
         if initial_collaboration_mode is not None:
             raise RpcUnavailableError("Initial collaboration mode requires atomic turn acceptance")
@@ -1138,6 +1142,8 @@ async def _handle_chat_send(params: dict | None, ctx: RpcContext) -> dict:
             ("workspace_id", "workspace_id"),
             ("promptAnnotationIds", "promptAnnotationIds"),
             ("prompt_annotation_ids", "promptAnnotationIds"),
+            ("documentContext", "documentContext"),
+            ("document_context", "documentContext"),
         ):
             if source_key in params:
                 extra[target_key] = params[source_key]

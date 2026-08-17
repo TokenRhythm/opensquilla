@@ -3,6 +3,7 @@ import type { WorkbenchResource } from '@/types/workbenchResources'
 import { createWorkbenchResourceRef } from '@/types/workbenchResources'
 import {
   artifactPayloadFromWorkbenchResource,
+  canonicalWorkbenchResources,
   createResourceCollectionWorkbenchItem,
   resourceFromPreparedPreview,
   resourceUsesNativeHtmlPreview,
@@ -52,6 +53,29 @@ describe('workbench resource items', () => {
       workbenchResourceKey(document.resource),
       workbenchResourceKey(deliverable.resource),
     ]).size).toBe(3)
+  })
+
+  it('projects explicit source bindings to their visible Document without name or hash merging', () => {
+    const document = resource('document', 'doc_1', { documentId: 'doc_1' })
+    const boundAttachment = resource('attachment', 'att_1', { documentId: 'doc_1' })
+    const boundDeliverable = resource('deliverable', 'art_1', { documentId: 'doc_1' })
+    const sameLookingUnbound = resource('attachment', 'att_2')
+    sameLookingUnbound.sha256 = boundAttachment.sha256
+
+    const visible = canonicalWorkbenchResources([
+      boundAttachment,
+      boundDeliverable,
+      document,
+      sameLookingUnbound,
+    ])
+    expect(visible).toEqual([document, sameLookingUnbound])
+
+    const item = createResourceCollectionWorkbenchItem({
+      resources: [boundAttachment, document, sameLookingUnbound],
+      sessionKey: 'agent:main:webchat:test',
+      title: 'Workbench',
+    })
+    expect(resourcesFromWorkbenchItem(item)).toEqual([document, sameLookingUnbound])
   })
 
   it('does not disguise a bound attachment as its mutable Document head', () => {

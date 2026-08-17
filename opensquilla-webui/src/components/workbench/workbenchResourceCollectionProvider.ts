@@ -17,7 +17,6 @@ type Translate = (key: string, params?: Record<string, unknown>) => string
 
 export interface WorkbenchResourceCollectionOptions {
   download(resource: WorkbenchResource, item: WorkbenchItem): Promise<void>
-  importDocument(resource: WorkbenchResource, item: WorkbenchItem): Promise<void>
   open(resource: WorkbenchResource, item: WorkbenchItem): Promise<void> | void
   publish(resource: WorkbenchResource, item: WorkbenchItem): Promise<void>
   pushError(message: string): void
@@ -39,13 +38,29 @@ class WorkbenchResourceCollectionRuntime implements WorkbenchPanelRuntime {
   async handleComponentEvent(event: WorkbenchComponentEvent, item: WorkbenchItem) {
     const resource = resourceFromEvent(event)
     if (!resource) return
-    if (event.type === 'resource-preview') {
-      await this.options.open(resource, item)
+    if (event.type === 'resource-open') {
+      const busyKey = workbenchResourceKey(resource.resource)
+      this.context.updateRenderState({
+        resourceBusyKey: busyKey,
+        resourceOpenErrorKey: '',
+        resourceOpenErrorMessage: '',
+      })
+      try {
+        await this.options.open(resource, item)
+      } catch (error) {
+        this.context.updateRenderState({
+          resourceOpenErrorKey: busyKey,
+          resourceOpenErrorMessage: error instanceof Error
+            ? error.message
+            : this.options.t('workbench.resources.actionFailed'),
+        })
+      } finally {
+        this.context.updateRenderState({ resourceBusyKey: '' })
+      }
       return
     }
     if (![
       'resource-download',
-      'resource-import',
       'resource-publish',
     ].includes(event.type)) return
 
@@ -54,8 +69,6 @@ class WorkbenchResourceCollectionRuntime implements WorkbenchPanelRuntime {
     try {
       if (event.type === 'resource-download') {
         await this.options.download(resource, item)
-      } else if (event.type === 'resource-import') {
-        await this.options.importDocument(resource, item)
       } else {
         await this.options.publish(resource, item)
       }
@@ -89,10 +102,6 @@ export function createWorkbenchResourceCollectionDefinition(
         'workbench.resources.download',
         { name: resource.name },
       ),
-      editLabel: (resource: WorkbenchResource) => options.t(
-        'workbench.resources.edit',
-        { name: resource.name },
-      ),
       emptyLabel: options.t('workbench.resources.empty'),
       groupLabels: {
         attachment: options.t('workbench.resources.groups.attachments'),
@@ -101,14 +110,18 @@ export function createWorkbenchResourceCollectionDefinition(
         url: options.t('workbench.resources.groups.urls'),
       },
       label: options.t('workbench.resources.title'),
-      previewLabel: (resource: WorkbenchResource) => options.t(
-        'workbench.resources.preview',
+      openErrorKey: String(state.runtimeState.resourceOpenErrorKey || ''),
+      openErrorMessage: String(state.runtimeState.resourceOpenErrorMessage || ''),
+      openLabel: (resource: WorkbenchResource) => options.t(
+        'workbench.resources.open',
         { name: resource.name },
       ),
+      preparingLabel: options.t('workbench.resources.preparing'),
       publishLabel: (resource: WorkbenchResource) => options.t(
         'workbench.resources.publish',
         { name: resource.name },
       ),
+      retryLabel: options.t('workbench.resources.retry'),
       resources: resourcesFromWorkbenchItem(item),
       unavailableReason: (resource: WorkbenchResource) => options.t(
         workbenchResourceUnavailableReasonKey(resource.capabilities.reasonCode),

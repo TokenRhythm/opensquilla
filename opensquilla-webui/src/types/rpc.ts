@@ -530,6 +530,12 @@ export interface ChatSendAttachmentPayload {
   file_uuid?: string
 }
 
+/** Exact editable document head bound to one chat send attempt. */
+export interface ChatDocumentContext {
+  documentId: string
+  headRevisionId: string
+}
+
 export interface ChatSendParams {
   message: string
   sessionKey: string
@@ -539,6 +545,8 @@ export interface ChatSendParams {
   clientMessageId?: string
   /** Ordered durable drafts consumed atomically with this chat ingress. */
   promptAnnotationIds?: string[]
+  /** Current editable document head made available only to this turn. */
+  documentContext?: ChatDocumentContext
   _source?: { elevated?: string; runMode?: 'safe' | 'full' }
   intent?: string
   workspaceId?: string

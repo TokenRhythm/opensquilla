@@ -157,6 +157,24 @@ def _tool_call_events(tool_use_id: str, arguments: dict[str, Any]) -> list[objec
     ]
 
 
+def _document_patch_call_events(
+    tool_use_id: str,
+    arguments: dict[str, Any],
+) -> list[object]:
+    return [
+        ProviderToolUseStartEvent(
+            tool_use_id=tool_use_id,
+            tool_name="document_patch",
+        ),
+        ProviderToolUseEndEvent(
+            tool_use_id=tool_use_id,
+            tool_name="document_patch",
+            arguments=arguments,
+        ),
+        ProviderDoneEvent(stop_reason="tool_use"),
+    ]
+
+
 def _effect_result(
     tool_use_id: str,
     *,
@@ -167,6 +185,7 @@ def _effect_result(
     code: str,
     is_error: bool,
     corrected: bool = False,
+    tool_name: str = "document_apply",
 ) -> ToolResult:
     outcome: dict[str, Any] = {
         "status": status,
@@ -178,7 +197,7 @@ def _effect_result(
         outcome.update({"corrected": True, "proposalAttempts": 2})
     return ToolResult(
         tool_use_id=tool_use_id,
-        tool_name="document_apply",
+        tool_name=tool_name,
         content=json.dumps({"status": status, "code": code}),
         is_error=is_error,
         effect_outcome=ToolEffectOutcome(
@@ -237,6 +256,43 @@ def _agent(
             exclusive_tools={"document_apply"},
             allowed_tools={"document_apply"},
             surfaced_tools={"document_apply"},
+            artifact_mutation_attempt_controller=controller,
+        ),
+    )
+
+
+def _ordinary_document_agent(
+    provider: Any,
+    controller: _MutationController,
+    handler: Any,
+) -> Agent:
+    return Agent(
+        provider=provider,
+        config=AgentConfig(
+            metadata={"artifact_operation_class": "document_edit", "locale": "en"},
+            model_capabilities=ModelCapabilities(supports_tools=True),
+            model_tools_capability_verified=True,
+            max_turn_llm_calls=8,
+            max_iterations=0,
+        ),
+        tool_definitions=[
+            ToolDefinition(
+                name="document_patch",
+                description="Patch the current bound document.",
+                input_schema=ToolInputSchema(
+                    properties={
+                        "expectedSha256": {"type": "string"},
+                        "edits": {"type": "array"},
+                    },
+                    required=["expectedSha256", "edits"],
+                ),
+            )
+        ],
+        tool_handler=handler,
+        tool_context=ToolContext(
+            is_owner=True,
+            session_key="agent:main:webchat:ordinary-document-loop-test",
+            surfaced_tools={"document_patch"},
             artifact_mutation_attempt_controller=controller,
         ),
     )
@@ -351,6 +407,56 @@ async def test_committed_mutation_gets_real_outcome_only_tools_disabled_finaliza
     assert done.text.endswith("The document changes were applied.")
     assert controller.observed == ["apply-1"]
     assert controller.rejected == []
+
+
+@pytest.mark.asyncio
+async def test_additive_document_patch_uses_same_guarded_writer_lifecycle() -> None:
+    provider = _ScriptedMutationProvider(
+        [
+            _document_patch_call_events(
+                "patch-1",
+                {
+                    "expectedSha256": "a" * 64,
+                    "edits": [
+                        {"expectedText": "Old heading", "replacement": "New heading"}
+                    ],
+                },
+            ),
+            [
+                ProviderTextDeltaEvent(text="Updated."),
+                ProviderDoneEvent(stop_reason="end_turn"),
+            ],
+        ]
+    )
+    controller = _MutationController()
+
+    async def handler(call: Any) -> ToolResult:
+        controller.committed_ids.add(call.tool_use_id)
+        return _effect_result(
+            call.tool_use_id,
+            status="applied",
+            effect_state="committed",
+            retry_policy="never",
+            loop_action="finalize_without_tools",
+            code="document_mutation_applied",
+            is_error=False,
+            tool_name="document_patch",
+        )
+
+    events = [
+        event
+        async for event in _ordinary_document_agent(provider, controller, handler).run_turn(
+            "Edit the open document"
+        )
+    ]
+    done = next(event for event in events if event.kind == "done")
+
+    assert controller.observed == ["patch-1"]
+    assert controller.rejected == []
+    assert provider.calls[0]["tools"] is not None
+    assert provider.calls[1]["tools"] is None
+    assert done.document_mutation_outcome["status"] == "applied"
+    assert done.text.endswith("The document changes were applied.")
 
 
 @pytest.mark.asyncio

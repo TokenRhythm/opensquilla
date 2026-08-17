@@ -153,6 +153,7 @@ describe('useChatSend prompt annotations', () => {
     expect(harness.options.acknowledgePromptAnnotations).toHaveBeenCalledWith(
       ['annotation-2', 'annotation-1'],
       ['annotation-2'],
+      'agent:main:webchat:test',
     )
   })
 
@@ -165,6 +166,7 @@ describe('useChatSend prompt annotations', () => {
     expect(harness.options.acknowledgePromptAnnotations).toHaveBeenCalledWith(
       ['annotation-2', 'annotation-1'],
       [],
+      'agent:main:webchat:test',
     )
     expect(harness.options.messages.value[0]?.promptAnnotations).toBeUndefined()
   })
@@ -279,10 +281,67 @@ describe('useChatSend prompt annotations', () => {
     expect(harness.options.acknowledgePromptAnnotations).toHaveBeenCalledWith(
       ['annotation-2', 'annotation-1'],
       ['annotation-2', 'annotation-1'],
+      'agent:main:webchat:test',
     )
     const userMessages = harness.options.messages.value.filter(message => message.role === 'user')
     expect(userMessages).toHaveLength(1)
     expect(userMessages[0]?.promptAnnotations?.map(item => item.annotationId))
       .toEqual(['annotation-2', 'annotation-1'])
+  })
+
+  it('acknowledges accepted annotations exactly once after receipt recovery', async () => {
+    vi.useFakeTimers()
+    try {
+      let rejectFirstSend!: (reason: unknown) => void
+      let sendCalls = 0
+      const acknowledgePromptAnnotations = vi.fn()
+      const harness = createHarness({ acknowledgePromptAnnotations })
+      harness.options.stream.startStreaming = vi.fn(() => {
+        harness.options.stream.isStreaming.value = true
+      })
+      harness.options.stream.endStreaming = vi.fn(() => {
+        harness.options.stream.isStreaming.value = false
+      })
+      harness.rpc.call.mockImplementation(<T = unknown>(
+        method: string,
+      ): Promise<T> => {
+        if (method === 'chat.abort') {
+          return Promise.resolve({ aborted: true }) as Promise<T>
+        }
+        sendCalls += 1
+        if (sendCalls === 1) {
+          return new Promise<T>((_resolve, reject) => {
+            rejectFirstSend = reject
+          })
+        }
+        return Promise.resolve({
+          sessionKey: 'agent:main:webchat:test',
+          task_id: 'task-recovered-annotation-send',
+          task_status: 'running',
+          acceptedPromptAnnotationIds: ['annotation-2'],
+        }) as Promise<T>
+      })
+
+      const firstSend = harness.api.onSend()
+      await Promise.resolve()
+      expect(sendCalls).toBe(1)
+      harness.api.onStop()
+      rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
+      await firstSend
+
+      expect(acknowledgePromptAnnotations).not.toHaveBeenCalled()
+      await vi.runAllTimersAsync()
+      await Promise.resolve()
+
+      expect(sendCalls).toBe(2)
+      expect(acknowledgePromptAnnotations).toHaveBeenCalledTimes(1)
+      expect(acknowledgePromptAnnotations).toHaveBeenCalledWith(
+        ['annotation-2', 'annotation-1'],
+        ['annotation-2'],
+        'agent:main:webchat:test',
+      )
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

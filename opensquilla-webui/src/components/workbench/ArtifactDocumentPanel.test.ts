@@ -3,6 +3,7 @@
 import { createApp, nextTick } from 'vue'
 import { createI18n } from 'vue-i18n'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createPinia } from 'pinia'
 
 import en from '@/locales/en.json'
 import type { ArtifactDocumentWorkspaceSnapshot } from '@/types/artifactDocuments'
@@ -14,6 +15,7 @@ import {
 } from '@/workbench/workbenchResourceItems'
 import { normalizeWorkbenchResource } from '@/workbench/workbenchResourceProvider'
 import ArtifactDocumentPanel from './ArtifactDocumentPanel.vue'
+import artifactDocumentPanelSource from './ArtifactDocumentPanel.vue?raw'
 
 const officeArtifact: ArtifactPayload = {
   id: 'artifact-office',
@@ -42,6 +44,7 @@ function mountPanel(props: Record<string, unknown>) {
     locale: 'en',
     messages: { en },
   }))
+  app.use(createPinia())
   app.mount(element)
   return {
     element,
@@ -59,7 +62,13 @@ afterEach(() => {
 })
 
 describe('ArtifactDocumentPanel', () => {
-  it('offers a visible editable-copy action without exposing document tabs', async () => {
+  it('routes a successful source save through the canonical head-change event', () => {
+    expect(artifactDocumentPanelSource).toContain('@source-saved="onSourceSaved"')
+    expect(artifactDocumentPanelSource).toContain("type: 'artifact-head-changed'")
+    expect(artifactDocumentPanelSource).toContain('payload: { revisionId }')
+  })
+
+  it('keeps immutable artifacts read-only without exposing an editable-copy action', async () => {
     const onWorkbenchEvent = vi.fn()
     const mounted = mountPanel({
       artifact: {
@@ -69,7 +78,6 @@ describe('ArtifactDocumentPanel', () => {
         download_url: '/api/v1/artifacts/deliverable-html',
       },
       documentFeatures: false,
-      editableCopyAvailable: true,
       onWorkbenchEvent,
       suspended: true,
     })
@@ -77,32 +85,57 @@ describe('ArtifactDocumentPanel', () => {
 
     expect([...mounted.element.querySelectorAll('[role="tab"]')]
       .map(tab => tab.textContent?.trim())).toEqual(['Preview'])
-    const editCopy = mounted.element.querySelector<HTMLButtonElement>(
+    expect(mounted.element.querySelector(
       '[data-artifact-action="create-editable-copy"]',
-    )
-    expect(editCopy?.textContent).toContain('Edit a copy of published.html')
-    editCopy?.click()
-    expect(onWorkbenchEvent).toHaveBeenCalledWith({
+    )).toBeNull()
+    expect(onWorkbenchEvent).not.toHaveBeenCalledWith(expect.objectContaining({
       type: 'artifact-create-editable-copy',
-    })
+    }))
     mounted.unmount()
+  })
 
-    const busy = mountPanel({
-      artifact: {
-        id: 'deliverable-html',
-        name: 'published.html',
-        mime: 'text/html',
-      },
-      documentFeatures: false,
-      editableCopyAvailable: true,
-      editableCopyBusy: true,
+  it('opens a mutable document on Source when requested by resource navigation', async () => {
+    const htmlArtifact: ArtifactPayload = {
+      id: 'artifact-html',
+      documentId: 'document-html',
+      revisionId: 'revision-head',
+      name: 'page.html',
+      mime: 'text/html',
+      download_url: '/api/v1/artifacts/artifact-html',
+    }
+    const legacy = createLegacyArtifactWorkspace(htmlArtifact, 'session-a')
+    const mounted = mountPanel({
+      artifact: htmlArtifact,
+      documentSnapshot: {
+        key: 'fixture-source',
+        loading: false,
+        loaded: true,
+        stale: false,
+        error: null,
+        workspace: {
+          ...legacy,
+          source: 'document-api',
+          document: {
+            ...legacy.document,
+            documentId: 'document-html',
+            headRevisionId: 'revision-head',
+            capabilities: {
+              ...legacy.document.capabilities,
+              edit: true,
+              source: true,
+            },
+          },
+        },
+      } satisfies ArtifactDocumentWorkspaceSnapshot,
+      initialSection: 'source',
+      sessionKey: 'session-a',
       suspended: true,
     })
     await nextTick()
-    expect(busy.element.querySelector<HTMLButtonElement>(
-      '[data-artifact-action="create-editable-copy"]',
-    )?.disabled).toBe(true)
-    busy.unmount()
+
+    expect(mounted.element.querySelector('[role="tab"][aria-selected="true"]')?.textContent)
+      .toContain('Source')
+    mounted.unmount()
   })
 
   it('keeps publishing out of the V1 document surface', async () => {

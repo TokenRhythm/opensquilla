@@ -69,6 +69,7 @@ import type {
   ArtifactSourceSnapshot,
 } from '@/types/artifactDocuments'
 import type { ArtifactPayload } from '@/types/rpc'
+import type { WorkbenchBeforeCloseOptions } from '@/workbench/types'
 import { copyTextWithFallback } from '@/utils/browser'
 import {
   createMutationClientRequestId,
@@ -138,6 +139,8 @@ let closePromise: Promise<boolean> | null = null
 let startPromise: Promise<boolean> | null = null
 let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
 let sessionMutationQueue: Promise<void> = Promise.resolve()
+let deferredHeadRevisionId = ''
+let cleanHeadReloadPromise: Promise<boolean> | null = null
 
 const EDIT_SESSION_HEARTBEAT_MS = 20_000
 const pendingSourceRequestIds = new PendingMutationRequestIds(4)
@@ -232,6 +235,75 @@ function enterHeadConflict(reason: unknown) {
   failEditSession(reason)
 }
 
+function reconcileDeferredHeadRevision() {
+  if (!deferredHeadRevisionId || saving.value || flushPromise) return
+  const observedHeadRevisionId = deferredHeadRevisionId
+  deferredHeadRevisionId = ''
+  if (snapshot.value?.revisionId !== observedHeadRevisionId) {
+    if (dirty.value) {
+      enterHeadConflict(new Error(t('workbench.artifactDocument.sourceConflict')))
+    } else {
+      void reloadCleanHead()
+    }
+  }
+}
+
+function editorTracksHead(headRevisionId: string): boolean {
+  return snapshot.value?.revisionId === headRevisionId
+    && (
+      editSessionMode.value !== 'active'
+      || editSession.value?.lastSavedRevisionId === headRevisionId
+    )
+}
+
+async function runCleanHeadReload(): Promise<boolean> {
+  while (
+    !unmounted
+    && !dirty.value
+    && !saving.value
+    && !flushPromise
+    && !headConflict.value
+  ) {
+    const requestedHeadRevisionId = props.document.headRevisionId
+    if (editorTracksHead(requestedHeadRevisionId)) return true
+
+    clearAutosave()
+    loadGeneration += 1
+    editor?.updateOptions({ readOnly: true })
+    await closeEditSessionBestEffort()
+    if (
+      unmounted
+      || dirty.value
+      || saving.value
+      || flushPromise
+      || headConflict.value
+    ) return false
+
+    editSession.value = null
+    editSessionMode.value = 'initializing'
+    editSessionClientRequestId = createMutationClientRequestId('edit-session')
+    error.value = ''
+    const loaded = await initializeEditor()
+    if (unmounted || dirty.value || headConflict.value) return false
+    if (loaded && editorTracksHead(props.document.headRevisionId)) return true
+    if (error.value || props.document.headRevisionId === requestedHeadRevisionId) return false
+    // A second head arrived while the source RPC was in flight. Repeat against
+    // that newest immutable head instead of publishing an intermediate buffer.
+  }
+  return false
+}
+
+function reloadCleanHead(): Promise<boolean> {
+  if (cleanHeadReloadPromise) return cleanHeadReloadPromise
+  const pending = runCleanHeadReload()
+  cleanHeadReloadPromise = pending
+  const clear = () => {
+    if (cleanHeadReloadPromise === pending) cleanHeadReloadPromise = null
+  }
+  void pending.then(clear, clear)
+  return pending
+}
+
 function assertActiveEditSession(
   candidate: ArtifactEditSession | null,
   expectedId?: string,
@@ -294,6 +366,7 @@ async function startEditing(): Promise<boolean> {
   if (!provider || !props.document.capabilities.source || unmounted) return false
   editSessionMode.value = 'initializing'
   editSession.value = null
+  deferredHeadRevisionId = ''
   headConflict.value = false
   error.value = ''
   editor?.updateOptions({ readOnly: true })
@@ -513,8 +586,20 @@ async function commitCurrentSnapshot(): Promise<boolean> {
     dirty.value = editVersion !== saveVersion
     savedAt.value = Date.now()
     updateElementIndex()
+    const observedHeadRevisionId = deferredHeadRevisionId
+      || props.document.headRevisionId
+    deferredHeadRevisionId = ''
+    if (
+      observedHeadRevisionId !== baseline.revisionId
+      && observedHeadRevisionId !== saved.revisionId
+    ) {
+      if (dirty.value) {
+        enterHeadConflict(new Error(t('workbench.artifactDocument.sourceConflict')))
+        return false
+      }
+      deferredHeadRevisionId = observedHeadRevisionId
+    }
     emit('source-saved', saved.revisionId)
-    void artifactDocuments.refresh(props.artifact, props.sessionKey)
     return true
   } catch (caught) {
     if (editSessionMode.value === 'active') failEditSession(caught)
@@ -522,6 +607,7 @@ async function commitCurrentSnapshot(): Promise<boolean> {
     return false
   } finally {
     saving.value = false
+    reconcileDeferredHeadRevision()
   }
 }
 
@@ -533,6 +619,7 @@ async function flush(): Promise<boolean> {
     return await pending
   } finally {
     if (flushPromise === pending) flushPromise = null
+    reconcileDeferredHeadRevision()
     if (dirty.value && editingReady.value && !headConflict.value && !unmounted) {
       scheduleAutosave()
     }
@@ -625,7 +712,8 @@ async function closeEditSessionBestEffort() {
   }
 }
 
-async function beforeClose(): Promise<boolean> {
+async function beforeClose(options: WorkbenchBeforeCloseOptions = {}): Promise<boolean> {
+  if (options.preserveRuntime) return drainPendingEdits()
   if (closePromise) return closePromise
   const closing = (async () => {
     if (!await drainPendingEdits()) return false
@@ -676,18 +764,18 @@ watch(
   () => props.document.headRevisionId,
   headRevisionId => {
     if (snapshot.value?.revisionId === headRevisionId) return
-    if (
-      editSessionMode.value === 'active'
-      && editSession.value?.lastSavedRevisionId !== headRevisionId
-    ) {
-      enterHeadConflict(new Error(t('workbench.artifactDocument.sourceConflict')))
+    // The Gateway may publish the state invalidation immediately before the
+    // source.patch response. Defer judgment until that response identifies
+    // the revision accepted for this exact in-flight save.
+    if (saving.value || flushPromise) {
+      deferredHeadRevisionId = headRevisionId
       return
     }
     if (dirty.value) {
       enterHeadConflict(new Error(t('workbench.artifactDocument.sourceConflict')))
       return
     }
-    void loadSource()
+    void reloadCleanHead()
   },
 )
 

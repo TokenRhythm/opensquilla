@@ -216,7 +216,7 @@ describe('ArtifactHtmlStudio', () => {
     useArtifactDocumentsStore(pinia).setProvider(provider)
     let studio: {
       flush: () => Promise<boolean>
-      beforeClose: () => Promise<boolean>
+      beforeClose: (options?: { preserveRuntime?: boolean }) => Promise<boolean>
     } | null = null
     const timeoutSpy = vi.spyOn(globalThis, 'setTimeout')
     const host = document.createElement('div')
@@ -261,6 +261,8 @@ describe('ArtifactHtmlStudio', () => {
       expectedHeadRevisionId: 'revision-1',
       clientRequestId: expect.stringMatching(/^document-save-/),
     }))
+    await expect(studio!.beforeClose({ preserveRuntime: true })).resolves.toBe(true)
+    expect(closeEditSession).not.toHaveBeenCalled()
     await expect(studio!.beforeClose()).resolves.toBe(true)
     expect(closeEditSession).toHaveBeenCalledWith({
       sessionKey: 'session-a',
@@ -566,6 +568,72 @@ describe('ArtifactHtmlStudio', () => {
     expect(host.querySelector('[data-state="dirty"]')).toBeNull()
   })
 
+  it('accepts its own head event when it arrives before the save response', async () => {
+    let resolveSave!: (value: ArtifactSourceSnapshot) => void
+    const pendingSave = new Promise<ArtifactSourceSnapshot>(resolve => {
+      resolveSave = resolve
+    })
+    const provider = {
+      readSource: vi.fn().mockResolvedValue({
+        documentId: documentModel.documentId,
+        revisionId: 'revision-1',
+        language: 'html',
+        content: '<p>before</p>',
+        sha256: 'a'.repeat(64),
+        offsetEncoding: 'unicode-code-point',
+        patchCount: null,
+        stateRevision: 1,
+      } satisfies ArtifactSourceSnapshot),
+      patchSource: vi.fn().mockReturnValue(pendingSave),
+    } as unknown as ArtifactDocumentProvider
+    const pinia = createPinia()
+    useArtifactDocumentsStore(pinia).setProvider(provider)
+    let studio: { flush: () => Promise<boolean> } | null = null
+    const state = reactive({ document: { ...documentModel } })
+    const host = document.createElement('div')
+    document.body.append(host)
+    const Root = defineComponent(() => () => h(ArtifactHtmlStudio, {
+      ref: (value: unknown) => { studio = value as typeof studio },
+      artifact,
+      document: state.document,
+      sessionKey: 'session-a',
+    }))
+    const app = createApp(Root)
+    app.use(pinia)
+    app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
+    apps.push(app)
+    app.mount(host)
+    await vi.waitFor(() => expect(monaco.editor.getValue()).toBe('<p>before</p>'))
+
+    monaco.input('<p>after</p>')
+    const saving = studio!.flush()
+    await vi.waitFor(() => expect(provider.patchSource).toHaveBeenCalledOnce())
+    state.document = {
+      ...state.document,
+      headRevisionId: 'revision-2',
+      generation: 2,
+      stateRevision: 2,
+    }
+    await nextTick()
+    expect(monaco.isReadOnly()).toBe(false)
+
+    resolveSave({
+      documentId: documentModel.documentId,
+      revisionId: 'revision-2',
+      language: 'html',
+      content: '',
+      sha256: 'b'.repeat(64),
+      offsetEncoding: 'unicode-code-point',
+      patchCount: 1,
+      stateRevision: 2,
+    })
+    await expect(saving).resolves.toBe(true)
+    await nextTick()
+    expect(monaco.isReadOnly()).toBe(false)
+    expect(host.querySelector('[data-testid="discard-and-load-latest"]')).toBeNull()
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+  })
+
   it('reuses an opaque save identity after response loss without aliasing another patch', async () => {
     const patchSource = vi.fn()
       .mockRejectedValueOnce(new Error('response lost'))
@@ -634,6 +702,110 @@ describe('ArtifactHtmlStudio', () => {
       expectedHeadRevisionId: 'revision-1',
       patches: [{ startOffset: 3, endOffset: 7, replacement: 'second private replacement' }],
     })
+  })
+
+  it('restarts editing and reloads an externally advanced head when the buffer is clean', async () => {
+    const liveDocument = reactive({ ...documentModel })
+    const startEditSession = vi.fn()
+      .mockResolvedValueOnce({
+        editSessionId: 'edit-session-clean-1',
+        documentId: documentModel.documentId,
+        baseRevisionId: 'revision-1',
+        lastSavedRevisionId: 'revision-1',
+        mode: 'edit',
+        status: 'active',
+        stateRevision: 1,
+        expiresAt: Date.now() + 60_000,
+      })
+      .mockResolvedValueOnce({
+        editSessionId: 'edit-session-clean-2',
+        documentId: documentModel.documentId,
+        baseRevisionId: 'revision-2',
+        lastSavedRevisionId: 'revision-2',
+        mode: 'edit',
+        status: 'active',
+        stateRevision: 1,
+        expiresAt: Date.now() + 60_000,
+      })
+    const readSource = vi.fn()
+      .mockResolvedValueOnce({
+        documentId: documentModel.documentId,
+        revisionId: 'revision-1',
+        language: 'html',
+        content: '<h1>Original</h1>',
+        sha256: 'a'.repeat(64),
+        offsetEncoding: 'unicode-code-point',
+        patchCount: null,
+        stateRevision: 1,
+      } satisfies ArtifactSourceSnapshot)
+      .mockResolvedValueOnce({
+        documentId: documentModel.documentId,
+        revisionId: 'revision-2',
+        language: 'html',
+        content: '<h1>Agent update</h1>',
+        sha256: 'b'.repeat(64),
+        offsetEncoding: 'unicode-code-point',
+        patchCount: null,
+        stateRevision: 2,
+      } satisfies ArtifactSourceSnapshot)
+    const closeEditSession = vi.fn(async (request: {
+      editSessionId: string
+    }) => ({
+      editSessionId: request.editSessionId,
+      documentId: documentModel.documentId,
+      baseRevisionId: request.editSessionId.endsWith('-1') ? 'revision-1' : 'revision-2',
+      lastSavedRevisionId: request.editSessionId.endsWith('-1') ? 'revision-1' : 'revision-2',
+      mode: 'edit' as const,
+      status: 'closed' as const,
+      stateRevision: 2,
+      expiresAt: Date.now() + 60_000,
+    }))
+    const provider = {
+      startEditSession,
+      heartbeatEditSession: vi.fn(),
+      closeEditSession,
+      readSource,
+      patchSource: vi.fn(),
+    } as unknown as ArtifactDocumentProvider
+    const pinia = createPinia()
+    useArtifactDocumentsStore(pinia).setProvider(provider)
+    const host = document.createElement('div')
+    document.body.append(host)
+    const Root = defineComponent(() => () => h(ArtifactHtmlStudio, {
+      artifact,
+      document: liveDocument,
+      sessionKey: 'session-a',
+    }))
+    const app = createApp(Root)
+    app.use(pinia)
+    app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
+    apps.push(app)
+    app.mount(host)
+    await vi.waitFor(() => expect(monaco.editor.getValue()).toBe('<h1>Original</h1>'))
+
+    liveDocument.headRevisionId = 'revision-2'
+    liveDocument.generation = 2
+    liveDocument.stateRevision = 2
+
+    await vi.waitFor(() => expect(startEditSession).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(monaco.editor.getValue()).toBe('<h1>Agent update</h1>'))
+    expect(closeEditSession).toHaveBeenCalledWith({
+      sessionKey: 'session-a',
+      editSessionId: 'edit-session-clean-1',
+      expectedStateRevision: 1,
+    })
+    expect(readSource).toHaveBeenLastCalledWith({
+      sessionKey: 'session-a',
+      documentId: documentModel.documentId,
+      revisionId: 'revision-2',
+    })
+    expect(monaco.isReadOnly()).toBe(false)
+    expect(host.querySelector('[data-testid="discard-and-load-latest"]')).toBeNull()
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+
+    monaco.input('<h1>Continue editing</h1>')
+    await nextTick()
+    expect(host.querySelector('[data-state="dirty"]')).not.toBeNull()
   })
 
   it('fails closed on a new head and lets the user copy or explicitly discard stale source', async () => {

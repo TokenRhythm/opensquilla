@@ -222,9 +222,12 @@ async def _current_scope(
 
     # Importing the Gateway type at invocation time avoids making the builtin
     # tool package depend on Gateway initialization order.
-    from opensquilla.gateway.artifact_contexts import BoundPromptAnnotationContext
+    from opensquilla.gateway.artifact_contexts import (
+        BoundDocumentContext,
+        BoundPromptAnnotationContext,
+    )
 
-    if not isinstance(context, BoundPromptAnnotationContext):
+    if not isinstance(context, (BoundDocumentContext, BoundPromptAnnotationContext)):
         raise _stale_context()
     if tool_name not in context.tool_names:
         raise SafeToolError("This capability is not available in the current editor context.")
@@ -237,9 +240,13 @@ async def _current_scope(
         raise _stale_context()
 
     try:
-        document = await service.get_document(context.document_id)
-        revision = await service.get_revision(context.revision_id)
-    except ArtifactSessionNotFoundError:
+        current = await service.get_document_head(
+            context.document_id,
+            expected_revision_id=context.revision_id,
+        )
+        document = current.document
+        revision = current.revision
+    except (ArtifactConflictError, ArtifactSessionNotFoundError):
         raise _stale_context() from None
     if (
         document.session_key != context.session_key
@@ -254,6 +261,20 @@ async def _current_scope(
         raise _stale_context()
     if required_format is not None and artifact_format != required_format:
         raise SafeToolError(f"This tool is available only for {required_format.upper()} artifacts.")
+
+    if isinstance(context, BoundDocumentContext):
+        if require_anchor:
+            raise RetryableToolInputError(
+                "Select content in the artifact before using this tool."
+            )
+        return _ArtifactScope(
+            ctx=ctx,
+            context=context,
+            service=service,
+            document=document,
+            revision=revision,
+            anchors=(),
+        )
 
     anchors: list[Anchor] = []
     for anchor_id in context.anchor_ids:
@@ -2192,6 +2213,171 @@ async def _prepare_document_mutation(
         registry=registry,
         reservation_id=reservation_id,
         proposal_sha256=proposal_sha256,
+    )
+
+
+async def _prepare_document_text_patch(
+    expected_sha256: str,
+    edits: list[dict[str, object]],
+    *,
+    proposal_sha256: str,
+) -> PreparedDocumentMutation:
+    """Prepare an exact-text patch against a server-bound document head.
+
+    The model supplies no path, revision, session, or source offsets.  Every
+    expected fragment must identify exactly one range in the current canonical
+    source, after which the ordinary mutation commit kernel owns lease, CAS,
+    candidate publication, validation, ChangeSet, revision, and event commit.
+    """
+
+    scope = await _current_scope("document_patch", required_format="html")
+    expected = str(expected_sha256 or "").strip().lower()
+    if _SHA256_RE.fullmatch(expected) is None:
+        raise DocumentMutationError(
+            "DOCUMENT_PATCH_EXPECTED_SHA_INVALID",
+            "expectedSha256 must be exactly 64 hexadecimal characters.",
+            retry_policy="correctable",
+        )
+    turn_id = str(scope.ctx.task_id or "").strip()
+    if not turn_id:
+        raise DocumentMutationError(
+            "DOCUMENT_MUTATION_AUTHORITY_UNAVAILABLE",
+            "Commit authority is unavailable.",
+            retry_policy="forbidden",
+        )
+    if not isinstance(edits, list) or not edits or len(edits) > _MAX_HTML_PATCHES:
+        raise DocumentMutationError(
+            "DOCUMENT_PATCH_EDITS_INVALID",
+            "edits must be a non-empty bounded array.",
+            retry_policy="correctable",
+        )
+
+    store, ref, raw = await _current_payload(scope)
+    await _require_single_file_html(scope, store, ref)
+    if expected != ref.sha256:
+        raise DocumentMutationError(
+            "DOCUMENT_MUTATION_CONFLICT",
+            "The document changed after it was read. Read the current document and retry.",
+            retry_policy="refresh",
+        )
+    source = _decode_html(raw)
+    patches: list[dict[str, object]] = []
+    canonical_edits: list[dict[str, str]] = []
+    for index, edit in enumerate(edits):
+        if not isinstance(edit, dict) or set(edit) != {"expectedText", "replacement"}:
+            raise DocumentMutationError(
+                "DOCUMENT_PATCH_EDIT_INVALID",
+                f"edits[{index}] must contain only expectedText and replacement.",
+                retry_policy="correctable",
+            )
+        expected_text = edit.get("expectedText")
+        replacement = edit.get("replacement")
+        if not isinstance(expected_text, str) or not expected_text:
+            raise DocumentMutationError(
+                "DOCUMENT_PATCH_EXPECTED_TEXT_INVALID",
+                f"edits[{index}].expectedText must be a non-empty string.",
+                retry_policy="correctable",
+            )
+        if not isinstance(replacement, str):
+            raise DocumentMutationError(
+                "DOCUMENT_PATCH_REPLACEMENT_INVALID",
+                f"edits[{index}].replacement must be a string.",
+                retry_policy="correctable",
+            )
+        start = source.find(expected_text)
+        if start < 0:
+            raise DocumentMutationError(
+                "DOCUMENT_PATCH_TEXT_NOT_FOUND",
+                f"edits[{index}].expectedText is not present in the current source.",
+                retry_policy="correctable",
+            )
+        if source.find(expected_text, start + 1) >= 0:
+            raise DocumentMutationError(
+                "DOCUMENT_PATCH_TEXT_AMBIGUOUS",
+                f"edits[{index}].expectedText is not unique in the current source.",
+                retry_policy="correctable",
+            )
+        patches.append(
+            {
+                "start_offset": start,
+                "end_offset": start + len(expected_text),
+                "expected_text": expected_text,
+                "replacement": replacement,
+            }
+        )
+        canonical_edits.append(
+            {"expectedText": expected_text, "replacement": replacement}
+        )
+
+    try:
+        updated, audit_patches = _validate_patches(
+            source,
+            patches,
+            offset_encoding=_HTML_OFFSET_ENCODING,
+        )
+        _assert_source_preserving_splice(source, updated, patches)
+        adapter = get_document_format_adapter("html")
+        adapter_validation = adapter.validate(updated)
+    except DocumentAdapterError as exc:
+        raise mutation_error_from_adapter(exc) from None
+    except RetryableToolInputError as exc:
+        raise DocumentMutationError(
+            "DOCUMENT_PATCH_INVALID",
+            exc.user_message,
+            retry_policy="correctable",
+        ) from None
+
+    normalized_proposal_sha256 = str(proposal_sha256 or "").strip().lower()
+    if _SHA256_RE.fullmatch(normalized_proposal_sha256) is None:
+        raise DocumentMutationError(
+            "DOCUMENT_MUTATION_PROPOSAL_INVALID",
+            "The mutation proposal digest is invalid.",
+            retry_policy="forbidden",
+        )
+    candidate_bytes = updated.encode("utf-8")
+    candidate_sha256 = hashlib.sha256(candidate_bytes).hexdigest()
+    registry = registry_for_context(scope.ctx)
+    reservation_id = f"document-text-patch:{secrets.token_urlsafe(16)}"
+    operations: tuple[dict[str, object], ...] = (
+        {
+            "op": "document_text_patch",
+            "adapter": adapter.format_id,
+            "adapter_version": adapter.adapter_version,
+            "expected_source_sha256": ref.sha256,
+            "result_source_sha256": candidate_sha256,
+            "offset_encoding": _HTML_OFFSET_ENCODING,
+            "patches": audit_patches,
+        },
+    )
+    return PreparedDocumentMutation(
+        scope=scope,
+        store=store,
+        ref=ref,
+        turn_id=turn_id,
+        summary=f"Applied {len(canonical_edits)} document text edits",
+        artifact_format="html",
+        adapter_id=adapter.format_id,
+        adapter_version=adapter.adapter_version,
+        base_revision_id=scope.revision.revision_id,
+        source_sha256=ref.sha256,
+        candidate_bytes=candidate_bytes,
+        candidate_sha256=candidate_sha256,
+        operations=operations,
+        validation_summary={
+            "format": "html",
+            "encoding": "utf-8",
+            "source_sha256": candidate_sha256,
+            "patch_count": len(audit_patches),
+            "text_match_validation": "unique_current_source",
+            "semantic_adapter_validation": adapter_validation,
+            "status": "passed",
+        },
+        mutation_kind="document_text_patch",
+        patch_count=len(audit_patches),
+        actor=_actor(scope),
+        registry=registry,
+        reservation_id=reservation_id,
+        proposal_sha256=normalized_proposal_sha256,
     )
 
 

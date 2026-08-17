@@ -15,6 +15,7 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { SandboxRunMode } from '@/types/sandbox'
 import { normalizeSandboxRunMode } from '@/types/sandbox'
 import type {
+  ChatDocumentContext,
   ChatSendParams,
   ChatSendResponse,
   SessionSteerV2Params,
@@ -81,6 +82,8 @@ interface SendAttempt {
   requestSessionKey: string
   promptAnnotationIds: string[]
   promptAnnotations: PromptAnnotationSnapshot[]
+  promptAnnotationsAcknowledged?: boolean
+  documentContext: ChatDocumentContext | null
   queueMode?: 'steer'
   text: string
   attachments: SendableAttachment[]
@@ -119,12 +122,14 @@ interface ExplicitSendPayload {
   forkBeforeMessageId: string | null
   workspaceId?: string | null
   initialCollaborationMode?: CollaborationMode | null
+  documentContext?: ChatDocumentContext | null
 }
 
 interface ComposerSnapshot {
   revision: number | null
   inputText: string
   promptAnnotationIds: string[]
+  documentContext: ChatDocumentContext | null
   attachmentRefs: Attachment[]
   payloadAttachments: Attachment[]
   intent: string | null
@@ -316,11 +321,30 @@ function sameSendableAttachments(
   })
 }
 
+function normalizeDocumentContext(value: unknown): ChatDocumentContext | null {
+  if (!value || typeof value !== 'object') return null
+  const raw = value as Record<string, unknown>
+  const documentId = typeof raw.documentId === 'string' ? raw.documentId.trim() : ''
+  const headRevisionId = typeof raw.headRevisionId === 'string'
+    ? raw.headRevisionId.trim()
+    : ''
+  return documentId && headRevisionId ? { documentId, headRevisionId } : null
+}
+
+function sameDocumentContext(
+  left: ChatDocumentContext | null,
+  right: ChatDocumentContext | null,
+): boolean {
+  return left?.documentId === right?.documentId
+    && left?.headRevisionId === right?.headRevisionId
+}
+
 function matchesRecoveredDraft(
   attempt: SendAttempt,
   input: {
     requestSessionKey: string
     promptAnnotationIds: readonly string[]
+    documentContext: ChatDocumentContext | null
     text: string
     attachments: SendableAttachment[]
     intent: string | null
@@ -332,6 +356,7 @@ function matchesRecoveredDraft(
   return (
     attempt.requestSessionKey === input.requestSessionKey &&
     JSON.stringify(attempt.promptAnnotationIds) === JSON.stringify(input.promptAnnotationIds) &&
+    sameDocumentContext(attempt.documentContext, input.documentContext) &&
     attempt.text === input.text &&
     attempt.intent === input.intent &&
     attempt.initialCollaborationMode === input.initialCollaborationMode &&
@@ -374,7 +399,15 @@ export interface UseChatSendOptions {
   acknowledgePromptAnnotations?: (
     requestedIds: readonly string[],
     acceptedIds: readonly string[],
+    sessionKey: string,
   ) => void
+  /** Synchronous, session-scoped identity used to avoid replaying against another document/head. */
+  currentDocumentContext?: (sessionKey: string) => ChatDocumentContext | null
+  /** Flushes the active editor and returns the exact head to bind to a fresh send. */
+  prepareDocumentContextForSend?: (
+    sessionKey: string,
+    options?: { isCurrent?: () => boolean },
+  ) => Promise<ChatDocumentContext | null | false>
   pendingWorkspaceId?: Ref<string | null>
   sendBlockedReason?: Readonly<Ref<string | null>>
   /** Transport/admission-only gate used by exact replays after unknown acceptance. */
@@ -542,7 +575,15 @@ export function useChatSend(options: UseChatSendOptions) {
     attempt: SendAttempt,
     response: ChatSendResponse,
   ) {
-    if (attempt.promptAnnotationIds.length === 0) return
+    if (
+      attempt.promptAnnotationIds.length === 0
+      || attempt.promptAnnotationsAcknowledged === true
+    ) return
+    // A direct response and the bounded receipt-recovery worker can race to
+    // observe the same accepted request. Consume the Gateway acknowledgement
+    // exactly once so drafts and the native annotation picker transition as
+    // one idempotent UI operation.
+    attempt.promptAnnotationsAcknowledged = true
     const requested = new Set(attempt.promptAnnotationIds)
     const accepted = acceptedPromptAnnotationIds(response)
       .filter(id => requested.has(id))
@@ -554,6 +595,7 @@ export function useChatSend(options: UseChatSendOptions) {
     options.acknowledgePromptAnnotations?.(
       attempt.promptAnnotationIds,
       accepted,
+      attempt.requestSessionKey,
     )
   }
 
@@ -604,6 +646,9 @@ export function useChatSend(options: UseChatSendOptions) {
       revision: options.composerRevision?.value ?? null,
       inputText: options.inputText.value,
       promptAnnotationIds: currentPromptAnnotationIds(),
+      documentContext: normalizeDocumentContext(
+        options.currentDocumentContext?.(options.sessionKey.value),
+      ),
       attachmentRefs,
       payloadAttachments: attachmentRefs.map(attachment => ({ ...attachment })),
       intent,
@@ -656,6 +701,7 @@ export function useChatSend(options: UseChatSendOptions) {
       forkBeforeMessageId: snapshot.forkBeforeMessageId,
       workspaceId: snapshot.workspaceId,
       initialCollaborationMode: snapshot.initialCollaborationMode,
+      documentContext: snapshot.documentContext,
     }
   }
 
@@ -916,6 +962,7 @@ export function useChatSend(options: UseChatSendOptions) {
     attempt: SendAttempt,
     response: ChatSendResponse,
   ): Promise<boolean> {
+    acknowledgeAttemptPromptAnnotations(attempt, response)
     attempt.acceptanceResolved = true
     attempt.acceptedTaskId = acceptedTaskId(response)
     attempt.acceptedSessionKey = response.sessionKey || attempt.requestSessionKey
@@ -2145,6 +2192,7 @@ export function useChatSend(options: UseChatSendOptions) {
       matchesRecoveredDraft(recoveredAttempt, {
         requestSessionKey: options.sessionKey.value,
         promptAnnotationIds: composerSnapshot.promptAnnotationIds,
+        documentContext: composerSnapshot.documentContext,
         text,
         attachments: sendableAttachments,
         intent: composerSnapshot.intent,
@@ -2507,6 +2555,11 @@ export function useChatSend(options: UseChatSendOptions) {
       ? sendOpts.payload.initialCollaborationMode ?? null
       : initialModeForIntent(intent)
     const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
+    const requestedDocumentContext = intent === null
+      ? sendOpts.payload
+        ? normalizeDocumentContext(sendOpts.payload.documentContext)
+        : normalizeDocumentContext(options.currentDocumentContext?.(requestSessionKey))
+      : null
     // This is deliberately before optimistic rendering, composer clearing,
     // stream state, and chat.send. A blocked draft remains exactly editable.
     if (modelImageSendBlocked(initialSendableAttachments)) return 'not_sent'
@@ -2529,6 +2582,7 @@ export function useChatSend(options: UseChatSendOptions) {
         && matchesRecoveredDraft(retryCandidate, {
           requestSessionKey,
           promptAnnotationIds: requestedPromptAnnotationIds,
+          documentContext: requestedDocumentContext,
           text,
           attachments: initialSendableAttachments,
           intent,
@@ -2573,6 +2627,14 @@ export function useChatSend(options: UseChatSendOptions) {
         return 'not_sent'
       }
     }
+    let attemptDocumentContext = retryAttempt?.documentContext ?? requestedDocumentContext
+    // Prompt annotations already bind their own exact document revision, and
+    // Gateway intentionally rejects combining both context protocols. A normal
+    // fresh send instead flushes the active source editor before any optimistic
+    // message, composer mutation, or RPC and binds the exact resulting head.
+    if (attemptPromptAnnotationIds.length > 0) {
+      attemptDocumentContext = null
+    }
     const sendAttachmentIds = new Set(
       (retryAttempt?.attachments || initialSendableAttachments)
         .map(attachment => attachment.local_id),
@@ -2590,6 +2652,27 @@ export function useChatSend(options: UseChatSendOptions) {
       if (!ready) return 'not_sent'
       if (options.sessionKey.value !== requestSessionKey) return 'not_sent'
       if (!preDispatchAllowed()) return 'not_sent'
+    }
+    if (
+      !retryAttempt
+      && attemptPromptAnnotationIds.length === 0
+      && requestedDocumentContext
+      && options.prepareDocumentContextForSend
+    ) {
+      let prepared: ChatDocumentContext | null | false
+      try {
+        prepared = await options.prepareDocumentContextForSend(
+          requestSessionKey,
+          { isCurrent: () => options.sessionKey.value === requestSessionKey },
+        )
+      } catch {
+        return 'not_sent'
+      }
+      if (prepared === false || options.sessionKey.value !== requestSessionKey) return 'not_sent'
+      if (blockedReason?.value || !preDispatchAllowed()) return 'not_sent'
+      const normalized = normalizeDocumentContext(prepared)
+      if (prepared !== null && normalized === null) return 'not_sent'
+      attemptDocumentContext = normalized
     }
     const composerChanged = sendOpts.composerSnapshot
       ? !composerMatchesSnapshot(sendOpts.composerSnapshot)
@@ -2684,6 +2767,8 @@ export function useChatSend(options: UseChatSendOptions) {
       if (attemptPromptAnnotationIds.length > 0) {
         params.promptAnnotationIds = [...attemptPromptAnnotationIds]
         if (!userText) params.displayText = ''
+      } else if (attemptDocumentContext) {
+        params.documentContext = { ...attemptDocumentContext }
       }
       params._source = chatSourceMetadata(options)
       if (intent) params.intent = intent
@@ -2703,6 +2788,7 @@ export function useChatSend(options: UseChatSendOptions) {
         requestSessionKey,
         promptAnnotationIds: [...attemptPromptAnnotationIds],
         promptAnnotations: options.promptAnnotationSnapshots?.(attemptPromptAnnotationIds) || [],
+        documentContext: attemptDocumentContext ? { ...attemptDocumentContext } : null,
         queueMode: sendOpts?.queueMode,
         text,
         attachments: attachmentsToSend.map(attachment => ({ ...attachment })),
@@ -3225,6 +3311,7 @@ export function useChatSend(options: UseChatSendOptions) {
       {
         requestSessionKey,
         promptAnnotationIds: [],
+        documentContext: null,
         text,
         attachments: [],
         intent: null,
@@ -3592,6 +3679,7 @@ export function useChatSend(options: UseChatSendOptions) {
       requestSessionKey,
       promptAnnotationIds: [],
       promptAnnotations: [],
+      documentContext: null,
       text: providerText,
       attachments: [],
       intent: hiddenSessionIntent,

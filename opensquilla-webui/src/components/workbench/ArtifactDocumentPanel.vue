@@ -31,17 +31,6 @@
       <span v-if="documentSnapshot.loading" class="artifact-document__loading" role="status">
         {{ t('workbench.artifactDocument.syncing') }}
       </span>
-      <button
-        v-if="editableCopyAvailable"
-        type="button"
-        class="artifact-document__publish"
-        data-artifact-action="create-editable-copy"
-        :disabled="editableCopyBusy || mutationBusy"
-        @click="createEditableCopy"
-      >
-        <Icon name="edit" :size="14" />
-        <span>{{ t('workbench.resources.edit', { name: artifact.name || '' }) }}</span>
-      </button>
     </nav>
 
     <p
@@ -161,6 +150,7 @@
         :artifact="artifact"
         :document="documentModel"
         :session-key="sessionKey"
+        @source-saved="onSourceSaved"
       />
     </div>
 
@@ -284,7 +274,10 @@ import {
 } from '@/types/promptAnnotations'
 import { isOfficeArtifact } from '@/utils/chat/artifacts'
 import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
-import type { WorkbenchComponentEvent } from '@/workbench/types'
+import type {
+  WorkbenchBeforeCloseOptions,
+  WorkbenchComponentEvent,
+} from '@/workbench/types'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
 import ArtifactHtmlStudio from './ArtifactHtmlStudio.vue'
 import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
@@ -292,7 +285,7 @@ import ArtifactPreviewPanel from './ArtifactPreviewPanel.vue'
 type DocumentTab = 'preview' | 'source' | 'versions' | 'changes'
 type PreviewHandle = { reload: () => Promise<void> }
 type SourceHandle = {
-  beforeClose: () => Promise<boolean>
+  beforeClose: (options?: WorkbenchBeforeCloseOptions) => Promise<boolean>
   reload: () => Promise<void>
 }
 
@@ -301,8 +294,7 @@ const props = withDefaults(defineProps<{
   documentActions?: ArtifactDocumentActions | null
   documentFeatures?: boolean
   documentSnapshot?: ArtifactDocumentWorkspaceSnapshot
-  editableCopyAvailable?: boolean
-  editableCopyBusy?: boolean
+  initialSection?: 'preview' | 'source'
   authToken?: string
   baseOrigin?: string
   nativeHtml?: boolean
@@ -335,8 +327,7 @@ const props = withDefaults(defineProps<{
   }),
   documentActions: null,
   documentFeatures: true,
-  editableCopyAvailable: false,
-  editableCopyBusy: false,
+  initialSection: 'preview',
   authToken: '',
   baseOrigin: '',
   nativeHtml: false,
@@ -367,8 +358,8 @@ const annotationFallbackInput = ref<HTMLTextAreaElement | null>(null)
 const annotationFallbackTooLong = computed(() => (
   !promptAnnotationBodyWithinLimit(annotationFallbackBody.value)
 ))
-const activeTab = ref<DocumentTab>('preview')
-const sourceActivated = ref(false)
+const activeTab = ref<DocumentTab>(props.initialSection)
+const sourceActivated = ref(props.initialSection === 'source')
 const previewRef = ref<PreviewHandle | null>(null)
 const sourceRef = ref<SourceHandle | null>(null)
 const busyAction = ref<string | null>(null)
@@ -464,8 +455,16 @@ watch(
   () => documentModel.value?.documentId || '',
   (documentId, previousDocumentId) => {
     if (!previousDocumentId || documentId === previousDocumentId) return
-    activeTab.value = 'preview'
-    sourceActivated.value = false
+    activeTab.value = props.initialSection
+    sourceActivated.value = props.initialSection === 'source'
+  },
+)
+
+watch(
+  () => props.initialSection,
+  (section) => {
+    activeTab.value = section
+    if (section === 'source') sourceActivated.value = true
   },
 )
 
@@ -513,6 +512,13 @@ function forwardWorkbenchEvent(event: WorkbenchComponentEvent) {
   emit('workbench-event', event)
 }
 
+function onSourceSaved(revisionId: string) {
+  emit('workbench-event', {
+    type: 'artifact-head-changed',
+    payload: { revisionId },
+  })
+}
+
 function downloadHead() {
   emit('workbench-event', {
     type: 'artifact-download',
@@ -520,10 +526,6 @@ function downloadHead() {
   })
 }
 
-function createEditableCopy() {
-  if (!props.editableCopyAvailable || props.editableCopyBusy) return
-  emit('workbench-event', { type: 'artifact-create-editable-copy' })
-}
 
 function downloadRevision(revisionId: string) {
   const revision = revisions.value.find(item => item.revisionId === revisionId)
@@ -614,8 +616,8 @@ async function reload() {
   else await previewRef.value?.reload()
 }
 
-async function beforeClose(): Promise<boolean> {
-  return await sourceRef.value?.beforeClose() ?? true
+async function beforeClose(options?: WorkbenchBeforeCloseOptions): Promise<boolean> {
+  return await sourceRef.value?.beforeClose(options) ?? true
 }
 
 defineExpose({ beforeClose, reload })
@@ -748,39 +750,6 @@ defineExpose({ beforeClose, reload })
   color: var(--text-muted);
   font-size: 11px;
   white-space: nowrap;
-}
-
-.artifact-document__publish {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 5px;
-  min-height: 30px;
-  margin-inline-start: auto;
-  padding: 0 9px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--bg);
-  color: var(--text);
-  cursor: pointer;
-  font: inherit;
-  font-size: 11px;
-  white-space: nowrap;
-}
-
-.artifact-document__loading + .artifact-document__publish {
-  margin-inline-start: 6px;
-}
-
-.artifact-document__publish:hover:not(:disabled),
-.artifact-document__publish:focus-visible {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-.artifact-document__publish:disabled {
-  cursor: default;
-  opacity: .6;
 }
 
 .artifact-document__mutation-error {

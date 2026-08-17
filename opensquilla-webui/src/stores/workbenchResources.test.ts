@@ -65,6 +65,80 @@ describe('workbench resources store', () => {
     expect(store.find('session-a', attachment.resource)?.downloadUrl).toBe(resolved.downloadUrl)
   })
 
+  it('single-flights current-head resolution and refreshes after silent materialization', async () => {
+    let completeOpen!: (value: Awaited<ReturnType<NonNullable<
+      WorkbenchResourceProvider['open']
+    >>>) => void
+    const currentDocument = {
+      ...attachment,
+      resource: { type: 'document' as const, id: 'doc-a' },
+      relations: {
+        documentId: 'doc-a',
+        headRevisionId: 'rev-a',
+        headArtifactId: 'artifact-a',
+      },
+    }
+    const opened = {
+      disposition: 'document' as const,
+      resolution: { status: 'materialized' as const },
+      resource: currentDocument,
+      document: { documentId: 'doc-a', headRevisionId: 'rev-a' },
+      revision: { documentId: 'doc-a', revisionId: 'rev-a' },
+      materialized: true,
+    } as Awaited<ReturnType<NonNullable<WorkbenchResourceProvider['open']>>>
+    const open = vi.fn(() => new Promise<typeof opened>((resolve) => {
+      completeOpen = resolve
+    }))
+    const list = vi.fn(async () => ({ resources: [currentDocument], totalCount: 1 }))
+    const provider = {
+      available: () => true,
+      list,
+      get: vi.fn(),
+      open,
+      importDocument: vi.fn(),
+      publishDocument: vi.fn(),
+    } as unknown as WorkbenchResourceProvider
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+
+    const first = store.openCurrent('session-a', attachment)
+    const second = store.openCurrent('session-a', attachment)
+    expect(open).toHaveBeenCalledTimes(1)
+
+    completeOpen(opened)
+    await expect(Promise.all([first, second])).resolves.toEqual([opened, opened])
+    expect(list).toHaveBeenCalledTimes(1)
+    expect(store.find('session-a', currentDocument.resource)).toEqual(currentDocument)
+  })
+
+  it('uses only explicit document relations for navigation projection', async () => {
+    const document = {
+      ...attachment,
+      resource: { type: 'document' as const, id: 'doc-a' },
+      relations: { documentId: 'doc-a' },
+    }
+    const bound = { ...attachment, relations: { documentId: 'doc-a' } }
+    const sameHashUnbound = {
+      ...attachment,
+      resource: { type: 'attachment' as const, id: 'att-b' },
+    }
+    const provider: WorkbenchResourceProvider = {
+      available: () => true,
+      list: vi.fn(async () => ({
+        resources: [bound, document, sameHashUnbound],
+        totalCount: 3,
+      })),
+      get: vi.fn(),
+      importDocument: vi.fn(),
+      publishDocument: vi.fn(),
+    }
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+    await store.load('session-a')
+
+    expect(store.navigationResources('session-a')).toEqual([document, sameHashUnbound])
+  })
+
   it('imports only after an explicit edit action and refreshes the projection', async () => {
     const list = vi.fn()
       .mockResolvedValueOnce({ resources: [attachment], totalCount: 1 })

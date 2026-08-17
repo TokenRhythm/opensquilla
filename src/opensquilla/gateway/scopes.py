@@ -237,6 +237,7 @@ METHOD_SCOPES: dict[str, str] = {
     "artifacts.prompt_annotations.update": WRITE_SCOPE,
     "artifacts.prompt_annotations.discard": WRITE_SCOPE,
     "artifacts.source.patch": WRITE_SCOPE,
+    "workbench.resources.open": WRITE_SCOPE,
     "documents.import": WRITE_SCOPE,
     "documents.publish": WRITE_SCOPE,
     "documents.editSessions.start": WRITE_SCOPE,

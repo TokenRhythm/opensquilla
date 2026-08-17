@@ -13,6 +13,7 @@ import type {
   WorkbenchResourcesListResponse,
   WorkbenchResourceType,
   WorkbenchPreviewResponse,
+  WorkbenchResourceOpenResponse,
 } from '@/types/workbenchResources'
 import { workbenchResourceRefId } from '@/types/workbenchResources'
 import {
@@ -23,6 +24,7 @@ import {
 export const WORKBENCH_RESOURCE_RPC_METHODS = {
   list: 'workbench.resources.list',
   get: 'workbench.resources.get',
+  open: 'workbench.resources.open',
   createPreview: 'workbench.previews.create',
   importDocument: 'documents.import',
   publishDocument: 'documents.publish',
@@ -49,6 +51,16 @@ export interface WorkbenchResourceProvider {
     resource: WorkbenchResourceRef,
     signal?: AbortSignal,
   ): Promise<WorkbenchResource | null>
+  open?(
+    sessionKey: string,
+    resource: WorkbenchResourceRef,
+    request: {
+      intent: 'edit-current'
+      expectedSha256?: string
+      idempotencyKey: string
+    },
+    signal?: AbortSignal,
+  ): Promise<WorkbenchResourceOpenResponse | null>
   createPreview?(
     sessionKey: string,
     resource: WorkbenchResourceRef,
@@ -341,6 +353,87 @@ export function createRpcWorkbenchResourceProvider(
         signal,
       )
       return normalizeWorkbenchResource(response.resource)
+    },
+    async open(sessionKey, resource, request, signal) {
+      if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.open)) return null
+      let response: Record<string, unknown>
+      try {
+        response = await call<Record<string, unknown>>(
+          WORKBENCH_RESOURCE_RPC_METHODS.open,
+          {
+            sessionKey,
+            resourceRef: serializeRef(resource),
+            intent: request.intent,
+            ...(request.expectedSha256
+              ? { expectedSha256: request.expectedSha256 }
+              : {}),
+            idempotencyKey: request.idempotencyKey,
+          },
+          signal,
+        )
+      } catch (error) {
+        // Mixed-version Gateways keep the existing preview/import fallback.
+        if (isMethodNotFound(error)) return null
+        throw error
+      }
+      const resolved = normalizeWorkbenchResource(response.resource)
+      const resolution = record(response.resolution)
+      const resolutionStatus = resolution ? stringAt(resolution, 'status') : ''
+      const disposition = stringAt(response, 'disposition')
+        || (resolutionStatus === 'readonly' ? 'readonly' : 'document')
+      if (!resolved) throw new Error('The workbench open response is invalid.')
+      if (disposition === 'readonly') {
+        const reasonCode = stringAt(response, 'reasonCode', 'reason_code')
+          || resolved.capabilities.editReasonCode
+          || resolved.capabilities.reasonCode
+          || 'format_edit_not_supported'
+        return {
+          disposition,
+          resolution: { status: 'readonly' },
+          resource: {
+            ...resolved,
+            capabilities: {
+              ...resolved.capabilities,
+              manualEdit: false,
+              edit: resolved.capabilities.agentEdit,
+              editReasonCode: reasonCode,
+              reasonCode,
+            },
+          },
+          reasonCode,
+          materialized: false,
+        }
+      }
+      if (disposition !== 'document') {
+        throw new Error('The workbench open disposition is invalid.')
+      }
+      const document = normalizeArtifactDocument(response.document, undefined, sessionKey)
+      const revision = normalizeArtifactRevision(response.revision)
+      const binding = response.binding === undefined
+        ? null
+        : normalizeBinding(response.binding)
+      if (
+        !document
+        || !revision
+        || revision.documentId !== document.documentId
+        || revision.revisionId !== document.headRevisionId
+        || resolved.resource.type !== 'document'
+        || workbenchResourceRefId(resolved.resource) !== document.documentId
+        || (response.binding !== undefined && !binding)
+      ) {
+        throw new Error('The current workbench document response is invalid.')
+      }
+      return {
+        disposition,
+        resolution: {
+          status: resolutionStatus === 'materialized' ? 'materialized' : 'current',
+        },
+        resource: resolved,
+        document,
+        revision,
+        ...(binding ? { binding } : {}),
+        materialized: boolAt(response, 'materialized'),
+      }
     },
     async createPreview(sessionKey, resource, signal) {
       if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.createPreview)) {

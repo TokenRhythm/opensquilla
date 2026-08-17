@@ -6,14 +6,6 @@ import type { ArtifactPayload } from '@/types/rpc'
 import type { ArtifactDocumentWorkspaceSnapshot } from '@/types/artifactDocuments'
 import type { ArtifactDocumentActions } from '@/types/artifactDocuments'
 import type {
-  WorkbenchResource,
-  WorkbenchResourceRef,
-} from '@/types/workbenchResources'
-import {
-  createWorkbenchResourceRef,
-  workbenchResourceRefId,
-} from '@/types/workbenchResources'
-import type {
   PromptAnnotation,
   PromptAnnotationCreateRequest,
 } from '@/types/promptAnnotations'
@@ -33,11 +25,13 @@ import { downloadBlob } from '@/utils/browser'
 import {
   artifactFromWorkbenchItem,
   artifactsFromWorkbenchItem,
+  initialSectionFromWorkbenchItem,
   preparedPreviewFromWorkbenchItem,
   sessionKeyFromWorkbenchItem,
 } from '@/workbench/artifactItems'
 import type {
   NativeSurfaceRect,
+  WorkbenchBeforeCloseOptions,
   WorkbenchComponentEvent,
   WorkbenchItem,
   WorkbenchPanelDefinition,
@@ -68,7 +62,7 @@ import ArtifactDocumentPanel from './ArtifactDocumentPanel.vue'
 type Translate = (key: string, params?: Record<string, unknown>) => string
 
 interface ArtifactPreviewPanelHandle {
-  beforeClose?: () => Promise<boolean>
+  beforeClose?: (options?: WorkbenchBeforeCloseOptions) => Promise<boolean>
   reload: () => Promise<void>
 }
 
@@ -124,14 +118,6 @@ export interface ArtifactWorkbenchProviderOptions {
     revisionId: string
     name: string
   }): Promise<void>
-  resolveEditableCopyResource?(request: {
-    sessionKey: string
-    resource: WorkbenchResourceRef
-  }): Promise<WorkbenchResource | null>
-  createEditableCopy?(request: {
-    sessionKey: string
-    resource: WorkbenchResource
-  }): Promise<void>
   platform: Platform
   previewLeasesEnabled?: boolean
   pushToast(message: string, options?: {
@@ -174,6 +160,12 @@ function previewStatePayload(
   ].includes(state)
     ? state as ArtifactPreviewResourceState
     : null
+}
+
+function headRevisionIdPayload(event: WorkbenchComponentEvent): string {
+  if (!event.payload || typeof event.payload !== 'object') return ''
+  const revisionId = (event.payload as { revisionId?: unknown }).revisionId
+  return typeof revisionId === 'string' ? revisionId : ''
 }
 
 function surfaceError(operation: string, message?: string): Error {
@@ -328,14 +320,14 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
   } | null = null
   private annotationUpdateTimer: ReturnType<typeof setTimeout> | null = null
   private component: ArtifactPreviewPanelHandle | null = null
+  private blockedHeadRevisionId = ''
   private createdSurface = false
   private generation = 0
   private item: WorkbenchItem
   private lease: ArtifactPreviewLease | null = null
+  private leaseArtifactId = ''
   private leaseRenewTimer: ReturnType<typeof setInterval> | null = null
   private defaultMode: WorkbenchPreviewMode
-  private editableCopyOperation = 0
-  private editableCopyResource: WorkbenchResource | null = null
   private mode: WorkbenchPreviewMode
   private nativeProtocolVersion: 1 | 2 | 3 = 1
   private noticeShown: boolean
@@ -382,8 +374,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       annotationAvailable: false,
       annotationMode: false,
       annotationModeStopping: false,
-      editableCopyAvailable: false,
-      editableCopyBusy: false,
     })
   }
 
@@ -396,7 +386,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         ).catch(() => undefined)
       : undefined
     await documentLoad
-    await this.refreshEditableCopyResource()
     if (
       !previewLeaseEnabledForItem(this.item, this.options)
       || !artifact
@@ -422,7 +411,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
 
   update(item: WorkbenchItem) {
     this.item = item
-    void this.refreshEditableCopyResource()
     const preparedPreview = preparedPreviewFromWorkbenchItem(item)
     if (!preparedPreview) return
     this.defaultMode = 'offline'
@@ -441,29 +429,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
 
   async handleComponentEvent(event: WorkbenchComponentEvent, item: WorkbenchItem) {
     this.item = item
-    if (event.type === 'artifact-create-editable-copy') {
-      if (this.context.getRenderState().editableCopyBusy === true) return
-      await this.refreshEditableCopyResource()
-      const resource = this.editableCopyResource
-      const sessionKey = artifactSessionKey(item, this.options)
-      if (!resource || !sessionKey || !this.options.createEditableCopy) return
-      this.context.updateRenderState({ editableCopyBusy: true })
-      try {
-        await this.options.createEditableCopy({ resource, sessionKey })
-      } catch (error) {
-        this.options.pushToast(
-          error instanceof Error && error.message
-            ? error.message
-            : this.options.t('workbench.resources.actionFailed'),
-          { tone: 'danger', duration: 9000 },
-        )
-      } finally {
-        if (this.context.isItemOpen()) {
-          this.context.updateRenderState({ editableCopyBusy: false })
-        }
-      }
-      return
-    }
     if (event.type === 'artifact-document-publish') {
       if (isPreparedImmutableResourcePreview(item)) return
       if (this.context.getRenderState().documentPublishing === true) return
@@ -610,12 +575,55 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       )
       return
     }
+    if (event.type === 'artifact-prompt-annotations-accepted') {
+      const visibleMode = runtimeContextStateValue(
+        this.context.getRenderState(),
+        'annotationMode',
+        this.annotationMode,
+      )
+      if (this.annotationMode || visibleMode) await this.setAnnotationMode(false)
+      else this.invalidateAnnotationSelectionAttempt()
+      return
+    }
     if (event.type === 'artifact-head-changed') {
       if (isPreparedImmutableResourcePreview(this.item)) return
       if (this.annotationMode) await this.setAnnotationMode(false)
       else this.invalidateAnnotationSelectionAttempt()
-      if (previewLeaseEnabledForItem(this.item, this.options)) await this.replaceLeasePreview()
-      else await this.component?.reload()
+      const expectedRevisionId = headRevisionIdPayload(event)
+      if (expectedRevisionId && !await this.ensureCanonicalDocumentHead(expectedRevisionId)) {
+        const message = this.options.t('workbench.artifactDocument.sourceUnavailable')
+        this.blockedHeadRevisionId = expectedRevisionId
+        await this.releaseNativeSurface(true)
+        await this.releaseLease()
+        this.context.updateRenderState({
+          nativeSurfaceState: 'error',
+          previewBlocked: true,
+          previewLeaseError: message,
+          previewReadiness: 'error',
+          previewState: 'error',
+        })
+        this.options.pushToast(
+          message,
+          { tone: 'danger' },
+        )
+        return
+      }
+      this.blockedHeadRevisionId = ''
+      if (previewLeaseEnabledForItem(this.item, this.options)) {
+        const artifact = artifactFromWorkbenchItem(this.item)
+        const headArtifact = artifact && this.options.artifactDocuments?.headArtifact(
+          artifact,
+          artifactSessionKey(this.item, this.options),
+        )
+        const headArtifactId = String(headArtifact?.id || '')
+        if (
+          expectedRevisionId
+          && this.lease
+          && headArtifactId
+          && headArtifactId === this.leaseArtifactId
+        ) return
+        await this.replaceLeasePreview()
+      } else await this.component?.reload()
     }
   }
 
@@ -651,15 +659,20 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       else this.invalidateAnnotationSelectionAttempt()
       let refreshedDocument = false
       if (artifact && !isPreparedImmutableResourcePreview(this.item)) {
-        const workspace = await this.options.artifactDocuments?.load(
+        await this.options.artifactDocuments?.load(
           artifact,
           artifactSessionKey(item, this.options),
           { force: true },
         ).catch(() => undefined)
+        const snapshot = this.options.artifactDocuments?.snapshot(
+          artifact,
+          artifactSessionKey(item, this.options),
+        )
         refreshedDocument = Boolean(
-          workspace
-          && typeof workspace === 'object'
-          && (workspace as { source?: unknown }).source === 'document-api',
+          snapshot?.loaded
+          && !snapshot.loading
+          && !snapshot.stale
+          && snapshot.workspace?.source === 'document-api',
         )
       }
       if (this.context.getRenderState().previewBlocked === true) {
@@ -1475,76 +1488,18 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     if (this.nativeProtocolVersion === 3) await this.refreshAnnotationCapability()
   }
 
-  async beforeClose(): Promise<boolean> {
+  async beforeClose(options?: WorkbenchBeforeCloseOptions): Promise<boolean> {
     if (this.annotationOverlayId) {
       await this.flushAnnotationBody(this.annotationOverlayId, this.annotationOverlayBody)
     }
-    return await this.component?.beforeClose?.() ?? true
+    return await this.component?.beforeClose?.(options) ?? true
   }
 
   async dispose() {
-    this.editableCopyOperation += 1
-    this.editableCopyResource = null
     this.component = null
     await this.releaseNativeSurface(true)
     await this.releaseLease()
     this.rect = null
-  }
-
-  private editableCopyResourceRef(): WorkbenchResourceRef | null {
-    const prepared = preparedPreviewFromWorkbenchItem(this.item)
-    if (
-      prepared
-      && (prepared.resource.type === 'attachment' || prepared.resource.type === 'deliverable')
-    ) return prepared.resource
-
-    const artifact = artifactFromWorkbenchItem(this.item)
-    const documentId = typeof artifact?.documentId === 'string'
-      ? artifact.documentId.trim()
-      : ''
-    if (!artifact || documentId) return null
-    const artifactId = typeof artifact.id === 'string' ? artifact.id.trim() : ''
-    return artifactId ? createWorkbenchResourceRef('deliverable', artifactId) : null
-  }
-
-  private async refreshEditableCopyResource() {
-    const operation = this.editableCopyOperation + 1
-    this.editableCopyOperation = operation
-    this.editableCopyResource = null
-    this.context.updateRenderState({ editableCopyAvailable: false })
-    const artifact = artifactFromWorkbenchItem(this.item)
-    const sessionKey = artifactSessionKey(this.item, this.options)
-    const resourceRef = this.editableCopyResourceRef()
-    if (
-      !sessionKey
-      || !resourceRef
-      || !this.options.resolveEditableCopyResource
-      || !this.options.createEditableCopy
-    ) return
-    const workspace = artifact && !isPreparedImmutableResourcePreview(this.item)
-      ? this.options.artifactDocuments?.snapshot(artifact, sessionKey).workspace
-      : null
-    if (workspace?.source === 'document-api') return
-    try {
-      const resource = await this.options.resolveEditableCopyResource({
-        resource: resourceRef,
-        sessionKey,
-      })
-      if (operation !== this.editableCopyOperation || !this.context.isItemOpen()) return
-      const matches = Boolean(
-        resource
-        && resource.resource.type === resourceRef.type
-        && workbenchResourceRefId(resource.resource) === workbenchResourceRefId(resourceRef)
-        && resource.capabilities.manualEdit
-        && resource.sha256,
-      )
-      this.editableCopyResource = matches ? resource : null
-      this.context.updateRenderState({ editableCopyAvailable: matches })
-    } catch {
-      if (operation !== this.editableCopyOperation || !this.context.isItemOpen()) return
-      this.editableCopyResource = null
-      this.context.updateRenderState({ editableCopyAvailable: false })
-    }
   }
 
   private remoteResourcesEnabled(): boolean {
@@ -1797,6 +1752,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
 
     this.lease = lease
+    this.leaseArtifactId = String(artifact.id || '')
     this.mode = lease.effective_mode
     this.context.updateRenderState({
       compatibilityFallback: false,
@@ -1897,6 +1853,52 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
   }
 
+  private async ensureCanonicalDocumentHead(expectedRevisionId: string): Promise<boolean> {
+    const artifact = artifactFromWorkbenchItem(this.item)
+    const documents = this.options.artifactDocuments
+    if (!artifact || !documents) return false
+    const sessionKey = artifactSessionKey(this.item, this.options)
+    const snapshot = documents.snapshot(artifact, sessionKey)
+    if (this.documentHeadReached(snapshot, expectedRevisionId)) return true
+    try {
+      await documents.load(artifact, sessionKey, { force: true })
+      return this.documentHeadReached(
+        documents.snapshot(artifact, sessionKey),
+        expectedRevisionId,
+      )
+    } catch {
+      return false
+    }
+  }
+
+  private documentHeadReached(
+    snapshot: ArtifactDocumentWorkspaceSnapshot,
+    expectedRevisionId: string,
+  ): boolean {
+    const workspace = snapshot.workspace
+    if (
+      snapshot.loading
+      || !snapshot.loaded
+      || snapshot.stale
+      || workspace?.source !== 'document-api'
+    ) return false
+    const headRevisionId = workspace.document.headRevisionId
+    if (headRevisionId === expectedRevisionId) return true
+    const expected = workspace.revisions.find(
+      revision => revision.revisionId === expectedRevisionId,
+    )
+    const head = workspace.revisions.find(
+      revision => revision.revisionId === headRevisionId,
+    )
+    return Boolean(
+      expected
+      && head
+      && Number.isSafeInteger(expected.generation)
+      && Number.isSafeInteger(head.generation)
+      && head.generation >= expected.generation,
+    )
+  }
+
   private startLeaseRenewal() {
     if (this.leaseRenewTimer) clearInterval(this.leaseRenewTimer)
     this.leaseRenewTimer = setInterval(() => {
@@ -1914,6 +1916,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         nativeBroker: this.context.nativeWorkbenchApi,
         sessionKey: artifactSessionKey(this.item, this.options),
       })
+      if (this.lease !== lease) return
       if (renewal.lease_id !== lease.lease_id) {
         throw new ArtifactPreviewLeaseError('Preview lease identity changed.', 502)
       }
@@ -1922,6 +1925,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         expires_at: renewal.expires_at,
       }
     } catch (error) {
+      if (this.lease !== lease) return
       if (
         error instanceof ArtifactPreviewLeaseError
         && (error.status === 404 || error.status === 410)
@@ -1940,6 +1944,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
     const lease = this.lease
     this.lease = null
+    this.leaseArtifactId = ''
     if (!lease) return
     if (this.options.platform.id !== 'desktop' && lease.preview_origin) {
       try {
@@ -1972,6 +1977,13 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       return
     }
     try {
+      if (
+        this.blockedHeadRevisionId
+        && !await this.ensureCanonicalDocumentHead(this.blockedHeadRevisionId)
+      ) {
+        throw new Error(this.options.t('workbench.artifactDocument.sourceUnavailable'))
+      }
+      this.blockedHeadRevisionId = ''
       this.context.updateRenderState({
         previewBlocked: true,
         previewLeaseError: '',
@@ -2433,12 +2445,7 @@ export function createArtifactWorkbenchDefinitions(
             artifactSessionKey(item, options),
           ).workspace?.source === 'document-api'
         })(),
-        editableCopyAvailable: runtimeStateValue(
-          state,
-          'editableCopyAvailable',
-          false,
-        ),
-        editableCopyBusy: runtimeStateValue(state, 'editableCopyBusy', false),
+        initialSection: initialSectionFromWorkbenchItem(item),
         authToken: options.authToken(),
         baseOrigin: options.baseOrigin,
         nativeHtml: state.nativeSurface,

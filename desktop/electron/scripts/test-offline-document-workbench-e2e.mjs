@@ -26,9 +26,11 @@ function run(command, args, options = {}) {
 //   2. one real Electron process proves the native preview/selection/editor
 //      surface, including keyboard and IME input under an explicit foreground
 //      precondition;
-//   3. one real Vue-to-Electron-to-Gateway fixture proves those boundaries are
-//      wired together, with synthetic provider replies and a durable +1/+1
-//      commit followed by an answer-only 0-write turn.
+//   3. one real Vue-to-Electron-to-Gateway fixture generates and adopts one
+//      HTML deliverable, opens its Source directly, commits a manual revision,
+//      exits annotation mode after an accepted answer-only turn, commits a
+//      document_patch revision, and verifies restart recovery without resource
+//      duplication.
 // Both fixtures are loopback-only and use synthetic bytes and model replies.
 const uv = process.platform === 'win32' ? 'uv.exe' : 'uv'
 run(

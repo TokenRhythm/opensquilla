@@ -6,6 +6,7 @@ import {
   artifactWorkbenchItemId,
   createArtifactCollectionWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
+  initialSectionFromWorkbenchItem,
   navigationArtifactsFromWorkbenchItem,
   preparedPreviewFromWorkbenchItem,
   previewableNavigationArtifactsFromWorkbenchItem,
@@ -60,6 +61,23 @@ describe('artifact Workbench items', () => {
 
     expect(attachment.id).not.toBe(document.id)
     expect(attachment.payload.previewLeaseEligible).toBe(false)
+  })
+
+  it('preserves Source as an explicit initial section for direct document navigation', () => {
+    const source = createArtifactPreviewWorkbenchItem({
+      artifact,
+      initialSection: 'source',
+      nativeHtml: false,
+      sessionKey: 'session-a',
+    })
+    const preview = createArtifactPreviewWorkbenchItem({
+      artifact,
+      nativeHtml: false,
+      sessionKey: 'session-a',
+    })
+
+    expect(initialSectionFromWorkbenchItem(source)).toBe('source')
+    expect(initialSectionFromWorkbenchItem(preview)).toBe('preview')
   })
 
   it('preserves only a validated opaque-offline prepared preview policy', () => {

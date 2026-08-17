@@ -876,9 +876,171 @@ class ArtifactSessionRepository:
             )
             return created, True
 
+    async def adopt_generated_deliverable(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        name: str,
+        kind: ArtifactKind,
+        deliverable: ArtifactBlobRef,
+        actor: Actor,
+    ) -> tuple[CommitResult, DocumentSourceBinding, bool]:
+        """Atomically adopt and bind one public generated deliverable.
+
+        ``created`` reports whether this call created the source binding.  A
+        legacy Document that already references the same immutable artifact is
+        reused and bound instead of being duplicated.
+        """
+
+        async with self._transaction("adopt_generated_deliverable") as conn:
+            binding_row = await _fetchone(
+                conn,
+                """
+                SELECT * FROM document_source_bindings
+                WHERE session_id = ? AND source_type = 'deliverable'
+                  AND source_resource_id = ?
+                """,
+                (session_id, deliverable.artifact_id),
+            )
+            if binding_row is not None:
+                binding = _document_source_binding_from_row(binding_row)
+                expected_source = (
+                    session_key,
+                    deliverable.sha256,
+                    deliverable.filename,
+                    deliverable.media_type,
+                    deliverable.byte_size,
+                    DocumentImportMode.COPY,
+                )
+                actual_source = (
+                    binding.session_key,
+                    binding.source_sha256,
+                    binding.source_name,
+                    binding.source_mime,
+                    binding.source_size,
+                    binding.mode,
+                )
+                if actual_source != expected_source:
+                    raise ArtifactConflictError(
+                        "generated deliverable source binding changed"
+                    )
+                document = await self._get_document_on_conn(conn, binding.document_id)
+                if document.session_key != session_key or document.session_id != session_id:
+                    raise ArtifactConflictError(
+                        "generated deliverable document scope changed"
+                    )
+                revision = await self._get_revision_on_conn(
+                    conn,
+                    document.head_revision_id,
+                )
+                if revision.document_id != document.document_id:
+                    raise ArtifactValidationError(
+                        "document head belongs to another document"
+                    )
+                return CommitResult(document=document, revision=revision), binding, False
+
+            rows = await _fetchall(
+                conn,
+                """
+                SELECT DISTINCT document.document_id
+                FROM artifact_documents AS document
+                JOIN artifact_revisions AS revision
+                  ON revision.document_id = document.document_id
+                WHERE document.session_key = ?
+                  AND document.session_id = ?
+                  AND revision.artifact_id = ?
+                ORDER BY document.document_id
+                LIMIT 2
+                """,
+                (session_key, session_id, deliverable.artifact_id),
+            )
+            if len(rows) > 1:
+                raise ArtifactConflictError(
+                    "generated deliverable is already adopted by multiple documents"
+                )
+            if rows:
+                document = await self._get_document_on_conn(
+                    conn,
+                    str(rows[0]["document_id"]),
+                )
+                revision = await self._get_revision_on_conn(
+                    conn,
+                    document.head_revision_id,
+                )
+                commit = CommitResult(document=document, revision=revision)
+            else:
+                commit = await self._create_document_on_conn(
+                    conn,
+                    session_key=session_key,
+                    session_id=session_id,
+                    name=name,
+                    kind=kind,
+                    initial_artifact=deliverable,
+                    actor=actor,
+                    document_id=self._id_factory("doc"),
+                    revision_id=self._id_factory("rev"),
+                    created_at=self._clock(),
+                )
+
+            prior_document_binding = await _fetchone(
+                conn,
+                "SELECT binding_id FROM document_source_bindings WHERE document_id = ?",
+                (commit.document.document_id,),
+            )
+            if prior_document_binding is not None:
+                raise ArtifactConflictError(
+                    "generated deliverable document already has another source binding"
+                )
+            binding_id = self._id_factory("binding")
+            created_at = self._clock()
+            await conn.execute(
+                """
+                INSERT INTO document_source_bindings (
+                    binding_id, document_id, session_key, session_id,
+                    source_type, source_resource_id, source_sha256,
+                    source_name, source_mime, source_size, mode, created_at
+                ) VALUES (?, ?, ?, ?, 'deliverable', ?, ?, ?, ?, ?, 'copy', ?)
+                """,
+                (
+                    binding_id,
+                    commit.document.document_id,
+                    session_key,
+                    session_id,
+                    deliverable.artifact_id,
+                    deliverable.sha256,
+                    deliverable.filename,
+                    deliverable.media_type,
+                    deliverable.byte_size,
+                    created_at,
+                ),
+            )
+            binding = await self._get_document_source_binding_on_conn(conn, binding_id)
+            return commit, binding, True
+
     async def get_document(self, document_id: str) -> Document:
         async with self._read_transaction("get_document") as conn:
             return await self._get_document_on_conn(conn, document_id)
+
+    async def get_document_head(
+        self,
+        document_id: str,
+        *,
+        expected_revision_id: str | None = None,
+    ) -> CommitResult:
+        """Read one document and its current head under one transaction snapshot."""
+
+        async with self._read_transaction("get_document_head") as conn:
+            document = await self._get_document_on_conn(conn, document_id)
+            if (
+                expected_revision_id is not None
+                and document.head_revision_id != expected_revision_id
+            ):
+                raise ArtifactConflictError("document head revision changed")
+            revision = await self._get_revision_on_conn(conn, document.head_revision_id)
+            if revision.document_id != document.document_id:
+                raise ArtifactValidationError("document head belongs to another document")
+            return CommitResult(document=document, revision=revision)
 
     async def reserve_document_import_attempt(
         self,

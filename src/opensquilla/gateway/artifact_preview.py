@@ -145,9 +145,11 @@ class ArtifactPreviewLeaseService:
         )
         if manifest is None:
             entrypoint = str(getattr(ref, "name", "") or "index.html")
-            warning_codes = legacy_html_bundle_warning_codes(
-                entrypoint,
-                native_io_path(entry_path).read_bytes(),
+            warning_codes = list(
+                legacy_html_bundle_warning_codes(
+                    entrypoint,
+                    native_io_path(entry_path).read_bytes(),
+                )
             )
             source = {
                 "kind": "single_file",

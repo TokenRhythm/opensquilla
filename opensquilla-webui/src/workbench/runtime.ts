@@ -7,6 +7,7 @@ import type {
 import type { useWorkbenchStore } from './store'
 import type {
   NativeSurfaceRect,
+  WorkbenchBeforeCloseOptions,
   WorkbenchComponentEvent,
   WorkbenchDisposeReason,
   WorkbenchItem,
@@ -202,12 +203,15 @@ export class WorkbenchRuntimeManager {
   }
 
   /** Ask the live panel to persist pending work before its store item is removed. */
-  async beforeClose(item: WorkbenchItem): Promise<boolean> {
+  async beforeClose(
+    item: WorkbenchItem,
+    options?: WorkbenchBeforeCloseOptions,
+  ): Promise<boolean> {
     if (!this.isCurrentDescriptor(item)) return true
     await this.flush(item.id)
     const runtime = await this.ensureRuntime(item)
     try {
-      return await runtime?.beforeClose?.() ?? true
+      return await runtime?.beforeClose?.(options) ?? true
     } catch (error) {
       this.reportError(error, item)
       return false

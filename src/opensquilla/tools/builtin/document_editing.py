@@ -26,6 +26,7 @@ from opensquilla.tools.builtin.artifact_editing import (
     _document_grant_binding,
     _json,
     _prepare_document_mutation,
+    _prepare_document_text_patch,
     _range_binding,
     _range_error,
     _require_single_file_html,
@@ -576,4 +577,129 @@ async def document_apply(
     return await _commit_prepared_document_mutation(prepared)
 
 
-__all__ = ["document_apply", "document_inspect", "document_locate", "document_read"]
+_DOCUMENT_PATCH_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "expectedSha256": {
+            "type": "string",
+            "pattern": "^[0-9a-fA-F]{64}$",
+        },
+        "edits": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": _MAX_DOCUMENT_MUTATIONS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "expectedText": {"type": "string", "minLength": 1},
+                    "replacement": {"type": "string"},
+                },
+                "required": ["expectedText", "replacement"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["expectedSha256", "edits"],
+    "additionalProperties": False,
+}
+
+
+@tool(
+    name="document_patch",
+    description=(
+        "Atomically patch the current bound HTML document. First call document_read with "
+        "view=source, then pass its sha256 and exact non-empty source fragments. Every "
+        "expectedText must occur exactly once; all edits apply together or none do."
+    ),
+    params=_DOCUMENT_PATCH_SCHEMA,
+    owner_only=True,
+    exposed_by_default=False,
+    result_budget_class="artifact",
+    sandbox=SandboxToolDescriptor.artifact(kind="document.patch"),
+    runtime_only_arguments={"_tool_use_id"},
+)
+async def document_patch(
+    expectedSha256: str,  # noqa: N803 - public tool schema uses camelCase
+    edits: list[dict[str, object]],
+    _tool_use_id: str | None = None,
+) -> str:
+    if not isinstance(edits, list):
+        raise DocumentMutationError(
+            "DOCUMENT_PATCH_EDITS_INVALID",
+            "edits must be an array.",
+            retry_policy="correctable",
+        )
+    canonical_edits = [dict(edit) if isinstance(edit, dict) else edit for edit in edits]
+    try:
+        proposal_payload = json.dumps(
+            {
+                "edits": canonical_edits,
+                "expectedSha256": expectedSha256,
+                "tool": "document_patch",
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise DocumentMutationError(
+            "DOCUMENT_PATCH_INPUT_INVALID",
+            "Patch input must be valid JSON.",
+            retry_policy="correctable",
+        ) from None
+    proposal_sha256 = hashlib.sha256(proposal_payload).hexdigest()
+    tool_context = current_tool_context.get()
+    controller = (
+        tool_context.artifact_mutation_attempt_controller
+        if tool_context is not None
+        else None
+    )
+    if controller is None or not isinstance(_tool_use_id, str) or not _tool_use_id:
+        raise DocumentMutationError(
+            "DOCUMENT_MUTATION_AUTHORITY_UNAVAILABLE",
+            "Commit authority is unavailable.",
+            retry_policy="forbidden",
+        )
+    try:
+        replay = await controller.replay_commit(_tool_use_id, proposal_sha256)
+    except ArtifactConflictError:
+        raise DocumentMutationError(
+            "DOCUMENT_MUTATION_REPLAY_CONFLICT",
+            "The mutation replay does not match the original proposal.",
+            retry_policy="forbidden",
+        ) from None
+    if replay is not None:
+        return _json({"status": "replayed"})
+
+    prepared = None
+    try:
+        prepared = await _prepare_document_text_patch(
+            expectedSha256,
+            canonical_edits,  # type: ignore[arg-type]
+            proposal_sha256=proposal_sha256,
+        )
+        reservation = await controller.reserve_commit(
+            _tool_use_id,
+            prepared.proposal_sha256,
+        )
+        if not reservation.created:
+            raise DocumentMutationError(
+                "DOCUMENT_MUTATION_REPLAY",
+                "The mutation attempt is already reserved.",
+                retry_policy="refresh",
+            )
+    except BaseException:
+        if prepared is not None:
+            prepared.release_grants()
+        raise
+    return await _commit_prepared_document_mutation(prepared)
+
+
+__all__ = [
+    "document_apply",
+    "document_inspect",
+    "document_locate",
+    "document_patch",
+    "document_read",
+]

@@ -148,7 +148,7 @@
     "resources": {
       "title": "Espace de travail", "count": "Espace de travail ({count})", "empty": "Aucune pièce jointe, copie de travail ou livraison publiée.",
       "groups": { "attachments": "Pièces jointes", "documents": "Copies de travail", "deliverables": "Publiés", "urls": "Liens" },
-      "preview": "Aperçu de {name}", "download": "Télécharger {name}", "edit": "Modifier une copie de {name}", "publish": "Publier {name}",
+      "open": "Ouvrir {name}", "preparing": "Préparation de l’éditeur…", "retry": "Réessayer", "preview": "Aperçu de {name}", "download": "Télécharger {name}", "edit": "Modifier une copie de {name}", "publish": "Publier {name}",
       "imported": "Une copie de travail modifiable de {name} a été créée.", "published": "Un instantané immuable de {name} a été publié.",
       "publishUnavailable": "Ce document n’a pas de révision actuelle publiable.", "actionFailed": "L’action de l’espace de travail a échoué.",
       "unavailableReasons": { "htmlEncodingUnsupported": "Ce HTML n’est pas un UTF-8 valide et ne peut pas être prévisualisé ou modifié en toute sécurité.", "htmlValidationFailed": "Ce HTML n’a pas pu être validé pour une prévisualisation ou une modification sûre.", "htmlEditTooLarge": "Ce HTML est trop volumineux pour être modifié dans l’application. Vous pouvez toujours le télécharger.", "htmlPreviewTooLarge": "Ce HTML est trop volumineux pour être prévisualisé en toute sécurité. Vous pouvez toujours le télécharger.", "officeAdapterNotAvailable": "L’édition Office n’est pas encore disponible.", "unsupported": "Cette action n’est pas disponible pour cette ressource." }

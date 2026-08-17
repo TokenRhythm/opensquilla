@@ -5,10 +5,13 @@ import { afterEach, describe, expect, it } from 'vitest'
 import {
   ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT,
   ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT,
+  ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT,
   focusArtifactPromptAnnotation,
+  notifyArtifactPromptAnnotationsAccepted,
   reuseArtifactPromptAnnotation,
   type ArtifactPromptAnnotationFocusDetail,
   type ArtifactPromptAnnotationReuseDetail,
+  type ArtifactPromptAnnotationsAcceptedDetail,
 } from './promptAnnotations'
 
 afterEach(() => {
@@ -64,5 +67,22 @@ describe('prompt annotation Workbench activation', () => {
       documentId: 'document-1',
       sessionKey: 'session-a',
     })).resolves.toBe(true)
+  })
+
+  it('notifies the Workbench only after concrete annotation ids are accepted', () => {
+    let detail: ArtifactPromptAnnotationsAcceptedDetail | null = null
+    window.addEventListener(ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT, (event) => {
+      detail = (event as CustomEvent<ArtifactPromptAnnotationsAcceptedDetail>).detail
+    }, { once: true })
+
+    notifyArtifactPromptAnnotationsAccepted({
+      acceptedIds: ['annotation-1'],
+      sessionKey: 'session-a',
+    })
+
+    expect(detail).toEqual({
+      acceptedIds: ['annotation-1'],
+      sessionKey: 'session-a',
+    })
   })
 })

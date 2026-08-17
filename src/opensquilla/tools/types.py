@@ -198,6 +198,14 @@ class ToolContext:
     artifact_event_emitter: (
         Callable[[dict[str, Any]], Awaitable[None]] | None
     ) = field(default=None, repr=False)
+    # Narrow, runtime-only hook that turns a freshly published editable
+    # deliverable into the session's canonical Document before the artifact
+    # event crosses the public stream boundary. The engine never receives the
+    # underlying persistence service and adoption failures remain recoverable
+    # through the Workbench open path.
+    generated_artifact_adopter: (
+        Callable[[Any], Awaitable[None]] | None
+    ) = field(default=None, repr=False)
     # Hard upper bound on the tools that may be exposed or dispatched during
     # this turn. Unlike ``allowed_tools``, declarative policy layers may never
     # widen this set. It is used only for narrowly scoped runtime authorities
@@ -328,6 +336,7 @@ SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
         "message",
         "publish_artifact",
         "document_apply",
+        "document_patch",
         "document_inspect",
         "document_locate",
         "document_read",

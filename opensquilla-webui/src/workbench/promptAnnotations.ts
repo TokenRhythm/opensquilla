@@ -2,6 +2,8 @@ export const ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT =
   'opensquilla:artifact-prompt-annotation-focus'
 export const ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT =
   'opensquilla:artifact-prompt-annotation-reuse'
+export const ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT =
+  'opensquilla:artifact-prompt-annotations-accepted'
 
 interface ArtifactPromptAnnotationActivationCallbacks {
   /** Synchronously proves that the trusted Control UI accepted the request. */
@@ -21,6 +23,11 @@ export interface ArtifactPromptAnnotationReuseDetail
   extends ArtifactPromptAnnotationActivationCallbacks {
   body: string
   documentId: string
+  sessionKey: string
+}
+
+export interface ArtifactPromptAnnotationsAcceptedDetail {
+  acceptedIds: string[]
   sessionKey: string
 }
 
@@ -69,4 +76,16 @@ export function reuseArtifactPromptAnnotation(
     ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT,
     detail,
   )
+}
+
+export function notifyArtifactPromptAnnotationsAccepted(
+  detail: ArtifactPromptAnnotationsAcceptedDetail,
+): void {
+  if (typeof window === 'undefined' || !detail.sessionKey || detail.acceptedIds.length === 0) return
+  window.dispatchEvent(new CustomEvent(ARTIFACT_PROMPT_ANNOTATIONS_ACCEPTED_EVENT, {
+    detail: {
+      acceptedIds: [...detail.acceptedIds],
+      sessionKey: detail.sessionKey,
+    },
+  }))
 }

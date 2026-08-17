@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,118 @@ def blob(artifact_id: str, text: str, *, name: str = "page.html") -> ArtifactBlo
         media_type="text/html",
         byte_size=len(payload),
     )
+
+
+@pytest.mark.asyncio
+async def test_generated_deliverable_adoption_is_atomic_direct_and_idempotent(
+    tmp_path: Path,
+) -> None:
+    service = await ArtifactSessionService.open(
+        tmp_path / "generated-resources.db",
+        id_factory=PredictableIds(),
+    )
+    actor = Actor(ActorKind.AGENT, "agent-main")
+    deliverable = blob("art-public-html", "<h1>generated</h1>")
+    try:
+        async def adopt():
+            return await service.adopt_generated_deliverable(
+                session_key="agent:main:webchat:generated",
+                session_id="session-generated",
+                name=deliverable.filename,
+                kind=ArtifactKind.HTML,
+                deliverable=deliverable,
+                actor=actor,
+            )
+
+        results = await asyncio.gather(*(adopt() for _ in range(12)))
+
+        assert sum(created for _commit, _binding, created in results) == 1
+        assert len({commit.document.document_id for commit, _binding, _ in results}) == 1
+        assert len({binding.binding_id for _commit, binding, _ in results}) == 1
+        first_commit, first_binding, _created = results[0]
+        assert first_commit.revision.artifact_id == deliverable.artifact_id
+        assert first_commit.revision.artifact_sha256 == deliverable.sha256
+        assert first_binding.document_id == first_commit.document.document_id
+        assert first_binding.source_type is DocumentSourceType.DELIVERABLE
+        assert first_binding.source_resource_id == deliverable.artifact_id
+        assert first_binding.mode is DocumentImportMode.COPY
+        assert len(
+            await service.list_documents(
+                session_key="agent:main:webchat:generated",
+                session_id="session-generated",
+            )
+        ) == 1
+
+        next_head = blob("art-internal-next", "<h1>edited</h1>")
+        advanced = await service.commit_revision(
+            document_id=first_commit.document.document_id,
+            expected_head_revision_id=first_commit.revision.revision_id,
+            expected_state_revision=first_commit.document.state_revision,
+            artifact=next_head,
+            actor=Actor(ActorKind.USER, "local-owner"),
+        )
+        replay, replay_binding, created = await adopt()
+        assert created is False
+        assert replay.document == advanced.document
+        assert replay.revision == advanced.revision
+        assert replay_binding == first_binding
+
+        with pytest.raises(ArtifactConflictError, match="head revision changed"):
+            await service.get_document_head(
+                first_commit.document.document_id,
+                expected_revision_id=first_commit.revision.revision_id,
+            )
+        current = await service.get_document_head(
+            first_commit.document.document_id,
+            expected_revision_id=advanced.revision.revision_id,
+        )
+        assert current == advanced
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_generated_deliverable_adoption_binds_legacy_adopted_document(
+    tmp_path: Path,
+) -> None:
+    service = await ArtifactSessionService.open(
+        tmp_path / "legacy-generated-resource.db",
+        id_factory=PredictableIds(),
+    )
+    actor = Actor(ActorKind.AGENT, "agent-main")
+    deliverable = blob("art-legacy-public-html", "<h1>legacy</h1>")
+    try:
+        legacy, adopted = await service.adopt_document(
+            session_key="agent:main:webchat:legacy-generated",
+            session_id="session-legacy-generated",
+            name=deliverable.filename,
+            kind=ArtifactKind.HTML,
+            initial_artifact=deliverable,
+            actor=actor,
+        )
+        assert adopted is True
+
+        commit, binding, created = await service.adopt_generated_deliverable(
+            session_key="agent:main:webchat:legacy-generated",
+            session_id="session-legacy-generated",
+            name=deliverable.filename,
+            kind=ArtifactKind.HTML,
+            deliverable=deliverable,
+            actor=actor,
+        )
+
+        assert created is True
+        assert commit == legacy
+        assert binding.document_id == legacy.document.document_id
+        assert binding.source_resource_id == deliverable.artifact_id
+        assert len(
+            await service.list_documents(
+                session_key="agent:main:webchat:legacy-generated",
+                session_id="session-legacy-generated",
+            )
+        ) == 1
+    finally:
+        await service.close()
 
 
 @pytest.mark.asyncio

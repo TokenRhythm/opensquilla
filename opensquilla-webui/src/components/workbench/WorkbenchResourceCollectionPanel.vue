@@ -15,9 +15,9 @@
             <button
               type="button"
               class="resource-collection__open"
-              :disabled="!resource.capabilities.preview || isBusy(resource)"
-              :aria-label="previewLabel(resource)"
-              @click="emitAction('resource-preview', resource)"
+              :disabled="isBusy(resource)"
+              :aria-label="openLabel(resource)"
+              @click="emitAction('resource-open', resource)"
             >
               <span class="resource-collection__icon" aria-hidden="true">
                 <Icon :name="resourceIcon(resource)" :size="18" />
@@ -25,6 +25,16 @@
               <span class="resource-collection__copy">
                 <strong>{{ resource.name }}</strong>
                 <small>{{ resourceMeta(resource) }}</small>
+                <small v-if="isBusy(resource)" role="status">
+                  {{ preparingLabel }}
+                </small>
+                <small
+                  v-if="hasOpenError(resource)"
+                  class="resource-collection__open-error"
+                  role="alert"
+                >
+                  {{ openErrorMessage }}
+                </small>
                 <small
                   v-if="resource.capabilities.reasonCode"
                   class="resource-collection__unavailable-reason"
@@ -35,14 +45,14 @@
             </button>
             <span class="resource-collection__actions">
               <button
-                v-if="resource.capabilities.manualEdit && resource.resource.type !== 'document'"
+                v-if="hasOpenError(resource)"
                 type="button"
                 :disabled="isBusy(resource)"
-                :title="editLabel(resource)"
-                :aria-label="editLabel(resource)"
-                @click="emitAction('resource-import', resource)"
+                :title="retryLabel"
+                :aria-label="retryLabel"
+                @click="emitAction('resource-open', resource)"
               >
-                <Icon name="edit" :size="15" />
+                <Icon name="refresh" :size="15" />
               </button>
               <button
                 v-if="resource.capabilities.publish && resource.resource.type === 'document'"
@@ -86,12 +96,15 @@ import type { WorkbenchComponentEvent } from '@/workbench/types'
 const props = defineProps<{
   busyKey?: string
   downloadLabel: (resource: WorkbenchResource) => string
-  editLabel: (resource: WorkbenchResource) => string
   emptyLabel: string
   groupLabels: Record<WorkbenchResourceType, string>
   label: string
-  previewLabel: (resource: WorkbenchResource) => string
+  openErrorKey?: string
+  openErrorMessage?: string
+  openLabel: (resource: WorkbenchResource) => string
+  preparingLabel: string
   publishLabel: (resource: WorkbenchResource) => string
+  retryLabel: string
   resources: readonly WorkbenchResource[]
   unavailableReason: (resource: WorkbenchResource) => string
 }>()
@@ -114,6 +127,10 @@ function resourceKey(resource: WorkbenchResource): string {
 
 function isBusy(resource: WorkbenchResource): boolean {
   return props.busyKey === resourceKey(resource)
+}
+
+function hasOpenError(resource: WorkbenchResource): boolean {
+  return props.openErrorKey === resourceKey(resource) && Boolean(props.openErrorMessage)
 }
 
 function resourceIcon(resource: WorkbenchResource): IconName {
@@ -247,6 +264,11 @@ function emitAction(type: string, resource: WorkbenchResource) {
 
 .resource-collection__copy .resource-collection__unavailable-reason {
   color: var(--warning, var(--text-dim));
+  white-space: normal;
+}
+
+.resource-collection__copy .resource-collection__open-error {
+  color: var(--danger);
   white-space: normal;
 }
 

@@ -656,6 +656,74 @@ def _validated_import_source(source: _ImportSource) -> tuple[_ImportSource, Docu
     return source, profile.adapter
 
 
+async def adopt_generated_deliverable_if_editable(
+    *,
+    service: ArtifactSessionService,
+    store: ArtifactStore,
+    session_key: str,
+    session_id: str,
+    ref: ArtifactRef,
+    actor: Actor | None = None,
+) -> tuple[Document, Revision, DocumentSourceBinding, bool] | None:
+    """Materialize one generated single-file HTML deliverable as a Document.
+
+    Unsupported material returns ``None`` so publication remains successful
+    and read-only. Storage or integrity failures still raise so the turn
+    boundary can record a recoverable materialization failure.
+    """
+
+    editable = await asyncio.to_thread(
+        store.supports_single_file_editing,
+        ref.id,
+        session_id=session_id,
+    )
+    if not editable:
+        return None
+    resolved, path = await asyncio.to_thread(
+        store.resolve_for_download,
+        ref.id,
+        session_id=session_id,
+    )
+    payload = await asyncio.to_thread(native_io_path(path).read_bytes)
+    if (
+        resolved.sha256 != ref.sha256
+        or resolved.name != ref.name
+        or resolved.mime != ref.mime
+        or resolved.size != ref.size
+    ):
+        raise ArtifactIntegrityError("generated deliverable identity changed")
+    source = _ImportSource(
+        source_type=DocumentSourceType.DELIVERABLE,
+        resource_id=resolved.id,
+        name=resolved.name,
+        mime=resolved.mime,
+        size=resolved.size,
+        sha256=resolved.sha256,
+        payload=payload,
+    )
+    try:
+        _validated_import_source(source)
+    except RpcHandlerError as exc:
+        if exc.code.startswith("DOCUMENT_IMPORT_"):
+            return None
+        raise
+    commit, binding, created = await service.adopt_generated_deliverable(
+        session_key=session_key,
+        session_id=session_id,
+        name=resolved.name,
+        kind=_kind_for(resolved.name, resolved.mime),
+        deliverable=ArtifactBlobRef(
+            artifact_id=resolved.id,
+            sha256=resolved.sha256,
+            filename=resolved.name,
+            media_type=resolved.mime,
+            byte_size=resolved.size,
+        ),
+        actor=actor or Actor(kind=ActorKind.SYSTEM, actor_id="generated-deliverable"),
+    )
+    return commit.document, commit.revision, binding, created
+
+
 def _attachment_payload(
     occurrence: _AttachmentOccurrence,
     *,
@@ -863,15 +931,13 @@ async def _scoped_document(
     document_id: str,
 ) -> tuple[Document, Revision]:
     try:
-        document = await service.get_document(document_id)
+        current = await service.get_document_head(document_id)
     except ArtifactSessionNotFoundError:
         raise _not_found("document", document_id) from None
+    document = current.document
     if document.session_key != session_key or document.session_id != session_id:
         raise _not_found("document", document_id)
-    revision = await service.get_revision(document.head_revision_id)
-    if revision.document_id != document.document_id:
-        raise RpcUnavailableError("document head integrity check failed")
-    return document, revision
+    return document, current.revision
 
 
 async def _resource_inventory(
@@ -1372,9 +1438,10 @@ def _revision_payload(revision: Revision) -> dict[str, Any]:
     }
 
 
-def _document_rpc_payload(result: DocumentImportResult) -> dict[str, Any]:
-    document = result.commit.document
-    revision = result.commit.revision
+def _document_rpc_payload_from_parts(
+    document: Document,
+    revision: Revision,
+) -> dict[str, Any]:
     return {
         "id": document.document_id,
         "documentId": document.document_id,
@@ -1390,6 +1457,13 @@ def _document_rpc_payload(result: DocumentImportResult) -> dict[str, Any]:
         "updatedAt": document.updated_at,
         "head": _revision_payload(revision),
     }
+
+
+def _document_rpc_payload(result: DocumentImportResult) -> dict[str, Any]:
+    return _document_rpc_payload_from_parts(
+        result.commit.document,
+        result.commit.revision,
+    )
 
 
 def _import_response(result: DocumentImportResult, *, replayed: bool) -> dict[str, Any]:
@@ -1710,6 +1784,222 @@ async def _handle_resources_get(
     return {"resource": resource}
 
 
+async def _current_document_open_response(
+    ctx: RpcContext,
+    *,
+    session_key: str,
+    session_id: str,
+    service: ArtifactSessionService,
+    document_id: str,
+    materialized: bool,
+    receipt: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    document, head = await _scoped_document(
+        service,
+        session_key=session_key,
+        session_id=session_id,
+        document_id=document_id,
+    )
+    inventory = await _resource_inventory(
+        ctx,
+        session_key=session_key,
+        session_id=session_id,
+        service=service,
+        include_inline_urls=True,
+    )
+    resource = next(
+        (
+            item
+            for item in inventory["document"]
+            if item["resource"]["id"] == document.document_id
+        ),
+        None,
+    )
+    if resource is None:
+        raise RpcUnavailableError("materialized document resource is unavailable")
+    bindings = await service.list_document_source_bindings(
+        session_id=session_id,
+        limit=1000,
+    )
+    binding = next(
+        (item for item in bindings if item.document_id == document.document_id),
+        None,
+    )
+    response: dict[str, Any] = {
+        "disposition": "document",
+        "resolution": {"status": "materialized" if materialized else "current"},
+        "resource": resource,
+        "document": _document_rpc_payload_from_parts(document, head),
+        "revision": _revision_payload(head),
+        "materialized": materialized,
+    }
+    if binding is not None:
+        response["binding"] = _binding_payload(binding)
+    if receipt is not None:
+        response["receipt"] = receipt
+    return response
+
+
+def _readonly_open_response(resource: dict[str, Any]) -> dict[str, Any]:
+    capabilities = resource.get("capabilities")
+    reason = "resource_edit_not_supported"
+    if isinstance(capabilities, dict):
+        candidate = capabilities.get("editReasonCode") or capabilities.get("reasonCode")
+        if isinstance(candidate, str) and candidate:
+            reason = candidate
+    return {
+        "disposition": "readonly",
+        "resolution": {"status": "readonly"},
+        "resource": resource,
+        "materialized": False,
+        "reasonCode": reason,
+    }
+
+
+def _open_idempotency_key(
+    *,
+    session_id: str,
+    resource_type: str,
+    resource_id: str,
+    sha256: str,
+) -> str:
+    identity = "\0".join(
+        ("workbench.resources.open", session_id, resource_type, resource_id, sha256)
+    )
+    return "open-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+
+@_d.method("workbench.resources.open", scope="operator.write")
+async def _handle_resources_open(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Resolve a resource to its current editable Document when supported."""
+
+    session_key, session_id, service = await _scope(params, ctx)
+    intent = _optional_string(params, "intent", max_bytes=32) or "edit-current"
+    if intent != "edit-current":
+        raise ValueError("params.intent must be edit-current")
+    expected_sha256 = _optional_string(params, "expectedSha256", max_bytes=64)
+    if expected_sha256 is not None:
+        expected_sha256 = expected_sha256.lower()
+        if _SHA256_RE.fullmatch(expected_sha256) is None:
+            raise ValueError("params.expectedSha256 must be a SHA-256 digest")
+    requested_idempotency_key = (
+        _idempotency_key(params)
+        if isinstance(params, dict)
+        and ("idempotencyKey" in params or "clientRequestId" in params)
+        else None
+    )
+    resource_type, resource_id = _resource_ref_with_legacy_alias(params)
+    if resource_type == "document":
+        response = await _current_document_open_response(
+            ctx,
+            session_key=session_key,
+            session_id=session_id,
+            service=service,
+            document_id=resource_id,
+            materialized=False,
+        )
+        resource_sha256 = response["resource"].get("sha256")
+        if expected_sha256 is not None and expected_sha256 != resource_sha256:
+            raise _conflict(ArtifactConflictError("document head hash changed"))
+        return response
+
+    inventory = await _resource_inventory(
+        ctx,
+        session_key=session_key,
+        session_id=session_id,
+        service=service,
+        include_inline_urls=True,
+    )
+    resource = next(
+        (
+            item
+            for item in inventory[resource_type]
+            if item["resource"]["id"] == resource_id
+        ),
+        None,
+    )
+    if resource is None:
+        raise _not_found(resource_type, resource_id)
+    resource_sha256 = resource.get("sha256")
+    if expected_sha256 is not None and expected_sha256 != resource_sha256:
+        raise _conflict(ArtifactConflictError("workbench resource hash changed"))
+    if resource_type not in _SUPPORTED_SOURCE_TYPES:
+        return _readonly_open_response(resource)
+
+    relations = resource.get("relations")
+    related_document_id = (
+        relations.get("documentId") if isinstance(relations, dict) else None
+    )
+    if isinstance(related_document_id, str) and related_document_id:
+        return await _current_document_open_response(
+            ctx,
+            session_key=session_key,
+            session_id=session_id,
+            service=service,
+            document_id=related_document_id,
+            materialized=False,
+        )
+
+    binding = await service.get_document_source_binding_for_resource(
+        session_id=session_id,
+        source_type=DocumentSourceType(resource_type),
+        source_resource_id=resource_id,
+    )
+    if binding is not None:
+        return await _current_document_open_response(
+            ctx,
+            session_key=session_key,
+            session_id=session_id,
+            service=service,
+            document_id=binding.document_id,
+            materialized=False,
+        )
+
+    capabilities = resource.get("capabilities")
+    if not isinstance(capabilities, dict) or capabilities.get("manualEdit") is not True:
+        return _readonly_open_response(resource)
+    sha256 = resource.get("sha256")
+    if not isinstance(sha256, str) or _SHA256_RE.fullmatch(sha256) is None:
+        readonly = _readonly_open_response(resource)
+        readonly["reasonCode"] = "resource_digest_unavailable"
+        return readonly
+
+    imported = await import_document_from_resource(
+        {
+            "sessionKey": session_key,
+            "source": _resource_ref_payload(resource_type, resource_id),
+            "mode": DocumentImportMode.COPY.value,
+            "expectedSha256": sha256,
+            "idempotencyKey": requested_idempotency_key
+            or _open_idempotency_key(
+                session_id=session_id,
+                resource_type=resource_type,
+                resource_id=resource_id,
+                sha256=sha256,
+            ),
+            "name": resource["name"],
+        },
+        ctx,
+    )
+    document = imported.get("document")
+    document_id = document.get("documentId") if isinstance(document, dict) else None
+    if not isinstance(document_id, str) or not document_id:
+        raise RpcUnavailableError("materialized document identity is unavailable")
+    receipt = imported.get("receipt")
+    return await _current_document_open_response(
+        ctx,
+        session_key=session_key,
+        session_id=session_id,
+        service=service,
+        document_id=document_id,
+        materialized=True,
+        receipt=receipt if isinstance(receipt, dict) else None,
+    )
+
+
 @_d.method("workbench.previews.create", scope="operator.read")
 async def _handle_preview_create(
     params: dict[str, Any] | None,
@@ -1934,6 +2224,8 @@ __all__ = [
     "_handle_preview_create",
     "_handle_resources_get",
     "_handle_resources_list",
+    "_handle_resources_open",
+    "adopt_generated_deliverable_if_editable",
     "import_document_from_resource",
     "resolve_recovery_import_source",
 ]

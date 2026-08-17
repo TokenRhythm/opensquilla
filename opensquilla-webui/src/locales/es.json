@@ -148,7 +148,7 @@
     "resources": {
       "title": "Área de trabajo", "count": "Área de trabajo ({count})", "empty": "Aún no hay adjuntos, copias de trabajo ni entregables publicados.",
       "groups": { "attachments": "Adjuntos", "documents": "Copias de trabajo", "deliverables": "Publicados", "urls": "Enlaces" },
-      "preview": "Vista previa de {name}", "download": "Descargar {name}", "edit": "Editar una copia de {name}", "publish": "Publicar {name}",
+      "open": "Abrir {name}", "preparing": "Preparando el editor…", "retry": "Reintentar", "preview": "Vista previa de {name}", "download": "Descargar {name}", "edit": "Editar una copia de {name}", "publish": "Publicar {name}",
       "imported": "Se creó una copia editable de {name}.", "published": "Se publicó una instantánea inmutable de {name}.",
       "publishUnavailable": "Este documento no tiene una revisión actual publicable.", "actionFailed": "La acción del área de trabajo falló.",
       "unavailableReasons": { "htmlEncodingUnsupported": "Este HTML no es UTF-8 válido y no se puede previsualizar ni editar de forma segura.", "htmlValidationFailed": "No se pudo validar este HTML para una vista previa o edición seguras.", "htmlEditTooLarge": "Este HTML es demasiado grande para editarlo en la aplicación. Aún puedes descargarlo.", "htmlPreviewTooLarge": "Este HTML es demasiado grande para previsualizarlo de forma segura. Aún puedes descargarlo.", "officeAdapterNotAvailable": "La edición de Office aún no está disponible.", "unsupported": "Esta acción no está disponible para este recurso." }

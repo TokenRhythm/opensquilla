@@ -1296,6 +1296,65 @@ def test_artifact_handler_appends_payload() -> None:
     assert len(state.turn_artifacts) == 1
 
 
+@pytest.mark.asyncio
+async def test_generated_artifact_is_adopted_before_public_yield() -> None:
+    order: list[tuple[str, str]] = []
+
+    async def adopt(event: ArtifactEvent) -> None:
+        order.append(("adopt", event.id))
+
+    artifact = ArtifactEvent(
+        id="art-editable",
+        name="page.html",
+        mime="text/html",
+        size=32,
+    )
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[artifact, DoneEvent(text="ready", text_snapshot="ready")]
+        )
+    )
+    inp = _make_input(
+        tool_context=ToolContext(generated_artifact_adopter=adopt),
+    )
+
+    yielded: list[Any] = []
+    async for event in stage.run(inp):
+        if isinstance(event, ArtifactEvent):
+            order.append(("yield", event.id))
+        yielded.append(event)
+
+    assert order == [("adopt", "art-editable"), ("yield", "art-editable")]
+    assert any(isinstance(event, ArtifactEvent) for event in yielded)
+    assert inp.state.turn_artifacts[0]["id"] == "art-editable"
+
+
+@pytest.mark.asyncio
+async def test_generated_artifact_adoption_failure_keeps_delivery() -> None:
+    async def fail_adoption(_event: ArtifactEvent) -> None:
+        raise RuntimeError("synthetic adoption failure")
+
+    artifact = ArtifactEvent(
+        id="art-fallback",
+        name="page.html",
+        mime="text/html",
+        size=32,
+    )
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[artifact, DoneEvent(text="ready", text_snapshot="ready")]
+        )
+    )
+    inp = _make_input(
+        tool_context=ToolContext(generated_artifact_adopter=fail_adoption),
+    )
+
+    yielded = await _drain(stage, inp)
+
+    assert any(isinstance(event, ArtifactEvent) for event in yielded)
+    assert inp.state.turn_artifacts[0]["id"] == "art-fallback"
+
+
 def test_error_handler_rewrites_timeout_envelope() -> None:
     state = _make_state()
     handler = _ErrorHandler()
@@ -2591,6 +2650,40 @@ def _make_publish_tool_context(tmp_path: Path) -> tuple[ToolContext, Path]:
         ],
     )
     return ctx, media_root
+
+
+@pytest.mark.asyncio
+async def test_auto_published_artifact_is_adopted_before_public_yield(
+    tmp_path: Path,
+) -> None:
+    order: list[tuple[str, str]] = []
+
+    async def adopt(event: ArtifactEvent) -> None:
+        order.append(("adopt", event.id))
+
+    ctx, _media_root = _make_publish_tool_context(tmp_path)
+    ctx.generated_artifact_adopter = adopt
+    stage, _ = _make_stage(
+        agent_run=_RecordingAgentRun(
+            events=[
+                TextDeltaEvent(text="Wrote report.csv"),
+                DoneEvent(text="Wrote report.csv"),
+            ]
+        )
+    )
+
+    yielded: list[Any] = []
+    async for event in stage.run(_make_input(tool_context=ctx)):
+        if isinstance(event, ArtifactEvent):
+            order.append(("yield", event.id))
+        yielded.append(event)
+    artifact_events = [event for event in yielded if isinstance(event, ArtifactEvent)]
+
+    assert len(artifact_events) == 1
+    assert order == [
+        ("adopt", artifact_events[0].id),
+        ("yield", artifact_events[0].id),
+    ]
 
 
 @pytest.mark.asyncio

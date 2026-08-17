@@ -148,7 +148,7 @@
     "resources": {
       "title": "Workbench", "count": "Workbench ({count})", "empty": "No attachments, working copies, or published deliverables yet.",
       "groups": { "attachments": "Attachments", "documents": "Working copies", "deliverables": "Published", "urls": "Links" },
-      "preview": "Preview {name}", "download": "Download {name}", "edit": "Edit a copy of {name}", "publish": "Publish {name}",
+      "open": "Open {name}", "preparing": "Preparing editor…", "retry": "Retry", "preview": "Preview {name}", "download": "Download {name}", "edit": "Edit a copy of {name}", "publish": "Publish {name}",
       "imported": "Created an editable working copy of {name}.", "published": "Published an immutable snapshot of {name}.",
       "publishUnavailable": "This document does not have a publishable current revision.", "actionFailed": "The workbench action failed.",
       "unavailableReasons": { "htmlEncodingUnsupported": "This HTML is not valid UTF-8 and cannot be previewed or edited safely.", "htmlValidationFailed": "This HTML could not be validated for safe preview or editing.", "htmlEditTooLarge": "This HTML is too large to edit in the app. You can still download it.", "htmlPreviewTooLarge": "This HTML is too large to preview safely in the app. You can still download it.", "officeAdapterNotAvailable": "Office editing is not available yet.", "unsupported": "This action is not available for this resource." }

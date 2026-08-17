@@ -109,6 +109,7 @@ export function createArtifactCollectionWorkbenchItem(options: {
 
 export function createArtifactPreviewWorkbenchItem(options: {
   artifact: ArtifactPayload
+  initialSection?: 'preview' | 'source'
   navigationArtifacts?: readonly ArtifactPayload[]
   nativeHtml: boolean
   preparedPreview?: WorkbenchPreviewDescriptor
@@ -118,6 +119,7 @@ export function createArtifactPreviewWorkbenchItem(options: {
 }): WorkbenchItem {
   const {
     artifact,
+    initialSection = 'preview',
     navigationArtifacts = [],
     nativeHtml,
     preparedPreview,
@@ -138,6 +140,7 @@ export function createArtifactPreviewWorkbenchItem(options: {
     retention: nativeHtml && kind === 'html' ? 'keep-alive' : 'dispose-on-suspend',
     payload: {
       artifact,
+      initialSection,
       navigationArtifacts: [...navigationArtifacts],
       ...(preparedPreview
         ? {
@@ -155,6 +158,14 @@ export function createArtifactPreviewWorkbenchItem(options: {
       sessionKey,
     },
   }
+}
+
+export function initialSectionFromWorkbenchItem(
+  item: WorkbenchItem | null,
+): 'preview' | 'source' {
+  return item?.kind === 'artifact-preview' && item.payload.initialSection === 'source'
+    ? 'source'
+    : 'preview'
 }
 
 /**

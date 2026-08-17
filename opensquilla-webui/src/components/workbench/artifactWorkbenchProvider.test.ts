@@ -113,6 +113,7 @@ describe('artifact Workbench provider', () => {
       sessionKey: 'session-a',
     })
     const renderState: Record<string, unknown> = {}
+    const pushToast = vi.fn()
     const definition = createArtifactWorkbenchDefinitions({
       artifactDocuments: {
         load: vi.fn(async () => undefined),
@@ -128,7 +129,7 @@ describe('artifact Workbench provider', () => {
       openArtifact: vi.fn(),
       platform: { capabilities: {}, files: {} } as unknown as Platform,
       publishDocument,
-      pushToast: vi.fn(),
+      pushToast,
       t: key => key,
     }).find(candidate => candidate.kind === 'artifact-preview')!
     const runtime = await definition.createRuntime!(item, {
@@ -310,112 +311,42 @@ describe('artifact Workbench provider', () => {
     expect(headArtifact).not.toHaveBeenCalled()
   })
 
-  it('creates one editable copy only after an explicit immutable-deliverable action', async () => {
-    const resource = normalizeWorkbenchResource({
-      resource: { type: 'deliverable', artifactId: 'deliverable-rev-1' },
-      name: 'published.html',
-      mime: 'text/html',
-      sha256: '1'.repeat(64),
-      downloadUrl: '/api/v1/artifacts/deliverable-rev-1',
-      capabilities: { preview: true, download: true, edit: true, publish: false },
-      relations: {
-        documentId: 'mutable-document-that-must-not-be-opened',
-        headRevisionId: 'revision-2',
-        publishedRevisionId: 'revision-1',
-      },
-    })!
-    const immutableArtifact = artifactPayloadFromWorkbenchResource(resource)
+  it('forwards direct document navigation to the Source section', async () => {
     const item = createArtifactPreviewWorkbenchItem({
-      artifact: immutableArtifact,
-      nativeHtml: false,
-      preparedPreview: {
-        protocolVersion: 1,
-        mode: 'isolated',
-        resource: resource.resource,
-        launchUrl: '/api/v1/workbench/previews/deliverable-rev-1',
-        sandboxProfile: 'opaque-offline',
-        network: false,
-        adapter: null,
+      artifact: {
+        id: 'artifact-current',
+        documentId: 'document-current',
+        revisionId: 'revision-current',
+        name: 'current.html',
+        mime: 'text/html',
       },
-      previewLeaseEligible: false,
-      resourceIdentity: 'deliverable:deliverable-rev-1',
+      initialSection: 'source',
+      nativeHtml: false,
+      resourceIdentity: 'document:document-current',
       sessionKey: 'session-a',
     })
-    const resolveEditableCopyResource = vi.fn(async () => resource)
-    let finishImport: (() => void) | undefined
-    const createEditableCopy = vi.fn(() => new Promise<void>((resolve) => {
-      finishImport = resolve
-    }))
-    const snapshot = vi.fn(() => ({
-      key: 'must-not-read-mutable-head',
-      loading: false,
-      loaded: true,
-      stale: false,
-      error: null,
-      workspace: null,
-    }))
-    const renderState: Record<string, unknown> = {}
     const definition = createArtifactWorkbenchDefinitions({
-      artifactDocuments: {
-        load: vi.fn(async () => undefined),
-        snapshot,
-        headArtifact: vi.fn(value => value),
-      },
       authToken: () => '',
       baseOrigin: 'http://localhost',
       confirmRemoteResources: vi.fn(async () => true),
-      createEditableCopy,
       currentSessionId: () => 'session-a',
       openArtifact: vi.fn(),
       platform: { capabilities: {}, files: {} } as unknown as Platform,
       pushToast: vi.fn(),
-      resolveEditableCopyResource,
       t: key => key,
     }).find(candidate => candidate.kind === 'artifact-preview')!
-    const runtime = await definition.createRuntime!(item, {
-      getRenderState: () => renderState,
-      updateRenderState: patch => Object.assign(renderState, patch),
-      isItemOpen: () => true,
-      setExpanded: vi.fn(),
-      reportError: vi.fn(),
-    })
 
-    expect(resolveEditableCopyResource).toHaveBeenCalledWith({
-      resource: expect.objectContaining({
-        type: 'deliverable',
-        artifactId: 'deliverable-rev-1',
-      }),
-      sessionKey: 'session-a',
-    })
-    expect(createEditableCopy).not.toHaveBeenCalled()
-    expect(renderState.editableCopyAvailable).toBe(true)
-    expect(snapshot).not.toHaveBeenCalled()
-    expect(definition.getProps?.(item, {
+    const props = definition.getProps?.(item, {
       active: true,
       hostAvailable: true,
       nativeSurface: false,
-      runtimeState: renderState,
-    })).toMatchObject({
-      documentFeatures: false,
-      editableCopyAvailable: true,
+      runtimeState: {},
     })
-
-    const first = runtime.handleComponentEvent?.({
-      type: 'artifact-create-editable-copy',
-    }, item)
-    await vi.waitFor(() => expect(createEditableCopy).toHaveBeenCalledTimes(1))
-    const second = runtime.handleComponentEvent?.({
-      type: 'artifact-create-editable-copy',
-    }, item)
-    expect(createEditableCopy).toHaveBeenCalledTimes(1)
-    expect(createEditableCopy).toHaveBeenCalledWith({
-      resource,
-      sessionKey: 'session-a',
+    expect(props).toMatchObject({
+      initialSection: 'source',
     })
-    finishImport?.()
-    await Promise.all([first, second])
-    expect(renderState.editableCopyBusy).toBe(false)
-    expect(immutableArtifact).not.toHaveProperty('documentId')
+    expect(props).not.toHaveProperty('editableCopyAvailable')
+    expect(props).not.toHaveProperty('editableCopyBusy')
   })
 
   it('forces a prepared resource preview offline and rejects every network-enabling action', async () => {
@@ -567,6 +498,7 @@ describe('artifact Workbench provider', () => {
       onSurfaceEvent: vi.fn(() => () => undefined),
     }
     const renderState: Record<string, unknown> = {}
+    const pushToast = vi.fn()
     const item = createArtifactPreviewWorkbenchItem({
       artifact,
       nativeHtml: true,
@@ -576,7 +508,7 @@ describe('artifact Workbench provider', () => {
       ...artifact,
       documentId: 'document-1',
     }, 'session-a')
-    const workspace = {
+    let workspace = {
       ...legacy,
       source: 'document-api' as const,
       document: {
@@ -585,14 +517,32 @@ describe('artifact Workbench provider', () => {
         headRevisionId: 'revision-1',
       },
     }
+    let nextHeadRevisionId = 'revision-2'
+    let staleSnapshot = false
+    const loadDocument = vi.fn(async (
+      _artifact: ArtifactPayload,
+      _sessionKey: string,
+      options?: { force?: boolean },
+    ) => {
+      if (options?.force && !staleSnapshot) {
+        workspace = {
+          ...workspace,
+          document: {
+            ...workspace.document,
+            headRevisionId: nextHeadRevisionId,
+          },
+        }
+      }
+      return workspace
+    })
     const definition = createArtifactWorkbenchDefinitions({
       artifactDocuments: {
-        load: vi.fn(async () => workspace),
+        load: loadDocument,
         snapshot: vi.fn(() => ({
           key: 'session-a\0artifact-1',
           loading: false,
           loaded: true,
-          stale: false,
+          stale: staleSnapshot,
           error: null,
           workspace,
         })),
@@ -609,7 +559,7 @@ describe('artifact Workbench provider', () => {
         files: {},
       } as unknown as Platform,
       previewLeasesEnabled: true,
-      pushToast: vi.fn(),
+      pushToast,
       t: key => key,
     }).find(candidate => candidate.kind === 'artifact-preview')!
     const runtime = await definition.createRuntime!(item, {
@@ -628,11 +578,41 @@ describe('artifact Workbench provider', () => {
       ...currentHead,
       id: 'artifact-head-2',
     }
-    await runtime.handleComponentEvent?.({ type: 'artifact-head-changed' }, item)
+    await runtime.handleComponentEvent?.({
+      type: 'artifact-head-changed',
+      payload: { revisionId: 'revision-2' },
+    }, item)
+    expect(loadDocument).toHaveBeenLastCalledWith(
+      artifact,
+      'session-a',
+      { force: true },
+    )
+    expect(pushToast).not.toHaveBeenCalled()
+    expect(destroySurface).toHaveBeenCalledOnce()
     expect(createLease).toHaveBeenNthCalledWith(2, expect.objectContaining({
       artifactId: 'artifact-head-2',
     }))
+    await runtime.handleComponentEvent?.({
+      type: 'artifact-head-changed',
+      payload: { revisionId: 'revision-2' },
+    }, item)
+    expect(createLease).toHaveBeenCalledTimes(2)
     expect(destroySurface).toHaveBeenCalledOnce()
+
+    staleSnapshot = true
+    await runtime.handleComponentEvent?.({
+      type: 'artifact-head-changed',
+      payload: { revisionId: 'revision-3' },
+    }, item)
+    expect(createLease).toHaveBeenCalledTimes(2)
+    expect(destroySurface).toHaveBeenCalledTimes(2)
+    expect(pushToast).toHaveBeenCalledWith(
+      'workbench.artifactDocument.sourceUnavailable',
+      { tone: 'danger' },
+    )
+
+    staleSnapshot = false
+    nextHeadRevisionId = 'revision-3'
     currentHead = {
       ...currentHead,
       id: 'artifact-head-3',
@@ -2524,6 +2504,19 @@ describe('artifact Workbench provider', () => {
     expect(discardAnnotation).toHaveBeenCalledTimes(discardCountBeforeAmbiguousCreate)
     expect(renderState.annotationFallback).toBeNull()
     expect(renderState.annotationMode).toBe(true)
+
+    // Once the Gateway has accepted the prompt annotations, the renderer must
+    // release the native picker instead of leaving the toolbar visibly pressed.
+    await runtime.handleComponentEvent?.({
+      type: 'artifact-prompt-annotations-accepted',
+      payload: { acceptedIds: ['annotation-accepted'] },
+    }, item)
+    expect(setMode).toHaveBeenLastCalledWith({
+      version: 3,
+      surfaceId: item.id,
+      enabled: false,
+    })
+    expect(renderState.annotationMode).toBe(false)
 
     await runtime.dispose?.('closed')
     expect(revokeScreenshotUrl).toHaveBeenCalledWith('blob:frozen-annotation-preview')

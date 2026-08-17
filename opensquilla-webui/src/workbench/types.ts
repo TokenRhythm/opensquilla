@@ -110,9 +110,14 @@ export interface WorkbenchRuntimeContext {
   reportError(error: unknown): void
 }
 
+export interface WorkbenchBeforeCloseOptions {
+  /** Flush pending work without releasing resources while the panel remains open. */
+  preserveRuntime?: boolean
+}
+
 export interface WorkbenchPanelRuntime {
   /** Persist pending user work before the owning descriptor is removed. */
-  beforeClose?(): boolean | Promise<boolean>
+  beforeClose?(options?: WorkbenchBeforeCloseOptions): boolean | Promise<boolean>
   setComponentHandle?(handle: unknown): void | Promise<void>
   handleComponentEvent?(
     event: WorkbenchComponentEvent,

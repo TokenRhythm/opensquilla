@@ -236,7 +236,10 @@ def _emit_steer_metric(disposition: str, **labels: Any) -> None:
 
 
 if TYPE_CHECKING:
-    from opensquilla.gateway.artifact_contexts import BoundPromptAnnotationContext
+    from opensquilla.gateway.artifact_contexts import (
+        BoundDocumentContext,
+        BoundPromptAnnotationContext,
+    )
     from opensquilla.gateway.task_runtime import TaskRuntime
 
 _ALLOWED_MEDIA_TYPES = _attachment_ingest.ALLOWED_MEDIA_TYPES
@@ -3409,11 +3412,80 @@ async def _handle_sessions_send_impl(
         prompt_annotation_ids = tuple(item.strip() for item in raw_prompt_annotation_ids)
         if len(set(prompt_annotation_ids)) != len(prompt_annotation_ids):
             raise ValueError("params.promptAnnotationIds must contain unique ids")
-    if prompt_annotation_ids:
+    if (
+        "documentContext" in params
+        and "document_context" in params
+        and params["documentContext"] != params["document_context"]
+    ):
+        raise ValueError("Conflicting documentContext aliases")
+    raw_document_context = params.get(
+        "documentContext",
+        params.get("document_context"),
+    )
+    document_context_request: dict[str, str] | None = None
+    if raw_document_context is not None:
+        if not isinstance(raw_document_context, dict):
+            raise ValueError("params.documentContext must be an object")
+        allowed_document_context_keys = {
+            "documentId",
+            "document_id",
+            "headRevisionId",
+            "head_revision_id",
+        }
+        if not set(raw_document_context) <= allowed_document_context_keys:
+            raise ValueError(
+                "params.documentContext accepts only documentId and headRevisionId"
+            )
+        if (
+            "documentId" in raw_document_context
+            and "document_id" in raw_document_context
+            and raw_document_context["documentId"] != raw_document_context["document_id"]
+        ):
+            raise ValueError("Conflicting documentId aliases")
+        if (
+            "headRevisionId" in raw_document_context
+            and "head_revision_id" in raw_document_context
+            and raw_document_context["headRevisionId"]
+            != raw_document_context["head_revision_id"]
+        ):
+            raise ValueError("Conflicting headRevisionId aliases")
+        raw_document_id = raw_document_context.get(
+            "documentId",
+            raw_document_context.get("document_id"),
+        )
+        raw_head_revision_id = raw_document_context.get(
+            "headRevisionId",
+            raw_document_context.get("head_revision_id"),
+        )
+        if (
+            not isinstance(raw_document_id, str)
+            or not raw_document_id.strip()
+            or not isinstance(raw_head_revision_id, str)
+            or not raw_head_revision_id.strip()
+        ):
+            raise ValueError(
+                "params.documentContext requires non-empty documentId and headRevisionId"
+            )
+        document_context_request = {
+            "documentId": raw_document_id.strip(),
+            "headRevisionId": raw_head_revision_id.strip(),
+        }
+    if prompt_annotation_ids and document_context_request is not None:
+        raise RpcHandlerError(
+            "DOCUMENT_CONTEXT_CONFLICT",
+            "A normal document context cannot be combined with prompt annotations.",
+            retryable=False,
+            accepted=False,
+        )
+    if prompt_annotation_ids or document_context_request is not None:
         if source_hint.get("caller_kind") != "web" or not ctx.principal.is_owner:
             raise RpcHandlerError(
-                "ARTIFACT_PROMPT_ANNOTATIONS_FORBIDDEN",
-                "Prompt annotations require an interactive owner Web session.",
+                (
+                    "ARTIFACT_PROMPT_ANNOTATIONS_FORBIDDEN"
+                    if prompt_annotation_ids
+                    else "DOCUMENT_CONTEXT_FORBIDDEN"
+                ),
+                "Document editing requires an interactive owner Web session.",
                 retryable=False,
                 accepted=False,
             )
@@ -3451,12 +3523,16 @@ async def _handle_sessions_send_impl(
     )
     if fork_before_message_id is not None and session_intent is not SessionIntent.CONTINUE:
         raise ValueError("forkBeforeMessageId cannot be combined with non-continue intent")
-    if prompt_annotation_ids and (
+    if (prompt_annotation_ids or document_context_request is not None) and (
         session_intent is not SessionIntent.CONTINUE or fork_before_message_id is not None
     ):
         raise RpcHandlerError(
-            "PROMPT_ANNOTATION_STALE",
-            "Prompt annotations cannot cross a reset, new task, or transcript fork.",
+            (
+                "PROMPT_ANNOTATION_STALE"
+                if prompt_annotation_ids
+                else "DOCUMENT_CONTEXT_STALE"
+            ),
+            "Document context cannot cross a reset, new task, or transcript fork.",
             retryable=True,
             accepted=False,
         )
@@ -3554,6 +3630,11 @@ async def _handle_sessions_send_impl(
     if raw_prompt_annotation_ids is not None:
         effective_fingerprint_params.pop("prompt_annotation_ids", None)
         effective_fingerprint_params["promptAnnotationIds"] = list(prompt_annotation_ids)
+    if raw_document_context is not None:
+        effective_fingerprint_params.pop("document_context", None)
+        effective_fingerprint_params["documentContext"] = dict(
+            document_context_request or {}
+        )
     ingress_identity = request_identity(
         params,
         request_session_key=key,
@@ -3620,7 +3701,7 @@ async def _handle_sessions_send_impl(
                     )
             return replay_response
 
-    if prompt_annotation_ids:
+    if prompt_annotation_ids or document_context_request is not None:
         existing_annotation_session = await storage.get_session(key)
         existing_collaboration_mode = str(
             getattr(existing_annotation_session, "collaboration_mode", "default") or "default"
@@ -3633,15 +3714,23 @@ async def _handle_sessions_send_impl(
             or existing_collaboration_mode == "plan"
         ):
             raise RpcHandlerError(
-                "ARTIFACT_PROMPT_ANNOTATIONS_PLAN_UNSUPPORTED",
-                "Prompt annotations must be sent from the normal execution mode, not Plan.",
+                (
+                    "ARTIFACT_PROMPT_ANNOTATIONS_PLAN_UNSUPPORTED"
+                    if prompt_annotation_ids
+                    else "DOCUMENT_CONTEXT_PLAN_UNSUPPORTED"
+                ),
+                "Document editing must be sent from the normal execution mode, not Plan.",
                 retryable=False,
                 accepted=False,
             )
         if _is_remote_web_guest(ctx.principal, source_hint):
             raise RpcHandlerError(
-                "ARTIFACT_PROMPT_ANNOTATIONS_FORBIDDEN",
-                "Prompt annotations require a locally proven owner.",
+                (
+                    "ARTIFACT_PROMPT_ANNOTATIONS_FORBIDDEN"
+                    if prompt_annotation_ids
+                    else "DOCUMENT_CONTEXT_FORBIDDEN"
+                ),
+                "Document editing requires a locally proven owner.",
                 retryable=False,
                 accepted=False,
             )
@@ -3657,7 +3746,7 @@ async def _handle_sessions_send_impl(
             accepted=False,
         )
 
-    artifact_turn_context: BoundPromptAnnotationContext | None = None
+    artifact_turn_context: BoundDocumentContext | BoundPromptAnnotationContext | None = None
     artifact_session_service = None
     artifact_event_emitter = None
     prompt_annotation_rows: tuple[Any, ...] = ()
@@ -3987,6 +4076,76 @@ async def _handle_sessions_send_impl(
                 "PROMPT_ANNOTATION_INVALID",
                 str(exc),
                 retryable=False,
+                accepted=False,
+            ) from exc
+    elif document_context_request is not None:
+        from opensquilla.gateway.artifact_contexts import (
+            DOCUMENT_CONTEXT_TOOL_NAMES,
+            BoundDocumentContext,
+        )
+
+        try:
+            artifact_session_service = await ArtifactSessionService.from_session_storage(
+                storage
+            )
+            current_head = await artifact_session_service.get_document_head(
+                document_context_request["documentId"],
+                expected_revision_id=document_context_request["headRevisionId"],
+            )
+            document = current_head.document
+            revision = current_head.revision
+            if (
+                document.session_key != key
+                or document.session_id != session_id
+                or document.head_revision_id != revision.revision_id
+                or revision.document_id != document.document_id
+            ):
+                raise ArtifactPromptAnnotationConflictError(
+                    "document context is not the current head for this session"
+                )
+            kind_value = getattr(document.kind, "value", document.kind)
+            media_type = revision.media_type.split(";", 1)[0].strip().lower()
+            if (
+                kind_value != "html"
+                and media_type not in {"text/html", "application/xhtml+xml"}
+                and Path(revision.filename).suffix.lower() not in {".html", ".htm", ".xhtml"}
+            ):
+                raise RpcHandlerError(
+                    "DOCUMENT_CONTEXT_UNSUPPORTED",
+                    "Only HTML documents can be edited in the current client.",
+                    retryable=False,
+                    accepted=False,
+                )
+            artifact_turn_context = BoundDocumentContext(
+                session_key=key,
+                session_id=session_id,
+                document_id=document.document_id,
+                revision_id=revision.revision_id,
+                artifact_format="html",
+                tool_names=DOCUMENT_CONTEXT_TOOL_NAMES,
+                operation_class="document_edit",
+                request_context_prompt=(
+                    "<active_document_context>\n"
+                    "The currently opened HTML document is bound to this turn. "
+                    "When the request concerns it, call document_read before document_patch. "
+                    "Patch only against the returned sha256 and exact source text; ordinary "
+                    "tools remain available for the rest of the request.\n"
+                    "</active_document_context>"
+                ),
+            )
+            artifact_event_emitter = _artifact_state_event_emitter(ctx, key)
+        except ArtifactPromptAnnotationNotFoundError as exc:
+            raise RpcHandlerError(
+                "DOCUMENT_CONTEXT_STALE",
+                "The document or selected revision no longer exists for this session.",
+                retryable=True,
+                accepted=False,
+            ) from exc
+        except ArtifactPromptAnnotationConflictError as exc:
+            raise RpcHandlerError(
+                "DOCUMENT_CONTEXT_STALE",
+                "The document changed or does not belong to this session. Refresh it.",
+                retryable=True,
                 accepted=False,
             ) from exc
     plan_run: PlanRunRecord | None = None
@@ -4458,7 +4617,11 @@ async def _handle_sessions_send_impl(
         route_envelope.runtime_services["artifact_context"] = artifact_turn_context
         route_envelope.runtime_services["artifact_session"] = artifact_session_service
         route_envelope.runtime_services["artifact_event_emitter"] = artifact_event_emitter
+        from opensquilla.gateway.artifact_contexts import BoundPromptAnnotationContext
+
         if (
+            isinstance(artifact_turn_context, BoundPromptAnnotationContext)
+            and
             route_envelope.source_kind.value == "web"
             and route_envelope.interaction_mode.value == "interactive"
             and ctx.principal.is_owner
@@ -4480,6 +4643,41 @@ async def _handle_sessions_send_impl(
                 route_envelope.runtime_services["desktop_artifact_bridge"] = (
                     desktop_artifact_bridge
                 )
+    if (
+        route_envelope.source_kind.value == "web"
+        and route_envelope.interaction_mode.value == "interactive"
+        and ctx.principal.is_owner
+        and not guest_safe
+    ):
+        try:
+            from opensquilla.artifacts import ArtifactStore
+            from opensquilla.gateway.generated_artifact_adoption import (
+                GeneratedArtifactAdopter,
+            )
+
+            if artifact_session_service is None:
+                artifact_session_service = (
+                    await ArtifactSessionService.from_session_storage(storage)
+                )
+            route_envelope.runtime_services["generated_artifact_adopter"] = (
+                GeneratedArtifactAdopter(
+                    service=artifact_session_service,
+                    store=ArtifactStore(media_root),
+                    session_key=key,
+                    session_id=session_id,
+                    event_emitter=(
+                        artifact_event_emitter
+                        if callable(artifact_event_emitter)
+                        else _artifact_state_event_emitter(ctx, key)
+                    ),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - adoption is a recoverable enhancement
+            log.warning(
+                "generated_artifact_adopter_unavailable",
+                session_key=key,
+                error_type=type(exc).__name__,
+            )
     elevated_hint = _trusted_elevated_hint(ctx, source_hint)
     if elevated_hint is not None:
         route_envelope.metadata["elevated"] = elevated_hint
@@ -4867,7 +5065,7 @@ async def _handle_sessions_send_impl(
         )
         _emit_steer_metric("legacy_interrupt_requested", session_key=key)
     runtime_mode = "interrupt" if requested_mode == "steer" else requested_mode
-    if prompt_annotation_ids:
+    if prompt_annotation_ids or document_context_request is not None:
         # One accepted annotation batch owns one distinct turn and one
         # ChangeSet. It must never be merged into or interrupt another turn.
         runtime_mode = "followup"
@@ -4918,6 +5116,13 @@ async def _handle_sessions_send_impl(
         raise RpcHandlerError(
             "PROMPT_ANNOTATION_DURABILITY_UNAVAILABLE",
             "Prompt annotations require atomic task acceptance; retry after Gateway recovery.",
+            retryable=True,
+            accepted=False,
+        )
+    if document_context_request is not None and not atomic_runtime_acceptance:
+        raise RpcHandlerError(
+            "DOCUMENT_CONTEXT_DURABILITY_UNAVAILABLE",
+            "Document editing requires atomic task acceptance; retry after Gateway recovery.",
             retryable=True,
             accepted=False,
         )

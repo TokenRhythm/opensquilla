@@ -282,16 +282,51 @@ const resourceSignature = computed(() => [
   props.previewSandboxProfile,
 ].join('\u0000'))
 
+let loadedResourceSignature: string | null = null
+let resourceSyncGeneration = 0
+
+async function syncPreviewResource(
+  signature: string,
+  suspended: boolean,
+  returningFromSuspend: boolean,
+) {
+  const generation = ++resourceSyncGeneration
+  if (suspended) {
+    preview.suspend()
+    return
+  }
+
+  if (returningFromSuspend) await preview.resume()
+  if (
+    generation !== resourceSyncGeneration
+    || props.suspended
+    || resourceSignature.value !== signature
+  ) return
+
+  // A panel opened directly on Source has never loaded preview bytes. Its
+  // first resume performs that initial load, so recording the signature here
+  // avoids fetching the same revision twice.
+  if (returningFromSuspend && loadedResourceSignature === null) {
+    loadedResourceSignature = signature
+    return
+  }
+
+  // Vue's watch tuple remembers signatures even while the panel is hidden.
+  // Keep a separate identity for the bytes actually loaded by the preview so
+  // resuming after a Source save cannot revive an older native lease or Blob.
+  if (loadedResourceSignature !== signature) await preview.reload()
+  else if (!returningFromSuspend) await preview.resume()
+  if (
+    generation === resourceSyncGeneration
+    && !props.suspended
+    && resourceSignature.value === signature
+  ) loadedResourceSignature = signature
+}
+
 watch(
   [resourceSignature, () => props.suspended],
   ([signature, suspended], previous) => {
-    if (suspended) {
-      preview.suspend()
-      return
-    }
-    const previousSignature = previous?.[0]
-    if (!previous || signature !== previousSignature) void preview.reload()
-    else void preview.resume()
+    void syncPreviewResource(signature, suspended, previous?.[1] === true)
   },
   { immediate: true },
 )

@@ -101,6 +101,24 @@ describe('workbench runtime registry', () => {
     expect(manager.hasRuntime(descriptor.id)).toBe(true)
   })
 
+  it('forwards a preserve-runtime flush without disposing the live panel', async () => {
+    const registry = new WorkbenchPanelRegistry()
+    const beforeClose = vi.fn(async () => true)
+    registry.register({
+      kind: 'artifact-preview',
+      createRuntime: () => ({ beforeClose }),
+    })
+    const manager = new WorkbenchRuntimeManager(registry)
+    const descriptor = item('send-flush')
+    manager.handle({ type: 'open', item: descriptor })
+    await manager.flush()
+
+    await expect(manager.beforeClose(descriptor, { preserveRuntime: true }))
+      .resolves.toBe(true)
+    expect(beforeClose).toHaveBeenCalledWith({ preserveRuntime: true })
+    expect(manager.hasRuntime(descriptor.id)).toBe(true)
+  })
+
   it('recreates dispose-on-suspend resources when resumed', async () => {
     const registry = new WorkbenchPanelRegistry()
     const runtimes: WorkbenchPanelRuntime[] = []

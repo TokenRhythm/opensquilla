@@ -41,7 +41,7 @@ class SourceKind(StrEnum):
 
 
 PRINCIPAL_HOST_EXECUTE_METADATA_KEY = "principal_host_execute"
-_ARTIFACT_MUTATION_WRITER_NAMES = frozenset({"document_apply"})
+_ARTIFACT_MUTATION_WRITER_NAMES = frozenset({"document_apply", "document_patch"})
 
 
 @dataclass(frozen=True)
@@ -593,14 +593,20 @@ def tool_context_from_envelope(
     artifact_session = envelope.runtime_services.get("artifact_session")
     desktop_artifact_bridge = envelope.runtime_services.get("desktop_artifact_bridge")
     artifact_event_emitter = envelope.runtime_services.get("artifact_event_emitter")
+    generated_artifact_adopter = envelope.runtime_services.get(
+        "generated_artifact_adopter"
+    )
     artifact_tool_names: object = getattr(artifact_context, "tool_names", frozenset())
     surfaced_tools: set[str] | None = None
     exclusive_tools: frozenset[str] | None = None
     artifact_mutation_attempt_controller: Any | None = None
-    from opensquilla.gateway.artifact_contexts import BoundPromptAnnotationContext
+    from opensquilla.gateway.artifact_contexts import (
+        BoundDocumentContext,
+        BoundPromptAnnotationContext,
+    )
 
     if (
-        isinstance(artifact_context, BoundPromptAnnotationContext)
+        isinstance(artifact_context, (BoundDocumentContext, BoundPromptAnnotationContext))
         and artifact_session is not None
         and caller_kind is CallerKind.WEB
         and interaction_mode is InteractionMode.INTERACTIVE
@@ -609,12 +615,13 @@ def tool_context_from_envelope(
         and isinstance(artifact_tool_names, frozenset)
     ):
         surfaced_tools = set(artifact_tool_names)
-        exclusive_tools = frozenset(artifact_tool_names)
-        allowed_tools = (
-            set(exclusive_tools)
-            if allowed_tools is None
-            else set(allowed_tools) & exclusive_tools
-        )
+        if isinstance(artifact_context, BoundPromptAnnotationContext):
+            exclusive_tools = frozenset(artifact_tool_names)
+            allowed_tools = (
+                set(exclusive_tools)
+                if allowed_tools is None
+                else set(allowed_tools) & exclusive_tools
+            )
         if _ARTIFACT_MUTATION_WRITER_NAMES & artifact_tool_names:
             task_id = str(envelope.metadata.get("task_id") or "").strip()
             document_id = str(getattr(artifact_context, "document_id", "") or "").strip()
@@ -637,6 +644,15 @@ def tool_context_from_envelope(
         desktop_artifact_bridge = None
     if not callable(artifact_event_emitter):
         artifact_event_emitter = None
+    if not (
+        callable(generated_artifact_adopter)
+        and caller_kind is CallerKind.WEB
+        and envelope.source_kind is SourceKind.WEB
+        and interaction_mode is InteractionMode.INTERACTIVE
+        and is_owner
+        and not guest_safe
+    ):
+        generated_artifact_adopter = None
     if desktop_artifact_bridge is not None:
         from opensquilla.gateway.desktop_artifact_bridge import (
             DesktopArtifactBridgeClient,
@@ -710,6 +726,7 @@ def tool_context_from_envelope(
         artifact_session=artifact_session,
         desktop_artifact_bridge=desktop_artifact_bridge,
         artifact_event_emitter=artifact_event_emitter,
+        generated_artifact_adopter=generated_artifact_adopter,
         exclusive_tools=exclusive_tools,
         artifact_mutation_attempt_controller=(
             artifact_mutation_attempt_controller

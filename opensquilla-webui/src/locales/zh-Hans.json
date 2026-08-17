@@ -148,7 +148,7 @@
     "resources": {
       "title": "工作台", "count": "工作台（{count}）", "empty": "暂无附件、工作副本或已发布产物。",
       "groups": { "attachments": "附件与参考", "documents": "工作副本", "deliverables": "已发布", "urls": "链接" },
-      "preview": "预览 {name}", "download": "下载 {name}", "edit": "创建 {name} 的可编辑副本", "publish": "发布 {name}",
+      "open": "打开 {name}", "preparing": "正在准备编辑器…", "retry": "重试", "preview": "预览 {name}", "download": "下载 {name}", "edit": "创建 {name} 的可编辑副本", "publish": "发布 {name}",
       "imported": "已为 {name} 创建可编辑工作副本。", "published": "已发布 {name} 的不可变快照。",
       "publishUnavailable": "此文档没有可发布的当前版本。", "actionFailed": "工作台操作失败。",
       "unavailableReasons": { "htmlEncodingUnsupported": "此 HTML 不是有效的 UTF-8，无法安全预览或编辑。", "htmlValidationFailed": "此 HTML 未通过安全校验，无法预览或编辑。", "htmlEditTooLarge": "此 HTML 过大，无法在应用内编辑；仍可下载。", "htmlPreviewTooLarge": "此 HTML 过大，无法在应用内安全预览；仍可下载。", "officeAdapterNotAvailable": "Office 编辑能力尚未启用。", "unsupported": "此资源暂不支持此操作。" }

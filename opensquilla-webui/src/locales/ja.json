@@ -148,7 +148,7 @@
     "resources": {
       "title": "ワークベンチ", "count": "ワークベンチ（{count}）", "empty": "添付ファイル、作業コピー、公開済み成果物はまだありません。",
       "groups": { "attachments": "添付ファイル", "documents": "作業コピー", "deliverables": "公開済み", "urls": "リンク" },
-      "preview": "{name} をプレビュー", "download": "{name} をダウンロード", "edit": "{name} のコピーを編集", "publish": "{name} を公開",
+      "open": "{name} を開く", "preparing": "エディターを準備しています…", "retry": "再試行", "preview": "{name} をプレビュー", "download": "{name} をダウンロード", "edit": "{name} のコピーを編集", "publish": "{name} を公開",
       "imported": "{name} の編集可能な作業コピーを作成しました。", "published": "{name} の不変スナップショットを公開しました。",
       "publishUnavailable": "このドキュメントには公開可能な現在のリビジョンがありません。", "actionFailed": "ワークベンチ操作に失敗しました。",
       "unavailableReasons": { "htmlEncodingUnsupported": "この HTML は有効な UTF-8 ではないため、安全にプレビューまたは編集できません。", "htmlValidationFailed": "この HTML は安全なプレビューまたは編集の検証に失敗しました。", "htmlEditTooLarge": "この HTML はアプリ内で編集するには大きすぎます。ダウンロードは引き続き可能です。", "htmlPreviewTooLarge": "この HTML はアプリ内で安全にプレビューするには大きすぎます。ダウンロードは引き続き可能です。", "officeAdapterNotAvailable": "Office の編集機能はまだ利用できません。", "unsupported": "この操作はこのリソースでは利用できません。" }

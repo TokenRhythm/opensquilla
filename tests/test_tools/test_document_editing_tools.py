@@ -24,6 +24,8 @@ from opensquilla.artifact_session import (
 from opensquilla.artifacts import ArtifactStore
 from opensquilla.engine.types import ToolCall
 from opensquilla.gateway.artifact_contexts import (
+    DOCUMENT_CONTEXT_TOOL_NAMES,
+    BoundDocumentContext,
     BoundPromptAnnotationContext,
 )
 from opensquilla.tools import get_default_registry
@@ -52,6 +54,66 @@ RETIRED_ANNOTATION_TOOL_NAMES = frozenset(
         "html_search_source",
     }
 )
+
+
+async def _bound_document_context(tmp_path: Path, *, source: bytes | None = None):
+    service = await ArtifactSessionService.open(tmp_path / "bound-document.db")
+    store = ArtifactStore(tmp_path / "bound-document-media")
+    payload = source or b"<main><h1>Original heading</h1><p>Keep me</p></main>"
+    ref = store.publish_bytes(
+        payload,
+        session_id=SESSION_ID,
+        session_key=SESSION_KEY,
+        name="bound.html",
+        mime="text/html",
+        source="bound_document_test",
+    )
+    created = await service.create_document(
+        session_key=SESSION_KEY,
+        session_id=SESSION_ID,
+        name="Bound page",
+        kind=ArtifactKind.HTML,
+        initial_artifact=ArtifactBlobRef(
+            artifact_id=ref.id,
+            sha256=ref.sha256,
+            filename=ref.name,
+            media_type=ref.mime,
+            byte_size=ref.size,
+        ),
+        actor=Actor(ActorKind.USER, "owner"),
+    )
+    bound = BoundDocumentContext(
+        session_key=SESSION_KEY,
+        session_id=SESSION_ID,
+        document_id=created.document.document_id,
+        revision_id=created.revision.revision_id,
+        artifact_format="html",
+        tool_names=DOCUMENT_CONTEXT_TOOL_NAMES,
+        operation_class="document_edit",
+        request_context_prompt="Bound current document.",
+    )
+    controller = ArtifactMutationAttemptController(
+        service,
+        document_id=created.document.document_id,
+        base_revision_id=created.revision.revision_id,
+        turn_id=TURN_ID,
+    )
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        interaction_mode=InteractionMode.INTERACTIVE,
+        subagent_depth=0,
+        agent_id="artifact-agent",
+        session_key=SESSION_KEY,
+        task_id=TURN_ID,
+        artifact_media_root=str(tmp_path / "bound-document-media"),
+        artifact_session_id=SESSION_ID,
+        surfaced_tools=set(DOCUMENT_CONTEXT_TOOL_NAMES),
+        artifact_context=bound,
+        artifact_session=service,
+        artifact_mutation_attempt_controller=controller,
+    )
+    return service, store, payload, ref, created, ctx
 
 
 async def _sent_img_context(tmp_path: Path):
@@ -384,6 +446,131 @@ def test_restricted_document_toolset_is_exactly_four_tools() -> None:
     assert set(writer.spec.parameters["properties"]) == {"mutations"}
     mutation_schema = writer.spec.parameters["properties"]["mutations"]["items"]
     assert set(mutation_schema["properties"]) == {"grant_token", "input"}
+
+    patch_writer = registry.get("document_patch")
+    assert patch_writer is not None
+    assert patch_writer.spec.owner_only is True
+    assert patch_writer.spec.exposed_by_default is False
+    assert set(patch_writer.spec.parameters["properties"]) == {
+        "edits",
+        "expectedSha256",
+    }
+    edit_schema = patch_writer.spec.parameters["properties"]["edits"]["items"]
+    assert set(edit_schema["properties"]) == {"expectedText", "replacement"}
+
+
+@pytest.mark.asyncio
+async def test_bound_document_patch_commits_unique_text_edits_atomically(
+    tmp_path: Path,
+) -> None:
+    service, store, _source, ref, created, ctx = await _bound_document_context(tmp_path)
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        read = await _call(handler, "document_read", {"view": "source"})
+        assert read.is_error is False, read.content
+        assert json.loads(read.content)["sha256"] == ref.sha256
+
+        controller = ctx.artifact_mutation_attempt_controller
+        assert controller is not None
+        await controller.observe_intent("call-document_patch")
+        applied = await _call(
+            handler,
+            "document_patch",
+            {
+                "expectedSha256": ref.sha256,
+                "edits": [
+                    {
+                        "expectedText": "Original heading",
+                        "replacement": "Updated heading",
+                    },
+                    {
+                        "expectedText": "Keep me",
+                        "replacement": "Still here",
+                    },
+                ],
+            },
+        )
+
+        assert applied.is_error is False, applied.content
+        result = json.loads(applied.content)
+        assert result["status"] == "applied"
+        assert result["change_set"]["mutation_kind"] == "document_text_patch"
+        assert result["change_set"]["patch_count"] == 2
+        document = await service.get_document(created.document.document_id)
+        revision = await service.get_revision(document.head_revision_id)
+        _new_ref, path = store.resolve_for_download(
+            revision.artifact_id,
+            session_id=SESSION_ID,
+        )
+        assert path.read_bytes() == (
+            b"<main><h1>Updated heading</h1><p>Still here</p></main>"
+        )
+        change_sets = await service.list_change_sets(created.document.document_id)
+        assert len(change_sets) == 1
+        assert change_sets[0].status is ChangeSetStatus.APPLIED
+        assert change_sets[0].operations[0]["op"] == "document_text_patch"
+        assert len(await service.list_revisions(created.document.document_id)) == 2
+        receipt = await service.reconcile_mutation_attempt(
+            document_id=created.document.document_id,
+            turn_id=TURN_ID,
+            tool_use_id="call-document_patch",
+        )
+        assert receipt.status is MutationAttemptStatus.APPLIED
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "edits", "expected_code"),
+    [
+        (
+            b"<p>same</p><p>same</p>",
+            [{"expectedText": "same", "replacement": "changed"}],
+            "DOCUMENT_PATCH_TEXT_AMBIGUOUS",
+        ),
+        (
+            b"<p>abcdef</p>",
+            [
+                {"expectedText": "abcdef", "replacement": "one"},
+                {"expectedText": "cde", "replacement": "two"},
+            ],
+            "DOCUMENT_PATCH_INVALID",
+        ),
+        (
+            b"<p>abcdef</p>",
+            [{"expectedText": "", "replacement": "changed"}],
+            "DOCUMENT_PATCH_EXPECTED_TEXT_INVALID",
+        ),
+    ],
+    ids=["ambiguous", "overlap", "empty"],
+)
+async def test_bound_document_patch_rejects_unsafe_text_matches(
+    tmp_path: Path,
+    source: bytes,
+    edits: list[dict[str, str]],
+    expected_code: str,
+) -> None:
+    service, _store, _source, ref, created, ctx = await _bound_document_context(
+        tmp_path,
+        source=source,
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        controller = ctx.artifact_mutation_attempt_controller
+        assert controller is not None
+        await controller.observe_intent("call-document_patch")
+        result = await _call(
+            handler,
+            "document_patch",
+            {"expectedSha256": ref.sha256, "edits": edits},
+        )
+        assert result.is_error is True
+        assert expected_code in result.content
+        assert await service.list_change_sets(created.document.document_id) == ()
+        assert len(await service.list_revisions(created.document.document_id)) == 1
+    finally:
+        await service.close()
 
 
 @pytest.mark.parametrize(

@@ -99,7 +99,7 @@ _REPEATED_CALL_NOTICE_ENV = "OPENSQUILLA_REPEATED_CALL_NOTICE"
 # Repeat-tracking state per handler closure holds keys and hashes only, never
 # result content.
 _REPEATED_CALL_NOTICE_MAX_ENTRIES = 1024
-_PROMPT_ANNOTATION_WRITERS = frozenset({"document_apply"})
+_PROMPT_ANNOTATION_WRITERS = frozenset({"document_apply", "document_patch"})
 # ToolSpec carries no mutating/read-only flag, so hash-compare only tools whose
 # results are pure functions of their arguments and observed state. Execution
 # and write tools stay excluded: byte-identical output from them is no proof

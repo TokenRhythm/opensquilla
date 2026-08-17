@@ -189,3 +189,36 @@ def test_prompt_annotation_ids_are_ordered_idempotency_fingerprint_input() -> No
 
     assert replay == first
     assert reordered != first
+
+
+def test_document_context_is_canonical_idempotency_fingerprint_input() -> None:
+    first = request_fingerprint(
+        {
+            "message": "modify",
+            "documentContext": {
+                "documentId": "document-1",
+                "headRevisionId": "revision-1",
+            },
+        }
+    )
+    replay = request_fingerprint(
+        {
+            "message": "modify",
+            "document_context": {
+                "document_id": "document-1",
+                "head_revision_id": "revision-1",
+            },
+        }
+    )
+    changed_head = request_fingerprint(
+        {
+            "message": "modify",
+            "documentContext": {
+                "documentId": "document-1",
+                "headRevisionId": "revision-2",
+            },
+        }
+    )
+
+    assert replay == first
+    assert changed_head != first

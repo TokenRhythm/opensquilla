@@ -22,6 +22,27 @@ export function workbenchResourceKey(resource: WorkbenchResourceRef): string {
   return `${resource.type}:${workbenchResourceRefId(resource)}`
 }
 
+/**
+ * Collapse only server-declared resource lineages for navigation. Raw resource
+ * identities remain available to transcript cards, downloads and audit views.
+ * Names and content hashes are intentionally ignored: two unrelated files may
+ * legitimately share either value.
+ */
+export function canonicalWorkbenchResources(
+  resources: readonly WorkbenchResource[],
+): WorkbenchResource[] {
+  const documentIds = new Set(
+    resources
+      .filter(resource => resource.resource.type === 'document')
+      .map(resource => workbenchResourceRefId(resource.resource)),
+  )
+  return resources.filter((resource) => {
+    if (resource.resource.type === 'document') return true
+    const documentId = resource.relations.documentId || ''
+    return !documentId || !documentIds.has(documentId)
+  })
+}
+
 export function resourceCollectionWorkbenchItemId(sessionKey: string): string {
   return `resource-collection:${identityToken(sessionKey)}`
 }
@@ -31,6 +52,7 @@ export function createResourceCollectionWorkbenchItem(options: {
   sessionKey: string
   title: string
 }): WorkbenchItem {
+  const resources = canonicalWorkbenchResources(options.resources)
   return {
     id: resourceCollectionWorkbenchItemId(options.sessionKey),
     kind: 'resource-collection',
@@ -39,7 +61,7 @@ export function createResourceCollectionWorkbenchItem(options: {
     hostKind: 'dom',
     retention: 'keep-alive',
     payload: {
-      resources: [...options.resources],
+      resources,
       sessionKey: options.sessionKey,
     },
   }

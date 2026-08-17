@@ -148,7 +148,7 @@
     "resources": {
       "title": "Arbeitsbereich", "count": "Arbeitsbereich ({count})", "empty": "Noch keine Anhänge, Arbeitskopien oder veröffentlichten Ergebnisse.",
       "groups": { "attachments": "Anhänge", "documents": "Arbeitskopien", "deliverables": "Veröffentlicht", "urls": "Links" },
-      "preview": "{name} ansehen", "download": "{name} herunterladen", "edit": "Kopie von {name} bearbeiten", "publish": "{name} veröffentlichen",
+      "open": "{name} öffnen", "preparing": "Editor wird vorbereitet…", "retry": "Erneut versuchen", "preview": "{name} ansehen", "download": "{name} herunterladen", "edit": "Kopie von {name} bearbeiten", "publish": "{name} veröffentlichen",
       "imported": "Eine bearbeitbare Arbeitskopie von {name} wurde erstellt.", "published": "Ein unveränderlicher Stand von {name} wurde veröffentlicht.",
       "publishUnavailable": "Dieses Dokument hat keine veröffentlichbare aktuelle Version.", "actionFailed": "Die Arbeitsbereichsaktion ist fehlgeschlagen.",
       "unavailableReasons": { "htmlEncodingUnsupported": "Dieses HTML ist kein gültiges UTF-8 und kann nicht sicher angezeigt oder bearbeitet werden.", "htmlValidationFailed": "Dieses HTML konnte nicht für eine sichere Vorschau oder Bearbeitung validiert werden.", "htmlEditTooLarge": "Dieses HTML ist für die Bearbeitung in der App zu groß. Es kann weiterhin heruntergeladen werden.", "htmlPreviewTooLarge": "Dieses HTML ist für eine sichere Vorschau in der App zu groß. Es kann weiterhin heruntergeladen werden.", "officeAdapterNotAvailable": "Die Office-Bearbeitung ist noch nicht verfügbar.", "unsupported": "Diese Aktion ist für diese Ressource nicht verfügbar." }

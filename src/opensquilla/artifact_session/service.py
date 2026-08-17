@@ -200,6 +200,23 @@ class ArtifactSessionService:
     async def get_document(self, document_id: str) -> Document:
         return await self.repository.get_document(_required(document_id, "document_id"))
 
+    async def get_document_head(
+        self,
+        document_id: str,
+        *,
+        expected_revision_id: str | None = None,
+    ) -> CommitResult:
+        """Read and optionally fence the current head in one repository snapshot."""
+
+        return await self.repository.get_document_head(
+            _required(document_id, "document_id"),
+            expected_revision_id=(
+                None
+                if expected_revision_id is None
+                else _required(expected_revision_id, "expected_revision_id")
+            ),
+        )
+
     async def adopt_document(
         self,
         *,
@@ -216,6 +233,33 @@ class ArtifactSessionService:
             name=_required(name, "name"),
             kind=kind,
             initial_artifact=_blob(initial_artifact),
+            actor=_actor(actor),
+        )
+
+    async def adopt_generated_deliverable(
+        self,
+        *,
+        session_key: str,
+        session_id: str,
+        name: str,
+        kind: ArtifactKind,
+        deliverable: ArtifactBlobRef,
+        actor: Actor,
+    ) -> tuple[CommitResult, DocumentSourceBinding, bool]:
+        """Adopt one immutable generated deliverable as a stable Document.
+
+        The initial revision references the already-published ArtifactStore
+        object directly.  The repository creates the Document and its source
+        binding in one transaction, so concurrent publication/open paths
+        converge on one logical identity without copying the public bytes.
+        """
+
+        return await self.repository.adopt_generated_deliverable(
+            session_key=_bounded_text(session_key, "session_key", max_bytes=2048),
+            session_id=_bounded_text(session_id, "session_id", max_bytes=512),
+            name=_bounded_text(name, "name", max_bytes=512),
+            kind=kind,
+            deliverable=_blob(deliverable),
             actor=_actor(actor),
         )
 

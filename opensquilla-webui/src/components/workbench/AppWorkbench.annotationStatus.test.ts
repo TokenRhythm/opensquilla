@@ -55,4 +55,22 @@ describe('AppWorkbench annotation mode status', () => {
       'refreshOpenArtifactDocuments(sessionKey)',
     )
   })
+
+  it('surfaces a localized readonly reason instead of a generic open failure', () => {
+    const start = appWorkbenchSource.indexOf('async function openWorkbenchResource(')
+    const end = appWorkbenchSource.indexOf('\nasync function importWorkbenchResourceForSession', start)
+    const source = appWorkbenchSource.slice(start, end)
+
+    expect(start).toBeGreaterThan(-1)
+    expect(source).toContain('current?.reasonCode || workbenchResourceActionReasonCode(')
+    expect(source).toContain('workbenchResourceUnavailableReasonKey(')
+    expect(source).not.toContain("throw new Error(t('workbench.resources.actionFailed'))")
+  })
+
+  it('contains expected resource refresh aborts at every fire-and-forget call site', () => {
+    const guardedLoads = appWorkbenchSource.match(
+      /void workbenchResources\.load\([^;]+?\.catch\(\(\) => undefined\)/gs,
+    ) || []
+    expect(guardedLoads).toHaveLength(4)
+  })
 })

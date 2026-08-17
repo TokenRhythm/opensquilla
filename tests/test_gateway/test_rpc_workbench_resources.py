@@ -24,6 +24,8 @@ from opensquilla.artifact_session import (
     MutationAttemptStatus,
 )
 from opensquilla.artifacts import ArtifactBundle, ArtifactBundleSourceFile, ArtifactStore
+from opensquilla.engine.types import ArtifactEvent
+from opensquilla.gateway.generated_artifact_adoption import GeneratedArtifactAdopter
 from opensquilla.gateway.rpc import RpcContext, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
@@ -38,6 +40,7 @@ def test_workbench_resource_method_scopes_are_fail_closed() -> None:
     assert METHOD_SCOPES["workbench.resources.list"] == READ_SCOPE
     assert METHOD_SCOPES["workbench.resources.get"] == READ_SCOPE
     assert METHOD_SCOPES["workbench.previews.create"] == READ_SCOPE
+    assert METHOD_SCOPES["workbench.resources.open"] == WRITE_SCOPE
     assert METHOD_SCOPES["documents.import"] == WRITE_SCOPE
     assert METHOD_SCOPES["documents.publish"] == WRITE_SCOPE
 
@@ -197,6 +200,26 @@ async def test_multifile_deliverable_is_preview_only_and_never_truncated_on_impo
         limit=10,
     ) == ()
 
+    opened = await _dispatch(
+        env,
+        "workbench.resources.open",
+        {
+            "sessionKey": SESSION_KEY,
+            "resourceRef": {"type": "deliverable", "artifactId": ref.id},
+        },
+    )
+    assert opened.error is None, opened.error
+    assert opened.payload["disposition"] == "readonly"
+    assert opened.payload["resolution"] == {"status": "readonly"}
+    assert opened.payload["materialized"] is False
+    assert opened.payload["reasonCode"] == "html_bundle_edit_not_supported"
+    assert opened.payload["resource"]["resource"]["id"] == ref.id
+    assert await service.list_documents(
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        limit=10,
+    ) == ()
+
 
 @pytest.mark.asyncio
 async def test_stale_partial_single_file_bundle_is_safely_revalidated_for_editing(
@@ -338,6 +361,118 @@ async def resource_env(tmp_path: Path):
 
 async def _dispatch(env, method: str, params: dict[str, object]):
     return await get_dispatcher().dispatch(f"test:{method}", method, params, env.ctx)
+
+
+@pytest.mark.asyncio
+async def test_generated_deliverable_helper_adopts_supported_html_without_copying(
+    resource_env,
+) -> None:
+    env = resource_env
+    ref = env.store.publish_bytes(
+        b"<!doctype html><h1>generated document</h1>",
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name="generated.html",
+        mime="text/html",
+        source="generated-helper-test",
+    )
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+
+    first = await resource_rpc.adopt_generated_deliverable_if_editable(
+        service=service,
+        store=env.store,
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        ref=ref,
+        actor=Actor(ActorKind.AGENT, "agent-main"),
+    )
+    second = await resource_rpc.adopt_generated_deliverable_if_editable(
+        service=service,
+        store=env.store,
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        ref=ref,
+        actor=Actor(ActorKind.AGENT, "agent-main"),
+    )
+
+    assert first is not None
+    assert second is not None
+    document, revision, binding, created = first
+    replay_document, replay_revision, replay_binding, replay_created = second
+    assert created is True
+    assert replay_created is False
+    assert replay_document == document
+    assert replay_revision == revision
+    assert replay_binding == binding
+    assert revision.artifact_id == ref.id
+    assert binding.source_resource_id == ref.id
+
+    opened = await _dispatch(
+        env,
+        "workbench.resources.open",
+        {
+            "sessionKey": SESSION_KEY,
+            "resourceRef": {"type": "deliverable", "artifactId": ref.id},
+        },
+    )
+    assert opened.error is None, opened.error
+    assert opened.payload["disposition"] == "document"
+    assert opened.payload["resolution"] == {"status": "current"}
+    assert opened.payload["materialized"] is False
+    assert opened.payload["document"]["documentId"] == document.document_id
+    assert opened.payload["revision"]["artifactId"] == ref.id
+    assert opened.payload["resource"]["resource"]["type"] == "document"
+
+
+@pytest.mark.asyncio
+async def test_generated_artifact_adopter_emits_once_after_atomic_adoption(
+    resource_env,
+) -> None:
+    env = resource_env
+    ref = env.store.publish_bytes(
+        b"<!doctype html><h1>generated through turn stream</h1>",
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name="stream-generated.html",
+        mime="text/html",
+        source="generated-adopter-test",
+    )
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    emitted: list[dict[str, object]] = []
+
+    async def emit(payload: dict[str, object]) -> None:
+        emitted.append(payload)
+
+    adopter = GeneratedArtifactAdopter(
+        service=service,
+        store=env.store,
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        event_emitter=emit,
+    )
+    event = ArtifactEvent(**ref.to_dict())
+
+    await adopter(event)
+    await adopter(event)
+
+    documents = await service.list_documents(
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        limit=10,
+    )
+    assert len(documents) == 1
+    revisions = await service.list_revisions(documents[0].document_id, limit=10)
+    assert len(revisions) == 1
+    assert revisions[0].artifact_id == ref.id
+    assert emitted == [
+        {
+            "artifactEventSeq": 1,
+            "documentId": documents[0].document_id,
+            "revisionId": revisions[0].revision_id,
+            "changeSetId": None,
+            "action": "document.created",
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -515,6 +650,89 @@ async def _import_attachment(env, attachment_id: str, *, key: str):
 
 
 @pytest.mark.asyncio
+async def test_resources_open_silently_materializes_legacy_html_sources(resource_env) -> None:
+    env = resource_env
+    attachment = await _append_attachment(
+        env,
+        message_id="silent-open-attachment",
+        name="uploaded.html",
+        payload=b"<!doctype html><h1>uploaded</h1>",
+        staged=True,
+    )
+    deliverable = env.store.publish_bytes(
+        b"<!doctype html><h1>published</h1>",
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name="published.html",
+        mime="text/html",
+        source="silent-open-test",
+    )
+    source_refs = (
+        (
+            {
+                "type": "attachment",
+                "attachmentId": str(attachment["attachment_id"]),
+            },
+            hashlib.sha256(b"<!doctype html><h1>uploaded</h1>").hexdigest(),
+        ),
+        (
+            {"type": "deliverable", "artifactId": deliverable.id},
+            deliverable.sha256,
+        ),
+    )
+
+    document_ids: list[str] = []
+    for index, (source_ref, source_sha256) in enumerate(source_refs):
+        first = await _dispatch(
+            env,
+            "workbench.resources.open",
+            {
+                "sessionKey": SESSION_KEY,
+                "resourceRef": source_ref,
+                "intent": "edit-current",
+                "expectedSha256": source_sha256,
+                "idempotencyKey": f"silent-open-{index}",
+            },
+        )
+        assert first.error is None, first.error
+        assert first.payload["disposition"] == "document"
+        assert first.payload["resolution"] == {"status": "materialized"}
+        assert first.payload["materialized"] is True
+        assert first.payload["resource"]["resource"]["type"] == "document"
+        assert first.payload["binding"]["source"]["type"] == source_ref["type"]
+        document_id = first.payload["document"]["documentId"]
+        document_ids.append(document_id)
+        assert first.payload["resource"]["resource"]["documentId"] == document_id
+        assert first.payload["revision"]["revisionId"] == (
+            first.payload["document"]["headRevisionId"]
+        )
+
+        replay = await _dispatch(
+            env,
+            "workbench.resources.open",
+            {"sessionKey": SESSION_KEY, "resource": source_ref},
+        )
+        assert replay.error is None, replay.error
+        assert replay.payload["disposition"] == "document"
+        assert replay.payload["resolution"] == {"status": "current"}
+        assert replay.payload["materialized"] is False
+        assert replay.payload["document"]["documentId"] == document_id
+        assert replay.payload["revision"]["revisionId"] == (
+            first.payload["revision"]["revisionId"]
+        )
+
+    assert len(set(document_ids)) == 2
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    assert len(
+        await service.list_documents(
+            session_key=SESSION_KEY,
+            session_id=env.session.session_id,
+            limit=10,
+        )
+    ) == 2
+
+
+@pytest.mark.asyncio
 async def test_attachment_preview_descriptor_is_read_only_and_content_free(resource_env) -> None:
     env = resource_env
     source = b"<!doctype html><h1>private preview heading</h1>"
@@ -606,6 +824,19 @@ async def test_invalid_html_attachments_fail_closed_without_read_side_writes(res
         assert preview.error.code == "WORKBENCH_PREVIEW_UNSUPPORTED"
         assert preview.error.details == {"reasonCode": expected_reason}
 
+        opened = await _dispatch(
+            env,
+            "workbench.resources.open",
+            {
+                "sessionKey": SESSION_KEY,
+                "resourceRef": {"type": "attachment", "id": attachment_id},
+            },
+        )
+        assert opened.error is None, opened.error
+        assert opened.payload["disposition"] == "readonly"
+        assert opened.payload["reasonCode"] == expected_reason
+        assert opened.payload["resource"]["resource"]["id"] == attachment_id
+
     assert env.storage.conn.total_changes == changes_before_reads
     service = await ArtifactSessionService.from_session_storage(env.storage)
     assert await service.list_documents(
@@ -696,6 +927,22 @@ async def test_oversized_html_capabilities_fail_before_doomed_ui_actions(resourc
     assert preview.error is not None
     assert preview.error.code == "WORKBENCH_PREVIEW_UNSUPPORTED"
     assert preview.error.details == {"reasonCode": "html_preview_size_unsupported"}
+
+    for attachment_id in (
+        str(edit_too_large["attachment_id"]),
+        str(preview_too_large["attachment_id"]),
+    ):
+        opened = await _dispatch(
+            env,
+            "workbench.resources.open",
+            {
+                "sessionKey": SESSION_KEY,
+                "resourceRef": {"type": "attachment", "id": attachment_id},
+            },
+        )
+        assert opened.error is None, opened.error
+        assert opened.payload["disposition"] == "readonly"
+        assert opened.payload["reasonCode"] == "html_edit_size_unsupported"
 
 
 @pytest.mark.asyncio
@@ -1392,6 +1639,41 @@ async def test_publish_receipt_pins_immutable_revision_and_recovers_promotion(
     )
     assert patched.error is None, patched.error
     assert patched.payload["revision"]["sha256"] != publication["sha256"]
+
+    documents_before_open = await (
+        await ArtifactSessionService.from_session_storage(env.storage)
+    ).list_documents(
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        limit=10,
+    )
+    opened = await _dispatch(
+        env,
+        "workbench.resources.open",
+        {
+            "sessionKey": SESSION_KEY,
+            "resourceRef": {
+                "type": "deliverable",
+                "artifactId": deliverable_id,
+            },
+            "intent": "edit-current",
+            "expectedSha256": publication["sha256"],
+            "idempotencyKey": "open-published-original",
+        },
+    )
+    assert opened.error is None, opened.error
+    assert opened.payload["resolution"] == {"status": "current"}
+    assert opened.payload["materialized"] is False
+    assert opened.payload["document"]["documentId"] == document_id
+    assert opened.payload["revision"]["revisionId"] == patched.payload["revision"]["id"]
+    documents_after_open = await (
+        await ArtifactSessionService.from_session_storage(env.storage)
+    ).list_documents(
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        limit=10,
+    )
+    assert documents_after_open == documents_before_open
 
     emitted_before_replay = len(emitted)
     replay = await _dispatch(

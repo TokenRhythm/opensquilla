@@ -23,23 +23,45 @@ const repoRoot = join(electronRoot, '..', '..')
 // gate admits the exact document surface. Requests still terminate at the
 // loopback fixture below; this never contacts or impersonates a live provider.
 const SYNTHETIC_MODEL = 'gpt-5.4-mini'
+const GENERATED_FILENAME = 'synthetic-v1-generated.html'
 const INITIAL_HEADING = 'Synthetic draft heading'
-const APPLIED_HEADING = 'Verified V1 heading'
-const ANNOTATION_BODY = 'Use a shorter synthetic heading.'
-const ANSWER_ONLY_ANNOTATION_BODY = 'Explain this synthetic paragraph without editing it.'
-const INITIAL_MESSAGE = 'Keep this synthetic fixture unchanged.'
-const APPLY_MESSAGE = 'Apply the selected synthetic instruction once.'
-const ANSWER_ONLY_MESSAGE = 'Explain the selected synthetic paragraph without changing it.'
-const EXPECTED_DOCUMENT_TOOLS = [
+const MANUAL_HEADING = 'Manual V1 heading'
+const APPLIED_HEADING = 'Agent-patched V1 heading'
+const PATCHED_TITLE = 'Patched V1 fixture'
+const GENERATED_HTML = `<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8"><title>Synthetic V1 fixture</title></head>
+  <body>
+    <main>
+      <h1 id="editable-heading">${INITIAL_HEADING}</h1>
+      <p id="preserved-copy">This byte range must remain unchanged.</p>
+    </main>
+  </body>
+</html>`
+const MANUAL_HTML = GENERATED_HTML.replace(INITIAL_HEADING, MANUAL_HEADING)
+const ANNOTATION_BODY = 'Explain this synthetic paragraph without editing it.'
+const GENERATE_MESSAGE = 'Create and publish the requested synthetic single-file HTML page.'
+const ANNOTATION_MESSAGE = 'Answer the selected annotation without changing the document.'
+const PATCH_MESSAGE = 'Update the current document heading and page style, then save it.'
+const EXPECTED_ANNOTATION_TOOLS = [
   'document_apply',
   'document_inspect',
   'document_locate',
   'document_read',
 ]
+const EXPECTED_CURRENT_DOCUMENT_TOOLS = [
+  'document_patch',
+  'document_read',
+]
 const TIMEOUT_MS = 60_000
 const STARTUP_TIMEOUT_MS = 120_000
-const OVERLAY_TEST_WINDOW_WIDTH = 1_100
-const OVERLAY_TEST_WINDOW_HEIGHT = 700
+const MANUAL_MODE = process.env.OPENSQUILLA_MANUAL_V1_HTML_EDIT === '1'
+const MANUAL_REAL_PROVIDER = process.env.OPENSQUILLA_MANUAL_REAL_PROVIDER === '1'
+const MANUAL_REUSE_PROFILE = process.env.OPENSQUILLA_MANUAL_V1_PROFILE_ROOT?.trim() || ''
+const TEST_WINDOW_WIDTH = 1_440
+const TEST_WINDOW_HEIGHT = 900
+const MANUAL_TEST_WINDOW_WIDTH = 1_440
+const MANUAL_TEST_WINDOW_HEIGHT = 900
 const execFileAsync = promisify(execFile)
 const uvExecutable = process.platform === 'win32' ? 'uv.exe' : 'uv'
 
@@ -63,17 +85,40 @@ function messageText(content) {
 
 function isMutationFinalizationRequest(payload) {
   const messages = Array.isArray(payload?.messages) ? payload.messages : []
-  return messages.some(message => (
-    message?.role === 'user'
-    && messageText(message?.content).includes('documentMutationOutcome')
-  ))
+  const currentUserMessage = [...messages]
+    .reverse()
+    .find(message => message?.role === 'user')
+  return messageText(currentUserMessage?.content).includes('documentMutationOutcome')
 }
 
-function documentToolNames(payload) {
+function matchingToolNames(payload, expected) {
   return (Array.isArray(payload?.tools) ? payload.tools : [])
     .map(item => item?.function?.name)
-    .filter(name => EXPECTED_DOCUMENT_TOOLS.includes(name))
+    .filter(name => expected.includes(name))
     .sort()
+}
+
+function annotationToolNames(payload) {
+  return matchingToolNames(payload, EXPECTED_ANNOTATION_TOOLS)
+}
+
+function currentDocumentToolNames(payload) {
+  return matchingToolNames(payload, EXPECTED_CURRENT_DOCUMENT_TOOLS)
+}
+
+function currentTurn(payload) {
+  const messages = Array.isArray(payload?.messages) ? payload.messages : []
+  let userIndex = -1
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === 'user') {
+      userIndex = index
+      break
+    }
+  }
+  return {
+    userText: userIndex >= 0 ? messageText(messages[userIndex]?.content) : '',
+    toolMessages: messages.slice(userIndex + 1).filter(message => message?.role === 'tool'),
+  }
 }
 
 function openAiTextChunks(model, text) {
@@ -125,7 +170,7 @@ function openAiToolChunks(model, callId, name, args) {
 
 async function startDeterministicProvider() {
   const requests = []
-  let documentApplyCalls = 0
+  let documentPatchCalls = 0
   const server = createServer((request, response) => {
     const url = new URL(request.url || '/', 'http://127.0.0.1')
     if (request.method === 'GET' && url.pathname === '/v1/models') {
@@ -150,67 +195,93 @@ async function startDeterministicProvider() {
       const model = String(payload.model || SYNTHETIC_MODEL)
       const tools = Array.isArray(payload.tools) ? payload.tools : []
       const toolNames = new Set(tools.map(item => item?.function?.name).filter(Boolean))
-      const messages = Array.isArray(payload.messages) ? payload.messages : []
-      const toolMessages = messages.filter(message => message?.role === 'tool')
-      const currentUserMessage = [...messages]
-        .reverse()
-        .find(message => message?.role === 'user')
-      const answerOnlyAnnotatedTurn = messageText(currentUserMessage?.content)
-        .includes(ANSWER_ONLY_MESSAGE)
-      const hasDocumentTools = toolNames.has('document_inspect')
+      const turn = currentTurn(payload)
+      const toolMessages = turn.toolMessages
+      const latestToolMessage = toolMessages.at(-1)
+      const latestToolCallId = String(latestToolMessage?.tool_call_id || '')
+      const latestToolName = String(latestToolMessage?.name || '')
+        || (latestToolCallId.includes('write_generated_html') ? 'write_file' : '')
+        || (latestToolCallId.includes('publish_generated_html') ? 'publish_artifact' : '')
+        || (latestToolCallId.includes('document_read') ? 'document_read' : '')
+        || (latestToolCallId.includes('document_patch') ? 'document_patch' : '')
+      const isGenerationTurn = turn.userText.includes(GENERATE_MESSAGE)
+      const hasAnnotationTools = toolNames.has('document_inspect')
         || toolNames.has('document_apply')
+      const hasCurrentDocumentTools = toolNames.has('document_patch')
+      const isMetadataRequest = payload.stream === false && toolNames.size === 0
       let bodyChunks
 
-      if (hasDocumentTools && answerOnlyAnnotatedTurn) {
+      if (isMetadataRequest) {
+        bodyChunks = openAiTextChunks(model, 'Synthetic HTML document')
+      } else if (isMutationFinalizationRequest(payload)) {
+        bodyChunks = openAiTextChunks(model, 'The current document was updated.')
+      } else if (isGenerationTurn && toolMessages.length === 0) {
+        assert.ok(
+          toolNames.has('write_file'),
+          `generation must expose write_file; received: ${[...toolNames].sort().join(', ')}`,
+        )
+        bodyChunks = openAiToolChunks(
+          model,
+          'call_write_generated_html_v1_e2e',
+          'write_file',
+          { path: GENERATED_FILENAME, content: GENERATED_HTML },
+        )
+      } else if (isGenerationTurn && latestToolName === 'write_file') {
+        assert.ok(toolNames.has('publish_artifact'), 'generation must expose publish_artifact')
+        bodyChunks = openAiToolChunks(
+          model,
+          'call_publish_generated_html_v1_e2e',
+          'publish_artifact',
+          {
+            path: GENERATED_FILENAME,
+            name: GENERATED_FILENAME,
+            mime: 'text/html',
+            bundle: 'none',
+          },
+        )
+      } else if (isGenerationTurn) {
+        bodyChunks = openAiTextChunks(model, 'The generated HTML file is ready.')
+      } else if (hasAnnotationTools) {
         bodyChunks = openAiTextChunks(
           model,
           'The selected synthetic paragraph explains preserved fixture content.',
         )
-      } else if (!hasDocumentTools) {
-        const finalizedMutation = toolMessages.some(message => (
-          message?.name === 'document_apply'
-          || String(message?.tool_call_id || '').includes('document_apply')
-        ))
-        bodyChunks = openAiTextChunks(
-          model,
-          finalizedMutation
-            ? 'The selected synthetic heading was updated.'
-            : 'Synthetic fixture acknowledged without a document edit.',
-        )
-      } else if (toolMessages.length === 0) {
+      } else if (hasCurrentDocumentTools && toolMessages.length === 0) {
         bodyChunks = openAiToolChunks(
           model,
-          'call_document_inspect_v1_e2e',
-          'document_inspect',
-          {},
+          'call_document_read_v1_e2e',
+          'document_read',
+          { view: 'source', max_chars: 16_384 },
         )
+      } else if (hasCurrentDocumentTools && latestToolName === 'document_read') {
+        const read = jsonFromToolContent(latestToolMessage?.content)
+        assert.equal(read.status, 'ok')
+        assert.equal(read.hasMore, false, 'the single-file fixture must fit in one source page')
+        assert.match(String(read.chunk?.text || ''), new RegExp(MANUAL_HEADING))
+        documentPatchCalls += 1
+        bodyChunks = openAiToolChunks(
+          model,
+          'call_document_patch_v1_e2e',
+          'document_patch',
+          {
+            expectedSha256: read.sha256,
+            edits: [
+              { expectedText: MANUAL_HEADING, replacement: APPLIED_HEADING },
+              {
+                expectedText: '<title>Synthetic V1 fixture</title>',
+                replacement: `<title>${PATCHED_TITLE}</title>`,
+              },
+              {
+                expectedText: '<body>',
+                replacement: '<body style="background: #f6f7fb;">',
+              },
+            ],
+          },
+        )
+      } else if (hasCurrentDocumentTools && latestToolName === 'document_patch') {
+        bodyChunks = openAiTextChunks(model, 'The current HTML document was updated.')
       } else {
-        const latest = toolMessages.at(-1)
-        const latestName = String(latest?.name || '')
-        if (latestName === 'document_apply') {
-          bodyChunks = openAiTextChunks(model, 'The selected synthetic heading was updated.')
-        } else {
-          const inspected = jsonFromToolContent(latest?.content)
-          const annotations = Array.isArray(inspected.annotations) ? inspected.annotations : []
-          assert.equal(annotations.length, 1, 'the fixture turn must expose exactly one annotation')
-          const locations = Array.isArray(annotations[0]?.initialLocations)
-            ? annotations[0].initialLocations
-            : []
-          const location = locations.find(candidate => candidate?.operation === 'replace_text')
-          assert.ok(location?.grantToken, 'document_inspect must return a replace_text grant')
-          documentApplyCalls += 1
-          bodyChunks = openAiToolChunks(
-            model,
-            'call_document_apply_v1_e2e',
-            'document_apply',
-            {
-              mutations: [{
-                grant_token: location.grantToken,
-                input: APPLIED_HEADING,
-              }],
-            },
-          )
-        }
+        bodyChunks = openAiTextChunks(model, 'Synthetic fixture acknowledged.')
       }
 
       if (payload.stream === false) {
@@ -259,7 +330,7 @@ async function startDeterministicProvider() {
   return {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     requests,
-    documentApplyCalls: () => documentApplyCalls,
+    documentPatchCalls: () => documentPatchCalls,
     close: () => new Promise((resolveClose, rejectClose) => {
       server.closeIdleConnections?.()
       server.close(error => error ? rejectClose(error) : resolveClose())
@@ -316,7 +387,7 @@ async function createDevelopmentElectronRoot(isolationRoot) {
   // which would test stale Python/static bytes. A minimal copied shell without
   // runtime/ forces the documented dev path (`uv run opensquilla`) and therefore
   // exercises this checkout's Gateway and freshly built Vue bundle.
-  const root = join(isolationRoot, 'electron-source-shell')
+  const root = join(isolationRoot, `electron-source-shell-${process.pid}`)
   await mkdir(join(root, 'src'), { recursive: true })
   await Promise.all([
     cp(join(electronRoot, 'dist'), join(root, 'dist'), { recursive: true }),
@@ -342,6 +413,8 @@ async function readDurableMutationEvidence(isolationRoot) {
   )
   const program = `
 import json
+import hashlib
+from pathlib import Path
 import sqlite3
 import sys
 
@@ -352,17 +425,50 @@ connection.row_factory = sqlite3.Row
 def scalar(query):
     return int(connection.execute(query).fetchone()[0])
 
-row = connection.execute(
+document = connection.execute(
     """
-    SELECT status, change_set_id, revision_id
-    FROM artifact_mutation_attempts
+    SELECT document_id, head_revision_id, generation
+    FROM artifact_documents
     """
 ).fetchone()
+binding = connection.execute(
+    """
+    SELECT document_id, source_type, source_resource_id, source_sha256
+    FROM document_source_bindings
+    """
+).fetchone()
+revision_one = connection.execute(
+    """
+    SELECT artifact_id, artifact_sha256
+    FROM artifact_revisions
+    WHERE generation = 1
+    """
+).fetchone()
+head = connection.execute(
+    """
+    SELECT artifact_sha256
+    FROM artifact_revisions
+    WHERE revision_id = (SELECT head_revision_id FROM artifact_documents LIMIT 1)
+    """
+).fetchone()
+original_payload_sha256 = None
+if binding is not None:
+    artifact_root = Path(database_path).parent.parent / "media" / "artifacts"
+    for marker in artifact_root.rglob(".artifact-id"):
+        if marker.read_text(encoding="utf-8").strip() == binding["source_resource_id"]:
+            original_payload_sha256 = hashlib.sha256(
+                (marker.parent / "data").read_bytes()
+            ).hexdigest()
+            break
 evidence = {
     "documents": scalar("SELECT COUNT(*) FROM artifact_documents"),
     "revisions": scalar("SELECT COUNT(*) FROM artifact_revisions"),
     "changeSets": scalar("SELECT COUNT(*) FROM artifact_change_sets"),
     "mutationAttempts": scalar("SELECT COUNT(*) FROM artifact_mutation_attempts"),
+    "sourceBindings": scalar("SELECT COUNT(*) FROM document_source_bindings"),
+    "deliverableBindings": scalar(
+        "SELECT COUNT(*) FROM document_source_bindings WHERE source_type = 'deliverable'"
+    ),
     "annotations": scalar("SELECT COUNT(*) FROM artifact_prompt_annotations"),
     "sentAnnotations": scalar(
         "SELECT COUNT(*) FROM artifact_prompt_annotations WHERE status = 'sent'"
@@ -383,9 +489,39 @@ evidence = {
           AND revision.change_set_id = change_set.change_set_id
         """
     ),
-    "attemptStatus": row["status"] if row is not None else None,
-    "attemptHasChangeSet": bool(row and row["change_set_id"]),
-    "attemptHasRevision": bool(row and row["revision_id"]),
+    "allAttemptsLinked": scalar(
+        """
+        SELECT COUNT(*)
+        FROM artifact_mutation_attempts
+        WHERE change_set_id IS NOT NULL AND revision_id IS NOT NULL
+        """
+    ),
+    "documentGeneration": int(document["generation"]) if document is not None else 0,
+    "bindingTargetsDocument": bool(
+        binding is not None
+        and document is not None
+        and binding["document_id"] == document["document_id"]
+    ),
+    "revisionOneReusesDeliverable": bool(
+        binding is not None
+        and revision_one is not None
+        and binding["source_resource_id"] == revision_one["artifact_id"]
+        and binding["source_sha256"] == revision_one["artifact_sha256"]
+    ),
+    "originalDeliverableUnchanged": bool(
+        binding is not None
+        and revision_one is not None
+        and binding["source_sha256"] == revision_one["artifact_sha256"]
+    ),
+    "originalDeliverableBytesMatch": bool(
+        binding is not None
+        and original_payload_sha256 == binding["source_sha256"]
+    ),
+    "headDiffersFromOriginal": bool(
+        binding is not None
+        and head is not None
+        and binding["source_sha256"] != head["artifact_sha256"]
+    ),
 }
 connection.close()
 print(json.dumps(evidence, sort_keys=True))
@@ -410,7 +546,7 @@ function launchEnvironment(isolationRoot, gatewayPort) {
     if (name.startsWith('OPENSQUILLA_')) delete inherited[name]
   }
   const isolatedHome = join(isolationRoot, 'home')
-  return {
+  const environment = {
     ...inherited,
     HOME: isolatedHome,
     USERPROFILE: isolatedHome,
@@ -432,6 +568,10 @@ function launchEnvironment(isolationRoot, gatewayPort) {
     NO_PROXY: '127.0.0.1,localhost,.localhost,::1',
     no_proxy: '127.0.0.1,localhost,.localhost,::1',
   }
+  if (MANUAL_REAL_PROVIDER) {
+    delete environment.OPENSQUILLA_DESKTOP_SECRET_STORAGE
+  }
+  return environment
 }
 
 function isAllowedLoopbackUrl(value) {
@@ -456,27 +596,104 @@ async function waitForSettledTurn(page) {
   )
 }
 
-async function collapseOverlayWorkbenchForComposer(page) {
-  const workbench = page.getByTestId('workbench-host')
-  if (!await workbench.evaluate(element => (
-    element.classList.contains('workbench-host--overlay')
-  ))) return false
-
-  await page.getByRole('button', { name: 'Collapse workbench' }).click()
-  await workbench.waitFor({ state: 'hidden', timeout: TIMEOUT_MS })
-  return true
+function generatedArtifactCard(page) {
+  return page.locator('.msg-artifact-chip').filter({ hasText: GENERATED_FILENAME })
 }
 
-async function reopenCollapsedWorkbench(page, editCopy, collapsed) {
-  if (!collapsed) return
-  await editCopy.click()
-  await page.getByTestId('workbench-host').waitFor({
+async function openGeneratedArtifactSource(page) {
+  const card = generatedArtifactCard(page)
+  await card.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  await card.locator('.msg-artifact-body').click()
+  await page.locator('.artifact-document').waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  const sourceTab = page.getByRole('tab', { name: /^Source/ })
+  await sourceTab.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  await waitFor(
+    async () => await sourceTab.getAttribute('aria-selected') === 'true',
+    'Source selected on artifact open',
+    TIMEOUT_MS,
+  )
+  await page.locator('.artifact-html-studio .monaco-editor').waitFor({
     state: 'visible',
     timeout: TIMEOUT_MS,
   })
-  await page.locator('.artifact-document').waitFor({
-    state: 'visible',
-    timeout: TIMEOUT_MS,
+}
+
+async function replaceSourceInEditor(page, source) {
+  const editor = page.locator('.artifact-html-studio .monaco-editor')
+  await editor.click()
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
+  await page.keyboard.insertText(source)
+  const save = page.locator('.artifact-html-studio__action')
+  await waitFor(async () => !await save.isDisabled(), 'dirty source editor', TIMEOUT_MS)
+  await save.click()
+  await waitFor(
+    async () => await page.locator('.artifact-html-studio__status').getAttribute('data-state') === 'saved',
+    'saved source editor',
+    TIMEOUT_MS,
+  )
+}
+
+async function verifyPatchedSourceRemainsEditable(page, versionsTab, changesTab) {
+  const sourceTab = page.getByRole('tab', { name: /^Source/ })
+  await sourceTab.click()
+  const editor = page.locator('.artifact-html-studio .monaco-editor')
+  await editor.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  const status = page.locator('.artifact-html-studio__status')
+  let lastSourceSnapshot = {}
+  try {
+    await waitFor(async () => {
+      const state = await status.getAttribute('data-state')
+      const renderedSource = await page.locator('.artifact-html-studio .view-lines').innerText()
+      // Monaco renders indentation with non-breaking spaces and may leave
+      // spacing between separately tokenized spans. Normalize only that
+      // presentation layer; the source must still prove all three R3 edits.
+      const source = renderedSource.replace(/\u00a0/g, ' ')
+      const error = await page.locator('.artifact-html-studio__error').allInnerTexts()
+      lastSourceSnapshot = { state, source, error }
+      if (state !== 'ready' && state !== 'saved') return false
+      return source.includes(APPLIED_HEADING)
+        && source.includes(PATCHED_TITLE)
+        && /background:\s*#f6f7fb;/.test(source)
+    }, 'revision 3 source loaded without a conflict', TIMEOUT_MS)
+  } catch (error) {
+    throw new Error(`${error.message}; source snapshot: ${JSON.stringify(lastSourceSnapshot)}`)
+  }
+
+  assert.equal(await page.locator('.artifact-html-studio__error').count(), 0)
+  assert.equal(await page.getByTestId('copy-unsaved-source').count(), 0)
+  assert.equal(await page.getByTestId('discard-and-load-latest').count(), 0)
+  const save = page.locator('.artifact-html-studio__action')
+  assert.equal(await save.isDisabled(), true, 'revision 3 source must start clean')
+
+  // Prove that the model-advanced head did not strand Monaco in read-only
+  // mode. Undo the probe before autosave, then let the pending timer drain;
+  // the durable revision/change counts must remain unchanged.
+  await editor.click()
+  await page.keyboard.insertText('__opensquilla_edit_probe__')
+  await waitFor(
+    async () => await status.getAttribute('data-state') === 'dirty',
+    'revision 3 source remains editable',
+    TIMEOUT_MS,
+  )
+  assert.equal(await save.isDisabled(), false)
+  await page.keyboard.press(process.platform === 'darwin' ? 'Meta+Z' : 'Control+Z')
+  await waitFor(async () => {
+    const state = await status.getAttribute('data-state')
+    return (state === 'ready' || state === 'saved') && await save.isDisabled()
+  }, 'revision 3 edit probe restored a clean buffer', TIMEOUT_MS)
+  await delay(1_500)
+  assert.match(await versionsTab.innerText(), /3/)
+  assert.match(await changesTab.innerText(), /2/)
+  assert.equal(await page.locator('.artifact-html-studio__error').count(), 0)
+}
+
+async function installOfflineRequestGuard(electronApp, externalRequests) {
+  await electronApp.context().route(url => (
+    (url.protocol === 'http:' || url.protocol === 'https:')
+    && !isAllowedLoopbackUrl(url.toString())
+  ), async route => {
+    externalRequests.push(route.request().url())
+    await route.abort('blockedbyclient')
   })
 }
 
@@ -505,7 +722,12 @@ async function previewWebContentsSnapshot(electronApp) {
           true,
         )
       } catch {}
-      result.push({ id: contents.id, type: contents.getType(), url, heading })
+      result.push({
+        id: contents.id,
+        type: contents.getType(),
+        url: url.startsWith('data:') ? 'data:[redacted]' : url,
+        heading,
+      })
     }
     return result
   })
@@ -621,11 +843,13 @@ async function typeAndSubmitAnnotation(electronApp, body) {
   }, body)
 }
 
-const isolationRoot = await mkdtemp(join(tmpdir(), 'opensquilla-v1-html-agent-edit-'))
+const isolationRoot = MANUAL_REUSE_PROFILE
+  || await mkdtemp(join(tmpdir(), 'opensquilla-v1-html-agent-edit-'))
 const userDataDir = join(isolationRoot, 'electron-user-data')
-const provider = await startDeterministicProvider()
+const provider = MANUAL_REAL_PROVIDER ? null : await startDeterministicProvider()
 const gatewayPort = await reserveLoopbackPort()
-await seedDesktopCredential(userDataDir, provider.baseUrl)
+const manualDebugPort = MANUAL_MODE ? await reserveLoopbackPort() : null
+if (provider) await seedDesktopCredential(userDataDir, provider.baseUrl)
 const developmentElectronRoot = await createDevelopmentElectronRoot(isolationRoot)
 
 let app
@@ -636,44 +860,53 @@ const externalRequests = []
 const evidence = {
   sessionUrl: '',
   selectedPreviewUrl: '',
-  versionsAfterApply: '',
-  changesAfterApply: '',
+  versionsAfterManualSave: '',
+  versionsAfterAgentPatch: '',
+  changesAfterAgentPatch: '',
   previewHeading: '',
-  answerOnlyPreservedCounts: false,
-  answerOnlyAnnotatedRequests: 0,
-  answerOnlyMutationFinalizations: 0,
-  exactDocumentToolRequests: 0,
+  annotationModeExitedAfterAcceptance: false,
+  annotationRequests: 0,
+  currentDocumentToolRequests: 0,
   toolFreeMutationFinalizations: 0,
+  recoveredRevisionCount: 0,
+  logicalResourceCount: 0,
+  originalDownloadEndpointVerified: false,
+  patchedSourceRemainedEditable: false,
+  manualPreviewSnapshot: [],
   durableMutation: null,
 }
 
 try {
+  desktopJourney: {
   app = await electron.launch({
     args: [
-      '--use-mock-keychain',
+      ...(MANUAL_REAL_PROVIDER ? [] : ['--use-mock-keychain']),
+      ...(manualDebugPort ? [`--remote-debugging-port=${manualDebugPort}`] : []),
       `--user-data-dir=${userDataDir}`,
       developmentElectronRoot,
     ],
     env: launchEnvironment(isolationRoot, gatewayPort),
   })
-  await app.context().route(url => (
-    (url.protocol === 'http:' || url.protocol === 'https:')
-    && !isAllowedLoopbackUrl(url.toString())
-  ), async route => {
-    externalRequests.push(route.request().url())
-    await route.abort('blockedbyclient')
-  })
+  if (!MANUAL_REAL_PROVIDER) {
+    await installOfflineRequestGuard(app, externalRequests)
+  }
 
   const page = await app.firstWindow({ timeout: STARTUP_TIMEOUT_MS })
+  const testWindowWidth = MANUAL_MODE
+    ? MANUAL_TEST_WINDOW_WIDTH
+    : TEST_WINDOW_WIDTH
+  const testWindowHeight = MANUAL_MODE
+    ? MANUAL_TEST_WINDOW_HEIGHT
+    : TEST_WINDOW_HEIGHT
   await app.evaluate(({ BrowserWindow }, bounds) => {
     BrowserWindow.getAllWindows()[0]?.setSize(bounds.width, bounds.height)
   }, {
-    width: OVERLAY_TEST_WINDOW_WIDTH,
-    height: OVERLAY_TEST_WINDOW_HEIGHT,
+    width: testWindowWidth,
+    height: testWindowHeight,
   })
   await page.waitForFunction(
     width => window.innerWidth <= width,
-    OVERLAY_TEST_WINDOW_WIDTH,
+    testWindowWidth,
   )
   page.on('pageerror', error => pageErrors.push(String(error?.message || error)))
   page.on('console', message => {
@@ -695,171 +928,194 @@ try {
   pageErrors.length = 0
   consoleErrors.length = 0
 
-  const syntheticHtml = Buffer.from(`<!doctype html>
-<html lang="en">
-  <head><meta charset="utf-8"><title>Synthetic V1 fixture</title></head>
-  <body>
-    <main>
-      <h1 id="editable-heading">${INITIAL_HEADING}</h1>
-      <p id="preserved-copy">This byte range must remain unchanged.</p>
-    </main>
-  </body>
-</html>`, 'utf8')
-  await page.locator('input[type="file"]').setInputFiles({
-    name: 'synthetic-v1-fixture.html',
-    mimeType: 'text/html',
-    buffer: syntheticHtml,
-  })
-  await page.locator('.attachment-chip__name').filter({
-    hasText: 'synthetic-v1-fixture.html',
-  }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
-  await page.locator('.chat-textarea').fill(INITIAL_MESSAGE)
+  if (MANUAL_MODE && MANUAL_REAL_PROVIDER) {
+    console.log(JSON.stringify({
+      ready: true,
+      mode: 'manual-real-provider',
+      branch: 'feature/artifact-prompt-annotations',
+      isolationRoot,
+      gatewayPort,
+      debugPort: manualDebugPort,
+      credentials: 'none preconfigured; enter the API key in Desktop settings',
+      shutdown: 'Close the Electron window.',
+    }, null, 2))
+    const electronProcess = app.process()
+    if (electronProcess.exitCode === null) {
+      await new Promise(resolveExit => electronProcess.once('exit', resolveExit))
+    }
+    break desktopJourney
+  }
+
+  if (MANUAL_MODE && MANUAL_REUSE_PROFILE) {
+    console.log(JSON.stringify({
+      ready: true,
+      mode: 'manual-v1-html-agent-edit-recovery',
+      branch: 'feature/artifact-prompt-annotations',
+      isolationRoot,
+      providerBaseUrl: provider.baseUrl,
+      gatewayPort,
+      debugPort: manualDebugPort,
+      instruction: 'Open the existing session and verify its recovered document history.',
+      shutdown: 'Close the Electron window.',
+    }, null, 2))
+    const electronProcess = app.process()
+    if (electronProcess.exitCode === null) {
+      await new Promise(resolveExit => electronProcess.once('exit', resolveExit))
+    }
+    break desktopJourney
+  }
+
+  await page.locator('.chat-textarea').fill(GENERATE_MESSAGE)
   await page.locator('.chat-send-btn.btn--primary').click()
   await waitFor(() => /\/control\/chat\?session=/.test(page.url()), 'materialized V1 session', TIMEOUT_MS)
   evidence.sessionUrl = page.url()
   await waitForSettledTurn(page)
-  await page.locator('.msg-file-chip__name').filter({
-    hasText: 'synthetic-v1-fixture.html',
-  }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
-
-  const editCopy = page.locator('button[aria-label^="Edit a copy of synthetic-v1-fixture.html"]')
-  await waitFor(
-    async () => await editCopy.count() === 1 && !await editCopy.isDisabled(),
-    'enabled Edit a copy action',
-    TIMEOUT_MS,
+  await generatedArtifactCard(page).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  assert.equal(await generatedArtifactCard(page).count(), 1, 'generation must show one HTML card')
+  assert.equal(
+    await page.locator('button[aria-label^="Edit a copy of "]').count(),
+    0,
+    'generated HTML must not expose the old editable-copy action',
   )
-  await editCopy.click()
-  await page.locator('.artifact-document').waitFor({ state: 'visible', timeout: TIMEOUT_MS })
-  await page.locator('[data-document-section="preview"]').waitFor({ state: 'visible', timeout: TIMEOUT_MS })
-  await waitFor(async () => {
-    const snapshot = await previewWebContentsSnapshot(app)
-    return snapshot.some(item => item.heading === INITIAL_HEADING)
-  }, 'native HTML preview heading', TIMEOUT_MS)
+  assert.equal(
+    await page.getByText(/Create (an )?editable copy/i).count(),
+    0,
+    'generated HTML must not expose an editable-copy CTA',
+  )
+  await openGeneratedArtifactSource(page)
+
+  if (MANUAL_MODE) {
+    console.log(JSON.stringify({
+      ready: true,
+      mode: 'manual-v1-html-agent-edit',
+      branch: 'feature/artifact-prompt-annotations',
+      fixture: GENERATED_FILENAME,
+      isolationRoot,
+      providerBaseUrl: provider.baseUrl,
+      gatewayPort,
+      debugPort: manualDebugPort,
+      exactPrompts: {
+        annotation: ANNOTATION_MESSAGE,
+        patch: PATCH_MESSAGE,
+      },
+      exactAnnotationBody: ANNOTATION_BODY,
+      shutdown: 'Close the Electron window.',
+    }, null, 2))
+    const electronProcess = app.process()
+    if (electronProcess.exitCode === null) {
+      await new Promise(resolveExit => electronProcess.once('exit', resolveExit))
+    }
+    break desktopJourney
+  }
 
   const versionsTab = page.getByRole('tab', { name: /Versions/ })
   const changesTab = page.getByRole('tab', { name: /Changes/ })
   assert.match(await versionsTab.innerText(), /1/)
   assert.match(await changesTab.innerText(), /0/)
 
-  const annotationButton = page.getByRole('button', { name: 'Annotate preview' })
-  await armAnnotationPicker(page, annotationButton)
-  const selected = await selectElementInNativePreview(app, '#editable-heading')
-  evidence.selectedPreviewUrl = selected.url
-  assert.equal(selected.tagName, 'h1')
-  const overlay = await waitFor(
-    async () => {
-      const state = await annotationOverlayState(app)
-      return state?.target === '<h1>' && state.focused ? state : null
-    },
-    'trusted annotation overlay',
-    TIMEOUT_MS,
-  )
-  assert.equal(overlay.target, '<h1>')
-  await typeAndSubmitAnnotation(app, ANNOTATION_BODY)
-  await page.locator('.chat-prompt-annotation-chip').filter({
-    hasText: ANNOTATION_BODY,
-  }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
-
-  // A constrained desktop display can put the existing non-modal Workbench in
-  // overlay mode. Follow its real narrow-screen interaction path instead of
-  // asking Playwright to click the composer through the native preview.
-  const collapsedForApply = await collapseOverlayWorkbenchForComposer(page)
-  assert.equal(collapsedForApply, true, 'the narrow-window journey must exercise overlay mode')
-  await page.locator('.chat-textarea').fill(APPLY_MESSAGE)
-  await page.locator('.chat-send-btn.btn--primary').click()
-  await waitForSettledTurn(page)
-  await reopenCollapsedWorkbench(page, editCopy, collapsedForApply)
-  await waitFor(async () => {
-    const snapshot = await previewWebContentsSnapshot(app)
-    return snapshot.some(item => item.heading === APPLIED_HEADING)
-  }, 'updated native preview heading', TIMEOUT_MS)
-  evidence.previewHeading = APPLIED_HEADING
+  await replaceSourceInEditor(page, MANUAL_HTML)
   await waitFor(async () => /2/.test(await versionsTab.innerText()), 'Versions = 2', TIMEOUT_MS)
   await waitFor(async () => /1/.test(await changesTab.innerText()), 'Changes = 1', TIMEOUT_MS)
-  evidence.versionsAfterApply = await versionsTab.innerText()
-  evidence.changesAfterApply = await changesTab.innerText()
-  assert.equal(provider.documentApplyCalls(), 1, 'the V1 edit turn must propose one document_apply')
+  evidence.versionsAfterManualSave = await versionsTab.innerText()
 
-  const mutationFinalizationsBeforeAnswer = provider.requests
-    .filter(isMutationFinalizationRequest)
-  assert.equal(
-    mutationFinalizationsBeforeAnswer.length,
-    1,
-    'the mutating turn must finish before the answer-only selection starts',
-  )
+  const previewTab = page.getByRole('tab', { name: /^Preview/ })
+  await previewTab.click()
+  await page.locator('[data-document-section="preview"]').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+  await waitFor(async () => {
+    const snapshot = await previewWebContentsSnapshot(app)
+    evidence.manualPreviewSnapshot = snapshot
+    return snapshot.some(item => item.heading === MANUAL_HEADING)
+  }, 'manually saved native HTML preview heading', TIMEOUT_MS)
 
-  // Prove that a selected-context turn may answer without entering the durable
-  // mutation lifecycle: create a second real annotation against the new head,
-  // then let the deterministic provider answer directly while exact4 is visible.
+  const annotationButton = page.getByRole('button', { name: 'Annotate preview' })
   await armAnnotationPicker(page, annotationButton)
-  const answerOnlySelected = await selectElementInNativePreview(app, '#preserved-copy')
-  assert.equal(answerOnlySelected.tagName, 'p')
-  const answerOnlyOverlay = await waitFor(
+  const selected = await selectElementInNativePreview(app, '#preserved-copy')
+  evidence.selectedPreviewUrl = selected.url
+  assert.equal(selected.tagName, 'p')
+  const overlay = await waitFor(
     async () => {
       const state = await annotationOverlayState(app)
       return state?.target === '<p>' && state.focused ? state : null
     },
-    'trusted answer-only annotation overlay',
+    'trusted annotation overlay',
     TIMEOUT_MS,
   )
-  assert.equal(answerOnlyOverlay.target, '<p>')
-  await typeAndSubmitAnnotation(app, ANSWER_ONLY_ANNOTATION_BODY)
+  assert.equal(overlay.target, '<p>')
+  await typeAndSubmitAnnotation(app, ANNOTATION_BODY)
   await page.locator('.chat-prompt-annotation-chip').filter({
-    hasText: ANSWER_ONLY_ANNOTATION_BODY,
+    hasText: ANNOTATION_BODY,
   }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
-
-  const answerOnlyRequestStart = provider.requests.length
-  const collapsedForAnswer = await collapseOverlayWorkbenchForComposer(page)
-  assert.equal(collapsedForAnswer, true, 'the answer-only turn must exercise overlay mode')
-  await page.locator('.chat-textarea').fill(ANSWER_ONLY_MESSAGE)
+  const annotationRequestStart = provider.requests.length
+  await page.locator('.chat-textarea').fill(ANNOTATION_MESSAGE)
   await page.locator('.chat-send-btn.btn--primary').click()
   await waitFor(
-    () => provider.requests.length > answerOnlyRequestStart,
-    'answer-only provider request',
+    () => provider.requests.slice(annotationRequestStart)
+      .some(payload => annotationToolNames(payload).length > 0),
+    'annotation exact4 provider request',
     TIMEOUT_MS,
   )
   await waitForSettledTurn(page)
-  await reopenCollapsedWorkbench(page, editCopy, collapsedForAnswer)
-  const answerOnlyRequests = provider.requests.slice(answerOnlyRequestStart)
-  assert.equal(
-    answerOnlyRequests.length,
-    1,
-    'selected-context answer must complete in one ordinary Agent call',
+  await waitFor(
+    async () => await annotationButton.getAttribute('aria-pressed') === 'false',
+    'annotation mode exit after accepted send',
+    TIMEOUT_MS,
   )
-  assert.deepEqual(
-    documentToolNames(answerOnlyRequests[0]),
-    EXPECTED_DOCUMENT_TOOLS,
-    'the answer-only turn must receive the same exact4 document surface',
-  )
-  const answerOnlyMutationFinalizations = answerOnlyRequests
-    .filter(isMutationFinalizationRequest)
+  await page.getByTestId('workbench-annotation-mode-status').waitFor({
+    state: 'detached',
+    timeout: TIMEOUT_MS,
+  })
   assert.equal(
-    answerOnlyMutationFinalizations.length,
+    await page.locator('.chat-prompt-annotation-chip').filter({ hasText: ANNOTATION_BODY }).count(),
     0,
-    'answer-only selected context must not create a mutation outcome finalizer',
+    'accepted annotation must leave the composer',
   )
-  evidence.answerOnlyAnnotatedRequests = answerOnlyRequests.length
-  evidence.answerOnlyMutationFinalizations = answerOnlyMutationFinalizations.length
+  evidence.annotationModeExitedAfterAcceptance = true
   assert.match(await versionsTab.innerText(), /2/)
   assert.match(await changesTab.innerText(), /1/)
-  assert.equal(provider.documentApplyCalls(), 1, 'answer-only follow-up must not commit')
-  evidence.answerOnlyPreservedCounts = true
 
-  const documentToolRequests = provider.requests.filter(payload => {
-    const names = documentToolNames(payload)
+  const annotationRequests = provider.requests.slice(annotationRequestStart)
+    .filter(payload => annotationToolNames(payload).length > 0)
+  assert.equal(annotationRequests.length, 1, 'annotation answer must use one exact4 request')
+  assert.deepEqual(annotationToolNames(annotationRequests[0]), EXPECTED_ANNOTATION_TOOLS)
+  evidence.annotationRequests = annotationRequests.length
+
+  const patchRequestStart = provider.requests.length
+  await page.locator('.chat-textarea').fill(PATCH_MESSAGE)
+  await page.locator('.chat-send-btn.btn--primary').click()
+  await waitFor(() => provider.documentPatchCalls() === 1, 'document_patch proposal', TIMEOUT_MS)
+  await waitForSettledTurn(page)
+  await waitFor(async () => /3/.test(await versionsTab.innerText()), 'Versions = 3', TIMEOUT_MS)
+  await waitFor(async () => /2/.test(await changesTab.innerText()), 'Changes = 2', TIMEOUT_MS)
+  evidence.versionsAfterAgentPatch = await versionsTab.innerText()
+  evidence.changesAfterAgentPatch = await changesTab.innerText()
+  await verifyPatchedSourceRemainsEditable(page, versionsTab, changesTab)
+  evidence.patchedSourceRemainedEditable = true
+  await previewTab.click()
+  await waitFor(async () => {
+    const snapshot = await previewWebContentsSnapshot(app)
+    return snapshot.some(item => item.heading === APPLIED_HEADING)
+  }, 'agent-patched native preview heading', TIMEOUT_MS)
+  evidence.previewHeading = APPLIED_HEADING
+
+  const currentDocumentToolRequests = provider.requests.slice(patchRequestStart).filter(payload => {
+    const names = currentDocumentToolNames(payload)
     if (names.length === 0) return false
-    assert.deepEqual(names, EXPECTED_DOCUMENT_TOOLS)
+    assert.deepEqual(names, EXPECTED_CURRENT_DOCUMENT_TOOLS)
     return true
   })
   assert.equal(
-    documentToolRequests.length,
-    3,
-    'inspect, apply, and answer-only legs must each expose exact4',
+    currentDocumentToolRequests.length,
+    2,
+    'document_read and document_patch legs must expose the current-document tools',
   )
-  evidence.exactDocumentToolRequests = documentToolRequests.length
+  evidence.currentDocumentToolRequests = currentDocumentToolRequests.length
 
-  const mutationFinalizations = provider.requests.filter(isMutationFinalizationRequest)
-  assert.equal(mutationFinalizations.length, 1, 'apply must end with one mutation finalization')
+  const mutationFinalizations = provider.requests.slice(patchRequestStart)
+    .filter(isMutationFinalizationRequest)
+  assert.equal(mutationFinalizations.length, 1, 'document_patch must finalize once')
   assert.equal(
     Array.isArray(mutationFinalizations[0].tools)
       ? mutationFinalizations[0].tools.length
@@ -869,15 +1125,53 @@ try {
   )
   evidence.toolFreeMutationFinalizations = mutationFinalizations.length
 
+  // Electron owns download UX, so assert the authenticated fetch before the
+  // shell receives the generated Blob. Its URL must remain the immutable chat
+  // artifact endpoint rather than the current Document head endpoint.
+  const originalDownloadPromise = page.waitForResponse(response => {
+    try {
+      return response.request().method() === 'GET'
+        && new URL(response.url()).pathname.startsWith('/api/v1/artifacts/')
+    } catch {
+      return false
+    }
+  })
+  await generatedArtifactCard(page).locator('.msg-artifact-download').click()
+  const originalDownload = await originalDownloadPromise
+  assert.equal(originalDownload.status(), 200)
+  const originalDownloadPath = new URL(originalDownload.url()).pathname
+  assert.match(
+    originalDownloadPath,
+    /^\/api\/v1\/artifacts\/[^/]+$/,
+    'chat-card download must keep using the immutable artifact endpoint',
+  )
+  evidence.originalDownloadEndpointVerified = true
+
   await versionsTab.click()
-  assert.equal(await page.locator('.artifact-document__versions > li').count(), 2)
+  assert.equal(await page.locator('.artifact-document__versions > li').count(), 3)
   await changesTab.click()
-  assert.equal(await page.locator('[data-document-section="changes"] li').count(), 1)
+  assert.equal(await page.locator('[data-document-section="changes"] li').count(), 2)
+
+  assert.equal(
+    await page.getByTestId('workbench-artifact-switcher').count(),
+    0,
+    'one logical generated HTML resource must not create a duplicate switcher entry',
+  )
+  await page.getByTestId('chat-session-action-deliverables').click()
+  const logicalResources = page.locator('.resource-collection__item')
+  await logicalResources.first().waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  evidence.logicalResourceCount = await logicalResources.count()
+  assert.equal(
+    evidence.logicalResourceCount,
+    1,
+    'resource navigation must fold the generated deliverable into its bound Document',
+  )
+  assert.match(await logicalResources.first().innerText(), new RegExp(GENERATED_FILENAME))
 
   assert.equal(
     await page.locator('[data-testid="chat-session-action-workbench"]').count(),
     0,
-    'V1 must not expose the internal Workbench resource count as a top-level action',
+    'the internal Workbench resource count must stay out of top-level actions',
   )
   assert.equal(
     await page.locator('[data-artifact-action="publish-head"]').count(),
@@ -887,31 +1181,99 @@ try {
   assert.equal(externalRequests.length, 0, 'the offline V1 journey must not use external network')
   assert.equal(pageErrors.length, 0, `renderer page errors: ${pageErrors.join(' | ')}`)
   assert.equal(consoleErrors.length, 0, `renderer console errors: ${consoleErrors.join(' | ')}`)
+
+  await app.close()
+  app = undefined
+  await delay(1_000)
+  pageErrors.length = 0
+  consoleErrors.length = 0
+
+  app = await electron.launch({
+    args: ['--use-mock-keychain', `--user-data-dir=${userDataDir}`, developmentElectronRoot],
+    env: launchEnvironment(isolationRoot, gatewayPort),
+  })
+  await installOfflineRequestGuard(app, externalRequests)
+  const recoveredPage = await app.firstWindow({ timeout: STARTUP_TIMEOUT_MS })
+  recoveredPage.on('pageerror', error => pageErrors.push(String(error?.message || error)))
+  recoveredPage.on('console', message => {
+    if (message.type() === 'error') consoleErrors.push(message.text())
+  })
+  await waitFor(
+    () => recoveredPage.url().includes('/control/chat'),
+    'restarted owned-Gateway Control UI',
+    STARTUP_TIMEOUT_MS,
+  )
+  await recoveredPage.locator('.conn-pill.connected').waitFor({
+    state: 'visible',
+    timeout: STARTUP_TIMEOUT_MS,
+  })
+  const recoveredSessionKey = new URL(evidence.sessionUrl).searchParams.get('session')
+  assert.ok(recoveredSessionKey, 'generated session key must survive restart')
+  const recoveredSessionRow = recoveredPage.locator(
+    `.sidebar-history-row[data-session-key="${recoveredSessionKey}"]`,
+  )
+  await recoveredSessionRow.waitFor({ state: 'visible', timeout: STARTUP_TIMEOUT_MS })
+  await delay(500)
+  // Start recovery assertions after optional startup probes have settled, then
+  // reopen through the user's persisted Recents entry instead of racing the
+  // router with a synthetic page navigation.
+  pageErrors.length = 0
+  consoleErrors.length = 0
+  await recoveredSessionRow.locator('.sidebar-history-item').click()
+  await waitFor(
+    () => new URL(recoveredPage.url()).searchParams.get('session') === recoveredSessionKey,
+    'recovered session selected from Recents',
+    TIMEOUT_MS,
+  )
+  await generatedArtifactCard(recoveredPage).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  assert.equal(await generatedArtifactCard(recoveredPage).count(), 1)
+  await openGeneratedArtifactSource(recoveredPage)
+  const recoveredVersionsTab = recoveredPage.getByRole('tab', { name: /Versions/ })
+  await waitFor(
+    async () => /3/.test(await recoveredVersionsTab.innerText()),
+    'three recovered versions',
+    TIMEOUT_MS,
+  )
+  evidence.recoveredRevisionCount = 3
+  await recoveredPage.getByRole('tab', { name: /^Preview/ }).click()
+  await waitFor(async () => {
+    const snapshot = await previewWebContentsSnapshot(app)
+    return snapshot.some(item => item.heading === APPLIED_HEADING)
+  }, 'recovered patched preview', TIMEOUT_MS)
+  assert.equal(pageErrors.length, 0, `restart renderer page errors: ${pageErrors.join(' | ')}`)
+  assert.equal(consoleErrors.length, 0, `restart renderer console errors: ${consoleErrors.join(' | ')}`)
+  }
 } catch (error) {
   runError = error
 } finally {
   await app?.close().catch(() => {})
-  if (!runError) {
+  if (!runError && !MANUAL_MODE) {
     try {
       evidence.durableMutation = await readDurableMutationEvidence(isolationRoot)
       assert.deepEqual(evidence.durableMutation, {
-        appliedAttempts: 1,
-        annotations: 2,
-        attemptHasChangeSet: true,
-        attemptHasRevision: true,
-        attemptLinksCommittedObjects: 1,
-        attemptStatus: 'applied',
-        changeSets: 1,
+        allAttemptsLinked: 2,
+        annotations: 1,
+        appliedAttempts: 2,
+        attemptLinksCommittedObjects: 2,
+        bindingTargetsDocument: true,
+        changeSets: 2,
+        deliverableBindings: 1,
+        documentGeneration: 3,
         documents: 1,
-        mutationAttempts: 1,
-        revisions: 2,
-        sentAnnotations: 2,
+        headDiffersFromOriginal: true,
+        mutationAttempts: 2,
+        originalDeliverableBytesMatch: true,
+        originalDeliverableUnchanged: true,
+        revisionOneReusesDeliverable: true,
+        revisions: 3,
+        sentAnnotations: 1,
+        sourceBindings: 1,
       })
     } catch (error) {
       runError = error
     }
   }
-  await provider.close().catch(() => {})
+  await provider?.close().catch(() => {})
   await delay(100)
   if (runError) {
     console.error(JSON.stringify({
@@ -921,6 +1283,7 @@ try {
       pageErrors,
       consoleErrors,
       externalRequests,
+      evidence,
     }, null, 2))
   }
   if (!runError && process.env.OPENSQUILLA_KEEP_V1_E2E_PROFILE !== '1') {
@@ -932,8 +1295,8 @@ if (runError) throw runError
 
 console.log(JSON.stringify({
   ok: true,
-  fixture: 'synthetic-v1-html-agent-edit',
-  providerRequests: provider.requests.length,
-  documentApplyCalls: provider.documentApplyCalls(),
+  fixture: MANUAL_REAL_PROVIDER ? 'manual-real-provider' : 'synthetic-v1-html-agent-edit',
+  providerRequests: provider?.requests.length ?? null,
+  documentPatchCalls: provider?.documentPatchCalls() ?? null,
   evidence,
 }, null, 2))

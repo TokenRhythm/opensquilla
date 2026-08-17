@@ -110,6 +110,29 @@ export interface WorkbenchPreviewResponse {
   preview: WorkbenchPreviewDescriptor
 }
 
+/**
+ * Resolves the resource a user clicked to its current editable identity. The
+ * Gateway may materialize an old immutable HTML source, but that copy boundary
+ * is deliberately hidden from the Workbench interaction.
+ */
+export type WorkbenchResourceOpenResponse =
+  | {
+      disposition: 'document'
+      resolution: { status: 'current' | 'materialized' }
+      resource: WorkbenchResource
+      document: ArtifactDocument
+      revision: ArtifactRevision
+      binding?: DocumentSourceBinding
+      materialized: boolean
+    }
+  | {
+      disposition: 'readonly'
+      resolution: { status: 'readonly' }
+      resource: WorkbenchResource
+      reasonCode: string
+      materialized: false
+    }
+
 export interface DocumentSourceBinding {
   bindingId: string
   documentId: string

@@ -1232,7 +1232,7 @@ _TOOL_ARGUMENT_PROJECTION_PREFIX = "[tool_use_argument_projection]\n"
 _HISTORICAL_TOOL_ARGUMENT_PROJECTION_PREFIX = "[historical_tool_argument_omitted]\n"
 _INVALID_PROVIDER_CONTEXT_PROJECTION_PREFIX = "[invalid_provider_context_projection:"
 _INVALID_PROVIDER_CONTEXT_ARGUMENTS_KEY = "_invalid_provider_context_arguments"
-_PROMPT_ANNOTATION_WRITER_TOOLS = frozenset({"document_apply"})
+_PROMPT_ANNOTATION_WRITER_TOOLS = frozenset({"document_apply", "document_patch"})
 _DOCUMENT_MUTATION_PROPOSAL_MAX_TOKENS = 8_192
 _DOCUMENT_MUTATION_FINALIZATION_MAX_TOKENS = 256
 _DOCUMENT_MUTATION_FINALIZATION_SYSTEM = (
@@ -7041,6 +7041,7 @@ class Agent:
             )
             for forbidden in (
                 "document_apply",
+                "document_patch",
                 "document_inspect",
                 "document_locate",
                 "document_read",
@@ -19978,13 +19979,13 @@ class Agent:
         return self._restricted_tool_boundary_active()
 
     def _artifact_writer_controller(self) -> Any | None:
-        """Return the single-writer controller for a restricted annotation turn."""
+        """Return the single-writer controller for a bound document turn."""
 
         ctx = self._tool_context or current_tool_context.get()
         if (
             ctx is None
-            or ctx.exclusive_tools is None
-            or not (_PROMPT_ANNOTATION_WRITER_TOOLS & ctx.exclusive_tools)
+            or ctx.surfaced_tools is None
+            or not (_PROMPT_ANNOTATION_WRITER_TOOLS & ctx.surfaced_tools)
         ):
             return None
         return ctx.artifact_mutation_attempt_controller
@@ -20002,8 +20003,8 @@ class Agent:
         ctx = self._tool_context or current_tool_context.get()
         if (
             ctx is None
-            or ctx.exclusive_tools is None
-            or tool_name not in ctx.exclusive_tools
+            or ctx.surfaced_tools is None
+            or tool_name not in ctx.surfaced_tools
         ):
             return None
         controller = ctx.artifact_mutation_attempt_controller
