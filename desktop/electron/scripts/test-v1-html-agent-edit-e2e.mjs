@@ -38,6 +38,8 @@ const EXPECTED_DOCUMENT_TOOLS = [
 ]
 const TIMEOUT_MS = 60_000
 const STARTUP_TIMEOUT_MS = 120_000
+const OVERLAY_TEST_WINDOW_WIDTH = 1_100
+const OVERLAY_TEST_WINDOW_HEIGHT = 700
 const execFileAsync = promisify(execFile)
 const uvExecutable = process.platform === 'win32' ? 'uv.exe' : 'uv'
 
@@ -454,6 +456,30 @@ async function waitForSettledTurn(page) {
   )
 }
 
+async function collapseOverlayWorkbenchForComposer(page) {
+  const workbench = page.getByTestId('workbench-host')
+  if (!await workbench.evaluate(element => (
+    element.classList.contains('workbench-host--overlay')
+  ))) return false
+
+  await page.getByRole('button', { name: 'Collapse workbench' }).click()
+  await workbench.waitFor({ state: 'hidden', timeout: TIMEOUT_MS })
+  return true
+}
+
+async function reopenCollapsedWorkbench(page, editCopy, collapsed) {
+  if (!collapsed) return
+  await editCopy.click()
+  await page.getByTestId('workbench-host').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+  await page.locator('.artifact-document').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+}
+
 async function armAnnotationPicker(page, annotationButton) {
   await annotationButton.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
   assert.equal(await annotationButton.isDisabled(), false)
@@ -639,6 +665,16 @@ try {
   })
 
   const page = await app.firstWindow({ timeout: STARTUP_TIMEOUT_MS })
+  await app.evaluate(({ BrowserWindow }, bounds) => {
+    BrowserWindow.getAllWindows()[0]?.setSize(bounds.width, bounds.height)
+  }, {
+    width: OVERLAY_TEST_WINDOW_WIDTH,
+    height: OVERLAY_TEST_WINDOW_HEIGHT,
+  })
+  await page.waitForFunction(
+    width => window.innerWidth <= width,
+    OVERLAY_TEST_WINDOW_WIDTH,
+  )
   page.on('pageerror', error => pageErrors.push(String(error?.message || error)))
   page.on('console', message => {
     if (message.type() === 'error') consoleErrors.push(message.text())
@@ -724,9 +760,15 @@ try {
     hasText: ANNOTATION_BODY,
   }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
 
+  // A constrained desktop display can put the existing non-modal Workbench in
+  // overlay mode. Follow its real narrow-screen interaction path instead of
+  // asking Playwright to click the composer through the native preview.
+  const collapsedForApply = await collapseOverlayWorkbenchForComposer(page)
+  assert.equal(collapsedForApply, true, 'the narrow-window journey must exercise overlay mode')
   await page.locator('.chat-textarea').fill(APPLY_MESSAGE)
   await page.locator('.chat-send-btn.btn--primary').click()
   await waitForSettledTurn(page)
+  await reopenCollapsedWorkbench(page, editCopy, collapsedForApply)
   await waitFor(async () => {
     const snapshot = await previewWebContentsSnapshot(app)
     return snapshot.some(item => item.heading === APPLIED_HEADING)
@@ -767,6 +809,8 @@ try {
   }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
 
   const answerOnlyRequestStart = provider.requests.length
+  const collapsedForAnswer = await collapseOverlayWorkbenchForComposer(page)
+  assert.equal(collapsedForAnswer, true, 'the answer-only turn must exercise overlay mode')
   await page.locator('.chat-textarea').fill(ANSWER_ONLY_MESSAGE)
   await page.locator('.chat-send-btn.btn--primary').click()
   await waitFor(
@@ -775,6 +819,7 @@ try {
     TIMEOUT_MS,
   )
   await waitForSettledTurn(page)
+  await reopenCollapsedWorkbench(page, editCopy, collapsedForAnswer)
   const answerOnlyRequests = provider.requests.slice(answerOnlyRequestStart)
   assert.equal(
     answerOnlyRequests.length,
