@@ -287,6 +287,25 @@ def test_worker_environment_contains_only_tokenrhythm_provider_secret(
     assert env["OPENSQUILLA_LIVE_DISABLE_DOTENV"] == "1"
 
 
+def test_isolated_home_environment_supports_path_home_in_child(tmp_path: Path) -> None:
+    isolated_home = tmp_path / "user-state"
+    isolated_home.mkdir()
+    env = e2e._worker_environment("synthetic-rotated-key")
+
+    e2e._apply_isolated_home_environment(env, isolated_home)
+
+    result = subprocess.run(
+        [sys.executable, "-c", "from pathlib import Path; print(Path.home())"],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+    assert Path(result.stdout.strip()) == isolated_home.resolve()
+    assert env["HOME"] == str(isolated_home.resolve())
+    assert env["USERPROFILE"] == str(isolated_home.resolve())
+
+
 def test_live_harness_checks_each_feature_default_independently(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

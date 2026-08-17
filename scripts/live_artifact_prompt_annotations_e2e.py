@@ -406,6 +406,17 @@ def _worker_environment(api_key: str) -> dict[str, str]:
     return apply_utf8_child_env(env)
 
 
+def _apply_isolated_home_environment(env: dict[str, str], home: Path) -> None:
+    """Give an isolated child a portable home without exposing the operator's profile."""
+
+    isolated_home = str(home.resolve())
+    # pathlib.Path.home() consults HOME on POSIX and USERPROFILE on Windows.
+    # Set both explicitly because the least-privilege provider environment
+    # intentionally inherits neither from the host.
+    env["HOME"] = isolated_home
+    env["USERPROFILE"] = isolated_home
+
+
 def _case_payload(scenario: Scenario, evidence: CaseEvidence | None = None) -> dict[str, Any]:
     observed = evidence if evidence is not None else CaseEvidence(status="not_run")
     return {
@@ -1299,6 +1310,7 @@ class GatewayCertificationDriver:
             allow_local_test_model_overrides=self.allow_local_test_model_overrides,
         )
         env = _worker_environment(self.api_key)
+        _apply_isolated_home_environment(env, self.user_state_dir)
         env.update(bridge_environment)
         env["OPENSQUILLA_DESKTOP"] = "1"
         env["PYTHONPATH"] = str(SRC_DIR)
