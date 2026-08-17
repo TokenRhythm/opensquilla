@@ -61,7 +61,11 @@
             class="usage-bar-row__fill usage-bar-row__fill--output"
             :style="`width:${row.outputPct.toFixed(1)}%`"
           />
-          <span class="usage-bar-row__cap" :style="`left:${Math.min(100, row.totalPct).toFixed(1)}%`" />
+          <span
+            v-if="row.totalPct > 0"
+            class="usage-bar-row__cap"
+            :style="`left:${Math.min(100, row.totalPct).toFixed(1)}%`"
+          />
         </span>
         <span class="usage-bar-row__value usage-mono">{{ row.valueLabel }}</span>
       </component>
