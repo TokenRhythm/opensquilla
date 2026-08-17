@@ -50,6 +50,7 @@
     "tests/test_channels/test_channel_delivery_store.py": 0.01,
     "tests/test_channels/test_channel_delivery_store_windows_long_paths.py": 0.01,
     "tests/test_channels/test_channel_manager_lifecycle.py": 0.019,
+    "tests/test_channels/test_channel_markdown_support.py": 0.01,
     "tests/test_channels/test_channel_mock_certification.py": 0.01,
     "tests/test_channels/test_channel_native_file_uploads.py": 0.016,
     "tests/test_channels/test_channel_pairing.py": 0.01,
