@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from typing import Any, cast
 
@@ -19,6 +20,20 @@ _retriever_lock = threading.Lock()
 _elig_ctx = EligibilityContext.auto()
 _elig_ctx_lock = threading.RLock()
 _elig_catalog_key: tuple[int, int] | None = None
+
+
+def _message_fingerprint(text: str | None) -> str:
+    """Return a non-recoverable identity for a user message in debug logs.
+
+    Debug logs must not carry recoverable user prompt text (issue #1208); a
+    short sha256 prefix plus the message length keeps recall-debug correlation
+    (same query -> same fingerprint) without exposing any content.
+    """
+
+    if not isinstance(text, str) or not text:
+        return ""
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"sha256:{digest}:len={len(text)}"
 
 
 def invalidate_skill_eligibility_cache() -> None:
@@ -327,11 +342,7 @@ async def filter_skills(ctx: TurnContext) -> TurnContext:
         query_preview=(
             "[goal objective]"
             if routing_hint is not None
-            else (
-                semantic_message[:60] + "..."
-                if isinstance(semantic_message, str) and len(semantic_message) > 60
-                else semantic_message
-            )
+            else _message_fingerprint(semantic_message)
         ),
         pinned_skills=pinned_ids,
         filtered_skills=filtered_ids,

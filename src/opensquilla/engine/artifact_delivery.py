@@ -248,6 +248,22 @@ def auto_publish_omitted_workspace_artifacts(
         if not _text_mentions_written_file(final_text, record):
             continue
 
+        target_key = artifact_delivery_publish_target_key(
+            str(target),
+            workspace_dir=workspace,
+        )
+        name_key = artifact_delivery_name_target_key(target.name)
+        if target_key is not None and target_key in getattr(
+            ctx, "published_artifact_source_keys", frozenset()
+        ):
+            # The same source file was explicitly published earlier this turn,
+            # possibly under a custom display name. Do not publish it a second
+            # time under its original filename.
+            for resolved_key in (target_key, name_key):
+                if resolved_key is not None and resolved_key not in resolved_target_keys:
+                    resolved_target_keys.append(resolved_key)
+            continue
+
         try:
             artifact_mime = artifact_mime_for_name(target.name)
             publish_max_bytes = artifact_publish_max_bytes_for_name(
@@ -288,11 +304,6 @@ def auto_publish_omitted_workspace_artifacts(
                 pptx_payload if pptx_payload is not None else target.read_bytes()
             ).hexdigest()
             artifact_key = (target_sha256, _safe_filename(target.name))
-            target_key = artifact_delivery_publish_target_key(
-                str(target),
-                workspace_dir=workspace,
-            )
-            name_key = artifact_delivery_name_target_key(target.name)
             if artifact_key in known_artifact_keys:
                 for resolved_key in (target_key, name_key):
                     if (
