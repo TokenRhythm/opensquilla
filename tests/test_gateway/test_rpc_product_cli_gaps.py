@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -1305,7 +1306,10 @@ async def test_providers_status_honors_configured_active_api_key_env(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_providers_status_probe_surfaces_classified_active_error(monkeypatch):
+async def test_providers_status_probe_surfaces_classified_active_error(
+    monkeypatch,
+    tmp_path: Path,
+):
     from opensquilla.provider.selector import ModelListResult, ProviderListError
 
     leaked = "sk-or-v1-abcdefghijklmnopqrstuvwxyz"
@@ -1331,7 +1335,8 @@ async def test_providers_status_probe_surfaces_classified_active_error(monkeypat
             "provider": "openrouter",
             "model": "openrouter/model",
             "api_key": "synthetic-unclassified-key",
-        }
+        },
+        state_dir=str(tmp_path / "state"),
     )
 
     res = await get_dispatcher().dispatch(
@@ -1347,11 +1352,19 @@ async def test_providers_status_probe_surfaces_classified_active_error(monkeypat
     assert probe["count"] == 0
     assert probe["failureKind"] == "auth_invalid"
     assert leaked not in repr(res.payload)
+    # The failed probe is recorded so the setup panel does not claim the
+    # provider is verified.
+    from opensquilla.onboarding.probe_history import load_probe_history
+
+    record = load_probe_history(cfg)["openrouter"]
+    assert record["ok"] is False
+    assert record["failureKind"] == "auth_invalid"
 
 
 @pytest.mark.asyncio
 async def test_providers_status_probe_distinguishes_empty_and_degraded_catalogs(
     monkeypatch,
+    tmp_path: Path,
 ):
     from opensquilla.provider.selector import ModelListResult, ProviderListError
 
@@ -1371,7 +1384,8 @@ async def test_providers_status_probe_distinguishes_empty_and_degraded_catalogs(
             "provider": "openrouter",
             "model": "openrouter/model",
             "api_key": "synthetic-unclassified-key",
-        }
+        },
+        state_dir=str(tmp_path / "state"),
     )
     ctx = _ctx(config=cfg, provider_selector=selector)
 
@@ -1411,6 +1425,50 @@ async def test_providers_status_probe_distinguishes_empty_and_degraded_catalogs(
     assert degraded_probe["status"] == "degraded"
     assert degraded_probe["count"] == 1
     assert degraded_probe["failureKind"] == "rate_limited"
+
+
+@pytest.mark.asyncio
+async def test_providers_status_successful_probe_marks_deployment_verified(
+    monkeypatch,
+    tmp_path: Path,
+):
+    from opensquilla.provider.selector import ModelListResult
+
+    class _Selector:
+        is_configured = True
+
+        async def list_models_detailed(self):
+            return ModelListResult(
+                models=[{"provider": "openrouter", "model_id": "openrouter/model"}]
+            )
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    cfg = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "openrouter/model",
+            "api_key": "synthetic-unclassified-key",
+        },
+        state_dir=str(tmp_path / "state"),
+    )
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "providers.status",
+        {"provider": "openrouter", "probeModels": True},
+        _ctx(config=cfg, provider_selector=_Selector()),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["providers"][0]["modelProbe"]["status"] == "ok"
+
+    # The successful CLI probe must be persisted so the setup panel reports
+    # the deployment as verified instead of "Not verified" (issue #1207).
+    from opensquilla.onboarding.probe_history import load_probe_history
+
+    record = load_probe_history(cfg)["openrouter"]
+    assert record["ok"] is True
+    assert record["failureKind"] == ""
 
 
 @pytest.mark.asyncio
