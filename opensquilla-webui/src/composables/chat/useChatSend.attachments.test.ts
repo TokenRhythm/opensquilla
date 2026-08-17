@@ -1514,7 +1514,7 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Ensemble doesn't support image input yet. Switch to single-model routing and try again.",
+      text: "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
     })
   })
 
@@ -6868,7 +6868,7 @@ describe('useChatSend Ensemble image guard', () => {
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Ensemble doesn't support image input yet. Switch to single-model routing and try again.",
+      text: "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
     })
   })
 
@@ -6885,7 +6885,7 @@ describe('useChatSend Ensemble image guard', () => {
     await known.api.onSend()
     expect(known.options.messages.value[known.options.messages.value.length - 1]).toMatchObject({
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Ensemble doesn't support image input yet. Switch to single-model routing and try again.",
+      text: "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
     })
 
     const unknownRpc = {
