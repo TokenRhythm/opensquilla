@@ -561,6 +561,22 @@ export function nativeWorkbenchV2NetworkUrlAllowed(
   }
 }
 
+export function nativeWorkbenchMissingResourceIsLocal(
+  value: string,
+  expectedOrigin?: string,
+): boolean {
+  if (!expectedOrigin) return false
+  try {
+    const target = new URL(value)
+    return (
+      (target.protocol === 'http:' || target.protocol === 'https:')
+      && target.origin === expectedOrigin
+    )
+  } catch {
+    return false
+  }
+}
+
 export function nativeWorkbenchDownloadAllowed(hasUserGesture: unknown): boolean {
   return hasUserGesture === true
 }

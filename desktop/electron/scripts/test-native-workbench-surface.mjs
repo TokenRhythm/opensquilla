@@ -30,6 +30,7 @@ import {
   nativeWorkbenchArtifactUrl,
   nativeWorkbenchCssRectToDip,
   nativeWorkbenchDownloadAllowed,
+  nativeWorkbenchMissingResourceIsLocal,
   nativeWorkbenchNetworkUrlAllowed,
   nativeWorkbenchV2NetworkUrlAllowed,
   parseNativeWorkbenchCreateRequest,
@@ -891,6 +892,21 @@ assert.equal(
   false,
 )
 assert.equal(nativeWorkbenchV2NetworkUrlAllowed('about:config', 'offline', previewOrigin), false)
+assert.equal(
+  nativeWorkbenchMissingResourceIsLocal(`${previewOrigin}/missing.css`, previewOrigin),
+  true,
+)
+assert.equal(
+  nativeWorkbenchMissingResourceIsLocal(
+    'https://fonts.googleapis.com/css2?family=Inter',
+    previewOrigin,
+  ),
+  false,
+)
+assert.equal(
+  nativeWorkbenchMissingResourceIsLocal('not a URL', previewOrigin),
+  false,
+)
 assert.equal(nativeWorkbenchDownloadAllowed(true), true)
 for (const untrustedGesture of [false, undefined, null, 1, 'true']) {
   assert.equal(

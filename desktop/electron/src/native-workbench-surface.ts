@@ -37,6 +37,7 @@ import {
   nativeWorkbenchArtifactUrl,
   nativeWorkbenchCssRectToDip,
   nativeWorkbenchDownloadAllowed,
+  nativeWorkbenchMissingResourceIsLocal,
   nativeWorkbenchNetworkUrlAllowed,
   nativeWorkbenchV2NetworkUrlAllowed,
   type NativeWorkbenchCreateRequest,
@@ -2615,6 +2616,10 @@ export class NativeWorkbenchSurfaceManager {
       if (
         details.resourceType !== 'mainFrame'
         && details.statusCode >= 400
+        && nativeWorkbenchMissingResourceIsLocal(
+          details.url,
+          record.expectedOrigin ?? undefined,
+        )
         && !record.missingResourceReported
       ) {
         record.missingResourceReported = true
@@ -2624,6 +2629,10 @@ export class NativeWorkbenchSurfaceManager {
     previewSession.webRequest.onErrorOccurred({ urls: ['<all_urls>'] }, details => {
       if (
         details.resourceType !== 'mainFrame'
+        && nativeWorkbenchMissingResourceIsLocal(
+          details.url,
+          record.expectedOrigin ?? undefined,
+        )
         && !record.missingResourceReported
         && !record.blockedNetworkReported
         && !record.privilegedOriginReported
