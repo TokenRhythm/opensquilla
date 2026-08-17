@@ -58,7 +58,17 @@ _SESSION_KEY_FIELDS = {
 
 
 class GuestRpcPolicyError(PermissionError):
-    """Raised when an anonymous guest crosses the RPC ownership boundary."""
+    """Raised when an anonymous guest crosses the RPC ownership boundary.
+
+    ``session_expired`` marks rejections caused by a stale or missing guest
+    identity (as opposed to an ordinary method/scope denial). Clients use this
+    to recycle the connection and re-handshake instead of leaving a physically
+    healthy WebSocket stuck on an invalidated business session.
+    """
+
+    def __init__(self, message: str, *, session_expired: bool = False):
+        super().__init__(message)
+        self.session_expired = session_expired
 
 
 def _guest_namespace_parts(session_key: object) -> tuple[str, str] | None:
@@ -139,7 +149,10 @@ class GuestRpcPolicy:
 
         owner_id = getattr(ctx.principal, "guest_owner_id", None)
         if not owner_id or not _OWNER_ID_RE.fullmatch(str(owner_id)):
-            raise GuestRpcPolicyError("Anonymous guest identity is unavailable")
+            raise GuestRpcPolicyError(
+                "Anonymous guest identity is unavailable",
+                session_expired=True,
+            )
 
         if method == "sessions.list":
             return params
@@ -171,7 +184,10 @@ class GuestRpcPolicy:
             if not isinstance(raw_keys, list) or not raw_keys:
                 raise GuestRpcPolicyError("Guest session key is required")
             if not all(guest_owns_session_key(owner_id, key) for key in raw_keys):
-                raise GuestRpcPolicyError("Guest session is not owned by this browser")
+                raise GuestRpcPolicyError(
+                    "Guest session is not owned by this browser",
+                    session_expired=True,
+                )
             normalized = dict(params)
             normalized["keys"] = raw_keys
             normalized.pop("key", None)
@@ -182,7 +198,10 @@ class GuestRpcPolicy:
         fields = _SESSION_KEY_FIELDS[method]
         key = next((params.get(field) for field in fields if params.get(field)), None)
         if not guest_owns_session_key(owner_id, key):
-            raise GuestRpcPolicyError("Guest session is not owned by this browser")
+            raise GuestRpcPolicyError(
+                "Guest session is not owned by this browser",
+                session_expired=True,
+            )
         normalized = dict(params)
         normalized[fields[0]] = key
         for alias in fields[1:]:

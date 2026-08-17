@@ -35,6 +35,7 @@ from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, GuestRpcPolicyE
 from opensquilla.gateway.protocol import (
     ERROR_INVALID_REQUEST,
     ERROR_METHOD_NOT_FOUND,
+    ERROR_SESSION_EXPIRED,
     ERROR_UNAUTHORIZED,
     ERROR_UNAVAILABLE,
     ResFrame,
@@ -265,7 +266,14 @@ class RpcRegistry:
 
         try:
             params = GuestRpcPolicy.authorize(method, params, ctx)
-        except GuestRpcPolicyError:
+        except GuestRpcPolicyError as exc:
+            if getattr(exc, "session_expired", False):
+                return make_error_res(
+                    req_id,
+                    ERROR_SESSION_EXPIRED,
+                    "Anonymous guest session has expired; reconnect to start a fresh session",
+                    details={"reason": "guest_session_expired"},
+                )
             return make_error_res(
                 req_id,
                 ERROR_UNAUTHORIZED,
