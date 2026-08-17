@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
 import re
@@ -523,6 +524,68 @@ def test_run_agent_command_json_includes_routing(
         "baseline_model": "openrouter/heavy",
         "routed_model": "openrouter/light",
     }
+
+
+def test_agent_command_emits_concise_profile_lock_error_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla import recovery
+    from opensquilla.cli.main import app
+
+    sensitive_profile = tmp_path / "customer-private-profile"
+
+    @contextlib.contextmanager
+    def busy_profile_guard(**_kwargs):
+        raise recovery.ProfileLockBusyError(
+            f"profile is in use by another writer: {sensitive_profile}"
+        )
+        yield  # pragma: no cover - contextmanager shape only
+
+    def fail_run_agent_command(**_kwargs) -> None:
+        raise AssertionError("agent must not run without the profile lock")
+
+    monkeypatch.setattr(recovery, "guarded_desktop_profile", busy_profile_guard)
+    monkeypatch.setattr("opensquilla.cli.main.run_agent_command", fail_run_agent_command)
+
+    result = CliRunner().invoke(app, ["agent", "-m", "hello"])
+
+    assert result.exit_code == 1
+    output = result.stdout + (result.stderr or "")
+    assert "already in use by another OpenSquilla writer" in output
+    assert "opensquilla chat" in output
+    assert "OPENSQUILLA_STATE_DIR" in output
+    assert str(sensitive_profile) not in output
+    assert "Traceback" not in output
+
+
+def test_agent_command_json_emits_stable_profile_lock_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from opensquilla import recovery
+    from opensquilla.cli.main import app
+
+    @contextlib.contextmanager
+    def busy_profile_guard(**_kwargs):
+        raise recovery.ProfileLockBusyError(
+            "profile is in use by another writer: some-private-path"
+        )
+        yield  # pragma: no cover - contextmanager shape only
+
+    def fail_run_agent_command(**_kwargs) -> None:
+        raise AssertionError("agent must not run without the profile lock")
+
+    monkeypatch.setattr(recovery, "guarded_desktop_profile", busy_profile_guard)
+    monkeypatch.setattr("opensquilla.cli.main.run_agent_command", fail_run_agent_command)
+
+    result = CliRunner().invoke(app, ["agent", "-m", "hello", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stderr)
+    assert payload["error"]["code"] == "profile_lock_busy"
+    assert "some-private-path" not in result.stderr
+    assert "Traceback" not in result.stderr
 
 
 @pytest.mark.asyncio
