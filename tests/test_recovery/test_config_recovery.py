@@ -134,6 +134,56 @@ def test_recover_config_is_a_no_op_on_a_healthy_profile(tmp_path: Path) -> None:
     assert _corrupt_configs(home) == []
 
 
+def test_recover_config_repairs_config_that_blocks_sandbox_migration(
+    tmp_path: Path,
+) -> None:
+    home = _profile(tmp_path)
+    # Valid TOML, but the lossless sandbox-upgrade patcher cannot rewrite an
+    # array-of-tables ``sandbox`` section: the gateway's startup migration
+    # fails closed with migration_failed_manual_recovery_required.
+    incompatible = (
+        "config_version = 1\n"
+        f"state_dir = {json.dumps(str(home / 'state'))}\n"
+        f"workspace_dir = {json.dumps(str(home / 'workspace'))}\n"
+        "[[sandbox]]\n"
+        "enabled = true\n"
+    )
+    (home / "config.toml").write_text(incompatible, encoding="utf-8")
+
+    before = inspect_profile(home)
+    assert before.outcome == "attention"
+    assert before.stable_code == "config_invalid"
+    assert "recover-config" in before.allowed_actions
+
+    report = recover_config(home)
+
+    assert report.outcome == "ready"
+    assert (home / "config.toml").read_text(encoding="utf-8") == "config_version = 1\n"
+    corrupt = _corrupt_configs(home)
+    assert len(corrupt) == 1
+    assert "[[sandbox]]" in corrupt[0].read_text(encoding="utf-8")
+
+
+def test_inspect_does_not_flag_config_after_sandbox_migration_committed(
+    tmp_path: Path,
+) -> None:
+    home = _profile(tmp_path)
+    incompatible = "config_version = 1\n[[sandbox]]\nenabled = true\n"
+    (home / "config.toml").write_text(incompatible, encoding="utf-8")
+    # A committed sandbox-upgrade journal means the gateway never re-runs the
+    # patch, so an incompatible shape no longer blocks startup and must not be
+    # reported as a recoverable config corruption.
+    (home / ".sandbox-upgrade-v2.json").write_text(
+        json.dumps({"migrationVersion": 2, "status": "committed", "stores": []}) + "\n",
+        encoding="utf-8",
+    )
+
+    report = inspect_profile(home)
+
+    assert report.stable_code != "config_invalid"
+    assert "recover-config" not in report.allowed_actions
+
+
 def test_config_unreadable_report_offers_recover_config(tmp_path: Path) -> None:
     home = _profile(tmp_path)
     (home / "config.toml").write_text("workspace_dir = [\n", encoding="utf-8")
