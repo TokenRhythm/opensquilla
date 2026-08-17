@@ -1205,5 +1205,6 @@ class WeComChannel:
                 content=accumulated,
                 reply_to=target or "",
                 metadata=out_meta,
+                format="markdown",
             )
         )

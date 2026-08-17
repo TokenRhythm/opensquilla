@@ -86,7 +86,6 @@ def _find_closer(text: str, start: int, opener: str) -> int:
     return -1
 
 
-
 def _escape_text(text: str) -> str:
     """Escape a literal text run for Telegram's HTML parser."""
     return html.escape(text, quote=False)
@@ -100,7 +99,7 @@ def _render_span(text: str) -> str:
         token = _match_delimiter(text, i)
         if token is None:
             link = _LINK_RE.search(text, i)
-            if link is None:
+            if link is None or link.start() != i:
                 out.append(_escape_text(text[i]))
                 i += 1
                 continue
@@ -180,7 +179,7 @@ def markdown_to_telegram_html(content: str) -> str:
                 assert match is not None
                 quote.append(match.group(1))
                 i += 1
-            rendered.append(f"<blockquote>{_render_inline(' '.join(quote))}</blockquote>")
+            rendered.append(f"<blockquote>{_render_inline('\n'.join(quote))}</blockquote>")
             continue
         unordered = _UNORDERED_RE.match(line)
         if unordered is not None:

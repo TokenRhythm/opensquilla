@@ -518,18 +518,35 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         JSON body. Build the payload directly so only the markdown fields
         are sent.
         """
-        from botpy.http import Route
+        if hasattr(self.api, "_http") and hasattr(self.api._http, "request"):
+            from botpy.http import Route
 
-        payload: dict[str, Any] = {
-            target_key: target,
-            "msg_type": 2,
-            "msg_seq": msg_seq,
-            "markdown": {"content": markdown_content},
-        }
-        if msg_id:
-            payload["msg_id"] = msg_id
-        route = Route("POST", route_path, **{target_key: target})
-        await self.api._http.request(route, json=payload)  # type: ignore[attr-defined]
+            payload: dict[str, Any] = {
+                target_key: target,
+                "msg_type": 2,
+                "msg_seq": msg_seq,
+                "markdown": {"content": markdown_content},
+            }
+            if msg_id:
+                payload["msg_id"] = msg_id
+            route = Route("POST", route_path, **{target_key: target})
+            await self.api._http.request(route, json=payload)  # type: ignore[attr-defined]
+        elif target_key == "group_openid" and hasattr(self.api, "post_group_message"):
+            await self.api.post_group_message(
+                group_openid=target,
+                msg_type=2,
+                markdown={"content": markdown_content},
+                msg_id=msg_id,
+                msg_seq=msg_seq,
+            )
+        elif hasattr(self.api, "post_c2c_message"):
+            await self.api.post_c2c_message(
+                openid=target,
+                msg_type=2,
+                markdown={"content": markdown_content},
+                msg_id=msg_id,
+                msg_seq=msg_seq,
+            )
 
     async def edit(self, message_id: str, content: str) -> None:
         """Raise: QQ Bot Platform has no message-edit primitive."""
@@ -607,4 +624,10 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             elif ct == "c2c" and "openid" not in out_meta:
                 out_meta["openid"] = target
 
-        await self.send(OutgoingMessage(content=accumulated, metadata=out_meta))
+        await self.send(
+            OutgoingMessage(
+                content=accumulated,
+                metadata=out_meta,
+                format="markdown",
+            )
+        )

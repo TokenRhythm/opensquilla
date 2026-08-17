@@ -119,11 +119,11 @@ def _feishu_markdown_chunks(content: str) -> list[str]:
         # Each pass at least halves the piece, so this terminates; a single
         # character serializes to well below the cap.
         limit = max(1, len(piece) // 2)
-        halves = split_markdown_for_channel(
-            piece, limit, unit=ChannelLengthUnit.UTF8_BYTES
-        )
+        halves = split_markdown_for_channel(piece, limit, unit=ChannelLengthUnit.UTF8_BYTES)
         pending[0:0] = halves
     return result
+
+
 _FEISHU_INBOUND_RESOURCE_DEFAULTS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
     "image": ("image.png", "image/png", "image", ("image_key",)),
     "file": ("file", "application/octet-stream", "file", ("file_key",)),
@@ -364,9 +364,8 @@ def _classify_feishu_websocket_error(error: BaseException) -> tuple[str, bool]:
         return "auth_invalid", False
 
     error_type = type(error)
-    if (
-        error_type.__name__ == "ClientException"
-        and error_type.__module__.startswith("lark_oapi.ws")
+    if error_type.__name__ == "ClientException" and error_type.__module__.startswith(
+        "lark_oapi.ws"
     ):
         return "auth_invalid", False
 
@@ -620,9 +619,7 @@ class FeishuWebSocketTransport:
                 self._bind_sdk_event_loop(worker_loop)
                 ws_client.start()
                 if not self._stop_requested.is_set():
-                    diagnostic = self._record_error(
-                        "Feishu WebSocket client stopped unexpectedly"
-                    )
+                    diagnostic = self._record_error("Feishu WebSocket client stopped unexpectedly")
                     startup_error.append(_FeishuWebSocketRuntimeError(diagnostic))
             except asyncio.CancelledError:
                 if not self._stop_requested.is_set():
@@ -728,11 +725,7 @@ class FeishuWebSocketTransport:
 
     def _connection_phase(self) -> Literal["connecting", "open", "reconnecting", "stopped"]:
         thread = self._thread
-        if (
-            self._stop_requested.is_set()
-            or thread is None
-            or not thread.is_alive()
-        ):
+        if self._stop_requested.is_set() or thread is None or not thread.is_alive():
             return "stopped"
         state = _feishu_sdk_websocket_state(self._ws_client)
         if state is WebSocketState.OPEN:
@@ -847,9 +840,7 @@ class FeishuWebSocketTransport:
                             timeout=_FEISHU_WS_JOIN_TIMEOUT_S,
                         )
                     except TimeoutError:
-                        diagnostic = self._record_error(
-                            "Feishu WebSocket disconnect timed out"
-                        )
+                        diagnostic = self._record_error("Feishu WebSocket disconnect timed out")
                         log.warning(
                             "feishu.websocket_disconnect_failed",
                             error=diagnostic["message"],
@@ -2108,7 +2099,7 @@ class FeishuChannel:
 
         if not accumulated:
             return None
-        await self.send(OutgoingMessage(content=accumulated, reply_to=target))
+        await self.send(OutgoingMessage(content=accumulated, reply_to=target, format="markdown"))
         return None
 
     # ------------------------------------------------------------------

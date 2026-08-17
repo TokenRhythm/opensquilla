@@ -358,9 +358,7 @@ class SlackChannel:
         chunks = split_text_for_channel(message.content, _SLACK_MAX_MESSAGE_CHARS)
         for chunk in chunks:
             payload["text"] = (
-                markdown_to_slack_mrkdwn(chunk)
-                if message.format == "markdown"
-                else chunk
+                markdown_to_slack_mrkdwn(chunk) if message.format == "markdown" else chunk
             )
             resp = await client.post("/chat.postMessage", json=payload)
             resp.raise_for_status()
@@ -504,7 +502,7 @@ class SlackChannel:
             nonlocal message_ts
             payload: dict[str, Any] = {
                 "channel": target,
-                "text": text,
+                "text": markdown_to_slack_mrkdwn(text),
             }
             if thread_ts:
                 payload["thread_ts"] = thread_ts
@@ -522,7 +520,7 @@ class SlackChannel:
                 json={
                     "channel": target,
                     "ts": message_ts,
-                    "text": text,
+                    "text": markdown_to_slack_mrkdwn(text),
                 },
             )
             resp.raise_for_status()

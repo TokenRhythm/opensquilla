@@ -184,9 +184,7 @@ class BackgroundCompletionManager:
         """Cancel only the completion group owned by one exact parent task."""
         group_id = self.group_id(parent_session_key, parent_task_id)
         async with self._state_lock:
-            known_group_ids = self._group_ids_for_parent_sessions_locked(
-                (parent_session_key,)
-            )
+            known_group_ids = self._group_ids_for_parent_sessions_locked((parent_session_key,))
             was_known = group_id in known_group_ids
             # Remember the exact cancellation even if group admission is racing
             # this call. A later admission for the same task must not revive it.
@@ -956,14 +954,24 @@ def _build_channel_message(
     if channel_name == "slack":
         metadata = {"channel": channel_id} if channel_id else {}
         if thread_id:
-            return OutgoingMessage(content=content, reply_to=thread_id, metadata=metadata)
+            return OutgoingMessage(
+                content=content,
+                reply_to=thread_id,
+                metadata=metadata,
+                format="markdown",
+            )
         if channel_id:
             return OutgoingMessage(
                 content=content,
                 reply_to=None,
                 metadata={**metadata, "thread_ts": None},
+                format="markdown",
             )
-    return OutgoingMessage(content=content, reply_to=thread_id or channel_id)
+    return OutgoingMessage(
+        content=content,
+        reply_to=thread_id or channel_id,
+        format="markdown",
+    )
 
 
 def _status_value(value: Any) -> str | None:
