@@ -232,11 +232,11 @@ class _DeterministicArtifactProvider:
         )
 
 
-def test_scenario_matrix_has_approved_42_63_64_budget() -> None:
+def test_scenario_matrix_has_approved_26_47_64_budget() -> None:
     e2e._assert_scenario_plan()
 
-    assert sum(row.expected_physical_calls for row in e2e.SCENARIOS) == 42
-    assert e2e.WORST_CASE_PHYSICAL_CALLS == 63
+    assert sum(row.expected_physical_calls for row in e2e.SCENARIOS) == 26
+    assert e2e.WORST_CASE_PHYSICAL_CALLS == 47
     assert e2e.HARD_PHYSICAL_CALL_CAP == 64
     assert sum(row.zero_call_preflight for row in e2e.SCENARIOS) == 3
     mutation_cases = [row for row in e2e.SCENARIOS if not row.zero_call_preflight]
@@ -254,18 +254,18 @@ def test_scenario_matrix_has_approved_42_63_64_budget() -> None:
 
 
 def test_physical_call_budget_refuses_overrun() -> None:
-    with pytest.raises(ValueError, match="between 63 and 64"):
-        e2e.PhysicalCallBudget(hard_cap=62)
+    with pytest.raises(ValueError, match="between 47 and 64"):
+        e2e.PhysicalCallBudget(hard_cap=46)
 
     budget = e2e.PhysicalCallBudget(hard_cap=64)
-    budget.reserve("baseline", 42)
+    budget.reserve("baseline", 26)
     budget.reserve("retry", 16)
     budget.reserve("ensemble_extra", 5)
-    budget.claim("baseline", 42)
+    budget.claim("baseline", 26)
     budget.claim("retry", 16)
     budget.claim("ensemble_extra", 5)
 
-    assert budget.observed == 63
+    assert budget.observed == 47
     with pytest.raises(RuntimeError, match="exceeded"):
         budget.claim("ensemble_extra")
 
@@ -424,7 +424,7 @@ def test_certification_reserves_each_case_and_completes_from_evidence_not_featur
     assert report["certification"] == "complete"
     assert report["featureDefaultEnabled"] is True
     assert report["reasonCodes"] == []
-    assert report["physicalCallBudget"]["observed"] == 42
+    assert report["physicalCallBudget"]["observed"] == 26
     assert all(row["status"] == "passed" for row in report["cases"])
 
 

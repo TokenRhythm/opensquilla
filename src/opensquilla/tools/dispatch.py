@@ -2214,16 +2214,9 @@ def build_tool_handler(
                 proposal_failures=mutation_proposal_failures,
             )
 
+        # The unwrap preserves the immutable origin trace, so the authoritative
+        # ingress injection decision above cannot change after normalization.
         tool_call = _unwrap_nested_json_arguments(tool_call, registered, effective_ctx)
-        injection_envelope = _check_injection_guard(tool_call, effective_ctx)
-        if injection_envelope is not None:
-            return await _finish_artifact_mutation_failure(
-                mutation_controller,
-                tool_call,
-                injection_envelope,
-                failure_code="writer_arguments_rejected",
-                proposal_failures=mutation_proposal_failures,
-            )
 
         runtime_only_supplied = sorted(
             set(tool_call.arguments) & registered.spec.runtime_only_arguments

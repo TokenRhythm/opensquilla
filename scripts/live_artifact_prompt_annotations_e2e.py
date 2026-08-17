@@ -48,6 +48,7 @@ if str(SRC_DIR) not in sys.path:
 from opensquilla.artifacts import ArtifactStore  # noqa: E402
 from opensquilla.gateway import rpc_artifact_editing as artifact_editing_rpc  # noqa: E402
 from opensquilla.gateway_client import GatewayRPCClient, GatewayRPCError  # noqa: E402
+from opensquilla.subprocess_encoding import apply_utf8_child_env  # noqa: E402
 from scripts.live_harness_security import (  # noqa: E402
     child_environment,
     classify_failure,
@@ -111,17 +112,18 @@ _ELEMENT_PATHS = {
     ),
 }
 
-# The six annotation cases have 42 expected physical requests: Direct and
+# The six annotation cases have 26 expected physical requests: Direct and
 # Router each need one inspect/locate round, one commit round, and one tools=[]
-# outcome-finalization round, while each full B5 Ensemble case needs three
-# five-member rounds. A single
+# outcome-finalization round. Each full B5 Ensemble case needs one five-member
+# fusion round, then two stateful primary-aggregator continuations that reuse
+# the admitted proposer evidence. A single
 # controlled scenario retry plus bounded in-place transient retries may consume
 # at most sixteen extra requests; one additional full Ensemble tool round is
 # five requests. Sixty-four remains an absolute guardrail, not a target.
-EXPECTED_PHYSICAL_CALLS = 42
+EXPECTED_PHYSICAL_CALLS = 26
 TRANSIENT_RETRY_ALLOWANCE = 16
 ENSEMBLE_EXTRA_TOOL_ROUND_ALLOWANCE = 5
-WORST_CASE_PHYSICAL_CALLS = 63
+WORST_CASE_PHYSICAL_CALLS = 47
 HARD_PHYSICAL_CALL_CAP = 64
 
 # A mutation case may legitimately consume its full request/turn deadline, and
@@ -232,8 +234,8 @@ SCENARIOS = (
     Scenario("direct_double_annotation", "direct", None, "configured_direct", _ANNOTATION_TOOLS, 3),
     Scenario("router_single_annotation", "router", "c2", "router_c2", _ANNOTATION_TOOLS, 3),
     Scenario("router_double_annotation", "router", "c3", "router_c3", _ANNOTATION_TOOLS, 3),
-    Scenario("ensemble_single_annotation", "ensemble", None, "static_b5", _ANNOTATION_TOOLS, 15),
-    Scenario("ensemble_double_annotation", "ensemble", None, "static_b5", _ANNOTATION_TOOLS, 15),
+    Scenario("ensemble_single_annotation", "ensemble", None, "static_b5", _ANNOTATION_TOOLS, 7),
+    Scenario("ensemble_double_annotation", "ensemble", None, "static_b5", _ANNOTATION_TOOLS, 7),
 )
 
 
@@ -401,7 +403,7 @@ def _worker_environment(api_key: str) -> dict[str, str]:
             raise RuntimeError("isolated worker received an unrelated provider credential")
     if BASE_URL_ENV in env:
         raise RuntimeError("isolated worker received an endpoint override")
-    return env
+    return apply_utf8_child_env(env)
 
 
 def _case_payload(scenario: Scenario, evidence: CaseEvidence | None = None) -> dict[str, Any]:
@@ -1032,7 +1034,23 @@ def _trace_evidence(records: Sequence[Mapping[str, Any]], *, mode: str) -> _Trac
                 traces.append(trace)
         if len(traces) != len(requests):
             accounting_ambiguous = True
-        physical_calls = sum(int(trace.get("llm_request_count") or 0) for trace in traces)
+        cumulative_request_counts = [
+            int(trace.get("llm_request_count") or 0) for trace in traces
+        ]
+        if (
+            not cumulative_request_counts
+            or cumulative_request_counts[0] <= 0
+            or any(
+                current <= previous
+                for previous, current in zip(
+                    cumulative_request_counts,
+                    cumulative_request_counts[1:],
+                    strict=False,
+                )
+            )
+        ):
+            accounting_ambiguous = True
+        physical_calls = cumulative_request_counts[-1] if cumulative_request_counts else 0
         aggregator_tools_verified = bool(traces)
         for trace_index, trace in enumerate(traces):
             ensemble_fallback_used = ensemble_fallback_used or trace.get("fallback_used") is True
@@ -1139,7 +1157,7 @@ def _write_gateway_config(
         'source = "state"',
         "",
         "[naming]",
-        # Auxiliary auto-title requests are outside the approved 42-call turn
+        # Auxiliary auto-title requests are outside the approved 26-call turn
         # matrix and must never consume the live credential.
         "enabled = false",
         "",
@@ -1321,7 +1339,25 @@ class GatewayCertificationDriver:
             self.port,
         )
         if error is not None:
-            raise RuntimeError("owned Gateway did not become ready")
+            for stream in (self._stdout, self._stderr):
+                if stream is not None:
+                    stream.flush()
+            try:
+                stderr_tail = self.stderr_path.read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )[-2000:]
+            except OSError:
+                stderr_tail = ""
+            diagnostic = f"{error}; stderr={stderr_tail}" if stderr_tail else error
+            for secret in (
+                self.api_key,
+                bridge_environment.get(DESKTOP_BRIDGE_TOKEN_ENV, ""),
+            ):
+                if secret:
+                    diagnostic = diagnostic.replace(secret, "<redacted>")
+            diagnostic = diagnostic.replace(str(self.temp_root), "<temp-root>")
+            raise RuntimeError(f"owned Gateway did not become ready: {diagnostic}")
         await self.client.connect(f"ws://127.0.0.1:{self.port}/ws")
 
     async def close(self) -> None:

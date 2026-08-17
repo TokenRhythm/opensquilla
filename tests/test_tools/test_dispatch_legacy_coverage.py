@@ -20,6 +20,7 @@ import importlib.util
 import trace
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_tools.dispatch_corpus import ALL_CASES
@@ -196,6 +197,78 @@ def _collect_executed_lines() -> set[int]:
             finally:
                 current_tool_context.reset(token)
 
+        class _MutationController:
+            def __init__(self) -> None:
+                self.status = "reserved"
+                self.proposal_rejection_count = 0
+
+            def owns_commit(self, _tool_use_id: str) -> bool:
+                return False
+
+            async def reject_proposal(self, _tool_use_id: str) -> None:
+                self.proposal_rejection_count += 1
+
+            async def reconcile(self, _tool_use_id: str) -> SimpleNamespace:
+                return SimpleNamespace(status=SimpleNamespace(value=self.status))
+
+            async def mark_ambiguous(
+                self,
+                _tool_use_id: str,
+                _code: str,
+            ) -> SimpleNamespace:
+                self.status = "ambiguous"
+                return await self.reconcile(_tool_use_id)
+
+        async def _run_artifact_writer_coverage(
+            *,
+            outcome: str,
+        ) -> None:
+            controller = _MutationController()
+            registry = ToolRegistry()
+
+            async def _writer(mutations: list[object], _tool_use_id: str) -> str:
+                del mutations, _tool_use_id
+                if outcome == "handler_error":
+                    raise RuntimeError("synthetic artifact writer failure")
+                controller.status = "applied"
+                return '{"status":"applied"}'
+
+            registry.register(
+                ToolSpec(
+                    name="document_apply",
+                    description="coverage artifact writer",
+                    parameters={"mutations": {"type": "array"}},
+                    required=["mutations"],
+                    runtime_only_arguments=frozenset({"_tool_use_id"}),
+                    exposed_by_default=False,
+                ),
+                _writer,
+            )
+            exclusive_tools = (
+                set() if outcome == "exclusive_denial" else {"document_apply"}
+            )
+            ctx = ToolContext(
+                is_owner=True,
+                session_key=f"agent:main:coverage:{outcome}",
+                collaboration_mode="plan" if outcome == "plan_denial" else "default",
+                exclusive_tools=exclusive_tools,
+                allowed_tools={"document_apply"},
+                surfaced_tools={"document_apply"},
+                artifact_mutation_attempt_controller=controller,
+            )
+            handler = build_tool_handler(registry, ctx)
+            token = current_tool_context.set(None)
+            try:
+                await handler(
+                    ToolCall(
+                        tool_use_id=f"tc-artifact-{outcome}",
+                        tool_name="document_apply",
+                        arguments={"mutations": []},
+                    )
+                )
+            finally:
+                current_tool_context.reset(token)
+
         for hooks in hook_variants:
             await _run_coverage_only(
                 tool_name="coverage_cancel",
@@ -241,6 +314,14 @@ def _collect_executed_lines() -> set[int]:
                 ),
                 hooks=hooks,
             )
+
+        for outcome in (
+            "success",
+            "handler_error",
+            "exclusive_denial",
+            "plan_denial",
+        ):
+            await _run_artifact_writer_coverage(outcome=outcome)
 
     tracer.runfunc(asyncio.run, _run_all())
 
