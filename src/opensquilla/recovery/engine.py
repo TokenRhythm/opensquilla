@@ -239,6 +239,45 @@ def _native_is_dir(path: str | Path) -> bool:
     return os.path.isdir(_native_io_path(path))
 
 
+def _config_blocks_sandbox_migration(home: Path, raw: bytes) -> str | None:
+    """Return a detail string when *raw* would fail the startup migration.
+
+    A syntactically valid TOML config can still be impossible for the lossless
+    sandbox-upgrade patcher to rewrite (an array-of-tables ``[[sandbox]]``, an
+    inline ``agents = [{...}]`` table on a shape the scanner cannot span, ...).
+    ``ensure_sandbox_upgrade_migrated`` then fails closed at gateway startup
+    with ``migration_failed_manual_recovery_required``. The recovery inspector
+    previously reported such profiles as ready, so ``recover-config`` never
+    repaired them.
+
+    The check is skipped once the migration journal is committed: the gateway
+    never re-runs the patch after a successful commit, so a later config edit
+    cannot trip the startup gate again.
+    """
+
+    try:
+        from opensquilla.sandbox.upgrade_migration import (
+            inspect_sandbox_upgrade,
+            lossless_patch_sandbox_fields,
+        )
+    except Exception:  # pragma: no cover - inspection must never fail
+        return None
+    try:
+        upgrade = inspect_sandbox_upgrade(home)
+    except Exception:  # pragma: no cover - inspection must never fail
+        return None
+    if upgrade.status == "committed":
+        return None
+    try:
+        lossless_patch_sandbox_fields(raw)
+    except Exception as exc:  # noqa: BLE001 - any patch failure blocks startup
+        return (
+            "config.toml is incompatible with the sandbox upgrade migration "
+            f"({type(exc).__name__}: {exc})"
+        )
+    return None
+
+
 def _read_config(home: Path) -> _ConfigView:
     config_path = home / "config.toml"
     try:
@@ -430,6 +469,22 @@ def _read_config(home: Path) -> _ConfigView:
         workspace = home / "workspace"
         explicit = False
         from_env = False
+    migration_detail = _config_blocks_sandbox_migration(home, snapshot.data)
+    if migration_detail is not None:
+        return _ConfigView(
+            path=config_path,
+            exists=exists,
+            payload=payload,
+            workspace=None,
+            workspace_explicit=False,
+            workspace_from_env=workspace_env is not None,
+            state_dir=state_dir,
+            state_explicit=state_explicit,
+            state_from_env=state_from_env,
+            error_code="config_invalid",
+            error_detail=migration_detail,
+        )
+
     return _ConfigView(
         path=config_path,
         exists=exists,
