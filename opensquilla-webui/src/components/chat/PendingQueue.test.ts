@@ -25,6 +25,7 @@ async function mountQueue(
     pendingUiId?: string
     text: string
     pendingInputId?: string
+    pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
     deliveryState?: 'steering' | 'retryable'
     steerAttempt?: PendingSteerAttempt
     attachments?: Attachment[]
