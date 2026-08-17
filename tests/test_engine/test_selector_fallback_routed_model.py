@@ -95,6 +95,7 @@ async def test_fallback_realigns_only_when_provider_call_starts() -> None:
     assert metadata["routed_model"] == "cheap/fallback"
     assert metadata["executed_provider"] == "fallback-provider"
     assert metadata["executed_model"] == "cheap/fallback"
+    assert metadata["router_fallback_hops"] == 1
     assert metadata["router_fallback_reason"] == "selector_fallback"
     assert metadata["savings_pct"] == 0.0
     assert metadata["savings_max_price_per_m"] == 0.0
@@ -946,6 +947,50 @@ async def test_tokenrhythm_tool_reasoning_fallback_rebuilds_from_canonical_histo
     assert any(event.kind == "done" and event.text == "done" for event in events)
 
 
+async def test_unknown_primary_capability_defers_to_provider_image_validation() -> None:
+    class _Provider:
+        provider_name = "ensemble"
+
+        def __init__(self) -> None:
+            self.validation_calls = 0
+            self.calls = 0
+
+        def validate_chat_request(self, messages):
+            del messages
+            self.validation_calls += 1
+            return ErrorEvent(
+                message="ensemble rejects image input",
+                code="ensemble_multimodal_unsupported",
+            )
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            self.calls += 1
+            yield DoneEvent(model="ensemble/model")
+
+    class _Selector:
+        active_provider_id = "ensemble"
+        current_config = SimpleNamespace(provider="ensemble", model="ensemble/model")
+
+    provider = _Provider()
+    wrapper = _SelectorFallbackProvider(provider, _Selector())
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+        )
+    ]
+
+    events = [event async for event in wrapper.chat(messages, config=ChatConfig())]
+
+    assert provider.validation_calls == 1
+    assert provider.calls == 0
+    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
+        "ensemble_multimodal_unsupported"
+    ]
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+
+
 async def test_image_request_does_not_call_text_only_fallback(monkeypatch: Any) -> None:
     class _Catalog:
         def get_capabilities(
@@ -1047,12 +1092,15 @@ async def test_image_request_does_not_call_text_only_fallback(monkeypatch: Any) 
         UNSUPPORTED_IMAGE_INPUT_REPLY
     ]
     done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.model == "vision-primary"
     assert done.input_tokens == 0
     assert done.output_tokens == 0
     assert metadata["image_input_mode"] == "rejected"
     assert metadata["image_input_reason"] == "fallback_vision_unsupported"
     assert metadata["routed_model"] == "vision-primary"
     assert metadata["executed_model"] == "vision-primary"
+    assert "router_fallback_hops" not in metadata
+    assert "router_fallback_reason" not in metadata
     assert metadata["savings_pct"] == 17.0
     assert [leg["model"] for leg in metadata["execution_legs"]] == [
         "vision-primary"
@@ -1178,6 +1226,8 @@ async def test_invalid_response_fallback_rejects_image_before_text_only_call(
     assert metadata["image_input_reason"] == "fallback_vision_unsupported"
     assert metadata["routed_model"] == "vision-primary"
     assert metadata["executed_model"] == "vision-primary"
+    assert "router_fallback_hops" not in metadata
+    assert "router_fallback_reason" not in metadata
     assert metadata["savings_pct"] == 17.0
     assert [leg["model"] for leg in metadata["execution_legs"]] == [
         "vision-primary"

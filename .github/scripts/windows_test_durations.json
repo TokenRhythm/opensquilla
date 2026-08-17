@@ -196,6 +196,7 @@
     "tests/test_engine/test_agent_canonical_text_contract.py": 0.01,
     "tests/test_engine/test_agent_deepseek_dsml_dispatch.py": 0.01,
     "tests/test_engine/test_agent_finalize_evidence_gate.py": 11.076,
+    "tests/test_engine/test_agent_image_capability_guard.py": 0.01,
     "tests/test_engine/test_agent_injection_provider.py": 0.01,
     "tests/test_engine/test_agent_invalid_provider_response.py": 1.924,
     "tests/test_engine/test_agent_llm_budget.py": 24.998,

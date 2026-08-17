@@ -2183,6 +2183,8 @@ class _SelectorFallbackProvider:
         # no-op, keeping the default fallback path byte-identical.
         self._health_ledger = health_ledger
         self._used_fallback = False
+        self._pending_fallback_hops = 0
+        self._last_executed_model = ""
         self._fallback_limits: dict[tuple[str, str], tuple[int, int]] = {}
         self._fallback_deployment_limits: dict[
             _FallbackDeploymentIdentity, tuple[int, int]
@@ -2319,18 +2321,28 @@ class _SelectorFallbackProvider:
                 metadata[savings_key] = 0.0
 
     def _note_fallback_hop(self) -> None:
-        """Count each selector fallback actually taken this turn.
+        """Remember a selected fallback until its provider call starts.
 
-        Read at turn finalize by the router decision record
-        (engine/steps/router_decision_record.py) so persisted rows report
-        how many hops away from the routed model the executed one is.
+        Selection alone is not execution: local capability validation may end
+        the turn before the newly selected provider is called.
         """
         self._used_fallback = True
+        self._pending_fallback_hops += 1
+
+    def _commit_fallback_hops(self) -> None:
+        """Publish fallback telemetry once the selected leg will execute."""
+
+        pending_hops = self._pending_fallback_hops
+        if pending_hops <= 0:
+            return
+        self._pending_fallback_hops = 0
         metadata = self._turn_metadata
         if metadata is None:
             return
         try:
-            metadata["router_fallback_hops"] = int(metadata.get("router_fallback_hops") or 0) + 1
+            metadata["router_fallback_hops"] = (
+                int(metadata.get("router_fallback_hops") or 0) + pending_hops
+            )
             metadata.setdefault("router_fallback_reason", "selector_fallback")
         except Exception:  # noqa: BLE001 — telemetry only
             pass
@@ -2738,16 +2750,18 @@ class _SelectorFallbackProvider:
         config: Any,
         *,
         reason: str,
+        reject_unknown_capability: bool,
     ) -> int:
         """Record a local image rejection for the active physical leg."""
 
         image_count = _count_image_blocks(messages)
-        if image_count <= 0 or bool(
-            getattr(
-                getattr(config, "model_capabilities", None),
-                "supports_vision",
-                False,
-            )
+        capabilities = getattr(config, "model_capabilities", None)
+        if image_count <= 0:
+            return 0
+        if capabilities is None and not reject_unknown_capability:
+            return 0
+        if capabilities is not None and bool(
+            getattr(capabilities, "supports_vision", False)
         ):
             return 0
         if self._turn_metadata is not None:
@@ -2771,6 +2785,7 @@ class _SelectorFallbackProvider:
             messages,
             active_config,
             reason=reason,
+            reject_unknown_capability=self._used_fallback,
         ):
             return UNSUPPORTED_IMAGE_INPUT_REPLY
         return None
@@ -2848,7 +2863,7 @@ class _SelectorFallbackProvider:
                 stop_reason="end_turn",
                 input_tokens=0,
                 output_tokens=0,
-                model=active_model,
+                model=self._last_executed_model or active_model,
             )
             return
 
@@ -2858,7 +2873,9 @@ class _SelectorFallbackProvider:
             return
 
         if self._used_fallback:
+            self._commit_fallback_hops()
             self._realign_routed_model_after_fallback()
+        self._last_executed_model = active_model
         record_execution_leg(
             self._turn_metadata,
             provider=active_provider_id,
@@ -3035,10 +3052,6 @@ class _SelectorFallbackProvider:
                         yield event
                         return
                     self._note_fallback_hop()
-                    if local_admission_escalation and self._turn_metadata is not None:
-                        self._turn_metadata["router_fallback_reason"] = (
-                            "local_admission_escalation"
-                        )
                     self._skip_benched_fallbacks()
                     # Close the failed physical leg before reserving the next
                     # one; otherwise an early-consumer break can defer unknown
@@ -3051,13 +3064,14 @@ class _SelectorFallbackProvider:
                         messages,
                         fallback_config,
                         reason="fallback_vision_unsupported",
+                        reject_unknown_capability=True,
                     ):
                         yield ProviderTextDeltaEvent(text=UNSUPPORTED_IMAGE_INPUT_REPLY)
                         yield ProviderDoneEvent(
                             stop_reason="end_turn",
                             input_tokens=0,
                             output_tokens=0,
-                            model=fallback_model,
+                            model=self._last_executed_model or active_model,
                         )
                         return
                     fallback_authority_config = getattr(
@@ -3105,7 +3119,13 @@ class _SelectorFallbackProvider:
                             )
                             return
                         await asyncio.sleep(retry_after_hint)
+                    self._commit_fallback_hops()
+                    if local_admission_escalation and self._turn_metadata is not None:
+                        self._turn_metadata["router_fallback_reason"] = (
+                            "local_admission_escalation"
+                        )
                     self._realign_routed_model_after_fallback()
+                    self._last_executed_model = fallback_model
                     # The phase frame is yielded before the fallback adapter is
                     # even asked for its first event, making ordering observable
                     # and preventing a fast fallback token from racing the UI.
