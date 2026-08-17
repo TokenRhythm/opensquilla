@@ -42,6 +42,7 @@ import { toParts, toolState, type ToPartsInterrupt } from '@/utils/chat/toParts'
 import { toSources } from '@/utils/chat/toSources'
 import { createdSessionFromToolCall } from '@/utils/chat/createdSessions'
 import { relativeTime, type TimeTranslator } from '@/utils/messageTime'
+import { normalizeEnsembleMemberRole } from '@/utils/ensembleRoles'
 import {
   isLegacySilentSentinelOnly,
   sanitizeAssistantPresentationSegments,
@@ -754,9 +755,9 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const model = String(msg.model || u.model || u.routed_model || '')
     const input = Number(msg.input ?? msg.input_tokens ?? u.input_tokens ?? u.inputTokens ?? 0)
     const output = Number(msg.output ?? msg.output_tokens ?? u.output_tokens ?? u.outputTokens ?? 0)
-    const cached = Number(u.cached_tokens || 0)
-    const reasoning = Number(u.reasoning_tokens || 0)
-    const cost = Number(u.cost_usd || 0)
+    const cached = numeric(u.cached_tokens ?? u.cachedTokens)
+    const reasoning = numeric(u.reasoning_tokens ?? u.reasoningTokens)
+    const cost = numeric(u.cost_usd ?? u.costUsd)
     const hasTier = !!(u.routed_tier && u.routing_source && u.routing_source !== 'none')
     const turnSavedPct = typeof u.total_savings_pct === 'number' && u.total_savings_pct > 0 ? u.total_savings_pct : 0
     const hasSaved = hasTier && turnSavedPct > 0 && !u.__savings_ui_suppressed
@@ -819,7 +820,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
 
     const traceCandidates = normalizeEnsembleUsageRows(trace?.candidates)
     const usedBreakdownIndexes = new Set<number>()
-    const models = traceCandidates
+    const physicalModels = traceCandidates
       .map(candidate => {
         const candidateKey = ensembleCandidateIdentity(candidate)
         const breakdownIndex = breakdown.findIndex((row, index) =>
@@ -841,7 +842,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
           .map(row => rowToEnsembleModel(row)),
       )
       .filter((row): row is ChatEnsembleMetaModel => row !== null)
-    const uniqueModels = new Set(models.map(row => `${row.role}:${row.provider}:${row.model}`))
+    const models = foldAggregatorRequests(physicalModels)
+    const uniqueModels = new Set(models.map(row => `${row.role}:${row.provider}:${row.model}:${row.sampleIndex || 0}`))
     const rowCost = models.reduce((sum, row) => sum + row.costUsd, 0)
     // The ledger total is authoritative whenever it is present, including a
     // legitimate 0. Probe for the field rather than for a positive number, or
@@ -924,8 +926,8 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
     const model = String(row.model || '').trim()
     if (!model) return null
     const provider = String(row.provider || '').trim()
-    const role = String(row.role || '').trim() || 'member'
-    const label = String(row.label || role).trim() || role
+    const role = normalizeEnsembleMemberRole(row.role)
+    const label = role
     const error = String(candidate?.error || '').trim()
     const errorCode = String(candidate?.error_code || candidate?.errorCode || '').trim()
     const status = errorCode === 'quorum_cancelled'
@@ -950,6 +952,50 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       error: error || undefined,
       errorCode: errorCode || undefined,
     }
+  }
+
+  function foldAggregatorRequests(
+    models: ChatEnsembleMetaModel[],
+  ): ChatEnsembleMetaModel[] {
+    // A tool continuation is another physical request made by the configured
+    // aggregator, not another logical member. rowToEnsembleModel already maps
+    // legacy execution names onto the public Aggregator role.
+    const logicalModels: ChatEnsembleMetaModel[] = []
+    const aggregatorIndexByIdentity = new Map<string, number>()
+
+    for (const model of models) {
+      if (model.role !== 'aggregator') {
+        logicalModels.push(model)
+        continue
+      }
+
+      const identity = [
+        model.provider,
+        model.model,
+        String(model.sampleIndex || 0),
+      ].join('\u0000')
+      const existingIndex = aggregatorIndexByIdentity.get(identity)
+      if (existingIndex == null) {
+        aggregatorIndexByIdentity.set(identity, logicalModels.length)
+        logicalModels.push(model)
+        continue
+      }
+
+      const existing = logicalModels[existingIndex]
+      logicalModels.splice(existingIndex, 1, {
+        ...existing,
+        input: existing.input + model.input,
+        output: existing.output + model.output,
+        costUsd: existing.costUsd + model.costUsd,
+        elapsedMs: Math.max(0, Number(existing.elapsedMs || 0))
+          + Math.max(0, Number(model.elapsedMs || 0)),
+        status: model.status ?? existing.status,
+        error: model.error ?? existing.error,
+        errorCode: model.errorCode ?? existing.errorCode,
+      })
+    }
+
+    return logicalModels
   }
 
   function numeric(value: unknown): number {

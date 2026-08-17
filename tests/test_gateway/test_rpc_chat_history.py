@@ -528,6 +528,236 @@ async def test_chat_history_batch_projects_missing_turn_usage_from_ledger(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_chat_history_projects_ledger_totals_over_partial_duplicate_usage(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-partial.db"))
+    await storage.connect()
+    await storage.initialize_usage_ledger(1)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-partial"
+    session = await manager.create(session_key)
+    turn_id = "partial-duplicate-turn"
+    try:
+        with turn_context_scope({"turn_id": turn_id}):
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "partial answer",
+                turn_usage={
+                    "provider": "routed-provider",
+                    "model": "routed-model",
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "cost_usd": 0.001,
+                    "ensemble_trace": {"final_request_role": "aggregator"},
+                    "model_usage_breakdown": [{"role": "proposer"}],
+                    "routing_source": "squilla_router",
+                },
+            )
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "final answer",
+            )
+
+        for event_id, call_index, input_tokens, output_tokens, cost_nanos in (
+            ("usage-partial-1", 0, 7, 3, 10_000_000),
+            ("usage-partial-2", 1, 5, 2, 20_000_000),
+        ):
+            await storage.start_usage_event(
+                UsageEventStart(
+                    event_id=event_id,
+                    execution_id=turn_id,
+                    call_index=call_index,
+                    session_id=session.session_id,
+                    session_epoch=session.epoch,
+                    started_at_ms=10 + call_index,
+                    turn_id=turn_id,
+                    provider="test-provider",
+                    model="test-model",
+                )
+            )
+            await storage.finalize_usage_event(
+                event_id,
+                UsageEventCompletion(
+                    completed_at_ms=20 + call_index,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
+                    cost_nanos=cost_nanos,
+                    billed_cost_nanos=cost_nanos,
+                    cost_source="provider_billed",
+                    provider="test-provider",
+                    model="test-model",
+                    coverage_status="complete",
+                ),
+            )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert len(result["messages"]) == 2
+        assert "usage" not in result["messages"][0]
+        usage = result["messages"][1]["usage"]
+        assert usage["input_tokens"] == 12
+        assert usage["output_tokens"] == 5
+        assert usage["total_tokens"] == 17
+        assert usage["cost_usd"] == pytest.approx(0.03)
+        assert usage["billed_cost"] == pytest.approx(0.03)
+        assert usage["coverage_status"] == "complete"
+        assert usage["missing_cost_entries"] == 0
+        assert usage["provider"] == "routed-provider"
+        assert usage["model"] == "routed-model"
+        assert usage["ensemble_trace"] == {"final_request_role": "aggregator"}
+        assert usage["model_usage_breakdown"] == [{"role": "proposer"}]
+        assert usage["routing_source"] == "squilla_router"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_chat_history_keeps_richer_ensemble_receipt_on_terminal_duplicate(
+    tmp_path,
+) -> None:
+    storage = SessionStorage(str(tmp_path / "history-usage-richer-receipt.db"))
+    await storage.connect()
+    await storage.initialize_usage_ledger(1)
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:usage-richer-receipt"
+    session = await manager.create(session_key)
+    turn_id = "richer-receipt-turn"
+    richer_breakdown = [
+        {
+            "role": "proposer",
+            "provider": "proposal-provider",
+            "model": "proposal-model",
+            "input_tokens": 4,
+            "output_tokens": 2,
+        },
+        {
+            "role": "aggregator",
+            "provider": "aggregator-provider",
+            "model": "aggregator-model",
+            "input_tokens": 6,
+            "output_tokens": 3,
+        },
+    ]
+    richer_trace = {
+        "profile": "custom_b5",
+        "physical_request_count": 2,
+        "final_request_role": "aggregator",
+        "proposer_roles": ["proposer"],
+    }
+    try:
+        with turn_context_scope({"turn_id": turn_id}):
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "initial ensemble answer",
+                turn_usage={
+                    "provider": "aggregator-provider",
+                    "model": "aggregator-model",
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "cost_usd": 0.001,
+                    "model_usage_breakdown": richer_breakdown,
+                    "ensemble_trace": richer_trace,
+                    "routing_source": "squilla_router",
+                },
+            )
+            await manager.append_message(
+                session_key,
+                "assistant",
+                "continued ensemble answer",
+                turn_usage={
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "cost_usd": 0.002,
+                    "model_usage_breakdown": [
+                        {
+                            "role": "aggregator",
+                            "provider": "aggregator-provider",
+                            "model": "aggregator-model",
+                            "input_tokens": 2,
+                            "output_tokens": 1,
+                        }
+                    ],
+                    "ensemble_trace": {
+                        "final_request_role": "aggregator",
+                        "physical_request_count": 1,
+                    },
+                },
+            )
+
+        for event_id, call_index, input_tokens, output_tokens, cost_nanos in (
+            ("usage-richer-1", 0, 7, 3, 10_000_000),
+            ("usage-richer-2", 1, 5, 2, 20_000_000),
+            ("usage-richer-3", 2, 4, 1, 30_000_000),
+        ):
+            await storage.start_usage_event(
+                UsageEventStart(
+                    event_id=event_id,
+                    execution_id=turn_id,
+                    call_index=call_index,
+                    session_id=session.session_id,
+                    session_epoch=session.epoch,
+                    started_at_ms=10 + call_index,
+                    turn_id=turn_id,
+                    provider="ledger-provider",
+                    model="ledger-model",
+                )
+            )
+            await storage.finalize_usage_event(
+                event_id,
+                UsageEventCompletion(
+                    completed_at_ms=20 + call_index,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    total_tokens=input_tokens + output_tokens,
+                    cost_nanos=cost_nanos,
+                    billed_cost_nanos=cost_nanos,
+                    cost_source="provider_billed",
+                    provider="ledger-provider",
+                    model="ledger-model",
+                    coverage_status="complete",
+                ),
+            )
+
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(
+                conn_id="test",
+                principal=SimpleNamespace(role="operator"),
+                session_manager=manager,
+            ),
+        )
+
+        assert len(result["messages"]) == 2
+        assert sum("usage" in message for message in result["messages"]) == 1
+        assert "usage" not in result["messages"][0]
+        usage = result["messages"][1]["usage"]
+        assert usage["input_tokens"] == 16
+        assert usage["output_tokens"] == 6
+        assert usage["total_tokens"] == 22
+        assert usage["cost_usd"] == pytest.approx(0.06)
+        assert usage["billed_cost"] == pytest.approx(0.06)
+        assert usage["coverage_status"] == "complete"
+        assert usage["missing_cost_entries"] == 0
+        assert usage["model_usage_breakdown"] == richer_breakdown
+        assert usage["ensemble_trace"] == richer_trace
+        assert usage["routing_source"] == "squilla_router"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_history_usage_projection_failure_does_not_hide_history(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,

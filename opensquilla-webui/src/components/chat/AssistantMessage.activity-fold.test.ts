@@ -517,7 +517,7 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.msg-meta-popover')?.textContent).not.toContain('$0')
   })
 
-  it('keeps the ensemble summary but hides exact zero cost for unknown-only legacy usage', async () => {
+  it('keeps numeric ensemble costs without adding an unknown-usage display state', async () => {
     const meta = usageMeta({
       input: 0,
       output: 0,
@@ -562,9 +562,9 @@ describe('AssistantMessage activity disclosure', () => {
     await nextTick()
     const popover = el.querySelector<HTMLElement>('.msg-meta-popover')
     expect(popover?.textContent).toContain('ensemble-review')
-    expect(popover?.textContent).toContain('exact usage total unavailable')
-    expect(popover?.textContent).not.toContain('$0')
-    expect(el.querySelector('.msg-meta-popover__model-cost')?.textContent?.trim()).toBe('—')
+    expect(popover?.textContent).not.toContain('exact usage total unavailable')
+    expect(popover?.textContent).toContain('$0')
+    expect(el.querySelector('.msg-meta-popover__model-cost')?.textContent?.trim()).toBe('$0')
   })
 
   it('adds compact usage without reordering a canonical-less legacy timeline', async () => {

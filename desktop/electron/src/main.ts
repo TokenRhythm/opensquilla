@@ -1785,15 +1785,14 @@ function ensembleConfigTomlLines(credential: DesktopConnection): string[] {
     throw new Error(`LLM Ensemble is not supported for provider ${credential.provider}.`)
   }
   const profile = DESKTOP_ENSEMBLE_PROFILES[selectionMode]
-  const roles = ['primary', 'contrast', 'fast_check', 'critic']
-  const candidates = profile.proposers.flatMap((model, index) => [
+  const candidates = profile.proposers.flatMap(model => [
     '',
     '[[llm_ensemble.candidates]]',
     `provider = ${tomlString(profile.provider)}`,
     `model = ${tomlString(model)}`,
     'source = "custom"',
     'enabled = true',
-    `role = ${tomlString(roles[index] || '')}`,
+    'role = "proposer"',
   ])
   candidates.push(
     '',

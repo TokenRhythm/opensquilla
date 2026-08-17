@@ -3063,7 +3063,7 @@ function removeEnsembleModelOption(value: string) {
   ensembleForm.removeModelOption(value)
 }
 
-function addEnsembleCandidate(provider: string, model: string, role: EnsembleCandidateRole = '') {
+function addEnsembleCandidate(provider: string, model: string, role: EnsembleCandidateRole = 'proposer') {
   ensembleForm.addCandidate(provider, model, role)
 }
 
@@ -3077,10 +3077,6 @@ function replaceEnsembleCandidate(candidate: EnsembleCandidateView, provider: st
 
 function setEnsembleAggregator(provider: string, model: string) {
   ensembleForm.setAggregator(provider, model)
-}
-
-function setEnsembleCandidateRole(candidate: EnsembleCandidateView, role: EnsembleCandidateRole) {
-  ensembleForm.setCandidateRole(candidate, role)
 }
 
 function importEnsembleTierCandidates() {
@@ -4002,7 +3998,6 @@ async function copyConfigPath() {
     removeEnsembleCandidate,
     replaceEnsembleCandidate,
     setEnsembleAggregator,
-    setEnsembleCandidateRole,
     importEnsembleTierCandidates,
     discoverModelStrategyProviderModels,
     migrateEnsembleLegacy,

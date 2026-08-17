@@ -1752,6 +1752,28 @@ describe('useChatRenderedMessages per-turn usage', () => {
     })
     expect(legacy?.meta?.coverageStatus).toBeUndefined()
   })
+
+  it('does not reinterpret missing cost entries as a presentation state', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'restored cost',
+      ts: 1,
+      usage: {
+        input_tokens: 11,
+        output_tokens: 3,
+        cost_usd: 0.0123,
+        missing_cost_entries: 1,
+      },
+    }])
+
+    expect(api.renderedMessages.value[0]?.meta).toMatchObject({
+      usageUnknown: false,
+      costUsd: 0.0123,
+    })
+    expect(api.renderedMessages.value[0]?.meta).not.toHaveProperty('costKnown')
+    expect(api.renderedMessages.value[0]?.meta).not.toHaveProperty('costIncomplete')
+    expect(api.renderedMessages.value[0]?.meta).not.toHaveProperty('missingCostEntries')
+  })
 })
 
 describe('useChatRenderedMessages clarify history recovery', () => {
@@ -2125,6 +2147,159 @@ describe('useChatRenderedMessages ensemble metadata', () => {
     expect(message.meta?.ensemble?.models.map(model => model.elapsedMs)).toEqual([
       105_000,
       12_000,
+    ])
+  })
+
+  it.each([
+    ['current API', 'aggregator'],
+    ['legacy API', 'primary_aggregator'],
+  ])('folds a %s continuation into the logical aggregator member', (_, continuationRole) => {
+    const api = renderedMessagesFor([
+      {
+        role: 'assistant',
+        text: 'tool-assisted fused answer',
+        ts: 0,
+        usage: {
+          model_usage_breakdown: [
+            {
+              role: 'proposer',
+              label: 'primary',
+              provider: 'tokenrhythm',
+              model: 'deepseek-v4-flash-0731',
+              input_tokens: 10,
+              output_tokens: 2,
+              cost_usd: 0.01,
+              elapsed_ms: 1_000,
+            },
+            {
+              role: 'aggregator',
+              label: 'aggregator',
+              provider: 'tokenrhythm',
+              model: 'deepseek-v4-flash-0731',
+              input_tokens: 20,
+              output_tokens: 4,
+              cost_usd: 0.02,
+              elapsed_ms: 2_000,
+            },
+            {
+              role: continuationRole,
+              label: continuationRole,
+              provider: 'tokenrhythm',
+              model: 'deepseek-v4-flash-0731',
+              input_tokens: 30,
+              output_tokens: 6,
+              cost_usd: 0.03,
+              elapsed_ms: 3_000,
+            },
+          ],
+          ensemble_trace: {
+            profile: 'custom_b5',
+            llm_request_count: 3,
+            fallback_used: false,
+          },
+        },
+      },
+    ])
+
+    const ensemble = api.renderedMessages.value[0].meta?.ensemble
+    expect(ensemble?.requestCount).toBe(3)
+    expect(ensemble?.modelCount).toBe(2)
+    expect(ensemble?.models.map(model => model.role)).toEqual([
+      'proposer',
+      'aggregator',
+    ])
+    expect(ensemble?.models[1]).toMatchObject({
+      role: 'aggregator',
+      label: 'aggregator',
+      provider: 'tokenrhythm',
+      model: 'deepseek-v4-flash-0731',
+      input: 50,
+      output: 10,
+      costUsd: 0.05,
+      elapsedMs: 5_000,
+    })
+  })
+
+  it('keeps the numeric aggregator subtotal without adding display-only completeness state', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'tool-assisted fused answer',
+      ts: 0,
+      usage: {
+        model_usage_breakdown: [
+          {
+            role: 'proposer',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.01,
+            cost_source: 'provider_billed',
+          },
+          {
+            role: 'aggregator',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0.02,
+            cost_source: 'provider_billed',
+          },
+          {
+            role: 'primary_aggregator',
+            provider: 'tokenrhythm',
+            model: 'deepseek-v4-flash-0731',
+            cost_usd: 0,
+            cost_source: 'unavailable',
+            missing_cost_entries: 1,
+          },
+        ],
+        ensemble_trace: {
+          profile: 'custom_b5',
+          llm_request_count: 3,
+          fallback_used: false,
+        },
+      },
+    }])
+
+    const message = api.renderedMessages.value[0]
+    expect(message.meta).toMatchObject({
+      usageUnknown: false,
+    })
+    expect(message.meta?.ensemble?.models[1]).toMatchObject({
+      role: 'aggregator',
+      costUsd: 0.02,
+    })
+    expect(message.meta).not.toHaveProperty('costIncomplete')
+    expect(message.meta?.ensemble?.models[1]).not.toHaveProperty('costIncomplete')
+  })
+
+  it('normalizes legacy candidate labels to one public proposer role', () => {
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'fused answer',
+      ts: 0,
+      usage: {
+        model_usage_breakdown: ['primary', 'contrast', 'fast_check', 'critic'].map((label, index) => ({
+          role: 'proposer',
+          label,
+          provider: 'tokenrhythm',
+          model: `model-${index + 1}`,
+          input_tokens: 10,
+          output_tokens: 2,
+        })),
+        ensemble_trace: {
+          profile: 'custom_b5',
+          llm_request_count: 4,
+          fallback_used: false,
+        },
+      },
+    }])
+
+    expect(api.renderedMessages.value[0].meta?.ensemble?.models.map(model => ({
+      role: model.role,
+      label: model.label,
+    }))).toEqual([
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
+      { role: 'proposer', label: 'proposer' },
     ])
   })
 

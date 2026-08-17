@@ -44,7 +44,6 @@ from opensquilla.router_tiers import (
     CUSTOM_B5_MIN_PROPOSERS,
     CUSTOM_B5_SELECTION_MODE,
     DEFAULT_TEXT_TIER,
-    ENSEMBLE_CANDIDATE_ROLES,
     LEGACY_OPENROUTER_MODEL_OPTIONS,
     ROUTER_TIER_ENSEMBLE_SELECTION_MODES,
     STATIC_B5_SELECTION_MODE_PROVIDERS,  # noqa: F401 - legacy import surface
@@ -472,23 +471,17 @@ def _default_llm_ensemble_model_options() -> list[str]:
     return []
 
 
-# Candidate roles for the custom B5 lineup. Proposer roles are advisory
-# labels surfaced in the UI and the decision trace; "aggregator" is
-# structural — it marks the single member that fuses drafts and produces
-# the final answer. Empty string = unassigned (runs as a proposer).
-# Backward-compatible symbol for callers that imported the old gateway table.
-LLM_ENSEMBLE_CANDIDATE_ROLES = ENSEMBLE_CANDIDATE_ROLES
-
-
+# Candidate roles for the custom B5 lineup. "proposer" drafts independently;
+# "aggregator" fuses those drafts and produces the final answer.
 class LlmEnsembleCandidateConfig(BaseModel):
     provider: str
     model: str
     source: Literal["custom", "legacy_model_options"] = "custom"
     enabled: bool = True
-    # Advisory role label; unknown values coerce to "" (unassigned) instead of
-    # failing validation so a hand-edited config never blocks gateway boot.
+    # Released advisory aliases and unknown values coerce to "proposer"
+    # instead of failing validation, so old or hand-edited configs still boot.
     # Strict role/lineup checks live on the RPC save path (upsert mutation).
-    role: str = ""
+    role: str = "proposer"
     # Per-candidate thinking level override: off|minimal|low|medium|high|xhigh.
     # Coerced to "" (inherit from turn config) on invalid input so a hand-edited
     # config never blocks gateway boot, matching the role field policy above.
@@ -503,7 +496,7 @@ class LlmEnsembleCandidateConfig(BaseModel):
     @classmethod
     def _normalize_role(cls, value: object) -> str:
         normalized = str(value or "").strip().lower()
-        return normalized if normalized in LLM_ENSEMBLE_CANDIDATE_ROLES else ""
+        return "aggregator" if normalized == "aggregator" else "proposer"
 
     @field_validator("thinking_level", mode="before")
     @classmethod

@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from opensquilla.router_tiers import (
-    CUSTOM_B5_PROPOSER_ROLES,
     CUSTOM_B5_SELECTION_MODE,
     INDEPENDENT_ENSEMBLE_SELECTION_MODES,
     STATIC_B5_PROFILES,
@@ -63,7 +62,7 @@ def _custom_candidate(
     provider: str,
     model: str,
     *,
-    role: str = "",
+    role: str = "proposer",
 ) -> dict[str, Any]:
     return {
         "provider": provider,
@@ -100,16 +99,8 @@ def _provider_ensemble_candidates(config: Any) -> list[dict[str, Any]]:
     )
     if static_profile is not None:
         static_candidates = [
-            _custom_candidate(
-                static_profile.provider_id,
-                model,
-                role=(
-                    CUSTOM_B5_PROPOSER_ROLES[index]
-                    if index < len(CUSTOM_B5_PROPOSER_ROLES)
-                    else ""
-                ),
-            )
-            for index, model in enumerate(static_profile.proposer_models)
+            _custom_candidate(static_profile.provider_id, model)
+            for model in static_profile.proposer_models
         ]
         static_candidates.append(
             _custom_candidate(
@@ -123,12 +114,6 @@ def _provider_ensemble_candidates(config: Any) -> list[dict[str, Any]]:
     router = getattr(config, "squilla_router", None)
     tiers = getattr(router, "tiers", {}) or {}
     tier_order = ("c0", "c1", "c2", "c3")
-    role_by_tier = {
-        "c0": "fast_check",
-        "c1": "primary",
-        "c2": "contrast",
-        "c3": "critic",
-    }
     seen: set[tuple[str, str]] = set()
     candidates: list[dict[str, Any]] = []
     if isinstance(tiers, dict):
@@ -154,13 +139,7 @@ def _provider_ensemble_candidates(config: Any) -> list[dict[str, Any]]:
             ):
                 continue
             seen.add(identity)
-            candidates.append(
-                _custom_candidate(
-                    member_provider,
-                    model,
-                    role=role_by_tier[tier],
-                )
-            )
+            candidates.append(_custom_candidate(member_provider, model))
             if len(candidates) >= 6:
                 break
     if len(candidates) < 2:

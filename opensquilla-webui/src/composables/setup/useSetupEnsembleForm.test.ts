@@ -55,7 +55,7 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
     expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
     expect(f.modelOptions.value).toEqual(['custom/model-a', 'custom/model-b'])
     expect(f.candidates.value).toEqual([
-      { provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true, role: '' },
+      { provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true, role: 'proposer' },
     ])
     expect(f.minSuccessfulProposers.value).toBe(2)
     expect(f.proposerMaxRetries.value).toBe(2)
@@ -156,16 +156,16 @@ describe('useSetupEnsembleForm — partial payload building', () => {
     })
   })
 
-  it('sends structured candidates with roles when custom candidates changed', () => {
+  it('sends structured candidates with only proposer and aggregator roles', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig(SAVED)
 
-    f.addCandidate('OpenRouter', 'qwen/qwen3.7-max', 'critic')
+    f.addCandidate('OpenRouter', 'qwen/qwen3.7-max')
 
     expect(f.payload()).toEqual({
       candidates: [
-        { provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true, role: '' },
-        { provider: 'openrouter', model: 'qwen/qwen3.7-max', source: 'custom', enabled: true, role: 'critic' },
+        { provider: 'deepseek', model: 'deepseek-v4-pro', source: 'custom', enabled: true, role: 'proposer' },
+        { provider: 'openrouter', model: 'qwen/qwen3.7-max', source: 'custom', enabled: true, role: 'proposer' },
       ],
     })
   })
@@ -278,8 +278,8 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     ])
     expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
     expect(f.candidates.value.map(c => c.model)).toEqual(['doubao-2.0-pro', 'deepseek-v4-flash'])
-    expect(f.candidates.value[0]!.role).toBe('critic')
-    expect(f.candidates.value[1]!.role).toBe('fast_check')
+    expect(f.candidates.value[0]!.role).toBe('proposer')
+    expect(f.candidates.value[1]!.role).toBe('proposer')
   })
 
   it('activateForProvider seeds mixed-provider tiers into a custom lineup', () => {
@@ -336,7 +336,7 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
     expect(f.candidates.value.filter(c => c.role === 'aggregator')).toHaveLength(1)
   })
 
-  it('keeps exactly one aggregator: promoting a row demotes the previous one', () => {
+  it('keeps exactly one aggregator when a proposer is selected for fusion', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       selection_mode: CUSTOM_B5_SELECTION_MODE,
@@ -345,11 +345,13 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
         { provider: 'a', model: 'm2' },
       ],
     })
-    f.setCandidateRole({ provider: 'a', model: 'm2', source: 'custom', role: '' }, 'aggregator')
+    f.setAggregator('a', 'm2')
     const aggregators = f.candidates.value.filter(c => c.role === 'aggregator')
     expect(aggregators).toHaveLength(1)
     expect(aggregators[0]!.model).toBe('m2')
-    expect(f.candidates.value.find(c => c.model === 'm1')!.role).toBe('')
+    expect(f.candidates.value.some(c => c.model === 'm1')).toBe(false)
+    expect(f.candidates.value.filter(c => c.model === 'm2').map(c => c.role))
+      .toEqual(['proposer', 'aggregator'])
   })
 
   it('deduplicates proposer deployments across sources while retaining the aggregator slot', () => {
@@ -387,7 +389,7 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
         model: 'shared-model',
         source: 'custom',
         enabled: true,
-        role: 'primary',
+        role: 'proposer',
       },
       {
         provider: 'provider-a',
@@ -399,7 +401,7 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
     ])
   })
 
-  it('replaces a proposer atomically without changing quorum or advisory roles', () => {
+  it('replaces a proposer atomically without changing quorum or protocol roles', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       selection_mode: CUSTOM_B5_SELECTION_MODE,
@@ -425,21 +427,21 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
         model: 'primary-model-next',
         source: 'custom',
         enabled: true,
-        role: 'primary',
+        role: 'proposer',
       },
       {
         provider: 'a',
         model: 'critic-model',
         source: 'custom',
         enabled: true,
-        role: 'critic',
+        role: 'proposer',
       },
       {
         provider: 'a',
         model: 'plain-model',
         source: 'custom',
         enabled: true,
-        role: '',
+        role: 'proposer',
       },
       {
         provider: 'a',
@@ -473,7 +475,7 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
     }).toEqual(beforeDuplicate)
   })
 
-  it('uses a proposer as aggregator without removing it or its advisory roles', () => {
+  it('uses a proposer as aggregator without removing its proposer slot', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       selection_mode: CUSTOM_B5_SELECTION_MODE,
@@ -492,14 +494,14 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
         model: 'shared-model',
         source: 'custom',
         enabled: true,
-        role: 'primary',
+        role: 'proposer',
       },
       {
         provider: 'a',
         model: 'other-proposer',
         source: 'custom',
         enabled: true,
-        role: 'critic',
+        role: 'proposer',
       },
       {
         provider: 'a',
@@ -631,7 +633,7 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
       model: 'deepseek-v4-flash',
       source: 'custom',
       enabled: true,
-      role: 'fast_check',
+      role: 'proposer',
     }])
   })
 
@@ -670,14 +672,14 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
         model: 'target-model',
         source: 'custom',
         enabled: true,
-        role: 'primary',
+        role: 'proposer',
       },
       {
         provider: 'provider-a',
         model: 'other-model',
         source: 'custom',
         enabled: true,
-        role: '',
+        role: 'proposer',
       },
     ])
   })
@@ -732,7 +734,7 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
         model: 'deepseek-chat',
         source: 'custom',
         enabled: true,
-        role: '',
+        role: 'proposer',
       },
     ])
   })
@@ -780,7 +782,7 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
 
     f.migrateLegacyToCustom([], 'provider-a')
 
-    expect(f.candidates.value.map(candidate => candidate.role)).toEqual(['', 'aggregator'])
+    expect(f.candidates.value.map(candidate => candidate.role)).toEqual(['proposer', 'aggregator'])
     expect(f.candidates.value.map(candidate => `${candidate.provider}/${candidate.model}`))
       .toEqual(['provider-a/shared', 'provider-a/shared'])
   })
@@ -896,7 +898,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
     expect(panel.value.scheme).toBe('legacy')
   })
 
-  it('splits the custom lineup into aggregator and role-labelled proposers', () => {
+  it('splits the custom lineup into aggregator and canonical proposers', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       enabled: true,
@@ -910,10 +912,30 @@ describe('useSetupEnsembleForm — panel contract', () => {
     const panel = makePanel(f, 'deepseek')
     expect(panel.value.custom.proposers.map(c => c.model))
       .toEqual(['deepseek-v4-pro', 'z-ai/glm-5.2'])
-    expect(panel.value.custom.proposers[0]!.role).toBe('primary')
+    expect(panel.value.custom.proposers[0]!.role).toBe('proposer')
     expect(panel.value.custom.aggregator!.model).toBe('deepseek-v4-flash')
     expect(panel.value.custom.aggregatorInherited).toBe(false)
     expect(panel.value.custom.facts.perTurnCalls).toBe(3)
+  })
+
+  it('migrates every released advisory role to the single proposer role', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({
+      enabled: true,
+      selection_mode: CUSTOM_B5_SELECTION_MODE,
+      candidates: ['primary', 'contrast', 'fast_check', 'critic'].map((role, index) => ({
+        provider: 'tokenrhythm',
+        model: `model-${index + 1}`,
+        role,
+      })),
+    })
+
+    expect(f.candidates.value.map(candidate => candidate.role)).toEqual([
+      'proposer',
+      'proposer',
+      'proposer',
+      'proposer',
+    ])
   })
 
   it('falls back to the inherited chat model when no aggregator is assigned', () => {
@@ -991,7 +1013,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
     })
 
     const legacy = makePanel(f, 'deepseek').value.customCandidates
-    expect(legacy.map(candidate => candidate.role)).toEqual(['', 'aggregator'])
+    expect(legacy.map(candidate => candidate.role)).toEqual(['proposer', 'aggregator'])
     expect(legacy.map(candidate => `${candidate.provider}:${candidate.model}`))
       .toEqual(['deepseek:shared-model', 'deepseek:shared-model'])
   })
