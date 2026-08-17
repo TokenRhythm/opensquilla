@@ -9,21 +9,29 @@ import { computed, ref, type ComputedRef } from 'vue'
 // The UI exposes exactly two schemes:
 // - "preset": the provider's fixed B5 lineup (OpenRouter / TokenRhythm only).
 // - "custom": an explicit user-authored lineup saved as selection_mode
-//   "custom_b5" (roles per candidate, single aggregator).
+//   "custom" (roles per candidate, single aggregator).
 // The legacy dynamic modes are read-compatible but hidden. router_dynamic can
 // be migrated to a custom lineup; the frozen tree baseline is config-only and
 // remains read-only in Settings.
 
-export const CUSTOM_B5_SELECTION_MODE = 'custom_b5'
+export const CUSTOM_B5_SELECTION_MODE = 'custom'
 export const TREE_BASELINE_SELECTION_MODE = 'router_tree_baseline'
 
 export const ENSEMBLE_SELECTION_MODES = [
-  'static_openrouter_b5',
-  'static_tokenrhythm_b5',
+  'static_openrouter',
+  'static_tokenrhythm',
   CUSTOM_B5_SELECTION_MODE,
   'router_dynamic',
   TREE_BASELINE_SELECTION_MODE,
 ] as const
+// Input-only compatibility for a cached older Web UI, an older gateway, or a
+// locally stored setup snapshot. State and RPC payloads always use the
+// canonical values above.
+const LEGACY_SELECTION_MODE_ALIASES: Readonly<Record<string, string>> = {
+  static_openrouter_b5: 'static_openrouter',
+  static_tokenrhythm_b5: 'static_tokenrhythm',
+  custom_b5: CUSTOM_B5_SELECTION_MODE,
+}
 export const ENSEMBLE_ALL_FAILED_POLICIES = ['fallback_single', 'error'] as const
 
 export type EnsembleCandidateRole =
@@ -70,13 +78,13 @@ export interface StaticB5Profile {
 }
 
 export const STATIC_B5_PROFILES: Record<string, StaticB5Profile> = {
-  static_openrouter_b5: {
+  static_openrouter: {
     provider: 'openrouter',
     label: 'OpenRouter',
     proposers: OPENROUTER_FIXED_ENSEMBLE_PROPOSERS,
     aggregator: OPENROUTER_FIXED_ENSEMBLE_AGGREGATOR,
   },
-  static_tokenrhythm_b5: {
+  static_tokenrhythm: {
     provider: 'tokenrhythm',
     label: 'TokenRhythm',
     proposers: TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS,
@@ -103,7 +111,7 @@ export const LEGACY_OPENROUTER_MODEL_OPTIONS = [
   'minimax/minimax-m3',
 ] as const
 
-const DEFAULT_SELECTION_MODE = 'static_openrouter_b5'
+const DEFAULT_SELECTION_MODE = 'static_openrouter'
 const DEFAULT_MIN_SUCCESSFUL_PROPOSERS = 1
 const DEFAULT_ALL_FAILED_POLICY = 'fallback_single'
 
@@ -215,8 +223,9 @@ interface EnsemblePanelContext {
 
 function normalizeSelectionMode(value: unknown): string {
   const raw = String(value || '').trim()
-  return (ENSEMBLE_SELECTION_MODES as readonly string[]).includes(raw)
-    ? raw
+  const canonical = LEGACY_SELECTION_MODE_ALIASES[raw] ?? raw
+  return (ENSEMBLE_SELECTION_MODES as readonly string[]).includes(canonical)
+    ? canonical
     : DEFAULT_SELECTION_MODE
 }
 
@@ -501,7 +510,7 @@ export function useSetupEnsembleForm() {
     modelOptions.value = modelOptions.value.filter(option => option !== value)
   }
 
-  // Lineup edits pin the mode to custom_b5 when a static preset is stored:
+  // Lineup edits pin the mode to custom when a static preset is stored:
   // editing candidates under a preset used to leave the pool ineffective at
   // runtime — the root cause of the "edited pool, preset still runs" trap.
   // A stored legacy router_dynamic mode is left alone (its pool IS read at
@@ -865,7 +874,7 @@ export function useSetupEnsembleForm() {
       configuredQuorum === DEFAULT_MIN_SUCCESSFUL_PROPOSERS ? autoQuorum : configuredQuorum,
       Math.max(1, proposerCount),
     )
-    // Mirrors the gateway builder: static presets and custom_b5 lineups get
+    // Mirrors the gateway builder: static presets and custom lineups get
     // the static defaults only while the stored value still equals the legacy
     // default; an explicit override runs (and reads) as configured. The
     // hidden legacy router_dynamic mode runs the stored values untouched and
@@ -914,7 +923,7 @@ export function useSetupEnsembleForm() {
               ? 'preset'
               // A static preset stored for another provider cannot run against
               // this one; the editor presents the custom scheme (edits pin
-              // custom_b5 explicitly via ensureCustomMode).
+              // custom explicitly via ensureCustomMode).
               : 'custom'
       )
 

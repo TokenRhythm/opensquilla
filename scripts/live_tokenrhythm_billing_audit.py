@@ -465,7 +465,7 @@ def _build_tokenrhythm_ensemble(
             "squilla_router": {"enabled": False},
             "llm_ensemble": {
                 "enabled": True,
-                "selection_mode": "static_tokenrhythm_b5",
+                "selection_mode": "static_tokenrhythm",
                 "min_successful_proposers": 4 if strict else 1,
                 "proposer_timeout_seconds": request_timeout_seconds,
                 "aggregator_timeout_seconds": request_timeout_seconds,

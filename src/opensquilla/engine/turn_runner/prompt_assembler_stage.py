@@ -79,6 +79,7 @@ class RunPipelineRequest:
     skill_catalog: Any | None = None
     usage_execution_context: Any | None = None
     turn_absolute_deadline: float | None = None
+    explicit_model: str | None = None
 
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
@@ -443,6 +444,7 @@ class PromptAssemblerStage:
             skill_catalog=inp.skill_catalog,
             usage_execution_context=inp.usage_execution_context,
             turn_absolute_deadline=inp.turn_absolute_deadline,
+            explicit_model=inp.model,
         )
         turn, provider = await self._pipeline_executor.run_pipeline(request)
 
@@ -475,7 +477,10 @@ class PromptAssemblerStage:
                 turn_metadata=turn.metadata,
                 realign_routed_model=True,
             )
-        if inp.cloned_selector is not None:
+        if (
+            inp.cloned_selector is not None
+            and turn.metadata.get("_router_single_provider_finalized") is not True
+        ):
             # Local import to avoid pulling _SelectorFallbackProvider name
             # into the stage's module-top namespace.
             from opensquilla.engine.runtime import _SelectorFallbackProvider

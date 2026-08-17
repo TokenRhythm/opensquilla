@@ -15,12 +15,19 @@ from opensquilla.provider.ensemble_observability import (
 
 
 @pytest.mark.parametrize(
-    "selection_mode",
-    ["static_openrouter_b5", "static_tokenrhythm_b5", "custom_b5"],
+    ("selection_mode", "profile_name"),
+    [
+        ("static_openrouter", "static_openrouter_b5"),
+        ("static_tokenrhythm", "static_tokenrhythm_b5"),
+        ("custom", "custom_b5"),
+    ],
 )
-def test_fixed_modes_log_each_selected_member(selection_mode: str) -> None:
+def test_fixed_modes_log_each_selected_member(
+    selection_mode: str,
+    profile_name: str,
+) -> None:
     plan = {
-        "strategy": selection_mode,
+        "strategy": profile_name,
         "selected_P": ["provider:model-a", "provider:model-b"],
         "selected_A": "provider:aggregator",
     }
@@ -29,7 +36,7 @@ def test_fixed_modes_log_each_selected_member(selection_mode: str) -> None:
         log_ensemble_decision_steps(
             decision_id=f"decision-{selection_mode}",
             selection_mode=selection_mode,
-            profile_name=selection_mode,
+            profile_name=profile_name,
             selection_plan=plan,
         )
 
@@ -371,13 +378,13 @@ def test_readiness_skip_closes_the_decision_lifecycle() -> None:
     with structlog.testing.capture_logs() as captured:
         log_ensemble_decision_started(
             decision_id="skipped-decision",
-            selection_mode="static_openrouter_b5",
+            selection_mode="static_openrouter",
             turn_metadata={},
             user_profile_enabled=None,
         )
         log_ensemble_decision_skipped(
             decision_id="skipped-decision",
-            selection_mode="static_openrouter_b5",
+            selection_mode="static_openrouter",
             reason="static_openrouter_b5_no_credential",
         )
 

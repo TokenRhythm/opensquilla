@@ -77,7 +77,7 @@ function panel(overrides: Record<string, unknown> = {}) {
       enabled: false,
       activeProvider: 'openrouter',
       activeModel: 'deepseek/deepseek-v4-pro',
-      selectionMode: 'custom_b5',
+      selectionMode: 'custom',
       scheme: 'custom',
       legacyMigratable: false,
       schemeCardsAvailable: true,
@@ -179,7 +179,7 @@ describe('SetupModelStrategyPanel', () => {
     expect(el.textContent).not.toContain('OpenRouter mix')
     expect(el.textContent).not.toContain('openrouter-mix')
     expect(el.textContent).not.toContain('router_dynamic')
-    expect(el.textContent).not.toContain('static_openrouter_b5')
+    expect(el.textContent).not.toContain('static_openrouter')
 
     app.unmount()
   })
@@ -925,7 +925,7 @@ describe('SetupModelStrategyPanel', () => {
       activeStrategy: 'ensemble',
       ensemble: {
         enabled: true,
-        selectionMode: 'static_openrouter_b5',
+        selectionMode: 'static_openrouter',
         scheme: 'preset',
         schemeCardsAvailable: true,
         fixedProfile: {
@@ -972,7 +972,7 @@ describe('SetupModelStrategyPanel', () => {
       providerLabel: 'OpenRouter',
       ensemble: {
         enabled: true,
-        selectionMode: 'static_tokenrhythm_b5',
+        selectionMode: 'static_tokenrhythm',
         scheme: 'preset',
         schemeCardsAvailable: true,
         presetProviderMismatch: true,
@@ -1262,7 +1262,7 @@ describe('SetupModelStrategyPanel', () => {
     const { app, el } = await mountPanel()
 
     const titles = Array.from(el.querySelectorAll('[title]')).map(node => node.getAttribute('title') || '').join('\n')
-    expect(titles).not.toMatch(/openrouter-mix|router_dynamic|static_openrouter_b5|tier_profile|Recommended|Default/)
+    expect(titles).not.toMatch(/openrouter-mix|router_dynamic|static_openrouter|tier_profile|Recommended|Default/)
 
     app.unmount()
   })

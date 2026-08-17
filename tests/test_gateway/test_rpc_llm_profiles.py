@@ -679,7 +679,7 @@ async def test_profile_activate_restart_round_trip_preserves_router_and_ensemble
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "success_threshold": 0.5,
             "candidates": [
                 {"provider": "openai", "model": "gpt-test", "role": "primary"},

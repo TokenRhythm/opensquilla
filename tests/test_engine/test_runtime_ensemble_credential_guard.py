@@ -351,7 +351,7 @@ def test_router_dynamic_route_memory_prefers_valid_effective_selection_plan(
     "override",
     [
         {"strategy": "static_openrouter_b5"},
-        {"selection_mode": "static_openrouter_b5"},
+        {"selection_mode": "static_openrouter"},
         {"decision_id": ""},
         {"selected_P": []},
         {"selected_P": ["replacement-without-provider"]},
@@ -537,7 +537,7 @@ async def test_static_tokenrhythm_b5_wrap_skipped_without_tokenrhythm_credential
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-synthetic")
     runner = TurnRunner(
         provider_selector=None,
-        config=_static_b5_config(selection_mode="static_tokenrhythm_b5"),
+        config=_static_b5_config(selection_mode="static_tokenrhythm"),
     )
     selector = _FakeSelector(provider="groq", api_key="sk-groq-synthetic")
 
@@ -564,7 +564,7 @@ async def test_static_tokenrhythm_b5_wraps_when_active_provider_is_keyed(
     monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
     runner = TurnRunner(
         provider_selector=None,
-        config=_static_b5_config(selection_mode="static_tokenrhythm_b5"),
+        config=_static_b5_config(selection_mode="static_tokenrhythm"),
     )
     selector = _FakeSelector(provider="tokenrhythm", api_key="sk-tr-synthetic")
 
@@ -1753,7 +1753,7 @@ def _custom_b5_guard_config(candidates: list[dict[str, Any]]) -> GatewayConfig:
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "candidates": candidates,
         },
     )

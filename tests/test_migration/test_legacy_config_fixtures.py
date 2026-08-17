@@ -25,6 +25,7 @@ from opensquilla.migration.opensquilla_home import (
     OpenSquillaHomeMigrator,
     OpenSquillaMigrationOptions,
 )
+from opensquilla.onboarding.config_store import persist_config
 
 FIXTURES_ROOT = Path(__file__).parent / "fixtures" / "homes"
 
@@ -115,6 +116,33 @@ def test_modern_era_configs_load_without_changes() -> None:
         )
         result = migrate_config_payload(data)
         assert not result.changed, (era, result.changes, result.removed_fields)
+
+
+def test_cli_05_ensemble_aliases_load_and_persist_canonically(
+    tmp_path: Path,
+) -> None:
+    source = FIXTURES_ROOT / "cli-0.5" / "config.toml"
+    target = tmp_path / "config.toml"
+    original = source.read_bytes()
+    target.write_bytes(original)
+    historical = tomllib.loads(original.decode("utf-8"))["llm_ensemble"]
+    assert historical["mode"] == "b5_fusion"
+    assert historical["selection_mode"] == "static_openrouter_b5"
+
+    config = GatewayConfig.load(target)
+
+    assert target.read_bytes() == original
+    assert config.llm_ensemble.mode == "multiple"
+    assert config.llm_ensemble.selection_mode == "static_openrouter"
+    dumped = config.llm_ensemble.model_dump(mode="json")
+    assert dumped["mode"] == "multiple"
+    assert dumped["selection_mode"] == "static_openrouter"
+
+    persist_config(config, path=target)
+    persisted = tomllib.loads(target.read_text(encoding="utf-8"))["llm_ensemble"]
+    assert persisted["mode"] == "multiple"
+    assert persisted["selection_mode"] == "static_openrouter"
+    assert source.read_bytes() == original
 
 
 def test_desktop_eras_canonicalize_legacy_tier_keys() -> None:

@@ -1487,6 +1487,12 @@ def test_task_analyzer_usage_wrapper_preserves_runner_local_callbacks(
     assert [item["physical_attempt_id"] for item in rows] == ["b" * 32, "c" * 32]
 
 
+@pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
+def test_group_specs_publish_canonical_config_without_renaming_arm_kind(module) -> None:
+    assert module.GROUP_SPECS["B1"]["kind"] == "router_single"
+    assert module.GROUP_SPECS["B2"]["selection_mode"] == "static_openrouter"
+
+
 def _openrouter_config() -> tuple[GatewayConfig, ProviderConfig]:
     config = GatewayConfig(
         llm={
@@ -1497,7 +1503,7 @@ def _openrouter_config() -> tuple[GatewayConfig, ProviderConfig]:
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
         },
     )
     inherited = ProviderConfig(
@@ -17942,8 +17948,8 @@ def _terminal_policy_call(
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
 def test_terminal_policy_allows_only_empty_nonterminal_fallback(module) -> None:
     plan = {
-        "strategy": "static_openrouter_b5",
-        "selection_mode": "static_openrouter_b5",
+        "strategy": "static_openrouter",
+        "selection_mode": "static_openrouter",
         "profile": "test",
         "proposer_models": ["p1", "p2", "p3", "p4"],
         "proposer_sample_count": 4,
@@ -17984,7 +17990,7 @@ def test_terminal_policy_allows_only_empty_nonterminal_fallback(module) -> None:
                     }
                 ),
             ),
-            expected_selection_mode="static_openrouter_b5",
+            expected_selection_mode="static_openrouter",
             expected_selection_plan=plan,
         )
 
@@ -18046,7 +18052,7 @@ def test_terminal_policy_allows_only_empty_nonterminal_fallback(module) -> None:
 @pytest.mark.parametrize("module", [runner, _load_resume_runner()], ids=["main", "resume"])
 def test_agent_ensemble_root_summary_uses_terminal_call(module) -> None:
     plan = {
-        "selection_mode": "static_openrouter_b5",
+        "selection_mode": "static_openrouter",
         "proposer_models": ["p1", "p2", "p3", "p4"],
         "selected_P": [
             "openrouter:p1",
@@ -19957,6 +19963,74 @@ def test_resume_expected_manifest_rejects_incompatible_contract(tmp_path: Path) 
             actual=actual,
             groups=["B1"],
         )
+
+
+def test_resume_expected_manifest_canonicalizes_legacy_public_config_literals(
+    tmp_path: Path,
+) -> None:
+    resume_runner = _load_resume_runner()
+    actual = _b2_compatibility_for(
+        resume_runner,
+        runner_concurrency=1,
+        judge_concurrency=1,
+    )
+    args = resume_runner.build_parser().parse_args(
+        [
+            "--input",
+            "tasks.jsonl",
+            "--groups",
+            "B2",
+            "--experiment-config",
+            str(ROOT / "configs" / "benchmarks" / "draco_b2_g12.json"),
+        ]
+    )
+    resume_runner.apply_b2_g12_argument_alignment(args, ["B2"])
+    alias_hashes = resume_runner.experiment_config_selection_alias_hashes(args)
+
+    expected = deepcopy(actual)
+    contract = expected["contracts"]["B2"]
+    contract["group_spec"]["selection_mode"] = "static_openrouter_b5"
+    contract["gateway_execution"]["llm_ensemble"]["mode"] = "b5_fusion"
+    contract["gateway_execution"]["llm_ensemble"]["selection_mode"] = (
+        "static_openrouter_b5"
+    )
+    contract["experiment_config"]["sha256"] = alias_hashes["legacy"]
+    expected["fingerprints"]["B2"] = resume_runner.canonical_json_sha256(contract)
+    manifest = tmp_path / "legacy-manifest.json"
+    manifest.write_text(
+        json.dumps({"run_compatibility": expected}),
+        encoding="utf-8",
+    )
+
+    resume_runner.validate_expected_run_compatibility(
+        path=manifest,
+        actual=actual,
+        groups=["B2"],
+        experiment_config_hashes=alias_hashes,
+    )
+
+    with pytest.raises(ValueError, match="incompatible"):
+        resume_runner.validate_expected_run_compatibility(
+            path=manifest,
+            actual=actual,
+            groups=["B2"],
+        )
+
+
+def test_run_compatibility_projection_canonicalizes_legacy_single_mode() -> None:
+    resume_runner = _load_resume_runner()
+    projected = resume_runner.canonicalize_run_compatibility_aliases(
+        {
+            "gateway_execution": {
+                "llm_ensemble": {
+                    "mode": "router_single",
+                    "selection_mode": "router_dynamic",
+                }
+            }
+        }
+    )
+
+    assert projected["gateway_execution"]["llm_ensemble"]["mode"] == "single"
 
 
 def _repair_source_drift_compatibility(

@@ -14,7 +14,7 @@ from typing import Any, Literal
 ModelRoutingMode = Literal["direct", "router", "ensemble"]
 
 _INDEPENDENT_ENSEMBLE_MODES = frozenset(
-    {"static_openrouter_b5", "static_tokenrhythm_b5", "custom_b5"}
+    {"static_openrouter", "static_tokenrhythm", "custom"}
 )
 
 
@@ -54,6 +54,15 @@ def _clean(value: object) -> str:
     return str(value or "").strip().lower()
 
 
+def _clean_selection_mode(value: object) -> str:
+    cleaned = _clean(value)
+    return {
+        "static_openrouter_b5": "static_openrouter",
+        "static_tokenrhythm_b5": "static_tokenrhythm",
+        "custom_b5": "custom",
+    }.get(cleaned, cleaned)
+
+
 def model_routing_snapshot(config: Any) -> dict[str, Any]:
     """Return the additive public snapshot for the current runtime strategy."""
 
@@ -62,7 +71,7 @@ def model_routing_snapshot(config: Any) -> dict[str, Any]:
     router_enabled = bool(getattr(router, "enabled", False))
     ensemble_enabled = bool(getattr(ensemble, "enabled", False))
     rollout_phase = _clean(getattr(router, "rollout_phase", "observe")) or "observe"
-    selection_mode = _clean(getattr(ensemble, "selection_mode", ""))
+    selection_mode = _clean_selection_mode(getattr(ensemble, "selection_mode", ""))
     router_required = selection_mode not in _INDEPENDENT_ENSEMBLE_MODES
 
     if ensemble_enabled:
@@ -103,7 +112,7 @@ def model_routing_patches(config: Any, mode: str) -> dict[str, Any]:
             "squilla_router.rollout_phase": "full",
         }
 
-    selection_mode = _clean(
+    selection_mode = _clean_selection_mode(
         getattr(getattr(config, "llm_ensemble", None), "selection_mode", "")
     )
     return {

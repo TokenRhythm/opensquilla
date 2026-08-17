@@ -458,6 +458,47 @@ _ACCEPTED_TURN_CONFIG: contextvars.ContextVar[Any | None] = contextvars.ContextV
     default=None,
 )
 
+# One router_single route freezes the two catalog budgets used for ranking.
+# The ContextVar carries those values across the pipeline -> AgentBootstrap
+# boundary without sharing mutable per-turn state between concurrent sessions.
+_ROUTER_SINGLE_FROZEN_CATALOG: contextvars.ContextVar[
+    dict[str, Any] | None
+] = contextvars.ContextVar(
+    "_router_single_frozen_catalog",
+    default=None,
+)
+
+
+def _consume_router_single_frozen_catalog(
+    provider: str,
+    model: str,
+) -> tuple[int, int, Any] | None:
+    """Consume one exact router_single catalog snapshot."""
+
+    frozen = _ROUTER_SINGLE_FROZEN_CATALOG.get()
+    if frozen is None:
+        return None
+    _ROUTER_SINGLE_FROZEN_CATALOG.set(None)
+    frozen_provider = str(frozen.get("provider") or "").strip().casefold()
+    frozen_model = str(frozen.get("model") or "").strip()
+    if (
+        frozen_provider != str(provider or "").strip().casefold()
+        or frozen_model != str(model or "").strip()
+    ):
+        raise RuntimeError("router_single frozen catalog identity drifted")
+    max_tokens = frozen.get("max_tokens")
+    context_window = frozen.get("context_window")
+    if (
+        isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or max_tokens <= 0
+        or isinstance(context_window, bool)
+        or not isinstance(context_window, int)
+        or context_window <= 0
+    ):
+        raise RuntimeError("router_single frozen catalog budget is invalid")
+    return max_tokens, context_window, frozen.get("capabilities")
+
 
 @contextlib.contextmanager
 def accepted_turn_config_scope(config: Any | None) -> Any:
@@ -1551,6 +1592,591 @@ def _router_dynamic_decision_projection(
     return projection
 
 
+_RouterSingleCleanupKey = tuple[str, str, str]
+_ROUTER_SINGLE_CLEANUP_LOCK = threading.Lock()
+_ROUTER_SINGLE_PENDING_CLEANUPS: dict[
+    _RouterSingleCleanupKey, set[asyncio.Future[Any]]
+] = {}
+_ROUTER_SINGLE_POISONED_CLEANUPS: set[_RouterSingleCleanupKey] = set()
+_ROUTER_SINGLE_FINISHED_CLEANUPS: set[asyncio.Future[Any]] = set()
+
+
+def _router_single_cleanup_key(
+    provider: str,
+    model: str,
+    upstream: str,
+) -> _RouterSingleCleanupKey:
+    return (
+        str(provider or "").strip().casefold(),
+        str(model or "").strip(),
+        str(upstream or "").strip().casefold(),
+    )
+
+
+def _router_single_cleanup_block_reason(key: _RouterSingleCleanupKey) -> str:
+    """Return why another physical request must not overlap this deployment."""
+
+    with _ROUTER_SINGLE_CLEANUP_LOCK:
+        if key in _ROUTER_SINGLE_POISONED_CLEANUPS:
+            return "router_single_cleanup_poisoned"
+        if _ROUTER_SINGLE_PENDING_CLEANUPS.get(key):
+            return "router_single_cleanup_pending"
+    return ""
+
+
+def _mark_router_single_cleanup_poisoned(key: _RouterSingleCleanupKey) -> None:
+    with _ROUTER_SINGLE_CLEANUP_LOCK:
+        _ROUTER_SINGLE_POISONED_CLEANUPS.add(key)
+
+
+def _settle_router_single_cleanup(
+    key: _RouterSingleCleanupKey,
+    future: asyncio.Future[Any],
+) -> bool:
+    """Publish close proof, poisoning the deployment on any failed cleanup."""
+
+    succeeded = False
+    if future.done():
+        try:
+            future.result()
+        except BaseException:  # cleanup failure must be consumed and retained
+            pass
+        else:
+            succeeded = True
+    with _ROUTER_SINGLE_CLEANUP_LOCK:
+        pending = _ROUTER_SINGLE_PENDING_CLEANUPS.get(key)
+        if pending is not None:
+            pending.discard(future)
+            if not pending:
+                _ROUTER_SINGLE_PENDING_CLEANUPS.pop(key, None)
+        _ROUTER_SINGLE_FINISHED_CLEANUPS.discard(future)
+        if not succeeded:
+            _ROUTER_SINGLE_POISONED_CLEANUPS.add(key)
+    return succeeded
+
+
+def _track_router_single_cleanup(
+    key: _RouterSingleCleanupKey,
+    future: asyncio.Future[Any],
+) -> None:
+    """Register physical cleanup before its first cancellable await."""
+
+    with _ROUTER_SINGLE_CLEANUP_LOCK:
+        _ROUTER_SINGLE_PENDING_CLEANUPS.setdefault(key, set()).add(future)
+
+    def _done(done: asyncio.Future[Any]) -> None:
+        with _ROUTER_SINGLE_CLEANUP_LOCK:
+            owner_finished = done in _ROUTER_SINGLE_FINISHED_CLEANUPS
+        if owner_finished:
+            _settle_router_single_cleanup(key, done)
+
+    future.add_done_callback(_done)
+
+
+def _finish_router_single_cleanup(
+    key: _RouterSingleCleanupKey,
+    future: asyncio.Future[Any],
+) -> None:
+    """Open the gate only after health settlement and physical cleanup."""
+
+    with _ROUTER_SINGLE_CLEANUP_LOCK:
+        _ROUTER_SINGLE_FINISHED_CLEANUPS.add(future)
+        cleanup_done = future.done()
+    if cleanup_done:
+        _settle_router_single_cleanup(key, future)
+
+
+class _RouterSingleDirectProvider:
+    """Single-route physical dispatch guard around one ordinary provider."""
+
+    _STREAM_CLOSE_TIMEOUT_SECONDS = 1.0
+
+    def __init__(
+        self,
+        provider: Any,
+        provider_config: Any,
+        *,
+        health_ledger: ProviderHealthLedger | None,
+        absolute_deadline: float | None,
+        frozen_catalog: Mapping[str, Any],
+        enforces_routed_thinking_policy: bool,
+    ) -> None:
+        from opensquilla.provider.deployment import (
+            canonicalize_provider_routing_upstream,
+        )
+
+        self._provider = provider
+        self._provider_config = provider_config
+        self._health_ledger = health_ledger
+        self._absolute_deadline = absolute_deadline
+        self._router_single_frozen_catalog = dict(frozen_catalog)
+        self._enforces_routed_thinking_policy = bool(
+            enforces_routed_thinking_policy
+        )
+        self._local_dispatch_blocked = False
+        self._upstream = canonicalize_provider_routing_upstream(
+            provider_config.provider_routing.get(provider_config.model, "")
+        )
+        self._cleanup_key = _router_single_cleanup_key(
+            self.active_provider_id,
+            self.active_model_id,
+            self._upstream,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._provider, name)
+
+    @property
+    def active_provider_id(self) -> str:
+        return str(self._provider_config.provider or "")
+
+    @property
+    def active_model_id(self) -> str:
+        return str(self._provider_config.model or "")
+
+    @property
+    def provider_config(self) -> Any:
+        return self._provider_config
+
+    @property
+    def router_single_frozen_catalog(self) -> dict[str, Any]:
+        return dict(self._router_single_frozen_catalog)
+
+    @property
+    def enforces_routed_thinking_policy(self) -> bool:
+        return self._enforces_routed_thinking_policy
+
+    @property
+    def retry_failed_call_safe(self) -> bool:
+        if self._local_dispatch_blocked:
+            return False
+        return getattr(self._provider, "retry_failed_call_safe", True) is not False
+
+    def chat(
+        self,
+        messages: list[Any],
+        tools: Any = None,
+        config: Any = None,
+    ) -> AsyncIterator[Any]:
+        return self._chat(messages, tools=tools, config=config)
+
+    def _remaining_seconds(self) -> float | None:
+        if self._absolute_deadline is None:
+            return None
+        return self._absolute_deadline - time.monotonic()
+
+    def _begin_health_attempt(self) -> dict[str, Any]:
+        cleanup_reason = _router_single_cleanup_block_reason(self._cleanup_key)
+        if cleanup_reason:
+            return {
+                "allowed": False,
+                "tracked": False,
+                "state": "cleanup_blocked",
+                "reason": cleanup_reason,
+            }
+        begin_attempt = getattr(self._health_ledger, "begin_attempt", None)
+        if not callable(begin_attempt):
+            return {"allowed": True, "tracked": False}
+        admission = begin_attempt(
+            self.active_provider_id,
+            self.active_model_id,
+            upstream=self._upstream,
+            never_strand_exempt=False,
+        )
+        if not isinstance(admission, Mapping):
+            raise RuntimeError("provider health admission returned invalid evidence")
+        return {**dict(admission), "tracked": True}
+
+    def _cancel_health_attempt(self, admission: Mapping[str, Any]) -> None:
+        if admission.get("tracked") is not True:
+            return
+        cancel_attempt = getattr(self._health_ledger, "cancel_attempt", None)
+        if not callable(cancel_attempt):
+            return
+        cancel_attempt(
+            self.active_provider_id,
+            self.active_model_id,
+            upstream=self._upstream,
+            lease_token=admission.get("lease_token"),
+        )
+
+    def _record_health_failure(
+        self,
+        admission: Mapping[str, Any],
+        event: ProviderErrorEvent,
+    ) -> None:
+        if admission.get("tracked") is not True:
+            return
+        record_failure = getattr(self._health_ledger, "record_failure", None)
+        if not callable(record_failure):
+            return
+        kind = classify_provider_error(
+            provider_name=self.active_provider_id,
+            status_code=int(event.code) if str(event.code).isdigit() else None,
+            raw_code=event.code,
+            message=event.message,
+        )
+        record_failure(
+            self.active_provider_id,
+            self.active_model_id,
+            kind,
+            retry_after_s=getattr(event, "retry_after_s", None),
+            upstream=self._upstream,
+            lease_token=admission.get("lease_token"),
+        )
+
+    def _record_health_success(self, admission: Mapping[str, Any]) -> None:
+        if admission.get("tracked") is not True:
+            return
+        record_success = getattr(self._health_ledger, "record_success", None)
+        if not callable(record_success):
+            return
+        record_success(
+            self.active_provider_id,
+            self.active_model_id,
+            upstream=self._upstream,
+            attempt_started_at=admission.get("started_at"),
+            lease_token=admission.get("lease_token"),
+        )
+
+    async def _close_stream_with_cleanup_reserve(
+        self,
+        stream: Any,
+        *,
+        require_aclose: bool,
+        cleanup_ownership: list[asyncio.Future[Any]],
+    ) -> bool:
+        """Close one stream, gating only when no terminal/EOF proof exists."""
+
+        try:
+            close = getattr(stream, "aclose", None)
+        except BaseException as exc:  # descriptor access is a provider boundary
+            if require_aclose:
+                _mark_router_single_cleanup_poisoned(self._cleanup_key)
+            log.warning(
+                "router_single.direct_stream_close_failed",
+                provider=self.active_provider_id,
+                model=self.active_model_id,
+                error_type=type(exc).__name__,
+            )
+            return not require_aclose
+        if not callable(close):
+            if require_aclose:
+                _mark_router_single_cleanup_poisoned(self._cleanup_key)
+            return not require_aclose
+        try:
+            close_future = asyncio.ensure_future(close())
+        except BaseException as exc:  # provider close construction is untrusted
+            if require_aclose:
+                _mark_router_single_cleanup_poisoned(self._cleanup_key)
+            log.warning(
+                "router_single.direct_stream_close_failed",
+                provider=self.active_provider_id,
+                model=self.active_model_id,
+                error_type=type(exc).__name__,
+            )
+            return not require_aclose
+
+        if require_aclose:
+            # Register before the first cancellable await. A timeout or caller
+            # cancellation transfers ownership to the process-level deployment
+            # gate until the physical close task really terminates.
+            _track_router_single_cleanup(self._cleanup_key, close_future)
+            cleanup_ownership.append(close_future)
+        else:
+            # Terminal/EOF already proves the physical request ended. The
+            # adapter's optional aclose is best-effort resource cleanup only.
+            def _consume(done: asyncio.Future[Any]) -> None:
+                try:
+                    done.result()
+                except BaseException:
+                    pass
+
+            close_future.add_done_callback(_consume)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(close_future),
+                timeout=self._STREAM_CLOSE_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            log.warning(
+                "router_single.direct_stream_close_timeout",
+                provider=self.active_provider_id,
+                model=self.active_model_id,
+            )
+            if not require_aclose:
+                close_future.cancel()
+            return not require_aclose
+        except asyncio.CancelledError:
+            if not require_aclose:
+                close_future.cancel()
+            raise
+        except Exception as exc:  # noqa: BLE001 - cleanup must not mask result
+            log.warning(
+                "router_single.direct_stream_close_failed",
+                provider=self.active_provider_id,
+                model=self.active_model_id,
+                error_type=type(exc).__name__,
+            )
+            return not require_aclose
+        return True
+
+    async def _chat(
+        self,
+        messages: list[Any],
+        tools: Any = None,
+        config: Any = None,
+    ) -> AsyncIterator[Any]:
+        self._local_dispatch_blocked = False
+        remaining = self._remaining_seconds()
+        if remaining is not None and remaining <= 0:
+            self._local_dispatch_blocked = True
+            yield ProviderErrorEvent(
+                message="router_single absolute deadline expired before dispatch",
+                code="router_single_absolute_deadline",
+                request_started=False,
+                physical_request_count=0,
+            )
+            return
+
+        effective_config = config
+        if remaining is not None:
+            model_copy = getattr(config, "model_copy", None)
+            if callable(model_copy):
+                configured_timeout = float(
+                    getattr(config, "timeout", remaining) or remaining
+                )
+                effective_config = model_copy(
+                    update={"timeout": min(configured_timeout, remaining)}
+                )
+        remaining = self._remaining_seconds()
+        if remaining is not None and remaining <= 0:
+            self._local_dispatch_blocked = True
+            yield ProviderErrorEvent(
+                message="router_single absolute deadline expired before dispatch",
+                code="router_single_absolute_deadline",
+                request_started=False,
+                physical_request_count=0,
+            )
+            return
+
+        # Admission is deliberately adjacent to the lazy provider call. A
+        # rejected half-open lease is a zero-request terminal failure and the
+        # direct route never selects another model in response.
+        try:
+            admission = self._begin_health_attempt()
+        except Exception:
+            self._local_dispatch_blocked = True
+            yield ProviderErrorEvent(
+                message="router_single health admission is unavailable",
+                code="router_single_health_admission_unavailable",
+                request_started=False,
+                physical_request_count=0,
+            )
+            return
+        if admission.get("allowed") is not True:
+            self._local_dispatch_blocked = True
+            yield ProviderErrorEvent(
+                message="router_single selected deployment is not healthy",
+                code=str(
+                    admission.get("reason")
+                    or "router_single_health_admission_rejected"
+                ),
+                request_started=False,
+                physical_request_count=0,
+            )
+            return
+
+        stream: Any = None
+        settled = False
+        physical_started = False
+        close_attempted = False
+        close_proven = False
+        terminal_event: Any = None
+        stream_boundary_observed = False
+        cleanup_ownership: list[asyncio.Future[Any]] = []
+
+        def incomplete_stream_event(message: str) -> ProviderErrorEvent:
+            return ProviderErrorEvent(
+                message=message,
+                code="incomplete_stream",
+                request_started=True,
+                physical_request_count=1,
+            )
+
+        def explicit_zero_request_error(event: ProviderErrorEvent) -> bool:
+            count = event.physical_request_count
+            valid_zero_count = count is None or (
+                isinstance(count, int)
+                and not isinstance(count, bool)
+                and count == 0
+            )
+            return event.request_started is False and valid_zero_count
+
+        async def close_once(*, require_aclose: bool) -> bool:
+            nonlocal close_attempted, close_proven
+            if close_attempted:
+                return close_proven
+            close_attempted = True
+            close_proven = stream is None or await self._close_stream_with_cleanup_reserve(
+                stream,
+                require_aclose=require_aclose,
+                cleanup_ownership=cleanup_ownership,
+            )
+            return close_proven
+
+        def finish_cleanup_ownership() -> None:
+            while cleanup_ownership:
+                _finish_router_single_cleanup(
+                    self._cleanup_key,
+                    cleanup_ownership.pop(),
+                )
+
+        try:
+            stream = self._provider.chat(
+                messages,
+                tools=tools,
+                config=effective_config,
+            )
+
+            async def forward() -> AsyncIterator[Any]:
+                nonlocal physical_started, stream_boundary_observed, terminal_event
+                iterator = stream.__aiter__()
+                while True:
+                    # Crossing the first __anext__ boundary is the earliest
+                    # reliable evidence that a lazy provider may have started
+                    # its physical request.
+                    physical_started = True
+                    try:
+                        event = await iterator.__anext__()
+                    except StopAsyncIteration:
+                        stream_boundary_observed = True
+                        return
+                    is_terminal = isinstance(event, ProviderErrorEvent) or (
+                        getattr(event, "kind", "") == "done"
+                    )
+                    if is_terminal:
+                        # Stop at the protocol terminal instead of probing for
+                        # another event. The terminal proves the physical
+                        # boundary; optional aclose remains bounded resource
+                        # cleanup and completes before the terminal is exposed.
+                        terminal_event = event
+                        stream_boundary_observed = True
+                        return
+                    yield event
+
+            remaining = self._remaining_seconds()
+            if remaining is None:
+                async for event in forward():
+                    yield event
+            elif remaining <= 0:
+                self._local_dispatch_blocked = True
+                self._cancel_health_attempt(admission)
+                settled = True
+                yield ProviderErrorEvent(
+                    message="router_single absolute deadline expired before dispatch",
+                    code="router_single_absolute_deadline",
+                    request_started=False,
+                    physical_request_count=0,
+                )
+            else:
+                try:
+                    async with asyncio.timeout(remaining):
+                        async for event in forward():
+                            yield event
+                except TimeoutError:
+                    self._local_dispatch_blocked = True
+                    timeout_event = ProviderErrorEvent(
+                        message="router_single absolute deadline expired",
+                        code="router_single_absolute_deadline",
+                        request_started=physical_started,
+                        physical_request_count=1 if physical_started else 0,
+                    )
+                    await close_once(require_aclose=physical_started)
+                    if physical_started and not settled:
+                        # The absolute deadline cancelled an in-flight physical
+                        # request. Count it as a transient deployment failure so
+                        # a half-open probe is not released as a local cancel.
+                        self._record_health_failure(
+                            admission,
+                            ProviderErrorEvent(
+                                message="router_single provider request timeout",
+                                code="timeout",
+                                request_started=True,
+                                physical_request_count=1,
+                            ),
+                        )
+                        settled = True
+                    finish_cleanup_ownership()
+                    yield timeout_event
+            if not settled:
+                await close_once(require_aclose=not stream_boundary_observed)
+                if terminal_event is None:
+                    self._record_health_failure(
+                        admission,
+                        incomplete_stream_event(
+                            "provider stream ended before terminal event"
+                        ),
+                    )
+                    settled = True
+                elif not close_proven:
+                    self._local_dispatch_blocked = True
+                    failure = incomplete_stream_event(
+                        "provider stream could not be closed"
+                    )
+                    self._record_health_failure(admission, failure)
+                    settled = True
+                    yield failure
+                elif isinstance(terminal_event, ProviderErrorEvent):
+                    if explicit_zero_request_error(terminal_event):
+                        self._cancel_health_attempt(admission)
+                    else:
+                        self._record_health_failure(admission, terminal_event)
+                    settled = True
+                    yield terminal_event
+                else:
+                    self._record_health_success(admission)
+                    settled = True
+                    yield terminal_event
+        except Exception:
+            if physical_started and not settled:
+                try:
+                    await close_once(require_aclose=True)
+                finally:
+                    self._record_health_failure(
+                        admission,
+                        incomplete_stream_event(
+                            "provider stream raised before terminal event"
+                        ),
+                    )
+                    settled = True
+            raise
+        finally:
+            try:
+                await close_once(
+                    require_aclose=(
+                        physical_started and not stream_boundary_observed
+                    )
+                )
+            finally:
+                if not settled:
+                    if (
+                        physical_started
+                        and not stream_boundary_observed
+                        and not close_proven
+                    ):
+                        self._record_health_failure(
+                            admission,
+                            incomplete_stream_event(
+                                "provider stream could not be closed"
+                            ),
+                        )
+                        settled = True
+                    else:
+                        self._cancel_health_attempt(admission)
+                finish_cleanup_ownership()
+
+
 class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors."""
 
@@ -2158,8 +2784,20 @@ class _SelectorFallbackProvider:
                     yield event
                     continue
                 if isinstance(event, ProviderErrorEvent):
+                    credential_provider_name = self.provider_name
+                    if (
+                        self._turn_metadata is not None
+                        and self._turn_metadata.get(
+                            "_router_single_provider_finalized"
+                        )
+                        is True
+                    ):
+                        configured_provider, _ = self._active_deployment()
+                        credential_provider_name = (
+                            configured_provider or credential_provider_name
+                        )
                     _report_credential_pool_failure(
-                        self.provider_name,
+                        credential_provider_name,
                         self._turn_metadata,
                         event,
                     )
@@ -4389,6 +5027,20 @@ class TurnRunner:
                     turn.metadata.get("router_control_hold_applied")
                 )
             router_event = build_router_decision_event(turn)
+            if (
+                router_event is not None
+                and turn.metadata.get("_router_single_provider_finalized") is True
+            ):
+                frozen_event_catalog = turn.metadata.get(
+                    "_router_single_frozen_catalog"
+                )
+                if isinstance(frozen_event_catalog, Mapping):
+                    frozen_window = frozen_event_catalog.get("context_window")
+                    if isinstance(frozen_window, int) and not isinstance(
+                        frozen_window,
+                        bool,
+                    ):
+                        router_event = replace(router_event, context_window=frozen_window)
             if router_event is not None:
                 yield router_event
             active_provider_id = (
@@ -4401,34 +5053,50 @@ class TurnRunner:
                 input_mode=input_mode,
                 turn_metadata=turn.metadata,
             )
-            ab_outcome = await self._agent_bootstrap_stage.run(
-                AgentBootstrapStageInput(
-                    provider=provider,
-                    cloned_selector=cloned_selector,
-                    turn=turn,
-                    final_prompt=final_prompt,
-                    cache_breakpoints=cache_breakpoints,
-                    request_context_prompt=request_context_prompt,
-                    resolved_model=resolved_model,
-                    session_id_for_log=session_id_for_log,
-                    tool_handler=tool_handler,
-                    turn_call_logger=turn_call_logger,
-                    tool_context=tool_context,
-                    session_key=session_key,
-                    agent_id=agent_id,
-                    timeout=runtime_timeout_override,
-                    max_iterations=max_iterations,
-                    iteration_timeout=iteration_timeout,
-                    tool_timeout=tool_timeout,
-                    request_timeout=request_timeout,
-                    max_provider_retries=max_provider_retries,
-                    length_capped_continuations=length_capped_continuations,
-                    active_provider_id=active_provider_id,
-                    turn_id=turn_id,
-                    run_kind=run_kind,
-                    session_epoch=self._usage_session_epoch_by_key.get(session_key, 0),
+            frozen_catalog_token: contextvars.Token[dict[str, Any] | None] | None = None
+            if turn.metadata.get("_router_single_provider_finalized") is True:
+                frozen_catalog = getattr(
+                    provider,
+                    "router_single_frozen_catalog",
+                    None,
                 )
-            )
+                if not isinstance(frozen_catalog, Mapping):
+                    raise RuntimeError("router_single frozen catalog is unavailable")
+                frozen_catalog_token = _ROUTER_SINGLE_FROZEN_CATALOG.set(
+                    dict(frozen_catalog)
+                )
+            try:
+                ab_outcome = await self._agent_bootstrap_stage.run(
+                    AgentBootstrapStageInput(
+                        provider=provider,
+                        cloned_selector=cloned_selector,
+                        turn=turn,
+                        final_prompt=final_prompt,
+                        cache_breakpoints=cache_breakpoints,
+                        request_context_prompt=request_context_prompt,
+                        resolved_model=resolved_model,
+                        session_id_for_log=session_id_for_log,
+                        tool_handler=tool_handler,
+                        turn_call_logger=turn_call_logger,
+                        tool_context=tool_context,
+                        session_key=session_key,
+                        agent_id=agent_id,
+                        timeout=runtime_timeout_override,
+                        max_iterations=max_iterations,
+                        iteration_timeout=iteration_timeout,
+                        tool_timeout=tool_timeout,
+                        request_timeout=request_timeout,
+                        max_provider_retries=max_provider_retries,
+                        length_capped_continuations=length_capped_continuations,
+                        active_provider_id=active_provider_id,
+                        turn_id=turn_id,
+                        run_kind=run_kind,
+                        session_epoch=self._usage_session_epoch_by_key.get(session_key, 0),
+                    )
+                )
+            finally:
+                if frozen_catalog_token is not None:
+                    _ROUTER_SINGLE_FROZEN_CATALOG.reset(frozen_catalog_token)
             ab_out = ab_outcome.require_output()
             agent = ab_out.agent
             agent_config = ab_out.agent_config
@@ -5626,6 +6294,23 @@ class TurnRunner:
     def _resolve_turn_thinking(self, turn: Any) -> bool | ThinkingLevel:
         """Resolve explicit config thinking before squilla-router suggestions."""
 
+        metadata = getattr(turn, "metadata", {}) or {}
+        managed_native_level = metadata.get(
+            "_router_single_managed_provider_thinking_level"
+        )
+        if managed_native_level is not None:
+            if isinstance(managed_native_level, ThinkingLevel):
+                return managed_native_level
+            native_raw = str(managed_native_level).strip().lower()
+            if native_raw == "x-high":
+                native_raw = ThinkingLevel.XHIGH.value
+            try:
+                return ThinkingLevel(native_raw)
+            except ValueError as exc:
+                raise ValueError(
+                    "router_single managed provider thinking level is invalid"
+                ) from exc
+
         llm_cfg = getattr(self._config, "llm", None) if self._config else None
         explicit = getattr(llm_cfg, "thinking", None)
         parsed = self._parse_thinking_level(
@@ -5637,7 +6322,6 @@ class TurnRunner:
         if explicit is not None and str(explicit).strip():
             return False
 
-        metadata = getattr(turn, "metadata", {}) or {}
         if not metadata.get("thinking_requested"):
             return False
 
@@ -6448,6 +7132,359 @@ class TurnRunner:
             total_max_chars=getattr(memory_cfg, "daily_notes_total_max_chars", 8000),
         )
 
+    async def _resolve_router_single_provider(
+        self,
+        *,
+        turn: Any,
+        provider: Any,
+        cloned_selector: Any,
+        turn_config: Any,
+        ensemble_cfg: Any,
+        turn_absolute_deadline: float | None,
+    ) -> Any:
+        """Resolve router_dynamic Top-1 onto an ordinary provider."""
+
+        from opensquilla.engine.routing.health import get_provider_health_ledger
+        from opensquilla.engine.selector_override import acquire_profile_credential
+        from opensquilla.provider.ensemble import resolve_router_single_route
+        from opensquilla.provider.ranking_router import (
+            RANKING_CONFIG_SCHEMA_VERSION,
+            DynamicRankingError,
+            TaskAnalyzerCandidate,
+            _prepare_effective_ranking_config,
+            analyze_task_with_fallback_chain,
+            analyze_task_with_provider,
+            build_single_model_request_context,
+            ranking_config_snapshot,
+            task_analyzer_chain_policy,
+            task_analyzer_policy,
+        )
+        from opensquilla.provider.selector import ModelSelector, SelectorConfig
+
+        if provider is None or cloned_selector is None:
+            raise DynamicRankingError(
+                "router_single requires a configured provider selector",
+                reason="router_single_provider_selector_unavailable",
+            )
+        current_provider_config = getattr(cloned_selector, "current_config", None)
+        if (
+            current_provider_config is None
+            or not str(getattr(current_provider_config, "provider", "") or "").strip()
+            or not str(getattr(current_provider_config, "model", "") or "").strip()
+        ):
+            raise DynamicRankingError(
+                "router_single provider selector has no complete current config",
+                reason="router_single_provider_selector_unavailable",
+            )
+        if self._model_catalog is None:
+            raise DynamicRankingError(
+                "router_single requires an authoritative model catalog",
+                reason="router_single_model_catalog_unavailable",
+            )
+
+        prepared_ranking_config = getattr(
+            ensemble_cfg,
+            "prepared_ranking_config",
+            None,
+        )
+        frozen_resolution_snapshot = getattr(
+            ensemble_cfg,
+            "ranking_config_resolution_snapshot",
+            None,
+        )
+        if callable(prepared_ranking_config):
+            ranking_config = prepared_ranking_config()
+            if not isinstance(ranking_config, Mapping):
+                raise DynamicRankingError(
+                    "prepared router_single ranking config is unavailable"
+                )
+            thinking_policy = ranking_config.get("thinking_assignment")
+            thinking_assignment_enabled = bool(
+                ranking_config.get("schema_version")
+                == RANKING_CONFIG_SCHEMA_VERSION
+                and isinstance(thinking_policy, Mapping)
+                and thinking_policy.get("enabled") is True
+            )
+        elif callable(frozen_resolution_snapshot):
+            frozen_resolution = frozen_resolution_snapshot()
+            ranking_config = frozen_resolution.get("effective_config")
+            if not isinstance(ranking_config, Mapping):
+                raise DynamicRankingError(
+                    "frozen router_single ranking config is unavailable"
+                )
+            thinking_assignment_enabled = (
+                frozen_resolution.get("thinking_assignment_enabled") is True
+            )
+        else:
+            thinking_assignment_enabled = bool(
+                getattr(
+                    ensemble_cfg,
+                    "ranking_thinking_assignment_enabled",
+                    False,
+                )
+            )
+            ranking_config = ranking_config_snapshot(
+                thinking_assignment_enabled=thinking_assignment_enabled,
+                override=(
+                    getattr(ensemble_cfg, "ranking_config_override", None)
+                    or None
+                ),
+            )
+        ranking_config = _prepare_effective_ranking_config(
+            ranking_config,
+            thinking_assignment_enabled=thinking_assignment_enabled,
+        )
+        analyzer_policy = task_analyzer_policy(ranking_config)
+        analyzer_chain = task_analyzer_chain_policy(ranking_config)
+        analyzer_provider_id = str(analyzer_policy["provider"])
+        analyzer_model_id = str(analyzer_policy["model"])
+        routing_extra = turn.metadata.get("routing_extra")
+        routing_extra_map = (
+            routing_extra if isinstance(routing_extra, Mapping) else {}
+        )
+        routed_tier = str(
+            turn.metadata.get("routed_tier")
+            or routing_extra_map.get("final_tier")
+            or routing_extra_map.get("base_tier")
+            or "c1"
+        )
+        try:
+            routing_confidence = float(
+                turn.metadata.get("routing_confidence") or 0.0
+            )
+        except (TypeError, ValueError):
+            routing_confidence = 0.0
+        configured_output_tokens = int(
+            getattr(getattr(turn_config, "llm", None), "max_tokens", 0) or 0
+        )
+        if configured_output_tokens <= 0:
+            context_policy = ranking_config.get("context")
+            context_policy_map = (
+                context_policy if isinstance(context_policy, Mapping) else {}
+            )
+            output_policy = context_policy_map.get("output_budget")
+            output_policy_map = (
+                output_policy if isinstance(output_policy, Mapping) else {}
+            )
+            configured_output_tokens = output_policy_map.get("default_tokens")
+            if (
+                isinstance(configured_output_tokens, bool)
+                or not isinstance(configured_output_tokens, int)
+                or configured_output_tokens <= 0
+            ):
+                raise DynamicRankingError(
+                    "router_single analyzer output budget is unavailable",
+                    reason="router_single_output_budget_unavailable",
+                )
+        request_context = build_single_model_request_context(
+            message=turn.semantic_message,
+            turn_metadata=turn.metadata,
+            attachments=turn.attachments,
+            output_tokens=configured_output_tokens,
+            ranking_config=ranking_config,
+        )
+        user_profile_enabled = bool(
+            getattr(
+                ensemble_cfg,
+                "ranking_user_profile_enabled",
+                False,
+            )
+        )
+        user_profile = (
+            self._resolve_user_profile(ranking_config, turn_config)
+            if user_profile_enabled
+            else None
+        )
+        decision_id = str(
+            turn.metadata.get("router_decision_id") or uuid.uuid4().hex
+        )
+
+        analyzer_admission_controller = None
+        analyzer_admission_deadline = None
+        admission_config = getattr(ensemble_cfg, "admission", None)
+        if (
+            str(
+                getattr(ensemble_cfg, "latency_class", "normal")
+                or "normal"
+            )
+            != "experiment"
+            and admission_config is not None
+            and bool(getattr(admission_config, "enabled", True))
+        ):
+            from opensquilla.provider.admission import (
+                get_shared_provider_admission_controller,
+                provider_admission_settings_from_config,
+            )
+
+            analyzer_admission_controller = (
+                get_shared_provider_admission_controller(
+                    provider_admission_settings_from_config(admission_config)
+                )
+            )
+            analyzer_admission_timeout = float(
+                analyzer_chain["total_timeout_seconds"]
+                if analyzer_chain["configured"]
+                else analyzer_policy["timeout_seconds"]
+            )
+            analyzer_admission_deadline = (
+                time.monotonic() + analyzer_admission_timeout
+            )
+            if turn_absolute_deadline is not None:
+                analyzer_admission_deadline = min(
+                    analyzer_admission_deadline,
+                    turn_absolute_deadline,
+                )
+        allow_canary_analyzer_route = bool(
+            str(
+                getattr(ensemble_cfg, "latency_class", "normal")
+                or "normal"
+            ).strip().casefold()
+            == "experiment"
+        )
+        if analyzer_chain["configured"]:
+            analyzer_candidates = [
+                TaskAnalyzerCandidate(
+                    provider=self._router_dynamic_task_analyzer_provider(
+                        current_provider_config,
+                        session_key=turn.session_key,
+                        ranking_config=ranking_config,
+                        analyzer_route=route,
+                        allow_canary_route=allow_canary_analyzer_route,
+                    ),
+                    provider_id=str(route["provider"]),
+                    model_id=str(route["model"]),
+                    upstream_provider=str(route["upstream_provider"]),
+                )
+                for route in analyzer_chain["routes"]
+            ]
+            task_analysis = await analyze_task_with_fallback_chain(
+                candidates=analyzer_candidates,
+                message=turn.semantic_message,
+                user_profile_enabled=user_profile is not None,
+                request_context=request_context,
+                routed_tier=routed_tier,
+                routing_confidence=routing_confidence,
+                usage_tracker=self._usage_tracker,
+                session_key=turn.session_key,
+                ranking_config=ranking_config,
+                decision_id=decision_id,
+                absolute_deadline=turn_absolute_deadline,
+                admission_controller=analyzer_admission_controller,
+                admission_deadline=analyzer_admission_deadline,
+            )
+        else:
+            analyzer_provider = self._router_dynamic_task_analyzer_provider(
+                current_provider_config,
+                session_key=turn.session_key,
+                ranking_config=ranking_config,
+                allow_canary_route=allow_canary_analyzer_route,
+            )
+            task_analysis = await analyze_task_with_provider(
+                provider=analyzer_provider,
+                message=turn.semantic_message,
+                user_profile_enabled=user_profile is not None,
+                request_context=request_context,
+                routed_tier=routed_tier,
+                routing_confidence=routing_confidence,
+                usage_tracker=self._usage_tracker,
+                session_key=turn.session_key,
+                analyzer_provider_id=analyzer_provider_id,
+                analyzer_model_id=analyzer_model_id,
+                ranking_config=ranking_config,
+                decision_id=decision_id,
+                admission_controller=analyzer_admission_controller,
+                admission_deadline=analyzer_admission_deadline,
+                _absolute_deadline=turn_absolute_deadline,
+            )
+
+        provider_health_ledger = get_provider_health_ledger()
+        route = resolve_router_single_route(
+            config=turn_config,
+            inherited_provider_config=current_provider_config,
+            turn_metadata=turn.metadata,
+            ranking_inputs={
+                "decision_id": decision_id,
+                "task_analysis": task_analysis,
+                "user_profile": user_profile,
+                "request_context": request_context,
+                "ranking_config": ranking_config,
+            },
+            requires_tools=bool(turn.tool_defs),
+            credential_pool_acquirer=acquire_profile_credential,
+            session_key=turn.session_key,
+            provider_health_ledger=provider_health_ledger,
+            model_catalog=self._model_catalog,
+        )
+
+        selected_config = route.provider_config
+        direct_selector = ModelSelector(
+            SelectorConfig(primary=selected_config, fallbacks=[])
+        )
+        direct_provider = _RouterSingleDirectProvider(
+            direct_selector.resolve(),
+            selected_config,
+            health_ledger=provider_health_ledger,
+            absolute_deadline=turn_absolute_deadline,
+            frozen_catalog={
+                "provider": selected_config.provider,
+                "model": selected_config.model,
+                "max_tokens": route.direct_output_tokens,
+                "context_window": route.context_window_tokens,
+                "capabilities": route.model_capabilities,
+            },
+            enforces_routed_thinking_policy=bool(
+                route.thinking_policy_version
+            ),
+        )
+        direct_provider = _SelectorFallbackProvider(
+            direct_provider,
+            direct_selector,
+            turn_metadata=turn.metadata,
+        )
+        cloned_selector.override_provider_config(selected_config)
+        turn.model = selected_config.model
+        turn.metadata.update(
+            {
+                "_router_single_provider_finalized": True,
+                "router_single_decision_id": decision_id,
+                "router_single_task_profile": task_analysis.profile,
+                "router_single_task_analyzer": task_analysis.trace(
+                    ranking_config
+                ),
+                "router_single_request_context_hash": request_context.get(
+                    "snapshot_hash"
+                ),
+                "router_single_decision": route.trace,
+                "router_single_selected_provider": selected_config.provider,
+                "router_single_selected_model": selected_config.model,
+                "executed_provider": selected_config.provider,
+                "executed_model": selected_config.model,
+                "routed_provider_applied": selected_config.provider,
+                "_router_single_frozen_catalog": {
+                    "provider": selected_config.provider,
+                    "model": selected_config.model,
+                    "max_tokens": route.direct_output_tokens,
+                    "context_window": route.context_window_tokens,
+                },
+            }
+        )
+        # Align RouterDecisionEvent and savings telemetry with the direct model
+        # that will actually execute, clearing savings computed for V4's prior
+        # recommendation when the model changed.
+        direct_provider._realign_routed_model_after_fallback()
+        if route.thinking_policy_version:
+            if not str(route.thinking or "").strip():
+                raise DynamicRankingError(
+                    "router_single managed thinking is missing provider-native level",
+                    reason="thinking_level_unavailable",
+                )
+            turn.metadata["thinking_requested"] = True
+            turn.metadata["thinking_level"] = route.thinking
+            turn.metadata[
+                "_router_single_managed_provider_thinking_level"
+            ] = route.thinking
+        return direct_provider
+
     async def _run_pipeline(
         self,
         message: str,
@@ -6475,6 +7512,7 @@ class TurnRunner:
         skill_catalog: Any | None = None,
         usage_execution_context: UsageExecutionContext | None = None,
         turn_absolute_deadline: float | None = None,
+        explicit_model: str | None = None,
     ) -> tuple[Any, Any]:
         """Run the pre-turn pipeline and re-resolve provider if model changed.
 
@@ -6742,6 +7780,30 @@ class TurnRunner:
 
         turn_config = self._turn_config()
         ensemble_cfg = getattr(turn_config, "llm_ensemble", None)
+        router_single_mode = bool(
+            getattr(ensemble_cfg, "enabled", False)
+            and str(getattr(ensemble_cfg, "mode", "multiple") or "multiple")
+            == "single"
+        )
+        if router_single_mode:
+            # Explicit per-turn model selection has higher priority than the
+            # dynamic Analyzer and therefore returns before any Analyzer call.
+            explicit_model_id = str(explicit_model or "").strip()
+            if explicit_model_id:
+                # Single-only early override preserves PromptAssembler's
+                # shared model precedence without changing b5/default paths.
+                turn.model = explicit_model_id
+                return turn, provider
+            provider = await self._resolve_router_single_provider(
+                turn=turn,
+                provider=provider,
+                cloned_selector=cloned_selector,
+                turn_config=turn_config,
+                ensemble_cfg=ensemble_cfg,
+                turn_absolute_deadline=turn_absolute_deadline,
+            )
+            return turn, provider
+
         if provider is not None and getattr(ensemble_cfg, "enabled", False):
             from opensquilla.engine.selector_override import (
                 acquire_profile_credential,
@@ -6767,6 +7829,12 @@ class TurnRunner:
                 else None
             )
             selection_mode = str(getattr(ensemble_cfg, "selection_mode", "") or "")
+            static_profile = static_b5_profile(selection_mode)
+            internal_selection_profile = selection_mode
+            if static_profile is not None:
+                internal_selection_profile = static_profile.profile_name
+            elif selection_mode == CUSTOM_B5_SELECTION_MODE:
+                internal_selection_profile = "custom_b5"
             provider_health_ledger = None
             canary_rollout_ledger = None
             if selection_mode == "router_dynamic":
@@ -6857,7 +7925,7 @@ class TurnRunner:
                     reason="incomplete_provider_selector_current_config",
                     decision_id=ensemble_decision_id,
                 )
-            elif static_b5_profile(selection_mode) is not None and not (
+            elif static_profile is not None and not (
                 static_b5_credential_available(
                     self._turn_config(),
                     current_provider_config,
@@ -6874,29 +7942,29 @@ class TurnRunner:
                 log_ensemble_decision_skipped(
                     decision_id=ensemble_decision_id,
                     selection_mode=selection_mode,
-                    reason=f"{selection_mode}_no_credential",
+                    reason=f"{internal_selection_profile}_no_credential",
                 )
                 log.warning(
                     "llm_ensemble.wrap_skipped",
-                    reason=f"{selection_mode}_no_credential",
+                    reason=f"{internal_selection_profile}_no_credential",
                     decision_id=ensemble_decision_id,
                 )
                 turn.metadata["ensemble_wrap_skipped_reason"] = (
-                    f"{selection_mode}_no_credential"
+                    f"{internal_selection_profile}_no_credential"
                 )
             elif not custom_has_proposer:
                 log_ensemble_decision_skipped(
                     decision_id=ensemble_decision_id,
                     selection_mode=selection_mode,
-                    reason=f"{selection_mode}_not_ready:no_proposers",
+                    reason=f"{internal_selection_profile}_not_ready:no_proposers",
                 )
                 log.warning(
                     "llm_ensemble.wrap_skipped",
-                    reason=f"{selection_mode}_not_ready:no_proposers",
+                    reason=f"{internal_selection_profile}_not_ready:no_proposers",
                     decision_id=ensemble_decision_id,
                 )
                 turn.metadata["ensemble_wrap_skipped_reason"] = (
-                    f"{selection_mode}_not_ready:no_proposers"
+                    f"{internal_selection_profile}_not_ready:no_proposers"
                 )
             else:
                 turn.metadata["ensemble_enabled"] = True

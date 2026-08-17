@@ -104,7 +104,7 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
         "1eb4e618c8df8e7f68bded3d2b6f77a541744aa1072eb338835b776183188a8d"
     )
     assert config.benchmark_input.task_count == 10
-    assert config.routing.selection_mode == "static_openrouter_b5"
+    assert config.routing.selection_mode == "static_openrouter"
     assert config.routing.skip_single_model_router is True
     assert config.g1_routing is not None
     assert config.router_dynamic_ranking_override == {}
@@ -237,6 +237,20 @@ def test_default_b2_config_is_g12_derived_quality_first_profile() -> None:
     assert config.judge.repeats == 3
     assert config.judge.concurrency == 6
     assert config.judge.max_attempts == 3
+
+
+def test_legacy_b2_selection_mode_loads_as_canonical_value(tmp_path: Path) -> None:
+    payload = json.loads(DEFAULT_CONFIG.read_text(encoding="utf-8"))
+    payload["routing"]["selection_mode"] = "static_openrouter_b5"
+    legacy = tmp_path / "legacy-b2.json"
+    legacy.write_text(json.dumps(payload), encoding="utf-8")
+
+    config = load_draco_experiment_config(legacy).config
+
+    assert config.routing.selection_mode == "static_openrouter"
+    assert config.model_dump(mode="json")["routing"]["selection_mode"] == (
+        "static_openrouter"
+    )
 
 
 @pytest.mark.parametrize("seed", [0, (1 << 64) - 1])

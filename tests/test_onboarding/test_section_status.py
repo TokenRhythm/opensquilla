@@ -246,14 +246,14 @@ def test_tree_baseline_status_reports_legacy_openrouter_pool_credentials(
     )
 
 
-@pytest.mark.parametrize("selection_mode", ["static_tokenrhythm_b5", "custom_b5"])
+@pytest.mark.parametrize("selection_mode", ["static_tokenrhythm", "custom"])
 def test_non_tree_modes_ignore_legacy_openrouter_model_options(selection_mode):
     ensemble: dict[str, object] = {
         "enabled": True,
         "selection_mode": selection_mode,
         "model_options": list(LEGACY_OPENROUTER_MODEL_OPTIONS),
     }
-    if selection_mode == "custom_b5":
+    if selection_mode == "custom":
         ensemble["candidates"] = [
             {
                 "provider": "deepseek",

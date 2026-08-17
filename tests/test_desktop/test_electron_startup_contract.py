@@ -519,7 +519,7 @@ def test_desktop_tokenrhythm_onboarding_supports_all_model_routing_modes() -> No
     onboarding_html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
 
     assert "routerSupported: true" in tokenrhythm_catalog
-    assert "ensembleSelectionMode: 'static_tokenrhythm_b5'" in tokenrhythm_catalog
+    assert "ensembleSelectionMode: 'static_tokenrhythm'" in tokenrhythm_catalog
     assert "const INLINE_ROUTER_PROFILE_IDS = new Set(['tokenrhythm'])" in main_ts
     assert "!INLINE_ROUTER_PROFILE_IDS.has(credential.provider)" in main_ts
     assert "Boolean(selected.ensembleSelectionMode)" in onboarding_html

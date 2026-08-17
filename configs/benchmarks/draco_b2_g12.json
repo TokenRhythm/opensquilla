@@ -28,7 +28,7 @@
     "enforce_reference_input": true
   },
   "routing": {
-    "selection_mode": "static_openrouter_b5",
+    "selection_mode": "static_openrouter",
     "skip_single_model_router": true
   },
   "g1_routing": {

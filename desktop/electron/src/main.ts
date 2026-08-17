@@ -87,7 +87,7 @@ type SecretEncryption = 'safeStorage' | 'plain'
 type DesktopConfigAuthority = 'generated' | 'profile'
 type RouterMode = 'recommended' | 'openrouter-mix' | 'disabled'
 type ModelRoutingMode = 'squilla_router' | 'direct' | 'llm_ensemble'
-type StaticEnsembleSelectionMode = 'static_openrouter_b5' | 'static_tokenrhythm_b5'
+type StaticEnsembleSelectionMode = 'static_openrouter' | 'static_tokenrhythm'
 type TextRouterTier = 'c0' | 'c1' | 'c2' | 'c3'
 
 interface ProviderCatalogEntry {
@@ -959,7 +959,7 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     apiKeyEnv: 'TOKENRHYTHM_API_KEY',
     requiresApiKey: true,
     routerSupported: true,
-    ensembleSelectionMode: 'static_tokenrhythm_b5',
+    ensembleSelectionMode: 'static_tokenrhythm',
     deployment: 'cloud',
     note: 'DeepSeek, GLM, MiniMax and Kimi model families on one key.',
   },
@@ -971,7 +971,7 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     apiKeyEnv: 'OPENROUTER_API_KEY',
     requiresApiKey: true,
     routerSupported: true,
-    ensembleSelectionMode: 'static_openrouter_b5',
+    ensembleSelectionMode: 'static_openrouter',
     deployment: 'cloud',
     note: 'One account for mixed-model routing.',
   },

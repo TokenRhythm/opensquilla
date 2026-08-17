@@ -54,11 +54,15 @@ There are five selection modes, dispatched by
 
 | `selection_mode` | Family | Status |
 |------------------|--------|--------|
-| `static_openrouter_b5` | Static lineup | Default for fresh configs |
-| `static_tokenrhythm_b5` | Static lineup | Supported |
-| `custom_b5` | Static lineup (user-authored) | Supported |
+| `static_openrouter` | Static lineup | Default for fresh configs |
+| `static_tokenrhythm` | Static lineup | Supported |
+| `custom` | Static lineup (user-authored) | Supported |
 | `router_dynamic` | Dynamic Step2 ranking | Supported (config-only) |
 | `router_tree_baseline` | Frozen local-tree slot ranking | Supported (config-only benchmark) |
+
+Legacy input values `static_openrouter_b5`, `static_tokenrhythm_b5`, and
+`custom_b5` are migrated to the first three canonical values above. New TOML,
+RPC responses, and UI writes use only the canonical values.
 
 The first three modes are **static**: the lineup is fixed ahead of the turn,
 either from a packaged preset or from an explicit user-authored list. The last
@@ -67,7 +71,7 @@ different algorithms. `router_dynamic` runs the current task-analyzer and
 Step2 ranker; `router_tree_baseline` freezes the former slot-template selector
 for apples-to-apples benchmark comparisons.
 
-Fresh configs default to `static_openrouter_b5`. The Web UI remains unchanged:
+Fresh configs default to `static_openrouter`. The Web UI remains unchanged:
 it offers the static families (preset + custom) and its existing
 `router_dynamic` compatibility path. `router_tree_baseline` is selected
 directly in TOML for benchmark runs; this change adds no Web UI surface.
@@ -80,9 +84,9 @@ A static lineup is fixed before the turn runs: a set of proposer models plus one
 aggregator model, all known ahead of time. No per-turn scoring happens. Two
 variants share this shape:
 
-- **Presets** — `static_openrouter_b5` / `static_tokenrhythm_b5`: packaged,
+- **Presets** — `static_openrouter` / `static_tokenrhythm`: packaged,
   hard-coded lineups on a single provider.
-- **Custom** — `custom_b5`: an explicit user-authored lineup with
+- **Custom** — `custom`: an explicit user-authored lineup with
   role-labelled candidates and a single aggregator.
 
 Both variants belong to the same **fixed-lineup defaults family**
@@ -102,6 +106,11 @@ all bound to a single provider:
 |---------|----------|-----------|------------|
 | `static_openrouter_b5` | `openrouter` | `deepseek/deepseek-v4-pro`, `z-ai/glm-5.2`, `moonshotai/kimi-k2.7-code`, `qwen/qwen3.7-max` | `z-ai/glm-5.2` |
 | `static_tokenrhythm_b5` | `tokenrhythm` | `deepseek-v4-pro`, `glm-5.2`, `kimi-k2.7-code`, `qwen3.7-max` | `glm-5.2` |
+
+The shorter `selection_mode` values resolve to these stable internal B5
+profile identifiers. Traces and historical artifacts may therefore retain the
+profile names above even though new configuration is written as
+`static_openrouter` or `static_tokenrhythm`.
 
 The TokenRhythm profile is a mirror of the OpenRouter one: same aggregation
 shape and defaults, the same four models, only the provider and the model-id
@@ -125,13 +134,13 @@ provider differs but whose environment carries the profile provider's env key
 member cannot resolve a key, the ensemble is skipped rather than posting a turn
 upstream with an empty bearer token.
 
-## 1.2 Custom lineup (`custom_b5`)
+## 1.2 Custom lineup (`custom`)
 
 Source: `_build_custom_b5_members`, `_custom_b5_candidates`
 (`src/opensquilla/provider/ensemble.py`); schema `LlmEnsembleCandidateConfig`
 (`src/opensquilla/gateway/config.py`).
 
-`custom_b5` lets an operator author the lineup explicitly via
+`custom` lets an operator author the lineup explicitly via
 `llm_ensemble.candidates`. Each candidate row carries:
 
 - **`provider`** / **`model`** — required, non-empty; provider is lower-cased.
@@ -161,7 +170,7 @@ Lineup assembly (`_build_custom_b5_members`):
 
 Enforced by `LlmEnsembleConfig._validate_custom_b5_lineup`
 (`src/opensquilla/gateway/config.py`), checked **only** when
-`selection_mode == "custom_b5"` (presets carry fixed lineups; both dynamic
+`selection_mode == "custom"` (presets carry fixed lineups; both dynamic
 modes select per turn):
 
 - At most **one** enabled candidate may carry role `aggregator`.
@@ -235,7 +244,7 @@ environment.
 ```toml
 [llm_ensemble]
 enabled = true
-selection_mode = "static_openrouter_b5"   # or static_tokenrhythm_b5 / custom_b5
+selection_mode = "static_openrouter"   # or static_tokenrhythm / custom
 ```
 
 Custom lineup:
@@ -243,7 +252,7 @@ Custom lineup:
 ```toml
 [llm_ensemble]
 enabled = true
-selection_mode = "custom_b5"
+selection_mode = "custom"
 
 [[llm_ensemble.candidates]]
 provider = "openrouter"
@@ -443,7 +452,7 @@ selection_mode = "router_tree_baseline"
 # Part 3 — `router_dynamic` Step2 Ranking
 
 > **Status: supported, config-only.** The Web UI still offers the static
-> families and migration to `custom_b5`, but existing TOML/RPC configs can use
+> families and migration to `custom`, but existing TOML/RPC configs can use
 > `router_dynamic`. Its implementation is the profile-driven Step2 ranking
 > pipeline, not the former fixed slot-template algorithm.
 

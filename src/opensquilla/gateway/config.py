@@ -429,6 +429,33 @@ CUSTOM_B5_MAX_PROPOSERS = 6
 CUSTOM_B5_MAX_TOTAL_CALLS = 8
 
 
+_LLM_ENSEMBLE_MODE_INPUT_ALIASES = {
+    "b5_fusion": "multiple",
+    "router_single": "single",
+}
+_LLM_ENSEMBLE_SELECTION_MODE_INPUT_ALIASES = {
+    "static_openrouter_b5": "static_openrouter",
+    "static_tokenrhythm_b5": "static_tokenrhythm",
+    "custom_b5": "custom",
+}
+
+
+def canonicalize_llm_ensemble_mode(value: object) -> object:
+    """Canonicalize released execution-mode spellings at the input boundary."""
+
+    if not isinstance(value, str):
+        return value
+    return _LLM_ENSEMBLE_MODE_INPUT_ALIASES.get(value, value)
+
+
+def canonicalize_llm_ensemble_selection_mode(value: object) -> object:
+    """Canonicalize released selection-mode spellings at the input boundary."""
+
+    if not isinstance(value, str):
+        return value
+    return _LLM_ENSEMBLE_SELECTION_MODE_INPUT_ALIASES.get(value, value)
+
+
 class LlmEnsembleCandidateConfig(BaseModel):
     provider: str
     model: str
@@ -755,14 +782,14 @@ class LlmEnsembleConfig(BaseSettings):
     # value remains below for read compatibility, but it is dormant until an
     # operator explicitly enables the ensemble surface.
     enabled: bool = False
-    mode: Literal["b5_fusion"] = "b5_fusion"
+    mode: Literal["multiple", "single"] = "multiple"
     selection_mode: Literal[
         "router_dynamic",
         "router_tree_baseline",
-        "static_openrouter_b5",
-        "static_tokenrhythm_b5",
-        "custom_b5",
-    ] = "static_openrouter_b5"
+        "static_openrouter",
+        "static_tokenrhythm",
+        "custom",
+    ] = "static_openrouter"
     # Expose tool schemas to proposers as advisory vocabulary only. Proposer
     # output is never dispatched; only the aggregator owns an executable tool
     # boundary.
@@ -836,6 +863,16 @@ class LlmEnsembleConfig(BaseSettings):
     )
     record_candidates: bool = False
 
+    @field_validator("mode", mode="before")
+    @classmethod
+    def _canonicalize_mode(cls, value: object) -> object:
+        return canonicalize_llm_ensemble_mode(value)
+
+    @field_validator("selection_mode", mode="before")
+    @classmethod
+    def _canonicalize_selection_mode(cls, value: object) -> object:
+        return canonicalize_llm_ensemble_selection_mode(value)
+
     @field_validator("candidate_order_seed", mode="before")
     @classmethod
     def _reject_boolean_candidate_order_seed(cls, value: object) -> object:
@@ -857,9 +894,27 @@ class LlmEnsembleConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _validate_execution_topology(self) -> LlmEnsembleConfig:
+        if self.mode != "single":
+            return self
+        if not self.enabled:
+            raise ValueError(
+                "llm_ensemble.mode='single' requires "
+                "llm_ensemble.enabled=true"
+            )
+        if self.selection_mode != "router_dynamic":
+            raise ValueError(
+                "llm_ensemble.mode='single' requires "
+                "llm_ensemble.selection_mode='router_dynamic'"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _validate_aggregator_output_budget(self) -> LlmEnsembleConfig:
         """Reject recovery budgets that runtime would otherwise rewrite silently."""
 
+        if self.mode == "single":
+            return self
         if self.aggregator_visible_answer_reserve_tokens >= self.aggregator_max_tokens_cap:
             raise ValueError(
                 "llm_ensemble.aggregator_visible_answer_reserve_tokens must be "
@@ -887,6 +942,8 @@ class LlmEnsembleConfig(BaseSettings):
         [CUSTOM_B5_MIN_PROPOSERS, CUSTOM_B5_MAX_PROPOSERS]. Disabled rows are
         kept (read compatibility) but never counted.
         """
+        if self.mode == "single":
+            return self
         aggregators = [
             candidate
             for candidate in self.candidates
@@ -897,7 +954,7 @@ class LlmEnsembleConfig(BaseSettings):
                 "llm_ensemble.candidates may mark at most one enabled "
                 "candidate with role='aggregator'"
             )
-        if self.selection_mode != "custom_b5":
+        if self.selection_mode != "custom":
             return self
         proposers = [
             candidate
@@ -906,30 +963,34 @@ class LlmEnsembleConfig(BaseSettings):
         ]
         if len(proposers) < CUSTOM_B5_MIN_PROPOSERS:
             raise ValueError(
-                "llm_ensemble.selection_mode='custom_b5' needs at least "
+                "llm_ensemble.selection_mode='custom' needs at least "
                 f"{CUSTOM_B5_MIN_PROPOSERS} enabled proposer candidates"
             )
         if len(proposers) > CUSTOM_B5_MAX_PROPOSERS:
             raise ValueError(
-                "llm_ensemble.selection_mode='custom_b5' allows at most "
+                "llm_ensemble.selection_mode='custom' allows at most "
                 f"{CUSTOM_B5_MAX_PROPOSERS} enabled proposer candidates"
             )
         # Total per-turn call ceiling (proposers + aggregator). Today k is
         # fixed at 1 per member; the ceiling still guards a future k surface.
         if len(proposers) + 1 > CUSTOM_B5_MAX_TOTAL_CALLS:
             raise ValueError(
-                "llm_ensemble custom_b5 lineup exceeds "
+                "llm_ensemble custom lineup exceeds "
                 f"{CUSTOM_B5_MAX_TOTAL_CALLS} total per-turn calls"
             )
         if self.min_successful_proposers > len(proposers):
             raise ValueError(
                 "llm_ensemble.min_successful_proposers cannot exceed the "
-                f"custom_b5 proposer count ({len(proposers)})"
+                f"custom proposer count ({len(proposers)})"
             )
         return self
 
     @model_validator(mode="after")
     def _freeze_ranking_config_at_load(self) -> LlmEnsembleConfig:
+        # router_single still consumes the authenticated proposer ranking
+        # graph. Only its aggregator recovery-chain cross-check is skipped
+        # later; resolution, hash binding, preparation, and cache publication
+        # remain identical to router_dynamic fusion.
         if self.selection_mode == "router_dynamic" or self.ranking_config_override:
             self.freeze_ranking_config()
         return self
@@ -1035,7 +1096,7 @@ class LlmEnsembleConfig(BaseSettings):
         provider construction as a misleading route-plan drift.
         """
 
-        if self.selection_mode != "router_dynamic":
+        if self.mode == "single" or self.selection_mode != "router_dynamic":
             return
         effective = effective_config
         if not isinstance(effective, Mapping):
@@ -1126,8 +1187,8 @@ class LlmEnsembleConfig(BaseSettings):
         return copy.deepcopy(effective)
 
 
-STATIC_OPENROUTER_B5_SELECTION_MODE = "static_openrouter_b5"
-STATIC_TOKENRHYTHM_B5_SELECTION_MODE = "static_tokenrhythm_b5"
+STATIC_OPENROUTER_B5_SELECTION_MODE = "static_openrouter"
+STATIC_TOKENRHYTHM_B5_SELECTION_MODE = "static_tokenrhythm"
 ROUTER_TREE_BASELINE_SELECTION_MODE = "router_tree_baseline"
 # selection_mode → member provider id for the static B5 profiles. Must stay
 # in lockstep with provider.ensemble.STATIC_B5_PROFILES (gateway must not be
@@ -3366,6 +3427,24 @@ class GatewayConfig(BaseSettings):
             setattr(cfg, field_name, applied)
             cfg.record_runtime_override(field_name, stored, applied)
 
+    @staticmethod
+    def _mark_llm_ensemble_aliases_for_persist(
+        cfg: GatewayConfig,
+        raw: Mapping[str, Any],
+    ) -> None:
+        ensemble = raw.get("llm_ensemble")
+        if not isinstance(ensemble, Mapping):
+            return
+        mode = ensemble.get("mode")
+        if isinstance(mode, str) and mode in _LLM_ENSEMBLE_MODE_INPUT_ALIASES:
+            cfg.mark_force_persist("llm_ensemble.mode")
+        selection_mode = ensemble.get("selection_mode")
+        if (
+            isinstance(selection_mode, str)
+            and selection_mode in _LLM_ENSEMBLE_SELECTION_MODE_INPUT_ALIASES
+        ):
+            cfg.mark_force_persist("llm_ensemble.selection_mode")
+
     @classmethod
     def load_from_toml(cls, path: str | Path) -> GatewayConfig:
         """Load config from a TOML file."""
@@ -3376,6 +3455,7 @@ class GatewayConfig(BaseSettings):
             data = tomllib.load(f)
         migration = migrate_config_payload(data)
         cfg = cls(**migration.payload)
+        cls._mark_llm_ensemble_aliases_for_persist(cfg, data)
         cfg._mark_env_absorbed_secrets(data)
         cls._apply_profile_path_overrides(cfg, target)
         if migration.changed:
@@ -3414,6 +3494,7 @@ class GatewayConfig(BaseSettings):
                     data = tomllib.load(f)
                 migration = migrate_config_payload(data, emit_diagnostics=not read_only)
                 cfg = cls(**migration.payload)
+                cls._mark_llm_ensemble_aliases_for_persist(cfg, data)
                 cls._apply_profile_path_overrides(cfg, path)
                 if migration.changed and not read_only:
                     _rewrite_migrated_config_best_effort(path, migration)

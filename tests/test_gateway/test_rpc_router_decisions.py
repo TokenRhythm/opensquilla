@@ -525,7 +525,7 @@ async def test_profile_generation_uses_persisted_decision_mode_not_current_mode(
         {"decisionId": "d" * 32, "rating": "up"},
         _feedback_ctx(
             generation_enabled=True,
-            selection_mode="static_openrouter_b5",
+            selection_mode="static_openrouter",
         ),
     )
 

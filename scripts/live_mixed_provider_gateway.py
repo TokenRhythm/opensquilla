@@ -563,7 +563,7 @@ def ensemble_payload(
     first, second, aggregator = group
     return {
         "enabled": True,
-        "selectionMode": "custom_b5",
+        "selectionMode": "custom",
         "candidates": [
             {**first.public(), "role": "primary", "enabled": True},
             {

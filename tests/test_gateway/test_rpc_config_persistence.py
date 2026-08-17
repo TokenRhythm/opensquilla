@@ -161,7 +161,7 @@ async def test_routing_mode_toggle_persists_only_its_paths(cfg_path) -> None:
     }
     data = tomllib.loads(cfg_path.read_text())
     assert data["llm_ensemble"]["enabled"] is True
-    # The default static_openrouter_b5 ensemble is independent, so the
+    # The default static_openrouter ensemble is independent, so the
     # canonical three-state reconciliation overrides the legacy conflicting
     # router=true field while preserving the explicit full rollout marker.
     reloaded = GatewayConfig.load(str(cfg_path))

@@ -163,6 +163,7 @@ from opensquilla.eval.draco_experiment_config import (
     DracoEnsembleMemberConfig,
     DracoExperimentConfig,
     DracoExperimentConfigBundle,
+    canonicalize_draco_selection_mode,
     load_draco_experiment_config,
     validate_formal_draco_credential_bindings,
     validate_formal_draco_ensemble_member_binding,
@@ -345,7 +346,7 @@ GROUP_SPECS: dict[str, dict[str, Any]] = {
     "B1": {"kind": "router_single", "label": "single_model_routing"},
     "B2": {
         "kind": "selection_mode",
-        "selection_mode": "static_openrouter_b5",
+        "selection_mode": "static_openrouter",
         "label": "b2_quality_first_static_openrouter_b5",
         "experiment_config": "draco_b2_quality_first_v1",
     },
@@ -6023,7 +6024,9 @@ def ensemble_call_core_reasons(
     return _shared_ensemble_call_core_reasons(
         trace,
         dependencies=_ensemble_call_validation_dependencies(),
-        expected_selection_mode=expected_selection_mode,
+        expected_selection_mode=canonicalize_draco_selection_mode(
+            expected_selection_mode
+        ),
         expected_selection_plan=expected_selection_plan,
         expected_g1_registry_contract=expected_g1_registry_contract,
         expected_task_analyzer_execution_contract=(

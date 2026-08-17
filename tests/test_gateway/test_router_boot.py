@@ -366,7 +366,7 @@ def test_static_openrouter_b5_effective_stream_timeouts_extend_webui_budget() ->
         llm={"provider": "openrouter", "api_key": "sk-or-synthetic"},
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
         },
     )
 
@@ -384,7 +384,7 @@ def test_static_openrouter_b5_keyless_install_keeps_default_stream_timeouts(
         llm={"provider": "groq", "api_key": "sk-groq-synthetic"},
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
         },
     )
 
@@ -399,7 +399,7 @@ def test_static_openrouter_b5_webui_grace_stays_above_custom_stream_idle() -> No
         llm={"provider": "openrouter", "api_key": "sk-or-synthetic"},
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
         },
     )
 

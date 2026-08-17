@@ -1188,7 +1188,7 @@ def _tokenrhythm_ensemble_config(
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_tokenrhythm_b5",
+            "selection_mode": "static_tokenrhythm",
         },
     )
 
@@ -4112,10 +4112,10 @@ async def test_ensemble_member_context_precedence_is_override_then_global_then_c
 @pytest.mark.parametrize(
     "selection_mode",
     [
-        "static_tokenrhythm_b5",
-        "static_openrouter_b5",
+        "static_tokenrhythm",
+        "static_openrouter",
         "router_dynamic",
-        "custom_b5",
+        "custom",
     ],
 )
 def test_all_lineup_modes_rebind_global_context_without_catalog(
@@ -4125,7 +4125,7 @@ def test_all_lineup_modes_rebind_global_context_without_catalog(
         "enabled": True,
         "selection_mode": selection_mode,
     }
-    if selection_mode == "custom_b5":
+    if selection_mode == "custom":
         ensemble_config["candidates"] = [
             {
                 "provider": "tokenrhythm",
@@ -5294,7 +5294,7 @@ def test_static_ensemble_never_prepares_typed_roster_replacement() -> None:
         all_failed_policy="error",
         selection_plan={
             "strategy": "static",
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
         },
     )
     event = ErrorEvent(
@@ -11457,7 +11457,7 @@ def _static_b5_gateway_config() -> Any:
     from opensquilla.gateway.config import GatewayConfig
 
     return GatewayConfig(
-        llm_ensemble={"enabled": True, "selection_mode": "static_openrouter_b5"},
+        llm_ensemble={"enabled": True, "selection_mode": "static_openrouter"},
     )
 
 
@@ -11529,9 +11529,9 @@ def test_static_tokenrhythm_b5_credential_resolution(
     from opensquilla.provider.ensemble import static_b5_credential_available
 
     config = GatewayConfig(
-        llm_ensemble={"enabled": True, "selection_mode": "static_tokenrhythm_b5"},
+        llm_ensemble={"enabled": True, "selection_mode": "static_tokenrhythm"},
     )
-    mode = "static_tokenrhythm_b5"
+    mode = "static_tokenrhythm"
 
     # Inherited tokenrhythm key satisfies the profile.
     monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)

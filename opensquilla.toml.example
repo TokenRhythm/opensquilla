@@ -180,7 +180,7 @@ base_url = "https://tokenrhythm.studio/v1"
 # OpenRouter lineup and fuses its proposer drafts into one answer.
 #
 # Upgrade note (0.5.0rc1 → current):
-#   * static_openrouter_b5 is the default for FRESH installs only. Configs
+#   * static_openrouter is the default for FRESH installs only. Configs
 #     saved by earlier versions keep their stored `enabled` value.
 #   * Current `router_dynamic` is the profile-driven Step2 ranker and invokes
 #     its dedicated task analyzer before selecting proposers and aggregator.
@@ -188,14 +188,14 @@ base_url = "https://tokenrhythm.studio/v1"
 #     `router_tree_baseline`; it uses SquillaRouter's local tier/model result
 #     directly and never invokes the remote task analyzer.
 #
-# Credential requirement: static_openrouter_b5 runs its members on
+# Credential requirement: static_openrouter runs its members on
 # OpenRouter, so it needs a resolvable OpenRouter credential — the [llm]
 # api_key when the active provider is "openrouter", or OPENROUTER_API_KEY
 # in the environment otherwise. Without one the ensemble is inactive and
 # every turn falls back to the single configured provider —
 # `opensquilla doctor` reports this as the llm_ensemble finding
 # "LLM ensemble is enabled but cannot run".
-# "static_tokenrhythm_b5" is the TokenRhythm mirror of the same lineup
+# "static_tokenrhythm" is the TokenRhythm mirror of the same lineup
 # (deepseek-v4-pro, glm-5.2, kimi-k2.7-code, qwen3.7-max + glm-5.2
 # aggregator) and needs a TokenRhythm credential the same way (the [llm]
 # api_key when the active provider is "tokenrhythm", or
@@ -211,9 +211,9 @@ base_url = "https://tokenrhythm.studio/v1"
 # without a gateway restart.
 [llm_ensemble]
 enabled = true
-# "static_openrouter_b5": fixed five-member OpenRouter proposer set (default).
-# "static_tokenrhythm_b5": the same lineup served through TokenRhythm.
-# "custom_b5": an explicit user-authored lineup from [[llm_ensemble.candidates]]
+# "static_openrouter": fixed five-member OpenRouter proposer set (default).
+# "static_tokenrhythm": the same lineup served through TokenRhythm.
+# "custom": an explicit user-authored lineup from [[llm_ensemble.candidates]]
 #   — 2-6 enabled proposer rows plus at most one role = "aggregator" row (the
 #   member that fuses drafts into the final answer; omitted = the current chat
 #   model fuses). The Web UI presents only Proposer and Aggregator. Released
@@ -224,7 +224,7 @@ enabled = true
 #   analyzer; supported through TOML/RPC/CLI but not offered in the Web UI.
 # "router_tree_baseline": frozen pre-Step2 local-tree slot-template baseline;
 #   supported through TOML/RPC/CLI but not offered in the Web UI.
-selection_mode = "static_openrouter_b5"
+selection_mode = "static_openrouter"
 # router_dynamic only: convert thumbs on dynamic-routing decisions into user-
 # profile preference memory. General feedback for offline self-learning is
 # still recorded when this is false.
@@ -239,7 +239,7 @@ ranking_user_profile_enabled = false
 # proposer and aggregator after model ranking. Disabled by default so existing
 # routing and provider request parameters remain unchanged.
 ranking_thinking_assignment_enabled = false
-# Explicit lineup for custom_b5 (ignored by the static profiles):
+# Explicit lineup for custom (ignored by the static profiles):
 # [[llm_ensemble.candidates]]
 # provider = "volcengine"
 # model = "doubao-2.0-pro"
@@ -265,7 +265,7 @@ model_options = [
   "minimax/minimax-m3",
 ]
 # Minimum proposers that must succeed before aggregation (>= 1). The fixed
-# lineups (static profiles and custom_b5) replace the untouched default of 1
+# lineups (static profiles and custom) replace the untouched default of 1
 # with their own quorum at runtime: 3-of-4 for the static profiles, N-1 for a
 # custom lineup of N proposers.
 min_successful_proposers = 1
@@ -273,7 +273,7 @@ min_successful_proposers = 1
 all_failed_policy = "fallback_single"
 
 # Advanced knobs — TOML-only (not on the configure RPC surface). Defaults:
-# mode = "b5_fusion"                  # only supported ensemble mode
+# mode = "multiple"                  # multiple | single; single requires router_dynamic
 # proposer_tools = false              # expose tool schemas as non-executable advice
 # aggregator_tools = true             # allow tool calls inside the final fusion turn
 # candidate_max_chars = 24000         # per-candidate transcript budget (0 = unlimited)

@@ -103,7 +103,7 @@ async function writeProviderProfileConfig(home, settings) {
     '',
     '[llm_ensemble]',
     'enabled = false',
-    'selection_mode = "static_openrouter_b5"',
+    'selection_mode = "static_openrouter"',
     '',
     '[privacy]',
     `disable_network_observability = ${settings.disableNetworkObservability ? 'true' : 'false'}`,

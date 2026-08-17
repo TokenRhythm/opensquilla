@@ -21,6 +21,7 @@ from opensquilla.gateway.config import (
     MemoryEmbeddingConfig,
     SquillaRouterConfig,
     _default_tiers,
+    canonicalize_llm_ensemble_selection_mode,
 )
 from opensquilla.gateway.config_secrets import (
     clear_runtime_secret_paths,
@@ -1113,7 +1114,9 @@ def upsert_llm_ensemble(
     if enabled is not None:
         merged["enabled"] = _strict_boolean(enabled, label="enabled")
     if selection_mode is not None:
-        mode_clean = str(selection_mode).strip()
+        mode_clean = str(
+            canonicalize_llm_ensemble_selection_mode(str(selection_mode).strip())
+        )
         if mode_clean not in _LLM_ENSEMBLE_SELECTION_MODES:
             raise ValueError(
                 "selection_mode must be one of: "
@@ -1193,6 +1196,10 @@ def upsert_llm_ensemble(
         # `configure ensemble --disabled` on a fresh config persists nothing
         # and is indistinguishable from a silent no-op.
         new_cfg.mark_force_persist("llm_ensemble.enabled")
+    if selection_mode is not None:
+        # Persist the canonical spelling even when an accepted released alias
+        # normalizes to the current/default value.
+        new_cfg.mark_force_persist("llm_ensemble.selection_mode")
     if ranking_user_profile_generation_enabled is not None:
         new_cfg.mark_force_persist(
             "llm_ensemble.ranking_user_profile_generation_enabled"

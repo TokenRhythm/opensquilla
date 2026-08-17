@@ -1682,20 +1682,28 @@ def evaluate_sandbox(payload: dict[str, Any]) -> list[HealthFinding]:
 # selection_mode → (member-provider label, env-key fallback) for the static
 # B5 profiles. Payload-driven mirror of the gateway's static-B5 mode table.
 _STATIC_B5_MODE_DETAILS = {
-    "static_openrouter_b5": ("OpenRouter", "OPENROUTER_API_KEY"),
-    "static_tokenrhythm_b5": ("TokenRhythm", "TOKENRHYTHM_API_KEY"),
+    "static_openrouter": (
+        "OpenRouter",
+        "OPENROUTER_API_KEY",
+        "static_openrouter_b5",
+    ),
+    "static_tokenrhythm": (
+        "TokenRhythm",
+        "TOKENRHYTHM_API_KEY",
+        "static_tokenrhythm_b5",
+    ),
 }
 
 
 def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
     enabled = bool(payload.get("enabled"))
     selection_mode = str(payload.get("selectionMode") or "")
-    if enabled and selection_mode == "custom_b5":
+    if enabled and selection_mode == "custom":
         return _evaluate_custom_b5_ensemble(payload)
     mode_details = _STATIC_B5_MODE_DETAILS.get(selection_mode)
     if not enabled or mode_details is None:
         return []
-    provider_label, env_key_fallback = mode_details
+    provider_label, env_key_fallback, finding_profile = mode_details
     api_key_env = str(payload.get("apiKeyEnv") or env_key_fallback)
     credential_available = bool(payload.get("credentialAvailable"))
     evidence = {
@@ -1708,7 +1716,7 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
     if credential_available:
         return [
             HealthFinding(
-                id=f"llm_ensemble.{selection_mode}.ready",
+                id=f"llm_ensemble.{finding_profile}.ready",
                 severity="ok",
                 surface="llm_ensemble",
                 title="LLM ensemble ready",
@@ -1721,7 +1729,7 @@ def evaluate_llm_ensemble(payload: dict[str, Any]) -> list[HealthFinding]:
         ]
     return [
         HealthFinding(
-            id=f"llm_ensemble.{selection_mode}.credentials.missing",
+            id=f"llm_ensemble.{finding_profile}.credentials.missing",
             severity="warn",
             surface="llm_ensemble",
             title="LLM ensemble is enabled but cannot run",
@@ -1764,7 +1772,7 @@ def _evaluate_custom_b5_ensemble(payload: dict[str, Any]) -> list[HealthFinding]
     reason = str(payload.get("lineupBlockedReason") or "")
     evidence = {
         "enabled": True,
-        "selectionMode": "custom_b5",
+        "selectionMode": "custom",
         "activeProvider": payload.get("activeProvider"),
         "lineupReady": ready,
         "lineupBlockedReason": reason,

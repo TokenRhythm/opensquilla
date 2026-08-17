@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import gc
 import hashlib
+import inspect
 import json
 import threading
 import time
@@ -41,6 +43,7 @@ from opensquilla.provider.ranking_router import (
     analyze_task_with_provider,
     build_model_registry_snapshot,
     build_request_context,
+    build_single_model_request_context,
     canonical_json_sha256,
     dynamic_output_token_budgets,
     fallback_task_profile,
@@ -49,6 +52,7 @@ from opensquilla.provider.ranking_router import (
     mock_user_profile,
     normalize_task_profile,
     rank_models,
+    rank_single_model,
     ranking_config_resolution,
     ranking_config_snapshot,
     ranking_trace_replay_reasons,
@@ -1924,6 +1928,126 @@ def test_request_context_uses_bounded_history_and_attachment_facts() -> None:
     assert context["input_modalities"] == ["text", "image"]
     assert context["workspace_state"]["referenced_files"] == ["diagram.png"]
     assert len(context["snapshot_hash"]) == 64
+
+
+def _legacy_request_context_golden_kwargs() -> dict[str, Any]:
+    config = load_ranking_config()
+    config["context"]["request_limits"].update(
+        {
+            "role_max_chars": 32,
+            "max_recent_turns": 6,
+            "fallback_history_max_turns": 4,
+            "turn_max_chars": 2_000,
+            "summary_max_chars": 4_000,
+            "state_max_items": 32,
+            "item_max_chars": 512,
+            "tool_summary_max_chars": 4_000,
+            "test_results_max_chars": 2_000,
+            "intermediate_max_items": 8,
+            "intermediate_max_chars": 2_000,
+            "attachment_max_items": 32,
+            "last_route_max_models": 8,
+            "max_scanned_items_multiplier": 4,
+        }
+    )
+    config["context"]["output_budget"]["minimum_tokens"] = 1
+    config["context"]["token_estimation"].update(
+        {
+            "utf8_bytes_per_token": 4,
+            "dense_chars_per_token": 1,
+        }
+    )
+    config["hard_filter"]["default_required_modalities"] = ["text"]
+    return {
+        "message": "ship 修复",
+        "turn_metadata": {
+            "router_history_user_texts": ["old-1", "old-2"],
+            "router_prev_assistant_text": "previous answer",
+            "input_tokens": 321,
+            "tool_log_tokens": 77,
+            "router_dynamic_request_context": {
+                "tool_state": {
+                    "called_tools": ["shell"],
+                    "tool_results_summary": "ok",
+                },
+                "workspace_state": {
+                    "changed_files": ["a.py"],
+                    "test_results": "pass",
+                },
+            },
+        },
+        "attachments": [
+            {"name": "diagram.JPG", "media_type": "IMAGE/JPG; charset=binary"},
+            {"name": "brief.pdf", "mime": "application/pdf"},
+        ],
+        "candidate_output_tokens": 2_000,
+        "aggregator_output_tokens": 3_000,
+        "ranking_config": config,
+    }
+
+
+def test_request_context_refactor_preserves_legacy_canonical_bytes() -> None:
+    context = build_request_context(**_legacy_request_context_golden_kwargs())
+
+    expected = (
+        b'{"attachment_refs":["diagram.JPG","brief.pdf"],'
+        b'"conversation":{"recent_turns":["user: old-1","user: old-2",'
+        b'"assistant: previous answer"],"summary":""},'
+        b'"input_modalities":["text","image"],'
+        b'"intermediate_outputs":{"current_errors":[],"previous_candidates":[]},'
+        b'"last_route":{},"routing_budget":{"aggregator_output_tokens":3000,'
+        b'"candidate_output_tokens":2000,"estimated_input_tokens":321,'
+        b'"tool_log_tokens":77},'
+        b'"snapshot_hash":"d8ef9ac869db0dec23192d2bbdabbdbd065d382e211df3f619aed1150ebc614a",'
+        b'"tool_state":{"called_tools":["shell"],"failed_tools":[],'
+        b'"tool_results_summary":"ok"},'
+        b'"workspace_state":{"changed_files":["a.py"],'
+        b'"referenced_files":["diagram.JPG","brief.pdf"],"test_results":"pass"}}'
+    )
+
+    assert ranking_router.canonical_json_bytes(context) == expected
+
+
+@pytest.mark.parametrize(
+    ("candidate_output_tokens", "aggregator_output_tokens"),
+    [(1, 1), (2_000, 3_000), (0, -7)],
+)
+def test_fusion_request_context_is_role_neutral_base_plus_legacy_budgets(
+    candidate_output_tokens: int,
+    aggregator_output_tokens: int,
+) -> None:
+    kwargs = _legacy_request_context_golden_kwargs()
+    kwargs["candidate_output_tokens"] = candidate_output_tokens
+    kwargs["aggregator_output_tokens"] = aggregator_output_tokens
+    actual = build_request_context(**kwargs)
+    effective_config = ranking_router._resolve_ranking_config(kwargs["ranking_config"])
+    expected = ranking_router._build_request_context_base(
+        message=kwargs["message"],
+        turn_metadata=kwargs["turn_metadata"],
+        attachments=kwargs["attachments"],
+        last_route=ranking_router._legacy_fusion_last_route(
+            turn_metadata=kwargs["turn_metadata"],
+            effective_config=effective_config,
+        ),
+        include_previous_candidates=True,
+        effective_config=effective_config,
+    )
+    minimum_tokens = effective_config["context"]["output_budget"]["minimum_tokens"]
+    expected["routing_budget"].update(
+        {
+            "candidate_output_tokens": max(minimum_tokens, candidate_output_tokens),
+            "aggregator_output_tokens": max(minimum_tokens, aggregator_output_tokens),
+        }
+    )
+    expected["snapshot_hash"] = ranking_router._request_context_hash(expected)
+
+    assert actual == expected
+    assert list(actual["routing_budget"]) == [
+        "estimated_input_tokens",
+        "tool_log_tokens",
+        "candidate_output_tokens",
+        "aggregator_output_tokens",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -6660,3 +6784,463 @@ def test_aggregator_recovery_candidates_do_not_pad_a_small_eligible_pool() -> No
     assert len(candidate_identities) == 2
     assert candidate_identities == ranked_identities
     assert len(set(candidate_identities)) == 2
+
+
+def _single_context(
+    *,
+    input_tokens: int = 1_000,
+    output_tokens: int = 1_000,
+) -> dict[str, Any]:
+    context = _context(input_tokens=input_tokens)
+    context["routing_budget"] = {
+        "estimated_input_tokens": input_tokens,
+        "tool_log_tokens": 0,
+        "direct_output_tokens": output_tokens,
+    }
+    context["snapshot_hash"] = ranking_router._request_context_hash(context)
+    return context
+
+
+_SINGLE_CONTEXT_FUSION_FIELDS = {
+    "aggregator_output_tokens",
+    "candidate_output_tokens",
+    "previous_candidates",
+    "selected_A",
+    "selected_P",
+}
+
+
+def _nested_mapping_keys(value: Any) -> set[str]:
+    if isinstance(value, dict):
+        return set(value).union(
+            *(_nested_mapping_keys(child) for child in value.values())
+        )
+    if isinstance(value, (list, tuple)):
+        return set().union(*(_nested_mapping_keys(child) for child in value))
+    return set()
+
+
+def _single_decision(
+    *models: dict[str, Any],
+    analysis: TaskAnalysisResult | None = None,
+    context: dict[str, Any] | None = None,
+    ranking_config: dict[str, Any] | None = None,
+    requires_tools: bool = False,
+    thinking_assignment_enabled: bool = False,
+):
+    return rank_single_model(
+        task_analysis=analysis or _analysis(),
+        user_profile=None,
+        request_context=context or _single_context(),
+        registry_snapshot=_snapshot(*models),
+        routed_tier="c2",
+        routing_confidence=0.9,
+        requires_tools=requires_tools,
+        ranking_config=ranking_config,
+        decision_id="single-test",
+        ranking_thinking_assignment_enabled=thinking_assignment_enabled,
+    )
+
+
+def test_build_single_model_request_context_has_only_direct_output_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("fusion budget helper must not be called")
+
+    monkeypatch.setattr(
+        ranking_router,
+        "dynamic_output_token_budgets",
+        fail_if_called,
+    )
+    monkeypatch.setattr(ranking_router, "build_request_context", fail_if_called)
+    monkeypatch.setattr(ranking_router, "_sanitize_last_route", fail_if_called)
+    context = build_single_model_request_context(
+        message="direct request",
+        turn_metadata={"input_tokens": 123, "tool_log_tokens": 9},
+        attachments=[],
+        output_tokens=2_048,
+    )
+
+    assert context["routing_budget"] == {
+        "estimated_input_tokens": 123,
+        "tool_log_tokens": 9,
+        "direct_output_tokens": 2_048,
+    }
+    assert context["last_route"] == {}
+    assert _nested_mapping_keys(context).isdisjoint(
+        _SINGLE_CONTEXT_FUSION_FIELDS
+    )
+    assert context["snapshot_hash"] == ranking_router._request_context_hash(context)
+
+
+def test_single_context_ignores_stale_fusion_route_in_hash_and_score() -> None:
+    clean = build_single_model_request_context(
+        message="direct request",
+        turn_metadata={"input_tokens": 123, "tool_log_tokens": 9},
+        attachments=[],
+        output_tokens=2_048,
+    )
+    stale = build_single_model_request_context(
+        message="direct request",
+        turn_metadata={
+            "input_tokens": 123,
+            "tool_log_tokens": 9,
+            "router_dynamic_request_context": {
+                "last_route": {
+                    "selected_P": ["test-provider:alpha"],
+                    "selected_A": "provider:stale-aggregator",
+                    "quality_feedback": 1.0,
+                    "escalation_level": 3,
+                },
+                "intermediate_outputs": {
+                    "previous_candidates": ["stale candidate answer"]
+                },
+            },
+            "router_dynamic_last_route": {
+                "selected_P": ["provider:other-stale-proposer"],
+                "selected_A": "provider:other-stale-aggregator",
+            },
+            "last_route": {
+                "selected_P": ["provider:third-stale-proposer"],
+                "selected_A": "provider:third-stale-aggregator",
+            },
+        },
+        attachments=[],
+        output_tokens=2_048,
+    )
+
+    assert stale == clean
+    assert stale["last_route"] == {}
+    assert _nested_mapping_keys(stale).isdisjoint(
+        _SINGLE_CONTEXT_FUSION_FIELDS
+    )
+    assert "stale" not in ranking_router.canonical_json_bytes(stale).decode()
+
+    models = (
+        _model("alpha", capability=0.90),
+        _model("beta", capability=0.80),
+    )
+    analysis = _analysis(intent="continue", intent_confidence=1.0)
+    clean_decision = _single_decision(*models, analysis=analysis, context=clean)
+    stale_decision = _single_decision(*models, analysis=analysis, context=stale)
+    assert stale_decision.model.identity == clean_decision.model.identity
+    assert stale_decision.trace["model_scores"] == clean_decision.trace["model_scores"]
+
+
+@pytest.mark.asyncio
+async def test_single_context_compaction_preserves_only_direct_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _AnalyzerProvider(json.dumps(_task_profile(tier=2)))
+    config = load_ranking_config()
+    config["task_analyzer"].update(
+        {
+            "payload_max_chars": 2_200,
+            "payload_max_bytes": 5_000,
+            "payload_max_estimated_tokens": 1_500,
+        }
+    )
+    request_context = build_single_model_request_context(
+        message="direct request",
+        turn_metadata={
+            "router_dynamic_request_context": {
+                "conversation": {"summary": "large context " * 1_000},
+                "intermediate_outputs": {
+                    "previous_candidates": ["stale candidate answer"]
+                },
+                "last_route": {
+                    "selected_P": ["provider:stale-proposer"],
+                    "selected_A": "provider:stale-aggregator",
+                },
+            }
+        },
+        attachments=[],
+        output_tokens=2_048,
+        ranking_config=config,
+    )
+
+    def fail_if_called(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("fusion last-route helper must not be called")
+
+    monkeypatch.setattr(ranking_router, "_sanitize_last_route", fail_if_called)
+    result = await analyze_task_with_provider(
+        provider=provider,
+        message="classify this direct request",
+        user_profile_enabled=False,
+        request_context=request_context,
+        routed_tier="c1",
+        routing_confidence=0.8,
+        ranking_config=config,
+    )
+
+    assert result.schema_valid is True
+    payload = json.loads(str(provider.calls[0][0][0].content))
+    compact_context = payload["request_context"]
+    assert compact_context["payload_context_truncated"] is True
+    assert compact_context["routing_budget"] == {
+        "estimated_input_tokens": request_context["routing_budget"][
+            "estimated_input_tokens"
+        ],
+        "tool_log_tokens": request_context["routing_budget"]["tool_log_tokens"],
+        "direct_output_tokens": 2_048,
+    }
+    assert compact_context["last_route"] == {}
+    assert compact_context["snapshot_hash"] == request_context["snapshot_hash"]
+    assert _nested_mapping_keys(compact_context).isdisjoint(
+        _SINGLE_CONTEXT_FUSION_FIELDS
+    )
+
+
+def test_rank_single_model_has_no_fusion_or_roster_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("fusion dependency was called")
+
+    forbidden = {
+        "rank_models",
+        "_selection_roster_counts",
+        "_proposer_bounds",
+        "_aggregator_filter_rows",
+        "_aggregator_rows",
+        "_assign_thinking_levels",
+        "_coverage_gain",
+        "_similarity",
+        "_error_complementarity",
+    }
+    for name in forbidden:
+        monkeypatch.setattr(ranking_router, name, fail_if_called)
+
+    decision = _single_decision(_model("only", capability=0.9))
+    source = inspect.getsource(rank_single_model)
+    tree = ast.parse(source)
+    called_names = {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+
+    assert decision.model.model_id == "only"
+    assert called_names.isdisjoint(forbidden)
+    assert "selection_roster" not in source
+    assert "aggregator" not in source
+
+
+def test_rank_single_model_enforces_direct_execution_hard_filters() -> None:
+    config = load_ranking_config()
+    config["hard_filter"]["eligible_statuses"].append("active")
+    unavailable_health = config["hard_filter"]["unavailable_health_states"][0]
+    decision = _single_decision(
+        _model(
+            "wrong-status",
+            status="active",
+            capability=0.99,
+            modalities=["text", "image"],
+        ),
+        _model(
+            "unhealthy",
+            health=unavailable_health,
+            capability=0.98,
+            modalities=["text", "image"],
+        ),
+        _model(
+            "no-credential",
+            credential_available=False,
+            capability=0.97,
+            modalities=["text", "image"],
+        ),
+        _model(
+            "short-context",
+            context_window=1,
+            capability=0.96,
+            modalities=["text", "image"],
+        ),
+        _model("wrong-modality", capability=0.95, modalities=["text"]),
+        _model("eligible", capability=0.80, modalities=["text", "image"]),
+        analysis=_analysis(modalities=["text", "image"]),
+        ranking_config=config,
+    )
+    filter_rows = {
+        row["model"]: row
+        for row in decision.trace["hard_filter"]["proposer_results"]
+    }
+
+    assert decision.model.model_id == "eligible"
+    assert "status_not_enabled" in filter_rows["wrong-status"]["reasons"]
+    assert "health_unavailable" in filter_rows["unhealthy"]["reasons"]
+    assert "credential_unavailable" in filter_rows["no-credential"]["reasons"]
+    assert "context_exceeded" in filter_rows["short-context"]["reasons"]
+    assert "modality_mismatch" in filter_rows["wrong-modality"]["reasons"]
+
+
+def test_rank_single_model_uses_candidate_specific_direct_output_budget() -> None:
+    exact_fit = _model(
+        "candidate-exact-fit",
+        capability=0.90,
+        context_window=6_000,
+    )
+    exact_fit["registry_facts"]["runtime_direct_output_tokens"] = 5_000
+    exact_short = _model(
+        "candidate-exact-short",
+        capability=0.99,
+        context_window=5_999,
+    )
+    exact_short["registry_facts"]["runtime_direct_output_tokens"] = 5_000
+    fallback = _model(
+        "request-fallback",
+        capability=0.80,
+        context_window=2_000,
+    )
+    decision = _single_decision(
+        exact_fit,
+        exact_short,
+        fallback,
+        context=_single_context(input_tokens=1_000, output_tokens=1_000),
+    )
+    filter_rows = {
+        row["model"]: row
+        for row in decision.trace["hard_filter"]["proposer_results"]
+    }
+
+    assert decision.model.model_id == "candidate-exact-fit"
+    assert filter_rows["candidate-exact-fit"]["context_need_tokens"] == 6_000
+    assert filter_rows["candidate-exact-fit"]["direct_output_tokens"] == 5_000
+    assert filter_rows["candidate-exact-fit"]["direct_output_tokens_source"] == (
+        "runtime_registry_fact"
+    )
+    assert "context_exceeded" in filter_rows["candidate-exact-short"]["reasons"]
+    assert filter_rows["candidate-exact-short"]["context_need_tokens"] == 6_000
+    assert filter_rows["request-fallback"]["context_need_tokens"] == 2_000
+    assert filter_rows["request-fallback"]["direct_output_tokens"] == 1_000
+    assert filter_rows["request-fallback"]["direct_output_tokens_source"] == (
+        "request_context_fallback"
+    )
+
+
+@pytest.mark.parametrize(
+    "runtime_direct_output_tokens",
+    [True, 0, -1, 1.5, "1000"],
+)
+def test_rank_single_model_rejects_invalid_runtime_direct_output_tokens(
+    runtime_direct_output_tokens: object,
+) -> None:
+    model = _model("invalid-runtime-output")
+    model["registry_facts"][
+        "runtime_direct_output_tokens"
+    ] = runtime_direct_output_tokens
+
+    with pytest.raises(
+        DynamicRankingError,
+        match="invalid runtime_direct_output_tokens",
+    ):
+        _single_decision(
+            model,
+            context=_single_context(output_tokens=5_000),
+        )
+
+
+@pytest.mark.parametrize("thinking_assignment_enabled", [False, True])
+def test_rank_single_model_tools_filter_is_independent_of_thinking_switch(
+    thinking_assignment_enabled: bool,
+) -> None:
+    model_factory = _thinking_model if thinking_assignment_enabled else _model
+    unsupported = model_factory("unsupported-tools", capability=0.99)
+    capable = model_factory("tool-capable", capability=0.80)
+    capable["registry_facts"]["supports_tools"] = True
+
+    without_tools = _single_decision(
+        unsupported,
+        capable,
+        requires_tools=False,
+        thinking_assignment_enabled=thinking_assignment_enabled,
+    )
+    with_tools = _single_decision(
+        unsupported,
+        capable,
+        requires_tools=True,
+        thinking_assignment_enabled=thinking_assignment_enabled,
+    )
+
+    assert without_tools.model.model_id == "unsupported-tools"
+    assert with_tools.model.model_id == "tool-capable"
+    unsupported_filter = next(
+        row
+        for row in with_tools.trace["hard_filter"]["proposer_results"]
+        if row["model"] == "unsupported-tools"
+    )
+    assert unsupported_filter["reasons"] == [
+        "required_parameter_tools_unsupported"
+    ]
+
+
+@pytest.mark.parametrize("surface", ["registry_snapshot", "request_context"])
+def test_rank_single_model_trace_rejects_secret_like_evidence(surface: str) -> None:
+    model = _model("unsafe", capability=0.90)
+    context = _single_context()
+    if surface == "registry_snapshot":
+        model["registry_facts"]["api_key"] = "must-not-enter-trace"
+    else:
+        context["authorization"] = "must-not-enter-trace"
+
+    with pytest.raises(DynamicRankingError, match="secret-like"):
+        _single_decision(model, context=context)
+
+
+def test_rank_single_model_uses_base_score_top_one_with_stable_ties() -> None:
+    decision = _single_decision(
+        _model("lower", capability=0.70, price=1.0),
+        _model("higher", capability=0.95, price=1.0),
+    )
+    tied = _single_decision(
+        _model("beta", capability=0.90, price=1.0),
+        _model("alpha", capability=0.90, price=1.0),
+    )
+
+    assert decision.model.model_id == "higher"
+    assert decision.trace["model_scores"][0]["model"] == "higher"
+    assert tied.model.model_id == "alpha"
+
+
+def test_rank_single_model_assigns_only_proposer_thinking() -> None:
+    decision = _single_decision(
+        _thinking_model("thinking", capability=0.95),
+        thinking_assignment_enabled=True,
+    )
+
+    assert decision.model.requested_thinking_level is not None
+    assert decision.model.effective_thinking_level is not None
+    assert set(decision.thinking_assignment) == {
+        "proposers",
+        "thinking_policy_version",
+    }
+    assert set(decision.thinking_assignment_details) == {
+        "effective_tier",
+        "proposers",
+    }
+
+
+def test_rank_single_model_trace_has_no_fusion_selection_fields() -> None:
+    decision = _single_decision(_model("direct", capability=0.90))
+    forbidden = {
+        "selected_A",
+        "aggregator",
+        "aggregator_candidates",
+        "aggregator_feasibility",
+        "selection_roster",
+    }
+
+    assert decision.trace["strategy"] == "router_dynamic"
+    assert decision.trace["execution_mode"] == "router_single"
+    assert decision.trace["selection_policy"] == "base_score_top1"
+    assert decision.trace["selected_model"] == decision.model.identity
+    assert decision.trace["selected_P"] == [decision.model.identity]
+    assert forbidden.isdisjoint(decision.trace)
+    assert "aggregator_results" not in decision.trace["hard_filter"]
+
+
+def test_rank_single_model_no_eligible_model_fails_closed() -> None:
+    with pytest.raises(DynamicRankingError) as exc_info:
+        _single_decision(_model("disabled", status="disabled"))
+
+    assert exc_info.value.reason == "no_eligible_single_model"

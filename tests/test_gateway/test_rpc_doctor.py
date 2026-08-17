@@ -882,7 +882,7 @@ async def test_doctor_status_warns_when_static_b5_ensemble_has_no_credential(
 
     config = GatewayConfig(
         llm={"provider": "groq", "api_key": "sk-groq-synthetic"},
-        llm_ensemble={"enabled": True, "selection_mode": "static_openrouter_b5"},
+        llm_ensemble={"enabled": True, "selection_mode": "static_openrouter"},
     )
     response = await get_dispatcher().dispatch(
         "req-1",
@@ -898,6 +898,7 @@ async def test_doctor_status_warns_when_static_b5_ensemble_has_no_credential(
         if finding["id"] == "llm_ensemble.static_openrouter_b5.credentials.missing"
     )
     assert finding["severity"] == "warn"
+    assert finding["evidence"]["selectionMode"] == "static_openrouter"
     assert finding["readinessImpact"] == "degrades"
     assert "OPENROUTER_API_KEY" in finding["detail"]
     assert finding["evidence"]["activeProvider"] == "groq"
@@ -918,7 +919,7 @@ async def test_doctor_status_reports_static_b5_ensemble_ready_when_keyed(
 
     config = GatewayConfig(
         llm={"provider": "groq", "api_key": "sk-groq-synthetic"},
-        llm_ensemble={"enabled": True, "selection_mode": "static_openrouter_b5"},
+        llm_ensemble={"enabled": True, "selection_mode": "static_openrouter"},
     )
     response = await get_dispatcher().dispatch(
         "req-1",
@@ -948,7 +949,7 @@ async def test_doctor_status_warns_when_static_tokenrhythm_b5_has_no_credential(
 
     config = GatewayConfig(
         llm={"provider": "groq", "api_key": "sk-groq-synthetic"},
-        llm_ensemble={"enabled": True, "selection_mode": "static_tokenrhythm_b5"},
+        llm_ensemble={"enabled": True, "selection_mode": "static_tokenrhythm"},
     )
     response = await get_dispatcher().dispatch(
         "req-1",
@@ -980,7 +981,7 @@ async def test_doctor_status_reports_static_tokenrhythm_b5_ready_when_keyed(
 
     config = GatewayConfig(
         llm={"provider": "groq", "api_key": "sk-groq-synthetic"},
-        llm_ensemble={"enabled": True, "selection_mode": "static_tokenrhythm_b5"},
+        llm_ensemble={"enabled": True, "selection_mode": "static_tokenrhythm"},
     )
     response = await get_dispatcher().dispatch(
         "req-1",

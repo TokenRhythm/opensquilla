@@ -346,7 +346,7 @@ def _llm_ensemble_payload(ctx: RpcContext) -> dict[str, Any]:
             getattr(config, "llm", None),
             selection_mode,
         )
-    elif payload["enabled"] and payload["selectionMode"] == "custom_b5":
+    elif payload["enabled"] and payload["selectionMode"] == "custom":
         from opensquilla.provider.ensemble import custom_b5_lineup_ready
 
         ready, reason = custom_b5_lineup_ready(config)

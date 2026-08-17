@@ -519,6 +519,43 @@ async def test_ensemble_configure_accepts_full_camel_case_payload(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("legacy", "canonical"),
+    [
+        ("static_openrouter_b5", "static_openrouter"),
+        ("static_tokenrhythm_b5", "static_tokenrhythm"),
+        ("custom_b5", "custom"),
+    ],
+)
+async def test_ensemble_configure_canonicalizes_released_selection_aliases(
+    tmp_path,
+    monkeypatch,
+    legacy: str,
+    canonical: str,
+) -> None:
+    config_path = tmp_path / f"{canonical}.toml"
+    monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(config_path))
+    payload: dict[str, object] = {"selectionMode": legacy}
+    if canonical == "custom":
+        payload["candidates"] = [
+            {"provider": "a", "model": "m1"},
+            {"provider": "b", "model": "m2"},
+        ]
+
+    res = await get_dispatcher().dispatch(
+        "r1",
+        "onboarding.ensemble.configure",
+        payload,
+        _admin_ctx(),
+    )
+
+    assert res.error is None, res.error
+    assert res.payload["entry"]["selection_mode"] == canonical
+    persisted = tomllib.loads(config_path.read_text())
+    assert persisted["llm_ensemble"]["selection_mode"] == canonical
+
+
+@pytest.mark.asyncio
 async def test_ensemble_configure_rejects_unknown_selection_mode(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(tmp_path / "c.toml"))
     res = await get_dispatcher().dispatch(

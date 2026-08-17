@@ -358,7 +358,7 @@ def _sample_findings() -> list[HealthFinding]:
         evaluate_llm_ensemble(
             {
                 "enabled": True,
-                "selectionMode": "static_openrouter_b5",
+                "selectionMode": "static_openrouter",
                 "activeProvider": "groq",
                 "apiKeyEnv": "OPENROUTER_API_KEY",
                 "credentialAvailable": False,
@@ -554,7 +554,7 @@ def test_llm_ensemble_custom_b5_health_findings_cover_ready_and_blocked() -> Non
     ready = evaluate_llm_ensemble(
         {
             "enabled": True,
-            "selectionMode": "custom_b5",
+            "selectionMode": "custom",
             "activeProvider": "volcengine",
             "lineupReady": True,
             "lineupBlockedReason": "",
@@ -562,11 +562,12 @@ def test_llm_ensemble_custom_b5_health_findings_cover_ready_and_blocked() -> Non
     )
     assert [finding.id for finding in ready] == ["llm_ensemble.custom_b5.ready"]
     assert ready[0].severity == "ok"
+    assert ready[0].evidence["selectionMode"] == "custom"
 
     blocked = evaluate_llm_ensemble(
         {
             "enabled": True,
-            "selectionMode": "custom_b5",
+            "selectionMode": "custom",
             "activeProvider": "volcengine",
             "lineupReady": False,
             "lineupBlockedReason": "missing_credential:openrouter",
@@ -581,7 +582,7 @@ def test_llm_ensemble_custom_b5_health_findings_cover_ready_and_blocked() -> Non
     empty = evaluate_llm_ensemble(
         {
             "enabled": True,
-            "selectionMode": "custom_b5",
+            "selectionMode": "custom",
             "activeProvider": "volcengine",
             "lineupReady": False,
             "lineupBlockedReason": "no_proposers",

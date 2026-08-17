@@ -154,6 +154,9 @@ def test_model_routing_snapshot_maps_config_to_one_public_mode(
 @pytest.mark.parametrize(
     ("selection_mode", "router_enabled"),
     [
+        ("static_openrouter", False),
+        ("static_tokenrhythm", False),
+        ("custom", False),
         ("static_openrouter_b5", False),
         ("static_tokenrhythm_b5", False),
         ("custom_b5", False),
@@ -165,8 +168,8 @@ def test_ensemble_patch_preserves_router_dependency_compatibility(
     selection_mode: str,
     router_enabled: bool,
 ) -> None:
-    # Use a config-like object so the compatibility branch remains covered for
-    # older/future selection tokens that the current Pydantic model rejects.
+    # Use a config-like object so canonical values, released aliases, and
+    # unknown future values exercise the same compatibility branch.
     config = SimpleNamespace(
         llm_ensemble=SimpleNamespace(selection_mode=selection_mode)
     )
@@ -606,7 +609,7 @@ def test_legacy_single_boolean_writes_select_one_canonical_mode() -> None:
 @pytest.mark.parametrize(
     ("ensemble_enabled", "router_enabled", "selection_mode", "expected_mode", "expected_router"),
     [
-        (True, True, "static_openrouter_b5", "ensemble", False),
+        (True, True, "static_openrouter", "ensemble", False),
         (True, False, "router_dynamic", "ensemble", True),
         (False, True, "router_dynamic", "router", True),
         (False, False, "router_dynamic", "direct", False),
@@ -707,7 +710,7 @@ async def test_live_ensemble_selection_change_preserves_prompt_only_phase(
     await _handle_config_set(
         {
             "path": "llm_ensemble.selection_mode",
-            "value": "static_openrouter_b5",
+            "value": "static_openrouter",
         },
         _ctx(config),
     )

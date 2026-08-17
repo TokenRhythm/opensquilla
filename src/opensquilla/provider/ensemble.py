@@ -19806,6 +19806,7 @@ _DYNAMIC_AGGREGATOR_SLOT = {
 }
 
 _STATIC_OPENROUTER_B5_PROFILE_NAME = "static_openrouter_b5"
+_STATIC_OPENROUTER_SELECTION_MODE = "static_openrouter"
 _STATIC_OPENROUTER_B5_PROPOSER_MODELS = (
     "deepseek/deepseek-v4-pro",
     "z-ai/glm-5.2",
@@ -19814,6 +19815,7 @@ _STATIC_OPENROUTER_B5_PROPOSER_MODELS = (
 )
 _STATIC_OPENROUTER_B5_AGGREGATOR_MODEL = "z-ai/glm-5.2"
 _STATIC_TOKENRHYTHM_B5_PROFILE_NAME = "static_tokenrhythm_b5"
+_STATIC_TOKENRHYTHM_SELECTION_MODE = "static_tokenrhythm"
 # The TokenRhythm mirror of the static OpenRouter B5 lineup: same aggregation
 # shape and defaults, model ids in TokenRhythm's bare naming.
 _STATIC_TOKENRHYTHM_B5_PROPOSER_MODELS = (
@@ -19838,13 +19840,13 @@ class StaticB5Profile:
 
 
 STATIC_B5_PROFILES: dict[str, StaticB5Profile] = {
-    _STATIC_OPENROUTER_B5_PROFILE_NAME: StaticB5Profile(
+    _STATIC_OPENROUTER_SELECTION_MODE: StaticB5Profile(
         profile_name=_STATIC_OPENROUTER_B5_PROFILE_NAME,
         provider_id="openrouter",
         proposer_models=_STATIC_OPENROUTER_B5_PROPOSER_MODELS,
         aggregator_model=_STATIC_OPENROUTER_B5_AGGREGATOR_MODEL,
     ),
-    _STATIC_TOKENRHYTHM_B5_PROFILE_NAME: StaticB5Profile(
+    _STATIC_TOKENRHYTHM_SELECTION_MODE: StaticB5Profile(
         profile_name=_STATIC_TOKENRHYTHM_B5_PROFILE_NAME,
         provider_id="tokenrhythm",
         proposer_models=_STATIC_TOKENRHYTHM_B5_PROPOSER_MODELS,
@@ -19859,7 +19861,8 @@ def static_b5_profile(selection_mode: str) -> StaticB5Profile | None:
     return STATIC_B5_PROFILES.get(str(selection_mode or ""))
 
 
-CUSTOM_B5_SELECTION_MODE = "custom_b5"
+CUSTOM_B5_SELECTION_MODE = "custom"
+_CUSTOM_B5_PROFILE_NAME = "custom_b5"
 TREE_BASELINE_SELECTION_MODE = "router_tree_baseline"
 
 
@@ -22257,6 +22260,682 @@ def _build_router_dynamic_members(
     return f"router_dynamic/{profile_tier}", proposers, aggregator, decision.trace
 
 
+@dataclass(frozen=True)
+class RouterSingleRoute:
+    """One fully resolved direct-generation route.
+
+    The credential-bearing provider config is hidden from repr. This type has
+    no ensemble member, quorum, or aggregator surface by construction.
+    """
+
+    provider_config: ProviderConfig = field(repr=False)
+    effective_tier: int
+    trace: dict[str, Any]
+    direct_output_tokens: int
+    context_window_tokens: int
+    model_capabilities: ModelCapabilities | None = field(repr=False)
+    thinking: str | None = None
+    requested_thinking_level: str | None = None
+    effective_thinking_level: str | None = None
+    thinking_fallback_reason: str = ""
+    thinking_policy_version: str = ""
+
+
+def _router_single_managed_thinking_is_executable(
+    *,
+    provider_config: ProviderConfig,
+    model_capabilities: ModelCapabilities,
+    thinking_policy_version: str,
+    effective_thinking_level: str | None,
+) -> bool:
+    """Return whether the selected adapter will emit managed thinking.
+
+    The OpenAI-compatible adapter gates reasoning on the frozen endpoint
+    capabilities, except for its explicit exact-id toggle roster. Anthropic
+    and Codex consume ``ChatConfig.thinking`` directly. Backends without one
+    of those audited contracts fail closed.
+    """
+
+    from .reasoning_dialects import DIALECTS
+
+    managed = bool(str(thinking_policy_version or "").strip())
+    level = str(effective_thinking_level or "").strip().casefold()
+    if not managed or level in {"", "off", "none", "false"}:
+        return True
+    try:
+        spec = get_provider_spec(str(provider_config.provider or "").strip().casefold())
+    except UnknownProviderError:
+        return False
+    if spec.backend in {"anthropic", "openai_codex"}:
+        return True
+    if spec.backend != "openai_compat":
+        return False
+    reasoning_format = str(model_capabilities.reasoning_format or "")
+    if reasoning_format not in DIALECTS:
+        return False
+    model_id = str(provider_config.model or "").strip().casefold()
+    return bool(model_capabilities.supports_reasoning) or (
+        model_id in spec.compat.thinking_toggle_model_ids
+    )
+
+
+def resolve_router_single_route(
+    *,
+    config: Any,
+    inherited_provider_config: ProviderConfig,
+    turn_metadata: dict[str, Any] | None,
+    ranking_inputs: Mapping[str, Any],
+    requires_tools: bool,
+    credential_pool_acquirer: CredentialPoolAcquirer | None = None,
+    session_key: str = "",
+    provider_health_ledger: Any | None = None,
+    model_catalog: Any | None = None,
+) -> RouterSingleRoute:
+    """Rank and materialize exactly one direct-generation deployment.
+
+    Kept separate from _build_router_dynamic_members so this path cannot read
+    fusion budgets, rank an aggregator, or build an EnsembleProvider.
+    """
+
+    from .compat_policy import compat_policy_for_kind, model_matches_policy_prefix
+    from .ranking_router import (
+        RANKING_CONFIG_SCHEMA_VERSION,
+        DynamicRankingError,
+        TaskAnalysisResult,
+        _is_validated_ranking_config,
+        _legacy_registry_snapshot_projection,
+        _prepare_effective_ranking_config,
+        build_model_registry_snapshot,
+        build_single_model_request_context,
+        load_model_registry_snapshot,
+        mock_user_profile,
+        rank_single_model,
+        ranking_config_snapshot,
+    )
+
+    metadata = dict(turn_metadata or {})
+    extra = metadata.get("routing_extra")
+    extra_map = extra if isinstance(extra, Mapping) else {}
+    routed_tier = (
+        _normalize_dynamic_tier(metadata.get("routed_tier"))
+        or _normalize_dynamic_tier(extra_map.get("final_tier"))
+        or _normalize_dynamic_tier(extra_map.get("base_tier"))
+        or "c1"
+    )
+    try:
+        routing_confidence = float(metadata.get("routing_confidence") or 0.0)
+    except (TypeError, ValueError):
+        routing_confidence = 0.0
+
+    ensemble_cfg = getattr(config, "llm_ensemble", None)
+    if ensemble_cfg is None:
+        raise DynamicRankingError("router_single requires config.llm_ensemble")
+    if str(getattr(ensemble_cfg, "selection_mode", "") or "") != "router_dynamic":
+        raise DynamicRankingError(
+            "router_single requires llm_ensemble.selection_mode='router_dynamic'"
+        )
+
+    inputs = dict(ranking_inputs or {})
+    prepared_ranking_config = getattr(ensemble_cfg, "prepared_ranking_config", None)
+    frozen_resolution = None
+    if callable(prepared_ranking_config):
+        ranking_config = prepared_ranking_config()
+        thinking_assignment_enabled = bool(
+            isinstance(ranking_config, Mapping)
+            and ranking_config.get("schema_version") == RANKING_CONFIG_SCHEMA_VERSION
+            and isinstance(ranking_config.get("thinking_assignment"), Mapping)
+            and ranking_config["thinking_assignment"].get("enabled") is True
+        )
+    else:
+        frozen_resolution_snapshot = getattr(
+            ensemble_cfg,
+            "ranking_config_resolution_snapshot",
+            None,
+        )
+        frozen_resolution = (
+            frozen_resolution_snapshot()
+            if callable(frozen_resolution_snapshot)
+            else None
+        )
+        ranking_config = inputs.get("ranking_config")
+        if not isinstance(ranking_config, Mapping) and isinstance(
+            frozen_resolution,
+            Mapping,
+        ):
+            ranking_config = frozen_resolution.get("effective_config")
+        thinking_assignment_enabled = bool(
+            frozen_resolution.get("thinking_assignment_enabled") is True
+            if isinstance(frozen_resolution, Mapping)
+            else getattr(
+                ensemble_cfg,
+                "ranking_thinking_assignment_enabled",
+                False,
+            )
+            is True
+        )
+    supplied_ranking_config = inputs.get("ranking_config")
+    if isinstance(supplied_ranking_config, Mapping):
+        ranking_config = supplied_ranking_config
+    if not isinstance(ranking_config, Mapping):
+        override_snapshot = getattr(
+            ensemble_cfg,
+            "ranking_config_override_snapshot",
+            None,
+        )
+        frozen_override = (
+            override_snapshot()
+            if callable(override_snapshot)
+            else getattr(ensemble_cfg, "ranking_config_override", None)
+        )
+        ranking_config = ranking_config_snapshot(
+            thinking_assignment_enabled=thinking_assignment_enabled,
+            override=frozen_override or None,
+        )
+    if _is_validated_ranking_config(ranking_config):
+        thinking_policy = ranking_config.get("thinking_assignment")
+        thinking_assignment_enabled = bool(
+            ranking_config.get("schema_version") == RANKING_CONFIG_SCHEMA_VERSION
+            and isinstance(thinking_policy, Mapping)
+            and thinking_policy.get("enabled") is True
+        )
+    ranking_config = _prepare_effective_ranking_config(
+        ranking_config,
+        thinking_assignment_enabled=thinking_assignment_enabled,
+    )
+
+    llm_cfg = getattr(config, "llm", None)
+    raw_generation_policy = inputs.get("generation_policy")
+    generation_policy = (
+        raw_generation_policy
+        if isinstance(raw_generation_policy, Mapping)
+        else None
+    )
+    if thinking_assignment_enabled:
+        configured_output_tokens, configured_temperature = (
+            resolve_effective_generation_request_parameters(
+                llm_config=llm_cfg,
+                generation_policy=generation_policy,
+            )
+        )
+    else:
+        configured_output_tokens = int(getattr(llm_cfg, "max_tokens", 0) or 0)
+        configured_temperature = getattr(llm_cfg, "temperature", None)
+    runtime_max_tokens_override = configured_output_tokens
+    if configured_output_tokens <= 0:
+        context_policy = ranking_config.get("context")
+        context_policy_map = (
+            context_policy if isinstance(context_policy, Mapping) else {}
+        )
+        output_policy = context_policy_map.get("output_budget")
+        output_policy_map = (
+            output_policy if isinstance(output_policy, Mapping) else {}
+        )
+        analyzer_output_hint = output_policy_map.get("default_tokens")
+        if (
+            isinstance(analyzer_output_hint, bool)
+            or not isinstance(analyzer_output_hint, int)
+            or analyzer_output_hint <= 0
+        ):
+            raise DynamicRankingError(
+                "router_single analyzer output budget is unavailable",
+                reason="router_single_output_budget_unavailable",
+            )
+        configured_output_tokens = analyzer_output_hint
+    request_context = inputs.get("request_context")
+    if not isinstance(request_context, Mapping):
+        request_context = build_single_model_request_context(
+            message=str(metadata.get("router_dynamic_task_text") or ""),
+            turn_metadata=metadata,
+            attachments=[],
+            output_tokens=configured_output_tokens,
+            ranking_config=ranking_config,
+        )
+
+    task_analysis = inputs.get("task_analysis")
+    if not isinstance(task_analysis, TaskAnalysisResult):
+        raise DynamicRankingError("router_single requires a completed task analysis")
+    user_profile_enabled = bool(
+        getattr(ensemble_cfg, "ranking_user_profile_enabled", False)
+    )
+    supplied_user_profile = inputs.get("user_profile")
+    user_profile = (
+        supplied_user_profile
+        if user_profile_enabled and isinstance(supplied_user_profile, Mapping)
+        else mock_user_profile(ranking_config)
+        if user_profile_enabled
+        else None
+    )
+    decision_id = str(inputs.get("decision_id") or "")
+
+    operator_candidates = [
+        {
+            "provider": str(getattr(candidate, "provider", "") or ""),
+            "model": str(getattr(candidate, "model", "") or ""),
+            "source": str(getattr(candidate, "source", "") or "custom"),
+            "enabled": bool(getattr(candidate, "enabled", True)),
+            "role": str(getattr(candidate, "role", "") or ""),
+        }
+        for candidate in getattr(ensemble_cfg, "candidates", []) or []
+    ]
+    legacy_model_options = list(getattr(ensemble_cfg, "model_options", []) or [])
+    if tuple(legacy_model_options) == _LEGACY_OPENROUTER_MODEL_OPTIONS:
+        legacy_model_options = []
+    router_cfg = getattr(config, "squilla_router", None)
+    router_tiers = getattr(router_cfg, "tiers", {}) or {}
+    anchor_modalities = ["text"]
+    try:
+        anchor_member = _member_from_ref(
+            _EnsembleModelRef(
+                provider=inherited_provider_config.provider,
+                model=inherited_provider_config.model,
+                thinking=None,
+            ),
+            config=config,
+            inherited=inherited_provider_config,
+            label="router_single_anchor_capability_probe",
+            credential_pool_acquirer=credential_pool_acquirer,
+            session_key=session_key,
+        )
+        if _member_model_capabilities(anchor_member).supports_vision:
+            anchor_modalities.append("image")
+    except Exception:  # noqa: BLE001 - registry facts remain authoritative
+        pass
+
+    registry_allowlist = inputs.get("registry_allowlist")
+    contract_source_snapshot: Mapping[str, Any] | None = None
+    if isinstance(registry_allowlist, Mapping):
+        source_version = str(
+            registry_allowlist.get("source_registry_snapshot_version") or ""
+        ).strip()
+        if source_version:
+            contract_source_snapshot = load_model_registry_snapshot(
+                base_version=source_version
+            )
+            if not thinking_assignment_enabled:
+                contract_source_snapshot = _legacy_registry_snapshot_projection(
+                    contract_source_snapshot
+                )
+    snapshot = build_model_registry_snapshot(
+        inherited_provider=inherited_provider_config.provider,
+        inherited_model=inherited_provider_config.model,
+        routed_tier=routed_tier,
+        anchor_modalities=anchor_modalities,
+        operator_candidates=operator_candidates,
+        legacy_model_options=legacy_model_options,
+        router_tiers=router_tiers if isinstance(router_tiers, Mapping) else {},
+        packaged_snapshot=(
+            deepcopy(contract_source_snapshot)
+            if contract_source_snapshot is not None
+            else None
+        ),
+        ranking_config=ranking_config,
+    )
+    if not thinking_assignment_enabled:
+        snapshot = _legacy_registry_snapshot_projection(snapshot)
+    allowlist_trace = _apply_router_dynamic_registry_allowlist(
+        snapshot,
+        registry_allowlist,
+        source_snapshot=contract_source_snapshot,
+    )
+    if (
+        allowlist_trace is not None
+        and allowlist_trace.get("candidate_scope") == "registry_all"
+    ):
+        provider_routing = dict(inherited_provider_config.provider_routing)
+        for identity in allowlist_trace["expected_identities"]:
+            provider_id, model_id = str(identity).split(":", 1)
+            if provider_id == "openrouter":
+                provider_routing.setdefault(model_id, "auto")
+        inherited_provider_config = replace(
+            inherited_provider_config,
+            provider_routing=provider_routing,
+        )
+
+    # Freeze the exact direct-call budgets AgentBootstrap will use onto each
+    # candidate before ranking. The analyzer scalar above is only a hint;
+    # context feasibility is proved from these candidate-specific values.
+    if model_catalog is None:
+        raise DynamicRankingError(
+            "router_single requires an authoritative model catalog",
+            reason="router_single_model_catalog_unavailable",
+        )
+    raw_max_tokens = runtime_max_tokens_override
+    raw_context_window = getattr(llm_cfg, "context_window_tokens", 0) or 0
+    if isinstance(raw_max_tokens, bool) or not isinstance(raw_max_tokens, int):
+        raise DynamicRankingError(
+            "router_single max_tokens override is invalid",
+            reason="router_single_model_budget_unavailable",
+        )
+    if isinstance(raw_context_window, bool) or not isinstance(
+        raw_context_window, int
+    ):
+        raise DynamicRankingError(
+            "router_single context window override is invalid",
+            reason="router_single_model_budget_unavailable",
+        )
+    for row in snapshot["models"]:
+        facts = row.get("registry_facts")
+        if not isinstance(facts, dict):
+            continue
+        provider_id = str(facts.get("provider") or "")
+        model_id = str(facts.get("model_id") or "")
+        try:
+            resolve_output_with_source = getattr(
+                model_catalog,
+                "resolve_max_tokens_with_source",
+                None,
+            )
+            if callable(resolve_output_with_source):
+                (
+                    direct_output_tokens,
+                    output_source,
+                ) = resolve_output_with_source(
+                    model_id,
+                    user_override=raw_max_tokens,
+                    provider=provider_id,
+                )
+            else:
+                direct_output_tokens = model_catalog.resolve_max_tokens(
+                    model_id,
+                    user_override=raw_max_tokens,
+                    provider=provider_id,
+                )
+                output_source = "catalog"
+            (
+                context_window_tokens,
+                context_source,
+            ) = resolve_effective_context_window(
+                model_catalog,
+                model_id,
+                provider=provider_id,
+                global_override=raw_context_window,
+            )
+        except Exception as exc:
+            raise DynamicRankingError(
+                f"router_single catalog budget unavailable for "
+                f"{provider_id}:{model_id}",
+                reason="router_single_model_budget_unavailable",
+            ) from exc
+        if (
+            isinstance(direct_output_tokens, bool)
+            or not isinstance(direct_output_tokens, int)
+            or direct_output_tokens <= 0
+            or isinstance(context_window_tokens, bool)
+            or not isinstance(context_window_tokens, int)
+            or context_window_tokens <= 0
+        ):
+            raise DynamicRankingError(
+                f"router_single catalog budget invalid for "
+                f"{provider_id}:{model_id}",
+                reason="router_single_model_budget_unavailable",
+            )
+        facts["runtime_direct_output_tokens"] = direct_output_tokens
+        facts["runtime_direct_output_tokens_source"] = str(output_source)
+        facts["context_window"] = context_window_tokens
+        facts["runtime_context_window_source"] = str(context_source)
+
+    candidate_deployments: list[tuple[str, str, str]] = []
+    for row in snapshot["models"]:
+        facts = row.get("registry_facts")
+        if not isinstance(facts, dict):
+            continue
+        provider_id = str(facts.get("provider") or "")
+        model_id = str(facts.get("model_id") or "")
+        if thinking_assignment_enabled and provider_id.strip().lower() == "openrouter":
+            provider_policy = compat_policy_for_kind("openrouter")
+            upstream = canonicalize_provider_routing_upstream(
+                inherited_provider_config.provider_routing.get(model_id, "")
+            )
+            if upstream:
+                facts["endpoint_provider_pin"] = upstream
+            sends_temperature = configured_temperature is not None
+            if (
+                sends_temperature
+                and provider_policy.unsupported_temperature_model_prefixes
+                and model_matches_policy_prefix(
+                    model_id,
+                    provider_policy.unsupported_temperature_model_prefixes,
+                )
+            ):
+                sends_temperature = False
+            if (
+                sends_temperature
+                and provider_policy.fixed_sampling_model_prefixes
+                and model_matches_policy_prefix(
+                    model_id,
+                    provider_policy.fixed_sampling_model_prefixes,
+                )
+                and configured_temperature != 1.0
+            ):
+                sends_temperature = False
+            facts["runtime_temperature_parameter_required"] = sends_temperature
+        try:
+            credential_available = _resolve_member_deployment(
+                _EnsembleModelRef(provider=provider_id, model=model_id),
+                inherited_provider_config,
+                config=config,
+                credential_pool_acquirer=credential_pool_acquirer,
+                session_key=session_key,
+            ).ready
+        except Exception:  # noqa: BLE001 - retained as hard-filter evidence
+            credential_available = False
+        facts["credential_available"] = credential_available
+        upstream = canonicalize_provider_routing_upstream(
+            facts.get("endpoint_provider_pin")
+            or inherited_provider_config.provider_routing.get(model_id, "")
+        )
+        candidate_deployments.append((provider_id, model_id, upstream))
+
+    generation_filter_trace = _apply_strict_generation_policy_candidate_filter(
+        snapshot,
+        generation_policy,
+    )
+    runtime_health_trace: list[dict[str, Any]] = []
+    runtime_facts = getattr(provider_health_ledger, "runtime_facts", None)
+    if callable(runtime_facts):
+        for row in snapshot["models"]:
+            facts = row.get("registry_facts")
+            if not isinstance(facts, dict):
+                continue
+            provider_id = str(facts.get("provider") or "")
+            model_id = str(facts.get("model_id") or "")
+            upstream = canonicalize_provider_routing_upstream(
+                facts.get("endpoint_provider_pin")
+                or inherited_provider_config.provider_routing.get(model_id, "")
+            )
+            health = runtime_facts(
+                provider_id,
+                model_id,
+                upstream=upstream,
+                candidate_deployments=candidate_deployments,
+            )
+            if not isinstance(health, Mapping):
+                continue
+            health_row = dict(health)
+            runtime_health_trace.append(health_row)
+            facts[_RUNTIME_HEALTH_FACTS_FIELD] = health_row
+            unavailable_reason = (
+                _RUNTIME_HEALTH_HALF_OPEN_BUSY_REASON
+                if health.get("half_open_inflight") is True
+                else _RUNTIME_HEALTH_BENCHED_REASON
+                if str(health.get("state") or "") == "benched"
+                else ""
+            )
+            if health.get("fresh") is True and unavailable_reason:
+                reasons_by_role = facts.setdefault(
+                    _RUNTIME_HARD_FILTER_REASONS_BY_ROLE_FIELD,
+                    {},
+                )
+                proposer_reasons = reasons_by_role.setdefault("proposer", [])
+                if unavailable_reason not in proposer_reasons:
+                    proposer_reasons.append(unavailable_reason)
+
+    decision = rank_single_model(
+        task_analysis=task_analysis,
+        user_profile=user_profile,
+        request_context=request_context,
+        registry_snapshot=snapshot,
+        routed_tier=routed_tier,
+        routing_confidence=routing_confidence,
+        requires_tools=requires_tools,
+        ranking_config=ranking_config,
+        decision_id=decision_id,
+        ranking_thinking_assignment_enabled=thinking_assignment_enabled,
+    )
+    if allowlist_trace is not None:
+        decision.trace["candidate_allowlist"] = allowlist_trace
+    if generation_filter_trace is not None:
+        decision.trace["generation_policy_filter"] = generation_filter_trace
+    if runtime_health_trace:
+        decision.trace["runtime_health"] = runtime_health_trace
+
+    model = decision.model
+    selected_direct_output_tokens = model.registry_facts.get(
+        "runtime_direct_output_tokens"
+    )
+    selected_context_window_tokens = model.registry_facts.get("context_window")
+    if (
+        isinstance(selected_direct_output_tokens, bool)
+        or not isinstance(selected_direct_output_tokens, int)
+        or selected_direct_output_tokens <= 0
+        or isinstance(selected_context_window_tokens, bool)
+        or not isinstance(selected_context_window_tokens, int)
+        or selected_context_window_tokens <= 0
+    ):
+        raise DynamicRankingError(
+            "router_single selected model has no frozen direct budget",
+            reason="router_single_model_budget_unavailable",
+        )
+    inherited_identity_matches = bool(
+        str(inherited_provider_config.provider or "").strip().casefold()
+        == str(model.provider or "").strip().casefold()
+        and str(inherited_provider_config.model or "").strip()
+        == str(model.model_id or "").strip()
+    )
+    resolution = resolve_provider_deployment(
+        config,
+        model.provider,
+        model.model_id,
+        inherited_provider_config=inherited_provider_config,
+        overrides=_EnsembleModelRef(
+            provider=model.provider,
+            model=model.model_id,
+            thinking=model.thinking,
+        ),
+        session_key=session_key,
+        turn_metadata=turn_metadata,
+        replay_provider_state=(
+            bool(inherited_provider_config.replay_provider_state)
+            if inherited_identity_matches
+            else False
+        ),
+        credential_pool_acquirer=credential_pool_acquirer,
+    )
+    if not resolution.ready or resolution.provider_config is None:
+        raise DynamicRankingError(
+            "router_single selected deployment became unavailable before dispatch",
+            reason="router_single_selected_deployment_unavailable",
+        )
+    provider_config = resolution.provider_config
+    try:
+        model_capabilities = model_catalog.get_capabilities(
+            provider_config.model,
+            provider_name=provider_config.provider,
+            base_url=provider_config.base_url,
+        )
+    except Exception as exc:
+        raise DynamicRankingError(
+            "router_single selected model capabilities are unavailable",
+            reason="router_single_model_capabilities_unavailable",
+        ) from exc
+    if not isinstance(model_capabilities, ModelCapabilities):
+        raise DynamicRankingError(
+            "router_single selected model capabilities are invalid",
+            reason="router_single_model_capabilities_unavailable",
+        )
+    from .model_catalog import CATALOG_CAPABILITIES_FOR_ANTHROPIC_OLLAMA
+
+    selected_provider_id = str(provider_config.provider or "").strip().casefold()
+    capability_flags_are_authoritative = bool(
+        selected_provider_id not in {"anthropic", "ollama"}
+        or CATALOG_CAPABILITIES_FOR_ANTHROPIC_OLLAMA
+    )
+    if (
+        requires_tools
+        and capability_flags_are_authoritative
+        and not model_capabilities.supports_tools
+    ):
+        raise DynamicRankingError(
+            "router_single selected model does not support tools",
+            reason="router_single_selected_model_tools_unavailable",
+        )
+    input_modalities = request_context.get("input_modalities")
+    requires_vision = bool(
+        isinstance(input_modalities, Sequence)
+        and not isinstance(input_modalities, (str, bytes, bytearray))
+        and "image" in input_modalities
+    )
+    if (
+        requires_vision
+        and capability_flags_are_authoritative
+        and not model_capabilities.supports_vision
+    ):
+        raise DynamicRankingError(
+            "router_single selected model does not support image input",
+            reason="router_single_selected_model_vision_unavailable",
+        )
+    if not _router_single_managed_thinking_is_executable(
+        provider_config=provider_config,
+        model_capabilities=model_capabilities,
+        thinking_policy_version=model.thinking_policy_version,
+        effective_thinking_level=model.effective_thinking_level,
+    ):
+        raise DynamicRankingError(
+            "router_single selected model cannot execute the managed thinking assignment",
+            reason="router_single_selected_model_reasoning_unavailable",
+        )
+    upstream = canonicalize_provider_routing_upstream(
+        provider_config.provider_routing.get(provider_config.model, "")
+    )
+    if callable(runtime_facts):
+        fresh_health = runtime_facts(
+            provider_config.provider,
+            provider_config.model,
+            upstream=upstream,
+            candidate_deployments=[
+                (provider_config.provider, provider_config.model, upstream)
+            ],
+        )
+        if isinstance(fresh_health, Mapping):
+            decision.trace["dispatch_health"] = dict(fresh_health)
+            unavailable = bool(
+                fresh_health.get("fresh") is True
+                and (
+                    str(fresh_health.get("state") or "") == "benched"
+                    or fresh_health.get("half_open_inflight") is True
+                )
+            )
+            if unavailable:
+                raise DynamicRankingError(
+                    "router_single selected deployment became unhealthy before dispatch",
+                    reason="router_single_selected_deployment_unhealthy",
+                )
+
+    return RouterSingleRoute(
+        provider_config=provider_config,
+        effective_tier=decision.effective_tier,
+        trace=deepcopy(decision.trace),
+        direct_output_tokens=selected_direct_output_tokens,
+        context_window_tokens=selected_context_window_tokens,
+        model_capabilities=model_capabilities,
+        thinking=model.thinking,
+        requested_thinking_level=model.requested_thinking_level,
+        effective_thinking_level=model.effective_thinking_level,
+        thinking_fallback_reason=model.thinking_fallback_reason,
+        thinking_policy_version=model.thinking_policy_version,
+    )
+
+
 def _build_router_tree_baseline_members(
     *,
     config: Any,
@@ -22446,7 +23125,7 @@ def _build_custom_b5_members(
     proposer_rows = [row for row in rows if row.role != "aggregator"]
     aggregator_rows = [row for row in rows if row.role == "aggregator"]
     if not proposer_rows:
-        raise ValueError("llm_ensemble custom_b5 lineup has no enabled proposers")
+        raise ValueError("llm_ensemble custom lineup has no enabled proposers")
     proposers = [
         _member_from_ref(
             _EnsembleModelRef(provider=row.provider, model=row.model, thinking=None),
@@ -22481,8 +23160,8 @@ def _build_custom_b5_members(
         session_key=session_key,
     )
     plan = {
-        "strategy": CUSTOM_B5_SELECTION_MODE,
-        "profile": CUSTOM_B5_SELECTION_MODE,
+        "strategy": _CUSTOM_B5_PROFILE_NAME,
+        "profile": _CUSTOM_B5_PROFILE_NAME,
         "proposer_count": len(proposers),
         "proposers": [
             {"provider": row.provider, "model": row.model, "role": row.role or ""}
@@ -22494,7 +23173,7 @@ def _build_custom_b5_members(
             "source": aggregator_source,
         },
     }
-    return CUSTOM_B5_SELECTION_MODE, proposers, aggregator, plan
+    return _CUSTOM_B5_PROFILE_NAME, proposers, aggregator, plan
 
 
 def custom_b5_lineup_ready(
@@ -22573,7 +23252,7 @@ def _resolve_member_deployment(
 def static_b5_credential_available(
     config: Any,
     inherited_provider_config: Any,
-    selection_mode: str = _STATIC_OPENROUTER_B5_PROFILE_NAME,
+    selection_mode: str = _STATIC_OPENROUTER_SELECTION_MODE,
     *,
     credential_pool_acquirer: CredentialPoolAcquirer | None = None,
     session_key: str = "",

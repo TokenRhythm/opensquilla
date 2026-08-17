@@ -1314,7 +1314,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
         squilla_router: { enabled: false, cross_provider_tiers: false },
         llm_ensemble: {
           enabled: true,
-          selection_mode: 'static_openrouter_b5',
+          selection_mode: 'static_openrouter',
         },
       },
       {
@@ -1328,7 +1328,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
 
     const { api, app } = await mountCatalog()
 
-    expect(api.ensemblePanel.value.selectionMode).toBe('static_openrouter_b5')
+    expect(api.ensemblePanel.value.selectionMode).toBe('static_openrouter')
     expect(api.sectionDirty('modelStrategy')).toBe(false)
     expect(api.hasUnsavedChanges.value).toBe(false)
     app.unmount()
@@ -1489,7 +1489,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
       { enabled: false, cross_provider_tiers: false },
       {
         enabled: true,
-        selection_mode: 'custom_b5',
+        selection_mode: 'custom',
         candidates,
         ...(modelOptions ? { model_options: modelOptions } : {}),
       },
@@ -1501,25 +1501,25 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     {
       name: 'keeps the OpenRouter static lineup off for an OpenRouter primary',
       provider: 'openrouter',
-      selectionMode: 'static_openrouter_b5',
+      selectionMode: 'static_openrouter',
       expected: false,
     },
     {
       name: 'detects the OpenRouter static lineup for a different primary',
       provider: 'tokenrhythm',
-      selectionMode: 'static_openrouter_b5',
+      selectionMode: 'static_openrouter',
       expected: true,
     },
     {
       name: 'keeps the TokenRhythm static lineup off for a TokenRhythm primary',
       provider: 'tokenrhythm',
-      selectionMode: 'static_tokenrhythm_b5',
+      selectionMode: 'static_tokenrhythm',
       expected: false,
     },
     {
       name: 'detects the TokenRhythm static lineup for a different primary',
       provider: 'openrouter',
-      selectionMode: 'static_tokenrhythm_b5',
+      selectionMode: 'static_tokenrhythm',
       expected: true,
     },
   ])('$name', async ({ provider, selectionMode, expected }) => {
@@ -1537,7 +1537,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
       { enabled: false, cross_provider_tiers: false },
       {
         enabled: true,
-        selection_mode: 'static_openrouter_b5',
+        selection_mode: 'static_openrouter',
         candidates: [
           { provider: 'deepseek', model: 'deepseek-chat' },
           { provider: 'gemini', model: 'gemini-flash' },
@@ -1650,7 +1650,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     await expectMultiProviderRouting(
       'tokenrhythm',
       { enabled: false },
-      { enabled: false, selection_mode: 'static_openrouter_b5' },
+      { enabled: false, selection_mode: 'static_openrouter' },
       false,
     )
   })
@@ -1835,7 +1835,7 @@ describe('useSetupCatalog configured provider management', () => {
           },
           llm_ensemble: {
             enabled: true,
-            selection_mode: 'custom_b5',
+            selection_mode: 'custom',
             candidates: [
               { provider: 'gemini', model: 'gemini-2.5-flash', role: 'aggregator' },
             ],

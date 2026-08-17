@@ -44,6 +44,7 @@ from .types import ChatConfig, DoneEvent, ErrorEvent, Message, TextDeltaEvent
 log = structlog.get_logger(__name__)
 
 RANKING_VERSION = "step2-ranking-v4"
+SINGLE_MODEL_RANKING_VERSION = "router-single-ranking-v1"
 LEGACY_THINKING_RANKING_VERSION = "step2-ranking-v3"
 LEGACY_RANKING_VERSION = "step2-ranking-v2"
 RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
@@ -783,6 +784,17 @@ class RankingDecision:
     # Ordered, unselected proposer replacements from the same hard-filtered
     # and scored registry snapshot.
     backup_proposers: tuple[RankedModel, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
+class SingleModelRankingDecision:
+    """One direct generation model and its replay evidence."""
+
+    model: RankedModel
+    effective_tier: int
+    trace: dict[str, Any]
+    thinking_assignment: dict[str, Any] = field(default_factory=dict)
+    thinking_assignment_details: dict[str, Any] = field(default_factory=dict)
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -3739,18 +3751,43 @@ def validate_user_profile(
     return errors
 
 
-def build_request_context(
+def _legacy_fusion_last_route(
+    *,
+    turn_metadata: Mapping[str, Any] | None,
+    effective_config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project the existing B5 P/A route memory without changing its contract."""
+
+    metadata = dict(turn_metadata or {})
+    supplied = metadata.get("router_dynamic_request_context") or metadata.get(
+        "request_context"
+    )
+    supplied_map = supplied if isinstance(supplied, Mapping) else {}
+    supplied_last_route = supplied_map.get("last_route")
+    if not isinstance(supplied_last_route, Mapping):
+        supplied_last_route = metadata.get("router_dynamic_last_route") or metadata.get(
+            "last_route"
+        )
+    return _sanitize_last_route(supplied_last_route, effective_config)
+
+
+def _build_request_context_base(
     *,
     message: str,
     turn_metadata: Mapping[str, Any] | None,
     attachments: Sequence[Mapping[str, Any]] | None,
-    candidate_output_tokens: int,
-    aggregator_output_tokens: int,
-    ranking_config: Mapping[str, Any] | None = None,
+    last_route: Mapping[str, Any],
+    include_previous_candidates: bool,
+    effective_config: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Build the temporary chapter-2 request context without logging raw input."""
+    """Build request facts shared by fusion and direct routing.
 
-    effective_config = _resolve_ranking_config(ranking_config)
+    Output-role budgets and the final snapshot hash deliberately belong to the
+    public mode-specific wrappers below.  Keeping this base role-neutral makes
+    it impossible for direct routing to acquire proposer/aggregator budgeting
+    as an implementation side effect.
+    """
+
     limits = _ranking_mapping(effective_config, "context", "request_limits")
     max_recent_turns = _as_int(limits["max_recent_turns"])
     fallback_history_max_turns = _as_int(limits["fallback_history_max_turns"])
@@ -3836,27 +3873,20 @@ def build_request_context(
     }
     supplied_intermediate = supplied_map.get("intermediate_outputs")
     intermediate_raw = supplied_intermediate if isinstance(supplied_intermediate, Mapping) else {}
-    intermediate_outputs = {
-        "previous_candidates": _bounded_string_list(
+    intermediate_outputs: dict[str, Any] = {}
+    if include_previous_candidates:
+        intermediate_outputs["previous_candidates"] = _bounded_string_list(
             intermediate_raw.get("previous_candidates"),
             max_items=intermediate_max_items,
             max_chars=intermediate_max_chars,
             max_scanned_items_multiplier=scan_multiplier,
-        ),
-        "current_errors": _bounded_string_list(
-            intermediate_raw.get("current_errors"),
-            max_items=intermediate_max_items,
-            max_chars=intermediate_max_chars,
-            max_scanned_items_multiplier=scan_multiplier,
-        ),
-    }
-    supplied_last_route = supplied_map.get("last_route")
-    if not isinstance(supplied_last_route, Mapping):
-        supplied_last_route = metadata.get("router_dynamic_last_route") or metadata.get(
-            "last_route"
         )
-    last_route = _sanitize_last_route(supplied_last_route, effective_config)
-
+    intermediate_outputs["current_errors"] = _bounded_string_list(
+        intermediate_raw.get("current_errors"),
+        max_items=intermediate_max_items,
+        max_chars=intermediate_max_chars,
+        max_scanned_items_multiplier=scan_multiplier,
+    )
     modalities = list(default_modalities)
     attachment_refs: list[str] = []
     for index, attachment_value in enumerate(attachments or []):
@@ -3953,8 +3983,6 @@ def build_request_context(
             _as_int(supplied_budget_map.get("tool_log_tokens"), 0),
             estimated_tool_tokens,
         ),
-        "candidate_output_tokens": max(minimum_tokens, candidate_output_tokens),
-        "aggregator_output_tokens": max(minimum_tokens, aggregator_output_tokens),
     }
     context = {
         "conversation": conversation,
@@ -3966,6 +3994,78 @@ def build_request_context(
         "input_modalities": modalities,
         "attachment_refs": attachment_refs,
     }
+    return context
+
+
+def build_request_context(
+    *,
+    message: str,
+    turn_metadata: Mapping[str, Any] | None,
+    attachments: Sequence[Mapping[str, Any]] | None,
+    candidate_output_tokens: int,
+    aggregator_output_tokens: int,
+    ranking_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the temporary chapter-2 fusion context without logging raw input."""
+
+    effective_config = _resolve_ranking_config(ranking_config)
+    context = _build_request_context_base(
+        message=message,
+        turn_metadata=turn_metadata,
+        attachments=attachments,
+        last_route=_legacy_fusion_last_route(
+            turn_metadata=turn_metadata,
+            effective_config=effective_config,
+        ),
+        include_previous_candidates=True,
+        effective_config=effective_config,
+    )
+    minimum_tokens = _ranking_int(
+        effective_config, "context", "output_budget", "minimum_tokens"
+    )
+    context["routing_budget"].update(
+        {
+            "candidate_output_tokens": max(minimum_tokens, candidate_output_tokens),
+            "aggregator_output_tokens": max(minimum_tokens, aggregator_output_tokens),
+        }
+    )
+    context["snapshot_hash"] = _request_context_hash(context)
+    return context
+
+
+def build_single_model_request_context(
+    *,
+    message: str,
+    turn_metadata: Mapping[str, Any] | None,
+    attachments: Sequence[Mapping[str, Any]] | None,
+    output_tokens: int,
+    ranking_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build direct-routing context without exposing fusion output budgets."""
+
+    if (
+        isinstance(output_tokens, bool)
+        or not isinstance(output_tokens, int)
+        or output_tokens <= 0
+    ):
+        raise DynamicRankingError(
+            "router_dynamic single-model output_tokens must be a positive integer"
+        )
+    effective_config = _resolve_ranking_config(ranking_config)
+    context = _build_request_context_base(
+        message=message,
+        turn_metadata=turn_metadata,
+        attachments=attachments,
+        last_route={},
+        include_previous_candidates=False,
+        effective_config=effective_config,
+    )
+    minimum_tokens = _ranking_int(
+        effective_config, "context", "output_budget", "minimum_tokens"
+    )
+    context["routing_budget"]["direct_output_tokens"] = max(
+        minimum_tokens, output_tokens
+    )
     context["snapshot_hash"] = _request_context_hash(context)
     return context
 
@@ -4749,15 +4849,20 @@ def _compact_task_analyzer_request_context(
     """Keep routing-critical facts when the full context exceeds the payload cap."""
 
     routing_budget_raw = request_context.get("routing_budget")
+    direct_routing = isinstance(routing_budget_raw, Mapping) and (
+        "direct_output_tokens" in routing_budget_raw
+    )
+    routing_budget_keys = ["estimated_input_tokens", "tool_log_tokens"]
+    if direct_routing:
+        routing_budget_keys.append("direct_output_tokens")
+    else:
+        routing_budget_keys.extend(
+            ["candidate_output_tokens", "aggregator_output_tokens"]
+        )
     routing_budget = (
         {
             key: max(0, _as_int(routing_budget_raw.get(key), 0))
-            for key in (
-                "estimated_input_tokens",
-                "tool_log_tokens",
-                "candidate_output_tokens",
-                "aggregator_output_tokens",
-            )
+            for key in routing_budget_keys
         }
         if isinstance(routing_budget_raw, Mapping)
         else {}
@@ -4774,9 +4879,13 @@ def _compact_task_analyzer_request_context(
     compact: dict[str, Any] = {
         "routing_budget": routing_budget,
         "input_modalities": modalities,
-        "last_route": _sanitize_last_route(
-            request_context.get("last_route"),
-            ranking_config,
+        "last_route": (
+            {}
+            if direct_routing
+            else _sanitize_last_route(
+                request_context.get("last_route"),
+                ranking_config,
+            )
         ),
         "payload_context_truncated": True,
     }
@@ -8414,6 +8523,505 @@ def _aggregator_score_trace(
             }
         )
     return trace
+
+
+def _single_model_context_need(
+    *,
+    task_profile: Mapping[str, Any],
+    request_context: Mapping[str, Any],
+    ranking_config: Mapping[str, Any],
+    direct_output_tokens: int,
+) -> int:
+    raw_budget = request_context.get("routing_budget")
+    budget = raw_budget if isinstance(raw_budget, Mapping) else {}
+    if (
+        isinstance(direct_output_tokens, bool)
+        or not isinstance(direct_output_tokens, int)
+        or direct_output_tokens <= 0
+    ):
+        raise DynamicRankingError(
+            "router_dynamic single-model request context requires a positive "
+            "direct_output_tokens budget"
+        )
+    constraints = task_profile.get("constraints")
+    constraint_map = constraints if isinstance(constraints, Mapping) else {}
+    default_bucket = _ranking_string(ranking_config, "context", "default_bucket")
+    bucket = str(constraint_map.get("context") or default_bucket)
+    bucket_min_tokens = _context_bucket_min_tokens(ranking_config)
+    input_tokens = max(
+        max(0, _as_int(budget.get("estimated_input_tokens"), 0)),
+        bucket_min_tokens.get(bucket, bucket_min_tokens[default_bucket]),
+    )
+    minimum_tokens = _ranking_int(
+        ranking_config, "context", "output_budget", "minimum_tokens"
+    )
+    return (
+        input_tokens
+        + max(0, _as_int(budget.get("tool_log_tokens"), 0))
+        + max(minimum_tokens, direct_output_tokens)
+    )
+
+
+def _single_model_direct_output_tokens(
+    model: RankedModel,
+    *,
+    request_context: Mapping[str, Any],
+) -> tuple[int, str]:
+    raw_budget = request_context.get("routing_budget")
+    budget = raw_budget if isinstance(raw_budget, Mapping) else {}
+    request_output_tokens = budget.get("direct_output_tokens")
+    if (
+        isinstance(request_output_tokens, bool)
+        or not isinstance(request_output_tokens, int)
+        or request_output_tokens <= 0
+    ):
+        raise DynamicRankingError(
+            "router_dynamic single-model request context requires a positive "
+            "direct_output_tokens budget"
+        )
+
+    runtime_output_tokens = model.registry_facts.get(
+        "runtime_direct_output_tokens"
+    )
+    if runtime_output_tokens is None:
+        # Compatibility for archived/external snapshots that predate runtime
+        # deployment enrichment. The request scalar is the audited safe upper
+        # bound used before a candidate-specific deployment is selected.
+        return request_output_tokens, "request_context_fallback"
+    if (
+        isinstance(runtime_output_tokens, bool)
+        or not isinstance(runtime_output_tokens, int)
+        or runtime_output_tokens <= 0
+    ):
+        raise DynamicRankingError(
+            "router_dynamic model registry "
+            f"{model.identity} has invalid runtime_direct_output_tokens"
+        )
+    return runtime_output_tokens, "runtime_registry_fact"
+
+
+def _single_model_filter_reasons(
+    model: RankedModel,
+    *,
+    task_profile: Mapping[str, Any],
+    user_profile: Mapping[str, Any],
+    request_context: Mapping[str, Any],
+    ranking_config: Mapping[str, Any],
+    thinking_policy: Mapping[str, Any] | None,
+    requires_tools: bool,
+) -> tuple[list[str], int, int, str]:
+    reasons, _ = _hard_filter_reasons(
+        model,
+        role="proposer",
+        task_profile=task_profile,
+        user_profile=user_profile,
+        request_context=request_context,
+        proposer_count=1,
+        ranking_config=ranking_config,
+        thinking_policy=thinking_policy,
+    )
+    reasons = [
+        reason
+        for reason in reasons
+        if reason
+        not in {
+            "context_exceeded",
+            "required_parameter_tools_unsupported",
+            "status_unavailable",
+        }
+    ]
+    if str(model.registry_facts.get("status") or "").strip().casefold() != "enabled":
+        reasons.append("status_not_enabled")
+    if requires_tools and model.registry_facts.get("supports_tools") is not True:
+        reasons.append("required_parameter_tools_unsupported")
+    direct_output_tokens, direct_output_tokens_source = (
+        _single_model_direct_output_tokens(
+            model,
+            request_context=request_context,
+        )
+    )
+    context_need = _single_model_context_need(
+        task_profile=task_profile,
+        request_context=request_context,
+        ranking_config=ranking_config,
+        direct_output_tokens=direct_output_tokens,
+    )
+    if _as_int(model.registry_facts.get("context_window"), 0) < context_need:
+        reasons.append("context_exceeded")
+    return (
+        list(dict.fromkeys(reasons)),
+        context_need,
+        direct_output_tokens,
+        direct_output_tokens_source,
+    )
+
+
+def rank_single_model(
+    *,
+    task_analysis: TaskAnalysisResult,
+    user_profile: Mapping[str, Any] | None,
+    request_context: Mapping[str, Any],
+    registry_snapshot: Mapping[str, Any],
+    routed_tier: str,
+    routing_confidence: float,
+    requires_tools: bool,
+    ranking_config: Mapping[str, Any] | None = None,
+    decision_id: str = "",
+    ranking_thinking_assignment_enabled: bool = False,
+) -> SingleModelRankingDecision:
+    """Select one enabled direct-call model by proposer base score."""
+
+    if not isinstance(requires_tools, bool):
+        raise DynamicRankingError(
+            "router_dynamic single-model requires_tools must be a boolean"
+        )
+    if not isinstance(ranking_thinking_assignment_enabled, bool):
+        raise DynamicRankingError(
+            "router_dynamic ranking_thinking_assignment_enabled must be a boolean"
+        )
+    if not isinstance(registry_snapshot, Mapping):
+        raise DynamicRankingError(
+            "router_dynamic single-model registry snapshot must be an object"
+        )
+
+    effective_ranking_config = _prepare_effective_ranking_config(
+        ranking_config,
+        thinking_assignment_enabled=ranking_thinking_assignment_enabled,
+    )
+    model_registry_snapshot = {
+        "schema_version": copy.deepcopy(registry_snapshot.get("schema_version")),
+        "snapshot_version": copy.deepcopy(registry_snapshot.get("snapshot_version")),
+        "models": copy.deepcopy(registry_snapshot.get("models")),
+    }
+    if not ranking_thinking_assignment_enabled:
+        model_registry_snapshot = _legacy_registry_snapshot_projection(
+            model_registry_snapshot
+        )
+    if (
+        ranking_thinking_assignment_enabled
+        and effective_ranking_config.get("schema_version")
+        != RANKING_CONFIG_SCHEMA_VERSION
+    ):
+        raise DynamicRankingError(
+            f"router_dynamic thinking_assignment requires {RANKING_CONFIG_SCHEMA_VERSION}"
+        )
+    if (
+        ranking_thinking_assignment_enabled
+        and _ranking_number(
+            effective_ranking_config,
+            "proposer_count",
+            "effective_tier_rounding_offset",
+        )
+        != 0.5
+    ):
+        raise DynamicRankingError(
+            "router_dynamic thinking-policy-v1 requires "
+            "proposer_count.effective_tier_rounding_offset to be 0.5"
+        )
+    thinking_policy = (
+        _thinking_assignment_policy(
+            effective_ranking_config,
+            allow_legacy_external_switch=True,
+        )
+        if ranking_thinking_assignment_enabled
+        else None
+    )
+    rows = model_registry_snapshot.get("models")
+    if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+        raise DynamicRankingError(
+            "router_dynamic single-model registry snapshot contains no models"
+        )
+    if any(not isinstance(row, Mapping) for row in rows):
+        raise DynamicRankingError(
+            "router_dynamic single-model registry snapshot contains a malformed model row"
+        )
+    models = [
+        _normalize_model(
+            row,
+            effective_ranking_config,
+            thinking_policy=thinking_policy,
+        )
+        for row in rows
+    ]
+    if not models:
+        raise DynamicRankingError(
+            "router_dynamic single-model registry snapshot is empty",
+            reason="no_eligible_single_model",
+        )
+    model_identities = [model.identity.casefold() for model in models]
+    if len(set(model_identities)) != len(model_identities):
+        raise DynamicRankingError(
+            "router_dynamic single-model registry snapshot contains duplicate "
+            "model identities"
+        )
+
+    user_profile_enabled = user_profile is not None
+    effective_user_profile = user_profile if user_profile is not None else {}
+    task_profile, session_trace = _apply_session_adjustment(
+        task_analysis.profile,
+        request_context,
+        effective_ranking_config,
+    )
+    effective_tier = _effective_tier(task_profile, effective_ranking_config)
+
+    proposer_filters: list[dict[str, Any]] = []
+    eligible: list[RankedModel] = []
+    for model in models:
+        (
+            reasons,
+            context_need,
+            direct_output_tokens,
+            direct_output_tokens_source,
+        ) = _single_model_filter_reasons(
+            model,
+            task_profile=task_profile,
+            user_profile=effective_user_profile,
+            request_context=request_context,
+            ranking_config=effective_ranking_config,
+            thinking_policy=thinking_policy,
+            requires_tools=requires_tools,
+        )
+        proposer_filters.append(
+            {
+                "identity": model.identity,
+                "model": model.model_id,
+                "role": "proposer",
+                "eligible": not reasons,
+                "reasons": reasons,
+                "context_need_tokens": context_need,
+                "direct_output_tokens": direct_output_tokens,
+                "direct_output_tokens_source": direct_output_tokens_source,
+            }
+        )
+        if not reasons:
+            eligible.append(model)
+    if not eligible:
+        reason_counts: dict[str, int] = {}
+        for filter_row in proposer_filters:
+            for reason in filter_row["reasons"]:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        log.warning(
+            "llm_ensemble.router_dynamic.no_eligible_single_model",
+            decision_id=decision_id,
+            registry_snapshot_version=model_registry_snapshot.get(
+                "snapshot_version"
+            ),
+            filter_reason_counts=reason_counts,
+        )
+        raise DynamicRankingError(
+            "router_dynamic has no enabled direct-call model after hard filtering",
+            reason="no_eligible_single_model",
+        )
+
+    score_rows = [
+        _base_score_row(
+            model,
+            task_profile,
+            user_profile,
+            request_context,
+            effective_ranking_config,
+        )
+        for model in eligible
+    ]
+    score_rows.sort(
+        key=lambda row: (
+            -_as_float(row["base"]),
+            -_as_float(row["quality"]),
+            row["model"].identity,
+        )
+    )
+    selected = score_rows[0]["model"]
+    session_nonzero_epsilon = _ranking_number(
+        effective_ranking_config, "trace", "session_nonzero_epsilon"
+    )
+    session_adjusted_ids = sorted(
+        row["model"].identity
+        for row in score_rows
+        if abs(_as_float(row.get("session_score"))) > session_nonzero_epsilon
+    )
+    session_trace["sticky_applied"] = (
+        session_trace["intent"] == "continue" and bool(session_adjusted_ids)
+    )
+    session_trace["adjusted_model_ids"] = session_adjusted_ids
+
+    assigned_model = selected
+    thinking_assignment: dict[str, Any] = {}
+    thinking_assignment_details: dict[str, Any] = {}
+    thinking_assignment_reasons: dict[str, Any] = {}
+    thinking_unsupported_fallbacks: list[dict[str, Any]] = []
+    if thinking_policy is not None:
+        target, target_reasons, risk_floor = _thinking_target_for_role(
+            role="proposer",
+            effective_tier=effective_tier,
+            task_profile=task_profile,
+            session_trace=session_trace,
+            policy=thinking_policy,
+        )
+        assigned_model, detail, unsupported = _resolve_model_thinking_level(
+            selected,
+            role="proposer",
+            requested_level=target,
+            reasons=target_reasons,
+            risk_floor=risk_floor,
+            policy=thinking_policy,
+        )
+        thinking_assignment = {
+            "proposers": {
+                assigned_model.identity: assigned_model.effective_thinking_level
+            },
+            "thinking_policy_version": str(thinking_policy["policy_version"]),
+        }
+        thinking_assignment_details = {
+            "effective_tier": effective_tier,
+            "proposers": [detail],
+        }
+        thinking_assignment_reasons = {
+            "proposers": {detail["identity"]: list(detail["reasons"])}
+        }
+        if unsupported is not None:
+            thinking_unsupported_fallbacks.append(unsupported)
+
+    reason_counts = {}
+    for filter_row in proposer_filters:
+        for reason in filter_row["reasons"]:
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    ranking_config_hash = _canonical_hash(effective_ranking_config)
+    registry_snapshot_hash = _canonical_hash(model_registry_snapshot)
+    profile_decimal_places = _ranking_int(
+        effective_ranking_config, "trace", "profile_decimal_places"
+    )
+    router_tier_mapping = _router_tier_mapping(effective_ranking_config)
+    router_tier_by_effective_tier = {
+        tier: router_tier for router_tier, tier in router_tier_mapping.items()
+    }
+    trace_registry_snapshot = copy.deepcopy(model_registry_snapshot)
+    trace_request_context = copy.deepcopy(dict(request_context))
+    trace_request_context["snapshot_hash"] = _request_context_hash(
+        trace_request_context
+    )
+    _assert_public_ranking_trace_payload(
+        trace_registry_snapshot,
+        label="registry_snapshot",
+    )
+    _assert_public_ranking_trace_payload(
+        trace_request_context,
+        label="request_context",
+    )
+    base_ranking_version = (
+        RANKING_VERSION
+        if ranking_thinking_assignment_enabled
+        else LEGACY_RANKING_VERSION
+    )
+    trace = {
+        "strategy": "router_dynamic",
+        "execution_mode": "router_single",
+        "decision_id": decision_id,
+        "ranking_version": SINGLE_MODEL_RANKING_VERSION,
+        "base_ranking_version": base_ranking_version,
+        "ranking_config_schema_version": str(
+            effective_ranking_config["schema_version"]
+        ),
+        "ranking_config_version": str(effective_ranking_config["config_version"]),
+        "ranking_config_hash": ranking_config_hash,
+        "task_profile_schema_version": TASK_PROFILE_SCHEMA_VERSION,
+        "registry_snapshot_version": str(
+            model_registry_snapshot.get("snapshot_version") or ""
+        ),
+        "registry_snapshot_hash": registry_snapshot_hash,
+        "registry_snapshot": trace_registry_snapshot,
+        "routed_tier": _router_tier(routed_tier, effective_ranking_config),
+        "routing_confidence": round(
+            _clamp(routing_confidence), profile_decimal_places
+        ),
+        "effective_tier": effective_tier,
+        "effective_router_tier": router_tier_by_effective_tier[effective_tier],
+        "task_analyzer": task_analysis.trace(effective_ranking_config),
+        "task_profile": copy.deepcopy(task_profile),
+        "task_profile_hash": _canonical_hash(task_profile),
+        "task_profile_pre_escalation": session_trace.pop(
+            "task_profile_pre_escalation"
+        ),
+        "task_profile_post_escalation": session_trace.pop(
+            "task_profile_post_escalation"
+        ),
+        "session": session_trace,
+        "user_profile_enabled": user_profile_enabled,
+        "user_profile_version": str(
+            effective_user_profile.get("profile_version") or ""
+        ),
+        "user_profile_source": str(
+            effective_user_profile.get("profile_source") or ""
+        ),
+        "request_context_hash": trace_request_context["snapshot_hash"],
+        "request_context": trace_request_context,
+        "candidate_pool_size": len(models),
+        "candidate_pool": [
+            model.trace(
+                include_thinking_contract=ranking_thinking_assignment_enabled
+            )
+            for model in models
+        ],
+        "hard_filter": {
+            "proposer_results": proposer_filters,
+            "eligible_proposer_ids": [model.identity for model in eligible],
+            "filter_reason_counts": reason_counts,
+        },
+        "model_scores": [
+            _score_trace(row, effective_ranking_config) for row in score_rows
+        ],
+        "selection_policy": "base_score_top1",
+        "selection_tie_breakers": [
+            "S_base_desc",
+            "S_qual_desc",
+            "identity_asc",
+        ],
+        "selected_model": assigned_model.identity,
+        "selected_P": [assigned_model.identity],
+        "proposer_count": 1,
+        "stop_reason": "single_model_top1_selected",
+    }
+    if thinking_policy is not None:
+        trace.update(
+            {
+                "ranking_thinking_assignment_enabled": True,
+                "thinking_physical_evidence_schema": (
+                    THINKING_PHYSICAL_EVIDENCE_SCHEMA
+                ),
+                "thinking_policy_version": str(thinking_policy["policy_version"]),
+                "thinking_assignment": copy.deepcopy(thinking_assignment),
+                "thinking_assignment_details": copy.deepcopy(
+                    thinking_assignment_details
+                ),
+                "assignment_reasons": copy.deepcopy(
+                    thinking_assignment_reasons
+                ),
+                "unsupported_level_fallbacks": copy.deepcopy(
+                    thinking_unsupported_fallbacks
+                ),
+                "policy_versions": {
+                    "ranking": base_ranking_version,
+                    "thinking": str(thinking_policy["policy_version"]),
+                },
+            }
+        )
+    log.info(
+        "llm_ensemble.router_dynamic.single_model_selection_recorded",
+        decision_id=decision_id,
+        selected_model=assigned_model.identity,
+        ranking_version=SINGLE_MODEL_RANKING_VERSION,
+        candidate_pool_size=len(models),
+        eligible_model_count=len(eligible),
+        requires_tools=requires_tools,
+    )
+    return SingleModelRankingDecision(
+        model=assigned_model,
+        effective_tier=effective_tier,
+        trace=trace,
+        thinking_assignment=copy.deepcopy(thinking_assignment),
+        thinking_assignment_details=copy.deepcopy(
+            thinking_assignment_details
+        ),
+    )
 
 
 def _selection_roster_counts(

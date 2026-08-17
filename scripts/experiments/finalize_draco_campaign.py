@@ -41,6 +41,10 @@ from opensquilla.eval.draco_artifact_io import (
     durable_artifact_capability_contract,
     verify_durable_draco_artifacts,
 )
+from opensquilla.eval.draco_experiment_config import (
+    canonicalize_draco_ensemble_mode,
+    canonicalize_draco_selection_mode,
+)
 from opensquilla.eval.draco_resume_source_index import (
     DracoResumeSourceError,
     ResumeRowLocator,
@@ -2585,6 +2589,29 @@ def _selection_plan_manifest_contract(
     }
 
 
+def canonicalize_run_compatibility_public_aliases(
+    contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Project legacy public config literals without rewriting protocol labels."""
+
+    def visit(value: Any, path: tuple[str, ...] = ()) -> Any:
+        if isinstance(value, Mapping):
+            normalized: dict[str, Any] = {}
+            for key, item in value.items():
+                if key == "selection_mode":
+                    normalized[key] = canonicalize_draco_selection_mode(item)
+                elif key == "mode" and path and path[-1] == "llm_ensemble":
+                    normalized[key] = canonicalize_draco_ensemble_mode(item)
+                else:
+                    normalized[key] = visit(item, (*path, str(key)))
+            return normalized
+        if isinstance(value, list):
+            return [visit(item, path) for item in value]
+        return copy.deepcopy(value)
+
+    return visit(contract)
+
+
 def load_manifest_contracts(
     paths: Sequence[Path],
     *,
@@ -3422,6 +3449,7 @@ def load_manifest_contracts(
             )
         fingerprints: dict[str, str] = {}
         contracts: dict[str, dict[str, Any]] = {}
+        source_fingerprints: dict[str, str] = {}
         for group in groups:
             fingerprint = str(raw_fingerprints.get(group) or "")
             contract = raw_contracts.get(group)
@@ -3433,8 +3461,10 @@ def load_manifest_contracts(
                 raise FinalizationError(
                     f"manifest {group} compatibility fingerprint differs: {path}"
                 )
-            fingerprints[group] = fingerprint
-            contracts[group] = contract
+            canonical_contract = canonicalize_run_compatibility_public_aliases(contract)
+            fingerprints[group] = canonical_sha256(canonical_contract, prefix=True)
+            contracts[group] = canonical_contract
+            source_fingerprints[group] = fingerprint
             runtime = contract.get("resolved_llm_runtime")
             candidate_key = (
                 normalize_key_fingerprint(
@@ -3467,6 +3497,7 @@ def load_manifest_contracts(
                 else file_sha256(result_path)
             ),
             "rows_written": result_row_count,
+            "run_compatibility_fingerprints": source_fingerprints,
             "execution_scheduling": execution_scheduling,
             "live_web_preflight": {
                 "status": preflight_status,
@@ -4268,9 +4299,10 @@ def validate_formal_campaign_contracts(
         if (
             not isinstance(b2_spec, Mapping)
             or b2_spec.get("kind") != "selection_mode"
-            or b2_spec.get("selection_mode") != "static_openrouter_b5"
+            or canonicalize_draco_selection_mode(b2_spec.get("selection_mode"))
+            != "static_openrouter"
         ):
-            raise FinalizationError("B2 formal contract must use static_openrouter_b5")
+            raise FinalizationError("B2 formal contract must use static_openrouter")
     routes: Mapping[str, Any] = {}
     g1_analyzer_policy: Mapping[str, Any] = {}
     if "G1" in active_groups:
@@ -11223,6 +11255,26 @@ def g1_retrospective_reclassification_recovery(
     }
 
 
+def source_run_compatibility_fingerprint(
+    record: SourceRecord,
+    *,
+    group: str,
+    authoritative_fingerprints: Mapping[str, str],
+    manifest_sources: Sequence[Mapping[str, Any]],
+) -> str:
+    """Return the raw fingerprint sealed into the record's own source shard."""
+
+    if 0 <= record.source_index < len(manifest_sources):
+        source_fingerprints = manifest_sources[record.source_index].get(
+            "run_compatibility_fingerprints"
+        )
+        if isinstance(source_fingerprints, Mapping):
+            source_fingerprint = str(source_fingerprints.get(group) or "")
+            if SHA256_VALUE.fullmatch(source_fingerprint):
+                return source_fingerprint
+    return str(authoritative_fingerprints[group])
+
+
 def select_results(
     records: Sequence[SourceRecord],
     *,
@@ -11314,16 +11366,22 @@ def select_results(
                         line=record.line,
                         row=validation_row,
                     )
+                expected_fingerprint = source_run_compatibility_fingerprint(
+                    validation_record,
+                    group=group,
+                    authoritative_fingerprints=fingerprints,
+                    manifest_sources=manifest_sources,
+                )
                 reasons = generation_reasons(
                     validation_record,
                     task=task,
-                    expected_fingerprint=fingerprints[group],
+                    expected_fingerprint=expected_fingerprint,
                     contract=contracts[group],
                 )
                 audit_reasons = generation_audit_reasons(
                     validation_record,
                     task=task,
-                    expected_fingerprint=fingerprints[group],
+                    expected_fingerprint=expected_fingerprint,
                     contract=contracts[group],
                 )
                 if audit_reasons:
@@ -15591,7 +15649,7 @@ def experiment_results_markdown(
     group_config_rows = {
         "B0": f"| B0 | single | `{B0_MODEL}` |",
         "B1": "| B1 | router_single | frozen `c0/c1/c2/c3` tiers |",
-        "B2": "| B2 | selection_mode | `static_openrouter_b5` |",
+        "B2": "| B2 | selection_mode | `static_openrouter` |",
         "B4": f"| B4 | single | `{B4_MODEL}` |",
         "G1": "| G1 | selection_mode | frozen-registry `router_dynamic` |",
     }

@@ -211,7 +211,7 @@ def test_untouched_ensemble_reports_default() -> None:
     fields = resolve_effective_llm(_config(), ModelCatalog())
     assert fields["llm_ensemble.enabled"] == ResolvedField(False, "default")
     assert fields["llm_ensemble.selection_mode"] == ResolvedField(
-        "static_openrouter_b5", "default"
+        "static_openrouter", "default"
     )
 
 

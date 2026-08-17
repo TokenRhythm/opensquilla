@@ -59,11 +59,11 @@ def test_interactive_ensemble_configure_persists(tmp_path, monkeypatch):
                 assert kwargs.get("choices") == [
                     "router_dynamic",
                     "router_tree_baseline",
-                    "static_openrouter_b5",
-                    "static_tokenrhythm_b5",
-                    "custom_b5",
+                    "static_openrouter",
+                    "static_tokenrhythm",
+                    "custom",
                 ]
-                assert kwargs.get("default") == "static_openrouter_b5"
+                assert kwargs.get("default") == "static_openrouter"
                 return _Answer("router_dynamic")
             if message == "Policy when all proposers fail":
                 assert kwargs.get("choices") == ["fallback_single", "error"]

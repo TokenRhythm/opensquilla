@@ -24,6 +24,30 @@ FORMAL_DRACO_WEB_SEARCH_API_KEY_ENVS = {
     "duckduckgo": "",
 }
 
+DRACO_SELECTION_MODE_ALIASES: dict[str, str] = {
+    "static_openrouter_b5": "static_openrouter",
+    "static_tokenrhythm_b5": "static_tokenrhythm",
+    "custom_b5": "custom",
+}
+DRACO_ENSEMBLE_MODE_ALIASES: dict[str, str] = {
+    "b5_fusion": "multiple",
+    "router_single": "single",
+}
+
+
+def canonicalize_draco_selection_mode(value: Any) -> str:
+    """Canonicalize legacy public selection-mode literals in DRACO artifacts."""
+
+    cleaned = str(value or "").strip()
+    return DRACO_SELECTION_MODE_ALIASES.get(cleaned, cleaned)
+
+
+def canonicalize_draco_ensemble_mode(value: Any) -> str:
+    """Canonicalize legacy public ensemble-mode literals in DRACO artifacts."""
+
+    cleaned = str(value or "").strip()
+    return DRACO_ENSEMBLE_MODE_ALIASES.get(cleaned, cleaned)
+
 
 class _StrictConfig(BaseModel):
     model_config = ConfigDict(
@@ -59,8 +83,13 @@ class DracoBenchmarkInputConfig(_StrictConfig):
 
 
 class DracoRoutingConfig(_StrictConfig):
-    selection_mode: Literal["static_openrouter_b5"]
+    selection_mode: Literal["static_openrouter"]
     skip_single_model_router: bool
+
+    @field_validator("selection_mode", mode="before")
+    @classmethod
+    def _canonicalize_selection_mode(cls, value: Any) -> str:
+        return canonicalize_draco_selection_mode(value)
 
 
 def _canonical_json_sha256(value: Any) -> str:

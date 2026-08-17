@@ -236,7 +236,8 @@ def test_selection_mode_only_upsert_keeps_all_other_keys() -> None:
     res = upsert_llm_ensemble(cfg, selection_mode="static_openrouter_b5")
 
     ensemble = res.config.llm_ensemble
-    assert ensemble.selection_mode == "static_openrouter_b5"
+    assert ensemble.selection_mode == "static_openrouter"
+    assert res.public_payload["selection_mode"] == "static_openrouter"
     assert ensemble.enabled is False
     assert ensemble.model_options == ["custom/model-a"]
     assert ensemble.min_successful_proposers == 2

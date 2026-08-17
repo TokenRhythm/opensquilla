@@ -154,7 +154,7 @@ describe('useSetupModelStrategyForm', () => {
     expect(ensemble.enabled.value).toBe(true)
     // Never the hidden legacy dynamic mode — an explicit custom lineup keeps
     // the edited pool effective at runtime.
-    expect(ensemble.selectionMode.value).toBe('custom_b5')
+    expect(ensemble.selectionMode.value).toBe('custom')
     expect(strategy.activeStrategy.value).toBe('ensemble')
   })
 
@@ -175,7 +175,7 @@ describe('useSetupModelStrategyForm', () => {
 
     strategy.setStrategy('ensemble')
 
-    expect(ensemble.selectionMode.value).toBe('custom_b5')
+    expect(ensemble.selectionMode.value).toBe('custom')
     expect(ensemble.candidates.value.map(c => c.model)).toEqual(['gpt-5.5', 'gpt-5.4-mini'])
   })
 
@@ -186,7 +186,7 @@ describe('useSetupModelStrategyForm', () => {
 
     expect(router.mode.value).toBe('disabled')
     expect(ensemble.enabled.value).toBe(true)
-    expect(ensemble.selectionMode.value).toBe('static_openrouter_b5')
+    expect(ensemble.selectionMode.value).toBe('static_openrouter')
   })
 
   it('selecting model ensemble uses the fixed TokenRhythm profile for TokenRhythm providers', () => {
@@ -196,7 +196,7 @@ describe('useSetupModelStrategyForm', () => {
 
     expect(router.mode.value).toBe('disabled')
     expect(ensemble.enabled.value).toBe(true)
-    expect(ensemble.selectionMode.value).toBe('static_tokenrhythm_b5')
+    expect(ensemble.selectionMode.value).toBe('static_tokenrhythm')
   })
 
   it('builds the routing choices in progressive order with guidance badges', () => {

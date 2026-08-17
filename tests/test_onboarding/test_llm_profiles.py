@@ -176,7 +176,7 @@ def test_profile_remove_rejects_ensemble_reference() -> None:
         llm_profiles={"openai": {"api_key_env": "OPENAI_PROFILE_KEY"}},
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "candidates": [
                 {"provider": "openai", "model": "gpt-5-mini", "role": "primary"},
                 {"provider": "deepseek", "model": "deepseek-chat", "role": "contrast"},
@@ -194,7 +194,7 @@ def test_profile_remove_rejects_disabled_ensemble_reference() -> None:
         llm_profiles={"openai": {"api_key_env": "OPENAI_PROFILE_KEY"}},
         llm_ensemble={
             "enabled": False,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "candidates": [
                 {
                     "provider": "deepseek",
@@ -225,7 +225,7 @@ def test_profile_remove_rejects_disabled_static_ensemble_reference() -> None:
         llm_profiles={"openrouter": {"api_key_env": "OPENROUTER_PROFILE_KEY"}},
         llm_ensemble={
             "enabled": False,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
         },
     )
 
@@ -271,7 +271,7 @@ def test_profile_activation_atomically_swaps_primary_without_touching_routes() -
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "candidates": [
                 {"provider": "deepseek", "model": "deepseek-chat", "role": "primary"},
                 {"provider": "openai", "model": "gpt-test", "role": "contrast"},

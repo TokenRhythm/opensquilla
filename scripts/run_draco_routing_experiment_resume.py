@@ -160,9 +160,12 @@ from opensquilla.eval.draco_experiment_artifacts import (
     publish_experiment_config_artifacts,
 )
 from opensquilla.eval.draco_experiment_config import (
+    DRACO_SELECTION_MODE_ALIASES,
     DracoEnsembleMemberConfig,
     DracoExperimentConfig,
     DracoExperimentConfigBundle,
+    canonicalize_draco_ensemble_mode,
+    canonicalize_draco_selection_mode,
     load_draco_experiment_config,
     validate_formal_draco_credential_bindings,
     validate_formal_draco_ensemble_member_binding,
@@ -340,7 +343,7 @@ GROUP_SPECS: dict[str, dict[str, Any]] = {
     "B1": {"kind": "router_single", "label": "single_model_routing"},
     "B2": {
         "kind": "selection_mode",
-        "selection_mode": "static_openrouter_b5",
+        "selection_mode": "static_openrouter",
         "label": "b2_quality_first_static_openrouter_b5",
         "experiment_config": "draco_b2_quality_first_v1",
     },
@@ -6502,7 +6505,9 @@ def ensemble_call_core_reasons(
     return _shared_ensemble_call_core_reasons(
         trace,
         dependencies=_ensemble_call_validation_dependencies(),
-        expected_selection_mode=expected_selection_mode,
+        expected_selection_mode=canonicalize_draco_selection_mode(
+            expected_selection_mode
+        ),
         expected_selection_plan=expected_selection_plan,
         expected_g1_registry_contract=expected_g1_registry_contract,
         expected_task_analyzer_execution_contract=(
@@ -11539,27 +11544,139 @@ def build_run_compatibility(
     }
 
 
+def experiment_config_selection_alias_hashes(args: argparse.Namespace) -> dict[str, str]:
+    """Return canonical and legacy hashes when selection spelling is the only drift."""
+
+    bundle = getattr(args, "_draco_experiment_config_bundle", None)
+    if not isinstance(bundle, DracoExperimentConfigBundle):
+        return {}
+    canonical = bundle.config.model_dump(mode="json")
+    if not canonical.get("router_dynamic_ranking_override"):
+        canonical.pop("router_dynamic_ranking_override", None)
+    ensemble_config = canonical.get("ensemble")
+    if isinstance(ensemble_config, dict):
+        ensemble_config.pop("proposer_backup_count", None)
+    runner_config = canonical.get("runner")
+    if isinstance(runner_config, dict):
+        runner_config.pop("concurrency", None)
+    judge_config = canonical.get("judge")
+    if isinstance(judge_config, dict):
+        judge_config.pop("concurrency", None)
+    routing = canonical.get("routing")
+    if not isinstance(routing, dict):
+        return {}
+    canonical_mode = canonicalize_draco_selection_mode(routing.get("selection_mode"))
+    legacy_mode = next(
+        (
+            legacy
+            for legacy, current in DRACO_SELECTION_MODE_ALIASES.items()
+            if current == canonical_mode
+        ),
+        "",
+    )
+    if not legacy_mode:
+        return {}
+    legacy = copy.deepcopy(canonical)
+    legacy["routing"]["selection_mode"] = legacy_mode
+    return {
+        "canonical": canonical_json_sha256(canonical),
+        "legacy": canonical_json_sha256(legacy),
+    }
+
+
+def canonicalize_run_compatibility_aliases(
+    contract: Mapping[str, Any],
+    *,
+    experiment_config_hashes: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Project old/new public config spellings onto one compatibility contract."""
+
+    projected = json.loads(json.dumps(dict(contract), ensure_ascii=False))
+
+    def visit(value: Any, path: tuple[str, ...] = ()) -> Any:
+        if isinstance(value, dict):
+            normalized: dict[str, Any] = {}
+            for key, item in value.items():
+                if key == "selection_mode":
+                    normalized[key] = canonicalize_draco_selection_mode(item)
+                elif key == "mode" and path and path[-1] == "llm_ensemble":
+                    normalized[key] = canonicalize_draco_ensemble_mode(item)
+                else:
+                    normalized[key] = visit(item, (*path, key))
+            return normalized
+        if isinstance(value, list):
+            return [visit(item, path) for item in value]
+        return value
+
+    projected = visit(projected)
+    experiment = projected.get("experiment_config")
+    hashes = dict(experiment_config_hashes or {})
+    canonical_hash = str(hashes.get("canonical") or "")
+    compatible_hashes = {str(item) for item in hashes.values() if str(item)}
+    if (
+        isinstance(experiment, dict)
+        and canonical_hash
+        and str(experiment.get("sha256") or "") in compatible_hashes
+    ):
+        experiment["sha256"] = canonical_hash
+    return projected
+
+
 def validate_expected_run_compatibility(
     *,
     path: Path,
     actual: dict[str, Any],
     groups: list[str],
+    experiment_config_hashes: Mapping[str, str] | None = None,
 ) -> None:
     if not path.is_file():
         raise ValueError(f"expected compatibility manifest does not exist: {path}")
     manifest = json.loads(path.read_text(encoding="utf-8"))
     expected = manifest.get("run_compatibility") if isinstance(manifest, dict) else None
     expected_fingerprints = expected.get("fingerprints") if isinstance(expected, dict) else None
+    expected_contracts = expected.get("contracts") if isinstance(expected, dict) else None
     actual_fingerprints = actual.get("fingerprints")
+    actual_contracts = actual.get("contracts")
     if not isinstance(expected_fingerprints, dict):
         raise ValueError(f"manifest lacks run_compatibility fingerprints: {path}")
     if not isinstance(actual_fingerprints, dict):
         raise ValueError("current run compatibility fingerprints are unavailable")
-    mismatches = [
-        group
-        for group in groups
-        if str(expected_fingerprints.get(group) or "") != str(actual_fingerprints.get(group) or "")
-    ]
+    mismatches: list[str] = []
+    for group in groups:
+        expected_contract = (
+            expected_contracts.get(group)
+            if isinstance(expected_contracts, Mapping)
+            else None
+        )
+        actual_contract = (
+            actual_contracts.get(group) if isinstance(actual_contracts, Mapping) else None
+        )
+        if not isinstance(expected_contract, Mapping) or not isinstance(
+            actual_contract, Mapping
+        ):
+            if str(expected_fingerprints.get(group) or "") != str(
+                actual_fingerprints.get(group) or ""
+            ):
+                mismatches.append(group)
+            continue
+        expected_fingerprint = str(expected_fingerprints.get(group) or "")
+        actual_fingerprint = str(actual_fingerprints.get(group) or "")
+        if expected_fingerprint != canonical_json_sha256(expected_contract):
+            mismatches.append(group)
+            continue
+        if actual_fingerprint != canonical_json_sha256(actual_contract):
+            mismatches.append(group)
+            continue
+        expected_projected = canonicalize_run_compatibility_aliases(
+            expected_contract,
+            experiment_config_hashes=experiment_config_hashes,
+        )
+        actual_projected = canonicalize_run_compatibility_aliases(
+            actual_contract,
+            experiment_config_hashes=experiment_config_hashes,
+        )
+        if expected_projected != actual_projected:
+            mismatches.append(group)
     if mismatches:
         raise ValueError(
             "current run configuration is incompatible with the expected manifest for "
@@ -11609,6 +11726,7 @@ def validate_repair_only_source_drift_compatibility(
     path: Path,
     actual: Mapping[str, Any],
     groups: list[str],
+    experiment_config_hashes: Mapping[str, str] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Allow only source_identity drift and inherit the original contracts."""
 
@@ -11662,6 +11780,14 @@ def validate_repair_only_source_drift_compatibility(
             reasons.append("current_fingerprint_not_canonical")
         expected_source = expected_contract_copy.pop("source_identity", None)
         actual_source = actual_contract_copy.pop("source_identity", None)
+        expected_contract_copy = canonicalize_run_compatibility_aliases(
+            expected_contract_copy,
+            experiment_config_hashes=experiment_config_hashes,
+        )
+        actual_contract_copy = canonicalize_run_compatibility_aliases(
+            actual_contract_copy,
+            experiment_config_hashes=experiment_config_hashes,
+        )
         if not isinstance(expected_source, Mapping):
             reasons.append("missing_expected_source_identity")
         if not isinstance(actual_source, Mapping):
@@ -11702,7 +11828,9 @@ def validate_repair_only_source_drift_compatibility(
         "mode": "repair_only_source_drift",
         "status": "compatibility_validated",
         "expected_manifest": str(path),
-        "allowed_difference": "per-group contract.source_identity only",
+        "allowed_difference": (
+            "per-group contract.source_identity plus canonical public config aliases"
+        ),
         "runtime_run_compatibility": "inherited_from_expected_manifest",
         "groups": group_audits,
     }
@@ -13805,7 +13933,9 @@ def ensemble_generation_completion_reasons(
     expected_plan = (
         routing_trace.get("selection_plan") if isinstance(routing_trace, Mapping) else None
     )
-    expected_selection_mode = str(expected_spec.get("selection_mode") or "")
+    expected_selection_mode = canonicalize_draco_selection_mode(
+        expected_spec.get("selection_mode")
+    )
     expected_g1_registry_contract = (
         expected_run_compatibility_contract.get("g1_registry_contract")
         if group == "G1" and isinstance(expected_run_compatibility_contract, Mapping)
@@ -13915,10 +14045,18 @@ def ensemble_generation_completion_reasons(
         reasons.append("missing_provider_spec")
     else:
         for key in ("kind", "selection_mode", "model"):
-            if key in expected_spec and provider_spec.get(key) != expected_spec.get(key):
+            actual_value = provider_spec.get(key)
+            expected_value = expected_spec.get(key)
+            values_match = (
+                canonicalize_draco_selection_mode(actual_value)
+                == canonicalize_draco_selection_mode(expected_value)
+                if key == "selection_mode"
+                else actual_value == expected_value
+            )
+            if key in expected_spec and not values_match:
                 reasons.append(f"wrong_provider_spec_{key}")
 
-    final_selection_mode = str(
+    final_selection_mode = canonicalize_draco_selection_mode(
         final_trace.get("selection_strategy")
         or (
             final_trace.get("selection_plan", {}).get("strategy")
@@ -14022,7 +14160,15 @@ def ensemble_generation_completion_reasons(
             "aggregator_model",
             "selected_A",
         ):
-            if key in expected_plan and executed_plan.get(key) != expected_plan.get(key):
+            actual_value = executed_plan.get(key)
+            expected_value = expected_plan.get(key)
+            values_match = (
+                canonicalize_draco_selection_mode(actual_value)
+                == canonicalize_draco_selection_mode(expected_value)
+                if key in {"strategy", "selection_mode"}
+                else actual_value == expected_value
+            )
+            if key in expected_plan and not values_match:
                 reasons.append(f"executed_selection_plan_mismatch_{key}")
         expected_total = expected_sample_count_value
         if expected_total <= 0:
@@ -14162,9 +14308,11 @@ def ensemble_generation_completion_reasons(
                 if expected_profile and executed_plan.get("profile") != expected_profile:
                     reasons.append("wrong_b2_profile")
                 expected_mode = (
-                    str(routing.get("selection_mode") or "") if isinstance(routing, Mapping) else ""
+                    canonicalize_draco_selection_mode(routing.get("selection_mode"))
+                    if isinstance(routing, Mapping)
+                    else ""
                 )
-                executed_mode = str(
+                executed_mode = canonicalize_draco_selection_mode(
                     executed_plan.get("selection_mode") or executed_plan.get("strategy") or ""
                 )
                 if expected_mode and executed_mode != expected_mode:
@@ -16672,6 +16820,7 @@ async def _amain_with_run_lock(
         group_tool_policies=stable_group_tool_policies,
         generation_policy=generation_policy,
     )
+    compatibility_alias_hashes = experiment_config_selection_alias_hashes(args)
     if repair_only_prerequisites is not None:
         (
             args._run_compatibility,
@@ -16680,6 +16829,7 @@ async def _amain_with_run_lock(
             path=expected_compatibility_manifest,
             actual=current_run_compatibility,
             groups=groups,
+            experiment_config_hashes=compatibility_alias_hashes,
         )
         args._repair_compatibility_audit["preconditions"] = repair_only_prerequisites
     else:
@@ -16689,6 +16839,7 @@ async def _amain_with_run_lock(
             path=expected_compatibility_manifest,
             actual=args._run_compatibility,
             groups=groups,
+            experiment_config_hashes=compatibility_alias_hashes,
         )
     if "G1" in groups:
         inherited_g1_contract = args._run_compatibility.get(

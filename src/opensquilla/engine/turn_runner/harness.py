@@ -259,6 +259,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
             "skill_catalog": request.skill_catalog,
             "usage_execution_context": request.usage_execution_context,
             "turn_absolute_deadline": request.turn_absolute_deadline,
+            "explicit_model": request.explicit_model,
         }
         accepted_kwargs = {
             name: value
@@ -471,8 +472,17 @@ class _TurnRunnerModelCatalogAdapter(ModelCatalogPort):
         user_proof_max_chars = _positive_int_or_zero(
             getattr(llm_cfg, "provider_request_proof_max_chars", 0)
         )
-        if runner._model_catalog is not None:
-            provider_name = provider or getattr(llm_cfg, "provider", "openrouter")
+        provider_name = provider or getattr(llm_cfg, "provider", "openrouter")
+        from opensquilla.engine.runtime import (
+            _consume_router_single_frozen_catalog,
+        )
+
+        frozen_catalog = _consume_router_single_frozen_catalog(
+            provider_name, model_id
+        )
+        if frozen_catalog is not None:
+            max_tokens, context_window, capabilities = frozen_catalog
+        elif runner._model_catalog is not None:
             base_url = getattr(llm_cfg, "base_url", "")
             max_tokens = runner._model_catalog.resolve_max_tokens(
                 model_id, user_override=user_max_tokens, provider=provider_name

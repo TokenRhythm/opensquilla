@@ -850,7 +850,7 @@ async def test_ensemble_message_limit_recovery_does_not_replay_roster(
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_tokenrhythm_b5",
+            "selection_mode": "static_tokenrhythm",
             "all_failed_policy": "error",
         },
     )

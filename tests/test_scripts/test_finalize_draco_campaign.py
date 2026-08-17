@@ -2998,7 +2998,7 @@ def _contract(module, group: str, key_hash: str) -> dict[str, object]:
             if group == "B1"
             else {
                 "kind": "selection_mode",
-                "selection_mode": ("static_openrouter_b5" if group == "B2" else "router_dynamic"),
+                "selection_mode": ("static_openrouter" if group == "B2" else "router_dynamic"),
             }
         ),
         "runner": {
@@ -3289,6 +3289,35 @@ def test_thinking_v4_full_registry_contract_uses_frozen_source_identity(module) 
     contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
     contracts["G1"]["g1_registry_contract"] = registry
     assert module.validate_formal_campaign_contracts(contracts).generation_max_attempts == 3
+
+
+def test_formal_campaign_accepts_legacy_b2_selection_mode(module) -> None:
+    contracts = {group: _contract(module, group, "a" * 64) for group in module.GROUPS}
+    contracts["B2"]["group_spec"]["selection_mode"] = "static_openrouter_b5"
+
+    assert module.validate_formal_campaign_contracts(contracts).generation_max_attempts == 3
+
+
+@pytest.mark.parametrize(
+    ("legacy", "canonical"),
+    [("b5_fusion", "multiple"), ("router_single", "single")],
+)
+def test_run_contract_projection_canonicalizes_legacy_ensemble_modes(
+    module,
+    legacy: str,
+    canonical: str,
+) -> None:
+    projected = module.canonicalize_run_compatibility_public_aliases(
+        {
+            "group_spec": {"kind": "router_single"},
+            "gateway_execution": {"llm_ensemble": {"mode": legacy}},
+            "ensemble_trace": {"mode": "b5_fusion"},
+        }
+    )
+
+    assert projected["gateway_execution"]["llm_ensemble"]["mode"] == canonical
+    assert projected["group_spec"]["kind"] == "router_single"
+    assert projected["ensemble_trace"]["mode"] == "b5_fusion"
 
 
 def test_thinking_v4_full_registry_contract_rejects_legacy_source_hash(module) -> None:
@@ -3990,7 +4019,7 @@ def _row(
     elif group == "B2":
         routing_trace = {
             "kind": "selection_mode",
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
             "selection_plan": {
                 "proposer_models": list(module.B2_PROPOSERS),
                 "aggregator_model": module.B2_AGGREGATOR,
@@ -4001,7 +4030,7 @@ def _row(
             list(module.B2_PROPOSERS),
             module.B2_AGGREGATOR,
             final_text=final_text,
-            selection_mode="static_openrouter_b5",
+            selection_mode="static_openrouter",
         )
     else:
         proposers = [
@@ -4244,7 +4273,7 @@ def test_ensemble_gate_allows_only_empty_nonterminal_fallback(module) -> None:
         list(module.B2_PROPOSERS),
         module.B2_AGGREGATOR,
         final_text=final_text,
-        selection_mode="static_openrouter_b5",
+        selection_mode="static_openrouter",
     )
     terminal = deepcopy(trace["calls"][0])
     terminal["agent_call_index"] = 2
@@ -4645,7 +4674,7 @@ def test_formal_output_binding_fails_closed(
         list(module.B2_PROPOSERS),
         module.B2_AGGREGATOR,
         final_text=final_text,
-        selection_mode="static_openrouter_b5",
+        selection_mode="static_openrouter",
     )
     call = trace["calls"][0]
     if mutation == "missing_schema":
@@ -4821,7 +4850,7 @@ def test_formal_ensemble_recovery_evidence_fails_closed(
         list(module.B2_PROPOSERS),
         module.B2_AGGREGATOR,
         final_text=final_text,
-        selection_mode="static_openrouter_b5",
+        selection_mode="static_openrouter",
     )
     call = trace["calls"][0]
     recovery = call["aggregator_recovery"]
@@ -4883,7 +4912,7 @@ def test_provider_shaped_degraded_aggregator_keeps_failed_physical_audit(
         list(module.B2_PROPOSERS),
         module.B2_AGGREGATOR,
         final_text=final_text,
-        selection_mode="static_openrouter_b5",
+        selection_mode="static_openrouter",
     )
     call = trace["calls"][0]
     recovery = call["aggregator_recovery"]
@@ -4941,7 +4970,7 @@ def test_failed_aggregator_attempt_without_explicit_degraded_binding_is_hard(
         list(module.B2_PROPOSERS),
         module.B2_AGGREGATOR,
         final_text=final_text,
-        selection_mode="static_openrouter_b5",
+        selection_mode="static_openrouter",
     )
     call = trace["calls"][0]
     recovery = call["aggregator_recovery"]
@@ -4979,7 +5008,7 @@ def test_static_aggregator_chain_can_be_bound_by_execution_receipt(module) -> No
         list(module.B2_PROPOSERS),
         module.B2_AGGREGATOR,
         final_text=final_text,
-        selection_mode="static_openrouter_b5",
+        selection_mode="static_openrouter",
     )
     call = trace["calls"][0]
     call["selection_plan"].pop("aggregator_candidates")
@@ -7627,6 +7656,59 @@ def _prior_campaign_window_reconciliation(
         for value in reconciliations
         if isinstance(value, dict)
     }
+
+
+def test_finalizer_accepts_legacy_ensemble_mode_across_source_manifests(
+    module,
+    tmp_path: Path,
+) -> None:
+    args, _, lock_fd = _campaign(module, tmp_path, with_repair=True)
+    source_fingerprints: list[dict[str, str]] = []
+    for mode, manifest_path, result_path in zip(
+        ("multiple", "b5_fusion"),
+        args.manifest,
+        args.result,
+        strict=True,
+    ):
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        compatibility = manifest["run_compatibility"]
+        fingerprints: dict[str, str] = {}
+        for group, contract in compatibility["contracts"].items():
+            contract["gateway_execution"]["llm_ensemble"]["mode"] = mode
+            fingerprints[group] = module.canonical_sha256(contract, prefix=True)
+        compatibility["fingerprints"] = fingerprints
+        _owner_json(manifest_path, manifest)
+        source_fingerprints.append(fingerprints)
+
+        rows = [
+            json.loads(line)
+            for line in result_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        resealed = []
+        for row in rows:
+            row["run_compatibility_fingerprint"] = fingerprints[str(row["group"])]
+            resealed.append(module.seal_result_row(row))
+        result_path.write_text(
+            "".join(json.dumps(row) + "\n" for row in resealed),
+            encoding="utf-8",
+        )
+        result_path.chmod(0o600)
+
+    try:
+        final_manifest = module.run_finalization(args)
+    finally:
+        os.close(lock_fd)
+
+    assert final_manifest["status"] == "complete"
+    assert final_manifest["run_compatibility_fingerprints"]["B2"] == (
+        source_fingerprints[0]["B2"]
+    )
+    assert source_fingerprints[0]["B2"] != source_fingerprints[1]["B2"]
+    assert [
+        source["run_compatibility_fingerprints"]["B2"]
+        for source in final_manifest["source_manifests"]
+    ] == [fingerprints["B2"] for fingerprints in source_fingerprints]
 
 
 def test_prior_campaign_window_reconciles_physical_first_sources(

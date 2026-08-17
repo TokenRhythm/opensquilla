@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from opensquilla.eval.draco_experiment_config import load_draco_experiment_config
-from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
+from opensquilla.gateway.config import GatewayConfig, LlmEnsembleConfig, LlmProviderProfile
 from opensquilla.provider import ranking_router
 from opensquilla.provider.compat_policy import compat_policy_for_kind
 from opensquilla.provider.ensemble import build_ensemble_provider_from_config
@@ -37,8 +37,8 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     ensemble = cfg.llm_ensemble
     assert cfg.squilla_router.enabled is True
     assert ensemble.enabled is False
-    assert ensemble.mode == "b5_fusion"
-    assert ensemble.selection_mode == "static_openrouter_b5"
+    assert ensemble.mode == "multiple"
+    assert ensemble.selection_mode == "static_openrouter"
     assert ensemble.ranking_user_profile_generation_enabled is False
     assert ensemble.ranking_user_profile_enabled is False
     assert ensemble.ranking_thinking_assignment_enabled is False
@@ -117,6 +117,162 @@ def test_llm_ensemble_defaults_to_disabled_for_model_router_first_install() -> N
     assert provider.candidate_order_seed is None
     assert provider.quorum_grace_seconds == 10.0
     assert provider._provider_health_ledger is None
+
+
+def test_llm_ensemble_multiple_serialization_golden_is_canonical() -> None:
+    default_cfg = GatewayConfig()
+    explicit_cfg = GatewayConfig(llm_ensemble={"mode": "multiple"})
+
+    default_dump = default_cfg.llm_ensemble.model_dump(mode="json")
+    explicit_dump = explicit_cfg.llm_ensemble.model_dump(mode="json")
+    default_public = default_cfg.to_public_dict()["llm_ensemble"]
+    explicit_public = explicit_cfg.to_public_dict()["llm_ensemble"]
+
+    assert canonical_json_sha256(default_dump) == (
+        "2a69626bf4918049a171852399f6aea0d2474ae90d136d657daf0e93a6532a62"
+    )
+    assert canonical_json_bytes(explicit_dump) == canonical_json_bytes(default_dump)
+    assert canonical_json_bytes(default_public) == canonical_json_bytes(default_dump)
+    assert canonical_json_bytes(explicit_public) == canonical_json_bytes(default_dump)
+
+
+@pytest.mark.parametrize(
+    ("legacy", "expected_mode", "expected_selection_mode"),
+    [
+        ({"mode": "b5_fusion"}, "multiple", "static_openrouter"),
+        (
+            {
+                "enabled": True,
+                "mode": "router_single",
+                "selection_mode": "router_dynamic",
+            },
+            "single",
+            "router_dynamic",
+        ),
+        (
+            {"selection_mode": "static_openrouter_b5"},
+            "multiple",
+            "static_openrouter",
+        ),
+        (
+            {"selection_mode": "static_tokenrhythm_b5"},
+            "multiple",
+            "static_tokenrhythm",
+        ),
+        (
+            {
+                "selection_mode": "custom_b5",
+                "candidates": [
+                    {"provider": "a", "model": "m1"},
+                    {"provider": "b", "model": "m2"},
+                ],
+            },
+            "multiple",
+            "custom",
+        ),
+    ],
+)
+def test_llm_ensemble_released_values_parse_as_canonical_values(
+    legacy: dict[str, object],
+    expected_mode: str,
+    expected_selection_mode: str,
+) -> None:
+    ensemble = GatewayConfig(llm_ensemble=legacy).llm_ensemble
+
+    assert ensemble.mode == expected_mode
+    assert ensemble.selection_mode == expected_selection_mode
+    serialized = ensemble.model_dump(mode="json")
+    assert serialized["mode"] == expected_mode
+    assert serialized["selection_mode"] == expected_selection_mode
+
+
+def test_llm_ensemble_released_mode_aliases_canonicalize_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_LLM_ENSEMBLE_MODE", "b5_fusion")
+    assert LlmEnsembleConfig().mode == "multiple"
+
+    monkeypatch.setenv("OPENSQUILLA_LLM_ENSEMBLE_ENABLED", "true")
+    monkeypatch.setenv("OPENSQUILLA_LLM_ENSEMBLE_MODE", "router_single")
+    monkeypatch.setenv(
+        "OPENSQUILLA_LLM_ENSEMBLE_SELECTION_MODE",
+        "router_dynamic",
+    )
+    ensemble = LlmEnsembleConfig()
+    assert ensemble.mode == "single"
+    assert ensemble.model_dump(mode="json")["mode"] == "single"
+
+
+@pytest.mark.parametrize(
+    "llm_ensemble",
+    [
+        {"mode": "single", "selection_mode": "router_dynamic"},
+        {"mode": "single", "enabled": True},
+    ],
+)
+def test_router_single_requires_enabled_router_dynamic(
+    llm_ensemble: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match=r"single.*requires"):
+        GatewayConfig(llm_ensemble=llm_ensemble)
+
+
+def test_router_single_ignores_fusion_only_aggregator_cross_validation() -> None:
+    cfg = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "router_dynamic",
+            "aggregator_max_tokens_cap": 2,
+            "aggregator_visible_answer_reserve_tokens": 2,
+            "aggregator_recovery_mode": "off",
+            "aggregator_recovery_top_k": 1,
+            "ranking_config_override": {
+                "aggregator": {"candidate_count": 3}
+            },
+            "candidates": [
+                {"provider": "a", "model": "m1", "role": "aggregator"},
+                {"provider": "b", "model": "m2", "role": "aggregator"},
+            ],
+        }
+    )
+
+    ensemble = cfg.llm_ensemble
+    assert ensemble.mode == "single"
+    assert ensemble.aggregator_visible_answer_reserve_tokens == 2
+    assert len(ensemble.candidates) == 2
+    assert ensemble.ranking_config_effective_snapshot()["aggregator"][
+        "candidate_count"
+    ] == 3
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"aggregator_max_tokens_cap": 1}, "aggregator_max_tokens_cap"),
+        ({"aggregator_recovery_top_k": 4}, "aggregator_recovery_top_k"),
+        (
+            {
+                "proposer_max_tokens_cap": 4_096,
+                "proposer_visible_answer_reserve_tokens": 4_096,
+            },
+            "proposer_visible_answer_reserve_tokens",
+        ),
+    ],
+)
+def test_router_single_keeps_field_bounds_and_proposer_validation(
+    overrides: dict[str, object],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        GatewayConfig(
+            llm_ensemble={
+                "enabled": True,
+                "mode": "single",
+                "selection_mode": "router_dynamic",
+                **overrides,
+            }
+        )
 
 
 def test_llm_ensemble_admission_normalizes_runtime_limit_keys() -> None:
@@ -626,6 +782,59 @@ def test_llm_ensemble_prepared_ranking_cache_reuses_only_authenticated_graphs(
     assert external_prepared["rerank"]["similarity_penalty_weight"] != 0.0
 
 
+def test_router_single_freezes_the_authenticated_prepared_ranking_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ranking_override = {"aggregator": {"candidate_count": 3}}
+    fusion = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "mode": "multiple",
+            "selection_mode": "router_dynamic",
+            "aggregator_recovery_top_k": 3,
+            "ranking_config_override": ranking_override,
+        }
+    ).llm_ensemble
+    single = GatewayConfig(
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "router_dynamic",
+            "aggregator_recovery_mode": "off",
+            "aggregator_recovery_top_k": 1,
+            "ranking_config_override": ranking_override,
+        }
+    ).llm_ensemble
+
+    assert single._ranking_config_frozen_state is not None
+    single_resolution = single.ranking_config_resolution_snapshot()
+    fusion_resolution = fusion.ranking_config_resolution_snapshot()
+    prepared = single.prepared_ranking_config()
+    assert single_resolution["effective_sha256"] == fusion_resolution[
+        "effective_sha256"
+    ]
+    assert canonical_json_sha256(prepared) == single_resolution["effective_sha256"]
+    assert json.loads(canonical_json_bytes(prepared)) == single_resolution[
+        "effective_config"
+    ]
+    assert _is_validated_ranking_config(prepared) is True
+
+    original_validate = ranking_router._validate_ranking_config
+    validation_count = 0
+
+    def counted_validate(*args: Any, **kwargs: Any) -> Any:
+        nonlocal validation_count
+        validation_count += 1
+        return original_validate(*args, **kwargs)
+
+    monkeypatch.setattr(ranking_router, "_validate_ranking_config", counted_validate)
+    for _ in range(100):
+        assert single.prepared_ranking_config() is prepared
+    copied = single.model_copy(deep=True)
+    assert copied.prepared_ranking_config() is prepared
+    assert validation_count == 0
+
+
 def test_llm_ensemble_prepared_ranking_cache_refreeze_evicts_without_turn_drift() -> None:
     cfg = GatewayConfig(llm_ensemble={"selection_mode": "router_dynamic"})
     ensemble = cfg.llm_ensemble
@@ -727,7 +936,7 @@ def test_llm_ensemble_serving_chain_timeout_serializes_and_reaches_provider() ->
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
             "aggregator_serving_chain_timeout_seconds": 45.0,
         }
     )
@@ -754,7 +963,7 @@ def test_static_openrouter_b5_does_not_need_model_options() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
             "model_options": [],
         }
     )
@@ -784,7 +993,7 @@ def test_static_tokenrhythm_b5_mirrors_the_openrouter_lineup() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_tokenrhythm_b5",
+            "selection_mode": "static_tokenrhythm",
         }
     )
 
@@ -835,7 +1044,7 @@ def test_static_b5_mode_tables_agree_across_gateway_and_provider() -> None:
     assert literal_modes == {
         "router_dynamic",
         "router_tree_baseline",
-        "custom_b5",
+        "custom",
         *STATIC_B5_SELECTION_MODE_PROVIDERS,
     }
 
@@ -1562,7 +1771,7 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
             "min_successful_proposers": 9,
             "shuffle_candidates": False,
         }
@@ -1610,7 +1819,7 @@ def test_static_openrouter_b5_ensemble_locks_members_across_routed_tiers() -> No
             "configured_shuffle_candidates": False,
             "effective_shuffle_candidates": False,
             "quorum_grace_seconds": 10.0,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
             "aggregator_recovery_mode": "serving",
             "aggregator_recovery_top_k": 3,
             "aggregator_max_tokens_cap": 65_536,
@@ -1643,7 +1852,7 @@ def test_static_openrouter_b5_ensemble_uses_profile_effective_defaults() -> None
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
         }
     )
     provider = build_ensemble_provider_from_config(
@@ -1672,7 +1881,7 @@ def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> No
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "static_openrouter_b5",
+            "selection_mode": "static_openrouter",
             "min_successful_proposers": 2,
             "proposer_timeout_seconds": 180.0,
             "aggregator_timeout_seconds": 900.0,
@@ -1699,7 +1908,7 @@ def test_static_openrouter_b5_ensemble_preserves_custom_effective_values() -> No
 def _custom_b5_config(**overrides: object) -> GatewayConfig:
     payload: dict[str, object] = {
         "enabled": True,
-        "selection_mode": "custom_b5",
+        "selection_mode": "custom",
         "candidates": [
             {"provider": "volcengine", "model": "doubao-2.0-pro", "role": "primary"},
             {"provider": "volcengine", "model": "deepseek-v4-flash", "role": "fast_check"},
@@ -1781,7 +1990,7 @@ def test_custom_b5_without_aggregator_row_inherits_the_routed_model() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "candidates": [
                 {"provider": "volcengine", "model": "doubao-2.0-pro"},
                 {"provider": "volcengine", "model": "kimi-k2.6"},
@@ -1802,7 +2011,7 @@ def test_custom_b5_disabled_candidates_are_excluded_from_the_lineup() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "candidates": [
                 {"provider": "volcengine", "model": "doubao-2.0-pro"},
                 {"provider": "volcengine", "model": "kimi-k2.6"},
@@ -1827,7 +2036,7 @@ def test_custom_b5_validation_rejects_undersized_and_oversized_lineups() -> None
         GatewayConfig(
             llm_ensemble={
                 "enabled": True,
-                "selection_mode": "custom_b5",
+                "selection_mode": "custom",
                 "candidates": [{"provider": "a", "model": "m1"}],
             }
         )
@@ -1835,7 +2044,7 @@ def test_custom_b5_validation_rejects_undersized_and_oversized_lineups() -> None
         GatewayConfig(
             llm_ensemble={
                 "enabled": True,
-                "selection_mode": "custom_b5",
+                "selection_mode": "custom",
                 "candidates": [{"provider": "a", "model": f"m{i}"} for i in range(7)],
             }
         )
@@ -1846,7 +2055,7 @@ def test_custom_b5_validation_rejects_quorum_above_proposer_count() -> None:
         GatewayConfig(
             llm_ensemble={
                 "enabled": True,
-                "selection_mode": "custom_b5",
+                "selection_mode": "custom",
                 "min_successful_proposers": 4,
                 "candidates": [
                     {"provider": "a", "model": "m1"},
@@ -1895,7 +2104,7 @@ def test_custom_b5_lineup_ready_gates_on_member_credentials(
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "candidates": [
                 {"provider": "volcengine", "model": "doubao-2.0-pro"},
                 {"provider": "openrouter", "model": "z-ai/glm-5.2"},
@@ -1939,7 +2148,7 @@ def test_custom_b5_resolves_each_non_primary_member_from_its_profile(
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "candidates": [
                 {"provider": "volcengine", "model": "doubao-proposer"},
                 {"provider": "openai", "model": "gpt-proposer"},
@@ -1993,7 +2202,7 @@ def test_cross_provider_ensemble_disables_replay_on_internal_fallback_adapters()
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "candidates": [
                 {"provider": "volcengine", "model": "doubao-proposer"},
                 {"provider": "openai", "model": "gpt-proposer"},
@@ -2148,7 +2357,7 @@ async def test_cross_provider_ensemble_disables_late_plugin_selector_fallback_re
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "min_successful_proposers": 1,
             "shuffle_candidates": False,
             "candidates": [
@@ -2496,7 +2705,7 @@ def test_custom_b5_uses_shared_session_pinned_profile_pool(
         },
         llm_ensemble={
             "enabled": True,
-            "selection_mode": "custom_b5",
+            "selection_mode": "custom",
             "candidates": [
                 {"provider": "volcengine", "model": "doubao-proposer"},
                 {"provider": "openai", "model": "gpt-proposer"},

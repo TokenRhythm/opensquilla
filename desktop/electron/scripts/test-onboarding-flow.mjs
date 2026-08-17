@@ -273,7 +273,7 @@ try {
   assert.doesNotMatch(config, /tier_profile = "tokenrhythm"/)
   assert.match(config, /\[squilla_router\.tiers\.c0\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-flash"/)
   assert.match(config, /\[squilla_router\.tiers\.c3\]\nprovider = "tokenrhythm"\nmodel = "glm-5\.2"/)
-  assert.match(config, /\[llm_ensemble\]\nenabled = true\nselection_mode = "static_tokenrhythm_b5"/)
+  assert.match(config, /\[llm_ensemble\]\nenabled = true\nselection_mode = "static_tokenrhythm"/)
 
   console.log(JSON.stringify({
     ok: true,

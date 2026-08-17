@@ -316,7 +316,7 @@ def test_ensemble_section_detail_reflects_selection_mode():
     assert s.sections["ensemble"].value == "ok"
     detail = s.section_details["ensemble"]
     assert detail["label"] == "LLM ensemble"
-    assert str(detail["detail"]).startswith("selection mode: static_openrouter_b5")
+    assert str(detail["detail"]).startswith("selection mode: static_openrouter")
 
 
 def test_ensemble_section_detail_shows_disabled():

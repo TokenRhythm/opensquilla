@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from functools import partial
 from typing import Any
 
+from opensquilla.eval.draco_experiment_config import (
+    canonicalize_draco_selection_mode,
+)
 from opensquilla.eval.draco_run_result import RunResult
 from opensquilla.eval.draco_runtime_contract import canonical_json_sha256
 from opensquilla.eval.draco_usage_evidence import coerce_metric_int
@@ -1462,7 +1465,10 @@ def ensemble_call_core_reasons_core(
         dict(expected_selection_plan) if isinstance(expected_selection_plan, Mapping) else {}
     )
     executed_plan = trace.get("selection_plan")
-    executed_mode = str(
+    expected_selection_mode = canonicalize_draco_selection_mode(
+        expected_selection_mode
+    )
+    executed_mode = canonicalize_draco_selection_mode(
         trace.get("selection_strategy")
         or (executed_plan.get("strategy") if isinstance(executed_plan, Mapping) else "")
         or ""
@@ -1576,10 +1582,14 @@ def ensemble_call_core_reasons_core(
                 "proposer_recovery_policy",
             ):
                 expected_value = expected_plan.get(field)
-                if (
-                    expected_value not in (None, [], "")
-                    and executed_plan.get(field) != expected_value
-                ):
+                actual_value = executed_plan.get(field)
+                values_match = (
+                    canonicalize_draco_selection_mode(actual_value)
+                    == canonicalize_draco_selection_mode(expected_value)
+                    if field in {"strategy", "selection_mode"}
+                    else actual_value == expected_value
+                )
+                if expected_value not in (None, [], "") and not values_match:
                     reasons.append(f"wrong_executed_{field}")
 
     if not isinstance(candidate_rows, list) or not candidate_rows:

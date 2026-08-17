@@ -67,6 +67,19 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
     expect(f.isDirty.value).toBe(false)
   })
 
+  it.each([
+    ['static_openrouter_b5', 'static_openrouter'],
+    ['static_tokenrhythm_b5', 'static_tokenrhythm'],
+    ['custom_b5', CUSTOM_B5_SELECTION_MODE],
+  ])('normalizes the legacy selection mode %s without making the form dirty', (legacy, canonical) => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({ ...SAVED, selection_mode: legacy })
+
+    expect(f.selectionMode.value).toBe(canonical)
+    expect(f.payload()).toEqual({})
+    expect(f.isDirty.value).toBe(false)
+  })
+
   it('keeps the config-only tree baseline readable without making it editable', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
@@ -107,7 +120,7 @@ describe('useSetupEnsembleForm — init + dirty tracking', () => {
     f.initFromConfig({ selection_mode: 'bogus', all_failed_policy: 'bogus', min_successful_proposers: -3 })
 
     expect(f.enabled.value).toBe(false)
-    expect(f.selectionMode.value).toBe('static_openrouter_b5')
+    expect(f.selectionMode.value).toBe('static_openrouter')
     expect(f.modelOptions.value).toEqual([])
     expect(f.candidates.value).toEqual([])
     expect(f.minSuccessfulProposers.value).toBe(1)
@@ -150,8 +163,8 @@ describe('useSetupEnsembleForm — partial payload building', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig(SAVED)
 
-    f.setSelectionMode('static_openrouter_b5')
-    expect(f.payload()).toEqual({ selectionMode: 'static_openrouter_b5' })
+    f.setSelectionMode('static_openrouter')
+    expect(f.payload()).toEqual({ selectionMode: 'static_openrouter' })
   })
 
   it('accumulates exactly the dirty keys across several edits', () => {
@@ -190,14 +203,14 @@ describe('useSetupEnsembleForm — partial payload building', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       enabled: true,
-      selection_mode: 'static_openrouter_b5',
+      selection_mode: 'static_openrouter',
       model_options: [],
       candidates: [],
       min_successful_proposers: 1,
       all_failed_policy: 'fallback_single',
     })
-    f.setScheme('custom', 'static_openrouter_b5')
-    f.setScheme('preset', 'static_openrouter_b5')
+    f.setScheme('custom', 'static_openrouter')
+    f.setScheme('preset', 'static_openrouter')
     expect(f.payload()).toEqual({})
   })
 })
@@ -207,14 +220,14 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       enabled: true,
-      selection_mode: 'static_openrouter_b5',
+      selection_mode: 'static_openrouter',
       model_options: [],
       candidates: [],
       min_successful_proposers: 1,
       all_failed_policy: 'fallback_single',
     })
 
-    f.setScheme('custom', 'static_openrouter_b5')
+    f.setScheme('custom', 'static_openrouter')
     expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
     const aggregators = f.candidates.value.filter(c => c.role === 'aggregator')
     expect(aggregators).toHaveLength(1)
@@ -228,11 +241,11 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       enabled: true,
-      selection_mode: 'static_tokenrhythm_b5',
+      selection_mode: 'static_tokenrhythm',
       candidates: [],
     })
 
-    f.setScheme('custom', 'static_tokenrhythm_b5')
+    f.setScheme('custom', 'static_tokenrhythm')
     expect(f.selectionMode.value).toBe(CUSTOM_B5_SELECTION_MODE)
     const proposers = f.candidates.value.filter(c => c.role !== 'aggregator')
     expect(proposers.map(c => c.model)).toEqual([...TOKENRHYTHM_FIXED_ENSEMBLE_PROPOSERS])
@@ -244,14 +257,14 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       enabled: true,
-      selection_mode: 'static_openrouter_b5',
+      selection_mode: 'static_openrouter',
       candidates: [],
     })
-    f.setScheme('custom', 'static_openrouter_b5')
+    f.setScheme('custom', 'static_openrouter')
     expect(f.candidates.value.length).toBeGreaterThan(0)
 
-    f.setScheme('preset', 'static_openrouter_b5')
-    expect(f.selectionMode.value).toBe('static_openrouter_b5')
+    f.setScheme('preset', 'static_openrouter')
+    expect(f.selectionMode.value).toBe('static_openrouter')
     expect(f.candidates.value).toEqual([])
     expect(f.isDirty.value).toBe(false)
   })
@@ -260,7 +273,7 @@ describe('useSetupEnsembleForm — scheme switching', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({})
     f.activateForProvider('tokenrhythm')
-    expect(f.selectionMode.value).toBe('static_tokenrhythm_b5')
+    expect(f.selectionMode.value).toBe('static_tokenrhythm')
   })
 
   it('activateForProvider gives other providers an explicit custom lineup seeded from tiers', () => {
@@ -544,11 +557,11 @@ describe('useSetupEnsembleForm — custom lineup editing', () => {
       ])
   })
 
-  it('editing the lineup pins the mode to custom_b5 (no ineffective-pool trap)', () => {
+  it('editing the lineup pins the mode to custom (no ineffective-pool trap)', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       enabled: true,
-      selection_mode: 'static_openrouter_b5',
+      selection_mode: 'static_openrouter',
       candidates: [],
     })
     f.addCandidate('volcengine', 'doubao-2.0-pro')
@@ -806,7 +819,7 @@ describe('useSetupEnsembleForm — model option edits', () => {
 describe('useSetupEnsembleForm — panel contract', () => {
   it('reports the preset scheme for a static selection on its own provider', () => {
     const f = useSetupEnsembleForm()
-    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
+    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter' })
     const panel = makePanel(f, 'openrouter')
     expect(panel.value.scheme).toBe('preset')
     expect(panel.value.activeProvider).toBe('openrouter')
@@ -821,7 +834,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
 
   it('uses the TokenRhythm 4+1 profile for the tokenrhythm static selection', () => {
     const f = useSetupEnsembleForm()
-    f.initFromConfig({ enabled: true, selection_mode: 'static_tokenrhythm_b5' })
+    f.initFromConfig({ enabled: true, selection_mode: 'static_tokenrhythm' })
     const panel = makePanel(f, 'tokenrhythm')
     expect(panel.value.scheme).toBe('preset')
     expect(panel.value.fixedProfile!.providerLabel).toBe('TokenRhythm')
@@ -836,7 +849,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
     // Stored TokenRhythm preset; the user later switched the active provider
     // to OpenRouter. The runtime builder keys off the stored mode, so the
     // TokenRhythm lineup still runs (and bills) — the card must show it.
-    f.initFromConfig({ enabled: true, selection_mode: 'static_tokenrhythm_b5' })
+    f.initFromConfig({ enabled: true, selection_mode: 'static_tokenrhythm' })
     const panel = makePanel(f, 'openrouter')
     expect(panel.value.scheme).toBe('preset')
     expect(panel.value.fixedProfile!.providerLabel).toBe('TokenRhythm')
@@ -848,7 +861,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
 
   it('reports no preset mismatch when the stored preset belongs to the active provider', () => {
     const f = useSetupEnsembleForm()
-    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
+    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter' })
     const panel = makePanel(f, 'openrouter')
     expect(panel.value.presetProviderMismatch).toBe(false)
     expect(panel.value.fixedProfile!.providerLabel).toBe('OpenRouter')
@@ -856,7 +869,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
 
   it('reports the custom scheme (no preset cards) for non-preset providers even with a stored static mode', () => {
     const f = useSetupEnsembleForm()
-    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
+    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter' })
     const panel = makePanel(f, 'volcengine')
     expect(panel.value.scheme).toBe('custom')
     expect(panel.value.schemeCardsAvailable).toBe(false)
@@ -931,7 +944,7 @@ describe('useSetupEnsembleForm — panel contract', () => {
 
   it('surfaces the effective preset facts (quorum 3/4, 300/480s, 10s grace)', () => {
     const f = useSetupEnsembleForm()
-    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
+    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter' })
     const facts = makePanel(f, 'openrouter').value.presetFacts
     expect(facts).toEqual({
       perTurnCalls: 5,
@@ -990,7 +1003,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     const f = useSetupEnsembleForm()
     f.initFromConfig({
       enabled: true,
-      selection_mode: 'static_openrouter_b5',
+      selection_mode: 'static_openrouter',
       proposer_timeout_seconds: 600,
       aggregator_timeout_seconds: 900,
     })
@@ -1007,7 +1020,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
     const explicitLegacy = useSetupEnsembleForm()
     explicitLegacy.initFromConfig({
       enabled: true,
-      selection_mode: 'static_openrouter_b5',
+      selection_mode: 'static_openrouter',
       proposer_timeout_seconds: 3600,
       aggregator_timeout_seconds: 3600,
     })
@@ -1017,7 +1030,7 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
 
     // Older gateways may omit the keys from the config slice entirely.
     const absent = useSetupEnsembleForm()
-    absent.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
+    absent.initFromConfig({ enabled: true, selection_mode: 'static_openrouter' })
     const absentFacts = makePanel(absent, 'openrouter').value.presetFacts
     expect(absentFacts.proposerTimeoutSeconds).toBe(300)
     expect(absentFacts.aggregatorTimeoutSeconds).toBe(480)
@@ -1056,9 +1069,9 @@ describe('useSetupEnsembleForm — effective timeout facts', () => {
 
 describe('staticB5ModeForProvider', () => {
   it('maps preset providers to their static mode and everything else to null', () => {
-    expect(staticB5ModeForProvider('openrouter')).toBe('static_openrouter_b5')
-    expect(staticB5ModeForProvider('OpenRouter')).toBe('static_openrouter_b5')
-    expect(staticB5ModeForProvider('tokenrhythm')).toBe('static_tokenrhythm_b5')
+    expect(staticB5ModeForProvider('openrouter')).toBe('static_openrouter')
+    expect(staticB5ModeForProvider('OpenRouter')).toBe('static_openrouter')
+    expect(staticB5ModeForProvider('tokenrhythm')).toBe('static_tokenrhythm')
     expect(staticB5ModeForProvider('deepseek')).toBeNull()
     expect(staticB5ModeForProvider('')).toBeNull()
     expect(staticB5ModeForProvider(undefined)).toBeNull()
