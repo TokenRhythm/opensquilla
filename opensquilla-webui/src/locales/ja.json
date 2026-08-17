@@ -4087,6 +4087,7 @@
       "taskRunning": "タスクを実行中",
       "taskCompletedUnread": "タスク完了、結果は未確認",
       "taskUnfinishedUnread": "タスク未完了、詳細は未確認",
+      "subagentGroupLabel": "{title}：{count} サブエージェント",
       "contractGap": "バックエンドの session-list-v1 契約フィールドが不足しています",
       "contractGapBadge": "不足",
       "rowActions": "{title} のアクション",

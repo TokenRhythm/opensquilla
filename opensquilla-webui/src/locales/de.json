@@ -4087,6 +4087,7 @@
       "taskRunning": "Aufgabe wird ausgeführt",
       "taskCompletedUnread": "Aufgabe abgeschlossen, Ergebnis nicht angesehen",
       "taskUnfinishedUnread": "Aufgabe nicht abgeschlossen, Details nicht angesehen",
+      "subagentGroupLabel": "{title}: {count} Unteragenten",
       "contractGap": "Backend-Vertragsfelder von session-list-v1 fehlen",
       "contractGapBadge": "Lücke",
       "rowActions": "Aktionen für {title}",

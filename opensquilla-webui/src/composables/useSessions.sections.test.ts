@@ -381,3 +381,76 @@ describe('arrangeSidebarSections — manual session ordering', () => {
     ])
   })
 })
+
+describe('arrangeSidebarSections — folded subagent groups', () => {
+  function parentWithChildren(childCount: number) {
+    const parentKey = 'agent:main:webchat:parent'
+    const items = [session({ key: parentKey, title: 'Parent', updatedAt: 500 })]
+    for (let index = 0; index < childCount; index++) {
+      items.push(session({
+        key: `agent:main:subagent:child-${index}`,
+        title: `Child ${index}`,
+        updatedAt: 400 - index,
+        parent: { key: parentKey, spawnDepth: 1 },
+      }))
+    }
+    return { parentKey, items }
+  }
+
+  it('keeps one to three direct subagents inline (no group)', () => {
+    const { items } = parentWithChildren(3)
+    const rows = sectionFor(arrangeSidebarSections(items), 'chats').rows
+
+    expect(rows).toHaveLength(4)
+    expect(rows[0].subagentGroup).toBeUndefined()
+    expect(rows.map(row => row.depth)).toEqual([0, 1, 1, 1])
+  })
+
+  it('folds four or more direct subagents into a compact group row', () => {
+    const { items } = parentWithChildren(4)
+    const rows = sectionFor(arrangeSidebarSections(items), 'chats').rows
+
+    expect(rows).toHaveLength(1)
+    const group = rows[0]
+    expect(group.title).toBe('Parent')
+    expect(group.subagentGroup).toBeDefined()
+    expect(group.subagentGroup!.count).toBe(4)
+    expect(group.subagentGroup!.children).toHaveLength(4)
+    expect(group.subagentGroup!.children.map(child => child.depth)).toEqual([1, 1, 1, 1])
+  })
+
+  it('summarizes running attention from a folded child', () => {
+    const parentKey = 'agent:main:webchat:parent'
+    const items = [
+      session({ key: parentKey, title: 'Parent', updatedAt: 500 }),
+      ...([0, 1, 2, 3].map(index => session({
+        key: `agent:main:subagent:child-${index}`,
+        title: `Child ${index}`,
+        updatedAt: 400 - index,
+        runStatus: index === 2 ? 'running' : 'idle',
+        parent: { key: parentKey, spawnDepth: 1 },
+      }))),
+    ]
+    const rows = sectionFor(arrangeSidebarSections(items), 'chats').rows
+
+    expect(rows).toHaveLength(1)
+    expect(rows[0].subagentGroup!.attention).toBe('running')
+  })
+
+  it('does not fold grandchildren into the flat ledger for non-group parents', () => {
+    const parentKey = 'agent:main:webchat:parent'
+    const childKey = 'agent:main:subagent:child'
+    const sections = arrangeSidebarSections([
+      session({ key: parentKey, title: 'Parent', updatedAt: 500 }),
+      session({ key: childKey, title: 'Child', updatedAt: 400, parent: { key: parentKey, spawnDepth: 1 } }),
+      session({
+        key: 'agent:main:subagent:grandchild',
+        title: 'Grandchild',
+        updatedAt: 300,
+        parent: { key: childKey, spawnDepth: 2 },
+      }),
+    ])
+
+    expect(sectionFor(sections, 'chats').rows.map(row => row.depth)).toEqual([0, 1, 2])
+  })
+})

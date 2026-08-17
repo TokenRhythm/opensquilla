@@ -792,6 +792,41 @@ summary.control-row--divider:focus-visible {
   pointer-events: none;
 }
 
+/* ── Sidebar: folded subagent group header ─────────────────────────── */
+
+.sidebar-subagent-group-head {
+  color: var(--sidebar-text);
+  gap: 6px;
+}
+.sidebar-subagent-group-head .sidebar-history-title {
+  flex: 1;
+}
+.sidebar-subagent-group-chevron {
+  color: var(--sidebar-text-soft);
+  flex-shrink: 0;
+  transition: transform var(--dur-base) var(--ease-standard);
+}
+.sidebar-subagent-group-head.is-expanded .sidebar-subagent-group-chevron {
+  transform: rotate(90deg);
+}
+.sidebar-subagent-group-count {
+  align-items: center;
+  background: var(--sidebar-control-bg);
+  border: 1px solid var(--sidebar-border);
+  border-radius: var(--radius-full);
+  color: var(--sidebar-text-soft);
+  display: inline-flex;
+  flex-shrink: 0;
+  font-size: 0.6875rem;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  height: 18px;
+  justify-content: center;
+  line-height: 1;
+  min-width: 18px;
+  padding-inline: 5px;
+}
+
 /* ── Sidebar: inline rename input ──────────────────────────────────── */
 
 .sidebar-history-rename {
