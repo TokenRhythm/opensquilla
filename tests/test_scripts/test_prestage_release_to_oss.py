@@ -104,6 +104,12 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
         encoding="utf-8",
     )
     executable.chmod(0o755)
+    python3 = fake_bin / "python3"
+    python3.write_text(
+        '#!/usr/bin/env bash\nexec "$FAKE_PYTHON" "$@"\n',
+        encoding="utf-8",
+    )
+    python3.chmod(0o755)
     return fake_bin, remote_root, call_log
 
 
