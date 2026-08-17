@@ -127,6 +127,21 @@ These fixed links advance only after a newer eligible release passes mirror
 verification. Use the versioned GitHub Release links above when you need a
 specific release.
 
+> [!NOTE]
+> The Desktop installers run the gateway and control console inside an
+> Electron shell and do **not** install the `opensquilla` command on PATH.
+> The bundled runtime executable is named `opensquilla-gateway`
+> (`opensquilla-gateway.exe` on Windows) under the application resources; it
+> is an internal runtime binary (it accepts `version --json` for build
+> diagnostics) and is not the documented CLI. To use the documented
+> `opensquilla ...` commands from a terminal — for example
+> `opensquilla gateway run`, `opensquilla chat`, or
+> `opensquilla providers status` — install the CLI separately with
+> [Quick terminal install](#quick-terminal-install) (or
+> [Install from source](#install-from-source)). The Desktop profile is a
+> separate home from a terminal installation's `~/.opensquilla`; see the
+> upgrade note below before mixing them.
+
 Quit any running OpenSquilla desktop app before upgrading. On macOS, drag the
 app from the DMG into Applications for installation or updates, eject the DMG,
 then open the Applications copy. The existing Desktop profile in the platform
