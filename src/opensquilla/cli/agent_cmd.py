@@ -1035,3 +1035,8 @@ def run_agent_command(
                     _print_no_provider_error()
                     raise typer.Exit(1)
                 typer.echo(f"Error: {error['message']}", err=True)
+    if result.errors:
+        # A failed turn (auth failure, provider error, terminal reset, ...)
+        # must exit nonzero so automation can distinguish success from
+        # failure. The JSON payload above still carries the error details.
+        raise typer.Exit(1)

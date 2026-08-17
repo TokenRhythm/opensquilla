@@ -525,6 +525,68 @@ def test_run_agent_command_json_includes_routing(
     }
 
 
+def test_run_agent_command_exits_nonzero_on_turn_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fake_run_agent_once(**kwargs: Any) -> AgentRunResult:
+        return AgentRunResult(
+            status="error",
+            agent_id="main",
+            session_key="agent:main:main",
+            text="",
+            usage={},
+            errors=[
+                {
+                    "message": "The model provider rejected the configured credentials.",
+                    "code": "auth_invalid",
+                }
+            ],
+        )
+
+    monkeypatch.setattr("opensquilla.cli.agent_cmd.run_agent_once", fake_run_agent_once)
+
+    from click.exceptions import Exit as ClickExit
+
+    with pytest.raises(ClickExit) as exc_info:
+        run_agent_command(message="hello")
+
+    assert exc_info.value.exit_code == 1
+    assert "rejected the configured credentials" in capsys.readouterr().err
+
+
+def test_run_agent_command_json_exits_nonzero_on_turn_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def fake_run_agent_once(**kwargs: Any) -> AgentRunResult:
+        return AgentRunResult(
+            status="error",
+            agent_id="main",
+            session_key="agent:main:main",
+            text="",
+            usage={},
+            errors=[
+                {
+                    "message": "The model provider rejected the configured credentials.",
+                    "code": "auth_invalid",
+                }
+            ],
+        )
+
+    monkeypatch.setattr("opensquilla.cli.agent_cmd.run_agent_once", fake_run_agent_once)
+
+    from click.exceptions import Exit as ClickExit
+
+    with pytest.raises(ClickExit) as exc_info:
+        run_agent_command(message="hello", json_output=True)
+
+    assert exc_info.value.exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error"
+    assert payload["errors"][0]["code"] == "auth_invalid"
+
+
 @pytest.mark.asyncio
 async def test_run_agent_once_collects_done_routing(
     monkeypatch: pytest.MonkeyPatch,
