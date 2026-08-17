@@ -89,6 +89,21 @@ FATAL_ERROR_CLASSES: tuple[str, ...] = (
 )
 
 _DINGTALK_AUTH_INVALID_MESSAGE = "凭证无效：检查 DingTalk AppKey/AppSecret"
+
+
+_DINGTALK_MARKDOWN_TITLE_MAX = 20
+
+
+def _dingtalk_markdown_title(content: str, fallback: str) -> str:
+    """Non-empty markdown title for DingTalk replies.
+
+    DingTalk requires markdown.title (robot replies are rejected when it is
+    empty). The first line, stripped of common markdown markers, becomes the
+    title; a blank result falls back to the channel name.
+    """
+    first_line = content.splitlines()[0] if content.splitlines() else ""
+    clean = re.sub(r"[#>*_`~\[\]()!]", "", first_line).strip()
+    return clean[:_DINGTALK_MARKDOWN_TITLE_MAX] or fallback
 _STREAM_STOP_TIMEOUT_S = 5.0
 _STREAM_CANCEL_GRACE_S = 0.25
 
@@ -1362,7 +1377,14 @@ class DingTalkChannel:
                 "require the original ChatbotMessage to resolve sessionWebhook"
             )
         if message.format == "markdown" and hasattr(self._handler, "reply_markdown"):
-            await asyncio.to_thread(self._handler.reply_markdown, message.content, target)
+            # dingtalk-stream's ChatbotHandler.reply_markdown signature is
+            # (title, text, incoming_message) and DingTalk requires a
+            # non-empty markdown title. The first line of the reply becomes
+            # the title; omitting any argument would raise a TypeError.
+            title = _dingtalk_markdown_title(message.content, self.config.name)
+            await asyncio.to_thread(
+                self._handler.reply_markdown, title, message.content, target
+            )
             log.debug("dingtalk.outbound_markdown_sent", length=len(message.content))
         else:
             await asyncio.to_thread(self._handler.reply_text, message.content, target)

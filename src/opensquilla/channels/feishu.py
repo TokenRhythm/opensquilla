@@ -39,6 +39,7 @@ from opensquilla.channels._util import (
     EventDedupeCache,
     RateLimiter,
     retry_request,
+    split_markdown_for_channel,
 )
 from opensquilla.channels.contract import (
     ChannelCapabilities,
@@ -73,6 +74,56 @@ _FEISHU_WS_SINGLETON_LOCK = threading.Lock()
 _FEISHU_WS_ACTIVE_TRANSPORT: FeishuWebSocketTransport | None = None
 _FEISHU_API_BASE = "https://open.feishu.cn/open-apis"
 _LARK_API_BASE = "https://open.larksuite.com/open-apis"
+# Feishu caps post/card message content at 30 KB (plain text allows 150 KB).
+# Markdown travels inside a JSON envelope, so the raw-text budget leaves
+# headroom for the envelope and JSON escaping. ensure_ascii=False keeps the
+# wire size close to the UTF-8 byte count, otherwise CJK would inflate 3x.
+_FEISHU_POST_MAX_BYTES = 30 * 1024
+_FEISHU_POST_TEXT_BUDGET = _FEISHU_POST_MAX_BYTES - 1024
+
+
+def _feishu_markdown_body_size(text: str) -> int:
+    """Serialized byte size of one Feishu post message carrying text."""
+    post_content = {
+        "zh_cn": {
+            "title": "",
+            "content": [[{"tag": "md", "text": text}]],
+        }
+    }
+    return len(json.dumps(post_content, ensure_ascii=False).encode("utf-8"))
+
+
+def _feishu_markdown_chunks(content: str) -> list[str]:
+    """Split markdown content so every post message fits the 30 KB cap.
+
+    The raw-text budget only approximates the wire size: JSON escaping
+    doubles quotes, backslashes and newlines, so a pathological chunk can
+    still exceed the cap after serialization. Every chunk is verified at
+    its serialized size and recursively re-split until it fits.
+    """
+    if not content:
+        return [""]
+    chunks = split_markdown_for_channel(
+        content,
+        _FEISHU_POST_TEXT_BUDGET,
+        unit=ChannelLengthUnit.UTF8_BYTES,
+    )
+    result: list[str] = []
+    pending = list(chunks)
+    while pending:
+        piece = pending.pop(0)
+        if _feishu_markdown_body_size(piece) <= _FEISHU_POST_MAX_BYTES:
+            result.append(piece)
+            continue
+        # Serialized form overflows: re-split at a strictly smaller budget.
+        # Each pass at least halves the piece, so this terminates; a single
+        # character serializes to well below the cap.
+        limit = max(1, len(piece) // 2)
+        halves = split_markdown_for_channel(
+            piece, limit, unit=ChannelLengthUnit.UTF8_BYTES
+        )
+        pending[0:0] = halves
+    return result
 _FEISHU_INBOUND_RESOURCE_DEFAULTS: dict[str, tuple[str, str, str, tuple[str, ...]]] = {
     "image": ("image.png", "image/png", "image", ("image_key",)),
     "file": ("file", "application/octet-stream", "file", ("file_key",)),
@@ -1760,48 +1811,27 @@ class FeishuChannel:
         *,
         request_uuid: str | None = None,
     ) -> str:
-        """Send a markdown message as a Feishu ``post`` (rich-text) message.
+        """Send markdown content as one or more Feishu post (rich-text) messages.
 
-        Feishu's ``post`` message type renders ``tag: "md"`` elements with the
-        platform's native markdown, so the gateway can ship the same markdown
-        it sends to other rich-text channels (help/status command output,
-        structured notices) without flattening it to plain text first.
+        Feishu's post message type renders tag-md elements with the platform's
+        native markdown. Content over the 30 KB post budget is split into
+        multiple post messages at markdown-aware boundaries so long replies
+        are delivered instead of rejected wholesale.
         """
-
         chat_id = str(chat_id or "").strip()
         if not chat_id:
             raise ValueError("feishu.send_markdown: chat target is required")
-        await self._rate_limiter.acquire()
-        headers = await self._auth_headers()
-        client = self._get_client()
-        receive_id_type = _feishu_receive_id_type(chat_id)
-        post_content: dict[str, Any] = {
-            "zh_cn": {
-                "title": "",
-                "content": [
-                    [{"tag": "md", "text": content}]
-                ],
-            }
-        }
-        payload: dict[str, Any] = {
-            "receive_id": chat_id,
-            "msg_type": "post",
-            "content": json.dumps(post_content),
-        }
-        resp = await retry_request(
-            client.post,
-            "/im/v1/messages",
-            params={
-                "receive_id_type": receive_id_type,
-                "uuid": _feishu_delivery_uuid(request_uuid),
-            },
-            json=payload,
-            headers=headers,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        self._raise_api_error(data, "send markdown failed")
-        return str(data.get("data", {}).get("message_id", ""))
+        last_message_id = ""
+        for index, chunk in enumerate(_feishu_markdown_chunks(content)):
+            # Each split message needs its own idempotency key, otherwise
+            # Feishu dedupes the later chunks as retries of the first one.
+            chunk_uuid = f"{request_uuid}#{index}" if request_uuid else None
+            last_message_id = await self._deliver_markdown(
+                chat_id=chat_id,
+                content=chunk,
+                request_uuid=chunk_uuid,
+            )
+        return last_message_id
 
     async def reply_markdown(
         self,
@@ -1810,32 +1840,61 @@ class FeishuChannel:
         *,
         request_uuid: str | None = None,
     ) -> str:
-        """Reply to a Feishu message with a markdown ``post`` message."""
+        """Reply to a Feishu message with markdown, split like send_markdown."""
+        last_message_id = ""
+        for index, chunk in enumerate(_feishu_markdown_chunks(content)):
+            chunk_uuid = f"{request_uuid}#{index}" if request_uuid else None
+            last_message_id = await self._deliver_markdown(
+                reply_to_message_id=message_id,
+                content=chunk,
+                request_uuid=chunk_uuid,
+            )
+        return last_message_id
 
+    async def _deliver_markdown(
+        self,
+        *,
+        chat_id: str | None = None,
+        reply_to_message_id: str | None = None,
+        content: str,
+        request_uuid: str | None,
+    ) -> str:
+        """Deliver one Feishu post message whose text fits the post budget."""
+        if chat_id is None and reply_to_message_id is None:
+            raise ValueError("feishu._deliver_markdown: chat or reply target required")
         await self._rate_limiter.acquire()
         headers = await self._auth_headers()
         client = self._get_client()
         post_content: dict[str, Any] = {
             "zh_cn": {
                 "title": "",
-                "content": [
-                    [{"tag": "md", "text": content}]
-                ],
+                "content": [[{"tag": "md", "text": content}]],
             }
         }
+        payload: dict[str, Any] = {
+            "msg_type": "post",
+            "content": json.dumps(post_content, ensure_ascii=False),
+        }
+        if reply_to_message_id is not None:
+            url = f"/im/v1/messages/{reply_to_message_id}/reply"
+            params = {"uuid": _feishu_delivery_uuid(request_uuid)}
+        else:
+            payload["receive_id"] = chat_id
+            url = "/im/v1/messages"
+            params = {
+                "receive_id_type": _feishu_receive_id_type(str(chat_id)),
+                "uuid": _feishu_delivery_uuid(request_uuid),
+            }
         resp = await retry_request(
             client.post,
-            f"/im/v1/messages/{message_id}/reply",
-            params={"uuid": _feishu_delivery_uuid(request_uuid)},
-            json={
-                "msg_type": "post",
-                "content": json.dumps(post_content),
-            },
+            url,
+            params=params,
+            json=payload,
             headers=headers,
         )
         resp.raise_for_status()
         data = resp.json()
-        self._raise_api_error(data, "reply failed")
+        self._raise_api_error(data, "send markdown failed")
         return str(data.get("data", {}).get("message_id", ""))
 
     async def read_message(self, message_id: str) -> dict[str, Any]:

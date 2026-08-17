@@ -21,6 +21,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from opensquilla.channels._markdown import markdown_to_slack_mrkdwn
 from opensquilla.channels._reactions import NULL_STATUS_REACTOR, SlackStatusReactor
 from opensquilla.channels._util import (
     ChannelAccessPolicy,
@@ -352,9 +353,15 @@ class SlackChannel:
         client = self._get_client()
         # Slack rejects text longer than 40000 chars; split so the full answer
         # is delivered across sequential messages instead of being dropped.
+        # Slack parses mrkdwn, not CommonMark: **bold** and [t](u) would
+        # render literally. Convert markdown replies so rich text lands.
         chunks = split_text_for_channel(message.content, _SLACK_MAX_MESSAGE_CHARS)
         for chunk in chunks:
-            payload["text"] = chunk
+            payload["text"] = (
+                markdown_to_slack_mrkdwn(chunk)
+                if message.format == "markdown"
+                else chunk
+            )
             resp = await client.post("/chat.postMessage", json=payload)
             resp.raise_for_status()
             data = resp.json()
