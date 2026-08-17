@@ -146,6 +146,34 @@ def test_auto_bundle_reports_partial_for_missing_dynamic_and_unsafe_dependencies
     assert {item.path for item in bundle.files} == {"app.js", "index.html"}
 
 
+def test_auto_bundle_keeps_remote_css_url_import_single_file_complete(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    html = workspace / "index.html"
+    html.write_text(
+        """
+        <style>
+          @import url('https://fonts.googleapis.com/css2?family=Inter');
+        </style>
+        <h1>Remote font stays an external preview resource</h1>
+        """,
+        encoding="utf-8",
+    )
+
+    bundle = collect_artifact_bundle(
+        html,
+        workspace_root=workspace,
+        mode="auto",
+    )
+
+    assert bundle is not None
+    assert bundle.collection_status == "complete"
+    assert bundle.warning_codes == ()
+    assert {item.path for item in bundle.files} == {"index.html"}
+
+
 def test_auto_bundle_collects_literal_service_worker_and_marks_dynamic_url_partial(
     tmp_path: Path,
 ) -> None:

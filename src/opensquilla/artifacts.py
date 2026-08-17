@@ -81,7 +81,7 @@ _CSS_URL_RE = re.compile(
     re.IGNORECASE,
 )
 _CSS_IMPORT_RE = re.compile(
-    r"""@import\s+(?:"([^"]+)"|'([^']+)'|([^"'();\s]+))""",
+    r"""@import\s+(?!url\s*\()(?:"([^"]+)"|'([^']+)'|([^"'();\s]+))""",
     re.IGNORECASE,
 )
 _JS_SERVICE_WORKER_RECEIVER_RE = (
