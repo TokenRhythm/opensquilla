@@ -2879,6 +2879,7 @@
       "sourceInstalling": "Installation von {name} läuft",
       "sourceFailures": "{count} fehlgeschlagen",
       "clearActivity": "Aktivität löschen",
+      "cancelInstall": "Installation abbrechen",
       "expandActivity": "Installationsaktivität erweitern",
       "collapseActivity": "Installationsaktivität einklappen",
       "queueStatus": {
@@ -2887,6 +2888,7 @@
         "installed": "Installiert",
         "unchanged": "Bereits aktuell",
         "deferred": "Nicht versucht",
+        "cancelled": "Abgebrochen",
         "failed": "Fehlgeschlagen"
       },
       "installingProgress": "Installation {current} von {total}…",

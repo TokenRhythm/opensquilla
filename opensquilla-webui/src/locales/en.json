@@ -2930,6 +2930,7 @@
       "sourceInstalling": "Installing {name}",
       "sourceFailures": "{count} failed",
       "clearActivity": "Clear activity",
+      "cancelInstall": "Cancel install",
       "expandActivity": "Expand install activity",
       "collapseActivity": "Collapse install activity",
       "queueStatus": {
@@ -2938,6 +2939,7 @@
         "installed": "Installed",
         "unchanged": "Already current",
         "deferred": "Not attempted",
+        "cancelled": "Cancelled",
         "failed": "Failed"
       },
       "installingProgress": "Installing {current} of {total}…",

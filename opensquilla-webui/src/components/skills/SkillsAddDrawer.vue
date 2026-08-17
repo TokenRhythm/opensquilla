@@ -104,6 +104,16 @@
                 </div>
                 <div class="sk-add-section-title__actions">
                   <button
+                    v-if="currentQueueRunning"
+                    class="btn btn--ghost btn--sm sk-add-cancel"
+                    type="button"
+                    data-testid="skills-cancel-install"
+                    @click="emit('cancelInstall', sourceMode)"
+                  >
+                    <Icon name="x" :size="14" />
+                    <span>{{ t('cronSkills.registry.cancelInstall') }}</span>
+                  </button>
+                  <button
                     class="btn btn--ghost btn--sm"
                     type="button"
                     :disabled="installControlsBlocked"
@@ -399,6 +409,7 @@ const emit = defineEmits<{
   installGithub: []
   install: [identifier: string, source: string, displayName: string]
   retry: [id: string, acknowledgeRisk?: boolean]
+  cancelInstall: [source: SkillInstallSource]
   clearActivity: [source: SkillInstallSource]
 }>()
 

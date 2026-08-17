@@ -2879,6 +2879,7 @@
       "sourceInstalling": "{name} をインストール中",
       "sourceFailures": "{count} 件失敗",
       "clearActivity": "履歴を消去",
+      "cancelInstall": "インストールをキャンセル",
       "expandActivity": "インストール状況を展開",
       "collapseActivity": "インストール状況を折りたたむ",
       "queueStatus": {
@@ -2887,6 +2888,7 @@
         "installed": "インストール済み",
         "unchanged": "すでに最新",
         "deferred": "未実行",
+        "cancelled": "キャンセル済み",
         "failed": "失敗"
       },
       "installingProgress": "{total} 件中 {current} 件目をインストール中…",

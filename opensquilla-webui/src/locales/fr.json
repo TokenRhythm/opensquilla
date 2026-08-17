@@ -2879,6 +2879,7 @@
       "sourceInstalling": "Installation de {name}",
       "sourceFailures": "{count} en échec",
       "clearActivity": "Effacer l’activité",
+      "cancelInstall": "Annuler l’installation",
       "expandActivity": "Développer l’activité d’installation",
       "collapseActivity": "Réduire l’activité d’installation",
       "queueStatus": {
@@ -2887,6 +2888,7 @@
         "installed": "Installé",
         "unchanged": "Déjà à jour",
         "deferred": "Non tentée",
+        "cancelled": "Annulée",
         "failed": "Échec"
       },
       "installingProgress": "Installation {current} sur {total}…",

@@ -2930,6 +2930,7 @@
       "sourceInstalling": "正在安装 {name}",
       "sourceFailures": "{count} 项失败",
       "clearActivity": "清除活动",
+      "cancelInstall": "取消安装",
       "expandActivity": "展开安装活动",
       "collapseActivity": "收起安装活动",
       "queueStatus": {
@@ -2938,6 +2939,7 @@
         "installed": "已安装",
         "unchanged": "已是最新",
         "deferred": "未尝试",
+        "cancelled": "已取消",
         "failed": "失败"
       },
       "installingProgress": "正在安装第 {current}/{total} 项…",
