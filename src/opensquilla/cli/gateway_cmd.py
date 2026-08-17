@@ -25,7 +25,12 @@ from opensquilla.gateway.boot import (
     gateway_shutdown_deadline,
     start_gateway_server,
 )
-from opensquilla.gateway.config import GatewayConfig, is_public_bind, resolve_listen_address
+from opensquilla.gateway.config import (
+    ConfigValidationError,
+    GatewayConfig,
+    is_public_bind,
+    resolve_listen_address,
+)
 from opensquilla.gateway.config_migration import ConfigParseError
 from opensquilla.paths import default_opensquilla_home
 
@@ -112,6 +117,13 @@ def _gateway_bind_available(host: str, port: int) -> bool:
 def _load_gateway_config(config_path: str | None, *, read_only: bool = False) -> GatewayConfig:
     try:
         return GatewayConfig.load(config_path, read_only=read_only)
+    except ConfigValidationError as exc:
+        console.print(f"[red]Invalid gateway config:[/red] {exc}")
+        console.print(
+            "Fix the keys listed above, or restore the newest valid backup with "
+            "[bold]opensquilla recovery recover-config --home <profile>[/bold]."
+        )
+        raise typer.Exit(code=1) from None
     except ConfigParseError as exc:
         console.print(f"[red]Invalid gateway config:[/red] {exc}")
         console.print(

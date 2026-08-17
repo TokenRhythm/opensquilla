@@ -19,6 +19,7 @@ from pydantic import (
     Field,
     PrivateAttr,
     SerializeAsAny,
+    ValidationError,
     field_validator,
     model_validator,
 )
@@ -30,6 +31,7 @@ from opensquilla.gateway.config_migration import (
     LATEST_CONFIG_VERSION,
     ConfigParseError,
     backup_and_write_migrated_config,
+    make_config_backup,
     migrate_config_payload,
 )
 from opensquilla.paths import default_opensquilla_home, native_io_path
@@ -3275,7 +3277,11 @@ class GatewayConfig(BaseSettings):
             except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
                 raise ConfigParseError(target, exc) from exc
         migration = migrate_config_payload(data)
-        cfg = cls(**migration.payload)
+        try:
+            cfg = cls(**migration.payload)
+        except ValidationError as exc:
+            backup = _auto_backup_invalid_config(target, exc)
+            raise ConfigValidationError(target, exc, backup=backup) from exc
         cfg._mark_env_absorbed_secrets(data)
         cls._apply_profile_path_overrides(cfg, target)
         if migration.changed:
@@ -3317,7 +3323,18 @@ class GatewayConfig(BaseSettings):
                     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
                         raise ConfigParseError(path, exc) from exc
                 migration = migrate_config_payload(data, emit_diagnostics=not read_only)
-                cfg = cls(**migration.payload)
+                _warn_unknown_config_keys(path, migration.payload)
+                try:
+                    cfg = cls(**migration.payload)
+                except ValidationError as exc:
+                    # A hand-edited config.toml (e.g. an agent writing fields
+                    # that do not exist in the schema) must not dead-end the
+                    # gateway with a bare "exited code=1". Surface every
+                    # offending key with its location, keep a timestamped
+                    # backup of the file the operator can restore, and raise a
+                    # dedicated error the boot/CLI layer can render.
+                    backup = _auto_backup_invalid_config(path, exc)
+                    raise ConfigValidationError(path, exc, backup=backup) from exc
                 cls._apply_profile_path_overrides(cfg, path)
                 if migration.changed and not read_only:
                     _rewrite_migrated_config_best_effort(path, migration)
@@ -3360,6 +3377,145 @@ class GatewayConfig(BaseSettings):
 
 
 # --- bind-address resolution ----------------------------------------------
+
+class ConfigValidationError(ValueError):
+    """A user config file failed schema validation with field-level detail.
+
+    ``load`` raises this (instead of a bare ``pydantic.ValidationError``) so
+    the boot/CLI surfaces can tell the operator exactly which keys are wrong
+    and where a timestamped backup of the original file was kept — turning a
+    silent ``gateway exited code=1`` into an actionable message.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        error: ValidationError,
+        backup: Path | None = None,
+    ) -> None:
+        self.path = Path(path)
+        self.backup = backup
+        self.field_errors = _config_validation_field_errors(error)
+        super().__init__(self._format_message())
+
+    def _format_message(self) -> str:
+        lines = [
+            f"config validation failed in {self.path}",
+            "The following fields could not be parsed or are not recognized:",
+        ]
+        for entry in self.field_errors:
+            location = ".".join(str(part) for part in entry["loc"]) or "<root>"
+            kind = entry["type"]
+            lines.append(f"  - {location}: {entry['msg']} (error {kind})")
+        if self.backup is not None:
+            lines.append(
+                f"A backup of the original file is available at {self.backup}"
+            )
+        lines.append(
+            "Fix the keys above, or restore the backup, and restart the gateway."
+        )
+        return "\n".join(lines)
+
+
+def _config_validation_field_errors(error: ValidationError) -> list[dict[str, Any]]:
+    """Return a stable, message-safe summary of a pydantic ValidationError."""
+    errors = getattr(error, "errors", None)
+    if not callable(errors):
+        return []
+    try:
+        raw = errors()
+    except Exception:
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "loc": item.get("loc", ()),
+            "msg": str(item.get("msg", "")),
+            "type": str(item.get("type", "")),
+        })
+    return out
+
+
+def _resolve_annotation(name: str) -> Any:
+    """Resolve a string annotation to a class within this module's namespace."""
+    target = name
+    if target.startswith("'") and target.endswith("'"):
+        target = target[1:-1]
+    if "[" in target:
+        target = target.split("[", 1)[0]
+    resolved = globals().get(target)
+    if resolved is not None:
+        return resolved
+    module = __import__("opensquilla.gateway.config", fromlist=[target])
+    return getattr(module, target, None)
+
+
+def _auto_backup_invalid_config(path: Path, _error: ValidationError) -> Path | None:
+    """Best-effort timestamped backup of a config that failed validation.
+
+    The backup is created with the shared ``make_config_backup`` helper so it
+    follows the same ``config.toml.backup.<stamp>`` naming scheme as every
+    other managed config backup; failures to back up are non-fatal because
+    the diagnostic itself is the primary recovery aid.
+    """
+    try:
+        return make_config_backup(path)
+    except Exception:
+        return None
+
+
+def _warn_unknown_config_keys(path: Path, payload: dict[str, Any]) -> None:
+    """Warn about top-level and one-level-deep keys outside the schema.
+
+    ``GatewayConfig`` (like most of its nested models) tolerates unknown keys
+    so old configs keep loading, which means a hand-edited typo such as
+    ``[image_generation] edit_primary`` silently no-ops instead of failing.
+    Logging the unknown keys turns that silent ignore into an actionable
+    hint at boot without breaking downgrade compatibility.
+    """
+    try:
+        model_fields = GatewayConfig.model_fields
+    except Exception:
+        return
+    unknown: list[str] = []
+    for key, value in payload.items():
+        if key in model_fields or key == "config_version":
+            continue
+        unknown.append(key)
+        # One level deeper: nested model sections (e.g. image_generation)
+        # that accept extras also swallow typos inside them.
+        if not isinstance(value, dict):
+            continue
+        field_info = model_fields.get(key)
+        nested_model = getattr(field_info, "annotation", None)
+        if isinstance(nested_model, str):
+            # ``from __future__ import annotations`` keeps the annotation a
+            # string until pydantic resolves it; resolve defensively.
+            try:
+                nested_model = _resolve_annotation(nested_model)
+            except Exception:
+                nested_model = None
+        if nested_model is None:
+            continue
+        try:
+            nested_fields = getattr(nested_model, "model_fields", None)
+        except Exception:
+            nested_fields = None
+        if not nested_fields:
+            continue
+        for nested_key in value:
+            if nested_key not in nested_fields:
+                unknown.append(f"{key}.{nested_key}")
+    if not unknown:
+        return
+    logging.getLogger(__name__).warning(
+        "config.unknown_keys path=%s keys=%s "
+        "(ignored; check spelling or restore a backup)",
+        path,
+        ", ".join(sorted(unknown)),
+    )
 
 
 def _rewrite_migrated_config_best_effort(path: Path, migration: Any) -> None:

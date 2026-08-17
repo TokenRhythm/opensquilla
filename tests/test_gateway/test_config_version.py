@@ -135,6 +135,67 @@ def test_config_parse_error_names_the_offending_file(tmp_path: Path) -> None:
         GatewayConfig.load_from_toml(toml_path)
 
 
+def test_config_validation_error_lists_unknown_fields_and_backs_up(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.config import ConfigValidationError
+
+    toml_path = tmp_path / "config.toml"
+    # A hand-edited config with a value outside the schema's constraints —
+    # the exact "agent hallucinated a config edit" scenario from the issue.
+    # The backup + field-level diagnostic are the recovery aids.
+    toml_path.write_text(
+        "log_file_backup_count = -1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigValidationError) as excinfo:
+        GatewayConfig.load(toml_path)
+    error = excinfo.value
+    assert str(toml_path) in str(error)
+    assert error.field_errors
+    assert error.field_errors[0]["loc"] == ("log_file_backup_count",)
+    assert error.backup is not None
+    assert error.backup.exists()
+    assert error.backup.read_text(encoding="utf-8") == "log_file_backup_count = -1\n"
+    # The original file is left untouched so the operator can fix or restore.
+    assert toml_path.read_text(encoding="utf-8") == "log_file_backup_count = -1\n"
+
+
+def test_config_validation_error_also_raised_from_load_from_toml(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.gateway.config import ConfigValidationError
+
+    toml_path = tmp_path / "config.toml"
+    toml_path.write_text("log_file_backup_count = -1\n", encoding="utf-8")
+
+    with pytest.raises(ConfigValidationError) as excinfo:
+        GatewayConfig.load_from_toml(toml_path)
+    assert excinfo.value.field_errors[0]["loc"] == ("log_file_backup_count",)
+    assert excinfo.value.backup is not None
+
+
+def test_config_unknown_keys_warn_without_failing(tmp_path: Path, caplog: Any) -> None:
+    toml_path = tmp_path / "config.toml"
+    # An unknown top-level section and an unknown key inside a nested model
+    # section must not fail loading (extra keys are tolerated for downgrade
+    # compatibility) but should produce an actionable boot-time warning.
+    toml_path.write_text(
+        "[image_generation]\nedit_primary = 'openai/gpt-image-1'\n",
+        encoding="utf-8",
+    )
+
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config"):
+        cfg = GatewayConfig.load(toml_path)
+
+    assert cfg.image_generation.primary == "openai/gpt-image-1"
+    assert "config.unknown_keys" in caplog.text
+    assert "image_generation.edit_primary" in caplog.text
+
+
 def test_migrated_config_write_syncs_before_publication(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
