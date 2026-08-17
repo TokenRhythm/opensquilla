@@ -284,6 +284,7 @@ def test_worker_environment_contains_only_tokenrhythm_provider_secret(
     assert "TOKENRHYTHM_BASE_URL" not in env
     assert "HTTP_PROXY" not in env
     assert "HOME" not in env
+    assert env["PYTHONUNBUFFERED"] == "1"
     assert env["OPENSQUILLA_LIVE_DISABLE_DOTENV"] == "1"
 
 

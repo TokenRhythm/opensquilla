@@ -403,7 +403,13 @@ def _worker_environment(api_key: str) -> dict[str, str]:
             raise RuntimeError("isolated worker received an unrelated provider credential")
     if BASE_URL_ENV in env:
         raise RuntimeError("isolated worker received an endpoint override")
-    return apply_utf8_child_env(env)
+    apply_utf8_child_env(env)
+    # Startup diagnostics must reach the private log before a health timeout,
+    # including when Windows cannot flush a still-running child process.
+    env["PYTHONUNBUFFERED"] = "1"
+    if os.name == "nt":
+        env["PYTHONPROFILEIMPORTTIME"] = "1"
+    return env
 
 
 def _apply_isolated_home_environment(env: dict[str, str], home: Path) -> None:
@@ -1354,14 +1360,18 @@ class GatewayCertificationDriver:
             for stream in (self._stdout, self._stderr):
                 if stream is not None:
                     stream.flush()
-            try:
-                stderr_tail = self.stderr_path.read_text(
-                    encoding="utf-8",
-                    errors="replace",
-                )[-2000:]
-            except OSError:
-                stderr_tail = ""
-            diagnostic = f"{error}; stderr={stderr_tail}" if stderr_tail else error
+            stream_tails: list[str] = []
+            for label, path in (
+                ("stdout", self.stdout_path),
+                ("stderr", self.stderr_path),
+            ):
+                try:
+                    tail = path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                except OSError:
+                    tail = ""
+                if tail:
+                    stream_tails.append(f"{label}={tail}")
+            diagnostic = "; ".join((error, *stream_tails))
             for secret in (
                 self.api_key,
                 bridge_environment.get(DESKTOP_BRIDGE_TOKEN_ENV, ""),
