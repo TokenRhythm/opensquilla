@@ -339,7 +339,13 @@ def is_complete_single_file_preview_bundle(
         manifest is not None
         and manifest.collection_status == "complete"
         and not manifest.warning_codes
-        and manifest.file_count == 1
+        and _is_single_file_preview_bundle(manifest)
+    )
+
+
+def _is_single_file_preview_bundle(manifest: ArtifactBundleManifest) -> bool:
+    return bool(
+        manifest.file_count == 1
         and len(manifest.files) == 1
         and manifest.files[0].path == manifest.entrypoint
     )
@@ -1736,6 +1742,48 @@ class ArtifactStore:
             session_id=session_id,
         )
         return self._describe_preview_bundle_for_ref(ref, material_path)
+
+    def supports_single_file_editing(
+        self,
+        artifact_id: str,
+        *,
+        session_id: str,
+    ) -> bool:
+        """Return whether an artifact can be copied into one editable document.
+
+        Bundle status is derived metadata. Older collectors could persist a
+        false ``missing_dependency`` warning for a remote CSS ``@import
+        url(...)``. Preserve the immutable manifest, but safely reclassify a
+        partial one-file HTML bundle from its integrity-checked entrypoint.
+        Real local, dynamic, unsafe, or undecodable dependencies remain closed.
+        """
+
+        ref, material_path = self.resolve_for_download(
+            artifact_id,
+            session_id=session_id,
+        )
+        manifest = self._describe_preview_bundle_for_ref(ref, material_path)
+        if manifest is None or is_complete_single_file_preview_bundle(manifest):
+            return True
+        if (
+            manifest.collection_status != "partial"
+            or manifest.warning_codes != ("missing_dependency",)
+        ):
+            return False
+        if not _is_single_file_preview_bundle(manifest):
+            return False
+        entry = manifest.files[0]
+        if entry.mime not in {"application/xhtml+xml", "text/html"} and (
+            Path(entry.path).suffix.casefold() not in {".htm", ".html", ".xhtml"}
+        ):
+            return False
+        try:
+            payload = _read_regular_bundle_file(material_path)
+        except (OSError, ArtifactPathError) as exc:
+            raise ArtifactIntegrityError("artifact bundle entrypoint is unreadable") from exc
+        if len(payload) != ref.size or hashlib.sha256(payload).hexdigest() != ref.sha256:
+            raise ArtifactIntegrityError("artifact bundle entrypoint does not match artifact")
+        return not legacy_html_bundle_warning_codes(manifest.entrypoint, payload)
 
     def _describe_preview_bundle_for_ref(
         self,

@@ -52,7 +52,6 @@ from opensquilla.artifacts import (
     ArtifactNotFoundError,
     ArtifactRef,
     ArtifactStore,
-    is_complete_single_file_preview_bundle,
 )
 from opensquilla.gateway.desktop_artifact_bridge import (
     DesktopArtifactBridgeError,
@@ -964,14 +963,14 @@ async def _revision_capabilities(
 
     store = ArtifactStore(media_root_from_config(ctx.config))
     try:
-        manifest = await asyncio.to_thread(
-            store.describe_preview_bundle,
+        supports_editing = await asyncio.to_thread(
+            store.supports_single_file_editing,
             revision.artifact_id,
             session_id=document.session_id,
         )
     except (ArtifactNotFoundError, ArtifactIntegrityError, OSError, ValueError):
         return _html_integrity_failure_capabilities()
-    if manifest is not None and not is_complete_single_file_preview_bundle(manifest):
+    if not supports_editing:
         return _html_bundle_capabilities()
     try:
         ref, path = await asyncio.to_thread(
@@ -2424,8 +2423,8 @@ async def _resolve_source_revision(
     )
     store = ArtifactStore(media_root_from_config(ctx.config))
     try:
-        manifest = await asyncio.to_thread(
-            store.describe_preview_bundle,
+        supports_editing = await asyncio.to_thread(
+            store.supports_single_file_editing,
             revision.artifact_id,
             session_id=session_id,
         )
@@ -2433,7 +2432,7 @@ async def _resolve_source_revision(
         raise _not_found("Revision", revision_id) from None
     except (ArtifactIntegrityError, OSError, ValueError) as exc:
         raise RpcHandlerError("ARTIFACT_INTEGRITY", str(exc)) from exc
-    if manifest is not None and not is_complete_single_file_preview_bundle(manifest):
+    if not supports_editing:
         raise RpcHandlerError(
             "ARTIFACT_SOURCE_UNSUPPORTED",
             "Source editing is available only for single-file HTML artifacts",

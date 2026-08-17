@@ -197,6 +197,112 @@ async def test_multifile_deliverable_is_preview_only_and_never_truncated_on_impo
         limit=10,
     ) == ()
 
+
+@pytest.mark.asyncio
+async def test_stale_partial_single_file_bundle_is_safely_revalidated_for_editing(
+    resource_env,
+) -> None:
+    env = resource_env
+    stale_remote_import = env.store.publish_bundle(
+        ArtifactBundle(
+            entrypoint="index.html",
+            files=(
+                ArtifactBundleSourceFile(
+                    path="index.html",
+                    mime="text/html",
+                    data=(
+                        b"<style>@import url('https://fonts.googleapis.com/css2?family=Inter');"
+                        b"</style><h1>Legacy remote font</h1>"
+                    ),
+                ),
+            ),
+            collection_status="partial",
+            warning_codes=("missing_dependency",),
+        ),
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name="legacy-remote-font.html",
+        mime="text/html",
+        source="workbench-resource-stale-bundle-test",
+    )
+    actual_missing_dependency = env.store.publish_bundle(
+        ArtifactBundle(
+            entrypoint="index.html",
+            files=(
+                ArtifactBundleSourceFile(
+                    path="index.html",
+                    mime="text/html",
+                    data=b"<link rel='stylesheet' href='missing.css'><h1>Incomplete</h1>",
+                ),
+            ),
+            collection_status="partial",
+            warning_codes=("missing_dependency",),
+        ),
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name="actual-missing-dependency.html",
+        mime="text/html",
+        source="workbench-resource-stale-bundle-test",
+    )
+
+    listed = await _dispatch(
+        env,
+        "workbench.resources.list",
+        {"sessionKey": SESSION_KEY, "types": ["deliverable"]},
+    )
+    assert listed.error is None, listed.error
+    capabilities_by_id = {
+        item["resource"]["id"]: item["capabilities"]
+        for item in listed.payload["resources"]
+    }
+    assert capabilities_by_id[stale_remote_import.id]["manualEdit"] is True
+    assert capabilities_by_id[actual_missing_dependency.id]["manualEdit"] is False
+
+    imported = await _dispatch(
+        env,
+        "documents.import",
+        {
+            "sessionKey": SESSION_KEY,
+            "source": {"type": "deliverable", "id": stale_remote_import.id},
+            "mode": "copy",
+            "expectedSha256": stale_remote_import.sha256,
+            "idempotencyKey": "import-revalidated-stale-single-file-bundle",
+        },
+    )
+    assert imported.error is None, imported.error
+
+    source = await _dispatch(
+        env,
+        "artifacts.source.read",
+        {
+            "sessionKey": SESSION_KEY,
+            "documentId": imported.payload["document"]["id"],
+        },
+    )
+    assert source.error is None, source.error
+
+    unchanged_manifest = env.store.describe_preview_bundle(
+        stale_remote_import.id,
+        session_id=env.session.session_id,
+    )
+    assert unchanged_manifest is not None
+    assert unchanged_manifest.collection_status == "partial"
+    assert unchanged_manifest.warning_codes == ("missing_dependency",)
+
+    rejected = await _dispatch(
+        env,
+        "documents.import",
+        {
+            "sessionKey": SESSION_KEY,
+            "source": {"type": "deliverable", "id": actual_missing_dependency.id},
+            "mode": "copy",
+            "expectedSha256": actual_missing_dependency.sha256,
+            "idempotencyKey": "reject-actual-missing-dependency-bundle",
+        },
+    )
+    assert rejected.error is not None
+    assert rejected.error.code == "DOCUMENT_BUNDLE_UNSUPPORTED"
+
 @pytest.fixture
 async def resource_env(tmp_path: Path):
     storage = SessionStorage(":memory:")

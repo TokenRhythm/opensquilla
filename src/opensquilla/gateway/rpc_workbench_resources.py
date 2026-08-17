@@ -41,7 +41,6 @@ from opensquilla.artifacts import (
     ArtifactRef,
     ArtifactStore,
     artifact_payload,
-    is_complete_single_file_preview_bundle,
 )
 from opensquilla.gateway.document_resource_recovery import DocumentImportRecoverySource
 from opensquilla.gateway.event_bridge import EventBridge
@@ -904,17 +903,15 @@ async def _resource_inventory(
             deliverable_importable[deliverable.id] = False
             continue
         try:
-            manifest = await asyncio.to_thread(
-                store.describe_preview_bundle,
+            importable = await asyncio.to_thread(
+                store.supports_single_file_editing,
                 deliverable.id,
                 session_id=session_id,
             )
         except (ArtifactError, OSError):
             deliverable_importable[deliverable.id] = False
         else:
-            deliverable_importable[deliverable.id] = (
-                manifest is None or is_complete_single_file_preview_bundle(manifest)
-            )
+            deliverable_importable[deliverable.id] = importable
     latest_publication_by_document: dict[str, DocumentPublication] = {}
     for publication in publications:
         latest_publication_by_document.setdefault(publication.document_id, publication)
@@ -930,17 +927,13 @@ async def _resource_inventory(
         )
         if trusted_capabilities:
             try:
-                manifest = await asyncio.to_thread(
-                    store.describe_preview_bundle,
+                trusted_capabilities = await asyncio.to_thread(
+                    store.supports_single_file_editing,
                     head.artifact_id,
                     session_id=session_id,
                 )
             except (ArtifactError, OSError):
                 trusted_capabilities = False
-            else:
-                trusted_capabilities = (
-                    manifest is None or is_complete_single_file_preview_bundle(manifest)
-                )
         document_resources.append(
             _document_payload(
                 document,
@@ -1158,12 +1151,12 @@ async def _resolve_import_source(
         raise _not_found(source_type, resource_id)
     store = ArtifactStore(media_root_from_config(ctx.config))
     try:
-        manifest = await asyncio.to_thread(
-            store.describe_preview_bundle,
+        importable = await asyncio.to_thread(
+            store.supports_single_file_editing,
             ref.id,
             session_id=session_id,
         )
-        if manifest is not None and not is_complete_single_file_preview_bundle(manifest):
+        if not importable:
             raise RpcHandlerError(
                 "DOCUMENT_BUNDLE_UNSUPPORTED",
                 "Multi-file deliverables cannot be imported as one editable document",
