@@ -12,6 +12,8 @@ from opensquilla.sandbox.integration import (
     in_process_network_precondition,
     run_in_process_network_action,
 )
+from opensquilla.sandbox.run_context import RunContext
+from opensquilla.sandbox.run_mode import RunMode
 from opensquilla.sandbox.types import DenialResult
 from opensquilla.tools.builtin.web import (
     _search_plan_argv_token,
@@ -26,6 +28,7 @@ from opensquilla.tools.rpc_payload import (
     tools_catalog_payload,
     tools_effective_payload,
 )
+from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
 
 _d = get_dispatcher()
 
@@ -42,6 +45,33 @@ async def run_web_search_payload(
         query,
         max_results,
         provider_name=provider,
+    )
+
+
+def _ensure_search_run_context() -> Any | None:
+    """Install a sandboxed base run context for operator-initiated search.
+
+    ``search.status`` / ``search.query`` run outside a turn, so no ToolContext
+    (and therefore no run context) is installed on the current contextvar. Web
+    search only needs the search provider's system-granted domains, which the
+    managed-proxy path adds on top of a SAFE base context. When a caller has
+    already installed a run context (a turn, or tests), leave it untouched and
+    return ``None``; otherwise return the contextvar token the caller must
+    reset after the RPC body.
+    """
+
+    existing = current_tool_context.get()
+    if existing is not None and isinstance(
+        getattr(existing, "sandbox_run_context", None),
+        RunContext,
+    ):
+        return None
+    return current_tool_context.set(
+        ToolContext(
+            is_owner=True,
+            caller_kind=CallerKind.CLI,
+            sandbox_run_context=RunContext(run_mode=RunMode.SAFE),
+        )
     )
 
 
@@ -398,7 +428,12 @@ async def _handle_search_status(params: dict | None, ctx: RpcContext) -> dict[st
     # reached, so report that half from the same posture the query will resolve.
     # Every readiness surface reaches this handler — the CLI table, and the
     # Control UI Overview through the doctor — so one field covers all of them.
-    reason = in_process_network_precondition()
+    token = _ensure_search_run_context()
+    try:
+        reason = in_process_network_precondition()
+    finally:
+        if token is not None:
+            current_tool_context.reset(token)
     payload["networkReady"] = reason is None
     payload["networkBlockedReason"] = reason
     return payload
@@ -436,19 +471,24 @@ async def _handle_search_query(params: dict | None, ctx: RpcContext) -> dict[str
             provider=provider_name,
         )
 
-    payload_or_denial = await run_in_process_network_action(
-        action_kind="web.fetch",
-        argv=(
-            "web_search",
-            query,
-            str(limit or ""),
-            _search_plan_argv_token(
-                {"query": query, "provider": provider_name},
-                tool_name="web_discover",
+    token = _ensure_search_run_context()
+    try:
+        payload_or_denial = await run_in_process_network_action(
+            action_kind="web.fetch",
+            argv=(
+                "web_search",
+                query,
+                str(limit or ""),
+                _search_plan_argv_token(
+                    {"query": query, "provider": provider_name},
+                    tool_name="web_discover",
+                ),
             ),
-        ),
-        callback=_run_search,
-    )
+            callback=_run_search,
+        )
+    finally:
+        if token is not None:
+            current_tool_context.reset(token)
     if isinstance(payload_or_denial, DenialResult):
         denial = payload_or_denial
         return {

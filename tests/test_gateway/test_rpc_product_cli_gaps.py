@@ -1694,7 +1694,7 @@ async def test_search_status_and_query_return_structured_payloads():
 
 
 @pytest.mark.asyncio
-async def test_search_status_reports_the_precondition_that_denies_query(tmp_path):
+async def test_search_status_reports_ready_for_operator_search(tmp_path):
     from opensquilla.sandbox.config import SandboxSettings
     from opensquilla.sandbox.integration import configure_runtime
 
@@ -1714,21 +1714,14 @@ async def test_search_status_reports_the_precondition_that_denies_query(tmp_path
     )
 
     status = await get_dispatcher().dispatch("r1", "search.status", {}, _ctx())
-    query = await get_dispatcher().dispatch(
-        "r2",
-        "search.query",
-        {"query": "hello", "limit": 2},
-        _ctx(),
-    )
 
     assert status.error is None, status.error
-    assert status.payload["networkReady"] is False
-    reason = status.payload["networkBlockedReason"]
-    assert "Run Context grants" in reason
-    assert query.error is None, query.error
-    assert query.payload["ok"] is False
-    assert query.payload["error"]["kind"] == "policy_denied"
-    assert query.payload["error"]["message"] == reason
+    # The search RPCs establish their own sandboxed run context, so an
+    # operator-initiated CLI query is no longer refused with the misleading
+    # "Run Context grants" precondition that made status and query disagree
+    # (issue #1202).
+    assert status.payload["networkReady"] is True
+    assert status.payload["networkBlockedReason"] is None
 
 
 @pytest.mark.asyncio
