@@ -532,13 +532,14 @@
       },
       "runtimes": {
         "title": "运行环境",
-        "description": "安全模式优先使用已安装的运行环境；完全访问优先使用宿主机工具。",
+        "description": "下载后会自动启用。安全模式优先使用已安装的运行环境；完全访问优先使用宿主机工具。",
         "target": "运行目标",
         "allowRuntime": "允许使用 {runtime}",
         "progress": "{runtime} 下载进度：{progress}%",
         "states": {
           "unknown": "状态暂不可用",
           "notInstalled": "未安装",
+          "disabled": "未启用",
           "installed": "已安装",
           "installedVersion": "已安装 · {version}",
           "unsupported": "当前系统不可用",
@@ -551,18 +552,23 @@
           "probing": "正在检查运行环境",
           "activating": "正在完成安装",
           "cancelling": "正在取消",
+          "queuedRemoval": "等待删除",
           "removing": "正在删除",
           "cancelled": "下载已取消",
           "failed": "下载失败",
+          "removeFailed": "删除失败",
+          "removeInterrupted": "删除已中断",
           "interrupted": "下载已暂停"
         },
         "actions": {
+          "enable": "启用",
           "download": "下载",
           "cancel": "取消",
           "resume": "继续下载",
           "retry": "重试",
           "repair": "修复",
-          "remove": "删除"
+          "remove": "删除",
+          "retryRemove": "重试删除"
         },
         "sources": {
           "oss": "北京 OSS",

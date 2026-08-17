@@ -469,11 +469,16 @@ export function useSandboxSettings() {
     method: 'sandbox.runtime.install' | 'sandbox.runtime.cancel' | 'sandbox.runtime.remove',
     componentId: SandboxRuntimeComponentId,
     params: Record<string, unknown>,
+    prepare?: () => Promise<boolean>,
   ): Promise<boolean> {
     if (runtimeActionPending[componentId] || runtimeStatusSupported.value === false) return false
     runtimeActionPending[componentId] = true
     runtimeActionError[componentId] = ''
     try {
+      if (prepare && !(await prepare())) {
+        runtimeActionError[componentId] = i18n.global.t('errors.saveFailed')
+        return false
+      }
       await rpc.waitForConnection()
       const response = await rpc.call<unknown>(method, params)
       const status = normalizeRuntimeStatusResponse(response)
@@ -497,8 +502,38 @@ export function useSandboxSettings() {
     }
   }
 
+  function ensureRuntimeEnabled(componentId: SandboxRuntimeComponentId): Promise<boolean> {
+    if (!draft.value) return Promise.resolve(false)
+    if (!draft.value.runtimes.enabled) {
+      draft.value.runtimes.python = false
+      draft.value.runtimes.node = false
+      draft.value.runtimes.gitBash = false
+    }
+    draft.value.runtimes.enabled = true
+    draft.value.runtimes[componentId] = true
+    return flushSectionSave('runtimes')
+  }
+
+  async function enableRuntime(componentId: SandboxRuntimeComponentId): Promise<boolean> {
+    if (runtimeActionPending[componentId]) return false
+    runtimeActionPending[componentId] = true
+    runtimeActionError[componentId] = ''
+    try {
+      const enabled = await ensureRuntimeEnabled(componentId)
+      if (!enabled) runtimeActionError[componentId] = i18n.global.t('errors.saveFailed')
+      return enabled
+    } finally {
+      runtimeActionPending[componentId] = false
+    }
+  }
+
   function installRuntime(componentId: SandboxRuntimeComponentId): Promise<boolean> {
-    return runRuntimeAction('sandbox.runtime.install', componentId, { componentId })
+    return runRuntimeAction(
+      'sandbox.runtime.install',
+      componentId,
+      { componentId },
+      () => ensureRuntimeEnabled(componentId),
+    )
   }
 
   function cancelRuntime(
@@ -735,6 +770,7 @@ export function useSandboxSettings() {
     load,
     loadRuntimeStatus,
     setRuntimeViewActive,
+    enableRuntime,
     installRuntime,
     cancelRuntime,
     removeRuntime,

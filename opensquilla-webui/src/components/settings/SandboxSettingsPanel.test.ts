@@ -93,6 +93,13 @@ async function mountPanel(options: {
   runtimeStatus?: unknown | ((params?: Record<string, unknown>) => unknown)
   runtimeStatusError?: Error
   runtimeAction?: (method: string, params?: Record<string, unknown>) => unknown
+  runtimePolicy?: {
+    enabled: boolean
+    python: boolean
+    node: boolean
+    gitBash: boolean
+  }
+  policyUpdateError?: Error
 } = {}) {
   vi.resetModules()
   document.body.innerHTML = ''
@@ -135,7 +142,11 @@ async function mountPanel(options: {
         ...(options.ensureDetail ? { detail: options.ensureDetail } : {}),
       }
     }
-    if (method === 'sandbox.policy.get') return JSON.parse(JSON.stringify(policy))
+    if (method === 'sandbox.policy.get') {
+      const loadedPolicy = JSON.parse(JSON.stringify(policy))
+      if (options.runtimePolicy) loadedPolicy.runtimes = structuredClone(options.runtimePolicy)
+      return loadedPolicy
+    }
     if (method === 'sandbox.runtime.status') {
       if (options.runtimeStatusError) throw options.runtimeStatusError
       if (typeof options.runtimeStatus === 'function') return options.runtimeStatus(params)
@@ -173,6 +184,7 @@ async function mountPanel(options: {
       }
     }
     if (method === 'sandbox.policy.update') {
+      if (options.policyUpdateError) throw options.policyUpdateError
       const saved = JSON.parse(JSON.stringify(params?.policy))
       saved.policyVersion = Number(params?.basePolicyVersion) + 1
       return saved
@@ -583,9 +595,13 @@ describe('SandboxSettingsPanel', () => {
       .toBe(false)
   })
 
-  it('renders compact runtime pack states and keeps toggles independent from installation', async () => {
-    const { el, call } = await mountPanel()
+  it('renders compact runtime pack states without ambiguous policy switches', async () => {
+    const { el } = await mountPanel()
 
+    expect(el.querySelector('[data-testid="sandbox-open-runtimes"]')?.textContent)
+      .toContain('Python')
+    expect(el.querySelector('[data-testid="sandbox-open-runtimes"]')?.textContent)
+      .not.toContain('Node.js')
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
     await settle()
 
@@ -595,12 +611,112 @@ describe('SandboxSettingsPanel', () => {
     expect(el.querySelector('[data-testid="sandbox-runtime-node"]')?.textContent)
       .toContain('Not installed')
     expect(el.querySelector('[data-testid="sandbox-runtime-install-node"]')).toBeTruthy()
-    expect(el.querySelector<HTMLInputElement>('[data-testid="sandbox-runtime-toggle-node"]')?.checked)
-      .toBe(true)
+    expect(el.querySelector('[data-testid^="sandbox-runtime-toggle-"]')).toBeNull()
+    expect(el.querySelector('.sandbox-detail-header .sandbox-switch')).toBeNull()
+  })
 
-    el.querySelector<HTMLInputElement>('[data-testid="sandbox-runtime-toggle-node"]')!.click()
+  it('does not project policy flags as installed runtimes while status is loading', async () => {
+    let resolveStatus!: (value: SandboxRuntimePackStatus) => void
+    const runtimeStatus = new Promise<SandboxRuntimePackStatus>((resolve) => {
+      resolveStatus = resolve
+    })
+    const { el } = await mountPanel({ runtimeStatus })
+
+    const summary = el.querySelector('[data-testid="sandbox-open-runtimes"]')?.textContent
+    expect(summary).toContain('Loading')
+    expect(summary).not.toContain('Python · Node.js')
+
+    resolveStatus(structuredClone(runtimePackStatus))
     await settle()
+  })
+
+  it('enables only the requested runtime before starting its download', async () => {
+    const { el, call } = await mountPanel({
+      runtimePolicy: {
+        enabled: false,
+        python: true,
+        node: true,
+        gitBash: true,
+      },
+    })
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-install-node"]')!.click()
+    await settle()
+
+    const policyCallIndex = call.mock.calls.findIndex(
+      ([method]) => method === 'sandbox.policy.update',
+    )
+    const installCallIndex = call.mock.calls.findIndex(
+      ([method]) => method === 'sandbox.runtime.install',
+    )
+    expect(policyCallIndex).toBeGreaterThanOrEqual(0)
+    expect(installCallIndex).toBeGreaterThan(policyCallIndex)
+    expect(call.mock.calls[policyCallIndex]?.[1]).toEqual(expect.objectContaining({
+      policy: expect.objectContaining({
+        runtimes: {
+          enabled: true,
+          python: false,
+          node: true,
+          gitBash: false,
+        },
+      }),
+    }))
+  })
+
+  it('does not download when automatic runtime enabling cannot be saved', async () => {
+    const { el, call } = await mountPanel({
+      runtimePolicy: {
+        enabled: false,
+        python: false,
+        node: false,
+        gitBash: false,
+      },
+      policyUpdateError: new Error('write rejected'),
+    })
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-install-node"]')!.click()
+    await settle()
+
     expect(call.mock.calls.some(([method]) => method === 'sandbox.policy.update')).toBe(true)
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
+    expect(el.querySelector('[data-testid="sandbox-runtime-node"]')?.textContent)
+      .toContain('Save failed')
+  })
+
+  it('offers one explicit Enable action for an installed legacy-disabled runtime', async () => {
+    const { el, call } = await mountPanel({
+      runtimePolicy: {
+        enabled: false,
+        python: false,
+        node: false,
+        gitBash: false,
+      },
+    })
+    expect(el.querySelector('[data-testid="sandbox-open-runtimes"]')?.textContent)
+      .toContain('Python (Not enabled)')
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    const pythonRow = el.querySelector('[data-testid="sandbox-runtime-python"]')
+    expect(pythonRow?.textContent).toContain('Installed · 3.13.14+20260728 · Not enabled')
+    expect(el.querySelector('[data-testid="sandbox-runtime-enable-python"]')).toBeTruthy()
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-enable-python"]')!.click()
+    await settle()
+
+    expect(call).toHaveBeenCalledWith('sandbox.policy.update', expect.objectContaining({
+      policy: expect.objectContaining({
+        runtimes: {
+          enabled: true,
+          python: true,
+          node: false,
+          gitBash: false,
+        },
+      }),
+    }))
     expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
   })
 
@@ -650,7 +766,6 @@ describe('SandboxSettingsPanel', () => {
   it('hides Git Bash for non-Windows runtime targets', async () => {
     const status = structuredClone(runtimePackStatus)
     status.target = 'darwin-arm64'
-    status.components = status.components.filter(component => component.componentId !== 'gitBash')
     const { el } = await mountPanel({ runtimeTarget: 'darwin-arm64', runtimeStatus: status })
 
     expect(el.querySelector('[data-testid="sandbox-open-runtimes"]')?.textContent)
@@ -676,6 +791,134 @@ describe('SandboxSettingsPanel', () => {
     expect(el.querySelector('[data-testid^="sandbox-runtime-install-"]')).toBeNull()
     expect(el.querySelector('[data-testid^="sandbox-runtime-remove-"]')).toBeNull()
     expect(el.querySelector('[data-testid="sandbox-runtime-status-retry"]')).toBeNull()
+  })
+
+  it('can re-enable a legacy runtime when the management RPC is unavailable', async () => {
+    const methodNotFound = Object.assign(new Error('method not found'), {
+      code: 'METHOD_NOT_FOUND',
+    })
+    const { el, call } = await mountPanel({
+      runtimeStatusError: methodNotFound,
+      runtimePolicy: {
+        enabled: false,
+        python: false,
+        node: false,
+        gitBash: false,
+      },
+    })
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    expect(el.querySelector('[data-testid="sandbox-runtime-python"]')?.textContent)
+      .toContain('3.13.14 · Not enabled')
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-enable-python"]')!.click()
+    await settle()
+
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.policy.update')).toBe(true)
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
+  })
+
+  it('keeps an explicit Enable failure inside the affected legacy runtime row', async () => {
+    const methodNotFound = Object.assign(new Error('method not found'), {
+      code: 'METHOD_NOT_FOUND',
+    })
+    const { el, call } = await mountPanel({
+      runtimeStatusError: methodNotFound,
+      runtimePolicy: {
+        enabled: false,
+        python: false,
+        node: false,
+        gitBash: false,
+      },
+      policyUpdateError: new Error('write rejected'),
+    })
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-enable-python"]')!.click()
+    await settle()
+
+    expect(call.mock.calls.some(([method]) => method === 'sandbox.runtime.install')).toBe(false)
+    expect(el.querySelector('[data-testid="sandbox-runtime-python"]')?.textContent)
+      .toContain('Save failed')
+  })
+
+  it('does not present unsupported managed runtimes as installed in the overview', async () => {
+    const unsupported = structuredClone(runtimePackStatus)
+    unsupported.managementSupported = false
+    unsupported.components = unsupported.components.map(component => ({
+      ...component,
+      availability: 'unsupported',
+      activeVersion: null,
+      installedBytes: null,
+      removable: false,
+    }))
+    const { el } = await mountPanel({ runtimeStatus: unsupported })
+
+    const summary = el.querySelector('[data-testid="sandbox-open-runtimes"]')?.textContent
+    expect(summary).toContain('Not available for this system')
+    expect(summary).not.toContain('Python · Node.js')
+  })
+
+  it('keeps remove operations distinct from download actions', async () => {
+    const status = structuredClone(runtimePackStatus)
+    status.components[0] = {
+      ...status.components[0],
+      operation: {
+        operationId: 'remove-1',
+        componentId: 'python',
+        kind: 'remove',
+        state: 'failed',
+        source: null,
+        downloadedBytes: 0,
+        totalBytes: null,
+        progressPercent: 0,
+        startedAtMs: 1,
+        updatedAtMs: 2,
+        error: null,
+      },
+    }
+    const { el, call } = await mountPanel({ runtimeStatus: status })
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    const pythonRow = el.querySelector('[data-testid="sandbox-runtime-python"]')
+    expect(pythonRow?.textContent).toContain('Removal failed')
+    expect(pythonRow?.textContent).toContain('Retry removal')
+    expect(el.querySelector('[data-testid="sandbox-runtime-install-python"]')).toBeNull()
+    expect(el.querySelector('[data-testid="sandbox-runtime-cancel-python"]')).toBeNull()
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-runtime-remove-python"]')!.click()
+    await settle()
+    expect(call).toHaveBeenCalledWith('sandbox.runtime.remove', { componentId: 'python' })
+  })
+
+  it('offers download again after a remove operation completes', async () => {
+    const status = structuredClone(runtimePackStatus)
+    status.components[0] = {
+      ...status.components[0],
+      availability: 'missing',
+      activeVersion: null,
+      installedBytes: null,
+      removable: false,
+      operation: {
+        operationId: 'remove-complete-1',
+        componentId: 'python',
+        kind: 'remove',
+        state: 'completed',
+        source: null,
+        downloadedBytes: 0,
+        totalBytes: null,
+        progressPercent: 0,
+        startedAtMs: 1,
+        updatedAtMs: 2,
+        error: null,
+      },
+    }
+    const { el } = await mountPanel({ runtimeStatus: status })
+    el.querySelector<HTMLButtonElement>('[data-testid="sandbox-open-runtimes"]')!.click()
+    await settle()
+
+    expect(el.querySelector('[data-testid="sandbox-runtime-install-python"]')).toBeTruthy()
+    expect(el.querySelector('[data-testid="sandbox-runtime-remove-python"]')).toBeNull()
   })
 
   it('keeps transient runtime status errors inside the runtime subpage and allows retry', async () => {

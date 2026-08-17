@@ -532,13 +532,14 @@
       },
       "runtimes": {
         "title": "Runtime packs",
-        "description": "Safe prefers installed runtime packs. Full Access keeps host tools first.",
+        "description": "Downloads are enabled automatically. Safe mode prefers installed runtime packs; Full Access keeps host tools first.",
         "target": "Runtime target",
         "allowRuntime": "Allow {runtime}",
         "progress": "{runtime} download: {progress}%",
         "states": {
           "unknown": "Status unavailable",
           "notInstalled": "Not installed",
+          "disabled": "Not enabled",
           "installed": "Installed",
           "installedVersion": "Installed · {version}",
           "unsupported": "Not available for this system",
@@ -551,18 +552,23 @@
           "probing": "Checking runtime",
           "activating": "Finishing installation",
           "cancelling": "Cancelling",
+          "queuedRemoval": "Waiting to remove",
           "removing": "Removing",
           "cancelled": "Download cancelled",
           "failed": "Download failed",
+          "removeFailed": "Removal failed",
+          "removeInterrupted": "Removal interrupted",
           "interrupted": "Download paused"
         },
         "actions": {
+          "enable": "Enable",
           "download": "Download",
           "cancel": "Cancel",
           "resume": "Resume",
           "retry": "Retry",
           "repair": "Repair",
-          "remove": "Remove"
+          "remove": "Remove",
+          "retryRemove": "Retry removal"
         },
         "sources": {
           "oss": "Beijing OSS",

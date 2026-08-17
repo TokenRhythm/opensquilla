@@ -494,15 +494,15 @@
         "blockAll": "Gesamten Netzwerkzugriff sperren", "blockAllDescription": "Erlaubte Domains bleiben Ausnahmen.", "allowDomains": "Erlaubte Domains", "denyDomains": "Gesperrte Domains"
       },
       "runtimes": {
-        "title": "Laufzeitpakete", "description": "Sicher bevorzugt installierte Laufzeitpakete; Vollzugriff bevorzugt Host-Werkzeuge.", "target": "Laufzeitziel",
+        "title": "Laufzeitpakete", "description": "Downloads werden automatisch aktiviert. Sicher bevorzugt installierte Laufzeitpakete; Vollzugriff priorisiert Host-Werkzeuge.", "target": "Laufzeitziel",
         "allowRuntime": "{runtime} erlauben", "progress": "{runtime}-Download: {progress}%",
         "states": {
-          "unknown": "Status nicht verfügbar", "notInstalled": "Nicht installiert", "installed": "Installiert", "installedVersion": "Installiert · {version}",
+          "unknown": "Status nicht verfügbar", "notInstalled": "Nicht installiert", "disabled": "Nicht aktiviert", "installed": "Installiert", "installedVersion": "Installiert · {version}",
           "unsupported": "Für dieses System nicht verfügbar", "corrupt": "Reparatur erforderlich", "queued": "Wartet auf Download", "downloading": "Wird heruntergeladen", "downloadingProgress": "Download · {progress}%",
-          "verifying": "Download wird geprüft", "extracting": "Wird installiert", "probing": "Laufzeit wird geprüft", "activating": "Installation wird abgeschlossen", "cancelling": "Wird abgebrochen", "removing": "Wird entfernt",
-          "cancelled": "Download abgebrochen", "failed": "Download fehlgeschlagen", "interrupted": "Download pausiert"
+          "verifying": "Download wird geprüft", "extracting": "Wird installiert", "probing": "Laufzeit wird geprüft", "activating": "Installation wird abgeschlossen", "cancelling": "Wird abgebrochen", "queuedRemoval": "Wartet auf Entfernung", "removing": "Wird entfernt",
+          "cancelled": "Download abgebrochen", "failed": "Download fehlgeschlagen", "removeFailed": "Entfernen fehlgeschlagen", "removeInterrupted": "Entfernen unterbrochen", "interrupted": "Download pausiert"
         },
-        "actions": { "download": "Herunterladen", "cancel": "Abbrechen", "resume": "Fortsetzen", "retry": "Erneut versuchen", "repair": "Reparieren", "remove": "Entfernen" },
+        "actions": { "enable": "Aktivieren", "download": "Herunterladen", "cancel": "Abbrechen", "resume": "Fortsetzen", "retry": "Erneut versuchen", "repair": "Reparieren", "remove": "Entfernen", "retryRemove": "Entfernen wiederholen" },
         "sources": { "oss": "OSS Peking", "github": "GitHub-Veröffentlichungen" }
       },
       "lan": {

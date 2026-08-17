@@ -494,15 +494,15 @@
         "blockAll": "Bloquer tout le réseau", "blockAllDescription": "Les domaines autorisés restent des exceptions.", "allowDomains": "Domaines autorisés", "denyDomains": "Domaines refusés"
       },
       "runtimes": {
-        "title": "Paquets d'exécution", "description": "Sûr privilégie les paquets installés ; Accès complet privilégie les outils de l'hôte.", "target": "Cible d'exécution",
+        "title": "Paquets d'exécution", "description": "Les téléchargements sont activés automatiquement. Sûr les privilégie ; Accès complet conserve la priorité aux outils de l'hôte.", "target": "Cible d'exécution",
         "allowRuntime": "Autoriser {runtime}", "progress": "Téléchargement de {runtime} : {progress}%",
         "states": {
-          "unknown": "État indisponible", "notInstalled": "Non installé", "installed": "Installé", "installedVersion": "Installé · {version}",
+          "unknown": "État indisponible", "notInstalled": "Non installé", "disabled": "Non activé", "installed": "Installé", "installedVersion": "Installé · {version}",
           "unsupported": "Indisponible pour ce système", "corrupt": "Réparation requise", "queued": "En attente de téléchargement", "downloading": "Téléchargement", "downloadingProgress": "Téléchargement · {progress}%",
-          "verifying": "Vérification du téléchargement", "extracting": "Installation", "probing": "Vérification de l'environnement", "activating": "Finalisation de l'installation", "cancelling": "Annulation", "removing": "Suppression",
-          "cancelled": "Téléchargement annulé", "failed": "Échec du téléchargement", "interrupted": "Téléchargement suspendu"
+          "verifying": "Vérification du téléchargement", "extracting": "Installation", "probing": "Vérification de l'environnement", "activating": "Finalisation de l'installation", "cancelling": "Annulation", "queuedRemoval": "En attente de suppression", "removing": "Suppression",
+          "cancelled": "Téléchargement annulé", "failed": "Échec du téléchargement", "removeFailed": "Échec de la suppression", "removeInterrupted": "Suppression interrompue", "interrupted": "Téléchargement suspendu"
         },
-        "actions": { "download": "Télécharger", "cancel": "Annuler", "resume": "Reprendre", "retry": "Réessayer", "repair": "Réparer", "remove": "Supprimer" },
+        "actions": { "enable": "Activer", "download": "Télécharger", "cancel": "Annuler", "resume": "Reprendre", "retry": "Réessayer", "repair": "Réparer", "remove": "Supprimer", "retryRemove": "Réessayer la suppression" },
         "sources": { "oss": "OSS de Pékin", "github": "Versions GitHub" }
       },
       "lan": {

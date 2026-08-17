@@ -494,15 +494,15 @@
         "blockAll": "すべてのネットワークを遮断", "blockAllDescription": "許可ドメインだけを例外にします。", "allowDomains": "許可ドメイン", "denyDomains": "拒否ドメイン"
       },
       "runtimes": {
-        "title": "ランタイムパック", "description": "安全モードはインストール済みパックを優先し、フルアクセスはホストツールを優先します。", "target": "ランタイム対象",
+        "title": "ランタイムパック", "description": "ダウンロード後は自動的に有効になります。安全モードはインストール済みパックを優先し、フルアクセスはホストツールを優先します。", "target": "ランタイム対象",
         "allowRuntime": "{runtime} を許可", "progress": "{runtime} のダウンロード：{progress}%",
         "states": {
-          "unknown": "状態を取得できません", "notInstalled": "未インストール", "installed": "インストール済み", "installedVersion": "インストール済み · {version}",
+          "unknown": "状態を取得できません", "notInstalled": "未インストール", "disabled": "無効", "installed": "インストール済み", "installedVersion": "インストール済み · {version}",
           "unsupported": "このシステムでは利用できません", "corrupt": "修復が必要です", "queued": "ダウンロード待ち", "downloading": "ダウンロード中", "downloadingProgress": "ダウンロード中 · {progress}%",
-          "verifying": "ダウンロードを検証中", "extracting": "インストール中", "probing": "ランタイムを確認中", "activating": "インストールを完了中", "cancelling": "キャンセル中", "removing": "削除中",
-          "cancelled": "ダウンロードをキャンセルしました", "failed": "ダウンロードに失敗しました", "interrupted": "ダウンロードを一時停止しました"
+          "verifying": "ダウンロードを検証中", "extracting": "インストール中", "probing": "ランタイムを確認中", "activating": "インストールを完了中", "cancelling": "キャンセル中", "queuedRemoval": "削除待ち", "removing": "削除中",
+          "cancelled": "ダウンロードをキャンセルしました", "failed": "ダウンロードに失敗しました", "removeFailed": "削除に失敗しました", "removeInterrupted": "削除が中断されました", "interrupted": "ダウンロードを一時停止しました"
         },
-        "actions": { "download": "ダウンロード", "cancel": "キャンセル", "resume": "再開", "retry": "再試行", "repair": "修復", "remove": "削除" },
+        "actions": { "enable": "有効にする", "download": "ダウンロード", "cancel": "キャンセル", "resume": "再開", "retry": "再試行", "repair": "修復", "remove": "削除", "retryRemove": "削除を再試行" },
         "sources": { "oss": "北京 OSS", "github": "GitHub リリース" }
       },
       "lan": {
