@@ -307,9 +307,31 @@ def test_isolated_home_environment_supports_path_home_in_child(tmp_path: Path) -
     assert env["USERPROFILE"] == str(isolated_home.resolve())
 
 
-def test_owned_gateway_startup_budget_covers_windows_first_boot_acl_hardening() -> None:
-    assert e2e._gateway_startup_timeout_seconds("nt") == 120.0
-    assert e2e._gateway_startup_timeout_seconds("posix") == 45.0
+@pytest.mark.skipif(os.name != "nt", reason="Windows isolated-profile ACL smoke")
+def test_isolated_home_environment_supports_windows_acl_hardening(tmp_path: Path) -> None:
+    isolated_home = tmp_path / "user-state"
+    isolated_home.mkdir()
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    env = e2e._worker_environment("synthetic-rotated-key")
+    e2e._apply_isolated_home_environment(env, isolated_home)
+    env["PYTHONPATH"] = str(e2e.SRC_DIR)
+    code = (
+        "from pathlib import Path; import sys; "
+        "from opensquilla.sandbox.upgrade_migration import "
+        "_current_windows_user_sid, _protect_private_path; "
+        "_protect_private_path(Path(sys.argv[1]), directory=True, "
+        "windows_user_sid=_current_windows_user_sid())"
+    )
+
+    subprocess.run(
+        [sys.executable, "-c", code, str(protected)],
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+        timeout=30,
+    )
 
 
 def test_live_harness_checks_each_feature_default_independently(

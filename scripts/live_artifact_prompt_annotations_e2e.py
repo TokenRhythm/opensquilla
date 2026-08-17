@@ -413,18 +413,22 @@ def _worker_environment(api_key: str) -> dict[str, str]:
 def _apply_isolated_home_environment(env: dict[str, str], home: Path) -> None:
     """Give an isolated child a portable home without exposing the operator's profile."""
 
-    isolated_home = str(home.resolve())
+    resolved_home = home.resolve()
+    isolated_home = str(resolved_home)
     # pathlib.Path.home() consults HOME on POSIX and USERPROFILE on Windows.
     # Set both explicitly because the least-privilege provider environment
     # intentionally inherits neither from the host.
     env["HOME"] = isolated_home
     env["USERPROFILE"] = isolated_home
-
-
-def _gateway_startup_timeout_seconds(platform_name: str | None = None) -> float:
-    """Allow Windows first-boot ACL hardening without weakening other startup gates."""
-
-    return 120.0 if (platform_name or os.name) == "nt" else 45.0
+    if os.name == "nt":
+        roaming = resolved_home / "AppData" / "Roaming"
+        local = resolved_home / "AppData" / "Local"
+        roaming.mkdir(mode=0o700, parents=True, exist_ok=True)
+        local.mkdir(mode=0o700, parents=True, exist_ok=True)
+        env["APPDATA"] = str(roaming)
+        env["LOCALAPPDATA"] = str(local)
+        env["HOMEDRIVE"] = resolved_home.drive
+        env["HOMEPATH"] = isolated_home[len(resolved_home.drive) :]
 
 
 def _case_payload(scenario: Scenario, evidence: CaseEvidence | None = None) -> dict[str, Any]:
@@ -1359,7 +1363,6 @@ class GatewayCertificationDriver:
             _wait_for_gateway_health,
             self.process,
             self.port,
-            timeout_seconds=_gateway_startup_timeout_seconds(),
         )
         if error is not None:
             for stream in (self._stdout, self._stderr):
