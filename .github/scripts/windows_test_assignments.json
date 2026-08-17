@@ -556,6 +556,7 @@
       "tests/test_gateway/test_task_runtime_overflow_policy.py",
       "tests/test_gateway/test_task_runtime_reservations.py",
       "tests/test_gateway/test_task_runtime_reserved_slots.py",
+      "tests/test_gateway/test_task_runtime_shutdown_fence.py",
       "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
       "tests/test_gateway/test_task_runtime_terminal_message.py",
       "tests/test_gateway/test_task_session_lifecycle.py",

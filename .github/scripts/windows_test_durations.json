@@ -521,6 +521,7 @@
     "tests/test_gateway/test_task_runtime_overflow_policy.py": 0.023,
     "tests/test_gateway/test_task_runtime_reservations.py": 0.01,
     "tests/test_gateway/test_task_runtime_reserved_slots.py": 0.019,
+    "tests/test_gateway/test_task_runtime_shutdown_fence.py": 0.01,
     "tests/test_gateway/test_task_runtime_terminal_cleanup.py": 17.435,
     "tests/test_gateway/test_task_runtime_terminal_message.py": 0.052,
     "tests/test_gateway/test_task_session_lifecycle.py": 0.026,
