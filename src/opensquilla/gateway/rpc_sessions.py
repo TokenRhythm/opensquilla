@@ -4640,7 +4640,10 @@ async def _handle_sessions_send_impl(
         assert persisted_entry is not None
         atomic_task_runtime = task_runtime
 
-        from opensquilla.gateway.task_runtime import TaskQueueFullError
+        from opensquilla.gateway.task_runtime import (
+            TaskQueueFullError,
+            TaskRuntimeShuttingDownError,
+        )
 
         meta_launch_promotion: str | None = None
 
@@ -4916,6 +4919,16 @@ async def _handle_sessions_send_impl(
             acceptance = await complete_durable_ingress(
                 _commit_with_session_admission()
             )
+        except TaskRuntimeShuttingDownError as exc:
+            _consumed_file_uuids = []
+            _cleanup_rejected_guest_profile()
+            raise RpcHandlerError(
+                "UNAVAILABLE",
+                "The Gateway is shutting down. Retry after it restarts.",
+                details={"session_key": exc.session_key},
+                retryable=True,
+                accepted=False,
+            ) from exc
         except TaskQueueFullError as exc:
             _consumed_file_uuids = []
             _cleanup_rejected_guest_profile()
@@ -5617,9 +5630,15 @@ async def _handle_sessions_send_impl(
             # the user can retry against the same uuid.
             _consumed_file_uuids = []  # noqa: F841 – explicit no-evict marker
             _cleanup_rejected_guest_profile()
-            from opensquilla.gateway.task_runtime import TaskQueueFullError
+            from opensquilla.gateway.task_runtime import (
+                TaskQueueFullError,
+                TaskRuntimeShuttingDownError,
+            )
 
-            if not isinstance(exc, TaskQueueFullError):
+            if not isinstance(
+                exc,
+                (TaskQueueFullError, TaskRuntimeShuttingDownError),
+            ):
                 if legacy_meta_launch_promotion == "promoted":
                     from opensquilla.engine.steps.meta_command import (
                         pending_meta_launch_restage,
@@ -5636,7 +5655,9 @@ async def _handle_sessions_send_impl(
             # storage error under load), surface a non-retryable error and
             # hand the orphan message_id to the client as an idempotency
             # token — clients must dedup before retrying.
-            orphan_id, rollback_ok = await _rollback_persisted_user_message("queue_full")
+            shutting_down = isinstance(exc, TaskRuntimeShuttingDownError)
+            rollback_reason = "runtime_shutting_down" if shutting_down else "queue_full"
+            orphan_id, rollback_ok = await _rollback_persisted_user_message(rollback_reason)
 
             if rollback_ok:
                 if legacy_meta_launch_promotion == "promoted":
@@ -5648,6 +5669,18 @@ async def _handle_sessions_send_impl(
                         key,
                         client_request_id=ingress_identity.client_request_id,
                     )
+                if shutting_down:
+                    raise RpcHandlerError(
+                        "UNAVAILABLE",
+                        "The Gateway is shutting down. Retry after it restarts.",
+                        details={
+                            "session_key": exc.session_key,
+                            "rollback_message_id": orphan_id,
+                        },
+                        retryable=True,
+                        accepted=False,
+                    ) from exc
+                assert isinstance(exc, TaskQueueFullError)
                 raise RpcHandlerError(
                     "QUEUE_FULL",
                     "The session task queue is full. Try again after queued work completes.",
@@ -5668,6 +5701,22 @@ async def _handle_sessions_send_impl(
                     key,
                     client_request_id=ingress_identity.client_request_id,
                 )
+            if shutting_down:
+                raise RpcHandlerError(
+                    "UNAVAILABLE",
+                    (
+                        "The Gateway is shutting down and the accepted transcript "
+                        "entry could not be rolled back."
+                    ),
+                    details={
+                        "session_key": exc.session_key,
+                        "orphan_message_id": orphan_id,
+                        "remediation": "client must dedup by message_id before retry",
+                    },
+                    retryable=False,
+                    accepted=True,
+                ) from exc
+            assert isinstance(exc, TaskQueueFullError)
             raise RpcHandlerError(
                 "QUEUE_FULL_DIRTY",
                 (
