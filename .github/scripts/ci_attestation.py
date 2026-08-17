@@ -47,6 +47,35 @@ class AttestationError(RuntimeError):
     """A queue attestation could not be trusted."""
 
 
+class _SafeArtifactRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow artifact redirects without forwarding GitHub API credentials."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+
+        source = urllib.parse.urlsplit(req.full_url)
+        target = urllib.parse.urlsplit(redirected.full_url)
+        if target.scheme.lower() != "https":
+            raise AttestationError("artifact download redirect must use HTTPS")
+        if (source.scheme.lower(), source.netloc.lower()) != (
+            target.scheme.lower(),
+            target.netloc.lower(),
+        ):
+            for header in ("Authorization", "Accept", "X-GitHub-Api-Version"):
+                redirected.remove_header(header)
+        return redirected
+
+
 def _git(*args: str, cwd: Path) -> str:
     completed = subprocess.run(
         ["git", *args],
@@ -202,7 +231,8 @@ def _request_bytes(url: str, token: str) -> bytes:
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
+    opener = urllib.request.build_opener(_SafeArtifactRedirectHandler())
+    with opener.open(request, timeout=60) as response:
         return response.read()
 
 
