@@ -100,7 +100,12 @@ from opensquilla.contracts.attachments import (
     normalize_attachment_mime as _normalize_attachment_mime,
 )
 from opensquilla.contracts.turn_execution import TurnExecutionContext
-from opensquilla.engine.agent import UNSUPPORTED_IMAGE_INPUT_REPLY, Agent, ToolHandler
+from opensquilla.engine.agent import (
+    UNSUPPORTED_IMAGE_INPUT_REPLY,
+    Agent,
+    ToolHandler,
+    model_explicitly_lacks_vision,
+)
 from opensquilla.engine.agent_injection import PendingInputProvider
 from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.engine.hooks import (
@@ -2527,7 +2532,7 @@ class _SelectorFallbackProvider:
             getattr(current_config, "provider", "") or self.provider_name
         ).strip()
         model = str(getattr(current_config, "model", "") or "").strip()
-        if model and getattr(config, "model_capabilities", None) is not None:
+        if model:
             deployment_capabilities = (
                 self._fallback_deployment_capabilities.get(
                     _fallback_deployment_identity(current_config)
@@ -5349,7 +5354,7 @@ class TurnRunner:
             current_turn_image_count = _count_image_blocks(extra_msgs or [])
             image_input_preflight_blocked = bool(
                 current_turn_image_count > 0
-                and not getattr(model_caps, "supports_vision", False)
+                and model_explicitly_lacks_vision(model_caps)
             )
             if image_input_preflight_blocked:
                 turn.metadata["image_input_mode"] = "rejected"

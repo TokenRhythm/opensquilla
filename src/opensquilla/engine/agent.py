@@ -368,6 +368,16 @@ UNSUPPORTED_IMAGE_INPUT_REPLY = (
     "当前选择的模型暂不支持查看图片，因此无法分析你上传的图片。"
     "请切换到支持图片的模型，或将图片中的文字和关键信息粘贴到消息中后重试。"
 )
+
+
+def model_explicitly_lacks_vision(capabilities: Any) -> bool:
+    """Return true only when capability data explicitly denies vision."""
+
+    return capabilities is not None and not bool(
+        getattr(capabilities, "supports_vision", False)
+    )
+
+
 _TEXT_ONLY_TOOL_RECOVERY_LIMIT = 2
 _TEXT_ONLY_TOOL_RECOVERY_MESSAGE = (
     "[Runtime recovery]\n"
@@ -6613,10 +6623,9 @@ class Agent:
             return
 
         current_turn_image_count = self._count_image_blocks(extra_messages or [])
-        model_supports_vision = bool(
-            getattr(self.config.model_capabilities, "supports_vision", False)
-        )
-        if current_turn_image_count > 0 and not model_supports_vision:
+        if current_turn_image_count > 0 and model_explicitly_lacks_vision(
+            self.config.model_capabilities
+        ):
             self.config.metadata["image_input_mode"] = "rejected"
             self.config.metadata["image_input_reason"] = "vision_unsupported"
             self.config.metadata["image_input_count"] = current_turn_image_count

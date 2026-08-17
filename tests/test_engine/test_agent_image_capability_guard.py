@@ -106,3 +106,27 @@ async def test_vision_model_still_receives_current_turn_image() -> None:
         if isinstance(message.content, list)
         for block in message.content
     )
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_capability_defers_to_provider() -> None:
+    provider = _RecordingProvider()
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=1,
+            model_id="custom-model",
+            model_capabilities=None,
+        ),
+    )
+
+    events = [
+        event
+        async for event in agent.run_turn(
+            "Describe this image.",
+            extra_messages=[_image_message()],
+        )
+    ]
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    assert len(provider.calls) == 1

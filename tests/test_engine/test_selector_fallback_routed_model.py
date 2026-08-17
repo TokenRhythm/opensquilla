@@ -430,7 +430,7 @@ def test_fallback_leg_never_increases_small_explicit_output_limit() -> None:
     assert wrapper.fallback_after_invalid_response("upstream 503") is True
     fallback_config = wrapper._config_for_active_leg(config)
 
-    assert fallback_config is config
+    assert fallback_config.max_tokens == config.max_tokens
     assert fallback_config.max_tokens == 4_096
 
 
@@ -440,7 +440,9 @@ def test_unknown_fallback_limit_does_not_apply_generic_default() -> None:
 
     assert wrapper.fallback_after_invalid_response("upstream 503") is True
 
-    assert wrapper._config_for_active_leg(config) is config
+    fallback_config = wrapper._config_for_active_leg(config)
+    assert fallback_config.max_tokens == config.max_tokens
+    assert fallback_config.model_capabilities.supports_vision is False
 
 
 def test_each_hop_uses_the_active_physical_models_own_output_limit() -> None:
@@ -569,10 +571,7 @@ def test_tokenrhythm_same_model_fallback_uses_exact_private_config_identity() ->
     wrapper.configure_fallback_limits(
         {("tokenrhythm", "shared/model"): (1_000_000, 131_072)}
     )
-    original = ChatConfig(
-        max_tokens=131_072,
-        model_capabilities=ModelCapabilities(supports_vision=True),
-    )
+    original = ChatConfig(max_tokens=131_072, model_capabilities=None)
 
     assert wrapper.fallback_after_invalid_response("first failure") is True
     first_fallback_config = wrapper._config_for_active_leg(original)
@@ -630,7 +629,9 @@ def test_dynamic_tokenrhythm_fallback_without_exact_limit_is_not_cross_clamped()
     original = ChatConfig(max_tokens=131_072)
 
     assert wrapper.fallback_after_invalid_response("dynamic plugin fallback") is True
-    assert wrapper._config_for_active_leg(original) is original
+    fallback_config = wrapper._config_for_active_leg(original)
+    assert fallback_config.max_tokens == original.max_tokens
+    assert fallback_config.model_capabilities.supports_vision is False
 
 
 PRIMARY_MODEL = "routed-primary"
@@ -989,6 +990,59 @@ async def test_unknown_primary_capability_defers_to_provider_image_validation() 
         "ensemble_multimodal_unsupported"
     ]
     assert not any(isinstance(event, TextDeltaEvent) for event in events)
+
+
+async def test_unknown_primary_uses_known_vision_fallback_for_image() -> None:
+    class _Provider:
+        provider_name = "openrouter"
+
+        def __init__(self, *, fails: bool) -> None:
+            self.fails = fails
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            self.calls += 1
+            if self.fails:
+                yield ErrorEvent(message="primary unavailable", code="503")
+                return
+            yield TextDeltaEvent(text="image accepted by fallback")
+            yield DoneEvent(model="vision-fallback")
+
+    primary_config = SimpleNamespace(provider="openrouter", model="unknown-primary")
+    fallback_config = SimpleNamespace(provider="openrouter", model="vision-fallback")
+
+    class _Selector:
+        active_provider_id = "openrouter"
+
+        def __init__(self) -> None:
+            self.primary = _Provider(fails=True)
+            self.fallback = _Provider(fails=False)
+            self.current_config = primary_config
+
+        def next_fallback_after_failure(self, _exc: Exception) -> _Provider:
+            self.current_config = fallback_config
+            return self.fallback
+
+    selector = _Selector()
+    wrapper = _SelectorFallbackProvider(selector.primary, selector)
+    wrapper.configure_fallback_deployment_limits(
+        [(fallback_config, 0, 0, ModelCapabilities(supports_vision=True))]
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+        )
+    ]
+
+    events = [event async for event in wrapper.chat(messages, config=ChatConfig())]
+
+    assert selector.primary.calls == 1
+    assert selector.fallback.calls == 1
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "image accepted by fallback"
+    ]
 
 
 async def test_image_request_does_not_call_text_only_fallback(monkeypatch: Any) -> None:

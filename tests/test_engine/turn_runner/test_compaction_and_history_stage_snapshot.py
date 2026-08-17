@@ -27,7 +27,14 @@ import pytest
 
 from opensquilla.engine.hooks.types import CompactionState
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.engine.turn_runner import (
+    AttachmentMaterializationStats,
+    AttachmentStageOutput,
+)
+from opensquilla.engine.turn_runner.outcome import StageOutcome
 from opensquilla.engine.types import ErrorEvent
+from opensquilla.provider import Message
+from opensquilla.provider.types import ContentBlockImage
 
 # Reuse upstream patch helpers from's equivalence harness — this
 # stage sits AFTER AgentBootstrapStage's slice so the same upstream
@@ -473,6 +480,35 @@ async def test_compaction_and_history_stage_snapshot(
         call_log["history"][0]["trim_last_user"]
         is case["history_has_persisted_user"]
     )
+
+
+@pytest.mark.asyncio
+async def test_unknown_vision_capability_does_not_skip_compaction() -> None:
+    case = dict(_CASE_BASE)
+    runner, call_log = _setup_runner(case)
+    image_message = Message(
+        role="user",
+        content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+    )
+
+    async def _attachment_run(_inp: Any) -> StageOutcome[AttachmentStageOutput]:
+        return StageOutcome.success(
+            AttachmentStageOutput(
+                extra_messages=[image_message],
+                turn_input="",
+                stats=AttachmentMaterializationStats(image_count=1),
+            )
+        )
+
+    runner._attachment_stage = SimpleNamespace(run=_attachment_run)
+
+    captured, _yielded, raised = await _drive(runner, case)
+
+    assert raised is None
+    assert captured is not None
+    assert len(call_log["t3"]) == 1
+    assert len(call_log["preflight"]) == 1
+    assert len(call_log["history"]) == 1
 
 
 @pytest.mark.asyncio
