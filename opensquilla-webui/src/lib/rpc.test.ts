@@ -783,4 +783,88 @@ describe('RpcClient', () => {
     expect(client.state).toBe('connected')
     client.disconnect()
   })
+
+  it('recycles the socket once when the gateway reports SESSION_EXPIRED', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+
+    const result = client.call('sessions.messages.subscribe', { key: 'agent:main:webchat:guest:aaaa:slug' })
+    const caught = result.catch((error: unknown) => error)
+    socket.receive({
+      type: 'res',
+      id: '2',
+      ok: false,
+      error: { code: 'SESSION_EXPIRED', message: 'Anonymous guest session has expired' },
+    })
+
+    const error = await caught
+    expect((error as RpcClientError).code).toBe('SESSION_EXPIRED')
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(pendingCount(client)).toBe(0)
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    client.disconnect()
+  })
+
+  it('does not loop when the replacement connection is also session-expired', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+
+    const first = client.call('sessions.messages.subscribe', { key: 'agent:main:webchat:guest:aaaa:slug' })
+    const firstCaught = first.catch((error: unknown) => error)
+    socket.receive({
+      type: 'res',
+      id: '2',
+      ok: false,
+      error: { code: 'SESSION_EXPIRED', message: 'expired' },
+    })
+    await firstCaught
+
+    await vi.advanceTimersByTimeAsync(0)
+    const replacement = MockWebSocket.instances[1]
+    establishConnection(replacement)
+
+    const second = client.call('sessions.messages.subscribe', { key: 'agent:main:webchat:guest:bbbb:slug' })
+    const secondCaught = second.catch((error: unknown) => error)
+    replacement.receive({
+      type: 'res',
+      id: '4',
+      ok: false,
+      error: { code: 'SESSION_EXPIRED', message: 'expired again' },
+    })
+    await secondCaught
+
+    // The fenced window (30s) must suppress a second recycle; the socket stays
+    // physically open for the user to recover manually.
+    expect(replacement.readyState).toBe(MockWebSocket.OPEN)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    client.disconnect()
+  })
+
+  it('keeps a plain UNAUTHORIZED denial from recycling the socket', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+
+    const result = client.call('config.get')
+    const caught = result.catch((error: unknown) => error)
+    socket.receive({
+      type: 'res',
+      id: '2',
+      ok: false,
+      error: { code: 'UNAUTHORIZED', message: 'Insufficient scope for method' },
+    })
+
+    const error = await caught
+    expect((error as RpcClientError).code).toBe('UNAUTHORIZED')
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
 })

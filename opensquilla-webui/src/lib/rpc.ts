@@ -155,6 +155,9 @@ export class RpcClient {
   private _wakeProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private _wakeProbeGeneration: number | null = null;
   private _lifecycleWatchStarted = false;
+  /** When the last session-expired recycle happened, or 0 if none yet. */
+  private _lastSessionExpiredRecycleAt = 0;
+  private static readonly SESSION_EXPIRED_RECYCLE_WINDOW_MS = 30_000;
 
   private readonly _handleWakeSignal = (event: Event): void => {
     if (
@@ -497,6 +500,9 @@ export class RpcClient {
             error.accepted = err.accepted;
           }
           this._rejectPending(id, error, generation);
+          if (error.code === 'SESSION_EXPIRED') {
+            this._recycleOnSessionExpired(generation, error);
+          }
         }
       } else if (data.type === 'event') {
         const meta = data.meta || {};
@@ -616,6 +622,29 @@ export class RpcClient {
   private _recycleConnection(generation: number, error: Error): void {
     if (generation !== this._socketGeneration) return;
     this._retireCurrentSocket(error, true);
+  }
+
+  /**
+   * Recycle the socket after the Gateway reports that the business/auth
+   * session expired. The WebSocket itself stays physically healthy (ping/pong
+   * continues), so the normal `onclose` path never fires; without this the
+   * client would stay stuck on an invalidated session until the user manually
+   * reconnects. The recycle is fenced: only one reconnect per window so a
+   * Gateway that keeps rejecting a stale guest identity cannot spin a loop.
+   */
+  private _recycleOnSessionExpired(generation: number, error: Error): void {
+    if (generation !== this._socketGeneration) return;
+    if (!this._autoReconnect) return;
+    const now = Date.now();
+    if (
+      this._lastSessionExpiredRecycleAt > 0
+      && now - this._lastSessionExpiredRecycleAt
+        < RpcClient.SESSION_EXPIRED_RECYCLE_WINDOW_MS
+    ) {
+      return;
+    }
+    this._lastSessionExpiredRecycleAt = now;
+    this._recycleConnection(generation, error);
   }
 
   private _clearReconnectTimer(): void {

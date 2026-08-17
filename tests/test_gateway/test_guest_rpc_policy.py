@@ -454,3 +454,75 @@ async def test_guest_sessions_list_clamps_limit(requested: int, expected: int) -
     )
 
     assert storage.last_limit == expected
+
+
+def test_guest_policy_unowned_session_error_marks_session_expired() -> None:
+    """An unowned/expired guest session must be distinguishable from an
+    ordinary method or scope denial so clients can recover the connection."""
+    with pytest.raises(GuestRpcPolicyError) as excinfo:
+        GuestRpcPolicy.authorize(
+            "sessions.messages.subscribe",
+            {"key": "agent:main:webchat:owner"},
+            _ctx(),
+        )
+    assert excinfo.value.session_expired is True
+
+
+def test_guest_policy_denied_method_does_not_mark_session_expired() -> None:
+    """A method that is simply outside the guest allowlist is a scope denial,
+    not a session-expiry signal, so clients must not recycle the socket."""
+    with pytest.raises(GuestRpcPolicyError) as excinfo:
+        GuestRpcPolicy.authorize("config.get", {}, _ctx())
+    assert excinfo.value.session_expired is False
+
+
+def test_guest_policy_missing_identity_marks_session_expired() -> None:
+    ctx = _ctx()
+    ctx.principal = SimpleNamespace(
+        guest_owner_id=None,
+        guest_session_key=None,
+        authenticated=False,
+        is_owner=False,
+        capabilities=frozenset({"guest.safe"}),
+        auth_state="guest",
+    )
+    with pytest.raises(GuestRpcPolicyError) as excinfo:
+        GuestRpcPolicy.authorize(
+            "sessions.messages.subscribe",
+            {"key": "agent:main:webchat:guest:unused:slug"},
+            ctx,
+        )
+    assert excinfo.value.session_expired is True
+
+
+@pytest.mark.asyncio
+async def test_registry_maps_session_expired_to_dedicated_code() -> None:
+    registry = RpcRegistry()
+
+    async def handler(params, ctx):
+        return {"ok": True}
+
+    registry.register("sessions.messages.subscribe", handler, scope="operator.read")
+    response = await registry.dispatch(
+        "guest-subscribe",
+        "sessions.messages.subscribe",
+        {"key": "agent:main:webchat:owner"},
+        _ctx(),
+    )
+
+    assert response.ok is False
+    assert response.error.code == "SESSION_EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_registry_keeps_ordinary_denial_as_unauthorized() -> None:
+    registry = RpcRegistry()
+
+    async def handler(params, ctx):
+        return {"ok": True}
+
+    registry.register("config.get", handler, scope="operator.read")
+    response = await registry.dispatch("guest-config", "config.get", {}, _ctx())
+
+    assert response.ok is False
+    assert response.error.code == "UNAUTHORIZED"
