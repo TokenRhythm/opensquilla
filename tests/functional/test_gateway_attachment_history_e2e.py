@@ -21,6 +21,7 @@ import pytest
 import opensquilla.engine.steps.squilla_router as squilla_router_step
 from opensquilla.attachment_refs import transcript_material_path
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine.agent import UNSUPPORTED_IMAGE_INPUT_REPLY
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway import rpc_sessions as _rpc_sessions  # noqa: F401
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
@@ -151,6 +152,22 @@ class _EventSink:
         meta: dict[str, Any] | None = None,  # noqa: ARG002
     ) -> None:
         self.events.append((event, dict(payload or {})))
+
+
+class _UsageSink:
+    def __init__(self) -> None:
+        self.started: list[Any] = []
+        self.finalized: list[tuple[Any, Any]] = []
+        self.unknown: list[tuple[Any, str]] = []
+
+    async def start(self, call: Any) -> None:
+        self.started.append(call)
+
+    async def finalize(self, call: Any, result: Any) -> None:
+        self.finalized.append((call, result))
+
+    async def mark_unknown(self, call: Any, reason: str) -> None:
+        self.unknown.append((call, reason))
 
 
 class _TextTierStrategy:
@@ -330,11 +347,13 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             _VISION_MODEL: vision_provider,
         }
     )
+    usage_sink = _UsageSink()
     runner = TurnRunner(
         provider_selector=selector,
         session_manager=manager,
         config=config,
         model_catalog=_FakeModelCatalog(),
+        usage_event_sink=usage_sink,
     )
     bootstrap_configs: list[AgentConfig] = []
     original_bootstrap_run = runner._agent_bootstrap_stage.run
@@ -384,12 +403,66 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             "store": store,
             "subscription_manager": subscription_manager,
             "text_provider": text_provider,
+            "usage_sink": usage_sink,
             "vision_provider": vision_provider,
         }
     finally:
         get_registry().unregister(sink.conn_id)
         set_upload_store(None)
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_single_text_model_returns_friendly_reply_without_provider_call(
+    _e2e_stack: dict[str, Any],
+) -> None:
+    config: GatewayConfig = _e2e_stack["config"]
+    manager: SessionManager = _e2e_stack["manager"]
+    subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
+    sink: _EventSink = _e2e_stack["sink"]
+    gate_provider: _RecordingProvider = _e2e_stack["gate_provider"]
+    text_provider: _RecordingProvider = _e2e_stack["text_provider"]
+    vision_provider: _RecordingProvider = _e2e_stack["vision_provider"]
+    usage_sink: _UsageSink = _e2e_stack["usage_sink"]
+    config.squilla_router.enabled = False
+    key = "agent:main:single-text-model-image"
+    await manager.create(session_key=key, agent_id="main")
+    subscription_manager.subscribe_messages(sink.conn_id, key)
+    for index in range(6):
+        await manager.append_message(key, "user", f"history-{index}:" + "u" * 5_000)
+        await manager.append_message(key, "assistant", "a" * 5_000)
+
+    file_uuid = await _upload_png(_e2e_stack["app"])
+    gate_calls_before = len(gate_provider.calls)
+    text_calls_before = len(text_provider.calls)
+    vision_calls_before = len(vision_provider.calls)
+    usage_started_before = len(usage_sink.started)
+    usage_finalized_before = len(usage_sink.finalized)
+    usage_unknown_before = len(usage_sink.unknown)
+    await _send_session_turn(
+        ctx=_e2e_stack["ctx"],
+        key=key,
+        sink=sink,
+        message="请分析这张图片。",
+        attachments=[_file_uuid_attachment(file_uuid)],
+    )
+
+    assert len(gate_provider.calls) == gate_calls_before
+    assert len(text_provider.calls) == text_calls_before
+    assert len(vision_provider.calls) == vision_calls_before
+    assert len(usage_sink.started) == usage_started_before
+    assert len(usage_sink.finalized) == usage_finalized_before
+    assert len(usage_sink.unknown) == usage_unknown_before
+    deltas = _event_payloads(sink, "session.event.text_delta")
+    assert deltas[-1]["text"] == UNSUPPORTED_IMAGE_INPUT_REPLY
+    assert _event_payloads(sink, "session.event.error") == []
+    done = _event_payloads(sink, "session.event.done")[-1]
+    assert done["text"] == UNSUPPORTED_IMAGE_INPUT_REPLY
+    assert done["input_tokens"] == 0
+    assert done["output_tokens"] == 0
+    transcript = await manager.get_transcript(key)
+    assert transcript[-1].role == "assistant"
+    assert transcript[-1].content == UNSUPPORTED_IMAGE_INPUT_REPLY
 
 
 @pytest.mark.asyncio
