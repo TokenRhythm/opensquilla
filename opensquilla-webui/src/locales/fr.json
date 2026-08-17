@@ -2879,6 +2879,7 @@
       "sourceInstalling": "Installation de {name}",
       "sourceFailures": "{count} en échec",
       "clearActivity": "Effacer l’activité",
+      "cancelInstall": "Annuler l’installation",
       "expandActivity": "Développer l’activité d’installation",
       "collapseActivity": "Réduire l’activité d’installation",
       "queueStatus": {
@@ -2887,6 +2888,7 @@
         "installed": "Installé",
         "unchanged": "Déjà à jour",
         "deferred": "Non tentée",
+        "cancelled": "Annulée",
         "failed": "Échec"
       },
       "installingProgress": "Installation {current} sur {total}…",
@@ -4087,6 +4089,7 @@
       "taskRunning": "Tâche en cours",
       "taskCompletedUnread": "Tâche terminée, résultat non consulté",
       "taskUnfinishedUnread": "Tâche inachevée, détails non consultés",
+      "subagentGroupLabel": "{title} : {count} sous-agents",
       "contractGap": "Des champs du contrat backend session-list-v1 sont manquants",
       "contractGapBadge": "Lacune",
       "rowActions": "Actions pour {title}",

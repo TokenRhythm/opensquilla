@@ -48,6 +48,7 @@ export type SkillInstallQueueStatus =
   | 'installed'
   | 'unchanged'
   | 'deferred'
+  | 'cancelled'
   | 'unknown'
   | 'failed'
 
@@ -199,6 +200,7 @@ export interface SkillRegistry {
   installGithub: () => Promise<void>
   installSkill: (identifier: string, source: string, displayName?: string) => Promise<void>
   retryQueueItem: (id: string, acknowledgeRisk?: boolean) => Promise<void>
+  cancelInstall: (source: SkillInstallSource) => Promise<void>
   clearInstallActivity: (source: SkillInstallSource) => void
   installDeps: (
     name: string,
@@ -229,6 +231,7 @@ export function useSkillRegistry(
   })
   const runningSource = ref<SkillInstallSource | null>(null)
   const queueRunning = computed(() => runningSource.value !== null)
+  const cancelRequested = ref<SkillInstallSource | null>(null)
   const mutationBusy = computed(() => mutationGate.busy.value)
   const installingDepsId = ref<string | null>(null)
   const uninstallingName = ref<string | null>(null)
@@ -335,6 +338,18 @@ export function useSkillRegistry(
     riskConfirmation = '',
   ) {
     for (const [index, item] of items.entries()) {
+      if (cancelRequested.value) {
+        // A cancellation was requested while an earlier item was installing.
+        // Anything not yet attempted is a pending install: mark it cancelled
+        // so the queue settles into an explicit cancelled state.
+        for (const pending of items.slice(index)) {
+          if (pending.status === 'queued') {
+            pending.status = 'cancelled'
+            pending.error = ''
+          }
+        }
+        break
+      }
       item.status = 'installing'
       item.error = ''
       item.result = undefined
@@ -363,12 +378,33 @@ export function useSkillRegistry(
       } finally {
         installingId.value = null
       }
+      if (cancelRequested.value) {
+        // The in-flight install already settled; it keeps its real outcome.
+        // Anything still queued is cancelled (handled by the loop guard).
+        continue
+      }
       if (!rateLimited) continue
       for (const deferred of items.slice(index + 1)) {
         deferred.status = 'deferred'
         deferred.error = ''
       }
       break
+    }
+  }
+
+  /**
+   * Ask the running queue for one source to stop. The current in-flight
+   * install is allowed to settle (its real outcome is preserved); every item
+   * that was still queued behind it is marked cancelled and the batch settles
+   * into the explicit cancelled state without touching the catalog. The
+   * running batch's `finally` block performs the actual cleanup, so this is a
+   * cheap flag flip even when a request is mid-flight.
+   */
+  async function cancelInstall(source: SkillInstallSource) {
+    if (runningSource.value !== source) return
+    cancelRequested.value = source
+    for (const item of installActivities.value[source].items) {
+      if (item.status === 'queued') item.status = 'cancelled'
     }
   }
 
@@ -379,6 +415,28 @@ export function useSkillRegistry(
       item.error ||= t('cronSkills.registry.installResultUnknown')
     }
     installActivities.value[source].phase = 'terminal'
+  }
+
+  function finishBatch(source: SkillInstallSource, items: SkillInstallQueueItem[]) {
+    const cancelled = cancelRequested.value === source
+    if (cancelled) {
+      // Cancellation is the user's explicit terminal state: keep any queued
+      // item marked cancelled (not "unknown"), never refresh the catalog, and
+      // release the mutation gate without pretending a partial failure.
+      for (const item of items) {
+        if (item.status === 'queued') {
+          item.status = 'cancelled'
+          item.error = ''
+        }
+      }
+    } else {
+      settleInterruptedItems(source)
+    }
+    installActivities.value[source].phase = 'terminal'
+    runningSource.value = null
+    installingId.value = null
+    cancelRequested.value = null
+    mutationGate.release('install_queue')
   }
 
   async function runNewBatch(requests: SkillInstallRequest[]) {
@@ -392,13 +450,11 @@ export function useSkillRegistry(
     runningSource.value = source
     try {
       await processQueueItems(activityItems)
+      if (cancelRequested.value === source) return
       removeSuccessfulGithubLines(activityItems)
       await refreshCatalogAfterBatch(source, activityItems)
     } finally {
-      settleInterruptedItems(source)
-      runningSource.value = null
-      installingId.value = null
-      mutationGate.release('install_queue')
+      finishBatch(source, activityItems)
     }
   }
 
@@ -456,15 +512,14 @@ export function useSkillRegistry(
     installActivities.value[source].refreshWarning = ''
     installActivities.value[source].phase = 'installing'
     runningSource.value = source
+    cancelRequested.value = null
     try {
       await processQueueItems([item], riskConfirmation)
+      if (cancelRequested.value === source) return
       removeSuccessfulGithubLines([item])
       await refreshCatalogAfterBatch(source, [item])
     } finally {
-      settleInterruptedItems(source)
-      runningSource.value = null
-      installingId.value = null
-      mutationGate.release('install_queue')
+      finishBatch(source, [item])
     }
   }
 
@@ -569,6 +624,7 @@ export function useSkillRegistry(
     installGithub,
     installSkill,
     retryQueueItem,
+    cancelInstall,
     clearInstallActivity,
     installDeps,
     uninstallSkill,

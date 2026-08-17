@@ -47,6 +47,7 @@ function mountDrawer(options: {
   const installed: Array<[string, string, string]> = []
   const retried: Array<[string, boolean | undefined]> = []
   const cleared: SkillInstallSource[] = []
+  const cancelled: SkillInstallSource[] = []
 
   const Root = defineComponent({
     setup() {
@@ -75,6 +76,9 @@ function mountDrawer(options: {
           onRetry: (id: string, acknowledgeRisk?: boolean) => {
             retried.push([id, acknowledgeRisk])
           },
+          onCancelInstall: (source: SkillInstallSource) => {
+            cancelled.push(source)
+          },
           onClearActivity: (source: SkillInstallSource) => {
             cleared.push(source)
             activities.value[source] = { items: [], refreshWarning: '' }
@@ -101,6 +105,7 @@ function mountDrawer(options: {
     installed,
     retried,
     cleared,
+    cancelled,
   }
 }
 
@@ -792,5 +797,66 @@ describe('SkillsAddDrawer', () => {
     expect(result.textContent).toContain('Installation result unknown')
     expect(result.textContent).toContain('View details')
     expect(result.textContent).not.toContain('connection closed')
+  })
+
+  it('offers a cancel action while a queue for the visible source is running', async () => {
+    const queue: SkillInstallQueueItem[] = [{
+      id: 'q1',
+      identifier: '@acme/one',
+      source: 'github',
+      displayName: 'One',
+      status: 'installing',
+    }, {
+      id: 'q2',
+      identifier: '@acme/two',
+      source: 'github',
+      displayName: 'Two',
+      status: 'queued',
+    }]
+    const { cancelled } = mountDrawer({ queue, runningSource: 'github' })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+
+    const cancelButton = document.querySelector<HTMLButtonElement>('[data-testid="skills-cancel-install"]')
+    expect(cancelButton).not.toBeNull()
+    cancelButton!.click()
+    await nextTick()
+
+    expect(cancelled).toEqual(['github'])
+  })
+
+  it('hides the cancel action when the running source differs from the visible one', async () => {
+    const queue: SkillInstallQueueItem[] = [{
+      id: 'q1',
+      identifier: '@acme/one',
+      source: 'clawhub',
+      displayName: 'One',
+      status: 'installing',
+    }]
+    mountDrawer({ queue, runningSource: 'clawhub' })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+
+    // The drawer opens on the GitHub source by default, so the running
+    // ClawHub queue must not expose a cancel button here.
+    expect(document.querySelector('[data-testid="skills-cancel-install"]')).toBeNull()
+  })
+
+  it('renders a cancelled queue item with its dedicated status label', async () => {
+    const queue: SkillInstallQueueItem[] = [{
+      id: 'q1',
+      identifier: '@acme/one',
+      source: 'github',
+      displayName: 'One',
+      status: 'cancelled',
+    }]
+    mountDrawer({ queue })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+
+    const item = document.querySelector<HTMLElement>('.sk-add-queue-item')
+    expect(item).not.toBeNull()
+    expect(item!.textContent).toContain('Cancelled')
+    expect(item!.getAttribute('data-status')).toBe('cancelled')
   })
 })

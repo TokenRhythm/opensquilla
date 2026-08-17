@@ -382,6 +382,92 @@ export interface SessionLedgerEntry {
   depth: number
   /** Resolved parent title for subagent rows; empty for root rows. */
   parentTitle: string
+  /**
+   * True on a parent entry with at least `SUBAGENT_GROUP_THRESHOLD` direct
+   * subagent children. `arrangeSessionLedger` keeps the flat list unchanged;
+   * `arrangeSidebarSections` folds such parents into one compact group row.
+   */
+  subagentGroup?: boolean
+  /** Direct subagent children folded under this parent (>= threshold). */
+  subagentGroupChildren?: SessionLedgerEntry[]
+}
+
+/** Minimum direct subagent children before a parent renders as a group. */
+export const SUBAGENT_GROUP_THRESHOLD = 4
+
+/**
+ * Fold parents with many simultaneous subagents into one group entry. The
+ * input is the flat `arrangeSessionLedger` output; the output keeps every
+ * root and non-group row in order, but a flagged parent carries its direct
+ * subagent children (and their descendants) in `subagentGroupChildren`
+ * instead of listing them flat, so the sidebar renders one compact row.
+ */
+export function foldSubagentGroupEntries(
+  entries: readonly SessionLedgerEntry[],
+): SessionLedgerEntry[] {
+  const groupKeys = new Set(
+    entries.filter(entry => entry.subagentGroup).map(entry => entry.item.key),
+  )
+  if (groupKeys.size === 0) return [...entries]
+
+  // Build parent -> ordered direct children from the flat ledger so the
+  // folded subtree keeps the exact traversal order the flat list used.
+  const byParent = new Map<string, SessionLedgerEntry[]>()
+  for (const entry of entries) {
+    const parentKey = sessionParentKey(entry.item)
+    if (!parentKey) continue
+    const list = byParent.get(parentKey) || []
+    list.push(entry)
+    byParent.set(parentKey, list)
+  }
+
+  const collectSubtree = (parentKey: string, depth: number): SessionLedgerEntry[] => {
+    const children = byParent.get(parentKey) || []
+    return children.map(child => ({
+      item: child.item,
+      depth: Math.min(child.depth, depth),
+      parentTitle: child.parentTitle,
+      subagentGroupChildren: collectSubtree(child.item.key, depth + 1),
+    }))
+  }
+
+  const folded: SessionLedgerEntry[] = []
+  const consumed = new Set<string>()
+  for (const entry of entries) {
+    if (consumed.has(entry.item.key)) continue
+    if (entry.subagentGroup) {
+      folded.push({
+        item: entry.item,
+        depth: entry.depth,
+        parentTitle: entry.parentTitle,
+        subagentGroup: true,
+        subagentGroupChildren: collectSubtree(entry.item.key, entry.depth + 1),
+      })
+      consumed.add(entry.item.key)
+      continue
+    }
+    // Any row whose ancestor chain leads into a folded group is carried by
+    // that group's `subagentGroupChildren`; never list it flat again.
+    let cursor = entry.item
+    let insideGroup = false
+    for (let hop = 0; hop < 4; hop++) {
+      const parentKey = sessionParentKey(cursor)
+      if (!parentKey) break
+      if (groupKeys.has(parentKey)) {
+        insideGroup = true
+        break
+      }
+      const parentItem = entries.find(candidate => candidate.item.key === parentKey)?.item
+      if (!parentItem) break
+      cursor = parentItem
+    }
+    if (insideGroup) {
+      consumed.add(entry.item.key)
+      continue
+    }
+    folded.push(entry)
+  }
+  return folded
 }
 
 /**
@@ -405,8 +491,18 @@ export function arrangeSessionLedger(items: SessionItem[]): SessionLedgerEntry[]
   }
   const entries: SessionLedgerEntry[] = []
   const visit = (item: SessionItem, depth: number, parentTitle: string) => {
-    entries.push({ item, depth, parentTitle: depth > 0 ? parentTitle : '' })
-    for (const child of children.get(item.key) || []) {
+    const directChildren = children.get(item.key) || []
+    entries.push({
+      item,
+      depth,
+      parentTitle: depth > 0 ? parentTitle : '',
+      // Flag parents with many simultaneous subagents so the sidebar can fold
+      // them into one compact group row. The flat list is unchanged — every
+      // child is still listed — so SessionsView and other consumers are
+      // unaffected; only `arrangeSidebarSections` acts on the flag.
+      subagentGroup: depth === 0 && directChildren.length >= SUBAGENT_GROUP_THRESHOLD,
+    })
+    for (const child of directChildren) {
       visit(child, Math.min(depth + 1, 3), item.title)
     }
   }
@@ -449,6 +545,17 @@ export interface SidebarSectionRow {
   provisional?: boolean
   /** Local sidebar preference; never changes the underlying session contract. */
   pinned?: boolean
+  /**
+   * Present on a parent row whose direct subagents were folded into a compact
+   * group (>= SUBAGENT_GROUP_THRESHOLD). `children` holds the folded rows so
+   * the sidebar can expand the group on demand; `count` and `attention`
+   * summarize the group for the collapsed header.
+   */
+  subagentGroup?: {
+    count: number
+    attention: SessionTaskAttention
+    children: SidebarSectionRow[]
+  }
 }
 
 /** One collapsible family section with its recency-ordered rows. */
@@ -546,6 +653,29 @@ export function arrangeSidebarSections(
     pinned: pinnedKeys.has(item.key),
   })
 
+  /** Convert one ledger entry (possibly a folded subagent group) to a row. */
+  const entryToRow = (entry: SessionLedgerEntry, depthOverride?: number): SidebarSectionRow => {
+    const row = toRow(entry.item, depthOverride ?? entry.depth)
+    const children = entry.subagentGroupChildren
+    if (!children?.length) return row
+    const childRows = children.map(child => entryToRow(child))
+    const attention: SessionTaskAttention = childRows.some(r => r.taskAttention === 'running')
+      ? 'running'
+      : childRows.some(r => r.taskAttention === 'failed')
+        ? 'failed'
+        : childRows.some(r => r.taskAttention === 'completed')
+          ? 'completed'
+          : 'none'
+    return {
+      ...row,
+      subagentGroup: {
+        count: childRows.length,
+        attention,
+        children: childRows,
+      },
+    }
+  }
+
   type WorkspaceBucket = {
     title: string
     displayPath?: string
@@ -562,7 +692,7 @@ export function arrangeSidebarSections(
     let index = 0
 
     for (const entry of entries) {
-      const row = toRow(entry.item, entry.depth)
+      const row = entryToRow(entry)
       const workspace = entry.item.workspace
       if (!workspace) {
         topLevel.push({ kind: 'row', row, index: index++ })
@@ -666,7 +796,7 @@ export function arrangeSidebarSections(
         })
       } else {
         rows.push(...projectEntries.map(entry => ({
-          ...toRow(entry.item, Math.min(entry.depth + 1, 4)),
+          ...entryToRow(entry, Math.min(entry.depth + 1, 4)),
           workspaceId: project.id,
         })))
       }
@@ -674,7 +804,7 @@ export function arrangeSidebarSections(
     rows.push(
       ...entries
         .filter(entry => !entry.item.workspaceId)
-        .map(entry => toRow(entry.item, entry.depth)),
+        .map(entry => entryToRow(entry)),
     )
     // Sessions belonging to a removed project remain durable but hidden until
     // that project is restored to the canonical project list.
@@ -687,7 +817,11 @@ export function arrangeSidebarSections(
     if (family === 'chats') {
       // Recency-sort first so the ledger's root ordering follows recency, then
       // flatten parent → child so subagents indent directly beneath their chat.
-      const ledger = arrangeSessionLedger([...bucket].sort(bySidebarOrder))
+      // Parents with SUBAGENT_GROUP_THRESHOLD+ direct subagents fold them into
+      // one compact group row instead of pushing every child into the ledger.
+      const ledger = foldSubagentGroupEntries(
+        arrangeSessionLedger([...bucket].sort(bySidebarOrder)),
+      )
       rows = projects === undefined
         ? arrangeWorkspaceRows(ledger)
         : arrangePersistedProjectRows(ledger, projects)

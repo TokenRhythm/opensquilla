@@ -2879,6 +2879,7 @@
       "sourceInstalling": "{name} をインストール中",
       "sourceFailures": "{count} 件失敗",
       "clearActivity": "履歴を消去",
+      "cancelInstall": "インストールをキャンセル",
       "expandActivity": "インストール状況を展開",
       "collapseActivity": "インストール状況を折りたたむ",
       "queueStatus": {
@@ -2887,6 +2888,7 @@
         "installed": "インストール済み",
         "unchanged": "すでに最新",
         "deferred": "未実行",
+        "cancelled": "キャンセル済み",
         "failed": "失敗"
       },
       "installingProgress": "{total} 件中 {current} 件目をインストール中…",
@@ -4087,6 +4089,7 @@
       "taskRunning": "タスクを実行中",
       "taskCompletedUnread": "タスク完了、結果は未確認",
       "taskUnfinishedUnread": "タスク未完了、詳細は未確認",
+      "subagentGroupLabel": "{title}：{count} サブエージェント",
       "contractGap": "バックエンドの session-list-v1 契約フィールドが不足しています",
       "contractGapBadge": "不足",
       "rowActions": "{title} のアクション",

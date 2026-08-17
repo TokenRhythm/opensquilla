@@ -173,6 +173,7 @@
       @install-github="installGithub"
       @install="installSkill"
       @retry="retryQueueItem"
+      @cancel-install="cancelInstall"
       @clear-activity="clearInstallActivity"
     />
 
@@ -345,6 +346,7 @@ const {
   installGithub,
   installSkill,
   retryQueueItem,
+  cancelInstall,
   clearInstallActivity,
   installDeps,
   uninstallSkill,

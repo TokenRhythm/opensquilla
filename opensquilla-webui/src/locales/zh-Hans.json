@@ -2930,6 +2930,7 @@
       "sourceInstalling": "正在安装 {name}",
       "sourceFailures": "{count} 项失败",
       "clearActivity": "清除活动",
+      "cancelInstall": "取消安装",
       "expandActivity": "展开安装活动",
       "collapseActivity": "收起安装活动",
       "queueStatus": {
@@ -2938,6 +2939,7 @@
         "installed": "已安装",
         "unchanged": "已是最新",
         "deferred": "未尝试",
+        "cancelled": "已取消",
         "failed": "失败"
       },
       "installingProgress": "正在安装第 {current}/{total} 项…",
@@ -4140,6 +4142,7 @@
       "taskRunning": "任务运行中",
       "taskCompletedUnread": "任务已完成，结果未查看",
       "taskUnfinishedUnread": "任务未完成，详情未查看",
+      "subagentGroupLabel": "{title}：{count} 个子代理",
       "contractGap": "缺少后端 session-list-v1 契约字段",
       "contractGapBadge": "缺失",
       "rowActions": "{title} 的操作",

@@ -783,3 +783,74 @@ describe('useSkillRegistry install state', () => {
     ])
   })
 })
+
+describe('useSkillRegistry cancel install', () => {
+  function deferredInstall() {
+    const pending = {
+      resolveCall: (_value: unknown) => {},
+      rejectCall: (_reason?: unknown) => {},
+    }
+    const call = vi.fn((method: string) => {
+      if (method === 'skills.install') {
+        return new Promise((resolve, reject) => {
+          pending.resolveCall = resolve
+          pending.rejectCall = reject
+        })
+      }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    return { call, pending }
+  }
+
+  it('marks queued items cancelled and never refreshes the catalog when cancelled mid-batch', async () => {
+    const { call, pending } = deferredInstall()
+    const loadData = vi.fn(async () => true)
+    const registry = useSkillRegistry({ call } as never, loadData)
+    registry.githubUrl.value = ['https://github.com/a/one', 'https://github.com/b/two', 'https://github.com/c/three'].join('\n')
+
+    const batch = registry.installGithub()
+    // First item is in flight; the rest are queued behind it.
+    await Promise.resolve()
+    expect(registry.installActivities.value.github.items[0].status).toBe('installing')
+
+    await registry.cancelInstall('github')
+    // The in-flight item settles with its real outcome.
+    pending.resolveCall({ success: true, installed: true, name: 'First' })
+    await batch
+
+    const statuses = registry.installActivities.value.github.items.map(item => item.status)
+    expect(statuses[0]).toBe('installed')
+    expect(statuses.slice(1)).toEqual(['cancelled', 'cancelled'])
+    expect(loadData).not.toHaveBeenCalled()
+    expect(registry.queueRunning.value).toBe(false)
+    expect(registry.mutationBusy.value).toBe(false)
+  })
+
+  it('keeps a failed in-flight outcome and still cancels the tail', async () => {
+    const { call, pending } = deferredInstall()
+    const loadData = vi.fn(async () => true)
+    const registry = useSkillRegistry({ call } as never, loadData)
+    registry.githubUrl.value = ['https://github.com/a/one', 'https://github.com/b/two', 'https://github.com/c/three'].join('\n')
+
+    const batch = registry.installGithub()
+    await Promise.resolve()
+    await registry.cancelInstall('github')
+    pending.rejectCall(new Error('network down'))
+    await batch
+
+    const statuses = registry.installActivities.value.github.items.map(item => item.status)
+    expect(statuses[0]).toBe('unknown')
+    expect(statuses.slice(1)).toEqual(['cancelled', 'cancelled'])
+    expect(registry.queueRunning.value).toBe(false)
+  })
+
+  it('is a no-op when the source is not currently running', async () => {
+    const call = vi.fn(async () => ({ success: true, installed: true }))
+    const registry = useSkillRegistry({ call } as never, vi.fn(async () => true))
+
+    await registry.cancelInstall('clawhub')
+
+    expect(registry.queueRunning.value).toBe(false)
+    expect(call).not.toHaveBeenCalled()
+  })
+})
