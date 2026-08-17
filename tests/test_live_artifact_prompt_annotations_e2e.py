@@ -1079,6 +1079,8 @@ def test_launch_worker_keeps_case_and_matrix_timeouts_separate(
     def fake_run(command, **kwargs):
         observed["command"] = command
         observed["timeout"] = kwargs["timeout"]
+        observed["cwd"] = kwargs["cwd"]
+        observed["env"] = kwargs["env"]
         kwargs["stdout"].write(
             json.dumps(e2e._incomplete_report(hard_cap=e2e.HARD_PHYSICAL_CALL_CAP))
         )
@@ -1100,6 +1102,11 @@ def test_launch_worker_keeps_case_and_matrix_timeouts_separate(
     assert command[case_timeout_index] == "17.0"
     assert "--matrix-timeout-seconds" not in command
     assert observed["timeout"] == 444.0
+    worker_root = Path(str(observed["cwd"])).resolve()
+    worker_env = observed["env"]
+    assert isinstance(worker_env, dict)
+    assert Path(worker_env["HOME"]) == worker_root / "user-state"
+    assert Path(worker_env["USERPROFILE"]) == worker_root / "user-state"
     assert report["certification"] == "incomplete"
 
 

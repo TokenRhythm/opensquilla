@@ -1977,6 +1977,10 @@ def _launch_worker(
     stderr_path.touch(mode=0o600)
     os.chmod(stdout_path, 0o600)
     os.chmod(stderr_path, 0o600)
+    worker_home = temp_root / "user-state"
+    worker_home.mkdir(mode=0o700)
+    worker_environment = _worker_environment(api_key)
+    _apply_isolated_home_environment(worker_environment, worker_home)
     secrets = {KEY_ENV: api_key}
     try:
         with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
@@ -1996,7 +2000,7 @@ def _launch_worker(
             completed = subprocess.run(
                 command,
                 cwd=temp_root,
-                env=_worker_environment(api_key),
+                env=worker_environment,
                 stdout=stdout,
                 stderr=stderr,
                 text=True,
