@@ -4,14 +4,21 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
+
+import structlog
 
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.redaction import redact_error_text
+from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.integration import (
+    get_runtime,
     in_process_network_precondition,
     run_in_process_network_action,
 )
+from opensquilla.sandbox.run_context import RunContext
 from opensquilla.sandbox.types import DenialResult
 from opensquilla.tools.builtin.web import (
     _search_plan_argv_token,
@@ -26,6 +33,9 @@ from opensquilla.tools.rpc_payload import (
     tools_catalog_payload,
     tools_effective_payload,
 )
+from opensquilla.tools.types import ToolContext, current_tool_context
+
+log = structlog.get_logger(__name__)
 
 _d = get_dispatcher()
 
@@ -387,6 +397,72 @@ async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict
     }
 
 
+def _operator_network_tool_context(ctx: RpcContext) -> ToolContext:
+    """The Run Context an operator-invoked network diagnostic runs under.
+
+    ``search.query`` reaches the same in-process network path as the chat
+    ``web_search`` tool, but an RPC never enters tool dispatch, so nothing sets
+    ``current_tool_context`` and ``current_tool_run_context()`` returns ``None``.
+    Under ``NetworkMode.PROXY_ALLOWLIST`` that is refused before the provider is
+    reached, which is why the same gateway answers Web Chat and refuses the CLI
+    (#1202).
+
+    The context authorizes nothing by itself: no mounts, no domains, no
+    public-network grant. It is the carrier the proxy path needs —
+    :func:`run_in_process_network_action` still resolves the policy, still mints
+    one fingerprinted ``expires_after="once"`` grant per action, and still puts
+    every host through ``NetworkApprovalService``.
+
+    The run mode is pinned to Safe, and deliberately not read from the gateway
+    config. A tool context is not a description of the deployment: every guard
+    that calls ``full_host_access_active()`` reads the run mode off whatever
+    context is current, so publishing ``full`` here would stand down protections
+    that have nothing to do with the network proxy — including the
+    sensitive-payload guard that stops a query containing secrets from being
+    sent to a search provider. Safe cannot widen anything, and it does not
+    weaken the network decision either: the mode that resolves the policy comes
+    from the graded ``SecurityLevel``, not from this field.
+    """
+
+    runtime = get_runtime()
+    workspace = str(getattr(runtime, "workspace", None) or "") or None
+    # Only the fields this path consumes are set. `caller_kind` and the tool
+    # allow/deny lists drive tool-list building, which an RPC never does, and a
+    # plausible-looking value there would be a claim nothing checks.
+    return ToolContext(
+        workspace_dir=workspace,
+        run_mode=RunMode.SAFE.value,
+        sandbox_run_context=RunContext(
+            run_mode=RunMode.SAFE,
+            workspace=workspace,
+            source="operator_rpc",
+        ),
+        source_kind="rpc",
+        source_name="search",
+    )
+
+
+@contextmanager
+def _operator_network_context(ctx: RpcContext) -> Iterator[None]:
+    """Run the block under the operator Run Context, or unchanged if it cannot be built.
+
+    Failing to build the context must not fail the caller: for ``search.query``
+    the fallback is the previous refusal, and ``search.status`` is a diagnostic
+    surface that has to keep answering even when the sandbox cannot be read.
+    """
+
+    try:
+        token = current_tool_context.set(_operator_network_tool_context(ctx))
+    except Exception:  # noqa: BLE001 - diagnostics degrade, they do not fail
+        log.debug("search.operator_network_context_unavailable", exc_info=True)
+        yield
+        return
+    try:
+        yield
+    finally:
+        current_tool_context.reset(token)
+
+
 @_d.method("search.status", scope="operator.read")
 async def _handle_search_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     if params is not None and not isinstance(params, dict):
@@ -398,7 +474,12 @@ async def _handle_search_status(params: dict | None, ctx: RpcContext) -> dict[st
     # reached, so report that half from the same posture the query will resolve.
     # Every readiness surface reaches this handler — the CLI table, and the
     # Control UI Overview through the doctor — so one field covers all of them.
-    reason = in_process_network_precondition()
+    #
+    # Probe it under the same context the query establishes: asking outside it
+    # would report the refusal the query no longer meets, which is the same
+    # disagreement from the other side.
+    with _operator_network_context(ctx):
+        reason = in_process_network_precondition()
     payload["networkReady"] = reason is None
     payload["networkBlockedReason"] = reason
     return payload
@@ -436,19 +517,20 @@ async def _handle_search_query(params: dict | None, ctx: RpcContext) -> dict[str
             provider=provider_name,
         )
 
-    payload_or_denial = await run_in_process_network_action(
-        action_kind="web.fetch",
-        argv=(
-            "web_search",
-            query,
-            str(limit or ""),
-            _search_plan_argv_token(
-                {"query": query, "provider": provider_name},
-                tool_name="web_discover",
+    with _operator_network_context(ctx):
+        payload_or_denial = await run_in_process_network_action(
+            action_kind="web.fetch",
+            argv=(
+                "web_search",
+                query,
+                str(limit or ""),
+                _search_plan_argv_token(
+                    {"query": query, "provider": provider_name},
+                    tool_name="web_discover",
+                ),
             ),
-        ),
-        callback=_run_search,
-    )
+            callback=_run_search,
+        )
     if isinstance(payload_or_denial, DenialResult):
         denial = payload_or_denial
         return {
