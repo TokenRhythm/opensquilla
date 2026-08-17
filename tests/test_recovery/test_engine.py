@@ -850,6 +850,55 @@ def test_unsafe_session_database_blocks_before_gateway_migrations(
     assert report.stable_code == stable_code
 
 
+def test_state_database_unreadable_detail_carries_os_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import errno
+
+    home = tmp_path / "opensquilla"
+    _workspace(home / "workspace")
+    _desktop_config(home)
+    database = home / "state" / "sessions.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE user_data (id INTEGER PRIMARY KEY)")
+        connection.commit()
+
+    real_lstat = os.lstat
+
+    def denying_lstat(path, *args, **kwargs):
+        if os.fspath(path).replace("\\", "/").endswith("/sessions.db"):
+            raise PermissionError(errno.EACCES, "Permission denied", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr("opensquilla.recovery.engine.os.lstat", denying_lstat)
+
+    report = inspect_profile(home, profile_kind="desktop-primary")
+
+    assert report.stable_code == "state_database_unreadable"
+    assert report.detail is not None
+    assert "sessions.db" in report.detail
+    assert "Permission denied" in report.detail
+    assert "errno 13" in report.detail
+    assert str(home) not in report.detail
+
+
+def test_state_database_invalid_detail_carries_quick_check_finding(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "opensquilla"
+    _workspace(home / "workspace")
+    _desktop_config(home)
+    (home / "state" / "sessions.db").write_bytes(b"not a sqlite database")
+
+    report = inspect_profile(home, profile_kind="desktop-primary")
+
+    assert report.stable_code == "state_database_invalid"
+    assert report.detail is not None
+    assert "sessions.db" in report.detail
+    assert str(home) not in report.detail
+
+
 def test_wal_database_without_shm_is_validated_from_private_read_only_source_snapshot(
     tmp_path: Path,
 ) -> None:

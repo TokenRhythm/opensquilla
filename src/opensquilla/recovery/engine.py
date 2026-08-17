@@ -588,6 +588,26 @@ class _DatabaseSourceChangedError(Exception):
     """The source bundle did not remain stable during offline inspection."""
 
 
+def _os_error_detail(path: Path, exc: OSError) -> str:
+    """Format a human-readable, non-secret cause for an ``OSError``.
+
+    Only the file *name* and OS error numbers/text are included; the full path
+    is deliberately omitted so the detail survives the ``<HOME>``-redacted
+    diagnostics protocol unchanged.
+    """
+
+    message = exc.strerror or (
+        os.strerror(exc.errno) if exc.errno is not None else "unknown OS error"
+    )
+    detail = f"{path.name}: {message}"
+    if exc.errno is not None:
+        detail += f" (errno {exc.errno}"
+        if os.name == "nt" and getattr(exc, "winerror", None) is not None:
+            detail += f", winerror {exc.winerror}"
+        detail += ")"
+    return detail
+
+
 def _regular_source_stat(path: Path) -> os.stat_result | None:
     try:
         value = os.lstat(_native_io_path(path))
@@ -595,7 +615,7 @@ def _regular_source_stat(path: Path) -> os.stat_result | None:
         return None
     except OSError as exc:
         raise RecoveryError(
-            "runtime database bundle cannot be inspected",
+            f"runtime database bundle cannot be inspected ({_os_error_detail(path, exc)})",
             stable_code="state_database_unreadable",
         ) from exc
     if (
@@ -643,7 +663,8 @@ def _copy_source_file_no_follow(source: Path, destination: Path) -> _DatabaseSou
         raise _DatabaseSourceChangedError from exc
     except OSError as exc:
         raise RecoveryError(
-            "runtime database bundle cannot be opened without following links",
+            f"runtime database bundle cannot be opened without following links "
+            f"({_os_error_detail(source, exc)})",
             stable_code="state_database_unreadable",
         ) from exc
     try:
@@ -734,18 +755,25 @@ def _bundle_names(path: Path) -> tuple[Path, ...]:
     return (path, path.with_name(f"{path.name}-wal"), path.with_name(f"{path.name}-journal"))
 
 
-def _database_safety_code(path: Path) -> str | None:
-    """Validate a stable private SQLite snapshot without opening the source."""
+def _database_safety_code(path: Path) -> tuple[str | None, str | None]:
+    """Validate a stable private SQLite snapshot without opening the source.
+
+    Returns ``(stable_code, detail)``; ``detail`` carries the underlying
+    cause (OS error, quick_check finding, or ``sqlite3.Error`` text) so the
+    recovery report and diagnostics are actionable on first contact.
+    """
 
     bundle = _bundle_names(path)
     try:
         present_before = tuple(_regular_source_stat(entry) is not None for entry in bundle)
     except RecoveryError as exc:
-        return exc.stable_code
+        return exc.stable_code, exc.message
     if not present_before[0]:
         # A durable sidecar without its database is ambiguous and must never be
         # treated as a fresh state root.
-        return "state_database_unsafe_path" if any(present_before[1:]) else None
+        if any(present_before[1:]):
+            return "state_database_unsafe_path", None
+        return None, None
 
     snapshots: list[_DatabaseSourceSnapshot] = []
     try:
@@ -771,7 +799,10 @@ def _database_safety_code(path: Path) -> str | None:
                 try:
                     check = connection.execute("PRAGMA quick_check").fetchone()
                     if not check or str(check[0]).lower() != "ok":
-                        return "state_database_invalid"
+                        finding = (
+                            str(check[0]) if check else "quick_check returned no row"
+                        )
+                        return "state_database_invalid", f"{path.name}: {finding}"
                     tables = connection.execute(
                         "SELECT name FROM sqlite_master WHERE type='table' "
                         "AND name LIKE '%yoyo_migration'"
@@ -793,48 +824,48 @@ def _database_safety_code(path: Path) -> str | None:
                         ).fetchall()
                 finally:
                     connection.close()
-            except sqlite3.Error:
-                return "state_database_invalid"
+            except sqlite3.Error as exc:
+                return "state_database_invalid", f"{path.name}: {type(exc).__name__}: {exc}"
             try:
                 present_after = tuple(_regular_source_stat(entry) is not None for entry in bundle)
             except RecoveryError as exc:
-                return exc.stable_code
+                return exc.stable_code, exc.message
             if present_after != present_before or not all(
                 _source_snapshot_is_current(snapshot) for snapshot in snapshots
             ):
                 raise _DatabaseSourceChangedError
     except _DatabaseSourceChangedError:
-        return "state_database_changed"
+        return "state_database_changed", None
     except RecoveryError as exc:
-        return exc.stable_code
+        return exc.stable_code, exc.message
 
     applied = {str(migration_id) for (migration_id,) in rows if migration_id}
     if not applied:
-        return None
+        return None, None
     known = _known_migration_ids()
     if not known:
-        return "state_migration_set_unavailable"
+        return "state_migration_set_unavailable", None
     if applied - known:
-        return "state_schema_too_new"
-    return None
+        return "state_schema_too_new", None
+    return None, None
 
 
-def _state_safety_code(state_dir: Path) -> str | None:
+def _state_safety_code(state_dir: Path) -> tuple[str | None, str | None]:
     try:
         state_before = PathIdentity.from_stat(_native_stat(state_dir))
-    except OSError:
-        return "effective_state_unreadable"
+    except OSError as exc:
+        return "effective_state_unreadable", _os_error_detail(state_dir, exc)
     for database_name in ("sessions.db", "scheduler.db"):
-        code = _database_safety_code(state_dir / database_name)
+        code, detail = _database_safety_code(state_dir / database_name)
         if code is not None:
-            return code
+            return code, detail
     try:
         state_after = PathIdentity.from_stat(_native_stat(state_dir))
     except OSError:
-        return "state_database_changed"
+        return "state_database_changed", None
     if state_before.metadata_tuple() != state_after.metadata_tuple():
-        return "state_database_changed"
-    return None
+        return "state_database_changed", None
+    return None, None
 
 
 def _profile_has_evidence(home: Path) -> bool:
@@ -2128,7 +2159,7 @@ def inspect_profile(
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
         )
-    state_code = _state_safety_code(state_candidate.path)
+    state_code, state_detail = _state_safety_code(state_candidate.path)
     if state_code is not None:
         return _report(
             home=home_path,
@@ -2136,6 +2167,7 @@ def inspect_profile(
             candidates=candidates,
             outcome="attention",
             stable_code=state_code,
+            detail=state_detail,
             effective_workspace=effective,
             allowed_actions=_RECOVERY_ACTIONS,
         )
