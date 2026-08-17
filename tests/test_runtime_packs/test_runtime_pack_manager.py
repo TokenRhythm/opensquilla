@@ -1,3 +1,5 @@
+"""Runtime Pack manager transactions and cross-platform contracts."""
+
 from __future__ import annotations
 
 import hashlib

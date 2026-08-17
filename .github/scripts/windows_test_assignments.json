@@ -669,7 +669,7 @@
       "tests/test_router_self_learning_dataset.py",
       "tests/test_router_self_learning_feedback.py",
       "tests/test_runtime_packs/test_catalog.py",
-      "tests/test_runtime_packs/test_manager.py",
+      "tests/test_runtime_packs/test_runtime_pack_manager.py",
       "tests/test_runtime_packs/test_shell_runtime_resolution.py",
       "tests/test_safety/test_secret_redaction.py",
       "tests/test_sandbox/test_channel_approval_gate.py",

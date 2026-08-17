@@ -797,7 +797,7 @@
     "tests/test_router_self_learning_training.py": 0.863,
     "tests/test_router_tier_contract.py": 0.127,
     "tests/test_runtime_packs/test_catalog.py": 0.01,
-    "tests/test_runtime_packs/test_manager.py": 0.01,
+    "tests/test_runtime_packs/test_runtime_pack_manager.py": 0.01,
     "tests/test_runtime_packs/test_shell_runtime_resolution.py": 0.01,
     "tests/test_safety/test_run_sandboxed_env.py": 0.01,
     "tests/test_safety/test_run_sandboxed_proc_cleanup.py": 0.01,
