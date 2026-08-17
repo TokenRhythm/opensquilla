@@ -85,7 +85,8 @@ async def test_qq_streamed_reply_targets_sender_even_after_newer_inbound() -> No
 
     assert channel.api.post_c2c_message.await_count == 1
     kwargs = channel.api.post_c2c_message.await_args.kwargs
-    assert "answer for a" in kwargs["content"]
+    body_text = kwargs.get("content") or kwargs.get("markdown", {}).get("content", "")
+    assert "answer for a" in body_text
     assert kwargs["openid"] == "openid-a"
     assert kwargs["msg_id"] == "m-a"
     assert kwargs["msg_seq"] == 1

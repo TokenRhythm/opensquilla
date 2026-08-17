@@ -96,9 +96,7 @@ async def test_feishu_send_text_stays_plain_when_format_is_text() -> None:
     )
 
     try:
-        await channel.send(
-            OutgoingMessage(content="plain", reply_to="ou_user", format="text")
-        )
+        await channel.send(OutgoingMessage(content="plain", reply_to="ou_user", format="text"))
     finally:
         await channel.stop()
 
@@ -128,9 +126,7 @@ def test_wecom_webhook_builds_plain_text_payload_by_default() -> None:
 
 
 def test_telegram_builds_html_payload_for_markdown() -> None:
-    channel = TelegramChannel(
-        TelegramChannelConfig(token="bot-token", connection_mode="webhook")
-    )
+    channel = TelegramChannel(TelegramChannelConfig(token="bot-token", connection_mode="webhook"))
     payload = channel._build_send_payload(  # noqa: SLF001
         OutgoingMessage(
             content="*bold* text",
@@ -143,9 +139,7 @@ def test_telegram_builds_html_payload_for_markdown() -> None:
 
 
 def test_telegram_builds_plain_payload_without_parse_mode() -> None:
-    channel = TelegramChannel(
-        TelegramChannelConfig(token="bot-token", connection_mode="webhook")
-    )
+    channel = TelegramChannel(TelegramChannelConfig(token="bot-token", connection_mode="webhook"))
     payload = channel._build_send_payload(  # noqa: SLF001
         OutgoingMessage(
             content="plain",
@@ -227,9 +221,7 @@ async def test_qq_markdown_uses_official_markdown_message() -> None:
 async def test_telegram_markdown_parse_failure_falls_back_to_plain_text() -> None:
     """Entity-parse failures fall back to plain text instead of dropping."""
 
-    channel = TelegramChannel(
-        TelegramChannelConfig(token="bot-token", connection_mode="webhook")
-    )
+    channel = TelegramChannel(TelegramChannelConfig(token="bot-token", connection_mode="webhook"))
     sent: list[dict] = []
 
     async def fake_api(method: str, payload: dict | None = None) -> Any:
@@ -262,9 +254,7 @@ async def test_telegram_markdown_parse_failure_falls_back_to_plain_text() -> Non
 async def test_telegram_markdown_non_parse_error_is_not_masked() -> None:
     """Errors unrelated to entity parsing must surface, not fall back."""
 
-    channel = TelegramChannel(
-        TelegramChannelConfig(token="bot-token", connection_mode="webhook")
-    )
+    channel = TelegramChannel(TelegramChannelConfig(token="bot-token", connection_mode="webhook"))
 
     async def fake_api(method: str, payload: dict | None = None) -> Any:
         raise TelegramApiError("Bad Request: chat not found", error_code=400)
@@ -307,7 +297,7 @@ def test_telegram_markdown_renders_nested_and_block_constructs() -> None:
     assert markdown_to_telegram_html("*a **b** c*") == "<i>a <b>b</b> c</i>"
     assert (
         markdown_to_telegram_html("```python\nprint('hi')\n```")
-        == '<pre><code class="language-python">print(\'hi\')</code></pre>'
+        == "<pre><code class=\"language-python\">print('hi')</code></pre>"
     )
     # Headings render as plain bold-free lines: Telegram rejects nested <b>.
     assert "Title" in markdown_to_telegram_html("# Title\n- one\n- two\n1. three")
@@ -315,6 +305,7 @@ def test_telegram_markdown_renders_nested_and_block_constructs() -> None:
     assert markdown_to_telegram_html("> quoted text") == "<blockquote>quoted text</blockquote>"
     # Intraword underscores are not emphasis (snake_case stays literal).
     assert markdown_to_telegram_html("snake_case_name") == "snake_case_name"
+
 
 def test_dingtalk_reply_markdown_matches_real_sdk_signature() -> None:
     """The adapter must call reply_markdown with the SDK's parameter shape."""
@@ -325,6 +316,7 @@ def test_dingtalk_reply_markdown_matches_real_sdk_signature() -> None:
 
     params = list(inspect.signature(ChatbotHandler.reply_markdown).parameters)
     assert params == ["self", "title", "text", "incoming_message"]
+
 
 @pytest.mark.asyncio
 async def test_dingtalk_markdown_reply_passes_all_sdk_arguments() -> None:
@@ -360,6 +352,7 @@ async def test_dingtalk_markdown_reply_passes_all_sdk_arguments() -> None:
     # non-empty markdown title), never an empty string.
     assert calls == [("markdown", "bold answer", "**bold** answer", raw)]
 
+
 def _feishu_mock_channel(requests: list[tuple[str, bytes]]) -> FeishuChannel:
     async def handler(request: httpx.Request) -> httpx.Response:
         body = await request.aread()
@@ -380,6 +373,7 @@ def _feishu_mock_channel(requests: list[tuple[str, bytes]]) -> FeishuChannel:
     )
     return channel
 
+
 @pytest.mark.asyncio
 async def test_feishu_markdown_over_post_budget_splits_into_multiple_posts() -> None:
     requests: list[tuple[str, bytes]] = []
@@ -387,9 +381,7 @@ async def test_feishu_markdown_over_post_budget_splits_into_multiple_posts() -> 
     content = "**bold** text " * 2200  # ~29 KB of UTF-8, over the post budget
 
     try:
-        await channel.send(
-            OutgoingMessage(content=content, reply_to="ou_user", format="markdown")
-        )
+        await channel.send(OutgoingMessage(content=content, reply_to="ou_user", format="markdown"))
     finally:
         await channel.stop()
 
@@ -399,6 +391,7 @@ async def test_feishu_markdown_over_post_budget_splits_into_multiple_posts() -> 
         for _path, body in requests
     )
     assert joined == content
+
 
 @pytest.mark.asyncio
 async def test_feishu_markdown_under_post_budget_stays_single_post() -> None:
@@ -418,6 +411,7 @@ async def test_feishu_markdown_under_post_budget_stays_single_post() -> None:
 
     assert len(requests) == 1
 
+
 @pytest.mark.asyncio
 async def test_feishu_markdown_cjk_stays_under_post_cap_on_the_wire() -> None:
     requests: list[tuple[str, bytes]] = []
@@ -425,14 +419,13 @@ async def test_feishu_markdown_cjk_stays_under_post_cap_on_the_wire() -> None:
     content = "内容" * 9900  # ~29.7 KB of UTF-8, over the post budget
 
     try:
-        await channel.send(
-            OutgoingMessage(content=content, reply_to="ou_user", format="markdown")
-        )
+        await channel.send(OutgoingMessage(content=content, reply_to="ou_user", format="markdown"))
     finally:
         await channel.stop()
 
     assert len(requests) >= 2
     assert all(len(body) < 30 * 1024 for _path, body in requests)
+
 
 @pytest.mark.asyncio
 async def test_feishu_reply_markdown_splits_over_budget() -> None:
@@ -459,9 +452,7 @@ async def test_feishu_reply_markdown_splits_over_budget() -> None:
 async def test_telegram_markdown_render_overflow_falls_back_to_plain_text() -> None:
     """A chunk whose HTML rendering exceeds 4096 units ships as plain text."""
 
-    channel = TelegramChannel(
-        TelegramChannelConfig(token="bot-token", connection_mode="webhook")
-    )
+    channel = TelegramChannel(TelegramChannelConfig(token="bot-token", connection_mode="webhook"))
     sent: list[dict] = []
 
     async def fake_api(method: str, payload: dict | None = None) -> Any:
@@ -503,7 +494,7 @@ def test_feishu_markdown_chunks_serialized_size_always_fits() -> None:
         '"' * 20000,  # every char needs JSON escaping
         "\\" * 12000,
         "\n" * 15000,
-        "\t\r\"\\\\ " * 4000,
+        '\t\r"\\\\ ' * 4000,
     ):
         chunks = _feishu_markdown_chunks(content)
         assert chunks
@@ -641,3 +632,149 @@ def test_dingtalk_markdown_title_is_never_empty() -> None:
     # A code-fence first line strips to empty, so the fallback name is used.
     assert _dingtalk_markdown_title("```\ncode\n```", "dingtalk") == "dingtalk"
     assert len(_dingtalk_markdown_title("x" * 100, "dingtalk")) <= 20
+
+
+def test_telegram_markdown_link_with_surrounding_text() -> None:
+    from opensquilla.channels._markdown import markdown_to_telegram_html
+
+    assert (
+        markdown_to_telegram_html("Visit [Google](https://google.com) for details")
+        == 'Visit <a href="https://google.com">Google</a> for details'
+    )
+    assert (
+        markdown_to_telegram_html("Check [one](https://1.com) and [two](https://2.com) here")
+        == 'Check <a href="https://1.com">one</a> and <a href="https://2.com">two</a> here'
+    )
+
+
+def test_telegram_markdown_multiline_blockquote_preserves_lines() -> None:
+    from opensquilla.channels._markdown import markdown_to_telegram_html
+
+    assert (
+        markdown_to_telegram_html("> line one\n> line two with **bold**")
+        == "<blockquote>line one\nline two with <b>bold</b></blockquote>"
+    )
+
+
+@pytest.mark.asyncio
+async def test_qq_send_streaming_emits_markdown_passive_message() -> None:
+    from collections.abc import AsyncIterator
+    from types import SimpleNamespace
+
+    from opensquilla.channels.qq import QQChannel, QQChannelConfig
+
+    captured: dict[str, object] = {}
+
+    class FakeHttp:
+        async def request(self, route: object, json: dict | None = None) -> dict:
+            captured["route"] = route
+            captured["json"] = json
+            return {"id": "mock-msg-id"}
+
+    channel = QQChannel(QQChannelConfig(name="qq", app_id="a", app_secret="s"))
+    channel.api = SimpleNamespace(_http=FakeHttp())
+
+    async def chunks() -> AsyncIterator[str]:
+        yield "# Title\n"
+        yield "**bold** answer"
+
+    await channel.send_streaming(
+        chunks(),
+        chat_type="c2c",
+        target="openid-1",
+        msg_id="m-1",
+    )
+
+    body = captured.get("json")
+    assert isinstance(body, dict)
+    assert body["msg_type"] == 2
+    assert "content" not in body
+    assert body["markdown"]["content"] == "# Title\n**bold** answer"
+
+
+@pytest.mark.asyncio
+async def test_feishu_send_streaming_emits_markdown_post() -> None:
+    from collections.abc import AsyncIterator
+
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        body = await request.aread()
+        payload = json.loads(body)
+        assert payload["msg_type"] == "post"
+        post = json.loads(payload["content"])["zh_cn"]
+        assert post["content"][0][0]["tag"] == "md"
+        assert post["content"][0][0]["text"] == "**streamed** bold"
+        return httpx.Response(200, json={"code": 0})
+
+    channel = FeishuChannel(
+        FeishuChannelConfig(app_id="app", app_secret="secret", connection_mode="webhook")
+    )
+    channel._token_state = _TokenState(token="tenant-token", expires_at=999999999.0)
+    channel._client = httpx.AsyncClient(
+        base_url="https://open.feishu.cn/open-apis",
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def chunks() -> AsyncIterator[str]:
+        yield "**streamed** "
+        yield "bold"
+
+    try:
+        await channel.send_streaming(chunks(), chat_id="ou_user")
+    finally:
+        await channel.stop()
+
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_wecom_send_streaming_emits_markdown() -> None:
+    from collections.abc import AsyncIterator
+
+    channel = WeComChannel(WeComChannelConfig(name="wecom", agent_id_int=1))
+    sent_messages: list[OutgoingMessage] = []
+
+    async def fake_send(msg: OutgoingMessage) -> None:
+        sent_messages.append(msg)
+
+    channel.send = fake_send  # type: ignore[method-assign]
+
+    async def chunks() -> AsyncIterator[str]:
+        yield "**streamed**"
+
+    await channel.send_streaming(chunks(), reply_to="user-1")
+
+    assert len(sent_messages) == 1
+    assert sent_messages[0].format == "markdown"
+    assert sent_messages[0].content == "**streamed**"
+
+
+@pytest.mark.asyncio
+async def test_slack_send_streaming_converts_to_mrkdwn() -> None:
+    from collections.abc import AsyncIterator
+
+    requests: list[dict[str, Any]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads((await request.aread()).decode())
+        requests.append(body)
+        return httpx.Response(200, json={"ok": True, "ts": "123"})
+
+    channel = SlackChannel(token="bot-token", slack_channel_id="C123")
+    channel._client = httpx.AsyncClient(
+        base_url="https://slack.com/api",
+        transport=httpx.MockTransport(handler),
+    )
+
+    async def chunks() -> AsyncIterator[str]:
+        yield "**streamed** answer"
+
+    try:
+        await channel.send_streaming(chunks(), channel="C123")
+    finally:
+        await channel.stop()
+
+    assert requests
+    assert requests[0]["text"] == "*streamed* answer"
