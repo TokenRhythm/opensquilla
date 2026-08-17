@@ -54,11 +54,15 @@ if ($isDirectory) {
 }
 $propagation = [System.Security.AccessControl.PropagationFlags]::None
 $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
-$allowed = @($userSid, "S-1-5-18", "S-1-5-32-544") | Select-Object -Unique
+$allowed = @($userSid)
+foreach ($trustedSid in @("S-1-5-18", "S-1-5-32-544")) {
+    if ($allowed -notcontains $trustedSid) {
+        $allowed += $trustedSid
+    }
+}
 if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rule-inputs") }
 foreach ($sidText in $allowed) {
     $sid = [System.Security.Principal.SecurityIdentifier]::new($sidText)
-    if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:sid-ready:$sidText") }
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
         $sid,
         $fullControl,
@@ -66,9 +70,7 @@ foreach ($sidText in $allowed) {
         $propagation,
         [System.Security.AccessControl.AccessControlType]::Allow
     )
-    if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rule-ready:$sidText") }
     [void]$acl.AddAccessRule($rule)
-    if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rule-added:$sidText") }
 }
 if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rules-ready") }
 if ($isDirectory) {
@@ -102,12 +104,16 @@ foreach ($rule in $rules) {
     }
 }
 foreach ($sidText in $allowed) {
-    $matches = @($rules | Where-Object {
-        $_.IdentityReference.Translate(
+    $matchCount = 0
+    foreach ($rule in $rules) {
+        $identity = $rule.IdentityReference.Translate(
             [System.Security.Principal.SecurityIdentifier]
-        ).Value -eq $sidText
-    })
-    if ($matches.Count -ne 1) {
+        ).Value
+        if ($identity -eq $sidText) {
+            $matchCount += 1
+        }
+    }
+    if ($matchCount -ne 1) {
         throw "DACL principal verification failed"
     }
 }

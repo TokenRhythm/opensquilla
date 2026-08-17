@@ -194,6 +194,8 @@ def test_windows_acl_script_does_not_require_powershell_module_autoload() -> Non
     script = upgrade_migration._WINDOWS_PRIVATE_ACL_SCRIPT
 
     assert "Get-Acl" not in script
+    assert "Select-Object" not in script
+    assert "Where-Object" not in script
     assert "[System.IO.Directory]::GetAccessControl($target)" in script
     assert "[System.IO.File]::GetAccessControl($target)" in script
 
