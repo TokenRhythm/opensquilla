@@ -100,16 +100,21 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
     )
     executable = fake_bin / "ossutil"
     executable.write_text(
-        '#!/usr/bin/env bash\nexec "$FAKE_PYTHON" "$FAKE_OSSUTIL" "$@"\n',
+        '#!/usr/bin/env bash\nexec "$PYTHON_BIN" "$FAKE_OSSUTIL" "$@"\n',
         encoding="utf-8",
     )
     executable.chmod(0o755)
-    python3 = fake_bin / "python3"
-    python3.write_text(
-        '#!/usr/bin/env bash\nexec "$FAKE_PYTHON" "$@"\n',
+    python = fake_bin / "opensquilla-test-python"
+    python.write_text(
+        "#!/usr/bin/env bash\n"
+        'python_path="$FAKE_PYTHON"\n'
+        "if command -v cygpath >/dev/null 2>&1; then\n"
+        '  python_path="$(cygpath -u "$python_path")"\n'
+        "fi\n"
+        'exec "$python_path" "$@"\n',
         encoding="utf-8",
     )
-    python3.chmod(0o755)
+    python.chmod(0o755)
     return fake_bin, remote_root, call_log
 
 
@@ -129,7 +134,8 @@ def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
             "FAKE_OSSUTIL": str(fake_bin / "ossutil.py"),
             "FAKE_PYTHON": sys.executable,
             "OSS_ADDRESSING_STYLE_NORMALIZED": "virtual",
-            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+            "OSSUTIL_BIN": (fake_bin / "ossutil").as_posix(),
+            "PYTHON_BIN": (fake_bin / "opensquilla-test-python").as_posix(),
         }
     )
     return subprocess.run(

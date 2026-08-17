@@ -23,7 +23,9 @@ if [[ "${ALIYUN_OSS_PREFIX_NORMALIZED}" != "releases" ]]; then
 fi
 
 version="${tag#v}"
-desktop_version="$(python3 - "${version}" <<'PY'
+python_bin="${PYTHON_BIN:-python3}"
+ossutil_bin="${OSSUTIL_BIN:-ossutil}"
+desktop_version="$("${python_bin}" - "${version}" <<'PY'
 import re
 import sys
 
@@ -43,7 +45,7 @@ expected=(
   "SHA256SUMS"
 )
 
-python3 - "${assets_dir}/SHA256SUMS" "${expected[@]}" <<'PY'
+"${python_bin}" - "${assets_dir}/SHA256SUMS" "${expected[@]}" <<'PY'
 from pathlib import Path, PurePosixPath
 import re
 import sys
@@ -91,7 +93,7 @@ trap cleanup EXIT
 object_exists() {
   local object="$1"
   local listing
-  if ! listing="$(ossutil ls \
+  if ! listing="$("${ossutil_bin}" ls \
     --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
     --short-format "${object}")"; then
     echo "Unable to list OSS object: ${object}" >&2
@@ -105,7 +107,7 @@ verify_immutable_object() {
   local name="$2"
   local object="$3"
   local remote_copy="${scratch}/${name}"
-  ossutil cp \
+  "${ossutil_bin}" cp \
     --force \
     --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
     "${object}" "${remote_copy}"
@@ -126,7 +128,7 @@ put_immutable_object() {
   local name="$2"
   local source_path
   source_path="$(realpath -- "${source}")"
-  ossutil api put-object \
+  "${ossutil_bin}" api put-object \
     --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
     --bucket "${ALIYUN_OSS_BUCKET}" \
     --key "${ALIYUN_OSS_PREFIX_NORMALIZED}/${tag}/${name}" \
@@ -169,6 +171,6 @@ done
 # This script deliberately has no channel/latest alias code. The stable/latest
 # manifests remain untouched until the human publishes the verified Draft and
 # the separate post-publish mirror workflow runs.
-ossutil ls \
+"${ossutil_bin}" ls \
   --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
   "${dest_prefix}/"
