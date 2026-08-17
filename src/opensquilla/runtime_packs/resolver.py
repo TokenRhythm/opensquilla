@@ -5,25 +5,64 @@ from __future__ import annotations
 import os
 import shutil
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
+from opensquilla.run_mode import RunMode, normalize_run_mode
 from opensquilla.runtime_packs.manager import RuntimePackService
-from opensquilla.sandbox.policy_models import RuntimePolicySettings
-from opensquilla.sandbox.run_mode import RunMode, normalize_run_mode
+
+
+class RuntimePolicyProtocol(Protocol):
+    """Minimal policy surface accepted from sandbox and non-sandbox callers."""
+
+    enabled: bool
+    python: bool
+    node: bool
+    git_bash: bool
+
+
+type RuntimePolicyInput = RuntimePolicyProtocol | Mapping[str, Any] | None
+
+
+@dataclass(frozen=True)
+class _RuntimePolicy:
+    enabled: bool = True
+    python: bool = True
+    node: bool = True
+    git_bash: bool = True
+
+
+def _policy_bool(value: object, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"Runtime Pack policy {field} must be a boolean")
+    return value
 
 
 def _runtime_policy(
-    value: RuntimePolicySettings | Mapping[str, Any] | None,
-) -> RuntimePolicySettings:
+    value: RuntimePolicyInput,
+) -> _RuntimePolicy:
     if value is None:
-        return RuntimePolicySettings()
-    if isinstance(value, RuntimePolicySettings):
-        return value
-    return RuntimePolicySettings.model_validate(value)
+        return _RuntimePolicy()
+    if isinstance(value, Mapping):
+        return _RuntimePolicy(
+            enabled=_policy_bool(value.get("enabled", True), "enabled"),
+            python=_policy_bool(value.get("python", True), "python"),
+            node=_policy_bool(value.get("node", True), "node"),
+            git_bash=_policy_bool(
+                value.get("git_bash", value.get("gitBash", True)),
+                "gitBash",
+            ),
+        )
+    return _RuntimePolicy(
+        enabled=_policy_bool(value.enabled, "enabled"),
+        python=_policy_bool(value.python, "python"),
+        node=_policy_bool(value.node, "node"),
+        git_bash=_policy_bool(value.git_bash, "gitBash"),
+    )
 
 
-def _enabled_components(settings: RuntimePolicySettings) -> tuple[str, ...]:
+def _enabled_components(settings: _RuntimePolicy) -> tuple[str, ...]:
     if not settings.enabled:
         return ()
     enabled = (
@@ -56,7 +95,7 @@ class RuntimePackResolver:
 
     def runtime_roots(
         self,
-        policy: RuntimePolicySettings | Mapping[str, Any] | None = None,
+        policy: RuntimePolicyInput = None,
     ) -> tuple[Path, ...]:
         settings = _runtime_policy(policy)
         roots = []
@@ -68,7 +107,7 @@ class RuntimePackResolver:
 
     def managed_path(
         self,
-        policy: RuntimePolicySettings | Mapping[str, Any] | None = None,
+        policy: RuntimePolicyInput = None,
     ) -> tuple[Path, ...]:
         settings = _runtime_policy(policy)
         paths: list[Path] = []
@@ -83,7 +122,7 @@ class RuntimePackResolver:
 
     def executable_paths(
         self,
-        policy: RuntimePolicySettings | Mapping[str, Any] | None = None,
+        policy: RuntimePolicyInput = None,
     ) -> Mapping[str, Path]:
         settings = _runtime_policy(policy)
         result: dict[str, Path] = {}
@@ -98,7 +137,7 @@ class RuntimePackResolver:
         mode: RunMode | str,
         host_path: Iterable[str | Path],
         *,
-        policy: RuntimePolicySettings | Mapping[str, Any] | None = None,
+        policy: RuntimePolicyInput = None,
         require_managed: bool = False,
     ) -> tuple[Path, ...]:
         host = tuple(Path(value) for value in host_path if str(value).strip())
@@ -116,7 +155,7 @@ class RuntimePackResolver:
         environment: Mapping[str, str] | None,
         *,
         mode: RunMode | str,
-        policy: RuntimePolicySettings | Mapping[str, Any] | None = None,
+        policy: RuntimePolicyInput = None,
         require_managed: bool = False,
     ) -> dict[str, str]:
         result = dict(environment or {})
@@ -151,4 +190,4 @@ class RuntimePackResolver:
         return None
 
 
-__all__ = ["RuntimePackResolver"]
+__all__ = ["RuntimePackResolver", "RuntimePolicyInput", "RuntimePolicyProtocol"]

@@ -57,6 +57,12 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # onboarding nor provider imports contrib, so no cycle.
     ("contrib", "onboarding"),
     ("contrib", "provider"),
+    # CodeTask resolves an explicitly selected Runtime Pack against the active
+    # sandbox/run-mode policy at execution time.  These imports remain lazy so
+    # ordinary CLI and Gateway startup do not initialize optional runtimes.
+    ("contrib", "runtime_packs"),
+    ("contrib", "sandbox"),
+    ("contrib", "tools"),
     # The diagnostics-bundle shim composes gateway redaction, the offline
     # doctor, and onboarding config resolution lazily for the bundle
     # generator; a top-level module (permissions.py precedent) so the
@@ -74,6 +80,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("engine", "persistence"),
     ("engine", "plugins"),
     ("engine", "provider"),
+    # Turn-scoped state binding keeps Runtime Pack storage aligned with the
+    # configured Gateway state root without making pack health a boot gate.
+    ("engine", "runtime_packs"),
     ("engine", "safety"),
     ("engine", "sandbox"),
     ("engine", "session"),
@@ -100,6 +109,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("gateway", "onboarding"),
     ("gateway", "persistence"),
     ("gateway", "provider"),
+    # Runtime Pack management and status are exposed through best-effort RPCs;
+    # catalog or package failures are contained by the runtime service.
+    ("gateway", "runtime_packs"),
     ("gateway", "sandbox"),
     # Browser-facing approval projections reuse the canonical secret redactor;
     # safety is a lower-level leaf and does not import gateway back.
@@ -181,6 +193,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     # Direct-update migration reuses the profile lock implementation owned by
     # recovery. Recovery no longer imports sandbox back, so this stays one-way.
     ("sandbox", "recovery"),
+    # The launcher consults Runtime Packs before the legacy bundled-runtime
+    # compatibility layout.  The lookup is lazy and fail-open for app startup.
+    ("sandbox", "runtime_packs"),
     ("sandbox", "safety"),
     ("sandbox", "tools"),
     ("scheduler", "agents"),
@@ -219,6 +234,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("tools", "identity"),
     ("tools", "memory"),
     ("tools", "provider"),
+    # Shell execution reads only verified active Runtime Pack roots and keeps
+    # host fallback ordering in the shared resolver.
+    ("tools", "runtime_packs"),
     ("tools", "safety"),
     ("tools", "sandbox"),
     ("tools", "scheduler"),

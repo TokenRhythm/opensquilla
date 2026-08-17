@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 
+import opensquilla.managed_artifacts as managed_artifacts
 import opensquilla.skills.toolchains.runtime as toolchain_runtime
 from opensquilla.skills.toolchains import manager, registry
 from opensquilla.skills.toolchains.manager import (
@@ -597,7 +598,7 @@ def test_single_file_archive_relocation_rejects_extra_members(tmp_path: Path) ->
 def test_extraction_size_limit_stops_decompression_bomb(tmp_path: Path, monkeypatch: Any) -> None:
     archive = tmp_path / "bomb.tar.xz"
     _write_tar_xz(archive, {"Bundle/large": b"x" * 2_000})
-    monkeypatch.setattr(manager, "_MAX_EXPANSION_RATIO", 1)
+    monkeypatch.setattr(managed_artifacts, "_MAX_EXPANSION_RATIO", 1)
     with pytest.raises(UnsafeArchiveError, match="extracted-size"):
         manager._extract_archive(archive, tmp_path / "out", "tar.xz", 1)
 

@@ -8,8 +8,8 @@ import time
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
 
+from opensquilla.run_mode import RunMode
 from opensquilla.runtime_packs.catalog import (
     RuntimePackCatalog,
     RuntimePackCatalogError,
@@ -36,9 +36,7 @@ from opensquilla.runtime_packs.models import (
     RuntimePackStatus,
     RuntimeSource,
 )
-from opensquilla.runtime_packs.resolver import RuntimePackResolver
-from opensquilla.sandbox.policy_models import RuntimePolicySettings
-from opensquilla.sandbox.run_mode import RunMode
+from opensquilla.runtime_packs.resolver import RuntimePackResolver, RuntimePolicyInput
 
 _services: dict[str, RuntimePackService] = {}
 _services_lock = threading.Lock()
@@ -167,7 +165,7 @@ def apply_runtime_environment(
     environment: Mapping[str, str] | None,
     *,
     mode: RunMode | str,
-    policy: RuntimePolicySettings | Mapping[str, Any] | None = None,
+    policy: RuntimePolicyInput = None,
     require_managed: bool = False,
     state_dir: str | Path | None = None,
 ) -> dict[str, str]:
@@ -191,7 +189,7 @@ def apply_runtime_environment(
 
 
 def runtime_roots(
-    policy: RuntimePolicySettings | Mapping[str, Any] | None = None,
+    policy: RuntimePolicyInput = None,
     state_dir: str | Path | None = None,
 ) -> tuple[Path, ...]:
     try:

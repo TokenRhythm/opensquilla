@@ -27,6 +27,13 @@ from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from opensquilla.managed_artifacts import (
+    DownloadVerificationError,
+    ManagedArtifactError,
+    ManagedArtifactInstallLock,
+    UnsafeArchiveError,
+    extract_managed_archive,
+)
 from opensquilla.paths import state_dir as default_state_dir
 from opensquilla.runtime_packs.catalog import (
     RuntimePackCatalog,
@@ -46,14 +53,7 @@ from opensquilla.runtime_packs.models import (
 from opensquilla.runtime_packs.models import (
     RuntimeError as RuntimePublicError,
 )
-from opensquilla.sandbox.runtime_manifest import runtime_target
-from opensquilla.skills.toolchains import (
-    DownloadVerificationError,
-    ManagedArtifactInstallLock,
-    ToolchainError,
-    UnsafeArchiveError,
-    extract_managed_archive,
-)
+from opensquilla.runtime_target import runtime_target
 
 _LAYOUT_VERSION = "v1"
 _OSS_BASE = "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/runtime-packs"
@@ -1648,7 +1648,7 @@ class RuntimePackService:
                             ),
                         )
                     return operation
-        except ToolchainError:
+        except ManagedArtifactError:
             return self._operation_after_claim_contention(
                 component_id,
                 previous_operation_id,
@@ -1722,7 +1722,7 @@ class RuntimePackService:
                             ),
                         )
                     return operation
-        except ToolchainError:
+        except ManagedArtifactError:
             return self._operation_after_claim_contention(
                 component_id,
                 previous_operation_id,

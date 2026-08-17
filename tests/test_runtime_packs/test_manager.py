@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import tarfile
 import threading
 import time
@@ -15,7 +16,11 @@ import pytest
 
 from opensquilla.runtime_packs import RuntimePackResolver
 from opensquilla.runtime_packs import manager as runtime_pack_manager
-from opensquilla.runtime_packs.catalog import RuntimePackCatalog, RuntimePackCatalogError
+from opensquilla.runtime_packs.catalog import (
+    RuntimePackCatalog,
+    RuntimePackCatalogError,
+    RuntimePackDescriptor,
+)
 from opensquilla.runtime_packs.manager import (
     RuntimePackService,
     runtime_pack_state_scope,
@@ -28,6 +33,29 @@ from opensquilla.runtime_packs.models import (
     RuntimeSource,
 )
 from opensquilla.sandbox.run_mode import RunMode
+
+_REAL_RUNTIME_PROBE = runtime_pack_manager._run_probe
+
+
+@pytest.fixture(autouse=True)
+def _isolate_synthetic_archive_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep transaction fixtures independent of the host operating system."""
+
+    def probe(
+        descriptor: RuntimePackDescriptor,
+        layout: runtime_pack_manager.PackLayout,
+        package: Path,
+    ) -> None:
+        if descriptor.version.endswith("+test"):
+            assert layout.component_id == descriptor.component_id
+            assert layout.target == descriptor.target
+            assert layout.version == descriptor.version
+            for relative in layout.executables.values():
+                assert (package / "payload" / Path(relative)).is_file()
+            return
+        _REAL_RUNTIME_PROBE(descriptor, layout, package)
+
+    monkeypatch.setattr(runtime_pack_manager, "_run_probe", probe)
 
 
 class _Response:
@@ -66,6 +94,17 @@ class _MemoryOpener:
                 self.body[start:], status=206, start=start, total=len(self.body)
             )
         return _Response(self.body, status=200, start=0, total=len(self.body))
+
+
+class _AssetMemoryOpener:
+    def __init__(self, bodies: dict[str, bytes]) -> None:
+        self.bodies = bodies
+
+    def __call__(self, request: Any, *, timeout: int) -> _Response:
+        assert timeout == 60
+        asset = request.full_url.rsplit("/", 1)[-1]
+        body = self.bodies[asset]
+        return _Response(body, status=200, start=0, total=len(body))
 
 
 class _IgnoringRangeOpener(_MemoryOpener):
@@ -119,17 +158,32 @@ def _runtime_archive(
     tmp_path: Path,
     *,
     catalog_version: str = "test.1",
+    component_id: str = "python",
     version: str = "3.13.14+test",
     extra_root: bool = False,
+    payload_bytes: int = 0,
 ) -> bytes:
-    package = tmp_path / f"archive-root-{catalog_version}"
-    binary = package / "payload" / "bin" / "python"
-    binary.parent.mkdir(parents=True)
-    binary.write_text(
-        f"#!/bin/sh\necho 'Python {version.split('+', 1)[0]}'\n",
-        encoding="utf-8",
+    package = tmp_path / f"archive-root-{component_id}-{catalog_version}"
+    bin_dir = package / "payload" / "bin"
+    bin_dir.mkdir(parents=True)
+    executables = (
+        {"python": "bin/python"}
+        if component_id == "python"
+        else {"node": "bin/node", "npm": "bin/npm", "npx": "bin/npx"}
     )
-    binary.chmod(0o755)
+    for name, relative in executables.items():
+        binary = package / "payload" / Path(relative)
+        output = (
+            f"Python {version.split('+', 1)[0]}"
+            if name == "python"
+            else f"v{version.split('+', 1)[0]}"
+        )
+        binary.write_text(f"#!/bin/sh\necho '{output}'\n", encoding="utf-8")
+        binary.chmod(0o755)
+    if payload_bytes:
+        padding = package / "payload" / "share" / "fixture.bin"
+        padding.parent.mkdir(parents=True)
+        padding.write_bytes(b"x" * payload_bytes)
     (package / "licenses").mkdir()
     (package / "licenses" / "LICENSE.txt").write_text("test\n", encoding="utf-8")
     (package / "SBOM.spdx.json").write_text("{}\n", encoding="utf-8")
@@ -138,18 +192,18 @@ def _runtime_archive(
             {
                 "schemaVersion": 1,
                 "catalogVersion": catalog_version,
-                "componentId": "python",
+                "componentId": component_id,
                 "target": "linux-x64",
                 "version": version,
                 "binDirs": ["bin"],
-                "executables": {"python": "bin/python"},
+                "executables": executables,
             }
         ),
         encoding="utf-8",
     )
     if extra_root:
         (package / "unexpected.txt").write_text("not allowed\n", encoding="utf-8")
-    archive = tmp_path / f"runtime-{catalog_version}.tar.xz"
+    archive = tmp_path / f"runtime-{component_id}-{catalog_version}.tar.xz"
     with tarfile.open(archive, "w:xz") as output:
         for child in sorted(package.iterdir()):
             output.add(child, arcname=child.name)
@@ -198,6 +252,160 @@ def _service(tmp_path: Path, body: bytes, opener: _MemoryOpener) -> RuntimePackS
         },
         opener=opener,
     )
+
+
+def test_python_probe_runs_declared_executable_with_runtime_only_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = tmp_path / "probe-package"
+    executable = package / "payload" / "bin" / "python"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"synthetic executable placeholder")
+    descriptor = RuntimePackDescriptor(
+        component_id="python",
+        target="linux-x64",
+        asset="OpenSquilla-Runtime-python-test-linux-x64.tar.xz",
+        archive_type="tar.xz",
+        version="3.13.14+probe",
+        size_bytes=1,
+        unpacked_size_bytes=1,
+        sha256="a" * 64,
+        trusted_archive_sha256=(),
+    )
+    layout = runtime_pack_manager.PackLayout(
+        component_id="python",
+        target="linux-x64",
+        version="3.13.14+probe",
+        bin_dirs=("bin",),
+        executables={"python": "bin/python"},
+    )
+    observed: dict[str, object] = {}
+    probe_output = b"Python 3.13.14\n"
+
+    def run_probe(
+        command: list[str],
+        *,
+        check: bool,
+        capture_output: bool,
+        timeout: int,
+        env: dict[str, str],
+    ) -> subprocess.CompletedProcess[bytes]:
+        observed.update(
+            command=command,
+            check=check,
+            capture_output=capture_output,
+            timeout=timeout,
+            env=env,
+        )
+        return subprocess.CompletedProcess(
+            command,
+            returncode=0,
+            stdout=probe_output,
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(runtime_pack_manager.subprocess, "run", run_probe)
+
+    _REAL_RUNTIME_PROBE(descriptor, layout, package)
+
+    assert observed["command"] == [str(executable), "--version"]
+    assert observed["check"] is False
+    assert observed["capture_output"] is True
+    environment = observed["env"]
+    assert isinstance(environment, dict)
+    path_key = next(key for key in environment if key.casefold() == "path")
+    assert environment[path_key] == str(executable.parent)
+
+    probe_output = b"Python 3.12.10\n"
+    with pytest.raises(runtime_pack_manager.RuntimePackError, match="python probe failed"):
+        _REAL_RUNTIME_PROBE(descriptor, layout, package)
+
+
+def test_status_reports_each_component_installed_size_independently(
+    tmp_path: Path,
+) -> None:
+    python_asset = "OpenSquilla-Runtime-python-test-linux-x64.tar.xz"
+    node_asset = "OpenSquilla-Runtime-node-test-linux-x64.tar.xz"
+    python_body = _runtime_archive(tmp_path, payload_bytes=1_024)
+    node_body = _runtime_archive(
+        tmp_path,
+        component_id="node",
+        version="24.18.1+test",
+        payload_bytes=4_096,
+    )
+    catalog = RuntimePackCatalog.model_validate(
+        {
+            "schemaVersion": 1,
+            "catalogVersion": "test.1",
+            "releaseTag": "vtest.1",
+            "finalized": True,
+            "targets": {
+                "linux-x64": {
+                    "python": {
+                        "asset": python_asset,
+                        "archiveType": "tar.xz",
+                        "version": "3.13.14+test",
+                        "sizeBytes": len(python_body),
+                        "unpackedSizeBytes": 1024 * 1024,
+                        "sha256": hashlib.sha256(python_body).hexdigest(),
+                    },
+                    "node": {
+                        "asset": node_asset,
+                        "archiveType": "tar.xz",
+                        "version": "24.18.1+test",
+                        "sizeBytes": len(node_body),
+                        "unpackedSizeBytes": 1024 * 1024,
+                        "sha256": hashlib.sha256(node_body).hexdigest(),
+                    },
+                }
+            },
+        }
+    )
+    service = RuntimePackService(
+        catalog,
+        root=tmp_path / "state",
+        target="linux-x64",
+        source_bases={
+            RuntimeSource.GITHUB: "https://github.example.invalid/runtime-packs",
+            RuntimeSource.OSS: "https://oss.example.invalid/runtime-packs",
+        },
+        opener=_AssetMemoryOpener(
+            {python_asset: python_body, node_asset: node_body}
+        ),
+    )
+
+    for component_id in ("python", "node"):
+        operation = service.start_install(component_id)
+        completed = service.wait_for_operation(operation.operation_id)
+        assert completed is not None
+        assert completed.state is RuntimeOperationState.COMPLETED
+
+    active = {
+        component_id: service.active_runtime(component_id)
+        for component_id in ("python", "node")
+    }
+    assert all(runtime is not None for runtime in active.values())
+
+    def package_size(component_id: str) -> int:
+        runtime = active[component_id]
+        assert runtime is not None
+        marker = runtime.package / runtime_pack_manager._PACK_MARKER
+        return sum(
+            path.stat().st_size
+            for path in runtime.package.rglob("*")
+            if path.is_file() and path != marker
+        )
+
+    expected = {component_id: package_size(component_id) for component_id in active}
+    observed = {
+        component.component_id: component.installed_bytes
+        for component in service.status().components
+        if component.component_id in active
+    }
+
+    assert expected["python"] != expected["node"]
+    assert observed == expected
 
 
 def test_install_resume_activate_resolve_and_remove(tmp_path: Path) -> None:
