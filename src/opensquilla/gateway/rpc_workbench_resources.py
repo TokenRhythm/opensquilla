@@ -61,6 +61,7 @@ from opensquilla.tools.builtin.document_format_adapters import (
     DocumentAdapterError,
     DocumentFormatAdapter,
     probe_document_format_adapter,
+    validate_editable_html_source,
 )
 
 _d = get_dispatcher()
@@ -628,7 +629,7 @@ def _validated_import_source(source: _ImportSource) -> tuple[_ImportSource, Docu
         )
     try:
         text = source.payload.decode("utf-8")
-        profile.adapter.validate(text)
+        validate_editable_html_source(text)
     except UnicodeDecodeError:
         raise RpcHandlerError(
             "DOCUMENT_IMPORT_ENCODING_UNSUPPORTED",

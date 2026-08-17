@@ -123,43 +123,66 @@ export class DesktopArtifactBridge {
     }
   }
 
-  captureSelection(value: unknown): Promise<DesktopArtifactBridgeResult<'captureSelection'>> {
-    return this.invoke('captureSelection', value)
+  captureSelection(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<'captureSelection'>> {
+    return this.invoke('captureSelection', value, signal)
   }
 
   resolveAnnotationSelection(
     value: unknown,
+    signal?: AbortSignal,
   ): Promise<DesktopArtifactBridgeResult<'resolveAnnotationSelection'>> {
-    return this.invoke('resolveAnnotationSelection', value)
+    return this.invoke('resolveAnnotationSelection', value, signal)
   }
 
-  focusAnnotation(value: unknown): Promise<DesktopArtifactBridgeResult<'focusAnnotation'>> {
-    return this.invoke('focusAnnotation', value)
+  focusAnnotation(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<'focusAnnotation'>> {
+    return this.invoke('focusAnnotation', value, signal)
   }
 
-  browserInspect(value: unknown): Promise<DesktopArtifactBridgeResult<'browserInspect'>> {
-    return this.invoke('browserInspect', value)
+  browserInspect(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<'browserInspect'>> {
+    return this.invoke('browserInspect', value, signal)
   }
 
-  browserAct(value: unknown): Promise<DesktopArtifactBridgeResult<'browserAct'>> {
-    return this.invoke('browserAct', value)
+  browserAct(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<'browserAct'>> {
+    return this.invoke('browserAct', value, signal)
   }
 
-  screenshot(value: unknown): Promise<DesktopArtifactBridgeResult<'screenshot'>> {
-    return this.invoke('screenshot', value)
+  screenshot(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<'screenshot'>> {
+    return this.invoke('screenshot', value, signal)
   }
 
-  officeFlush(value: unknown): Promise<DesktopArtifactBridgeResult<'officeFlush'>> {
-    return this.invoke('officeFlush', value)
+  officeFlush(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<'officeFlush'>> {
+    return this.invoke('officeFlush', value, signal)
   }
 
-  reloadSurface(value: unknown): Promise<DesktopArtifactBridgeResult<'reloadSurface'>> {
-    return this.invoke('reloadSurface', value)
+  reloadSurface(
+    value: unknown,
+    signal?: AbortSignal,
+  ): Promise<DesktopArtifactBridgeResult<'reloadSurface'>> {
+    return this.invoke('reloadSurface', value, signal)
   }
 
   private invoke<M extends DesktopArtifactBridgeMethod>(
     method: M,
     value: unknown,
+    signal?: AbortSignal,
   ): Promise<DesktopArtifactBridgeResult<M>> {
     let request: DesktopArtifactBridgeRequestByMethod[M]
     try {
@@ -187,8 +210,8 @@ export class DesktopArtifactBridge {
     }
 
     const operation = this.operationQueue.then(
-      () => this.perform(method, request, target),
-      () => this.perform(method, request, target),
+      () => this.perform(method, request, target, signal),
+      () => this.perform(method, request, target, signal),
     )
     this.operationQueue = operation.then(() => undefined, () => undefined)
     return operation
@@ -198,7 +221,16 @@ export class DesktopArtifactBridge {
     method: M,
     request: DesktopArtifactBridgeRequestByMethod[M],
     target: DesktopArtifactBridgeTarget,
+    externalSignal?: AbortSignal,
   ): Promise<DesktopArtifactBridgeResult<M>> {
+    if (externalSignal?.aborted) {
+      return {
+        ok: false,
+        method,
+        code: 'timed-out',
+        message: 'The Desktop artifact operation timed out.',
+      }
+    }
     if (!this.targetIsCurrent(target)) {
       return {
         ok: false,
@@ -219,16 +251,23 @@ export class DesktopArtifactBridge {
 
     const controller = new AbortController()
     let timeout: NodeJS.Timeout | undefined
+    let abortListener: (() => void) | undefined
+    let externalAbortListener: (() => void) | undefined
     try {
+      const aborted = new Promise<never>((_resolve, reject) => {
+        abortListener = () => reject(new Error('Desktop artifact operation timed out.'))
+        controller.signal.addEventListener('abort', abortListener, { once: true })
+      })
+      if (externalSignal) {
+        externalAbortListener = () => controller.abort()
+        externalSignal.addEventListener('abort', externalAbortListener, { once: true })
+        if (externalSignal.aborted) controller.abort()
+      }
+      timeout = setTimeout(() => controller.abort(), this.operationTimeoutMs)
+      timeout.unref()
       const value = await Promise.race([
         handler(request, controller.signal),
-        new Promise<never>((_resolve, reject) => {
-          timeout = setTimeout(() => {
-            controller.abort()
-            reject(new Error('Desktop artifact operation timed out.'))
-          }, this.operationTimeoutMs)
-          timeout.unref()
-        }),
+        aborted,
       ])
       if (!this.targetIsCurrent(target)) {
         return {
@@ -251,6 +290,10 @@ export class DesktopArtifactBridge {
       }
     } finally {
       if (timeout) clearTimeout(timeout)
+      if (abortListener) controller.signal.removeEventListener('abort', abortListener)
+      if (externalSignal && externalAbortListener) {
+        externalSignal.removeEventListener('abort', externalAbortListener)
+      }
     }
   }
 

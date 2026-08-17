@@ -1797,6 +1797,47 @@ async def test_chat_history_prefers_attachment_display_text() -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_history_strips_legacy_ids_from_missing_attachment_placeholders() -> None:
+    entry = TranscriptEntry(
+        session_id="session-1",
+        session_key="agent:main:webchat:test",
+        role="user",
+        content=json.dumps(
+            {
+                "text": "Inspect the unavailable attachment.",
+                "attachments": [
+                    {
+                        "attachment_id": "att_legacy_unaddressable",
+                        "name": "missing.pdf",
+                        "mime": "application/pdf",
+                        "size": 12,
+                        "missing_reason": "attachment persistence disabled",
+                    }
+                ],
+            }
+        ),
+    )
+
+    result = await _handle_chat_history(
+        {"sessionKey": "agent:main:webchat:test"},
+        RpcContext(
+            conn_id="test",
+            principal=SimpleNamespace(role="operator"),
+            session_manager=_FakeSessionManager([entry]),
+        ),
+    )
+
+    assert result["messages"][0]["attachments"] == [
+        {
+            "name": "missing.pdf",
+            "mime": "application/pdf",
+            "size": 12,
+            "missing_reason": "attachment persistence disabled",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_chat_history_exposes_download_url_for_transcript_attachment_refs() -> None:
     sha = "d" * 64
     entry = TranscriptEntry(

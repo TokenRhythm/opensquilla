@@ -1204,12 +1204,7 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
                 "The requested document mutation does not change the document.",
             )
         candidate_bytes = updated.encode("utf-8")
-        if not candidate_bytes or len(candidate_bytes) > _MAX_HTML_CANDIDATE_BYTES:
-            raise DocumentAdapterError(
-                "DOCUMENT_CANDIDATE_SIZE_INVALID",
-                "The edited HTML document is empty or too large.",
-            )
-        adapter_validation = self.validate_candidate(updated)
+        adapter_validation = validate_editable_html_source(updated)
         audit_facts: list[dict[str, object]] = []
         semantic_operations: list[dict[str, object]] = []
         for _start, _end, current, prepared, mutation in ordered:
@@ -1290,6 +1285,27 @@ class HtmlDocumentFormatAdapter(DocumentFormatAdapter):
 
 
 _ADAPTERS: dict[str, DocumentFormatAdapter] = {"html": HtmlDocumentFormatAdapter()}
+
+
+def validate_editable_html_source(source: str) -> dict[str, object]:
+    """Validate the bounded NUL-free source contract shared by every HTML editor."""
+
+    if not source:
+        raise DocumentAdapterError(
+            "DOCUMENT_CANDIDATE_EMPTY",
+            "The edited HTML document must not be empty.",
+        )
+    if "\x00" in source:
+        raise DocumentAdapterError(
+            "DOCUMENT_HTML_ENCODING_INVALID",
+            "HTML semantic editing requires NUL-free UTF-8 content.",
+        )
+    if len(source.encode("utf-8")) > _MAX_HTML_CANDIDATE_BYTES:
+        raise DocumentAdapterError(
+            "DOCUMENT_CANDIDATE_SIZE_INVALID",
+            "The edited HTML document is too large.",
+        )
+    return _ADAPTERS["html"].validate(source)
 
 
 def probe_document_format_adapter(

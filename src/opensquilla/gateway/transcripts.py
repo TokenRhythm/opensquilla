@@ -119,7 +119,6 @@ def build_transcript_attachment_envelope(
     disk_writes: list[dict[str, Any]] = []
 
     for attachment in attachments:
-        attachment_id = _new_attachment_id()
         media_type = (
             attachment.get("type") or attachment.get("mime") or attachment.get("media_type")
         )
@@ -128,7 +127,7 @@ def build_transcript_attachment_envelope(
             sha = attachment["sha256"]
             persisted_attachments.append(
                 {
-                    "attachment_id": attachment_id,
+                    "attachment_id": _new_attachment_id(),
                     "sha256_ref": sha,
                     "name": name,
                     "mime": media_type,
@@ -147,7 +146,6 @@ def build_transcript_attachment_envelope(
                 log.warning("transcript.persist_decode_failed name=%s err=%s", name, exc)
                 persisted_attachments.append(
                     {
-                        "attachment_id": attachment_id,
                         "name": name,
                         "mime": media_type,
                         "missing_reason": "attachment decode failed",
@@ -175,7 +173,7 @@ def build_transcript_attachment_envelope(
 
             persisted_attachments.append(
                 {
-                    "attachment_id": attachment_id,
+                    "attachment_id": _new_attachment_id(),
                     "sha256_ref": sha,
                     "name": name,
                     "mime": media_type,
@@ -189,7 +187,6 @@ def build_transcript_attachment_envelope(
                 log.warning("transcript.persist_decode_failed name=%s err=%s", name, exc)
                 persisted_attachments.append(
                     {
-                        "attachment_id": attachment_id,
                         "name": name,
                         "mime": media_type,
                         "missing_reason": "attachment decode failed",
@@ -198,7 +195,6 @@ def build_transcript_attachment_envelope(
                 continue
             persisted_attachments.append(
                 {
-                    "attachment_id": attachment_id,
                     "name": name,
                     "mime": media_type,
                     "size": len(payload),
@@ -208,7 +204,7 @@ def build_transcript_attachment_envelope(
         else:
             persisted_attachments.append(
                 {
-                    "attachment_id": attachment_id,
+                    "attachment_id": _new_attachment_id(),
                     "type": media_type,
                     "name": name,
                     "data": data,

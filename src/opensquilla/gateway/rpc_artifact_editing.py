@@ -75,6 +75,7 @@ from opensquilla.tools.builtin.document_format_adapters import (
     DocumentAdapterError,
     get_document_format_adapter,
     probe_document_format_adapter,
+    validate_editable_html_source,
 )
 
 _d = get_dispatcher()
@@ -979,7 +980,7 @@ async def _revision_capabilities(
             session_id=document.session_id,
         )
         source = await asyncio.to_thread(_html_source, ref, path)
-        get_document_format_adapter("html").validate(source)
+        validate_editable_html_source(source)
     except RpcHandlerError as exc:
         reason = (
             "html_source_encoding_unsupported"
@@ -2493,7 +2494,7 @@ async def _handle_source_read(
 def _apply_source_patches(
     source: str,
     raw_patches: object,
-) -> tuple[str, tuple[dict[str, object], ...]]:
+) -> tuple[str, tuple[dict[str, object], ...], dict[str, object]]:
     if not isinstance(raw_patches, list) or not raw_patches:
         raise ValueError("params.patches must be a non-empty array")
     if len(raw_patches) > _MAX_SOURCE_PATCHES:
@@ -2523,10 +2524,7 @@ def _apply_source_patches(
     result = source
     for start, end, replacement in reversed(patches):
         result = result[:start] + replacement + result[end:]
-    if not result:
-        raise ValueError("HTML source must not be empty")
-    if len(result.encode("utf-8")) > DEFAULT_ARTIFACT_MAX_BYTES:
-        raise ValueError("patched HTML source exceeds the artifact size limit")
+    adapter_validation = validate_editable_html_source(result)
     audit_patches = tuple(
         {
             "start_offset": start,
@@ -2538,7 +2536,7 @@ def _apply_source_patches(
         }
         for start, end, replacement in patches
     )
-    return result, audit_patches
+    return result, audit_patches, adapter_validation
 
 
 def _manual_mutation_request_id(params: dict[str, Any] | None) -> str:
@@ -2740,10 +2738,18 @@ async def _handle_source_patch(
     actual_sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
     if expected_sha != actual_sha:
         raise _conflict(ArtifactConflictError("source sha256 changed"))
-    updated, audit_patches = _apply_source_patches(
-        source,
-        params.get("patches") if isinstance(params, dict) else None,
-    )
+    try:
+        updated, audit_patches, adapter_validation = _apply_source_patches(
+            source,
+            params.get("patches") if isinstance(params, dict) else None,
+        )
+    except DocumentAdapterError as exc:
+        raise RpcHandlerError(
+            exc.code,
+            exc.user_message,
+            retryable=False,
+            accepted=False,
+        ) from None
     patch_count = len(audit_patches)
     request_id = _manual_mutation_request_id(params)
     turn_id = f"manual-source-patch:{request_id}"
@@ -2904,6 +2910,7 @@ async def _handle_source_patch(
                 "encoding": "utf-8",
                 "source_sha256": candidate.sha256,
                 "patch_count": patch_count,
+                "adapter_validation": adapter_validation,
                 "status": "passed",
             },
             actor=actor,

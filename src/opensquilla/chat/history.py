@@ -41,6 +41,23 @@ def _sanitize_display_protocol_payload(value: Any) -> Any:
     return value
 
 
+def _public_attachment_projection(value: Any) -> Any:
+    """Hide occurrence ids that never identified addressable attachment material."""
+
+    if not isinstance(value, list):
+        return value
+    return [
+        {
+            key: item
+            for key, item in attachment.items()
+            if key != "attachment_id" or not attachment.get("missing_reason")
+        }
+        if isinstance(attachment, dict)
+        else attachment
+        for attachment in value
+    ]
+
+
 def _is_legacy_generated_plan_implementation(
     content: str,
     turn_context: Any,
@@ -232,7 +249,7 @@ def transcript_entries_to_chat_messages(
                 if isinstance(parsed, dict) and "text" in parsed:
                     display_text = parsed.get("display_text")
                     content = display_text if isinstance(display_text, str) else parsed["text"]
-                    attachments = parsed.get("attachments")
+                    attachments = _public_attachment_projection(parsed.get("attachments"))
                     from opensquilla.prompt_annotations import (
                         PromptAnnotationSnapshotError,
                         normalize_prompt_annotation_snapshots,

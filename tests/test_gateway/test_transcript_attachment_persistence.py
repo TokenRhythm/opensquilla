@@ -173,8 +173,6 @@ def test_persist_transcripts_disabled_skips_disk_copy(tmp_path: Path) -> None:
     )
     parsed = json.loads(envelope)
     persisted = parsed["attachments"][0]
-    attachment_id = persisted.pop("attachment_id")
-    assert attachment_id.startswith("att_")
     assert persisted == {
         "name": "r.pdf",
         "mime": "application/pdf",

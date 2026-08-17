@@ -17,6 +17,7 @@ from opensquilla.tools.builtin.document_format_adapters import (
     PreparedAdapterCandidate,
     mutation_error_from_adapter,
     probe_document_format_adapter,
+    validate_editable_html_source,
 )
 
 
@@ -128,6 +129,23 @@ def test_adapter_probe_fails_closed_for_unrecognized_binary_material() -> None:
         media_type="application/octet-stream",
         source=b"\x00\xffnot-html",
     ) is None
+
+
+@pytest.mark.parametrize(
+    ("source", "code"),
+    [
+        ("<main>before\x00after</main>", "DOCUMENT_HTML_ENCODING_INVALID"),
+        ("x" * (2 * 1024 * 1024 + 1), "DOCUMENT_CANDIDATE_SIZE_INVALID"),
+    ],
+)
+def test_html_adapter_rejects_sources_outside_the_editable_contract(
+    source: str,
+    code: str,
+) -> None:
+    with pytest.raises(DocumentAdapterError) as raised:
+        validate_editable_html_source(source)
+
+    assert raised.value.code == code
 
 
 def test_html_adapter_removes_void_img_without_requiring_an_end_tag() -> None:

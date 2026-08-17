@@ -954,6 +954,102 @@ async def test_html_preview_bundle_is_preview_only_and_source_tools_are_not_boun
         session_id=env.session.session_id,
     ) is not None
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("invalid_case", "expected_code"),
+    [
+        ("nul", "DOCUMENT_HTML_ENCODING_INVALID"),
+        ("oversized", "DOCUMENT_CANDIDATE_SIZE_INVALID"),
+    ],
+)
+async def test_source_patch_rejects_invalid_html_before_durable_mutation(
+    artifact_editing_env,
+    invalid_case: str,
+    expected_code: str,
+) -> None:
+    env = artifact_editing_env
+    _ref, document = await _adopt_html(env)
+    source = await _dispatch(
+        env,
+        "artifacts.source.read",
+        {"sessionKey": SESSION_KEY, "documentId": document["id"]},
+    )
+    assert source.error is None, source.error
+    revisions_before = await _dispatch(
+        env,
+        "artifacts.revisions.list",
+        {"sessionKey": SESSION_KEY, "documentId": document["id"]},
+    )
+    changes_before = await _dispatch(
+        env,
+        "artifacts.changes.list",
+        {"sessionKey": SESSION_KEY, "documentId": document["id"]},
+    )
+    attempt_cursor = await env.storage.conn.execute(
+        "SELECT COUNT(*) FROM artifact_mutation_attempts WHERE document_id = ?",
+        (document["id"],),
+    )
+    attempt_row = await attempt_cursor.fetchone()
+    await attempt_cursor.close()
+    assert attempt_row is not None
+    attempt_count = int(attempt_row[0])
+    metadata_before = tuple(sorted(Path(env.store.media_root).rglob("meta.json")))
+    replacement = "\x00" if invalid_case == "nul" else "x" * (2 * 1024 * 1024)
+
+    rejected = await _dispatch(
+        env,
+        "artifacts.source.patch",
+        {
+            "sessionKey": SESSION_KEY,
+            "documentId": document["id"],
+            "clientRequestId": f"invalid-source-{invalid_case}",
+            "expectedHeadRevisionId": document["headRevisionId"],
+            "expectedStateRevision": document["stateRevision"],
+            "expectedSourceSha256": source.payload["source"]["sha256"],
+            "offsetEncoding": "unicode-code-point",
+            "patches": [
+                {
+                    "startOffset": 4,
+                    "endOffset": 10,
+                    "replacement": replacement,
+                }
+            ],
+        },
+    )
+
+    assert rejected.error is not None
+    assert rejected.error.code == expected_code
+    current = await _dispatch(
+        env,
+        "artifacts.documents.get",
+        {"sessionKey": SESSION_KEY, "documentId": document["id"]},
+    )
+    revisions_after = await _dispatch(
+        env,
+        "artifacts.revisions.list",
+        {"sessionKey": SESSION_KEY, "documentId": document["id"]},
+    )
+    changes_after = await _dispatch(
+        env,
+        "artifacts.changes.list",
+        {"sessionKey": SESSION_KEY, "documentId": document["id"]},
+    )
+    attempt_cursor = await env.storage.conn.execute(
+        "SELECT COUNT(*) FROM artifact_mutation_attempts WHERE document_id = ?",
+        (document["id"],),
+    )
+    attempt_row = await attempt_cursor.fetchone()
+    await attempt_cursor.close()
+    assert attempt_row is not None
+    assert current.payload["document"]["headRevisionId"] == document["headRevisionId"]
+    assert current.payload["document"]["stateRevision"] == document["stateRevision"]
+    assert revisions_after.payload == revisions_before.payload
+    assert changes_after.payload == changes_before.payload
+    assert int(attempt_row[0]) == attempt_count
+    assert tuple(sorted(Path(env.store.media_root).rglob("meta.json"))) == metadata_before
+
+
 @pytest.mark.asyncio
 async def test_legacy_ref_is_lazily_adopted_and_source_patch_is_cas_safe(
     artifact_editing_env,

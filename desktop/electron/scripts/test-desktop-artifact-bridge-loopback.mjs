@@ -8,6 +8,11 @@ import {
 } from '../dist/desktop-artifact-bridge-loopback.js'
 
 let reloadCount = 0
+let slowReload = false
+let releaseSlowReload
+let slowReloadAbortObserved = false
+let lateReloadCount = 0
+const slowReloadGate = new Promise(resolve => { releaseSlowReload = resolve })
 const annotationDigest = 'b'.repeat(64)
 const annotationElementProof = 'c'.repeat(64)
 const activePreviewArtifactId = 'art-loopback-preview'
@@ -48,7 +53,16 @@ const target = {
     width: 32,
     height: 16,
   }),
-  reloadSurface: async () => {
+  reloadSurface: async (_request, signal) => {
+    if (slowReload) {
+      await slowReloadGate
+      if (signal.aborted) {
+        slowReloadAbortObserved = true
+        throw new Error('The delayed reload was cancelled.')
+      }
+      lateReloadCount += 1
+      return { reloaded: true }
+    }
     reloadCount += 1
     return { reloaded: true }
   },
@@ -191,6 +205,34 @@ assert.deepEqual(await reloadResponse.json(), {
   value: { reloaded: true },
 })
 assert.equal(reloadCount, 1)
+
+slowReload = true
+const deadlineResponse = await post(
+  '/v1/invoke',
+  {
+    version: 3,
+    method: 'reloadSurface',
+    request: { version: 3 },
+  },
+  { headers: { 'x-opensquilla-deadline-at-ms': String(Date.now() + 100) } },
+)
+assert.equal(deadlineResponse.status, 408)
+assert.equal((await deadlineResponse.json()).code, 'deadline-exceeded')
+
+// The expired operation must release the bridge queue before its handler
+// settles, while the propagated signal prevents a late side effect.
+slowReload = false
+const postDeadlineReloadResponse = await post('/v1/invoke', {
+  version: 3,
+  method: 'reloadSurface',
+  request: { version: 3 },
+})
+assert.equal(postDeadlineReloadResponse.status, 200)
+assert.equal(reloadCount, 2)
+releaseSlowReload()
+await new Promise(resolve => setTimeout(resolve, 0))
+assert.equal(slowReloadAbortObserved, true)
+assert.equal(lateReloadCount, 0)
 
 const screenshotResponse = await post('/v1/invoke', {
   version: 3,

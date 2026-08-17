@@ -304,9 +304,11 @@ export class DesktopArtifactBridgeLoopbackTransport {
       }
       operation = method
       this.assertBeforeDeadline(deadlineAt)
+      const invocationController = new AbortController()
       const result = await this.beforeDeadline(
-        this.invokeBridge(method, body.request),
+        this.invokeBridge(method, body.request, invocationController.signal),
         deadlineAt,
+        invocationController,
       )
       outcome = result.ok ? 'allowed' : 'failed'
       code = result.ok ? 'ok' : result.code
@@ -354,7 +356,11 @@ export class DesktopArtifactBridgeLoopbackTransport {
     }
   }
 
-  private async beforeDeadline<T>(operation: Promise<T>, deadlineAt: number): Promise<T> {
+  private async beforeDeadline<T>(
+    operation: Promise<T>,
+    deadlineAt: number,
+    controller: AbortController,
+  ): Promise<T> {
     const remaining = deadlineAt - this.now()
     if (remaining < 1) {
       throw new TransportRequestError(408, 'deadline-exceeded', 'The request deadline expired.')
@@ -365,6 +371,7 @@ export class DesktopArtifactBridgeLoopbackTransport {
         operation,
         new Promise<never>((_resolve, reject) => {
           timeout = setTimeout(() => {
+            controller.abort()
             reject(new TransportRequestError(408, 'deadline-exceeded', 'The request deadline expired.'))
           }, remaining)
           timeout.unref()
@@ -378,8 +385,9 @@ export class DesktopArtifactBridgeLoopbackTransport {
   private invokeBridge<M extends DesktopArtifactBridgeMethod>(
     method: M,
     request: unknown,
+    signal: AbortSignal,
   ): Promise<DesktopArtifactBridgeResult<M>> {
-    return this.bridge[method](request) as Promise<DesktopArtifactBridgeResult<M>>
+    return this.bridge[method](request, signal) as Promise<DesktopArtifactBridgeResult<M>>
   }
 
   private now(): number {
