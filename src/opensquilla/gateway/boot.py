@@ -2358,8 +2358,9 @@ class GatewayServer:
             # Always stop the serve task so it is never left pending, even when a
             # teardown step above raised (close() is now invoked on every shutdown,
             # not only on Ctrl+C, so the serve task is typically still running). A
-            # teardown exception still propagates after this runs; the pid lock is
-            # released regardless in the inner finally.
+            # teardown exception still propagates after this runs. The pid lock
+            # is released only after a clean runtime shutdown; otherwise process
+            # exit remains the ownership fence.
             try:
                 if self._server is not None:
                     self._server.should_exit = True

@@ -3035,13 +3035,17 @@ class TaskRuntime:
         ):
             return await self._shutdown_result(started, abandoned_task_count)
 
+        # Claim and persist the timeout terminal state before delivering the
+        # final cancellation. Otherwise the driver can win the cancellation
+        # race, publish an earlier classification, and leave the shutdown
+        # coordinator without a durable ABANDONED record at return time.
+        marked_abandoned = await self._mark_unfinished_abandoned()
         timed_out_tasks = await self._request_shutdown_cancellation(
             source="gateway_shutdown_timeout",
             reason="shutdown_timeout",
             cancelled_drivers=cancelled_drivers,
             force=True,
         )
-        marked_abandoned = await self._mark_unfinished_abandoned()
         abandoned_task_count = max(timed_out_tasks, marked_abandoned)
         return await self._shutdown_result(started, abandoned_task_count)
 
@@ -5877,7 +5881,7 @@ class TaskRuntime:
     async def _mark_unfinished_abandoned(self) -> int:
         async with self._state_lock:
             unfinished = [
-                task for task in self._tasks.values() if task.status not in TERMINAL_STATUSES
+                task for task in self._tasks.values() if not task.terminal_closing
             ]
         for task in unfinished:
             await self._mark_terminal(
