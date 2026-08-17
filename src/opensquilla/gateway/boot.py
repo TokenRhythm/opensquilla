@@ -2340,7 +2340,10 @@ class GatewayServer:
                     await close_active_clients()
                     log.info("gateway.mcp_clients_closed")
                 except ImportError:
-                    pass
+                    log.debug(
+                        "gateway.mcp_clients_close_skipped_import_unavailable",
+                        exc_info=True,
+                    )
             else:
                 log.warning("gateway.mcp_clients_close_skipped_for_live_runtime")
 

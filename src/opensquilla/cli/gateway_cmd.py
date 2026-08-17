@@ -45,8 +45,9 @@ def _flush_shutdown_streams() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.flush()
-        except Exception:
-            pass
+        except (OSError, ValueError):
+            # A closed or failed stream must not prevent the watchdog exit.
+            continue
 
 
 def _force_process_exit(exit_code: int) -> None:
@@ -314,7 +315,6 @@ def run_gateway(
                 app.state.request_shutdown = _request_shutdown
         server_task = server._task
         waiter = asyncio.ensure_future(shutdown.wait())
-        close_reason = shutdown_reason
         explicit_shutdown = False
         try:
             await asyncio.wait(

@@ -4920,7 +4920,6 @@ async def _handle_sessions_send_impl(
                 _commit_with_session_admission()
             )
         except TaskRuntimeShuttingDownError as exc:
-            _consumed_file_uuids = []
             _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "UNAVAILABLE",
@@ -4930,7 +4929,6 @@ async def _handle_sessions_send_impl(
                 accepted=False,
             ) from exc
         except TaskQueueFullError as exc:
-            _consumed_file_uuids = []
             _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "QUEUE_FULL",
@@ -4943,7 +4941,6 @@ async def _handle_sessions_send_impl(
                 accepted=False,
             ) from exc
         except StorageBusyError as exc:
-            _consumed_file_uuids = []
             _cleanup_rejected_guest_profile()
             raise RpcHandlerError(
                 "STORAGE_BUSY",

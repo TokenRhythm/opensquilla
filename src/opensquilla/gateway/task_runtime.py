@@ -3148,8 +3148,7 @@ class TaskRuntime:
             )
             if not state_waiter.done():
                 state_waiter.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await state_waiter
+                await asyncio.gather(state_waiter, return_exceptions=True)
             if not done:
                 return False
 
