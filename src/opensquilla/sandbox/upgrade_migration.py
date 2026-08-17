@@ -37,11 +37,14 @@ $ErrorActionPreference = "Stop"
 $target = $env:OPENSQUILLA_UPGRADE_ACL_TARGET
 $userSid = $env:OPENSQUILLA_UPGRADE_ACL_USER_SID
 $isDirectory = $env:OPENSQUILLA_UPGRADE_ACL_IS_DIRECTORY -eq "1"
+$diagnostics = $env:OPENSQUILLA_UPGRADE_ACL_DIAGNOSTICS -eq "1"
+if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:start") }
 $acl = if ($isDirectory) {
     [System.Security.AccessControl.DirectorySecurity]::new()
 } else {
     [System.Security.AccessControl.FileSecurity]::new()
 }
+if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:security-object") }
 $acl.SetAccessRuleProtection($true, $false)
 $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
 if ($isDirectory) {
@@ -62,13 +65,17 @@ foreach ($sidText in $allowed) {
     )
     [void]$acl.AddAccessRule($rule)
 }
+if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rules-ready") }
 if ($isDirectory) {
     [System.IO.Directory]::SetAccessControl($target, $acl)
+    if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:access-set") }
     $verified = [System.IO.Directory]::GetAccessControl($target)
 } else {
     [System.IO.File]::SetAccessControl($target, $acl)
+    if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:access-set") }
     $verified = [System.IO.File]::GetAccessControl($target)
 }
+if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:access-read") }
 if (-not $verified.AreAccessRulesProtected) {
     throw "DACL inheritance remains enabled"
 }
@@ -99,6 +106,7 @@ foreach ($sidText in $allowed) {
         throw "DACL principal verification failed"
     }
 }
+if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:verified") }
 """
 _WINDOWS_PRIVATE_ACL_ENCODED = base64.b64encode(
     _WINDOWS_PRIVATE_ACL_SCRIPT.encode("utf-16-le")
@@ -206,7 +214,9 @@ def _protect_private_path(
                     timeout=_WINDOWS_ACL_TIMEOUT_SECONDS,
                 )
         except subprocess.TimeoutExpired as exc:
-            raise OSError(f"Windows ACL hardening timed out: {path}") from exc
+            detail = " ".join(str(exc.stderr or exc.stdout or "").strip().split())
+            suffix = f" ({detail[-500:]})" if detail else ""
+            raise OSError(f"Windows ACL hardening timed out: {path}{suffix}") from exc
         if completed.returncode != 0:
             detail = " ".join((completed.stderr or completed.stdout).strip().split())
             suffix = f" ({detail[-500:]})" if detail else ""
