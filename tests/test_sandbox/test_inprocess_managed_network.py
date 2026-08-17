@@ -1487,6 +1487,71 @@ async def test_rpc_search_query_allows_search_provider_endpoint_under_managed_ne
 
 
 @pytest.mark.asyncio
+async def test_rpc_search_query_establishes_its_own_run_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator ``search.query`` must not be refused for a missing run context.
+
+    The CLI search RPC runs outside a turn, so no ToolContext/run context is
+    installed. The handler establishes a SAFE base context itself, letting the
+    managed proxy apply the search provider's system domain grants instead of
+    failing closed with the misleading "Run Context grants" precondition
+    (issue #1202).
+    """
+
+    seen: dict[str, object] = {}
+
+    class FakeProxy:
+        host = "127.0.0.1"
+        port = 28080
+
+        def __init__(self, decide: object, **kwargs: object) -> None:
+            self._decide = decide
+
+        async def start(self) -> None:
+            decision = self._decide("api.search.brave.com")
+            assert isinstance(decision, NetworkDecision)
+            seen["provider_decision"] = decision.status
+            seen["provider_reason"] = decision.reason
+
+        async def stop(self) -> None:
+            return None
+
+    async def fake_search(*args: object, **kwargs: object) -> dict[str, object]:
+        seen["search_called"] = True
+        return {
+            "ok": True,
+            "query": "python packages",
+            "provider": "brave",
+            "results": [{"title": "PyPI", "url": "https://pypi.org", "snippet": ""}],
+        }
+
+    monkeypatch.setattr(rpc_tools, "run_web_search_payload", fake_search)
+    monkeypatch.setattr(integration_mod, "SandboxProxyServer", FakeProxy)
+    web_mod.configure_search("brave", api_key="test-key")
+    ctx = RpcContext(
+        conn_id="c",
+        principal=Principal(
+            role="operator",
+            scopes=frozenset(["operator.write", "operator.read"]),
+            is_owner=True,
+            authenticated=True,
+        ),
+    )
+
+    assert current_tool_context.get() is None
+    result = await rpc_tools._handle_search_query({"query": "python packages"}, ctx)
+
+    assert result["ok"] is True
+    assert result["provider"] == "brave"
+    assert seen == {
+        "provider_decision": "allow",
+        "provider_reason": "system_domain_grant",
+        "search_called": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_rpc_search_query_grants_only_auto_execution_plan_providers(
     monkeypatch: pytest.MonkeyPatch,
     managed_context: ToolContext,
