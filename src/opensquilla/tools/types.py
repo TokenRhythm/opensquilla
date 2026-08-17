@@ -193,6 +193,12 @@ class ToolContext:
     # and projection code use this bit to avoid replacing raw tool output with
     # a handle that the current model is not authorized to retrieve.
     tool_result_retrieval_available: bool = False
+    # Canonical workspace source identities ("path:...") of files successfully
+    # published during this turn via publish_artifact. The omitted-artifact
+    # backstop consults this to avoid re-publishing the same source file under
+    # its original filename after an explicit publish used a custom display
+    # name. Runtime-only; never serialized into task details or transcripts.
+    published_artifact_source_keys: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.validate_path_roots()

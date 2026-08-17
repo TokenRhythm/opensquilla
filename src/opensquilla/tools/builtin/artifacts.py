@@ -59,6 +59,31 @@ def _bundle_result(manifest: ArtifactBundleManifest) -> dict[str, object]:
     }
 
 
+def _record_published_artifact_source_key(
+    ctx: ToolContext,
+    target: Path,
+    workspace: Path,
+) -> None:
+    """Record a successfully published file's canonical workspace identity.
+
+    The omitted-artifact backstop consults this per-turn set so a source file
+    explicitly published under a custom display name is not published a second
+    time under its original filename. The import is deferred to keep this tool
+    module import-cycle-free.
+    """
+
+    from opensquilla.engine.artifact_delivery import (
+        artifact_delivery_publish_target_key,
+    )
+
+    source_key = artifact_delivery_publish_target_key(
+        str(target),
+        workspace_dir=workspace,
+    )
+    if source_key is not None:
+        ctx.published_artifact_source_keys.add(source_key)
+
+
 def _normalized_filename(value: str) -> str:
     return "".join(ch for ch in value.lower() if ch.isalnum())
 
@@ -577,6 +602,7 @@ async def publish_artifact(
         payload = artifact_payload(existing)
         if not any(item.get("id") == payload.get("id") for item in ctx.published_artifacts):
             ctx.published_artifacts.append(payload)
+        _record_published_artifact_source_key(ctx, target, workspace)
         llm_artifact = _llm_artifact_payload(
             payload,
             ctx=ctx,
@@ -640,6 +666,7 @@ async def publish_artifact(
 
     payload = artifact_payload(ref)
     ctx.published_artifacts.append(payload)
+    _record_published_artifact_source_key(ctx, target, workspace)
     llm_artifact = _llm_artifact_payload(
         payload,
         ctx=ctx,
