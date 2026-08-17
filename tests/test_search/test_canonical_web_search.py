@@ -1214,3 +1214,28 @@ async def test_canonical_web_search_cache_key_includes_execution_plan(monkeypatc
     assert calls == ["bocha", "bocha"]
     assert first["diagnostics"]["cache_status"] == "miss"
     assert second["diagnostics"]["cache_status"] == "miss"
+
+
+@pytest.mark.asyncio
+async def test_canonical_web_search_reports_not_configured_when_no_provider_available() -> None:
+    """With no usable search provider the tool must fail fast with an explicit
+    "not configured" hint instead of a generic "search provider request
+    failed", so an agent can surface the configuration gap and degrade to
+    knowledge-based answering."""
+    from opensquilla.search.runtime_config import ResolvedSearchRuntime
+
+    empty_runtime = ResolvedSearchRuntime(
+        config=SearchRuntimeConfig(provider="duckduckgo", fallback_policy="off"),
+        providers={},
+    )
+    payload = await run_canonical_web_search(
+        SearchOptions(query="latest python release", fetch_top_k=0),
+        runtime=empty_runtime,
+    )
+
+    assert payload["ok"] is False
+    assert payload["error_kind"] == "not_configured"
+    assert payload["provider_retryable"] is False
+    assert payload["retry_allowed"] is False
+    assert "not configured" in payload["error"].lower()
+    assert "duckduckgo" in payload["error"].lower()
