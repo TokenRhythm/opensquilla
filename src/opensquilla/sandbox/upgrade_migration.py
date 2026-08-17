@@ -103,6 +103,8 @@ foreach ($sidText in $allowed) {
 _WINDOWS_PRIVATE_ACL_ENCODED = base64.b64encode(
     _WINDOWS_PRIVATE_ACL_SCRIPT.encode("utf-16-le")
 ).decode("ascii")
+_WINDOWS_IDENTITY_TIMEOUT_SECONDS = 10.0
+_WINDOWS_ACL_TIMEOUT_SECONDS = 15.0
 _WINDOWS_DLL_DIRECTORY_LOCK = threading.Lock()
 
 
@@ -138,13 +140,19 @@ def _system_windows_process_context() -> Iterator[None]:
 
 
 def _current_windows_user_sid() -> str:
-    with _system_windows_process_context():
-        completed = subprocess.run(
-            ["whoami", "/user", "/fo", "csv", "/nh"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+    try:
+        with _system_windows_process_context():
+            completed = subprocess.run(
+                ["whoami", "/user", "/fo", "csv", "/nh"],
+                capture_output=True,
+                creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+                stdin=subprocess.DEVNULL,
+                text=True,
+                check=False,
+                timeout=_WINDOWS_IDENTITY_TIMEOUT_SECONDS,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise OSError("Windows user SID lookup timed out") from exc
     if completed.returncode != 0:
         raise OSError("cannot resolve the current Windows user SID")
     try:
@@ -178,20 +186,27 @@ def _protect_private_path(
             "OPENSQUILLA_UPGRADE_ACL_USER_SID": windows_user_sid,
             "OPENSQUILLA_UPGRADE_ACL_IS_DIRECTORY": "1" if directory else "0",
         }
-        with _system_windows_process_context():
-            completed = subprocess.run(
-                [
-                    "powershell",
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-EncodedCommand",
-                    _WINDOWS_PRIVATE_ACL_ENCODED,
-                ],
-                env=environment,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+        try:
+            with _system_windows_process_context():
+                completed = subprocess.run(
+                    [
+                        "powershell",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-NoLogo",
+                        "-EncodedCommand",
+                        _WINDOWS_PRIVATE_ACL_ENCODED,
+                    ],
+                    env=environment,
+                    capture_output=True,
+                    creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    check=False,
+                    timeout=_WINDOWS_ACL_TIMEOUT_SECONDS,
+                )
+        except subprocess.TimeoutExpired as exc:
+            raise OSError(f"Windows ACL hardening timed out: {path}") from exc
         if completed.returncode != 0:
             detail = " ".join((completed.stderr or completed.stdout).strip().split())
             suffix = f" ({detail[-500:]})" if detail else ""
