@@ -57,9 +57,20 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
                 stream.write(json.dumps(args) + "\\n")
             root = Path(os.environ["FAKE_OSS_ROOT"])
 
+            def native_path(value: str) -> Path:
+                if (
+                    os.name == "nt"
+                    and len(value) >= 3
+                    and value[0] == "/"
+                    and value[1].isalpha()
+                    and value[2] == "/"
+                ):
+                    value = f"{value[1].upper()}:{value[2:]}"
+                return Path(value)
+
             def mapped(value: str) -> Path:
                 if not value.startswith("oss://"):
-                    return Path(value)
+                    return native_path(value)
                 bucket_key = value.removeprefix("oss://")
                 bucket, _, key = bucket_key.partition("/")
                 return root / bucket / key
@@ -72,7 +83,7 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
                 if destination.exists():
                     raise SystemExit(9)
                 assert option("--forbid-overwrite") == "true"
-                source = option("--body").removeprefix("file://")
+                source = native_path(option("--body").removeprefix("file://"))
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
                 raise SystemExit(0)
