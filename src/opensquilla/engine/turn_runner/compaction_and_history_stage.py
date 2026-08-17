@@ -9,7 +9,8 @@ stream-consumer loop.
 
 Side-effect contract:
 
-- ``t3_upgrade.maybe_compact`` and ``preflight.maybe_compact`` MAY mutate
+- Unless ``skip_compaction`` is requested, ``t3_upgrade.maybe_compact`` and
+  ``preflight.maybe_compact`` MAY mutate
   the DB transcript via ``SessionManager.compact``. They MAY also mutate
   the runner's per-turn ``has_compacted_this_turn`` flag and the
   per-session compaction-failure circuit state. All exceptions other
@@ -233,12 +234,17 @@ class CompactionAndHistoryStageInput:
     # invoke T3/preflight compaction or replay durable summaries because those
     # paths can make auxiliary provider calls over unprojected history.
     restricted_turn: bool = False
+    # An upstream terminal preflight may suppress auxiliary compaction while
+    # retaining the ordinary history-loading path.
+    skip_compaction: bool = False
 
 @dataclass(frozen=True)
 class CompactionAndHistoryStageOutput:
     """The pieces of state subsequent stages and the harness consume.
 
-    - ``t3_upgrade_status``: one of the four ``_T3_*`` sentinels.
+    - ``t3_upgrade_status``: one of the ``_T3_*`` sentinels,
+      ``"restricted_turn_skipped"`` at the restricted authority boundary, or
+      ``"skipped"`` when an upstream terminal preflight suppresses compaction.
       Surfaced for observability + the equivalence harness snapshot;
       NOT consumed by downstream stages. It is used only
       to decide whether to call preflight (folded into the stage body).
@@ -272,8 +278,9 @@ class CompactionAndHistoryStage:
     and before the attachment-build + stream-consumer steps. The four
     ports execute strictly sequentially:
 
-    1. ``t3_upgrade.maybe_compact`` (called unless the turn is restricted).
-    2. ``preflight.maybe_compact`` (called ONLY when t3 returned
+    1. ``t3_upgrade.maybe_compact`` (unless compaction is suppressed).
+    2. ``preflight.maybe_compact`` (called ONLY when compaction is enabled and
+       t3 returned
        ``_T3_NOT_APPLICABLE`` or ``_T3_FLUSH_FAILED``).
     3. ``history_loader.load`` (always called).
     4. ``request_context_prepender.prepend`` (always called; pure).
@@ -333,6 +340,8 @@ class CompactionAndHistoryStage:
         preflight_invoked = False
         if inp.restricted_turn:
             t3_status = _RESTRICTED_TURN_SKIPPED
+        elif inp.skip_compaction:
+            t3_status = "skipped"
         else:
             # 1. T3-upgrade compaction. Hook fires around the call so even a
             #    no-op path's observability is uniform.
@@ -384,14 +393,9 @@ class CompactionAndHistoryStage:
                     bound_user_message_id=inp.bound_user_message_id,
                     provider_request_correlation=inp.provider_request_correlation,
                     consumer_admission=inp.consumer_admission,
-                    consumer_admission_fingerprint=(
-                        inp.consumer_admission_fingerprint
-                    ),
+                    consumer_admission_fingerprint=inp.consumer_admission_fingerprint,
                 )
-                await self._fire_after_compact(
-                    preflight_state,
-                    {"status": "ran"},
-                )
+                await self._fire_after_compact(preflight_state, {"status": "ran"})
 
         # 3. Load history (transcript + reconstructed messages + durable summary).
         loaded_compaction_summary_context = await self._history_loader.load(

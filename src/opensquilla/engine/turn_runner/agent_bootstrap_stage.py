@@ -862,7 +862,9 @@ class AgentBootstrapStage:
             and catalog.capabilities is not None
             and getattr(catalog.capabilities, "supports_tools", False)
         )
-        private_fallback_limits: list[tuple[Any, int, int]] = []
+        private_fallback_limits: list[
+            tuple[Any, int, int, ModelCapabilities | None]
+        ] = []
         fallback_deployment_configs = getattr(
             inp.provider,
             "fallback_deployment_configs",
@@ -899,6 +901,7 @@ class AgentBootstrapStage:
                         deployment,
                         fallback_catalog.context_window,
                         effective_max_tokens,
+                        fallback_catalog.capabilities,
                     )
                 )
                 fallback_capabilities.setdefault(
