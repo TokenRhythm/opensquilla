@@ -226,6 +226,43 @@ async def _model_probe(provider_id: str, ctx: RpcContext) -> dict[str, Any]:
         }
 
 
+def _record_provider_probe(
+    ctx: RpcContext,
+    provider_id: str,
+    probe: dict[str, Any],
+) -> None:
+    """Persist a live model probe as the saved deployment's verification.
+
+    ``providers.status --probe-models`` validates the saved deployment against
+    the live provider, but its outcome used to live only in the RPC response:
+    the setup panel's "verified" state reads ``probe_history.json`` instead,
+    so a successful CLI probe left the provider row "Not verified". Recording
+    the probe outcome keeps Settings, Overview, and the CLI consistent
+    (issue #1207).
+    """
+
+    config = getattr(ctx, "config", None)
+    if config is None:
+        return
+    status = str(probe.get("status") or "")
+    if status == "ok":
+        ok: bool = True
+        failure_kind = ""
+    else:
+        ok = False
+        failure_kind = str(probe.get("failureKind") or "")
+        if not failure_kind:
+            failure_kind = (
+                "probe_failed" if status == "error" else str(status or "unknown")
+            )
+    try:
+        from opensquilla.onboarding.probe_history import record_probe
+
+        record_probe(config, provider_id, ok=ok, failure_kind=failure_kind)
+    except Exception:  # noqa: BLE001 - a status probe never fails its caller
+        return
+
+
 @_d.method("providers.status", scope="operator.read")
 async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     from opensquilla.onboarding.provider_specs import list_provider_setup_specs
@@ -347,6 +384,8 @@ async def _handle_providers_status(params: dict | None, ctx: RpcContext) -> dict
                     "failureKind": None,
                 }
             )
+        if probe_models and is_active and probe.get("attempted"):
+            _record_provider_probe(ctx, spec.provider_id, probe)
         rows.append(
             {
                 "providerId": spec.provider_id,
