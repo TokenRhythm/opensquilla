@@ -541,6 +541,7 @@
       :reorder-pending="pendingQueueReorderPending"
       :image-blocked-message="queuedImageSendBlockedMessage"
       :steer-available="sameTurnSteerAvailable"
+      :durable-steer-available="rpc.supportsMethod('sessions.pending_inputs.steer')"
       :steer-unavailable-message="sameTurnSteerUnavailableMessage"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"

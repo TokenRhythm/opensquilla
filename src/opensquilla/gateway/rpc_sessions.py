@@ -83,6 +83,7 @@ from opensquilla.gateway.subagent_announce import (
     quiesce_background_completion_sessions,
 )
 from opensquilla.gateway.turn_ingress import (
+    TurnRequestIdentity,
     accepted_turn_payload,
     complete_durable_ingress,
     request_fingerprint,
@@ -6750,8 +6751,178 @@ async def _steer_v2_response(
     return payload
 
 
+@_d.method("sessions.pending_inputs.steer", scope="operator.write")
+async def _handle_pending_inputs_steer(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Atomically convert one durable queued input into a same-turn steer."""
+
+    if not isinstance(params, dict):
+        raise ValueError("params must be an object")
+    key = _pending_input_key(params)
+    pending_input_id = _pending_input_param(
+        params,
+        "pendingInputId",
+        "pending_input_id",
+    )
+    client_request_id = _pending_input_param(
+        params,
+        "clientRequestId",
+        "client_request_id",
+    )
+    client_message_id = _pending_input_param(
+        params,
+        "clientMessageId",
+        "client_message_id",
+    )
+    supplied_fingerprint = _optional_string_param(
+        params,
+        "requestFingerprint",
+        "request_fingerprint",
+    )
+    if supplied_fingerprint is None:
+        raise RpcHandlerError(
+            "PENDING_INPUT_FINGERPRINT_REQUIRED",
+            "Pending input steer requires its staged fingerprint",
+            retryable=False,
+            accepted=False,
+        )
+    expected_revision = params.get(
+        "expectedRevision",
+        params.get("expected_revision"),
+    )
+    if (
+        isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or expected_revision < 1
+    ):
+        raise ValueError("params.expectedRevision must be a positive integer")
+
+    storage = _pending_input_storage(ctx)
+    source_scope = _turn_source_scope(
+        _normalize_session_send_source_hint(params),
+        ctx,
+    )
+    async with _pending_input_lock_for(pending_input_id):
+        row = await storage.get_pending_chat_input(pending_input_id)
+        if row is None:
+            receipt = await storage.get_pending_chat_input_dispatch_receipt(
+                pending_input_id
+            )
+            if receipt is None or (
+                receipt.session_key != key
+                or receipt.source_scope != source_scope
+                or receipt.client_request_id != client_request_id
+                or receipt.client_message_id != client_message_id
+                or receipt.request_fingerprint != supplied_fingerprint
+            ):
+                raise RpcHandlerError(
+                    "PENDING_INPUT_NOT_FOUND",
+                    "Pending input no longer exists",
+                    retryable=False,
+                    accepted=False,
+                )
+            raw_message = params.get("message")
+            if not isinstance(raw_message, str) or not raw_message.strip():
+                raise ValueError("params.message must be a non-empty string")
+        else:
+            if (
+                row.session_key != key
+                or row.source_scope != source_scope
+                or row.client_request_id != client_request_id
+                or row.client_message_id != client_message_id
+                or row.request_fingerprint != supplied_fingerprint
+                or row.state_revision != expected_revision
+            ):
+                raise RpcHandlerError(
+                    "PENDING_INPUT_CONFLICT",
+                    "Pending input steer identity does not match the staged row",
+                    retryable=True,
+                    accepted=False,
+                )
+            payload = row.payload
+            raw_message = payload.get("message")
+            attachments = payload.get("attachments")
+            has_non_text_semantics = any(
+                payload.get(field) is not None
+                for field in (
+                    "intent",
+                    "model",
+                    "model_id",
+                    "workspaceId",
+                    "workspace_id",
+                    "collaborationMode",
+                    "collaboration_mode",
+                    "runMode",
+                    "run_mode",
+                )
+            )
+            if (
+                not isinstance(raw_message, str)
+                or not raw_message.strip()
+                or attachments not in (None, [])
+                or has_non_text_semantics
+            ):
+                expected_turn_id = _optional_string_param(
+                    params,
+                    "expected_turn_id",
+                    "expectedTurnId",
+                )
+                if expected_turn_id is None:
+                    raise ValueError("params.expected_turn_id is required")
+                return _steer_v2_failure(
+                    key=key,
+                    expected_turn_id=expected_turn_id,
+                    failure_code="STEER_UNSUPPORTED_INPUT",
+                    capability={
+                        "mode": "queue_only",
+                        "expected_turn_id": expected_turn_id,
+                        "input_kinds": ["text"],
+                        "reason": "text_only",
+                    },
+                )
+
+        steer_params = {
+            "key": key,
+            "message": raw_message,
+            "expected_turn_id": params.get(
+                "expected_turn_id",
+                params.get("expectedTurnId"),
+            ),
+            "client_request_id": client_request_id,
+            "client_message_id": client_message_id,
+            "surface_id": params.get("surface_id", params.get("surfaceId")),
+            "_source": (
+                row.payload.get("_source")
+                if row is not None and isinstance(row.payload.get("_source"), dict)
+                else params.get("_source")
+            ),
+        }
+        return await _handle_sessions_steer_v2_impl(
+            steer_params,
+            ctx,
+            pending_input_id=pending_input_id,
+            pending_input_fingerprint=supplied_fingerprint,
+            pending_input_revision=expected_revision,
+            pending_source_scope=source_scope,
+        )
+
+
 @_d.method("sessions.steer.v2", scope="operator.write")
 async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dict:
+    return await _handle_sessions_steer_v2_impl(params, ctx)
+
+
+async def _handle_sessions_steer_v2_impl(
+    params: dict | None,
+    ctx: RpcContext,
+    *,
+    pending_input_id: str | None = None,
+    pending_input_fingerprint: str | None = None,
+    pending_input_revision: int | None = None,
+    pending_source_scope: str | None = None,
+) -> dict:
     """Durably attach text to one explicitly named running turn."""
 
     key = _require_key(params)
@@ -6895,21 +7066,35 @@ async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dic
         _optional_string_param(params, "surface_id", "surfaceId")
         or default_surface_id
     )
-    source_scope = f"{_turn_source_scope(source_hint, ctx)}:steer.v2"[:256]
-    ingress_identity = request_identity(
-        params,
-        request_session_key=key,
-        source_scope=source_scope,
-        fingerprint_params={
-            "message": raw_message,
-            "intent": "steer.v2",
-            "queueMode": {
-                "expected_turn_id": expected_turn_id,
-                "client_message_id": client_message_id,
-                "surface_id": surface_id,
+    if pending_input_id is not None:
+        if (
+            pending_input_fingerprint is None
+            or pending_input_revision is None
+            or pending_source_scope is None
+        ):
+            raise ValueError("pending input steer guard must be complete")
+        ingress_identity = TurnRequestIdentity(
+            source_scope=pending_source_scope,
+            request_session_key=key,
+            client_request_id=client_request_id,
+            request_fingerprint=pending_input_fingerprint,
+        )
+    else:
+        source_scope = f"{_turn_source_scope(source_hint, ctx)}:steer.v2"[:256]
+        ingress_identity = request_identity(
+            params,
+            request_session_key=key,
+            source_scope=source_scope,
+            fingerprint_params={
+                "message": raw_message,
+                "intent": "steer.v2",
+                "queueMode": {
+                    "expected_turn_id": expected_turn_id,
+                    "client_message_id": client_message_id,
+                    "surface_id": surface_id,
+                },
             },
-        },
-    )
+        )
     log.info(
         "sessions.steer_v2.requested",
         session_key=key,
@@ -7003,6 +7188,9 @@ async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dic
                 client_request_id=ingress_identity.client_request_id,
                 request_fingerprint=ingress_identity.request_fingerprint,
                 workspace_guard=workspace_guard,
+                pending_input_id=pending_input_id,
+                pending_input_fingerprint=pending_input_fingerprint,
+                pending_input_revision=pending_input_revision,
             ),
         )
 
@@ -7046,6 +7234,22 @@ async def _handle_sessions_steer_v2(params: dict | None, ctx: RpcContext) -> dic
             str(exc),
             details={"fallback_safe": False},
             retryable=False,
+            accepted=False,
+        ) from exc
+    except PendingChatInputNotFoundError as exc:
+        raise RpcHandlerError(
+            "PENDING_INPUT_NOT_FOUND",
+            "Pending input disappeared before steer acceptance",
+            details={"fallback_safe": False},
+            retryable=True,
+            accepted=False,
+        ) from exc
+    except PendingChatInputConflictError as exc:
+        raise RpcHandlerError(
+            "PENDING_INPUT_CONFLICT",
+            "Pending input changed before steer acceptance",
+            details={"fallback_safe": False},
+            retryable=True,
             accepted=False,
         ) from exc
     except ProjectWorkspaceStateError as exc:

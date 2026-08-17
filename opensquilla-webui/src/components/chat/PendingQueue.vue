@@ -142,6 +142,7 @@ const { t } = useI18n()
 interface PendingQueueItem {
   pendingUiId: string
   text: string
+  pendingInputId?: string
   displayTextOverride?: string
   hiddenControl?: boolean
   attachments?: Attachment[]
@@ -164,6 +165,7 @@ const props = withDefaults(defineProps<{
   reorderPending?: boolean
   imageBlockedMessage?: string
   steerAvailable?: boolean
+  durableSteerAvailable?: boolean
   steerUnavailableMessage?: string
 }>(), {
   reorderEnabled: true,
@@ -297,6 +299,11 @@ function attachmentBlockMessage(item: PendingQueueItem): string {
 function pendingSteerBlocker(item: PendingQueueItem): PendingSteerBlocker | null {
   if (isControlInput(item.text)) return 'controlInput'
   if (item.attachments?.length) return 'attachment'
+  if (
+    item.pendingInputId
+    && item.pendingPersistenceState === 'staged'
+    && props.durableSteerAvailable !== true
+  ) return 'capability'
   if (!props.steerAvailable && item.deliveryState !== 'retryable' && !isSteerRetry(item)) {
     return 'capability'
   }
@@ -318,6 +325,13 @@ function steerTitle(item: PendingQueueItem): string {
     case 'attachment':
       return attachmentBlockMessage(item) || t('chat.pending.steerUnavailable.attachment')
     case 'capability':
+      if (
+        item.pendingInputId
+        && item.pendingPersistenceState === 'staged'
+        && props.durableSteerAvailable !== true
+      ) {
+        return t('chat.pending.steerUnavailable.gatewayUnsupported')
+      }
       return props.steerUnavailableMessage?.trim() || t('chat.sendQueues')
     case 'otherDelivery':
       return t('chat.pending.steerUnavailable.deliveryInProgress')

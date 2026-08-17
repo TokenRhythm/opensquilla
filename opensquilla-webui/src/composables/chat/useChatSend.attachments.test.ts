@@ -3536,6 +3536,75 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
   })
 
+  it('atomically steers a durable queued item with its staged identity', async () => {
+    const rpc = {
+      call: vi.fn().mockResolvedValue({
+        accepted: true,
+        turn_id: 'turn-current',
+        disposition: 'steering',
+      }),
+    }
+    const { api, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      supportsMethod: method => (
+        method === 'sessions.steer.v2'
+        || method === 'sessions.pending_inputs.steer'
+      ),
+      rpc,
+    })
+    stream.isStreaming.value = true
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-durable-steer',
+      text: 'steer the staged message',
+      attachments: [],
+      intent: null,
+      pendingInputId: 'pending-durable-steer',
+      pendingClientRequestId: 'request-durable-steer',
+      pendingClientMessageId: 'message-durable-steer',
+      pendingRequestFingerprint: 'sha256:durable-steer',
+      pendingServerRevision: 3,
+      pendingPersistenceState: 'staged',
+    }
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('accepted')
+
+    expect(rpc.call).toHaveBeenCalledWith(
+      'sessions.pending_inputs.steer',
+      expect.objectContaining({
+        key: 'agent:main:webchat:test',
+        message: 'steer the staged message',
+        expected_turn_id: 'turn-current',
+        client_request_id: 'request-durable-steer',
+        client_message_id: 'message-durable-steer',
+        pendingInputId: 'pending-durable-steer',
+        requestFingerprint: 'sha256:durable-steer',
+        expectedRevision: 3,
+      }),
+    )
+  })
+
+  it('does not steer a durable queued item through an older gateway', async () => {
+    const { api, rpc, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+    })
+    stream.isStreaming.value = true
+    const queued: ChatPendingItem = {
+      pendingUiId: 'pending-ui-old-gateway',
+      text: 'keep this queued',
+      attachments: [],
+      intent: null,
+      pendingInputId: 'pending-old-gateway',
+      pendingClientRequestId: 'request-old-gateway',
+      pendingClientMessageId: 'message-old-gateway',
+      pendingRequestFingerprint: 'sha256:old-gateway',
+      pendingServerRevision: 1,
+      pendingPersistenceState: 'staged',
+    }
+
+    await expect(api.sendQueuedSteer(queued)).resolves.toBe('not_sent')
+    expect(rpc.call).not.toHaveBeenCalled()
+  })
+
   it('allows an explicit queued Steer while authoritative A is running', async () => {
     const taskOwnership = useChatTaskOwnership()
     taskOwnership.noteRunning('turn-current')
