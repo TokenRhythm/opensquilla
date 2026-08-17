@@ -8,6 +8,7 @@ import {
   type InjectionKey,
   type Ref,
 } from 'vue'
+import type { ContextWarning } from '@/composables/chat/useChatUsageWidget'
 import type { IconName } from '@/utils/icons'
 
 export type ChatRouteHeaderAction =
@@ -24,6 +25,7 @@ export interface ChatRouteHeaderModel {
   deliverableCount: Readonly<Ref<number>>
   shareMode: Readonly<Ref<boolean>>
   shareableMessageCount: Readonly<Ref<number>>
+  contextWarning: Readonly<Ref<ContextWarning | null>>
 }
 
 export interface ChatRouteHeaderCommands {
@@ -54,6 +56,7 @@ export interface ChatRouteHeaderBridge {
     deliverableCount: ComputedRef<number>
     shareMode: ComputedRef<boolean>
     shareableMessageCount: ComputedRef<number>
+    contextWarning: ComputedRef<ContextWarning | null>
   }
   register: (
     model: ChatRouteHeaderModel,
@@ -129,6 +132,7 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
       deliverableCount: computed(() => ownerValue('deliverableCount', 0)),
       shareMode: computed(() => ownerValue('shareMode', false)),
       shareableMessageCount: computed(() => ownerValue('shareableMessageCount', 0)),
+      contextWarning: computed(() => ownerValue('contextWarning', null)),
     },
     register(model, commands) {
       closeMenu()

@@ -3322,6 +3322,7 @@
     "deliverables": "Livrables",
     "deliverablesCount": "Livrables ({count})",
     "contextPressure": "Contexte {pct} %",
+    "contextPressureInfoTitle": "Fenêtre de contexte {used}k / {window}k jetons",
     "contextPressureTitle": "Fenêtre de contexte {used}k / {window}k jetons — proche du seuil de compactage",
     "sessionDeliverables": "Livrables de la session",
     "noDeliverables": "Aucun livrable pour l'instant.",

@@ -3375,6 +3375,7 @@
     "deliverables": "产物",
     "deliverablesCount": "产物（{count}）",
     "contextPressure": "上下文 {pct}%",
+    "contextPressureInfoTitle": "上下文窗口 {used}k / {window}k tokens",
     "contextPressureTitle": "上下文窗口 {used}k / {window}k tokens — 接近压缩阈值",
     "sessionDeliverables": "会话产物",
     "noDeliverables": "暂无产物。",

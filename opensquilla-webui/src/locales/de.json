@@ -3322,6 +3322,7 @@
     "deliverables": "Ergebnisse",
     "deliverablesCount": "Ergebnisse ({count})",
     "contextPressure": "Kontext {pct} %",
+    "contextPressureInfoTitle": "Kontextfenster {used}k / {window}k Tokens",
     "contextPressureTitle": "Kontextfenster {used}k / {window}k Tokens — nahe der Komprimierungsschwelle",
     "sessionDeliverables": "Sitzungsergebnisse",
     "noDeliverables": "Noch keine Ergebnisse.",
