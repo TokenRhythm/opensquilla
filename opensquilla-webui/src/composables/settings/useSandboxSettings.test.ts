@@ -522,6 +522,51 @@ describe('useSandboxSettings runtime packs', () => {
     scope.stop()
   })
 
+  it('ignores a status response that predates a successful runtime action', async () => {
+    let resolveStaleStatus!: (value: SandboxRuntimePackStatus) => void
+    const staleStatus = new Promise<SandboxRuntimePackStatus>((resolve) => {
+      resolveStaleStatus = resolve
+    })
+    let statusCalls = 0
+    const queuedOperation = {
+      operationId: 'operation-1',
+      componentId: 'python',
+      kind: 'install',
+      state: 'queued',
+      downloadedBytes: 0,
+      totalBytes: 100,
+      progressPercent: 0,
+      source: null,
+      startedAtMs: 1,
+      updatedAtMs: 1,
+      error: null,
+    }
+    const { scope, settings } = await createSandboxSettings({
+      runtimeStatus: () => {
+        statusCalls += 1
+        return statusCalls === 1 ? readyRuntimeStatus : staleStatus
+      },
+      runtimeAction: () => queuedOperation,
+    })
+    await settings.load()
+    await settle()
+
+    settings.setRuntimeViewActive(true)
+    await settle()
+    expect(statusCalls).toBe(2)
+    await expect(settings.installRuntime('python')).resolves.toBe(true)
+    expect(settings.runtimeStatus.value?.components[0]?.operation?.operationId)
+      .toBe('operation-1')
+
+    resolveStaleStatus(structuredClone(readyRuntimeStatus))
+    await settle()
+
+    expect(settings.runtimeStatus.value?.components[0]?.operation?.operationId)
+      .toBe('operation-1')
+    expect(settings.runtimeStatusLoading.value).toBe(false)
+    scope.stop()
+  })
+
   it('polls after 750 ms only while the runtime view has an active operation', async () => {
     vi.useFakeTimers()
     let statusCalls = 0

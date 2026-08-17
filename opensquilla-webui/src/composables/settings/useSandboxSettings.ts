@@ -481,6 +481,9 @@ export function useSandboxSettings() {
       }
       await rpc.waitForConnection()
       const response = await rpc.call<unknown>(method, params)
+      clearRuntimePoll()
+      runtimeStatusRequestGeneration += 1
+      runtimeStatusLoading.value = false
       const status = normalizeRuntimeStatusResponse(response)
       if (status) {
         runtimeStatus.value = status
