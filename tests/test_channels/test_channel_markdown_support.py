@@ -191,18 +191,22 @@ def test_runtime_reply_defaults_to_markdown_format() -> None:
 
 @pytest.mark.asyncio
 async def test_qq_markdown_uses_official_markdown_message() -> None:
-    """QQ markdown replies use msg_type=2 + markdown.content."""
+    """QQ markdown replies use msg_type=2 + markdown.content, no top-level content."""
 
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock
 
     from opensquilla.channels.qq import QQChannelConfig
 
+    captured: dict[str, object] = {}
+
+    class FakeHttp:
+        async def request(self, route: object, json: dict | None = None) -> dict:
+            captured["route"] = route
+            captured["json"] = json
+            return {"id": "mock-msg-id"}
+
     channel = QQChannel(QQChannelConfig(name="qq", app_id="a", app_secret="s"))
-    channel.api = SimpleNamespace(
-        post_c2c_message=AsyncMock(),
-        post_group_message=AsyncMock(),
-    )
+    channel.api = SimpleNamespace(_http=FakeHttp())
     await channel.send(
         OutgoingMessage(
             content="**bold** list",
@@ -210,11 +214,13 @@ async def test_qq_markdown_uses_official_markdown_message() -> None:
             metadata={"chat_type": "c2c", "openid": "openid-1", "msg_id": "m-1"},
         )
     )
-    channel.api.post_c2c_message.assert_awaited_once()
-    kwargs = channel.api.post_c2c_message.await_args.kwargs
-    assert kwargs["msg_type"] == 2
-    assert kwargs["content"] is None
-    assert kwargs["markdown"]["content"] == "**bold** list"
+    body = captured["json"]
+    assert isinstance(body, dict)
+    assert body["msg_type"] == 2
+    assert "content" not in body  # QQ rejects top-level content (even null)
+    assert body["markdown"]["content"] == "**bold** list"
+    assert body["openid"] == "openid-1"
+    assert body["msg_id"] == "m-1"
 
 
 @pytest.mark.asyncio

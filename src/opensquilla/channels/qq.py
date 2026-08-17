@@ -448,52 +448,88 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
         chat_type = meta.get("chat_type", "")
         msg_id = meta.get("msg_id") or meta.get("reply_to_msg_id") or message.reply_to
 
-        markdown_content = (
-            message.content if message.format == "markdown" else None
-        )
-        msg_type = 2 if markdown_content is not None else 0
-        markdown_payload = None
-        if markdown_content is not None:
-            try:
-                from botpy.types.message import MarkdownPayload
-
-                markdown_payload = MarkdownPayload(content=markdown_content)
-            except ImportError:
-                # SDK variant without MarkdownPayload; degrade to plain text.
-                markdown_content = None
-                msg_type = 0
+        markdown_content = message.content if message.format == "markdown" else None
         api = self.api
         if chat_type == "group":
             target = meta.get("group_openid", "")
             if not target:
                 raise ValueError("qq.send: metadata['group_openid'] required for group chat_type")
             seq = self._next_msg_seq(f"group:{msg_id or target}")
-            await api.post_group_message(
-                group_openid=target,
-                msg_type=msg_type,
-                content=None if markdown_payload is not None else message.content,
-                markdown=markdown_payload,
-                msg_id=msg_id,
-                msg_seq=seq,
-            )
+            if markdown_content is not None:
+                await self._post_markdown(
+                    route_path="/v2/groups/{group_openid}/messages",
+                    target_key="group_openid",
+                    target=target,
+                    msg_id=msg_id,
+                    msg_seq=seq,
+                    markdown_content=markdown_content,
+                )
+            else:
+                await api.post_group_message(
+                    group_openid=target,
+                    msg_type=0,
+                    content=message.content,
+                    msg_id=msg_id,
+                    msg_seq=seq,
+                )
         elif chat_type == "c2c":
             target = meta.get("openid", "") or meta.get("user_openid", "")
             if not target:
                 raise ValueError("qq.send: metadata['openid'] required for c2c chat_type")
             seq = self._next_msg_seq(f"c2c:{msg_id or target}")
-            await api.post_c2c_message(
-                openid=target,
-                msg_type=msg_type,
-                content=None if markdown_payload is not None else message.content,
-                markdown=markdown_payload,
-                msg_id=msg_id,
-                msg_seq=seq,
-            )
+            if markdown_content is not None:
+                await self._post_markdown(
+                    route_path="/v2/users/{openid}/messages",
+                    target_key="openid",
+                    target=target,
+                    msg_id=msg_id,
+                    msg_seq=seq,
+                    markdown_content=markdown_content,
+                )
+            else:
+                await api.post_c2c_message(
+                    openid=target,
+                    msg_type=0,
+                    content=message.content,
+                    msg_id=msg_id,
+                    msg_seq=seq,
+                )
         else:
             raise ValueError(
                 f"qq.send: metadata['chat_type'] must be 'c2c' or 'group', got {chat_type!r}"
             )
         log.debug("qq.outbound_sent", chat_type=chat_type, length=len(message.content))
+
+    async def _post_markdown(
+        self,
+        *,
+        route_path: str,
+        target_key: str,
+        target: str,
+        msg_id: str | None,
+        msg_seq: int,
+        markdown_content: str,
+    ) -> None:
+        """Send a QQ official markdown passive message.
+
+        QQ's markdown API rejects messages whose top-level ``content``
+        is present (even null), while botpy's ``post_*_message`` helpers
+        serialize every argument — including ``content=None`` — into the
+        JSON body. Build the payload directly so only the markdown fields
+        are sent.
+        """
+        from botpy.http import Route
+
+        payload: dict[str, Any] = {
+            target_key: target,
+            "msg_type": 2,
+            "msg_seq": msg_seq,
+            "markdown": {"content": markdown_content},
+        }
+        if msg_id:
+            payload["msg_id"] = msg_id
+        route = Route("POST", route_path, **{target_key: target})
+        await self.api._http.request(route, json=payload)  # type: ignore[attr-defined]
 
     async def edit(self, message_id: str, content: str) -> None:
         """Raise: QQ Bot Platform has no message-edit primitive."""
