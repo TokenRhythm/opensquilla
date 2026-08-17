@@ -195,6 +195,27 @@ _CASE_KEYS = frozenset(
     }
 )
 _ALLOWED_TOOLS = frozenset(_ANNOTATION_TOOLS)
+_WINDOWS_PROCESS_ENV_ALLOWLIST = frozenset(
+    {
+        "ALLUSERSPROFILE",
+        "COMPUTERNAME",
+        "NUMBER_OF_PROCESSORS",
+        "OS",
+        "PROCESSOR_ARCHITECTURE",
+        "PROCESSOR_IDENTIFIER",
+        "PROCESSOR_LEVEL",
+        "PROCESSOR_REVISION",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "PROGRAMW6432",
+        "PUBLIC",
+        "SYSTEMDRIVE",
+        "USERDOMAIN",
+        "USERDOMAIN_ROAMINGPROFILE",
+        "USERNAME",
+    }
+)
 _ALLOWED_STATUSES = frozenset({"not_run", "passed", "failed"})
 _ALLOWED_REASON_CODES = frozenset(
     {
@@ -407,6 +428,10 @@ def _worker_environment(api_key: str) -> dict[str, str]:
     # Startup diagnostics must reach the private log before a health timeout,
     # including when Windows cannot flush a still-running child process.
     env["PYTHONUNBUFFERED"] = "1"
+    if os.name == "nt":
+        for name, value in os.environ.items():
+            if name.upper() in _WINDOWS_PROCESS_ENV_ALLOWLIST and value:
+                env[name] = value
     return env
 
 
@@ -429,6 +454,27 @@ def _apply_isolated_home_environment(env: dict[str, str], home: Path) -> None:
         env["LOCALAPPDATA"] = str(local)
         env["HOMEDRIVE"] = resolved_home.drive
         env["HOMEPATH"] = isolated_home[len(resolved_home.drive) :]
+        program_files = env.get("PROGRAMFILES") or env.get("ProgramFiles")
+        windows_root = env.get("WINDIR") or env.get("windir")
+        module_roots = [
+            (
+                str(Path(program_files) / "WindowsPowerShell" / "Modules")
+                if program_files
+                else ""
+            ),
+            (
+                str(
+                    Path(windows_root)
+                    / "System32"
+                    / "WindowsPowerShell"
+                    / "v1.0"
+                    / "Modules"
+                )
+                if windows_root
+                else ""
+            ),
+        ]
+        env["PSModulePath"] = os.pathsep.join(path for path in module_roots if path)
 
 
 def _case_payload(scenario: Scenario, evidence: CaseEvidence | None = None) -> dict[str, Any]:

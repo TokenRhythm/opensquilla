@@ -324,14 +324,20 @@ def test_isolated_home_environment_supports_windows_acl_hardening(tmp_path: Path
         "windows_user_sid=_current_windows_user_sid())"
     )
 
-    subprocess.run(
-        [sys.executable, "-c", code, str(protected)],
-        check=True,
-        capture_output=True,
-        env=env,
-        text=True,
-        timeout=30,
-    )
+    try:
+        subprocess.run(
+            [sys.executable, "-c", code, str(protected)],
+            check=True,
+            capture_output=True,
+            env=env,
+            text=True,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            f"isolated Windows ACL hardening timed out: stdout={exc.stdout!r} "
+            f"stderr={exc.stderr!r}"
+        ) from exc
 
 
 def test_live_harness_checks_each_feature_default_independently(
