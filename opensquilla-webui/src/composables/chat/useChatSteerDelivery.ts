@@ -87,6 +87,13 @@ export function snapshotSteerRequest(
     expected_turn_id: request.expected_turn_id,
     client_request_id: request.client_request_id,
     client_message_id: request.client_message_id,
+    ...(request.pendingInputId ? { pendingInputId: request.pendingInputId } : {}),
+    ...(request.requestFingerprint
+      ? { requestFingerprint: request.requestFingerprint }
+      : {}),
+    ...(request.expectedRevision !== undefined
+      ? { expectedRevision: request.expectedRevision }
+      : {}),
     ...(request.surface_id ? { surface_id: request.surface_id } : {}),
     ...(source ? { _source: source } : {}),
   })
