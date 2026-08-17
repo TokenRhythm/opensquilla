@@ -97,6 +97,28 @@ async def test_fresh_match_arms_sticky_cache():
 
 
 @pytest.mark.asyncio
+async def test_match_log_does_not_leak_user_message():
+    import structlog
+
+    message = "帮我写篇论文 UNIQUE_MARKER"
+    skills = [_meta_spec(name="meta-paper-write", triggers=("帮我写篇论文",))]
+    ctx = _ctx(message=message, session_id="S-LOG", skills=skills)
+
+    with structlog.testing.capture_logs() as captured:
+        await meta_resolution(ctx)
+
+    matched = [
+        entry for entry in captured if entry.get("event") == "meta_resolution.matched"
+    ]
+    assert matched
+    head = matched[-1].get("message_head")
+    assert isinstance(head, str)
+    assert head.startswith("sha256:")
+    assert message not in repr(captured)
+    assert "UNIQUE_MARKER" not in repr(captured)
+
+
+@pytest.mark.asyncio
 async def test_pinned_catalog_avoids_reloading_during_meta_resolution():
     skills = [_meta_spec(name="meta-paper-write", triggers=("帮我写篇论文",))]
     ctx = _ctx(message="帮我写篇论文", session_id="S-PINNED", skills=[])

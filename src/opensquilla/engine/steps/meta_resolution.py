@@ -25,6 +25,7 @@ Behaviour (post-hard-takeover-removal)
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import threading
@@ -51,6 +52,21 @@ from opensquilla.skills.retrieval import HybridRetriever
 from opensquilla.skills.types import SkillSpec
 
 log = structlog.get_logger(__name__)
+
+
+def _message_fingerprint(text: str | None) -> str:
+    """Return a non-recoverable identity for user-message text in logs.
+
+    Info-level logs must not carry recoverable user prompt content (issue
+    #1208); a short sha256 prefix plus the character length keeps
+    fire-diagnosis correlation (same message -> same fingerprint) without
+    exposing any content.
+    """
+
+    if not isinstance(text, str) or not text:
+        return ""
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"sha256:{digest}:len={len(text)}"
 
 
 # ── Session-sticky meta match (continuation across multi-turn chats) ──
@@ -1464,9 +1480,11 @@ async def meta_resolution(ctx: TurnContext) -> TurnContext:
         # D1: log all candidate names + priorities so operators can
         # spot trigger overlaps from logs without re-running the turn.
         candidate_list=[(n, p) for p, n, _t in candidate_digest],
-        # Include the head of the actual input so an operator can
-        # diagnose accidental fires from the log alone.
-        message_head=semantic_text[:200],
-        trigger_scan_head=trigger_text[:200],
+        # The head of the actual input used to be logged here so an operator
+        # could diagnose accidental fires from the log alone; that leaked
+        # recoverable user prompt text, so a non-recoverable fingerprint is
+        # logged instead (issue #1208).
+        message_head=_message_fingerprint(semantic_text),
+        trigger_scan_head=_message_fingerprint(trigger_text),
     )
     return ctx
