@@ -46,6 +46,7 @@ $acl = if ($isDirectory) {
 }
 if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:security-object") }
 $acl.SetAccessRuleProtection($true, $false)
+if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rules-protected") }
 $inheritance = [System.Security.AccessControl.InheritanceFlags]::None
 if ($isDirectory) {
     $inheritance = [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
@@ -54,8 +55,10 @@ if ($isDirectory) {
 $propagation = [System.Security.AccessControl.PropagationFlags]::None
 $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
 $allowed = @($userSid, "S-1-5-18", "S-1-5-32-544") | Select-Object -Unique
+if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rule-inputs") }
 foreach ($sidText in $allowed) {
     $sid = [System.Security.Principal.SecurityIdentifier]::new($sidText)
+    if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:sid-ready:$sidText") }
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
         $sid,
         $fullControl,
@@ -63,7 +66,9 @@ foreach ($sidText in $allowed) {
         $propagation,
         [System.Security.AccessControl.AccessControlType]::Allow
     )
+    if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rule-ready:$sidText") }
     [void]$acl.AddAccessRule($rule)
+    if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rule-added:$sidText") }
 }
 if ($diagnostics) { [Console]::Error.WriteLine("acl-stage:rules-ready") }
 if ($isDirectory) {
