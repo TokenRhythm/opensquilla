@@ -56,6 +56,7 @@ import SidebarSessionHoverCard, {
 } from './SidebarSessionHoverCard.vue'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
+import { usePlatform } from '@/platform'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
 import {
   buildSidebarDisplayProjection,
@@ -86,6 +87,8 @@ const props = withDefaults(defineProps<{
   canManageProjects: false,
   canCreateProjects: false,
 })
+
+const isDesktop = usePlatform().capabilities.isDesktop
 
 const emit = defineEmits<{
   (e: 'select', key: string): void
@@ -561,6 +564,26 @@ function setRenameInput(el: Element | ComponentPublicInstance | null) {
 // duplicate save through the input's blur handler.
 let renameCommitting = false
 
+function canOpenSessionMenu(row: SidebarDisplayRow): boolean {
+  return row.rowKind === 'session'
+    && (
+      row.sessionKind === 'chat'
+      || row.sessionKind === 'cron'
+      || row.sessionKind === 'channel'
+      || row.sessionKind === 'task'
+    )
+    && !row.provisional
+    && renamingKey.value !== row.key
+    && !selectionMode.value
+}
+
+function focusOpenMenu() {
+  nextTick(() => {
+    const items = openMenuEl.value?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item')
+    items?.[0]?.focus()
+  })
+}
+
 function toggleMenu(key: string, event?: Event) {
   if (openMenuKey.value === key) {
     closeMenu()
@@ -588,10 +611,30 @@ function toggleMenu(key: string, event?: Event) {
     }
   }
   // Move focus into the menu so keyboard users land on an actionable item.
-  nextTick(() => {
-    const items = openMenuEl.value?.querySelectorAll<HTMLElement>('.sidebar-row-menu__item')
-    items?.[0]?.focus()
-  })
+  focusOpenMenu()
+}
+
+function openSessionContextMenu(row: SidebarDisplayRow, event: MouseEvent) {
+  // Keep the browser's native context menu on the web build. The desktop shell
+  // owns right-click behavior and reuses the same actions as the row's ⋯ menu.
+  if (!isDesktop || !canOpenSessionMenu(row)) return
+  event.preventDefault()
+  event.stopPropagation()
+  closeSessionPreview()
+  openMenuKey.value = row.key
+  const trigger = event.currentTarget
+  menuTriggerEl.value = trigger instanceof HTMLElement ? trigger : null
+  const openLeft = event.clientX + 160 > window.innerWidth
+  const openUp = event.clientY + 220 > window.innerHeight
+  menuStyle.value = {
+    position: 'fixed',
+    left: `${event.clientX}px`,
+    top: `${event.clientY}px`,
+    transform: openLeft
+      ? (openUp ? 'translate(-100%, -100%)' : 'translateX(-100%)')
+      : (openUp ? 'translateY(-100%)' : 'none'),
+  }
+  focusOpenMenu()
 }
 
 function closeMenu() {
@@ -1125,6 +1168,7 @@ function onSelectRow(row: SidebarConversationItem) {
               :aria-pressed="selectionMode && !row.provisional ? isRowSelected(row.key) : undefined"
               :aria-describedby="sessionPreview?.row.key === row.key ? 'sidebar-session-preview' : undefined"
               @click="onSelectRow(row)"
+              @contextmenu="openSessionContextMenu(row, $event)"
             >
               <span
                 v-if="selectionMode && !row.provisional"
@@ -1219,18 +1263,7 @@ function onSelectRow(row: SidebarConversationItem) {
             </Teleport>
 
             <div
-              v-if="
-                row.rowKind === 'session'
-                && (
-                  row.sessionKind === 'chat'
-                  || row.sessionKind === 'cron'
-                  || row.sessionKind === 'channel'
-                  || row.sessionKind === 'task'
-                )
-                && !row.provisional
-                && renamingKey !== row.key
-                && !selectionMode
-              "
+              v-if="canOpenSessionMenu(row)"
               class="sidebar-row-menu-wrap"
             >
               <button
