@@ -33,7 +33,8 @@ def _write_release_assets(root: Path, *, changed_dmg: bool = False) -> None:
             payload += b"-changed"
         (root / name).write_bytes(payload)
         lines.append(f"{hashlib.sha256(payload).hexdigest()}  {name}")
-    (root / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    checksum_bytes = ("\n".join(lines) + "\n").encode("utf-8")
+    (root / "SHA256SUMS").write_bytes(checksum_bytes)
 
 
 def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
