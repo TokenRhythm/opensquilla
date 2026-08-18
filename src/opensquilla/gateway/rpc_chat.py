@@ -128,6 +128,29 @@ def _history_structural_richness(value: object) -> tuple[int, int]:
     return (1, 0) if value is not None else (0, 0)
 
 
+def _clear_history_usage_for_turn_indexes(
+    entries: list[object],
+    indexes_by_turn: Mapping[str, list[int]],
+) -> list[object]:
+    projected = list(entries)
+    for indexes in indexes_by_turn.values():
+        for index in indexes:
+            entry = copy.copy(projected[index])
+            setattr(entry, "turn_usage", None)
+            projected[index] = entry
+    return projected
+
+
+def _clear_history_usage_for_indexes(
+    projected: list[object],
+    indexes: list[int],
+) -> None:
+    for index in indexes:
+        entry = copy.copy(projected[index])
+        setattr(entry, "turn_usage", None)
+        projected[index] = entry
+
+
 def _canonical_webchat_session_key(value: object = None) -> str:
     """Map legacy WebChat defaults onto the canonical WebChat session."""
     raw = str(value or "").strip()
@@ -649,16 +672,24 @@ async def _project_missing_history_usage(
 
     storage = getattr(mgr, "storage", None)
     batch_project = getattr(storage, "get_turn_usage_projections", None)
+    batch_context = getattr(storage, "get_turn_history_usage_context", None)
     get_session = getattr(mgr, "get_session", None)
-    if not callable(batch_project) or not callable(get_session):
+    if not callable(batch_project) or not callable(batch_context) or not callable(get_session):
         return entries
     try:
         session = await get_session(session_key)
         if session is None:
             return entries
+        session_id = str(getattr(session, "session_id", "") or "")
+        session_epoch = max(0, int(getattr(session, "epoch", 0) or 0))
         projections = await batch_project(
-            session_id=str(getattr(session, "session_id", "") or ""),
-            session_epoch=max(0, int(getattr(session, "epoch", 0) or 0)),
+            session_id=session_id,
+            session_epoch=session_epoch,
+            turn_ids=list(indexes_by_turn),
+        )
+        contexts = await batch_context(
+            session_id=session_id,
+            session_epoch=session_epoch,
             turn_ids=list(indexes_by_turn),
         )
     except Exception:  # noqa: BLE001 - usage fallback must not hide transcript history
@@ -668,19 +699,38 @@ async def _project_missing_history_usage(
             entry_count=len(entries),
             exc_info=True,
         )
-        return entries
-    if not projections:
-        return entries
+        return _clear_history_usage_for_turn_indexes(entries, indexes_by_turn)
+    if not projections or not contexts:
+        return _clear_history_usage_for_turn_indexes(entries, indexes_by_turn)
 
     projected = list(entries)
     for turn_id, indexes in indexes_by_turn.items():
         usage = projections.get(turn_id)
+        context = contexts.get(turn_id)
+        terminal_message_id = (
+            str(getattr(context, "terminal_message_id", "") or "") if context is not None else ""
+        )
         if usage is None:
             continue
-        # A well-formed turn has one assistant row. If damaged legacy history
-        # contains duplicates, attach usage only to its terminal row so the UI
-        # cannot present the same provider spend more than once.
-        index = indexes[-1]
+        if not terminal_message_id:
+            _clear_history_usage_for_indexes(projected, indexes)
+            continue
+
+        terminal_index: int | None = None
+        for index in reversed(indexes):
+            if str(getattr(projected[index], "message_id", "") or "") == terminal_message_id:
+                terminal_index = index
+                break
+        for index in indexes:
+            if index == terminal_index:
+                continue
+            duplicate_entry = copy.copy(projected[index])
+            setattr(duplicate_entry, "turn_usage", None)
+            projected[index] = duplicate_entry
+        if terminal_index is None:
+            continue
+
+        index = terminal_index
         entry = copy.copy(projected[index])
         existing = getattr(entry, "turn_usage", None)
         existing_keys = set(existing) if isinstance(existing, dict) else set()
@@ -702,22 +752,13 @@ async def _project_missing_history_usage(
         if isinstance(existing, dict):
             structural_sources.append(existing)
         duplicate_structural: dict[str, Any] = {}
-        for duplicate_index in indexes[:-1]:
-            duplicate = getattr(projected[duplicate_index], "turn_usage", None)
-            if not isinstance(duplicate, dict):
-                continue
+        for duplicate in getattr(context, "structural_usage_candidates", ()):
             structural_sources.append(duplicate)
             for key, value in duplicate.items():
                 if key in {"provider", "model"} and key not in duplicate_structural:
                     duplicate_structural[key] = copy.deepcopy(value)
-                if (
-                    key not in _TURN_USAGE_PROJECTION_FIELDS
-                    and key not in merged_usage
-                ):
+                if key not in _TURN_USAGE_PROJECTION_FIELDS and key not in merged_usage:
                     merged_usage[key] = copy.deepcopy(value)
-            duplicate_entry = copy.copy(projected[duplicate_index])
-            setattr(duplicate_entry, "turn_usage", None)
-            projected[duplicate_index] = duplicate_entry
 
         # A rebuilt continuation can publish a small terminal receipt after an
         # earlier row already persisted the complete ensemble structure. Keep
