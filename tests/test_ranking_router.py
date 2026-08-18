@@ -996,14 +996,14 @@ def test_ranking_snapshot_none_tracks_the_packaged_thinking_default(
         (
             False,
             "step2-ranking-config-v3",
-            "step2-ranking-2026-08-18.3",
-            "667eb6057b2d261a2cb6a82b1073c87896e5b3f7b25124f18ade488900792e16",
+            "step2-ranking-2026-08-18.4",
+            "a81e82aa1ac60e7fcaee3ebb6a084a8c20576526c11171aa65ca316064755693",
         ),
         (
             True,
             "step2-ranking-config-v4",
-            "step2-ranking-2026-08-18.3",
-            "07fe68f66881107f73166a6276cd61cab5712658c542f8ef56379292669eadb9",
+            "step2-ranking-2026-08-18.4",
+            "ca3778b791caaa4719388330cc8c2721ae16b1a1f6ba5d7e4310b929ace93dcf",
         ),
     ],
 )
@@ -1067,7 +1067,7 @@ def test_task_analyzer_chain_policy_preserves_historical_single_route() -> None:
         for provider, model, upstream in _TASK_ANALYZER_CHAIN_ROUTES
     ]
     assert current["total_timeout_seconds"] == 60.0
-    assert current["schema_repair_max_retries"] == 1
+    assert current["schema_repair_max_retries"] == 0
     assert historical["configured"] is False
     assert historical["routes"] == current["routes"][:1]
     assert historical["total_timeout_seconds"] == 20.0
@@ -1097,7 +1097,7 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert historical["base_sha256"] == (
         "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
-    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-18.3"
+    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-18.4"
     assert "role_reliability" in default["base_config"]
     assert default["base_config"]["normalization"][
         "price_reference_usd_per_million"
@@ -1111,6 +1111,34 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     }
     assert default["base_config"]["rerank"]["top_l_min"] == 8
     assert default["base_config"]["task_analyzer"]["max_retries"] == 1
+    assert default["base_config"]["task_analyzer"]["schema_repair_max_retries"] == 0
+
+    previous_schema_repair_policy = ranking_config_resolution(
+        thinking_assignment_enabled=False,
+        base_version="step2-ranking-2026-08-18.3",
+    )
+    previous_schema_repair_policy_thinking = ranking_config_resolution(
+        thinking_assignment_enabled=True,
+        base_version="step2-ranking-2026-08-18.3",
+    )
+    assert (
+        previous_schema_repair_policy["base_config"]["task_analyzer"][
+            "schema_repair_max_retries"
+        ]
+        == 1
+    )
+    assert previous_schema_repair_policy["base_config"]["normalization"] == (
+        default["base_config"]["normalization"]
+    )
+    assert previous_schema_repair_policy["base_config"]["penalties"] == (
+        default["base_config"]["penalties"]
+    )
+    assert previous_schema_repair_policy["base_sha256"] == (
+        "667eb6057b2d261a2cb6a82b1073c87896e5b3f7b25124f18ade488900792e16"
+    )
+    assert previous_schema_repair_policy_thinking["base_sha256"] == (
+        "07fe68f66881107f73166a6276cd61cab5712658c542f8ef56379292669eadb9"
+    )
 
     previous_resource_policy = ranking_config_resolution(
         thinking_assignment_enabled=False,
@@ -1271,7 +1299,7 @@ def test_ranking_config_resolution_deep_merges_sparse_nested_override() -> None:
     }
     assert snapshot == resolution["effective_config"]
     assert resolution["effective_config"]["config_version"] == (
-        "step2-ranking-2026-08-18.3+override."
+        "step2-ranking-2026-08-18.4+override."
         f"{resolution['override_sha256'][:12]}"
     )
     assert resolution["effective_sha256"] != resolution["base_sha256"]
@@ -1444,10 +1472,10 @@ def test_ranking_config_override_resolves_against_selected_thinking_base() -> No
     assert "thinking_assignment" in thinking["effective_config"]
     suffix = legacy["override_sha256"][:12]
     assert legacy["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-18.3+override.{suffix}"
+        f"step2-ranking-2026-08-18.4+override.{suffix}"
     )
     assert thinking["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-18.3+override.{suffix}"
+        f"step2-ranking-2026-08-18.4+override.{suffix}"
     )
 
 
@@ -3294,25 +3322,16 @@ async def test_task_analyzer_fallback_chain_selects_first_valid_candidate(
     assert result.schema_valid is True
     assert result.provider_id == _TASK_ANALYZER_CHAIN_ROUTES[success_index][0]
     assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[success_index][1]
-    expected_call_counts = (
-        [1, 0, 0]
-        if success_index == 0
-        else [2, *[1 if index <= success_index else 0 for index in range(1, 3)]]
-    )
+    expected_call_counts = [1 if index <= success_index else 0 for index in range(3)]
     assert [len(provider.calls) for provider in providers] == expected_call_counts
     assert all(
         config is not None and config.allow_provider_stream_fallback is False
         for provider in providers
         for _, config in provider.calls
     )
-    expected_models = (
-        [_TASK_ANALYZER_CHAIN_ROUTES[0][1]]
-        if success_index == 0
-        else [
-            _TASK_ANALYZER_CHAIN_ROUTES[0][1],
-            *[route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES[: success_index + 1]],
-        ]
-    )
+    expected_models = [
+        route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES[: success_index + 1]
+    ]
     assert result.usage["attempt_count"] == len(expected_models)
     attempts = result.usage["physical_attempts"]
     assert [attempt["attempt"] for attempt in attempts] == list(range(1, len(attempts) + 1))
@@ -3332,7 +3351,7 @@ async def test_task_analyzer_fallback_chain_selects_first_valid_candidate(
     ]
     assert chain["selected_index"] == success_index
     assert chain["exhausted"] is False
-    assert chain["schema_repair_max_retries"] == 1
+    assert chain["schema_repair_max_retries"] == 0
     assert [attempt["outcome"] for attempt in chain["attempt_outcomes"]] == [
         *(["failed"] * success_index),
         "success",
@@ -3676,6 +3695,7 @@ async def test_task_analyzer_schema_repair_reuses_chain_deadline() -> None:
             routed_tier="c2",
             routing_confidence=0.77,
             timeout_seconds=0.05,
+            schema_repair_max_retries=1,
         ),
         timeout=0.2,
     )
@@ -3706,12 +3726,14 @@ async def test_task_analyzer_fallback_chain_returns_fallback_after_exhaustion() 
     assert result.profile["tier_dist"] == {"3": 1.0}
     assert result.provider_id == _TASK_ANALYZER_CHAIN_ROUTES[0][0]
     assert result.model_id == _TASK_ANALYZER_CHAIN_ROUTES[-1][1]
-    assert [len(provider.calls) for provider in providers] == [2, 1, 1]
-    assert result.usage["attempt_count"] == 4
+    assert [len(provider.calls) for provider in providers] == [1, 1, 1]
+    assert result.usage["attempt_count"] == 3
     assert [
         attempt["requested_model"]
         for attempt in result.usage["physical_attempts"]
-    ] == [_TASK_ANALYZER_CHAIN_ROUTES[0][1], *[route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES]]
+    ] == [
+        route[1] for route in _TASK_ANALYZER_CHAIN_ROUTES
+    ]
     chain = result.trace()["chain"]
     assert chain["selected_index"] is None
     assert chain["exhausted"] is True
@@ -6636,7 +6658,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     assert disabled.trace["ranking_version"] == "step2-ranking-v2"
     assert (
         disabled.trace["ranking_config_hash"]
-        == "667eb6057b2d261a2cb6a82b1073c87896e5b3f7b25124f18ade488900792e16"
+        == "a81e82aa1ac60e7fcaee3ebb6a084a8c20576526c11171aa65ca316064755693"
     )
     for field in (
         "ranking_thinking_assignment_enabled",
@@ -7589,13 +7611,13 @@ def test_packaged_ranking_config_without_affinity_preserves_golden_bytes_and_has
     resolution = ranking_config_resolution()
 
     assert hashlib.sha256(raw_payload).hexdigest() == (
-        "27cdcabc91f9af4e3b744d885e3451dfb10db0b2d734e73a55de61ae047d3b3d"
+        "fe0a18a67448a399d245438533beae21caf11a84528c6db9c49a7d9e049f539c"
     )
     assert canonical_json_sha256(loaded) == (
-        "7f4209b5bb4533c86348408c9231e835f14b7c69dbdd06bbd93032ea6c5a873c"
+        "19ea5d71a4a3f02ec96daebc67efdb0b6935a56e259d60e4af77361269fc16a7"
     )
     assert resolution["base_sha256"] == (
-        "667eb6057b2d261a2cb6a82b1073c87896e5b3f7b25124f18ade488900792e16"
+        "a81e82aa1ac60e7fcaee3ebb6a084a8c20576526c11171aa65ca316064755693"
     )
     assert resolution["effective_sha256"] == resolution["base_sha256"]
     assert "kv_cache_affinity" not in loaded["session"]

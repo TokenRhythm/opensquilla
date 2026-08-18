@@ -67,8 +67,9 @@ RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
 LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
-_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.3"
-_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.3"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.4"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.4"
+_PRE_SCHEMA_REPAIR_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.3"
 _PRE_RESOURCE_AWARE_RERANK_CONFIG_VERSION = "step2-ranking-2026-08-18.2"
 _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.1"
 _PREVIOUS_COST_BALANCE_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.2"
@@ -87,6 +88,7 @@ _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS = frozenset(
 )
 _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
     {
+        _PRE_SCHEMA_REPAIR_RANKING_CONFIG_VERSION,
         _PRE_RESOURCE_AWARE_RERANK_CONFIG_VERSION,
         _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION,
         _PREVIOUS_COST_BALANCE_RANKING_CONFIG_VERSION,
@@ -2762,6 +2764,9 @@ def _ranking_config_for_base_version(
         )
     historical = _detached_ranking_config(packaged)
     historical["config_version"] = requested
+    historical["task_analyzer"]["schema_repair_max_retries"] = 1
+    if requested == _PRE_SCHEMA_REPAIR_RANKING_CONFIG_VERSION:
+        return _validate_ranking_config(historical)
     historical["normalization"]["price_reference_usd_per_million"] = 40.0
     historical["penalties"].pop("latency_penalty_enabled", None)
     if requested == _PRE_RESOURCE_AWARE_RERANK_CONFIG_VERSION:
