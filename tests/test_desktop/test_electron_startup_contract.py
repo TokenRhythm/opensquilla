@@ -610,7 +610,10 @@ def test_boot_timer_tracks_each_status_identity_without_spamming_live_regions() 
     assert "if (statusIdentity !== phaseStatusIdentity)" in apply_status
     assert "phaseStatusIdentity = statusIdentity" in apply_status
     assert "const statusAtMs = Date.parse(statusAt)" in apply_status
-    assert "const wallAgeMs = Number.isFinite(statusAtMs) ? Date.now() - statusAtMs : 0" in apply_status
+    assert (
+        "const wallAgeMs = Number.isFinite(statusAtMs) ? Date.now() - statusAtMs : 0"
+        in apply_status
+    )
     assert "phaseStartedAt = performance.now() - Math.max(0, wallAgeMs)" in apply_status
     assert "updateTimer()" in apply_status
     assert "performance.now() - phaseStartedAt" in timer
