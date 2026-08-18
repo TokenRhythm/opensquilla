@@ -2495,6 +2495,55 @@ def test_auto_publish_dedupes_current_artifact_by_store_safe_name(
     assert len(ctx.published_artifacts) == 1
 
 
+def test_auto_publish_keeps_distinct_source_paths_with_identical_content(
+    tmp_path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    first = workspace / "a.html"
+    second = workspace / "b.html"
+    payload = b"<title>identical</title>"
+    first.write_bytes(payload)
+    second.write_bytes(payload)
+    first_sha = hashlib.sha256(payload).hexdigest()
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-identical",
+        session_key="agent:main:webchat:identical",
+    )
+    # a.html was explicitly published this turn under a custom display name.
+    ctx.published_artifacts.append(
+        {"id": "art-a", "sha256": first_sha, "name": "Overview A.html"}
+    )
+    ctx.published_artifact_source_keys.add(
+        artifact_delivery_publish_target_key(
+            str(first.resolve()),
+            workspace_dir=workspace,
+        )
+    )
+    for name, path in (("a.html", first), ("b.html", second)):
+        ctx.workspace_file_writes.append(
+            {
+                "created": True,
+                "path": str(path),
+                "relative_path": name,
+                "name": name,
+            }
+        )
+
+    result = auto_publish_omitted_workspace_artifacts(
+        ctx,
+        final_text="Created a.html and b.html for you.",
+    )
+
+    assert len(result.artifacts) == 1
+    assert result.artifacts[0]["name"] == "b.html"
+    assert len(ctx.published_artifacts) == 2
+
+
 def test_auto_publish_oversized_pptx_preflights_before_read_or_validation(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
