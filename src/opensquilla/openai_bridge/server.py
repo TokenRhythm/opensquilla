@@ -177,10 +177,46 @@ def _write_cached_key(agent_id: str, key: str) -> None:
         print(f"[openai-bridge] persistent key 缓存失败: {key}")
 
 
-async def _create_session(client: GatewayRPCClient, agent_id: str) -> str:
+def _first_user_text(messages: list[dict[str, Any]]) -> str | None:
+    """提取首条非空 user 消息文本（不含 system 前缀），用于生成会话显示名。"""
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "user":
+            continue
+        text = _extract_text_content(msg.get("content"))
+        if text:
+            return text
+    return None
+
+
+def _build_display_name(agent_id: str, first_user_text: str | None) -> str:
+    """生成会话显示名：时间前缀 + 首句摘要，便于在 channel 列表区分多场对话。
+
+    stateless 模式每次请求都会新建会话，若名字只含 agent_id，列表会出现大量
+    同名 channel，用户无法定位具体对话。加入本地时间戳与首句摘要（纯本地
+    生成、零额外 LLM 调用），使每场对话一眼可辨。
+    """
+    stamp = time.strftime("%m-%d %H:%M")
+    base = f"OpenAI bridge · {stamp}"
+    if first_user_text:
+        # 折叠空白/换行，仅保留可打印字符，避免控制字符污染 displayName
+        collapsed = "".join(
+            ch for ch in " ".join(first_user_text.split()) if ch.isprintable()
+        )
+        if collapsed:
+            snippet = collapsed if len(collapsed) <= 24 else collapsed[:24] + "…"
+            return f"{base} · {snippet}"
+    return base
+
+
+async def _create_session(
+    client: GatewayRPCClient, agent_id: str, *, display_name: str | None = None
+) -> str:
+    name = display_name or f"OpenAI bridge ({agent_id})"
     result = await client.call(
         "sessions.create",
-        {"agentId": agent_id, "displayName": f"OpenAI bridge ({agent_id})"},
+        {"agentId": agent_id, "displayName": name},
     )
     key = result.get("key") if isinstance(result, dict) else None
     if not key:
@@ -189,7 +225,12 @@ async def _create_session(client: GatewayRPCClient, agent_id: str) -> str:
 
 
 async def _resolve_or_create_session(
-    client: GatewayRPCClient, agent_id: str, *, explicit_key: str | None, force_new: bool
+    client: GatewayRPCClient,
+    agent_id: str,
+    *,
+    explicit_key: str | None,
+    force_new: bool,
+    display_name: str | None = None,
 ) -> str:
     if explicit_key:
         try:
@@ -198,9 +239,9 @@ async def _resolve_or_create_session(
         except GatewayRPCError as exc:
             raise HTTPException(404, f"会话不存在或不可用: {exc}") from exc
     if SESSION_MODE == "stateless":
-        return await _create_session(client, agent_id)
+        return await _create_session(client, agent_id, display_name=display_name)
     if force_new:
-        key = await _create_session(client, agent_id)
+        key = await _create_session(client, agent_id, display_name=display_name)
         _write_cached_key(agent_id, key)
         return key
     # persistent：优先复用缓存 key
@@ -211,7 +252,7 @@ async def _resolve_or_create_session(
             return cached
         except GatewayRPCError:
             pass  # 缓存失效（会话被删/清库），重建
-    key = await _create_session(client, agent_id)
+    key = await _create_session(client, agent_id, display_name=display_name)
     _write_cached_key(agent_id, key)
     return key
 
@@ -628,11 +669,19 @@ async def chat_completions(
     force_new = request.headers.get("X-OpenSquilla-New-Session", "") == "1"
     route = request.headers.get("X-OpenSquilla-Route")
 
+    # 会话显示名：仅在真正需要新建会话时使用；由首条 user 消息生成本地摘要，
+    # 避免 stateless 模式下列表出现大量同名 channel。
+    display_name = _build_display_name(agent_id, _first_user_text(messages))
+
     # 解析/创建会话 key
     client = await _new_client()
     try:
         key = await _resolve_or_create_session(
-            client, agent_id, explicit_key=explicit_key, force_new=force_new
+            client,
+            agent_id,
+            explicit_key=explicit_key,
+            force_new=force_new,
+            display_name=display_name,
         )
     finally:
         await client.close()

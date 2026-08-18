@@ -6,10 +6,12 @@ from fastapi.testclient import TestClient
 
 from opensquilla.openai_bridge import server as bridge_server
 from opensquilla.openai_bridge.server import (
+    _build_display_name,
     _collect_terminal_error,
     _detect_client_title_request,
     _event_error_message,
     _filter_stream_delta,
+    _first_user_text,
     _map_error_event,
     _message_text,
     _resolve_agent_id,
@@ -316,3 +318,60 @@ def test_chat_completions_short_circuits_client_title_request() -> None:
     body = resp.json()
     assert body["choices"][0]["message"]["content"] == "回答我：159753"
     assert body["choices"][0]["finish_reason"] == "stop"
+
+
+def test_first_user_text_extracts_first_non_empty_user() -> None:
+    """首条非空 user 消息被提取，system 与空 user 被跳过。"""
+    messages = [
+        {"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": ""},
+        {"role": "user", "content": "  第一条有效消息  "},
+        {"role": "user", "content": "后续消息"},
+    ]
+    assert _first_user_text(messages) == "  第一条有效消息  "
+
+
+def test_first_user_text_supports_content_parts() -> None:
+    """content 为 [{"type":"text","text":...}] 数组时仍能提取。"""
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "片段一"}, {"type": "text", "text": "片段二"}]}
+    ]
+    assert _first_user_text(messages) == "片段一\n片段二"
+
+
+def test_first_user_text_returns_none_without_user() -> None:
+    """无 user 消息时返回 None。"""
+    assert _first_user_text([{"role": "system", "content": "sys"}]) is None
+    assert _first_user_text([]) is None
+
+
+def test_build_display_name_includes_timestamp_and_snippet() -> None:
+    """命名含时间前缀 + 首句摘要。"""
+    name = _build_display_name("main", "解释一下相对论")
+    assert name.startswith("OpenAI bridge · ")
+    assert "解释一下相对论" in name
+
+
+def test_build_display_name_falls_back_without_user_text() -> None:
+    """无首句时退化为仅时间前缀。"""
+    name = _build_display_name("main", None)
+    assert name.startswith("OpenAI bridge · ")
+    assert " · " in name  # 时间戳占位存在
+
+
+def test_build_display_name_truncates_long_snippet() -> None:
+    """首句超长截断到 24 字符并加省略号。"""
+    long_text = "这是一段非常非常非常非常非常非常非常非常非常非常非常长的输入"
+    name = _build_display_name("main", long_text)
+    snippet = name.split(" · ")[-1]
+    assert snippet.endswith("…")
+    assert len(snippet) <= 25  # 24 字 + 省略号
+
+
+def test_build_display_name_collapses_whitespace_and_control_chars() -> None:
+    """换行/制表折叠为空格，控制字符被剔除。"""
+    name = _build_display_name("main", "第一行\n第二行\t第三行\x00")
+    assert "\n" not in name
+    assert "\t" not in name
+    assert "\x00" not in name
+    assert "第一行 第二行 第三行" in name
