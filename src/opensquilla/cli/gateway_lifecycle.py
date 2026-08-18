@@ -316,8 +316,41 @@ class GatewayLifecycleManager:
                 message="Gateway started.",
             )
 
-        self._terminate_pid(process.pid)
-        self._remove_pidfile()
+        # The gateway may still be coming up (slow first boot, model catalog
+        # warm-up, a long-running migration) when the health deadline expires.
+        # A "late success" is still a success: give the process one more
+        # short window to report ready before declaring the start failed.
+        if self._late_health_grace():
+            return self._result(
+                "start",
+                "running",
+                pid=process.pid,
+                managed=True,
+                started_at=started_at,
+                message="Gateway started (after a slow boot).",
+            )
+
+        terminated = self._terminate_pid(process.pid)
+        if terminated:
+            self._remove_pidfile()
+        else:
+            # The process refused to die (or the drain endpoint could not be
+            # reached). Keep the pidfile so a later `status` still sees a
+            # managed, running gateway instead of an orphaned unmanaged one,
+            # and say so instead of pretending the start cleaned up.
+            return self._result(
+                "start",
+                "start_failed",
+                ok=False,
+                pid=process.pid,
+                managed=True,
+                code="HEALTH_TIMEOUT_TERMINATE_FAILED",
+                message=(
+                    "Gateway did not become ready before the timeout and could "
+                    "not be stopped; it may still be finishing startup."
+                ),
+                exit_code_value=1,
+            )
         return self._result(
             "start",
             "start_failed",
@@ -676,6 +709,21 @@ class GatewayLifecycleManager:
 
     def _wait_for_health(self) -> bool:
         deadline = time.monotonic() + max(self.health_timeout, 0.0)
+        while time.monotonic() <= deadline:
+            if self._probe_ready():
+                return True
+            time.sleep(self.poll_interval)
+        return False
+
+    # Extra window after the primary health deadline during which a "late
+    # success" (the gateway finishing a slow first boot) is still accepted.
+    # Without this, a gateway that becomes ready ~35s into a 30s deadline is
+    # torn down even though it is perfectly healthy — the exact "did not
+    # become healthy" failure reported after ~37.5s boots.
+    LATE_HEALTH_GRACE_SECONDS = 15.0
+
+    def _late_health_grace(self) -> bool:
+        deadline = time.monotonic() + LATE_HEALTH_GRACE_SECONDS
         while time.monotonic() <= deadline:
             if self._probe_ready():
                 return True

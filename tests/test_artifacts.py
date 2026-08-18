@@ -1829,6 +1829,61 @@ async def test_publish_artifact_tool_is_idempotent_for_existing_turn_artifact(
 
 
 @pytest.mark.asyncio
+async def test_backstop_skips_file_explicitly_published_with_custom_name(
+    tmp_path: Path,
+) -> None:
+    from opensquilla.engine.artifact_delivery import (
+        auto_publish_omitted_workspace_artifacts,
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "index.html"
+    target.write_text("<title>World Countries</title>", encoding="utf-8")
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        workspace_dir=str(workspace),
+        artifact_media_root=str(tmp_path / "media"),
+        artifact_session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+    )
+    ctx.workspace_file_writes.append(
+        {
+            "created": True,
+            "path": str(target),
+            "relative_path": "index.html",
+            "name": target.name,
+        }
+    )
+
+    token = current_tool_context.set(ctx)
+    try:
+        result = json.loads(
+            await publish_artifact(
+                path="index.html",
+                name="World Countries Overview",
+            )
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert result["status"] == "published"
+    assert result["artifact"]["name"] == "World Countries Overview.html"
+    assert len(ctx.published_artifacts) == 1
+
+    publish_result = auto_publish_omitted_workspace_artifacts(
+        ctx,
+        final_text="I created index.html for you.",
+    )
+
+    assert publish_result.artifacts == []
+    assert publish_result.failure_summaries == []
+    assert len(ctx.published_artifacts) == 1
+    assert ctx.published_artifacts[0]["name"] == "World Countries Overview.html"
+
+
+@pytest.mark.asyncio
 async def test_publish_artifact_tool_reuses_existing_session_deliverable_across_contexts(
     tmp_path: Path,
 ) -> None:

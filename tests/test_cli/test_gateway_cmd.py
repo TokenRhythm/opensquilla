@@ -1514,3 +1514,69 @@ def test_hard_kill_backstop_does_not_reuse_full_shutdown_timeout(monkeypatch) ->
     assert mgr._terminate_pid(4321) is True
     # First wait uses the graceful budget; the hard-kill backstop is short, not 75s again.
     assert waits == [75.0, gateway_lifecycle._HARD_KILL_BACKSTOP_S]
+
+
+def test_gateway_start_accepts_late_health_success_after_deadline(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A gateway that becomes healthy shortly after the primary health deadline
+    must not be torn down: the late-success grace window still accepts it."""
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
+    monkeypatch.setattr(
+        gateway_lifecycle.subprocess,
+        "Popen",
+        lambda *a, **k: SimpleNamespace(pid=5150),
+    )
+    monkeypatch.setattr(Manager, "_wait_for_health", lambda self: False)
+    monkeypatch.setattr(Manager, "_late_health_grace", lambda self: True)
+    monkeypatch.setattr(Manager, "_write_pidfile", lambda self, record: None)
+    monkeypatch.setattr(Manager, "_remove_pidfile", lambda self: None)
+    calls = []
+
+    def fake_record(self, pid, argv, started_at):
+        calls.append(("record", pid))
+        return {"pid": pid, "host": self.host, "port": self.port}
+
+    monkeypatch.setattr(Manager, "_record", fake_record)
+
+    result = Manager(port=18791, health_timeout=0).start()
+
+    assert result.ok is True
+    assert result.state == "running"
+    assert result.pid == 5150
+    assert "slow boot" in result.message
+    assert calls == [("record", 5150)]
+
+
+def test_gateway_start_keeps_pidfile_when_terminate_fails_after_timeout(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """If the gateway survives the post-timeout terminate, the pidfile must be
+    kept so a later `status` still recognizes the managed process instead of
+    leaving an orphaned unmanaged gateway."""
+    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path / "home"))
+    monkeypatch.setattr(
+        gateway_lifecycle.subprocess,
+        "Popen",
+        lambda *a, **k: SimpleNamespace(pid=5151),
+    )
+    monkeypatch.setattr(Manager, "_wait_for_health", lambda self: False)
+    monkeypatch.setattr(Manager, "_late_health_grace", lambda self: False)
+    monkeypatch.setattr(Manager, "_terminate_pid", lambda self, pid: False)
+    monkeypatch.setattr(Manager, "_write_pidfile", lambda self, record: None)
+    removed = []
+
+    def fake_remove(self):
+        removed.append(True)
+
+    monkeypatch.setattr(Manager, "_remove_pidfile", fake_remove)
+
+    result = Manager(port=18791, health_timeout=0).start()
+
+    assert result.ok is False
+    assert result.state == "start_failed"
+    assert result.code == "HEALTH_TIMEOUT_TERMINATE_FAILED"
+    assert "could not be stopped" in result.message
+    assert removed == []  # pidfile preserved for a later status
