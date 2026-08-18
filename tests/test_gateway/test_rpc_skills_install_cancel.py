@@ -144,4 +144,12 @@ async def test_install_cancellation_rejects_invalid_operation_id(tmp_path) -> No
 
 def test_install_cancellation_protocol_is_advertised_and_admin_only() -> None:
     assert "skills.install" in websocket._DETACHED_RPC_METHODS
+    assert websocket._should_detach_rpc_request(
+        "skills.install",
+        {"identifier": "demo", "operationId": str(uuid4())},
+    )
+    assert not websocket._should_detach_rpc_request(
+        "skills.install",
+        {"identifier": "demo"},
+    )
     assert METHOD_SCOPES["skills.install.cancel"] == ADMIN_SCOPE

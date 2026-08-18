@@ -105,6 +105,19 @@ _MAX_DETACHED_REQUESTS_PER_CONNECTION = 9
 _DETACHED_REQUEST_DRAIN_SECONDS = 0.25
 
 
+def _should_detach_rpc_request(method: str, params: Any) -> bool:
+    if method not in _DETACHED_RPC_METHODS:
+        return False
+    if method != "skills.install":
+        return True
+    if not isinstance(params, dict):
+        return False
+    return any(
+        isinstance(params.get(key), str) and bool(params[key].strip())
+        for key in ("operationId", "operation_id")
+    )
+
+
 @dataclass(slots=True)
 class _OutboundFrame:
     """A frame queued for the writer task.
@@ -1365,7 +1378,7 @@ async def _message_loop(
                 memory_stores=memory_stores or {},
                 memory_retrievers=memory_retrievers or {},
             )
-            if method in _DETACHED_RPC_METHODS:
+            if _should_detach_rpc_request(method, params):
                 if (
                     len(conn._detached_request_tasks)
                     >= _MAX_DETACHED_REQUESTS_PER_CONNECTION

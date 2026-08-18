@@ -272,6 +272,84 @@ async def test_blocked_skill_install_can_be_cancelled_on_same_websocket(
 
 
 @pytest.mark.parametrize("writer_queue_enabled", [False, True])
+async def test_legacy_skill_install_without_operation_id_remains_serialized(
+    tmp_path,
+    writer_queue_enabled: bool,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    observed: dict[str, bool] = {}
+
+    class _Installer:
+        async def install(self, *_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return SimpleNamespace(
+                success=True,
+                name="demo",
+                message="installed",
+                path=None,
+                scan=None,
+            )
+
+    async def finish_after_responses(socket: _HistoryWebSocket) -> None:
+        await socket.wait_for_response("install")
+        await socket.wait_for_response("quick")
+
+    ws = _HistoryWebSocket(
+        [
+            _CONNECT_FRAME,
+            json.dumps({
+                "type": "req",
+                "id": "install",
+                "method": "skills.install",
+                "params": {"identifier": "demo"},
+            }),
+            json.dumps({"type": "req", "id": "quick", "method": "health"}),
+        ],
+        get_dispatcher(),
+        after_frames=finish_after_responses,
+    )
+    loader = SkillLoader(
+        managed_dir=tmp_path / "managed",
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+    loader.load_all()
+
+    async def release_after_serialization_check() -> None:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        try:
+            await asyncio.wait_for(ws.quick_response_sent.wait(), timeout=0.05)
+            observed["quick_overtook_install"] = True
+        except TimeoutError:
+            observed["quick_overtook_install"] = False
+        finally:
+            release.set()
+
+    observer = asyncio.create_task(release_after_serialization_check())
+    try:
+        await asyncio.wait_for(
+            handle_ws_connection(
+                ws,
+                GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
+                dispatcher=get_dispatcher(),
+                skill_loader=loader,
+                skill_management_service=_Installer(),
+                skill_management_state={},
+            ),
+            timeout=2,
+        )
+    finally:
+        await observer
+
+    responses = {frame["id"]: frame for frame in ws.responses()}
+    assert observed["quick_overtook_install"] is False
+    assert responses["install"]["payload"]["success"] is True
+    assert responses["quick"]["payload"]["status"] == "ok"
+    assert ws.close_codes == []
+
+
+@pytest.mark.parametrize("writer_queue_enabled", [False, True])
 async def test_slow_chat_history_does_not_block_later_interactive_rpc(
     writer_queue_enabled: bool,
 ) -> None:
