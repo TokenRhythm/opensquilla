@@ -4435,7 +4435,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     ? artifact.documentId.trim()
     : typeof artifact.document_id === 'string' ? artifact.document_id.trim() : ''
   if ((!artifactId && !documentId) || !sessionKey.value) {
-    openLegacyArtifactWorkbench(artifact, documentId ? 'source' : 'preview')
+    openLegacyArtifactWorkbench(artifact)
     return
   }
   try {
@@ -4454,7 +4454,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       currentArtifact.revisionId = current.revision.revisionId
       const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
         artifact: currentArtifact,
-        initialSection: 'source',
+        initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
         nativeHtml: Boolean(
           platform.capabilities.hasNativeWorkbenchSurfaces
@@ -4472,7 +4472,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     if (!current && resource.resource.type === 'document') {
       openLegacyArtifactWorkbench(
         artifactPayloadFromWorkbenchResource(resource),
-        'source',
+        'preview',
       )
       return
     }
@@ -4491,7 +4491,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       importedArtifact.revisionId = imported.revision.revisionId
       const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
         artifact: importedArtifact,
-        initialSection: 'source',
+        initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
         nativeHtml: Boolean(
           platform.capabilities.hasNativeWorkbenchSurfaces

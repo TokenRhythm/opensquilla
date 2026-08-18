@@ -15,7 +15,7 @@ describe('ChatView artifact preview routing', () => {
     expect(openArtifactSource).toContain('artifactImageLightbox.open({')
   })
 
-  it('resolves generated deliverables to the current head before opening Source', () => {
+  it('resolves generated deliverables to the current head before opening Preview', () => {
     const typedStart = chatViewSource.indexOf('async function openDeliverableWorkbenchResource(')
     const openStart = chatViewSource.indexOf('function openArtifact(')
     const end = chatViewSource.indexOf('\nfunction closeDeliverables', openStart)
@@ -27,7 +27,8 @@ describe('ChatView artifact preview routing', () => {
     expect(source).toContain('workbenchResourcesStore.openCurrent(sessionKey.value, resource)')
     expect(source).toContain("current?.disposition === 'document'")
     expect(source).toContain('artifactPayloadFromRevision(current.revision)')
-    expect(source).toContain("initialSection: 'source'")
+    expect(source).toContain("initialSection: 'preview'")
+    expect(source).not.toContain("initialSection: 'source'")
     expect(source).toContain('workbenchResourcesStore.preview(')
     expect(source).toContain('preparedPreview: preview.preview')
     expect(source).toContain('previewLeaseEligible: false')

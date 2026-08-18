@@ -67,6 +67,27 @@ describe('AppWorkbench annotation mode status', () => {
     expect(source).not.toContain("throw new Error(t('workbench.resources.actionFailed'))")
   })
 
+  it('opens current and silently materialized HTML documents on Preview', () => {
+    const openStart = appWorkbenchSource.indexOf('async function openWorkbenchResource(')
+    const importStart = appWorkbenchSource.indexOf(
+      '\nasync function importWorkbenchResourceForSession',
+      openStart,
+    )
+    const publishStart = appWorkbenchSource.indexOf(
+      '\nasync function publishWorkbenchResource',
+      importStart,
+    )
+    const openSource = appWorkbenchSource.slice(openStart, importStart)
+    const importSource = appWorkbenchSource.slice(importStart, publishStart)
+
+    expect(openSource).toContain(
+      'openResourceArtifact(current.resource, artifact, sessionKey)',
+    )
+    expect(openSource).not.toContain("undefined, 'source'")
+    expect(importSource).toContain('}, artifact, sessionKey)')
+    expect(importSource).not.toContain("undefined, 'source'")
+  })
+
   it('contains expected resource refresh aborts at every fire-and-forget call site', () => {
     const guardedLoads = appWorkbenchSource.match(
       /void workbenchResources\.load\([^;]+?\.catch\(\(\) => undefined\)/gs,

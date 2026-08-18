@@ -491,7 +491,7 @@ async function openWorkbenchResource(resource: WorkbenchResource, item: Workbenc
     const artifact = artifactPayloadFromRevision(current.revision)
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
-    openResourceArtifact(current.resource, artifact, sessionKey, undefined, 'source')
+    openResourceArtifact(current.resource, artifact, sessionKey)
     return
   }
   if (!current && resource.resource.type === 'document') {
@@ -499,8 +499,6 @@ async function openWorkbenchResource(resource: WorkbenchResource, item: Workbenc
       resource,
       artifactPayloadFromWorkbenchResource(resource),
       sessionKey,
-      undefined,
-      'source',
     )
     return
   }
@@ -578,7 +576,7 @@ async function importWorkbenchResourceForSession(
       headArtifactId: imported.revision.artifactId,
       source: resource.resource,
     },
-  }, artifact, sessionKey, undefined, 'source')
+  }, artifact, sessionKey)
 }
 
 async function publishWorkbenchResource(

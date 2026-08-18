@@ -54,7 +54,10 @@ const EXPECTED_CURRENT_DOCUMENT_TOOLS = [
   'document_read',
 ]
 const TIMEOUT_MS = 60_000
-const STARTUP_TIMEOUT_MS = 120_000
+// A cold desktop profile performs recovery discovery before it starts the
+// source Gateway. Keep functional assertions at 60 seconds, but allow this
+// one-time startup phase to complete on slower CI and developer machines.
+const STARTUP_TIMEOUT_MS = 180_000
 const MANUAL_MODE = process.env.OPENSQUILLA_MANUAL_V1_HTML_EDIT === '1'
 const MANUAL_REAL_PROVIDER = process.env.OPENSQUILLA_MANUAL_REAL_PROVIDER === '1'
 const MANUAL_REUSE_PROFILE = process.env.OPENSQUILLA_MANUAL_V1_PROFILE_ROOT?.trim() || ''
@@ -600,16 +603,31 @@ function generatedArtifactCard(page) {
   return page.locator('.msg-artifact-chip').filter({ hasText: GENERATED_FILENAME })
 }
 
-async function openGeneratedArtifactSource(page) {
+async function openGeneratedArtifact(page) {
   const card = generatedArtifactCard(page)
   await card.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
   await card.locator('.msg-artifact-body').click()
   await page.locator('.artifact-document').waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  const previewTab = page.getByRole('tab', { name: /^Preview/ })
+  await waitFor(
+    async () => await previewTab.getAttribute('aria-selected') === 'true',
+    'Preview selected on artifact open',
+    TIMEOUT_MS,
+  )
+  await page.locator('[data-document-section="preview"]').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+}
+
+async function openGeneratedArtifactSource(page) {
+  await openGeneratedArtifact(page)
   const sourceTab = page.getByRole('tab', { name: /^Source/ })
   await sourceTab.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  await sourceTab.click()
   await waitFor(
     async () => await sourceTab.getAttribute('aria-selected') === 'true',
-    'Source selected on artifact open',
+    'Source selected after explicit user action',
     TIMEOUT_MS,
   )
   await page.locator('.artifact-html-studio .monaco-editor').waitFor({
@@ -1173,6 +1191,16 @@ try {
     'resource navigation must fold the generated deliverable into its bound Document',
   )
   assert.match(await logicalResources.first().innerText(), new RegExp(GENERATED_FILENAME))
+  await logicalResources.first().locator('.resource-collection__open').click()
+  await waitFor(
+    async () => await previewTab.getAttribute('aria-selected') === 'true',
+    'Preview selected from resource navigation',
+    TIMEOUT_MS,
+  )
+  await page.locator('[data-document-section="preview"]').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
 
   assert.equal(
     await page.locator('[data-testid="chat-session-action-workbench"]').count(),
