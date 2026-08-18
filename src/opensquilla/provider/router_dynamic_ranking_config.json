@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-ranking-config-v4",
-  "config_version": "step2-ranking-2026-08-18.2",
+  "config_version": "step2-ranking-2026-08-18.3",
   "validation": {
     "weight_sum_tolerance": 1e-9,
     "task_profile_sum_tolerance": 0.02
@@ -209,7 +209,7 @@
     "decision_propensity": 1.0
   },
   "normalization": {
-    "price_reference_usd_per_million": 40.0,
+    "price_reference_usd_per_million": 20.0,
     "latency_reference_ms": 30000.0,
     "price_input_weight": 0.30,
     "price_output_weight": 0.70
@@ -241,6 +241,7 @@
     "prior_failure": 1
   },
   "penalties": {
+    "latency_penalty_enabled": false,
     "task_cost_weights": {
       "low": 0.20,
       "medium": 0.10,

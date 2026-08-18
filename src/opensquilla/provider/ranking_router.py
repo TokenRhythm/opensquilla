@@ -67,8 +67,9 @@ RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
 LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
-_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.2"
-_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.2"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.3"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.3"
+_PRE_RESOURCE_AWARE_RERANK_CONFIG_VERSION = "step2-ranking-2026-08-18.2"
 _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.1"
 _PREVIOUS_COST_BALANCE_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.2"
 _PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.1"
@@ -86,6 +87,7 @@ _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS = frozenset(
 )
 _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
     {
+        _PRE_RESOURCE_AWARE_RERANK_CONFIG_VERSION,
         _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION,
         _PREVIOUS_COST_BALANCE_RANKING_CONFIG_VERSION,
         _PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION,
@@ -94,10 +96,15 @@ _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
         _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION,
     }
 )
-_CURRENT_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-18.1"
-_PREVIOUS_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-07-31.1"
+_CURRENT_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-18.2"
+_PREVIOUS_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-18.1"
+_LEGACY_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-07-31.1"
 _HISTORICAL_REGISTRY_BASE_VERSIONS = frozenset(
-    {_CURRENT_REGISTRY_BASE_VERSION, _PREVIOUS_REGISTRY_BASE_VERSION}
+    {
+        _CURRENT_REGISTRY_BASE_VERSION,
+        _PREVIOUS_REGISTRY_BASE_VERSION,
+        _LEGACY_REGISTRY_BASE_VERSION,
+    }
 )
 _POST_BASE_REGISTRY_FACT_OVERRIDES = {
     "deepseek/deepseek-v4-pro": {
@@ -127,7 +134,30 @@ _POST_BASE_REGISTRY_FACT_OVERRIDES = {
     }
 }
 _POST_BASE_STATIC_PROFILE_OVERRIDES = {
-    "moonshotai/kimi-k3": {"tier_dist_prior": {"4": 0.79}}
+    "anthropic/claude-sonnet-5": {
+        "role_fit_prior": {"proposer": 0.96},
+    },
+    "moonshotai/kimi-k3": {"tier_dist_prior": {"4": 0.79}},
+    "openai/gpt-5.3-codex": {
+        "capability_dist_prior": {
+            "summarization": 0.93,
+            "writing": 0.93,
+        },
+        "domain_dist_prior": {
+            "business_analysis": 0.95,
+            "creative_writing": 0.94,
+            "education": 0.95,
+            "customer_support": 0.93,
+            "general": 0.97,
+        },
+        "tier_dist_prior": {"4": 0.94},
+        "role_fit_prior": {"proposer": 0.99},
+    },
+}
+_POST_PREVIOUS_BASE_STATIC_PROFILE_OVERRIDES = {
+    model_id: copy.deepcopy(overrides)
+    for model_id, overrides in _POST_BASE_STATIC_PROFILE_OVERRIDES.items()
+    if model_id in {"anthropic/claude-sonnet-5", "openai/gpt-5.3-codex"}
 }
 _POST_BASE_DISABLED_MODEL_IDS = frozenset(
     {
@@ -953,6 +983,24 @@ def _is_pre_role_reliability_config_version(value: Any) -> bool:
     return version in _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS
 
 
+def _is_pre_resource_aware_rerank_config_version(value: Any) -> bool:
+    """Return whether a frozen policy predates resource-aware proposer reranking."""
+
+    version = str(value or "").strip().split("+override.", 1)[0]
+    return version in {
+        _PRE_RESOURCE_AWARE_RERANK_CONFIG_VERSION,
+        _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION,
+        _PREVIOUS_COST_BALANCE_RANKING_CONFIG_VERSION,
+        _PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION,
+        _PRE_ANALYZER_CHAIN_RANKING_CONFIG_VERSION,
+        _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION,
+        "step2-ranking-2026-08-02.2",
+        "step2-ranking-2026-08-02.1",
+        _PRE_ROSTER_PACKAGED_RANKING_CONFIG_VERSION,
+        _PRE_ROSTER_LEGACY_RANKING_CONFIG_VERSION,
+    }
+
+
 def _legacy_registry_snapshot_projection(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     """Project the additive v2 thinking facts onto the exact v1 snapshot."""
 
@@ -1579,6 +1627,20 @@ def _validate_ranking_config(
             "router_dynamic legacy ranking config cannot declare thinking_assignment"
         )
     config_version = _ranking_string(config, "config_version")
+    penalties_config = _ranking_mapping(config, "penalties")
+    has_latency_penalty_policy = "latency_penalty_enabled" in penalties_config
+    predates_resource_aware_rerank = _is_pre_resource_aware_rerank_config_version(
+        config_version
+    )
+    if has_latency_penalty_policy and predates_resource_aware_rerank:
+        raise DynamicRankingError(
+            "router_dynamic historical ranking config cannot declare "
+            "penalties.latency_penalty_enabled"
+        )
+    if not has_latency_penalty_policy and not predates_resource_aware_rerank:
+        raise DynamicRankingError(
+            "router_dynamic ranking config lacks the versioned latency penalty policy"
+        )
     has_role_reliability = "role_reliability" in config
     if not has_role_reliability and not _is_pre_role_reliability_config_version(
         config_version
@@ -1844,6 +1906,7 @@ def _validate_ranking_config(
             else {}
         ),
         ("penalties",): {
+            *({"latency_penalty_enabled"} if has_latency_penalty_policy else set()),
             "task_cost_weights",
             "task_latency_weights",
             "user_cost_sensitivity_weights",
@@ -1912,6 +1975,8 @@ def _validate_ranking_config(
         }
     for object_path, expected_keys in fixed_object_keys.items():
         _require_exact_config_keys(config, object_path, expected_keys)
+    if has_latency_penalty_policy:
+        _ranking_bool(config, "penalties", "latency_penalty_enabled")
     _validate_cache_affinity_config(config)
     if "prompt_version" in aggregator_config:
         from .aggregator_prompt import AGGREGATOR_PROMPT_VERSIONS
@@ -2697,6 +2762,10 @@ def _ranking_config_for_base_version(
         )
     historical = _detached_ranking_config(packaged)
     historical["config_version"] = requested
+    historical["normalization"]["price_reference_usd_per_million"] = 40.0
+    historical["penalties"].pop("latency_penalty_enabled", None)
+    if requested == _PRE_RESOURCE_AWARE_RERANK_CONFIG_VERSION:
+        return _validate_ranking_config(historical)
     historical["task_analyzer"]["max_retries"] = 3
     historical["penalties"]["task_cost_weights"] = {
         "low": 0.20,
@@ -6622,7 +6691,11 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
         raise DynamicRankingError(
             "router_dynamic model registry cannot reconstruct the requested base snapshot"
         )
-    if requested not in {recorded_base, _PREVIOUS_REGISTRY_BASE_VERSION}:
+    if requested not in {
+        recorded_base,
+        _PREVIOUS_REGISTRY_BASE_VERSION,
+        _LEGACY_REGISTRY_BASE_VERSION,
+    }:
         raise DynamicRankingError(
             "router_dynamic model registry reliability provenance has a different base"
         )
@@ -6642,7 +6715,7 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
         if not isinstance(facts, dict):
             continue
         model_id = str(facts.get("model_id") or "").strip()
-        if requested == _PREVIOUS_REGISTRY_BASE_VERSION:
+        if requested == _LEGACY_REGISTRY_BASE_VERSION:
             if model_id in _POST_BASE_DISABLED_MODEL_IDS:
                 facts["status"] = "enabled"
             for key, value in _POST_BASE_REGISTRY_FACT_OVERRIDES.get(model_id, {}).items():
@@ -6650,13 +6723,16 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
         static_profile = row.get("static_profile")
         if not isinstance(static_profile, dict):
             continue
-        if requested == _PREVIOUS_REGISTRY_BASE_VERSION:
-            for profile_key, values in _POST_BASE_STATIC_PROFILE_OVERRIDES.get(
-                model_id, {}
-            ).items():
-                profile = static_profile.get(profile_key)
-                if isinstance(profile, dict):
-                    profile.update(copy.deepcopy(values))
+        if requested == _LEGACY_REGISTRY_BASE_VERSION:
+            profile_overrides = _POST_BASE_STATIC_PROFILE_OVERRIDES
+        elif requested == _PREVIOUS_REGISTRY_BASE_VERSION:
+            profile_overrides = _POST_PREVIOUS_BASE_STATIC_PROFILE_OVERRIDES
+        else:
+            profile_overrides = {}
+        for profile_key, values in profile_overrides.get(model_id, {}).items():
+            profile = static_profile.get(profile_key)
+            if isinstance(profile, dict):
+                profile.update(copy.deepcopy(values))
     return _validate_registry_snapshot(historical)
 
 
@@ -8604,6 +8680,12 @@ def _cost_latency_weights(
     user_profile: Mapping[str, Any] | None,
     ranking_config: Mapping[str, Any],
 ) -> tuple[float, float]:
+    penalties = _ranking_mapping(ranking_config, "penalties")
+    latency_penalty_enabled = (
+        _ranking_bool(ranking_config, "penalties", "latency_penalty_enabled")
+        if "latency_penalty_enabled" in penalties
+        else True
+    )
     constraints = task_profile.get("constraints")
     constraints_map = constraints if isinstance(constraints, Mapping) else {}
     default_cost = _ranking_number(ranking_config, "penalties", "default_cost_weight")
@@ -8619,7 +8701,7 @@ def _cost_latency_weights(
         default_latency,
     )
     if user_profile is None:
-        return cost_weight, latency_weight
+        return cost_weight, latency_weight if latency_penalty_enabled else 0.0
     preference = user_profile.get("preference")
     preference_map = preference if isinstance(preference, Mapping) else {}
     sensitivity = str(preference_map.get("cost_sensitivity") or "medium")
@@ -8645,7 +8727,15 @@ def _cost_latency_weights(
             cost_weight
             - _ranking_number(ranking_config, "penalties", "quality_first_cost_reduction"),
         )
-    return cost_weight, latency_weight
+    return cost_weight, latency_weight if latency_penalty_enabled else 0.0
+
+
+def _resource_aware_proposer_rerank_enabled(
+    ranking_config: Mapping[str, Any],
+) -> bool:
+    """Return whether proposer marginal scores include resource penalties."""
+
+    return "latency_penalty_enabled" in _ranking_mapping(ranking_config, "penalties")
 
 
 def _base_score_row(
@@ -10596,6 +10686,13 @@ def rank_models(
                 + rerank_error_weight * error_complementarity
                 - rerank_similarity_penalty * similarity
             )
+            if _resource_aware_proposer_rerank_enabled(effective_ranking_config):
+                marginal -= _as_float(row["cost_weight"]) * _as_float(
+                    row["cost_normalized"]
+                )
+                marginal -= _as_float(row["latency_weight"]) * _as_float(
+                    row["latency_normalized"]
+                )
             cache_adjustment = row.get("cache_affinity_adjustment")
             if isinstance(cache_adjustment, CacheAffinityScoreAdjustment):
                 marginal += cache_adjustment.score_adjustment

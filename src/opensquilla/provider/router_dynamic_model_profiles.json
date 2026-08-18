@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-model-registry-v2",
-  "snapshot_version": "curated-openrouter-step2-2026-08-18.1-reliability-20260818T104001Z-75215e083f8a",
+  "snapshot_version": "curated-openrouter-step2-2026-08-18.2-reliability-20260818T121632Z-a04f8e2167bf",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -2201,7 +2201,7 @@
           "4": 0.91
         },
         "role_fit_prior": {
-          "proposer": 0.96,
+          "proposer": 0.94,
           "aggregator": 0.95
         }
       },
@@ -3721,8 +3721,8 @@
           "tool_use": 0.99,
           "planning": 0.99,
           "retrieval": 0.88,
-          "summarization": 0.93,
-          "writing": 0.93,
+          "summarization": 0.89,
+          "writing": 0.86,
           "math": 0.96,
           "data_analysis": 0.96,
           "visual_understanding": 0.9,
@@ -3735,25 +3735,25 @@
           "software_engineering": 0.99,
           "data_science": 0.97,
           "document_processing": 0.88,
-          "business_analysis": 0.95,
-          "creative_writing": 0.94,
-          "education": 0.95,
+          "business_analysis": 0.9,
+          "creative_writing": 0.89,
+          "education": 0.89,
           "research": 0.89,
-          "customer_support": 0.93,
+          "customer_support": 0.88,
           "legal": 0.79,
           "finance": 0.86,
           "medical": 0.79,
           "technical_writing": 0.95,
-          "general": 0.97
+          "general": 0.91
         },
         "tier_dist_prior": {
           "1": 0.98,
           "2": 0.97,
           "3": 0.96,
-          "4": 0.94
+          "4": 0.88
         },
         "role_fit_prior": {
-          "proposer": 0.99,
+          "proposer": 0.97,
           "aggregator": 0.86
         }
       },
@@ -9731,11 +9731,11 @@
   ],
   "role_reliability_snapshot": {
     "schema_version": "role-reliability-snapshot-v2",
-    "generated_at": "2026-08-18T10:40:01+00:00",
-    "base_snapshot_version": "curated-openrouter-step2-2026-08-18.1",
+    "generated_at": "2026-08-18T12:16:32+00:00",
+    "base_snapshot_version": "curated-openrouter-step2-2026-08-18.2",
     "window_size": 50,
     "observation_policy": "aef-physical-model-calls-v5",
     "completion_gate": "manual_thresholded_draco_audit",
-    "content_sha256": "75215e083f8a7903f21a0da3d4b669da666a509ace20faf4a7a02c8c52c00306"
+    "content_sha256": "a04f8e2167bf496d989b8d600a5e8f027ef3ea4533bcd02956f50f63b2e022f7"
   }
 }
