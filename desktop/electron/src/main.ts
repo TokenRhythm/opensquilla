@@ -36,6 +36,7 @@ import {
 import {
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
+  waitForGatewayReadiness,
 } from './gateway-lifecycle.js'
 import { buildCliInvocation } from './cli-invocation.js'
 import {
@@ -7662,15 +7663,20 @@ function classifyGatewayExitMessage(message: string, outputTail: string): string
 }
 
 async function waitForGateway(url: string, earlyExitMessage?: () => string | null): Promise<void> {
-  const startedAt = Date.now()
-  while (Date.now() - startedAt < 45_000) {
-    const earlyExit = earlyExitMessage?.()
-    if (earlyExit) throw new Error(earlyExit)
-    if (await healthCheck(url)) return
-    await new Promise((resolveWait) => setTimeout(resolveWait, 500))
+  const result = await waitForGatewayReadiness({
+    probe: () => healthCheck(url),
+    exitMessage: earlyExitMessage,
+    primaryTimeoutMs: 45_000,
+    lateGraceMs: 15_000,
+    pollIntervalMs: 500,
+  })
+  if (result.status === 'ready') {
+    if (result.late) {
+      desktopLog('gateway_health_ready_after_primary_deadline', { port: gatewayState.port })
+    }
+    return
   }
-  const earlyExit = earlyExitMessage?.()
-  if (earlyExit) throw new Error(earlyExit)
+  if (result.status === 'exited') throw new Error(result.message)
   throw new Error(`Gateway did not become healthy at ${url}`)
 }
 
@@ -7716,6 +7722,9 @@ async function reuseHealthyGatewayState(): Promise<GatewayState | null> {
   if (gatewayProfileKey !== desktopProfileKey()) return null
   if (!gatewayState.url) return null
   if (gatewayState.status !== 'ready' && !gatewayProcess) return null
+  // A live owned child must pass the exact-child and profile checks in
+  // resumeOwnedGatewayStartup; a healthy port alone is not ownership proof.
+  if (gatewayProcess && gatewayState.owned) return null
 
   if (await healthCheck(gatewayState.url)) {
     gatewayState.status = 'ready'
@@ -7729,6 +7738,44 @@ async function reuseHealthyGatewayState(): Promise<GatewayState | null> {
     gatewayState.status = 'stopped'
   }
   return null
+}
+
+async function resumeOwnedGatewayStartup(): Promise<GatewayState | null> {
+  const child = gatewayProcess
+  if (
+    !child
+    || !gatewayState.owned
+    || !gatewayState.url
+    || gatewayProfileKey !== desktopProfileKey()
+    || hasGatewayProcessExited(child)
+  ) return null
+
+  const url = gatewayState.url
+  const childExitMessage = (): string | null => {
+    if (gatewayProcess === child && !hasGatewayProcessExited(child)) return null
+    return gatewayState.error || 'gateway exited before becoming healthy'
+  }
+  gatewayState.status = 'starting'
+  gatewayState.error = undefined
+  sendBootStatus('gateway-health')
+  await waitForGateway(url, childExitMessage)
+  await waitForControlUi(url, childExitMessage)
+
+  // Health alone never grants ownership. The same exact child and profile that
+  // entered this resume path must still be current after both asynchronous
+  // probes, otherwise a concurrent restart or profile switch won the race.
+  if (
+    gatewayProcess !== child
+    || hasGatewayProcessExited(child)
+    || gatewayProfileKey !== desktopProfileKey()
+  ) {
+    throw new Error(childExitMessage() || 'Desktop gateway changed while startup resumed.')
+  }
+
+  gatewayState.status = 'ready'
+  gatewayState.error = undefined
+  sendBootStatus('control')
+  return gatewayState
 }
 
 const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000
@@ -7836,6 +7883,11 @@ async function startGateway(): Promise<GatewayState> {
     })
     throw new Error(desktopGatewayStillRunningMessage())
   }
+
+  const resumedGateway = forceOnboardingOnNextStartup
+    ? null
+    : await resumeOwnedGatewayStartup()
+  if (resumedGateway) return resumedGateway
 
   if (gatewayProcess && gatewayState.owned) {
     if (hasGatewayProcessExited(gatewayProcess)) {
@@ -12427,11 +12479,40 @@ ipcMain.handle('desktop:boot:state', () => ({
   gateway: { ...gatewayState },
   recovery: recoveryStateSnapshot(),
 }))
+ipcMain.handle('desktop:boot:resume', async () => {
+  bootError = null
+  await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
+  try {
+    const gateway = gatewayStartPromise
+      ? await gatewayStartPromise
+      : await resumeOwnedGatewayStartup()
+    if (!gateway) {
+      // With no exact live child to resume, use the normal open flow so profile
+      // inspection and recovery gates still run before any replacement spawn.
+      void openOrResumeDesktopApp()
+      return { ok: true }
+    }
+    await loadControlUiIntoCurrentWindow(gateway.url)
+    return { ok: true }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    if (gatewayState.status !== 'ready') {
+      gatewayState.status = 'error'
+      gatewayState.error = message
+    }
+    desktopLog('gateway_start_resume_failed', {
+      gatewayPid: gatewayProcess?.pid,
+      gatewayStatus: gatewayState.status,
+      error: message,
+    })
+    sendBootError(message)
+    return { ok: false, error: message }
+  }
+})
 ipcMain.handle('desktop:boot:retry', async () => {
-  // Backs both the boot-error "Retry" button and the Control UI "Restart
-  // runtime" action. If a start attempt is already in flight, join it and clear
-  // the stale bootError so the reloaded splash shows live progress instead of
-  // instantly re-rendering the previous error panel.
+  // The Control UI "Restart runtime" action intentionally forces a new child.
+  // The boot page uses desktop:boot:resume instead so a slow owned child can be
+  // accepted after it becomes healthy instead of being torn down first.
   if (gatewayStartPromise) {
     bootError = null
     void openOrResumeDesktopApp()

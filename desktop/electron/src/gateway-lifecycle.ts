@@ -6,6 +6,58 @@ export interface LifecycleProcessDrainOptions<T> {
   maxRounds?: number
 }
 
+export interface GatewayReadinessWaitOptions {
+  probe: () => Promise<boolean>
+  exitMessage?: () => string | null
+  primaryTimeoutMs: number
+  lateGraceMs: number
+  pollIntervalMs: number
+  now?: () => number
+  sleep?: (milliseconds: number) => Promise<void>
+}
+
+export type GatewayReadinessWaitResult =
+  | { status: 'ready'; late: boolean }
+  | { status: 'exited'; message: string }
+  | { status: 'timeout' }
+
+/**
+ * Wait for a spawned Gateway without turning the first readiness deadline into
+ * an irreversible failure. The late window remains bounded, and child exit is
+ * checked on both sides of every probe so a dead process never consumes the
+ * remainder of the startup budget.
+ */
+export async function waitForGatewayReadiness(
+  options: GatewayReadinessWaitOptions,
+): Promise<GatewayReadinessWaitResult> {
+  const now = options.now ?? Date.now
+  const sleep = options.sleep ?? ((milliseconds: number) => (
+    new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
+  ))
+  const primaryTimeoutMs = Math.max(0, options.primaryTimeoutMs)
+  const totalTimeoutMs = primaryTimeoutMs + Math.max(0, options.lateGraceMs)
+  const pollIntervalMs = Math.max(1, options.pollIntervalMs)
+  const startedAt = now()
+
+  while (true) {
+    const beforeProbeExit = options.exitMessage?.()
+    if (beforeProbeExit) return { status: 'exited', message: beforeProbeExit }
+
+    const elapsedBeforeProbe = Math.max(0, now() - startedAt)
+    if (elapsedBeforeProbe > totalTimeoutMs) return { status: 'timeout' }
+    const ready = await options.probe()
+
+    const afterProbeExit = options.exitMessage?.()
+    if (afterProbeExit) return { status: 'exited', message: afterProbeExit }
+    if (ready) return { status: 'ready', late: elapsedBeforeProbe >= primaryTimeoutMs }
+
+    const elapsedAfterProbe = Math.max(0, now() - startedAt)
+    const remainingMs = totalTimeoutMs - elapsedAfterProbe
+    if (remainingMs <= 0) return { status: 'timeout' }
+    await sleep(Math.min(pollIntervalMs, remainingMs))
+  }
+}
+
 export function lifecycleAllowsProcessSpawn(
   lifecycleClosing: boolean,
   profileWriterAdmissionClosed: boolean,
