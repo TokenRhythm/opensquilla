@@ -580,6 +580,9 @@ export interface SessionSteerV2Params {
   expected_turn_id: string
   client_request_id: string
   client_message_id: string
+  pendingInputId?: string
+  requestFingerprint?: string
+  expectedRevision?: number
   surface_id?: string
   _source?: { elevated?: string; runMode?: 'safe' | 'full' }
 }

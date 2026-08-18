@@ -221,6 +221,18 @@ class TaskHandle:
     status: AgentTaskStatus
 
 
+@dataclass(frozen=True, slots=True)
+class TaskRuntimeShutdownResult:
+    """Observable outcome of one process-lifetime runtime shutdown."""
+
+    clean: bool
+    elapsed_ms: int
+    abandoned_task_count: int
+    remaining_driver_count: int
+    remaining_reservation_count: int
+    remaining_auxiliary_count: int
+
+
 @dataclass(frozen=True)
 class SteerAdmissionResult:
     """Result of one expected-turn same-turn input admission."""
@@ -879,6 +891,14 @@ class TaskQueueFullError(RuntimeError):
         self.max_pending = max_pending
 
 
+class TaskRuntimeShuttingDownError(RuntimeError):
+    """Raised when new root work arrives after shutdown admission closes."""
+
+    def __init__(self, *, session_key: str) -> None:
+        super().__init__(f"task runtime is shutting down; rejected session '{session_key}'")
+        self.session_key = session_key
+
+
 class _CollectIdentityRebindError(RuntimeError):
     """Legacy collect could not durably bind its prompt to the queued turn."""
 
@@ -1011,6 +1031,8 @@ class TaskRuntime:
         # follow-up write cannot rely on the durable-task event alone.
         self._driver_tasks_by_session: dict[str, set[asyncio.Task[None]]] = {}
         self._driver_state_changed = asyncio.Event()
+        self._closing = False
+        self._shutdown_task: asyncio.Task[TaskRuntimeShutdownResult] | None = None
         self._terminal_fallback_records: dict[str, AgentTaskRecord] = {}
         self._pending_by_session: dict[str, list[_RuntimeTask]] = {}
         self._running_by_session: dict[str, _RuntimeTask] = {}
@@ -1432,6 +1454,8 @@ class TaskRuntime:
 
         async with self.collect_admission(key):
             async with self._state_lock:
+                if self._closing:
+                    return False
                 busy = bool(
                     self._pending_by_session.get(key)
                     or self._running_by_session.get(key)
@@ -1441,6 +1465,7 @@ class TaskRuntime:
                 if busy:
                     return False
                 self._auxiliary_tasks_by_session[key] = current
+                self._signal_driver_state_changed()
 
         execution_lock = self._session_execution_locks.setdefault(key, asyncio.Lock())
         try:
@@ -1460,6 +1485,7 @@ class TaskRuntime:
             async with self._state_lock:
                 if self._auxiliary_tasks_by_session.get(key) is current:
                     self._auxiliary_tasks_by_session.pop(key, None)
+                    self._signal_driver_state_changed()
 
     @contextlib.asynccontextmanager
     async def quiesce_sessions(
@@ -1758,6 +1784,7 @@ class TaskRuntime:
         update_envelope_cache: bool = True,
         overflow_policy: PendingOverflowPolicy | str | None = None,
         bypass_pending_limit: bool = False,
+        _allow_during_shutdown: bool = False,
     ) -> TaskReservation:
         """Reserve queue admission without persistence, cancellation, or execution."""
 
@@ -1925,6 +1952,10 @@ class TaskRuntime:
         )
 
         async with self._state_lock:
+            if self._closing and not _allow_during_shutdown:
+                raise TaskRuntimeShuttingDownError(
+                    session_key=envelope.session_key,
+                )
             if (
                 not bypass_pending_limit
                 and queue_mode not in {QueueMode.STEER.value, QueueMode.INTERRUPT.value}
@@ -1963,6 +1994,7 @@ class TaskRuntime:
             self._reservations_by_session.setdefault(envelope.session_key, []).append(
                 reservation
             )
+            self._signal_driver_state_changed()
         try:
             runtime_task.envelope = _materialize_guest_task_envelope(
                 runtime_task.envelope,
@@ -1993,6 +2025,7 @@ class TaskRuntime:
                     reservation.overflow_victim.task_id
                 )
             reservation.aborted = True
+            self._signal_driver_state_changed()
         _cleanup_guest_profile(reservation.runtime_task)
 
     async def _emit_queued_activation(
@@ -2908,7 +2941,7 @@ class TaskRuntime:
         timeout: float = 5.0,
         graceful: bool = False,
         graceful_timeout: float | None = None,
-    ) -> None:
+    ) -> TaskRuntimeShutdownResult:
         """Shut down all in-flight tasks.
 
         Parameters
@@ -2929,78 +2962,225 @@ class TaskRuntime:
         graceful_timeout:
             Deadline (seconds) for the graceful drain phase.  ``None`` means
             wait indefinitely (use with care in production; set a finite value).
+
+        The first call closes admission and owns the shutdown budgets. Concurrent
+        and later callers await that same process-lifetime shutdown result.
         """
-        auxiliary_tasks = [
-            task
-            for task in self._auxiliary_tasks_by_session.values()
-            if not task.done()
-        ]
+        async with self._state_lock:
+            shutdown_task = self._shutdown_task
+            if shutdown_task is None:
+                self._closing = True
+                shutdown_task = asyncio.create_task(
+                    self._shutdown_impl(
+                        cancel=cancel,
+                        timeout=timeout,
+                        graceful=graceful,
+                        graceful_timeout=graceful_timeout,
+                    )
+                )
+                self._shutdown_task = shutdown_task
+                self._signal_driver_state_changed()
+        return await asyncio.shield(shutdown_task)
+
+    async def _shutdown_impl(
+        self,
+        *,
+        cancel: bool,
+        timeout: float,
+        graceful: bool,
+        graceful_timeout: float | None,
+    ) -> TaskRuntimeShutdownResult:
+        started = time.monotonic()
+        abandoned_task_count = 0
+
+        async with self._state_lock:
+            auxiliary_tasks = {
+                task
+                for task in self._auxiliary_tasks_by_session.values()
+                if not task.done()
+            }
         for auxiliary_task in auxiliary_tasks:
             auxiliary_task.cancel()
-        tasks = [
-            task.asyncio_task
-            for task in self._tasks.values()
-            if task.asyncio_task is not None and not task.asyncio_task.done()
-        ]
-        if auxiliary_tasks:
-            await asyncio.gather(*auxiliary_tasks, return_exceptions=True)
-        if not tasks:
-            return
 
         if graceful:
-            # Phase 1: wait for all tasks to finish naturally.
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*tasks, return_exceptions=True),
-                    timeout=graceful_timeout,
-                )
-                return
-            except TimeoutError:
-                log.warning(
-                    "task_runtime.graceful_shutdown_timeout",
-                    graceful_timeout=graceful_timeout,
-                    remaining=sum(1 for t in tasks if not t.done()),
-                )
-            # Phase 2: cancel whatever is still running after the drain timeout.
-            tasks = [t for t in tasks if not t.done()]
+            graceful_deadline = (
+                None
+                if graceful_timeout is None
+                else time.monotonic() + max(0.0, graceful_timeout)
+            )
+            if await self._wait_for_shutdown_quiescence(deadline=graceful_deadline):
+                return await self._shutdown_result(started, abandoned_task_count)
+            drivers, reservations, auxiliaries = await self._shutdown_counts()
+            log.warning(
+                "task_runtime.graceful_shutdown_timeout",
+                graceful_timeout=graceful_timeout,
+                remaining_drivers=drivers,
+                remaining_reservations=reservations,
+                remaining_auxiliary=auxiliaries,
+            )
 
+        cancel_deadline = time.monotonic() + max(0.0, timeout)
+        cancelled_drivers: set[asyncio.Task[None]] = set()
         if cancel:
+            await self._request_shutdown_cancellation(
+                source="gateway_shutdown",
+                reason="graceful_timeout" if graceful else "shutdown",
+                cancelled_drivers=cancelled_drivers,
+            )
+        if await self._wait_for_shutdown_quiescence(
+            deadline=cancel_deadline,
+            cancel_source=("gateway_shutdown" if cancel else None),
+            cancel_reason=("graceful_timeout" if graceful else "shutdown"),
+            cancelled_drivers=cancelled_drivers,
+        ):
+            return await self._shutdown_result(started, abandoned_task_count)
+
+        # Claim and persist the timeout terminal state before delivering the
+        # final cancellation. Otherwise the driver can win the cancellation
+        # race, publish an earlier classification, and leave the shutdown
+        # coordinator without a durable ABANDONED record at return time.
+        marked_abandoned = await self._mark_unfinished_abandoned()
+        timed_out_tasks = await self._request_shutdown_cancellation(
+            source="gateway_shutdown_timeout",
+            reason="shutdown_timeout",
+            cancelled_drivers=cancelled_drivers,
+            force=True,
+        )
+        abandoned_task_count = max(timed_out_tasks, marked_abandoned)
+        return await self._shutdown_result(started, abandoned_task_count)
+
+    async def _request_shutdown_cancellation(
+        self,
+        *,
+        source: str,
+        reason: str,
+        cancelled_drivers: set[asyncio.Task[None]],
+        force: bool = False,
+    ) -> int:
+        """Cancel every currently visible driver once per shutdown phase."""
+
+        async with self._state_lock:
             runtime_tasks = [
-                runtime_task
-                for runtime_task in list(self._tasks.values())
-                if runtime_task.asyncio_task in tasks
+                task
+                for task in self._tasks.values()
+                if task.status not in TERMINAL_STATUSES
+                and (
+                    force
+                    or not task.cancel_requested
+                    or task.cancel_source != source
+                )
             ]
+            drivers = {
+                driver
+                for session_drivers in self._driver_tasks_by_session.values()
+                for driver in session_drivers
+                if not driver.done()
+            }
+            runtime_drivers = {
+                task.asyncio_task
+                for task in runtime_tasks
+                if task.asyncio_task is not None
+            }
+            for task in runtime_tasks:
+                if task.asyncio_task is not None:
+                    cancelled_drivers.add(task.asyncio_task)
+
+        if runtime_tasks:
             await self._cancel_runtime_tasks(
                 runtime_tasks,
-                source="gateway_shutdown",
-                reason=("graceful_timeout" if graceful else "shutdown"),
+                source=source,
+                reason=reason,
             )
-        if tasks:
-            done, pending = await asyncio.wait(tasks, timeout=timeout)
-            if pending:
-                pending_drivers = set(pending)
-                async with self._state_lock:
-                    for runtime_task in self._tasks.values():
-                        if (
-                            runtime_task.asyncio_task in pending_drivers
-                            and not runtime_task.terminal_closing
-                        ):
-                            # The driver cancellation below is an implementation
-                            # detail of the expired shutdown wait. Preserve the
-                            # public ABANDONED contract regardless of whether its
-                            # CancelledError branch or the fallback marker wins.
-                            runtime_task.cancel_requested = True
-                            runtime_task.cancel_source = "gateway_shutdown_timeout"
-                            runtime_task.cancel_reason = "shutdown_timeout"
-            for task in pending:
-                task.cancel()
-            if pending:
-                await self._mark_unfinished_abandoned()
-            for task in done:
-                try:
-                    task.result()
-                except (asyncio.CancelledError, Exception):
-                    pass
+        for driver in drivers:
+            if driver not in runtime_drivers and (
+                force or driver not in cancelled_drivers
+            ):
+                driver.cancel()
+                cancelled_drivers.add(driver)
+        return len(runtime_tasks)
+
+    async def _wait_for_shutdown_quiescence(
+        self,
+        *,
+        deadline: float | None,
+        cancel_source: str | None = None,
+        cancel_reason: str | None = None,
+        cancelled_drivers: set[asyncio.Task[None]] | None = None,
+    ) -> bool:
+        """Wait for the driver registry and admission gap to reach a fixed point."""
+
+        if cancelled_drivers is None:
+            cancelled_drivers = set()
+        while True:
+            if cancel_source is not None:
+                await self._request_shutdown_cancellation(
+                    source=cancel_source,
+                    reason=cancel_reason or "shutdown",
+                    cancelled_drivers=cancelled_drivers,
+                )
+
+            async with self._state_lock:
+                state_changed = self._driver_state_changed
+                drivers = {
+                    driver
+                    for session_drivers in self._driver_tasks_by_session.values()
+                    for driver in session_drivers
+                }
+                reservations = sum(
+                    len(items) for items in self._reservations_by_session.values()
+                )
+                auxiliaries = {
+                    task for task in self._auxiliary_tasks_by_session.values()
+                }
+            if not drivers and reservations == 0 and not auxiliaries:
+                return True
+
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+
+            state_waiter = asyncio.create_task(state_changed.wait())
+            waiters: set[asyncio.Task[Any]] = {
+                state_waiter,
+                *(driver for driver in drivers if not driver.done()),
+                *(task for task in auxiliaries if not task.done()),
+            }
+            done, _pending = await asyncio.wait(
+                waiters,
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not state_waiter.done():
+                state_waiter.cancel()
+                await asyncio.gather(state_waiter, return_exceptions=True)
+            if not done:
+                return False
+
+    async def _shutdown_counts(self) -> tuple[int, int, int]:
+        async with self._state_lock:
+            drivers = sum(
+                len(items) for items in self._driver_tasks_by_session.values()
+            )
+            reservations = sum(
+                len(items) for items in self._reservations_by_session.values()
+            )
+            auxiliaries = len(self._auxiliary_tasks_by_session)
+        return drivers, reservations, auxiliaries
+
+    async def _shutdown_result(
+        self,
+        started: float,
+        abandoned_task_count: int,
+    ) -> TaskRuntimeShutdownResult:
+        drivers, reservations, auxiliaries = await self._shutdown_counts()
+        return TaskRuntimeShutdownResult(
+            clean=drivers == 0 and reservations == 0 and auxiliaries == 0,
+            elapsed_ms=max(0, int((time.monotonic() - started) * 1000)),
+            abandoned_task_count=abandoned_task_count,
+            remaining_driver_count=drivers,
+            remaining_reservation_count=reservations,
+            remaining_auxiliary_count=auxiliaries,
+        )
 
     async def apply_overflow_policy(
         self,
@@ -4510,6 +4690,11 @@ class TaskRuntime:
                 message_count=max(1, len(message_ids)),
                 fresh_user_session=False,
                 update_envelope_cache=False,
+                # These inputs were accepted before shutdown admission closed.
+                # Their durable ownership transfer must still complete, but the
+                # ``activate=False`` shutdown path below leaves execution for
+                # startup recovery.
+                _allow_during_shutdown=True,
             )
             if atomic_promotion:
                 promote_inputs_fn = cast(
@@ -5693,10 +5878,10 @@ class TaskRuntime:
                 exc_info=True,
             )
 
-    async def _mark_unfinished_abandoned(self) -> None:
+    async def _mark_unfinished_abandoned(self) -> int:
         async with self._state_lock:
             unfinished = [
-                task for task in self._tasks.values() if task.status not in TERMINAL_STATUSES
+                task for task in self._tasks.values() if not task.terminal_closing
             ]
         for task in unfinished:
             await self._mark_terminal(
@@ -5706,6 +5891,7 @@ class TaskRuntime:
                 promote_pending_steers=True,
                 activate_promoted_steers=False,
             )
+        return len(unfinished)
 
     def _remove_pending(self, task: _RuntimeTask) -> None:
         pending = self._pending_by_session.get(task.envelope.session_key)

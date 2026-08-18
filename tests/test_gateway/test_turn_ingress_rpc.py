@@ -2541,6 +2541,39 @@ async def test_sessions_send_queue_full_is_unaccepted_and_does_not_persist_messa
 
 
 @pytest.mark.asyncio
+async def test_sessions_send_during_shutdown_is_unavailable_without_persistence(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        result = await stack.runtime.shutdown(timeout=1.0)
+        assert result.clean is True
+
+        response = await get_dispatcher().dispatch(
+            "rpc-runtime-shutting-down",
+            "sessions.send",
+            {
+                "key": SESSION_KEY,
+                "message": "must not be persisted",
+                "clientRequestId": CLIENT_REQUEST_ID,
+                "queueMode": "followup",
+            },
+            stack.context,
+        )
+
+        assert response.ok is False
+        assert response.error is not None
+        assert response.error.code == "UNAVAILABLE"
+        assert response.error.retryable is True
+        assert response.error.accepted is False
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 0,
+            "agent_tasks": 0,
+            "turn_ingress_receipts": 0,
+        }
+        _assert_no_runtime_acceptance_state(stack.runtime)
+
+
+@pytest.mark.asyncio
 async def test_collect_mode_atomically_merges_message_and_receipt_into_queued_task(
     tmp_path: Path,
 ) -> None:

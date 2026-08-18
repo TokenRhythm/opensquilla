@@ -1728,6 +1728,23 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!options.supportsMethod?.('sessions.steer.v2')) {
       return recovered ? 'retryable_failure' : 'not_sent'
     }
+    const durablePending = Boolean(
+      recovered?.request.pendingInputId
+      || (
+        pendingItem?.pendingPersistenceState === 'staged'
+        && pendingItem.pendingInputId
+        && pendingItem.pendingClientRequestId
+        && pendingItem.pendingClientMessageId
+        && pendingItem.pendingRequestFingerprint
+        && pendingItem.pendingServerRevision
+      ),
+    )
+    if (
+      durablePending
+      && !options.supportsMethod?.('sessions.pending_inputs.steer')
+    ) {
+      return recovered ? 'retryable_failure' : 'not_sent'
+    }
     if (
       !recovered
       && !canSteerPayload(
@@ -1747,12 +1764,36 @@ export function useChatSend(options: UseChatSendOptions) {
 
     const expectedTurnId = recovered?.request.expected_turn_id || capabilityExpectedTurnId()
     if (!expectedTurnId) return 'not_sent'
+    const pendingIdentity = pendingItem?.pendingPersistenceState === 'staged'
+      && pendingItem.pendingInputId
+      && pendingItem.pendingClientRequestId
+      && pendingItem.pendingClientMessageId
+      && pendingItem.pendingRequestFingerprint
+      && pendingItem.pendingServerRevision
+      ? {
+          pendingInputId: pendingItem.pendingInputId,
+          clientRequestId: pendingItem.pendingClientRequestId,
+          clientMessageId: pendingItem.pendingClientMessageId,
+          requestFingerprint: pendingItem.pendingRequestFingerprint,
+          expectedRevision: pendingItem.pendingServerRevision,
+        }
+      : null
+    if (durablePending && !pendingIdentity && !recovered?.request.pendingInputId) {
+      return recovered ? 'retryable_failure' : 'not_sent'
+    }
     const freshParams: SessionSteerV2Params = {
       key: requestSessionKey,
       message: text.trim(),
       expected_turn_id: expectedTurnId,
-      client_request_id: createClientRequestId(),
-      client_message_id: createClientMessageId(),
+      client_request_id: pendingIdentity?.clientRequestId || createClientRequestId(),
+      client_message_id: pendingIdentity?.clientMessageId || createClientMessageId(),
+      ...(pendingIdentity
+        ? {
+            pendingInputId: pendingIdentity.pendingInputId,
+            requestFingerprint: pendingIdentity.requestFingerprint,
+            expectedRevision: pendingIdentity.expectedRevision,
+          }
+        : {}),
       surface_id: 'webui',
       _source: chatSourceMetadata(options),
     }
@@ -1793,7 +1834,9 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     try {
       const response = await options.rpc.call<SessionSteerV2Response>(
-        'sessions.steer.v2',
+        params.pendingInputId
+          ? 'sessions.pending_inputs.steer'
+          : 'sessions.steer.v2',
         params as unknown as Record<string, unknown>,
       )
       const sessionChanged = options.sessionKey.value !== requestSessionKey

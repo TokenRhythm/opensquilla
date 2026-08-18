@@ -55,6 +55,7 @@ from opensquilla.gateway.session_lifecycle import (
 )
 from opensquilla.gateway.session_services import get_session_lock, get_session_storage
 from opensquilla.gateway.session_streams import get_session_streams, reset_session_streams
+from opensquilla.gateway.task_runtime import TaskRuntimeShutdownResult
 from opensquilla.gateway.terminal_activity import (
     append_activity_phase,
     is_usage_accounting_barrier,
@@ -2236,12 +2237,21 @@ class GatewayServer:
         finally:
             self._pid_lock = None
 
-    async def close(self, reason: str = "shutdown") -> None:
+    async def close(
+        self,
+        reason: str = "shutdown",
+    ) -> TaskRuntimeShutdownResult | None:
         """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server."""
+        runtime_shutdown_result: TaskRuntimeShutdownResult | None = None
+        runtime_shutdown_clean = bool(
+            self._services is None
+            or getattr(self._services, "task_runtime", None) is None
+        )
         try:
-            # Drain in-flight turns FIRST so replies are not lost.
-            # task_runtime.shutdown() waits for all running turns to complete before
-            # returning; only then do we stop channel delivery.
+            # Drain in-flight turns FIRST so replies are not lost. A bounded
+            # shutdown can report residual drivers; in that case transports are
+            # stopped below but stateful dependencies stay open until the process
+            # watchdog terminates the Gateway.
             drain_budget = gateway_graceful_timeout()
             goal_service = (
                 getattr(self._services, "goal_service", None)
@@ -2255,13 +2265,40 @@ class GatewayServer:
                     log.debug("gateway.goal_service_shutdown_failed", exc_info=True)
             if self._services is not None and self._services.task_runtime is not None:
                 try:
-                    await self._services.task_runtime.shutdown(
+                    runtime_shutdown_result = await self._services.task_runtime.shutdown(
                         graceful=True, graceful_timeout=drain_budget
                     )
+                    runtime_shutdown_clean = (
+                        runtime_shutdown_result is None
+                        or runtime_shutdown_result.clean
+                    )
                 except Exception:
-                    pass
+                    runtime_shutdown_clean = False
+                    runtime_shutdown_result = TaskRuntimeShutdownResult(
+                        clean=False,
+                        elapsed_ms=0,
+                        abandoned_task_count=0,
+                        remaining_driver_count=0,
+                        remaining_reservation_count=0,
+                        remaining_auxiliary_count=0,
+                    )
+                    log.exception("gateway.task_runtime_shutdown_failed")
 
-            if self._background_completion_manager is not None:
+            if runtime_shutdown_result is not None and not runtime_shutdown_result.clean:
+                log.error(
+                    "gateway.task_runtime_shutdown_incomplete",
+                    elapsed_ms=runtime_shutdown_result.elapsed_ms,
+                    abandoned_tasks=runtime_shutdown_result.abandoned_task_count,
+                    remaining_drivers=runtime_shutdown_result.remaining_driver_count,
+                    remaining_reservations=(
+                        runtime_shutdown_result.remaining_reservation_count
+                    ),
+                    remaining_auxiliary=(
+                        runtime_shutdown_result.remaining_auxiliary_count
+                    ),
+                )
+
+            if self._background_completion_manager is not None and runtime_shutdown_clean:
                 try:
                     await self._background_completion_manager.close(timeout=drain_budget)
                 except Exception:
@@ -2275,6 +2312,10 @@ class GatewayServer:
                 except Exception:
                     pass
                 self._background_completion_manager = None
+            elif self._background_completion_manager is not None:
+                log.warning(
+                    "gateway.background_completion_close_skipped_for_live_runtime"
+                )
 
             # Stop channels after task_runtime is drained (no in-flight turns remain)
             live_channel_manager = self._channel_manager
@@ -2292,21 +2333,34 @@ class GatewayServer:
                 await conn.close()
 
             # Close MCP clients
-            try:
-                from opensquilla.mcp.discovery import close_active_clients
+            if runtime_shutdown_clean:
+                try:
+                    from opensquilla.mcp.discovery import close_active_clients
 
-                await close_active_clients()
-                log.info("gateway.mcp_clients_closed")
-            except ImportError:
-                pass
+                    await close_active_clients()
+                    log.info("gateway.mcp_clients_closed")
+                except ImportError:
+                    log.debug(
+                        "gateway.mcp_clients_close_skipped_import_unavailable",
+                        exc_info=True,
+                    )
+            else:
+                log.warning("gateway.mcp_clients_close_skipped_for_live_runtime")
 
-            log.info("gateway.stopped", reason=reason)
+            if runtime_shutdown_clean:
+                log.info("gateway.stopped", reason=reason)
+            else:
+                log.warning(
+                    "gateway.transports_stopped_with_runtime_residuals",
+                    reason=reason,
+                )
         finally:
             # Always stop the serve task so it is never left pending, even when a
             # teardown step above raised (close() is now invoked on every shutdown,
             # not only on Ctrl+C, so the serve task is typically still running). A
-            # teardown exception still propagates after this runs; the pid lock is
-            # released regardless in the inner finally.
+            # teardown exception still propagates after this runs. The pid lock
+            # is released only after a clean runtime shutdown; otherwise process
+            # exit remains the ownership fence.
             try:
                 if self._server is not None:
                     self._server.should_exit = True
@@ -2331,13 +2385,17 @@ class GatewayServer:
                         preview_task.cancel()
                 if preview_socket is not None:
                     preview_socket.close()
-                if self._services is not None:
+                if self._services is not None and runtime_shutdown_clean:
                     try:
                         await self._services.close()
                     except Exception:
                         log.debug("gateway.services_close_failed", exc_info=True)
+                elif self._services is not None:
+                    log.warning("gateway.services_close_skipped_for_live_runtime")
             finally:
-                self._release_pid_lock()
+                if runtime_shutdown_clean:
+                    self._release_pid_lock()
+        return runtime_shutdown_result
 
 
 def build_flush_service(

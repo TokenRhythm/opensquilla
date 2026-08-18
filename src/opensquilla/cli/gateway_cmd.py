@@ -7,9 +7,12 @@ import json
 import os
 import signal
 import socket
+import sys
+import threading
 import time
 from collections.abc import Callable
 
+import structlog
 import typer
 
 from opensquilla.cli.gateway_lifecycle import (
@@ -29,11 +32,59 @@ from opensquilla.gateway.config import GatewayConfig, is_public_bind, resolve_li
 from opensquilla.gateway.config_migration import ConfigParseError
 from opensquilla.paths import default_opensquilla_home
 
+log = structlog.get_logger(__name__)
+
 _SHUTDOWN_SIGNALS: tuple[signal.Signals, ...] = tuple(
     sig
     for sig in (getattr(signal, "SIGINT", None), getattr(signal, "SIGTERM", None))
     if sig is not None
 )
+
+
+def _flush_shutdown_streams() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (OSError, ValueError):
+            # A closed or failed stream must not prevent the watchdog exit.
+            continue
+
+
+def _force_process_exit(exit_code: int) -> None:
+    """End the real Gateway process without running cancellation cleanup again."""
+
+    os._exit(exit_code)
+
+
+class _GatewayShutdownWatchdog:
+    """Process boundary for a close path that cannot cooperatively finish."""
+
+    def __init__(self, *, timeout: float, exit_code: int) -> None:
+        self._timeout = max(0.0, timeout)
+        self._exit_code = exit_code
+        self._disarmed = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="opensquilla-gateway-shutdown-watchdog",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def disarm(self) -> None:
+        self._disarmed.set()
+
+    def _run(self) -> None:
+        if self._disarmed.wait(self._timeout):
+            return
+        log.error(
+            "gateway.shutdown_watchdog_expired",
+            timeout=self._timeout,
+            exit_code=self._exit_code,
+        )
+        _flush_shutdown_streams()
+        _force_process_exit(self._exit_code)
 
 
 def _install_shutdown_handlers(
@@ -217,7 +268,7 @@ def run_gateway(
             "self-disable that pill.[/yellow]"
         )
 
-    async def _run() -> None:
+    async def _run() -> bool:
         # Subscription manager is gateway-specific (WS event routing)
         from opensquilla.gateway.websocket import SubscriptionManager
 
@@ -264,24 +315,65 @@ def run_gateway(
                 app.state.request_shutdown = _request_shutdown
         server_task = server._task
         waiter = asyncio.ensure_future(shutdown.wait())
+        explicit_shutdown = False
         try:
             await asyncio.wait(
                 {server_task, waiter}, return_when=asyncio.FIRST_COMPLETED
             )
-            await server.close(shutdown_reason)
+            close_reason = shutdown_reason
+            explicit_shutdown = shutdown.is_set()
         except (KeyboardInterrupt, asyncio.CancelledError):
             # Fallback for platforms where add_signal_handler is unavailable
             # (Windows / non-main-thread): SIGINT arrives as KeyboardInterrupt.
             shutdown.set()
-            await server.close("keyboard_interrupt")
+            close_reason = "keyboard_interrupt"
+            explicit_shutdown = True
         finally:
             waiter.cancel()
             _remove_shutdown_handlers(loop, installed_signals)
-        if shutdown.is_set():
+
+        exit_code = 0 if explicit_shutdown else 1
+        watchdog = _GatewayShutdownWatchdog(
+            timeout=gateway_shutdown_deadline(),
+            exit_code=exit_code,
+        )
+        watchdog.start()
+        close_result = await server.close(close_reason)
+        clean = close_result is None or bool(getattr(close_result, "clean", False))
+        if not clean:
+            log.error(
+                "gateway.shutdown_incomplete_force_exit",
+                reason=close_reason,
+                exit_code=exit_code,
+                remaining_drivers=getattr(
+                    close_result,
+                    "remaining_driver_count",
+                    None,
+                ),
+                remaining_reservations=getattr(
+                    close_result,
+                    "remaining_reservation_count",
+                    None,
+                ),
+                remaining_auxiliary=getattr(
+                    close_result,
+                    "remaining_auxiliary_count",
+                    None,
+                ),
+            )
+            watchdog.disarm()
+            _flush_shutdown_streams()
+            _force_process_exit(exit_code)
+            return explicit_shutdown
+        watchdog.disarm()
+        if explicit_shutdown:
             console.print("\n[yellow]Gateway stopped.[/yellow]")
+        return explicit_shutdown
 
     try:
-        asyncio.run(_run())
+        explicit_shutdown = asyncio.run(_run())
+        if not explicit_shutdown:
+            raise typer.Exit(code=1)
     except ValueError as exc:
         from opensquilla.onboarding.next_steps import env_recovery_commands
         from opensquilla.onboarding.status import get_onboarding_status
