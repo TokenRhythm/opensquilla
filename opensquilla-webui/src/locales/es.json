@@ -540,8 +540,9 @@
       "moreOptionsIn": "Hay más opciones en",
       "copyConfigPath": "Copiar ruta de configuración",
       "applyLiveNote": "La mayoría de los cambios se aplican en vivo; algunos requieren reiniciar la puerta de enlace",
-      "discardTitle": "¿Descartar los cambios sin guardar?",
-      "discardBody": "Tienes ediciones sin guardar. Si cierras ahora se perderán.",
+      "discardTitle": "Cambios sin guardar",
+      "discardBody": "Guarda las ediciones antes de cerrar o descártalas.",
+      "saveAndClose": "Guardar y cerrar",
       "discardConfirmPrimary": "Descartar cambios"
     },
     "gateway": {

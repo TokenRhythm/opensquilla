@@ -540,8 +540,9 @@
       "moreOptionsIn": "Plus d'options se trouvent dans",
       "copyConfigPath": "Copier le chemin de configuration",
       "applyLiveNote": "La plupart des changements s'appliquent à chaud ; certains nécessitent un redémarrage de la passerelle",
-      "discardTitle": "Abandonner les modifications non enregistrées ?",
-      "discardBody": "Vous avez des modifications non enregistrées. Fermer maintenant les perdra.",
+      "discardTitle": "Modifications non enregistrées",
+      "discardBody": "Enregistrez les modifications avant de fermer ou abandonnez-les.",
+      "saveAndClose": "Enregistrer et fermer",
       "discardConfirmPrimary": "Abandonner les modifications"
     },
     "gateway": {

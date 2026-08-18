@@ -540,8 +540,9 @@
       "moreOptionsIn": "Weitere Optionen finden sich in",
       "copyConfigPath": "Konfigurationspfad kopieren",
       "applyLiveNote": "Die meisten Änderungen werden sofort übernommen; einige erfordern einen Neustart des Gateways",
-      "discardTitle": "Ungespeicherte Änderungen verwerfen?",
-      "discardBody": "Es gibt ungespeicherte Änderungen. Beim Schließen gehen sie verloren.",
+      "discardTitle": "Nicht gespeicherte Änderungen",
+      "discardBody": "Speichern Sie die Änderungen vor dem Schließen oder verwerfen Sie sie.",
+      "saveAndClose": "Speichern und schließen",
       "discardConfirmPrimary": "Änderungen verwerfen"
     },
     "gateway": {

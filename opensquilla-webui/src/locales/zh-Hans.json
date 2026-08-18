@@ -620,8 +620,9 @@
       "moreOptionsIn": "更多选项位于",
       "copyConfigPath": "复制配置路径",
       "applyLiveNote": "大多数更改即时生效；部分需要重启网关",
-      "discardTitle": "放弃未保存的修改？",
-      "discardBody": "有尚未保存的编辑，现在关闭将丢失它们。",
+      "discardTitle": "有未保存的修改",
+      "discardBody": "关闭前可选择保存这些编辑，或放弃修改。",
+      "saveAndClose": "保存并关闭",
       "discardConfirmPrimary": "放弃修改"
     },
     "gateway": {

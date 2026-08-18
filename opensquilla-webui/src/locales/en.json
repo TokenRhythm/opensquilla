@@ -620,8 +620,9 @@
       "moreOptionsIn": "More options live in",
       "copyConfigPath": "Copy config path",
       "applyLiveNote": "Most changes apply live; some need a gateway restart",
-      "discardTitle": "Discard unsaved changes?",
-      "discardBody": "You have unsaved edits. Closing now will lose them.",
+      "discardTitle": "Unsaved changes",
+      "discardBody": "Save your edits before closing, or discard them.",
+      "saveAndClose": "Save and close",
       "discardConfirmPrimary": "Discard changes"
     },
     "gateway": {

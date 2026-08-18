@@ -540,8 +540,9 @@
       "moreOptionsIn": "その他のオプションは次の場所にあります",
       "copyConfigPath": "設定パスをコピー",
       "applyLiveNote": "ほとんどの変更は即時に反映されます。一部はゲートウェイの再起動が必要です",
-      "discardTitle": "未保存の変更を破棄しますか？",
-      "discardBody": "未保存の編集があります。今閉じると失われます。",
+      "discardTitle": "未保存の変更があります",
+      "discardBody": "閉じる前に保存するか、変更を破棄してください。",
+      "saveAndClose": "保存して閉じる",
       "discardConfirmPrimary": "変更を破棄"
     },
     "gateway": {
