@@ -89,6 +89,7 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "if (!alreadyOnEmptyDraft)" in first_send_gate
     assert "await header.waitFor({ state: 'attached'" in first_send_gate
     assert "await page.mouse.move(1, 1)" in first_send_gate
+    assert "rendererErrors" in first_send_gate
 
 
 def test_release_workflow_runs_legacy_windows_upgrade_checks_on_server_2022() -> None:
