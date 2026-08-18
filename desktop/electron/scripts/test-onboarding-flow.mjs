@@ -426,7 +426,7 @@ async function verifySubmitFeedbackAndSingleFlight() {
     await verifyBootPhaseTimer(app)
     const submitClockOrigin = Date.now()
     await page.clock.install({ time: submitClockOrigin })
-    await page.clock.pauseAt(submitClockOrigin)
+    await page.clock.pauseAt(submitClockOrigin + 1_000)
     const apiKey = page.locator('#apiKey')
     await apiKey.fill('synthetic-submit-key')
     await page.locator('#onboardingLocale').selectOption('de')
