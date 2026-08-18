@@ -287,6 +287,26 @@ describe('catalog parity', () => {
     expect(zhHans.chat.goal.removeConfirmBody).toContain('请使用“停止”')
   })
 
+  it('explains the Ensemble image limit with actionable routing choices', () => {
+    const locales = [
+      { messages: en, imagePattern: /image input/i },
+      { messages: zhHans, imagePattern: /图片输入/ },
+      { messages: de, imagePattern: /Bildeingaben/i },
+      { messages: es, imagePattern: /im[aá]gen/i },
+      { messages: fr, imagePattern: /images en entrée/i },
+      { messages: ja, imagePattern: /画像入力/ },
+    ]
+
+    for (const { messages, imagePattern } of locales) {
+      const composer = messages.chat.composer
+      expect(composer.modelRoutingEnsembleDesc).toMatch(imagePattern)
+      expect(composer.ensembleImageUnsupported).toMatch(imagePattern)
+      expect(composer.ensembleImageUnsupported).toContain(composer.modelRouting)
+      expect(composer.ensembleImageUnsupported).toContain(composer.modelRoutingSquillaRouter)
+      expect(composer.ensembleImageUnsupported).toContain(composer.modelRoutingOff)
+    }
+  })
+
   it('no zh-Hans value is left as the English source', () => {
     const enFlat = flatten(en as Record<string, unknown>)
     const zhFlat = flatten(zhHans as Record<string, unknown>)

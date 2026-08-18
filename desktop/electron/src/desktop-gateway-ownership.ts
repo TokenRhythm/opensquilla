@@ -38,6 +38,11 @@ export interface DesktopGatewayLaunchAuthority {
   port: number
 }
 
+export interface DesktopGatewayLaunchVerificationOptions {
+  load?: (ownershipDir: string) => DesktopGatewayOwnershipRecordLoad
+  verify?: (record: DesktopGatewayOwnershipRecord) => Promise<boolean>
+}
+
 /**
  * Bind a record to the launch secret and profile, not the immediate child PID.
  * In development `uv run` is the Electron ChildProcess while the Python
@@ -50,6 +55,24 @@ export function desktopGatewayOwnershipMatchesLaunch(
   return record.instance_nonce === authority.instanceNonce
     && record.profile_fingerprint === authority.profileFingerprint
     && record.port === authority.port
+}
+
+/**
+ * Prove that a ready loopback listener is the Gateway from this exact launch.
+ * A live launcher child and successful health/control probes are deliberately
+ * insufficient because another listener can win the probe-to-bind race.
+ */
+export async function verifyDesktopGatewayLaunchOwnership(
+  ownershipDir: string,
+  authority: DesktopGatewayLaunchAuthority,
+  options: DesktopGatewayLaunchVerificationOptions = {},
+): Promise<boolean> {
+  const loaded = (options.load ?? loadDesktopGatewayOwnershipRecord)(ownershipDir)
+  if (
+    loaded.status !== 'valid'
+    || !desktopGatewayOwnershipMatchesLaunch(loaded.record, authority)
+  ) return false
+  return await (options.verify ?? verifyDesktopGatewayOwnership)(loaded.record)
 }
 
 export interface DesktopGatewayIdentityPayload {

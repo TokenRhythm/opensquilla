@@ -23,6 +23,15 @@ describe('profile import locale contract', () => {
       expect(messages.settings.rail.memory.length, code).toBeGreaterThan(0)
       expect(messages.settings.memoryImport.diffLineAdded.length, code).toBeGreaterThan(0)
       expect(messages.settings.memoryImport.diffLineRemoved.length, code).toBeGreaterThan(0)
+      for (const key of [
+        'stepsLabel',
+        'sourceStepTitle',
+        'sourceStepDescription',
+        'pasteStepTitle',
+        'pasteStepDescription',
+      ] as const) {
+        expect(messages.settings.memoryImport[key].length, `${code}:${key}`).toBeGreaterThan(0)
+      }
     }
   })
 

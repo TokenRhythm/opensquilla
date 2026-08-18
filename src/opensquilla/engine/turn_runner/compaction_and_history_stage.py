@@ -9,7 +9,8 @@ stream-consumer loop.
 
 Side-effect contract:
 
-- ``t3_upgrade.maybe_compact`` and ``preflight.maybe_compact`` MAY mutate
+- Unless ``skip_compaction`` is requested, ``t3_upgrade.maybe_compact`` and
+  ``preflight.maybe_compact`` MAY mutate
   the DB transcript via ``SessionManager.compact``. They MAY also mutate
   the runner's per-turn ``has_compacted_this_turn`` flag and the
   per-session compaction-failure circuit state. All exceptions other
@@ -226,12 +227,14 @@ class CompactionAndHistoryStageInput:
     )
     consumer_admission: Any | None = field(default=None, repr=False)
     consumer_admission_fingerprint: str = ""
+    skip_compaction: bool = False
 
 @dataclass(frozen=True)
 class CompactionAndHistoryStageOutput:
     """The pieces of state subsequent stages and the harness consume.
 
-    - ``t3_upgrade_status``: one of the four ``_T3_*`` sentinels.
+    - ``t3_upgrade_status``: one of the four ``_T3_*`` sentinels, or
+      ``"skipped"`` when an upstream terminal preflight suppresses compaction.
       Surfaced for observability + the equivalence harness snapshot;
       NOT consumed by downstream stages. It is used only
       to decide whether to call preflight (folded into the stage body).
@@ -265,8 +268,8 @@ class CompactionAndHistoryStage:
     and before the attachment-build + stream-consumer steps. The four
     ports execute strictly sequentially:
 
-    1. ``t3_upgrade.maybe_compact`` (always called).
-    2. ``preflight.maybe_compact`` (called ONLY when t3 returned
+    1. ``t3_upgrade.maybe_compact`` (unless ``skip_compaction`` is set).
+    2. ``preflight.maybe_compact`` (called ONLY when compaction is enabled and t3 returned
        ``_T3_NOT_APPLICABLE`` or ``_T3_FLUSH_FAILED``).
     3. ``history_loader.load`` (always called).
     4. ``request_context_prepender.prepend`` (always called; pure).
@@ -316,47 +319,23 @@ class CompactionAndHistoryStage:
         )
         compaction_model = inp.compaction_model or inp.resolved_model
 
-        # 1. T3-upgrade compaction. Hook fires around the call so even a
-        #    no-op path's observability is uniform.
-        t3_state = CompactionState(
-            session_key=inp.session_key,
-            agent_id=inp.agent_id,
-            total_tokens=0,
-            threshold_tokens=compaction_context_window_tokens,
-            extra={"phase": "t3_upgrade"},
-        )
-        await self._fire_before_compact(t3_state)
-        t3_status = await self._t3_upgrade.maybe_compact(
-            session_key=inp.session_key,
-            turn=inp.turn,
-            context_window_tokens=compaction_context_window_tokens,
-            compaction_provider=compaction_provider,
-            compaction_model=compaction_model,
-            compaction_plan=inp.compaction_plan,
-            history_capacity_tokens=inp.history_capacity_tokens,
-            history_capacity_chars=inp.history_capacity_chars,
-            history_has_persisted_user=inp.history_has_persisted_user,
-            bound_user_message_id=inp.bound_user_message_id,
-            provider_request_correlation=inp.provider_request_correlation,
-            consumer_admission=inp.consumer_admission,
-            consumer_admission_fingerprint=inp.consumer_admission_fingerprint,
-        )
-        await self._fire_after_compact(t3_state, {"status": t3_status})
-
-        # 2. Preflight compaction (fall-through cases only).
         preflight_invoked = False
-        if t3_status in {_T3_NOT_APPLICABLE, _T3_FLUSH_FAILED}:
-            preflight_invoked = True
-            preflight_state = CompactionState(
+        if inp.skip_compaction:
+            t3_status = "skipped"
+        else:
+            # 1. T3-upgrade compaction. Hook fires around the call so even a
+            #    no-op path's observability is uniform.
+            t3_state = CompactionState(
                 session_key=inp.session_key,
                 agent_id=inp.agent_id,
                 total_tokens=0,
                 threshold_tokens=compaction_context_window_tokens,
-                extra={"phase": "preflight"},
+                extra={"phase": "t3_upgrade"},
             )
-            await self._fire_before_compact(preflight_state)
-            await self._preflight.maybe_compact(
+            await self._fire_before_compact(t3_state)
+            t3_status = await self._t3_upgrade.maybe_compact(
                 session_key=inp.session_key,
+                turn=inp.turn,
                 context_window_tokens=compaction_context_window_tokens,
                 compaction_provider=compaction_provider,
                 compaction_model=compaction_model,
@@ -369,7 +348,34 @@ class CompactionAndHistoryStage:
                 consumer_admission=inp.consumer_admission,
                 consumer_admission_fingerprint=inp.consumer_admission_fingerprint,
             )
-            await self._fire_after_compact(preflight_state, {"status": "ran"})
+            await self._fire_after_compact(t3_state, {"status": t3_status})
+
+            # 2. Preflight compaction (fall-through cases only).
+            if t3_status in {_T3_NOT_APPLICABLE, _T3_FLUSH_FAILED}:
+                preflight_invoked = True
+                preflight_state = CompactionState(
+                    session_key=inp.session_key,
+                    agent_id=inp.agent_id,
+                    total_tokens=0,
+                    threshold_tokens=compaction_context_window_tokens,
+                    extra={"phase": "preflight"},
+                )
+                await self._fire_before_compact(preflight_state)
+                await self._preflight.maybe_compact(
+                    session_key=inp.session_key,
+                    context_window_tokens=compaction_context_window_tokens,
+                    compaction_provider=compaction_provider,
+                    compaction_model=compaction_model,
+                    compaction_plan=inp.compaction_plan,
+                    history_capacity_tokens=inp.history_capacity_tokens,
+                    history_capacity_chars=inp.history_capacity_chars,
+                    history_has_persisted_user=inp.history_has_persisted_user,
+                    bound_user_message_id=inp.bound_user_message_id,
+                    provider_request_correlation=inp.provider_request_correlation,
+                    consumer_admission=inp.consumer_admission,
+                    consumer_admission_fingerprint=inp.consumer_admission_fingerprint,
+                )
+                await self._fire_after_compact(preflight_state, {"status": "ran"})
 
         # 3. Load history (transcript + reconstructed messages + durable summary).
         compaction_summary_context = await self._history_loader.load(

@@ -202,6 +202,73 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('reconciles the turn clock from authoritative live-task hydration', () => {
+    vi.setSystemTime(120_000)
+    const { api } = makeStream()
+    api.startStreaming()
+
+    expect(api.streamTurnElapsed.value).toBe('0s')
+    expect(api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: '90000',
+    })).toBe(true)
+    expect(api.streamTurnElapsed.value).toBe('30s')
+
+    vi.advanceTimersByTime(5_000)
+    expect(api.streamTurnElapsed.value).toBe('35s')
+    api.cleanup()
+  })
+
+  it('never moves the same task clock forward and resets for a successor task', () => {
+    vi.setSystemTime(120_000)
+    const { api } = makeStream()
+    api.startStreaming()
+
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 90_000,
+    })
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 100_000,
+    })
+    expect(api.streamTurnElapsed.value).toBe('30s')
+
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-successor',
+      startedAt: 115_000,
+    })
+    expect(api.streamTurnElapsed.value).toBe('5s')
+    api.cleanup()
+  })
+
+  it('ignores invalid task timestamps and clears task identity on a live reset', () => {
+    vi.setSystemTime(120_000)
+    const { api } = makeStream()
+    api.startStreaming()
+
+    expect(api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 'not-a-timestamp',
+    })).toBe(false)
+    expect(api.streamTurnElapsed.value).toBe('0s')
+
+    api.reconcileStreamTaskClock({
+      sessionKey: 'agent:main:webchat:a',
+      taskId: 'task-live',
+      startedAt: 90_000,
+    })
+    api.resetLiveTurnState()
+    api.startStreaming()
+    expect(api.streamTurnElapsed.value).toBe('0s')
+    api.cleanup()
+  })
+
   it('preserves the authoritative active-task steer capability when streaming starts late', () => {
     const { api, runStatus, applySessionRunState } = makeStream()
     runStatus.value = {

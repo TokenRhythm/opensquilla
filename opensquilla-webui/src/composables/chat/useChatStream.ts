@@ -113,6 +113,22 @@ export interface UseChatStreamOptions {
   rpcPolicy?: () => Record<string, unknown> | null | undefined
 }
 
+export interface StreamTaskClockSnapshot {
+  sessionKey: string
+  taskId: string
+  startedAt?: number | string | null
+}
+
+function normalizedTaskStartedAt(value: unknown): number | null {
+  if (typeof value !== 'number' && typeof value !== 'string') return null
+  if (typeof value === 'string' && !value.trim()) return null
+  const numeric = Number(value)
+  if (Number.isSafeInteger(numeric) && numeric > 0) return numeric
+  if (typeof value !== 'string') return null
+  const parsed = Date.parse(value)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null
+}
+
 export function streamIdleTimeoutFromPolicy(policy: Record<string, unknown> | null | undefined): number {
   const raw = policy?.webui_stream_idle_grace_ms
   return typeof raw === 'number' && Number.isFinite(raw) && raw > 0
@@ -157,6 +173,7 @@ export function useChatStream(options: UseChatStreamOptions) {
   // Provider/router transitions may restart the small phase timer, but the
   // disclosure header must measure one uninterrupted user-visible run.
   const streamTurnStartedAt = ref(0)
+  let streamTaskClockIdentity = ''
   const streamActivityTick = ref(0)
   let streamActivityTimer: ReturnType<typeof setInterval> | null = null
   const streamRound = ref(1)
@@ -445,6 +462,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     openToolItems.value = new Set()
     streamToolGroupSeq = 0
     streamRound.value = 1
+    streamTaskClockIdentity = ''
     streamTurnStartedAt.value = Date.now()
     noteStreamSignal()
     streamBubble.value = true
@@ -452,6 +470,31 @@ export function useChatStream(options: UseChatStreamOptions) {
     setStreamActivity('Sending')
     options.autoScroll.value = true
     resetStreamIdleTimer()
+  }
+
+  function reconcileStreamTaskClock(snapshot: StreamTaskClockSnapshot): boolean {
+    const sessionKey = snapshot.sessionKey.trim()
+    const taskId = snapshot.taskId.trim()
+    const startedAt = normalizedTaskStartedAt(snapshot.startedAt)
+    if (!sessionKey || !taskId || startedAt === null) return false
+
+    const identity = `${sessionKey}\u0000${taskId}`
+    if (streamTaskClockIdentity !== identity) {
+      streamTaskClockIdentity = identity
+      streamTurnStartedAt.value = startedAt
+      return true
+    }
+    // A repeated hydrate for the same task may be older or richer, but it must
+    // never make the visible run look younger than this client already knows.
+    if (!streamTurnStartedAt.value || startedAt < streamTurnStartedAt.value) {
+      streamTurnStartedAt.value = startedAt
+    }
+    return true
+  }
+
+  function clearStreamTaskClock() {
+    streamTaskClockIdentity = ''
+    streamTurnStartedAt.value = 0
   }
 
   function endStreaming(opts?: { reason?: string, suppressed?: boolean }) {
@@ -537,7 +580,7 @@ export function useChatStream(options: UseChatStreamOptions) {
         checkpointedRaw = ''
         checkpointedAcrossToolBoundary = false
         activeStreamTurnId = ''
-        streamTurnStartedAt.value = 0
+        clearStreamTaskClock()
         activeAssistantMessageId = ''
         return
       }
@@ -576,7 +619,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
-    streamTurnStartedAt.value = 0
+    clearStreamTaskClock()
     activeAssistantMessageId = ''
   }
 
@@ -666,7 +709,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     checkpointedRaw = ''
     checkpointedAcrossToolBoundary = false
     activeStreamTurnId = ''
-    streamTurnStartedAt.value = 0
+    clearStreamTaskClock()
     activeAssistantMessageId = ''
   }
 
@@ -1378,6 +1421,7 @@ export function useChatStream(options: UseChatStreamOptions) {
     thinkingVisible,
     thinkingText,
     startStreaming,
+    reconcileStreamTaskClock,
     endStreaming,
     checkpointForUserMessage,
     resetStreamForRouterReplay,

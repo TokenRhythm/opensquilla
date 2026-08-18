@@ -737,7 +737,10 @@ async def run_channel_dispatch(
         await status_reactor.received(msg)
 
         if task_runtime is not None:
-            from opensquilla.gateway.task_runtime import TaskQueueFullError
+            from opensquilla.gateway.task_runtime import (
+                TaskQueueFullError,
+                TaskRuntimeShuttingDownError,
+            )
 
             # Cap check BEFORE enqueue/append: reject early so no transcript
             # entry is written and no runtime turn is started when the channel
@@ -896,6 +899,17 @@ async def run_channel_dispatch(
                     await channel.send(
                         _route_envelope_reply_message(
                             workspace_message,
+                            route_envelope,
+                        )
+                    )
+                    if delivery_store is not None:
+                        delivery_store.fail_inbound(ingress_claim, exc)
+                    continue
+                if isinstance(exc, TaskRuntimeShuttingDownError):
+                    await status_reactor.failed(msg)
+                    await channel.send(
+                        _route_envelope_reply_message(
+                            "The Gateway is shutting down. Please retry after it restarts.",
                             route_envelope,
                         )
                     )
@@ -1588,7 +1602,10 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     status_reactor = _status_reactor(channel)
     await status_reactor.received(msg)
     raw_content = getattr(combined, "raw_content", None) or msg.content
-    from opensquilla.gateway.task_runtime import TaskQueueFullError
+    from opensquilla.gateway.task_runtime import (
+        TaskQueueFullError,
+        TaskRuntimeShuttingDownError,
+    )
 
     # Cap check BEFORE enqueue/append: reject early so no transcript entry is
     # written and no runtime turn is started (accept-then-drop fix).
@@ -1693,6 +1710,15 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
             await channel.send(
                 _route_envelope_reply_message(
                     workspace_message,
+                    route_envelope,
+                )
+            )
+            return
+        if isinstance(exc, TaskRuntimeShuttingDownError):
+            await status_reactor.failed(msg)
+            await channel.send(
+                _route_envelope_reply_message(
+                    "The Gateway is shutting down. Please retry after it restarts.",
                     route_envelope,
                 )
             )

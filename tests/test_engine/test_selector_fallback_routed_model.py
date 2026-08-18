@@ -16,7 +16,7 @@ from typing import Any
 
 from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.engine import ToolResult
-from opensquilla.engine.agent import Agent
+from opensquilla.engine.agent import UNSUPPORTED_IMAGE_INPUT_REPLY, Agent
 from opensquilla.engine.agent_injection import ListPendingInputProvider
 from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.runtime import TurnRunner, _SelectorFallbackProvider
@@ -32,6 +32,7 @@ from opensquilla.provider import (
     ErrorEvent,
     Message,
     ModelCapabilities,
+    ProviderActivityEvent,
     ProviderRequestCorrelation,
     TextDeltaEvent,
     ToolDefinition,
@@ -40,6 +41,7 @@ from opensquilla.provider import (
     ToolUseStartEvent,
 )
 from opensquilla.provider.openai import OpenAIProvider
+from opensquilla.provider.types import ContentBlockImage
 from opensquilla.tools.types import CallerKind, ToolContext
 
 
@@ -48,14 +50,24 @@ class _StubSelector:
         self._fallback_model = fallback_model
 
     def next_fallback_after_failure(self, exc: Exception) -> object:
-        return object()
+        del exc
+        return _SuccessfulProvider()
 
     @property
     def current_config(self) -> SimpleNamespace:
         return SimpleNamespace(provider="fallback-provider", model=self._fallback_model)
 
 
-def test_fallback_realigns_routed_model_and_drops_savings() -> None:
+class _SuccessfulProvider:
+    provider_name = "fallback-provider"
+
+    async def chat(self, messages, tools=None, config=None):
+        del messages, tools, config
+        yield TextDeltaEvent(text="ok")
+        yield DoneEvent(model="cheap/fallback")
+
+
+async def test_fallback_realigns_only_when_provider_call_starts() -> None:
     metadata: dict[str, object] = {
         "routed_model": "expensive/model",
         "savings_pct": 12.5,
@@ -63,16 +75,27 @@ def test_fallback_realigns_routed_model_and_drops_savings() -> None:
         "savings_routed_price_per_m": 0.5,
     }
     wrapper = _SelectorFallbackProvider(
-        object(),
+        _SuccessfulProvider(),
         _StubSelector("cheap/fallback"),
         turn_metadata=metadata,
     )
 
     assert wrapper.fallback_after_invalid_response("upstream 503") is True
+    assert metadata["routed_model"] == "expensive/model"
+    assert "executed_model" not in metadata
+
+    _ = [
+        event
+        async for event in wrapper.chat(
+            [Message(role="user", content="hello")],
+            config=ChatConfig(),
+        )
+    ]
 
     assert metadata["routed_model"] == "cheap/fallback"
     assert metadata["executed_provider"] == "fallback-provider"
     assert metadata["executed_model"] == "cheap/fallback"
+    assert metadata["router_fallback_hops"] == 1
     assert metadata["router_fallback_reason"] == "selector_fallback"
     assert metadata["savings_pct"] == 0.0
     assert metadata["savings_max_price_per_m"] == 0.0
@@ -407,7 +430,7 @@ def test_fallback_leg_never_increases_small_explicit_output_limit() -> None:
     assert wrapper.fallback_after_invalid_response("upstream 503") is True
     fallback_config = wrapper._config_for_active_leg(config)
 
-    assert fallback_config is config
+    assert fallback_config.max_tokens == config.max_tokens
     assert fallback_config.max_tokens == 4_096
 
 
@@ -417,7 +440,9 @@ def test_unknown_fallback_limit_does_not_apply_generic_default() -> None:
 
     assert wrapper.fallback_after_invalid_response("upstream 503") is True
 
-    assert wrapper._config_for_active_leg(config) is config
+    fallback_config = wrapper._config_for_active_leg(config)
+    assert fallback_config.max_tokens == config.max_tokens
+    assert fallback_config.model_capabilities.supports_vision is False
 
 
 def test_each_hop_uses_the_active_physical_models_own_output_limit() -> None:
@@ -528,20 +553,34 @@ def test_tokenrhythm_same_model_fallback_uses_exact_private_config_identity() ->
     )
     wrapper.configure_fallback_deployment_limits(
         [
-            (fallback_same_model, 64_000, 8_192),
-            (fallback_other_model, 32_000, 4_096),
+            (
+                fallback_same_model,
+                64_000,
+                8_192,
+                ModelCapabilities(supports_vision=False),
+            ),
+            (
+                fallback_other_model,
+                32_000,
+                4_096,
+                ModelCapabilities(supports_vision=True),
+            ),
         ]
     )
     # A sanitized provider/model-only compatibility limit would be wrong for B.
     wrapper.configure_fallback_limits(
         {("tokenrhythm", "shared/model"): (1_000_000, 131_072)}
     )
-    original = ChatConfig(max_tokens=131_072)
+    original = ChatConfig(max_tokens=131_072, model_capabilities=None)
 
     assert wrapper.fallback_after_invalid_response("first failure") is True
-    assert wrapper._config_for_active_leg(original).max_tokens == 8_192
+    first_fallback_config = wrapper._config_for_active_leg(original)
+    assert first_fallback_config.max_tokens == 8_192
+    assert first_fallback_config.model_capabilities.supports_vision is False
     assert wrapper.fallback_after_invalid_response("second failure") is True
-    assert wrapper._config_for_active_leg(original).max_tokens == 4_096
+    second_fallback_config = wrapper._config_for_active_leg(original)
+    assert second_fallback_config.max_tokens == 4_096
+    assert second_fallback_config.model_capabilities.supports_vision is True
 
     serialized = json.dumps(metadata, sort_keys=True)
     assert "synthetic-key-a" not in serialized
@@ -590,7 +629,9 @@ def test_dynamic_tokenrhythm_fallback_without_exact_limit_is_not_cross_clamped()
     original = ChatConfig(max_tokens=131_072)
 
     assert wrapper.fallback_after_invalid_response("dynamic plugin fallback") is True
-    assert wrapper._config_for_active_leg(original) is original
+    fallback_config = wrapper._config_for_active_leg(original)
+    assert fallback_config.max_tokens == original.max_tokens
+    assert fallback_config.model_capabilities.supports_vision is False
 
 
 PRIMARY_MODEL = "routed-primary"
@@ -905,6 +946,346 @@ async def test_tokenrhythm_tool_reasoning_fallback_rebuilds_from_canonical_histo
     assert primary_wire_tool_call["reasoning_content"] == ""
     assert fallback_wire_tool_call["reasoning_content"] == long_reasoning
     assert any(event.kind == "done" and event.text == "done" for event in events)
+
+
+async def test_unknown_primary_capability_defers_to_provider_image_validation() -> None:
+    class _Provider:
+        provider_name = "ensemble"
+
+        def __init__(self) -> None:
+            self.validation_calls = 0
+            self.calls = 0
+
+        def validate_chat_request(self, messages):
+            del messages
+            self.validation_calls += 1
+            return ErrorEvent(
+                message="ensemble rejects image input",
+                code="ensemble_multimodal_unsupported",
+            )
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            self.calls += 1
+            yield DoneEvent(model="ensemble/model")
+
+    class _Selector:
+        active_provider_id = "ensemble"
+        current_config = SimpleNamespace(provider="ensemble", model="ensemble/model")
+
+    provider = _Provider()
+    wrapper = _SelectorFallbackProvider(provider, _Selector())
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+        )
+    ]
+
+    events = [event async for event in wrapper.chat(messages, config=ChatConfig())]
+
+    assert provider.validation_calls == 1
+    assert provider.calls == 0
+    assert [event.code for event in events if isinstance(event, ErrorEvent)] == [
+        "ensemble_multimodal_unsupported"
+    ]
+    assert not any(isinstance(event, TextDeltaEvent) for event in events)
+
+
+async def test_unknown_primary_uses_known_vision_fallback_for_image() -> None:
+    class _Provider:
+        provider_name = "openrouter"
+
+        def __init__(self, *, fails: bool) -> None:
+            self.fails = fails
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            self.calls += 1
+            if self.fails:
+                yield ErrorEvent(message="primary unavailable", code="503")
+                return
+            yield TextDeltaEvent(text="image accepted by fallback")
+            yield DoneEvent(model="vision-fallback")
+
+    primary_config = SimpleNamespace(provider="openrouter", model="unknown-primary")
+    fallback_config = SimpleNamespace(provider="openrouter", model="vision-fallback")
+
+    class _Selector:
+        active_provider_id = "openrouter"
+
+        def __init__(self) -> None:
+            self.primary = _Provider(fails=True)
+            self.fallback = _Provider(fails=False)
+            self.current_config = primary_config
+
+        def next_fallback_after_failure(self, _exc: Exception) -> _Provider:
+            self.current_config = fallback_config
+            return self.fallback
+
+    selector = _Selector()
+    wrapper = _SelectorFallbackProvider(selector.primary, selector)
+    wrapper.configure_fallback_deployment_limits(
+        [(fallback_config, 0, 0, ModelCapabilities(supports_vision=True))]
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+        )
+    ]
+
+    events = [event async for event in wrapper.chat(messages, config=ChatConfig())]
+
+    assert selector.primary.calls == 1
+    assert selector.fallback.calls == 1
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        "image accepted by fallback"
+    ]
+
+
+async def test_image_request_does_not_call_text_only_fallback(monkeypatch: Any) -> None:
+    class _Catalog:
+        def get_capabilities(
+            self,
+            model_id: str,
+            provider_name: str = "openrouter",
+            base_url: str = "",
+        ) -> ModelCapabilities:
+            del model_id, provider_name, base_url
+            return ModelCapabilities(supports_vision=False)
+
+    class _Provider:
+        provider_name = "openrouter"
+
+        def __init__(self, *, fails: bool) -> None:
+            self.fails = fails
+            self.calls = 0
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            self.calls += 1
+            if self.fails:
+                yield ErrorEvent(
+                    message="rate limited",
+                    code="429",
+                    retry_after_s=901.0,
+                )
+                return
+            yield TextDeltaEvent(text="fallback must not run")
+            yield DoneEvent(model="text-fallback")
+
+    class _Selector:
+        def __init__(self) -> None:
+            self.primary = _Provider(fails=True)
+            self.fallback = _Provider(fails=False)
+            self.current_config = SimpleNamespace(
+                provider="openrouter",
+                model="vision-primary",
+                api_key="synthetic-shared-key",
+                base_url="https://openrouter.ai/api/v1",
+                org_id="",
+                proxy="http://127.0.0.1:8118",
+            )
+
+        @property
+        def active_provider_id(self) -> str:
+            return "openrouter"
+
+        def next_fallback_after_failure(self, _exc: Exception) -> _Provider:
+            self.current_config = SimpleNamespace(
+                provider="openrouter",
+                model="text-fallback",
+                api_key="synthetic-shared-key",
+                base_url="https://openrouter.ai/api/v1",
+                org_id="",
+                proxy="http://127.0.0.1:8118",
+            )
+            return self.fallback
+
+    monkeypatch.setattr("opensquilla.engine.runtime.shared_catalog", lambda: _Catalog())
+    selector = _Selector()
+    metadata: dict[str, Any] = {
+        "routed_model": "vision-primary",
+        "executed_provider": "openrouter",
+        "executed_model": "vision-primary",
+        "savings_pct": 17.0,
+    }
+    wrapper = _SelectorFallbackProvider(
+        selector.primary,
+        selector,
+        turn_metadata=metadata,
+    )
+    messages = [
+        Message(
+            role="user",
+            content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+        )
+    ]
+
+    events = [
+        event
+        async for event in wrapper.chat(
+            messages,
+            config=ChatConfig(
+                model_capabilities=ModelCapabilities(supports_vision=True)
+            ),
+        )
+    ]
+
+    assert selector.primary.calls == 1
+    assert selector.fallback.calls == 0
+    assert not any(
+        isinstance(event, ProviderActivityEvent)
+        and event.phase in {"retry_wait", "fallback"}
+        for event in events
+    )
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
+        UNSUPPORTED_IMAGE_INPUT_REPLY
+    ]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.model == "vision-primary"
+    assert done.input_tokens == 0
+    assert done.output_tokens == 0
+    assert metadata["image_input_mode"] == "rejected"
+    assert metadata["image_input_reason"] == "fallback_vision_unsupported"
+    assert metadata["routed_model"] == "vision-primary"
+    assert metadata["executed_model"] == "vision-primary"
+    assert "router_fallback_hops" not in metadata
+    assert "router_fallback_reason" not in metadata
+    assert metadata["savings_pct"] == 17.0
+    assert [leg["model"] for leg in metadata["execution_legs"]] == [
+        "vision-primary"
+    ]
+
+
+async def test_invalid_response_fallback_rejects_image_before_text_only_call(
+    monkeypatch: Any,
+) -> None:
+    class _Catalog:
+        def get_capabilities(
+            self,
+            model_id: str,
+            provider_name: str = "openrouter",
+            base_url: str = "",
+        ) -> ModelCapabilities:
+            del model_id, provider_name, base_url
+            return ModelCapabilities(supports_vision=False)
+
+    class _Provider:
+        provider_name = "openrouter"
+
+        def __init__(self, *, empty: bool) -> None:
+            self.empty = empty
+            self.calls = 0
+            self.validation_calls = 0
+
+        def validate_chat_request(self, messages):
+            del messages
+            self.validation_calls += 1
+            if not self.empty:
+                return ErrorEvent(
+                    message="text-only fallback rejects image input",
+                    code="unsupported_image",
+                )
+            return None
+
+        async def chat(self, messages, tools=None, config=None):
+            del messages, tools, config
+            self.calls += 1
+            if self.empty:
+                yield DoneEvent(
+                    stop_reason="stop",
+                    input_tokens=3,
+                    output_tokens=0,
+                    model="vision-primary",
+                )
+                return
+            yield TextDeltaEvent(text="fallback must not run")
+            yield DoneEvent(model="text-fallback")
+
+    class _Selector:
+        def __init__(self) -> None:
+            self.primary = _Provider(empty=True)
+            self.fallback = _Provider(empty=False)
+            self.current_config = SimpleNamespace(
+                provider="openrouter",
+                model="vision-primary",
+                base_url="",
+            )
+
+        @property
+        def active_provider_id(self) -> str:
+            return "openrouter"
+
+        def next_fallback_after_failure(self, _exc: Exception) -> _Provider:
+            self.current_config = SimpleNamespace(
+                provider="openrouter",
+                model="text-fallback",
+                base_url="",
+            )
+            return self.fallback
+
+    monkeypatch.setattr("opensquilla.engine.runtime.shared_catalog", lambda: _Catalog())
+    selector = _Selector()
+    metadata: dict[str, Any] = {
+        "routed_model": "vision-primary",
+        "executed_provider": "openrouter",
+        "executed_model": "vision-primary",
+        "savings_pct": 17.0,
+    }
+    wrapper = _SelectorFallbackProvider(
+        selector.primary,
+        selector,
+        turn_metadata=metadata,
+    )
+    agent = Agent(
+        provider=wrapper,
+        config=AgentConfig(
+            max_provider_retries=0,
+            max_turn_llm_calls=1,
+            model_id="vision-primary",
+            model_capabilities=ModelCapabilities(supports_vision=True),
+        ),
+    )
+    image_message = Message(
+        role="user",
+        content=[ContentBlockImage(media_type="image/png", data="c3ludGhldGlj")],
+    )
+
+    events = [
+        event
+        async for event in agent.run_turn(
+            "Describe the image.",
+            extra_messages=[image_message],
+        )
+    ]
+
+    assert selector.primary.calls == 1
+    assert selector.fallback.calls == 0
+    assert selector.primary.validation_calls == 2
+    assert selector.fallback.validation_calls == 0
+    assert not any(event.kind == "error" for event in events)
+    assert any(
+        event.kind == "warning" and event.code == "provider_empty_retry"
+        for event in events
+    )
+    done = next(event for event in events if isinstance(event, EngineDoneEvent))
+    assert done.text == UNSUPPORTED_IMAGE_INPUT_REPLY
+    assert done.input_tokens == 3
+    assert done.output_tokens == 0
+    assert metadata["image_input_mode"] == "rejected"
+    assert metadata["image_input_reason"] == "fallback_vision_unsupported"
+    assert metadata["routed_model"] == "vision-primary"
+    assert metadata["executed_model"] == "vision-primary"
+    assert "router_fallback_hops" not in metadata
+    assert "router_fallback_reason" not in metadata
+    assert metadata["savings_pct"] == 17.0
+    assert [leg["model"] for leg in metadata["execution_legs"]] == [
+        "vision-primary"
+    ]
 
 
 async def test_local_admission_failure_escalates_to_larger_authorized_leg(

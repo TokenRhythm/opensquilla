@@ -426,6 +426,96 @@ test('Goal mode renders mocked continuation snapshots without correctness pollin
   expect(gateway.methods.filter(method => forbiddenGoalMethods.includes(method))).toEqual([])
 })
 
+test('Composer Add menu stays above active Goal progress across responsive layouts', async ({ page }) => {
+  await page.setViewportSize({ width: 1368, height: 546 })
+  await page.emulateMedia({ colorScheme: 'dark', reducedMotion: 'no-preference' })
+  const gateway = await installFakeGoalGateway(page)
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+
+  gateway.emitGoal(goalSnapshot({
+    stateRevision: 2,
+    objective: 'Verify a responsive Goal workflow with a deliberately long objective that wraps on narrow windows without covering the Composer Add menu.',
+  }))
+  const goalDock = page.locator('.goal-run-dock')
+  await expect(goalDock).toBeVisible()
+
+  const addButton = page.getByRole('button', { name: 'Add', exact: true })
+  await addButton.click()
+  const addMenu = page.locator('.composer-add-menu')
+  await expect(addMenu).toBeVisible()
+
+  const assertClearance = async () => {
+    await expect.poll(async () => page.evaluate(() => {
+      const menu = document.querySelector<HTMLElement>('.composer-add-menu')
+      const goal = document.querySelector<HTMLElement>('.goal-run-dock')
+      if (!menu || !goal) return -1
+      return Math.floor(goal.getBoundingClientRect().top - menu.getBoundingClientRect().bottom)
+    })).toBeGreaterThanOrEqual(8)
+
+    const frames = await page.evaluate(async () => {
+      const samples: Array<{ clearance: number; menuTop: number }> = []
+      for (let index = 0; index < 12; index += 1) {
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+        const menu = document.querySelector<HTMLElement>('.composer-add-menu')!
+        const goal = document.querySelector<HTMLElement>('.goal-run-dock')!
+        samples.push({
+          clearance: goal.getBoundingClientRect().top - menu.getBoundingClientRect().bottom,
+          menuTop: menu.getBoundingClientRect().top,
+        })
+      }
+      return samples
+    })
+    expect(frames.every(frame => frame.clearance >= 7)).toBe(true)
+    expect(frames.every(frame => frame.menuTop >= 7)).toBe(true)
+  }
+
+  await assertClearance()
+  await page.setViewportSize({ width: 390, height: 844 })
+  await page.emulateMedia({ colorScheme: 'light', reducedMotion: 'reduce' })
+  await assertClearance()
+
+  await addMenu.getByRole('menuitem', { name: /Attach files/ }).focus()
+  await expect(addMenu.getByRole('menuitem', { name: /Attach files/ })).toBeFocused()
+  await addMenu.press('Escape')
+  await expect(addMenu).toHaveCount(0)
+
+  await page.evaluate(() => {
+    localStorage.setItem('opensquilla.composerFx', JSON.stringify({ enabled: false }))
+  })
+  await page.reload()
+  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+  await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+  await expect(page.locator('.chat')).not.toHaveClass(/chat--composer-floating/)
+
+  gateway.emitGoal(goalSnapshot({
+    stateRevision: 3,
+    objective: 'Verify the same Goal and Add menu clearance in the original docked Composer layout.',
+  }))
+  await expect(goalDock).toBeVisible()
+  await addButton.click()
+  await expect(addMenu).toBeVisible()
+  await assertClearance()
+
+  gateway.emitGoal(goalSnapshot({
+    status: 'complete',
+    stateRevision: 4,
+    activeTaskId: null,
+    executionState: 'idle',
+    turnsSettled: 1,
+    terminalReason: 'complete',
+    finishedAt: 4_000,
+  }))
+  await expect(goalDock).toHaveCount(0)
+  await expect.poll(async () => page.evaluate(() => {
+    const menu = document.querySelector<HTMLElement>('.composer-add-menu')
+    const button = document.querySelector<HTMLElement>('.chat-plus-btn')
+    if (!menu || !button) return 1
+    return Math.ceil(menu.getBoundingClientRect().bottom - button.getBoundingClientRect().top)
+  })).toBeLessThanOrEqual(-7)
+})
+
 test('Goal mode continues through a real Gateway, refresh, and deterministic provider', async ({
   page,
   baseURL,

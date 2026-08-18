@@ -52,6 +52,12 @@ export interface UseChatSessionSubscriptionOptions {
   acceptanceStopPending?: Ref<boolean>
   sessionRunStatus: (source: ChatRunStatusSource | null | undefined) => ChatRunStatus
   startStreaming: () => void
+  /** Adopt durable task timing even when snapshot replay already opened the bubble. */
+  reconcileStreamTaskClock?: (snapshot: {
+    sessionKey: string
+    taskId: string
+    startedAt?: number | string | null
+  }) => boolean | void
   loadHistory: () => void | Promise<unknown>
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
@@ -308,9 +314,20 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       const activeTask = (res.active_task || res.activeTask) as {
         task_id?: string
         taskId?: string
+        started_at?: number | string | null
+        startedAt?: number | string | null
       } | null | undefined
       const taskId = activeTask?.task_id || activeTask?.taskId
-      if (taskId) options.activeStreamTaskId.value = taskId
+      if (taskId) {
+        options.activeStreamTaskId.value = taskId
+        if (options.runStatus.value.status !== 'queued') {
+          options.reconcileStreamTaskClock?.({
+            sessionKey: key,
+            taskId,
+            startedAt: activeTask?.started_at ?? activeTask?.startedAt,
+          })
+        }
+      }
     }
     // Replayed events can rebuild a live bubble for work that is already
     // terminal. An authoritative idle snapshot removes only that stale tail.

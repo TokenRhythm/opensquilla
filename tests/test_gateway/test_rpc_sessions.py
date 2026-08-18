@@ -38,6 +38,7 @@ from opensquilla.gateway.rpc_sessions import _normalize_terminal_event_payload
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
 from opensquilla.gateway.session_lifecycle import SessionTaskSnapshot
 from opensquilla.gateway.session_streams import SessionStreamRegistry, get_session_streams
+from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
 from opensquilla.project_workspaces import ProjectWorkspaceStateError, project_path_key
@@ -77,6 +78,10 @@ def test_sessions_messages_hydrate_scope_contract() -> None:
 
 def test_sessions_steer_v2_scope_contract() -> None:
     assert METHOD_SCOPES["sessions.steer.v2"] == WRITE_SCOPE
+
+
+def test_sessions_pending_inputs_steer_scope_contract() -> None:
+    assert METHOD_SCOPES["sessions.pending_inputs.steer"] == WRITE_SCOPE
 
 
 @dataclass
@@ -4534,6 +4539,145 @@ class TestSessionsSend:
 
 
 class TestSessionsSteer:
+    @pytest.mark.asyncio
+    async def test_pending_input_steer_atomically_consumes_durable_row(
+        self,
+        dispatcher,
+        tmp_path,
+    ) -> None:
+        from opensquilla.gateway.routing import RouteEnvelope, SourceKind
+        from opensquilla.gateway.task_runtime import TaskRuntime
+        from opensquilla.session.manager import SessionManager
+        from opensquilla.session.models import SessionNode
+        from opensquilla.session.storage import SessionStorage
+
+        key = "agent:main:webchat:pending-steer"
+        store = SessionStorage(str(tmp_path / "pending-steer.db"))
+        await store.connect()
+        project = tmp_path / "pending-steer-project"
+        project.mkdir()
+        workspace = await store.create_or_restore_project_workspace(
+            path=str(project.resolve()),
+            path_key=project_path_key(project, strict=True),
+            display_name="pending-steer-project",
+            trusted_at=100,
+            now_ms=100,
+        )
+        await store.upsert_session(
+            SessionNode(
+                session_key=key,
+                session_id="session-pending-steer",
+                agent_id="main",
+                created_at=100,
+                updated_at=100,
+                workspace_id=workspace.workspace_id,
+            )
+        )
+        manager = SessionManager(store, inject_time_prefix=False)
+        started = asyncio.Event()
+        blocker = asyncio.Event()
+
+        async def _handler(_run: Any) -> None:
+            started.set()
+            await blocker.wait()
+
+        runtime = TaskRuntime(storage=store, turn_handler=_handler)
+        handle = await runtime.enqueue(
+            RouteEnvelope(
+                source_kind=SourceKind.WEB,
+                source_name="test",
+                agent_id="main",
+                session_key=key,
+                input_provenance={"kind": "test"},
+            ),
+            "first",
+        )
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+        ctx = make_ctx(session_manager=manager, task_runtime=runtime)
+        payload = {
+            "key": key,
+            "message": "queued guidance",
+            "attachments": [],
+            "queueMode": "followup",
+            "clientRequestId": "request-pending-steer",
+            "clientMessageId": "client-pending-steer",
+            "_source": {"caller_kind": "web", "channel_kind": "web"},
+        }
+        fingerprint = request_fingerprint(payload)
+        row, replayed = await store.enqueue_pending_chat_input(
+            pending_input_id="pending-steer-1",
+            session_key=key,
+            source_scope="web:web:operator",
+            client_request_id="request-pending-steer",
+            client_message_id="client-pending-steer",
+            request_fingerprint=fingerprint,
+            payload=payload,
+        )
+        assert replayed is False
+        params = {
+            "key": key,
+            "message": "client echo must not replace the staged text",
+            "pendingInputId": row.pending_input_id,
+            "clientRequestId": row.client_request_id,
+            "clientMessageId": row.client_message_id,
+            "requestFingerprint": row.request_fingerprint,
+            "expectedRevision": row.state_revision,
+            "expected_turn_id": handle.task_id,
+            "surface_id": "webui",
+            "_source": {"caller_kind": "web", "channel_kind": "web"},
+        }
+        try:
+            mismatch = await dispatcher.dispatch(
+                "r-pending-steer-mismatch",
+                "sessions.pending_inputs.steer",
+                {**params, "expected_turn_id": "another-turn"},
+                ctx,
+            )
+            assert mismatch.ok is True
+            assert mismatch.payload["accepted"] is False
+            assert mismatch.payload["failure_code"] == "EXPECTED_TURN_MISMATCH"
+            assert [
+                item.pending_input_id
+                for item in await store.list_pending_chat_inputs(key)
+            ] == [row.pending_input_id]
+
+            accepted = await dispatcher.dispatch(
+                "r-pending-steer",
+                "sessions.pending_inputs.steer",
+                params,
+                ctx,
+            )
+            replay = await dispatcher.dispatch(
+                "r-pending-steer-replay",
+                "sessions.pending_inputs.steer",
+                params,
+                ctx,
+            )
+
+            assert accepted.ok is True
+            assert accepted.payload["accepted"] is True
+            assert accepted.payload["replayed"] is False
+            assert accepted.payload["turn_id"] == handle.task_id
+            assert replay.ok is True
+            assert replay.payload["accepted"] is True
+            assert replay.payload["replayed"] is True
+            assert replay.payload["user_message_id"] == accepted.payload["user_message_id"]
+            assert await store.list_pending_chat_inputs(key) == []
+
+            receipt = await store.get_pending_chat_input_dispatch_receipt(
+                row.pending_input_id
+            )
+            assert receipt is not None
+            assert receipt.client_request_id == row.client_request_id
+            transcript = await store.get_transcript("session-pending-steer")
+            assert len(transcript) == 1
+            assert transcript[0].content == "queued guidance"
+            assert transcript[0].turn_context["disposition"] == "steering"
+        finally:
+            await runtime.cancel(task_id=handle.task_id, source="test_cleanup")
+            await runtime.wait(handle.task_id, timeout=2.0)
+            await store.close()
+
     @pytest.mark.asyncio
     async def test_steer_v2_is_expected_turn_bound_and_idempotent(
         self,

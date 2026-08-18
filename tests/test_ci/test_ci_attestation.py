@@ -4,7 +4,9 @@ import io
 import json
 import runpy
 import subprocess
+import urllib.request
 import zipfile
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -14,10 +16,55 @@ MODULE: dict[str, Any] = runpy.run_path(
     ".github/scripts/ci_attestation.py", run_name="ci_attestation"
 )
 AttestationError = MODULE["AttestationError"]
+SafeArtifactRedirectHandler = MODULE["_SafeArtifactRedirectHandler"]
 create_attestation = MODULE["create_attestation"]
 policy_digest = MODULE["policy_digest"]
 validate_candidate = MODULE["validate_candidate"]
 verify_queue = MODULE["verify_queue"]
+
+
+def _artifact_redirect(newurl: str) -> urllib.request.Request:
+    request = urllib.request.Request(
+        "https://api.github.com/repos/opensquilla/opensquilla/actions/artifacts/1/zip",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": "Bearer synthetic-token",
+            "User-Agent": "opensquilla-ci-attestation",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    redirected = SafeArtifactRedirectHandler().redirect_request(
+        request,
+        None,
+        302,
+        "Found",
+        Message(),
+        newurl,
+    )
+    assert redirected is not None
+    return redirected
+
+
+def test_artifact_redirect_strips_api_credentials_cross_origin() -> None:
+    redirected = _artifact_redirect(
+        "https://productionresultssa.blob.core.windows.net/actions-results/attestation.zip"
+    )
+
+    assert redirected.get_header("Authorization") is None
+    assert redirected.get_header("Accept") is None
+    assert redirected.get_header("X-Github-Api-Version") is None
+
+
+def test_artifact_redirect_preserves_api_credentials_same_origin() -> None:
+    redirected = _artifact_redirect("https://api.github.com/artifact-download")
+
+    assert redirected.get_header("Authorization") == "Bearer synthetic-token"
+    assert redirected.get_header("Accept") == "application/vnd.github+json"
+
+
+def test_artifact_redirect_rejects_non_https_target() -> None:
+    with pytest.raises(AttestationError, match="must use HTTPS"):
+        _artifact_redirect("http://artifact-storage.example.invalid/attestation.zip")
 
 
 def _git(repo: Path, *args: str) -> str:

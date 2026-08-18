@@ -8,6 +8,7 @@ from opensquilla.engine.pricing import (
     PricingCache,
     lookup_price,
     reset_live_price_cache_for_tests,
+    resolve_model_price,
     seed_live_price_cache_for_tests,
 )
 
@@ -17,6 +18,22 @@ def reset_pricing_cache() -> Iterator[None]:
     reset_live_price_cache_for_tests()
     yield
     reset_live_price_cache_for_tests()
+
+
+def test_default_test_session_disables_live_pricing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_fetch(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("default tests must not fetch live OpenRouter pricing")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.pricing._fetch_live_openrouter_price",
+        unexpected_fetch,
+    )
+
+    resolved = resolve_model_price("vendor/synthetic-model", provider="openrouter")
+
+    assert resolved.source == "default"
 
 
 def test_deepseek_v4_pro_static_price_matches_current_official(

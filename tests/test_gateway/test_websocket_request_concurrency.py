@@ -7,13 +7,16 @@ import json
 from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from starlette.websockets import WebSocketDisconnect, WebSocketState
 
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.protocol import make_ok_res
+from opensquilla.gateway.rpc import get_dispatcher
 from opensquilla.gateway.websocket import handle_ws_connection
+from opensquilla.skills.loader import SkillLoader
 
 _CONNECT_FRAME = json.dumps(
     {
@@ -120,12 +123,14 @@ class _HistoryWebSocket:
         *,
         release_after_quick_response: bool = False,
         after_frames: Callable[[_HistoryWebSocket], Awaitable[None]] | None = None,
+        before_frame: Callable[[str], Awaitable[None]] | None = None,
         fail_response_id: str | None = None,
     ) -> None:
         self._frames = list(frames)
         self.dispatcher = dispatcher
         self.release_after_quick_response = release_after_quick_response
         self.after_frames = after_frames
+        self.before_frame = before_frame
         self.fail_response_id = fail_response_id
         self.sent: list[str] = []
         self.close_codes: list[int] = []
@@ -153,7 +158,10 @@ class _HistoryWebSocket:
 
     async def receive_text(self) -> str:
         if self._frames:
-            return self._frames.pop(0)
+            frame = self._frames.pop(0)
+            if self.before_frame is not None:
+                await self.before_frame(frame)
+            return frame
         if self.after_frames is not None:
             await self.after_frames(self)
             raise WebSocketDisconnect(code=1000)
@@ -186,6 +194,159 @@ class _HistoryWebSocket:
     def has_response(self, req_id: str) -> bool:
         event = self._response_events.get(req_id)
         return event is not None and event.is_set()
+
+
+@pytest.mark.parametrize("writer_queue_enabled", [False, True])
+async def test_blocked_skill_install_can_be_cancelled_on_same_websocket(
+    tmp_path,
+    writer_queue_enabled: bool,
+) -> None:
+    entered = asyncio.Event()
+    cleaned_up = asyncio.Event()
+
+    class _Installer:
+        async def install(self, *_args, **_kwargs):
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned_up.set()
+
+    operation_id = str(uuid4())
+
+    async def wait_until_install_is_active(frame: str) -> None:
+        decoded = json.loads(frame)
+        if decoded.get("id") == "cancel":
+            await asyncio.wait_for(entered.wait(), timeout=1)
+
+    async def finish_after_responses(socket: _HistoryWebSocket) -> None:
+        await socket.wait_for_response("install")
+        await socket.wait_for_response("cancel")
+
+    ws = _HistoryWebSocket(
+        [
+            _CONNECT_FRAME,
+            json.dumps({
+                "type": "req",
+                "id": "install",
+                "method": "skills.install",
+                "params": {"identifier": "demo", "operationId": operation_id},
+            }),
+            json.dumps({
+                "type": "req",
+                "id": "cancel",
+                "method": "skills.install.cancel",
+                "params": {"operationId": operation_id},
+            }),
+        ],
+        get_dispatcher(),
+        before_frame=wait_until_install_is_active,
+        after_frames=finish_after_responses,
+    )
+    loader = SkillLoader(
+        managed_dir=tmp_path / "managed",
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+    loader.load_all()
+    skill_management_state: dict[str, Any] = {}
+
+    await asyncio.wait_for(
+        handle_ws_connection(
+            ws,
+            GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
+            dispatcher=get_dispatcher(),
+            skill_loader=loader,
+            skill_management_service=_Installer(),
+            skill_management_state=skill_management_state,
+        ),
+        timeout=2,
+    )
+
+    responses = {frame["id"]: frame for frame in ws.responses()}
+    assert responses["install"]["payload"]["cancelled"] is True
+    assert responses["cancel"]["payload"]["cancelled"] is True
+    assert responses["cancel"]["payload"]["pending"] is False
+    assert cleaned_up.is_set()
+    assert skill_management_state["_active_skill_installs"] == {}
+    assert ws.close_codes == []
+
+
+@pytest.mark.parametrize("writer_queue_enabled", [False, True])
+async def test_legacy_skill_install_without_operation_id_remains_serialized(
+    tmp_path,
+    writer_queue_enabled: bool,
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    observed: dict[str, bool] = {}
+
+    class _Installer:
+        async def install(self, *_args, **_kwargs):
+            entered.set()
+            await release.wait()
+            return SimpleNamespace(
+                success=True,
+                name="demo",
+                message="installed",
+                path=None,
+                scan=None,
+            )
+
+    async def finish_after_responses(socket: _HistoryWebSocket) -> None:
+        await socket.wait_for_response("install")
+        await socket.wait_for_response("quick")
+
+    ws = _HistoryWebSocket(
+        [
+            _CONNECT_FRAME,
+            json.dumps({
+                "type": "req",
+                "id": "install",
+                "method": "skills.install",
+                "params": {"identifier": "demo"},
+            }),
+            json.dumps({"type": "req", "id": "quick", "method": "health"}),
+        ],
+        get_dispatcher(),
+        after_frames=finish_after_responses,
+    )
+    loader = SkillLoader(
+        managed_dir=tmp_path / "managed",
+        snapshot_path=tmp_path / "snapshot.json",
+    )
+    loader.load_all()
+
+    async def release_after_serialization_check() -> None:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        try:
+            await asyncio.wait_for(ws.quick_response_sent.wait(), timeout=0.05)
+            observed["quick_overtook_install"] = True
+        except TimeoutError:
+            observed["quick_overtook_install"] = False
+        finally:
+            release.set()
+
+    observer = asyncio.create_task(release_after_serialization_check())
+    try:
+        await asyncio.wait_for(
+            handle_ws_connection(
+                ws,
+                GatewayConfig(ws_writer_queue_enabled=writer_queue_enabled),
+                dispatcher=get_dispatcher(),
+                skill_loader=loader,
+                skill_management_service=_Installer(),
+                skill_management_state={},
+            ),
+            timeout=2,
+        )
+    finally:
+        await observer
+
+    responses = {frame["id"]: frame for frame in ws.responses()}
+    assert observed["quick_overtook_install"] is False
+    assert responses["install"]["payload"]["success"] is True
+    assert responses["quick"]["payload"]["status"] == "ok"
+    assert ws.close_codes == []
 
 
 @pytest.mark.parametrize("writer_queue_enabled", [False, True])

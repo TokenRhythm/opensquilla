@@ -58,6 +58,7 @@ contextBridge.exposeInMainWorld('opensquillaDesktop', {
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
   getBootState: () => ipcRenderer.invoke('desktop:boot:state'),
+  resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume'),
   retryStartup: () => ipcRenderer.invoke('desktop:boot:retry'),
   quitApp: () => ipcRenderer.invoke('desktop:boot:quit'),
   getRecoveryState: () => ipcRenderer.invoke('desktop:recovery:state'),

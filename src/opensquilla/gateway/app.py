@@ -484,7 +484,9 @@ def create_gateway_app(
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
             skill_management_service=skill_management_service,
-            skill_management_state=skill_management_state or {},
+            skill_management_state=(
+                skill_management_state if skill_management_state is not None else {}
+            ),
             cron_scheduler=cron_scheduler,
             turn_runner=turn_runner,
             task_runtime=task_runtime,
@@ -748,7 +750,9 @@ def create_gateway_app(
             usage_event_sink=usage_event_sink,
             meta_run_writer=meta_run_writer,
             skill_loader=skill_loader,
-            skill_management_state=skill_management_state or {},
+            skill_management_state=(
+                skill_management_state if skill_management_state is not None else {}
+            ),
             cron_scheduler=cron_scheduler,
             turn_runner=turn_runner,
             task_runtime=task_runtime,

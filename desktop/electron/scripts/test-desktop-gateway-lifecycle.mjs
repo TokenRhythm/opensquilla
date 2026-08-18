@@ -3,7 +3,125 @@ import assert from 'node:assert/strict'
 import {
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
+  waitForGatewayReadiness,
 } from '../dist/gateway-lifecycle.js'
+
+function fakeClock() {
+  let current = 0
+  return {
+    now: () => current,
+    advance: (milliseconds) => {
+      current += milliseconds
+    },
+    sleep: async (milliseconds) => {
+      current += milliseconds
+    },
+  }
+}
+
+async function runReadinessBeforePrimaryDeadlineCase() {
+  const clock = fakeClock()
+  let probes = 0
+  const result = await waitForGatewayReadiness({
+    probe: async () => ++probes === 2,
+    primaryTimeoutMs: 10,
+    lateGraceMs: 10,
+    pollIntervalMs: 5,
+    ...clock,
+  })
+
+  assert.deepEqual(result, { status: 'ready', late: false })
+  assert.equal(probes, 2)
+}
+
+async function runLateReadinessCase() {
+  const clock = fakeClock()
+  const result = await waitForGatewayReadiness({
+    probe: async () => clock.now() >= 15,
+    primaryTimeoutMs: 10,
+    lateGraceMs: 10,
+    pollIntervalMs: 5,
+    ...clock,
+  })
+
+  assert.deepEqual(result, { status: 'ready', late: true })
+  assert.equal(clock.now(), 15)
+}
+
+async function runReadinessTimeoutCase() {
+  const clock = fakeClock()
+  const result = await waitForGatewayReadiness({
+    probe: async () => false,
+    primaryTimeoutMs: 10,
+    lateGraceMs: 10,
+    pollIntervalMs: 6,
+    ...clock,
+  })
+
+  assert.deepEqual(result, { status: 'timeout' })
+  assert.equal(clock.now(), 20)
+}
+
+async function runReadinessExitCase() {
+  const clock = fakeClock()
+  const result = await waitForGatewayReadiness({
+    probe: async () => false,
+    exitMessage: () => clock.now() >= 5 ? 'gateway exited' : null,
+    primaryTimeoutMs: 10,
+    lateGraceMs: 10,
+    pollIntervalMs: 5,
+    ...clock,
+  })
+
+  assert.deepEqual(result, { status: 'exited', message: 'gateway exited' })
+  assert.equal(clock.now(), 5)
+}
+
+async function runReadinessExitDuringSuccessfulProbeCase() {
+  let exited = false
+  const result = await waitForGatewayReadiness({
+    probe: async () => {
+      exited = true
+      return true
+    },
+    exitMessage: () => exited ? 'gateway exited during probe' : null,
+    primaryTimeoutMs: 10,
+    lateGraceMs: 10,
+    pollIntervalMs: 5,
+  })
+
+  assert.deepEqual(result, { status: 'exited', message: 'gateway exited during probe' })
+}
+
+async function runProbeCrossesDeadlineCase() {
+  const clock = fakeClock()
+  const result = await waitForGatewayReadiness({
+    probe: async (remainingMs) => {
+      clock.advance(remainingMs + 1)
+      return true
+    },
+    primaryTimeoutMs: 10,
+    lateGraceMs: 10,
+    pollIntervalMs: 5,
+    ...clock,
+  })
+
+  assert.deepEqual(result, { status: 'timeout' })
+  assert.equal(clock.now(), 21, 'readiness after the hard deadline is rejected')
+}
+
+async function runNeverResolvingProbeCase() {
+  const startedAt = performance.now()
+  const result = await waitForGatewayReadiness({
+    probe: async () => await new Promise(() => {}),
+    primaryTimeoutMs: 5,
+    lateGraceMs: 10,
+    pollIntervalMs: 2,
+  })
+
+  assert.deepEqual(result, { status: 'timeout' })
+  assert.ok(performance.now() - startedAt < 250, 'a stuck probe cannot escape the hard budget')
+}
 
 async function runStoppingSetOnlyCase() {
   const stopping = { name: 'already-stopping', live: true }
@@ -122,5 +240,12 @@ await runCurrentPlusStoppingCase()
 await runLatePublishedChildCase()
 await runFailClosedCase()
 await runPendingSpawnAdmissionCase()
+await runReadinessBeforePrimaryDeadlineCase()
+await runLateReadinessCase()
+await runReadinessTimeoutCase()
+await runReadinessExitCase()
+await runReadinessExitDuringSuccessfulProbeCase()
+await runProbeCrossesDeadlineCase()
+await runNeverResolvingProbeCase()
 
 console.log('desktop gateway lifecycle tests passed')

@@ -24,6 +24,8 @@ async function mountQueue(
   items: Array<{
     pendingUiId?: string
     text: string
+    pendingInputId?: string
+    pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
     deliveryState?: 'steering' | 'retryable'
     steerAttempt?: PendingSteerAttempt
     attachments?: Attachment[]
@@ -35,6 +37,7 @@ async function mountQueue(
   props: {
     imageBlockedMessage?: string
     steerAvailable?: boolean
+    durableSteerAvailable?: boolean
     steerUnavailableMessage?: string
   } = {},
 ) {
@@ -95,6 +98,22 @@ describe('PendingQueue', () => {
     expect(steer?.title).not.toContain('stale reason')
     expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
     expect(steer?.getAttribute('aria-describedby')).toBeNull()
+    app.unmount()
+  })
+
+  it('keeps a durable queued item disabled until the gateway supports atomic steer', async () => {
+    const { app, el } = await mountQueue({}, [{
+      text: 'Durably queued guidance',
+      pendingInputId: 'pending-durable',
+      pendingPersistenceState: 'staged',
+    }], {
+      steerAvailable: true,
+      durableSteerAvailable: false,
+    })
+
+    const steer = el.querySelector<HTMLButtonElement>('.chat-pending-action--steer')
+    expect(steer?.disabled).toBe(true)
+    expect(steer?.title).toContain('gateway does not support')
     app.unmount()
   })
 
