@@ -307,6 +307,11 @@ def test_desktop_retry_waits_for_all_owned_gateways_and_fails_closed() -> None:
 def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     preload = _read("desktop/electron/src/preload.cts")
+    resume_flow = _section(
+        main_ts,
+        "async function resumeBootStartup()",
+        "ipcMain.handle('desktop:boot:resume'",
+    )
     resume_handler = _section(
         main_ts,
         "ipcMain.handle('desktop:boot:resume'",
@@ -324,14 +329,19 @@ def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
     )
 
     assert "resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume')" in preload
-    assert "const gateway = gatewayStartPromise" in resume_handler
-    assert "await resumeOwnedGatewayStartup()" in resume_handler
-    assert "if (!gateway)" in resume_handler
-    assert "void openOrResumeDesktopApp()" in resume_handler
-    assert "await loadControlUiIntoCurrentWindow(gateway.url)" in resume_handler
-    assert "stopAndJoinAllLifecycleOwnedGateways" not in resume_handler
-    assert "clearReusableGatewayState" not in resume_handler
-    assert "stopGateway()" not in resume_handler
+    assert "const pendingStart = gatewayStartPromise" in resume_flow
+    assert "await resumeOwnedGatewayStartup()" in resume_flow
+    assert "if (!gateway)" in resume_flow
+    assert "void openOrResumeDesktopApp()" in resume_flow
+    assert "await loadControlUiIntoCurrentWindow(" in resume_flow
+    assert "bootResumeAuthorityIsCurrent(authority)" in resume_flow
+    assert "if (pendingStart || !initialAuthority" in resume_flow
+    assert "stopAndJoinAllLifecycleOwnedGateways" not in resume_flow
+    assert "clearReusableGatewayState" not in resume_flow
+    assert "stopGateway()" not in resume_flow
+    assert "if (bootResumePromise) return await bootResumePromise" in resume_handler
+    assert "bootResumePromise = promise" in resume_handler
+    assert "bootResumePromise = null" in resume_handler
 
     assert "await resumeOwnedGatewayStartup()" in start
     assert start.index("await resumeOwnedGatewayStartup()") < start.index(
@@ -341,7 +351,65 @@ def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
     assert "gatewayProfileKey !== desktopProfileKey()" in resume_owned
     assert "await waitForGateway(url, childExitMessage)" in resume_owned
     assert "await waitForControlUi(url, childExitMessage)" in resume_owned
+    assert "await verifyOwnedGatewayLaunch(child)" in resume_owned
     assert "gatewayState.status = 'ready'" in resume_owned
+
+
+def test_desktop_gateway_ready_requires_exact_launch_identity() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    start = _section(
+        main_ts,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery()",
+    )
+    verifier = _section(
+        main_ts,
+        "async function verifyOwnedGatewayLaunch",
+        "async function resumeOwnedGatewayStartup",
+    )
+
+    assert "gatewayProcessOwnershipContexts.get(child)" in verifier
+    assert "verifyDesktopGatewayLaunchOwnership" in verifier
+    assert "await verifyOwnedGatewayLaunch(child)" in start
+    assert "hardTerminateGatewayProcess(child)" in start
+    assert "requestGatewayShutdown" not in start
+    assert "unverified listener" in start
+
+
+def test_desktop_boot_resume_fences_stale_async_state_and_ready_events() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    authority = _section(
+        main_ts,
+        "function bootResumeAuthorityIsCurrent",
+        "async function resumeBootStartup",
+    )
+    resume_flow = _section(
+        main_ts,
+        "async function resumeBootStartup",
+        "ipcMain.handle('desktop:boot:resume'",
+    )
+    control_load = _section(
+        main_ts,
+        "async function loadControlUiIntoCurrentWindow",
+        "async function restoreMainWindowToBootPage",
+    )
+
+    for fence in [
+        "!isQuitting",
+        "gatewayProcess === authority.child",
+        "gatewayProfileKey === authority.profileKey",
+        "desktopOpenFlowRevision === authority.openFlowRevision",
+    ]:
+        assert fence in authority
+    assert "if (initialAuthority && !bootResumeAuthorityIsCurrent" in resume_flow
+    assert "if (!authority || !bootResumeAuthorityIsCurrent" in resume_flow
+    assert "!bootResumeAuthorityIsCurrent(initialAuthority)" in resume_flow
+
+    first_fence = control_load.index("if (!isCurrent()) return false")
+    load = control_load.index("await loadControlUi(window, gatewayUrl)")
+    final_fence = control_load.index("if (!isCurrent()) return false", load)
+    ready = control_load.rindex("sendBootStatus('ready')")
+    assert first_fence < load < final_fence < ready
 
 
 def test_desktop_shared_spawn_gate_blocks_still_stopping_gateways() -> None:

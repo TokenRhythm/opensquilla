@@ -27,6 +27,7 @@ import {
   desktopProfileFingerprint,
   loadDesktopGatewayOwnershipRecord,
   requestVerifiedDesktopGatewayShutdown,
+  verifyDesktopGatewayLaunchOwnership,
   waitForDesktopGatewayOwnershipRelease,
   type DesktopGatewayOwnershipRecord,
 } from './desktop-gateway-ownership.js'
@@ -493,6 +494,7 @@ const gatewayProcessTreeChildren = new WeakSet<ChildProcessWithoutNullStreams>()
 const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
 let desktopOpenFlowPromise: Promise<void> | null = null
+let bootResumePromise: Promise<{ ok: boolean; error?: string }> | null = null
 
 function invalidateDesktopOpenFlow(): number {
   desktopOpenFlowRevision += 1
@@ -7740,6 +7742,18 @@ async function reuseHealthyGatewayState(): Promise<GatewayState | null> {
   return null
 }
 
+async function verifyOwnedGatewayLaunch(
+  child: ChildProcessWithoutNullStreams,
+): Promise<boolean> {
+  const context = gatewayProcessOwnershipContexts.get(child)
+  if (!context) return false
+  return await verifyDesktopGatewayLaunchOwnership(context.ownershipDir, {
+    instanceNonce: context.nonce,
+    profileFingerprint: context.profileFingerprint,
+    port: context.port,
+  })
+}
+
 async function resumeOwnedGatewayStartup(): Promise<GatewayState | null> {
   const child = gatewayProcess
   if (
@@ -7770,6 +7784,18 @@ async function resumeOwnedGatewayStartup(): Promise<GatewayState | null> {
     || gatewayProfileKey !== desktopProfileKey()
   ) {
     throw new Error(childExitMessage() || 'Desktop gateway changed while startup resumed.')
+  }
+  if (!await verifyOwnedGatewayLaunch(child)) {
+    throw new Error(
+      'OPENSQUILLA_GATEWAY_IDENTITY_MISMATCH: The healthy listener is not the Desktop Gateway from this launch.',
+    )
+  }
+  if (
+    gatewayProcess !== child
+    || hasGatewayProcessExited(child)
+    || gatewayProfileKey !== desktopProfileKey()
+  ) {
+    throw new Error(childExitMessage() || 'Desktop gateway changed during ownership verification.')
   }
 
   gatewayState.status = 'ready'
@@ -8109,6 +8135,24 @@ async function startGateway(): Promise<GatewayState> {
     throw new Error(childExitMessage
       || 'OPENSQUILLA_GATEWAY_PORT_IN_USE: desktop gateway did not keep the port bind.')
   }
+  if (!await verifyOwnedGatewayLaunch(child)) {
+    // Never send a shutdown request to the unverified listener. Terminate only
+    // the exact child handle we spawned, then let port recovery choose another
+    // loopback port once that child has released its profile writer lease.
+    if (gatewayProcess === child) {
+      trackStoppingGatewayProcess(child)
+      gatewayProcess = null
+      hardTerminateGatewayProcess(child)
+      await waitForGatewayProcessExit(child)
+    }
+    throw new Error(
+      'OPENSQUILLA_GATEWAY_PORT_IN_USE: Gateway port is already in use by an unverified listener.',
+    )
+  }
+  if (hasGatewayProcessExited(child) || gatewayProcess !== child) {
+    throw new Error(childExitMessage
+      || 'OPENSQUILLA_GATEWAY_PORT_IN_USE: desktop gateway changed during ownership verification.')
+  }
   sendBootStatus('control')
   gatewayState.status = 'ready'
   return gatewayState
@@ -8372,23 +8416,30 @@ function ensureGatewayStarted(): Promise<GatewayState> {
   return gatewayStartPromise
 }
 
-async function loadControlUiIntoCurrentWindow(gatewayUrl: string): Promise<void> {
+async function loadControlUiIntoCurrentWindow(
+  gatewayUrl: string,
+  isCurrent: () => boolean = () => true,
+): Promise<boolean> {
+  if (!isCurrent()) return false
   const window = currentMainWindow()
-  if (!window) return
+  if (!window) return false
 
   sendBootStatus('control')
   if (isCurrentWindowAtControlUi(window, gatewayUrl)) {
+    if (!isCurrent()) return false
     sendBootStatus('ready')
-    return
+    return true
   }
 
   try {
     await loadControlUi(window, gatewayUrl)
   } catch (error) {
-    if (window.isDestroyed()) return
+    if (window.isDestroyed()) return false
     throw error
   }
+  if (!isCurrent()) return false
   sendBootStatus('ready')
+  return true
 }
 
 // Bring the main window back to the boot splash when a gateway failure happens
@@ -12479,12 +12530,46 @@ ipcMain.handle('desktop:boot:state', () => ({
   gateway: { ...gatewayState },
   recovery: recoveryStateSnapshot(),
 }))
-ipcMain.handle('desktop:boot:resume', async () => {
+
+interface BootResumeAuthority {
+  child: ChildProcessWithoutNullStreams
+  profileKey: string
+  openFlowRevision: number
+}
+
+function currentBootResumeAuthority(): BootResumeAuthority | null {
+  if (
+    !gatewayProcess
+    || !gatewayState.owned
+    || !gatewayProfileKey
+    || hasGatewayProcessExited(gatewayProcess)
+  ) return null
+  return {
+    child: gatewayProcess,
+    profileKey: gatewayProfileKey,
+    openFlowRevision: desktopOpenFlowRevision,
+  }
+}
+
+function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
+  return !isQuitting
+    && gatewayProcess === authority.child
+    && !hasGatewayProcessExited(authority.child)
+    && gatewayState.owned
+    && gatewayProfileKey === authority.profileKey
+    && desktopProfileKey() === authority.profileKey
+    && desktopOpenFlowRevision === authority.openFlowRevision
+}
+
+async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
+  const pendingStart = gatewayStartPromise
+  const initialAuthority = pendingStart ? null : currentBootResumeAuthority()
   bootError = null
   await currentMainWindow()?.loadFile(bootPagePath()).catch(() => null)
+  if (initialAuthority && !bootResumeAuthorityIsCurrent(initialAuthority)) return { ok: true }
   try {
-    const gateway = gatewayStartPromise
-      ? await gatewayStartPromise
+    const gateway = pendingStart
+      ? await pendingStart
       : await resumeOwnedGatewayStartup()
     if (!gateway) {
       // With no exact live child to resume, use the normal open flow so profile
@@ -12492,10 +12577,21 @@ ipcMain.handle('desktop:boot:resume', async () => {
       void openOrResumeDesktopApp()
       return { ok: true }
     }
-    await loadControlUiIntoCurrentWindow(gateway.url)
+    const authority = pendingStart ? currentBootResumeAuthority() : initialAuthority
+    if (!authority || !bootResumeAuthorityIsCurrent(authority)) return { ok: true }
+    await loadControlUiIntoCurrentWindow(
+      gateway.url,
+      () => bootResumeAuthorityIsCurrent(authority),
+    )
     return { ok: true }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
+    // The original open flow owns errors from a pending initial start. For a
+    // direct resume, an exit handler or a newer quit/reset/restart owns any
+    // state after this exact child/profile/revision loses authority.
+    if (pendingStart || !initialAuthority || !bootResumeAuthorityIsCurrent(initialAuthority)) {
+      return { ok: false, error: message }
+    }
     if (gatewayState.status !== 'ready') {
       gatewayState.status = 'error'
       gatewayState.error = message
@@ -12507,6 +12603,17 @@ ipcMain.handle('desktop:boot:resume', async () => {
     })
     sendBootError(message)
     return { ok: false, error: message }
+  }
+}
+
+ipcMain.handle('desktop:boot:resume', async () => {
+  if (bootResumePromise) return await bootResumePromise
+  const promise = resumeBootStartup()
+  bootResumePromise = promise
+  try {
+    return await promise
+  } finally {
+    if (bootResumePromise === promise) bootResumePromise = null
   }
 })
 ipcMain.handle('desktop:boot:retry', async () => {
