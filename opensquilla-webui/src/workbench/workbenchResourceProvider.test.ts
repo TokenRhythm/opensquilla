@@ -203,7 +203,7 @@ describe('workbench resource provider', () => {
     })
 
     expect(result.document.documentId).toBe('doc-a')
-    expect(result.binding.source).toEqual({
+    expect(result.binding?.source).toEqual({
       type: 'attachment',
       attachmentId: 'att-a',
       id: 'att-a',

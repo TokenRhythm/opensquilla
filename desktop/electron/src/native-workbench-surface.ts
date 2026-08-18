@@ -171,6 +171,16 @@ const NATIVE_WORKBENCH_MAX_SCREENSHOT_BYTES = 16 * 1024 * 1024
 const NATIVE_WORKBENCH_CDP_TIMEOUT_MS = 5_000
 const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_CHANNEL =
   'opensquilla:workbench-annotation-overlay:init'
+const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_DEFAULT_COPY = Object.freeze({
+  targetLabel: 'Selected area',
+  contextLabel: 'Current selection',
+  bodyLabel: 'Page annotation',
+  placeholder: 'Describe what you want to change…',
+  newlineHint: 'Shift + Enter for a new line',
+  cancelLabel: 'Cancel',
+  submitLabel: 'Add annotation',
+  emptyBodyMessage: 'Describe the requested change.',
+})
 const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_PRELOAD = fileURLToPath(new URL(
   './native-workbench-annotation-overlay-preload.cjs',
   import.meta.url,
@@ -578,15 +588,15 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
   >
     <header class="annotation-header">
       <h1 id="annotation-title" class="annotation-title">
-        <code id="annotation-target" class="annotation-target" aria-label="当前选中的 HTML 元素">&lt;element&gt;</code>
-        <span class="annotation-context">当前选区</span>
+        <span id="annotation-target" class="annotation-target" aria-label="Selected area">Selected area</span>
+        <span id="annotation-context" class="annotation-context">Current selection</span>
       </h1>
     </header>
-    <textarea id="annotation-body" maxlength="16384" required aria-label="批注修改要求" placeholder="描述希望 AI 如何修改…"></textarea>
+    <textarea id="annotation-body" maxlength="16384" required aria-label="Page annotation" placeholder="Describe what you want to change…"></textarea>
     <footer>
       <span id="annotation-newline-hint" class="annotation-shortcut-hint"></span>
-      <button id="annotation-cancel" type="button">取消</button>
-      <button id="annotation-submit" type="submit">添加批注</button>
+      <button id="annotation-cancel" type="button">Cancel</button>
+      <button id="annotation-submit" type="submit">Add annotation</button>
     </footer>
   </form>
 </body>
@@ -594,6 +604,8 @@ const NATIVE_WORKBENCH_ANNOTATION_OVERLAY_HTML = `<!doctype html>
 
 export interface NativeWorkbenchSurfaceResult {
   ok: boolean
+  code?: string
+  retryable?: boolean
   message?: string
 }
 
@@ -971,6 +983,7 @@ export class NativeWorkbenchSurfaceManager {
         available: false,
         picker: false,
         trustedOverlay: false,
+        overlayCopyVersion: 1,
         reason: 'No active protocol-v3 HTML artifact preview is available.',
       }
     }
@@ -980,6 +993,7 @@ export class NativeWorkbenchSurfaceManager {
         available: false,
         picker: false,
         trustedOverlay: false,
+        overlayCopyVersion: 1,
         reason: 'The isolated DOM inspector is unavailable.',
       }
     }
@@ -997,6 +1011,7 @@ export class NativeWorkbenchSurfaceManager {
         available: false,
         picker: true,
         trustedOverlay: false,
+        overlayCopyVersion: 1,
         reason: 'The trusted annotation editor is unavailable.',
       }
     }
@@ -1005,6 +1020,7 @@ export class NativeWorkbenchSurfaceManager {
       available: true,
       picker: true,
       trustedOverlay: true,
+      overlayCopyVersion: 1,
     }
   }
 
@@ -1022,6 +1038,11 @@ export class NativeWorkbenchSurfaceManager {
     if (!record) {
       return {
         ok: false,
+        // The renderer may still hold a scoped capability for a surface that
+        // Desktop has already replaced. Give it a stable, retryable signal so
+        // it can rebuild the preview once instead of surfacing IPC details.
+        code: 'PREVIEW_CAPABILITY_EXPIRED',
+        retryable: true,
         message: 'Only the active protocol-v3 HTML artifact preview supports annotations.',
       }
     }
@@ -1031,14 +1052,31 @@ export class NativeWorkbenchSurfaceManager {
         'picker-cancelled',
         true,
       )
-      if (cleanupFailure) return { ok: false, message: cleanupFailure }
+      if (cleanupFailure) {
+        return {
+          ok: false,
+          code: 'ANNOTATION_BUSY',
+          retryable: true,
+          message: cleanupFailure,
+        }
+      }
       return { ok: true }
     }
     if (!record.cdpReady || !record.view.webContents.debugger.isAttached()) {
-      return { ok: false, message: 'The isolated DOM inspector is unavailable.' }
+      return {
+        ok: false,
+        code: 'ANNOTATION_UNAVAILABLE',
+        retryable: true,
+        message: 'The isolated DOM inspector is unavailable.',
+      }
     }
     if (this.activeAnnotationOverlayBinding(record)) {
-      return { ok: false, message: 'Finish the current annotation before choosing another element.' }
+      return {
+        ok: false,
+        code: 'ANNOTATION_BUSY',
+        retryable: true,
+        message: 'Finish the current annotation before choosing another element.',
+      }
     }
     this.clearAnnotationCandidate(record)
     record.annotationPickerActive = true
@@ -1056,6 +1094,8 @@ export class NativeWorkbenchSurfaceManager {
       const cleanupFailure = await this.clearAnnotationInspectState(record, true)
       return {
         ok: false,
+        code: 'ANNOTATION_UNAVAILABLE',
+        retryable: true,
         message: cleanupFailure
           ? `${errorMessage(error)} ${cleanupFailure}`
           : errorMessage(error),
@@ -1078,14 +1118,24 @@ export class NativeWorkbenchSurfaceManager {
         this.clearAnnotationCandidate(record)
         this.failAnnotationOverlay(record, request.annotationId, 'selection-stale')
       }
-      return { ok: false, message: 'The selected preview element is stale or unavailable.' }
+      return {
+        ok: false,
+        code: 'ANNOTATION_UNAVAILABLE',
+        retryable: true,
+        message: 'The selected preview element is stale or unavailable.',
+      }
     }
     try {
       await this.refreshAnnotationCandidateIntegrity(record, candidate)
     } catch (error) {
       this.clearAnnotationCandidate(record)
       this.failAnnotationOverlay(record, request.annotationId, 'selection-stale')
-      return { ok: false, message: errorMessage(error) }
+      return {
+        ok: false,
+        code: 'ANNOTATION_UNAVAILABLE',
+        retryable: true,
+        message: errorMessage(error),
+      }
     }
     try {
       const overlay = await this.annotationOverlayForOwner(record.owner)
@@ -1116,7 +1166,7 @@ export class NativeWorkbenchSurfaceManager {
         {
           version: 1,
           initialBody: request.initialBody,
-          tagName: candidate.selection.tagName,
+          copy: request.copy || NATIVE_WORKBENCH_ANNOTATION_OVERLAY_DEFAULT_COPY,
         },
         [channel.port2],
       )
@@ -1132,8 +1182,22 @@ export class NativeWorkbenchSurfaceManager {
       this.startAnnotationGeometryWatcher(record, candidate)
       return { ok: true }
     } catch (error) {
-      this.failAnnotationOverlay(record, request.annotationId, 'trusted-overlay-unavailable')
-      return { ok: false, message: errorMessage(error) }
+      // Recreate only the trusted editor view on the caller's single bounded
+      // replay. Keep the opaque selection bound to the active preview so a
+      // transient renderer failure does not force the user to select again.
+      const failedOverlay = this.annotationOverlays.get(record.owner)
+      if (record.annotationCandidate) {
+        this.stopAnnotationGeometryWatcher(record.annotationCandidate)
+      }
+      if (failedOverlay) await this.disposeAnnotationOverlay(failedOverlay)
+      record.annotationFallbackActive = false
+      this.setPhysicalVisibility(record, this.ownerCanShowSurfaces(record.owner))
+      return {
+        ok: false,
+        code: 'PREVIEW_RENDERER_FAILED',
+        retryable: true,
+        message: errorMessage(error),
+      }
     }
   }
 
@@ -1142,7 +1206,12 @@ export class NativeWorkbenchSurfaceManager {
   ): NativeWorkbenchSurfaceResult {
     const record = this.surfaces.get(request.surfaceId)
     if (!record || record.disposed) {
-      return { ok: false, message: 'The native Workbench surface no longer exists.' }
+      return {
+        ok: false,
+        code: 'PREVIEW_CAPABILITY_EXPIRED',
+        retryable: true,
+        message: 'The native Workbench surface no longer exists.',
+      }
     }
     const overlay = this.annotationOverlays.get(record.owner)
     const binding = overlay?.binding
@@ -1151,7 +1220,12 @@ export class NativeWorkbenchSurfaceManager {
       && binding
       && binding.annotationId !== request.annotationId
     ) {
-      return { ok: false, message: 'The trusted annotation editor changed.' }
+      return {
+        ok: false,
+        code: 'ANNOTATION_BUSY',
+        retryable: true,
+        message: 'The trusted annotation editor changed.',
+      }
     }
     if (overlay) this.closeAnnotationOverlayBinding(overlay, false)
     record.annotationFallbackActive = false

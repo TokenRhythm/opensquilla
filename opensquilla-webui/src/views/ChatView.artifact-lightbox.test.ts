@@ -43,7 +43,8 @@ describe('ChatView artifact preview routing', () => {
     const catchSource = source.slice(catchStart)
 
     expect(catchStart).toBeGreaterThan(-1)
-    expect(catchSource).toContain("t('workbench.resources.actionFailed')")
+    expect(catchSource).toContain('classifyArtifactProductError(error)')
+    expect(catchSource).toContain('classified.messageKey')
     expect(catchSource).toContain("{ tone: 'danger', duration: 9000 }")
     expect(catchSource).not.toContain('openLegacyArtifactWorkbench')
   })
@@ -58,6 +59,22 @@ describe('ChatView artifact preview routing', () => {
     expect(source).toContain("downloadBlob(blob, artifact.name || 'artifact')")
     expect(source).not.toContain('openCurrent')
     expect(source).not.toContain('headArtifact')
+  })
+
+  it('opens attachment cards through the current resource before the old Gateway fallback', () => {
+    const start = chatViewSource.indexOf('async function previewAttachmentResource(')
+    const end = chatViewSource.indexOf('\nasync function editAttachmentResource(', start)
+    const source = chatViewSource.slice(start, end)
+
+    expect(start).toBeGreaterThan(-1)
+    expect(source).toContain('workbenchResourcesStore.openCurrent(sessionKey.value, resource)')
+    expect(source).toContain("current?.disposition === 'document'")
+    expect(source).toContain('workbenchResourcesStore.importDocument(')
+    expect(source.indexOf('openCurrent(sessionKey.value, resource)'))
+      .toBeLessThan(source.indexOf('importDocument('))
+    expect(source).toContain("initialSection: 'preview'")
+    expect(source).toContain('classifyArtifactProductError(error)')
+    expect(source).not.toContain('error.message')
   })
 
   it('refreshes the typed resource inventory when a new deliverable appears', () => {
@@ -78,7 +95,7 @@ describe('ChatView artifact preview routing', () => {
     const refreshEnd = chatViewSource.indexOf('\nfunction openLegacyArtifactWorkbench', refreshStart)
     const refreshSource = chatViewSource.slice(refreshStart, refreshEnd)
 
-    expect(explicitOpenCalls).toHaveLength(6)
+    expect(explicitOpenCalls).toHaveLength(8)
     expect(chatViewSource).toContain('function artifactPreviewItemForExplicitOpen(')
     expect(refreshSource).toContain(
       'initialSectionRequestId: initialSectionRequestIdFromWorkbenchItem(item)',

@@ -66,6 +66,96 @@ async def test_dispatch_catchall_logs_traceback(capsys) -> None:
     assert "Traceback" in combined
 
 
+@pytest.mark.parametrize(
+    ("method", "scope", "exception", "expected_code", "expected_message", "accepted"),
+    [
+        (
+            "artifacts.synthetic",
+            "operator.write",
+            ValueError("private artifact validation detail"),
+            "INVALID_REQUEST",
+            "The request could not be completed. Check the input and try again.",
+            False,
+        ),
+        (
+            "workbench.resources.synthetic",
+            "operator.write",
+            KeyError("private resource identity"),
+            "MUTATION_OUTCOME_PENDING",
+            "The update result cannot be confirmed yet. Open the page to check before retrying.",
+            None,
+        ),
+        (
+            "documents.synthetic",
+            "operator.read",
+            RuntimeError("private document storage detail"),
+            "INTERNAL_ERROR",
+            "The operation could not be completed. Try again.",
+            False,
+        ),
+        (
+            "workbench.previews.synthetic-value",
+            "operator.read",
+            ValueError("private preview validation detail"),
+            "INVALID_REQUEST",
+            "The request could not be completed. Check the input and try again.",
+            False,
+        ),
+        (
+            "workbench.previews.synthetic-runtime",
+            "operator.read",
+            RuntimeError("private preview renderer detail"),
+            "INTERNAL_ERROR",
+            "The operation could not be completed. Try again.",
+            False,
+        ),
+    ],
+    ids=(
+        "artifact-value-error",
+        "resource-key-error",
+        "document-exception",
+        "preview-value-error",
+        "preview-runtime-error",
+    ),
+)
+async def test_artifact_product_dispatch_fallback_never_exposes_exception(
+    capsys,
+    method: str,
+    scope: str,
+    exception: Exception,
+    expected_code: str,
+    expected_message: str,
+    accepted: bool | None,
+) -> None:
+    registry = RpcRegistry()
+
+    async def _boom(params, ctx):
+        raise exception
+
+    registry.register(method, _boom, scope)
+    ctx = RpcContext(conn_id="test", config=GatewayConfig())
+
+    response = await registry.dispatch("req-artifact", method, {}, ctx)
+
+    assert response.ok is False
+    assert response.error is not None
+    assert response.error.code == expected_code
+    assert response.error.message == expected_message
+    assert response.error.accepted is accepted
+    assert response.error.details is not None
+    correlation_id = response.error.details["correlationId"]
+    assert isinstance(correlation_id, str)
+    assert len(correlation_id) == 32
+    assert str(exception) not in response.error.message
+    assert str(exception) not in str(response.error.details)
+
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    assert "artifact.rpc_dispatch_failed" in combined
+    assert correlation_id in combined
+    assert str(exception) in combined
+
+
 @pytest.mark.asyncio
 async def test_dispatch_binds_configured_toolchain_state_per_task(
     monkeypatch: pytest.MonkeyPatch,

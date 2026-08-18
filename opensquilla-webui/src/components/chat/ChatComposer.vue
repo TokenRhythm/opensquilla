@@ -52,9 +52,7 @@
             v-for="annotation in promptAnnotations"
             :key="annotation.annotationId"
             class="chat-prompt-annotation-chip"
-            :class="{ 'is-stale': annotation.freshness === 'stale' }"
             :data-annotation-id="annotation.annotationId"
-            :data-freshness="annotation.freshness"
             role="group"
           >
             <span class="chat-prompt-annotation-chip__rail" aria-hidden="true" />
@@ -88,14 +86,11 @@
                 :title="annotation.body"
                 @click="emit('jumpPromptAnnotation', annotation.annotationId)"
               >
-                <code class="chat-prompt-annotation-chip__target">
-                  {{ annotation.tagName ? `<${annotation.tagName}>` : t('chat.promptAnnotations.element') }}
-                </code>
+                <span class="chat-prompt-annotation-chip__target">
+                  {{ promptAnnotationTargetLabel(annotation, t) }}
+                </span>
                 <span class="chat-prompt-annotation-chip__text">
                   {{ annotation.body || t('chat.promptAnnotations.emptyDraft') }}
-                </span>
-                <span v-if="annotation.freshness === 'stale'" class="chat-prompt-annotation-chip__stale">
-                  {{ t('chat.promptAnnotations.stale') }}
                 </span>
               </button>
               <button
@@ -458,6 +453,7 @@ import type { SandboxRunMode } from '@/types/sandbox'
 import type { CollaborationMode } from '@/types/plans'
 import type { PromptCacheKeepaliveStatus } from '@/types/promptCacheKeepalive'
 import type { PromptAnnotation } from '@/types/promptAnnotations'
+import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresentation'
 import {
   PROMPT_ANNOTATION_MAX_BODY_LENGTH,
   promptAnnotationBodyWithinLimit,
@@ -1122,19 +1118,11 @@ defineExpose<ChatComposerExpose>({
   border-top: 1px solid var(--border);
 }
 
-.chat-prompt-annotation-chip.is-stale {
-  color: var(--warn);
-}
-
 .chat-prompt-annotation-chip__rail {
   width: 3px;
   align-self: stretch;
   border-radius: var(--radius-full);
   background: var(--accent);
-}
-
-.chat-prompt-annotation-chip.is-stale .chat-prompt-annotation-chip__rail {
-  background: var(--warn);
 }
 
 .chat-prompt-annotation-chip__main {
@@ -1169,19 +1157,12 @@ defineExpose<ChatComposerExpose>({
   border-radius: var(--radius-sm);
   background: var(--bg-hover);
   color: var(--text-muted);
-  font-family: var(--font-mono);
   font-size: var(--fs-xs);
 }
 
 .chat-prompt-annotation-chip__text {
   color: var(--text);
   font-size: var(--fs-sm);
-}
-
-.chat-prompt-annotation-chip__stale {
-  grid-column: 2;
-  color: var(--warn);
-  font-size: var(--fs-xs);
 }
 
 .chat-prompt-annotation-chip__editor {
@@ -1231,9 +1212,6 @@ defineExpose<ChatComposerExpose>({
     display: none;
   }
 
-  .chat-prompt-annotation-chip__stale {
-    grid-column: 1;
-  }
 }
 
 .attachment-chip {

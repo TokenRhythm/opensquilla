@@ -198,9 +198,9 @@ class _DeterministicArtifactProvider:
         annotation_payload = self._json_tool_content(tool_messages[-1].get("content"))
         mutations: list[dict[str, str]] = []
         for annotation in annotation_payload["annotations"]:
-            tag = annotation["selection"]["tag"]
+            target_kind = annotation["selection"]["kind"]
             locations = annotation["initialLocations"]
-            if tag == "button":
+            if target_kind == "button":
                 location = next(
                     item for item in locations if item["operation"] == "set_style"
                 )
@@ -208,7 +208,7 @@ class _DeterministicArtifactProvider:
                     "grant_token": location["grantToken"],
                     "input": "background-color: #ef4444",
                 }
-            elif tag == "img":
+            elif target_kind == "image":
                 location = next(
                     item for item in locations if item["operation"] == "remove_node"
                 )
@@ -506,7 +506,7 @@ def test_certification_closes_driver_and_never_invents_report_after_executor_fai
 
     with pytest.raises(RuntimeError, match="synthetic executor failure"):
         asyncio.run(e2e._run_certification(FailingDriver(), hard_cap=64))
-    assert events == ["start", "run:stale_head_zero_call", "close"]
+    assert events == ["start", "run:discarded_annotation_zero_call", "close"]
 
 
 def test_certification_rejects_case_that_exceeds_its_pre_reserved_calls() -> None:

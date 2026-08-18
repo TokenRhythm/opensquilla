@@ -33,11 +33,9 @@ async function save(event: Event) {
     const saved = await platform.settings.saveDesktopPreferences({ workbenchPreviewMode: next })
     preferences.value = saved
     value.value = saved.workbenchPreviewMode ?? next
-  } catch (error) {
+  } catch {
     value.value = previous
-    pushToast(t('setup.runtime.previewModeSaveFailed', {
-      error: error instanceof Error ? error.message : String(error),
-    }), { tone: 'danger' })
+    pushToast(t('setup.runtime.previewModeSaveFailed'), { tone: 'danger' })
   } finally {
     saving.value = false
   }

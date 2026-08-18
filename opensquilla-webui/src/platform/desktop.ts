@@ -274,6 +274,7 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
               ...(typeof raw.trustedOverlay === 'boolean'
                 ? { trustedOverlay: raw.trustedOverlay }
                 : {}),
+              ...(raw.overlayCopyVersion === 1 ? { overlayCopyVersion: 1 as const } : {}),
               ...(typeof raw.reason === 'string' ? { reason: raw.reason } : {}),
             }
           },

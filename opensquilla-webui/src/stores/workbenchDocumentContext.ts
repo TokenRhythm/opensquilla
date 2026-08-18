@@ -15,9 +15,19 @@ export interface WorkbenchDocumentContextPrepareRequest {
   sessionKey: string
 }
 
+export interface WorkbenchDocumentPrepareRequest {
+  documentId: string
+  isCurrent?: () => boolean
+  sessionKey: string
+}
+
 type WorkbenchDocumentContextPreparer = (
   request: WorkbenchDocumentContextPrepareRequest,
 ) => Promise<ChatDocumentContext | false>
+
+type WorkbenchDocumentPreparer = (
+  request: WorkbenchDocumentPrepareRequest,
+) => Promise<ChatDocumentContext | null | false>
 
 export interface WorkbenchDocumentContextController {
   clear(): void
@@ -57,14 +67,20 @@ export const useWorkbenchDocumentContextStore = defineStore(
     const active = shallowRef<ActiveWorkbenchDocumentContext | null>(null)
     let controller: {
       prepare: WorkbenchDocumentContextPreparer
+      prepareDocument?: WorkbenchDocumentPreparer
       token: symbol
     } | null = null
 
     function attachController(
       prepare: WorkbenchDocumentContextPreparer,
+      prepareDocument?: WorkbenchDocumentPreparer,
     ): WorkbenchDocumentContextController {
       const token = Symbol('workbench-document-context-controller')
-      controller = { prepare, token }
+      controller = {
+        prepare,
+        token,
+        ...(prepareDocument ? { prepareDocument } : {}),
+      }
       active.value = null
 
       const ownsBridge = () => controller?.token === token
@@ -126,6 +142,36 @@ export const useWorkbenchDocumentContextStore = defineStore(
       return { ...result }
     }
 
+    async function prepareDocumentForSend(
+      sessionKey: string,
+      documentId: string,
+      options: { isCurrent?: () => boolean } = {},
+    ): Promise<ChatDocumentContext | null | false> {
+      const normalizedDocumentId = String(documentId || '').trim()
+      if (!sessionKey || !normalizedDocumentId || options.isCurrent?.() === false) return false
+      const attached = controller
+      if (!attached) return null
+      if (!attached.prepareDocument) {
+        const current = active.value
+        if (current?.sessionKey !== sessionKey || current.documentId !== normalizedDocumentId) {
+          return null
+        }
+        return prepareDocumentContextForSend(sessionKey, options)
+      }
+      const result = await attached.prepareDocument({
+        documentId: normalizedDocumentId,
+        sessionKey,
+        ...(options.isCurrent ? { isCurrent: options.isCurrent } : {}),
+      })
+      if (result === false || result === null || options.isCurrent?.() === false) return result
+      if (controller !== attached || result.documentId !== normalizedDocumentId) return false
+      const current = active.value
+      if (current?.sessionKey === sessionKey && current.documentId === normalizedDocumentId) {
+        active.value = { ...current, headRevisionId: result.headRevisionId }
+      }
+      return { ...result }
+    }
+
     function reset() {
       active.value = null
       controller = null
@@ -136,6 +182,7 @@ export const useWorkbenchDocumentContextStore = defineStore(
       attachController,
       currentDocumentContext,
       prepareDocumentContextForSend,
+      prepareDocumentForSend,
       reset,
     }
   },

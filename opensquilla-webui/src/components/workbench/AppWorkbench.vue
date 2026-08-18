@@ -183,10 +183,15 @@ import {
   useWorkbenchDocumentContextStore,
   type ActiveWorkbenchDocumentContext,
   type WorkbenchDocumentContextPrepareRequest,
+  type WorkbenchDocumentPrepareRequest,
 } from '@/stores/workbenchDocumentContext'
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useRpcStore } from '@/stores/rpc'
-import type { ArtifactPayload, ArtifactStateEventPayload } from '@/types/rpc'
+import type {
+  ArtifactPayload,
+  ArtifactStateEventPayload,
+  ChatDocumentContext,
+} from '@/types/rpc'
 import type {
   WorkbenchPreviewDescriptor,
   WorkbenchResource,
@@ -212,10 +217,12 @@ import {
   artifactCategory,
   artifactFileTitle,
 } from '@/utils/chat/artifacts'
+import { artifactProductClientError } from '@/utils/artifactProductErrors'
 import {
   readPreviewPreferences,
   savePreviewPreferences,
 } from '@/utils/workbench/previewPreferences'
+import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import {
   attachWorkbenchRuntime,
   WorkbenchRuntimeManager,
@@ -225,7 +232,6 @@ import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvide
 import { createRpcWorkbenchResourceProvider } from '@/workbench/workbenchResourceProvider'
 import {
   workbenchResourceActionReasonCode,
-  workbenchResourceUnavailableReasonKey,
 } from '@/workbench/resourceCapabilityPresentation'
 import {
   artifactPayloadFromWorkbenchResource,
@@ -311,6 +317,7 @@ const artifactEventSequences = new Map<string, number>()
 let scopeChangeGeneration = 0
 const documentContextController = workbenchDocumentContext.attachController(
   prepareActiveDocumentContext,
+  prepareWorkbenchDocument,
 )
 
 function artifactPreviewItemForExplicitOpen(
@@ -525,12 +532,19 @@ async function openWorkbenchResource(resource: WorkbenchResource, item: Workbenc
   const readonlyResource = current?.resource || resource
   refreshResourceCollectionItem(sessionKey)
   if (!readonlyResource.capabilities.preview) {
-    throw new Error(t(workbenchResourceUnavailableReasonKey(
-      current?.reasonCode || workbenchResourceActionReasonCode(
+    const previewKind = artifactWorkbenchPreviewKind(
+      artifactPayloadFromWorkbenchResource(readonlyResource),
+    )
+    if (previewKind !== 'html' && readonlyResource.capabilities.download) {
+      await downloadWorkbenchResource(readonlyResource, item)
+      return
+    }
+    throw artifactProductClientError('RESOURCE_UNSUPPORTED', {
+      reasonCode: current?.reasonCode || workbenchResourceActionReasonCode(
         readonlyResource.capabilities,
         'preview',
-      ),
-    )))
+      ) || undefined,
+    })
   }
   if (
     resourceUsesNativeHtmlPreview(readonlyResource)
@@ -886,13 +900,6 @@ function onArtifactState(event: ArtifactStateEventPayload) {
       refreshResourceCollectionItem(activeSessionKey)
     }).catch(() => undefined)
   }
-  const headChanged = [
-    'revision.restored',
-    'change.reverted',
-    'source.patched',
-  ].includes(String(event.action || ''))
-  if (headChanged) artifactPromptAnnotations.markDocumentStale(documentId)
-
   for (const item of store.items) {
     const artifact = artifactFromWorkbenchItem(item)
     if (!artifact) continue
@@ -953,17 +960,6 @@ async function onPromptAnnotationFocus(event: Event) {
   if (!item) {
     detail.complete?.(false)
     return
-  }
-  const annotation = artifactPromptAnnotations.annotations[detail.annotationId]
-  if (annotation?.freshness === 'stale') {
-    runtimeManager.handleComponentEvent(item, {
-      type: 'artifact-prompt-annotation-reselect',
-      payload: {
-        annotationId: annotation.annotationId,
-        body: annotation.body,
-      },
-    })
-    await runtimeManager.flush(item.id)
   }
   detail.complete?.(true)
 }
@@ -1113,6 +1109,59 @@ async function prepareActiveDocumentContext(
       }
     },
   })
+}
+
+function workbenchDocumentItem(request: WorkbenchDocumentPrepareRequest): WorkbenchItem | null {
+  if (
+    request.isCurrent?.() === false
+    || props.sessionId.trim() !== request.sessionKey
+    || store.activeSessionId !== request.sessionKey
+  ) return null
+  const matches = store.items.filter((item) => {
+    if (
+      item.kind !== 'artifact-preview'
+      || item.scope.type !== 'session'
+      || item.scope.id !== request.sessionKey
+    ) return false
+    const artifact = artifactFromWorkbenchItem(item)
+    if (!artifact) return false
+    return artifactDocuments.snapshot(artifact, request.sessionKey)
+      .workspace?.document.documentId === request.documentId
+  })
+  return matches.length === 1 ? matches[0]! : null
+}
+
+async function prepareWorkbenchDocument(
+  request: WorkbenchDocumentPrepareRequest,
+): Promise<ChatDocumentContext | null | false> {
+  const item = workbenchDocumentItem(request)
+  if (!item) return null
+  const artifact = artifactFromWorkbenchItem(item)
+  if (!artifact) return null
+  const isCurrent = () => (
+    request.isCurrent?.() !== false
+    && workbenchDocumentItem(request)?.id === item.id
+  )
+  if (!isCurrent()) return false
+  try {
+    if (!await beforeCloseItem(item, { preserveRuntime: true }) || !isCurrent()) return false
+    const latest = await waitForLatestArtifactDocument(artifact, request.sessionKey)
+    const workspace = latest.workspace
+    if (
+      !isCurrent()
+      || latest.loading
+      || latest.stale
+      || workspace?.source !== 'document-api'
+      || workspace.document.documentId !== request.documentId
+      || !workspace.document.headRevisionId
+    ) return false
+    return {
+      documentId: workspace.document.documentId,
+      headRevisionId: workspace.document.headRevisionId,
+    }
+  } catch {
+    return false
+  }
 }
 
 watch(

@@ -1069,7 +1069,7 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.tool-row--error')).toBeNull()
   })
 
-  it('keeps a failed document apply visible and summarizes a later corrected receipt', async () => {
+  it('keeps a failed page update visible and uses the unified successful summary', async () => {
     const failedApply = timelineGroup(failedDocumentApplyCall())
     if (failedApply.type !== 'tool-group') throw new Error('expected tool group')
     failedApply.group.isError = true
@@ -1097,9 +1097,11 @@ describe('AssistantMessage activity disclosure', () => {
     expect(activity?.querySelector('.assistant-activity__summary')?.getAttribute('aria-expanded'))
       .toBe('false')
     expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
-      .toContain('Corrected and applied')
+      .toContain('Page updated')
+    expect(activity?.querySelector('.assistant-activity__summary')?.textContent)
+      .not.toMatch(/receipt|reconciliation|revision|document_apply/i)
     expect(activity?.querySelector('.tool-row--error')).not.toBeNull()
-    expect(activity?.textContent).toContain('Proposal validation failed')
+    expect(activity?.textContent).not.toContain('Proposal validation failed')
   })
 
   it('hides restored failures whose error state only survived on the group', async () => {

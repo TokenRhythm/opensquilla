@@ -42,13 +42,16 @@ from opensquilla.artifacts import (
     ArtifactStore,
     artifact_payload,
 )
+from opensquilla.gateway.artifact_product_errors import (
+    ArtifactProductErrorCode,
+    artifact_product_error,
+    logged_artifact_product_error,
+)
 from opensquilla.gateway.document_resource_recovery import DocumentImportRecoverySource
 from opensquilla.gateway.event_bridge import EventBridge
-from opensquilla.gateway.protocol import ERROR_NOT_FOUND
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
-    RpcUnavailableError,
     get_dispatcher,
 )
 from opensquilla.gateway.rpc_artifacts import _session_id_for_key
@@ -83,6 +86,16 @@ _MAX_EDITABLE_HTML_BYTES = 2 * 1024 * 1024
 _MAX_PREVIEWABLE_HTML_BYTES = 5 * 1024 * 1024
 _CANDIDATE_PUBLICATION_WAIT_SECONDS = 5.0
 _CANDIDATE_PUBLICATION_POLL_SECONDS = 0.01
+_MUTATION_RESOLUTION_RETRY_AFTER_MS = 250
+_MUTATION_OPERATION_TURN_PREFIX = {
+    "source.patch": "manual-source-patch",
+    "revision.restore": "revision-restore",
+    "change.revert": "change-revert",
+}
+_MUTATION_IMPORT_OPERATIONS = frozenset(
+    {"document.import", "workbench.resources.open"}
+)
+_MUTATION_PUBLISH_OPERATIONS = frozenset({"document.publish"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +175,20 @@ def _idempotency_key(params: dict[str, Any] | None) -> str:
     return request_id
 
 
+def _mutation_resolution_request_id(params: dict[str, Any] | None) -> str:
+    """Read the public request identity while retaining additive aliases."""
+
+    request_id = _optional_string(params, "requestId", max_bytes=256)
+    client_request_id = _optional_string(params, "clientRequestId", max_bytes=256)
+    idempotency_key = _optional_string(params, "idempotencyKey", max_bytes=256)
+    supplied = tuple(
+        value for value in (request_id, client_request_id, idempotency_key) if value is not None
+    )
+    if not supplied or len(set(supplied)) != 1:
+        raise artifact_product_error(ArtifactProductErrorCode.INVALID_REQUEST)
+    return supplied[0]
+
+
 def _required_sha256(params: dict[str, Any] | None, name: str) -> str:
     value = _require_string(params, name, max_bytes=64).lower()
     if _SHA256_RE.fullmatch(value) is None:
@@ -195,14 +222,13 @@ async def _scope(
     session_key = _session_key(params)
     session_id = await _session_id_for_key(ctx, session_key)
     if session_id is None:
-        raise RpcHandlerError(
-            ERROR_NOT_FOUND,
-            "Session not found",
-            details={"sessionKey": session_key},
+        raise artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            reason_code="session_unavailable",
         )
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
-        raise RpcUnavailableError("session storage is not wired")
+        raise artifact_product_error(ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE)
     return (
         session_key,
         session_id,
@@ -211,19 +237,40 @@ async def _scope(
 
 
 def _not_found(resource_type: str, resource_id: str) -> RpcHandlerError:
-    return RpcHandlerError(
-        ERROR_NOT_FOUND,
-        "Workbench resource not found",
-        details={"resource": _resource_ref_payload(resource_type, resource_id)},
+    # Resource identifiers stay in diagnostics and inventory responses.  A
+    # missing resource is one product recovery state regardless of its
+    # internal storage kind.
+    del resource_type, resource_id
+    return artifact_product_error(
+        ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+        reason_code="resource_unavailable",
     )
 
 
 def _conflict(exc: Exception) -> RpcHandlerError:
-    return RpcHandlerError(
-        "DOCUMENT_RESOURCE_CONFLICT",
-        str(exc),
-        retryable=False,
-        accepted=False,
+    return logged_artifact_product_error(
+        ArtifactProductErrorCode.DOCUMENT_CHANGED,
+        exc,
+        operation="workbench.resource_mutation",
+    )
+
+
+def _internal_product_error(
+    code: ArtifactProductErrorCode,
+    detail: str,
+    *,
+    operation: str,
+    accepted: bool | None = False,
+    retryable: bool = False,
+) -> RpcHandlerError:
+    """Keep an implementation diagnostic in logs while returning safe copy."""
+
+    return logged_artifact_product_error(
+        code,
+        RuntimeError(detail),
+        operation=operation,
+        accepted=accepted,
+        retryable=retryable,
     )
 
 
@@ -350,11 +397,9 @@ def _decode_resource_cursor(
     )
     actual = (payload.get("s"), payload.get("t"), payload.get("d"))
     if actual != expected or offset > len(resources):
-        raise RpcHandlerError(
-            "WORKBENCH_CURSOR_STALE",
-            "Workbench resources changed; restart listing from the first page",
-            retryable=False,
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_CHANGED,
+            reason_code="resource_list_changed",
         )
     return offset
 
@@ -407,7 +452,11 @@ async def _attachment_occurrences(
 ) -> tuple[_AttachmentOccurrence, ...]:
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
-        raise RpcUnavailableError("session storage is not wired")
+        raise _internal_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            "session storage is not wired",
+            operation="workbench.attachments.list",
+        )
     entries = await storage.get_canonical_transcript(session_id)
     occurrences: list[_AttachmentOccurrence] = []
     seen: dict[str, tuple[str, int, str]] = {}
@@ -469,7 +518,11 @@ async def _attachment_occurrences(
             identity = (message_id, index, sha)
             previous = seen.get(attachment_id)
             if previous is not None and previous != identity:
-                raise RpcUnavailableError("attachment resource identity collision")
+                raise _internal_product_error(
+                    ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+                    "attachment resource identity collision",
+                    operation="workbench.attachments.list",
+                )
             seen[attachment_id] = identity
             occurrences.append(
                 _AttachmentOccurrence(
@@ -591,57 +644,43 @@ def _effective_edit_reason(profile: _FormatProfile, *, editable: bool) -> str | 
 
 def _validated_import_source(source: _ImportSource) -> tuple[_ImportSource, DocumentFormatAdapter]:
     if not source.payload or len(source.payload) > _MAX_EDITABLE_HTML_BYTES:
-        raise RpcHandlerError(
-            "DOCUMENT_IMPORT_SIZE_UNSUPPORTED",
-            "Editable HTML must be non-empty and no larger than 2 MiB",
-            retryable=False,
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="html_edit_size_unsupported",
         )
     if b"\x00" in source.payload:
-        raise RpcHandlerError(
-            "DOCUMENT_IMPORT_ENCODING_UNSUPPORTED",
-            "Editable HTML must be NUL-free UTF-8",
-            retryable=False,
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="html_encoding_unsupported",
         )
     profile = _format_profile(source.name, source.mime, payload=source.payload)
     if profile.reason_code == "html_encoding_unsupported":
-        raise RpcHandlerError(
-            "DOCUMENT_IMPORT_ENCODING_UNSUPPORTED",
-            "Editable HTML must be NUL-free UTF-8",
-            retryable=False,
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="html_encoding_unsupported",
         )
     if profile.reason_code == "html_validation_failed":
-        raise RpcHandlerError(
-            "DOCUMENT_IMPORT_HTML_INVALID",
-            "Editable HTML could not be validated safely",
-            retryable=False,
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="html_validation_failed",
         )
     if profile.adapter is None or profile.adapter.format_id != "html" or not profile.editable:
-        raise RpcHandlerError(
-            "DOCUMENT_IMPORT_FORMAT_UNSUPPORTED",
-            "Only single-file UTF-8 HTML can be imported for editing",
-            retryable=False,
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code=profile.reason_code or "format_edit_not_supported",
         )
     try:
         text = source.payload.decode("utf-8")
         validate_editable_html_source(text)
     except UnicodeDecodeError:
-        raise RpcHandlerError(
-            "DOCUMENT_IMPORT_ENCODING_UNSUPPORTED",
-            "Editable HTML must be NUL-free UTF-8",
-            retryable=False,
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="html_encoding_unsupported",
         ) from None
-    except DocumentAdapterError as exc:
-        raise RpcHandlerError(
-            exc.code,
-            exc.user_message,
-            retryable=False,
-            accepted=False,
+    except DocumentAdapterError:
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="html_validation_failed",
         ) from None
     if source.mime.split(";", 1)[0].strip().lower() not in _HTML_MIMES:
         source = _ImportSource(
@@ -704,7 +743,7 @@ async def adopt_generated_deliverable_if_editable(
     try:
         _validated_import_source(source)
     except RpcHandlerError as exc:
-        if exc.code.startswith("DOCUMENT_IMPORT_"):
+        if exc.code == ArtifactProductErrorCode.RESOURCE_UNSUPPORTED.value:
             return None
         raise
     commit, binding, created = await service.adopt_generated_deliverable(
@@ -919,7 +958,12 @@ async def _public_deliverables(
             limit=100_000,
         )
     except OSError as exc:
-        raise RpcUnavailableError("Artifact storage is temporarily unavailable.") from exc
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            exc,
+            operation="workbench.deliverables.list",
+            retryable=True,
+        ) from exc
     return page.refs
 
 
@@ -986,7 +1030,11 @@ async def _resource_inventory(
     for document in documents:
         head = await service.get_revision(document.head_revision_id)
         if head.document_id != document.document_id:
-            raise RpcUnavailableError("document head integrity check failed")
+            raise _internal_product_error(
+                ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+                "document head integrity check failed",
+                operation="workbench.resources.list",
+            )
         profile = _format_profile(document.name, head.media_type)
         trusted_capabilities = (
             profile.editable or profile.agent_editable or profile.selection_context
@@ -1073,12 +1121,9 @@ async def _preview_material(
             if isinstance(capabilities, dict)
             else "preview_not_supported"
         )
-        raise RpcHandlerError(
-            "WORKBENCH_PREVIEW_UNSUPPORTED",
-            "This resource does not have a supported isolated preview",
-            details={"reasonCode": reason},
-            retryable=False,
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code=reason,
         )
 
     if resource_type == "attachment":
@@ -1141,7 +1186,11 @@ async def _preview_material(
             and len(payload) != expected_size
         )
     ):
-        raise RpcUnavailableError("workbench preview material failed integrity validation")
+        raise _internal_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            "workbench preview material failed integrity validation",
+            operation="workbench.resources.preview",
+        )
     return resource, payload
 
 
@@ -1157,18 +1206,14 @@ def _preview_payload(resource: dict[str, Any], payload: bytes, *, mode: str) -> 
             source = payload.decode("utf-8")
             adapter_payload = profile.adapter.preview(source)
         except UnicodeDecodeError:
-            raise RpcHandlerError(
-                "WORKBENCH_PREVIEW_ENCODING_UNSUPPORTED",
-                "The HTML preview requires UTF-8 source",
-                retryable=False,
-                accepted=False,
+            raise artifact_product_error(
+                ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+                reason_code="html_encoding_unsupported",
             ) from None
-        except DocumentAdapterError as exc:
-            raise RpcHandlerError(
-                exc.code,
-                exc.user_message,
-                retryable=False,
-                accepted=False,
+        except DocumentAdapterError:
+            raise artifact_product_error(
+                ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+                reason_code="html_validation_failed",
             ) from None
     return {
         "protocolVersion": 1,
@@ -1223,11 +1268,9 @@ async def _resolve_import_source(
             session_id=session_id,
         )
         if not importable:
-            raise RpcHandlerError(
-                "DOCUMENT_BUNDLE_UNSUPPORTED",
-                "Multi-file deliverables cannot be imported as one editable document",
-                retryable=False,
-                accepted=False,
+            raise artifact_product_error(
+                ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+                reason_code="html_bundle_edit_not_supported",
             )
         resolved, path = await asyncio.to_thread(
             store.resolve_for_download,
@@ -1311,7 +1354,11 @@ async def _ensure_internal_candidate(
             )
         except ArtifactNotFoundError:
             if payload is None:
-                raise RpcUnavailableError("journaled document bytes are unavailable") from None
+                raise _internal_product_error(
+                    ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+                    "journaled document bytes are unavailable",
+                    operation="documents.candidate.restore",
+                ) from None
             try:
                 existing = await asyncio.to_thread(
                     store.publish_bytes,
@@ -1331,15 +1378,27 @@ async def _ensure_internal_candidate(
                 # its publisher rolls the partial bucket back, the next loop
                 # safely retries publication from the journaled source bytes.
                 if asyncio.get_running_loop().time() >= deadline:
-                    raise RpcUnavailableError(
-                        "journaled document candidate publication is still pending"
+                    raise _internal_product_error(
+                        ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
+                        "journaled document candidate publication is still pending",
+                        operation="documents.candidate.publish",
+                        accepted=None,
                     ) from None
                 await asyncio.sleep(_CANDIDATE_PUBLICATION_POLL_SECONDS)
                 continue
             except (ArtifactError, OSError) as exc:
-                raise RpcUnavailableError("journaled document bytes are unavailable") from exc
+                raise logged_artifact_product_error(
+                    ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
+                    exc,
+                    operation="documents.candidate.publish",
+                    accepted=None,
+                ) from exc
         except (ArtifactIntegrityError, OSError, ValueError) as exc:
-            raise RpcUnavailableError("journaled document bytes are unavailable") from exc
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+                exc,
+                operation="documents.candidate.read",
+            ) from exc
         break
     if (
         existing.sha256 != artifact.sha256
@@ -1347,7 +1406,11 @@ async def _ensure_internal_candidate(
         or existing.mime != artifact.media_type
         or existing.size != artifact.byte_size
     ):
-        raise RpcUnavailableError("journaled document candidate integrity mismatch")
+        raise _internal_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            "journaled document candidate integrity mismatch",
+            operation="documents.candidate.verify",
+        )
     return existing
 
 
@@ -1370,8 +1433,11 @@ async def _discard_unused_candidate(
             artifact_id=candidate_artifact_id,
         )
     except (ArtifactError, OSError) as exc:
-        raise RpcUnavailableError(
-            "document import committed but candidate cleanup is pending; retry safely"
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
+            exc,
+            operation="documents.import.cleanup",
+            accepted=None,
         ) from exc
     if not deleted:
         try:
@@ -1383,12 +1449,18 @@ async def _discard_unused_candidate(
         except ArtifactNotFoundError:
             pass
         except (ArtifactError, OSError) as exc:
-            raise RpcUnavailableError(
-                "document import committed but candidate cleanup is pending; retry safely"
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
+                exc,
+                operation="documents.import.cleanup",
+                accepted=None,
             ) from exc
         else:
-            raise RpcUnavailableError(
-                "document import committed but candidate cleanup is pending; retry safely"
+            raise _internal_product_error(
+                ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
+                "document import committed but candidate cleanup is pending",
+                operation="documents.import.cleanup",
+                accepted=None,
             )
     try:
         await service.mark_document_import_candidate_cleaned(
@@ -1396,8 +1468,11 @@ async def _discard_unused_candidate(
             idempotency_key=idempotency_key,
         )
     except (ArtifactConflictError, ArtifactValidationError) as exc:
-        raise RpcUnavailableError(
-            "document import committed but cleanup receipt is pending; retry safely"
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
+            exc,
+            operation="documents.import.cleanup",
+            accepted=None,
         ) from exc
 
 
@@ -1594,7 +1669,12 @@ async def import_document_from_resource(
                 payload=None,
                 source="document_import",
             )
-        except RpcUnavailableError:
+        except RpcHandlerError as exc:
+            if exc.code not in {
+                ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE.value,
+                ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING.value,
+            }:
+                raise
             source = await _resolve_import_source(
                 ctx,
                 session_key=session_key,
@@ -1816,7 +1896,11 @@ async def _current_document_open_response(
         None,
     )
     if resource is None:
-        raise RpcUnavailableError("materialized document resource is unavailable")
+        raise _internal_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            "materialized document resource is unavailable",
+            operation="workbench.resources.open",
+        )
     bindings = await service.list_document_source_bindings(
         session_id=session_id,
         limit=1000,
@@ -1838,6 +1922,151 @@ async def _current_document_open_response(
     if receipt is not None:
         response["receipt"] = receipt
     return response
+
+
+def _mutation_resolution_status(status: MutationAttemptStatus) -> str:
+    if status is MutationAttemptStatus.APPLIED:
+        return "applied"
+    if status is MutationAttemptStatus.FAILED:
+        return "not_applied"
+    return "pending"
+
+
+async def _mutation_resolution_payload(
+    service: ArtifactSessionService,
+    *,
+    session_key: str,
+    session_id: str,
+    status: MutationAttemptStatus,
+    document_id: str | None,
+    revision_id: str | None,
+) -> dict[str, Any]:
+    """Project internal journals into the intentionally small product wire."""
+
+    public_status = _mutation_resolution_status(status)
+    response: dict[str, Any] = {"status": public_status}
+    if public_status == "pending":
+        response["retryAfterMs"] = _MUTATION_RESOLUTION_RETRY_AFTER_MS
+        return response
+    if public_status != "applied" or document_id is None:
+        return response
+
+    document, head = await _scoped_document(
+        service,
+        session_key=session_key,
+        session_id=session_id,
+        document_id=document_id,
+    )
+    effective_revision = head
+    if revision_id is not None:
+        try:
+            candidate = await service.get_revision(revision_id)
+        except ArtifactSessionNotFoundError:
+            candidate = head
+        if candidate.document_id == document.document_id:
+            effective_revision = candidate
+    response["document"] = _document_rpc_payload_from_parts(document, head)
+    response["result"] = {
+        "documentId": document.document_id,
+        "revisionId": effective_revision.revision_id,
+        "sha256": effective_revision.artifact_sha256,
+        "stateRevision": document.state_revision,
+    }
+    return response
+
+
+@_d.method("artifacts.mutations.resolve", scope="operator.write")
+async def _handle_mutation_resolve(
+    params: dict[str, Any] | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Resolve a response-loss-safe Artifact mutation without replaying it."""
+
+    session_key, session_id, service = await _scope(params, ctx)
+    operation = _require_string(params, "operation", max_bytes=64)
+    request_id = _mutation_resolution_request_id(params)
+
+    if operation in _MUTATION_OPERATION_TURN_PREFIX:
+        document_id = _optional_string(params, "documentId", max_bytes=256)
+        if document_id is None:
+            raise artifact_product_error(ArtifactProductErrorCode.INVALID_REQUEST)
+        await _scoped_document(
+            service,
+            session_key=session_key,
+            session_id=session_id,
+            document_id=document_id,
+        )
+        turn_id = f"{_MUTATION_OPERATION_TURN_PREFIX[operation]}:{request_id}"
+        try:
+            mutation_attempt = await service.get_mutation_attempt_for_resolution(
+                document_id=document_id,
+                turn_id=turn_id,
+            )
+        except ArtifactSessionNotFoundError:
+            return {
+                "status": "pending",
+                "retryAfterMs": _MUTATION_RESOLUTION_RETRY_AFTER_MS,
+            }
+        return await _mutation_resolution_payload(
+            service,
+            session_key=session_key,
+            session_id=session_id,
+            status=mutation_attempt.status,
+            document_id=mutation_attempt.document_id,
+            revision_id=mutation_attempt.revision_id,
+        )
+
+    if operation in _MUTATION_IMPORT_OPERATIONS:
+        try:
+            import_attempt = await service.get_document_import_attempt(
+                session_id=session_id,
+                idempotency_key=request_id,
+            )
+        except ArtifactSessionNotFoundError:
+            return {
+                "status": "pending",
+                "retryAfterMs": _MUTATION_RESOLUTION_RETRY_AFTER_MS,
+            }
+        if import_attempt.session_key != session_key:
+            raise artifact_product_error(ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE)
+        return await _mutation_resolution_payload(
+            service,
+            session_key=session_key,
+            session_id=session_id,
+            status=import_attempt.status,
+            document_id=import_attempt.document_id,
+            revision_id=import_attempt.revision_id,
+        )
+
+    if operation in _MUTATION_PUBLISH_OPERATIONS:
+        try:
+            publish_attempt = await service.get_document_publish_attempt(
+                session_id=session_id,
+                idempotency_key=request_id,
+            )
+        except ArtifactSessionNotFoundError:
+            return {
+                "status": "pending",
+                "retryAfterMs": _MUTATION_RESOLUTION_RETRY_AFTER_MS,
+            }
+        if publish_attempt.session_key != session_key:
+            raise artifact_product_error(ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE)
+        return await _mutation_resolution_payload(
+            service,
+            session_key=session_key,
+            session_id=session_id,
+            status=publish_attempt.status,
+            document_id=publish_attempt.document_id,
+            revision_id=publish_attempt.revision_id,
+        )
+
+    exc = ValueError("unsupported artifact mutation operation")
+    raise logged_artifact_product_error(
+        ArtifactProductErrorCode.INVALID_REQUEST,
+        exc,
+        operation="artifacts.mutations.resolve",
+        requested_operation=operation,
+    ) from None
 
 
 def _readonly_open_response(resource: dict[str, Any]) -> dict[str, Any]:
@@ -1987,7 +2216,11 @@ async def _handle_resources_open(
     document = imported.get("document")
     document_id = document.get("documentId") if isinstance(document, dict) else None
     if not isinstance(document_id, str) or not document_id:
-        raise RpcUnavailableError("materialized document identity is unavailable")
+        raise _internal_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            "materialized document identity is unavailable",
+            operation="workbench.resources.open",
+        )
     receipt = imported.get("receipt")
     return await _current_document_open_response(
         ctx,
@@ -2072,12 +2305,9 @@ async def _handle_documents_publish(
             raise _not_found("revision", revision_id)
         profile = _format_profile(revision.filename, revision.media_type)
         if not profile.publishable:
-            raise RpcHandlerError(
-                "DOCUMENT_PUBLISH_FORMAT_UNSUPPORTED",
-                "This document format cannot be published from the Workbench",
-                details={"reasonCode": profile.reason_code or "publish_not_supported"},
-                retryable=False,
-                accepted=False,
+            raise artifact_product_error(
+                ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+                reason_code=profile.reason_code or "format_publish_not_supported",
             )
         candidate = ArtifactBlobRef(
             artifact_id=ArtifactStore.allocate_artifact_id(),
@@ -2172,7 +2402,12 @@ async def _handle_documents_publish(
                 pass
             raise _conflict(exc) from exc
         except (ArtifactNotFoundError, ArtifactIntegrityError, OSError, ValueError) as exc:
-            raise RpcUnavailableError("document revision bytes are unavailable") from exc
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
+                exc,
+                operation="documents.publish.prepare",
+                accepted=None,
+            ) from exc
     else:
         result = await service.apply_document_publish_attempt(
             session_id=session_id,
@@ -2195,8 +2430,11 @@ async def _handle_documents_publish(
         OSError,
         ValueError,
     ) as exc:
-        raise RpcUnavailableError(
-            "publication is committed but deliverable promotion is pending; retry safely"
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
+            exc,
+            operation="documents.publish.promote",
+            accepted=None,
         ) from exc
     try:
         await service.mark_document_publish_promoted(
@@ -2204,8 +2442,11 @@ async def _handle_documents_publish(
             idempotency_key=idempotency_key,
         )
     except (ArtifactConflictError, ArtifactValidationError) as exc:
-        raise RpcUnavailableError(
-            "publication is visible but promotion receipt is pending; retry safely"
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
+            exc,
+            operation="documents.publish.promote",
+            accepted=None,
         ) from exc
     if should_emit:
         await _emit_publish_events(

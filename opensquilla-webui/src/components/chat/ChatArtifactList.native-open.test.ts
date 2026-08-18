@@ -3,9 +3,25 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick } from 'vue'
 import { createPinia, setActivePinia } from 'pinia'
 import i18n from '@/i18n'
+import { useToasts } from '@/composables/useToasts'
 import { useRpcStore } from '@/stores/rpc'
 import type { ArtifactPayload } from '@/types/rpc'
 import ChatArtifactList from './ChatArtifactList.vue'
+
+const platformState = vi.hoisted(() => ({
+  id: 'web' as 'web' | 'desktop',
+  capabilities: {
+    isDesktop: false,
+    canOpenArtifactsNatively: false,
+  },
+  files: {
+    openArtifact: vi.fn(),
+  },
+}))
+
+vi.mock('@/platform', () => ({
+  usePlatform: () => platformState,
+}))
 
 const htmlArtifact: ArtifactPayload = {
   id: 'art-html',
@@ -51,7 +67,14 @@ beforeEach(() => {
   i18n.global.locale.value = 'en'
   document.body.innerHTML = ''
   vi.restoreAllMocks()
+  vi.clearAllMocks()
   vi.unstubAllGlobals()
+  platformState.id = 'web'
+  platformState.capabilities.isDesktop = false
+  platformState.capabilities.canOpenArtifactsNatively = false
+  platformState.files.openArtifact.mockReset()
+  const { dismissToast, toasts } = useToasts()
+  for (const toast of [...toasts.value]) dismissToast(toast.id)
 })
 
 describe('ChatArtifactList native HTML open', () => {
@@ -90,6 +113,39 @@ describe('ChatArtifactList native HTML open', () => {
 
     expect(onDownload).toHaveBeenCalledWith(htmlArtifact)
     expect(fetchImpl).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('does not expose a Desktop native-open diagnostic in the toast', async () => {
+    const diagnostic = 'spawn ENOENT /fixture/private/page.html'
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    platformState.id = 'desktop'
+    platformState.capabilities.isDesktop = true
+    platformState.capabilities.canOpenArtifactsNatively = true
+    platformState.files.openArtifact.mockResolvedValue({
+      ok: false,
+      message: diagnostic,
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<p>fixture</p>', {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    })))
+    const { app, el } = await mountList({ isOwner: true })
+
+    const open = Array.from(el.querySelectorAll<HTMLButtonElement>('.msg-artifact-action'))
+      .find(button => button.textContent?.includes('Open'))
+    expect(open).toBeTruthy()
+    open?.click()
+    await settle()
+
+    await vi.waitFor(() => {
+      expect(platformState.files.openArtifact).toHaveBeenCalledOnce()
+    })
+    const toastItems = useToasts().toasts.value
+    const latestToast = toastItems[toastItems.length - 1]
+    expect(latestToast?.message).toBe(i18n.global.t('chat.toast.artifactOpenFailed'))
+    expect(latestToast?.message).not.toContain(diagnostic)
+    expect(warn).toHaveBeenCalledWith('[artifact] Native open failed:', diagnostic)
     app.unmount()
   })
 

@@ -13,6 +13,7 @@ import json
 from typing import Any
 
 from opensquilla.artifact_session.errors import ArtifactConflictError
+from opensquilla.artifact_session.html_anchors import contextual_candidate
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 from opensquilla.tools.builtin.artifact_editing import (
     _MAX_HTML_READ_CHUNK_CHARS,
@@ -161,11 +162,16 @@ def _locations_for_operation(
     annotation_order: int,
     operation: str,
     attribute_name: str | None = None,
+    anchor_locator: object | None = None,
 ) -> list[dict[str, object]]:
     try:
         ranges = adapter.locate(
             payload,
-            anchor_locator=scope.anchors[annotation_order].locator,
+            anchor_locator=(
+                scope.anchors[annotation_order].locator
+                if anchor_locator is None
+                else anchor_locator
+            ),
             annotation_order=annotation_order,
             operation=operation,
             attribute_name=attribute_name,
@@ -213,24 +219,28 @@ async def document_inspect() -> str:
     annotations: list[dict[str, object]] = []
     for order, (snapshot, anchor) in enumerate(zip(snapshots, scope.anchors, strict=True)):
         locations: list[dict[str, object]] = []
-        for operation in _INITIAL_OPERATIONS:
-            locations.extend(
-                _locations_for_operation(
-                    adapter=adapter,
-                    scope=scope,
-                    payload=payload,
-                    source_sha256=ref.sha256,
-                    annotation_order=order,
-                    operation=operation,
+        target = scope.context.targets[order]
+        if target.status == "ready":
+            for operation in _INITIAL_OPERATIONS:
+                locations.extend(
+                    _locations_for_operation(
+                        adapter=adapter,
+                        scope=scope,
+                        payload=payload,
+                        source_sha256=ref.sha256,
+                        annotation_order=order,
+                        operation=operation,
+                    )
                 )
-            )
-        tag_name = anchor.locator.get("tag_name") if isinstance(anchor.locator, dict) else None
         annotations.append(
             {
                 "order": snapshot["order"],
                 "instruction": snapshot["body"],
                 "selection": {
-                    "tag": tag_name if isinstance(tag_name, str) else None,
+                    "kind": target.target_kind,
+                    "text": target.target_text,
+                    "status": target.status,
+                    "reason": target.reason,
                     "quote": _bounded_anchor_text(anchor.quote, "quote"),
                 },
                 "initialLocations": locations,
@@ -336,6 +346,21 @@ async def document_read(
     if not isinstance(canonical, str):
         raise SafeToolError("DOCUMENT_VIEW_INVALID: The source view is unavailable.")
     text, end = _take_utf8_chunk(canonical, start, max_chars)
+    document_binding = _document_grant_binding(
+        scope,
+        ref.sha256,
+        adapter_id=adapter.format_id,
+        adapter_version=adapter.adapter_version,
+    )
+    try:
+        document_grant_registry_for_context(scope.ctx).record_source_read(
+            binding=document_binding,
+            start=start,
+            end=end,
+            text=text,
+        )
+    except ArtifactRangeGrantError as exc:
+        raise _range_error(exc) from None
     next_cursor: str | None = None
     if end < len(canonical):
         try:
@@ -364,6 +389,11 @@ _DOCUMENT_LOCATE_SCHEMA: dict[str, Any] = {
             "enum": sorted(DOCUMENT_SEMANTIC_OPERATIONS),
         },
         "attribute_name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "candidateSource": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 16384,
+        },
     },
     "required": ["annotation_order", "operation"],
     "additionalProperties": False,
@@ -391,6 +421,7 @@ async def document_locate(
     annotation_order: int,
     operation: str,
     attribute_name: str | None = None,
+    candidateSource: str | None = None,  # noqa: N803 - public schema uses camelCase
 ) -> str:
     if operation not in DOCUMENT_SEMANTIC_OPERATIONS:
         raise SafeToolError(
@@ -410,6 +441,64 @@ async def document_locate(
         require_anchor=True,
     )
     order = _annotation_order(annotation_order, len(scope.anchors))
+    from opensquilla.gateway.artifact_contexts import BoundPromptAnnotationContext
+
+    if not isinstance(scope.context, BoundPromptAnnotationContext):
+        raise SafeToolError("No prompt annotations are bound to this document turn.")
+    target = scope.context.targets[order]
+    source = _decode_html(payload)
+    contextual_locator: object | None = None
+    contextual_fingerprint: str | None = None
+    document_registry = document_grant_registry_for_context(scope.ctx)
+    if target.status == "ready":
+        if candidateSource is not None:
+            raise SafeToolError(
+                "DOCUMENT_CANDIDATE_UNEXPECTED: This target is already located."
+            )
+    else:
+        if not isinstance(candidateSource, str):
+            raise SafeToolError(
+                "DOCUMENT_CANDIDATE_REQUIRED: Read the current source and provide one "
+                "complete opening tag for this target."
+            )
+        binding = _document_grant_binding(
+            scope,
+            ref.sha256,
+            adapter_id=adapter.format_id,
+            adapter_version=adapter.adapter_version,
+        )
+        try:
+            candidate = contextual_candidate(
+                source=source,
+                candidate_source=candidateSource,
+                expected_tag_name=target.tag_name,
+            )
+            candidate_start = candidate.locator.get("start_offset")
+            candidate_end = candidate.locator.get("start_tag_end_offset")
+            if not document_registry.candidate_range_was_read(
+                binding=binding,
+                start=candidate_start if isinstance(candidate_start, int) else -1,
+                end=candidate_end if isinstance(candidate_end, int) else -1,
+            ):
+                raise SafeToolError(
+                    "DOCUMENT_CANDIDATE_UNREAD: candidateSource must come from the current "
+                    "document_read source output."
+                )
+            document_registry.bind_contextual_candidate(
+                annotation_order=order,
+                candidate_fingerprint=candidate.fingerprint,
+            )
+        except SafeToolError:
+            raise
+        except (ArtifactRangeGrantError, ValueError) as exc:
+            if isinstance(exc, ArtifactRangeGrantError):
+                raise _range_error(exc) from None
+            raise SafeToolError(
+                "DOCUMENT_CANDIDATE_INVALID: The proposed element is not one unique, "
+                "supported opening tag for this annotation."
+            ) from None
+        contextual_locator = candidate.locator
+        contextual_fingerprint = candidate.fingerprint
     query_key = json.dumps(
         [
             scope.document.document_id,
@@ -417,6 +506,7 @@ async def document_locate(
             order,
             operation,
             attribute_name,
+            contextual_fingerprint,
         ],
         ensure_ascii=True,
         separators=(",", ":"),
@@ -435,6 +525,7 @@ async def document_locate(
         annotation_order=order,
         operation=operation,
         attribute_name=attribute_name,
+        anchor_locator=contextual_locator,
     )
     return _json(
         {

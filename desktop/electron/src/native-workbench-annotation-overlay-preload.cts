@@ -7,8 +7,20 @@ type OverlayPort = MessagePort
 
 let port: OverlayPort | null = null
 let pendingInitialBody = ''
-let pendingTagName = 'element'
 let isComposing = false
+
+interface OverlayCopy {
+  targetLabel: string
+  contextLabel: string
+  bodyLabel: string
+  placeholder: string
+  newlineHint: string
+  cancelLabel: string
+  submitLabel: string
+  emptyBodyMessage: string
+}
+
+let pendingCopy: OverlayCopy | null = null
 
 function boundedBody(value: unknown): string | null {
   if (typeof value !== 'string') return null
@@ -21,20 +33,42 @@ function send(message: Record<string, unknown>): void {
   } catch {}
 }
 
-function boundedTagName(value: unknown): string | null {
-  return typeof value === 'string' && /^[a-z][a-z0-9._:-]{0,63}$/.test(value)
-    ? value
-    : null
+const COPY_KEYS = [
+  'targetLabel',
+  'contextLabel',
+  'bodyLabel',
+  'placeholder',
+  'newlineHint',
+  'cancelLabel',
+  'submitLabel',
+  'emptyBodyMessage',
+] as const
+
+function boundedCopy(value: unknown): OverlayCopy | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const source = value as Record<string, unknown>
+  if (Object.keys(source).some(key => !COPY_KEYS.includes(key as typeof COPY_KEYS[number]))) {
+    return null
+  }
+  const entries = COPY_KEYS.map(key => {
+    const raw = source[key]
+    if (typeof raw !== 'string') return null
+    const normalized = raw.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim()
+    return normalized && normalized.length <= 240 ? [key, normalized] as const : null
+  })
+  if (entries.some(entry => entry === null)) return null
+  return Object.fromEntries(entries as Array<readonly [string, string]>) as unknown as OverlayCopy
 }
 
-function bindUi(initialBody: string, tagName: string): void {
+function bindUi(initialBody: string, copy: OverlayCopy): void {
   const textarea = document.querySelector<HTMLTextAreaElement>('#annotation-body')
   const form = document.querySelector<HTMLFormElement>('#annotation-form')
   const cancel = document.querySelector<HTMLButtonElement>('#annotation-cancel')
   const submitButton = document.querySelector<HTMLButtonElement>('#annotation-submit')
   const target = document.querySelector<HTMLElement>('#annotation-target')
+  const context = document.querySelector<HTMLElement>('#annotation-context')
   const newlineHint = document.querySelector<HTMLElement>('#annotation-newline-hint')
-  if (!textarea || !form || !cancel || !submitButton || !target || !newlineHint) {
+  if (!textarea || !form || !cancel || !submitButton || !target || !context || !newlineHint) {
     send({ version: 1, type: 'cancel' })
     return
   }
@@ -43,10 +77,14 @@ function bindUi(initialBody: string, tagName: string): void {
   // emits compositionend; never carry that IME state into the next editor.
   isComposing = false
   textarea.value = initialBody
-  target.textContent = `<${tagName}>`
-  newlineHint.textContent = /Mac|iPhone|iPad|iPod/i.test(navigator.userAgent)
-    ? '⇧ Enter 换行'
-    : 'Shift + Enter 换行'
+  target.textContent = copy.targetLabel
+  target.setAttribute('aria-label', copy.targetLabel)
+  context.textContent = copy.contextLabel
+  textarea.setAttribute('aria-label', copy.bodyLabel)
+  textarea.placeholder = copy.placeholder
+  newlineHint.textContent = copy.newlineHint
+  cancel.textContent = copy.cancelLabel
+  submitButton.textContent = copy.submitLabel
   const updateSubmitState = () => {
     submitButton.disabled = !textarea.value.trim() || boundedBody(textarea.value) === null
   }
@@ -74,7 +112,9 @@ function bindUi(initialBody: string, tagName: string): void {
       const body = boundedBody(textarea.value)
       if (body === null) return
       if (!body.trim()) {
-        textarea.setCustomValidity('请输入批注修改要求。')
+        textarea.setCustomValidity(
+          pendingCopy?.emptyBodyMessage || copy.emptyBodyMessage,
+        )
         textarea.reportValidity()
         textarea.focus()
         return
@@ -107,13 +147,13 @@ ipcRenderer.on(OVERLAY_CHANNEL, (event, payload: unknown) => {
     ? payload as Record<string, unknown>
     : null
   const initialBody = boundedBody(request?.initialBody)
-  const tagName = boundedTagName(request?.tagName)
+  const copy = boundedCopy(request?.copy)
   if (
     !request
     || request.version !== 1
     || initialBody === null
-    || tagName === null
-    || Object.keys(request).some(key => !['version', 'initialBody', 'tagName'].includes(key))
+    || copy === null
+    || Object.keys(request).some(key => !['version', 'initialBody', 'copy'].includes(key))
   ) return
   try {
     port?.close()
@@ -121,14 +161,16 @@ ipcRenderer.on(OVERLAY_CHANNEL, (event, payload: unknown) => {
   port = event.ports[0]!
   port.start()
   pendingInitialBody = initialBody
-  pendingTagName = tagName
+  pendingCopy = copy
   if (document.readyState === 'loading') {
     window.addEventListener(
       'DOMContentLoaded',
-      () => bindUi(pendingInitialBody, pendingTagName),
+      () => {
+        if (pendingCopy) bindUi(pendingInitialBody, pendingCopy)
+      },
       { once: true },
     )
   } else {
-    bindUi(pendingInitialBody, pendingTagName)
+    bindUi(pendingInitialBody, copy)
   }
 })

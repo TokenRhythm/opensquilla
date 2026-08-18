@@ -34,6 +34,7 @@ from .models import (
     EditSessionStatus,
     MutationAttempt,
     MutationAttemptStatus,
+    PreparedPromptAnnotationTarget,
     PromptAnnotation,
     PromptAnnotationStatus,
     Revision,
@@ -47,6 +48,7 @@ from .mutation_attempts import (
 from .mutation_outcomes import document_mutation_outcome_from_attempt
 from .repository import (
     ArtifactSessionRepository,
+    consume_prepared_prompt_annotations_on_conn,
     consume_prompt_annotations_on_conn,
     preflight_prompt_annotations_on_conn,
 )
@@ -86,6 +88,7 @@ __all__ = [
     "MutationAttempt",
     "MutationAttemptReservation",
     "MutationAttemptStatus",
+    "PreparedPromptAnnotationTarget",
     "PromptAnnotation",
     "PromptAnnotationStatus",
     "Revision",
@@ -93,6 +96,7 @@ __all__ = [
     "WriterLease",
     "WriterLeaseConflictError",
     "WriterLeaseExpiredError",
+    "consume_prepared_prompt_annotations_on_conn",
     "consume_prompt_annotations_on_conn",
     "document_mutation_outcome_from_attempt",
     "preflight_prompt_annotations_on_conn",

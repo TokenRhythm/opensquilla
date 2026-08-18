@@ -29,6 +29,8 @@ function annotationMessage(overrides: Partial<ChatRenderedMessage> = {}): ChatRe
       anchorId: 'anchor-1',
       body: 'Make the heading concise.',
       tagName: 'h1',
+      targetKind: 'heading',
+      targetText: 'Welcome',
       locator: {},
       quote: '<h1>',
       sourceExcerpt: null,
@@ -47,6 +49,7 @@ async function mountAnnotationMessage(
   const reuse = vi.fn()
   const previewAttachment = vi.fn()
   const editAttachment = vi.fn()
+  const downloadAttachment = vi.fn(async () => true)
   const defaultAttachmentResources = new Map<string, WorkbenchResource>(
     (message.attachments || []).flatMap(attachment => attachment.attachmentId
       ? [[attachment.attachmentId, {
@@ -74,7 +77,7 @@ async function mountAnnotationMessage(
     shareMessageId: message.id,
     stripTimePrefix: (value: string) => value,
     copyMessage: async () => true,
-    downloadAttachment: async () => true,
+    downloadAttachment,
     workbenchResourcePreviewEnabled: true,
     workbenchResourceEditEnabled: true,
     workbenchAttachmentResources: attachmentResources || defaultAttachmentResources,
@@ -86,11 +89,11 @@ async function mountAnnotationMessage(
   app.use(i18n)
   app.mount(host)
   await nextTick()
-  return { app, editAttachment, host, previewAttachment, reuse }
+  return { app, downloadAttachment, editAttachment, host, previewAttachment, reuse }
 }
 
 describe('UserMessage prompt annotation snapshots', () => {
-  it('offers HTML attachment preview and edit only with a stable attachment identity', async () => {
+  it('opens an HTML attachment from its card and keeps original download separate', async () => {
     const attachment = {
       kind: 'staged' as const,
       displayId: 'attachment-1',
@@ -101,22 +104,32 @@ describe('UserMessage prompt annotation snapshots', () => {
       size: 42,
       download_url: '/api/v1/attachments/fixture',
     }
-    const { app, editAttachment, host, previewAttachment } = await mountAnnotationMessage(
+    const {
+      app,
+      downloadAttachment,
+      editAttachment,
+      host,
+      previewAttachment,
+    } = await mountAnnotationMessage(
       annotationMessage({ promptAnnotations: [], attachments: [attachment] }),
     )
 
-    const preview = host.querySelector<HTMLButtonElement>(
-      '[aria-label="Preview uploaded.html"]',
+    const open = host.querySelector<HTMLButtonElement>(
+      '[aria-label="Open uploaded.html"]',
     )
-    const edit = host.querySelector<HTMLButtonElement>(
-      '[aria-label="Edit a copy of uploaded.html"]',
+    const download = host.querySelector<HTMLButtonElement>(
+      '[aria-label="Download uploaded.html"]',
     )
-    expect(preview).not.toBeNull()
-    expect(edit).not.toBeNull()
-    preview?.click()
-    edit?.click()
+    expect(open).not.toBeNull()
+    expect(download).not.toBeNull()
+    expect(host.querySelector(
+      '.msg-file-resource__actions [aria-label^="Edit"]',
+    )).toBeNull()
+    open?.click()
+    download?.click()
     expect(previewAttachment).toHaveBeenCalledWith(attachment)
-    expect(editAttachment).toHaveBeenCalledWith(attachment)
+    expect(downloadAttachment).toHaveBeenCalledWith(attachment)
+    expect(editAttachment).not.toHaveBeenCalled()
     app.unmount()
   })
 
@@ -167,7 +180,8 @@ describe('UserMessage prompt annotation snapshots', () => {
     app.mount(host)
     await nextTick()
 
-    expect(host.querySelector('[aria-label="Preview preview-only.html"]')).not.toBeNull()
+    expect(host.querySelector('[aria-label="Open preview-only.html"]')).not.toBeNull()
+    expect(host.querySelector('[aria-label="Download preview-only.html"]')).not.toBeNull()
     expect(host.querySelector('[aria-label="Edit a copy of preview-only.html"]')).toBeNull()
     app.unmount()
   })
@@ -219,7 +233,8 @@ describe('UserMessage prompt annotation snapshots', () => {
     app.mount(host)
     await nextTick()
 
-    expect(host.querySelector('[aria-label="Preview legacy.html"]')).toBeNull()
+    expect(host.querySelector('[aria-label="Open legacy.html"]')).toBeNull()
+    expect(host.querySelector('[aria-label="Download legacy.html"]')).not.toBeNull()
     expect(host.querySelector('[aria-label="Edit a copy of legacy.html"]')).toBeNull()
     app.unmount()
   })
@@ -258,25 +273,22 @@ describe('UserMessage prompt annotation snapshots', () => {
       new Map([[attachment.attachmentId, resource]]),
     )
 
-    const preview = host.querySelector<HTMLButtonElement>(
-      '[aria-label^="Preview invalid.html"]',
+    const download = host.querySelector<HTMLButtonElement>(
+      '[aria-label="Download invalid.html"]',
     )
-    const edit = host.querySelector<HTMLButtonElement>(
-      '[aria-label^="Edit a copy of invalid.html"]',
-    )
-    expect(preview?.disabled).toBe(true)
-    expect(edit?.disabled).toBe(true)
+    expect(download).not.toBeNull()
+    expect(host.querySelector('[aria-label^="Open invalid.html"]')).toBeNull()
+    expect(host.querySelector('[aria-label^="Edit a copy of invalid.html"]')).toBeNull()
     const reason = host.querySelector('[data-testid="attachment-workbench-unavailable"]')
     expect(reason?.textContent).toContain('not valid UTF-8')
     expect(reason?.textContent).not.toContain('html_encoding_unsupported')
-    preview?.click()
-    edit?.click()
+    download?.click()
     expect(previewAttachment).not.toHaveBeenCalled()
     expect(editAttachment).not.toHaveBeenCalled()
     app.unmount()
   })
 
-  it('keeps preview low-friction while disabling an oversized HTML edit', async () => {
+  it('opens an oversized editable HTML resource in its available preview', async () => {
     const attachment = {
       kind: 'staged' as const,
       displayId: 'attachment-oversized',
@@ -309,18 +321,12 @@ describe('UserMessage prompt annotation snapshots', () => {
       new Map([[attachment.attachmentId, resource]]),
     )
 
-    const preview = host.querySelector<HTMLButtonElement>(
-      '[aria-label="Preview large.html"]',
+    const open = host.querySelector<HTMLButtonElement>(
+      '[aria-label="Open large.html"]',
     )
-    const edit = host.querySelector<HTMLButtonElement>(
-      '[aria-label^="Edit a copy of large.html"]',
-    )
-    expect(preview?.disabled).toBe(false)
-    expect(edit?.disabled).toBe(true)
-    expect(host.querySelector('[data-testid="attachment-workbench-unavailable"]')
-      ?.textContent).toContain('too large to edit')
-    preview?.click()
-    edit?.click()
+    expect(open?.disabled).toBe(false)
+    expect(host.querySelector('[aria-label^="Edit a copy of large.html"]')).toBeNull()
+    open?.click()
     expect(previewAttachment).toHaveBeenCalledWith(attachment)
     expect(editAttachment).not.toHaveBeenCalled()
     app.unmount()
@@ -332,7 +338,8 @@ describe('UserMessage prompt annotation snapshots', () => {
 
     const card = host.querySelector('[data-testid="sent-prompt-annotation"]')
     expect(card?.textContent).toContain('page.html')
-    expect(card?.textContent).toContain('<h1>')
+    expect(card?.textContent).toContain('Heading: Welcome')
+    expect(card?.textContent).not.toContain('<h1>')
     expect(card?.textContent).toContain('Make the heading concise.')
     expect(card?.querySelector('.msg-prompt-annotation__rail')).not.toBeNull()
     expect(card?.querySelector('code')).toBeNull()
@@ -343,10 +350,10 @@ describe('UserMessage prompt annotation snapshots', () => {
     const copyButton = host.querySelector<HTMLButtonElement>('.msg-prompt-annotation__reuse')
     expect(copyButton?.textContent).not.toContain('Copy as new annotation')
     expect(copyButton?.getAttribute('aria-label')).toBe(
-      'Copies the modification request; then select the element again in the current version.',
+      'Copy the modification request and choose its target on the page.',
     )
     expect(copyButton?.getAttribute('title')).toBe(
-      'Copies the modification request; then select the element again in the current version.',
+      'Copy the modification request and choose its target on the page.',
     )
     copyButton?.click()
     expect(reuse).toHaveBeenCalledWith(message.promptAnnotations?.[0])
@@ -355,7 +362,7 @@ describe('UserMessage prompt annotation snapshots', () => {
 
   it.each([
     {
-      name: 'renders an authoritative applied receipt',
+      name: 'renders an applied page update',
       message: annotationMessage({
         messageId: 'user-1',
         turnId: 'turn-1',
@@ -373,7 +380,7 @@ describe('UserMessage prompt annotation snapshots', () => {
       expected: 'applied',
     },
     {
-      name: 'renders an authoritative not-applied receipt',
+      name: 'renders a page update failure',
       message: annotationMessage({
         messageId: 'user-1',
         turnId: 'turn-1',
@@ -386,7 +393,7 @@ describe('UserMessage prompt annotation snapshots', () => {
       expected: 'not_applied',
     },
     {
-      name: 'renders an authoritative conflict receipt',
+      name: 'maps an internal conflict to the same page update failure',
       message: annotationMessage({
         messageId: 'user-1',
         turnId: 'turn-1',
@@ -396,10 +403,10 @@ describe('UserMessage prompt annotation snapshots', () => {
           documentMutationOutcome: { version: 1, status: 'conflict' },
         },
       }),
-      expected: 'conflict',
+      expected: 'not_applied',
     },
     {
-      name: 'renders an authoritative ambiguous receipt',
+      name: 'renders a pending page update check',
       message: annotationMessage({
         messageId: 'user-1',
         turnId: 'turn-1',
@@ -414,8 +421,14 @@ describe('UserMessage prompt annotation snapshots', () => {
   ])('$name', async ({ message, expected }) => {
     const { app, host } = await mountAnnotationMessage(message)
 
-    expect(host.querySelector('[data-testid="prompt-annotation-turn-status"]')
-      ?.getAttribute('data-status')).toBe(expected)
+    const status = host.querySelector('[data-testid="prompt-annotation-turn-status"]')
+    expect(status?.getAttribute('data-status')).toBe(expected)
+    expect(status?.textContent).toBe({
+      applied: 'Page updated',
+      not_applied: 'Couldn’t update page',
+      ambiguous: 'Checking update',
+    }[expected])
+    expect(status?.textContent).not.toMatch(/receipt|reconciliation|revision|conflict/i)
 
     app.unmount()
   })
@@ -433,25 +446,13 @@ describe('UserMessage prompt annotation snapshots', () => {
         turnOutcome: { turnId: 'turn-1', status: 'succeeded' },
       }),
     },
-    {
-      name: 'an authoritative not-attempted receipt',
-      message: annotationMessage({
-        messageId: 'user-1',
-        turnId: 'turn-1',
-        turnOutcome: {
-          turnId: 'turn-1',
-          status: 'succeeded',
-          documentMutationOutcome: { version: 1, status: 'not_attempted' },
-        },
-      }),
-    },
   ])('does not render a standalone status for $name', async ({ message }) => {
     const { app, host } = await mountAnnotationMessage(message)
     expect(host.querySelector('[data-testid="prompt-annotation-turn-status"]')).toBeNull()
     app.unmount()
   })
 
-  it('labels a corrected proposal only when the authoritative applied receipt says so', async () => {
+  it('maps a corrected proposal to the same page-updated state', async () => {
     const { app, host } = await mountAnnotationMessage(annotationMessage({
       messageId: 'user-1',
       turnId: 'turn-1',
@@ -469,7 +470,24 @@ describe('UserMessage prompt annotation snapshots', () => {
 
     const card = host.querySelector('[data-testid="prompt-annotation-turn-status"]')
     expect(card?.getAttribute('data-status')).toBe('applied')
-    expect(card?.textContent).toContain('Corrected and applied')
+    expect(card?.textContent).toBe('Page updated')
+    app.unmount()
+  })
+
+  it('maps a not-attempted internal outcome to the page update failure state', async () => {
+    const { app, host } = await mountAnnotationMessage(annotationMessage({
+      messageId: 'user-1',
+      turnId: 'turn-1',
+      turnOutcome: {
+        turnId: 'turn-1',
+        status: 'succeeded',
+        documentMutationOutcome: { version: 1, status: 'not_attempted' },
+      },
+    }))
+
+    const card = host.querySelector('[data-testid="prompt-annotation-turn-status"]')
+    expect(card?.getAttribute('data-status')).toBe('not_applied')
+    expect(card?.textContent).toBe('Couldn’t update page')
     app.unmount()
   })
 })

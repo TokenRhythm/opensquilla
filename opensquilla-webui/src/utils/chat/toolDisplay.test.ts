@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest'
 
-import { toolResultCount } from '@/utils/chat/toolDisplay'
+import {
+  toolActionLabel,
+  toolDisplayName,
+  toolOperationKey,
+  toolResultCount,
+  toolSecondaryText,
+} from '@/utils/chat/toolDisplay'
 
 describe('toolResultCount', () => {
   it('counts structured result collections', () => {
@@ -52,5 +58,40 @@ describe('toolResultCount', () => {
     ]
 
     expect(toolResultCount(JSON.stringify({ results }), 'web_search')).toBe(2)
+  })
+})
+
+describe('page tool product presentation', () => {
+  it.each([
+    ['document_read', 'document.read', 'Read page'],
+    ['document_locate', 'document.read', 'Read page'],
+    ['gateway.document_inspect', 'document.read', 'Read page'],
+    ['document_apply', 'document.update', 'Update page'],
+    ['document_patch', 'document.update', 'Update page'],
+  ])('maps %s to a product action', (name, operation, label) => {
+    expect(toolOperationKey(name)).toBe(operation)
+    expect(toolDisplayName(name, '{}')).toBe(label)
+    expect(toolActionLabel(name)).toBe(label)
+  })
+
+  it('never exposes page-tool protocol payloads as secondary text', () => {
+    const raw = JSON.stringify({
+      expectedSha256: 'a'.repeat(64),
+      cursor: 'private-cursor',
+      grant: 'one-time-grant',
+    })
+    expect(toolSecondaryText({
+      toolId: 'tool-1',
+      name: 'document_apply',
+      displayName: 'document_apply',
+      inputRaw: raw,
+      inputPreview: raw,
+      result: raw,
+      resultPreview: raw,
+      isRunning: false,
+      status: 'success',
+      isError: false,
+      isOpen: false,
+    })).toBe('')
   })
 })

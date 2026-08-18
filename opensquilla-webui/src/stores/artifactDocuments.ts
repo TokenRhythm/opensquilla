@@ -7,7 +7,13 @@ import type {
   ArtifactDocumentWorkspaceSnapshot,
 } from '@/types/artifactDocuments'
 import type { ArtifactPayload } from '@/types/rpc'
+import {
+  artifactMutationOutcomeMayBePending,
+  artifactProductClientError,
+  classifyArtifactProductError,
+} from '@/utils/artifactProductErrors'
 import { PendingMutationRequestIds } from '@/utils/mutationRequestIdentity'
+import { resolveArtifactMutationBounded } from '@/workbench/artifactMutationRecovery'
 import {
   createLegacyArtifactWorkspace,
   type ArtifactDocumentProvider,
@@ -44,13 +50,12 @@ function emptySnapshot(key: string): ArtifactDocumentWorkspaceSnapshot {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error && error.message
-    ? error.message
-    : 'Artifact document metadata is unavailable.'
+  return classifyArtifactProductError(error).fallbackMessage
 }
 
 function unavailableAction(message: string): Error {
-  return new Error(message)
+  void message
+  return artifactProductClientError('DOCUMENT_UNAVAILABLE')
 }
 
 export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => {
@@ -63,7 +68,6 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
   function setProvider(next: ArtifactDocumentProvider | null) {
     if (provider.value === next) return
     abortAll()
-    mutationRequestIds.clear()
     provider.value = next ? markRaw(next) : null
   }
 
@@ -125,7 +129,7 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
             loading: false,
             loaded: true,
             stale: true,
-            error: 'Artifact document metadata is temporarily unavailable.',
+            error: errorMessage(artifactProductClientError('DOCUMENT_UNAVAILABLE')),
             workspace: current.workspace,
           })
           return current.workspace
@@ -188,27 +192,92 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
     return { provider: currentProvider, workspace }
   }
 
-  async function refreshAfterMutation<T>(
+  async function runDocumentMutation<T>(
     artifact: ArtifactPayload,
     sessionKey: string,
-    mutation: () => Promise<T | null>,
+    options: {
+      currentProvider: ArtifactDocumentProvider
+      documentId: string
+      operation: 'revision.restore' | 'change.revert'
+      logicalKey: string
+      requestPrefix: string
+      buildPayload: (requestId: string) => Readonly<Record<string, unknown>>
+      execute: (payload: Readonly<Record<string, unknown>>) => Promise<T | null>
+    },
   ): Promise<ArtifactDocumentWorkspace> {
-    let mutationError: unknown = null
-    let result: T | null = null
-    try {
-      result = await mutation()
-      if (result === null) {
-        mutationError = unavailableAction('Artifact document action was not accepted.')
+    const clientRequestId = mutationRequestIds.idFor(
+      options.logicalKey,
+      options.requestPrefix,
+    )
+    const wasPending = mutationRequestIds.isPending(options.logicalKey, clientRequestId)
+    const payload = mutationRequestIds.pendingPayload(options.logicalKey, clientRequestId)
+      || mutationRequestIds.freeze(
+        options.logicalKey,
+        clientRequestId,
+        options.buildPayload(clientRequestId),
+      )
+    const release = () => mutationRequestIds.release(options.logicalKey, clientRequestId)
+    const pendingError = () => artifactProductClientError('MUTATION_OUTCOME_PENDING')
+    const notApplied = async (): Promise<never> => {
+      release()
+      await refresh(artifact, sessionKey)
+      throw artifactProductClientError('MUTATION_NOT_APPLIED')
+    }
+    const resolve = async () => {
+      if (!options.currentProvider.resolveMutation) return null
+      try {
+        return await resolveArtifactMutationBounded(
+          request => options.currentProvider.resolveMutation!(request),
+          {
+            sessionKey,
+            operation: options.operation,
+            requestId: clientRequestId,
+            documentId: options.documentId,
+          },
+        )
+      } catch {
+        throw pendingError()
       }
-    } catch (error) {
-      mutationError = error
     }
 
-    // A request can commit on the server even if its response is interrupted.
-    // Always force a canonical refetch before reporting the outcome.
-    const workspace = await refresh(artifact, sessionKey)
-    if (mutationError) throw mutationError
-    return workspace
+    if (wasPending && options.currentProvider.resolveMutation) {
+      const resolution = await resolve()
+      if (resolution?.status === 'not_applied') return notApplied()
+      if (resolution?.status === 'pending') throw pendingError()
+      if (resolution?.status === 'applied') {
+        release()
+        return refresh(artifact, sessionKey)
+      }
+      // Null means an old Gateway. Continue with an explicit exact replay.
+    }
+
+    try {
+      const result = await options.execute(payload)
+      if (result === null) {
+        release()
+        await refresh(artifact, sessionKey)
+        throw unavailableAction('Artifact document action was not accepted.')
+      }
+      release()
+      return refresh(artifact, sessionKey)
+    } catch (error) {
+      if (!artifactMutationOutcomeMayBePending(error)) {
+        release()
+        await refresh(artifact, sessionKey)
+        throw error
+      }
+      mutationRequestIds.markPending(options.logicalKey, clientRequestId)
+      if (!wasPending && options.currentProvider.resolveMutation) {
+        const resolution = await resolve()
+        if (resolution?.status === 'not_applied') return notApplied()
+        if (resolution?.status === 'applied') {
+          release()
+          return refresh(artifact, sessionKey)
+        }
+      }
+      await refresh(artifact, sessionKey)
+      throw pendingError()
+    }
   }
 
   const restoreRevision: ArtifactDocumentActions['restoreRevision'] = async (
@@ -231,24 +300,26 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
       document.headRevisionId,
       document.stateRevision,
     ])
-    const clientRequestId = mutationRequestIds.idFor(
-      logicalRequestKey,
-      'document-restore',
-    )
-    const result = await refreshAfterMutation(
+    return runDocumentMutation(
       artifact,
       sessionKey,
-      () => current.provider.restoreRevision({
-        sessionKey,
+      {
+        currentProvider: current.provider,
         documentId: document.documentId,
-        revisionId: revision.revisionId,
-        expectedHeadRevisionId: document.headRevisionId,
-        expectedStateRevision: document.stateRevision,
-        clientRequestId,
-      }),
+        operation: 'revision.restore',
+        logicalKey: logicalRequestKey,
+        requestPrefix: 'document-restore',
+        buildPayload: clientRequestId => ({
+          sessionKey,
+          documentId: document.documentId,
+          revisionId: revision.revisionId,
+          expectedHeadRevisionId: document.headRevisionId,
+          expectedStateRevision: document.stateRevision,
+          clientRequestId,
+        }),
+        execute: payload => current.provider.restoreRevision(payload),
+      },
     )
-    mutationRequestIds.release(logicalRequestKey, clientRequestId)
-    return result
   }
 
   const revertChangeSet: ArtifactDocumentActions['revertChangeSet'] = async (
@@ -278,24 +349,26 @@ export const useArtifactDocumentsStore = defineStore('artifactDocuments', () => 
       document.headRevisionId,
       document.stateRevision,
     ])
-    const clientRequestId = mutationRequestIds.idFor(
-      logicalRequestKey,
-      'document-revert',
-    )
-    const result = await refreshAfterMutation(
+    return runDocumentMutation(
       artifact,
       sessionKey,
-      () => current.provider.revertChangeSet({
-        sessionKey,
+      {
+        currentProvider: current.provider,
         documentId: document.documentId,
-        changeSetId: changeSet.changeSetId,
-        expectedHeadRevisionId: document.headRevisionId,
-        expectedStateRevision: document.stateRevision,
-        clientRequestId,
-      }),
+        operation: 'change.revert',
+        logicalKey: logicalRequestKey,
+        requestPrefix: 'document-revert',
+        buildPayload: clientRequestId => ({
+          sessionKey,
+          documentId: document.documentId,
+          changeSetId: changeSet.changeSetId,
+          expectedHeadRevisionId: document.headRevisionId,
+          expectedStateRevision: document.stateRevision,
+          clientRequestId,
+        }),
+        execute: payload => current.provider.revertChangeSet(payload),
+      },
     )
-    mutationRequestIds.release(logicalRequestKey, clientRequestId)
-    return result
   }
 
   function clearSession(sessionKey: string) {

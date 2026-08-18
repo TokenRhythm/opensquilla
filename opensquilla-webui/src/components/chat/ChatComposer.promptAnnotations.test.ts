@@ -23,6 +23,9 @@ function annotation(overrides: Partial<PromptAnnotation> = {}): PromptAnnotation
     staleReason: null,
     stateRevision: 1,
     tagName: 'button',
+    targetStatus: 'ready',
+    targetKind: 'button',
+    targetText: 'Continue',
     locator: {},
     quote: '<button>',
     sourceExcerpt: '<button>Before</button>',
@@ -82,11 +85,12 @@ describe('ChatComposer prompt annotation drafts', () => {
     expect(host.querySelector('.chat-composer')?.classList.contains('chat-composer--collapsed'))
       .toBe(false)
     const chip = host.querySelector<HTMLElement>('.chat-prompt-annotation-chip')
-    expect(chip?.dataset.freshness).toBe('fresh')
+    expect(chip?.dataset.freshness).toBeUndefined()
     expect(chip?.getAttribute('role')).toBe('group')
     expect(host.querySelector('[data-testid="composer-prompt-annotations-label"]')?.textContent)
       .toContain('Annotations · 1')
-    expect(chip?.textContent).toContain('<button>')
+    expect(chip?.textContent).toContain('Button: Continue')
+    expect(chip?.textContent).not.toContain('<button>')
     expect(chip?.textContent).toContain('Make this button clearer.')
     expect(chip?.querySelector('.chat-prompt-annotation-chip__rail')).not.toBeNull()
     expect(chip?.querySelector('[data-testid="prompt-annotation-ready-status"]')).toBeNull()
@@ -130,7 +134,7 @@ describe('ChatComposer prompt annotation drafts', () => {
     expect(host.querySelector('.chat-composer')?.classList.contains('chat-composer--floating'))
       .toBe(true)
     expect(host.querySelector('.chat-prompt-annotation-chip__target')?.textContent)
-      .toContain('<button>')
+      .toContain('Button: Continue')
     host.querySelector<HTMLButtonElement>('.chat-prompt-annotation-chip__main')?.click()
     expect(jump).toHaveBeenCalledWith('annotation-1')
 
@@ -155,7 +159,7 @@ describe('ChatComposer prompt annotation drafts', () => {
     app.unmount()
   })
 
-  it('keeps a stale chip visible and clearly marks it for reselection', async () => {
+  it('keeps a compatibility stale draft sendable without exposing revision state', async () => {
     const host = document.createElement('div')
     document.body.append(host)
     const app = createApp(ChatComposer, composerProps({
@@ -166,9 +170,9 @@ describe('ChatComposer prompt annotation drafts', () => {
     await nextTick()
 
     expect(host.querySelector('.chat-prompt-annotation-chip')?.classList.contains('is-stale'))
-      .toBe(true)
-    expect(host.querySelector('.chat-prompt-annotation-chip__stale')?.textContent)
-      .toContain('Select this element again')
+      .toBe(false)
+    expect(host.querySelector('.chat-prompt-annotation-chip__stale')).toBeNull()
+    expect(host.textContent).not.toContain('Select this element again')
     app.unmount()
   })
 

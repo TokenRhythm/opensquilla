@@ -46,7 +46,7 @@
           {{ t('workbench.artifactDocument.discardAndLoadLatest') }}
         </button>
         <button v-else type="button" class="btn btn--ghost" @click="retry">
-          {{ t('common.retry') }}
+          {{ t('workbench.resources.retry') }}
         </button>
       </span>
     </div>
@@ -66,15 +66,23 @@ import { useArtifactDocumentsStore } from '@/stores/artifactDocuments'
 import type {
   ArtifactDocument,
   ArtifactEditSession,
+  ArtifactMutationResolution,
   ArtifactSourceSnapshot,
+  ArtifactSourcePatchResult,
 } from '@/types/artifactDocuments'
 import type { ArtifactPayload } from '@/types/rpc'
 import type { WorkbenchBeforeCloseOptions } from '@/workbench/types'
 import { copyTextWithFallback } from '@/utils/browser'
 import {
+  artifactMutationOutcomeMayBePending,
+  artifactProductClientError,
+  classifyArtifactProductError,
+} from '@/utils/artifactProductErrors'
+import {
   createMutationClientRequestId,
   PendingMutationRequestIds,
 } from '@/utils/mutationRequestIdentity'
+import { resolveArtifactMutationBounded } from '@/workbench/artifactMutationRecovery'
 import {
   htmlElementAtOffsets,
   htmlSourceElements,
@@ -120,10 +128,13 @@ const dirty = ref(false)
 const error = ref('')
 const savedAt = ref(0)
 const editSession = ref<ArtifactEditSession | null>(null)
+const canonicalHeadRevisionId = ref(props.document.headRevisionId)
 const headConflict = ref(false)
 const copyState = ref<'idle' | 'copied' | 'failed'>('idle')
-const editSessionMode = ref<'initializing' | 'active' | 'legacy' | 'failed' | 'closed'>(
-  'initializing',
+const editSessionMode = ref<
+  'starting' | 'healthy' | 'degraded' | 'reacquiring' | 'legacy' | 'closed'
+>(
+  'starting',
 )
 let editor: Monaco.editor.IStandaloneCodeEditor | null = null
 let modelSubscription: Monaco.IDisposable | null = null
@@ -138,16 +149,31 @@ let flushPromise: Promise<boolean> | null = null
 let closePromise: Promise<boolean> | null = null
 let startPromise: Promise<boolean> | null = null
 let heartbeatTimer: ReturnType<typeof setTimeout> | null = null
+let reacquireTimer: ReturnType<typeof setTimeout> | null = null
 let sessionMutationQueue: Promise<void> = Promise.resolve()
 let deferredHeadRevisionId = ''
 let cleanHeadReloadPromise: Promise<boolean> | null = null
+let reacquirePromise: Promise<boolean> | null = null
+let autosaveBlocked = false
+
+type PendingSourceMutation = {
+  logicalKey: string
+  requestId: string
+  request: Readonly<Record<string, unknown>>
+  baseline: ArtifactSourceSnapshot
+  content: string
+}
+
+let pendingSourceMutation: PendingSourceMutation | null = null
 
 const EDIT_SESSION_HEARTBEAT_MS = 20_000
 const pendingSourceRequestIds = new PendingMutationRequestIds(4)
 let editSessionClientRequestId = createMutationClientRequestId('edit-session')
 
 const editingReady = computed(() => (
-  editSessionMode.value === 'active' || editSessionMode.value === 'legacy'
+  !headConflict.value
+  && editSessionMode.value !== 'starting'
+  && editSessionMode.value !== 'closed'
 ))
 
 const status = computed(() => error.value
@@ -195,7 +221,13 @@ function scheduleParse() {
 
 function scheduleAutosave() {
   clearAutosave()
-  if (headConflict.value || !editingReady.value || unmounted) return
+  if (
+    headConflict.value
+    || !editingReady.value
+    || pendingSourceMutation !== null
+    || autosaveBlocked
+    || unmounted
+  ) return
   autosaveTimer = setTimeout(() => void flush(), 1_200)
 }
 
@@ -205,9 +237,9 @@ function clearAutosave() {
 }
 
 function rpcError(errorValue: unknown): string {
-  return errorValue instanceof Error && errorValue.message
-    ? errorValue.message
-    : t('workbench.artifactDocument.sourceUnavailable')
+  const classified = classifyArtifactProductError(errorValue)
+  const translated = t(classified.messageKey)
+  return translated === classified.messageKey ? classified.fallbackMessage : translated
 }
 
 function runSessionMutation<T>(operation: () => Promise<T>): Promise<T> {
@@ -221,18 +253,31 @@ function stopHeartbeat() {
   heartbeatTimer = null
 }
 
-function failEditSession(reason: unknown) {
+function stopReacquire() {
+  if (reacquireTimer) clearTimeout(reacquireTimer)
+  reacquireTimer = null
+}
+
+function blockEditing(reason: unknown) {
   stopHeartbeat()
   clearAutosave()
-  editSessionMode.value = 'failed'
+  stopReacquire()
+  editSessionMode.value = 'degraded'
   error.value = rpcError(reason)
   editor?.updateOptions({ readOnly: true })
+}
+
+function degradeEditSession(reason: unknown) {
+  stopHeartbeat()
+  editSessionMode.value = 'degraded'
+  error.value = rpcError(reason)
+  editor?.updateOptions({ readOnly: snapshot.value === null || headConflict.value })
 }
 
 function enterHeadConflict(reason: unknown) {
   headConflict.value = true
   copyState.value = 'idle'
-  failEditSession(reason)
+  blockEditing(reason)
 }
 
 function reconcileDeferredHeadRevision() {
@@ -241,7 +286,7 @@ function reconcileDeferredHeadRevision() {
   deferredHeadRevisionId = ''
   if (snapshot.value?.revisionId !== observedHeadRevisionId) {
     if (dirty.value) {
-      enterHeadConflict(new Error(t('workbench.artifactDocument.sourceConflict')))
+      enterHeadConflict(artifactProductClientError('DOCUMENT_CHANGED'))
     } else {
       void reloadCleanHead()
     }
@@ -251,7 +296,7 @@ function reconcileDeferredHeadRevision() {
 function editorTracksHead(headRevisionId: string): boolean {
   return snapshot.value?.revisionId === headRevisionId
     && (
-      editSessionMode.value !== 'active'
+      editSessionMode.value !== 'healthy'
       || editSession.value?.lastSavedRevisionId === headRevisionId
     )
 }
@@ -264,7 +309,7 @@ async function runCleanHeadReload(): Promise<boolean> {
     && !flushPromise
     && !headConflict.value
   ) {
-    const requestedHeadRevisionId = props.document.headRevisionId
+    const requestedHeadRevisionId = canonicalHeadRevisionId.value
     if (editorTracksHead(requestedHeadRevisionId)) return true
 
     clearAutosave()
@@ -280,13 +325,13 @@ async function runCleanHeadReload(): Promise<boolean> {
     ) return false
 
     editSession.value = null
-    editSessionMode.value = 'initializing'
+    editSessionMode.value = 'starting'
     editSessionClientRequestId = createMutationClientRequestId('edit-session')
     error.value = ''
     const loaded = await initializeEditor()
     if (unmounted || dirty.value || headConflict.value) return false
-    if (loaded && editorTracksHead(props.document.headRevisionId)) return true
-    if (error.value || props.document.headRevisionId === requestedHeadRevisionId) return false
+    if (loaded && editorTracksHead(canonicalHeadRevisionId.value)) return true
+    if (error.value || canonicalHeadRevisionId.value === requestedHeadRevisionId) return false
     // A second head arrived while the source RPC was in flight. Repeat against
     // that newest immutable head instead of publishing an intermediate buffer.
   }
@@ -316,15 +361,24 @@ function assertActiveEditSession(
     || (Boolean(expectedId) && candidate.editSessionId !== expectedId)
     || !candidate.lastSavedRevisionId
   ) {
-    throw new Error(t('workbench.artifactDocument.sourceConflict'))
+    throw artifactProductClientError('EDIT_SESSION_RENEWAL_REQUIRED')
   }
   return candidate
 }
 
 function scheduleHeartbeat() {
   stopHeartbeat()
-  if (editSessionMode.value !== 'active' || unmounted) return
+  if (editSessionMode.value !== 'healthy' || unmounted) return
   heartbeatTimer = setTimeout(onHeartbeatTimer, EDIT_SESSION_HEARTBEAT_MS)
+}
+
+function scheduleReacquire(delayMs = 0) {
+  stopReacquire()
+  if (unmounted || headConflict.value || editSessionMode.value === 'legacy') return
+  reacquireTimer = setTimeout(() => {
+    reacquireTimer = null
+    void reacquireEditing()
+  }, delayMs)
 }
 
 function onHeartbeatTimer() {
@@ -332,10 +386,11 @@ function onHeartbeatTimer() {
 }
 
 async function heartbeatEditSession() {
-  if (editSessionMode.value !== 'active' || unmounted) return
+  if (editSessionMode.value !== 'healthy' || unmounted) return
   const provider = artifactDocuments.provider
   if (!provider?.heartbeatEditSession) {
-    failEditSession(new Error(t('workbench.artifactDocument.sourceConflict')))
+    degradeEditSession(artifactProductClientError('EDIT_SESSION_RENEWAL_REQUIRED'))
+    scheduleReacquire()
     return
   }
   try {
@@ -351,20 +406,94 @@ async function heartbeatEditSession() {
         updated.stateRevision <= current.stateRevision
         || updated.lastSavedRevisionId !== current.lastSavedRevisionId
       ) {
-        throw new Error(t('workbench.artifactDocument.sourceConflict'))
+        throw artifactProductClientError('DOCUMENT_CHANGED')
       }
       editSession.value = updated
     })
     scheduleHeartbeat()
-  } catch (caught) {
-    failEditSession(caught)
+  } catch {
+    degradeEditSession(artifactProductClientError('EDIT_SESSION_RENEWAL_REQUIRED'))
+    scheduleReacquire()
   }
+}
+
+async function runReacquireEditing(): Promise<boolean> {
+  const provider = artifactDocuments.provider
+  if (!provider || unmounted || headConflict.value) return false
+  if (!provider.startEditSession) {
+    editSession.value = null
+    editSessionMode.value = 'legacy'
+    error.value = ''
+    editor?.updateOptions({ readOnly: snapshot.value === null })
+    return true
+  }
+  const expectedRevisionId = snapshot.value?.revisionId || canonicalHeadRevisionId.value
+  editSessionMode.value = 'reacquiring'
+  editor?.updateOptions({ readOnly: snapshot.value === null })
+  try {
+    const requestId = createMutationClientRequestId('edit-session')
+    const started = await runSessionMutation(() => provider.startEditSession!({
+      sessionKey: props.sessionKey,
+      documentId: props.document.documentId,
+      mode: 'edit',
+      clientRequestId: requestId,
+    }))
+    if (!started) {
+      editSession.value = null
+      editSessionMode.value = 'legacy'
+      error.value = ''
+      editor?.updateOptions({ readOnly: snapshot.value === null })
+      return true
+    }
+    const active = assertActiveEditSession(started)
+    if (active.lastSavedRevisionId !== expectedRevisionId) {
+      if (dirty.value) {
+        enterHeadConflict(artifactProductClientError('DOCUMENT_CHANGED'))
+      } else {
+        canonicalHeadRevisionId.value = active.lastSavedRevisionId
+        deferredHeadRevisionId = ''
+        editSession.value = active
+        editSessionMode.value = 'healthy'
+        error.value = ''
+        editor?.updateOptions({ readOnly: true })
+        scheduleHeartbeat()
+        void artifactDocuments.refresh(props.artifact, props.sessionKey)
+        return loadSource(active.lastSavedRevisionId)
+      }
+      return false
+    }
+    editSession.value = active
+    editSessionMode.value = 'healthy'
+    error.value = ''
+    editor?.updateOptions({ readOnly: snapshot.value === null })
+    scheduleHeartbeat()
+    if (snapshot.value === null) return loadSource()
+    if (dirty.value) scheduleAutosave()
+    return true
+  } catch {
+    degradeEditSession(artifactProductClientError('EDIT_SESSION_RENEWAL_REQUIRED'))
+    scheduleReacquire(1_000)
+    return false
+  }
+}
+
+function reacquireEditing(): Promise<boolean> {
+  if (editSessionMode.value === 'legacy') return Promise.resolve(true)
+  if (editSessionMode.value === 'healthy') return Promise.resolve(true)
+  if (reacquirePromise) return reacquirePromise
+  const pending = runReacquireEditing()
+  reacquirePromise = pending
+  const clear = () => {
+    if (reacquirePromise === pending) reacquirePromise = null
+  }
+  void pending.then(clear, clear)
+  return pending
 }
 
 async function startEditing(): Promise<boolean> {
   const provider = artifactDocuments.provider
   if (!provider || !props.document.capabilities.source || unmounted) return false
-  editSessionMode.value = 'initializing'
+  editSessionMode.value = 'starting'
   editSession.value = null
   deferredHeadRevisionId = ''
   headConflict.value = false
@@ -388,15 +517,16 @@ async function startEditing(): Promise<boolean> {
       return true
     }
     const active = assertActiveEditSession(started)
-    if (active.lastSavedRevisionId !== props.document.headRevisionId) {
-      throw new Error(t('workbench.artifactDocument.sourceConflict'))
+    if (active.lastSavedRevisionId !== canonicalHeadRevisionId.value) {
+      throw artifactProductClientError('DOCUMENT_CHANGED')
     }
     editSession.value = active
-    editSessionMode.value = 'active'
+    editSessionMode.value = 'healthy'
     scheduleHeartbeat()
     return true
   } catch (caught) {
-    failEditSession(caught)
+    degradeEditSession(caught)
+    scheduleReacquire()
     return false
   }
 }
@@ -415,15 +545,21 @@ async function initializeEditor(): Promise<boolean> {
 }
 
 async function retry() {
-  if (editSessionMode.value === 'initializing') return
-  if (editSessionMode.value === 'failed' && !snapshot.value && !dirty.value) {
+  if (editSessionMode.value === 'starting' || editSessionMode.value === 'reacquiring') return
+  if (editSessionMode.value === 'degraded' && !snapshot.value && !dirty.value) {
     await initializeEditor()
     return
+  }
+  if (editSessionMode.value === 'degraded') {
+    if (!await reacquireEditing()) return
+    if (snapshot.value) return
   }
   await loadSource()
 }
 
-async function loadSource(): Promise<boolean> {
+async function loadSource(
+  revisionId: string = canonicalHeadRevisionId.value,
+): Promise<boolean> {
   const provider = artifactDocuments.provider
   if (
     !provider
@@ -433,12 +569,12 @@ async function loadSource(): Promise<boolean> {
     || unmounted
   ) return false
   if (dirty.value || saving.value || flushPromise) {
-    error.value = t('workbench.artifactDocument.sourceConflict')
+    error.value = rpcError(artifactProductClientError('DOCUMENT_CHANGED'))
     return false
   }
   const generation = ++loadGeneration
   const requestedDocumentId = props.document.documentId
-  const requestedRevisionId = props.document.headRevisionId
+  const requestedRevisionId = revisionId
   const requestedSessionKey = props.sessionKey
   const startingEditVersion = editVersion
   loading.value = true
@@ -450,13 +586,13 @@ async function loadSource(): Promise<boolean> {
       documentId: requestedDocumentId,
       revisionId: requestedRevisionId,
     })
-    if (!loaded) throw new Error(t('workbench.artifactDocument.sourceUnavailable'))
+    if (!loaded) throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
     if (
       generation !== loadGeneration
       || unmounted
       || props.sessionKey !== requestedSessionKey
       || props.document.documentId !== requestedDocumentId
-      || props.document.headRevisionId !== requestedRevisionId
+      || canonicalHeadRevisionId.value !== requestedRevisionId
     ) {
       return false
     }
@@ -464,12 +600,12 @@ async function loadSource(): Promise<boolean> {
       loaded.documentId !== requestedDocumentId
       || loaded.revisionId !== requestedRevisionId
     ) {
-      throw new Error(t('workbench.artifactDocument.sourceConflict'))
+      throw artifactProductClientError('DOCUMENT_CHANGED')
     }
     // Monaco is read-only while loading, but the edit generation is still a
     // final guard against programmatic edits and late responses.
     if (dirty.value || editVersion !== startingEditVersion) {
-      error.value = t('workbench.artifactDocument.sourceConflict')
+      error.value = rpcError(artifactProductClientError('DOCUMENT_CHANGED'))
       return false
     }
     snapshot.value = loaded
@@ -494,117 +630,282 @@ async function loadSource(): Promise<boolean> {
   }
 }
 
+function sourceFromResolution(
+  pending: PendingSourceMutation,
+  resolution: ArtifactMutationResolution,
+): ArtifactSourcePatchResult | null {
+  const result = resolution.result
+  if (
+    resolution.status !== 'applied'
+    || !result
+    || result.documentId !== props.document.documentId
+  ) return null
+  return {
+    documentId: result.documentId,
+    revisionId: result.revisionId,
+    language: pending.baseline.language,
+    content: '',
+    sha256: result.sha256,
+    offsetEncoding: SOURCE_OFFSET_ENCODING,
+    patchCount: 1,
+    stateRevision: result.stateRevision,
+    editSession: null,
+  }
+}
+
+function beginSilentEditSessionRecovery() {
+  if (editSessionMode.value === 'legacy') return
+  stopHeartbeat()
+  editSessionMode.value = 'degraded'
+  error.value = ''
+  editor?.updateOptions({ readOnly: snapshot.value === null || headConflict.value })
+  scheduleReacquire()
+}
+
+function acceptSavedSource(
+  pending: PendingSourceMutation,
+  saved: ArtifactSourcePatchResult,
+  options: { responseConfirmed: boolean },
+): boolean {
+  const { responseConfirmed } = options
+  if (
+    saved.documentId !== props.document.documentId
+    || !saved.revisionId
+    || !saved.sha256
+  ) {
+    error.value = rpcError(artifactProductClientError('DOCUMENT_UNAVAILABLE'))
+    autosaveBlocked = true
+    return false
+  }
+  if (responseConfirmed && editSessionMode.value === 'healthy' && editSession.value) {
+    const current = editSession.value
+    const updated = assertActiveEditSession(saved.editSession, current.editSessionId)
+    if (
+      updated.lastSavedRevisionId !== saved.revisionId
+      || updated.stateRevision <= current.stateRevision
+    ) {
+      enterHeadConflict(artifactProductClientError('DOCUMENT_CHANGED'))
+      return false
+    }
+    editSession.value = updated
+  } else if (!responseConfirmed) {
+    beginSilentEditSessionRecovery()
+  }
+
+  pendingSourceRequestIds.release(pending.logicalKey, pending.requestId)
+  pendingSourceMutation = null
+  snapshot.value = { ...saved, content: pending.content }
+  dirty.value = currentSource() !== pending.content
+  autosaveBlocked = false
+  savedAt.value = Date.now()
+  updateElementIndex()
+  const observedHeadRevisionId = deferredHeadRevisionId || canonicalHeadRevisionId.value
+  deferredHeadRevisionId = ''
+  canonicalHeadRevisionId.value = saved.revisionId
+  if (
+    observedHeadRevisionId !== pending.baseline.revisionId
+    && observedHeadRevisionId !== saved.revisionId
+  ) {
+    if (dirty.value) {
+      enterHeadConflict(artifactProductClientError('DOCUMENT_CHANGED'))
+      return false
+    }
+    deferredHeadRevisionId = observedHeadRevisionId
+  }
+  emit('source-saved', saved.revisionId)
+  return true
+}
+
+async function resolvePendingSourceMutation(
+  options: { allowLegacyReplay: boolean },
+): Promise<'applied' | 'not_applied' | 'pending'> {
+  const provider = artifactDocuments.provider
+  const pending = pendingSourceMutation
+  if (!provider || !pending) return 'not_applied'
+
+  let resolution: ArtifactMutationResolution | null = null
+  if (provider.resolveMutation) {
+    try {
+      resolution = await resolveArtifactMutationBounded(
+        async request => {
+          try {
+            return await provider.resolveMutation!(request)
+          } catch (caught) {
+            if (!artifactMutationOutcomeMayBePending(caught)) throw caught
+            return { status: 'pending', retryAfterMs: null, result: null }
+          }
+        },
+        {
+          sessionKey: props.sessionKey,
+          operation: 'source.patch',
+          requestId: pending.requestId,
+          documentId: props.document.documentId,
+        },
+      )
+    } catch {
+      resolution = { status: 'pending', retryAfterMs: null, result: null }
+    }
+  }
+
+  if (resolution?.status === 'applied') {
+    const saved = sourceFromResolution(pending, resolution)
+    if (!saved) {
+      error.value = rpcError(artifactProductClientError('MUTATION_OUTCOME_PENDING'))
+      autosaveBlocked = true
+      return 'pending'
+    }
+    return acceptSavedSource(pending, saved, { responseConfirmed: false })
+      ? 'applied'
+      : 'pending'
+  }
+  if (resolution?.status === 'not_applied') {
+    pendingSourceRequestIds.markNotApplied(pending.logicalKey, pending.requestId)
+    pendingSourceMutation = null
+    error.value = rpcError(artifactProductClientError('MUTATION_NOT_APPLIED'))
+    autosaveBlocked = true
+    return 'not_applied'
+  }
+  if (resolution?.status === 'pending') {
+    error.value = rpcError(artifactProductClientError('MUTATION_OUTCOME_PENDING'))
+    autosaveBlocked = true
+    return 'pending'
+  }
+
+  if (!options.allowLegacyReplay) {
+    error.value = rpcError(artifactProductClientError('MUTATION_OUTCOME_PENDING'))
+    autosaveBlocked = true
+    return 'pending'
+  }
+
+  // On an explicit retry against an older Gateway, replay the exact frozen
+  // request. No field or request identity may be recomputed here.
+  try {
+    const replay = () => provider.patchSource(pending.request)
+    const saved = pending.request.editSessionId
+      ? await runSessionMutation(replay)
+      : await replay()
+    if (!saved) throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
+    return acceptSavedSource(pending, saved, { responseConfirmed: true })
+      ? 'applied'
+      : 'pending'
+  } catch {
+    error.value = rpcError(artifactProductClientError('MUTATION_OUTCOME_PENDING'))
+    autosaveBlocked = true
+    return 'pending'
+  }
+}
+
 async function commitCurrentSnapshot(): Promise<boolean> {
   clearAutosave()
   const provider = artifactDocuments.provider
-  const baseline = snapshot.value
-  const content = currentSource()
-  const saveVersion = editVersion
-  if (!provider || !baseline || !dirty.value) return !dirty.value
-  if (!editingReady.value || headConflict.value) {
-    error.value = t('workbench.artifactDocument.sourceConflict')
-    editor?.updateOptions({ readOnly: true })
-    return false
-  }
-  const patch = minimalSourcePatch(baseline.content, content)
-  if (!patch) {
-    dirty.value = false
-    return true
-  }
-  // The replacement is used only in this component's bounded in-memory key.
-  // The RPC receives a random opaque ID, so source text and paths cannot leak
-  // through clientRequestId while an exact response-loss retry stays stable.
-  const logicalSaveKey = JSON.stringify([
-    props.sessionKey,
-    props.document.documentId,
-    baseline.revisionId,
-    baseline.stateRevision,
-    baseline.sha256,
-    SOURCE_OFFSET_ENCODING,
-    patch.startOffset,
-    patch.endOffset,
-    patch.replacement,
-  ])
-  const saveClientRequestId = pendingSourceRequestIds.idFor(
-    logicalSaveKey,
-    'document-save',
-  )
+  if (!provider) return false
   saving.value = true
-  error.value = ''
   try {
-    const requiresEditSession = editSessionMode.value === 'active'
-    const save = async () => {
-      const request: Record<string, unknown> = {
-        sessionKey: props.sessionKey,
-        documentId: props.document.documentId,
-        expectedHeadRevisionId: baseline.revisionId,
-        expectedStateRevision: baseline.stateRevision,
-        expectedSourceSha256: baseline.sha256,
-        offsetEncoding: SOURCE_OFFSET_ENCODING,
-        patches: [patch],
-        clientRequestId: saveClientRequestId,
-      }
-      if (requiresEditSession && editSessionMode.value !== 'active') {
-        throw new Error(t('workbench.artifactDocument.sourceConflict'))
-      }
-      const currentSession = requiresEditSession
-        ? assertActiveEditSession(editSession.value)
-        : null
-      if (currentSession) {
-        if (currentSession.lastSavedRevisionId !== baseline.revisionId) {
-          throw new Error(t('workbench.artifactDocument.sourceConflict'))
-        }
-        request.editSessionId = currentSession.editSessionId
-        request.expectedEditSessionStateRevision = currentSession.stateRevision
-        request.expectedLastSavedRevisionId = currentSession.lastSavedRevisionId
-      }
-      const result = await provider.patchSource(request)
-      if (!result) throw new Error(t('workbench.artifactDocument.sourceUnavailable'))
-      if (currentSession) {
-        const updated = assertActiveEditSession(
-          result.editSession,
-          currentSession.editSessionId,
-        )
-        if (
-          updated.lastSavedRevisionId !== result.revisionId
-          || updated.stateRevision <= currentSession.stateRevision
-        ) {
-          throw new Error(t('workbench.artifactDocument.sourceConflict'))
-        }
-        editSession.value = updated
-      }
-      pendingSourceRequestIds.release(logicalSaveKey, saveClientRequestId)
-      return result
+    if (headConflict.value) {
+      error.value = rpcError(artifactProductClientError('DOCUMENT_CHANGED'))
+      editor?.updateOptions({ readOnly: true })
+      return false
     }
-    const saved = requiresEditSession
-      ? await runSessionMutation(save)
-      : await save()
-    if (!saved) throw new Error(t('workbench.artifactDocument.sourceUnavailable'))
-    snapshot.value = { ...saved, content }
-    // The response advances only the immutable buffer captured above. An edit
-    // made while the request was in flight remains a new dirty generation.
-    dirty.value = editVersion !== saveVersion
-    savedAt.value = Date.now()
-    updateElementIndex()
-    const observedHeadRevisionId = deferredHeadRevisionId
-      || props.document.headRevisionId
-    deferredHeadRevisionId = ''
+    error.value = ''
+    if (pendingSourceMutation) {
+      const outcome = await resolvePendingSourceMutation({ allowLegacyReplay: true })
+      if (outcome === 'pending') return false
+      if (outcome === 'applied') return !dirty.value
+    }
+
     if (
-      observedHeadRevisionId !== baseline.revisionId
-      && observedHeadRevisionId !== saved.revisionId
-    ) {
-      if (dirty.value) {
-        enterHeadConflict(new Error(t('workbench.artifactDocument.sourceConflict')))
+      (editSessionMode.value === 'degraded' || editSessionMode.value === 'reacquiring')
+      && !await reacquireEditing()
+    ) return false
+
+    const baseline = snapshot.value
+    const content = currentSource()
+    if (!baseline || !dirty.value) return !dirty.value
+    if (!editingReady.value || headConflict.value) {
+      error.value = rpcError(artifactProductClientError('DOCUMENT_CHANGED'))
+      editor?.updateOptions({ readOnly: true })
+      return false
+    }
+    const patch = minimalSourcePatch(baseline.content, content)
+    if (!patch) {
+      dirty.value = false
+      autosaveBlocked = false
+      return true
+    }
+    const logicalSaveKey = JSON.stringify([
+      props.sessionKey,
+      props.document.documentId,
+      baseline.revisionId,
+      baseline.stateRevision,
+      baseline.sha256,
+      SOURCE_OFFSET_ENCODING,
+      patch.startOffset,
+      patch.endOffset,
+      patch.replacement,
+    ])
+    const requestId = pendingSourceRequestIds.idFor(logicalSaveKey, 'document-save')
+    const request: Record<string, unknown> = {
+      sessionKey: props.sessionKey,
+      documentId: props.document.documentId,
+      expectedHeadRevisionId: baseline.revisionId,
+      expectedStateRevision: baseline.stateRevision,
+      expectedSourceSha256: baseline.sha256,
+      offsetEncoding: SOURCE_OFFSET_ENCODING,
+      patches: [patch],
+      clientRequestId: requestId,
+    }
+    const requiresEditSession = editSessionMode.value !== 'legacy'
+    const currentSession = requiresEditSession
+      ? assertActiveEditSession(editSession.value)
+      : null
+    if (currentSession) {
+      if (currentSession.lastSavedRevisionId !== baseline.revisionId) {
+        enterHeadConflict(artifactProductClientError('DOCUMENT_CHANGED'))
         return false
       }
-      deferredHeadRevisionId = observedHeadRevisionId
+      request.editSessionId = currentSession.editSessionId
+      request.expectedEditSessionStateRevision = currentSession.stateRevision
+      request.expectedLastSavedRevisionId = currentSession.lastSavedRevisionId
     }
-    emit('source-saved', saved.revisionId)
-    return true
-  } catch (caught) {
-    if (editSessionMode.value === 'active') failEditSession(caught)
-    else if (!error.value) error.value = rpcError(caught)
-    return false
+    const frozenRequest = pendingSourceRequestIds.freeze(
+      logicalSaveKey,
+      requestId,
+      request,
+    )
+    const pending: PendingSourceMutation = {
+      logicalKey: logicalSaveKey,
+      requestId,
+      request: frozenRequest,
+      baseline,
+      content,
+    }
+    pendingSourceMutation = pending
+
+    try {
+      const save = () => provider.patchSource(frozenRequest)
+      const saved = requiresEditSession ? await runSessionMutation(save) : await save()
+      if (!saved) throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
+      return acceptSavedSource(pending, saved, { responseConfirmed: true })
+    } catch (caught) {
+      if (artifactMutationOutcomeMayBePending(caught)) {
+        pendingSourceRequestIds.markPending(logicalSaveKey, requestId)
+        const outcome = await resolvePendingSourceMutation({ allowLegacyReplay: false })
+        return outcome === 'applied' && !dirty.value
+      }
+      pendingSourceRequestIds.markNotApplied(logicalSaveKey, requestId)
+      pendingSourceMutation = null
+      autosaveBlocked = true
+      const classified = classifyArtifactProductError(caught)
+      if (classified.code === 'DOCUMENT_CHANGED') {
+        enterHeadConflict(caught)
+      } else if (classified.code === 'EDIT_SESSION_RENEWAL_REQUIRED') {
+        degradeEditSession(caught)
+        scheduleReacquire()
+      } else {
+        error.value = rpcError(caught)
+      }
+      return false
+    }
   } finally {
     saving.value = false
     reconcileDeferredHeadRevision()
@@ -654,14 +955,15 @@ async function discardAndLoadLatest(): Promise<boolean> {
   await closeEditSessionBestEffort()
 
   editSession.value = null
-  editSessionMode.value = 'initializing'
+  editSessionMode.value = 'starting'
   editSessionClientRequestId = createMutationClientRequestId('edit-session')
+  autosaveBlocked = false
   copyState.value = 'idle'
   headConflict.value = false
   error.value = ''
   const loaded = await initializeEditor()
   if (!loaded && !error.value) {
-    failEditSession(new Error(t('workbench.artifactDocument.sourceUnavailable')))
+    blockEditing(artifactProductClientError('DOCUMENT_UNAVAILABLE'))
   }
   return loaded
 }
@@ -677,11 +979,12 @@ async function drainPendingEdits(): Promise<boolean> {
 
 async function closeEditSessionBestEffort() {
   stopHeartbeat()
+  stopReacquire()
   if (startPromise) await startPromise
-  if (editSessionMode.value !== 'active' && editSession.value?.status !== 'active') return
+  if (editSession.value?.status !== 'active') return
   const provider = artifactDocuments.provider
   if (!provider?.closeEditSession) {
-    editSessionMode.value = 'failed'
+    editSessionMode.value = 'closed'
     return
   }
   try {
@@ -698,17 +1001,19 @@ async function closeEditSessionBestEffort() {
         || closed.documentId !== props.document.documentId
         || closed.status !== 'closed'
       ) {
-        throw new Error(t('workbench.artifactDocument.sourceConflict'))
+        throw artifactProductClientError('EDIT_SESSION_RENEWAL_REQUIRED')
       }
       editSession.value = closed
       editSessionMode.value = 'closed'
     })
-  } catch (caught) {
+  } catch {
     // Closing is best effort after the source is durable. The server TTL still
     // releases an unreachable session, while stale/expired sessions never get
     // another write from this editor instance.
-    editSessionMode.value = 'failed'
-    if (!unmounted) error.value = rpcError(caught)
+    editSessionMode.value = 'closed'
+    if (!unmounted && dirty.value) {
+      error.value = rpcError(artifactProductClientError('EDIT_SESSION_RENEWAL_REQUIRED'))
+    }
   }
 }
 
@@ -752,6 +1057,7 @@ onMounted(async () => {
   modelSubscription = editor.onDidChangeModelContent(() => {
     if (suppressChanges) return
     editVersion += 1
+    autosaveBlocked = false
     dirty.value = snapshot.value?.content !== editor?.getValue()
     scheduleParse()
     if (dirty.value) scheduleAutosave()
@@ -763,6 +1069,7 @@ onMounted(async () => {
 watch(
   () => props.document.headRevisionId,
   headRevisionId => {
+    canonicalHeadRevisionId.value = headRevisionId
     if (snapshot.value?.revisionId === headRevisionId) return
     // The Gateway may publish the state invalidation immediately before the
     // source.patch response. Defer judgment until that response identifies
@@ -772,7 +1079,7 @@ watch(
       return
     }
     if (dirty.value) {
-      enterHeadConflict(new Error(t('workbench.artifactDocument.sourceConflict')))
+      enterHeadConflict(artifactProductClientError('DOCUMENT_CHANGED'))
       return
     }
     void reloadCleanHead()
@@ -781,6 +1088,7 @@ watch(
 
 onBeforeUnmount(() => {
   stopHeartbeat()
+  stopReacquire()
   clearAutosave()
   if (parseTimer) clearTimeout(parseTimer)
   parseTimer = null

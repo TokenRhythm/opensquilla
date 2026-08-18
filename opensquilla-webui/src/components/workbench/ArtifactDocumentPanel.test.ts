@@ -550,7 +550,7 @@ describe('ArtifactDocumentPanel', () => {
 
     expect(mounted.element.querySelector(
       '.artifact-document__annotation-shortcut-hint',
-    )?.textContent).toContain('⇧ Enter for a new line')
+    )?.textContent).toContain('⇧ Return for a new line')
     mounted.unmount()
   })
 
@@ -604,15 +604,15 @@ describe('ArtifactDocumentPanel', () => {
           documentId: workspace.document.documentId,
           baseRevisionId: workspace.document.headRevisionId,
           turnId: 'turn-1',
-          summary: 'Replace the heading',
-          status: 'ready',
+          summary: 'stale native editor trusted editor document_apply sha256 deadbeef',
+          status: 'applied',
           operations: [{ op: 'replace' }],
           candidateArtifact: null,
           validation: null,
           stateRevision: 1,
           createdByKind: 'agent',
           createdById: 'main',
-          appliedRevisionId: null,
+          appliedRevisionId: workspace.document.headRevisionId,
           createdAt: null,
           updatedAt: null,
           schemaVersion: 1,
@@ -637,13 +637,19 @@ describe('ArtifactDocumentPanel', () => {
 
     tabs[1]?.click()
     await nextTick()
-    expect(mounted.element.querySelector('[data-document-section="versions"]')?.textContent)
-      .toContain('Version 1')
+    const versions = mounted.element.querySelector('[data-document-section="versions"]')
+    expect(versions?.textContent).toContain('Original version')
+    expect(versions?.textContent).toContain('Version 1')
+    expect(versions?.textContent).not.toMatch(/system|actor|initial/i)
 
     tabs[2]?.click()
     await nextTick()
-    expect(mounted.element.querySelector('[data-document-section="changes"]')?.textContent)
-      .toContain('1 operations')
+    const changes = mounted.element.querySelector('[data-document-section="changes"]')
+    expect(changes?.textContent).toContain('Updated by OpenSquilla')
+    expect(changes?.textContent).toContain('Page updated')
+    expect(changes?.textContent).not.toMatch(
+      /stale|native editor|trusted editor|operations|change-1|document_apply|sha256|deadbeef/i,
+    )
 
     mounted.unmount()
   })
@@ -749,6 +755,9 @@ describe('ArtifactDocumentPanel', () => {
 
     tabs.find(tab => tab.textContent?.includes('Changes'))?.click()
     await nextTick()
+    expect(mounted.element.querySelector(
+      '[data-document-section="changes"]',
+    )?.textContent).toContain('Replace the heading')
     mounted.element.querySelector<HTMLButtonElement>(
       '[data-artifact-action="revert-change-set"]',
     )?.click()

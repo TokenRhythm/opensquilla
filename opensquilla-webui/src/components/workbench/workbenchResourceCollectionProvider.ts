@@ -1,9 +1,15 @@
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import {
+  artifactPayloadFromWorkbenchResource,
   resourcesFromWorkbenchItem,
   workbenchResourceKey,
 } from '@/workbench/workbenchResourceItems'
 import { workbenchResourceUnavailableReasonKey } from '@/workbench/resourceCapabilityPresentation'
+import {
+  artifactProductReasonCode,
+  classifyArtifactProductError,
+} from '@/utils/artifactProductErrors'
+import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import type {
   WorkbenchComponentEvent,
   WorkbenchItem,
@@ -29,6 +35,25 @@ function resourceFromEvent(event: WorkbenchComponentEvent): WorkbenchResource | 
     : null
 }
 
+function productErrorMessage(
+  error: unknown,
+  options: WorkbenchResourceCollectionOptions,
+): string {
+  const classified = classifyArtifactProductError(error)
+  const reasonCode = artifactProductReasonCode(error)
+  if (classified.code === 'RESOURCE_UNSUPPORTED' && reasonCode) {
+    return options.t(workbenchResourceUnavailableReasonKey(reasonCode))
+  }
+  const translated = options.t(classified.messageKey)
+  return translated === classified.messageKey ? classified.fallbackMessage : translated
+}
+
+function primaryActionIsDownload(resource: WorkbenchResource): boolean {
+  return !resource.capabilities.preview
+    && resource.capabilities.download
+    && artifactWorkbenchPreviewKind(artifactPayloadFromWorkbenchResource(resource)) !== 'html'
+}
+
 class WorkbenchResourceCollectionRuntime implements WorkbenchPanelRuntime {
   constructor(
     private readonly context: WorkbenchRuntimeContext,
@@ -50,9 +75,7 @@ class WorkbenchResourceCollectionRuntime implements WorkbenchPanelRuntime {
       } catch (error) {
         this.context.updateRenderState({
           resourceOpenErrorKey: busyKey,
-          resourceOpenErrorMessage: error instanceof Error
-            ? error.message
-            : this.options.t('workbench.resources.actionFailed'),
+          resourceOpenErrorMessage: productErrorMessage(error, this.options),
         })
       } finally {
         this.context.updateRenderState({ resourceBusyKey: '' })
@@ -73,9 +96,7 @@ class WorkbenchResourceCollectionRuntime implements WorkbenchPanelRuntime {
         await this.options.publish(resource, item)
       }
     } catch (error) {
-      this.options.pushError(error instanceof Error
-        ? error.message
-        : this.options.t('workbench.resources.actionFailed'))
+      this.options.pushError(productErrorMessage(error, this.options))
     } finally {
       this.context.updateRenderState({ resourceBusyKey: '' })
     }
@@ -104,23 +125,19 @@ export function createWorkbenchResourceCollectionDefinition(
       ),
       emptyLabel: options.t('workbench.resources.empty'),
       groupLabels: {
-        attachment: options.t('workbench.resources.groups.attachments'),
-        document: options.t('workbench.resources.groups.documents'),
-        deliverable: options.t('workbench.resources.groups.deliverables'),
-        url: options.t('workbench.resources.groups.urls'),
+        files: options.t('workbench.resources.groups.files'),
+        links: options.t('workbench.resources.groups.links'),
       },
       label: options.t('workbench.resources.title'),
       openErrorKey: String(state.runtimeState.resourceOpenErrorKey || ''),
       openErrorMessage: String(state.runtimeState.resourceOpenErrorMessage || ''),
       openLabel: (resource: WorkbenchResource) => options.t(
-        'workbench.resources.open',
+        primaryActionIsDownload(resource)
+          ? 'workbench.resources.download'
+          : 'workbench.resources.open',
         { name: resource.name },
       ),
       preparingLabel: options.t('workbench.resources.preparing'),
-      publishLabel: (resource: WorkbenchResource) => options.t(
-        'workbench.resources.publish',
-        { name: resource.name },
-      ),
       retryLabel: options.t('workbench.resources.retry'),
       resources: resourcesFromWorkbenchItem(item),
       unavailableReason: (resource: WorkbenchResource) => options.t(

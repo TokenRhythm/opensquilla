@@ -41,6 +41,7 @@ def test_workbench_resource_method_scopes_are_fail_closed() -> None:
     assert METHOD_SCOPES["workbench.resources.get"] == READ_SCOPE
     assert METHOD_SCOPES["workbench.previews.create"] == READ_SCOPE
     assert METHOD_SCOPES["workbench.resources.open"] == WRITE_SCOPE
+    assert METHOD_SCOPES["artifacts.mutations.resolve"] == WRITE_SCOPE
     assert METHOD_SCOPES["documents.import"] == WRITE_SCOPE
     assert METHOD_SCOPES["documents.publish"] == WRITE_SCOPE
 
@@ -192,7 +193,8 @@ async def test_multifile_deliverable_is_preview_only_and_never_truncated_on_impo
         },
     )
     assert imported.error is not None
-    assert imported.error.code == "DOCUMENT_BUNDLE_UNSUPPORTED"
+    assert imported.error.code == "RESOURCE_UNSUPPORTED"
+    assert imported.error.details == {"reasonCode": "html_bundle_edit_not_supported"}
     service = await ArtifactSessionService.from_session_storage(env.storage)
     assert await service.list_documents(
         session_key=SESSION_KEY,
@@ -324,7 +326,8 @@ async def test_stale_partial_single_file_bundle_is_safely_revalidated_for_editin
         },
     )
     assert rejected.error is not None
-    assert rejected.error.code == "DOCUMENT_BUNDLE_UNSUPPORTED"
+    assert rejected.error.code == "RESOURCE_UNSUPPORTED"
+    assert rejected.error.details == {"reasonCode": "html_bundle_edit_not_supported"}
 
 @pytest.fixture
 async def resource_env(tmp_path: Path):
@@ -422,6 +425,175 @@ async def test_generated_deliverable_helper_adopts_supported_html_without_copyin
     assert opened.payload["document"]["documentId"] == document.document_id
     assert opened.payload["revision"]["artifactId"] == ref.id
     assert opened.payload["resource"]["resource"]["type"] == "document"
+
+
+@pytest.mark.asyncio
+async def test_mutation_resolution_projects_only_product_outcomes(resource_env) -> None:
+    env = resource_env
+    original = b"<!doctype html><h1>Before</h1>"
+    ref = env.store.publish_bytes(
+        original,
+        session_id=env.session.session_id,
+        session_key=SESSION_KEY,
+        name="resolve.html",
+        mime="text/html",
+        source="mutation-resolution-test",
+    )
+    service = await ArtifactSessionService.from_session_storage(env.storage)
+    adopted = await resource_rpc.adopt_generated_deliverable_if_editable(
+        service=service,
+        store=env.store,
+        session_key=SESSION_KEY,
+        session_id=env.session.session_id,
+        ref=ref,
+        actor=Actor(ActorKind.AGENT, "agent-main"),
+    )
+    assert adopted is not None
+    document, revision, _binding, _created = adopted
+
+    missing = await _dispatch(
+        env,
+        "artifacts.mutations.resolve",
+        {
+            "sessionKey": SESSION_KEY,
+            "operation": "source.patch",
+            "requestId": "missing-request",
+            "documentId": document.document_id,
+        },
+    )
+    assert missing.error is None
+    # The resolve request can race durable admission of an already-sent write.
+    # Absence is therefore unknown, never proof that a new request ID is safe.
+    assert missing.payload == {"status": "pending", "retryAfterMs": 250}
+
+    for operation in (
+        "document.import",
+        "workbench.resources.open",
+        "document.publish",
+    ):
+        admission_race = await _dispatch(
+            env,
+            "artifacts.mutations.resolve",
+            {
+                "sessionKey": SESSION_KEY,
+                "operation": operation,
+                "requestId": f"missing-{operation}",
+            },
+        )
+        assert admission_race.error is None
+        assert admission_race.payload == {"status": "pending", "retryAfterMs": 250}
+
+    pending_request_id = "pending-request"
+    pending_turn_id = f"manual-source-patch:{pending_request_id}"
+    pending_tool_id = "rpc-source-patch:pending-test"
+    await service.reserve_mutation_attempt(
+        document_id=document.document_id,
+        turn_id=pending_turn_id,
+        tool_use_id=pending_tool_id,
+        base_revision_id=revision.revision_id,
+        proposal_sha256="b" * 64,
+    )
+    pending = await _dispatch(
+        env,
+        "artifacts.mutations.resolve",
+        {
+            "sessionKey": SESSION_KEY,
+            "operation": "source.patch",
+            "clientRequestId": pending_request_id,
+            "documentId": document.document_id,
+        },
+    )
+    assert pending.error is None
+    assert pending.payload == {"status": "pending", "retryAfterMs": 250}
+
+    await service.mark_mutation_attempt_failed(
+        document_id=document.document_id,
+        turn_id=pending_turn_id,
+        tool_use_id=pending_tool_id,
+        failure_code="synthetic_failure",
+    )
+    failed = await _dispatch(
+        env,
+        "artifacts.mutations.resolve",
+        {
+            "sessionKey": SESSION_KEY,
+            "operation": "source.patch",
+            "requestId": pending_request_id,
+            "documentId": document.document_id,
+        },
+    )
+    assert failed.error is None
+    assert failed.payload == {"status": "not_applied"}
+
+    applied_request_id = "applied-request"
+    applied = await _dispatch(
+        env,
+        "artifacts.source.patch",
+        {
+            "sessionKey": SESSION_KEY,
+            "documentId": document.document_id,
+            "expectedHeadRevisionId": revision.revision_id,
+            "expectedStateRevision": document.state_revision,
+            "expectedSourceSha256": revision.artifact_sha256,
+            "offsetEncoding": "unicode-code-point",
+            "patches": [
+                {
+                    "startOffset": 0,
+                    "endOffset": len(original.decode("utf-8")),
+                    "replacement": "<!doctype html><h1>After</h1>",
+                }
+            ],
+            "clientRequestId": applied_request_id,
+        },
+    )
+    assert applied.error is None, applied.error
+    resolved = await _dispatch(
+        env,
+        "artifacts.mutations.resolve",
+        {
+            "sessionKey": SESSION_KEY,
+            "operation": "source.patch",
+            "requestId": applied_request_id,
+            "documentId": document.document_id,
+        },
+    )
+    assert resolved.error is None, resolved.error
+    assert resolved.payload["status"] == "applied"
+    assert resolved.payload["result"] == {
+        "documentId": document.document_id,
+        "revisionId": applied.payload["source"]["revisionId"],
+        "sha256": applied.payload["source"]["sha256"],
+        "stateRevision": applied.payload["source"]["stateRevision"],
+    }
+    serialized = json.dumps(resolved.payload, sort_keys=True)
+    for internal_name in (
+        "attemptId",
+        "baseRevisionId",
+        "changeSetId",
+        "editSessionId",
+        "leaseId",
+        "receipt",
+    ):
+        assert internal_name not in serialized
+
+
+@pytest.mark.asyncio
+async def test_mutation_resolution_rejects_unknown_operation_with_safe_error(
+    resource_env,
+) -> None:
+    response = await _dispatch(
+        resource_env,
+        "artifacts.mutations.resolve",
+        {
+            "sessionKey": SESSION_KEY,
+            "operation": "private.receipt.inspect",
+            "requestId": "safe-error-request",
+        },
+    )
+    assert response.error is not None
+    assert response.error.code == "INVALID_REQUEST"
+    assert "private.receipt.inspect" not in response.error.message
+    assert response.error.details["correlationId"]
 
 
 @pytest.mark.asyncio
@@ -821,7 +993,7 @@ async def test_invalid_html_attachments_fail_closed_without_read_side_writes(res
             },
         )
         assert preview.error is not None
-        assert preview.error.code == "WORKBENCH_PREVIEW_UNSUPPORTED"
+        assert preview.error.code == "RESOURCE_UNSUPPORTED"
         assert preview.error.details == {"reasonCode": expected_reason}
 
         opened = await _dispatch(
@@ -925,7 +1097,7 @@ async def test_oversized_html_capabilities_fail_before_doomed_ui_actions(resourc
         },
     )
     assert preview.error is not None
-    assert preview.error.code == "WORKBENCH_PREVIEW_UNSUPPORTED"
+    assert preview.error.code == "RESOURCE_UNSUPPORTED"
     assert preview.error.details == {"reasonCode": "html_preview_size_unsupported"}
 
     for attachment_id in (
@@ -1151,7 +1323,12 @@ async def test_import_is_session_scoped_and_recovers_reserved_candidate_after_cr
     }
     interrupted = await _dispatch(env, "documents.import", params)
     assert interrupted.error is not None
-    assert interrupted.error.code == "UNAVAILABLE"
+    assert interrupted.error.code == "MUTATION_OUTCOME_PENDING"
+    assert interrupted.error.accepted is None
+    assert interrupted.error.details is not None
+    assert interrupted.error.details["correlationId"]
+    visible_error = f"{interrupted.error.message} {interrupted.error.details}".lower()
+    assert all(term not in visible_error for term in ("candidate", "journal", "receipt"))
 
     service = await ArtifactSessionService.from_session_storage(env.storage)
     attempt = await service.get_document_import_attempt(
@@ -1190,7 +1367,8 @@ async def test_import_is_session_scoped_and_recovers_reserved_candidate_after_cr
         },
     )
     assert cross_session.error is not None
-    assert cross_session.error.code == "NOT_FOUND"
+    assert cross_session.error.code == "DOCUMENT_UNAVAILABLE"
+    assert cross_session.error.details == {"reasonCode": "resource_unavailable"}
 
 
 @pytest.mark.asyncio
@@ -1264,7 +1442,9 @@ async def test_import_expected_hash_is_validated_and_bound_to_idempotency(
         {**params, "expectedSha256": "0" * 64},
     )
     assert mismatch.error is not None
-    assert mismatch.error.code == "DOCUMENT_RESOURCE_CONFLICT"
+    assert mismatch.error.code == "DOCUMENT_CHANGED"
+    assert "hash" not in mismatch.error.message.lower()
+    assert mismatch.error.details["correlationId"]
 
 
 @pytest.mark.asyncio
@@ -1374,7 +1554,8 @@ async def test_resource_pagination_is_stable_and_url_type_is_reserved(
         },
     )
     assert stale.error is not None
-    assert stale.error.code == "WORKBENCH_CURSOR_STALE"
+    assert stale.error.code == "DOCUMENT_CHANGED"
+    assert stale.error.details == {"reasonCode": "resource_list_changed"}
 
     urls = await _dispatch(
         env,
@@ -1448,7 +1629,8 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
         },
     )
     assert forged_import.error is not None
-    assert forged_import.error.code == "DOCUMENT_IMPORT_FORMAT_UNSUPPORTED"
+    assert forged_import.error.code == "RESOURCE_UNSUPPORTED"
+    assert forged_import.error.details == {"reasonCode": "office_adapter_not_available"}
     service = await ArtifactSessionService.from_session_storage(env.storage)
     assert await service.list_documents(
         session_key=SESSION_KEY,
@@ -1511,7 +1693,8 @@ async def test_office_resource_exposes_stable_edit_unavailable_reason(
         },
     )
     assert rejected_publish.error is not None
-    assert rejected_publish.error.code == "DOCUMENT_PUBLISH_FORMAT_UNSUPPORTED"
+    assert rejected_publish.error.code == "RESOURCE_UNSUPPORTED"
+    assert rejected_publish.error.details == {"reasonCode": "office_adapter_not_available"}
     assert await service.list_document_publications(
         session_id=env.session.session_id,
         document_id=created.document.document_id,
@@ -1591,7 +1774,10 @@ async def test_publish_receipt_pins_immutable_revision_and_recovers_promotion(
     }
     interrupted = await _dispatch(env, "documents.publish", params)
     assert interrupted.error is not None
-    assert interrupted.error.code == "UNAVAILABLE"
+    assert interrupted.error.code == "MUTATION_OUTCOME_PENDING"
+    assert "promotion" not in interrupted.error.message.lower()
+    assert "receipt" not in interrupted.error.message.lower()
+    assert interrupted.error.details["correlationId"]
     assert env.store.list_refs(session_id=env.session.session_id, limit=10).refs == ()
 
     monkeypatch.setattr(ArtifactStore, "promote_internal_ref", original_promote)

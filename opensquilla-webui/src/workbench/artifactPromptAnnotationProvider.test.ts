@@ -48,6 +48,10 @@ describe('artifact prompt annotation RPC provider', () => {
         locator: { start_offset: 7 },
         quote: '<h1>',
       },
+      targetStatus: 'contextual',
+      targetReason: 'no_match',
+      targetKind: 'heading',
+      targetText: 'Quarterly results',
     })).toEqual(expect.objectContaining({
       annotationId: 'annotation-history-1',
       documentId: 'document-1',
@@ -57,12 +61,22 @@ describe('artifact prompt annotation RPC provider', () => {
       anchorId: 'anchor-2',
       tagName: 'h1',
       quote: '<h1>',
+      targetStatus: 'contextual',
+      targetReason: 'no_match',
+      targetKind: 'heading',
+      targetText: 'Quarterly results',
       sentOrder: 2,
     }))
   })
 
   it('restores only draft annotations and hydrates the scoped session key', async () => {
-    const call = vi.fn().mockResolvedValue({ annotations: [serverAnnotation()] })
+    const call = vi.fn().mockResolvedValue({
+      annotations: [serverAnnotation({
+        targetStatus: 'ready',
+        targetKind: 'section',
+        targetText: 'Overview',
+      })],
+    })
     const provider = createRpcArtifactPromptAnnotationProvider({ call })
 
     const annotations = await provider.list('session-a')
@@ -78,6 +92,9 @@ describe('artifact prompt annotation RPC provider', () => {
         sessionKey: 'session-a',
         freshness: 'fresh',
         tagName: 'section',
+        targetStatus: 'ready',
+        targetKind: 'section',
+        targetText: 'Overview',
         quote: '<section>',
       }),
     ])

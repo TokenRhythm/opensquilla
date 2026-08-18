@@ -266,6 +266,39 @@ describe('DesktopRuntimePanel close behavior preference', () => {
     app.unmount()
   })
 
+  it('rolls back a failed preview-mode save without exposing diagnostic details', async () => {
+    const privateDiagnostic = 'lease failed at /fixture/private-profile'
+    const { app, el, toasts } = await mountPanel(desktopApi({
+      getDesktopPreferences: async () => ({
+        mainWindowCloseBehavior: 'quit' as const,
+        canRunInBackground: true,
+        platform: 'darwin' as const,
+        schemaVersion: 2,
+        workbenchPreviewMode: 'offline' as const,
+        effectiveWorkbenchPreviewMode: 'offline' as const,
+        workbenchPreviewNoticeShown: false,
+        workbenchPreviewForcedOffline: false,
+      }),
+      saveDesktopPreferences: vi.fn(async () => {
+        throw new Error(privateDiagnostic)
+      }),
+    }))
+    const select = findPreviewModeSelect(el)
+
+    select.value = 'full'
+    select.dispatchEvent(new Event('change', { bubbles: true }))
+    await settle()
+
+    expect(select.value).toBe('offline')
+    const toast = toasts.value[toasts.value.length - 1]
+    expect(toast).toMatchObject({
+      message: 'Could not save the webpage preview setting. Try again.',
+      tone: 'danger',
+    })
+    expect(toast?.message).not.toContain(privateDiagnostic)
+    app.unmount()
+  })
+
   it('explains when the process-level incident switch forces offline previews', async () => {
     const { app, el } = await mountPanel(desktopApi({
       getDesktopPreferences: async () => ({
@@ -283,7 +316,8 @@ describe('DesktopRuntimePanel close behavior preference', () => {
 
     expect(findPreviewModeSelect(el).value).toBe('full')
     const warning = el.querySelector<HTMLElement>('[data-testid="desktop-preview-mode-forced"]')
-    expect(warning?.textContent).toContain('OPENSQUILLA_PREVIEW_FORCE_OFFLINE')
+    expect(warning?.textContent).toContain('Restricted preview is currently required by policy.')
+    expect(warning?.textContent).not.toContain('OPENSQUILLA_PREVIEW_FORCE_OFFLINE')
     app.unmount()
   })
 })

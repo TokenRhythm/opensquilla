@@ -1,8 +1,14 @@
 import { ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
+import i18n from '@/i18n'
+import { useToasts } from '@/composables/useToasts'
 import type { ChatMessage } from '@/types/chat'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
+import type {
+  PendingInputWal,
+  ResponseHandoffWalRecord,
+} from '@/utils/chat/pendingInputWal'
 import type { UseChatSendOptions } from './useChatSend'
 import { useChatSend } from './useChatSend'
 
@@ -139,7 +145,7 @@ describe('useChatSend prompt annotations', () => {
     await harness.api.onSend()
 
     expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
-      message: 'Apply the attached artifact instructions.',
+      message: i18n.global.t('chat.promptAnnotations.applyPrompt'),
       displayText: '',
       promptAnnotationIds: ['annotation-2', 'annotation-1'],
     }))
@@ -233,6 +239,92 @@ describe('useChatSend prompt annotations', () => {
     expect(harness.options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
     expect(harness.options.messages.value.find(message => message.role === 'user')?.promptAnnotations)
       .toBeUndefined()
+  })
+
+  it.each([
+    'PERMISSION_DENIED',
+    'INVALID_REQUEST',
+    'INTERNAL_ERROR',
+    'UNEXPECTED_ARTIFACT_FAILURE',
+  ])('does not expose raw %s failures for an annotation send', async (code) => {
+    const privateMessage = `private revision/receipt diagnostic for ${code}`
+    const harness = createHarness()
+    harness.rpc.call.mockRejectedValue(Object.assign(new Error(privateMessage), {
+      code,
+      accepted: false,
+      retryable: false,
+    }))
+
+    await harness.api.onSend()
+
+    const renderedMessages = JSON.stringify(harness.options.messages.value)
+    expect(renderedMessages).not.toContain(privateMessage)
+    expect(renderedMessages).not.toContain('revision/receipt')
+    expect(harness.options.messages.value.some(message => message.role === 'error')).toBe(true)
+  })
+
+  it('preserves the existing raw fallback for an unrelated ordinary chat error', async () => {
+    const harness = createHarness({
+      inputText: ref('hello'),
+      promptAnnotationIds: ref([]),
+      promptAnnotationSnapshots: () => [],
+    })
+    harness.rpc.call.mockRejectedValue(Object.assign(new Error('ordinary provider detail'), {
+      code: 'PROVIDER_REJECTED',
+      accepted: false,
+      retryable: false,
+    }))
+
+    await harness.api.onSend()
+
+    expect(JSON.stringify(harness.options.messages.value)).toContain('ordinary provider detail')
+  })
+
+  it('keeps raw errors out of annotation handoff recovery toasts', async () => {
+    const params = {
+      sessionKey: 'agent:main:webchat:test',
+      clientRequestId: 'annotation-handoff-request',
+      clientMessageId: 'annotation-handoff-message',
+      message: 'Apply annotations',
+      promptAnnotationIds: ['annotation-2'],
+    }
+    const record: ResponseHandoffWalRecord = {
+      schemaVersion: 1,
+      ownerRequestId: params.clientRequestId,
+      requestSessionKey: params.sessionKey,
+      clientRequestId: params.clientRequestId,
+      clientMessageId: params.clientMessageId,
+      composerText: '',
+      recoveryAttachments: [],
+      params,
+      state: 'submitting',
+      createdAt: 1,
+      updatedAt: 1,
+    }
+    const pendingInputWal: PendingInputWal = {
+      put: async () => {},
+      list: async () => [],
+      delete: async () => {},
+      listHandoffs: async () => [record],
+      putHandoff: async () => {},
+      close: () => {},
+    }
+    const harness = createHarness({ pendingInputWal })
+    const privateMessage = 'private receipt and revision from replay'
+    harness.rpc.call.mockRejectedValue(Object.assign(new Error(privateMessage), {
+      code: 'INTERNAL_ERROR',
+      accepted: false,
+      retryable: false,
+    }))
+    const { toasts, dismissToast } = useToasts()
+    for (const toast of [...toasts.value]) dismissToast(toast.id)
+
+    await harness.api.recoverResponseHandoffs()
+
+    expect(toasts.value).toHaveLength(1)
+    expect(toasts.value[0]?.message).not.toContain(privateMessage)
+    expect(toasts.value[0]?.message).not.toContain('receipt')
+    dismissToast(toasts.value[0]!.id)
   })
 
   it('replays unknown acceptance before a newly-stale local annotation gate', async () => {

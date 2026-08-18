@@ -45,6 +45,11 @@ from opensquilla.engine.steps.router_decision_record import (
 )
 from opensquilla.gateway import attachment_ingest as _attachment_ingest
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
+from opensquilla.gateway.artifact_product_errors import (
+    ArtifactProductErrorCode,
+    artifact_product_error,
+    logged_artifact_product_error,
+)
 from opensquilla.gateway.compaction_target import (
     build_gateway_consumer_admission,
     effective_session_model,
@@ -3384,6 +3389,7 @@ async def _handle_sessions_send_impl(
     pending_input_id: str | None = None,
     pending_input_fingerprint: str | None = None,
     pending_input_revision: int | None = None,
+    _prompt_annotation_acceptance_retries: int = 1,
 ) -> dict:
     key = _require_key(params)
     if not isinstance(params, dict) or "message" not in params:
@@ -3526,15 +3532,9 @@ async def _handle_sessions_send_impl(
     if (prompt_annotation_ids or document_context_request is not None) and (
         session_intent is not SessionIntent.CONTINUE or fork_before_message_id is not None
     ):
-        raise RpcHandlerError(
-            (
-                "PROMPT_ANNOTATION_STALE"
-                if prompt_annotation_ids
-                else "DOCUMENT_CONTEXT_STALE"
-            ),
-            "Document context cannot cross a reset, new task, or transcript fork.",
-            retryable=True,
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.INVALID_REQUEST,
+            retryable=False,
         )
     raw_workspace_id = params.get("workspaceId", params.get("workspace_id"))
     workspace_id: str | None = None
@@ -3750,6 +3750,7 @@ async def _handle_sessions_send_impl(
     artifact_session_service = None
     artifact_event_emitter = None
     prompt_annotation_rows: tuple[Any, ...] = ()
+    prepared_prompt_annotation_targets: tuple[Any, ...] = ()
     prompt_annotation_snapshots: tuple[dict[str, Any], ...] = ()
     from opensquilla.artifact_session import (
         ArtifactConflictError as ArtifactPromptAnnotationConflictError,
@@ -3961,9 +3962,16 @@ async def _handle_sessions_send_impl(
         else key.split(":")[-1] or key
     )
     if prompt_annotation_ids:
+        from opensquilla.artifact_session import (
+            ActorKind,
+            PreparedPromptAnnotationTarget,
+        )
+        from opensquilla.artifact_session.html_anchors import remap_html_anchor
+        from opensquilla.artifacts import ArtifactError, ArtifactStore
         from opensquilla.gateway.artifact_contexts import (
             PROMPT_ANNOTATION_TOOL_NAMES,
             BoundPromptAnnotationContext,
+            BoundPromptAnnotationTarget,
         )
         from opensquilla.prompt_annotations import (
             PromptAnnotationSnapshotError,
@@ -3980,12 +3988,13 @@ async def _handle_sessions_send_impl(
                 session_key=key,
                 session_id=session_id,
                 session_epoch=int(getattr(session, "epoch", 0) or 0),
+                require_current_head=False,
             )
             annotation_document = await artifact_session_service.get_document(
                 prompt_annotation_rows[0].document_id
             )
             annotation_revision = await artifact_session_service.get_revision(
-                prompt_annotation_rows[0].revision_id
+                annotation_document.head_revision_id
             )
             annotation_anchors = tuple(
                 [
@@ -3993,22 +4002,125 @@ async def _handle_sessions_send_impl(
                     for annotation in prompt_annotation_rows
                 ]
             )
+            store = ArtifactStore(media_root)
+            source_cache: dict[str, str] = {}
+
+            async def _revision_source(revision: Any) -> str:
+                cached = source_cache.get(revision.revision_id)
+                if cached is not None:
+                    return cached
+                try:
+                    supports_editing = await asyncio.to_thread(
+                        store.supports_single_file_editing,
+                        revision.artifact_id,
+                        session_id=session_id,
+                    )
+                    if not supports_editing:
+                        raise ArtifactPromptAnnotationValidationError(
+                            "prompt annotations require one editable HTML file"
+                        )
+                    ref, path = await asyncio.to_thread(
+                        store.resolve_for_download,
+                        revision.artifact_id,
+                        session_id=session_id,
+                    )
+                    payload = await asyncio.to_thread(path.read_bytes)
+                except (ArtifactError, OSError, ValueError) as exc:
+                    raise ArtifactPromptAnnotationValidationError(
+                        "the annotated page is temporarily unavailable"
+                    ) from exc
+                if (
+                    ref.session_key != key
+                    or ref.sha256 != revision.artifact_sha256
+                    or ref.size != revision.byte_size
+                    or len(payload) != ref.size
+                ):
+                    raise ArtifactPromptAnnotationValidationError(
+                        "the annotated page failed integrity validation"
+                    )
+                try:
+                    source = payload.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ArtifactPromptAnnotationValidationError(
+                        "prompt annotations require UTF-8 HTML"
+                    ) from exc
+                source_cache[revision.revision_id] = source
+                return source
+
+            current_source = await _revision_source(annotation_revision)
             raw_snapshots: list[dict[str, Any]] = []
+            prepared_targets: list[PreparedPromptAnnotationTarget] = []
+            bound_targets: list[BoundPromptAnnotationTarget] = []
+            principal_actor_id = getattr(ctx.principal, "token_public_id", None)
+            actor_id = (
+                principal_actor_id
+                if isinstance(principal_actor_id, str) and principal_actor_id
+                else "local-owner"
+            )
             for order, (annotation, anchor) in enumerate(
                 zip(prompt_annotation_rows, annotation_anchors, strict=True)
             ):
-                locator = dict(anchor.locator)
+                old_revision = await artifact_session_service.get_revision(
+                    annotation.revision_id
+                )
+                if old_revision.document_id != annotation_document.document_id:
+                    raise ArtifactPromptAnnotationConflictError(
+                        "prompt annotation revision belongs to another document"
+                    )
+                try:
+                    resolution = remap_html_anchor(
+                        old_source=await _revision_source(old_revision),
+                        current_source=current_source,
+                        anchor=anchor,
+                    )
+                except ValueError as exc:
+                    raise ArtifactPromptAnnotationValidationError(
+                        "the annotation target could not be normalized"
+                    ) from exc
+                locator = dict(resolution.locator)
                 tag_name = locator.get("tag_name") or locator.get("tagName")
                 if not isinstance(tag_name, str) or not tag_name.strip():
                     raise ArtifactPromptAnnotationConflictError(
                         "prompt annotation anchor lost its element tag"
                     )
+                new_anchor_id = artifact_session_service.allocate_id("anchor")
+                prepared_targets.append(
+                    PreparedPromptAnnotationTarget(
+                        expected_annotation=annotation,
+                        previous_anchor_id=anchor.anchor_id,
+                        anchor_id=new_anchor_id,
+                        audit_event_id=artifact_session_service.allocate_id("audit"),
+                        revision_id=annotation_revision.revision_id,
+                        kind=resolution.kind,
+                        locator=locator,
+                        quote=resolution.quote,
+                        context=dict(resolution.context),
+                        state=resolution.state,
+                        actor_kind=ActorKind.USER,
+                        actor_id=actor_id,
+                    )
+                )
+                bound_targets.append(
+                    BoundPromptAnnotationTarget(
+                        annotation_id=annotation.annotation_id,
+                        anchor_id=new_anchor_id,
+                        status=resolution.status,
+                        reason=resolution.reason,
+                        tag_name=tag_name.lower(),
+                        target_kind=resolution.target_kind,
+                        target_text=resolution.target_text,
+                    )
+                )
                 raw_snapshots.append(
                     {
                         "version": 1,
                         "annotationId": annotation.annotation_id,
                         "order": order,
                         "body": annotation.body,
+                        "targetStatus": resolution.status,
+                        "targetReason": resolution.reason,
+                        "targetKind": resolution.target_kind,
+                        "targetText": resolution.target_text,
                         "document": {
                             "id": annotation_document.document_id,
                             "name": annotation_document.name,
@@ -4020,11 +4132,11 @@ async def _handle_sessions_send_impl(
                             "sha256": annotation_revision.artifact_sha256,
                         },
                         "anchor": {
-                            "id": anchor.anchor_id,
-                            "kind": anchor.kind.value,
+                            "id": new_anchor_id,
+                            "kind": resolution.kind.value,
                             "tagName": tag_name.lower(),
                             "locator": locator,
-                            "quote": anchor.quote,
+                            "quote": resolution.quote,
                         },
                     }
                 )
@@ -4046,37 +4158,38 @@ async def _handle_sessions_send_impl(
                 session_id=session_id,
                 document_id=annotation_document.document_id,
                 revision_id=annotation_revision.revision_id,
-                annotation_ids=tuple(
-                    annotation.annotation_id for annotation in prompt_annotation_rows
-                ),
-                anchor_ids=tuple(anchor.anchor_id for anchor in annotation_anchors),
+                targets=tuple(bound_targets),
                 snapshots=prompt_annotation_snapshots,
                 artifact_format="html",
                 tool_names=PROMPT_ANNOTATION_TOOL_NAMES,
                 operation_class=operation_class,
                 request_context_prompt=request_context_prompt,
             )
+            prepared_prompt_annotation_targets = tuple(prepared_targets)
             artifact_event_emitter = _artifact_state_event_emitter(ctx, key)
         except ArtifactPromptAnnotationNotFoundError as exc:
-            raise RpcHandlerError(
-                "PROMPT_ANNOTATION_STALE",
-                "A prompt annotation no longer exists for this session.",
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+                exc,
+                operation="prompt_annotations.prepare",
                 retryable=True,
-                accepted=False,
+                session_key=key,
             ) from exc
         except ArtifactPromptAnnotationConflictError as exc:
-            raise RpcHandlerError(
-                "PROMPT_ANNOTATION_STALE",
-                "The artifact changed. Select the affected element again.",
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.ANNOTATION_BUSY,
+                exc,
+                operation="prompt_annotations.prepare",
                 retryable=True,
-                accepted=False,
+                session_key=key,
             ) from exc
         except (ArtifactPromptAnnotationValidationError, PromptAnnotationSnapshotError) as exc:
-            raise RpcHandlerError(
-                "PROMPT_ANNOTATION_INVALID",
-                str(exc),
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+                exc,
+                operation="prompt_annotations.prepare",
                 retryable=False,
-                accepted=False,
+                session_key=key,
             ) from exc
     elif document_context_request is not None:
         from opensquilla.gateway.artifact_contexts import (
@@ -4090,7 +4203,6 @@ async def _handle_sessions_send_impl(
             )
             current_head = await artifact_session_service.get_document_head(
                 document_context_request["documentId"],
-                expected_revision_id=document_context_request["headRevisionId"],
             )
             document = current_head.document
             revision = current_head.revision
@@ -4111,8 +4223,8 @@ async def _handle_sessions_send_impl(
                 and Path(revision.filename).suffix.lower() not in {".html", ".htm", ".xhtml"}
             ):
                 raise RpcHandlerError(
-                    "DOCUMENT_CONTEXT_UNSUPPORTED",
-                    "Only HTML documents can be edited in the current client.",
+                    ArtifactProductErrorCode.RESOURCE_UNSUPPORTED.value,
+                    "This file cannot be edited here.",
                     retryable=False,
                     accepted=False,
                 )
@@ -4135,18 +4247,20 @@ async def _handle_sessions_send_impl(
             )
             artifact_event_emitter = _artifact_state_event_emitter(ctx, key)
         except ArtifactPromptAnnotationNotFoundError as exc:
-            raise RpcHandlerError(
-                "DOCUMENT_CONTEXT_STALE",
-                "The document or selected revision no longer exists for this session.",
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+                exc,
+                operation="document_context.bind",
                 retryable=True,
-                accepted=False,
+                session_key=key,
             ) from exc
         except ArtifactPromptAnnotationConflictError as exc:
-            raise RpcHandlerError(
-                "DOCUMENT_CONTEXT_STALE",
-                "The document changed or does not belong to this session. Refresh it.",
-                retryable=True,
-                accepted=False,
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+                exc,
+                operation="document_context.bind",
+                retryable=False,
+                session_key=key,
             ) from exc
     plan_run: PlanRunRecord | None = None
     plan_revision_to_create: PlanRevisionRecord | None = None
@@ -5295,7 +5409,7 @@ async def _handle_sessions_send_impl(
                     require_idle_for_current_plan_implementation
                 ),
                 goal_mutation=goal_claim_mutation,
-                expected_prompt_annotations=prompt_annotation_rows,
+                prepared_prompt_annotation_targets=prepared_prompt_annotation_targets,
                 prompt_annotation_turn_id=(turn_id if prompt_annotation_rows else None),
                 pending_input_id=pending_input_id,
                 pending_input_fingerprint=pending_input_fingerprint,
@@ -5485,20 +5599,55 @@ async def _handle_sessions_send_impl(
         ) as exc:
             _consumed_file_uuids = []
             _cleanup_rejected_guest_profile()
-            raise RpcHandlerError(
-                "PROMPT_ANNOTATION_STALE",
-                "A prompt annotation or its artifact revision changed before acceptance.",
+            if prompt_annotation_ids and _prompt_annotation_acceptance_retries > 0:
+                log.info(
+                    "prompt_annotations.accept_head_race_retry",
+                    session_key=key,
+                    attempts_remaining=_prompt_annotation_acceptance_retries,
+                )
+                return cast(
+                    dict[Any, Any],
+                    await _handle_sessions_send_impl(
+                        params,
+                        ctx,
+                        fingerprint_params=fingerprint_params,
+                        plan_revision_id=plan_revision_id,
+                        plan_context_revision_id=plan_context_revision_id,
+                        plan_run_driver_kind=plan_run_driver_kind,
+                        plan_run_driver_id=plan_run_driver_id,
+                        required_collaboration_mode=required_collaboration_mode,
+                        required_collaboration_revision=required_collaboration_revision,
+                        initial_collaboration_mode=initial_collaboration_mode,
+                        expected_collaboration_revision=expected_collaboration_revision,
+                        expected_active_plan_revision_id=expected_active_plan_revision_id,
+                        require_idle_for_current_plan_implementation=(
+                            require_idle_for_current_plan_implementation
+                        ),
+                        atomic_collaboration_mode_update=atomic_collaboration_mode_update,
+                        pending_input_id=pending_input_id,
+                        pending_input_fingerprint=pending_input_fingerprint,
+                        pending_input_revision=pending_input_revision,
+                        _prompt_annotation_acceptance_retries=(
+                            _prompt_annotation_acceptance_retries - 1
+                        ),
+                    ),
+                )
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.DOCUMENT_CHANGED,
+                exc,
+                operation="prompt_annotations.accept",
                 retryable=True,
-                accepted=False,
+                session_key=key,
             ) from exc
         except ArtifactPromptAnnotationValidationError as exc:
             _consumed_file_uuids = []
             _cleanup_rejected_guest_profile()
-            raise RpcHandlerError(
-                "PROMPT_ANNOTATION_INVALID",
-                str(exc),
+            raise logged_artifact_product_error(
+                ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+                exc,
+                operation="prompt_annotations.accept",
                 retryable=False,
-                accepted=False,
+                session_key=key,
             ) from exc
         except TaskRuntimeShuttingDownError as exc:
             _cleanup_rejected_guest_profile()

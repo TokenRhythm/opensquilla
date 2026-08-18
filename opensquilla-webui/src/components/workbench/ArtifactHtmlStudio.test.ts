@@ -271,11 +271,31 @@ describe('ArtifactHtmlStudio', () => {
     })
   })
 
-  it('fails closed when an EditSession heartbeat becomes stale', async () => {
+  it('keeps the dirty buffer editable while a failed heartbeat reacquires editing', async () => {
+    let resolveReacquire!: (value: Record<string, unknown>) => void
     const heartbeatEditSession = vi.fn().mockRejectedValue(new Error('EditSession stale'))
-    const patchSource = vi.fn()
-    const provider = {
-      startEditSession: vi.fn().mockResolvedValue({
+    const patchSource = vi.fn().mockResolvedValue({
+      documentId: documentModel.documentId,
+      revisionId: 'revision-2',
+      language: 'html',
+      content: '',
+      sha256: 'b'.repeat(64),
+      offsetEncoding: 'unicode-code-point',
+      patchCount: 1,
+      stateRevision: 2,
+      editSession: {
+        editSessionId: 'edit-session-reacquired',
+        documentId: documentModel.documentId,
+        baseRevisionId: 'revision-1',
+        lastSavedRevisionId: 'revision-2',
+        mode: 'edit',
+        status: 'active',
+        stateRevision: 2,
+        expiresAt: Date.now() + 60_000,
+      },
+    })
+    const startEditSession = vi.fn()
+      .mockResolvedValueOnce({
         editSessionId: 'edit-session-stale',
         documentId: documentModel.documentId,
         baseRevisionId: 'revision-1',
@@ -284,7 +304,12 @@ describe('ArtifactHtmlStudio', () => {
         status: 'active',
         stateRevision: 1,
         expiresAt: Date.now() + 60_000,
-      }),
+      })
+      .mockReturnValueOnce(new Promise(resolve => {
+        resolveReacquire = resolve
+      }))
+    const provider = {
+      startEditSession,
       heartbeatEditSession,
       closeEditSession: vi.fn(),
       patchSource,
@@ -326,12 +351,105 @@ describe('ArtifactHtmlStudio', () => {
     ))?.[0]
     expect(heartbeatCallback).toBeTypeOf('function')
     heartbeatCallback?.()
-    monaco.input('<p>must not write</p>')
-    await expect(studio!.flush()).resolves.toBe(false)
     await vi.waitFor(() => expect(heartbeatEditSession).toHaveBeenCalledOnce())
-    await vi.waitFor(() => expect(monaco.isReadOnly()).toBe(true))
+    await vi.waitFor(() => expect(startEditSession).toHaveBeenCalledTimes(2))
+    expect(monaco.isReadOnly()).toBe(false)
+
+    monaco.input('<p>kept while reconnecting</p>')
+    const saving = studio!.flush()
     expect(patchSource).not.toHaveBeenCalled()
-    expect(host.textContent).toContain('EditSession stale')
+    resolveReacquire({
+      editSessionId: 'edit-session-reacquired',
+      documentId: documentModel.documentId,
+      baseRevisionId: 'revision-1',
+      lastSavedRevisionId: 'revision-1',
+      mode: 'edit',
+      status: 'active',
+      stateRevision: 1,
+      expiresAt: Date.now() + 60_000,
+    })
+    await expect(saving).resolves.toBe(true)
+    expect(monaco.editor.getValue()).toBe('<p>kept while reconnecting</p>')
+    expect(monaco.isReadOnly()).toBe(false)
+    expect(patchSource).toHaveBeenCalledWith(expect.objectContaining({
+      editSessionId: 'edit-session-reacquired',
+      expectedLastSavedRevisionId: 'revision-1',
+    }))
+    expect(host.textContent).not.toContain('EditSession stale')
+  })
+
+  it('loads the current clean head when reacquisition discovers a server update', async () => {
+    const startEditSession = vi.fn()
+      .mockResolvedValueOnce({
+        editSessionId: 'edit-session-clean-old',
+        documentId: documentModel.documentId,
+        baseRevisionId: 'revision-1',
+        lastSavedRevisionId: 'revision-1',
+        mode: 'edit',
+        status: 'active',
+        stateRevision: 1,
+      })
+      .mockResolvedValueOnce({
+        editSessionId: 'edit-session-clean-current',
+        documentId: documentModel.documentId,
+        baseRevisionId: 'revision-2',
+        lastSavedRevisionId: 'revision-2',
+        mode: 'edit',
+        status: 'active',
+        stateRevision: 1,
+      })
+    const heartbeatEditSession = vi.fn().mockRejectedValue(new Error('private lease detail'))
+    const readSource = vi.fn().mockImplementation(
+      ({ revisionId }: { revisionId: string }) => Promise.resolve({
+        documentId: documentModel.documentId,
+        revisionId,
+        language: 'html',
+        content: revisionId === 'revision-2' ? '<p>current</p>' : '<p>old</p>',
+        sha256: (revisionId === 'revision-2' ? 'b' : 'a').repeat(64),
+        offsetEncoding: 'unicode-code-point',
+        patchCount: null,
+        stateRevision: revisionId === 'revision-2' ? 2 : 1,
+      } satisfies ArtifactSourceSnapshot),
+    )
+    const provider = {
+      startEditSession,
+      heartbeatEditSession,
+      closeEditSession: vi.fn(),
+      patchSource: vi.fn(),
+      readSource,
+      loadWorkspace: vi.fn().mockResolvedValue(
+        createLegacyArtifactWorkspace(artifact, 'session-a'),
+      ),
+    } as unknown as ArtifactDocumentProvider
+    const pinia = createPinia()
+    useArtifactDocumentsStore(pinia).setProvider(provider)
+    const timeoutSpy = vi.spyOn(globalThis, 'setTimeout')
+    const host = document.createElement('div')
+    document.body.append(host)
+    const app = createApp(ArtifactHtmlStudio, {
+      artifact,
+      document: documentModel,
+      sessionKey: 'session-a',
+    })
+    app.use(pinia)
+    app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
+    apps.push(app)
+    app.mount(host)
+
+    await vi.waitFor(() => expect(monaco.editor.getValue()).toBe('<p>old</p>'))
+    const heartbeatCallback = timeoutSpy.mock.calls.find(call => (
+      call[1] === 20_000 && (call[0] as { name?: string }).name === 'onHeartbeatTimer'
+    ))?.[0]
+    heartbeatCallback?.()
+
+    await vi.waitFor(() => expect(startEditSession).toHaveBeenCalledTimes(2))
+    await vi.waitFor(() => expect(monaco.editor.getValue()).toBe('<p>current</p>'))
+    expect(readSource).toHaveBeenLastCalledWith(expect.objectContaining({
+      documentId: documentModel.documentId,
+      revisionId: 'revision-2',
+    }))
+    expect(monaco.isReadOnly()).toBe(false)
+    expect(host.textContent).not.toContain('private lease detail')
   })
 
   it('closes a session whose start response arrives during component teardown', async () => {
@@ -635,9 +753,13 @@ describe('ArtifactHtmlStudio', () => {
   })
 
   it('reuses an opaque save identity after response loss without aliasing another patch', async () => {
+    const transportLoss = (message: string) => Object.assign(new Error(message), {
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: null,
+    })
     const patchSource = vi.fn()
-      .mockRejectedValueOnce(new Error('response lost'))
-      .mockRejectedValueOnce(new Error('response still unavailable'))
+      .mockRejectedValueOnce(transportLoss('response lost'))
+      .mockRejectedValueOnce(transportLoss('response still unavailable'))
       .mockResolvedValueOnce({
         documentId: documentModel.documentId,
         revisionId: 'revision-2',
@@ -647,6 +769,16 @@ describe('ArtifactHtmlStudio', () => {
         offsetEncoding: 'unicode-code-point',
         patchCount: 1,
         stateRevision: 2,
+      } satisfies ArtifactSourceSnapshot)
+      .mockResolvedValueOnce({
+        documentId: documentModel.documentId,
+        revisionId: 'revision-3',
+        language: 'html',
+        content: '',
+        sha256: 'c'.repeat(64),
+        offsetEncoding: 'unicode-code-point',
+        patchCount: 1,
+        stateRevision: 3,
       } satisfies ArtifactSourceSnapshot)
     const provider = {
       readSource: vi.fn().mockResolvedValue({
@@ -660,6 +792,87 @@ describe('ArtifactHtmlStudio', () => {
         stateRevision: 1,
       } satisfies ArtifactSourceSnapshot),
       patchSource,
+      loadWorkspace: vi.fn().mockResolvedValue(
+        createLegacyArtifactWorkspace(artifact, 'session-a'),
+      ),
+    } as unknown as ArtifactDocumentProvider
+    const pinia = createPinia()
+    useArtifactDocumentsStore(pinia).setProvider(provider)
+    const liveDocument = reactive({ ...documentModel })
+    let studio: { flush: () => Promise<boolean> } | null = null
+    const host = document.createElement('div')
+    document.body.append(host)
+    const Root = defineComponent(() => () => h(ArtifactHtmlStudio, {
+      ref: (value: unknown) => { studio = value as typeof studio },
+      artifact,
+      document: liveDocument,
+      sessionKey: 'session-a',
+      onSourceSaved: (revisionId: string) => {
+        liveDocument.headRevisionId = revisionId
+        liveDocument.generation += 1
+        liveDocument.stateRevision += 1
+      },
+    }))
+    const app = createApp(Root)
+    app.use(pinia)
+    app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
+    apps.push(app)
+    app.mount(host)
+    await vi.waitFor(() => expect(monaco.editor.getValue()).toBe('<p>base</p>'))
+
+    monaco.input('<p>first private replacement</p>')
+    await expect(studio!.flush()).resolves.toBe(false)
+    expect(patchSource).toHaveBeenCalledOnce()
+    await expect(studio!.flush()).resolves.toBe(false)
+
+    monaco.input('<p>second private replacement</p>')
+    await expect(studio!.flush()).resolves.toBe(false)
+    await expect(studio!.flush()).resolves.toBe(true)
+
+    const requestIds = patchSource.mock.calls.map(call => String(call[0]?.clientRequestId))
+    expect(requestIds[0]).toMatch(/^document-save-/)
+    expect(requestIds[1]).toBe(requestIds[0])
+    expect(requestIds[2]).toBe(requestIds[0])
+    expect(requestIds[3]).not.toBe(requestIds[0])
+    expect(requestIds.join(' ')).not.toContain('private replacement')
+    expect(patchSource.mock.calls[0]?.[0]).toMatchObject({
+      expectedHeadRevisionId: 'revision-1',
+      patches: [{ startOffset: 3, endOffset: 7, replacement: 'first private replacement' }],
+    })
+    expect(patchSource.mock.calls[3]?.[0]).toMatchObject({
+      expectedHeadRevisionId: 'revision-2',
+      patches: [expect.objectContaining({ replacement: 'second' })],
+    })
+  })
+
+  it('resolves a committed response loss without replaying the source write', async () => {
+    const patchSource = vi.fn().mockRejectedValue(Object.assign(new Error('private disconnect'), {
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: null,
+    }))
+    const resolveMutation = vi.fn().mockResolvedValue({
+      status: 'applied',
+      retryAfterMs: null,
+      result: {
+        documentId: documentModel.documentId,
+        revisionId: 'revision-2',
+        sha256: 'b'.repeat(64),
+        stateRevision: 2,
+      },
+    })
+    const provider = {
+      readSource: vi.fn().mockResolvedValue({
+        documentId: documentModel.documentId,
+        revisionId: 'revision-1',
+        language: 'html',
+        content: '<p>base</p>',
+        sha256: 'a'.repeat(64),
+        offsetEncoding: 'unicode-code-point',
+        patchCount: null,
+        stateRevision: 1,
+      } satisfies ArtifactSourceSnapshot),
+      patchSource,
+      resolveMutation,
       loadWorkspace: vi.fn().mockResolvedValue(
         createLegacyArtifactWorkspace(artifact, 'session-a'),
       ),
@@ -682,26 +895,16 @@ describe('ArtifactHtmlStudio', () => {
     app.mount(host)
     await vi.waitFor(() => expect(monaco.editor.getValue()).toBe('<p>base</p>'))
 
-    monaco.input('<p>first private replacement</p>')
-    await expect(studio!.flush()).resolves.toBe(false)
-    await expect(studio!.flush()).resolves.toBe(false)
-
-    monaco.input('<p>second private replacement</p>')
+    monaco.input('<p>committed</p>')
     await expect(studio!.flush()).resolves.toBe(true)
 
-    const requestIds = patchSource.mock.calls.map(call => String(call[0]?.clientRequestId))
-    expect(requestIds[0]).toMatch(/^document-save-/)
-    expect(requestIds[1]).toBe(requestIds[0])
-    expect(requestIds[2]).not.toBe(requestIds[0])
-    expect(requestIds.join(' ')).not.toContain('private replacement')
-    expect(patchSource.mock.calls[0]?.[0]).toMatchObject({
-      expectedHeadRevisionId: 'revision-1',
-      patches: [{ startOffset: 3, endOffset: 7, replacement: 'first private replacement' }],
-    })
-    expect(patchSource.mock.calls[2]?.[0]).toMatchObject({
-      expectedHeadRevisionId: 'revision-1',
-      patches: [{ startOffset: 3, endOffset: 7, replacement: 'second private replacement' }],
-    })
+    expect(patchSource).toHaveBeenCalledOnce()
+    expect(resolveMutation).toHaveBeenCalledOnce()
+    expect(resolveMutation).toHaveBeenCalledWith(expect.objectContaining({
+      operation: 'source.patch',
+      requestId: patchSource.mock.calls[0]?.[0]?.clientRequestId,
+    }))
+    expect(host.textContent).not.toContain('private disconnect')
   })
 
   it('restarts editing and reloads an externally advanced head when the buffer is clean', async () => {
@@ -906,10 +1109,14 @@ describe('ArtifactHtmlStudio', () => {
     await vi.advanceTimersByTimeAsync(1_200)
     await expect(studio!.flush()).resolves.toBe(false)
     expect(patchSource).not.toHaveBeenCalled()
-
-    host.querySelector<HTMLButtonElement>('[data-testid="copy-unsaved-source"]')?.click()
-    await nextTick()
-    expect(copyTextWithFallback).toHaveBeenCalledWith('<h1>Local unsaved</h1>')
+    const copyButton = host.querySelector<HTMLButtonElement>(
+      '[data-testid="copy-unsaved-source"]',
+    )
+    expect(copyButton?.disabled).toBe(false)
+    copyButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    await vi.waitFor(() => {
+      expect(copyTextWithFallback).toHaveBeenCalledWith('<h1>Local unsaved</h1>')
+    })
 
     await expect(studio!.discardAndLoadLatest()).resolves.toBe(true)
     expect(closeEditSession).toHaveBeenCalledWith({

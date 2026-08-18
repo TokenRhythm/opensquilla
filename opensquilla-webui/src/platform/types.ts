@@ -214,6 +214,7 @@ export interface NativeArtifactAnnotationCapabilities {
   available: boolean
   picker?: boolean
   trustedOverlay?: boolean
+  overlayCopyVersion?: 1
   reason?: string
 }
 
@@ -229,6 +230,17 @@ export interface NativeArtifactAnnotationOverlayRequest {
   selectionId: string
   annotationId: string
   initialBody?: string
+  overlayCopyVersion?: 1
+  copy?: {
+    targetLabel: string
+    contextLabel: string
+    bodyLabel: string
+    placeholder: string
+    newlineHint: string
+    cancelLabel: string
+    submitLabel: string
+    emptyBodyMessage: string
+  }
 }
 
 export interface NativeArtifactAnnotationOverlayCloseRequest {
@@ -280,6 +292,8 @@ export interface NativeWorkbenchSurfaceRectRequest {
 
 export interface NativeWorkbenchSurfaceResult {
   ok: boolean
+  code?: string
+  retryable?: boolean
   message?: string
 }
 

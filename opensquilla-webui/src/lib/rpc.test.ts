@@ -360,7 +360,11 @@ describe('RpcClient', () => {
       { onSent },
     ).catch((caught: unknown) => caught)
 
-    expect(error).toMatchObject({ message: 'send failed' })
+    expect(error).toMatchObject({
+      message: 'send failed',
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: false,
+    })
     expect(onSent).not.toHaveBeenCalled()
     expect(pendingCount(client)).toBe(0)
     expect(socket.readyState).toBe(MockWebSocket.CLOSED)
@@ -391,6 +395,8 @@ describe('RpcClient', () => {
     expect(await caught).toBeInstanceOf(RpcTimeoutError)
     await expect(siblingCaught).resolves.toMatchObject({
       message: 'Connection recycled after chat.history terminated',
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: null,
     })
     await vi.runOnlyPendingTimersAsync()
 

@@ -1,5 +1,7 @@
 export type PromptAnnotationStatus = 'draft' | 'sent' | 'discarded'
 export type PromptAnnotationFreshness = 'fresh' | 'stale'
+export type PromptAnnotationTargetStatus = 'ready' | 'contextual'
+export type PromptAnnotationTargetReason = 'no_match' | 'ambiguous'
 
 /**
  * A trusted, server-validated description of the element selected in the
@@ -32,6 +34,10 @@ export interface PromptAnnotation {
   staleReason: string | null
   stateRevision: number
   tagName: string
+  targetStatus?: PromptAnnotationTargetStatus
+  targetReason?: PromptAnnotationTargetReason
+  targetKind?: string
+  targetText?: string
   locator: Readonly<Record<string, unknown>>
   quote: string | null
   sourceExcerpt: string | null
@@ -53,6 +59,10 @@ export interface PromptAnnotationSnapshot {
   anchorId: string
   body: string
   tagName: string
+  targetStatus?: PromptAnnotationTargetStatus
+  targetReason?: PromptAnnotationTargetReason
+  targetKind?: string
+  targetText?: string
   locator: Readonly<Record<string, unknown>>
   quote: string | null
   sourceExcerpt: string | null

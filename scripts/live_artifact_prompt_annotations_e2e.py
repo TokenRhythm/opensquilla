@@ -45,8 +45,10 @@ if str(REPO_ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from opensquilla.artifact_session.html_anchors import (  # noqa: E402
+    canonical_selection_proofs,
+)
 from opensquilla.artifacts import ArtifactStore  # noqa: E402
-from opensquilla.gateway import rpc_artifact_editing as artifact_editing_rpc  # noqa: E402
 from opensquilla.gateway_client import GatewayRPCClient, GatewayRPCError  # noqa: E402
 from opensquilla.subprocess_encoding import apply_utf8_child_env  # noqa: E402
 from scripts.live_harness_security import (  # noqa: E402
@@ -248,7 +250,7 @@ class Scenario:
 
 
 SCENARIOS = (
-    Scenario("stale_head_zero_call", "preflight", None, "none", (), 0, True),
+    Scenario("discarded_annotation_zero_call", "preflight", None, "none", (), 0, True),
     Scenario("cross_session_zero_call", "preflight", None, "none", (), 0, True),
     Scenario("dom_mismatch_zero_call", "preflight", None, "none", (), 0, True),
     Scenario("direct_single_annotation", "direct", None, "configured_direct", _ANNOTATION_TOOLS, 3),
@@ -1327,13 +1329,7 @@ def _records_for_session(
 
 
 def _source_proofs(source: str, element_path: str) -> tuple[str, str]:
-    parser = artifact_editing_rpc.lxml_html.HTMLParser(recover=True, no_network=True)
-    root = artifact_editing_rpc.lxml_html.document_fromstring(source, parser=parser)
-    selected = artifact_editing_rpc._element_at_path(root, element_path)
-    return (
-        artifact_editing_rpc._browser_dom_digest(root, source=source),
-        artifact_editing_rpc._element_proof_sha256(root, selected=selected),
-    )
+    return canonical_selection_proofs(source, element_path=element_path)
 
 
 class GatewayCertificationDriver:
@@ -1647,9 +1643,11 @@ class GatewayCertificationDriver:
                     )
                 except GatewayRPCError as exc:
                     rejected = exc.code in {
+                        "ANNOTATION_UNAVAILABLE",
                         "ARTIFACT_ELEMENT_CHANGED",
                         "ARTIFACT_SELECTION_MISMATCH",
                         "ARTIFACT_PREVIEW_CHANGED",
+                        "DOCUMENT_CHANGED",
                     }
             else:
                 annotation_id = await self._create_annotation(
@@ -1660,28 +1658,22 @@ class GatewayCertificationDriver:
                     body=_SINGLE_ANNOTATION_BODY,
                 )
                 send_session_key = session_key
-                if scenario.case == "stale_head_zero_call":
-                    source = await self.client.call(
-                        "artifacts.source.read",
+                if scenario.case == "discarded_annotation_zero_call":
+                    listed = await self.client.call(
+                        "artifacts.prompt_annotations.list",
                         {"sessionKey": session_key, "documentId": document["id"]},
                     )
-                    snapshot = source["source"]
+                    annotation = next(
+                        row
+                        for row in listed["annotations"]
+                        if row["id"] == annotation_id
+                    )
                     await self.client.call(
-                        "artifacts.source.patch",
+                        "artifacts.prompt_annotations.discard",
                         {
                             "sessionKey": session_key,
-                            "documentId": document["id"],
-                            "expectedHeadRevisionId": snapshot["revisionId"],
-                            "expectedStateRevision": snapshot["stateRevision"],
-                            "expectedSourceSha256": snapshot["sha256"],
-                            "offsetEncoding": snapshot["offsetEncoding"],
-                            "patches": [
-                                {
-                                    "startOffset": len(_FIXTURE_HTML),
-                                    "endOffset": len(_FIXTURE_HTML),
-                                    "replacement": "\n",
-                                }
-                            ],
+                            "annotationId": annotation_id,
+                            "expectedStateRevision": annotation["stateRevision"],
                         },
                     )
                 elif scenario.case == "cross_session_zero_call":
@@ -1702,9 +1694,13 @@ class GatewayCertificationDriver:
                     )
                 except GatewayRPCError as exc:
                     rejected = exc.code in {
+                        "ANNOTATION_BUSY",
+                        "ANNOTATION_UNAVAILABLE",
                         "ARTIFACT_ANNOTATION_NOT_FOUND",
                         "ARTIFACT_ANNOTATION_STALE",
                         "ARTIFACT_REVISION_CHANGED",
+                        "DOCUMENT_CHANGED",
+                        "DOCUMENT_UNAVAILABLE",
                         "NOT_FOUND",
                         "PROMPT_ANNOTATION_STALE",
                     }

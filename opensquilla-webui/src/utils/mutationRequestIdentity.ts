@@ -30,32 +30,84 @@ export function createMutationClientRequestId(prefix: string): string {
  * ID, even when they share the same document revision and source offsets.
  */
 export class PendingMutationRequestIds {
-  private readonly entries = new Map<string, string>()
+  private readonly entries = new Map<string, {
+    requestId: string
+    state: 'ready' | 'pending'
+    payloadJson: string | null
+  }>()
 
   constructor(private readonly capacity = 32) {}
 
-  idFor(logicalKey: string, prefix: string): string {
+  idFor(logicalKey: string, prefix: string, preferredRequestId?: string): string {
     const key = privateLogicalKeyDigest(logicalKey)
     const existing = this.entries.get(key)
     if (existing) {
       this.entries.delete(key)
       this.entries.set(key, existing)
-      return existing
+      return existing.requestId
     }
 
-    const requestId = createMutationClientRequestId(prefix)
-    this.entries.set(key, requestId)
-    while (this.entries.size > Math.max(1, this.capacity)) {
-      const oldest = this.entries.keys().next().value
-      if (typeof oldest !== 'string') break
-      this.entries.delete(oldest)
+    const requestId = preferredRequestId || createMutationClientRequestId(prefix)
+    while (this.entries.size >= Math.max(1, this.capacity)) {
+      const oldestReady = [...this.entries].find(([, entry]) => entry.state === 'ready')?.[0]
+      if (!oldestReady) {
+        throw new Error('Too many page updates are waiting for confirmation.')
+      }
+      this.entries.delete(oldestReady)
     }
+    this.entries.set(key, { requestId, state: 'ready', payloadJson: null })
     return requestId
+  }
+
+  freeze<T extends Readonly<Record<string, unknown>>>(
+    logicalKey: string,
+    requestId: string,
+    payload: T,
+  ): T {
+    const key = privateLogicalKeyDigest(logicalKey)
+    const entry = this.entries.get(key)
+    if (!entry || entry.requestId !== requestId) {
+      throw new Error('This page update can no longer be retried safely.')
+    }
+    const payloadJson = JSON.stringify(payload)
+    if (entry.payloadJson !== null && entry.payloadJson !== payloadJson) {
+      throw new Error('This page update no longer matches the pending request.')
+    }
+    entry.payloadJson = payloadJson
+    return Object.freeze(JSON.parse(payloadJson)) as T
+  }
+
+  pendingPayload<T extends Readonly<Record<string, unknown>>>(
+    logicalKey: string,
+    requestId: string,
+  ): T | null {
+    const entry = this.entries.get(privateLogicalKeyDigest(logicalKey))
+    if (
+      !entry
+      || entry.requestId !== requestId
+      || entry.state !== 'pending'
+      || entry.payloadJson === null
+    ) return null
+    return Object.freeze(JSON.parse(entry.payloadJson)) as T
+  }
+
+  markPending(logicalKey: string, requestId: string): void {
+    const entry = this.entries.get(privateLogicalKeyDigest(logicalKey))
+    if (entry?.requestId === requestId) entry.state = 'pending'
+  }
+
+  isPending(logicalKey: string, requestId: string): boolean {
+    const entry = this.entries.get(privateLogicalKeyDigest(logicalKey))
+    return entry?.requestId === requestId && entry.state === 'pending'
+  }
+
+  markNotApplied(logicalKey: string, requestId: string): void {
+    this.release(logicalKey, requestId)
   }
 
   release(logicalKey: string, requestId: string): void {
     const key = privateLogicalKeyDigest(logicalKey)
-    if (this.entries.get(key) === requestId) this.entries.delete(key)
+    if (this.entries.get(key)?.requestId === requestId) this.entries.delete(key)
   }
 
   clear(): void {

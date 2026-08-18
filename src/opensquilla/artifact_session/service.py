@@ -168,6 +168,11 @@ class ArtifactSessionService:
     async def close(self) -> None:
         await self.repository.close()
 
+    def allocate_id(self, prefix: str) -> str:
+        """Allocate an opaque id for a transaction-prepared internal record."""
+
+        return self.repository.allocate_id(_required(prefix, "prefix"))
+
     async def __aenter__(self) -> ArtifactSessionService:
         return self
 
@@ -1032,6 +1037,19 @@ class ArtifactSessionService:
             tool_use_id=_required(tool_use_id, "tool_use_id"),
         )
 
+    async def get_mutation_attempt_for_resolution(
+        self,
+        *,
+        document_id: str,
+        turn_id: str,
+    ) -> MutationAttempt:
+        """Return a durable receipt for a trusted, session-scoped outcome query."""
+
+        return await self.repository.get_mutation_attempt_for_resolution(
+            document_id=_required(document_id, "document_id"),
+            turn_id=_required(turn_id, "turn_id"),
+        )
+
     async def register_mutation_candidate(
         self,
         *,
@@ -1305,6 +1323,7 @@ class ArtifactSessionService:
         session_key: str,
         session_id: str,
         session_epoch: int,
+        require_current_head: bool = True,
     ) -> tuple[PromptAnnotation, ...]:
         normalized_ids = tuple(_required(item, "annotation_id") for item in annotation_ids)
         return await self.repository.preflight_prompt_annotations(
@@ -1312,6 +1331,7 @@ class ArtifactSessionService:
             session_key=_required(session_key, "session_key"),
             session_id=_required(session_id, "session_id"),
             session_epoch=_nonnegative(session_epoch, "session_epoch"),
+            require_current_head=require_current_head,
         )
 
     async def get_edit_session(self, edit_session_id: str) -> EditSession:

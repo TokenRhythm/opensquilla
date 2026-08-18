@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any
 
 from lxml import etree  # type: ignore[import-untyped]
-from lxml import html as lxml_html  # type: ignore[import-untyped]
 
 from opensquilla.artifact_session import (
     Actor,
@@ -45,6 +44,26 @@ from opensquilla.artifact_session import (
 from opensquilla.artifact_session import (
     ArtifactNotFoundError as ArtifactSessionNotFoundError,
 )
+from opensquilla.artifact_session.html_anchors import (
+    HtmlAnchorChangedError,
+    remap_html_anchor,
+    target_projection,
+)
+from opensquilla.artifact_session.html_anchors import (
+    canonical_browser_dom_digest as shared_browser_dom_digest,
+)
+from opensquilla.artifact_session.html_anchors import (
+    canonical_element_at_path as shared_element_at_path,
+)
+from opensquilla.artifact_session.html_anchors import (
+    canonical_element_proof_sha256 as shared_element_proof_sha256,
+)
+from opensquilla.artifact_session.html_anchors import (
+    canonical_opening_anchor as shared_canonical_opening_anchor,
+)
+from opensquilla.artifact_session.html_anchors import (
+    parse_element_path as shared_parse_element_path,
+)
 from opensquilla.artifacts import (
     DEFAULT_ARTIFACT_MAX_BYTES,
     ArtifactError,
@@ -53,16 +72,19 @@ from opensquilla.artifacts import (
     ArtifactRef,
     ArtifactStore,
 )
+from opensquilla.gateway.artifact_product_errors import (
+    ArtifactProductErrorCode,
+    artifact_product_error,
+    logged_artifact_product_error,
+)
 from opensquilla.gateway.desktop_artifact_bridge import (
     DesktopArtifactBridgeError,
     get_desktop_artifact_bridge_client,
 )
 from opensquilla.gateway.event_bridge import EventBridge
-from opensquilla.gateway.protocol import ERROR_NOT_FOUND
 from opensquilla.gateway.rpc import (
     RpcContext,
     RpcHandlerError,
-    RpcUnavailableError,
     get_dispatcher,
 )
 from opensquilla.gateway.rpc_artifacts import _session_id_for_key
@@ -493,33 +515,7 @@ def _element_proof_sha256(
 
 
 def _parse_element_path(value: str) -> tuple[tuple[str, str, int], ...]:
-    if not value or len(value) > 4_096 or "\x00" in value:
-        raise ValueError("params.selection.elementPath is invalid")
-    try:
-        raw = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise ValueError("params.selection.elementPath is invalid") from exc
-    if not isinstance(raw, list) or not 1 <= len(raw) <= 128:
-        raise ValueError("params.selection.elementPath is invalid")
-    result: list[tuple[str, str, int]] = []
-    for segment in raw:
-        if (
-            not isinstance(segment, list)
-            or len(segment) != 3
-            or not isinstance(segment[0], str)
-            or len(segment[0]) > 256
-            or any(ord(character) < 32 or ord(character) == 127 for character in segment[0])
-            or not isinstance(segment[1], str)
-            or not _HTML_TAG_NAME_RE.fullmatch(segment[1])
-            or isinstance(segment[2], bool)
-            or not isinstance(segment[2], int)
-            or not 1 <= segment[2] <= 9_007_199_254_740_991
-        ):
-            raise ValueError("params.selection.elementPath is invalid")
-        result.append((segment[0], segment[1].lower(), segment[2]))
-    if json.dumps(raw, ensure_ascii=False, separators=(",", ":")) != value:
-        raise ValueError("params.selection.elementPath is invalid")
-    return tuple(result)
+    return shared_parse_element_path(value)
 
 
 def _element_at_path(root: etree._Element, path: str) -> etree._Element:
@@ -580,54 +576,23 @@ def _canonical_opening_anchor(
     expected_element_proof_sha256: str,
     expected_tag_name: str,
 ) -> tuple[dict[str, Any], str, dict[str, Any]]:
-    parser = lxml_html.HTMLParser(recover=True, no_network=True)
     try:
-        root = lxml_html.document_fromstring(source, parser=parser)
-    except (etree.ParserError, ValueError) as exc:
-        raise ValueError("The canonical HTML source cannot be parsed safely") from exc
-    _normalize_browser_html_dom(root, source=source)
-    try:
-        selected = _element_at_path(root, element_path)
-    except ValueError as exc:
-        raise RpcHandlerError(
-            "ARTIFACT_ELEMENT_CHANGED",
-            "The selected preview element no longer matches the canonical artifact source",
-            accepted=False,
-        ) from exc
-    _namespace, selected_tag = _element_name(selected)
-    if selected_tag != expected_tag_name.lower():
-        raise RpcHandlerError(
-            "ARTIFACT_ELEMENT_CHANGED",
-            "The selected preview element no longer matches the canonical artifact source",
-            accepted=False,
+        return shared_canonical_opening_anchor(
+            source,
+            element_path=element_path,
+            expected_element_proof_sha256=expected_element_proof_sha256,
+            expected_tag_name=expected_tag_name,
         )
-    actual_element_proof_sha256 = _element_proof_sha256(root, selected=selected)
-    if actual_element_proof_sha256 != expected_element_proof_sha256:
-        raise RpcHandlerError(
-            "ARTIFACT_ELEMENT_CHANGED",
-            "The selected preview element no longer matches the canonical artifact source",
-            accepted=False,
-        )
-    start, start_tag_end, _opening_tag_name = _opening_span_for_element(
-        source,
-        root=root,
-        selected=selected,
-    )
-    opening_tag = source[start:start_tag_end]
-    source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
-    locator = {
-        "start_offset": start,
-        "start_tag_end_offset": start_tag_end,
-        "tag_name": selected_tag,
-        "source_sha256": source_sha256,
-        "offset_encoding": _SOURCE_OFFSET_ENCODING,
-    }
-    context = {
-        "element_path": element_path,
-        "element_proof_sha256": actual_element_proof_sha256,
-        "opening_tag_sha256": hashlib.sha256(opening_tag.encode("utf-8")).hexdigest(),
-    }
-    return locator, opening_tag, context
+    except HtmlAnchorChangedError as exc:
+        raise artifact_product_error(ArtifactProductErrorCode.DOCUMENT_CHANGED) from exc
+
+
+# Compatibility aliases for tests and older internal imports. Production
+# creation/focus paths use the shared pure module directly through the wrapper
+# above, so DOM proof and source-span rules have one implementation.
+_browser_dom_digest = shared_browser_dom_digest
+_element_at_path = shared_element_at_path
+_element_proof_sha256 = shared_element_proof_sha256
 
 
 def _validate_source_offset_encoding(container: object) -> str:
@@ -694,7 +659,11 @@ def _actor(ctx: RpcContext) -> Actor:
 async def _service(ctx: RpcContext) -> ArtifactSessionService:
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
-        raise RpcUnavailableError("artifact session storage is not wired")
+        raise artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            retryable=True,
+            reason_code="service_unavailable",
+        )
     return await ArtifactSessionService.from_session_storage(storage)
 
 
@@ -705,10 +674,9 @@ async def _scope(
     session_key = _session_key(params)
     session_id = await _session_id_for_key(ctx, session_key)
     if session_id is None:
-        raise RpcHandlerError(
-            ERROR_NOT_FOUND,
-            "Session not found",
-            details={"sessionKey": session_key},
+        raise artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            reason_code="session_unavailable",
         )
     return session_key, session_id, await _service(ctx)
 
@@ -716,7 +684,11 @@ async def _scope(
 async def _session_epoch(ctx: RpcContext, session_key: str) -> int:
     storage = get_session_storage(ctx.session_manager)
     if storage is None:
-        raise RpcUnavailableError("session storage is not wired")
+        raise artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            retryable=True,
+            reason_code="service_unavailable",
+        )
     return int(await storage.get_epoch(session_key))
 
 
@@ -728,19 +700,24 @@ def _prompt_annotation_body(params: dict[str, Any] | None) -> str:
 
 
 def _not_found(kind: str, identifier: str) -> RpcHandlerError:
-    return RpcHandlerError(
-        ERROR_NOT_FOUND,
-        f"{kind} not found",
-        details={f"{kind[0].lower()}{kind[1:]}Id": identifier},
+    del kind, identifier
+    return artifact_product_error(
+        ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+        reason_code="resource_unavailable",
     )
 
 
-def _conflict(exc: Exception) -> RpcHandlerError:
-    return RpcHandlerError(
-        "ARTIFACT_CONFLICT",
-        str(exc),
+def _conflict(
+    exc: Exception,
+    *,
+    code: ArtifactProductErrorCode = ArtifactProductErrorCode.DOCUMENT_CHANGED,
+    operation: str = "artifact_document.mutate",
+) -> RpcHandlerError:
+    return logged_artifact_product_error(
+        code,
+        exc,
+        operation=operation,
         retryable=False,
-        accepted=False,
     )
 
 
@@ -981,9 +958,11 @@ async def _revision_capabilities(
         source = await asyncio.to_thread(_html_source, ref, path)
         validate_editable_html_source(source)
     except RpcHandlerError as exc:
+        details = exc.details if isinstance(exc.details, dict) else {}
         reason = (
             "html_source_encoding_unsupported"
             if exc.code == "ARTIFACT_SOURCE_ENCODING"
+            or details.get("reasonCode") == "encoding_unsupported"
             else "html_source_unavailable"
         )
         return _html_source_unavailable_capabilities(reason)
@@ -1122,6 +1101,7 @@ def _prompt_annotation_payload(
     anchor: Anchor,
     current_head_revision_id: str,
 ) -> dict[str, Any]:
+    target_status, target_reason, target_kind, target_text = target_projection(anchor)
     return {
         "id": annotation.annotation_id,
         "documentId": annotation.document_id,
@@ -1135,6 +1115,10 @@ def _prompt_annotation_payload(
             if annotation.revision_id == current_head_revision_id
             else "stale"
         ),
+        "targetStatus": target_status,
+        "targetReason": target_reason,
+        "targetKind": target_kind,
+        "targetText": target_text,
         "stateRevision": annotation.state_revision,
         "sentMessageId": annotation.sent_message_id,
         "sentTurnId": annotation.sent_turn_id,
@@ -1390,7 +1374,11 @@ async def _handle_document_open(
             actor=_actor(ctx),
         )
     except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
+        raise _conflict(
+            exc,
+            code=ArtifactProductErrorCode.DOCUMENT_CHANGED,
+            operation="document.open",
+        ) from exc
     if adopted:
         await _emit_artifact_state(
             ctx,
@@ -1458,7 +1446,11 @@ async def _handle_document_rename(
             actor=_actor(ctx),
         )
     except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
+        raise _conflict(
+            exc,
+            code=ArtifactProductErrorCode.DOCUMENT_CHANGED,
+            operation="document.rename",
+        ) from exc
     await _emit_artifact_state(
         ctx,
         session_key=session_key,
@@ -1543,7 +1535,11 @@ async def _handle_edit_session_start(
             edit_session_id=edit_session_id,
         )
     except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
+        raise _conflict(
+            exc,
+            code=ArtifactProductErrorCode.WRITE_BUSY,
+            operation="edit_session.start",
+        ) from exc
     return {"editSession": _edit_session_payload(edit_session)}
 
 
@@ -1574,7 +1570,11 @@ async def _handle_edit_session_heartbeat(
             actor=actor,
         )
     except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
+        raise _conflict(
+            exc,
+            code=ArtifactProductErrorCode.EDIT_SESSION_RENEWAL_REQUIRED,
+            operation="edit_session.heartbeat",
+        ) from exc
     return {"editSession": _edit_session_payload(edit_session)}
 
 
@@ -1604,7 +1604,11 @@ async def _handle_edit_session_close(
             actor=actor,
         )
     except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
+        raise _conflict(
+            exc,
+            code=ArtifactProductErrorCode.EDIT_SESSION_RENEWAL_REQUIRED,
+            operation="edit_session.close",
+        ) from exc
     return {"editSession": _edit_session_payload(edit_session)}
 
 
@@ -1673,7 +1677,11 @@ async def _handle_revision_restore(
             revision_event_type="document.restored",
         )
     except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
+        raise _conflict(
+            exc,
+            code=ArtifactProductErrorCode.DOCUMENT_CHANGED,
+            operation="revision.restore",
+        ) from exc
     if not replayed:
         await _emit_artifact_state(
             ctx,
@@ -1759,9 +1767,9 @@ async def _handle_change_revert(
     if change_set.document_id != document.document_id:
         raise _not_found("ChangeSet", change_id)
     if change_set.applied_revision_id is None:
-        raise RpcHandlerError(
-            "ARTIFACT_CHANGE_NOT_APPLIED",
-            "Only an applied change set can be reverted",
+        raise artifact_product_error(
+            ArtifactProductErrorCode.MUTATION_NOT_APPLIED,
+            reason_code="change_not_applied",
         )
     target_revision = await _scoped_revision(
         service,
@@ -1792,16 +1800,19 @@ async def _handle_change_revert(
             candidate_artifact_id=target_revision.artifact_id,
         )
     except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
+        raise _conflict(
+            exc,
+            code=ArtifactProductErrorCode.DOCUMENT_CHANGED,
+            operation="change.revert_replay",
+        ) from exc
     if replay is not None:
         result, mutation_change = replay
         replayed = True
     else:
         if document.head_revision_id != change_set.applied_revision_id:
-            raise RpcHandlerError(
-                "ARTIFACT_CHANGE_NOT_HEAD",
-                "Only the change set at the current document head can be reverted",
-                accepted=False,
+            raise artifact_product_error(
+                ArtifactProductErrorCode.DOCUMENT_CHANGED,
+                reason_code="change_not_current",
             )
         try:
             result, mutation_change, replayed = await _commit_revision_copy_mutation(
@@ -1892,10 +1903,9 @@ async def _trusted_annotation_selection(
 ) -> None:
     bridge = get_desktop_artifact_bridge_client()
     if bridge is None or not hasattr(bridge, "resolve_annotation_selection"):
-        raise RpcHandlerError(
-            "ARTIFACT_SELECTION_UNAVAILABLE",
-            "A trusted Desktop selection bridge is required for preview annotations",
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+            reason_code="preview_unavailable",
         )
     try:
         resolved = await bridge.resolve_annotation_selection(
@@ -1908,10 +1918,11 @@ async def _trusted_annotation_selection(
             deadline_ms=2_000,
         )
     except (DesktopArtifactBridgeError, ValueError) as exc:
-        raise RpcHandlerError(
-            "ARTIFACT_SELECTION_CHANGED",
-            "The selected preview element is no longer available",
-            accepted=False,
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+            exc,
+            operation="prompt_annotations.resolve_native_selection",
+            reason_code="selection_changed",
         ) from exc
     if (
         getattr(resolved, "selection_id", None) != selection_id
@@ -1923,10 +1934,9 @@ async def _trusted_annotation_selection(
         or getattr(resolved, "active_preview_artifact_id", None)
         != active_preview_artifact_id
     ):
-        raise RpcHandlerError(
-            "ARTIFACT_PREVIEW_CHANGED",
-            "The active Desktop preview no longer matches this artifact revision",
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+            reason_code="preview_changed",
         )
 
 
@@ -1999,12 +2009,7 @@ async def _idempotent_prompt_annotation_create(
         or context.get("element_path") != element_path
         or context.get("element_proof_sha256") != element_proof_sha256
     ):
-        raise RpcHandlerError(
-            "ARTIFACT_CONFLICT",
-            "The prompt annotation id is already in use",
-            retryable=False,
-            accepted=False,
-        )
+        raise artifact_product_error(ArtifactProductErrorCode.ANNOTATION_BUSY)
     return annotation, anchor
 
 
@@ -2080,11 +2085,7 @@ async def _handle_prompt_annotation_create(
     )
     revision_id = _optional_string(params, "revisionId") or document.head_revision_id
     if revision_id != document.head_revision_id:
-        raise RpcHandlerError(
-            "ARTIFACT_REVISION_CHANGED",
-            "The selected artifact revision is no longer current",
-            accepted=False,
-        )
+        raise artifact_product_error(ArtifactProductErrorCode.DOCUMENT_CHANGED)
     revision = await _scoped_revision(service, document=document, revision_id=revision_id)
     (
         selection_id,
@@ -2118,10 +2119,9 @@ async def _handle_prompt_annotation_create(
         }
     capabilities = await _revision_capabilities(ctx, document, revision)
     if not capabilities.get("promptAnnotations"):
-        raise RpcHandlerError(
-            "ARTIFACT_SELECTION_UNSUPPORTED",
-            "Preview annotations require editable single-file HTML",
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="annotation_unsupported",
         )
     await _trusted_annotation_selection(
         session_key=session_key,
@@ -2162,7 +2162,11 @@ async def _handle_prompt_annotation_create(
             body=body,
         )
     except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
+        raise _conflict(
+            exc,
+            code=ArtifactProductErrorCode.ANNOTATION_BUSY,
+            operation="prompt_annotations.create",
+        ) from exc
     except ArtifactSessionNotFoundError:
         raise _not_found("PromptAnnotation", annotation_id) from None
     return {
@@ -2192,10 +2196,9 @@ async def _handle_prompt_annotation_focus(
         session_epoch=session_epoch,
     )
     if annotation.status is not PromptAnnotationStatus.DRAFT:
-        raise RpcHandlerError(
-            "ARTIFACT_ANNOTATION_NOT_DRAFT",
-            "Only an unsent prompt annotation can be focused",
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+            reason_code="not_draft",
         )
     document = await _scoped_document(
         service,
@@ -2203,91 +2206,78 @@ async def _handle_prompt_annotation_focus(
         session_key=session_key,
         session_id=session_id,
     )
-    if annotation.revision_id != document.head_revision_id:
-        raise RpcHandlerError(
-            "ARTIFACT_REVISION_CHANGED",
-            "The annotation belongs to an older artifact revision",
-            accepted=False,
-        )
     revision = await _scoped_revision(
         service,
         document=document,
-        revision_id=annotation.revision_id,
+        revision_id=document.head_revision_id,
     )
     bridge = get_desktop_artifact_bridge_client()
     if bridge is None or not hasattr(bridge, "focus_annotation"):
-        raise RpcHandlerError(
-            "ARTIFACT_FOCUS_UNAVAILABLE",
-            "No active Desktop annotation preview is available",
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+            reason_code="preview_unavailable",
         )
     if not (await _revision_capabilities(ctx, document, revision)).get("promptAnnotations"):
-        raise RpcHandlerError(
-            "ARTIFACT_FOCUS_UNSUPPORTED",
-            "This artifact revision does not support native annotation focus",
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="annotation_unsupported",
         )
     anchor = await _prompt_annotation_anchor(service, annotation)
-    context = anchor.context
-    locator = anchor.locator
-    if (
-        anchor.kind is not AnchorKind.DOM_SOURCE
-        or anchor.state is not AnchorState.RESOLVED
-        or not isinstance(context, dict)
-        or not isinstance(locator, dict)
-    ):
-        raise RpcHandlerError(
-            "ARTIFACT_FOCUS_UNSUPPORTED",
-            "The prompt annotation has no active DOM source anchor",
-            accepted=False,
+    if anchor.kind is not AnchorKind.DOM_SOURCE:
+        raise artifact_product_error(ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE)
+    try:
+        old_revision = await _scoped_revision(
+            service,
+            document=document,
+            revision_id=annotation.revision_id,
         )
-    element_path = context.get("element_path")
-    element_proof_sha256 = context.get("element_proof_sha256")
-    tag_name = locator.get("tag_name")
+        _old_resolved, _old_ref, _old_path, old_source = await _resolve_source_revision(
+            ctx=ctx,
+            service=service,
+            session_id=session_id,
+            document=document,
+            revision_id=old_revision.revision_id,
+        )
+        _current_resolved, _current_ref, _current_path, current_source = (
+            await _resolve_source_revision(
+                ctx=ctx,
+                service=service,
+                session_id=session_id,
+                document=document,
+                revision_id=revision.revision_id,
+            )
+        )
+        resolution = remap_html_anchor(
+            old_source=old_source,
+            current_source=current_source,
+            anchor=anchor,
+        )
+    except ValueError as exc:
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+            exc,
+            operation="prompt_annotations.focus_remap",
+            retryable=False,
+            annotation_id=annotation.annotation_id,
+        ) from exc
+    if resolution.status != "ready":
+        raise artifact_product_error(
+            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+            reason_code=resolution.reason,
+        )
+    verified_context = resolution.context
+    verified_locator = resolution.locator
+    element_path = verified_context.get("element_path")
+    element_proof_sha256 = verified_context.get("element_proof_sha256")
+    tag_name = verified_locator.get("tag_name")
     if (
         not isinstance(element_path, str)
-        or not 1 <= len(element_path) <= 4096
         or not isinstance(element_proof_sha256, str)
         or not _SHA256_RE.fullmatch(element_proof_sha256)
         or not isinstance(tag_name, str)
         or not _HTML_TAG_NAME_RE.fullmatch(tag_name)
     ):
-        raise RpcHandlerError(
-            "ARTIFACT_FOCUS_UNSUPPORTED",
-            "The prompt annotation DOM anchor is invalid",
-            accepted=False,
-        )
-    try:
-        _parse_element_path(element_path)
-        _resolved, _ref, _path, source = await _resolve_source_revision(
-            ctx=ctx,
-            service=service,
-            session_id=session_id,
-            document=document,
-            revision_id=revision.revision_id,
-        )
-        verified_locator, opening_tag, verified_context = _canonical_opening_anchor(
-            source,
-            element_path=element_path,
-            expected_element_proof_sha256=element_proof_sha256,
-            expected_tag_name=tag_name,
-        )
-    except (ArtifactIntegrityError, OSError, ValueError) as exc:
-        raise RpcHandlerError(
-            "ARTIFACT_FOCUS_UNSUPPORTED",
-            "The prompt annotation DOM anchor cannot be verified",
-            accepted=False,
-        ) from exc
-    if (
-        verified_locator != locator
-        or verified_context != context
-        or opening_tag[:2048] != anchor.quote
-    ):
-        raise RpcHandlerError(
-            "ARTIFACT_FOCUS_UNSUPPORTED",
-            "The prompt annotation DOM anchor no longer matches its source revision",
-            accepted=False,
-        )
+        raise artifact_product_error(ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE)
     try:
         focused = await bridge.focus_annotation(
             annotation_id=annotation.annotation_id,
@@ -2299,16 +2289,19 @@ async def _handle_prompt_annotation_focus(
             deadline_ms=2_000,
         )
     except (DesktopArtifactBridgeError, ValueError) as exc:
-        raise RpcHandlerError(
-            "ARTIFACT_FOCUS_UNAVAILABLE",
-            "The active Desktop preview could not focus this annotation",
-            accepted=False,
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+            exc,
+            operation="prompt_annotations.focus_native",
+            retryable=True,
+            reason_code="preview_unavailable",
+            annotation_id=annotation.annotation_id,
         ) from exc
     if focused is not True:
-        raise RpcHandlerError(
-            "ARTIFACT_FOCUS_UNAVAILABLE",
-            "The active Desktop preview did not focus this annotation",
-            accepted=False,
+        raise artifact_product_error(
+            ArtifactProductErrorCode.ANNOTATION_UNAVAILABLE,
+            retryable=True,
+            reason_code="preview_unavailable",
         )
     return {
         "focused": True,
@@ -2344,7 +2337,11 @@ async def _handle_prompt_annotation_update(
             body=_prompt_annotation_body(params),
         )
     except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
+        raise _conflict(
+            exc,
+            code=ArtifactProductErrorCode.ANNOTATION_BUSY,
+            operation="prompt_annotations.update",
+        ) from exc
     return {
         "annotation": _prompt_annotation_payload(
             annotation,
@@ -2380,7 +2377,11 @@ async def _handle_prompt_annotation_discard(
             expected_state_revision=_require_positive_int(params, "expectedStateRevision"),
         )
     except ArtifactConflictError as exc:
-        raise _conflict(exc) from exc
+        raise _conflict(
+            exc,
+            code=ArtifactProductErrorCode.ANNOTATION_BUSY,
+            operation="prompt_annotations.discard",
+        ) from exc
     return {
         "annotation": _prompt_annotation_payload(
             annotation,
@@ -2392,19 +2393,22 @@ async def _handle_prompt_annotation_discard(
 
 def _html_source(ref: ArtifactRef, path: Path) -> str:
     if _format_for(ref.name, ref.mime) != "html":
-        raise RpcHandlerError(
-            "ARTIFACT_SOURCE_UNSUPPORTED",
-            "Source editing is available only for HTML artifacts",
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="format_unsupported",
         )
     payload = path.read_bytes()
     if len(payload) > DEFAULT_ARTIFACT_MAX_BYTES:
-        raise RpcHandlerError("ARTIFACT_SOURCE_TOO_LARGE", "Artifact source is too large")
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="size_unsupported",
+        )
     try:
         return payload.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise RpcHandlerError(
-            "ARTIFACT_SOURCE_ENCODING",
-            "HTML source must be UTF-8",
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="encoding_unsupported",
         ) from exc
 
 
@@ -2431,11 +2435,16 @@ async def _resolve_source_revision(
     except ArtifactNotFoundError:
         raise _not_found("Revision", revision_id) from None
     except (ArtifactIntegrityError, OSError, ValueError) as exc:
-        raise RpcHandlerError("ARTIFACT_INTEGRITY", str(exc)) from exc
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            exc,
+            operation="artifact.source.supports_editing",
+            retryable=True,
+        ) from exc
     if not supports_editing:
-        raise RpcHandlerError(
-            "ARTIFACT_SOURCE_UNSUPPORTED",
-            "Source editing is available only for single-file HTML artifacts",
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="bundle_unsupported",
         )
     try:
         ref, path = await asyncio.to_thread(
@@ -2446,7 +2455,12 @@ async def _resolve_source_revision(
     except ArtifactNotFoundError:
         raise _not_found("Revision", revision_id) from None
     except ArtifactIntegrityError as exc:
-        raise RpcHandlerError("ARTIFACT_INTEGRITY", str(exc)) from exc
+        raise logged_artifact_product_error(
+            ArtifactProductErrorCode.DOCUMENT_UNAVAILABLE,
+            exc,
+            operation="artifact.source.resolve",
+            retryable=True,
+        ) from exc
     source = await asyncio.to_thread(_html_source, ref, path)
     return revision, ref, path, source
 
@@ -2473,9 +2487,9 @@ async def _handle_source_read(
     )
     canonical = get_document_format_adapter("html").read(source, view="source")
     if not isinstance(canonical, str):
-        raise RpcHandlerError(
-            "ARTIFACT_SOURCE_UNSUPPORTED",
-            "The active document adapter does not expose a canonical source view",
+        raise artifact_product_error(
+            ArtifactProductErrorCode.RESOURCE_UNSUPPORTED,
+            reason_code="source_view_unavailable",
         )
     return {
         "source": {
@@ -2721,7 +2735,9 @@ async def _handle_source_patch(
         )
         if edit_document.document_id != document_id:
             raise _conflict(
-                ArtifactConflictError("edit session belongs to another document")
+                ArtifactConflictError("edit session belongs to another document"),
+                code=ArtifactProductErrorCode.EDIT_SESSION_RENEWAL_REQUIRED,
+                operation="edit_session.validate_save",
             )
     expected_head = _require_string(params, "expectedHeadRevisionId")
     revision, ref, _path, source = await _resolve_source_revision(
@@ -2733,7 +2749,13 @@ async def _handle_source_patch(
     )
     expected_sha = _require_string(params, "expectedSourceSha256").lower()
     expected_state_revision = _require_positive_int(params, "expectedStateRevision")
-    _validate_source_offset_encoding(params)
+    try:
+        _validate_source_offset_encoding(params)
+    except ValueError:
+        raise artifact_product_error(
+            ArtifactProductErrorCode.INVALID_REQUEST,
+            reason_code="invalid_source_edit",
+        ) from None
     actual_sha = hashlib.sha256(source.encode("utf-8")).hexdigest()
     if expected_sha != actual_sha:
         raise _conflict(ArtifactConflictError("source sha256 changed"))
@@ -2742,12 +2764,10 @@ async def _handle_source_patch(
             source,
             params.get("patches") if isinstance(params, dict) else None,
         )
-    except DocumentAdapterError as exc:
-        raise RpcHandlerError(
-            exc.code,
-            exc.user_message,
-            retryable=False,
-            accepted=False,
+    except (DocumentAdapterError, ValueError):
+        raise artifact_product_error(
+            ArtifactProductErrorCode.INVALID_REQUEST,
+            reason_code="invalid_source_edit",
         ) from None
     patch_count = len(audit_patches)
     request_id = _manual_mutation_request_id(params)
@@ -2832,7 +2852,11 @@ async def _handle_source_patch(
                 expected_last_saved_revision_id=edit_session_last_saved_revision_id,
             )
         except ArtifactConflictError as exc:
-            raise _conflict(exc) from exc
+            raise _conflict(
+                exc,
+                code=ArtifactProductErrorCode.EDIT_SESSION_RENEWAL_REQUIRED,
+                operation="edit_session.validate_save",
+            ) from exc
     store = ArtifactStore(media_root_from_config(ctx.config))
     candidate: ArtifactRef | None = None
     candidate_id: str | None = None
@@ -3032,10 +3056,10 @@ async def _handle_source_patch(
                 pass
         if result is None:
             if cleanup_ambiguous:
-                raise RpcHandlerError(
-                    "ARTIFACT_MUTATION_CLEANUP_AMBIGUOUS",
-                    "The failed document edit candidate could not be safely cleaned up",
-                    accepted=False,
+                raise artifact_product_error(
+                    ArtifactProductErrorCode.MUTATION_OUTCOME_PENDING,
+                    retryable=True,
+                    reason_code="cleanup_pending",
                 ) from None
             if isinstance(exc, ArtifactConflictError):
                 raise _conflict(exc) from exc

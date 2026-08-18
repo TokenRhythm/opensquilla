@@ -1,6 +1,10 @@
 import type { RpcCallOptions } from '@/lib/rpc'
 import type { ArtifactPayload } from '@/types/rpc'
 import type {
+  ArtifactMutationResolution,
+  ArtifactMutationResolutionRequest,
+} from '@/types/artifactDocuments'
+import type {
   DocumentImportResponse,
   DocumentOperationReceipt,
   DocumentPublication,
@@ -28,6 +32,7 @@ export const WORKBENCH_RESOURCE_RPC_METHODS = {
   createPreview: 'workbench.previews.create',
   importDocument: 'documents.import',
   publishDocument: 'documents.publish',
+  mutationResolve: 'artifacts.mutations.resolve',
 } as const
 
 type WorkbenchResourceRpc = {
@@ -80,6 +85,11 @@ export interface WorkbenchResourceProvider {
     idempotencyKey: string
     name?: string
   }, signal?: AbortSignal): Promise<DocumentPublishResponse>
+  /** Null means the connected Gateway predates mutation outcome resolution. */
+  resolveMutation?(
+    request: ArtifactMutationResolutionRequest,
+    signal?: AbortSignal,
+  ): Promise<ArtifactMutationResolution | null>
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -573,6 +583,55 @@ export function createRpcWorkbenchResourceProvider(
         || !publication.artifactId
       ) throw new Error('The document publication is invalid.')
       return { deliverable, publication, receipt }
+    },
+    async resolveMutation(request, signal) {
+      if (!supports(WORKBENCH_RESOURCE_RPC_METHODS.mutationResolve)) return null
+      let response: Record<string, unknown>
+      try {
+        response = await call<Record<string, unknown>>(
+          WORKBENCH_RESOURCE_RPC_METHODS.mutationResolve,
+          { ...request },
+          signal,
+        )
+      } catch (error) {
+        if (isMethodNotFound(error)) return null
+        throw error
+      }
+      const status = stringAt(response, 'status')
+      if (status !== 'applied' && status !== 'not_applied' && status !== 'pending') {
+        throw new Error('Invalid page update resolution response')
+      }
+      const rawResult = record(response.result)
+      const document = normalizeArtifactDocument(response.document, undefined, request.sessionKey)
+      const rawDocument = record(response.document)
+      const revision = normalizeArtifactRevision(rawDocument?.head)
+      const documentId = rawResult ? stringAt(rawResult, 'documentId') : ''
+      const revisionId = rawResult ? stringAt(rawResult, 'revisionId') : ''
+      const sha256 = rawResult ? stringAt(rawResult, 'sha256') : ''
+      const rawStateRevision = rawResult ? Number(rawResult.stateRevision) : NaN
+      const rawRetryAfterMs = valueAt(response, 'retryAfterMs')
+      const retryAfterMs = Number(rawRetryAfterMs)
+      return {
+        status,
+        retryAfterMs: rawRetryAfterMs !== null
+          && rawRetryAfterMs !== undefined
+          && Number.isFinite(retryAfterMs)
+          ? Math.max(0, retryAfterMs)
+          : null,
+        result: documentId
+          && revisionId
+          && /^[0-9a-f]{64}$/.test(sha256)
+          && Number.isFinite(rawStateRevision)
+          ? {
+              documentId,
+              revisionId,
+              sha256,
+              stateRevision: Math.max(1, rawStateRevision),
+            }
+          : null,
+        ...(document ? { document } : {}),
+        ...(revision ? { revision } : {}),
+      }
     },
   }
 }

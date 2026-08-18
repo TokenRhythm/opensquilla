@@ -55,16 +55,6 @@
                 <Icon name="refresh" :size="15" />
               </button>
               <button
-                v-if="resource.capabilities.publish && resource.resource.type === 'document'"
-                type="button"
-                :disabled="isBusy(resource)"
-                :title="publishLabel(resource)"
-                :aria-label="publishLabel(resource)"
-                @click="emitAction('resource-publish', resource)"
-              >
-                <Icon name="share" :size="15" />
-              </button>
-              <button
                 v-if="resource.capabilities.download"
                 type="button"
                 :disabled="isBusy(resource)"
@@ -87,7 +77,6 @@ import { computed } from 'vue'
 import Icon from '@/components/Icon.vue'
 import type {
   WorkbenchResource,
-  WorkbenchResourceType,
 } from '@/types/workbenchResources'
 import { workbenchResourceRefId } from '@/types/workbenchResources'
 import type { IconName } from '@/utils/icons'
@@ -97,13 +86,12 @@ const props = defineProps<{
   busyKey?: string
   downloadLabel: (resource: WorkbenchResource) => string
   emptyLabel: string
-  groupLabels: Record<WorkbenchResourceType, string>
+  groupLabels: { files: string; links: string }
   label: string
   openErrorKey?: string
   openErrorMessage?: string
   openLabel: (resource: WorkbenchResource) => string
   preparingLabel: string
-  publishLabel: (resource: WorkbenchResource) => string
   retryLabel: string
   resources: readonly WorkbenchResource[]
   unavailableReason: (resource: WorkbenchResource) => string
@@ -114,10 +102,14 @@ const emit = defineEmits<{
 }>()
 
 const groups = computed(() => (
-  (['attachment', 'document', 'deliverable', 'url'] as const).map(type => ({
+  (['files', 'links'] as const).map(type => ({
     type,
     label: props.groupLabels[type],
-    resources: props.resources.filter(resource => resource.resource.type === type),
+    resources: props.resources.filter(resource => (
+      type === 'links'
+        ? resource.resource.type === 'url'
+        : resource.resource.type !== 'url'
+    )),
   }))
 ))
 
@@ -135,7 +127,6 @@ function hasOpenError(resource: WorkbenchResource): boolean {
 
 function resourceIcon(resource: WorkbenchResource): IconName {
   if (resource.resource.type === 'attachment') return 'paperclip'
-  if (resource.resource.type === 'document') return 'edit'
   if (resource.resource.type === 'url') return 'externalLink'
   return 'fileText'
 }

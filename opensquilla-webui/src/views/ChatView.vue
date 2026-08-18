@@ -972,6 +972,7 @@ import {
 } from '@/utils/workbench/artifactPreview'
 import { focusArtifactInTranscript } from '@/utils/chat/artifactFocus'
 import { fetchDisplayAttachmentBlob } from '@/utils/chat/attachmentAccess'
+import { classifyArtifactProductError } from '@/utils/artifactProductErrors'
 import {
   persistDeferredMetaDraft,
   takeDeferredMetaDrafts,
@@ -1223,7 +1224,6 @@ function promptAnnotationBlockedMessage(): string {
   if (!promptAnnotationsEnabled.value) return ''
   const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value)
   if (reason === 'editing') return t('chat.promptAnnotations.editingBlocked')
-  if (reason === 'stale') return t('chat.promptAnnotations.staleBlocked')
   if (reason === 'empty') return t('chat.promptAnnotations.emptyBlocked')
   if (reason === 'too-long') return t('chat.promptAnnotations.tooLongBlocked')
   return ''
@@ -1263,22 +1263,11 @@ async function jumpPromptAnnotation(annotationId: string) {
     pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
     return
   }
-  // A stale draft is never sent through the focus RPC. Activating the panel
-  // above starts the trusted re-selection flow, which mints a fresh anchor.
-  if (annotation.freshness === 'stale') return
   try {
     await artifactPromptAnnotationsStore.focus(annotationId)
   } catch (error) {
     if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_REVISION_CHANGED') {
-      artifactPromptAnnotationsStore.markAnnotationStale(
-        annotationId,
-        'head-changed',
-      )
-      await focusArtifactPromptAnnotation({
-        annotationId,
-        documentId: annotation.documentId,
-        sessionKey: annotation.sessionKey,
-      })
+      pushToast(t('chat.promptAnnotations.focusUnavailable'), { tone: 'warn' })
       return
     }
     if (promptAnnotationRpcErrorCode(error) === 'ARTIFACT_ANNOTATION_NOT_DRAFT') {
@@ -2834,6 +2823,17 @@ const chatSend = useChatSend({
     workbenchDocumentContextStore.prepareDocumentContextForSend(key, prepareOptions)
   ),
   preparePromptAnnotationsForSend: async (ids, prepareOptions) => {
+    const targetDocuments = new Set(
+      artifactPromptAnnotationsStore.snapshotsForIds(ids).map(item => item.documentId),
+    )
+    for (const documentId of targetDocuments) {
+      const flushed = await workbenchDocumentContextStore.prepareDocumentForSend(
+        sessionKey.value,
+        documentId,
+        prepareOptions,
+      )
+      if (flushed === false) return false
+    }
     const prepared = await artifactPromptAnnotationsStore.prepareForSend(ids)
     return prepared && (prepareOptions?.isCurrent?.() ?? true)
   },
@@ -4193,71 +4193,118 @@ async function attachmentWorkbenchResource(
 }
 
 async function previewAttachmentResource(attachment: DisplayAttachment) {
-  const resource = await attachmentWorkbenchResource(attachment)
-  if (!resource || !sessionKey.value) return
-  if (!resource.capabilities.preview) {
-    pushToast(t(workbenchResourceUnavailableReasonKey(
-      workbenchResourceActionReasonCode(resource.capabilities, 'preview'),
-    )), { tone: 'warn' })
-    return
-  }
-  const preview = await workbenchResourcesStore.preview(
-    sessionKey.value,
-    resource.resource,
-  )
-  if (!preview) return
-  const preparedResource = resourceFromPreparedPreview(preview)
-  const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
-    artifact: artifactPayloadFromWorkbenchResource(preparedResource),
-    nativeHtml: false,
-    preparedPreview: preview.preview,
-    previewLeaseEligible: false,
-    resourceIdentity: workbenchResourceKey(resource.resource),
-    sessionKey: sessionKey.value,
-  }))
-  if (!opened) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-  }
-}
-
-async function editAttachmentResource(attachment: DisplayAttachment) {
-  const resource = await attachmentWorkbenchResource(attachment)
-  if (!resource || !sessionKey.value) return
-  if (!resource.capabilities.manualEdit) {
-    pushToast(t(workbenchResourceUnavailableReasonKey(
-      workbenchResourceActionReasonCode(resource.capabilities, 'edit'),
-    )), { tone: 'warn' })
-    return
-  }
   try {
-    const imported = await workbenchResourcesStore.importDocument(
+    const resource = await attachmentWorkbenchResource(attachment)
+    if (!resource || !sessionKey.value) return
+    const current = await workbenchResourcesStore.openCurrent(sessionKey.value, resource)
+    if (current?.disposition === 'document') {
+      const artifact = artifactPayloadFromRevision(current.revision)
+      artifact.documentId = current.document.documentId
+      artifact.revisionId = current.revision.revisionId
+      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+        artifact,
+        initialSection: 'preview',
+        nativeHtml: Boolean(
+          platform.capabilities.hasNativeWorkbenchSurfaces
+          && platform.workbench.native,
+        ),
+        previewLeaseEligible: true,
+        resourceIdentity: workbenchResourceKey(current.resource.resource),
+        sessionKey: sessionKey.value,
+      }))
+      if (!opened) {
+        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+      }
+      return
+    }
+    if (!current && resource.resource.type === 'document') {
+      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+        artifact: artifactPayloadFromWorkbenchResource(resource),
+        initialSection: 'preview',
+        nativeHtml: Boolean(
+          platform.capabilities.hasNativeWorkbenchSurfaces
+          && platform.workbench.native,
+        ),
+        previewLeaseEligible: true,
+        resourceIdentity: workbenchResourceKey(resource.resource),
+        sessionKey: sessionKey.value,
+      }))
+      if (!opened) {
+        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+      }
+      return
+    }
+    if (
+      !current
+      && resource.resource.type !== 'document'
+      && resource.capabilities.manualEdit
+      && resource.sha256
+    ) {
+      const imported = await workbenchResourcesStore.importDocument(
+        sessionKey.value,
+        resource,
+      )
+      const artifact = artifactPayloadFromRevision(imported.revision)
+      artifact.documentId = imported.document.documentId
+      artifact.revisionId = imported.revision.revisionId
+      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+        artifact,
+        initialSection: 'preview',
+        nativeHtml: Boolean(
+          platform.capabilities.hasNativeWorkbenchSurfaces
+          && platform.workbench.native,
+        ),
+        previewLeaseEligible: true,
+        resourceIdentity: `document:${imported.document.documentId}`,
+        sessionKey: sessionKey.value,
+      }))
+      if (!opened) {
+        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+      }
+      return
+    }
+    const readonlyResource = current?.resource || resource
+    if (!readonlyResource.capabilities.preview) {
+      pushToast(t(workbenchResourceUnavailableReasonKey(
+        current?.reasonCode || workbenchResourceActionReasonCode(
+          readonlyResource.capabilities,
+          'preview',
+        ),
+      )), { tone: 'warn' })
+      return
+    }
+    const preview = await workbenchResourcesStore.preview(
       sessionKey.value,
-      resource,
+      readonlyResource.resource,
     )
-    const artifact = artifactPayloadFromRevision(imported.revision)
-    artifact.documentId = imported.document.documentId
-    artifact.revisionId = imported.revision.revisionId
+    if (!preview) return
+    const preparedResource = resourceFromPreparedPreview(preview)
     const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
-      artifact,
-      nativeHtml: Boolean(
-        platform.capabilities.hasNativeWorkbenchSurfaces
-        && platform.workbench.native,
-      ),
-      previewLeaseEligible: true,
-      resourceIdentity: `document:${imported.document.documentId}`,
+      artifact: artifactPayloadFromWorkbenchResource(preparedResource),
+      initialSection: 'preview',
+      nativeHtml: false,
+      preparedPreview: preview.preview,
+      previewLeaseEligible: false,
+      resourceIdentity: workbenchResourceKey(readonlyResource.resource),
       sessionKey: sessionKey.value,
     }))
     if (!opened) {
       pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      return
     }
-    pushToast(t('workbench.resources.imported', { name: resource.name }), { tone: 'ok' })
   } catch (error) {
+    const classified = classifyArtifactProductError(error)
+    const translated = t(classified.messageKey)
     pushToast(
-      error instanceof Error ? error.message : t('workbench.resources.actionFailed'),
+      translated === classified.messageKey ? classified.fallbackMessage : translated,
       { tone: 'danger', duration: 9000 },
     )
   }
+}
+
+async function editAttachmentResource(attachment: DisplayAttachment) {
+  // Compatibility event for older message renderers. The visible UI exposes a
+  // single Open action, and both paths resolve the same logical file.
+  await previewAttachmentResource(attachment)
 }
 
 async function downloadArtifact(artifact: ArtifactPayload) {
@@ -4556,10 +4603,10 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
     // follows the compatibility path above. Any other failure must remain
     // visible: silently opening the immutable chat artifact would disguise a
     // failed current-head resolution as a successful edit action.
+    const classified = classifyArtifactProductError(error)
+    const translated = t(classified.messageKey)
     pushToast(
-      error instanceof Error && error.message
-        ? error.message
-        : t('workbench.resources.actionFailed'),
+      translated === classified.messageKey ? classified.fallbackMessage : translated,
       { tone: 'danger', duration: 9000 },
     )
   }

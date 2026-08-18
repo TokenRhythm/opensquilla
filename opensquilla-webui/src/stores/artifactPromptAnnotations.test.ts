@@ -133,7 +133,7 @@ describe('artifact prompt annotations store', () => {
       .toEqual(['annotation-1', 'annotation-3'])
   })
 
-  it('retains stale and empty drafts but blocks them from send', async () => {
+  it('allows compatibility stale drafts while still blocking empty instructions', async () => {
     const store = useArtifactPromptAnnotationsStore()
     store.setProvider(provider([
       annotation('annotation-stale', { freshness: 'stale' }),
@@ -141,8 +141,9 @@ describe('artifact prompt annotations store', () => {
     ]))
     await store.load('session-a')
 
-    expect(store.sendableDraftsForSession('session-a')).toEqual([])
-    expect(store.sendBlockedReason('session-a')).toBe('stale')
+    expect(store.sendableDraftsForSession('session-a').map(item => item.annotationId))
+      .toEqual(['annotation-stale'])
+    expect(store.sendBlockedReason('session-a')).toBe('empty')
     expect(store.draftsForSession('session-a')).toHaveLength(2)
   })
 
@@ -419,7 +420,7 @@ describe('artifact prompt annotations store', () => {
     expect(store.snapshotsForIds(['annotation-overlay'])).toEqual([])
   })
 
-  it('focuses a fresh draft with opaque IDs and never focuses a stale draft', async () => {
+  it('lets the Gateway resolve both current and compatibility stale drafts', async () => {
     const rpc = provider([
       annotation('annotation-fresh'),
       annotation('annotation-stale', { freshness: 'stale' }),
@@ -438,7 +439,11 @@ describe('artifact prompt annotations store', () => {
       annotationId: 'annotation-fresh',
     })
 
-    await expect(store.focus('annotation-stale')).resolves.toBeNull()
-    expect(rpc.focus).toHaveBeenCalledOnce()
+    await expect(store.focus('annotation-stale')).resolves.toMatchObject({
+      focused: true,
+      annotationId: 'annotation-stale',
+      documentId: 'document-a',
+    })
+    expect(rpc.focus).toHaveBeenCalledTimes(2)
   })
 })

@@ -231,6 +231,9 @@ const FILE_INSPECT_TOOLS = new Set([
   'list_directory',
   'glob_search',
   'grep_search',
+  'document_inspect',
+  'document_read',
+  'document_locate',
 ])
 const FILE_CHANGE_TOOLS = new Set([
   'write_file',
@@ -240,6 +243,8 @@ const FILE_CHANGE_TOOLS = new Set([
   'edit_file',
   'edit_source',
   'apply_patch',
+  'document_apply',
+  'document_patch',
 ])
 const COMMAND_TOOLS = new Set([
   'exec',

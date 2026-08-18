@@ -332,7 +332,8 @@ async function openFile(artifact: ArtifactPayload) {
       mime: fetched.blob.type || String(artifact.mime || ''),
     })
     if (!result.ok) {
-      pushToast(result.message || t('chat.toast.artifactOpenFailed'), { tone: 'danger' })
+      if (result.message) console.warn('[artifact] Native open failed:', result.message)
+      pushToast(t('chat.toast.artifactOpenFailed'), { tone: 'danger' })
     }
     return
   }

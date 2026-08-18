@@ -2,6 +2,11 @@ import { defineStore } from 'pinia'
 import { markRaw, ref, shallowRef } from 'vue'
 
 import type {
+  ArtifactMutationOperation,
+  ArtifactMutationResolution,
+  ArtifactMutationResolutionRequest,
+} from '@/types/artifactDocuments'
+import type {
   DocumentImportResponse,
   DocumentPublishResponse,
   WorkbenchPreviewResponse,
@@ -10,6 +15,13 @@ import type {
   WorkbenchResourceRef,
 } from '@/types/workbenchResources'
 import { workbenchResourceRefId } from '@/types/workbenchResources'
+import {
+  artifactMutationOutcomeMayBePending,
+  artifactProductClientError,
+  classifyArtifactProductError,
+} from '@/utils/artifactProductErrors'
+import { PendingMutationRequestIds } from '@/utils/mutationRequestIdentity'
+import { resolveArtifactMutationBounded } from '@/workbench/artifactMutationRecovery'
 import type { WorkbenchResourceProvider } from '@/workbench/workbenchResourceProvider'
 import { canonicalWorkbenchResources } from '@/workbench/workbenchResourceItems'
 
@@ -36,9 +48,7 @@ function emptySnapshot(sessionKey: string): WorkbenchResourceSnapshot {
 }
 
 function message(error: unknown): string {
-  return error instanceof Error && error.message
-    ? error.message
-    : 'Workbench resources are unavailable.'
+  return classifyArtifactProductError(error).fallbackMessage
 }
 
 const PENDING_PUBLISH_STORAGE_PREFIX = 'opensquilla.workbench.pending-publish.'
@@ -55,33 +65,6 @@ function identityToken(value: string): string {
   return `${bytes.length.toString(36)}-${first.toString(16).padStart(8, '0')}${second
     .toString(16)
     .padStart(8, '0')}`
-}
-
-function stableImportIdempotencyKey(
-  sessionKey: string,
-  resource: WorkbenchResource,
-): string {
-  return `import-${identityToken([
-    sessionKey,
-    resource.resource.type,
-    workbenchResourceRefId(resource.resource),
-    resource.sha256 || '',
-    resource.name,
-    'copy',
-  ].join('\u0000'))}`
-}
-
-function stableOpenIdempotencyKey(
-  sessionKey: string,
-  resource: WorkbenchResource,
-): string {
-  return `open-${identityToken([
-    sessionKey,
-    resource.resource.type,
-    workbenchResourceRefId(resource.resource),
-    resource.sha256 || '',
-    'edit-current',
-  ].join('\u0000'))}`
 }
 
 function importOperationKey(sessionKey: string, resource: WorkbenchResource): string {
@@ -169,6 +152,104 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     provider: WorkbenchResourceProvider
     promise: Promise<WorkbenchResourceOpenResponse | null>
   }>()
+  const mutationRequestIds = new PendingMutationRequestIds(64)
+
+  async function runRecoverableMutation<
+    T,
+    P extends Readonly<Record<string, unknown>>,
+  >(options: {
+    currentProvider: WorkbenchResourceProvider
+    logicalKey: string
+    requestPrefix: string
+    preferredRequestId?: string
+    operation: ArtifactMutationOperation
+    sessionKey: string
+    documentId?: string
+    buildPayload: (requestId: string) => P
+    execute: (payload: P) => Promise<T>
+    onAppliedResolution: (resolution: ArtifactMutationResolution) => Promise<T>
+    onRelease?: () => void
+  }): Promise<T> {
+    const requestId = mutationRequestIds.idFor(
+      options.logicalKey,
+      options.requestPrefix,
+      options.preferredRequestId,
+    )
+    const wasPending = mutationRequestIds.isPending(options.logicalKey, requestId)
+    const payload = mutationRequestIds.pendingPayload<P>(options.logicalKey, requestId)
+      || mutationRequestIds.freeze(
+        options.logicalKey,
+        requestId,
+        options.buildPayload(requestId),
+      )
+    const resolutionRequest: ArtifactMutationResolutionRequest = {
+      sessionKey: options.sessionKey,
+      operation: options.operation,
+      requestId,
+      ...(options.documentId ? { documentId: options.documentId } : {}),
+    }
+
+    const release = () => {
+      mutationRequestIds.release(options.logicalKey, requestId)
+      options.onRelease?.()
+    }
+    const pendingError = () => artifactProductClientError('MUTATION_OUTCOME_PENDING')
+    const notApplied = (): never => {
+      release()
+      throw artifactProductClientError('MUTATION_NOT_APPLIED')
+    }
+    const returnApplied = async (resolution: ArtifactMutationResolution): Promise<T> => {
+      // Durable applied is terminal. Never replay a write just to recover its
+      // response DTO, and never downgrade that fact when the canonical read
+      // model is temporarily unavailable.
+      release()
+      try {
+        return await options.onAppliedResolution(resolution)
+      } catch {
+        throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
+      }
+    }
+    const resolve = async () => {
+      if (!options.currentProvider.resolveMutation) return null
+      try {
+        return await resolveArtifactMutationBounded(
+          request => options.currentProvider.resolveMutation!(request),
+          resolutionRequest,
+        )
+      } catch {
+        throw pendingError()
+      }
+    }
+
+    // A later user retry first asks a current Gateway for the durable outcome.
+    // If the Gateway predates resolution, the same frozen request is replayed
+    // explicitly; no automatic second write is issued after the first loss.
+    if (wasPending && options.currentProvider.resolveMutation) {
+      const resolution = await resolve()
+      if (resolution?.status === 'not_applied') return notApplied()
+      if (resolution?.status === 'pending') throw pendingError()
+      if (resolution?.status === 'applied') return returnApplied(resolution)
+      // Null is the old-Gateway compatibility signal. Continue to exact replay.
+    }
+
+    try {
+      const result = await options.execute(payload)
+      release()
+      return result
+    } catch (error) {
+      if (!artifactMutationOutcomeMayBePending(error)) {
+        release()
+        throw error
+      }
+      mutationRequestIds.markPending(options.logicalKey, requestId)
+      if (!wasPending && options.currentProvider.resolveMutation) {
+        const resolution = await resolve()
+        if (resolution?.status === 'not_applied') return notApplied()
+        if (resolution?.status === 'applied') return returnApplied(resolution)
+      }
+      throw pendingError()
+    }
+  }
 
   function setProvider(next: WorkbenchResourceProvider | null) {
     if (provider.value === next) return
@@ -332,15 +413,58 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     if (pending?.provider === currentProvider) return pending.promise
 
     const promise = (async () => {
-      const result = await currentProvider.open!(
+      const result = await runRecoverableMutation({
+        currentProvider,
+        logicalKey: operationKey,
+        requestPrefix: 'workbench-open',
+        operation: 'workbench.resources.open',
         sessionKey,
-        resource.resource,
-        {
-          intent: 'edit-current',
-          ...(resource.sha256 ? { expectedSha256: resource.sha256 } : {}),
-          idempotencyKey: stableOpenIdempotencyKey(sessionKey, resource),
+        buildPayload: idempotencyKey => ({
+          sessionKey,
+          resource: resource.resource,
+          request: {
+            intent: 'edit-current' as const,
+            ...(resource.sha256 ? { expectedSha256: resource.sha256 } : {}),
+            idempotencyKey,
+          },
+        }),
+        execute: payload => currentProvider.open!(
+          payload.sessionKey as string,
+          payload.resource as WorkbenchResourceRef,
+          payload.request as {
+            intent: 'edit-current'
+            expectedSha256?: string
+            idempotencyKey: string
+          },
+        ),
+        onAppliedResolution: async resolution => {
+          const document = resolution.document
+          const revision = resolution.revision
+          if (
+            !document
+            || !revision
+            || revision.documentId !== document.documentId
+            || revision.revisionId !== document.headRevisionId
+          ) throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
+          const documentRef: WorkbenchResourceRef = {
+            type: 'document',
+            documentId: document.documentId,
+            id: document.documentId,
+          }
+          const resolvedResource = await currentProvider.get(sessionKey, documentRef)
+          if (!resolvedResource) throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
+          upsertResource(sessionKey, resolvedResource)
+          const materialized = resource.resource.type !== 'document'
+          return {
+            disposition: 'document' as const,
+            resolution: { status: materialized ? 'materialized' as const : 'current' as const },
+            resource: resolvedResource,
+            document,
+            revision,
+            materialized,
+          }
         },
-      )
+      })
       if (!result) return null
       upsertResource(sessionKey, result.resource)
       if (result.disposition === 'document' && result.materialized) {
@@ -374,12 +498,38 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     if (pending?.provider === currentProvider) return pending.promise
 
     const promise = (async () => {
-      const result = await currentProvider.importDocument({
+      const result = await runRecoverableMutation({
+        currentProvider,
+        logicalKey: operationKey,
+        requestPrefix: 'document-import',
+        ...(idempotencyKey ? { preferredRequestId: idempotencyKey } : {}),
+        operation: 'document.import',
         sessionKey,
-        source: resource.resource,
-        expectedSha256,
-        idempotencyKey: idempotencyKey || stableImportIdempotencyKey(sessionKey, resource),
-        name: resource.name,
+        buildPayload: requestId => ({
+          sessionKey,
+          source: resource.resource,
+          expectedSha256,
+          idempotencyKey: requestId,
+          name: resource.name,
+        }),
+        execute: payload => currentProvider.importDocument({
+          sessionKey: payload.sessionKey as string,
+          source: payload.source as WorkbenchResourceRef,
+          expectedSha256: payload.expectedSha256 as string,
+          idempotencyKey: payload.idempotencyKey as string,
+          name: payload.name as string,
+        }),
+        onAppliedResolution: async resolution => {
+          if (
+            !resolution.document
+            || !resolution.revision
+            || resolution.revision.documentId !== resolution.document.documentId
+          ) throw artifactProductClientError('DOCUMENT_UNAVAILABLE')
+          return {
+            document: resolution.document,
+            revision: resolution.revision,
+          }
+        },
       })
       await load(sessionKey, true)
       return result
@@ -398,19 +548,38 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
     revisionId: string,
     name?: string,
     idempotencyKey?: string,
-  ): Promise<DocumentPublishResponse> {
+  ): Promise<DocumentPublishResponse | null> {
     const currentProvider = provider.value
     if (!currentProvider) throw new Error('Document publication is unavailable.')
     const operationKey = publicationOperationKey(sessionKey, documentId, revisionId)
-    const receiptKey = idempotencyKey || pendingPublishIdempotencyKey(operationKey)
-    const result = await currentProvider.publishDocument({
+    const persistedRequestId = idempotencyKey || pendingPublishIdempotencyKey(operationKey)
+    const result = await runRecoverableMutation({
+      currentProvider,
+      logicalKey: `publish:${operationKey}`,
+      requestPrefix: 'document-publish',
+      preferredRequestId: persistedRequestId,
+      operation: 'document.publish',
       sessionKey,
       documentId,
-      revisionId,
-      idempotencyKey: receiptKey,
-      name,
+      buildPayload: requestId => ({
+        sessionKey,
+        documentId,
+        revisionId,
+        idempotencyKey: requestId,
+        ...(name ? { name } : {}),
+      }),
+      execute: payload => currentProvider.publishDocument({
+        sessionKey: payload.sessionKey as string,
+        documentId: payload.documentId as string,
+        revisionId: payload.revisionId as string,
+        idempotencyKey: payload.idempotencyKey as string,
+        ...(typeof payload.name === 'string' ? { name: payload.name } : {}),
+      }),
+      onAppliedResolution: async () => null,
+      ...(!idempotencyKey
+        ? { onRelease: () => clearPendingPublishIdempotencyKey(operationKey) }
+        : {}),
     })
-    if (!idempotencyKey) clearPendingPublishIdempotencyKey(operationKey)
     await load(sessionKey, true)
     return result
   }
@@ -429,6 +598,7 @@ export const useWorkbenchResourcesStore = defineStore('workbenchResources', () =
   function reset() {
     abortAll()
     opens.clear()
+    mutationRequestIds.clear()
     snapshots.value = {}
   }
 

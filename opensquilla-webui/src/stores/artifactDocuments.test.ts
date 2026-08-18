@@ -86,7 +86,7 @@ function editableWorkspace(): ArtifactDocumentWorkspace {
       baseRevisionId: 'revision-old',
       turnId: 'turn-1',
       summary: 'Change heading',
-      status: 'applied',
+      status: 'applied' as const,
       operations: [{ op: 'replace' }],
       candidateArtifact: null,
       validation: { ok: true },
@@ -180,7 +180,7 @@ describe('artifact documents store', () => {
     expect(store.snapshot(artifact, 'session-a')).toMatchObject({
       loaded: true,
       stale: true,
-      error: 'document service unavailable',
+      error: 'The operation could not be completed. Try again.',
       workspace: { headArtifact: artifact },
     })
   })
@@ -214,7 +214,7 @@ describe('artifact documents store', () => {
       loaded: true,
       loading: false,
       stale: true,
-      error: 'document refresh timed out',
+      error: 'The operation could not be completed. Try again.',
       workspace: {
         source: 'document-api',
         document: { documentId: 'document-1', headRevisionId: 'revision-head' },
@@ -250,7 +250,7 @@ describe('artifact documents store', () => {
       .toBe('/api/v1/artifact-documents/document-1')
     expect(store.snapshot(artifact, 'session-a')).toMatchObject({
       stale: true,
-      error: 'Artifact document metadata is temporarily unavailable.',
+      error: 'This page is temporarily unavailable. Try again.',
       workspace: { source: 'document-api' },
     })
   })
@@ -308,20 +308,24 @@ describe('artifact documents store', () => {
   it('keeps restore and revert request identities stable across ambiguous retries', async () => {
     const workspace = editableWorkspace()
     const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
-    vi.mocked(provider.restoreRevision).mockRejectedValue(new Error('response lost'))
-    vi.mocked(provider.revertChangeSet).mockRejectedValue(new Error('response lost'))
+    const responseLost = () => Object.assign(new Error('response lost'), {
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: null,
+    })
+    vi.mocked(provider.restoreRevision).mockRejectedValue(responseLost())
+    vi.mocked(provider.revertChangeSet).mockRejectedValue(responseLost())
     const store = useArtifactDocumentsStore()
     store.setProvider(provider)
     await store.load(artifact, 'session-a')
 
     await expect(store.restoreRevision(artifact, 'session-a', 'revision-old'))
-      .rejects.toThrow('response lost')
+      .rejects.toThrow('cannot be confirmed')
     await expect(store.restoreRevision(artifact, 'session-a', 'revision-old'))
-      .rejects.toThrow('response lost')
+      .rejects.toThrow('cannot be confirmed')
     await expect(store.revertChangeSet(artifact, 'session-a', 'change-applied'))
-      .rejects.toThrow('response lost')
+      .rejects.toThrow('cannot be confirmed')
     await expect(store.revertChangeSet(artifact, 'session-a', 'change-applied'))
-      .rejects.toThrow('response lost')
+      .rejects.toThrow('cannot be confirmed')
 
     const restoreIds = vi.mocked(provider.restoreRevision).mock.calls
       .map(call => String(call[0].clientRequestId))
@@ -334,6 +338,64 @@ describe('artifact documents store', () => {
     expect(new Set(revertIds)).toEqual(new Set([revertIds[0]]))
     expect(revertIds[0]).toMatch(/^document-revert-/)
     expect(revertIds[0]).not.toBe(restoreIds[0])
+  })
+
+  it('accepts a durable applied restore resolution without replaying the write', async () => {
+    const workspace = editableWorkspace()
+    const responseLost = Object.assign(new Error('private transport detail'), {
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: null,
+    })
+    const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
+    vi.mocked(provider.restoreRevision).mockRejectedValue(responseLost)
+    provider.resolveMutation = vi.fn(async () => ({
+      status: 'applied' as const,
+      retryAfterMs: null,
+      result: {
+        documentId: workspace.document.documentId,
+        revisionId: 'revision-old',
+        sha256: 'a'.repeat(64),
+        stateRevision: workspace.document.stateRevision + 1,
+      },
+    }))
+    const store = useArtifactDocumentsStore()
+    store.setProvider(provider)
+    await store.load(artifact, 'session-a')
+
+    await expect(store.restoreRevision(artifact, 'session-a', 'revision-old'))
+      .resolves.toEqual(workspace)
+    expect(provider.restoreRevision).toHaveBeenCalledTimes(1)
+    expect(provider.resolveMutation).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases a not-applied restore identity before the next retry', async () => {
+    const workspace = editableWorkspace()
+    const responseLost = Object.assign(new Error('private transport detail'), {
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: null,
+    })
+    const provider = providerWithLoad(vi.fn().mockResolvedValue(workspace))
+    vi.mocked(provider.restoreRevision)
+      .mockRejectedValueOnce(responseLost)
+      .mockResolvedValueOnce(workspace.revisions[1]!)
+    provider.resolveMutation = vi.fn(async () => ({
+      status: 'not_applied' as const,
+      retryAfterMs: null,
+      result: null,
+    }))
+    const store = useArtifactDocumentsStore()
+    store.setProvider(provider)
+    await store.load(artifact, 'session-a')
+
+    await expect(store.restoreRevision(artifact, 'session-a', 'revision-old'))
+      .rejects.toMatchObject({ code: 'MUTATION_NOT_APPLIED' })
+    await expect(store.restoreRevision(artifact, 'session-a', 'revision-old'))
+      .resolves.toEqual(workspace)
+
+    const requestIds = vi.mocked(provider.restoreRevision).mock.calls
+      .map(call => String(call[0].clientRequestId))
+    expect(requestIds).toHaveLength(2)
+    expect(requestIds[1]).not.toBe(requestIds[0])
   })
 
   it('fails closed for stale or unscoped review mutations', async () => {

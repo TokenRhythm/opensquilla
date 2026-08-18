@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+from lxml import html as lxml_html  # type: ignore[import-untyped]
 from starlette.applications import Starlette
 
 import opensquilla.gateway.desktop_artifact_bridge as desktop_artifact_bridge
@@ -21,6 +22,11 @@ from opensquilla.artifact_session import (
     ArtifactBlobRef,
     ArtifactSessionService,
     MutationAttemptStatus,
+)
+from opensquilla.artifact_session.html_anchors import (
+    canonical_browser_dom_digest,
+    canonical_element_at_path,
+    canonical_element_proof_sha256,
 )
 from opensquilla.artifacts import (
     ArtifactBundle,
@@ -113,11 +119,11 @@ async def _adopt_html(env, source: bytes = b"<h1>before</h1>"):
 
 
 def _annotation_proofs(html: str, element_path: str) -> tuple[str, str]:
-    parser = artifact_editing_rpc.lxml_html.HTMLParser(recover=True, no_network=True)
-    root = artifact_editing_rpc.lxml_html.document_fromstring(html, parser=parser)
-    dom_sha256 = artifact_editing_rpc._browser_dom_digest(root, source=html)
-    selected = artifact_editing_rpc._element_at_path(root, element_path)
-    element_proof_sha256 = artifact_editing_rpc._element_proof_sha256(
+    parser = lxml_html.HTMLParser(recover=True, no_network=True)
+    root = lxml_html.document_fromstring(html, parser=parser)
+    dom_sha256 = canonical_browser_dom_digest(root, source=html)
+    selected = canonical_element_at_path(root, element_path)
+    element_proof_sha256 = canonical_element_proof_sha256(
         root,
         selected=selected,
     )
@@ -248,7 +254,7 @@ async def test_prompt_annotation_create_replay_does_not_reuse_native_candidate(
             {**params, **mutation},
         )
         assert mismatched.error is not None
-        assert mismatched.error.code == "ARTIFACT_CONFLICT"
+        assert mismatched.error.code == "ANNOTATION_BUSY"
         assert bridge.resolve_calls == 1
 
     other_session_key = "agent:main:webchat:artifact-editing-other"
@@ -259,7 +265,8 @@ async def test_prompt_annotation_create_replay_does_not_reuse_native_candidate(
         {**params, "sessionKey": other_session_key},
     )
     assert cross_session.error is not None
-    assert cross_session.error.code == "NOT_FOUND"
+    assert cross_session.error.code == "DOCUMENT_UNAVAILABLE"
+    assert cross_session.error.details == {"reasonCode": "resource_unavailable"}
     assert bridge.resolve_calls == 1
 
     discarded = await _dispatch(
@@ -274,7 +281,7 @@ async def test_prompt_annotation_create_replay_does_not_reuse_native_candidate(
     assert discarded.error is None, discarded.error
     terminal_replay = await _dispatch(env, "artifacts.prompt_annotations.create", params)
     assert terminal_replay.error is not None
-    assert terminal_replay.error.code == "ARTIFACT_CONFLICT"
+    assert terminal_replay.error.code == "ANNOTATION_BUSY"
     assert bridge.resolve_calls == 1
     assert await _annotation_row_counts(env) == counts_after_commit
 
@@ -383,7 +390,8 @@ async def test_invalid_utf8_html_never_advertises_source_or_preview_annotations(
         {"sessionKey": SESSION_KEY, "documentId": document["id"]},
     )
     assert source.error is not None
-    assert source.error.code == "ARTIFACT_SOURCE_ENCODING"
+    assert source.error.code == "RESOURCE_UNSUPPORTED"
+    assert source.error.details == {"reasonCode": "encoding_unsupported"}
 
 
 @pytest.mark.asyncio
@@ -536,13 +544,13 @@ async def test_prompt_annotation_accepts_unrelated_runtime_dom_mutation(
 
     assert created.error is None, created.error
     anchor_context = created.payload["annotation"]["anchor"]["context"]
-    assert anchor_context == {
-        "element_path": element_path,
-        "element_proof_sha256": source_element_proof,
-        "opening_tag_sha256": hashlib.sha256(
-            b'<section class="target">'
-        ).hexdigest(),
-    }
+    assert anchor_context["element_path"] == element_path
+    assert anchor_context["element_proof_sha256"] == source_element_proof
+    assert anchor_context["opening_tag_sha256"] == hashlib.sha256(
+        b'<section class="target">'
+    ).hexdigest()
+    assert anchor_context["semantic_profile_v1"]["tag_name"] == "section"
+    assert anchor_context["semantic_profile_v1"]["normalized_text"] == "Title"
     assert "dom_sha256" not in anchor_context
     assert await _annotation_row_counts(env) == (1, 1, 1)
 
@@ -604,7 +612,8 @@ async def test_prompt_annotation_rejects_wrong_active_artifact_before_persistenc
     )
 
     assert rejected.error is not None
-    assert rejected.error.code == "ARTIFACT_PREVIEW_CHANGED"
+    assert rejected.error.code == "ANNOTATION_UNAVAILABLE"
+    assert rejected.error.details == {"reasonCode": "preview_changed"}
     assert rejected.error.accepted is False
     assert bridge.resolve_calls[0]["active_preview_artifact_id"] == target_ref.id
     assert wrong_ref.id != target_ref.id
@@ -674,7 +683,8 @@ async def test_prompt_annotation_head_race_rolls_back_anchor_draft_and_audit(
     )
 
     assert rejected.error is not None
-    assert rejected.error.code == "ARTIFACT_CONFLICT"
+    assert rejected.error.code == "ANNOTATION_BUSY"
+    assert "revision" not in rejected.error.message.lower()
     assert rejected.error.accepted is False
     assert await _annotation_row_counts(env) == (0, 0, 0)
 
@@ -770,7 +780,8 @@ async def test_prompt_annotation_changed_element_fails_before_persistence(
     )
 
     assert rejected.error is not None
-    assert rejected.error.code == "ARTIFACT_ELEMENT_CHANGED"
+    assert rejected.error.code == "DOCUMENT_CHANGED"
+    assert "element" not in rejected.error.message.lower()
     assert rejected.error.accepted is False
     assert len(bridge.resolve_calls) == 1
     assert await _annotation_row_counts(env) == (0, 0, 0)
@@ -837,7 +848,8 @@ async def test_incomplete_single_entrypoint_bundle_remains_preview_only(
         {"sessionKey": SESSION_KEY, "documentId": document["id"]},
     )
     assert source.error is not None
-    assert source.error.code == "ARTIFACT_SOURCE_UNSUPPORTED"
+    assert source.error.code == "RESOURCE_UNSUPPORTED"
+    assert source.error.details == {"reasonCode": "bundle_unsupported"}
 
 
 @pytest.mark.asyncio
@@ -900,7 +912,8 @@ async def test_html_preview_bundle_is_preview_only_and_source_tools_are_not_boun
         {"sessionKey": SESSION_KEY, "documentId": document["id"]},
     )
     assert source.error is not None
-    assert source.error.code == "ARTIFACT_SOURCE_UNSUPPORTED"
+    assert source.error.code == "RESOURCE_UNSUPPORTED"
+    assert source.error.details == {"reasonCode": "bundle_unsupported"}
 
     revisions_before = await _dispatch(
         env,
@@ -927,7 +940,8 @@ async def test_html_preview_bundle_is_preview_only_and_source_tools_are_not_boun
         },
     )
     assert patched.error is not None
-    assert patched.error.code == "ARTIFACT_SOURCE_UNSUPPORTED"
+    assert patched.error.code == "RESOURCE_UNSUPPORTED"
+    assert patched.error.details == {"reasonCode": "bundle_unsupported"}
     current = await _dispatch(
         env,
         "artifacts.documents.get",
@@ -956,17 +970,10 @@ async def test_html_preview_bundle_is_preview_only_and_source_tools_are_not_boun
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("invalid_case", "expected_code"),
-    [
-        ("nul", "DOCUMENT_HTML_ENCODING_INVALID"),
-        ("oversized", "DOCUMENT_CANDIDATE_SIZE_INVALID"),
-    ],
-)
+@pytest.mark.parametrize("invalid_case", ["nul", "oversized"])
 async def test_source_patch_rejects_invalid_html_before_durable_mutation(
     artifact_editing_env,
     invalid_case: str,
-    expected_code: str,
 ) -> None:
     env = artifact_editing_env
     _ref, document = await _adopt_html(env)
@@ -1019,7 +1026,8 @@ async def test_source_patch_rejects_invalid_html_before_durable_mutation(
     )
 
     assert rejected.error is not None
-    assert rejected.error.code == expected_code
+    assert rejected.error.code == "INVALID_REQUEST"
+    assert rejected.error.details == {"reasonCode": "invalid_source_edit"}
     current = await _dispatch(
         env,
         "artifacts.documents.get",
@@ -1091,7 +1099,8 @@ async def test_legacy_ref_is_lazily_adopted_and_source_patch_is_cas_safe(
         },
     )
     assert ambiguous_patches.error is not None
-    assert "share a start offset" in ambiguous_patches.error.message
+    assert ambiguous_patches.error.code == "INVALID_REQUEST"
+    assert ambiguous_patches.error.details == {"reasonCode": "invalid_source_edit"}
 
     patch_params = {
         "sessionKey": SESSION_KEY,
@@ -1137,7 +1146,7 @@ async def test_legacy_ref_is_lazily_adopted_and_source_patch_is_cas_safe(
         },
     )
     assert mismatched_replay.error is not None
-    assert mismatched_replay.error.code == "ARTIFACT_CONFLICT"
+    assert mismatched_replay.error.code == "DOCUMENT_CHANGED"
 
     # Internal revision blobs stay addressable through revision history but do
     # not become duplicate chat artifacts in the legacy list.
@@ -1166,7 +1175,7 @@ async def test_legacy_ref_is_lazily_adopted_and_source_patch_is_cas_safe(
         },
     )
     assert stale_head.error is not None
-    assert stale_head.error.code == "ARTIFACT_CONFLICT"
+    assert stale_head.error.code == "DOCUMENT_CHANGED"
 
     current_source = await _dispatch(
         env,
@@ -1187,8 +1196,8 @@ async def test_legacy_ref_is_lazily_adopted_and_source_patch_is_cas_safe(
         },
     )
     assert wrong_source_hash.error is not None
-    assert wrong_source_hash.error.code == "ARTIFACT_CONFLICT"
-    assert "sha256" in wrong_source_hash.error.message
+    assert wrong_source_hash.error.code == "DOCUMENT_CHANGED"
+    assert "sha256" not in wrong_source_hash.error.message.lower()
 
     metadata_before = list((Path(env.store.media_root)).rglob("meta.json"))
     stale_state = await _dispatch(
@@ -1204,7 +1213,7 @@ async def test_legacy_ref_is_lazily_adopted_and_source_patch_is_cas_safe(
         },
     )
     assert stale_state.error is not None
-    assert stale_state.error.code == "ARTIFACT_CONFLICT"
+    assert stale_state.error.code == "DOCUMENT_CHANGED"
     assert list((Path(env.store.media_root)).rglob("meta.json")) == metadata_before
     attempt_cursor = await env.storage.conn.execute(
         "SELECT COUNT(*) FROM artifact_mutation_attempts WHERE document_id = ?",
@@ -1450,7 +1459,7 @@ async def test_edit_session_lifecycle_is_idempotent_and_heartbeat_is_atomic(
     assert sum(response.error is None for response in heartbeats) == 1
     rejected = next(response for response in heartbeats if response.error is not None)
     assert rejected.error is not None
-    assert rejected.error.code == "ARTIFACT_CONFLICT"
+    assert rejected.error.code == "EDIT_SESSION_RENEWAL_REQUIRED"
     heartbeat = next(response for response in heartbeats if response.error is None)
     touched = heartbeat.payload["editSession"]
     assert touched["stateRevision"] == 2
@@ -1585,7 +1594,7 @@ async def test_session_bound_source_patch_advances_session_and_fails_closed(
         },
     )
     assert stale.error is not None
-    assert stale.error.code == "ARTIFACT_CONFLICT"
+    assert stale.error.code == "EDIT_SESSION_RENEWAL_REQUIRED"
     assert len(await service.list_revisions(document["id"])) == 2
     assert len(await service.list_change_sets(document["id"])) == 1
     assert await service.list_mutation_attempts_by_turn_ids(
@@ -1622,7 +1631,7 @@ async def test_session_bound_source_patch_advances_session_and_fails_closed(
         },
     )
     assert closed_save.error is not None
-    assert closed_save.error.code == "ARTIFACT_CONFLICT"
+    assert closed_save.error.code == "EDIT_SESSION_RENEWAL_REQUIRED"
     assert len(await service.list_revisions(document["id"])) == 2
     assert len(await service.list_change_sets(document["id"])) == 1
     assert await service.list_mutation_attempts_by_turn_ids(
@@ -1663,7 +1672,7 @@ async def test_session_bound_source_patch_advances_session_and_fails_closed(
         },
     )
     assert expired_save.error is not None
-    assert expired_save.error.code == "ARTIFACT_CONFLICT"
+    assert expired_save.error.code == "EDIT_SESSION_RENEWAL_REQUIRED"
     assert len(await service.list_revisions(document["id"])) == 2
     assert len(await service.list_change_sets(document["id"])) == 1
     assert await service.list_mutation_attempts_by_turn_ids(
@@ -1759,7 +1768,7 @@ async def test_edit_session_start_key_is_scoped_and_expired_heartbeat_does_not_r
         },
     )
     assert reused.error is not None
-    assert reused.error.code == "ARTIFACT_CONFLICT"
+    assert reused.error.code == "WRITE_BUSY"
 
     edit_session = started.payload["editSession"]
     service = await ArtifactSessionService.from_session_storage(env.storage)
@@ -1779,7 +1788,7 @@ async def test_edit_session_start_key_is_scoped_and_expired_heartbeat_does_not_r
         },
     )
     assert expired.error is not None
-    assert expired.error.code == "ARTIFACT_CONFLICT"
+    assert expired.error.code == "EDIT_SESSION_RENEWAL_REQUIRED"
     lease_after = await service.get_writer_lease(first_document["id"])
     assert lease_after is None
     source = await _dispatch(
@@ -1805,7 +1814,7 @@ async def test_edit_session_start_key_is_scoped_and_expired_heartbeat_does_not_r
         },
     )
     assert expired_save.error is not None
-    assert expired_save.error.code == "ARTIFACT_CONFLICT"
+    assert expired_save.error.code == "EDIT_SESSION_RENEWAL_REQUIRED"
     assert len(await service.list_revisions(first_document["id"])) == 1
     assert await service.list_change_sets(first_document["id"]) == ()
 
@@ -1846,7 +1855,7 @@ async def test_concurrent_manual_source_patches_commit_one_revision_and_change_s
     assert sum(response.error is None for response in responses) == 1
     rejected = next(response for response in responses if response.error is not None)
     assert rejected.error is not None
-    assert rejected.error.code == "ARTIFACT_CONFLICT"
+    assert rejected.error.code == "DOCUMENT_CHANGED"
     service = await ArtifactSessionService.from_session_storage(env.storage)
     assert len(await service.list_revisions(document["id"])) == 2
     assert len(await service.list_change_sets(document["id"])) == 1
@@ -1908,7 +1917,11 @@ async def test_source_patch_reconciles_candidate_cleanup_across_commit_errors(
         expected_status = MutationAttemptStatus.APPLIED
     else:
         assert patched.error is not None
-        assert patched.error.code == "INTERNAL_ERROR"
+        assert patched.error.code == "MUTATION_OUTCOME_PENDING"
+        assert patched.error.accepted is None
+        assert patched.error.details is not None
+        assert patched.error.details["correlationId"]
+        assert "synthetic" not in patched.error.message
         assert list((Path(env.store.media_root)).rglob("meta.json")) == metadata_before
         current = await ArtifactSessionService.from_session_storage(env.storage)
         assert (await current.get_document(document["id"])).head_revision_id == document[
@@ -1967,7 +1980,8 @@ async def test_manual_source_patch_cleanup_ambiguity_is_restart_recoverable(
         },
     )
     assert patched.error is not None
-    assert patched.error.code == "ARTIFACT_MUTATION_CLEANUP_AMBIGUOUS"
+    assert patched.error.code == "MUTATION_OUTCOME_PENDING"
+    assert patched.error.details == {"reasonCode": "cleanup_pending"}
 
     service = await ArtifactSessionService.from_session_storage(env.storage)
     turn_id = f"manual-source-patch:{client_request_id}"
@@ -2100,7 +2114,7 @@ async def test_restore_and_applied_change_revert_preserve_history(
         {**restore_params, "clientRequestId": "stale-restore"},
     )
     assert stale_restore.error is not None
-    assert stale_restore.error.code == "ARTIFACT_CONFLICT"
+    assert stale_restore.error.code == "DOCUMENT_CHANGED"
     assert len(await service.list_revisions(initial_document["id"])) == restore_revision_count
     assert len(await service.list_change_sets(initial_document["id"])) == restore_change_count
 
@@ -2210,7 +2224,8 @@ async def test_restore_and_applied_change_revert_preserve_history(
         },
     )
     assert stale_revert.error is not None
-    assert stale_revert.error.code == "ARTIFACT_CHANGE_NOT_HEAD"
+    assert stale_revert.error.code == "DOCUMENT_CHANGED"
+    assert stale_revert.error.details == {"reasonCode": "change_not_current"}
 
     reverted_source = await _dispatch(
         env,
@@ -2393,12 +2408,13 @@ async def test_prompt_annotation_selection_is_revalidated_and_persisted_as_ancho
         {"sessionKey": SESSION_KEY, "annotationId": annotation["id"]},
     )
     assert discarded_focus.error is not None
-    assert discarded_focus.error.code == "ARTIFACT_ANNOTATION_NOT_DRAFT"
+    assert discarded_focus.error.code == "ANNOTATION_UNAVAILABLE"
+    assert discarded_focus.error.details == {"reasonCode": "not_draft"}
     assert len(fake_bridge.focus_calls) == 1
 
 
 @pytest.mark.asyncio
-async def test_prompt_annotation_focus_fails_closed_before_desktop_call(
+async def test_prompt_annotation_focus_handles_bridge_loss_and_remaps_current_head(
     artifact_editing_env,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2414,6 +2430,7 @@ async def test_prompt_annotation_focus_fails_closed_before_desktop_call(
     class FakeBridge:
         def __init__(self) -> None:
             self.focus_calls = 0
+            self.last_focus_kwargs: dict[str, object] | None = None
 
         async def resolve_annotation_selection(self, **kwargs):
             return SimpleNamespace(
@@ -2426,8 +2443,9 @@ async def test_prompt_annotation_focus_fails_closed_before_desktop_call(
                 scope_id=SESSION_KEY,
             )
 
-        async def focus_annotation(self, **_kwargs):
+        async def focus_annotation(self, **kwargs):
             self.focus_calls += 1
+            self.last_focus_kwargs = kwargs
             return True
 
     fake_bridge = FakeBridge()
@@ -2471,7 +2489,8 @@ async def test_prompt_annotation_focus_fails_closed_before_desktop_call(
         {"sessionKey": SESSION_KEY, "annotationId": annotation_id},
     )
     assert unavailable.error is not None
-    assert unavailable.error.code == "ARTIFACT_FOCUS_UNAVAILABLE"
+    assert unavailable.error.code == "ANNOTATION_UNAVAILABLE"
+    assert unavailable.error.details == {"reasonCode": "preview_unavailable"}
     assert fake_bridge.focus_calls == 0
 
     monkeypatch.setattr(
@@ -2489,7 +2508,21 @@ async def test_prompt_annotation_focus_fails_closed_before_desktop_call(
         "artifacts.source.read",
         {"sessionKey": SESSION_KEY, "documentId": document["id"]},
     )
-    start = html.index("one")
+    updated_html = '<main><section><p style="color:blue">one</p></section></main>'
+    updated_element_path = json.dumps(
+        [
+            ["", "html", 1],
+            ["", "body", 1],
+            ["", "main", 1],
+            ["", "section", 1],
+            ["", "p", 1],
+        ],
+        separators=(",", ":"),
+    )
+    _updated_dom_sha256, updated_element_proof_sha256 = _annotation_proofs(
+        updated_html,
+        updated_element_path,
+    )
     patched = await _dispatch(
         env,
         "artifacts.source.patch",
@@ -2499,18 +2532,33 @@ async def test_prompt_annotation_focus_fails_closed_before_desktop_call(
             "expectedHeadRevisionId": current.payload["document"]["headRevisionId"],
             "expectedStateRevision": current.payload["document"]["stateRevision"],
             "expectedSourceSha256": source.payload["source"]["sha256"],
-            "patches": [{"startOffset": start, "endOffset": start + 3, "replacement": "two"}],
+            "patches": [
+                {
+                    "startOffset": 0,
+                    "endOffset": len(html),
+                    "replacement": updated_html,
+                }
+            ],
         },
     )
     assert patched.error is None, patched.error
-    stale = await _dispatch(
+    remapped = await _dispatch(
         env,
         "artifacts.prompt_annotations.focus",
         {"sessionKey": SESSION_KEY, "annotationId": annotation_id},
     )
-    assert stale.error is not None
-    assert stale.error.code == "ARTIFACT_REVISION_CHANGED"
-    assert fake_bridge.focus_calls == 0
+    assert remapped.error is None, remapped.error
+    assert fake_bridge.focus_calls == 1
+    assert fake_bridge.last_focus_kwargs is not None
+    assert (
+        fake_bridge.last_focus_kwargs["active_preview_artifact_id"]
+        == patched.payload["revision"]["artifactId"]
+    )
+    assert fake_bridge.last_focus_kwargs["element_path"] == updated_element_path
+    assert (
+        fake_bridge.last_focus_kwargs["element_proof_sha256"]
+        == updated_element_proof_sha256
+    )
 
 
 @pytest.mark.asyncio
@@ -2590,7 +2638,10 @@ async def test_prompt_annotation_focus_rejects_another_active_artifact_in_same_s
     )
 
     assert rejected.error is not None
-    assert rejected.error.code == "ARTIFACT_FOCUS_UNAVAILABLE"
+    assert rejected.error.code == "ANNOTATION_UNAVAILABLE"
+    assert rejected.error.details is not None
+    assert rejected.error.details["reasonCode"] == "preview_unavailable"
+    assert rejected.error.details["correlationId"]
     assert rejected.error.accepted is False
     assert bridge.focus_calls == [
         {
@@ -2739,7 +2790,8 @@ async def test_html_source_offsets_are_unicode_code_points_across_non_bmp_text(
         },
     )
     assert unsupported.error is not None
-    assert "offsetEncoding" in unsupported.error.message
+    assert unsupported.error.code == "INVALID_REQUEST"
+    assert unsupported.error.details == {"reasonCode": "invalid_source_edit"}
 
 
 @pytest.mark.asyncio

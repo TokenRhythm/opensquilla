@@ -266,6 +266,30 @@ class PromptAnnotation:
 
 
 @dataclass(frozen=True, slots=True)
+class PreparedPromptAnnotationTarget:
+    """Send-time anchor replacement fenced by one immutable draft snapshot.
+
+    HTML parsing happens before turn acceptance.  This bounded value is then
+    applied inside SessionStorage's acceptance transaction, where the document
+    head and draft CAS are checked again before any transcript, task, or
+    request receipt becomes visible.
+    """
+
+    expected_annotation: PromptAnnotation
+    previous_anchor_id: str
+    anchor_id: str
+    audit_event_id: str
+    revision_id: str
+    kind: AnchorKind
+    locator: dict[str, Any]
+    quote: str | None
+    context: dict[str, Any]
+    state: AnchorState
+    actor_kind: ActorKind
+    actor_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class MutationAttempt:
     """Durable idempotency receipt for one document mutation in one turn."""
 

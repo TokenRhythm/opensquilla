@@ -6,6 +6,23 @@ attach trusted document context to the next chat message. The active agent may
 answer from that context without writing the document, or apply selected edits
 as one reversible change set when the request requires a mutation.
 
+## User experience
+
+An HTML file has one identity and a visible version history. Opening it shows
+the current page; Source, Versions, and Changes are adjacent views of that same
+file. A user never imports a working copy or chooses between a generated file
+and an editable file.
+
+Annotations follow the page. If the user or OpenSquilla changes the HTML after
+an annotation is created, the Gateway resolves the instruction against the
+current page when the message is sent. A uniquely identified element remains
+an exact target. If the element moved, was rewritten, or can no longer be
+identified uniquely, the instruction is still sent as bounded page context so
+the model can attempt a safe current-page match. One unresolved annotation
+does not prevent other exact annotations in the same message from being
+applied. The original generated/downloadable file and every prior version stay
+unchanged in history.
+
 Versioned HTML resources are enabled by default. Source-backed DOM annotations
 default on only in Electron builds that synchronously expose the complete
 native protocol-v3 annotation bridge; browser-hosted Web UI and older or
@@ -78,13 +95,15 @@ The following contracts must remain true:
 - Edit sessions retain only editor baseline and lifecycle state. They never
   retain writer authority; each manual save acquires and releases one short
   writer lease around its commit.
-- A send batch contains at most 16 annotations and belongs to one session,
-  document, revision, and current head.
+- A send batch contains at most 16 annotations and belongs to one session and
+  document. Draft targets are normalized to the current head during turn
+  acceptance.
 - An instruction is limited to 16 KiB of UTF-8 data. The rendered active-turn
   context is limited to 64 KiB.
-- A changed head makes all remaining drafts for that revision stale. Stale,
-  ambiguous, cross-session, or mismatched selections fail before any provider
-  call.
+- A changed head deterministically remaps remaining drafts during acceptance.
+  Unique matches become current exact targets; missing or ambiguous matches
+  become contextual targets. Cross-session or mismatched document ownership
+  still fails before any provider call.
 - The active turn receives the bounded instruction and source quote. Later
   turns receive only an inert historical marker, so an old instruction cannot
   silently run again.
@@ -109,7 +128,7 @@ The renderer resolves two independent feature defaults in
 `opensquilla-webui/src/stores/app.ts`:
 
 - `documentWorkbenchResources` defaults to `true` and enables resource
-  discovery, uploaded HTML preview, explicit copy import, and versioned editing;
+  discovery, HTML preview, silent legacy materialization, and versioned editing;
 - `artifactPromptAnnotations` defaults to `true` only when the client is
   Electron Desktop and every native surface, preview-lease, screenshot, and
   protocol-v3 annotation bridge method required by the flow is present at app
@@ -155,8 +174,8 @@ override is an operational/testing boundary, not a persisted user preference.
 The initial supported surface is deliberately small:
 
 - Electron Desktop only;
-- a single-file `.html`/`.htm` Document imported from a session attachment or
-  immutable deliverable;
+- a single-file `.html`/`.htm` Document generated in a session or materialized
+  from an older attachment or deliverable;
 - strict UTF-8 source of at most the editor limit;
 - one or more top-frame DOM elements whose path, tag, attributes, and ancestor
   identity map uniquely to opening tags in the canonical source;
@@ -237,7 +256,7 @@ pre-upgrade profile backup instead of attempting ad hoc SQL surgery.
 - Desktop derives the active preview's immutable artifact identity from the
   Gateway-authorized preview lease, never from annotation parameters supplied
   by the renderer. Selection resolution and later focus both require that
-  identity to match the target revision before any anchor or draft is written.
+  identity to match the active document before any anchor or draft is written.
 - The renderer sends an opaque selection handle. The Gateway rereads the
   current head and validates the selected element's source-backed ancestor
   proof, unique path, source SHA, opening-tag boundaries, anchor, session epoch,
@@ -317,10 +336,10 @@ changed ancestor, wrong active artifact, or runtime-only path still fails
 closed before draft persistence.
 
 The offline document Workbench gate additionally composes an owned-Gateway
-WebSocket lifecycle (preview, import, EditSession save, exact-four agent edit,
+WebSocket lifecycle (preview, materialization, EditSession save, exact-four agent edit,
 backend publication-journal and immutable-source checks) with the real Electron
-native surface suite. Its V1 user-journey fixture starts the current Vue UI and
-owned Gateway, imports synthetic HTML through `Edit a copy`, selects through the
+native surface suite. Its user-journey fixture starts the current Vue UI and
+owned Gateway, generates synthetic HTML as one editable file, selects through the
 native picker and trusted overlay, applies exactly one Agent change, observes
 Preview plus Versions/Changes refresh, and proves an answer-only follow-up adds
 no durable write. It is credential-free and requires Electron foreground focus;
@@ -390,7 +409,7 @@ For each release:
    the release candidate.
 2. Complete the live Direct/Router/Ensemble matrix with an isolated profile.
 3. Canary the exact Desktop build and watch sanitized audit events,
-   stale-selection rates, validation failures, and orphan cleanup.
+   annotation remap outcomes, validation failures, and orphan cleanup.
 4. Keep the default enabled only while the one-turn/one-change-set, zero-call
    rejection, and Aggregator-only mutation invariants remain true.
 

@@ -46,7 +46,7 @@
           <span class="msg-prompt-annotation__body">
             <span class="msg-prompt-annotation__meta">
               {{ annotation.documentName }} ·
-              {{ annotation.tagName ? `<${annotation.tagName}>` : t('chat.promptAnnotations.element') }}
+              {{ promptAnnotationTargetLabel(annotation, t) }}
             </span>
             <span class="msg-prompt-annotation__text">{{ annotation.body }}</span>
           </span>
@@ -73,7 +73,6 @@
           <span class="msg-prompt-annotations__status-dot" aria-hidden="true" />
           <span class="msg-prompt-annotations__status-copy">
             <strong>{{ promptAnnotationStatusLabel }}</strong>
-            <small v-if="promptAnnotationStatusDetail">{{ promptAnnotationStatusDetail }}</small>
           </span>
         </span>
       </div>
@@ -103,11 +102,11 @@
               type="button"
               class="msg-file-chip"
               :class="{ 'msg-file-chip--failed': failedDownloads.has(attachment.renderKey) }"
-              :title="attachmentDownloadLabel(attachment)"
-              :aria-label="attachmentDownloadLabel(attachment)"
+              :title="attachmentPrimaryActionLabel(attachment)"
+              :aria-label="attachmentPrimaryActionLabel(attachment)"
               :aria-busy="downloadingAttachments.has(attachment.renderKey)"
               :disabled="downloadingAttachments.has(attachment.renderKey)"
-              @click.stop="downloadAttachment(attachment)"
+              @click.stop="activateAttachment(attachment)"
             >
               <span class="msg-file-chip__icon" aria-hidden="true">
                 <span v-if="downloadingAttachments.has(attachment.renderKey)" class="spinner msg-file-chip__spinner" />
@@ -120,30 +119,19 @@
               </span>
             </button>
             <span
-              v-if="(
-                workbenchResourcePreviewEnabled || workbenchResourceEditEnabled
-              ) && workbenchAttachmentResource(attachment) && !shareMode"
+              v-if="workbenchAttachmentResource(attachment) && !shareMode"
               class="msg-file-resource__actions"
             >
               <button
-                v-if="workbenchResourcePreviewEnabled"
+                v-if="attachmentCanOpen(attachment)"
                 type="button"
-                :title="attachmentActionLabel(attachment, 'preview')"
-                :aria-label="attachmentActionLabel(attachment, 'preview')"
-                :disabled="!attachmentActionAvailable(attachment, 'preview')"
-                @click.stop="emit('previewAttachment', attachment)"
+                :title="attachmentDownloadLabel(attachment)"
+                :aria-label="attachmentDownloadLabel(attachment)"
+                :aria-busy="downloadingAttachments.has(attachment.renderKey)"
+                :disabled="downloadingAttachments.has(attachment.renderKey)"
+                @click.stop="downloadAttachment(attachment)"
               >
-                <Icon name="eye" :size="14" />
-              </button>
-              <button
-                v-if="workbenchResourceEditEnabled"
-                type="button"
-                :title="attachmentActionLabel(attachment, 'edit')"
-                :aria-label="attachmentActionLabel(attachment, 'edit')"
-                :disabled="!attachmentActionAvailable(attachment, 'edit')"
-                @click.stop="emit('editAttachment', attachment)"
-              >
-                <Icon name="edit" :size="14" />
+                <Icon name="download" :size="14" />
               </button>
               <span
                 v-if="attachmentUnavailableReason(attachment)"
@@ -218,8 +206,8 @@ import { useRelativeNow } from '@/composables/useRelativeNow'
 import type {
   ChatRenderedMessage,
   DisplayAttachment,
-  DocumentMutationStatus,
 } from '@/types/chat'
+import { promptAnnotationTargetLabel } from '@/utils/chat/promptAnnotationPresentation'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { isImageDisplayAttachment } from '@/utils/chat/attachments'
@@ -229,7 +217,6 @@ import {
 } from '@/utils/chat/turnOutcome'
 import { absoluteTime, fullTime, isoTime, relativeTime } from '@/utils/messageTime'
 import {
-  type WorkbenchResourceAction,
   workbenchResourceActionReasonCode,
   workbenchResourceUnavailableReasonKey,
 } from '@/workbench/resourceCapabilityPresentation'
@@ -273,7 +260,7 @@ const timeAbs = computed(() => absoluteTime(props.message.ts))
 const timeRel = computed(() => relativeTime(props.message.ts, now.value, t))
 const timeFull = computed(() => fullTime(props.message.ts))
 
-type PromptAnnotationTurnStatus = Exclude<DocumentMutationStatus, 'not_attempted'>
+type PromptAnnotationTurnStatus = 'applied' | 'not_applied' | 'ambiguous'
 
 const documentMutationOutcome = computed(() => props.message.turnOutcome?.documentMutationOutcome)
 const showTurnOutcomeStatus = computed(() => Boolean(
@@ -290,26 +277,19 @@ const showTurnOutcomeStatus = computed(() => Boolean(
 const promptAnnotationStatus = computed<PromptAnnotationTurnStatus | null>(() => {
   if (!props.message.promptAnnotations?.length) return null
   const status = documentMutationOutcome.value?.status
-  return status && status !== 'not_attempted' ? status : null
+  if (!status) return null
+  if (status === 'applied') return 'applied'
+  if (status === 'ambiguous') return 'ambiguous'
+  return 'not_applied'
 })
 
 const promptAnnotationStatusLabel = computed(() => {
   const status = promptAnnotationStatus.value
   if (!status) return ''
-  const corrected = status === 'applied' && (
-    documentMutationOutcome.value?.corrected === true
-    || Number(documentMutationOutcome.value?.proposalAttempts || 0) > 1
-  )
-  return t(`chat.promptAnnotations.status.${corrected ? 'appliedCorrected' : status}`)
-})
-const promptAnnotationStatusDetail = computed(() => {
-  const status = documentMutationOutcome.value?.status
-  return status ? t(`chat.promptAnnotations.statusDetail.${status}`) : ''
+  return t(`chat.promptAnnotations.status.${status}`)
 })
 const promptAnnotationStatusRole = computed<'alert' | 'status'>(() => (
-  ['not_applied', 'conflict', 'ambiguous'].includes(
-    promptAnnotationStatus.value || '',
-  )
+  promptAnnotationStatus.value === 'not_applied'
     ? 'alert'
     : 'status'
 ))
@@ -413,49 +393,40 @@ function workbenchAttachmentResource(attachment: DisplayAttachment): WorkbenchRe
   return props.workbenchAttachmentResources?.get(attachment.attachmentId) || null
 }
 
-function attachmentActionAvailable(
-  attachment: DisplayAttachment,
-  action: WorkbenchResourceAction,
-): boolean {
+function attachmentCanOpen(attachment: DisplayAttachment): boolean {
   const resource = workbenchAttachmentResource(attachment)
-  return action === 'preview'
-    ? resource?.capabilities.preview === true
-    : resource?.capabilities.manualEdit === true
+  if (!resource) return false
+  if (!props.workbenchResourcePreviewEnabled && !props.workbenchResourceEditEnabled) return false
+  return resource.capabilities.preview === true || resource.capabilities.manualEdit === true
 }
 
-function attachmentActionReason(
-  attachment: DisplayAttachment,
-  action: WorkbenchResourceAction,
-): string {
+function attachmentOpenReason(attachment: DisplayAttachment): string {
   const resource = workbenchAttachmentResource(attachment)
-  if (!resource || attachmentActionAvailable(attachment, action)) return ''
+  if (!resource || attachmentCanOpen(attachment)) return ''
+  if (!props.workbenchResourcePreviewEnabled && !props.workbenchResourceEditEnabled) return ''
+  const action = props.workbenchResourcePreviewEnabled ? 'preview' : 'edit'
   return t(workbenchResourceUnavailableReasonKey(
     workbenchResourceActionReasonCode(resource.capabilities, action),
   ))
 }
 
-function attachmentActionLabel(
-  attachment: DisplayAttachment,
-  action: WorkbenchResourceAction,
-): string {
-  const label = t(
-    action === 'preview' ? 'workbench.resources.preview' : 'workbench.resources.edit',
-    { name: attachment.name },
-  )
-  const reason = attachmentActionReason(attachment, action)
+function attachmentPrimaryActionLabel(attachment: DisplayAttachment): string {
+  if (!attachmentCanOpen(attachment)) return attachmentDownloadLabel(attachment)
+  const label = t('workbench.resources.open', { name: attachment.name })
+  const reason = attachmentOpenReason(attachment)
   return reason ? `${label}. ${reason}` : label
 }
 
 function attachmentUnavailableReason(attachment: DisplayAttachment): string {
-  const reasons = [
-    props.workbenchResourcePreviewEnabled
-      ? attachmentActionReason(attachment, 'preview')
-      : '',
-    props.workbenchResourceEditEnabled
-      ? attachmentActionReason(attachment, 'edit')
-      : '',
-  ].filter(Boolean)
-  return [...new Set(reasons)].join(' ')
+  return attachmentOpenReason(attachment)
+}
+
+function activateAttachment(attachment: DisplayAttachment) {
+  if (attachmentCanOpen(attachment)) {
+    emit('previewAttachment', attachment)
+    return
+  }
+  void downloadAttachment(attachment)
 }
 </script>
 

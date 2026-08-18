@@ -57,7 +57,7 @@ assert.match(
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
-  /if \(!request\.enabled\) \{[\s\S]*?cancelAnnotationInteraction\([\s\S]*?if \(cleanupFailure\)[\s\S]*?return \{ ok: false, message: cleanupFailure \}/,
+  /if \(!request\.enabled\) \{[\s\S]*?cancelAnnotationInteraction\([\s\S]*?if \(cleanupFailure\)[\s\S]*?return \{[\s\S]*?ok: false,[\s\S]*?code: 'ANNOTATION_BUSY',[\s\S]*?message: cleanupFailure/,
   'explicit picker disable must report a failed native-overlay cleanup',
 )
 assert.match(
@@ -418,6 +418,64 @@ assert.deepEqual(
     annotationId: 'annotation_42',
     initialBody: 'Make this concise.',
   },
+)
+assert.deepEqual(
+  parseNativeWorkbenchAnnotationOverlayShowRequest({
+    version: 3,
+    surfaceId: 'artifact:v3',
+    selectionId: 'selection_42',
+    annotationId: 'annotation_42',
+    initialBody: '',
+    overlayCopyVersion: 1,
+    copy: {
+      targetLabel: 'Heading: Welcome',
+      contextLabel: 'Current selection',
+      bodyLabel: 'Page annotation',
+      placeholder: 'Describe the change…',
+      newlineHint: 'Shift + Enter for a new line',
+      cancelLabel: 'Cancel',
+      submitLabel: 'Add annotation',
+      emptyBodyMessage: 'Describe the requested change.',
+    },
+  }),
+  {
+    version: 3,
+    surfaceId: 'artifact:v3',
+    selectionId: 'selection_42',
+    annotationId: 'annotation_42',
+    initialBody: '',
+    overlayCopyVersion: 1,
+    copy: {
+      targetLabel: 'Heading: Welcome',
+      contextLabel: 'Current selection',
+      bodyLabel: 'Page annotation',
+      placeholder: 'Describe the change…',
+      newlineHint: 'Shift + Enter for a new line',
+      cancelLabel: 'Cancel',
+      submitLabel: 'Add annotation',
+      emptyBodyMessage: 'Describe the requested change.',
+    },
+  },
+)
+assert.throws(
+  () => parseNativeWorkbenchAnnotationOverlayShowRequest({
+    version: 3,
+    surfaceId: 'artifact:v3',
+    selectionId: 'selection_42',
+    annotationId: 'annotation_42',
+    overlayCopyVersion: 1,
+  }),
+  /overlay copy is invalid/,
+)
+assert.throws(
+  () => parseNativeWorkbenchAnnotationOverlayShowRequest({
+    version: 3,
+    surfaceId: 'artifact:v3',
+    selectionId: 'selection_42',
+    annotationId: 'annotation_42',
+    copy: {},
+  }),
+  /overlay copy is invalid/,
 )
 assert.deepEqual(
   parseNativeWorkbenchAnnotationOverlayCloseRequest({

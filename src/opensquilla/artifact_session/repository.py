@@ -48,6 +48,7 @@ from .models import (
     EditSessionStatus,
     MutationAttempt,
     MutationAttemptStatus,
+    PreparedPromptAnnotationTarget,
     PromptAnnotation,
     PromptAnnotationStatus,
     Revision,
@@ -245,6 +246,7 @@ async def preflight_prompt_annotations_on_conn(
     session_key: str,
     session_id: str,
     session_epoch: int,
+    require_current_head: bool = True,
 ) -> tuple[PromptAnnotation, ...]:
     """Validate an ordered annotation batch without opening or committing a transaction."""
 
@@ -275,10 +277,12 @@ async def preflight_prompt_annotations_on_conn(
 
     document_ids = {annotation.document_id for annotation in annotations}
     revision_ids = {annotation.revision_id for annotation in annotations}
-    if len(document_ids) != 1 or len(revision_ids) != 1:
-        raise ArtifactValidationError("a prompt annotation batch must target one document revision")
+    if len(document_ids) != 1 or (require_current_head and len(revision_ids) != 1):
+        raise ArtifactValidationError(
+            "a prompt annotation batch must target one document"
+            + (" revision" if require_current_head else "")
+        )
     document_id = annotations[0].document_id
-    revision_id = annotations[0].revision_id
     row = await _fetchone(
         conn,
         """
@@ -294,7 +298,7 @@ async def preflight_prompt_annotations_on_conn(
         or str(row["session_id"]) != session_id
     ):
         raise ArtifactNotFoundError(f"document not found: {document_id}")
-    if str(row["head_revision_id"]) != revision_id:
+    if require_current_head and str(row["head_revision_id"]) != annotations[0].revision_id:
         raise ArtifactConflictError("prompt annotation revision is no longer current")
 
     for annotation in annotations:
@@ -310,11 +314,201 @@ async def preflight_prompt_annotations_on_conn(
         if (
             anchor_row is None
             or str(anchor_row["document_id"]) != document_id
-            or str(anchor_row["revision_id"]) != revision_id
-            or str(anchor_row["state"]) != AnchorState.RESOLVED.value
+            or str(anchor_row["revision_id"]) != annotation.revision_id
+            or (
+                require_current_head
+                and str(anchor_row["state"]) != AnchorState.RESOLVED.value
+            )
         ):
             raise ArtifactConflictError("prompt annotation anchor is no longer valid")
     return tuple(annotations)
+
+
+async def consume_prepared_prompt_annotations_on_conn(
+    conn: Any,
+    *,
+    prepared_targets: Sequence[PreparedPromptAnnotationTarget],
+    session_key: str,
+    session_id: str,
+    session_epoch: int,
+    message_id: str,
+    turn_id: str,
+    updated_at: int,
+) -> tuple[PromptAnnotation, ...]:
+    """Atomically rebind a normalized batch and mark it sent.
+
+    Source parsing is intentionally completed before this transaction.  The
+    immutable draft snapshots, previous anchors, and current document head are
+    fenced again here so a concurrent save rolls the entire turn acceptance
+    back before the task can run.
+    """
+
+    prepared = tuple(prepared_targets)
+    if not prepared:
+        return ()
+    if len(prepared) > MAX_PROMPT_ANNOTATIONS_PER_BATCH:
+        raise ArtifactValidationError("a prompt annotation batch may contain at most 16 items")
+    if len({item.expected_annotation.annotation_id for item in prepared}) != len(prepared):
+        raise ArtifactValidationError("prompt annotation ids must be unique")
+    if len({item.anchor_id for item in prepared}) != len(prepared):
+        raise ArtifactValidationError("prepared prompt annotation anchor ids must be unique")
+    if not message_id.strip() or not turn_id.strip():
+        raise ArtifactValidationError("message_id and turn_id must not be empty")
+    if isinstance(updated_at, bool) or updated_at < 0:
+        raise ArtifactValidationError("updated_at must be a non-negative integer")
+
+    expected = tuple(item.expected_annotation for item in prepared)
+    current = await preflight_prompt_annotations_on_conn(
+        conn,
+        annotation_ids=tuple(item.annotation_id for item in expected),
+        session_key=session_key,
+        session_id=session_id,
+        session_epoch=session_epoch,
+        require_current_head=False,
+    )
+    document_ids = {item.document_id for item in expected}
+    revision_ids = {item.revision_id for item in prepared}
+    if len(document_ids) != 1 or len(revision_ids) != 1:
+        raise ArtifactValidationError("prepared prompt annotations must target one current head")
+    document_id = next(iter(document_ids))
+    current_revision_id = next(iter(revision_ids))
+    document_row = await _fetchone(
+        conn,
+        """
+        SELECT session_key, session_id, head_revision_id
+        FROM artifact_documents
+        WHERE document_id = ?
+        """,
+        (document_id,),
+    )
+    if (
+        document_row is None
+        or str(document_row["session_key"]) != session_key
+        or str(document_row["session_id"]) != session_id
+    ):
+        raise ArtifactNotFoundError(f"document not found: {document_id}")
+    if str(document_row["head_revision_id"]) != current_revision_id:
+        raise ArtifactConflictError("document changed while prompt annotations were prepared")
+    revision_row = await _fetchone(
+        conn,
+        "SELECT document_id FROM artifact_revisions WHERE revision_id = ?",
+        (current_revision_id,),
+    )
+    if revision_row is None or str(revision_row["document_id"]) != document_id:
+        raise ArtifactConflictError("prepared prompt annotation revision is unavailable")
+
+    for prepared_item, expected_item, current_item in zip(
+        prepared,
+        expected,
+        current,
+        strict=True,
+    ):
+        expected_hash = hashlib.sha256(expected_item.body.encode("utf-8")).digest()
+        current_hash = hashlib.sha256(current_item.body.encode("utf-8")).digest()
+        if (
+            expected_item.annotation_id != current_item.annotation_id
+            or expected_item.state_revision != current_item.state_revision
+            or expected_item.document_id != current_item.document_id
+            or expected_item.revision_id != current_item.revision_id
+            or expected_item.anchor_id != current_item.anchor_id
+            or prepared_item.previous_anchor_id != current_item.anchor_id
+            or expected_hash != current_hash
+        ):
+            raise ArtifactConflictError("prompt annotation changed after normalization")
+        previous_anchor = await _fetchone(
+            conn,
+            """
+            SELECT document_id, revision_id
+            FROM artifact_anchors
+            WHERE anchor_id = ?
+            """,
+            (prepared_item.previous_anchor_id,),
+        )
+        if (
+            previous_anchor is None
+            or str(previous_anchor["document_id"]) != document_id
+            or str(previous_anchor["revision_id"]) != current_item.revision_id
+        ):
+            raise ArtifactConflictError("prompt annotation source anchor changed")
+        await conn.execute(
+            """
+            INSERT INTO artifact_anchors (
+                anchor_id, document_id, revision_id, kind, locator_json,
+                quote, context_json, state, remapped_from_anchor_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                prepared_item.anchor_id,
+                document_id,
+                current_revision_id,
+                prepared_item.kind.value,
+                _json_dumps(prepared_item.locator),
+                prepared_item.quote,
+                _json_dumps(prepared_item.context),
+                prepared_item.state.value,
+                prepared_item.previous_anchor_id,
+                updated_at,
+            ),
+        )
+        await conn.execute(
+            """
+            INSERT INTO artifact_audit_events (
+                event_id, document_id, event_type, actor_kind, actor_id,
+                revision_id, anchor_id, payload_json, created_at
+            ) VALUES (?, ?, 'anchor.remapped', ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                prepared_item.audit_event_id,
+                document_id,
+                prepared_item.actor_kind.value,
+                prepared_item.actor_id,
+                current_revision_id,
+                prepared_item.anchor_id,
+                _json_dumps(
+                    {
+                        "kind": prepared_item.kind.value,
+                        "remapped_from_anchor_id": prepared_item.previous_anchor_id,
+                        "state": prepared_item.state.value,
+                    }
+                ),
+                updated_at,
+            ),
+        )
+
+    consumed: list[PromptAnnotation] = []
+    for sent_order, (prepared_item, annotation) in enumerate(zip(prepared, current, strict=True)):
+        cursor = await conn.execute(
+            """
+            UPDATE artifact_prompt_annotations
+            SET revision_id = ?, anchor_id = ?, status = ?,
+                state_revision = state_revision + 1,
+                sent_message_id = ?, sent_turn_id = ?, sent_order = ?, updated_at = ?
+            WHERE annotation_id = ? AND status = ? AND state_revision = ?
+              AND revision_id = ? AND anchor_id = ? AND body = ?
+            """,
+            (
+                current_revision_id,
+                prepared_item.anchor_id,
+                PromptAnnotationStatus.SENT.value,
+                message_id,
+                turn_id,
+                sent_order,
+                updated_at,
+                annotation.annotation_id,
+                PromptAnnotationStatus.DRAFT.value,
+                annotation.state_revision,
+                annotation.revision_id,
+                annotation.anchor_id,
+                annotation.body,
+            ),
+        )
+        try:
+            if cursor.rowcount != 1:
+                raise ArtifactConflictError("prompt annotation compare-and-swap failed")
+        finally:
+            await cursor.close()
+        consumed.append(await get_prompt_annotation_on_conn(conn, annotation.annotation_id))
+    return tuple(consumed)
 
 
 async def consume_prompt_annotations_on_conn(
@@ -428,6 +622,11 @@ class ArtifactSessionRepository:
         self._id_factory = id_factory
         self._owned_connection = owned_connection
         self._closed = False
+
+    def allocate_id(self, prefix: str) -> str:
+        """Allocate an opaque id for a value later fenced by a transaction."""
+
+        return self._id_factory(prefix)
 
     @classmethod
     async def from_session_storage(
@@ -3265,6 +3464,27 @@ class ArtifactSessionRepository:
                 raise ArtifactConflictError("mutation attempt belongs to a different tool_use_id")
             return attempt
 
+    async def get_mutation_attempt_for_resolution(
+        self,
+        *,
+        document_id: str,
+        turn_id: str,
+    ) -> MutationAttempt:
+        """Load a receipt for a session-scoped product outcome query.
+
+        Tool execution reconciliation continues to require ``tool_use_id`` via
+        :meth:`reconcile_mutation_attempt`.  This narrower read exists for the
+        Gateway's authenticated mutation-resolution RPC, which verifies the
+        owning Document and never returns the receipt itself.
+        """
+
+        async with self._read_transaction("get_mutation_attempt_for_resolution") as conn:
+            return await self._get_mutation_attempt_on_conn(
+                conn,
+                document_id=document_id,
+                turn_id=turn_id,
+            )
+
     async def _mutation_result_refs_on_conn(
         self,
         conn: Any,
@@ -3887,6 +4107,7 @@ class ArtifactSessionRepository:
         session_key: str,
         session_id: str,
         session_epoch: int,
+        require_current_head: bool = True,
     ) -> tuple[PromptAnnotation, ...]:
         async with self._transaction("preflight_prompt_annotations") as conn:
             return await preflight_prompt_annotations_on_conn(
@@ -3895,6 +4116,7 @@ class ArtifactSessionRepository:
                 session_key=session_key,
                 session_id=session_id,
                 session_epoch=session_epoch,
+                require_current_head=require_current_head,
             )
 
     async def start_edit_session(

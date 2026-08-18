@@ -154,8 +154,8 @@ export interface DocumentOperationReceipt {
 export interface DocumentImportResponse {
   document: ArtifactDocument
   revision: ArtifactRevision
-  binding: DocumentSourceBinding
-  receipt: DocumentOperationReceipt
+  binding?: DocumentSourceBinding
+  receipt?: DocumentOperationReceipt
 }
 
 export interface DocumentPublication {

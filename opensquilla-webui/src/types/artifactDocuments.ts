@@ -194,6 +194,37 @@ export interface ArtifactSourcePatchResult extends ArtifactSourceSnapshot {
   editSession: ArtifactEditSession | null
 }
 
+export type ArtifactMutationOperation =
+  | 'source.patch'
+  | 'revision.restore'
+  | 'change.revert'
+  | 'document.import'
+  | 'document.publish'
+  | 'workbench.resources.open'
+
+export interface ArtifactMutationResolutionRequest {
+  sessionKey: string
+  operation: ArtifactMutationOperation
+  requestId: string
+  documentId?: string
+}
+
+export interface ArtifactMutationResolutionResult {
+  documentId: string
+  revisionId: string
+  sha256: string
+  stateRevision: number
+}
+
+export interface ArtifactMutationResolution {
+  status: 'applied' | 'not_applied' | 'pending'
+  retryAfterMs: number | null
+  result: ArtifactMutationResolutionResult | null
+  /** Canonical read model returned after a durable applied outcome. */
+  document?: ArtifactDocument | null
+  revision?: ArtifactRevision | null
+}
+
 export type ArtifactDocumentWorkspaceSource = 'document-api' | 'legacy-artifact'
 
 export interface ArtifactDocumentWorkspace {

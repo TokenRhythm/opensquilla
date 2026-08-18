@@ -63,8 +63,19 @@ describe('AppWorkbench annotation mode status', () => {
 
     expect(start).toBeGreaterThan(-1)
     expect(source).toContain('current?.reasonCode || workbenchResourceActionReasonCode(')
-    expect(source).toContain('workbenchResourceUnavailableReasonKey(')
+    expect(source).toContain("artifactProductClientError('RESOURCE_UNSUPPORTED'")
     expect(source).not.toContain("throw new Error(t('workbench.resources.actionFailed'))")
+  })
+
+  it('downloads non-previewable files directly while preserving HTML readonly reasons', () => {
+    const start = appWorkbenchSource.indexOf('async function openWorkbenchResource(')
+    const end = appWorkbenchSource.indexOf('\nasync function importWorkbenchResourceForSession', start)
+    const source = appWorkbenchSource.slice(start, end)
+
+    expect(source).toContain("previewKind !== 'html' && readonlyResource.capabilities.download")
+    expect(source).toContain('await downloadWorkbenchResource(readonlyResource, item)')
+    expect(source.indexOf("previewKind !== 'html'"))
+      .toBeLessThan(source.indexOf("artifactProductClientError('RESOURCE_UNSUPPORTED'"))
   })
 
   it('opens current and silently materialized HTML documents on Preview', () => {

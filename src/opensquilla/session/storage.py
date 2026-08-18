@@ -116,7 +116,7 @@ from opensquilla.turn_outcome_projection import (
 from opensquilla.usage_reasons import normalize_usage_unknown_reason
 
 if TYPE_CHECKING:
-    from opensquilla.artifact_session import PromptAnnotation
+    from opensquilla.artifact_session import PreparedPromptAnnotationTarget, PromptAnnotation
     from opensquilla.persistence.meta_run_writer import MetaRunWriter
     from opensquilla.project_workspaces import ProjectWorkspaceGuard
 
@@ -11798,6 +11798,7 @@ class SessionStorage:
             StartGoalMutation | ClaimGoalMutation | ClaimCurrentGoalMutation | None
         ) = None,
         expected_prompt_annotations: Sequence[PromptAnnotation] = (),
+        prepared_prompt_annotation_targets: Sequence[PreparedPromptAnnotationTarget] = (),
         prompt_annotation_turn_id: str | None = None,
         pending_input_id: str | None = None,
         pending_input_fingerprint: str | None = None,
@@ -11843,7 +11844,15 @@ class SessionStorage:
         if goal_mutation is not None and meta_control_intent_id is not None:
             raise ValueError("Goal turns cannot consume a MetaSkill control intent")
         expected_prompt_annotations = tuple(expected_prompt_annotations)
-        if expected_prompt_annotations:
+        prepared_prompt_annotation_targets = tuple(prepared_prompt_annotation_targets)
+        if expected_prompt_annotations and prepared_prompt_annotation_targets:
+            raise ValueError(
+                "prompt annotation acceptance cannot use legacy and prepared inputs together"
+            )
+        prompt_annotation_acceptance = bool(
+            expected_prompt_annotations or prepared_prompt_annotation_targets
+        )
+        if prompt_annotation_acceptance:
             if session_node is not None or merge_into_task:
                 raise ValueError(
                     "prompt annotations require an existing session and a distinct turn"
@@ -12122,20 +12131,35 @@ class SessionStorage:
                     ),
                 )
 
-            if expected_prompt_annotations:
-                from opensquilla.artifact_session import consume_prompt_annotations_on_conn
+            if prompt_annotation_acceptance:
+                from opensquilla.artifact_session import (
+                    consume_prepared_prompt_annotations_on_conn,
+                    consume_prompt_annotations_on_conn,
+                )
 
                 assert prompt_annotation_turn_id is not None
-                await consume_prompt_annotations_on_conn(
-                    conn,
-                    expected_annotations=expected_prompt_annotations,
-                    session_key=entry.session_key,
-                    session_id=entry.session_id,
-                    session_epoch=expected_epoch,
-                    message_id=entry.message_id,
-                    turn_id=prompt_annotation_turn_id,
-                    updated_at=updated_at,
-                )
+                if prepared_prompt_annotation_targets:
+                    await consume_prepared_prompt_annotations_on_conn(
+                        conn,
+                        prepared_targets=prepared_prompt_annotation_targets,
+                        session_key=entry.session_key,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                        message_id=entry.message_id,
+                        turn_id=prompt_annotation_turn_id,
+                        updated_at=updated_at,
+                    )
+                else:
+                    await consume_prompt_annotations_on_conn(
+                        conn,
+                        expected_annotations=expected_prompt_annotations,
+                        session_key=entry.session_key,
+                        session_id=entry.session_id,
+                        session_epoch=expected_epoch,
+                        message_id=entry.message_id,
+                        turn_id=prompt_annotation_turn_id,
+                        updated_at=updated_at,
+                    )
             if pending_input_id is not None:
                 pending = await self._select_pending_chat_input(
                     conn,

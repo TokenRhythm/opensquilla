@@ -86,6 +86,16 @@ function normalizedFreshness(raw: Record<string, unknown>): PromptAnnotationFres
     : 'fresh'
 }
 
+function normalizedTargetStatus(raw: Record<string, unknown>): 'ready' | 'contextual' | undefined {
+  const value = stringAt(raw, 'targetStatus', 'target_status').toLowerCase()
+  return value === 'ready' || value === 'contextual' ? value : undefined
+}
+
+function normalizedTargetReason(raw: Record<string, unknown>): 'no_match' | 'ambiguous' | undefined {
+  const value = stringAt(raw, 'targetReason', 'target_reason').toLowerCase()
+  return value === 'no_match' || value === 'ambiguous' ? value : undefined
+}
+
 export function normalizePromptAnnotation(
   value: unknown,
   defaults: { sessionKey?: string } = {},
@@ -124,6 +134,14 @@ export function normalizePromptAnnotation(
     staleReason: nullableStringAt(raw, 'staleReason', 'stale_reason'),
     stateRevision: Math.max(1, numberAt(raw, 1, 'stateRevision', 'state_revision')),
     tagName: tagName.toLowerCase(),
+    ...(normalizedTargetStatus(raw) ? { targetStatus: normalizedTargetStatus(raw) } : {}),
+    ...(normalizedTargetReason(raw) ? { targetReason: normalizedTargetReason(raw) } : {}),
+    ...(stringAt(raw, 'targetKind', 'target_kind').trim()
+      ? { targetKind: stringAt(raw, 'targetKind', 'target_kind').trim().toLowerCase() }
+      : {}),
+    ...(stringAt(raw, 'targetText', 'target_text').trim()
+      ? { targetText: stringAt(raw, 'targetText', 'target_text').trim().slice(0, 160) }
+      : {}),
     locator,
     quote: nullableStringAt(raw, 'quote')
       || (anchor ? nullableStringAt(anchor, 'quote') : null),
@@ -177,6 +195,14 @@ export function normalizePromptAnnotationSnapshot(
     tagName: (stringAt(raw, 'tagName', 'tag_name')
       || (anchor ? stringAt(anchor, 'tagName', 'tag_name') : '')
       || String(locator.tagName || locator.tag_name || '')).toLowerCase(),
+    ...(normalizedTargetStatus(raw) ? { targetStatus: normalizedTargetStatus(raw) } : {}),
+    ...(normalizedTargetReason(raw) ? { targetReason: normalizedTargetReason(raw) } : {}),
+    ...(stringAt(raw, 'targetKind', 'target_kind').trim()
+      ? { targetKind: stringAt(raw, 'targetKind', 'target_kind').trim().toLowerCase() }
+      : {}),
+    ...(stringAt(raw, 'targetText', 'target_text').trim()
+      ? { targetText: stringAt(raw, 'targetText', 'target_text').trim().slice(0, 160) }
+      : {}),
     locator,
     quote: nullableStringAt(raw, 'quote')
       || (anchor ? nullableStringAt(anchor, 'quote') : null),

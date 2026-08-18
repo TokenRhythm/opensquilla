@@ -308,6 +308,12 @@ export function projectActivityToolDetail(
   call: ChatToolCallRenderItem,
   operationKey: string,
 ): ActivityToolDetailProjection {
+  // Page editing tools carry source excerpts, revision hashes, cursors and
+  // one-time grants. Those belong in diagnostics, not in the ordinary chat
+  // activity disclosure.
+  if (operationKey === 'document.read' || operationKey === 'document.update') {
+    return { lines: [], rawContent: '' }
+  }
   const inputRecord = parseRecord(call.inputRaw || call.inputPreview)
   const resultRecord = parseRecord(call.result || call.resultPreview)
   const lines: ActivityToolDetailLine[] = []

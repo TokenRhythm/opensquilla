@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type {
   NativeWorkbenchApi,
+  NativeWorkbenchSurfaceResult,
   Platform,
 } from '@/platform/types'
 import type { ArtifactPayload } from '@/types/rpc'
@@ -29,6 +30,7 @@ const artifact: ArtifactPayload = {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
 
@@ -89,6 +91,55 @@ async function createNativeRuntimeHarness(
 }
 
 describe('artifact Workbench provider', () => {
+  it('does not expose a Desktop native-open diagnostic in the toast', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<p>fixture</p>', {
+      status: 200,
+      headers: { 'content-type': 'text/html' },
+    })))
+    const diagnostic = 'spawn EACCES /private/operator/report.html'
+    const nativeOpen = vi.fn(async () => ({ ok: false, message: diagnostic }))
+    const pushToast = vi.fn()
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const item = createArtifactPreviewWorkbenchItem({
+      artifact,
+      nativeHtml: false,
+      sessionKey: 'session-a',
+    })
+    const definition = createArtifactWorkbenchDefinitions({
+      authToken: () => 'synthetic-token',
+      baseOrigin: 'http://localhost',
+      confirmRemoteResources: vi.fn(async () => true),
+      currentSessionId: () => 'session-a',
+      openArtifact: vi.fn(),
+      platform: {
+        id: 'desktop',
+        capabilities: { canOpenArtifactsNatively: true },
+        files: { openArtifact: nativeOpen },
+      } as unknown as Platform,
+      pushToast,
+      t: key => key,
+    }).find(candidate => candidate.kind === 'artifact-preview')!
+    const runtime = await definition.createRuntime!(item, {
+      getRenderState: () => ({}),
+      updateRenderState: vi.fn(),
+      isItemOpen: () => true,
+      setExpanded: vi.fn(),
+      reportError: vi.fn(),
+    })
+
+    await runtime.handleComponentEvent?.({
+      type: 'artifact-external-open',
+      payload: artifact,
+    }, item)
+
+    expect(nativeOpen).toHaveBeenCalledOnce()
+    expect(pushToast).toHaveBeenCalledWith('chat.toast.artifactOpenFailed', {
+      tone: 'danger',
+    })
+    expect(JSON.stringify(pushToast.mock.calls)).not.toContain(diagnostic)
+    expect(warn).toHaveBeenCalledWith('[artifact] Native open failed:', diagnostic)
+  })
+
   it('routes a validated current-head publish request through the injected store action', async () => {
     const legacy = createLegacyArtifactWorkspace({
       ...artifact,
@@ -843,7 +894,7 @@ describe('artifact Workbench provider', () => {
     await runtime.dispose?.('closed')
   })
 
-  it('owns native surface actions, events, visibility, and render state', async () => {
+  it('silently rebuilds a failed native surface once before showing recovery UI', async () => {
     const createSurface = vi.fn(async () => ({ ok: true }))
     const setSurfaceRect = vi.fn(async () => ({ ok: true }))
     const activateSurface = vi.fn(async () => ({ ok: true }))
@@ -946,20 +997,19 @@ describe('artifact Workbench provider', () => {
       ]),
     )
 
+    const createsBeforeFailure = createSurface.mock.calls.length
     await runtime.handleNativeSurfaceEvent?.({
       version: 1,
       surfaceId: item.id,
       type: 'error',
     }, item)
-    expect(renderState.nativeSurfaceState).toBe('error')
+    expect(createSurface).toHaveBeenCalledTimes(createsBeforeFailure + 1)
+    expect(renderState.nativeSurfaceState).toBe('loading')
+    expect(context.reportError).not.toHaveBeenCalled()
     expect(setSurfaceRect).toHaveBeenLastCalledWith(
-      expect.objectContaining({ surfaceId: item.id, visible: false }),
+      expect.objectContaining({ surfaceId: item.id }),
     )
 
-    await runtime.handleComponentEvent?.({
-      type: 'native-html-ready',
-      payload: nativeResource,
-    }, item)
     await runtime.handleNativeSurfaceEvent?.({
       version: 1,
       surfaceId: item.id,
@@ -968,6 +1018,7 @@ describe('artifact Workbench provider', () => {
     }, item)
     expect(renderState.nativeSurfaceState).toBe('crashed')
     expect(destroySurface).toHaveBeenLastCalledWith(item.id)
+    expect(context.reportError).toHaveBeenCalledOnce()
     expect(definition.getToolbarItems?.(item, {
       active: true,
       hostAvailable: true,
@@ -1209,13 +1260,15 @@ describe('artifact Workbench provider', () => {
       type: 'preview-state-change',
       payload: 'error',
     }, harness.item)
-    expect(harness.renderState.nativeSurfaceState).toBe('error')
+    expect(harness.renderState.nativeSurfaceState).toBe('loading')
     expect(destroySurface).toHaveBeenCalledTimes(2)
 
     await harness.runtime.handleComponentEvent?.({
       type: 'preview-state-change',
       payload: 'unsupported',
     }, harness.item)
+    expect(harness.renderState.nativeSurfaceState).toBe('error')
+    expect(destroySurface).toHaveBeenCalledTimes(3)
     expect(harness.definition.getToolbarItems?.(harness.item, {
       active: true,
       hostAvailable: true,
@@ -1314,7 +1367,7 @@ describe('artifact Workbench provider', () => {
 
     expect(renderState).toMatchObject({
       previewBlocked: true,
-      previewLeaseError: 'Artifact integrity check failed.',
+      previewLeaseError: 'The operation could not be completed. Try again.',
       previewLaunchUrl: '',
       previewState: 'error',
     })
@@ -1325,7 +1378,7 @@ describe('artifact Workbench provider', () => {
       runtimeState: renderState,
     })).toMatchObject({
       previewBlocked: true,
-      previewErrorMessage: 'Artifact integrity check failed.',
+      previewErrorMessage: 'The operation could not be completed. Try again.',
       previewLaunchUrl: '',
     })
     expect(createSurface).not.toHaveBeenCalled()
@@ -1348,6 +1401,109 @@ describe('artifact Workbench provider', () => {
       previewLaunchUrl: lease.launch_url,
     })
     await runtime.dispose?.('closed')
+  })
+
+  it('settles a revoked-lease replacement failure without an unhandled renewal rejection', async () => {
+    vi.useFakeTimers()
+    const privateDiagnostic = 'revoked lease at /private/operator/profile'
+    const lease = {
+      version: 1 as const,
+      lease_id: 'apl-renewal-fixture',
+      effective_mode: 'full' as const,
+      launch_url: 'http://p-1123456789abcdef0123456789abcdef.localhost:48721/index.html',
+      entrypoint: 'index.html',
+      expires_at: '2099-01-01T00:00:00Z',
+      preview_origin: 'http://p-1123456789abcdef0123456789abcdef.localhost:48721',
+      idle_timeout_seconds: 28_800,
+      source: {
+        kind: 'single_file' as const,
+        collection_status: 'not_applicable' as const,
+        file_count: 1,
+        total_bytes: 42,
+        warning_codes: [],
+      },
+    }
+    const destroySurface = vi.fn(async () => ({ ok: false as const }))
+    const pushToast = vi.fn()
+    const reportError = vi.fn()
+    const nativeApi: NativeWorkbenchApi = {
+      getCapabilities: vi.fn(async () => ({
+        protocolVersions: [2] as Array<2>,
+        modes: ['full', 'offline'] as Array<'full' | 'offline'>,
+        maxSurfaces: 8,
+      })),
+      createArtifactPreviewLease: vi.fn(async () => ({
+        ok: true as const,
+        status: 201,
+        payload: lease,
+      })),
+      renewArtifactPreviewLease: vi.fn(async () => ({
+        ok: false as const,
+        status: 410,
+        code: 'PREVIEW_CAPABILITY_EXPIRED',
+        message: privateDiagnostic,
+      })),
+      revokeArtifactPreviewLease: vi.fn(async () => ({
+        ok: true as const,
+        status: 204,
+        payload: undefined,
+      })),
+      createSurface: vi.fn(async () => ({ ok: true as const })),
+      setSurfaceRect: vi.fn(async () => ({ ok: true as const })),
+      activateSurface: vi.fn(async () => ({ ok: true as const })),
+      destroySurface,
+      onSurfaceEvent: vi.fn(() => () => undefined),
+    }
+    const renderState: Record<string, unknown> = {}
+    const previewItem = createArtifactPreviewWorkbenchItem({
+      artifact: { ...artifact, id: 'artifact-renewal' },
+      nativeHtml: true,
+      sessionKey: 'session-a',
+    })
+    const definition = createArtifactWorkbenchDefinitions({
+      authToken: () => 'synthetic-token',
+      baseOrigin: 'http://127.0.0.1:18791',
+      confirmRemoteResources: vi.fn(async () => true),
+      currentSessionId: () => 'session-a',
+      openArtifact: vi.fn(),
+      platform: {
+        id: 'desktop',
+        capabilities: { canOpenArtifactsNatively: true },
+        files: {},
+      } as unknown as Platform,
+      previewLeasesEnabled: true,
+      pushToast,
+      t: key => key,
+    }).find(candidate => candidate.kind === 'artifact-preview')!
+    const runtime = await definition.createRuntime!(previewItem, {
+      nativeWorkbenchApi: nativeApi,
+      getRenderState: () => renderState,
+      updateRenderState: patch => Object.assign(renderState, patch),
+      isItemOpen: () => true,
+      setExpanded: vi.fn(),
+      reportError,
+    })
+
+    try {
+      await vi.advanceTimersByTimeAsync(15 * 60 * 1000)
+      expect(nativeApi.renewArtifactPreviewLease).toHaveBeenCalledOnce()
+      expect(destroySurface).toHaveBeenCalledTimes(2)
+      expect(renderState).toMatchObject({
+        nativeSurfaceState: 'error',
+        previewBlocked: true,
+        previewReadiness: 'error',
+        previewState: 'error',
+      })
+      expect(reportError).toHaveBeenCalledOnce()
+      expect(pushToast).toHaveBeenCalledWith(
+        expect.not.stringContaining(privateDiagnostic),
+        { tone: 'danger' },
+      )
+      expect(renderState.annotationMode).not.toBe(true)
+    } finally {
+      await runtime.dispose?.('closed')
+      vi.useRealTimers()
+    }
   })
 
   it('uses the explicit v1 compatibility path when a v2-era Desktop lacks the lease broker', async () => {
@@ -1513,6 +1669,10 @@ describe('artifact Workbench provider', () => {
       surfaceActive = true
       return { ok: true as const }
     })
+    const setArtifactAnnotationMode = vi.fn(
+      async (): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }),
+    )
+    const pushToast = vi.fn()
     const nativeApi: NativeWorkbenchApi = {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [3] as Array<3>,
@@ -1520,7 +1680,7 @@ describe('artifact Workbench provider', () => {
         maxSurfaces: 8,
       })),
       getArtifactAnnotationCapabilities,
-      setArtifactAnnotationMode: vi.fn(async () => ({ ok: true as const })),
+      setArtifactAnnotationMode,
       showArtifactAnnotationOverlay: vi.fn(async () => ({ ok: true as const })),
       closeArtifactAnnotationOverlay: vi.fn(async () => ({ ok: true as const })),
       createArtifactPreviewLease: vi.fn(async () => {
@@ -1603,7 +1763,7 @@ describe('artifact Workbench provider', () => {
         files: {},
       } as unknown as Platform,
       previewLeasesEnabled: true,
-      pushToast: vi.fn(),
+      pushToast,
       t: key => key,
     }).find(candidate => candidate.kind === 'artifact-preview')!
     const runtime = await definition.createRuntime!(item, {
@@ -1644,6 +1804,74 @@ describe('artifact Workbench provider', () => {
       nativeSurface: true,
       runtimeState: renderState,
     })?.some(toolbarItem => toolbarItem.id === 'toggle-annotation-mode')).toBe(true)
+
+    // Source can replace the native surface while Preview is hidden. The
+    // temporary capability miss must preserve the user's picker intent until
+    // the replacement surface becomes visible again.
+    await runtime.performAction?.('toggle-annotation-mode', item)
+    expect(renderState.annotationMode).toBe(true)
+    await runtime.handleSurfaceRect?.({
+      itemId: item.id,
+      x: 300,
+      y: 40,
+      width: 600,
+      height: 500,
+      visible: false,
+    }, item)
+    workspace.document.headRevisionId = 'revision-2'
+    await runtime.handleComponentEvent?.({ type: 'artifact-head-changed' }, item)
+    expect(renderState.annotationAvailable).toBe(false)
+    expect(renderState.annotationMode).toBe(false)
+
+    await runtime.handleSurfaceRect?.({
+      itemId: item.id,
+      x: 300,
+      y: 40,
+      width: 600,
+      height: 500,
+      visible: true,
+    }, item)
+    expect(renderState.annotationAvailable).toBe(true)
+    expect(renderState.annotationMode).toBe(true)
+    expect(nativeApi.setArtifactAnnotationMode).toHaveBeenLastCalledWith({
+      version: 3,
+      surfaceId: item.id,
+      enabled: true,
+    })
+
+    // A scoped Desktop capability can disappear between two annotations.
+    // Rebuild the same resource/head once and replay the bounded picker
+    // enable without showing recovery UI or releasing the pressed state.
+    await runtime.performAction?.('toggle-annotation-mode', item)
+    expect(renderState.annotationMode).toBe(false)
+    const createsBeforeCapabilityRecovery = createSurface.mock.calls.length
+    setArtifactAnnotationMode.mockResolvedValueOnce({
+      ok: false as const,
+      code: 'PREVIEW_CAPABILITY_EXPIRED',
+      retryable: true,
+    })
+    await runtime.performAction?.('toggle-annotation-mode', item)
+    expect(createSurface).toHaveBeenCalledTimes(createsBeforeCapabilityRecovery + 1)
+    expect(renderState.annotationMode).toBe(true)
+    expect(renderState.annotationAvailable).toBe(true)
+    expect(pushToast).not.toHaveBeenCalled()
+
+    // The same resource/head gets only one silent rebuild. A second failure
+    // settles into localized product UI instead of looping surface creation.
+    await runtime.performAction?.('toggle-annotation-mode', item)
+    const createsBeforeSecondFailure = createSurface.mock.calls.length
+    setArtifactAnnotationMode.mockResolvedValueOnce({
+      ok: false as const,
+      code: 'PREVIEW_CAPABILITY_EXPIRED',
+      retryable: true,
+    })
+    await runtime.performAction?.('toggle-annotation-mode', item)
+    expect(createSurface).toHaveBeenCalledTimes(createsBeforeSecondFailure)
+    expect(renderState.annotationMode).toBe(false)
+    expect(pushToast).toHaveBeenCalledWith(
+      'workbench.artifactAnnotation.unavailable',
+      { tone: 'danger' },
+    )
     await runtime.dispose?.('closed')
   })
 
@@ -1770,7 +1998,10 @@ describe('artifact Workbench provider', () => {
     const setActiveDocument = vi.fn()
     const showOverlay = vi.fn(async (
       _request: Parameters<NonNullable<NativeWorkbenchApi['showArtifactAnnotationOverlay']>>[0],
-    ) => ({ ok: false as const, message: 'overlay-unavailable' }))
+    ): Promise<NativeWorkbenchSurfaceResult> => ({
+      ok: false,
+      message: 'overlay-unavailable',
+    }))
     let deferNextScreenshot = false
     let resolveDeferredScreenshot: (() => void) | null = null
     const finishDeferredScreenshot = () => {
@@ -1803,8 +2034,8 @@ describe('artifact Workbench provider', () => {
       .mockImplementation(() => undefined)
     const closeOverlay = vi.fn(async (
       _request: Parameters<NonNullable<NativeWorkbenchApi['closeArtifactAnnotationOverlay']>>[0],
-    ): Promise<{ ok: boolean; message?: string }> => ({ ok: true }))
-    type AnnotationModeResult = { ok: boolean; message?: string }
+    ): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }))
+    type AnnotationModeResult = NativeWorkbenchSurfaceResult
     let deferNextModeEnable = false
     let resolveDeferredModeEnable: ((result: AnnotationModeResult) => void) | null = null
     const finishDeferredModeEnable = (
@@ -1860,6 +2091,7 @@ describe('artifact Workbench provider', () => {
         warning_codes: [],
       },
     }
+    const createSurface = vi.fn(async () => ({ ok: true as const }))
     const nativeApi: NativeWorkbenchApi = {
       getCapabilities: vi.fn(async () => ({
         protocolVersions: [3] as Array<3>,
@@ -1871,6 +2103,7 @@ describe('artifact Workbench provider', () => {
         available: true,
         picker: true,
         trustedOverlay: true,
+        overlayCopyVersion: 1 as const,
       })),
       setArtifactAnnotationMode: setMode,
       showArtifactAnnotationOverlay: showOverlay,
@@ -1891,7 +2124,7 @@ describe('artifact Workbench provider', () => {
         status: 204,
         payload: undefined,
       })),
-      createSurface: vi.fn(async () => ({ ok: true as const })),
+      createSurface,
       setSurfaceRect: vi.fn(async () => ({ ok: true as const })),
       activateSurface: vi.fn(async () => ({ ok: true as const })),
       destroySurface: vi.fn(async () => ({ ok: true as const })),
@@ -1954,6 +2187,14 @@ describe('artifact Workbench provider', () => {
     workspace.document.capabilities.selectionContext = true
     workspace.document.capabilities.agentEdit = true
     await runtime.resume?.(item)
+    await runtime.handleSurfaceRect?.({
+      itemId: item.id,
+      x: 300,
+      y: 40,
+      width: 600,
+      height: 500,
+      visible: true,
+    }, item)
     expect(renderState.annotationAvailable).toBe(true)
     await runtime.performAction?.('toggle-annotation-mode', item)
     expect(setMode).toHaveBeenCalledWith({ version: 3, surfaceId: item.id, enabled: true })
@@ -2023,6 +2264,49 @@ describe('artifact Workbench provider', () => {
       runtimeState: renderState,
     })).toMatchObject({ annotationFallback: expect.any(Object) })
 
+    // A normal close is blocked when the latest trusted-editor body cannot be
+    // saved. The draft owner, frozen screenshot, and user text stay available
+    // for a later retry.
+    await runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: item.id,
+      type: 'annotation-draft-change',
+      detail: { annotationId, body: 'Keep this local body.' },
+    }, item)
+    rejectNextUpdate = new Error('synthetic close flush failure')
+    await expect(runtime.beforeClose?.()).resolves.toBe(false)
+    expect(renderState.annotationFallback).toMatchObject({
+      annotationId,
+      body: 'Keep this local body.',
+      screenshotUrl: 'blob:frozen-annotation-preview',
+    })
+    expect(revokeScreenshotUrl).not.toHaveBeenCalled()
+
+    // A required Preview/head rebuild may continue, but it transfers the
+    // unsaved body to the Web fallback instead of clearing it. The replacement
+    // native Preview stays hidden until this editor is submitted or cancelled.
+    await runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: item.id,
+      type: 'annotation-draft-change',
+      detail: { annotationId, body: 'Keep this body through refresh.' },
+    }, item)
+    rejectNextUpdate = new Error('synthetic rebuild flush failure')
+    const createsBeforeUnflushedRebuild = createSurface.mock.calls.length
+    await runtime.handleComponentEvent?.({ type: 'artifact-head-changed' }, item)
+    expect(createSurface).toHaveBeenCalledTimes(createsBeforeUnflushedRebuild + 1)
+    expect(renderState.annotationFallback).toMatchObject({
+      annotationId,
+      body: 'Keep this body through refresh.',
+      reason: 'update-pending',
+      screenshotUrl: 'blob:frozen-annotation-preview',
+    })
+    expect(renderState.annotationMode).toBe(true)
+    expect(revokeScreenshotUrl).not.toHaveBeenCalled()
+    expect(nativeApi.setSurfaceRect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ surfaceId: item.id, visible: false }),
+    )
+
     // Native submit/cancel messages are only intents. Empty input and failed
     // persistence must retain ownership of the same visible editor; no native
     // close acknowledgement or hidden picker rearm may happen.
@@ -2066,8 +2350,11 @@ describe('artifact Workbench provider', () => {
       surfaceId: item.id,
       annotationId,
     })
-    expect(setMode.mock.calls.map(([request]) => request.enabled)).toEqual([true, true])
-    expect(setMode).not.toHaveBeenCalledWith(expect.objectContaining({ enabled: false }))
+    expect(setMode.mock.calls.map(([request]) => request.enabled)).toEqual([
+      true,
+      false,
+      true,
+    ])
     expect(renderState.annotationMode).toBe(true)
     expect(completeOverlayEdit).toHaveBeenCalledWith(annotationId)
     expect(releaseOverlayEdit).toHaveBeenCalledWith(annotationId)
@@ -2102,10 +2389,10 @@ describe('artifact Workbench provider', () => {
     )
     expect(setMode.mock.calls.map(([request]) => request.enabled)).toEqual([
       true,
+      false,
       true,
       true,
     ])
-    expect(setMode).not.toHaveBeenCalledWith(expect.objectContaining({ enabled: false }))
 
     // The recovered picker accepts a local proof after unrelated runtime DOM
     // changes, without a whole-DOM hash or an extra toolbar toggle.
@@ -2134,9 +2421,15 @@ describe('artifact Workbench provider', () => {
     }))
     expect(showOverlay).toHaveBeenCalledTimes(2)
 
-    // If Desktop cannot rearm after the trusted editor closes, the pressed
-    // toolbar state must turn off instead of advertising a dead picker.
-    setMode.mockResolvedValueOnce({ ok: false as const, message: 'picker unavailable' })
+    // If the scoped surface disappears while closing the trusted editor, the
+    // persisted draft remains valid. Acknowledge the vanished overlay, rebuild
+    // once, and rearm without exposing capability details or making the user
+    // select annotation mode again.
+    setMode.mockResolvedValueOnce({
+      ok: false,
+      code: 'PREVIEW_CAPABILITY_EXPIRED',
+      retryable: true,
+    })
     const secondAnnotationId = String(showOverlay.mock.calls[1]?.[0].annotationId || '')
     const closeCountBeforeDiscardFailure = closeOverlay.mock.calls.length
     rejectNextDiscard = new Error('synthetic discard failure')
@@ -2152,6 +2445,15 @@ describe('artifact Workbench provider', () => {
       'workbench.artifactAnnotation.discardFailed',
       { tone: 'danger', duration: 9000 },
     )
+    const createsBeforeCloseRecovery = createSurface.mock.calls.length
+    const closeFailureToastCount = pushToast.mock.calls.filter(
+      ([message]) => message === 'workbench.artifactAnnotation.closeFailed',
+    ).length
+    closeOverlay.mockResolvedValueOnce({
+      ok: false,
+      code: 'PREVIEW_CAPABILITY_EXPIRED',
+      retryable: true,
+    })
     await runtime.handleNativeSurfaceEvent?.({
       version: 3,
       surfaceId: item.id,
@@ -2166,14 +2468,18 @@ describe('artifact Workbench provider', () => {
     ]!
     expect(lastDiscardOrder).toBeLessThan(lastCloseOrder)
     expect(completeOverlayEdit).not.toHaveBeenCalledWith(secondAnnotationId)
-    expect(renderState.annotationMode).toBe(false)
+    expect(createSurface).toHaveBeenCalledTimes(createsBeforeCloseRecovery + 1)
+    expect(renderState.annotationMode).toBe(true)
+    expect(pushToast.mock.calls.filter(
+      ([message]) => message === 'workbench.artifactAnnotation.closeFailed',
+    )).toHaveLength(closeFailureToastCount)
     expect(definition.getToolbarItems?.(item, {
       active: true,
       hostAvailable: true,
       nativeSurface: true,
       runtimeState: renderState,
     }).find(toolbarItem => toolbarItem.id === 'toggle-annotation-mode')).toMatchObject({
-      pressed: false,
+      pressed: true,
     })
 
     const lateSelection = (selectionId: string, proof: string) => ({
@@ -2193,6 +2499,8 @@ describe('artifact Workbench provider', () => {
 
     // A refresh fences a deferred create before its continuation can target
     // the refreshed surface. The late draft is discarded and never rendered.
+    await runtime.performAction?.('toggle-annotation-mode', item)
+    expect(renderState.annotationMode).toBe(false)
     await runtime.performAction?.('toggle-annotation-mode', item)
     deferNextCreate = true
     resolveDeferredCreate = null
@@ -2214,8 +2522,8 @@ describe('artifact Workbench provider', () => {
     expect(renderState.annotationFallback).toBeNull()
     expect(renderState.annotationMode).toBe(false)
 
-    // A head replacement also invalidates both the document identity and the
-    // native surface generation before a deferred create returns.
+    // A head replacement invalidates the old selection attempt, then restores
+    // the picker on the current page without making the user restart it.
     await runtime.performAction?.('toggle-annotation-mode', item)
     deferNextCreate = true
     resolveDeferredCreate = null
@@ -2235,11 +2543,15 @@ describe('artifact Workbench provider', () => {
     expect(discardAnnotation).toHaveBeenCalledWith(headAnnotationId)
     expect(showOverlay).toHaveBeenCalledTimes(2)
     expect(renderState.annotationFallback).toBeNull()
-    expect(renderState.annotationMode).toBe(false)
+    expect(renderState.annotationMode).toBe(true)
+    expect(setMode).toHaveBeenLastCalledWith({
+      version: 3,
+      surfaceId: item.id,
+      enabled: true,
+    })
 
     // Turning annotation mode off is an immediate intent fence, even while
     // the create RPC is still outstanding. The old completion cannot rearm.
-    await runtime.performAction?.('toggle-annotation-mode', item)
     deferNextCreate = true
     resolveDeferredCreate = null
     const toggleCreateIndex = createAnnotation.mock.calls.length
@@ -2304,7 +2616,11 @@ describe('artifact Workbench provider', () => {
       disabled: false,
       pressed: true,
     })
-    expect(pushToast).toHaveBeenCalledWith('native stop rejected', { tone: 'danger' })
+    expect(pushToast).toHaveBeenCalledWith(
+      'workbench.artifactAnnotation.unavailable',
+      { tone: 'danger' },
+    )
+    expect(pushToast.mock.calls.flat().join(' ')).not.toContain('native stop rejected')
     const setModeCountBeforeStopRetry = setMode.mock.calls.length
     await runtime.performAction?.('toggle-annotation-mode', item)
     expect(setMode).toHaveBeenCalledTimes(setModeCountBeforeStopRetry + 1)
@@ -2414,7 +2730,7 @@ describe('artifact Workbench provider', () => {
     await vi.waitFor(() => expect(resolveDeferredUpdate).toBeTypeOf('function'))
     workspace.document.headRevisionId = 'revision-4'
     await runtime.handleComponentEvent?.({ type: 'artifact-head-changed' }, item)
-    await runtime.performAction?.('toggle-annotation-mode', item)
+    expect(renderState.annotationMode).toBe(true)
     const newSubmitCreateIndex = createAnnotation.mock.calls.length
     await runtime.handleNativeSurfaceEvent?.(
       lateSelection('selection-new-after-submit', '6'),
@@ -2445,7 +2761,7 @@ describe('artifact Workbench provider', () => {
     await vi.waitFor(() => expect(resolveDeferredDiscard).toBeTypeOf('function'))
     workspace.document.headRevisionId = 'revision-5'
     await runtime.handleComponentEvent?.({ type: 'artifact-head-changed' }, item)
-    await runtime.performAction?.('toggle-annotation-mode', item)
+    expect(renderState.annotationMode).toBe(true)
     const newCancelCreateIndex = createAnnotation.mock.calls.length
     await runtime.handleNativeSurfaceEvent?.(
       lateSelection('selection-new-after-cancel', '7'),
@@ -2526,10 +2842,26 @@ describe('artifact Workbench provider', () => {
     // mode after that newer accepted-send intent wins.
     await runtime.performAction?.('toggle-annotation-mode', item)
     await runtime.performAction?.('toggle-annotation-mode', item)
+    const overlayCallsBeforeRendererRecovery = showOverlay.mock.calls.length
+    const fallbackToastsBeforeRendererRecovery = pushToast.mock.calls.filter(
+      ([message]) => message === 'workbench.artifactAnnotation.overlayFallback',
+    ).length
+    showOverlay
+      .mockResolvedValueOnce({
+        ok: false,
+        code: 'PREVIEW_RENDERER_FAILED',
+        retryable: true,
+      })
+      .mockResolvedValueOnce({ ok: true })
     await runtime.handleNativeSurfaceEvent?.(
       lateSelection('selection-acceptance-race', 'a'),
       item,
     )
+    expect(showOverlay).toHaveBeenCalledTimes(overlayCallsBeforeRendererRecovery + 2)
+    expect(pushToast.mock.calls.filter(
+      ([message]) => message === 'workbench.artifactAnnotation.overlayFallback',
+    )).toHaveLength(fallbackToastsBeforeRendererRecovery)
+    expect(renderState.annotationFallback).toBeNull()
     const acceptanceRaceAnnotationId = String(
       showOverlay.mock.calls[showOverlay.mock.calls.length - 1]?.[0].annotationId || '',
     )

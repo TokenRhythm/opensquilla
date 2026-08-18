@@ -11,11 +11,14 @@ from opensquilla.artifact_session import (
     Actor,
     ActorKind,
     AnchorKind,
+    AnchorState,
     ArtifactConflictError,
     ArtifactKind,
     ArtifactSessionService,
     ArtifactValidationError,
+    PreparedPromptAnnotationTarget,
     PromptAnnotationStatus,
+    consume_prepared_prompt_annotations_on_conn,
     consume_prompt_annotations_on_conn,
 )
 
@@ -376,5 +379,135 @@ async def test_prompt_annotation_cas_scope_limits_and_stale_head(tmp_path: Path)
                 session_id=SESSION_ID,
                 session_epoch=2,
             )
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_prepared_rebind_and_consume_is_atomic_for_contextual_target(
+    tmp_path: Path,
+) -> None:
+    service = await ArtifactSessionService.open(
+        tmp_path / "artifacts.db",
+        clock=FakeClock(),
+        id_factory=PredictableIds(),
+    )
+    try:
+        created, anchor = await _document_and_anchor(service)
+        draft = await service.create_prompt_annotation(
+            annotation_id="annotation-remap",
+            session_key=SESSION_KEY,
+            session_id=SESSION_ID,
+            session_epoch=3,
+            document_id=created.document.document_id,
+            revision_id=created.revision.revision_id,
+            anchor_id=anchor.anchor_id,
+            body="Update this region.",
+        )
+        current = await service.commit_revision(
+            document_id=created.document.document_id,
+            expected_head_revision_id=created.revision.revision_id,
+            expected_state_revision=created.document.state_revision,
+            artifact=blob("current"),
+            actor=USER,
+        )
+        prepared = PreparedPromptAnnotationTarget(
+            expected_annotation=draft,
+            previous_anchor_id=anchor.anchor_id,
+            anchor_id="anchor-remapped",
+            audit_event_id="audit-remapped",
+            revision_id=current.revision.revision_id,
+            kind=AnchorKind.DOM_SOURCE,
+            locator={
+                "tag_name": "main",
+                "source_sha256": current.revision.artifact_sha256,
+                "offset_encoding": "unicode-code-point",
+            },
+            quote="<main>",
+            context={
+                "semantic_profile_v1": {"version": 1, "tag_name": "main"},
+                "target_reason": "no_match",
+            },
+            state=AnchorState.ORPHANED,
+            actor_kind=ActorKind.USER,
+            actor_id=USER.actor_id,
+        )
+
+        async with service.repository._transaction("test.prepared_consume") as conn:
+            sent = await consume_prepared_prompt_annotations_on_conn(
+                conn,
+                prepared_targets=(prepared,),
+                session_key=SESSION_KEY,
+                session_id=SESSION_ID,
+                session_epoch=3,
+                message_id="message-remap",
+                turn_id="turn-remap",
+                updated_at=9876,
+            )
+
+        assert sent[0].status is PromptAnnotationStatus.SENT
+        assert sent[0].revision_id == current.revision.revision_id
+        assert sent[0].anchor_id == "anchor-remapped"
+        remapped = await service.get_anchor("anchor-remapped")
+        assert remapped.state is AnchorState.ORPHANED
+        assert remapped.remapped_from_anchor_id == anchor.anchor_id
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_prepared_rebind_head_race_rolls_back_new_anchor(tmp_path: Path) -> None:
+    service = await ArtifactSessionService.open(tmp_path / "artifacts.db")
+    try:
+        created, anchor = await _document_and_anchor(service)
+        draft = await service.create_prompt_annotation(
+            annotation_id="annotation-race",
+            session_key=SESSION_KEY,
+            session_id=SESSION_ID,
+            session_epoch=0,
+            document_id=created.document.document_id,
+            revision_id=created.revision.revision_id,
+            anchor_id=anchor.anchor_id,
+            body="Update this region.",
+        )
+        prepared = PreparedPromptAnnotationTarget(
+            expected_annotation=draft,
+            previous_anchor_id=anchor.anchor_id,
+            anchor_id="anchor-never-committed",
+            audit_event_id="audit-never-committed",
+            revision_id=created.revision.revision_id,
+            kind=AnchorKind.DOM_SOURCE,
+            locator=anchor.locator,
+            quote=anchor.quote,
+            context={},
+            state=AnchorState.RESOLVED,
+            actor_kind=ActorKind.USER,
+            actor_id=USER.actor_id,
+        )
+        await service.commit_revision(
+            document_id=created.document.document_id,
+            expected_head_revision_id=created.revision.revision_id,
+            expected_state_revision=created.document.state_revision,
+            artifact=blob("raced"),
+            actor=USER,
+        )
+
+        with pytest.raises(ArtifactConflictError, match="changed"):
+            async with service.repository._transaction("test.prepared_race") as conn:
+                await consume_prepared_prompt_annotations_on_conn(
+                    conn,
+                    prepared_targets=(prepared,),
+                    session_key=SESSION_KEY,
+                    session_id=SESSION_ID,
+                    session_epoch=0,
+                    message_id="message-race",
+                    turn_id="turn-race",
+                    updated_at=1,
+                )
+        with pytest.raises(Exception, match="not found"):
+            await service.get_anchor("anchor-never-committed")
+        assert (await service.get_prompt_annotation(draft.annotation_id)).status is (
+            PromptAnnotationStatus.DRAFT
+        )
     finally:
         await service.close()

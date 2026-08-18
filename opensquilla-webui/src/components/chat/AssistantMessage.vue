@@ -930,15 +930,6 @@ const documentMutationOutcome = computed(() =>
   props.message.turnOutcome?.documentMutationOutcome,
 )
 
-const documentMutationCorrected = computed(() => {
-  const outcome = documentMutationOutcome.value
-  return outcome?.status === 'applied' && (
-    outcome.corrected === true
-    || Number(outcome.proposalAttempts || 0) > 1
-    || documentApplyFailureCount.value > 0
-  )
-})
-
 const activityStepCount = computed(() => Math.max(
   1,
   visibleActivityClusters.value.length
@@ -1093,11 +1084,13 @@ function withMaintenanceSummary(label: string): string {
 
 const activitySummaryLabel = computed(() => {
   const mutationStatus = documentMutationOutcome.value?.status
-  const mutationSummaryKey = documentMutationCorrected.value
-    ? 'appliedCorrected'
-    : mutationStatus === 'not_applied' || mutationStatus === 'conflict' || mutationStatus === 'ambiguous'
-      ? mutationStatus
-      : ''
+  const mutationSummaryKey = mutationStatus === 'applied'
+    ? 'applied'
+    : mutationStatus === 'ambiguous'
+      ? 'ambiguous'
+      : mutationStatus
+        ? 'not_applied'
+        : ''
   if (mutationSummaryKey) {
     return withMaintenanceSummary([
       String(t(`chat.promptAnnotations.status.${mutationSummaryKey}`)),

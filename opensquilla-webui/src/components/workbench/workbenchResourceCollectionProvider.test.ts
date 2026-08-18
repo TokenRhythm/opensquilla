@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
+import { RpcTransportError } from '@/lib/rpc'
 import type { WorkbenchResource } from '@/types/workbenchResources'
+import { artifactProductClientError } from '@/utils/artifactProductErrors'
 import { createResourceCollectionWorkbenchItem } from '@/workbench/workbenchResourceItems'
 import type { WorkbenchRuntimeContext } from '@/workbench/types'
 import { createWorkbenchResourceCollectionDefinition } from './workbenchResourceCollectionProvider'
@@ -51,6 +53,32 @@ function harness() {
 }
 
 describe('Workbench resource collection provider', () => {
+  it('presents non-previewable binary files as downloads but readonly HTML as openable', () => {
+    const { definition, item } = harness()
+    const presentation = {
+      active: true,
+      hostAvailable: true,
+      nativeSurface: false,
+      runtimeState: {},
+    }
+    const props = definition.getProps?.(item, presentation) as {
+      openLabel(resource: WorkbenchResource): string
+    }
+    const binary = {
+      ...attachment,
+      name: 'archive.zip',
+      mime: 'application/zip',
+      capabilities: { ...attachment.capabilities, preview: false },
+    }
+    const readonlyHtml = {
+      ...attachment,
+      capabilities: { ...attachment.capabilities, preview: false },
+    }
+
+    expect(props.openLabel(binary)).toBe('workbench.resources.download')
+    expect(props.openLabel(readonlyHtml)).toBe('workbench.resources.open')
+  })
+
   it('routes the unified open action and clears its busy state', async () => {
     const { calls, context, definition, item, state } = harness()
     const runtime = await definition.createRuntime!(item, context)
@@ -63,7 +91,7 @@ describe('Workbench resource collection provider', () => {
 
   it('keeps a failed open inline and allows the same row to retry', async () => {
     const { calls, context, definition, item, state } = harness()
-    calls.open.mockRejectedValueOnce(new Error('Gateway disconnected'))
+    calls.open.mockRejectedValueOnce(new RpcTransportError('Gateway disconnected', null))
     const runtime = await definition.createRuntime!(item, context)
 
     await runtime.handleComponentEvent?.({ type: 'resource-open', payload: attachment }, item)
@@ -71,7 +99,7 @@ describe('Workbench resource collection provider', () => {
     expect(state).toMatchObject({
       resourceBusyKey: '',
       resourceOpenErrorKey: 'attachment:att_fixture',
-      resourceOpenErrorMessage: 'Gateway disconnected',
+      resourceOpenErrorMessage: 'This page is temporarily unavailable. Try again.',
     })
     await runtime.handleComponentEvent?.({ type: 'resource-open', payload: attachment }, item)
     expect(calls.open).toHaveBeenCalledTimes(2)
@@ -80,10 +108,17 @@ describe('Workbench resource collection provider', () => {
   })
 
   it('preserves a localized readonly reason as the inline retry error', async () => {
-    const { calls, context, definition, item, state } = harness()
-    calls.open.mockRejectedValueOnce(new Error(
-      'This HTML is not valid UTF-8 and cannot be previewed or edited safely.',
-    ))
+    const { calls, context, item, state } = harness()
+    calls.open.mockRejectedValueOnce(artifactProductClientError('RESOURCE_UNSUPPORTED', {
+      reasonCode: 'html_encoding_unsupported',
+    }))
+    const definition = createWorkbenchResourceCollectionDefinition({
+      ...calls,
+      pushError: vi.fn(),
+      t: key => key === 'workbench.resources.unavailableReasons.htmlEncodingUnsupported'
+        ? 'This HTML is not valid UTF-8 and cannot be previewed or edited safely.'
+        : key,
+    })
     const runtime = await definition.createRuntime!(item, context)
 
     await runtime.handleComponentEvent?.({ type: 'resource-open', payload: attachment }, item)

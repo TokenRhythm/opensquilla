@@ -39,9 +39,22 @@ const GENERATED_HTML = `<!doctype html>
   </body>
 </html>`
 const MANUAL_HTML = GENERATED_HTML.replace(INITIAL_HEADING, MANUAL_HEADING)
+const UNRELATED_HTML = MANUAL_HTML.replace(
+  '    </main>',
+  '      <!-- unrelated source change -->\n    </main>',
+)
+const DUPLICATED_TARGET_OPENING = '<p id="preserved-copy">'
+const DUPLICATED_TARGET_HTML = UNRELATED_HTML.replace(
+  '      <p id="preserved-copy">This byte range must remain unchanged.</p>',
+  `      <section>${DUPLICATED_TARGET_OPENING}This byte range must remain unchanged.</p></section>
+      <aside>${DUPLICATED_TARGET_OPENING}This byte range must remain unchanged.</p></aside>`,
+)
 const ANNOTATION_BODY = 'Explain this synthetic paragraph without editing it.'
+const SECOND_ANNOTATION_BODY = 'Keep this heading concise and accessible.'
+const AMBIGUOUS_ANNOTATION_BODY = 'Remove only the paragraph I selected.'
 const GENERATE_MESSAGE = 'Create and publish the requested synthetic single-file HTML page.'
-const ANNOTATION_MESSAGE = 'Answer the selected annotation without changing the document.'
+const ANNOTATION_MESSAGE = 'Answer the selected annotations without changing the document.'
+const AMBIGUOUS_MESSAGE = 'Try the selected page update, but do not guess between duplicate targets.'
 const PATCH_MESSAGE = 'Update the current document heading and page style, then save it.'
 const EXPECTED_ANNOTATION_TOOLS = [
   'document_apply',
@@ -175,6 +188,8 @@ function openAiToolChunks(model, callId, name, args) {
 async function startDeterministicProvider() {
   const requests = []
   let documentPatchCalls = 0
+  let contextualLocateCalls = 0
+  let contextualCandidateErrors = 0
   const server = createServer((request, response) => {
     const url = new URL(request.url || '/', 'http://127.0.0.1')
     if (request.method === 'GET' && url.pathname === '/v1/models') {
@@ -208,7 +223,9 @@ async function startDeterministicProvider() {
         || (latestToolCallId.includes('publish_generated_html') ? 'publish_artifact' : '')
         || (latestToolCallId.includes('document_read') ? 'document_read' : '')
         || (latestToolCallId.includes('document_patch') ? 'document_patch' : '')
+        || (latestToolCallId.includes('document_locate') ? 'document_locate' : '')
       const isGenerationTurn = turn.userText.includes(GENERATE_MESSAGE)
+      const isAmbiguousTurn = turn.userText.includes(AMBIGUOUS_MESSAGE)
       const hasAnnotationTools = toolNames.has('document_inspect')
         || toolNames.has('document_apply')
       const hasCurrentDocumentTools = toolNames.has('document_patch')
@@ -245,6 +262,58 @@ async function startDeterministicProvider() {
         )
       } else if (isGenerationTurn) {
         bodyChunks = openAiTextChunks(model, 'The generated HTML file is ready.')
+      } else if (isAmbiguousTurn && toolMessages.length === 0) {
+        bodyChunks = openAiToolChunks(
+          model,
+          'call_contextual_document_read_v1_e2e',
+          'document_read',
+          { view: 'source', max_chars: 16_384 },
+        )
+      } else if (isAmbiguousTurn && latestToolName === 'document_read') {
+        const read = jsonFromToolContent(latestToolMessage?.content)
+        assert.equal(read.status, 'ok')
+        assert.equal(read.hasMore, false)
+        assert.equal(
+          String(read.chunk?.text || '').split(DUPLICATED_TARGET_OPENING).length - 1,
+          2,
+          'the contextual fixture must contain two indistinguishable candidates',
+        )
+        contextualLocateCalls += 1
+        bodyChunks = openAiToolChunks(
+          model,
+          `call_contextual_document_locate_${contextualLocateCalls}_v1_e2e`,
+          'document_locate',
+          {
+            annotation_order: 0,
+            operation: 'remove_node',
+            candidateSource: DUPLICATED_TARGET_OPENING,
+          },
+        )
+      } else if (isAmbiguousTurn && latestToolName === 'document_locate') {
+        assert.match(
+          String(latestToolMessage?.content || ''),
+          /DOCUMENT_CANDIDATE_INVALID/,
+          'a duplicated contextual candidate must be rejected without a grant',
+        )
+        contextualCandidateErrors += 1
+        if (contextualLocateCalls < 2) {
+          contextualLocateCalls += 1
+          bodyChunks = openAiToolChunks(
+            model,
+            `call_contextual_document_locate_${contextualLocateCalls}_v1_e2e`,
+            'document_locate',
+            {
+              annotation_order: 0,
+              operation: 'remove_node',
+              candidateSource: DUPLICATED_TARGET_OPENING,
+            },
+          )
+        } else {
+          bodyChunks = openAiTextChunks(
+            model,
+            'The selected page area could not be located uniquely, so no update was made.',
+          )
+        }
       } else if (hasAnnotationTools) {
         bodyChunks = openAiTextChunks(
           model,
@@ -335,6 +404,8 @@ async function startDeterministicProvider() {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     requests,
     documentPatchCalls: () => documentPatchCalls,
+    contextualLocateCalls: () => contextualLocateCalls,
+    contextualCandidateErrors: () => contextualCandidateErrors,
     close: () => new Promise((resolveClose, rejectClose) => {
       server.closeIdleConnections?.()
       server.close(error => error ? rejectClose(error) : resolveClose())
@@ -673,7 +744,7 @@ async function verifyPatchedSourceRemainsEditable(page, versionsTab, changesTab)
       return source.includes(APPLIED_HEADING)
         && source.includes(PATCHED_TITLE)
         && /background:\s*#f6f7fb;/.test(source)
-    }, 'revision 3 source loaded without a conflict', TIMEOUT_MS)
+    }, 'latest source loaded without a conflict', TIMEOUT_MS)
   } catch (error) {
     throw new Error(`${error.message}; source snapshot: ${JSON.stringify(lastSourceSnapshot)}`)
   }
@@ -682,7 +753,7 @@ async function verifyPatchedSourceRemainsEditable(page, versionsTab, changesTab)
   assert.equal(await page.getByTestId('copy-unsaved-source').count(), 0)
   assert.equal(await page.getByTestId('discard-and-load-latest').count(), 0)
   const save = page.locator('.artifact-html-studio__action')
-  assert.equal(await save.isDisabled(), true, 'revision 3 source must start clean')
+  assert.equal(await save.isDisabled(), true, 'latest source must start clean')
 
   // Prove that the model-advanced head did not strand Monaco in read-only
   // mode. Undo the probe before autosave, then let the pending timer drain;
@@ -691,7 +762,7 @@ async function verifyPatchedSourceRemainsEditable(page, versionsTab, changesTab)
   await page.keyboard.insertText('__opensquilla_edit_probe__')
   await waitFor(
     async () => await status.getAttribute('data-state') === 'dirty',
-    'revision 3 source remains editable',
+    'latest source remains editable',
     TIMEOUT_MS,
   )
   assert.equal(await save.isDisabled(), false)
@@ -699,10 +770,10 @@ async function verifyPatchedSourceRemainsEditable(page, versionsTab, changesTab)
   await waitFor(async () => {
     const state = await status.getAttribute('data-state')
     return (state === 'ready' || state === 'saved') && await save.isDisabled()
-  }, 'revision 3 edit probe restored a clean buffer', TIMEOUT_MS)
+  }, 'latest edit probe restored a clean buffer', TIMEOUT_MS)
   await delay(1_500)
-  assert.match(await versionsTab.innerText(), /3/)
-  assert.match(await changesTab.innerText(), /2/)
+  assert.match(await versionsTab.innerText(), /5/)
+  assert.match(await changesTab.innerText(), /4/)
   assert.equal(await page.locator('.artifact-html-studio__error').count(), 0)
 }
 
@@ -807,7 +878,19 @@ async function annotationOverlayState(electronApp) {
             newlineHint: document.getElementById('annotation-newline-hint')?.textContent || '',
           }
         })()`, true)
-        if (state) return { id: contents.id, ...state }
+        if (state) {
+          const owner = contents.getOwnerBrowserWindow()
+          const view = owner?.contentView.children.find(candidate => (
+            candidate.webContents?.id === contents.id
+          ))
+          const visible = view?.getVisible?.() === true
+          if (!visible) continue
+          return {
+            id: contents.id,
+            visible,
+            ...state,
+          }
+        }
       } catch {}
     }
     return null
@@ -820,8 +903,13 @@ async function typeAndSubmitAnnotation(electronApp, body) {
       if (contents.isDestroyed()) continue
       let hasEditor = false
       try {
+        const owner = contents.getOwnerBrowserWindow()
+        const view = owner?.contentView.children.find(candidate => (
+          candidate.webContents?.id === contents.id
+        ))
+        if (view?.getVisible?.() !== true) continue
         hasEditor = await contents.executeJavaScript(
-          "Boolean(document.getElementById('annotation-body'))",
+          "document.activeElement?.id === 'annotation-body'",
           true,
         )
       } catch {}
@@ -861,6 +949,25 @@ async function typeAndSubmitAnnotation(electronApp, body) {
   }, body)
 }
 
+async function dropNextChatSend(page) {
+  await page.evaluate(() => {
+    window.__opensquillaV1DroppedChatSend = false
+    const originalSend = WebSocket.prototype.send
+    WebSocket.prototype.send = function dropSyntheticSessionsSend(data) {
+      if (
+        typeof data === 'string'
+        && data.includes('"method":"chat.send"')
+      ) {
+        WebSocket.prototype.send = originalSend
+        window.__opensquillaV1DroppedChatSend = true
+        this.close(4000, 'synthetic sessions.send disconnect')
+        return
+      }
+      return originalSend.call(this, data)
+    }
+  })
+}
+
 const isolationRoot = MANUAL_REUSE_PROFILE
   || await mkdtemp(join(tmpdir(), 'opensquilla-v1-html-agent-edit-'))
 const userDataDir = join(isolationRoot, 'electron-user-data')
@@ -879,13 +986,19 @@ const evidence = {
   sessionUrl: '',
   selectedPreviewUrl: '',
   versionsAfterManualSave: '',
+  versionsAfterUnrelatedSave: '',
   versionsAfterAgentPatch: '',
   changesAfterAgentPatch: '',
   previewHeading: '',
   annotationModeExitedAfterAcceptance: false,
+  annotationSendFailureRetained: false,
   annotationAcceptanceEvents: [],
   annotationModeAfterAcceptance: null,
   annotationRequests: 0,
+  annotationsPrepared: 0,
+  contextualLocateCalls: 0,
+  contextualCandidateErrors: 0,
+  ambiguousRevisionStayedPut: false,
   currentDocumentToolRequests: 0,
   toolFreeMutationFinalizations: 0,
   recoveredRevisionCount: 0,
@@ -893,6 +1006,7 @@ const evidence = {
   originalDownloadEndpointVerified: false,
   patchedSourceRemainedEditable: false,
   manualPreviewSnapshot: [],
+  nativeAnnotationSurfaceEvents: [],
   durableMutation: null,
 }
 
@@ -964,6 +1078,18 @@ try {
   // the renderer-error assertion at the first user interaction boundary.
   pageErrors.length = 0
   consoleErrors.length = 0
+  await page.evaluate(() => {
+    window.__opensquillaV1NativeAnnotationSurfaceEvents = []
+    window.opensquillaDesktop?.onWorkbenchSurfaceEvent?.((payload) => {
+      if (!payload || typeof payload !== 'object') return
+      const event = payload
+      if (!String(event.type || '').startsWith('annotation-')) return
+      window.__opensquillaV1NativeAnnotationSurfaceEvents.push({
+        type: event.type,
+        detail: event.detail,
+      })
+    })
+  })
 
   if (MANUAL_MODE && MANUAL_REAL_PROVIDER) {
     console.log(JSON.stringify({
@@ -1075,20 +1201,26 @@ try {
   const overlay = await waitFor(
     async () => {
       const state = await annotationOverlayState(app)
-      return state?.target === '<p>' && state.focused ? state : null
+      return state?.target && !/^<[^>]+>$/.test(state.target) && state.focused ? state : null
     },
     'trusted annotation overlay',
     TIMEOUT_MS,
   )
-  assert.equal(overlay.target, '<p>')
+  assert.doesNotMatch(overlay.target, /^<[^>]+>$/)
   assert.equal(
     overlay.newlineHint,
-    process.platform === 'darwin' ? '⇧ Enter 换行' : 'Shift + Enter 换行',
+    process.platform === 'darwin'
+      ? '⇧ Return for a new line'
+      : 'Shift + Enter for a new line',
   )
   await typeAndSubmitAnnotation(app, ANNOTATION_BODY)
   await page.locator('.chat-prompt-annotation-chip').filter({
     hasText: ANNOTATION_BODY,
   }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  await waitFor(async () => {
+    const state = await annotationOverlayState(app)
+    return !state?.visible
+  }, 'first annotation editor acknowledged and closed', TIMEOUT_MS)
   const activeAnnotationButton = page.getByRole('button', { name: 'Stop annotating' })
   await activeAnnotationButton.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
   assert.equal(
@@ -1100,6 +1232,64 @@ try {
     state: 'visible',
     timeout: TIMEOUT_MS,
   })
+
+  // Move the head without touching the selected paragraph. Draft targets must
+  // follow the current page automatically, and the continuous picker intent
+  // must survive the native preview rebuild.
+  const sourceTab = page.getByRole('tab', { name: /^Source/ })
+  await sourceTab.click()
+  await replaceSourceInEditor(page, UNRELATED_HTML)
+  await waitFor(async () => /3/.test(await versionsTab.innerText()), 'Versions = 3', TIMEOUT_MS)
+  await waitFor(async () => /2/.test(await changesTab.innerText()), 'Changes = 2', TIMEOUT_MS)
+  evidence.versionsAfterUnrelatedSave = await versionsTab.innerText()
+  await previewTab.click()
+  await page.locator('[data-document-section="preview"]').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+  await page.getByTestId('workbench-annotation-mode-status').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+  assert.equal(
+    await page.getByRole('button', { name: 'Stop annotating' }).getAttribute('aria-pressed'),
+    'true',
+    'an unrelated source change must not make the user restart annotation mode',
+  )
+
+  const secondSelected = await selectElementInNativePreview(app, '#editable-heading')
+  assert.equal(secondSelected.tagName, 'h1')
+  const secondOverlay = await waitFor(
+    async () => {
+      const state = await annotationOverlayState(app)
+      return state?.target && !/^<[^>]+>$/.test(state.target) && state.focused ? state : null
+    },
+    'second trusted annotation overlay',
+    TIMEOUT_MS,
+  )
+  assert.doesNotMatch(secondOverlay.target, /^<[^>]+>$/)
+  await typeAndSubmitAnnotation(app, SECOND_ANNOTATION_BODY)
+  try {
+    await page.locator('.chat-prompt-annotation-chip').filter({
+      hasText: SECOND_ANNOTATION_BODY,
+    }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  } catch (error) {
+    evidence.nativeAnnotationSurfaceEvents = await page.evaluate(
+      () => window.__opensquillaV1NativeAnnotationSurfaceEvents || [],
+    )
+    throw error
+  }
+  evidence.nativeAnnotationSurfaceEvents = await page.evaluate(
+    () => window.__opensquillaV1NativeAnnotationSurfaceEvents || [],
+  )
+  evidence.annotationsPrepared = await page.locator('.chat-prompt-annotation-chip').count()
+  assert.equal(evidence.annotationsPrepared, 2, 'continuous selection must collect two drafts')
+  assert.equal(
+    await page.getByRole('button', { name: 'Stop annotating' }).getAttribute('aria-pressed'),
+    'true',
+    'adding another draft must keep annotation mode active before send acceptance',
+  )
+
   await page.evaluate(() => {
     window.__opensquillaV1AnnotationAcceptanceEvents = []
     window.addEventListener('opensquilla:artifact-prompt-annotations-accepted', (event) => {
@@ -1108,6 +1298,42 @@ try {
   })
   const annotationRequestStart = provider.requests.length
   await page.locator('.chat-textarea').fill(ANNOTATION_MESSAGE)
+  await dropNextChatSend(page)
+  await page.locator('.chat-send-btn.btn--primary').click()
+  await page.waitForFunction(
+    () => window.__opensquillaV1DroppedChatSend === true,
+    undefined,
+    { timeout: TIMEOUT_MS },
+  )
+  await page.locator('.conn-pill.connected').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+  await waitForSettledTurn(page)
+  assert.equal(
+    await page.locator('.chat-textarea').inputValue(),
+    ANNOTATION_MESSAGE,
+    'a disconnected send must retain the user message for retry',
+  )
+  assert.equal(
+    await page.locator('.chat-prompt-annotation-chip').count(),
+    2,
+    'a disconnected send must retain every prepared annotation',
+  )
+  assert.equal(
+    await page.getByRole('button', { name: 'Stop annotating' }).getAttribute('aria-pressed'),
+    'true',
+    'a disconnected send must keep the continuous picker pressed',
+  )
+  assert.equal(
+    await page.evaluate(() => (
+      window.__opensquillaV1AnnotationAcceptanceEvents || []
+    ).length),
+    0,
+    'a disconnected send must not publish an acceptance event',
+  )
+  evidence.annotationSendFailureRetained = true
+
   await page.locator('.chat-send-btn.btn--primary').click()
   await waitFor(
     () => provider.requests.slice(annotationRequestStart)
@@ -1146,9 +1372,14 @@ try {
     0,
     'accepted annotation must leave the composer',
   )
+  assert.equal(
+    await page.locator('.chat-prompt-annotation-chip').count(),
+    0,
+    'all accepted annotations must leave the composer together',
+  )
   evidence.annotationModeExitedAfterAcceptance = true
-  assert.match(await versionsTab.innerText(), /2/)
-  assert.match(await changesTab.innerText(), /1/)
+  assert.match(await versionsTab.innerText(), /3/)
+  assert.match(await changesTab.innerText(), /2/)
 
   const annotationRequests = provider.requests.slice(annotationRequestStart)
     .filter(payload => annotationToolNames(payload).length > 0)
@@ -1156,13 +1387,80 @@ try {
   assert.deepEqual(annotationToolNames(annotationRequests[0]), EXPECTED_ANNOTATION_TOOLS)
   evidence.annotationRequests = annotationRequests.length
 
+  // Create a new selection, then move the original element and introduce two
+  // indistinguishable candidates. The accepted turn may ask AI to help, but a
+  // repeated ambiguous candidate must never mint a grant or advance history.
+  await armAnnotationPicker(page, page.getByRole('button', { name: 'Annotate preview' }))
+  const ambiguousSelected = await selectElementInNativePreview(app, '#preserved-copy')
+  assert.equal(ambiguousSelected.tagName, 'p')
+  await waitFor(
+    async () => {
+      const state = await annotationOverlayState(app)
+      return state?.visible && state.focused ? state : null
+    },
+    'contextual annotation overlay',
+    TIMEOUT_MS,
+  )
+  await typeAndSubmitAnnotation(app, AMBIGUOUS_ANNOTATION_BODY)
+  await page.locator('.chat-prompt-annotation-chip').filter({
+    hasText: AMBIGUOUS_ANNOTATION_BODY,
+  }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  await waitFor(async () => !await annotationOverlayState(app),
+    'contextual annotation editor acknowledged and closed', TIMEOUT_MS)
+
+  await sourceTab.click()
+  await replaceSourceInEditor(page, DUPLICATED_TARGET_HTML)
+  await waitFor(async () => /4/.test(await versionsTab.innerText()), 'Versions = 4', TIMEOUT_MS)
+  await waitFor(async () => /3/.test(await changesTab.innerText()), 'Changes = 3', TIMEOUT_MS)
+  await previewTab.click()
+  await page.locator('[data-document-section="preview"]').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+  await page.getByTestId('workbench-annotation-mode-status').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+
+  const ambiguousRequestStart = provider.requests.length
+  await page.locator('.chat-textarea').fill(AMBIGUOUS_MESSAGE)
+  await page.locator('.chat-send-btn.btn--primary').click()
+  await waitFor(
+    () => provider.contextualCandidateErrors() === 2,
+    'two rejected contextual candidates',
+    TIMEOUT_MS,
+  )
+  await waitForSettledTurn(page)
+  evidence.contextualLocateCalls = provider.contextualLocateCalls()
+  evidence.contextualCandidateErrors = provider.contextualCandidateErrors()
+  assert.equal(evidence.contextualLocateCalls, 2)
+  assert.equal(evidence.contextualCandidateErrors, 2)
+  assert.equal(
+    provider.requests.slice(ambiguousRequestStart)
+      .filter(isMutationFinalizationRequest).length,
+    0,
+    'ambiguous candidates must not reach mutation finalization',
+  )
+  assert.match(await versionsTab.innerText(), /4/)
+  assert.match(await changesTab.innerText(), /3/)
+  assert.equal(
+    await page.locator('.chat-prompt-annotation-chip').count(),
+    0,
+    'the accepted contextual annotation leaves the composer without guessing a target',
+  )
+  await page.getByTestId('workbench-annotation-mode-status').waitFor({
+    state: 'detached',
+    timeout: TIMEOUT_MS,
+  })
+  evidence.ambiguousRevisionStayedPut = true
+
   const patchRequestStart = provider.requests.length
   await page.locator('.chat-textarea').fill(PATCH_MESSAGE)
   await page.locator('.chat-send-btn.btn--primary').click()
   await waitFor(() => provider.documentPatchCalls() === 1, 'document_patch proposal', TIMEOUT_MS)
   await waitForSettledTurn(page)
-  await waitFor(async () => /3/.test(await versionsTab.innerText()), 'Versions = 3', TIMEOUT_MS)
-  await waitFor(async () => /2/.test(await changesTab.innerText()), 'Changes = 2', TIMEOUT_MS)
+  await waitFor(async () => /5/.test(await versionsTab.innerText()), 'Versions = 5', TIMEOUT_MS)
+  await waitFor(async () => /4/.test(await changesTab.innerText()), 'Changes = 4', TIMEOUT_MS)
   evidence.versionsAfterAgentPatch = await versionsTab.innerText()
   evidence.changesAfterAgentPatch = await changesTab.innerText()
   await verifyPatchedSourceRemainsEditable(page, versionsTab, changesTab)
@@ -1222,9 +1520,9 @@ try {
   evidence.originalDownloadEndpointVerified = true
 
   await versionsTab.click()
-  assert.equal(await page.locator('.artifact-document__versions > li').count(), 3)
+  assert.equal(await page.locator('.artifact-document__versions > li').count(), 5)
   await changesTab.click()
-  assert.equal(await page.locator('[data-document-section="changes"] li').count(), 2)
+  assert.equal(await page.locator('[data-document-section="changes"] li').count(), 4)
 
   assert.equal(
     await page.getByTestId('workbench-artifact-switcher').count(),
@@ -1314,11 +1612,11 @@ try {
   await openGeneratedArtifactSource(recoveredPage)
   const recoveredVersionsTab = recoveredPage.getByRole('tab', { name: /Versions/ })
   await waitFor(
-    async () => /3/.test(await recoveredVersionsTab.innerText()),
-    'three recovered versions',
+    async () => /5/.test(await recoveredVersionsTab.innerText()),
+    'five recovered versions',
     TIMEOUT_MS,
   )
-  evidence.recoveredRevisionCount = 3
+  evidence.recoveredRevisionCount = 5
   await recoveredPage.getByRole('tab', { name: /^Preview/ }).click()
   await waitFor(async () => {
     const snapshot = await previewWebContentsSnapshot(app)
@@ -1335,22 +1633,22 @@ try {
     try {
       evidence.durableMutation = await readDurableMutationEvidence(isolationRoot)
       assert.deepEqual(evidence.durableMutation, {
-        allAttemptsLinked: 2,
-        annotations: 1,
-        appliedAttempts: 2,
-        attemptLinksCommittedObjects: 2,
+        allAttemptsLinked: 4,
+        annotations: 3,
+        appliedAttempts: 4,
+        attemptLinksCommittedObjects: 4,
         bindingTargetsDocument: true,
-        changeSets: 2,
+        changeSets: 4,
         deliverableBindings: 1,
-        documentGeneration: 3,
+        documentGeneration: 5,
         documents: 1,
         headDiffersFromOriginal: true,
-        mutationAttempts: 2,
+        mutationAttempts: 4,
         originalDeliverableBytesMatch: true,
         originalDeliverableUnchanged: true,
         revisionOneReusesDeliverable: true,
-        revisions: 3,
-        sentAnnotations: 1,
+        revisions: 5,
+        sentAnnotations: 3,
         sourceBindings: 1,
       })
     } catch (error) {

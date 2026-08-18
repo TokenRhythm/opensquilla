@@ -42,6 +42,10 @@ import {
   type SendableAttachment,
 } from '@/utils/chat/attachments'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import {
+  classifyArtifactProductError,
+  isKnownArtifactProductErrorCode,
+} from '@/utils/artifactProductErrors'
 import { isControlInput } from '@/utils/chat/inputSemantics'
 import {
   createClientMessageId,
@@ -227,8 +231,22 @@ function errorCode(err: unknown): string | undefined {
   return typeof code === 'string' && code ? code : undefined
 }
 
-function sendFailureMessage(err: unknown): string {
-  return localizedChatErrorMessage(errorCode(err), 'Send failed: ' + errorMessage(err))
+function paramsHaveArtifactContext(
+  params: Pick<ChatSendParams, 'promptAnnotationIds' | 'documentContext'>,
+): boolean {
+  return Boolean(params.promptAnnotationIds?.length || params.documentContext)
+}
+
+function sendFailureMessage(err: unknown, artifactContext = false): string {
+  const code = errorCode(err)
+  if (artifactContext || isKnownArtifactProductErrorCode(code)) {
+    const classified = classifyArtifactProductError(err)
+    const translated = String(i18n.global.t(classified.messageKey))
+    return translated === classified.messageKey
+      ? classified.fallbackMessage
+      : translated
+  }
+  return localizedChatErrorMessage(code, 'Send failed: ' + errorMessage(err))
 }
 
 function shouldRestoreSendAttempt(err: unknown): boolean {
@@ -1687,7 +1705,10 @@ export function useChatSend(options: UseChatSendOptions) {
                 updatedAt: Date.now(),
               }).catch(() => {})
               await options.failPendingQueueHandoff?.(replayRecord.ownerRequestId)
-              pushToast(sendFailureMessage(error), { tone: 'danger' })
+              pushToast(
+                sendFailureMessage(error, paramsHaveArtifactContext(replayRecord.params)),
+                { tone: 'danger' },
+              )
             }
             // Unknown/retryable acceptance deliberately remains submitting
             // and is replayed byte-for-byte after the next reconnect.
@@ -3188,7 +3209,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         options.messages.value.push({
           role: 'error',
-          text: sendFailureMessage(err),
+          text: sendFailureMessage(err, paramsHaveArtifactContext(attempt.params)),
           errorCode: errorCode(err),
           ts: new Date().toISOString(),
         })
@@ -3233,7 +3254,7 @@ export function useChatSend(options: UseChatSendOptions) {
       if (acceptedError || !sendOpts.suppressRejectedFailureMessage) {
         options.messages.value.push({
           role: 'error',
-          text: sendFailureMessage(err),
+          text: sendFailureMessage(err, paramsHaveArtifactContext(attempt.params)),
           errorCode: errorCode(err),
           ts: new Date().toISOString(),
         })
@@ -3918,7 +3939,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         options.messages.value.push({
           role: 'error',
-          text: sendFailureMessage(err),
+          text: sendFailureMessage(err, paramsHaveArtifactContext(params)),
           errorCode: errorCode(err),
           ts: new Date().toISOString(),
         })
@@ -3985,7 +4006,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       options.messages.value.push({
         role: 'error',
-        text: sendFailureMessage(err),
+        text: sendFailureMessage(err, paramsHaveArtifactContext(params)),
         errorCode: errorCode(err),
         ts: new Date().toISOString(),
       })

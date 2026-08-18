@@ -1608,7 +1608,9 @@ def test_desktop_gateway_exit_classifies_newer_config_validation_errors() -> Non
     assert "await waitForGateway(url, () => childExitMessage)" in start
     assert "waitForGatewayReadiness({" in wait
     assert "primaryTimeoutMs: 45_000" in wait
-    assert "lateGraceMs: 15_000" in wait
+    assert (
+        "lateGraceMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS - 45_000" in wait
+    )
     assert "exitMessage: earlyExitMessage" in wait
     assert "if (result.status === 'exited') throw new Error(result.message)" in wait
 

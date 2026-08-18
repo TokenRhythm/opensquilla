@@ -282,6 +282,49 @@ def test_document_grant_releases_failed_proposal_for_relocation_or_retry() -> No
     assert retried[0].operation == "set_style"
 
 
+def test_document_source_reads_are_utf8_bounded_and_total_capacity_is_exact() -> None:
+    registry = DocumentMutationGrantRegistry()
+    binding = _document_binding()
+    multibyte_fragment = "界" * 5_461
+
+    registry.record_source_read(
+        binding=binding,
+        start=0,
+        end=len(multibyte_fragment),
+        text=multibyte_fragment,
+    )
+    assert registry.candidate_range_was_read(
+        binding=binding,
+        start=2,
+        end=5,
+    )
+
+    registry.clear()
+    for index in range(8):
+        fragment = f"{index:02d}" + ("x" * (15 * 1024 - 2))
+        start = index * len(fragment)
+        registry.record_source_read(
+            binding=binding,
+            start=start,
+            end=start + len(fragment),
+            text=fragment,
+        )
+
+    assert registry.candidate_range_was_read(
+        binding=binding,
+        start=(15 * 1024) - 3,
+        end=(15 * 1024) + 3,
+    )
+
+    with pytest.raises(ArtifactRangeGrantError, match="ARTIFACT_RANGE_LIMIT"):
+        registry.record_source_read(
+            binding=binding,
+            start=8 * 15 * 1024,
+            end=9 * 15 * 1024,
+            text="overflow" + ("y" * (15 * 1024 - len("overflow"))),
+        )
+
+
 def test_registry_ttl_cursor_single_use_and_shared_capacity() -> None:
     now = [100.0]
     registry = ArtifactRangeGrantRegistry(

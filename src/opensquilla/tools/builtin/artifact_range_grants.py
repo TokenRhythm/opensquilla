@@ -27,6 +27,8 @@ _DOCUMENT_REGISTRY_ATTRIBUTE = "_document_mutation_grant_registry"
 MAX_RANGE_GRANTS_PER_TURN = 64
 MAX_RANGE_GRANT_TTL_SECONDS = 15 * 60
 MAX_RANGE_QUERIES_PER_TURN = 4
+MAX_RECORDED_SOURCE_FRAGMENT_BYTES = 16 * 1024
+MAX_RECORDED_SOURCE_BYTES_PER_TURN = 128 * 1024
 
 
 class RangeGrantContext(Protocol):
@@ -160,6 +162,13 @@ class _CursorEntry:
     position: int
     expires_at: float
     state: str = "fresh"
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceReadSpan:
+    start: int
+    end: int
+    byte_size: int
 
 
 class ArtifactRangeGrantError(ValueError):
@@ -490,6 +499,8 @@ class DocumentMutationGrantRegistry:
         self._entries: dict[str, _DocumentGrantEntry] = {}
         self._query_count = 0
         self._query_keys: set[str] = set()
+        self._contextual_candidates: dict[int, str] = {}
+        self._source_reads: dict[tuple[object, ...], list[_SourceReadSpan]] = {}
         self._lock = threading.Lock()
 
     def clear(self) -> None:
@@ -497,6 +508,110 @@ class DocumentMutationGrantRegistry:
             self._entries.clear()
             self._query_count = 0
             self._query_keys.clear()
+            self._contextual_candidates.clear()
+            self._source_reads.clear()
+
+    def record_source_read(
+        self,
+        *,
+        binding: DocumentGrantBinding,
+        start: int,
+        end: int,
+        text: str,
+    ) -> None:
+        """Remember a bounded canonical-source interval returned this turn."""
+
+        if (
+            not isinstance(text, str)
+            or isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or start < 0
+            or end < start
+            or len(text) != end - start
+        ):
+            raise ArtifactRangeGrantError(
+                "ARTIFACT_RANGE_BINDING_INVALID",
+                "The document source read could not be recorded safely.",
+            )
+        text_size = len(text.encode("utf-8"))
+        if text_size > MAX_RECORDED_SOURCE_FRAGMENT_BYTES:
+            raise ArtifactRangeGrantError(
+                "ARTIFACT_RANGE_BINDING_INVALID",
+                "The document source read could not be recorded safely.",
+            )
+        with self._lock:
+            spans = self._source_reads.setdefault(binding.key, [])
+            span = _SourceReadSpan(start=start, end=end, byte_size=text_size)
+            if span not in spans:
+                recorded_size = sum(item.byte_size for item in spans)
+                if recorded_size + text_size > MAX_RECORDED_SOURCE_BYTES_PER_TURN:
+                    raise ArtifactRangeGrantError(
+                        "ARTIFACT_RANGE_LIMIT",
+                        "This turn has reached the document source read limit.",
+                    )
+                spans.append(span)
+
+    def candidate_range_was_read(
+        self,
+        *,
+        binding: DocumentGrantBinding,
+        start: int,
+        end: int,
+    ) -> bool:
+        """Return whether read intervals fully cover a candidate source range."""
+
+        if (
+            isinstance(start, bool)
+            or not isinstance(start, int)
+            or isinstance(end, bool)
+            or not isinstance(end, int)
+            or start < 0
+            or end <= start
+        ):
+            return False
+        with self._lock:
+            covered_until = start
+            for span in sorted(
+                self._source_reads.get(binding.key, ()),
+                key=lambda item: (item.start, item.end),
+            ):
+                if span.end <= covered_until:
+                    continue
+                if span.start > covered_until:
+                    return False
+                covered_until = span.end
+                if covered_until >= end:
+                    return True
+            return False
+
+    def bind_contextual_candidate(
+        self,
+        *,
+        annotation_order: int,
+        candidate_fingerprint: str,
+    ) -> None:
+        """Allow one distinct candidate per contextual annotation and turn."""
+
+        if (
+            isinstance(annotation_order, bool)
+            or not isinstance(annotation_order, int)
+            or annotation_order < 0
+            or re.fullmatch(r"[0-9a-f]{64}", candidate_fingerprint) is None
+        ):
+            raise ArtifactRangeGrantError(
+                "ARTIFACT_RANGE_BINDING_INVALID",
+                "The contextual document target is invalid.",
+            )
+        with self._lock:
+            existing = self._contextual_candidates.get(annotation_order)
+            if existing is not None and existing != candidate_fingerprint:
+                raise ArtifactRangeGrantError(
+                    "ARTIFACT_RANGE_QUERY_LIMIT",
+                    "This annotation already used a different contextual target this turn.",
+                )
+            self._contextual_candidates[annotation_order] = candidate_fingerprint
 
     def consume_query_budget(self, *, query_key: str | None = None) -> int:
         with self._lock:

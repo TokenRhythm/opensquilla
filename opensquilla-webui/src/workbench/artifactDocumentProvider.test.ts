@@ -455,6 +455,44 @@ describe('artifact document provider', () => {
     })
   })
 
+  it('normalizes the product-only mutation resolution wire', async () => {
+    const call = vi.fn(async (method: string) => {
+      expect(method).toBe(ARTIFACT_DOCUMENT_RPC_METHODS.mutationResolve)
+      return {
+        status: 'applied',
+        retryAfterMs: null,
+        result: {
+          documentId: 'doc-html',
+          revisionId: 'rev-2',
+          sha256: 'b'.repeat(64),
+          stateRevision: 4,
+        },
+        receipt: { attemptId: 'must-be-ignored' },
+      }
+    })
+    const provider = createRpcArtifactDocumentProvider({
+      call: call as unknown as GenericRpcCall,
+      supportsMethod: () => true,
+      markMethodUnavailable: vi.fn(),
+    })
+
+    await expect(provider.resolveMutation?.({
+      sessionKey: 'session-a',
+      operation: 'source.patch',
+      requestId: 'request-a',
+      documentId: 'doc-html',
+    })).resolves.toEqual({
+      status: 'applied',
+      retryAfterMs: null,
+      result: {
+        documentId: 'doc-html',
+        revisionId: 'rev-2',
+        sha256: 'b'.repeat(64),
+        stateRevision: 4,
+      },
+    })
+  })
+
   it('normalizes and advances explicit edit sessions while preserving legacy fallback', async () => {
     let sessionStateRevision = 1
     let lastSavedRevisionId = 'rev-1'

@@ -180,7 +180,7 @@ describe('workbench resources store', () => {
     expect(list).toHaveBeenCalledTimes(2)
   })
 
-  it('derives one stable import receipt key for the same immutable source', async () => {
+  it('retires an applied import identity before the next explicit import', async () => {
     const importDocument = vi.fn(async (
       _request: Parameters<WorkbenchResourceProvider['importDocument']>[0],
     ) => ({
@@ -204,8 +204,9 @@ describe('workbench resources store', () => {
 
     const firstKey = importDocument.mock.calls[0]?.[0].idempotencyKey
     const secondKey = importDocument.mock.calls[1]?.[0].idempotencyKey
-    expect(firstKey).toMatch(/^import-/)
-    expect(secondKey).toBe(firstKey)
+    expect(firstKey).toMatch(/^document-import-/)
+    expect(secondKey).toMatch(/^document-import-/)
+    expect(secondKey).not.toBe(firstKey)
   })
 
   it('single-flights concurrent imports of the same immutable source', async () => {
@@ -307,7 +308,143 @@ describe('workbench resources store', () => {
     expect(importDocument).toHaveBeenCalledTimes(1)
     await expect(store.importDocument('session-import-retry', attachment)).resolves.toEqual(imported)
     expect(importDocument).toHaveBeenCalledTimes(2)
+    expect(importDocument.mock.calls[1]?.[0].idempotencyKey)
+      .not.toBe(importDocument.mock.calls[0]?.[0].idempotencyKey)
     expect(list).toHaveBeenCalledTimes(1)
+  })
+
+  it('releases a terminal not-applied import and retries with a new identity', async () => {
+    const imported = {
+      document: { documentId: 'doc-after-retry' },
+      revision: { revisionId: 'rev-after-retry' },
+    } as Awaited<ReturnType<WorkbenchResourceProvider['importDocument']>>
+    const responseLost = Object.assign(new Error('private transport detail'), {
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: null,
+    })
+    const importDocument = vi.fn<WorkbenchResourceProvider['importDocument']>()
+      .mockRejectedValueOnce(responseLost)
+      .mockResolvedValueOnce(imported)
+    const resolveMutation = vi.fn(async () => ({
+      status: 'not_applied' as const,
+      retryAfterMs: null,
+      result: null,
+    }))
+    const provider = {
+      available: () => true,
+      list: vi.fn(async () => ({ resources: [attachment], totalCount: 1 })),
+      get: vi.fn(),
+      importDocument,
+      publishDocument: vi.fn(),
+      resolveMutation,
+    } as unknown as WorkbenchResourceProvider
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+
+    await expect(store.importDocument('session-terminal', attachment))
+      .rejects.toThrow('was not updated')
+    await expect(store.importDocument('session-terminal', attachment)).resolves.toEqual(imported)
+
+    expect(importDocument).toHaveBeenCalledTimes(2)
+    expect(resolveMutation).toHaveBeenCalledTimes(1)
+    expect(importDocument.mock.calls[1]?.[0].idempotencyKey)
+      .not.toBe(importDocument.mock.calls[0]?.[0].idempotencyKey)
+  })
+
+  it('uses an applied resolution without replaying the import write', async () => {
+    const responseLost = Object.assign(new Error('private transport detail'), {
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: null,
+    })
+    const importDocument = vi.fn<WorkbenchResourceProvider['importDocument']>()
+      .mockRejectedValue(responseLost)
+    const canonicalDocument = {
+      documentId: 'doc-resolved',
+      headRevisionId: 'rev-resolved',
+    }
+    const canonicalRevision = {
+      documentId: 'doc-resolved',
+      revisionId: 'rev-resolved',
+    }
+    const provider = {
+      available: () => true,
+      list: vi.fn(async () => ({ resources: [], totalCount: 0 })),
+      get: vi.fn(),
+      importDocument,
+      publishDocument: vi.fn(),
+      resolveMutation: vi.fn(async () => ({
+        status: 'applied' as const,
+        retryAfterMs: null,
+        result: {
+          documentId: 'doc-resolved',
+          revisionId: 'rev-resolved',
+          sha256: 'b'.repeat(64),
+          stateRevision: 2,
+        },
+        document: canonicalDocument,
+        revision: canonicalRevision,
+      })),
+    } as unknown as WorkbenchResourceProvider
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+
+    await expect(store.importDocument('session-applied', attachment)).resolves.toMatchObject({
+      document: canonicalDocument,
+      revision: canonicalRevision,
+    })
+    expect(importDocument).toHaveBeenCalledTimes(1)
+  })
+
+  it('resolves a pending open without replaying and keeps applied after a read failure', async () => {
+    const responseLost = Object.assign(new Error('private transport detail'), {
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: null,
+    })
+    const open = vi.fn<NonNullable<WorkbenchResourceProvider['open']>>()
+      .mockRejectedValue(responseLost)
+    const canonicalDocument = {
+      documentId: 'doc-open-resolved',
+      headRevisionId: 'rev-open-resolved',
+    }
+    const canonicalRevision = {
+      documentId: 'doc-open-resolved',
+      revisionId: 'rev-open-resolved',
+    }
+    const appliedResolution = {
+      status: 'applied' as const,
+      retryAfterMs: null,
+      result: {
+        documentId: 'doc-open-resolved',
+        revisionId: 'rev-open-resolved',
+        sha256: 'c'.repeat(64),
+        stateRevision: 2,
+      },
+      document: canonicalDocument,
+      revision: canonicalRevision,
+    }
+    const resolveMutation = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(appliedResolution)
+    const provider = {
+      available: () => true,
+      list: vi.fn(async () => ({ resources: [], totalCount: 0 })),
+      get: vi.fn().mockRejectedValue(new Error('private canonical read failure')),
+      open,
+      importDocument: vi.fn(),
+      publishDocument: vi.fn(),
+      resolveMutation,
+    } as unknown as WorkbenchResourceProvider
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+
+    await expect(store.openCurrent('session-open-applied', attachment))
+      .rejects.toMatchObject({ code: 'MUTATION_OUTCOME_PENDING' })
+    await expect(store.openCurrent('session-open-applied', attachment))
+      .rejects.toMatchObject({ code: 'DOCUMENT_UNAVAILABLE' })
+
+    expect(open).toHaveBeenCalledTimes(1)
+    expect(resolveMutation).toHaveBeenCalledTimes(2)
+    expect(provider.get).toHaveBeenCalledTimes(1)
   })
 
   it('reuses an uncertain publish key and retires it only after an applied receipt', async () => {
@@ -328,7 +465,10 @@ describe('workbench resources store', () => {
       },
     })
     const publishDocument = vi.fn<WorkbenchResourceProvider['publishDocument']>()
-      .mockRejectedValueOnce(new Error('response lost'))
+      .mockRejectedValueOnce(Object.assign(new Error('response lost'), {
+        code: 'RPC_TRANSPORT_ERROR',
+        accepted: null,
+      }))
       .mockResolvedValueOnce(appliedPublication('a'))
       .mockResolvedValueOnce(appliedPublication('b'))
     const provider = {
@@ -337,6 +477,7 @@ describe('workbench resources store', () => {
       get: vi.fn(),
       importDocument: vi.fn(),
       publishDocument,
+      resolveMutation: vi.fn(async () => null),
     } as unknown as WorkbenchResourceProvider
     const store = useWorkbenchResourcesStore()
     store.setProvider(provider)
@@ -345,7 +486,7 @@ describe('workbench resources store', () => {
       'session-publish-retry',
       'doc-a',
       'rev-a',
-    )).rejects.toThrow('response lost')
+    )).rejects.toThrow('cannot be confirmed')
     await store.publishDocument('session-publish-retry', 'doc-a', 'rev-a')
     await store.publishDocument('session-publish-retry', 'doc-a', 'rev-a')
 
@@ -353,6 +494,43 @@ describe('workbench resources store', () => {
     expect(keys[0]).toMatch(/^publish-/)
     expect(keys[1]).toBe(keys[0])
     expect(keys[2]).not.toBe(keys[1])
+  })
+
+  it('does not replay a publish write after the resolver proves it applied', async () => {
+    const responseLost = Object.assign(new Error('private transport detail'), {
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: null,
+    })
+    const publishDocument = vi.fn<WorkbenchResourceProvider['publishDocument']>()
+      .mockRejectedValue(responseLost)
+    const provider = {
+      available: () => true,
+      list: vi.fn(async () => ({ resources: [], totalCount: 0 })),
+      get: vi.fn(),
+      importDocument: vi.fn(),
+      publishDocument,
+      resolveMutation: vi.fn(async () => ({
+        status: 'applied' as const,
+        retryAfterMs: null,
+        result: {
+          documentId: 'doc-published',
+          revisionId: 'rev-published',
+          sha256: 'd'.repeat(64),
+          stateRevision: 3,
+        },
+      })),
+    } as unknown as WorkbenchResourceProvider
+    const store = useWorkbenchResourcesStore()
+    store.setProvider(provider)
+
+    await expect(store.publishDocument(
+      'session-publish-applied',
+      'doc-published',
+      'rev-published',
+    )).resolves.toBeNull()
+
+    expect(publishDocument).toHaveBeenCalledTimes(1)
+    expect(provider.resolveMutation).toHaveBeenCalledTimes(1)
   })
 
   it('fails closed when editing is not advertised', async () => {

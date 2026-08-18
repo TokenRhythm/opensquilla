@@ -240,9 +240,12 @@ async def _current_scope(
         raise _stale_context()
 
     try:
+        expected_revision_id = (
+            None if isinstance(context, BoundDocumentContext) else context.revision_id
+        )
         current = await service.get_document_head(
             context.document_id,
-            expected_revision_id=context.revision_id,
+            expected_revision_id=expected_revision_id,
         )
         document = current.document
         revision = current.revision
@@ -251,8 +254,11 @@ async def _current_scope(
     if (
         document.session_key != context.session_key
         or document.session_id != context.session_id
-        or document.head_revision_id != context.revision_id
         or revision.document_id != document.document_id
+        or (
+            isinstance(context, BoundPromptAnnotationContext)
+            and document.head_revision_id != context.revision_id
+        )
     ):
         raise _stale_context()
 
@@ -277,15 +283,22 @@ async def _current_scope(
         )
 
     anchors: list[Anchor] = []
-    for anchor_id in context.anchor_ids:
+    for target in context.targets:
         try:
-            anchor = await service.get_anchor(anchor_id)
+            anchor = await service.get_anchor(target.anchor_id)
         except ArtifactSessionNotFoundError:
             raise _stale_context() from None
         if (
             anchor.document_id != document.document_id
             or anchor.revision_id != revision.revision_id
-            or anchor.state is not AnchorState.RESOLVED
+            or (
+                target.status == "ready"
+                and anchor.state is not AnchorState.RESOLVED
+            )
+            or (
+                target.status == "contextual"
+                and anchor.state is not AnchorState.ORPHANED
+            )
         ):
             raise _stale_context()
         anchors.append(anchor)
@@ -298,9 +311,9 @@ async def _current_scope(
             annotations.append(await service.get_prompt_annotation(annotation_id))
     except ArtifactSessionNotFoundError:
         raise _stale_context() from None
-    for annotation, expected_anchor_id in zip(
+    for annotation, target in zip(
         annotations,
-        context.anchor_ids,
+        context.targets,
         strict=True,
     ):
         if (
@@ -308,7 +321,7 @@ async def _current_scope(
             or annotation.session_id != context.session_id
             or annotation.document_id != document.document_id
             or annotation.revision_id != revision.revision_id
-            or annotation.anchor_id != expected_anchor_id
+            or annotation.anchor_id != target.anchor_id
             or annotation.status.value != "sent"
             or annotation.sent_turn_id != turn_id
         ):

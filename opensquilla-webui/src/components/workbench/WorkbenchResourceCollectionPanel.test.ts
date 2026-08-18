@@ -37,15 +37,12 @@ function mount(
     downloadLabel: (item: WorkbenchResource) => `Download ${item.name}`,
     emptyLabel: 'Empty',
     groupLabels: {
-      attachment: 'Attachments',
-      document: 'Working copies',
-      deliverable: 'Published',
-      url: 'Links',
+      files: 'Files',
+      links: 'Links',
     },
     label: 'Workbench',
     openLabel: (item: WorkbenchResource) => `Open ${item.name}`,
     preparingLabel: 'Preparing editor…',
-    publishLabel: (item: WorkbenchResource) => `Publish ${item.name}`,
     retryLabel: 'Retry',
     resources,
     unavailableReason: (item: WorkbenchResource) => (
@@ -97,7 +94,7 @@ describe('WorkbenchResourceCollectionPanel', () => {
     mounted.app.unmount()
   })
 
-  it('orders lifecycle groups and localizes capability reasons without leaking codes', () => {
+  it('shows only product file and link groups without leaking storage lifecycles', () => {
     const onWorkbenchEvent = vi.fn()
     const readonlyOffice = resource('attachment', 'office_adapter_not_available')
     const mounted = mount([
@@ -108,11 +105,11 @@ describe('WorkbenchResourceCollectionPanel', () => {
     ], { onWorkbenchEvent })
 
     expect([...mounted.element.querySelectorAll('h3')].map(item => item.textContent)).toEqual([
-      'Attachments',
-      'Working copies',
-      'Published',
+      'Files',
       'Links',
     ])
+    expect(mounted.element.textContent).not.toMatch(/working cop|published/i)
+    expect(mounted.element.querySelector('[aria-label^="Publish "]')).toBeNull()
     expect(mounted.element.textContent).toContain('Office editing is not available yet.')
     expect(mounted.element.textContent).toContain('Editing is not available for this resource.')
     expect(mounted.element.textContent).not.toContain('office_adapter_not_available')
@@ -128,6 +125,26 @@ describe('WorkbenchResourceCollectionPanel', () => {
     })
     expect(mounted.element.querySelector('[aria-label="Download attachment.html"]'))
       .not.toBeNull()
+    mounted.app.unmount()
+  })
+
+  it('labels a download-only file row as Download while keeping readonly HTML as Open', () => {
+    const downloadOnly = resource('attachment', 'resource_unsupported')
+    downloadOnly.name = 'archive.zip'
+    downloadOnly.mime = 'application/zip'
+    downloadOnly.capabilities.preview = false
+    downloadOnly.capabilities.download = true
+    const readonlyHtml = resource('deliverable', 'bundle_not_supported')
+    readonlyHtml.capabilities.preview = false
+    readonlyHtml.capabilities.download = true
+    const mounted = mount([downloadOnly, readonlyHtml], {
+      openLabel: (item: WorkbenchResource) => (
+        item === downloadOnly ? `Download ${item.name}` : `Open ${item.name}`
+      ),
+    })
+
+    expect(mounted.element.querySelector('[aria-label="Download archive.zip"]')).not.toBeNull()
+    expect(mounted.element.querySelector('[aria-label="Open deliverable.html"]')).not.toBeNull()
     mounted.app.unmount()
   })
 })

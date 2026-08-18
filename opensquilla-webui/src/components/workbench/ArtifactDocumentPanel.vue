@@ -176,10 +176,10 @@
       <ol v-else class="artifact-document__list artifact-document__versions">
         <li v-for="revision in revisions" :key="revision.revisionId">
           <span class="artifact-document__list-main">
-            <strong>
+            <strong>{{ revisionLabel(revision) }}</strong>
+            <small>
               {{ t('workbench.artifactDocument.versionNumber', { generation: revision.generation }) }}
-            </strong>
-            <small>{{ revision.source }} · {{ actorLabel(revision.actorId, revision.actorKind) }}</small>
+            </small>
           </span>
           <span class="artifact-document__list-meta">
             <span
@@ -228,18 +228,14 @@
       role="tabpanel"
       :aria-labelledby="tabId('changes')"
     >
-      <p v-if="changeSets.length === 0" class="artifact-document__empty">
+      <p v-if="appliedChangeSets.length === 0" class="artifact-document__empty">
         {{ t('workbench.artifactDocument.noChanges') }}
       </p>
       <ol v-else class="artifact-document__list">
-        <li v-for="changeSet in changeSets" :key="changeSet.changeSetId">
+        <li v-for="changeSet in appliedChangeSets" :key="changeSet.changeSetId">
           <span class="artifact-document__list-main">
-            <strong>{{ changeSet.summary || changeSet.status }}</strong>
-            <small>
-              {{ changeSet.status }} · {{ t('workbench.artifactDocument.operationCount', {
-                count: changeSet.operations.length,
-              }) }}
-            </small>
+            <strong>{{ changeSetLabel(changeSet.createdByKind) }}</strong>
+            <small>{{ safeChangeSetSummary(changeSet) }}</small>
           </span>
           <span class="artifact-document__list-meta">
             <time v-if="changeSet.updatedAt" :datetime="dateTime(changeSet.updatedAt)">
@@ -365,7 +361,7 @@ const instanceId = useId()
 const promptAnnotationMaxBodyLength = PROMPT_ANNOTATION_MAX_BODY_LENGTH
 const annotationNewlineHint = computed(() => t(
   'workbench.artifactAnnotation.newlineHint',
-  { shortcut: isMacPlatform() ? '⇧ Enter' : 'Shift + Enter' },
+  { shortcut: isMacPlatform() ? '⇧ Return' : 'Shift + Enter' },
 ))
 const annotationFallbackBody = ref('')
 const annotationFallbackInput = ref<HTMLTextAreaElement | null>(null)
@@ -449,6 +445,9 @@ const workspace = computed(() => documentFeatures.value
 const documentModel = computed(() => workspace.value?.document || null)
 const revisions = computed(() => workspace.value?.revisions || [])
 const changeSets = computed(() => workspace.value?.changeSets || [])
+const appliedChangeSets = computed(() => changeSets.value.filter(
+  changeSet => changeSet.status === 'applied',
+))
 const headArtifact = computed(() => documentFeatures.value
   ? workspace.value?.headArtifact || props.artifact
   : props.artifact)
@@ -507,7 +506,7 @@ const tabs = computed<Array<{ id: DocumentTab; label: string; count: number | nu
   if (documentFeatures.value) {
     result.push(
       { id: 'versions', label: t('workbench.artifactDocument.versions'), count: revisions.value.length },
-      { id: 'changes', label: t('workbench.artifactDocument.changes'), count: changeSets.value.length },
+      { id: 'changes', label: t('workbench.artifactDocument.changes'), count: appliedChangeSets.value.length },
     )
   }
   return result
@@ -636,8 +635,44 @@ function formatDate(value: number | string): string {
   return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString()
 }
 
-function actorLabel(actorId: string, kind: string): string {
-  return actorId || t('workbench.artifactDocument.actor', { kind })
+function revisionLabel(revision: (typeof revisions.value)[number]): string {
+  if (revision.source === 'initial') return String(t('workbench.artifactDocument.versionOriginal'))
+  if (revision.source === 'restore') return String(t('workbench.artifactDocument.versionRestored'))
+  if (revision.source === 'revert') return String(t('workbench.artifactDocument.versionUndone'))
+  if (revision.source === 'manual' || revision.actorKind === 'user') {
+    return String(t('workbench.artifactDocument.versionByYou'))
+  }
+  return String(t('workbench.artifactDocument.versionByOpenSquilla'))
+}
+
+function changeSetLabel(actorKind: string): string {
+  if (actorKind === 'user') return String(t('workbench.artifactDocument.versionByYou'))
+  if (actorKind === 'agent') return String(t('workbench.artifactDocument.versionByOpenSquilla'))
+  return String(t('workbench.artifactDocument.changeApplied'))
+}
+
+const UNSAFE_CHANGE_SUMMARY = /<\/?[a-z][^>]*>|\b(?:stale|sha(?:256)?|receipt|reconciliation|edit[ -]?session|change[ -]?set|actor[ -]?id|document_(?:apply|patch)|cursor|grant|working copy|immutable snapshot|protocol-v3|(?:native|trusted)[ -]?editor|opaque sandbox|revision|mutations?|operations?|anchor|lease)\b/i
+
+function safeChangeSetSummary(changeSet: (typeof changeSets.value)[number]): string {
+  const revision = revisions.value.find(item => item.changeSetId === changeSet.changeSetId)
+  if (revision?.source === 'restore') {
+    return String(t('workbench.artifactDocument.versionRestored'))
+  }
+  if (revision?.source === 'revert') {
+    return String(t('workbench.artifactDocument.versionUndone'))
+  }
+  if (revision?.source === 'manual' || changeSet.createdByKind === 'user') {
+    return String(t('workbench.artifactDocument.changeEdited'))
+  }
+  const summary = changeSet.summary.replace(/\s+/g, ' ').trim()
+  if (
+    changeSet.createdByKind === 'agent'
+    && summary.length > 0
+    && summary.length <= 120
+    && !/[\u0000-\u001f\u007f]/.test(summary)
+    && !UNSAFE_CHANGE_SUMMARY.test(summary)
+  ) return summary
+  return String(t('workbench.artifactDocument.changeApplied'))
 }
 
 async function reload() {

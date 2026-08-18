@@ -64,6 +64,35 @@ describe('workbench document context bridge', () => {
     })
   })
 
+  it('flushes a requested hidden document without rebinding the active item', async () => {
+    const store = useWorkbenchDocumentContextStore()
+    const prepareActive = vi.fn()
+    const prepareDocument = vi.fn(async request => ({
+      documentId: request.documentId,
+      headRevisionId: 'revision-hidden-saved',
+    }))
+    const controller = store.attachController(prepareActive, prepareDocument)
+    controller.setActive({
+      ...context,
+      activeItemId: 'artifact-preview-b',
+      documentId: 'document-b',
+    })
+
+    await expect(store.prepareDocumentForSend('session-a', 'document-a')).resolves.toEqual({
+      documentId: 'document-a',
+      headRevisionId: 'revision-hidden-saved',
+    })
+    expect(prepareActive).not.toHaveBeenCalled()
+    expect(prepareDocument).toHaveBeenCalledWith({
+      documentId: 'document-a',
+      sessionKey: 'session-a',
+    })
+    expect(store.currentDocumentContext('session-a')).toEqual({
+      documentId: 'document-b',
+      headRevisionId: 'revision-a',
+    })
+  })
+
   it('rejects a preparation whose active item changes while flushing', async () => {
     let complete!: (value: { documentId: string; headRevisionId: string }) => void
     const prepare = vi.fn(() => new Promise<{

@@ -24,6 +24,7 @@ from opensquilla.artifact_session import (
     ArtifactSessionService,
     PromptAnnotationStatus,
 )
+from opensquilla.artifacts import ArtifactStore
 from opensquilla.attachment_refs import (
     PENDING_CHAT_INPUT_MATERIAL_STORE,
     pending_chat_input_material_path,
@@ -453,17 +454,28 @@ async def _create_html_prompt_annotation(
     annotation_id: str,
 ) -> tuple[ArtifactSessionService, Any]:
     service = await ArtifactSessionService.from_session_storage(stack.storage)
+    source = b"<html><body><h1>Original</h1></body></html>"
+    ref = ArtifactStore(
+        Path(stack.context.config.attachments.media_root or "")
+    ).publish_bytes(
+        source,
+        session_id=stack.session_id,
+        session_key=SESSION_KEY,
+        name="page.html",
+        mime="text/html",
+        source="test",
+    )
     created = await service.create_document(
         session_key=SESSION_KEY,
         session_id=stack.session_id,
         name="page.html",
         kind=ArtifactKind.HTML,
         initial_artifact=ArtifactBlobRef(
-            artifact_id=f"artifact-{annotation_id}",
-            sha256="b" * 64,
-            filename="page.html",
-            media_type="text/html",
-            byte_size=22,
+            artifact_id=ref.id,
+            sha256=ref.sha256,
+            filename=ref.name,
+            media_type=ref.mime,
+            byte_size=ref.size,
         ),
         actor=Actor(ActorKind.USER, "user-1"),
     )
@@ -472,11 +484,11 @@ async def _create_html_prompt_annotation(
         revision_id=created.revision.revision_id,
         kind=AnchorKind.DOM_SOURCE,
         locator={
-            "start_offset": 6,
-            "start_tag_end_offset": 10,
+            "start_offset": source.decode().index("<h1>"),
+            "start_tag_end_offset": source.decode().index("<h1>") + len("<h1>"),
             "tag_name": "h1",
-            "source_sha256": "b" * 64,
-            "offset_encoding": "unicode_code_points",
+            "source_sha256": ref.sha256,
+            "offset_encoding": "unicode-code-point",
         },
         quote="<h1>",
         actor=Actor(ActorKind.USER, "user-1"),
@@ -616,40 +628,33 @@ async def test_owner_web_turn_receives_narrow_generated_artifact_adopter(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["stale", "cross_session"])
 async def test_chat_send_rejects_unbound_document_context_before_acceptance(
     tmp_path: Path,
-    failure: str,
 ) -> None:
-    async with _open_real_stack(tmp_path / f"document-context-{failure}.db") as stack:
-        if failure == "cross_session":
-            _service, created = await _create_html_document(
-                stack,
-                session_key="agent:main:webchat:another-session",
-                session_id="another-session-id",
-            )
-            revision_id = created.revision.revision_id
-        else:
-            _service, created = await _create_html_document(stack)
-            revision_id = "missing-head-revision"
+    async with _open_real_stack(tmp_path / "document-context-cross-session.db") as stack:
+        _service, created = await _create_html_document(
+            stack,
+            session_key="agent:main:webchat:another-session",
+            session_id="another-session-id",
+        )
 
         response = await get_dispatcher().dispatch(
-            f"rpc-document-context-{failure}",
+            "rpc-document-context-cross-session",
             "chat.send",
             {
                 "sessionKey": SESSION_KEY,
                 "message": "Edit this document.",
-                "clientRequestId": f"document-context-{failure}",
+                "clientRequestId": "document-context-cross-session",
                 "documentContext": {
                     "documentId": created.document.document_id,
-                    "headRevisionId": revision_id,
+                    "headRevisionId": created.revision.revision_id,
                 },
             },
             stack.context,
         )
 
         assert response.error is not None
-        assert response.error.code == "DOCUMENT_CONTEXT_STALE"
+        assert response.error.code == "DOCUMENT_UNAVAILABLE"
         assert response.error.accepted is False
         assert _table_counts(stack.db_path) == {
             "transcript_entries": 0,
@@ -657,6 +662,38 @@ async def test_chat_send_rejects_unbound_document_context_before_acceptance(
             "turn_ingress_receipts": 0,
         }
         _assert_no_runtime_acceptance_state(stack.runtime)
+
+
+@pytest.mark.asyncio
+async def test_chat_send_treats_document_context_revision_as_freshness_hint(
+    tmp_path: Path,
+) -> None:
+    async with _open_real_stack(tmp_path / "document-context-hint.db") as stack:
+        _service, created = await _create_html_document(stack)
+
+        response = await get_dispatcher().dispatch(
+            "rpc-document-context-hint",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "Edit this document.",
+                "clientRequestId": "document-context-hint",
+                "documentContext": {
+                    "documentId": created.document.document_id,
+                    "headRevisionId": "old-client-head-hint",
+                },
+            },
+            stack.context,
+        )
+
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        bound = runtime_task.envelope.runtime_services["artifact_context"]
+        assert isinstance(bound, BoundDocumentContext)
+        assert bound.revision_id == created.revision.revision_id
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
 
 
 @pytest.mark.asyncio
@@ -730,17 +767,24 @@ async def test_chat_send_atomically_consumes_prompt_annotations_into_runtime_con
         assert response.payload["acceptedPromptAnnotationIds"] == [draft.annotation_id]
         sent = await service.get_prompt_annotation(draft.annotation_id)
         assert sent.status is PromptAnnotationStatus.SENT
+        assert sent.anchor_id != draft.anchor_id
+        normalized_anchor = await service.get_anchor(sent.anchor_id)
+        assert normalized_anchor.remapped_from_anchor_id == draft.anchor_id
         assert sent.sent_message_id == response.payload["user_message_id"]
         assert sent.sent_turn_id == response.payload["task_id"]
         entries = await stack.storage.get_transcript(stack.session_id)
         envelope = json.loads(entries[-1].content)
         assert envelope["prompt_annotations"][0]["annotationId"] == draft.annotation_id
         assert envelope["prompt_annotations"][0]["body"] == draft.body
+        assert envelope["prompt_annotations"][0]["targetStatus"] == "ready"
+        assert envelope["prompt_annotations"][0]["targetKind"] == "heading"
 
         runtime_task = stack.runtime._tasks[response.payload["task_id"]]
         bound = runtime_task.envelope.runtime_services["artifact_context"]
         assert bound.operation_class == "selection_edit"
         assert bound.annotation_ids == (draft.annotation_id,)
+        assert bound.targets[0].status == "ready"
+        assert bound.targets[0].anchor_id == sent.anchor_id
         assert bound.tool_names == PROMPT_ANNOTATION_TOOL_NAMES
         assert "document_apply" in bound.request_context_prompt
         assert "html_edit_source" not in bound.request_context_prompt
@@ -765,6 +809,162 @@ async def test_chat_send_atomically_consumes_prompt_annotations_into_runtime_con
 
         stack.release_handler.set()
         await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current_source", "expected_status", "expected_reason"),
+    [
+        (
+            b"<html><body><section><h1 style='color:blue'>Original</h1></section></body></html>",
+            "ready",
+            None,
+        ),
+        (
+            b"<html><body><h1>Original</h1><h1>Original</h1></body></html>",
+            "contextual",
+            "ambiguous",
+        ),
+    ],
+    ids=["moved-and-restyled", "ambiguous"],
+)
+async def test_chat_send_normalizes_annotations_to_current_head_before_acceptance(
+    tmp_path: Path,
+    current_source: bytes,
+    expected_status: str,
+    expected_reason: str | None,
+) -> None:
+    async with _open_real_stack(tmp_path / f"normalize-{expected_status}.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id=f"annotation-normalize-{expected_status}",
+        )
+        document = await service.get_document(draft.document_id)
+        ref = ArtifactStore(
+            Path(stack.context.config.attachments.media_root or "")
+        ).publish_bytes(
+            current_source,
+            session_id=stack.session_id,
+            session_key=SESSION_KEY,
+            name="page.html",
+            mime="text/html",
+            source="test-current-head",
+        )
+        current = await service.commit_revision(
+            document_id=document.document_id,
+            expected_head_revision_id=document.head_revision_id,
+            expected_state_revision=document.state_revision,
+            artifact=ArtifactBlobRef(
+                artifact_id=ref.id,
+                sha256=ref.sha256,
+                filename=ref.name,
+                media_type=ref.mime,
+                byte_size=ref.size,
+            ),
+            actor=Actor(ActorKind.USER, "owner"),
+        )
+
+        response = await get_dispatcher().dispatch(
+            f"rpc-normalize-{expected_status}",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "",
+                "clientRequestId": f"normalize-{expected_status}",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+
+        assert response.error is None, response.error
+        await stack.wait_until_running()
+        sent = await service.get_prompt_annotation(draft.annotation_id)
+        assert sent.revision_id == current.revision.revision_id
+        normalized_anchor = await service.get_anchor(sent.anchor_id)
+        assert normalized_anchor.remapped_from_anchor_id == draft.anchor_id
+        runtime_task = stack.runtime._tasks[response.payload["task_id"]]
+        target = runtime_task.envelope.runtime_services["artifact_context"].targets[0]
+        assert target.status == expected_status
+        assert target.reason == expected_reason
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_chat_send_reprepares_annotation_after_head_race_before_provider_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "annotation-head-race.db") as stack:
+        service, draft = await _create_html_prompt_annotation(
+            stack,
+            annotation_id="annotation-head-race",
+        )
+        original_accept_turn = stack.storage.accept_turn
+        acceptance_calls = 0
+        raced_revision_id: str | None = None
+
+        async def _accept_after_one_head_change(*args: Any, **kwargs: Any) -> Any:
+            nonlocal acceptance_calls, raced_revision_id
+            acceptance_calls += 1
+            if acceptance_calls == 1:
+                assert stack.handler_started.is_set() is False
+                document = await service.get_document(draft.document_id)
+                source = b"<html><body><section><h1>Original</h1></section></body></html>"
+                ref = ArtifactStore(
+                    Path(stack.context.config.attachments.media_root or "")
+                ).publish_bytes(
+                    source,
+                    session_id=stack.session_id,
+                    session_key=SESSION_KEY,
+                    name="page.html",
+                    mime="text/html",
+                    source="test-head-race",
+                )
+                committed = await service.commit_revision(
+                    document_id=document.document_id,
+                    expected_head_revision_id=document.head_revision_id,
+                    expected_state_revision=document.state_revision,
+                    artifact=ArtifactBlobRef(
+                        artifact_id=ref.id,
+                        sha256=ref.sha256,
+                        filename=ref.name,
+                        media_type=ref.mime,
+                        byte_size=ref.size,
+                    ),
+                    actor=Actor(ActorKind.USER, "owner"),
+                )
+                raced_revision_id = committed.revision.revision_id
+            return await original_accept_turn(*args, **kwargs)
+
+        monkeypatch.setattr(stack.storage, "accept_turn", _accept_after_one_head_change)
+
+        response = await get_dispatcher().dispatch(
+            "rpc-annotation-head-race",
+            "chat.send",
+            {
+                "sessionKey": SESSION_KEY,
+                "message": "",
+                "clientRequestId": "annotation-head-race",
+                "promptAnnotationIds": [draft.annotation_id],
+            },
+            stack.context,
+        )
+
+        assert response.error is None, response.error
+        assert acceptance_calls == 2
+        assert raced_revision_id is not None
+        await stack.wait_until_running()
+        sent = await service.get_prompt_annotation(draft.annotation_id)
+        assert sent.revision_id == raced_revision_id
+        assert _table_counts(stack.db_path) == {
+            "transcript_entries": 1,
+            "agent_tasks": 1,
+            "turn_ingress_receipts": 1,
+        }
+        stack.release_handler.set()
+        await stack.runtime.wait(response.payload["task_id"], timeout=2.0)
+
 
 @pytest.mark.asyncio
 async def test_chat_send_first_ordinary_turn_schedules_auto_title_once(

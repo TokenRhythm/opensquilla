@@ -110,6 +110,39 @@ def normalize_prompt_annotation_snapshot(value: object) -> dict[str, Any]:
         "revision": revision,
         "anchor": anchor,
     }
+    raw_target_status = value.get("targetStatus", "ready")
+    if raw_target_status not in {"ready", "contextual"}:
+        raise PromptAnnotationSnapshotError("targetStatus is invalid")
+    raw_target_reason = value.get("targetReason")
+    if raw_target_reason not in {None, "no_match", "ambiguous"}:
+        raise PromptAnnotationSnapshotError("targetReason is invalid")
+    if raw_target_status == "ready" and raw_target_reason is not None:
+        raise PromptAnnotationSnapshotError("a ready target cannot have a targetReason")
+    if raw_target_status == "contextual" and raw_target_reason is None:
+        raise PromptAnnotationSnapshotError("a contextual target requires a targetReason")
+    raw_target_kind = value.get("targetKind", "region")
+    if raw_target_kind not in {
+        "heading",
+        "button",
+        "link",
+        "image",
+        "input",
+        "form",
+        "section",
+        "list",
+        "table",
+        "text",
+        "region",
+    }:
+        raise PromptAnnotationSnapshotError("targetKind is invalid")
+    normalized["targetStatus"] = raw_target_status
+    normalized["targetReason"] = raw_target_reason
+    normalized["targetKind"] = raw_target_kind
+    normalized["targetText"] = _optional_text(
+        value.get("targetText"),
+        field="targetText",
+        max_bytes=512,
+    )
     # Re-validate required authority/display projections after bounding the
     # containing objects.  IDs remain useful to the trusted runtime but are
     # never rendered into Router telemetry.
@@ -181,7 +214,11 @@ def render_active_prompt_annotation_context(values: object) -> str | None:
         "declaration list such as 'color: #222; background-color: #fff;' and must not contain "
         "selectors, rule braces, or a style= wrapper. Correct a rejected proposal only when the "
         "tool outcome permits it; a stale or invalid grant must not create a revision. Do not "
-        "claim a document change succeeded without an applied tool receipt."
+        "claim a document change succeeded without an applied tool receipt. For a contextual "
+        "target, first read the current source and pass exactly one complete, source-backed "
+        "opening tag as candidateSource to document_locate. The candidate must occur once and "
+        "represent the same element kind. If no unique candidate exists, leave that item "
+        "unchanged; do not guess. Exact and contextual items may be handled in one batch."
     )
     lines = [
         "<artifact_prompt_annotations>",
@@ -199,7 +236,9 @@ def render_active_prompt_annotation_context(values: object) -> str | None:
                 f"<revision generation='{revision['generation']}' "
                 f"sha256='{xml_escape(revision['sha256'])}' />",
                 f"<element tag='{xml_escape(anchor['tagName'])}' "
-                f"kind='{xml_escape(anchor['kind'])}' />",
+                f"kind='{xml_escape(anchor['kind'])}' "
+                f"target_status='{xml_escape(item['targetStatus'])}' "
+                f"target_kind='{xml_escape(item['targetKind'])}' />",
                 f"<instruction>{xml_escape(item['body'])}</instruction>",
             ]
         )

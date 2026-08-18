@@ -999,6 +999,17 @@ try {
         selectionId: selected.selectionId,
         annotationId: 'annotation_electron_fixture',
         initialBody: 'Initial annotation',
+        overlayCopyVersion: 1,
+        copy: {
+          targetLabel: '区域：示例',
+          contextLabel: '当前选区',
+          bodyLabel: '页面批注',
+          placeholder: '描述希望进行的修改…',
+          newlineHint: process.platform === 'darwin' ? '⇧ Return 换行' : 'Shift + Enter 换行',
+          cancelLabel: '取消',
+          submitLabel: '添加批注',
+          emptyBodyMessage: '请描述希望的修改。',
+        },
       })
       const annotationOverlay = manager.annotationOverlays.get(owner)
       if (!annotationOverlay) throw new Error('Trusted annotation overlay was not created.')
@@ -1248,6 +1259,19 @@ try {
         selectionId: annotationRearmSelection.selectionId,
         annotationId: 'annotation_rearmed_fixture',
         initialBody: '',
+        overlayCopyVersion: 1,
+        copy: {
+          targetLabel: 'Button: Rearmed target',
+          contextLabel: 'Selected area',
+          bodyLabel: 'Page annotation',
+          placeholder: 'Describe the next change…',
+          newlineHint: process.platform === 'darwin'
+            ? '⇧ Return for a new line'
+            : 'Shift + Enter for a new line',
+          cancelLabel: 'Cancel',
+          submitLabel: 'Add annotation',
+          emptyBodyMessage: 'Describe the next requested change.',
+        },
       })
       await waitFor(
         async () => await annotationOverlay.view.webContents.executeJavaScript(
@@ -1255,6 +1279,19 @@ try {
         ),
         'rearmed annotation textarea focus',
       )
+      const annotationRearmCopy =
+        await annotationOverlay.view.webContents.executeJavaScript(`(() => ({
+          target: document.getElementById('annotation-target').textContent,
+          placeholder: document.getElementById('annotation-body').placeholder,
+          newlineHint: document.getElementById('annotation-newline-hint').textContent,
+        }))()`)
+      const annotationRearmEmptyBodyMessage =
+        await annotationOverlay.view.webContents.executeJavaScript(`(() => {
+          const form = document.getElementById('annotation-form')
+          const textarea = document.getElementById('annotation-body')
+          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+          return textarea.validationMessage
+        })()`)
       annotationOverlay.view.webContents.insertText('Rearmed input')
       const annotationRearmTypedValue = await waitFor(
         async () => {
@@ -1686,6 +1723,11 @@ try {
         && event.type === 'navigation-state')
       await manager.destroySurface('artifact:v3-bridge')
       await waitFor(() => v3Contents.isDestroyed(), 'protocol-v3 preview destruction')
+      const annotationExpiredModeResult = await manager.setArtifactAnnotationMode({
+        version: 3,
+        surfaceId: 'artifact:v3-bridge',
+        enabled: true,
+      })
 
       const isolated = await manager.createSurface({
         version: 2,
@@ -2236,6 +2278,8 @@ try {
         annotationOverlayClosedAfterAcknowledgement,
         annotationPickerRearm,
         annotationRearmOverlayResult,
+        annotationRearmCopy,
+        annotationRearmEmptyBodyMessage,
         annotationRearmTypedValue,
         annotationRearmShiftEnter,
         annotationRearmShiftEnterDidNotSubmit,
@@ -2273,6 +2317,7 @@ try {
         annotationPageClicksBeforePickerOff,
         annotationPageClicksAfterPickerOff,
         annotationSelectionAfterPickerOff,
+        annotationExpiredModeResult,
         v3NavigationEventCount: v3NavigationEvents.length,
         v3Reload,
         v3Screenshot: {
@@ -2513,6 +2558,7 @@ try {
     available: true,
     picker: true,
     trustedOverlay: true,
+    overlayCopyVersion: 1,
   })
   assert.equal(result.annotationPicker.ok, true)
   assert.equal(
@@ -2548,9 +2594,9 @@ try {
     role: 'dialog',
     ariaModal: 'false',
     labelledBy: 'annotation-title',
-    textareaLabel: '批注修改要求',
-    targetText: '<div>',
-    newlineHint: process.platform === 'darwin' ? '⇧ Enter 换行' : 'Shift + Enter 换行',
+    textareaLabel: '页面批注',
+    targetText: '区域：示例',
+    newlineHint: process.platform === 'darwin' ? '⇧ Return 换行' : 'Shift + Enter 换行',
     initialBody: 'Initial annotation',
     submitDisabled: false,
     cardRadius: '12px',
@@ -2604,6 +2650,18 @@ try {
   assert.equal(result.annotationOverlayClosedAfterAcknowledgement, true)
   assert.equal(result.annotationPickerRearm.ok, true)
   assert.equal(result.annotationRearmOverlayResult.ok, true)
+  assert.deepEqual(result.annotationRearmCopy, {
+    target: 'Button: Rearmed target',
+    placeholder: 'Describe the next change…',
+    newlineHint: process.platform === 'darwin'
+      ? '⇧ Return for a new line'
+      : 'Shift + Enter for a new line',
+  })
+  assert.equal(
+    result.annotationRearmEmptyBodyMessage,
+    'Describe the next requested change.',
+    'a reused overlay must validate with the latest localized copy',
+  )
   assert.equal(result.annotationRearmTypedValue, 'Rearmed input')
   assert.deepEqual(result.annotationRearmShiftEnter, {
     defaultAllowed: true,
@@ -2676,6 +2734,12 @@ try {
     'a failed setInspectMode(none) must never be reported as a successful picker stop',
   )
   assert.equal(result.annotationPickerCleanupRecovery.ok, true)
+  assert.deepEqual(result.annotationExpiredModeResult, {
+    ok: false,
+    code: 'PREVIEW_CAPABILITY_EXPIRED',
+    retryable: true,
+    message: 'Only the active protocol-v3 HTML artifact preview supports annotations.',
+  })
   assert.equal(result.annotationPickerBeforeOff.ok, true)
   assert.equal(result.annotationPickerOff.ok, true)
   assert.equal(result.annotationPickerActiveAfterOff, false)

@@ -16,7 +16,19 @@ export interface NativeWorkbenchAnnotationCapabilities {
   available: boolean
   picker: boolean
   trustedOverlay: boolean
+  overlayCopyVersion?: 1
   reason?: string
+}
+
+export interface NativeWorkbenchAnnotationOverlayCopy {
+  targetLabel: string
+  contextLabel: string
+  bodyLabel: string
+  placeholder: string
+  newlineHint: string
+  cancelLabel: string
+  submitLabel: string
+  emptyBodyMessage: string
 }
 
 export interface NativeWorkbenchAnnotationModeRequest {
@@ -31,6 +43,8 @@ export interface NativeWorkbenchAnnotationOverlayShowRequest {
   selectionId: string
   annotationId: string
   initialBody: string
+  overlayCopyVersion?: 1
+  copy?: NativeWorkbenchAnnotationOverlayCopy
 }
 
 export interface NativeWorkbenchAnnotationOverlayCloseRequest {
@@ -89,6 +103,41 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+const OVERLAY_COPY_KEYS = [
+  'targetLabel',
+  'contextLabel',
+  'bodyLabel',
+  'placeholder',
+  'newlineHint',
+  'cancelLabel',
+  'submitLabel',
+  'emptyBodyMessage',
+] as const
+
+function boundedOverlayCopyText(value: unknown): string {
+  if (typeof value !== 'string') {
+    throw new Error('The native Workbench annotation overlay copy is invalid.')
+  }
+  const normalized = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim()
+  if (!normalized || normalized.length > 240) {
+    throw new Error('The native Workbench annotation overlay copy is invalid.')
+  }
+  return normalized
+}
+
+function parseOverlayCopy(value: unknown): NativeWorkbenchAnnotationOverlayCopy {
+  const copy = objectRecord(value)
+  if (!copy || Object.keys(copy).some(key => !OVERLAY_COPY_KEYS.includes(
+    key as typeof OVERLAY_COPY_KEYS[number],
+  ))) {
+    throw new Error('The native Workbench annotation overlay copy is invalid.')
+  }
+  return Object.fromEntries(OVERLAY_COPY_KEYS.map(key => [
+    key,
+    boundedOverlayCopyText(copy[key]),
+  ])) as unknown as NativeWorkbenchAnnotationOverlayCopy
+}
+
 function parseExactRequest(
   value: unknown,
   allowedKeys: readonly string[],
@@ -145,9 +194,30 @@ export function parseNativeWorkbenchAnnotationOverlayShowRequest(
 ): NativeWorkbenchAnnotationOverlayShowRequest {
   const request = parseExactRequest(
     value,
-    ['version', 'surfaceId', 'selectionId', 'annotationId', 'initialBody'],
+    [
+      'version',
+      'surfaceId',
+      'selectionId',
+      'annotationId',
+      'initialBody',
+      'overlayCopyVersion',
+      'copy',
+    ],
     'overlay',
   )
+  let localizedCopy: Pick<
+    NativeWorkbenchAnnotationOverlayShowRequest,
+    'overlayCopyVersion' | 'copy'
+  > = {}
+  if (request.overlayCopyVersion !== undefined || request.copy !== undefined) {
+    if (request.overlayCopyVersion !== 1 || request.copy === undefined) {
+      throw new Error('The native Workbench annotation overlay copy is invalid.')
+    }
+    localizedCopy = {
+      overlayCopyVersion: 1,
+      copy: parseOverlayCopy(request.copy),
+    }
+  }
   return {
     version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
     surfaceId: parseNativeWorkbenchSurfaceId(request.surfaceId),
@@ -156,6 +226,7 @@ export function parseNativeWorkbenchAnnotationOverlayShowRequest(
     initialBody: request.initialBody === undefined
       ? ''
       : parseNativeWorkbenchAnnotationBody(request.initialBody),
+    ...localizedCopy,
   }
 }
 

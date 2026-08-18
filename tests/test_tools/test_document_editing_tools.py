@@ -11,6 +11,7 @@ from opensquilla.artifact_session import (
     Actor,
     ActorKind,
     AnchorKind,
+    AnchorState,
     ArtifactBlobRef,
     ArtifactConflictError,
     ArtifactKind,
@@ -19,6 +20,8 @@ from opensquilla.artifact_session import (
     ArtifactSessionService,
     ChangeSetStatus,
     MutationAttemptStatus,
+    PreparedPromptAnnotationTarget,
+    consume_prepared_prompt_annotations_on_conn,
     consume_prompt_annotations_on_conn,
 )
 from opensquilla.artifacts import ArtifactStore
@@ -27,6 +30,7 @@ from opensquilla.gateway.artifact_contexts import (
     DOCUMENT_CONTEXT_TOOL_NAMES,
     BoundDocumentContext,
     BoundPromptAnnotationContext,
+    BoundPromptAnnotationTarget,
 )
 from opensquilla.tools import get_default_registry
 from opensquilla.tools.builtin.artifact_editing import _range_error, _stale_context
@@ -408,6 +412,172 @@ async def _sent_heading_and_img_context(tmp_path: Path):
     return service, store, source, ref, created, ctx
 
 
+async def _sent_contextual_button_context(
+    tmp_path: Path,
+    *,
+    source_text: str | None = None,
+):
+    service = await ArtifactSessionService.open(tmp_path / "contextual-document.db")
+    store = ArtifactStore(tmp_path / "contextual-media")
+    source = (
+        source_text
+        or '<main><button id="one">One</button><button id="two">Two</button></main>'
+    ).encode()
+    ref = store.publish_bytes(
+        source,
+        session_id=SESSION_ID,
+        session_key=SESSION_KEY,
+        name="contextual.html",
+        mime="text/html",
+        source="contextual_document_test",
+    )
+    created = await service.create_document(
+        session_key=SESSION_KEY,
+        session_id=SESSION_ID,
+        name="Contextual page",
+        kind=ArtifactKind.HTML,
+        initial_artifact=ArtifactBlobRef(
+            artifact_id=ref.id,
+            sha256=ref.sha256,
+            filename=ref.name,
+            media_type=ref.mime,
+            byte_size=ref.size,
+        ),
+        actor=Actor(ActorKind.USER, "owner"),
+    )
+    original_opening = '<button id="one">'
+    original_start = source.decode().index(original_opening)
+    original = await service.create_anchor(
+        document_id=created.document.document_id,
+        revision_id=created.revision.revision_id,
+        kind=AnchorKind.DOM_SOURCE,
+        locator={
+            "start_offset": original_start,
+            "start_tag_end_offset": original_start + len(original_opening),
+            "tag_name": "button",
+            "source_sha256": ref.sha256,
+        },
+        quote=original_opening,
+        context={"semantic_profile_v1": {"version": 1, "tag_name": "button"}},
+        actor=Actor(ActorKind.USER, "owner"),
+    )
+    draft = await service.create_prompt_annotation(
+        annotation_id="annotation-contextual-button",
+        session_key=SESSION_KEY,
+        session_id=SESSION_ID,
+        session_epoch=0,
+        document_id=created.document.document_id,
+        revision_id=created.revision.revision_id,
+        anchor_id=original.anchor_id,
+        body="Remove the intended button.",
+    )
+    prepared = PreparedPromptAnnotationTarget(
+        expected_annotation=draft,
+        previous_anchor_id=original.anchor_id,
+        anchor_id="anchor-contextual-button",
+        audit_event_id="audit-contextual-button",
+        revision_id=created.revision.revision_id,
+        kind=AnchorKind.DOM_SOURCE,
+        locator={
+            "tag_name": "button",
+            "source_sha256": ref.sha256,
+            "offset_encoding": "unicode-code-point",
+        },
+        quote=original_opening,
+        context={
+            "semantic_profile_v1": {"version": 1, "tag_name": "button"},
+            "target_reason": "ambiguous",
+        },
+        state=AnchorState.ORPHANED,
+        actor_kind=ActorKind.USER,
+        actor_id="owner",
+    )
+    async with service.repository._transaction("test.contextual.consume") as conn:
+        await consume_prepared_prompt_annotations_on_conn(
+            conn,
+            prepared_targets=(prepared,),
+            session_key=SESSION_KEY,
+            session_id=SESSION_ID,
+            session_epoch=0,
+            message_id="message-contextual",
+            turn_id=TURN_ID,
+            updated_at=1234,
+        )
+    snapshot = {
+        "version": 1,
+        "annotationId": draft.annotation_id,
+        "order": 0,
+        "body": draft.body,
+        "targetStatus": "contextual",
+        "targetReason": "ambiguous",
+        "targetKind": "button",
+        "targetText": None,
+        "document": {
+            "id": created.document.document_id,
+            "name": created.document.name,
+            "kind": created.document.kind.value,
+        },
+        "revision": {
+            "id": created.revision.revision_id,
+            "generation": created.revision.generation,
+            "sha256": created.revision.artifact_sha256,
+        },
+        "anchor": {
+            "id": prepared.anchor_id,
+            "kind": prepared.kind.value,
+            "tagName": "button",
+            "locator": prepared.locator,
+            "quote": prepared.quote,
+        },
+    }
+    bound = BoundPromptAnnotationContext(
+        session_key=SESSION_KEY,
+        session_id=SESSION_ID,
+        document_id=created.document.document_id,
+        revision_id=created.revision.revision_id,
+        targets=(
+            BoundPromptAnnotationTarget(
+                annotation_id=draft.annotation_id,
+                anchor_id=prepared.anchor_id,
+                status="contextual",
+                reason="ambiguous",
+                tag_name="button",
+                target_kind="button",
+                target_text=None,
+            ),
+        ),
+        snapshots=(snapshot,),
+        artifact_format="html",
+        tool_names=DOCUMENT_TOOL_NAMES,
+        operation_class="selection_edit",
+        request_context_prompt="Bound contextual document context.",
+    )
+    controller = ArtifactMutationAttemptController(
+        service,
+        document_id=created.document.document_id,
+        base_revision_id=created.revision.revision_id,
+        turn_id=TURN_ID,
+    )
+    ctx = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.WEB,
+        interaction_mode=InteractionMode.INTERACTIVE,
+        subagent_depth=0,
+        agent_id="artifact-agent",
+        session_key=SESSION_KEY,
+        task_id=TURN_ID,
+        artifact_media_root=str(tmp_path / "contextual-media"),
+        artifact_session_id=SESSION_ID,
+        surfaced_tools=set(DOCUMENT_TOOL_NAMES),
+        allowed_tools=set(DOCUMENT_TOOL_NAMES),
+        exclusive_tools=set(DOCUMENT_TOOL_NAMES),
+        artifact_context=bound,
+        artifact_session=service,
+        artifact_mutation_attempt_controller=controller,
+    )
+    return service, store, source, ref, created, ctx
+
+
 async def _call(
     handler,
     name: str,
@@ -521,6 +691,45 @@ async def test_bound_document_patch_commits_unique_text_edits_atomically(
 
 
 @pytest.mark.asyncio
+async def test_bound_document_read_uses_call_time_head_after_context_binding(
+    tmp_path: Path,
+) -> None:
+    service, store, _source, _ref, created, ctx = await _bound_document_context(tmp_path)
+    updated_source = b"<main><h1>Current heading</h1></main>"
+    updated_ref = store.publish_bytes(
+        updated_source,
+        session_id=SESSION_ID,
+        session_key=SESSION_KEY,
+        name="bound.html",
+        mime="text/html",
+        source="bound_document_current_head_test",
+    )
+    committed = await service.commit_revision(
+        document_id=created.document.document_id,
+        expected_head_revision_id=created.revision.revision_id,
+        expected_state_revision=created.document.state_revision,
+        artifact=ArtifactBlobRef(
+            artifact_id=updated_ref.id,
+            sha256=updated_ref.sha256,
+            filename=updated_ref.name,
+            media_type=updated_ref.mime,
+            byte_size=updated_ref.size,
+        ),
+        actor=Actor(ActorKind.USER, "owner"),
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        read = await _call(handler, "document_read", {"view": "source"})
+
+        assert read.is_error is False, read.content
+        payload = json.loads(read.content)
+        assert payload["sha256"] == committed.revision.artifact_sha256
+        assert payload["chunk"]["text"] == updated_source.decode("utf-8")
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("source", "edits", "expected_code"),
     [
@@ -598,6 +807,145 @@ def test_stale_bound_document_context_requires_a_new_refreshed_turn() -> None:
 
     assert error.code == "DOCUMENT_CONTEXT_STALE"
     assert error.retry_policy == "refresh"
+
+
+@pytest.mark.asyncio
+async def test_contextual_locate_requires_read_and_allows_only_one_candidate(
+    tmp_path: Path,
+) -> None:
+    service, store, _source, _ref, created, ctx = await _sent_contextual_button_context(
+        tmp_path
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    first = '<button id="one">'
+    second = '<button id="two">'
+    try:
+        unread = await _call(
+            handler,
+            "document_locate",
+            {
+                "annotation_order": 0,
+                "operation": "remove_node",
+                "candidateSource": second,
+            },
+        )
+        assert unread.is_error is True
+        assert "DOCUMENT_CANDIDATE_UNREAD" in unread.content
+
+        read = await _call(handler, "document_read", {"view": "source"})
+        assert read.is_error is False, read.content
+        located = await _call(
+            handler,
+            "document_locate",
+            {
+                "annotation_order": 0,
+                "operation": "remove_node",
+                "candidateSource": second,
+            },
+        )
+        assert located.is_error is False, located.content
+        locations = json.loads(located.content)["locations"]
+        assert len(locations) == 1
+
+        changed_candidate = await _call(
+            handler,
+            "document_locate",
+            {
+                "annotation_order": 0,
+                "operation": "set_style",
+                "candidateSource": first,
+            },
+        )
+        assert changed_candidate.is_error is True
+        assert "ARTIFACT_RANGE_QUERY_LIMIT" in changed_candidate.content
+
+        controller = ctx.artifact_mutation_attempt_controller
+        assert controller is not None
+        await controller.observe_intent("call-contextual-apply")
+        applied = await _call(
+            handler,
+            "document_apply",
+            {"mutations": [{"grant_token": locations[0]["grantToken"]}]},
+            tool_use_id="call-contextual-apply",
+        )
+        assert applied.is_error is False, applied.content
+        document = await service.get_document(created.document.document_id)
+        revision = await service.get_revision(document.head_revision_id)
+        _new_ref, path = store.resolve_for_download(
+            revision.artifact_id,
+            session_id=SESSION_ID,
+        )
+        assert path.read_bytes() == b'<main><button id="one">One</button></main>'
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_contextual_candidate_may_span_adjacent_document_read_pages(
+    tmp_path: Path,
+) -> None:
+    candidate = '<button id="boundary" aria-label="Across pages">'
+    prefix = '<main><button id="one">One</button>'
+    source_text = (
+        prefix
+        + ("x" * (250 - len(prefix)))
+        + candidate
+        + "Two</button></main>"
+    )
+    assert source_text.index(candidate) == 250
+    service, _store, _source, _ref, _created, ctx = (
+        await _sent_contextual_button_context(
+            tmp_path,
+            source_text=source_text,
+        )
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    try:
+        first_page = await _call(
+            handler,
+            "document_read",
+            {"view": "source", "max_chars": 256},
+        )
+        assert first_page.is_error is False, first_page.content
+        first_payload = json.loads(first_page.content)
+        assert first_payload["nextCursor"]
+
+        partial = await _call(
+            handler,
+            "document_locate",
+            {
+                "annotation_order": 0,
+                "operation": "remove_node",
+                "candidateSource": candidate,
+            },
+        )
+        assert partial.is_error is True
+        assert "DOCUMENT_CANDIDATE_UNREAD" in partial.content
+
+        second_page = await _call(
+            handler,
+            "document_read",
+            {
+                "view": "source",
+                "cursor": first_payload["nextCursor"],
+                "max_chars": 256,
+            },
+        )
+        assert second_page.is_error is False, second_page.content
+
+        located = await _call(
+            handler,
+            "document_locate",
+            {
+                "annotation_order": 0,
+                "operation": "remove_node",
+                "candidateSource": candidate,
+            },
+        )
+        assert located.is_error is False, located.content
+        assert len(json.loads(located.content)["locations"]) == 1
+    finally:
+        await service.close()
 
 
 @pytest.mark.asyncio

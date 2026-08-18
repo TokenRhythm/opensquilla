@@ -46,6 +46,10 @@ function snapshotOf(annotation: PromptAnnotation, order: number): PromptAnnotati
     locator: annotation.locator,
     quote: annotation.quote,
     sourceExcerpt: annotation.sourceExcerpt,
+    ...(annotation.targetStatus ? { targetStatus: annotation.targetStatus } : {}),
+    ...(annotation.targetReason ? { targetReason: annotation.targetReason } : {}),
+    ...(annotation.targetKind ? { targetKind: annotation.targetKind } : {}),
+    ...(annotation.targetText ? { targetText: annotation.targetText } : {}),
     sentOrder: order,
   }
 }
@@ -140,15 +144,14 @@ export const useArtifactPromptAnnotationsStore = defineStore(
 
     function sendableDraftsForSession(sessionKey: string): PromptAnnotation[] {
       return activeDraftsForSession(sessionKey).filter(item => (
-        item.freshness === 'fresh'
-        && item.body.trim().length > 0
+        item.body.trim().length > 0
         && promptAnnotationBodyWithinLimit(item.body)
       ))
     }
 
     function sendBlockedReason(
       sessionKey: string,
-    ): 'editing' | 'stale' | 'empty' | 'too-long' | null {
+    ): 'editing' | 'empty' | 'too-long' | null {
       const editing = Object.entries(overlayOwnerSessions.value).some(
         ([annotationId, ownerSessionKey]) => (
           ownerSessionKey === sessionKey
@@ -157,7 +160,6 @@ export const useArtifactPromptAnnotationsStore = defineStore(
       )
       if (editing) return 'editing'
       const active = activeDraftsForSession(sessionKey)
-      if (active.some(item => item.freshness === 'stale')) return 'stale'
       if (active.some(item => item.body.trim().length === 0)) return 'empty'
       if (active.some(item => !promptAnnotationBodyWithinLimit(item.body))) return 'too-long'
       return null
@@ -358,7 +360,6 @@ export const useArtifactPromptAnnotationsStore = defineStore(
     async function focus(annotationId: string) {
       const current = annotations.value[annotationId]
       if (!current || current.status !== 'draft') return null
-      if (current.freshness === 'stale') return null
       const focused = await provider.value?.focus({
         annotationId,
         sessionKey: current.sessionKey,
@@ -390,7 +391,6 @@ export const useArtifactPromptAnnotationsStore = defineStore(
           item
           && item.status === 'draft'
           && overlayOwnerSessions.value[id] === undefined
-          && item.freshness === 'fresh'
           && item.body.trim()
           && promptAnnotationBodyWithinLimit(item.body),
         )
@@ -423,32 +423,6 @@ export const useArtifactPromptAnnotationsStore = defineStore(
       }
       annotations.value = next
       for (const sessionKey of changedSessions) recordSessionMutation(sessionKey)
-    }
-
-    function markDocumentStale(documentId: string) {
-      const next = { ...annotations.value }
-      let changed = false
-      for (const [id, item] of Object.entries(next)) {
-        if (item.documentId !== documentId || item.status !== 'draft') continue
-        next[id] = { ...item, freshness: 'stale', staleReason: 'head-changed' }
-        changed = true
-        recordSessionMutation(item.sessionKey)
-      }
-      if (changed) annotations.value = next
-    }
-
-    function markAnnotationStale(annotationId: string, reason = 'head-changed') {
-      const current = annotations.value[annotationId]
-      if (!current || current.status !== 'draft') return
-      annotations.value = {
-        ...annotations.value,
-        [annotationId]: {
-          ...current,
-          freshness: 'stale',
-          staleReason: reason,
-        },
-      }
-      recordSessionMutation(current.sessionKey)
     }
 
     function clearSession(sessionKey: string) {
@@ -514,8 +488,6 @@ export const useArtifactPromptAnnotationsStore = defineStore(
       prepareForSend,
       snapshotsForIds,
       acknowledgeAccepted,
-      markDocumentStale,
-      markAnnotationStale,
       clearSession,
       reset,
     }

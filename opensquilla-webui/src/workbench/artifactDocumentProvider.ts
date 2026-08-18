@@ -20,6 +20,8 @@ import type {
   ArtifactEditSessionCloseRequest,
   ArtifactEditSessionHeartbeatRequest,
   ArtifactEditSessionStartRequest,
+  ArtifactMutationResolution,
+  ArtifactMutationResolutionRequest,
   ArtifactRevision,
   ArtifactRevisionsListResponse,
   ArtifactRevisionSource,
@@ -45,6 +47,7 @@ export const ARTIFACT_DOCUMENT_RPC_METHODS = {
   changesRevert: 'artifacts.changes.revert',
   sourceRead: 'artifacts.source.read',
   sourcePatch: 'artifacts.source.patch',
+  mutationResolve: 'artifacts.mutations.resolve',
   editSessionStart: 'documents.editSessions.start',
   editSessionHeartbeat: 'documents.editSessions.heartbeat',
   editSessionClose: 'documents.editSessions.close',
@@ -118,6 +121,11 @@ export interface ArtifactDocumentProvider {
     request: Readonly<Record<string, unknown>>,
     signal?: AbortSignal,
   ): Promise<ArtifactSourcePatchResult | null>
+  /** Null means the connected Gateway predates mutation outcome resolution. */
+  resolveMutation?(
+    request: ArtifactMutationResolutionRequest,
+    signal?: AbortSignal,
+  ): Promise<ArtifactMutationResolution | null>
   /** Null means the connected Gateway does not implement EditSessions. */
   startEditSession?(
     request: ArtifactEditSessionStartRequest,
@@ -1045,6 +1053,42 @@ export function createRpcArtifactDocumentProvider(
       return {
         ...source,
         editSession: normalizeArtifactEditSession(response?.editSession),
+      }
+    },
+    async resolveMutation(request, signal) {
+      const response = await optionalCall<Record<string, unknown>>(
+        ARTIFACT_DOCUMENT_RPC_METHODS.mutationResolve,
+        { ...request },
+        signal,
+      )
+      if (!response) return null
+      const status = response.status
+      if (status !== 'applied' && status !== 'not_applied' && status !== 'pending') {
+        throw new Error('Invalid page update resolution response')
+      }
+      const rawResult = objectValue(response.result)
+      const document = normalizeArtifactDocument(response.document, undefined, request.sessionKey)
+      const rawDocument = objectValue(response.document)
+      const revision = normalizeArtifactRevision(rawDocument?.head)
+      const documentId = rawResult ? stringAt(rawResult, 'documentId') : ''
+      const revisionId = rawResult ? stringAt(rawResult, 'revisionId') : ''
+      const sha256 = rawResult ? stringAt(rawResult, 'sha256') : ''
+      const stateRevision = rawResult
+        ? Math.max(1, numberAt(rawResult, 1, 'stateRevision'))
+        : 1
+      const rawRetryAfterMs = response.retryAfterMs
+      return {
+        status,
+        retryAfterMs: rawRetryAfterMs !== null
+          && rawRetryAfterMs !== undefined
+          && Number.isFinite(Number(rawRetryAfterMs))
+          ? Math.max(0, Number(rawRetryAfterMs))
+          : null,
+        result: documentId && revisionId && /^[0-9a-f]{64}$/.test(sha256)
+          ? { documentId, revisionId, sha256, stateRevision }
+          : null,
+        ...(document ? { document } : {}),
+        ...(revision ? { revision } : {}),
       }
     },
     async startEditSession(request, signal) {
