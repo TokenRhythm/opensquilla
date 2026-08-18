@@ -2113,16 +2113,13 @@ async def write_file(
     p = _resolve_path(path)
     if full_host_access_active():
         created = not p.exists()
-        before_fingerprint = fingerprint_path(p)
 
         def _write_full_host() -> None:
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
 
         def _settle_full_host(error: BaseException | None) -> None:
-            after_fingerprint = fingerprint_path(p)
-            changed = before_fingerprint != after_fingerprint
-            if error is None or changed:
+            if error is None:
                 record_workspace_file_write(p, operation="write_file", created=created)
                 _notify_memory_source_write(p)
                 _notify_bootstrap_source_write(p)
