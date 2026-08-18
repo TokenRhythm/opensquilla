@@ -446,7 +446,21 @@ def test_desktop_boot_resume_fences_stale_async_state_and_ready_events() -> None
     )
     load_index = open_flow.index("await loadControlUiIntoCurrentWindow(")
     load_call = open_flow[load_index : load_index + 300]
-    assert "desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)" in load_call
+    assert "operationIsCurrent" in load_call
+
+    authority_capture = open_flow[
+        open_flow.index("const gatewayUrl = gateway.url") : load_index
+    ]
+    for exact_gateway_fence in [
+        "const expectedOwned = gateway.owned",
+        "const expectedChild = expectedOwned ? gatewayProcess : null",
+        "gatewayState.url === gatewayUrl",
+        "gatewayState.owned === expectedOwned",
+        "gatewayProcess === expectedChild",
+        "!hasGatewayProcessExited(expectedChild)",
+    ]:
+        assert exact_gateway_fence in authority_capture
+    assert "const authoritative = operationIsCurrent()" in open_flow
 
 
 def test_desktop_open_flow_rejects_stale_start_errors() -> None:
@@ -457,14 +471,14 @@ def test_desktop_open_flow_rejects_stale_start_errors() -> None:
         "const GATEWAY_SHUTDOWN_KILL_AFTER_MS",
     )
     catch = open_flow.index("} catch (error) {")
-    authority = open_flow.index("const authoritative = desktopOpenAuthorityIsCurrent", catch)
+    authority = open_flow.index("const authoritative = operationIsCurrent()", catch)
     status = open_flow.index("gatewayState.status = 'error'", authority)
     state_error = open_flow.index("gatewayState.error =", status)
     send_error = open_flow.index("sendBootError(error)", state_error)
     loop_fence = open_flow.index("desktopOpenAuthorityIsCurrent", send_error)
 
     assert catch < authority < status < state_error < send_error < loop_fence
-    assert "revision, requestedProfileKey" in open_flow[authority:status]
+    assert "operationIsCurrent()" in open_flow[authority:status]
 
 
 def test_desktop_shared_spawn_gate_blocks_still_stopping_gateways() -> None:

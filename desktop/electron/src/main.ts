@@ -8689,6 +8689,9 @@ async function openOrResumeDesktopApp(): Promise<void> {
     while (!isQuitting) {
       const revision = desktopOpenFlowRevision
       const requestedProfileKey = desktopProfileKey()
+      let operationIsCurrent = () => (
+        desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)
+      )
       await createMainWindow()
       focusMainWindow()
 
@@ -8698,22 +8701,38 @@ async function openOrResumeDesktopApp(): Promise<void> {
             const reusableGateway = forceOnboardingOnNextStartup
               ? null
               : await reuseHealthyGatewayState(
-                () => desktopOpenAuthorityIsCurrent(revision, requestedProfileKey),
+                operationIsCurrent,
               )
-            if (!desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) {
+            if (!operationIsCurrent()) {
               throw new Error('Desktop startup was superseded by a newer open request.')
             }
             const gateway = reusableGateway ?? await ensureGatewayStarted()
-            if (desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) {
+            const gatewayUrl = gateway.url
+            const expectedOwned = gateway.owned
+            const expectedChild = expectedOwned ? gatewayProcess : null
+            operationIsCurrent = () => (
+              desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)
+              && gatewayState.url === gatewayUrl
+              && gatewayState.owned === expectedOwned
+              && (
+                !expectedOwned
+                || (
+                  expectedChild !== null
+                  && gatewayProcess === expectedChild
+                  && !hasGatewayProcessExited(expectedChild)
+                )
+              )
+            )
+            if (operationIsCurrent()) {
               await loadControlUiIntoCurrentWindow(
-                gateway.url,
-                () => desktopOpenAuthorityIsCurrent(revision, requestedProfileKey),
+                gatewayUrl,
+                operationIsCurrent,
               )
             }
           }
         }
       } catch (error) {
-        const authoritative = desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)
+        const authoritative = operationIsCurrent()
         if (authoritative) {
           if (gatewayState.status !== 'ready') {
             gatewayState.status = 'error'
