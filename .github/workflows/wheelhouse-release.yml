@@ -10,6 +10,15 @@ on:
         description: Optional existing tag to upload artifacts to
         required: false
         default: ""
+      target:
+        description: Artifact subset to build
+        required: false
+        type: choice
+        options:
+          - all
+          - macos
+          - windows
+        default: all
 
 permissions:
   contents: read
@@ -113,6 +122,7 @@ jobs:
 
   build-release-assets:
     name: Build Python release assets
+    if: ${{ github.event_name == 'push' || github.event.inputs.target == '' || github.event.inputs.target == 'all' }}
     needs: build-control-ui
     runs-on: windows-latest
     timeout-minutes: 90
@@ -310,6 +320,7 @@ jobs:
 
   build-desktop-macos:
     name: Build macOS Electron installer
+    if: ${{ github.event_name == 'push' || github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == 'macos' }}
     needs: build-control-ui
     runs-on: macos-latest
     timeout-minutes: 150
@@ -423,6 +434,7 @@ jobs:
 
   build-desktop-windows:
     name: Build unsigned Windows Electron installer
+    if: ${{ github.event_name == 'push' || github.event.inputs.target == '' || github.event.inputs.target == 'all' || github.event.inputs.target == 'windows' }}
     needs: build-control-ui
     # Keep the v0.5.0rc3 upgrade baseline on the OS generation it shipped on.
     # The legacy NSIS installer can crash with 0xC0000005 on Windows Server 2025

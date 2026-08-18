@@ -161,10 +161,10 @@ async function readDesktopLogSummary(userDataDir) {
       eventCounts[event] = (eventCounts[event] || 0) + 1
       if (event === 'renderer_console' && rendererErrors.length < 10) {
         rendererErrors.push({
-          level: record?.detail?.level,
-          message: record?.detail?.message,
-          source: record?.detail?.source,
-          line: record?.detail?.line,
+          level: record?.level,
+          message: record?.message,
+          source: record?.source,
+          line: record?.line,
         })
       }
     } catch {
@@ -471,7 +471,11 @@ if (runError) {
     iterations,
     completedChatSends: rpcSendCounts.size,
     provider: provider?.counts(),
-    renderer: { pageErrors: pageErrors.length, consoleErrors: consoleErrors.length },
+    renderer: {
+      pageErrors: pageErrors.length,
+      consoleErrors: consoleErrors.length,
+      consoleErrorMessages: consoleErrors.slice(0, 10),
+    },
     externalRendererRequests: outboundNetwork.length,
     desktopLog: desktopLogSummary,
   }, null, 2))
