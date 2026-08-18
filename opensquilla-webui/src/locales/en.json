@@ -3360,6 +3360,7 @@
     "sendQueuesUntilCompaction": "Send (queues until compaction finishes)",
     "stopResponse": "Stop current response",
     "stopResponseEsc": "Stop current response (Esc)",
+    "stoppingResponse": "Stopping safely… New messages will be queued.",
     "messageToSend": "Message to send",
     "placeholder": "Send a message...",
     "placeholderCompact": "Message...",

@@ -3360,6 +3360,7 @@
     "sendQueuesUntilCompaction": "发送（排队等待压缩完成）",
     "stopResponse": "停止当前回复",
     "stopResponseEsc": "停止当前回复（Esc）",
+    "stoppingResponse": "正在安全停止… 新消息将进入队列。",
     "messageToSend": "要发送的消息",
     "placeholder": "发送消息……",
     "placeholderCompact": "消息……",

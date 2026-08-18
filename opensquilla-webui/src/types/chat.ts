@@ -280,6 +280,8 @@ export interface ChatTurnOutcome {
 
 export interface ChatRunTask {
   status?: string
+  cancel_requested?: boolean
+  cancelRequested?: boolean
   task_id?: string
   taskId?: string
   started_at?: number | string

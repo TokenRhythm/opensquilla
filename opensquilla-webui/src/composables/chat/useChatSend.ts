@@ -2105,6 +2105,7 @@ export function useChatSend(options: UseChatSendOptions) {
         }
         if (
           options.busySendMode.value === 'steer'
+          && !options.taskOwnership?.stopRequestedTaskId.value
           && !isLiteralSlash
           && canSteerPayload(
             text,
@@ -3200,10 +3201,15 @@ export function useChatSend(options: UseChatSendOptions) {
     // intentionally retains legacy session-tree cancellation semantics.
     if (stoppedTurnId || taskAcceptancePending) abortParams.scope = 'task'
     if (stoppedTurnId) abortParams.taskId = stoppedTurnId
-    options.rpc.call<{ aborted?: boolean }>('chat.abort', abortParams)
+    options.rpc.call<{ aborted?: boolean, reason?: string }>('chat.abort', abortParams)
       .then((response) => {
         if (response?.aborted === true) {
           options.scheduleHistorySync()
+          return
+        }
+        if (String(response?.reason || '').toLowerCase() === 'task_cancel_unknown') {
+          options.scheduleHistorySync()
+          void options.reconcileTaskOwnership?.()
           return
         }
         if (acceptanceOwnsStop) return

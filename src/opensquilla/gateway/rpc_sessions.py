@@ -1903,6 +1903,8 @@ def _task_summary(row: Any) -> dict[str, Any]:
         steer_capability = details.get("steer_capability")
         if isinstance(steer_capability, dict):
             summary["steer_capability"] = dict(steer_capability)
+        if isinstance(details.get("cancellation_requested"), dict):
+            summary["cancel_requested"] = True
     finished_at = getattr(row, "finished_at", None)
     if finished_at is not None:
         summary["finished_at"] = finished_at
@@ -2107,6 +2109,12 @@ async def _overlay_runtime_task_snapshot(
                 and task_id not in queued_task_ids
             ):
                 queued_task_ids.append(task_id)
+    raw_cancel_requested_ids = getattr(snapshot, "cancel_requested_task_ids", ())
+    cancel_requested_task_ids = {
+        value.strip()
+        for value in raw_cancel_requested_ids
+        if isinstance(value, str) and value.strip()
+    }
 
     active_task_id = running_task_id or (queued_task_ids[0] if queued_task_ids else None)
     durable_active = task_state.get("active_task")
@@ -2156,6 +2164,8 @@ async def _overlay_runtime_task_snapshot(
         if active_task is None:
             active_task = {"task_id": active_task_id}
         active_task["status"] = active_status
+        if active_task_id in cancel_requested_task_ids:
+            active_task["cancel_requested"] = True
 
     task_state["active_task"] = active_task
     task_state["queued_task_ids"] = queued_task_ids
@@ -7911,6 +7921,22 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     "key": key,
                     "reason": "task_scope_unsupported",
                 }
+            if cancelled_result is exact_cancel_unknown:
+                return {
+                    "aborted": False,
+                    "key": key,
+                    # The request may already have crossed TaskRuntime's
+                    # cancellation boundary.  Do not claim the task is
+                    # terminal; the client must reconcile and retry the same
+                    # exact identity.
+                    "reason": "task_cancel_unknown",
+                }
+            if int(cancelled_result) > 0:
+                # The exact runtime cancellation boundary is authoritative.
+                # Auxiliary and descendant cleanup started alongside it and
+                # continues under its own deadline; do not make Stop wait for
+                # those safety drains or for the task's terminal event.
+                return {"aborted": True, "key": key}
             cancelled_auxiliary = int(
                 await _await_abort_background_task(
                     exact_auxiliary_cleanup,
@@ -7927,28 +7953,11 @@ async def _handle_sessions_abort(params: dict | None, ctx: RpcContext) -> dict:
                     default=0,
                 )
             )
-            if cancelled_result is exact_cancel_unknown:
-                return {
-                    "aborted": False,
-                    "key": key,
-                    # The request may already have crossed TaskRuntime's
-                    # cancellation boundary.  Do not claim the task is
-                    # terminal; the client must reconcile and retry the same
-                    # exact identity.
-                    "reason": "task_cancel_unknown",
-                }
             cancelled_count = (
                 int(cancelled_result)
                 + cancelled_auxiliary
                 + cancelled_descendants
             )
-            if int(cancelled_result) > 0:
-                await _drain_cancelled_task_runtime(
-                    task_runtime,
-                    session_key=key,
-                    task_ids=(requested_task_id,),
-                    deadline_at_monotonic=abort_deadline,
-                )
             reason = "task_not_active"
             if cancelled_count <= 0:
                 # Classification is diagnostic only.  The exact cancel above

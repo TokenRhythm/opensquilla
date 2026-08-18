@@ -447,6 +447,12 @@ class ToolDefinition(BaseModel):
     execution_timeout_seconds: float | None = None
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
+    # Runtime-only metadata. Provider adapters must never put this field on
+    # the model-facing tool schema.
+    cancellation_policy: Literal["bounded", "must_settle"] = Field(
+        default="bounded",
+        exclude=True,
+    )
 
 
 # ---------------------------------------------------------------------------

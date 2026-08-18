@@ -3278,6 +3278,7 @@
     "sendQueuesUntilCompaction": "Senden (in Warteschlange, bis die Verdichtung abgeschlossen ist)",
     "stopResponse": "Aktuelle Antwort stoppen",
     "stopResponseEsc": "Aktuelle Antwort stoppen (Esc)",
+    "stoppingResponse": "Wird sicher beendet… Neue Nachrichten werden eingereiht.",
     "messageToSend": "Zu sendende Nachricht",
     "placeholder": "Eine Nachricht senden...",
     "placeholderCompact": "Nachricht...",

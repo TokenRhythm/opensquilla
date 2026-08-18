@@ -7,7 +7,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
@@ -340,6 +340,9 @@ class ToolSpec:
     execution_timeout_seconds: float | None = None
     execution_timeout_argument: str | None = None
     execution_timeout_padding: float = 0.0
+    # Internal cancellation semantics. ``None`` lets the registry infer
+    # must-settle behavior for filesystem mutation descriptors.
+    cancellation_policy: Literal["bounded", "must_settle"] | None = None
     result_budget_class: str | None = None
     sandbox: SandboxToolDescriptor = field(
         default_factory=lambda: SandboxToolDescriptor.custom(kind="")

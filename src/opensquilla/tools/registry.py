@@ -11,7 +11,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import structlog
 
@@ -403,6 +403,14 @@ class ToolRegistry:
                 execution_timeout_seconds=rt.spec.execution_timeout_seconds,
                 execution_timeout_argument=rt.spec.execution_timeout_argument,
                 execution_timeout_padding=rt.spec.execution_timeout_padding,
+                cancellation_policy=(
+                    rt.spec.cancellation_policy
+                    or (
+                        "must_settle"
+                        if rt.spec.sandbox.kind in {"fs.write", "fs.edit"}
+                        else "bounded"
+                    )
+                ),
             )
             for rt in visible_tools
         ]
@@ -588,6 +596,7 @@ def tool(
     execution_timeout_seconds: float | None = None,
     execution_timeout_argument: str | None = None,
     execution_timeout_padding: float = 0.0,
+    cancellation_policy: Literal["bounded", "must_settle"] | None = None,
     result_budget_class: str | None = None,
     sandbox: SandboxToolDescriptor | None = None,
     registry: ToolRegistry | None = None,
@@ -616,6 +625,7 @@ def tool(
             execution_timeout_seconds=execution_timeout_seconds,
             execution_timeout_argument=execution_timeout_argument,
             execution_timeout_padding=execution_timeout_padding,
+            cancellation_policy=cancellation_policy,
             result_budget_class=result_budget_class,
             sandbox=sandbox or SandboxToolDescriptor.custom(kind=name),
             plan_access=plan_access,

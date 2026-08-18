@@ -3278,6 +3278,7 @@
     "sendQueuesUntilCompaction": "Envoyer (mise en file jusqu'à la fin du compactage)",
     "stopResponse": "Arrêter la réponse actuelle",
     "stopResponseEsc": "Arrêter la réponse actuelle (Échap)",
+    "stoppingResponse": "Arrêt sécurisé en cours… Les nouveaux messages seront mis en file.",
     "messageToSend": "Message à envoyer",
     "placeholder": "Envoyer un message...",
     "placeholderCompact": "Message...",

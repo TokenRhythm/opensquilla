@@ -1821,6 +1821,23 @@ describe('useChatSend attachment payloads', () => {
     }))
   })
 
+  it('queues the next message instead of steering after Stop is requested', async () => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('turn-current')
+    expect(taskOwnership.beginStop()).toBe('turn-current')
+    const { api, options, rpc, stream } = makeOptions({
+      ...sameTurnSteerOptions(),
+      taskOwnership,
+      busySendMode: ref<BusySendMode>('steer'),
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(rpc.call).not.toHaveBeenCalledWith('sessions.steer.v2', expect.anything())
+    expect(options.enqueuePendingInput).toHaveBeenCalledWith('hello', undefined)
+  })
+
   it.each([
     {
       name: 'an old gateway',

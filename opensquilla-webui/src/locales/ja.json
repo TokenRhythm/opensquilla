@@ -3278,6 +3278,7 @@
     "sendQueuesUntilCompaction": "送信（圧縮の完了までキューへ追加）",
     "stopResponse": "現在の応答を停止",
     "stopResponseEsc": "現在の応答を停止（Esc）",
+    "stoppingResponse": "安全に停止しています… 新しいメッセージはキューに入ります。",
     "messageToSend": "送信するメッセージ",
     "placeholder": "メッセージを送信...",
     "placeholderCompact": "メッセージ...",

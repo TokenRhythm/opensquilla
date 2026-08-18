@@ -395,8 +395,19 @@
           @interrupt="onStop"
         />
 
+        <!-- Stop is acknowledged locally before the Gateway reaches terminal.
+             Keep the composer usable while making that settlement phase explicit. -->
+        <div v-if="isStopPending && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
+          <div class="msg-ai-main">
+            <div class="thinking-status">
+              <span class="stream-activity-dot" aria-hidden="true" />
+              <span class="thinking-elapsed">{{ t('chat.stoppingResponse') }}</span>
+            </div>
+          </div>
+        </div>
+
         <!-- Thinking indicator -->
-        <div v-if="thinkingVisible && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
+        <div v-else-if="thinkingVisible && answerRevealOpen" class="msg-ai thinking" role="status" aria-live="polite">
           <div class="msg-ai-main">
             <div class="thinking-status">
               <span class="stream-activity-dot" aria-hidden="true" />
@@ -1279,6 +1290,11 @@ const activeStreamSessionKey = ref<string>('')
 const acceptanceStopPending = ref(false)
 const acceptanceRecoveryPending = ref(false)
 const taskOwnership = useChatTaskOwnership()
+const isStopPending = computed(() => (
+  Boolean(taskOwnership.stopRequestedTaskId.value)
+  || acceptanceStopPending.value
+  || acceptanceRecoveryPending.value
+))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
 let restoreLiveTurnSnapshot = (_snapshot: SessionMessagesSnapshotResponse) => {}
 
@@ -2893,6 +2909,7 @@ const sameTurnSteerUnavailableMessage = computed(() => {
 
 const composerSameTurnSteerAvailable = computed(() => (
   sameTurnSteerAvailable.value
+  && !isStopPending.value
   && pendingAttachments.value.length === 0
   && !pendingSessionIntent.value
   && !pendingForkBeforeMessageId.value

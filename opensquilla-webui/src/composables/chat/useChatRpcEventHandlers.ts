@@ -1382,6 +1382,8 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentTaskPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     stream.resetStreamIdleTimer()
+    const taskId = payloadTaskId(payload) || activeStreamTaskId.value
+    if (taskId && options.taskOwnership?.stopRequestedTaskId.value === taskId) return
     options.markEnsembleHandoff()
     const presentation = payload.presentation
     if (presentation === 'intermediate' || presentation === 'answer') {

@@ -442,6 +442,7 @@ class _RuntimeTask:
     # Final idempotency fence, including observer-failure cleanup paths.
     terminal_settled: bool = False
     cancel_requested: bool = False
+    cancel_requested_at_monotonic: float | None = None
     execution_started: bool = False
     guest_profile_cleaned: bool = False
     acquired_slot: bool = False
@@ -2369,9 +2370,18 @@ class TaskRuntime:
                 if task.task_id != excluding_task_id
                 and task.status is AgentTaskStatus.QUEUED
             )
+            cancel_requested_task_ids = tuple(
+                task.task_id
+                for task in (
+                    *((running,) if running is not None else ()),
+                    *self._pending_by_session.get(key, ()),
+                )
+                if task.task_id != excluding_task_id and task.cancel_requested
+            )
         return SessionTaskSnapshot(
             running_task_id=running_task_id,
             queued_task_ids=queued_task_ids,
+            cancel_requested_task_ids=cancel_requested_task_ids,
         )
 
     @staticmethod
@@ -2798,6 +2808,8 @@ class TaskRuntime:
                     and task.status not in TERMINAL_STATUSES
                 ]
                 for task in tasks:
+                    if not task.cancel_requested:
+                        task.cancel_requested_at_monotonic = time.monotonic()
                     if (
                         task.status == AgentTaskStatus.QUEUED
                         and not task.execution_started
@@ -5707,6 +5719,15 @@ class TaskRuntime:
             # left the runtime ledger. Otherwise a caller can observe a
             # terminal record while automatic admission still sees stale work.
             task.done.set()
+        if task.cancel_requested_at_monotonic is not None:
+            log.info(
+                "task_runtime.cancellation_settled",
+                reason=task.cancel_reason or terminal_reason,
+                duration_ms=int(
+                    (time.monotonic() - task.cancel_requested_at_monotonic) * 1000
+                ),
+                settlement=status.value,
+            )
         await self._notify_subagent_terminal(
             task,
             status,
