@@ -187,6 +187,81 @@ describe('useSkillRegistry install state', () => {
     expect(registry.queueRunning.value).toBe(false)
   })
 
+  it('cancels the active backend install and does not start queued items', async () => {
+    let finishInstall: ((result: { success: boolean; cancelled: boolean }) => void) | undefined
+    const call = vi.fn((method: string, _params: Record<string, unknown>) => {
+      if (method === 'skills.install') {
+        return new Promise(resolve => { finishInstall = resolve })
+      }
+      if (method === 'skills.install.cancel') {
+        finishInstall?.({ success: false, cancelled: true })
+        return Promise.resolve({ success: false, cancelled: true })
+      }
+      return Promise.reject(new Error(`Unexpected RPC method: ${method}`))
+    })
+    const loadData = vi.fn(async () => true)
+    const registry = useSkillRegistry({
+      call,
+      supportsMethod: (method: string) => method === 'skills.install.cancel',
+    } as never, loadData)
+    registry.githubUrl.value = [
+      'https://github.com/acme/one',
+      'https://github.com/acme/two',
+    ].join('\n')
+
+    const installing = registry.installGithub()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    const operationId = call.mock.calls[0][1].operationId
+
+    const cancelling = registry.cancelInstall('github')
+    expect(registry.installActivities.value.github.items.map(item => item.status))
+      .toEqual(['cancelling', 'cancelled'])
+    expect(call).toHaveBeenLastCalledWith('skills.install.cancel', { operationId })
+
+    await cancelling
+    await installing
+
+    expect(String(operationId)).toMatch(/^[0-9a-f-]{36}$/)
+    expect(registry.installActivities.value.github.items.map(item => item.status))
+      .toEqual(['cancelled', 'cancelled'])
+    expect(call.mock.calls.filter(([method]) => method === 'skills.install')).toHaveLength(1)
+    expect(loadData).not.toHaveBeenCalled()
+    expect(registry.queueRunning.value).toBe(false)
+  })
+
+  it('preserves a success that commits while cancellation races and refreshes it', async () => {
+    let finishInstall: ((result: { success: boolean; installed: boolean }) => void) | undefined
+    const call = vi.fn((method: string) => {
+      if (method === 'skills.install') {
+        return new Promise(resolve => { finishInstall = resolve })
+      }
+      if (method === 'skills.install.cancel') {
+        finishInstall?.({ success: true, installed: true })
+        return Promise.resolve({ success: false, cancelled: true })
+      }
+      return Promise.reject(new Error(`Unexpected RPC method: ${method}`))
+    })
+    const loadData = vi.fn(async () => true)
+    const registry = useSkillRegistry({
+      call,
+      supportsMethod: (method: string) => method === 'skills.install.cancel',
+    } as never, loadData)
+    registry.githubUrl.value = [
+      'https://github.com/acme/one',
+      'https://github.com/acme/two',
+    ].join('\n')
+
+    const installing = registry.installGithub()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(1))
+    await registry.cancelInstall('github')
+    await installing
+
+    expect(registry.installActivities.value.github.items.map(item => item.status))
+      .toEqual(['installed', 'cancelled'])
+    expect(registry.githubUrl.value).toBe('https://github.com/acme/two')
+    expect(loadData).toHaveBeenCalledOnce()
+  })
+
   it('rejects more than ten unique GitHub references without truncating or starting RPCs', async () => {
     const call = vi.fn(async () => ({ success: true, installed: true }))
     const loadData = vi.fn(async () => true)

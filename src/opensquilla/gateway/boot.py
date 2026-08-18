@@ -4921,7 +4921,7 @@ async def start_gateway_server(
         meta_run_writer=getattr(svc, "meta_run_writer", None),
         skill_loader=svc.skill_loader,
         skill_management_service=getattr(svc, "skill_management_service", None),
-        skill_management_state=getattr(svc, "skill_management_state", None) or {},
+        skill_management_state=svc.skill_management_state,
         cron_scheduler=svc.cron_scheduler,
         turn_runner=turn_runner,
         task_runtime=task_runtime,

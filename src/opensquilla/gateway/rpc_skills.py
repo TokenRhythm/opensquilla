@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, cast
+from uuid import UUID
 
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.paths import default_opensquilla_home
@@ -62,6 +63,13 @@ _deps_locks: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
     weakref.WeakValueDictionary()
 )
 
+_ACTIVE_SKILL_INSTALLS_STATE_KEY = "_active_skill_installs"
+_PENDING_SKILL_INSTALL_CANCELLATIONS_STATE_KEY = (
+    "_pending_skill_install_cancellations"
+)
+_MAX_PENDING_SKILL_INSTALL_CANCELLATIONS_PER_CONNECTION = 8
+_MAX_PENDING_SKILL_INSTALL_CANCELLATIONS = 256
+
 
 def _deps_lock_for(name: str, install_id: str) -> asyncio.Lock:
     key = (name, install_id)
@@ -70,6 +78,44 @@ def _deps_lock_for(name: str, install_id: str) -> asyncio.Lock:
         lock = asyncio.Lock()
         _deps_locks[key] = lock
     return lock
+
+
+def _skill_install_operation_id(params: dict[str, Any]) -> str:
+    raw = _exact_identity_param(params, "operationId", "operation_id")
+    if not raw:
+        return ""
+    try:
+        return str(UUID(raw))
+    except ValueError as exc:
+        raise ValueError("params.operationId must be a UUID") from exc
+
+
+def _skill_install_operation_key(ctx: RpcContext, operation_id: str) -> tuple[str, str]:
+    return (ctx.conn_id, operation_id)
+
+
+def _active_skill_installs(ctx: RpcContext) -> dict[tuple[str, str], asyncio.Task[Any]]:
+    state = ctx.skill_management_state
+    active = state.setdefault(_ACTIVE_SKILL_INSTALLS_STATE_KEY, {})
+    if not isinstance(active, dict):
+        raise RuntimeError("Invalid active skill-install state")
+    return cast(dict[tuple[str, str], asyncio.Task[Any]], active)
+
+
+def _pending_skill_install_cancellations(ctx: RpcContext) -> set[tuple[str, str]]:
+    state = ctx.skill_management_state
+    pending = state.setdefault(_PENDING_SKILL_INSTALL_CANCELLATIONS_STATE_KEY, set())
+    if not isinstance(pending, set):
+        raise RuntimeError("Invalid pending skill-install cancellation state")
+    return cast(set[tuple[str, str]], pending)
+
+
+def _skill_install_cancelled_payload() -> dict[str, Any]:
+    return {
+        "success": False,
+        "cancelled": True,
+        "message": "Skill installation cancelled",
+    }
 
 
 def _get_loader(ctx: RpcContext) -> SkillLoader | None:
@@ -1176,6 +1222,38 @@ async def _handle_skills_install(params: dict | None, ctx: RpcContext) -> dict[s
     """Install a skill from a Community source."""
     if not isinstance(params, dict) or "identifier" not in params:
         raise ValueError("params.identifier is required")
+    operation_id = _skill_install_operation_id(params)
+    operation_key = (
+        _skill_install_operation_key(ctx, operation_id) if operation_id else None
+    )
+    active_installs = _active_skill_installs(ctx) if operation_key else None
+    pending_cancellations = (
+        _pending_skill_install_cancellations(ctx) if operation_key else None
+    )
+    if operation_key and pending_cancellations is not None:
+        if operation_key in pending_cancellations:
+            pending_cancellations.discard(operation_key)
+            return _skill_install_cancelled_payload()
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Skill installation is not running in an asyncio task")
+        assert active_installs is not None
+        if operation_key in active_installs:
+            raise ValueError("params.operationId is already active")
+        active_installs[operation_key] = task
+
+    try:
+        return await _run_skill_install(params, ctx)
+    except asyncio.CancelledError:
+        if not operation_id:
+            raise
+        return _skill_install_cancelled_payload()
+    finally:
+        if operation_key and active_installs is not None:
+            active_installs.pop(operation_key, None)
+
+
+async def _run_skill_install(params: dict[str, Any], ctx: RpcContext) -> dict[str, Any]:
     recovery_failure = _recovery_required_payload(ctx)
     if recovery_failure is not None:
         return recovery_failure
@@ -1250,6 +1328,40 @@ async def _handle_skills_install(params: dict | None, ctx: RpcContext) -> dict[s
             did_change=lambda value: bool(value.success),
         )
     return _install_result_to_dict(result)
+
+
+@_d.method("skills.install.cancel", scope="operator.admin")
+async def _handle_skills_install_cancel(
+    params: dict | None,
+    ctx: RpcContext,
+) -> dict[str, Any]:
+    """Cancel one install owned by this connection and await its cleanup."""
+    if not isinstance(params, dict):
+        raise ValueError("params.operationId is required")
+    operation_id = _skill_install_operation_id(params)
+    if not operation_id:
+        raise ValueError("params.operationId is required")
+
+    operation_key = _skill_install_operation_key(ctx, operation_id)
+    active_installs = _active_skill_installs(ctx)
+    task = active_installs.get(operation_key)
+    if task is None:
+        pending = _pending_skill_install_cancellations(ctx)
+        connection_pending = [key for key in pending if key[0] == ctx.conn_id]
+        if len(connection_pending) >= _MAX_PENDING_SKILL_INSTALL_CANCELLATIONS_PER_CONNECTION:
+            pending.discard(connection_pending[0])
+        if len(pending) >= _MAX_PENDING_SKILL_INSTALL_CANCELLATIONS:
+            pending.pop()
+        pending.add(operation_key)
+        return {**_skill_install_cancelled_payload(), "pending": True}
+
+    task.cancel()
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if not task.cancelled():
+            raise
+    return {**_skill_install_cancelled_payload(), "pending": False}
 
 
 @_d.method("skills.update", scope="operator.admin")
