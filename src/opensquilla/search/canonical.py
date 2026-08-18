@@ -136,15 +136,15 @@ async def run_canonical_web_search(
         break
 
     if not selected_provider:
-        search_error = _coerce_search_error(
-            "unknown",
-            RuntimeError("No search provider is available."),
-        )
         return _failure_payload(
             options,
             diagnostics,
-            error_kind=search_error.kind,
-            error=_public_error_message(search_error.provider, search_error.kind),
+            error_kind="not_configured",
+            error=(
+                "Web search is not configured. Add a search provider API key "
+                "(or enable the built-in DuckDuckGo provider) in Settings, then "
+                "retry; answer from existing knowledge in the meantime."
+            ),
             provider_retryable=False,
             error_class="RuntimeError",
         )
