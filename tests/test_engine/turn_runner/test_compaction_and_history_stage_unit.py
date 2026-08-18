@@ -9,7 +9,8 @@ exception-propagation contract without the runtime wrapper.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import asyncio
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -285,9 +286,7 @@ async def test_compaction_hook_fires_around_both_calls() -> None:
     # After-compact outcome dict carries status
     after_t3 = next(p for k, ph, p in hook.events if k == "after" and ph == "t3_upgrade")
     assert after_t3 == {"status": "not_applicable"}
-    after_preflight = next(
-        p for k, ph, p in hook.events if k == "after" and ph == "preflight"
-    )
+    after_preflight = next(p for k, ph, p in hook.events if k == "after" and ph == "preflight")
     assert after_preflight == {"status": "ran"}
 
 
@@ -413,9 +412,7 @@ async def test_compaction_state_threshold_uses_context_window_tokens() -> None:
         async def before_compact(self, state: CompactionState) -> None:
             seen_states.append(state)
 
-        async def after_compact(
-            self, state: CompactionState, outcome: Any
-        ) -> None:  # noqa: ARG002
+        async def after_compact(self, state: CompactionState, outcome: Any) -> None:  # noqa: ARG002
             return None
 
     stage, _, _, _, _ = _make_stage(
@@ -431,3 +428,106 @@ async def test_compaction_state_threshold_uses_context_window_tokens() -> None:
         assert s.agent_id == "agent:main"
     assert seen_states[0].extra == {"phase": "t3_upgrade"}
     assert seen_states[1].extra == {"phase": "preflight"}
+
+
+@pytest.mark.asyncio
+async def test_post_compaction_resolver_runs_before_history_with_replacement_agent() -> None:
+    order: list[str] = []
+    replacement_agent = _make_agent_stub(
+        request_context_prompt="REPLACEMENT",
+    )
+
+    class _OrderedT3(_RecordingT3):
+        async def maybe_compact(self, **kwargs: Any) -> str:
+            order.append("t3")
+            return await super().maybe_compact(**kwargs)
+
+    class _OrderedPreflight(_RecordingPreflight):
+        async def maybe_compact(self, **kwargs: Any) -> None:
+            order.append("preflight")
+            await super().maybe_compact(**kwargs)
+
+    class _OrderedHistory(_RecordingHistoryLoader):
+        async def load(self, **kwargs: Any) -> str | None:
+            order.append("history")
+            assert kwargs["agent"] is replacement_agent
+            return await super().load(**kwargs)
+
+    class _OrderedPrepender(_RecordingPrepender):
+        def prepend(self, **kwargs: Any) -> str | None:
+            order.append("prepend")
+            assert kwargs["existing"] == "REPLACEMENT"
+            return super().prepend(**kwargs)
+
+    stage, _, _, _, _ = _make_stage(
+        t3=_OrderedT3(return_value="not_applicable"),
+        preflight=_OrderedPreflight(),
+        history=_OrderedHistory(return_value="SUMMARY"),
+        prepender=_OrderedPrepender(),
+    )
+
+    async def resolve_replacement() -> Any:
+        order.append("resolver")
+        return replacement_agent
+
+    inp = replace(
+        _make_input(request_context_prompt="ORIGINAL"),
+        post_compaction_agent_resolver=resolve_replacement,
+    )
+    outcome = await stage.run(inp)
+
+    assert order == ["t3", "preflight", "resolver", "history", "prepend"]
+    assert outcome.output.final_request_context_prompt == ("SUMMARY\n\nREPLACEMENT")
+
+
+@pytest.mark.asyncio
+async def test_default_path_keeps_compaction_history_order_without_resolver() -> None:
+    order: list[str] = []
+
+    class _Port:
+        async def maybe_compact(self, **kwargs: Any) -> str | None:
+            del kwargs
+            label = "t3" if not order else "preflight"
+            order.append(label)
+            return "not_applicable" if label == "t3" else None
+
+    class _History:
+        async def load(self, **kwargs: Any) -> None:
+            del kwargs
+            order.append("history")
+
+    class _Prepender:
+        def prepend(self, **kwargs: Any) -> None:
+            del kwargs
+            order.append("prepend")
+
+    shared_port = _Port()
+    stage = CompactionAndHistoryStage(
+        t3_upgrade=shared_port,
+        preflight=shared_port,
+        history_loader=_History(),
+        request_context_prepender=_Prepender(),
+    )
+    await stage.run(_make_input())
+
+    assert order == ["t3", "preflight", "history", "prepend"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
+async def test_post_compaction_resolver_errors_propagate_before_history(
+    error_type: type[BaseException],
+) -> None:
+    history = _RecordingHistoryLoader()
+    stage, _, _, _, _ = _make_stage(history=history)
+
+    async def fail_resolution() -> Any:
+        raise error_type("resolver failed")
+
+    inp = replace(
+        _make_input(),
+        post_compaction_agent_resolver=fail_resolution,
+    )
+    with pytest.raises(error_type):
+        await stage.run(inp)
+    assert history.calls == []

@@ -8,6 +8,7 @@ from opensquilla.engine.pricing import (
     PricingCache,
     lookup_price,
     reset_live_price_cache_for_tests,
+    resolve_cache_price_quote_exact,
     seed_live_price_cache_for_tests,
 )
 
@@ -106,6 +107,104 @@ def test_price_entry_cache_fields_default_none() -> None:
     entry = PriceEntry(3.0, 15.0)
     assert entry.cache_read_per_m is None
     assert entry.cache_write_per_m is None
+
+
+def test_cache_quote_uses_exact_static_rates_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("cache quote must never fetch live pricing")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.pricing._cached_or_fetch_live",
+        fail_if_called,
+    )
+    quote = resolve_cache_price_quote_exact(
+        provider="anthropic",
+        model_id="anthropic/claude-opus-4.8",
+        endpoint_scope="https://api.anthropic.com",
+        upstream_scope="anthropic",
+        ranking_price_source="static_table",
+        ranking_input_per_million=5.0,
+        ranking_output_per_million=25.0,
+    )
+
+    assert quote is not None
+    assert quote.normal_input_per_million == 5.0
+    assert quote.normal_output_per_million == 25.0
+    assert quote.cache_read_per_million == 0.5
+    assert quote.cache_write_per_million == 6.25
+    assert quote.price_source == "static_table"
+    assert quote.endpoint_scope == "https://api.anthropic.com:443/"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"provider": "openrouter"},
+        {"ranking_price_source": "catalog"},
+        {"ranking_input_per_million": 5.1},
+        {"ranking_output_per_million": 25.1},
+        {"model_id": "google/gemini-2.5-pro"},
+        {"endpoint_scope": "https://api.anthropic.com/v1?tenant=ambiguous"},
+    ],
+)
+def test_cache_quote_fails_closed_without_exact_scope_and_rates(overrides) -> None:
+    values = {
+        "provider": "anthropic",
+        "model_id": "anthropic/claude-opus-4.8",
+        "endpoint_scope": "https://api.anthropic.com",
+        "upstream_scope": "anthropic",
+        "ranking_price_source": "static_table",
+        "ranking_input_per_million": 5.0,
+        "ranking_output_per_million": 25.0,
+    }
+    values.update(overrides)
+
+    assert resolve_cache_price_quote_exact(**values) is None
+
+
+@pytest.mark.parametrize(
+    ("provider", "endpoint", "upstream"),
+    [
+        ("anthropic", "https://proxy.example/v1", "anthropic"),
+        ("anthropic", "https://api.anthropic.com/custom", "anthropic"),
+        ("custom", "https://proxy.example/v1", "custom"),
+        ("minimax", "https://api.minimaxi.com/anthropic", "minimax"),
+    ],
+)
+def test_cache_quote_rejects_unproven_static_provider_scope(
+    provider: str,
+    endpoint: str,
+    upstream: str,
+) -> None:
+    assert (
+        resolve_cache_price_quote_exact(
+            provider=provider,
+            model_id="anthropic/claude-opus-4.8",
+            endpoint_scope=endpoint,
+            upstream_scope=upstream,
+            ranking_price_source="static_table",
+            ranking_input_per_million=5.0,
+            ranking_output_per_million=25.0,
+        )
+        is None
+    )
+
+
+def test_cache_quote_rejects_static_entry_without_provider_price_provenance() -> None:
+    assert (
+        resolve_cache_price_quote_exact(
+            provider="openai",
+            model_id="openai/gpt-5.6-sol",
+            endpoint_scope="https://api.openai.com/v1",
+            upstream_scope="openai",
+            ranking_price_source="static_table",
+            ranking_input_per_million=5.0,
+            ranking_output_per_million=30.0,
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(

@@ -1,9 +1,10 @@
 # Router Dynamic 的 KV Cache 亲和设计
 
-- 状态：设计方案，尚未修改生产代码
-- 基线：`962666faae62eea5863af25562922c0659c314ea`
-- Worktree：`/home/codex/code/opensquilla-dev-20260814`
-- 日期：2026-08-17
+- 状态：已实现，并通过本地与远端 Linux 验收
+- 基线：`01c1dddb8cc8659ad39e7e726668c786f78190f7`
+- 远端权威 worktree：`/home/codex/code/opensquilla-kv-cache-affinity-20260818`
+- 本地验证镜像：`/Users/liuxinchen/Documents/SSH/opensquilla-kv-cache-affinity-20260818`
+- 日期：2026-08-18
 
 ## 1. 结论
 
@@ -358,7 +359,8 @@ pricing 层先返回一个不可变、已规范化的 `CachePriceQuote`：
 
 ```text
 {provider, canonical_model, cache_domain/upstream_scope, price_source,
- normal_input_per_million, cache_read_per_million, cache_write_per_million,
+ normal_input_per_million, normal_output_per_million,
+ cache_read_per_million, cache_write_per_million,
  cache_bucket_rates_are_total=true}
 ```
 
@@ -368,6 +370,12 @@ pricing 层先返回一个不可变、已规范化的 `CachePriceQuote`：
 `_model_price()` 使用的可分解 input/output price 完全一致；否则 `score_adjustment=0`。
 raw scalar price、来源不明或 normal rate 不一致时均 fail closed，不能把“刷新价格源”伪装成
 “cache 节省”。
+
+全局静态价格表本身也不是任意部署的精确定价证据。首版只允许 provider registry 中已声明的
+canonical first-party endpoint、`upstream_scope == provider`，且静态条目带有明确的
+provider/model provenance allowlist；仅有 catalog namespace 并不足以证明价格归属。custom
+host/path、无 canonical endpoint、跨 provider/model namespace 或缺少结构化 provenance 的
+静态条目一律 fail closed。
 
 OpenRouter 当前 pricing API 不能证明 strict upstream 的精确定价，所以即使 cache-domain guard
 成立，没有 upstream-scoped exact quote 时 expected-cost 也退化为原成本；bonus 策略不受此
@@ -470,42 +478,64 @@ Delta_cache_cost = 0.25 * (3.8000/10 - 3.4304/10) = 0.00924
 
 ```text
 {identity, role, strategy, evidence_kind, decay_factor,
- N, K, p, price_source, C0, Chit, Cmiss,
+ N, K, cache_evidence_tokens, p, price_source,
+ cache_read_per_million, cache_write_per_million, C0, Chit, Cmiss,
  r_input_eff, cost_normalized_before, cost_normalized_after,
  score_adjustment}
 ```
 
-这些数值按 ranking trace 的 canonical number/decimal 规则序列化；排序和 replay 使用未截断值，
-展示层四舍五入不得反向参与重放。
+`cache_evidence_tokens` 是 receipt 中与 evidence kind 对应的原始 token 桶；replay 必须验证
+`K=min(N, cache_evidence_tokens)`，再结合冻结 registry 的 normal input rate 与上述 cache
+read/write total-bucket rate重算 `Chit/Cmiss`。这些数值按 ranking trace 的 canonical
+number/decimal 规则序列化；排序和 replay 使用未截断值，展示层四舍五入不得反向参与重放。
 
 若决定分阶段上线，建议先用 `strategy=bonus` 校验 receipt 与命中稳定性，再通过独立配置
 实验启用 `strategy=expected_cost`；但两种策略的计算与互斥合同都在本设计中冻结。
 
 ## 4. 改动范围
 
-核心实现预计改动：
+实际实现改动：
 
 - 新增 `src/opensquilla/provider/cache_affinity.py`：私有 receipt 类型、严格 cache token
   校验、evidence 分类、cache-domain guard 与 normalized `CachePriceQuote` 成本计算；它只消费
   quote，不 import `engine.pricing`，也不包含全局状态；
 - `src/opensquilla/provider/deployment.py`：在 credential resolution 边界生成仅进程内的
-  opaque `credential_namespace_token` 并随 private resolution 传递；不公开 secret/digest；
+  opaque `credential_namespace_token` 并随 private resolution 传递；同时为 cache-aware
+  deployment 冻结本次 OpenRouter strict request policy；不公开 secret/digest；
+- `src/opensquilla/provider/selector.py` 与 `provider/openai.py`：只在 cache-aware 路径透传
+  上述进程内 strict policy 快照，保证排序 guard、实际 OpenRouter payload 与 receipt guard
+  使用同一个值；配置块缺失时仍保留原有 env 驱动行为与序列化形状；
 - `src/opensquilla/provider/ranking_router.py`：校验 optional 判别式配置；在 `rank_single_model`
   和 multiple P/A 的明确插点应用 `bonus` 或 `expected_cost`；冻结安全 replay 输入；
 - `src/opensquilla/provider/ensemble.py`：multiple 每次 `chat()` 在成功关闭边界产出私有
-  P/A receipt batch，并向 retry provider 透传 callback；
+  P/A receipt batch，并向 retry provider 透传 callback；对真正获得 cache adjustment 的
+  selected P/A 在物化前 fresh-check deployment、credential、cache-domain 与 health，发生漂移
+  时最多执行一次无 affinity 重排；
 - `src/opensquilla/engine/runtime.py`：
   - 在 `_RouterSingleDirectProvider._chat` 的 raw Provider `Done`、close proof 和 health success
     之后产生 `single` receipt；
   - 用独立 `_router_dynamic_cache_affinity` LRU 暂存/读取三种角色状态；
-  - 在最终 engine `Done` 后 one-shot commit，所有失败/取消路径 discard；
+  - 在 Analyzer 前注册空的 terminal sidecar，在最终 engine `Done` 后 one-shot commit；因此
+    Analyzer/ranking 提前失败、成功但无 receipt、fallback 与取消都能清除上一轮旧证据；
+  - session epoch 无法证明时立即失效该 session 的旧亲和状态并推进 dispatch generation；
   - 在 single Analyzer 前冻结 session-level `cache_continuity_available`，把它贯穿 analyzer
     primary/retry/fallback normalization 与后续 ranking；Analyzer 后再传 candidate-specific
     `cache_affinity_inputs`，全程不伪造 B5 last route；
+  - single Top-1 获得非零 adjustment 时，在物化前 fresh-check health 与 cache-domain；发生
+    漂移时与 credential drift 共用一次无 affinity 重排，绝不继续执行旧加分选出的部署；
   - 从现有 `engine.pricing` 解析与 ranking row 对齐的 total-bucket quote；无法证明 strict
     upstream 或费率/来源不一致时不给 expected-cost adjustment；
   - 注册/注销 compaction listener，credential/session epoch 失效时清理；
-- 对应 ranking、ensemble、runtime 测试。
+- `src/opensquilla/engine/pricing.py`：提供无网络、与 ranking price source/rate 精确对齐的
+  cache total-bucket quote；不确定的 OpenRouter upstream 价格保持 fail closed；
+- `src/opensquilla/engine/turn_runner/compaction_and_history_stage.py`：在 compaction 完成后、
+  history 注入和物理 dispatch 前提供一次无 affinity 重排缝，避免失效分数继续执行；
+- `src/opensquilla/gateway/rpc_sessions.py`、`gateway/session_services.py`、
+  `session/manager.py` 与 `session/storage.py`：在 durable delete、prune 与容量淘汰后统一通知
+  session 生命周期 listener，清除 epoch cache，并使对应 affinity、pending sidecar 与 dispatch
+  generation 失效；
+- 对应 cache primitive、pricing、deployment、ranking、ensemble、runtime、compaction 与
+  session lifecycle 测试。
 
 配置支持放在现有 ranking config validator；不新增 Gateway 顶层布尔开关。operator 只有在
 `ranking_config_override.session.kv_cache_affinity` 中提供完整对象时才开启。若要给 packaged
@@ -535,7 +565,8 @@ compaction 立即失效”，需另外修改 `cache_break_monitor.py` 或 `rpc_s
    bonus/TTL/概率数值 fallback；只配置 single 时 multiple 原链不读取 affinity，反之亦然；
 3. bonus 策略用两组不同配置验证 `S_cache=配置值*d(age)`；single Top-1、multiple proposer
    marginal 与 aggregator score 都使用配置值，而非固定 `0.03/0.015`；
-4. expected-cost 用表驱动测试逐项核对 `N/K/p/C0/Chit/Cmiss/E_input/r_input_eff` 与
+4. expected-cost 用表驱动测试逐项核对 `N/K/cache_evidence_tokens/p`、cache read/write
+   total-bucket rate、`C0/Chit/Cmiss/E_input/r_input_eff` 与
    `Delta_cache_cost`；覆盖 total-bucket cache-write、clamp、`N=0`、价格缺失、raw scalar、
    strict-upstream quote 缺失以及 quote/ranking normal rate 或 source 不一致；这些 fail-closed
    情况均要求 delta=0，并证明 request USD 未与 `$/M` 直接相加；

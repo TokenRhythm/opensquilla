@@ -3643,6 +3643,7 @@ class OpenAIProvider:
         compat: OpenAICompatPolicy | None = None,
         replay_provider_state: bool = True,
         provider_id: str | None = None,
+        provider_routing_strict: bool | None = None,
     ) -> None:
         self._api_key = clean_header_secret(api_key, label="LLM API key")
         self._model = model
@@ -3670,9 +3671,20 @@ class OpenAIProvider:
         # instead of the default {"order": [...], "allow_fallbacks": true},
         # so requests fail rather than silently reroute when the pinned
         # upstream is unavailable. Off by default.
+        if provider_routing_strict is not None and not isinstance(
+            provider_routing_strict,
+            bool,
+        ):
+            raise TypeError("provider_routing_strict must be a bool or None")
         self._provider_routing_strict = (
-            os.environ.get("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "").strip().lower()
-            in {"1", "true", "yes", "on", "enabled"}
+            provider_routing_strict
+            if provider_routing_strict is not None
+            else (
+                os.environ.get("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "")
+                .strip()
+                .lower()
+                in {"1", "true", "yes", "on", "enabled"}
+            )
         )
         self._openrouter_metadata_required = (
             self._provider_kind == "openrouter"

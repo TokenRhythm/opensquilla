@@ -462,6 +462,7 @@ class _RecordingTurnRunner:
     def __init__(self) -> None:
         self.run_calls: list[dict[str, Any]] = []
         self._locks: dict[str, asyncio.Lock] = {}
+        self.cache_affinity_invalidations: list[tuple[str, str]] = []
 
     def _get_session_lock(self, session_key: str) -> asyncio.Lock:
         return self._locks.setdefault(session_key, asyncio.Lock())
@@ -469,6 +470,14 @@ class _RecordingTurnRunner:
     async def run(self, message: str, session_key: str, **kwargs):
         self.run_calls.append({"message": message, "session_key": session_key, **kwargs})
         yield DoneEvent()
+
+    def _invalidate_router_dynamic_cache_affinity(
+        self,
+        *,
+        session_key: str,
+        reason: str,
+    ) -> None:
+        self.cache_affinity_invalidations.append((session_key, reason))
 
 
 class _FakeUploadStore:
@@ -3849,6 +3858,66 @@ class TestSessionsDelete:
 
         assert res.ok is True
         assert await manager._storage.get_session(session.session_key) is None
+        assert turn_runner.cache_affinity_invalidations == [
+            (session.session_key, "session_deleted")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_delete_clears_cached_epoch_and_router_affinity(
+        self,
+        dispatcher,
+        session,
+    ):
+        manager = FakeSessionManager([session])
+        manager._epoch_cache = {session.session_key: session.epoch}
+        turn_runner = _RecordingTurnRunner()
+        ctx = make_ctx(session_manager=manager, turn_runner=turn_runner)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.delete",
+            {"key": session.session_key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert manager._epoch_cache == {}
+        assert turn_runner.cache_affinity_invalidations == [
+            (session.session_key, "session_deleted")
+        ]
+
+    @pytest.mark.asyncio
+    async def test_legacy_delete_failure_preserves_epoch_and_router_affinity(
+        self,
+        dispatcher,
+        session,
+        monkeypatch,
+    ):
+        manager = FakeSessionManager([session])
+        manager._epoch_cache = {session.session_key: session.epoch}
+        turn_runner = _RecordingTurnRunner()
+
+        async def fail_delete(key: str) -> None:
+            assert key == session.session_key
+            raise RuntimeError("synthetic durable delete failure")
+
+        monkeypatch.setattr(manager._storage, "delete_session", fail_delete)
+        ctx = make_ctx(session_manager=manager, turn_runner=turn_runner)
+
+        res = await dispatcher.dispatch(
+            "r1",
+            "sessions.delete",
+            {"key": session.session_key},
+            ctx,
+        )
+
+        assert res.ok is True
+        assert res.payload["deleted"] == []
+        assert res.payload["errors"] == [
+            f"{session.session_key}: synthetic durable delete failure"
+        ]
+        assert manager._epoch_cache == {session.session_key: session.epoch}
+        assert turn_runner.cache_affinity_invalidations == []
 
     @pytest.mark.asyncio
     async def test_delete_legacy_alias_uses_canonical_session_lock(self, dispatcher):

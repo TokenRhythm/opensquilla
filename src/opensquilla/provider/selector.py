@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import InitVar, dataclass, field, replace
 
 from opensquilla.redaction import redact_error_text
 
@@ -38,6 +38,30 @@ class ProviderConfig:
     # state minted elsewhere (thinking blocks / thought signatures) must not
     # be replayed to a provider that did not produce it.
     replay_provider_state: bool = True
+    # Cache-affinity-aware resolution freezes the actual OpenRouter request
+    # policy at the deployment boundary.  Ordinary callers leave this unset,
+    # preserving the adapter's historical environment-driven behavior.
+    _provider_routing_strict_override: InitVar[bool | None] = None
+
+    def __post_init__(
+        self,
+        _provider_routing_strict_override: bool | None,
+    ) -> None:
+        if _provider_routing_strict_override is not None and not isinstance(
+            _provider_routing_strict_override,
+            bool,
+        ):
+            raise TypeError(
+                "_provider_routing_strict_override must be a bool or None"
+            )
+        # InitVar keeps this process-local execution proof out of dataclass
+        # serialization while retaining it across dataclasses.replace().  Do
+        # not add even a private instance attribute on the ordinary path: its
+        # ``vars()``/copy surface remains byte-for-byte unchanged.
+        if _provider_routing_strict_override is not None:
+            self.__dict__["_provider_routing_strict_override"] = (
+                _provider_routing_strict_override
+            )
 
 
 @dataclass
@@ -120,7 +144,15 @@ def _exception_status_code(exc: Exception) -> int | None:
 
 
 _ProviderConfigIdentity = tuple[
-    str, str, str, str, str, str, bool, tuple[tuple[str, str], ...]
+    str,
+    str,
+    str,
+    str,
+    str,
+    str,
+    bool,
+    bool | None,
+    tuple[tuple[str, str], ...],
 ]
 
 
@@ -134,6 +166,7 @@ def _provider_config_identity(cfg: ProviderConfig) -> _ProviderConfigIdentity:
         cfg.org_id,
         cfg.proxy,
         cfg.replay_provider_state,
+        getattr(cfg, "_provider_routing_strict_override", None),
         provider_routing,
     )
 
@@ -191,6 +224,11 @@ class ProviderBuildContext:
     proxy: str = ""
     provider_routing: Mapping[str, str] = field(default_factory=dict)
     replay_provider_state: bool = True
+    provider_routing_strict_override: bool | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     # OllamaProvider knob; never populated today because ProviderConfig has
     # no num_ctx field — kept visible so the gap is explicit.
     num_ctx: int | None = None
@@ -211,6 +249,9 @@ def _build_context(cfg: ProviderConfig, spec: ProviderSpec) -> ProviderBuildCont
         proxy=cfg.proxy,
         provider_routing=dict(cfg.provider_routing),
         replay_provider_state=cfg.replay_provider_state,
+        provider_routing_strict_override=(
+            getattr(cfg, "_provider_routing_strict_override", None)
+        ),
         auth_header_style=spec.auth_header_style,
         compat=spec.compat,
     )
@@ -239,6 +280,7 @@ def _build_openai_compat(ctx: ProviderBuildContext) -> LLMProvider:
         "compat": ctx.compat,
         "replay_provider_state": ctx.replay_provider_state,
         "provider_id": ctx.provider_id,
+        "provider_routing_strict": ctx.provider_routing_strict_override,
     }
     if ctx.base_url:
         kwargs["base_url"] = ctx.base_url
@@ -448,6 +490,13 @@ class ModelSelector:
                 proxy=self._chain[0].proxy,
                 provider_routing=self._chain[0].provider_routing,
                 replay_provider_state=self._chain[0].replay_provider_state,
+                _provider_routing_strict_override=(
+                    getattr(
+                        self._chain[0],
+                        "_provider_routing_strict_override",
+                        None,
+                    )
+                ),
             )
             fallback_chain = [original_primary, *self._chain[1:]]
             deduped_fallbacks: list[ProviderConfig] = []
@@ -551,6 +600,13 @@ class ModelSelector:
                     proxy=current.proxy,
                     provider_routing=current.provider_routing,
                     replay_provider_state=current.replay_provider_state,
+                    _provider_routing_strict_override=(
+                        getattr(
+                            current,
+                            "_provider_routing_strict_override",
+                            None,
+                        )
+                    ),
                 )
             )
 

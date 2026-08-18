@@ -21,6 +21,8 @@ class SessionEpochCache(Protocol):
 
     def set_cached_epoch(self, session_key: str, epoch: int) -> None: ...
 
+    def clear_cached_epoch(self, session_key: str) -> None: ...
+
 
 class SessionLockProvider(Protocol):
     def get_session_lock(self, session_key: str) -> asyncio.Lock: ...
@@ -62,6 +64,19 @@ def set_session_epoch(session_manager: object | None, session_key: str, epoch: i
     cache = getattr(session_manager, "_epoch_cache", None)
     if isinstance(cache, dict):
         cache[session_key] = epoch
+
+
+def clear_session_epoch(session_manager: object | None, session_key: str) -> None:
+    """Remove an in-process epoch entry after durable session deletion."""
+    if session_manager is None:
+        return
+    clearer = getattr(session_manager, "clear_cached_epoch", None)
+    if callable(clearer):
+        clearer(session_key)
+        return
+    cache = getattr(session_manager, "_epoch_cache", None)
+    if isinstance(cache, dict):
+        cache.pop(session_key, None)
 
 
 def get_session_lock(

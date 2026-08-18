@@ -5,7 +5,7 @@ import hashlib
 import json
 import random
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
@@ -57,20 +57,38 @@ from opensquilla.provider.admission import (
     ProviderAdmissionController,
     ProviderAdmissionSettings,
 )
+from opensquilla.provider.cache_affinity import (
+    CachePriceQuote,
+    build_cache_affinity_receipt,
+    build_credential_namespace_token,
+)
+from opensquilla.provider.deployment import ProviderDeploymentResolution
 from opensquilla.provider.ensemble import (
     EnsembleMemberConfig,
     EnsembleProvider,
+    RouterSingleRoute,
     _apply_canary_candidate_filter,
     _apply_runtime_health_candidate_filter,
     _attach_final_request_output,
     _bind_managed_usage_rows,
+    _build_router_dynamic_members,
+    _cache_affinity_domain_guard_for_member,
+    _cache_affinity_evidence_for_candidate,
+    _cache_affinity_guard_for_resolution,
+    _cache_affinity_selected_mode,
+    _cache_affinity_thinking_modes,
+    _cache_affinity_thinking_projection,
     _canary_rollout_bucket,
     _CandidateResult,
     _canonicalize_usage_row,
     _close_async_iterator,
     _deduplicate_continuation,
+    _DefaultRouterDynamicRetryFactory,
     _done_event_with_physical_attempt_id,
+    _EnsembleCacheAffinityReceiptCollector,
+    _EnsembleCacheAffinitySequenceAllocator,
     _error_event_physical_request_count,
+    _frozen_cache_affinity_model_aliases,
     _guard_canary_physical_request_stream,
     _is_thinking_parameter_rejection,
     _json_safe,
@@ -87,11 +105,13 @@ from opensquilla.provider.ensemble import (
     _StreamCloseStatus,
     _summed_float,
     _unrepresented_diagnostic_usage_rows,
+    _validated_final_cache_affinity_receipts,
     _visible_answer_is_progress_only,
     _visible_answer_is_repetitive_stall,
     _visible_answer_looks_usable,
     build_ensemble_provider_from_config,
     openrouter_static_capabilities,
+    resolve_router_single_route,
 )
 from opensquilla.provider.failures import ProviderFailureKind
 from opensquilla.provider.protocol import (
@@ -99,6 +119,9 @@ from opensquilla.provider.protocol import (
 )
 from opensquilla.provider.ranking_router import (
     DynamicRankingError,
+    RankedModel,
+    RankingDecision,
+    SingleModelRankingDecision,
     TaskAnalysisResult,
     TaskAnalyzerCandidate,
     analyze_task_with_fallback_chain,
@@ -107,6 +130,7 @@ from opensquilla.provider.ranking_router import (
     fallback_task_profile,
     load_model_registry_snapshot,
     ranking_config_resolution,
+    ranking_config_snapshot,
 )
 from opensquilla.provider.selector import ProviderConfig
 from opensquilla.provider.types import (
@@ -880,6 +904,8 @@ class _FakePlan:
     started: asyncio.Event | None = None
     closed: asyncio.Event | None = None
     failure: Exception | None = None
+    on_close: Any | None = None
+    on_event: Any | None = None
 
 
 @dataclass
@@ -933,6 +959,8 @@ class _FakeProvider:
             if plan.failure is not None:
                 raise plan.failure
             for event in plan.events:
+                if callable(plan.on_event):
+                    plan.on_event(event)
                 if isinstance(event, DoneEvent) and not event.provider:
                     yield replace(event, provider=self._cfg.provider)
                 else:
@@ -940,6 +968,8 @@ class _FakeProvider:
         finally:
             if plan.closed is not None:
                 plan.closed.set()
+            if callable(plan.on_close):
+                plan.on_close()
 
     async def list_models(self) -> list[Any]:
         return []
@@ -4219,6 +4249,44 @@ def test_router_dynamic_selection_plan_is_materialized_without_rewriting_members
     )
 
 
+def test_router_dynamic_without_cache_policy_never_calls_affinity_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("absent cache policy must be a strict no-op")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._cache_affinity_private_inputs",
+        fail_if_called,
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+        },
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2"},
+    )
+
+    assert provider.selection_plan["selection_mode"] == "router_dynamic"
+
+
 def test_router_dynamic_direct_build_reuses_prepared_config_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4971,6 +5039,9 @@ def test_router_dynamic_retry_metadata_projects_around_real_skill_loader(
 
 
 def test_router_dynamic_default_off_ignores_managed_only_request_inputs_exactly() -> None:
+    import opensquilla.provider.cache_affinity as cache_affinity_module
+
+    cache_affinity_module._credential_hmac_key.cache_clear()
     config = GatewayConfig(
         llm={
             "provider": "openrouter",
@@ -5018,6 +5089,7 @@ def test_router_dynamic_default_off_ignores_managed_only_request_inputs_exactly(
         for member in legacy.proposers
     ]
     assert noisy.aggregator.provider_config == legacy.aggregator.provider_config
+    assert cache_affinity_module._credential_hmac_key.cache_info().currsize == 0
 
 
 def _default_off_router_dynamic_provider(
@@ -12645,6 +12717,8 @@ def _billed_done(
     cost: float,
     stop_reason: str = "end_turn",
     reasoning_tokens: int = 0,
+    cached_tokens: int = 0,
+    cache_write_tokens: int = 0,
 ) -> DoneEvent:
     return DoneEvent(
         provider="fake",
@@ -12652,6 +12726,8 @@ def _billed_done(
         input_tokens=10,
         output_tokens=2,
         reasoning_tokens=reasoning_tokens,
+        cached_tokens=cached_tokens,
+        cache_write_tokens=cache_write_tokens,
         billed_cost=cost,
         cost_source="provider_billed",
         stop_reason=stop_reason,
@@ -13830,6 +13906,60 @@ def _slot_recovery_plan(
     }
 
 
+def _cache_affinity_member(model: str) -> EnsembleMemberConfig:
+    member = _member(model)
+    credential_namespace_token = build_credential_namespace_token(
+        provider=member.provider_config.provider,
+        resolved_secret=member.provider_config.api_key,
+        org_id=member.provider_config.org_id,
+    )
+    assert credential_namespace_token is not None
+    return replace(
+        member,
+        provider_config=replace(
+            member.provider_config,
+            base_url="https://cache-affinity.example/v1",
+            _provider_routing_strict_override=False,
+        ),
+        _cache_affinity_credential_namespace_token=(
+            credential_namespace_token
+        ),
+    )
+
+
+def test_router_single_route_freezes_only_registry_model_aliases() -> None:
+    aliases = _frozen_cache_affinity_model_aliases(
+        {
+            "model_id": "model-requested",
+            "version": "model-requested-20260818",
+            "unrelated_alias": "model-unknown",
+        }
+    )
+    credential_namespace_token = build_credential_namespace_token(
+        provider="fake",
+        resolved_secret="private",
+    )
+    assert credential_namespace_token is not None
+    route = RouterSingleRoute(
+        provider_config=ProviderConfig(provider="fake", model="model-requested"),
+        effective_tier=2,
+        trace={},
+        direct_output_tokens=1,
+        context_window_tokens=2,
+        model_capabilities=None,
+        actual_model_aliases=aliases,
+        credential_namespace_token=credential_namespace_token,
+    )
+
+    assert route.actual_model_aliases == (
+        "model-requested",
+        "model-requested-20260818",
+    )
+    assert "model-requested-20260818" not in repr(route)
+    assert "CredentialNamespaceToken" not in repr(route)
+    assert "model-unknown" not in route.actual_model_aliases
+
+
 def _analyzer_failure_fallback_recovery_plan(
     proposers: list[EnsembleMemberConfig],
 ) -> dict[str, Any]:
@@ -13917,6 +14047,2263 @@ async def test_router_dynamic_aggregator_binds_physical_attempt_evidence(
         for row in aggregator_rows
     } == {physical_attempt_id}
     assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_cache_affinity_callback_waits_for_outer_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.provider.ensemble as ensemble_module
+
+    class _ReceiptClock:
+        def __init__(self) -> None:
+            self.now = 100.0
+
+        def monotonic(self) -> float:
+            return self.now
+
+        def advance_for_close(self) -> None:
+            self.now += 10.0
+
+    receipt_clock = _ReceiptClock()
+    terminal_times: dict[str, float] = {}
+
+    def record_terminal(model: str) -> Any:
+        def _record(event: StreamEvent) -> None:
+            if isinstance(event, DoneEvent):
+                terminal_times[model] = receipt_clock.now
+
+        return _record
+
+    monkeypatch.setattr(
+        ensemble_module,
+        "time",
+        SimpleNamespace(
+            monotonic=receipt_clock.monotonic,
+            monotonic_ns=time.monotonic_ns,
+            time=time.time,
+        ),
+    )
+    closed = {
+        model: asyncio.Event() for model in ("p0", "p1", "agg")
+    }
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft 0"),
+                    _billed_done(
+                        "p0",
+                        cost=0.1,
+                        cached_tokens=11,
+                    ),
+                ],
+                closed=closed["p0"],
+                on_close=receipt_clock.advance_for_close,
+                on_event=record_terminal("p0"),
+            ),
+            "p1": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft 1"),
+                    _billed_done(
+                        "p1",
+                        cost=0.1,
+                        cache_write_tokens=13,
+                    ),
+                ],
+                closed=closed["p1"],
+                on_close=receipt_clock.advance_for_close,
+                on_event=record_terminal("p1"),
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final"),
+                    _billed_done(
+                        "agg",
+                        cost=0.2,
+                        cached_tokens=17,
+                        cache_write_tokens=19,
+                    ),
+                ],
+                closed=closed["agg"],
+                on_close=receipt_clock.advance_for_close,
+                on_event=record_terminal("agg"),
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_cache_affinity_member("p0"), _cache_affinity_member("p1")]
+    selection_plan = _slot_recovery_plan(proposers, [])
+    selection_plan["decision_id"] = "cache-affinity-decision"
+    batches: list[Any] = []
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_cache_affinity_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=selection_plan,
+        _cache_affinity_receipt_callback=batches.append,
+        _cache_affinity_turn_id="turn-1",
+        _cache_affinity_provider_instance_token="provider-token-1",
+        _cache_affinity_session_epoch=7,
+    )
+    scope_id = "router-dynamic-cache-affinity-close"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    stream = provider.chat(
+        [Message(role="user", content="answer")],
+        config=ChatConfig(max_tokens=64, thinking=False),
+    )
+    events: list[StreamEvent] = []
+    async for event in stream:
+        events.append(event)
+        if isinstance(event, DoneEvent):
+            break
+
+    assert batches == []
+    await stream.aclose()
+
+    assert all(event.is_set() for event in closed.values())
+    [batch] = batches
+    assert batch.turn_id == "turn-1"
+    assert batch.decision_id == "cache-affinity-decision"
+    assert batch.provider_instance_token == "provider-token-1"
+    assert batch.provider_instance_generation == 0
+    assert batch.chat_sequence == 0
+    assert batch.topology == "multiple"
+    assert len(batch.chat_call_id) == 32
+    assert [receipt.role for receipt in batch.receipts] == [
+        "proposer",
+        "proposer",
+        "aggregator",
+    ]
+    assert [receipt.execution_slot for receipt in batch.receipts] == [
+        "0:0",
+        "1:0",
+        "0:0",
+    ]
+    assert [receipt.evidence_kind for receipt in batch.receipts] == [
+        "read_hit",
+        "write_only",
+        "read_hit",
+    ]
+    assert [receipt.cached_tokens for receipt in batch.receipts] == [
+        11,
+        0,
+        17,
+    ]
+    assert [receipt.cache_write_tokens for receipt in batch.receipts] == [
+        0,
+        13,
+        19,
+    ]
+    assert all(
+        receipt.observed_at_monotonic < receipt_clock.now
+        for receipt in batch.receipts
+    )
+    assert set(terminal_times) == {"p0", "p1", "agg"}
+    for receipt in batch.receipts:
+        requested_model = receipt.requested_identity.partition(":")[2]
+        assert receipt.observed_at_monotonic == terminal_times[requested_model]
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    final_attempt_ids = {
+        row["physical_attempt_id"] for row in done.model_usage_breakdown
+    }
+    assert {
+        receipt.physical_attempt_id for receipt in batch.receipts
+    }.issubset(final_attempt_ids)
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("actual_suffix", "expected_receipt_count"),
+    [
+        ("20260818", 2),
+        ("unlisted", 0),
+    ],
+)
+async def test_router_dynamic_cache_affinity_accepts_only_frozen_model_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    actual_suffix: str,
+    expected_receipt_count: int,
+) -> None:
+    actual_proposer_model = f"p0-{actual_suffix}"
+    actual_aggregator_model = f"agg-{actual_suffix}"
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft 0"),
+                    _billed_done(
+                        actual_proposer_model,
+                        cost=0.1,
+                        cached_tokens=11,
+                    ),
+                ]
+            ),
+            "p1": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft 1"),
+                    _billed_done("p1", cost=0.1),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final"),
+                    _billed_done(
+                        actual_aggregator_model,
+                        cost=0.2,
+                        cached_tokens=13,
+                    ),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    alias_member = replace(
+        _cache_affinity_member("p0"),
+        _cache_affinity_actual_model_aliases=("p0", "p0-20260818"),
+    )
+    alias_aggregator = replace(
+        _cache_affinity_member("agg"),
+        _cache_affinity_actual_model_aliases=("agg", "agg-20260818"),
+    )
+    proposers = [alias_member, _cache_affinity_member("p1")]
+    batches: list[Any] = []
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=alias_aggregator,
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+        _cache_affinity_receipt_callback=batches.append,
+        _cache_affinity_turn_id="turn-model-alias",
+        _cache_affinity_provider_instance_token="provider-model-alias",
+        _cache_affinity_session_epoch=16,
+    )
+    scope_id = f"router-dynamic-cache-affinity-alias-{actual_suffix}"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    await _collect(provider)
+
+    [batch] = batches
+    assert len(batch.receipts) == expected_receipt_count
+    if batch.receipts:
+        assert [receipt.role for receipt in batch.receipts] == [
+            "proposer",
+            "aggregator",
+        ]
+        assert [receipt.requested_model for receipt in batch.receipts] == [
+            "p0",
+            "agg",
+        ]
+        assert [receipt.actual_model for receipt in batch.receipts] == [
+            "p0-20260818",
+            "agg-20260818",
+        ]
+        assert [receipt.actual_model_aliases for receipt in batch.receipts] == [
+            ("p0", "p0-20260818"),
+            ("agg", "agg-20260818"),
+        ]
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_cache_affinity_publishes_empty_next_chat_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [
+                [
+                    TextDeltaEvent(text="draft 0 first"),
+                    _billed_done("p0", cost=0.1, cached_tokens=5),
+                ],
+                [
+                    TextDeltaEvent(text="draft 0 second"),
+                    _billed_done("p0", cost=0.1),
+                ],
+            ],
+            "p1": [
+                [
+                    TextDeltaEvent(text="draft 1 first"),
+                    _billed_done("p1", cost=0.1, cache_write_tokens=7),
+                ],
+                [
+                    TextDeltaEvent(text="draft 1 second"),
+                    _billed_done("p1", cost=0.1),
+                ],
+            ],
+            "agg": [
+                [
+                    TextDeltaEvent(text="final first"),
+                    _billed_done("agg", cost=0.2, cached_tokens=9),
+                ],
+                [
+                    TextDeltaEvent(text="final second"),
+                    _billed_done("agg", cost=0.2),
+                ],
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_cache_affinity_member("p0"), _cache_affinity_member("p1")]
+    selection_plan = _slot_recovery_plan(proposers, [])
+    selection_plan["decision_id"] = "cache-affinity-tool-loop"
+    batches: list[Any] = []
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_cache_affinity_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=selection_plan,
+        _cache_affinity_receipt_callback=batches.append,
+        _cache_affinity_turn_id="turn-tool-loop",
+        _cache_affinity_provider_instance_token="provider-token-loop",
+        _cache_affinity_session_epoch=8,
+    )
+    scope_id = "router-dynamic-cache-affinity-tool-loop"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    first_events = await _collect(provider)
+    second_events = await _collect(provider)
+
+    assert any(isinstance(event, DoneEvent) for event in first_events)
+    assert any(isinstance(event, DoneEvent) for event in second_events)
+    assert len(batches) == 2
+    assert len(batches[0].receipts) == 3
+    assert batches[1].receipts == ()
+    assert batches[0].chat_call_id != batches[1].chat_call_id
+    assert [batch.chat_sequence for batch in batches] == [0, 1]
+    assert {batch.provider_instance_generation for batch in batches} == {0}
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_cache_affinity_keeps_only_final_aggregator_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    failed_usage = {
+        "role": "aggregator",
+        "provider": "fake",
+        "model": "agg",
+        "input_tokens": 10,
+        "output_tokens": 1,
+        "reasoning_tokens": 0,
+        "cached_tokens": 101,
+        "cache_write_tokens": 0,
+        "billed_cost": 0.4,
+        "cost_source": "provider_billed",
+    }
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [[TextDeltaEvent(text="draft 0"), _billed_done("p0", cost=0.1)]],
+            "p1": [[TextDeltaEvent(text="draft 1"), _billed_done("p1", cost=0.1)]],
+            "agg": [
+                [
+                    ErrorEvent(
+                        message="rate limited after billing",
+                        code="429",
+                        model_usage_breakdown=[failed_usage],
+                    )
+                ],
+                [
+                    TextDeltaEvent(text="final"),
+                    _billed_done(
+                        "agg",
+                        cost=0.2,
+                        cache_write_tokens=23,
+                    ),
+                ],
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._ENSEMBLE_AGGREGATOR_RETRY_BACKOFF_SECONDS",
+        (0.0,),
+    )
+    proposers = [_cache_affinity_member("p0"), _cache_affinity_member("p1")]
+    selection_plan = _slot_recovery_plan(proposers, [])
+    selection_plan["decision_id"] = "cache-affinity-aggregator-retry"
+    batches: list[Any] = []
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_cache_affinity_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=selection_plan,
+        _cache_affinity_receipt_callback=batches.append,
+        _cache_affinity_turn_id="turn-retry",
+        _cache_affinity_provider_instance_token="provider-token-retry",
+        _cache_affinity_session_epoch=9,
+    )
+    scope_id = "router-dynamic-cache-affinity-aggregator-retry"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    started_attempts = [
+        attempt
+        for attempt in done.ensemble_trace["aggregator_recovery"]["attempts"]
+        if attempt["request_started"] is True
+    ]
+    assert len(started_attempts) == 2
+    [batch] = batches
+    [receipt] = batch.receipts
+    assert receipt.role == "aggregator"
+    assert receipt.evidence_kind == "write_only"
+    assert receipt.cached_tokens == 0
+    assert receipt.cache_write_tokens == 23
+    assert receipt.physical_attempt_id == started_attempts[-1][
+        "physical_attempt_id"
+    ]
+    assert receipt.physical_attempt_id != started_attempts[0][
+        "physical_attempt_id"
+    ]
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_cache_affinity_default_callback_is_strict_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [TextDeltaEvent(text="draft 0"), _billed_done("p0", cost=0.1)]
+            ),
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft 1"), _billed_done("p1", cost=0.1)]
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), _billed_done("agg", cost=0.2)]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+
+    def unexpected_guard(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("disabled affinity must not construct a guard")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._cache_affinity_domain_guard_for_member",
+        unexpected_guard,
+    )
+
+    def unexpected_allocator() -> Any:
+        raise AssertionError("disabled affinity must not allocate ordering state")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._EnsembleCacheAffinitySequenceAllocator",
+        unexpected_allocator,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+    )
+    scope_id = "router-dynamic-cache-affinity-disabled"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert "cache_affinity" not in json.dumps(done.ensemble_trace)
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_cache_affinity_guard_failure_publishes_empty_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft 0"),
+                    _billed_done("p0", cost=0.1, cached_tokens=5),
+                ]
+            ),
+            "p1": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft 1"),
+                    _billed_done("p1", cost=0.1, cache_write_tokens=7),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final"),
+                    _billed_done("agg", cost=0.2, cached_tokens=9),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_member("p0"), _member("p1")]
+    batches: list[Any] = []
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+        _cache_affinity_receipt_callback=batches.append,
+        _cache_affinity_turn_id="turn-guard-fail",
+        _cache_affinity_provider_instance_token="provider-guard-fail",
+        _cache_affinity_session_epoch=10,
+    )
+    scope_id = "router-dynamic-cache-affinity-guard-fail"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    assert any(isinstance(event, DoneEvent) for event in events)
+    [batch] = batches
+    assert batch.receipts == ()
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_cache_affinity_done_survives_best_effort_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft 0"),
+                    _billed_done("p0", cost=0.1, cached_tokens=5),
+                ]
+            ),
+            "p1": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft 1"),
+                    _billed_done("p1", cost=0.1, cache_write_tokens=7),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final"),
+                    _billed_done("agg", cost=0.2, cached_tokens=9),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_cache_affinity_member("p0"), _cache_affinity_member("p1")]
+    batches: list[Any] = []
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_cache_affinity_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+        _cache_affinity_receipt_callback=batches.append,
+        _cache_affinity_turn_id="turn-close-fail",
+        _cache_affinity_provider_instance_token="provider-close-fail",
+        _cache_affinity_session_epoch=11,
+    )
+    scope_id = "router-dynamic-cache-affinity-close-fail"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+    original_chat_owned = provider._chat_owned
+
+    class _FailingBestEffortClose:
+        def __init__(self, stream: AsyncIterator[StreamEvent]) -> None:
+            self._stream = stream
+
+        def __aiter__(self) -> _FailingBestEffortClose:
+            return self
+
+        async def __anext__(self) -> StreamEvent:
+            return await anext(self._stream)
+
+        async def aclose(self) -> None:
+            close = getattr(self._stream, "aclose", None)
+            if callable(close):
+                await close()
+            raise RuntimeError("best-effort close failed after terminal Done")
+
+    def failing_chat_owned(
+        messages: list[Message],
+        tools: list[ToolDefinition] | None = None,
+        config: ChatConfig | None = None,
+    ) -> AsyncIterator[StreamEvent]:
+        return _FailingBestEffortClose(
+            original_chat_owned(messages, tools=tools, config=config)
+        )
+
+    monkeypatch.setattr(provider, "_chat_owned", failing_chat_owned)
+    stream = provider.chat(
+        [Message(role="user", content="answer")],
+        config=ChatConfig(max_tokens=64, thinking=False),
+    )
+    async for event in stream:
+        if isinstance(event, DoneEvent):
+            break
+    with pytest.raises(RuntimeError, match="stream did not close"):
+        await stream.aclose()
+
+    [batch] = batches
+    assert len(batch.receipts) == 3
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_cache_affinity_final_validation_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft 0"),
+                    _billed_done("p0", cost=0.1, cached_tokens=5),
+                ]
+            ),
+            "p1": _FakePlan(
+                [
+                    TextDeltaEvent(text="draft 1"),
+                    _billed_done("p1", cost=0.1, cache_write_tokens=7),
+                ]
+            ),
+            "agg": _FakePlan(
+                [
+                    TextDeltaEvent(text="final"),
+                    _billed_done("agg", cost=0.2, cached_tokens=9),
+                ]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_cache_affinity_member("p0"), _cache_affinity_member("p1")]
+    batches: list[Any] = []
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_cache_affinity_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+        _cache_affinity_receipt_callback=batches.append,
+        _cache_affinity_turn_id="turn-final-validation",
+        _cache_affinity_provider_instance_token="provider-final-validation",
+        _cache_affinity_session_epoch=12,
+    )
+    scope_id = "router-dynamic-cache-affinity-final-validation"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    [batch] = batches
+    assert len(batch.receipts) == 3
+    for trace_updates in (
+        {"delivery_outcome": "degraded_success"},
+        {"fallback_used": True},
+        {"final_request_role": "fallback_single"},
+    ):
+        invalid_trace = deepcopy(done.ensemble_trace)
+        invalid_trace.update(trace_updates)
+        invalid_done = replace(done, ensemble_trace=invalid_trace)
+        assert _validated_final_cache_affinity_receipts(
+            invalid_done,
+            batch.receipts,
+        ) == ()
+
+    drifted_trace = deepcopy(done.ensemble_trace)
+    drifted_trace["selection_plan"]["selected_P"] = [
+        "fake:wrong-p0",
+        "fake:wrong-p1",
+    ]
+    drifted_trace["selection_plan"]["selected_A"] = "fake:wrong-agg"
+    assert _validated_final_cache_affinity_receipts(
+        replace(done, ensemble_trace=drifted_trace),
+        batch.receipts,
+    ) == ()
+
+    missing_rows = [
+        {**row, "usage_unknown": True}
+        for row in done.model_usage_breakdown
+    ]
+    assert _validated_final_cache_affinity_receipts(
+        replace(done, model_usage_breakdown=missing_rows),
+        batch.receipts,
+    ) == ()
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+def test_router_dynamic_cache_affinity_retry_factory_uses_unique_provider_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def callback(batch: Any) -> None:
+        del batch
+
+    captured: list[dict[str, Any]] = []
+    generations: list[int] = []
+    chat_sequences: list[int] = []
+    sentinel = object()
+    allocator = _EnsembleCacheAffinitySequenceAllocator()
+    assert allocator.allocate_provider_generation() == 0
+    assert allocator.allocate_chat_sequence() == 0
+
+    def capture_builder(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        shared = kwargs["_cache_affinity_sequence_allocator"]
+        generations.append(shared.allocate_provider_generation())
+        chat_sequences.append(shared.allocate_chat_sequence())
+        return sentinel
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.build_ensemble_provider_from_config",
+        capture_builder,
+    )
+    factory = _DefaultRouterDynamicRetryFactory(
+        config=object(),
+        inherited_provider_config=_member("base").provider_config,
+        cache_affinity_receipt_callback=callback,
+        cache_affinity_provider_instance_token="initial-provider-token",
+        cache_affinity_sequence_allocator=allocator,
+    )
+
+    assert factory({}) is sentinel
+    assert factory({}) is sentinel
+
+    tokens = [
+        call["_cache_affinity_provider_instance_token"]
+        for call in captured
+    ]
+    assert len(tokens) == 2
+    assert tokens[0] != tokens[1]
+    assert all(len(token) == 32 for token in tokens)
+    assert all(
+        call["_cache_affinity_receipt_callback"] is callback
+        for call in captured
+    )
+    assert all(
+        call["_cache_affinity_sequence_allocator"] is allocator
+        for call in captured
+    )
+    assert generations == [1, 2]
+    assert chat_sequences == [1, 2]
+
+
+def test_router_dynamic_cache_affinity_guard_binds_effective_thinking_mode() -> None:
+    collector = _EnsembleCacheAffinityReceiptCollector(
+        turn_id="turn-thinking",
+        decision_id="decision-thinking",
+        provider_instance_token="provider-thinking",
+        provider_instance_generation=0,
+        chat_sequence=0,
+        chat_call_id="chat-thinking",
+        execution_mode="full",
+        session_epoch=13,
+    )
+    member = replace(
+        _cache_affinity_member("thinking-model"),
+        effective_thinking_level="highest",
+    )
+    off = _cache_affinity_domain_guard_for_member(
+        member,
+        collector=collector,
+        role="proposer",
+        chat_config=ChatConfig(
+            thinking=False,
+            thinking_level=None,
+            thinking_budget_tokens=0,
+        ),
+    )
+    high = _cache_affinity_domain_guard_for_member(
+        member,
+        collector=collector,
+        role="proposer",
+        chat_config=ChatConfig(
+            thinking=True,
+            thinking_level="high",
+            thinking_budget_tokens=4096,
+        ),
+    )
+    different_budget = _cache_affinity_domain_guard_for_member(
+        member,
+        collector=collector,
+        role="proposer",
+        chat_config=ChatConfig(
+            thinking=True,
+            thinking_level="high",
+            thinking_budget_tokens=8192,
+        ),
+    )
+
+    assert off is not None
+    assert high is not None
+    assert different_budget is not None
+    assert len({repr(off), repr(high), repr(different_budget)}) == 1
+    assert off != high
+    assert high != different_budget
+    same_physical_config = _cache_affinity_domain_guard_for_member(
+        replace(member, effective_thinking_level="low"),
+        collector=collector,
+        role="proposer",
+        chat_config=ChatConfig(
+            thinking=True,
+            thinking_level="high",
+            thinking_budget_tokens=4096,
+        ),
+    )
+    assert same_physical_config == high
+
+
+def test_router_dynamic_cache_affinity_guard_consumes_boundary_token_only() -> None:
+    class _UnreadableSecret:
+        def get_secret_value(self) -> str:
+            raise AssertionError("terminal collector must not reread credentials")
+
+        def __str__(self) -> str:
+            raise AssertionError("terminal collector must not stringify credentials")
+
+    collector = _EnsembleCacheAffinityReceiptCollector(
+        turn_id="turn-boundary-token",
+        decision_id="decision-boundary-token",
+        provider_instance_token="provider-boundary-token",
+        provider_instance_generation=0,
+        chat_sequence=0,
+        chat_call_id="chat-boundary-token",
+        execution_mode="full",
+        session_epoch=17,
+    )
+    member = _cache_affinity_member("boundary-token-model")
+    member = replace(
+        member,
+        provider_config=replace(
+            member.provider_config,
+            api_key=_UnreadableSecret(),  # type: ignore[arg-type]
+        ),
+    )
+
+    guard = _cache_affinity_domain_guard_for_member(
+        member,
+        collector=collector,
+        role="proposer",
+        chat_config=ChatConfig(thinking=False),
+    )
+
+    assert guard is not None
+
+
+@pytest.mark.parametrize(
+    ("frozen_strict", "late_env", "guard_expected"),
+    [(True, "0", True), (False, "1", False)],
+)
+def test_cache_affinity_single_and_multiple_guards_use_frozen_request_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    frozen_strict: bool,
+    late_env: str,
+    guard_expected: bool,
+) -> None:
+    model = "deepseek/deepseek-v4-flash"
+    provider_config = ProviderConfig(
+        provider="openrouter",
+        model=model,
+        api_key="synthetic-key",
+        base_url="https://openrouter.ai/api/v1",
+        provider_routing={model: "deepseek"},
+        _provider_routing_strict_override=frozen_strict,
+    )
+    token = build_credential_namespace_token(
+        provider="openrouter",
+        resolved_secret="synthetic-key",
+    )
+    assert token is not None
+    resolution = ProviderDeploymentResolution(
+        provider="openrouter",
+        model=model,
+        ready=True,
+        provider_config=provider_config,
+    )
+    member = EnsembleMemberConfig(
+        provider_config=provider_config,
+        runtime_health_upstream="deepseek",
+        _cache_affinity_credential_namespace_token=token,
+    )
+    collector = _EnsembleCacheAffinityReceiptCollector(
+        turn_id="turn-frozen-routing",
+        decision_id="decision-frozen-routing",
+        provider_instance_token="provider-frozen-routing",
+        provider_instance_generation=0,
+        chat_sequence=0,
+        chat_call_id="chat-frozen-routing",
+        execution_mode="full",
+        session_epoch=18,
+    )
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", late_env)
+
+    single_guard = _cache_affinity_guard_for_resolution(
+        resolution,
+        token,
+        role="single",
+        topology="single",
+        session_epoch=18,
+        upstream="deepseek",
+        thinking_enabled=False,
+        effective_thinking_level="off",
+        thinking_budget_tokens=0,
+    )
+    multiple_guard = _cache_affinity_domain_guard_for_member(
+        member,
+        collector=collector,
+        role="proposer",
+        chat_config=ChatConfig(thinking=False),
+    )
+
+    assert (single_guard is not None) is guard_expected
+    assert (multiple_guard is not None) is guard_expected
+
+
+def test_router_dynamic_cache_affinity_unmanaged_uses_physical_high_budget() -> None:
+    outer = _cache_affinity_thinking_projection(
+        thinking_enabled=True,
+        effective_thinking_level="enabled",
+        thinking_budget_tokens=12_345,
+    )
+    assert outer is not None
+    row, resolution, credential_token, _ = (
+        _cache_affinity_ranking_evidence_fixture()
+    )
+    row["runtime"] = {"thinking": "high"}
+    modes = _cache_affinity_thinking_modes(
+        row,
+        topology="multiple",
+        thinking_assignment_enabled=False,
+        outer_projection=outer,
+    )
+    assert [
+        (
+            mode.thinking_enabled,
+            mode.effective_thinking_level,
+            mode.thinking_budget_tokens,
+        )
+        for mode in modes
+    ] == [(True, "high", 12_345)]
+    guard = _cache_affinity_guard_for_resolution(
+        resolution,
+        credential_token,
+        role="proposer",
+        topology="multiple",
+        session_epoch=21,
+        upstream="fake",
+        thinking_enabled=True,
+        effective_thinking_level="high",
+        thinking_budget_tokens=12_345,
+    )
+    receipt = build_cache_affinity_receipt(
+        physical_attempt_id="attempt-high",
+        role="proposer",
+        topology="multiple",
+        execution_slot="0",
+        requested_identity="fake:model-a",
+        actual_identity="fake:model-a",
+        cache_domain_guard=guard,
+        cached_tokens=100,
+        cache_write_tokens=0,
+        observed_at_monotonic=10.0,
+    )
+    assert receipt is not None
+    evidence, matched = _cache_affinity_evidence_for_candidate(
+        identity="fake:model-a",
+        role="proposer",
+        topology="multiple",
+        resolution=resolution,
+        credential_namespace_token=credential_token,
+        upstream="fake",
+        row=row,
+        thinking_modes=modes,
+        receipts=(receipt,),
+        policy={
+            "strategy": "bonus",
+            "ttl_seconds": 100.0,
+            "age_decay": "none",
+        },
+        session_epoch=21,
+        now_monotonic=11.0,
+        quote_resolver=None,
+    )
+    assert evidence is not None
+    assert matched is receipt
+
+
+def test_router_dynamic_cache_affinity_managed_maps_highest_to_native_xhigh() -> None:
+    outer = _cache_affinity_thinking_projection(
+        thinking_enabled=True,
+        effective_thinking_level="enabled",
+        thinking_budget_tokens=777,
+    )
+    assert outer is not None
+    row = {
+        "runtime": {"thinking": "xhigh"},
+        "registry_facts": {
+            "thinking_level_mapping": {
+                "high": "high",
+                "highest": "xhigh",
+            }
+        },
+    }
+    modes = _cache_affinity_thinking_modes(
+        row,
+        topology="multiple",
+        thinking_assignment_enabled=True,
+        outer_projection=outer,
+    )
+    assert {
+        (mode.effective_thinking_level, mode.thinking_budget_tokens)
+        for mode in modes
+    } == {("high", 20_000), ("xhigh", 50_000)}
+    selected = _cache_affinity_selected_mode(
+        SimpleNamespace(thinking="xhigh", effective_thinking_level="highest"),
+        topology="multiple",
+        thinking_assignment_enabled=True,
+        outer_projection=outer,
+    )
+    assert selected is not None
+    assert selected.effective_thinking_level == "xhigh"
+    assert selected.thinking_budget_tokens == 50_000
+
+
+def test_router_dynamic_cache_affinity_mapper_failure_keeps_candidates_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy = {
+        "strategy": "bonus",
+        "topologies": ["multiple"],
+        "ttl_seconds": 300,
+        "age_decay": "linear",
+        "bonus_by_evidence": {"read_hit": 0.05, "write_only": 0.025},
+    }
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": "deepseek/deepseek-v4-pro",
+            "api_key": "fake",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+            "ranking_config_override": {
+                "session": {"kv_cache_affinity": policy}
+            },
+        },
+    )
+
+    def broken_mapper(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise RuntimeError("synthetic optional mapper failure")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._cache_affinity_thinking_modes",
+        broken_mapper,
+    )
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=ProviderConfig(
+            provider="openrouter",
+            model="deepseek/deepseek-v4-pro",
+            api_key="fake",
+        ),
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2"},
+        ranking_inputs={
+            "cache_affinity_policy": policy,
+            "cache_affinity_receipts": (),
+            "cache_affinity_session_epoch": 1,
+            "cache_affinity_now_monotonic": 1.0,
+            "cache_affinity_outer_thinking_projection": {
+                "thinking_enabled": True,
+                "effective_thinking_level": "enabled",
+                "thinking_budget_tokens": 12_345,
+            },
+        },
+    )
+
+    assert provider.proposers
+    assert all(member.ready for member in provider.proposers)
+    assert provider.aggregator.ready
+
+
+def _fresh_guard_ranked_model(model_id: str) -> RankedModel:
+    return RankedModel(
+        provider="fake",
+        model_id=model_id,
+        version=f"{model_id}-v1",
+        source="fresh-guard-test",
+        registry_facts={
+            "provider": "fake",
+            "model_id": model_id,
+            "version": f"{model_id}-v1",
+            "status": "enabled",
+            "roles": ["proposer", "aggregator"],
+            "supports_tools": True,
+            "supports_reasoning": False,
+            "modalities": ["text"],
+            "context_window": 200_000,
+            "credential_available": True,
+        },
+        static_profile={"capability": 0.9},
+        online_profile={},
+        thinking=None,
+    )
+
+
+class _FreshGuardCatalog:
+    def resolve_max_tokens(
+        self,
+        model_id: str,
+        user_override: int = 0,
+        provider: str = "",
+    ) -> int:
+        del model_id, provider
+        return user_override or 4_096
+
+    def resolve_max_tokens_with_source(
+        self,
+        model_id: str,
+        user_override: int = 0,
+        provider: str = "",
+    ) -> tuple[int, str]:
+        return (
+            self.resolve_max_tokens(model_id, user_override, provider),
+            "override" if user_override else "catalog",
+        )
+
+    def resolve_context_window(
+        self,
+        model_id: str,
+        provider: str = "",
+    ) -> int:
+        del model_id, provider
+        return 200_000
+
+    def resolve_context_window_with_source(
+        self,
+        model_id: str,
+        provider: str = "",
+    ) -> tuple[int, str]:
+        return self.resolve_context_window(model_id, provider), "catalog"
+
+    def get_capabilities(
+        self,
+        model_id: str,
+        provider_name: str = "",
+        base_url: str = "",
+    ) -> Any:
+        from opensquilla.provider import ModelCapabilities
+
+        del model_id, provider_name, base_url
+        return ModelCapabilities()
+
+
+def _fresh_guard_resolution(
+    model_id: str,
+    *,
+    secret: str,
+    base_url: str,
+) -> tuple[ProviderDeploymentResolution, object]:
+    provider_config = ProviderConfig(
+        provider="fake",
+        model=model_id,
+        api_key=secret,
+        base_url=base_url,
+        _provider_routing_strict_override=False,
+    )
+    token = build_credential_namespace_token(
+        provider="fake",
+        resolved_secret=secret,
+    )
+    assert token is not None
+    return (
+        ProviderDeploymentResolution(
+            provider="fake",
+            model=model_id,
+            ready=True,
+            provider_config=provider_config,
+        ),
+        token,
+    )
+
+
+def _fresh_guard_receipt(
+    *,
+    model_id: str,
+    topology: Literal["single", "multiple"],
+    role: Literal["single", "proposer", "aggregator"],
+    session_epoch: int,
+) -> Any:
+    resolution, token = _fresh_guard_resolution(
+        model_id,
+        secret="old-secret",
+        base_url="https://old.example/v1",
+    )
+    guard = _cache_affinity_guard_for_resolution(
+        resolution,
+        token,
+        role=role,
+        topology=topology,
+        session_epoch=session_epoch,
+        upstream="",
+        thinking_enabled=False,
+        effective_thinking_level="off",
+        thinking_budget_tokens=0,
+    )
+    assert guard is not None
+    receipt = build_cache_affinity_receipt(
+        physical_attempt_id=f"{topology}-fresh-guard",
+        role=role,
+        topology=topology,
+        execution_slot="0",
+        requested_identity=f"fake:{model_id}",
+        actual_identity=f"fake:{model_id}",
+        cache_domain_guard=guard,
+        cached_tokens=100,
+        cache_write_tokens=0,
+        observed_at_monotonic=10.0,
+    )
+    assert receipt is not None
+    return receipt
+
+
+@pytest.mark.parametrize(
+    ("guard_drift", "health_drift"),
+    [(False, False), (True, False), (False, True)],
+    ids=["stable", "guard-drift", "health-drift"],
+)
+def test_router_single_cache_affinity_rechecks_fresh_selected_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    guard_drift: bool,
+    health_drift: bool,
+) -> None:
+    import opensquilla.provider.ensemble as ensemble_module
+    import opensquilla.provider.ranking_router as ranking_module
+
+    hit_model = _fresh_guard_ranked_model("synthetic/hit")
+    baseline_model = _fresh_guard_ranked_model("synthetic/baseline")
+    models = (hit_model, baseline_model)
+    policy = {
+        "strategy": "bonus",
+        "topologies": ["single"],
+        "ttl_seconds": 300,
+        "age_decay": "linear",
+        "bonus_by_evidence": {"read_hit": 0.05, "write_only": 0.025},
+    }
+    ranking_config = ranking_config_snapshot(
+        override={"session": {"kv_cache_affinity": policy}}
+    )
+    config = SimpleNamespace(
+        llm_ensemble=SimpleNamespace(
+            selection_mode="router_dynamic",
+            prepared_ranking_config=lambda: ranking_config,
+            ranking_user_profile_enabled=False,
+            candidates=[],
+            model_options=[],
+            ranking_thinking_assignment_enabled=False,
+        ),
+        llm=SimpleNamespace(
+            max_tokens=4_096,
+            context_window_tokens=0,
+            temperature=None,
+        ),
+        squilla_router=SimpleNamespace(tiers={}),
+    )
+    inherited = ProviderConfig(
+        provider="fake",
+        model=hit_model.model_id,
+        api_key="old-secret",
+        base_url="https://old.example/v1",
+    )
+    monkeypatch.setattr(
+        ranking_module,
+        "_legacy_registry_snapshot_projection",
+        lambda snapshot: snapshot,
+    )
+    monkeypatch.setattr(
+        ranking_module,
+        "build_model_registry_snapshot",
+        lambda **kwargs: {
+            "snapshot_version": "fresh-guard-test",
+            "models": [
+                {
+                    "registry_facts": dict(model.registry_facts),
+                    "runtime": {"thinking": None},
+                }
+                for model in models
+            ],
+        },
+    )
+    monkeypatch.setattr(ensemble_module, "_member_from_ref", lambda *a, **k: object())
+    monkeypatch.setattr(
+        ensemble_module,
+        "_member_model_capabilities",
+        lambda member: SimpleNamespace(supports_vision=False),
+    )
+    resolver_calls: dict[str, int] = {}
+
+    def resolve_cache_identity(
+        config: Any,
+        provider: str,
+        model: str,
+        **kwargs: Any,
+    ) -> tuple[ProviderDeploymentResolution, object]:
+        del config, provider, kwargs
+        resolver_calls[model] = resolver_calls.get(model, 0) + 1
+        drifted = guard_drift and model == hit_model.model_id and resolver_calls[model] > 1
+        return _fresh_guard_resolution(
+            model,
+            secret="new-secret" if drifted else "old-secret",
+            base_url=(
+                "https://new.example/v1"
+                if drifted
+                else "https://old.example/v1"
+            ),
+        )
+
+    monkeypatch.setattr(
+        ensemble_module,
+        "resolve_provider_deployment_cache_identity",
+        resolve_cache_identity,
+    )
+    rank_calls: list[dict[str, Any]] = []
+
+    def rank_single(**kwargs: Any) -> SingleModelRankingDecision:
+        rank_calls.append(kwargs)
+        cache_enabled = kwargs.get("cache_affinity_inputs") is not None
+        selected = hit_model if cache_enabled else baseline_model
+        selected_facts = next(
+            row["registry_facts"]
+            for row in kwargs["registry_snapshot"]["models"]
+            if row["registry_facts"]["model_id"] == selected.model_id
+        )
+        selected = replace(selected, registry_facts=dict(selected_facts))
+        score_row: dict[str, Any] = {"identity": selected.identity}
+        if cache_enabled:
+            score_row["cache_affinity"] = {"score_adjustment": 0.05}
+        return SingleModelRankingDecision(
+            model=selected,
+            effective_tier=2,
+            trace={
+                "selected_model": selected.identity,
+                "selected_P": [selected.identity],
+                "model_scores": [score_row],
+            },
+        )
+
+    monkeypatch.setattr(ranking_module, "rank_single_model", rank_single)
+    health_calls: dict[str, int] = {}
+
+    class _FreshHealthLedger:
+        def runtime_facts(
+            self,
+            provider: str,
+            model: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            del provider, kwargs
+            health_calls[model] = health_calls.get(model, 0) + 1
+            unavailable = bool(
+                model == hit_model.model_id and health_calls[model] > 1
+            )
+            return {
+                "fresh": True,
+                "state": "benched" if unavailable else "closed",
+                "half_open_inflight": False,
+            }
+
+    route = resolve_router_single_route(
+        config=config,
+        inherited_provider_config=inherited,
+        turn_metadata={"routed_tier": "c2"},
+        ranking_inputs={
+            "decision_id": "single-fresh-guard",
+            "ranking_config": ranking_config,
+            "task_analysis": TaskAnalysisResult(
+                profile={
+                    "session_intent": {"type": "continue", "confidence": 1.0}
+                },
+                source="fresh-guard-test",
+                schema_valid=True,
+                confidence=1.0,
+            ),
+            "request_context": {
+                "routing_budget": {
+                    "estimated_input_tokens": 100,
+                    "tool_log_tokens": 0,
+                    "direct_output_tokens": 4_096,
+                },
+                "input_modalities": ["text"],
+            },
+            "cache_continuity_available": True,
+            "cache_affinity_policy": policy,
+            "cache_affinity_receipts": (
+                _fresh_guard_receipt(
+                    model_id=hit_model.model_id,
+                    topology="single",
+                    role="single",
+                    session_epoch=31,
+                ),
+            ),
+            "cache_affinity_session_epoch": 31,
+            "cache_affinity_now_monotonic": 11.0,
+            "cache_affinity_outer_thinking_projection": {
+                "thinking_enabled": False,
+                "effective_thinking_level": "off",
+                "thinking_budget_tokens": 0,
+            },
+        },
+        requires_tools=False,
+        provider_health_ledger=(
+            _FreshHealthLedger() if health_drift else None
+        ),
+        model_catalog=_FreshGuardCatalog(),
+    )
+
+    assert resolver_calls[hit_model.model_id] == 2
+    assert route.credential_namespace_token is not None
+    reranked = guard_drift or health_drift
+    assert len(rank_calls) == (2 if reranked else 1)
+    if reranked:
+        assert route.provider_config.model == baseline_model.model_id
+        assert "cache_affinity" not in route.trace["model_scores"][0]
+        assert rank_calls[-1]["cache_affinity_inputs"] is None
+    else:
+        assert route.provider_config.model == hit_model.model_id
+        assert route.trace["model_scores"][0]["cache_affinity"][
+            "score_adjustment"
+        ] == 0.05
+    if health_drift:
+        assert health_calls[hit_model.model_id] >= 2
+        assert health_calls[baseline_model.model_id] >= 2
+        rerank_facts = {
+            row["registry_facts"]["model_id"]: row["registry_facts"]
+            for row in rank_calls[-1]["registry_snapshot"]["models"]
+        }
+        assert rerank_facts[hit_model.model_id][
+            "runtime_hard_filter_reasons_by_role"
+        ]["proposer"] == ["runtime_deployment_benched"]
+        assert "runtime_hard_filter_reasons_by_role" not in rerank_facts[
+            baseline_model.model_id
+        ]
+
+
+@pytest.mark.parametrize(
+    ("guard_drift", "health_drift_role"),
+    [
+        (False, None),
+        (True, None),
+        (False, "proposer"),
+        (False, "aggregator"),
+    ],
+    ids=[
+        "stable",
+        "guard-drift",
+        "proposer-health-drift",
+        "aggregator-health-drift",
+    ],
+)
+def test_router_multiple_cache_affinity_rechecks_fresh_selected_guard(
+    monkeypatch: pytest.MonkeyPatch,
+    guard_drift: bool,
+    health_drift_role: str | None,
+) -> None:
+    import opensquilla.provider.ensemble as ensemble_module
+    import opensquilla.provider.ranking_router as ranking_module
+
+    hit_model = _fresh_guard_ranked_model("synthetic/hit")
+    baseline_model = _fresh_guard_ranked_model("synthetic/baseline")
+    aggregator_model = _fresh_guard_ranked_model("synthetic/aggregator")
+    baseline_aggregator_model = _fresh_guard_ranked_model(
+        "synthetic/aggregator-baseline"
+    )
+    models = (
+        hit_model,
+        baseline_model,
+        aggregator_model,
+        baseline_aggregator_model,
+    )
+    policy = {
+        "strategy": "bonus",
+        "topologies": ["multiple"],
+        "ttl_seconds": 300,
+        "age_decay": "linear",
+        "bonus_by_evidence": {"read_hit": 0.05, "write_only": 0.025},
+    }
+    ranking_config = ranking_config_snapshot(
+        override={"session": {"kv_cache_affinity": policy}}
+    )
+    config = GatewayConfig(
+        llm={
+            "provider": "fake",
+            "model": hit_model.model_id,
+            "api_key": "old-secret",
+            "base_url": "https://old.example/v1",
+            "max_tokens": 4_096,
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+            "ranking_config_override": {
+                "session": {"kv_cache_affinity": policy}
+            },
+        },
+    )
+    inherited = ProviderConfig(
+        provider="fake",
+        model=hit_model.model_id,
+        api_key="old-secret",
+        base_url="https://old.example/v1",
+    )
+    monkeypatch.setattr(
+        ranking_module,
+        "_legacy_registry_snapshot_projection",
+        lambda snapshot: snapshot,
+    )
+    monkeypatch.setattr(
+        ranking_module,
+        "build_model_registry_snapshot",
+        lambda **kwargs: {
+            "snapshot_version": "fresh-guard-test",
+            "models": [
+                {
+                    "registry_facts": dict(model.registry_facts),
+                    "runtime": {"thinking": None},
+                }
+                for model in models
+            ],
+        },
+    )
+    resolver_calls: dict[str, int] = {}
+
+    def resolve_cache_identity(
+        config: Any,
+        provider: str,
+        model: str,
+        **kwargs: Any,
+    ) -> tuple[ProviderDeploymentResolution, object]:
+        del config, provider, kwargs
+        resolver_calls[model] = resolver_calls.get(model, 0) + 1
+        drifted = guard_drift and model == hit_model.model_id and resolver_calls[model] > 1
+        return _fresh_guard_resolution(
+            model,
+            secret="new-secret" if drifted else "old-secret",
+            base_url=(
+                "https://new.example/v1"
+                if drifted
+                else "https://old.example/v1"
+            ),
+        )
+
+    monkeypatch.setattr(
+        ensemble_module,
+        "resolve_provider_deployment_cache_identity",
+        resolve_cache_identity,
+    )
+    rank_calls: list[dict[str, Any]] = []
+
+    def ranked_with_facts(model: RankedModel, snapshot: Mapping[str, Any]) -> RankedModel:
+        facts = next(
+            row["registry_facts"]
+            for row in snapshot["models"]
+            if row["registry_facts"]["model_id"] == model.model_id
+        )
+        return replace(model, registry_facts=dict(facts))
+
+    def rank_multiple(**kwargs: Any) -> RankingDecision:
+        rank_calls.append(kwargs)
+        cache_enabled = kwargs.get("cache_affinity_inputs") is not None
+        selected = hit_model if cache_enabled else baseline_model
+        backup = baseline_model if cache_enabled else hit_model
+        selected = ranked_with_facts(selected, kwargs["registry_snapshot"])
+        backup = ranked_with_facts(backup, kwargs["registry_snapshot"])
+        selected_aggregator = (
+            baseline_aggregator_model
+            if not cache_enabled and health_drift_role == "aggregator"
+            else aggregator_model
+        )
+        aggregator = ranked_with_facts(
+            selected_aggregator,
+            kwargs["registry_snapshot"],
+        )
+        score_row: dict[str, Any] = {"identity": selected.identity}
+        aggregator_score: dict[str, Any] = {
+            "identity": aggregator.identity
+        }
+        if cache_enabled:
+            score_row["cache_affinity"] = {"score_adjustment": 0.05}
+            aggregator_score["cache_affinity"] = {
+                "score_adjustment": 0.05
+            }
+        return RankingDecision(
+            proposers=(selected,),
+            aggregator=aggregator,
+            effective_tier=2,
+            trace={
+                "decision_id": "multiple-fresh-guard",
+                "selected_P": [selected.identity],
+                "backup_P": [backup.identity],
+                "selected_A": aggregator.identity,
+                "aggregator_candidates": [aggregator.identity],
+                "N_min": 1,
+                "proposer_sample_count": 1,
+                "model_scores": [score_row],
+                "hard_filter": {
+                    "eligible_proposer_ids": [
+                        hit_model.identity,
+                        baseline_model.identity,
+                    ],
+                    "eligible_aggregator_ids": [
+                        aggregator_model.identity,
+                        baseline_aggregator_model.identity,
+                    ],
+                },
+                "aggregator": {"scores": [aggregator_score]},
+            },
+            aggregator_candidates=(aggregator,),
+            backup_proposers=(backup,),
+        )
+
+    monkeypatch.setattr(ranking_module, "rank_models", rank_multiple)
+    health_calls: dict[str, int] = {}
+
+    class _FreshHealthLedger:
+        def runtime_facts(
+            self,
+            provider: str,
+            model: str,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            del provider, kwargs
+            health_calls[model] = health_calls.get(model, 0) + 1
+            drift_model = (
+                aggregator_model.model_id
+                if health_drift_role == "aggregator"
+                else hit_model.model_id
+            )
+            unavailable = bool(
+                model == drift_model and health_calls[model] > 1
+            )
+            return {
+                "fresh": True,
+                "state": "benched" if unavailable else "closed",
+                "half_open_inflight": False,
+            }
+
+    _, proposers, aggregator, trace = _build_router_dynamic_members(
+        config=config,
+        inherited_provider_config=inherited,
+        turn_metadata={"routed_tier": "c2"},
+        ranking_inputs={
+            "decision_id": "multiple-fresh-guard",
+            "ranking_config": ranking_config,
+            "cache_continuity_available": True,
+            "cache_affinity_policy": policy,
+            "cache_affinity_receipts": (
+                _fresh_guard_receipt(
+                    model_id=hit_model.model_id,
+                    topology="multiple",
+                    role="proposer",
+                    session_epoch=41,
+                ),
+                _fresh_guard_receipt(
+                    model_id=aggregator_model.model_id,
+                    topology="multiple",
+                    role="aggregator",
+                    session_epoch=41,
+                ),
+            ),
+            "cache_affinity_session_epoch": 41,
+            "cache_affinity_now_monotonic": 11.0,
+            "cache_affinity_outer_thinking_projection": {
+                "thinking_enabled": False,
+                "effective_thinking_level": "off",
+                "thinking_budget_tokens": 0,
+            },
+        },
+        provider_health_ledger=(
+            _FreshHealthLedger()
+            if health_drift_role is not None
+            else None
+        ),
+    )
+
+    assert resolver_calls[hit_model.model_id] == 2
+    expected_aggregator_model = (
+        baseline_aggregator_model.model_id
+        if health_drift_role == "aggregator"
+        else aggregator_model.model_id
+    )
+    assert aggregator.provider_config.model == expected_aggregator_model
+    assert proposers[0]._cache_affinity_credential_namespace_token is not None
+    assert aggregator._cache_affinity_credential_namespace_token is not None
+    expected_rank_calls = (
+        3 if health_drift_role is not None else 2 if guard_drift else 1
+    )
+    assert len(rank_calls) == expected_rank_calls
+    if guard_drift or health_drift_role is not None:
+        assert proposers[0].provider_config.model == baseline_model.model_id
+        assert "cache_affinity" not in trace["model_scores"][0]
+        assert rank_calls[-1]["cache_affinity_inputs"] is None
+    else:
+        assert proposers[0].provider_config.model == hit_model.model_id
+        assert trace["model_scores"][0]["cache_affinity"][
+            "score_adjustment"
+        ] == 0.05
+    if health_drift_role is not None:
+        drift_model = (
+            aggregator_model
+            if health_drift_role == "aggregator"
+            else hit_model
+        )
+        healthy_baseline = (
+            baseline_aggregator_model
+            if health_drift_role == "aggregator"
+            else baseline_model
+        )
+        assert health_calls[drift_model.model_id] >= 3
+        assert health_calls[healthy_baseline.model_id] >= 2
+        rerank_facts = {
+            row["registry_facts"]["model_id"]: row["registry_facts"]
+            for row in rank_calls[-1]["registry_snapshot"]["models"]
+        }
+        assert rerank_facts[drift_model.model_id][
+            "runtime_hard_filter_reasons_by_role"
+        ][health_drift_role] == ["runtime_deployment_benched"]
+        assert "runtime_hard_filter_reasons_by_role" not in rerank_facts[
+            healthy_baseline.model_id
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_index", [1, 2])
+async def test_router_dynamic_cache_affinity_accepts_final_aggregator_roster(
+    monkeypatch: pytest.MonkeyPatch,
+    fallback_index: int,
+) -> None:
+    final_model = f"agg-top{fallback_index + 1}"
+    registry = _RecoveryScriptRegistry(
+        {
+            "p0": [[TextDeltaEvent(text="draft 0"), _billed_done("p0", cost=0.1)]],
+            "p1": [[TextDeltaEvent(text="draft 1"), _billed_done("p1", cost=0.1)]],
+            final_model: [
+                [
+                    TextDeltaEvent(text="final"),
+                    _billed_done(final_model, cost=0.2, cached_tokens=31),
+                ]
+            ],
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+
+    def unavailable(model: str) -> EnsembleMemberConfig:
+        return replace(
+            _cache_affinity_member(model),
+            ready=False,
+            unavailable_reason="deployment_unavailable",
+        )
+
+    proposers = [_cache_affinity_member("p0"), _cache_affinity_member("p1")]
+    fallback_models = ["agg-top2", "agg-top3"][:fallback_index]
+    fallbacks = [
+        (
+            _cache_affinity_member(model)
+            if model == final_model
+            else unavailable(model)
+        )
+        for model in fallback_models
+    ]
+    selection_plan = _slot_recovery_plan(proposers, [])
+    selection_plan.update(
+        {
+            "decision_id": f"cache-affinity-aggregator-top{fallback_index + 1}",
+            "aggregator_candidates": [
+                "fake:agg",
+                *(f"fake:{model}" for model in fallback_models),
+            ],
+        }
+    )
+    batches: list[Any] = []
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=unavailable("agg"),
+        aggregator_fallbacks=fallbacks,
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        aggregator_recovery_top_k=3,
+        selection_plan=selection_plan,
+        _cache_affinity_receipt_callback=batches.append,
+        _cache_affinity_turn_id="turn-aggregator-roster",
+        _cache_affinity_provider_instance_token="provider-aggregator-roster",
+        _cache_affinity_session_epoch=15,
+    )
+    scope_id = f"router-dynamic-cache-affinity-top{fallback_index + 1}"
+    assert provider.begin_provider_retry_scope(
+        scope_id,
+        max_additional_physical_requests=3,
+    )
+
+    events = await _collect(provider)
+
+    done = next(event for event in events if isinstance(event, DoneEvent))
+    assert done.model == final_model
+    assert done.ensemble_trace["aggregator_recovery"]["fallback_index"] == (
+        fallback_index
+    )
+    [batch] = batches
+    [receipt] = batch.receipts
+    assert receipt.role == "aggregator"
+    assert receipt.actual_model == final_model
+    assert receipt.cached_tokens == 31
+    assert provider.end_provider_retry_scope(scope_id)
+
+
+@pytest.mark.asyncio
+async def test_router_dynamic_cache_affinity_without_terminal_publishes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = asyncio.Event()
+    registry = _FakeRegistry(
+        {
+            "p0": _FakePlan(
+                [TextDeltaEvent(text="draft 0"), _billed_done("p0", cost=0.1)],
+                gate=gate,
+            ),
+            "p1": _FakePlan(
+                [TextDeltaEvent(text="draft 1"), _billed_done("p1", cost=0.1)],
+                gate=gate,
+            ),
+            "agg": _FakePlan(
+                [TextDeltaEvent(text="final"), _billed_done("agg", cost=0.2)]
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        registry.provider_for,
+    )
+    proposers = [_cache_affinity_member("p0"), _cache_affinity_member("p1")]
+    batches: list[Any] = []
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        aggregator=_cache_affinity_member("agg"),
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        shuffle_candidates=False,
+        aggregator_recovery_mode="experiment",
+        selection_plan=_slot_recovery_plan(proposers, []),
+        _cache_affinity_receipt_callback=batches.append,
+        _cache_affinity_turn_id="turn-no-terminal",
+        _cache_affinity_provider_instance_token="provider-no-terminal",
+        _cache_affinity_session_epoch=14,
+    )
+    stream = provider.chat([Message(role="user", content="answer")])
+    event = await anext(stream)
+    assert not isinstance(event, (DoneEvent, ErrorEvent))
+    await stream.aclose()
+
+    assert batches == []
+
+
+def _cache_affinity_ranking_evidence_fixture(
+    *,
+    price_source: str = "",
+) -> tuple[
+    dict[str, Any],
+    ProviderDeploymentResolution,
+    object,
+    Any,
+]:
+    provider_config = ProviderConfig(
+        provider="fake",
+        model="model-a",
+        api_key="secret-a",
+        base_url="https://cache.example/v1",
+        _provider_routing_strict_override=False,
+    )
+    resolution = ProviderDeploymentResolution(
+        provider="fake",
+        model="model-a",
+        ready=True,
+        provider_config=provider_config,
+    )
+    credential_token = build_credential_namespace_token(
+        provider="fake",
+        resolved_secret="secret-a",
+    )
+    assert credential_token is not None
+    guard = _cache_affinity_guard_for_resolution(
+        resolution,
+        credential_token,
+        role="single",
+        topology="single",
+        session_epoch=21,
+        upstream="fake",
+        thinking_enabled=False,
+        effective_thinking_level="off",
+        thinking_budget_tokens=0,
+    )
+    receipt = build_cache_affinity_receipt(
+        physical_attempt_id="attempt-a",
+        role="single",
+        topology="single",
+        execution_slot="0",
+        requested_identity="fake:model-a",
+        actual_identity="fake:model-a",
+        cache_domain_guard=guard,
+        cached_tokens=100,
+        cache_write_tokens=0,
+        observed_at_monotonic=10.0,
+    )
+    assert receipt is not None
+    price: dict[str, Any] = {
+        "input_per_million": 2.0,
+        "output_per_million": 4.0,
+    }
+    if price_source:
+        price["price_source"] = price_source
+    row = {
+        "registry_facts": {
+            "provider": "fake",
+            "model_id": "model-a",
+            "price": price,
+        }
+    }
+    return row, resolution, credential_token, receipt
+
+
+def test_router_dynamic_expected_cost_uses_independent_row_price_facts() -> None:
+    row, resolution, credential_token, receipt = (
+        _cache_affinity_ranking_evidence_fixture(price_source="static_table")
+    )
+    requests: list[Any] = []
+
+    def resolve_quote(request: Any) -> CachePriceQuote:
+        requests.append(request)
+        return CachePriceQuote(
+            provider=request.provider,
+            canonical_model=request.model_id,
+            endpoint_scope=request.endpoint_scope,
+            upstream_scope=request.upstream_scope,
+            price_source=request.ranking_price_source,
+            normal_input_per_million=request.ranking_input_per_million,
+            normal_output_per_million=request.ranking_output_per_million,
+            cache_read_per_million=0.2,
+            cache_write_per_million=2.5,
+        )
+
+    evidence, matched = _cache_affinity_evidence_for_candidate(
+        identity="fake:model-a",
+        role="single",
+        topology="single",
+        resolution=resolution,
+        credential_namespace_token=credential_token,
+        upstream="fake",
+        row=row,
+        thinking_modes=(
+            _cache_affinity_thinking_projection(
+                thinking_enabled=False,
+                effective_thinking_level="off",
+                thinking_budget_tokens=0,
+            ),
+        ),
+        receipts=(receipt,),
+        policy={
+            "strategy": "expected_cost",
+            "ttl_seconds": 100.0,
+            "age_decay": "none",
+        },
+        session_epoch=21,
+        now_monotonic=11.0,
+        quote_resolver=resolve_quote,
+    )
+
+    assert matched is receipt
+    assert evidence is not None
+    assert evidence.price_quote is not None
+    assert evidence.ranking_price_source == "static_table"
+    assert evidence.endpoint_scope == "https://cache.example:443/v1"
+    assert evidence.upstream_scope == "fake"
+    [request] = requests
+    assert request.ranking_input_per_million == 2.0
+    assert request.ranking_output_per_million == 4.0
+    assert request.ranking_price_source == "static_table"
+
+
+def test_router_dynamic_expected_cost_missing_row_source_skips_quote() -> None:
+    row, resolution, credential_token, receipt = (
+        _cache_affinity_ranking_evidence_fixture()
+    )
+
+    def unexpected_quote(request: Any) -> CachePriceQuote:
+        del request
+        raise AssertionError("missing row price source must fail closed")
+
+    evidence, matched = _cache_affinity_evidence_for_candidate(
+        identity="fake:model-a",
+        role="single",
+        topology="single",
+        resolution=resolution,
+        credential_namespace_token=credential_token,
+        upstream="fake",
+        row=row,
+        thinking_modes=(
+            _cache_affinity_thinking_projection(
+                thinking_enabled=False,
+                effective_thinking_level="off",
+                thinking_budget_tokens=0,
+            ),
+        ),
+        receipts=(receipt,),
+        policy={
+            "strategy": "expected_cost",
+            "ttl_seconds": 100.0,
+            "age_decay": "none",
+        },
+        session_epoch=21,
+        now_monotonic=11.0,
+        quote_resolver=unexpected_quote,
+    )
+
+    assert matched is receipt
+    assert evidence is not None
+    assert evidence.price_quote is None
+    assert evidence.ranking_price_source == ""
+    assert evidence.endpoint_scope == "https://cache.example:443/v1"
+    assert evidence.upstream_scope == "fake"
+
+
+def test_router_dynamic_openrouter_expected_cost_exposes_safe_quote_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_id = "deepseek/deepseek-v4-pro"
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "true")
+    provider_config = ProviderConfig(
+        provider="openrouter",
+        model=model_id,
+        api_key="fake",
+        base_url="https://openrouter.ai/api/v1",
+        provider_routing={model_id: "deepseek"},
+        _provider_routing_strict_override=True,
+    )
+    resolution = ProviderDeploymentResolution(
+        provider="openrouter",
+        model=model_id,
+        ready=True,
+        provider_config=provider_config,
+    )
+    credential_token = build_credential_namespace_token(
+        provider="openrouter",
+        resolved_secret="fake",
+    )
+    assert credential_token is not None
+    guard = _cache_affinity_guard_for_resolution(
+        resolution,
+        credential_token,
+        role="proposer",
+        topology="multiple",
+        session_epoch=22,
+        upstream="deepseek",
+        thinking_enabled=True,
+        effective_thinking_level="enabled",
+        thinking_budget_tokens=12_345,
+    )
+    receipt = build_cache_affinity_receipt(
+        physical_attempt_id="openrouter-production-seam",
+        role="proposer",
+        topology="multiple",
+        execution_slot="0",
+        requested_identity=f"openrouter:{model_id}",
+        actual_identity=f"openrouter:{model_id}",
+        cache_domain_guard=guard,
+        cached_tokens=1_000,
+        cache_write_tokens=0,
+        observed_at_monotonic=10.0,
+    )
+    assert receipt is not None
+
+    def resolve_cache_identity(
+        config: Any,
+        provider: str,
+        model: str,
+        **kwargs: Any,
+    ) -> tuple[ProviderDeploymentResolution, object]:
+        del config, kwargs
+        resolved_config = replace(
+            provider_config,
+            provider=provider,
+            model=model,
+        )
+        return (
+            ProviderDeploymentResolution(
+                provider=provider,
+                model=model,
+                ready=True,
+                provider_config=resolved_config,
+            ),
+            credential_token,
+        )
+
+    def unexpected_quote(request: Any) -> None:
+        del request
+        raise AssertionError(
+            "packaged OpenRouter rows without price_source must not request a quote"
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.resolve_provider_deployment_cache_identity",
+        resolve_cache_identity,
+    )
+    policy = {
+        "strategy": "expected_cost",
+        "topologies": ["multiple"],
+        "ttl_seconds": 300,
+        "age_decay": "linear",
+        "hit_probability_by_evidence": {
+            "read_hit": 0.8,
+            "write_only": 0.5,
+        },
+    }
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": model_id,
+            "api_key": "fake",
+            "base_url": "https://openrouter.ai/api/v1",
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+            "ranking_config_override": {
+                "session": {"kv_cache_affinity": policy}
+            },
+        },
+    )
+
+    provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=provider_config,
+        fallback_provider=None,
+        turn_metadata={"routed_tier": "c2"},
+        ranking_inputs={
+            "cache_affinity_policy": policy,
+            "cache_affinity_receipts": (receipt,),
+            "cache_affinity_session_epoch": 22,
+            "cache_affinity_now_monotonic": 11.0,
+            "cache_affinity_price_quote_resolver": unexpected_quote,
+            "cache_affinity_outer_thinking_projection": {
+                "thinking_enabled": True,
+                "effective_thinking_level": "enabled",
+                "thinking_budget_tokens": 12_345,
+            },
+        },
+    )
+
+    reason_rows = provider.selection_plan[
+        "cache_affinity_unavailable_reasons"
+    ]
+    assert reason_rows == [
+        {
+            "role": "proposer",
+            "identity": f"openrouter:{model_id}",
+            "reason": "exact_cache_price_quote_unavailable",
+        }
+    ]
+    assert provider.selection_plan["cache_affinity_inputs"] == []
+    frozen_row = next(
+        row["registry_facts"]
+        for row in provider.selection_plan["registry_snapshot"]["models"]
+        if row["registry_facts"]["model_id"] == model_id
+    )
+    assert "price_source" not in frozen_row["price"]
 
 
 def _slot_candidate(
@@ -16328,6 +18715,103 @@ def test_router_dynamic_recovery_guard_detects_generation_config_drift(
             f"{runtime_role}-config-drift",
             max_additional_physical_requests=3,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "runtime_role",
+    [
+        "proposer",
+        "proposer_backup",
+        "aggregator",
+        "aggregator_fallback",
+    ],
+)
+async def test_router_dynamic_recovery_guard_binds_frozen_strict_request_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    runtime_role: str,
+) -> None:
+    def strict_member(model: str) -> EnsembleMemberConfig:
+        member = _member(model)
+        return replace(
+            member,
+            provider_config=replace(
+                member.provider_config,
+                _provider_routing_strict_override=True,
+            ),
+        )
+
+    proposers = [strict_member("p0"), strict_member("p1")]
+    backups = [strict_member("backup")]
+    aggregator = strict_member("agg")
+    aggregator_fallback = strict_member("agg-fallback")
+    selection_plan = _slot_recovery_plan(proposers, backups)
+    selection_plan["aggregator_candidates"] = [
+        "fake:agg",
+        "fake:agg-fallback",
+    ]
+    provider = EnsembleProvider(
+        profile_name="router_dynamic/c2",
+        proposers=proposers,
+        proposer_backups=backups,
+        aggregator=aggregator,
+        aggregator_fallbacks=[aggregator_fallback],
+        min_successful_proposers=2,
+        all_failed_policy="error",
+        selection_plan=selection_plan,
+    )
+
+    if runtime_role == "proposer":
+        members = provider.proposers
+        index = 0
+    elif runtime_role == "proposer_backup":
+        members = provider.proposer_backups
+        index = 0
+    elif runtime_role == "aggregator":
+        provider.aggregator = replace(
+            provider.aggregator,
+            provider_config=replace(
+                provider.aggregator.provider_config,
+                _provider_routing_strict_override=False,
+            ),
+        )
+        members = []
+        index = 0
+    else:
+        members = provider.aggregator_fallbacks
+        index = 0
+    if members:
+        members[index] = replace(
+            members[index],
+            provider_config=replace(
+                members[index].provider_config,
+                _provider_routing_strict_override=False,
+            ),
+        )
+
+    provider_calls: list[str] = []
+
+    def forbidden_provider_build(config: ProviderConfig) -> Any:
+        provider_calls.append(config.model)
+        raise AssertionError("strict request-policy drift started a provider")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._build_provider",
+        forbidden_provider_build,
+    )
+
+    events = await _collect(provider)
+
+    assert provider_calls == []
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.code == "router_dynamic_proposer_recovery_plan_drift"
+    assert error.request_started is False
+    assert error.physical_request_count == 0
+    assert error.ensemble_trace["proposer_recovery_plan_guard"] == {
+        "valid": False,
+        "reason": "runtime_execution_config_drift",
+        "frozen_fingerprint": provider._proposer_recovery_guard_fingerprint,
+    }
 
 
 def test_router_dynamic_recovery_guard_allows_validated_pre_execution_reseal() -> None:

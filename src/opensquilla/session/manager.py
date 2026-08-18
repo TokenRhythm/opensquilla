@@ -8,6 +8,7 @@ import json
 import os
 import re
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -235,6 +236,21 @@ class SessionManager:
         # read the current epoch without a DB round-trip on every event.
         # Invalidated (updated) whenever increment_epoch commits a new value.
         self._epoch_cache: dict[str, int] = {}
+        self._storage_delete_listener_finalizer: weakref.finalize | None = None
+        add_delete_listener = getattr(storage, "add_session_delete_listener", None)
+        if callable(add_delete_listener):
+            manager_ref = weakref.ref(self)
+
+            def _on_session_deleted(session_key: str) -> None:
+                manager = manager_ref()
+                if manager is not None:
+                    manager.clear_cached_epoch(session_key)
+
+            remove_delete_listener = add_delete_listener(_on_session_deleted)
+            self._storage_delete_listener_finalizer = weakref.finalize(
+                self,
+                remove_delete_listener,
+            )
 
     @property
     def storage(self) -> SessionStorage:
@@ -248,6 +264,10 @@ class SessionManager:
     def set_cached_epoch(self, session_key: str, epoch: int) -> None:
         """Update the in-process epoch cache after durable epoch changes."""
         self._epoch_cache[session_key] = epoch
+
+    def clear_cached_epoch(self, session_key: str) -> None:
+        """Forget an epoch after the corresponding session is deleted."""
+        self._epoch_cache.pop(session_key, None)
 
     def attach_task_runtime(self, task_runtime: Any) -> None:
         """Attach the TaskRuntime so kill_session can cancel running children."""

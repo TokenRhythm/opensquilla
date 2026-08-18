@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 import time
+import weakref
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from types import SimpleNamespace
@@ -15,6 +17,12 @@ from opensquilla.engine.routing.health import ProviderHealthLedger
 from opensquilla.engine.runtime import (
     _ROUTER_SINGLE_FROZEN_CATALOG,
     TurnRunner,
+    _router_dynamic_cache_affinity_policy,
+    _RouterDynamicCacheAffinityCollectionContext,
+    _RouterDynamicCacheAffinityPolicy,
+    _RouterDynamicCacheAffinityReceiptBatch,
+    _RouterDynamicCacheReroutePlan,
+    _RouterDynamicCacheRerouteResult,
     _RouterSingleDirectProvider,
     _SelectorFallbackProvider,
 )
@@ -26,6 +34,7 @@ from opensquilla.engine.turn_runner.prompt_assembler_stage import (
     PromptAssemblerStage,
     PromptAssemblerStageInput,
 )
+from opensquilla.engine.types import DoneEvent as EngineDone
 from opensquilla.gateway.config import GatewayConfig, SquillaRouterConfig
 from opensquilla.provider import (
     ChatConfig,
@@ -36,6 +45,11 @@ from opensquilla.provider import (
 )
 from opensquilla.provider import (
     ErrorEvent as ProviderError,
+)
+from opensquilla.provider.cache_affinity import (
+    CacheDomainGuard,
+    build_cache_affinity_receipt,
+    build_credential_namespace_token,
 )
 from opensquilla.provider.deployment import ProviderDeploymentResolution
 from opensquilla.provider.ensemble import resolve_router_single_route
@@ -129,6 +143,20 @@ async def test_explicit_model_returns_before_router_single_analyzer(
         raise AssertionError("explicit model must skip router_single Analyzer")
 
     monkeypatch.setattr(runner, "_resolve_router_single_provider", fail_if_called)
+    for method_name in (
+        "_ensure_router_dynamic_cache_compaction_listener",
+        "_resolve_router_dynamic_session_epoch",
+        "_router_single_cache_continuity_snapshot",
+        "_register_router_dynamic_cache_sidecar",
+        "_stage_router_dynamic_cache_affinity_batch",
+    ):
+        monkeypatch.setattr(
+            runner,
+            method_name,
+            lambda *args, _name=method_name, **kwargs: (_ for _ in ()).throw(
+                AssertionError(f"explicit model touched cache affinity: {_name}")
+            ),
+        )
     original = _NoChatProvider()
     turn, provider = await runner._run_pipeline(
         "hello",
@@ -268,9 +296,7 @@ async def test_router_single_early_return_never_enters_fusion_block(
 
 def test_fusion_gate_remains_the_original_unqualified_block() -> None:
     source = inspect.getsource(TurnRunner._run_pipeline)
-    original_gate = (
-        "if provider is not None and getattr(ensemble_cfg, \"enabled\", False):"
-    )
+    original_gate = 'if provider is not None and getattr(ensemble_cfg, "enabled", False):'
 
     assert source.count(original_gate) == 1
     assert source.index("if router_single_mode:") < source.index(original_gate)
@@ -447,18 +473,13 @@ def _patch_single_resolver_dependencies(
         "build_model_registry_snapshot",
         lambda **kwargs: {
             "snapshot_version": "test",
-            "models": [
-                {"registry_facts": dict(model.registry_facts)}
-                for model in models
-            ],
+            "models": [{"registry_facts": dict(model.registry_facts)} for model in models],
         },
     )
 
     def rank_single(**kwargs: Any) -> SingleModelRankingDecision:
         rank_calls.append(kwargs)
-        selected_facts = kwargs["registry_snapshot"]["models"][1][
-            "registry_facts"
-        ]
+        selected_facts = kwargs["registry_snapshot"]["models"][1]["registry_facts"]
         selected_model = replace(models[1], registry_facts=dict(selected_facts))
         return SingleModelRankingDecision(
             model=selected_model,
@@ -477,9 +498,7 @@ def _patch_single_resolver_dependencies(
     monkeypatch.setattr(
         ranking_module,
         "dynamic_output_token_budgets",
-        lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError("single route read fusion budgets")
-        ),
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("single route read fusion budgets")),
     )
     monkeypatch.setattr(
         ranking_module,
@@ -554,20 +573,43 @@ def test_single_resolver_freezes_candidate_catalog_budgets_without_fusion(
         model_catalog=catalog,
     )
 
-    facts = [
-        row["registry_facts"]
-        for row in rank_calls[0]["registry_snapshot"]["models"]
-    ]
+    facts = [row["registry_facts"] for row in rank_calls[0]["registry_snapshot"]["models"]]
     assert route.provider_config == selected
     assert [row["runtime_direct_output_tokens"] for row in facts] == [4_096, 8_192]
     assert [row["context_window"] for row in facts] == [128_000, 200_000]
     assert route.direct_output_tokens == 8_192
     assert route.context_window_tokens == 200_000
-    assert route.trace["selected_P"] == [
-        "openrouter:anthropic/claude-sonnet-4.5"
-    ]
+    assert route.trace["selected_P"] == ["openrouter:anthropic/claude-sonnet-4.5"]
     assert "selected_A" not in route.trace
     assert "aggregator" not in route.trace
+
+
+def test_single_resolver_without_cache_policy_never_calls_affinity_helper(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_single_resolver_dependencies(monkeypatch)
+    config, inherited, inputs = _resolver_inputs()
+
+    def fail_if_called(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise AssertionError("absent cache policy must be a strict no-op")
+
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble._cache_affinity_private_inputs",
+        fail_if_called,
+    )
+
+    route = resolve_router_single_route(
+        config=config,
+        inherited_provider_config=inherited,
+        turn_metadata={},
+        ranking_inputs=inputs,
+        requires_tools=False,
+        provider_health_ledger=SimpleNamespace(runtime_facts=lambda *args, **kwargs: _health_row()),
+        model_catalog=_Catalog(),
+    )
+
+    assert route.provider_config.model == "anthropic/claude-sonnet-4.5"
 
 
 def test_single_resolver_fresh_health_failure_is_fail_closed_without_reselect(
@@ -617,9 +659,7 @@ def test_agent_bootstrap_consumes_frozen_single_budget_after_catalog_mutation() 
     catalog.output["openai/gpt-5.5"] = 99_999
     catalog.context["openai/gpt-5.5"] = 999_999
 
-    resolved = _TurnRunnerModelCatalogAdapter(runner).lookup(
-        "openai/gpt-5.5", "openrouter"
-    )
+    resolved = _TurnRunnerModelCatalogAdapter(runner).lookup("openai/gpt-5.5", "openrouter")
 
     assert resolved.max_tokens == 4_096
     assert resolved.context_window == 128_000
@@ -657,9 +697,7 @@ class _HealthLedger:
         kind: ProviderFailureKind,
         **kwargs: Any,
     ) -> None:
-        self.failures.append(
-            {"provider": provider, "model": model, "kind": kind, **kwargs}
-        )
+        self.failures.append({"provider": provider, "model": model, "kind": kind, **kwargs})
 
     def record_success(self, provider: str, model: str, **kwargs: Any) -> None:
         self.successes.append({"provider": provider, "model": model, **kwargs})
@@ -766,10 +804,7 @@ async def test_direct_deadline_records_timeout_failure_and_bounds_stubborn_close
     provider._STREAM_CLOSE_TIMEOUT_SECONDS = 0.03
     started = time.monotonic()
 
-    events = [
-        event
-        async for event in provider.chat([], config=ChatConfig(timeout=30.0))
-    ]
+    events = [event async for event in provider.chat([], config=ChatConfig(timeout=30.0))]
     elapsed = time.monotonic() - started
 
     assert elapsed < 0.2
@@ -870,9 +905,7 @@ async def test_half_open_atomic_admission_allows_only_one_physical_request() -> 
         frozen_catalog={},
         enforces_routed_thinking_policy=False,
     )
-    first_task = asyncio.create_task(
-        _collect(first.chat([], config=ChatConfig(timeout=30.0)))
-    )
+    first_task = asyncio.create_task(_collect(first.chat([], config=ChatConfig(timeout=30.0))))
     while not raw.streams:
         await asyncio.sleep(0)
     await raw.streams[0].started.wait()
@@ -973,9 +1006,7 @@ async def test_half_open_lease_is_held_until_cancelled_stream_closes() -> None:
         frozen_catalog={},
         enforces_routed_thinking_policy=False,
     )
-    first_task = asyncio.create_task(
-        _collect(first.chat([], config=ChatConfig(timeout=30.0)))
-    )
+    first_task = asyncio.create_task(_collect(first.chat([], config=ChatConfig(timeout=30.0))))
     await asyncio.wait_for(raw.stream.started.wait(), timeout=0.5)
 
     first_task.cancel()
@@ -1008,9 +1039,7 @@ async def test_direct_real_health_ledger_cancel_releases_probe_after_close() -> 
         frozen_catalog={},
         enforces_routed_thinking_policy=False,
     )
-    task = asyncio.create_task(
-        _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
-    )
+    task = asyncio.create_task(_collect(provider.chat([], config=ChatConfig(timeout=30.0))))
     await asyncio.wait_for(raw.stream.started.wait(), timeout=0.5)
 
     task.cancel()
@@ -1070,12 +1099,8 @@ async def test_direct_tool_loop_calls_share_one_absolute_deadline() -> None:
     )
     tools = [object()]
 
-    first = await _collect(
-        provider.chat([], tools=tools, config=ChatConfig(timeout=30.0))
-    )
-    second = await _collect(
-        provider.chat([], tools=tools, config=ChatConfig(timeout=30.0))
-    )
+    first = await _collect(provider.chat([], tools=tools, config=ChatConfig(timeout=30.0)))
+    second = await _collect(provider.chat([], tools=tools, config=ChatConfig(timeout=30.0)))
 
     assert first[-1].kind == "done"
     assert second[-1].kind == "done"
@@ -1087,9 +1112,7 @@ async def test_direct_tool_loop_calls_share_one_absolute_deadline() -> None:
     assert 0 < second_timeout < first_timeout - 0.02
 
     await asyncio.sleep(max(0.0, deadline - time.monotonic()) + 0.01)
-    rejected = await _collect(
-        provider.chat([], tools=tools, config=ChatConfig(timeout=30.0))
-    )
+    rejected = await _collect(provider.chat([], tools=tools, config=ChatConfig(timeout=30.0)))
     assert len(raw.calls) == 2
     assert rejected[0].request_started is False
     assert rejected[0].physical_request_count == 0
@@ -1314,6 +1337,168 @@ def test_single_realigns_routed_model_and_clears_stale_savings() -> None:
     assert metadata["savings_routed_price_per_m"] == 0.0
 
 
+async def test_selector_wrapper_generation_guard_blocks_stale_ensemble_dispatch() -> None:
+    raw = _NoChatProvider()
+    raw._router_dynamic_cache_dispatch_generation_guard = lambda: False
+    wrapped = _SelectorFallbackProvider(raw, _Selector())
+
+    events = await _collect(wrapped.chat([], config=ChatConfig()))
+
+    assert raw.calls == 0
+    assert len(events) == 1
+    assert events[0].code == "router_dynamic_cache_generation_changed"
+    assert events[0].physical_request_count == 0
+
+
+async def test_selector_wrapper_rechecks_generation_after_lazy_usage_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RawProvider:
+        provider_name = "openrouter"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(
+            self,
+            messages: list[Any],
+            tools: Any = None,
+            config: Any = None,
+        ) -> AsyncIterator[Any]:
+            del messages, tools, config
+            self.calls += 1
+
+            async def stream() -> AsyncIterator[Any]:
+                yield ProviderDone(provider="openrouter", model="openai/gpt-5.5")
+
+            return stream()
+
+    setup_entered = asyncio.Event()
+    release_setup = asyncio.Event()
+
+    def delayed_account_provider_stream(
+        stream_factory: Any,
+        **kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        del kwargs
+
+        async def stream() -> AsyncIterator[Any]:
+            setup_entered.set()
+            await release_setup.wait()
+            async for event in stream_factory():
+                yield event
+
+        return stream()
+
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime.account_provider_stream",
+        delayed_account_provider_stream,
+    )
+    generation = 0
+    raw = RawProvider()
+    raw._router_dynamic_cache_dispatch_generation_guard = lambda: generation == 0
+    wrapped = _SelectorFallbackProvider(raw, _Selector())
+
+    collect_task = asyncio.create_task(_collect(wrapped.chat([], config=ChatConfig())))
+    await asyncio.wait_for(setup_entered.wait(), timeout=1.0)
+    generation = 1
+    release_setup.set()
+    events = await asyncio.wait_for(collect_task, timeout=1.0)
+
+    assert raw.calls == 0
+    assert len(events) == 1
+    assert events[0].code == "router_dynamic_cache_generation_changed"
+    assert events[0].request_started is False
+    assert events[0].physical_request_count == 0
+    assert not any(getattr(event, "kind", "") == "router_decision" for event in events)
+
+
+async def test_selector_fallback_rechecks_generation_after_lazy_usage_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FallbackProvider:
+        provider_name = "openrouter"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(
+            self,
+            messages: list[Any],
+            tools: Any = None,
+            config: Any = None,
+        ) -> AsyncIterator[Any]:
+            del messages, tools, config
+            self.calls += 1
+
+            async def stream() -> AsyncIterator[Any]:
+                yield ProviderDone(provider="openrouter", model="fallback/model")
+
+            return stream()
+
+    class FallbackSelector:
+        def __init__(self, fallback: FallbackProvider) -> None:
+            self._fallback = fallback
+            self.current_config = ProviderConfig(
+                provider="openrouter",
+                model="primary/model",
+                api_key="synthetic",
+            )
+
+        @property
+        def active_provider_id(self) -> str:
+            return self.current_config.provider
+
+        def next_fallback_after_failure(self, error: Exception) -> FallbackProvider:
+            del error
+            self.current_config = replace(self.current_config, model="fallback/model")
+            return self._fallback
+
+    setup_entered = asyncio.Event()
+    release_setup = asyncio.Event()
+    account_call_count = 0
+
+    def delayed_fallback_account_provider_stream(
+        stream_factory: Any,
+        **kwargs: Any,
+    ) -> AsyncIterator[Any]:
+        nonlocal account_call_count
+        del kwargs
+        account_call_count += 1
+        call_number = account_call_count
+
+        async def stream() -> AsyncIterator[Any]:
+            if call_number == 2:
+                setup_entered.set()
+                await release_setup.wait()
+            async for event in stream_factory():
+                yield event
+
+        return stream()
+
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime.account_provider_stream",
+        delayed_fallback_account_provider_stream,
+    )
+    generation = 0
+    primary = _ErrorProvider("429")
+    primary._router_dynamic_cache_dispatch_generation_guard = lambda: generation == 0
+    fallback = FallbackProvider()
+    wrapped = _SelectorFallbackProvider(primary, FallbackSelector(fallback))
+
+    collect_task = asyncio.create_task(_collect(wrapped.chat([], config=ChatConfig())))
+    await asyncio.wait_for(setup_entered.wait(), timeout=1.0)
+    generation = 1
+    release_setup.set()
+    events = await asyncio.wait_for(collect_task, timeout=1.0)
+
+    assert account_call_count == 2
+    assert fallback.calls == 0
+    assert len(events) == 1
+    assert events[0].code == "router_dynamic_cache_generation_changed"
+    assert events[0].physical_request_count == 0
+
+
 class _ErrorProvider:
     provider_name = "openai"
 
@@ -1351,23 +1536,53 @@ async def test_single_pool_failure_uses_configured_provider_identity(
         )
     )
     monkeypatch.setattr(llm_runtime, "profile_credential_pools", lambda: pool)
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology="single",
+        ttl_seconds=60.0,
+        route_cache_max_entries=4,
+        source={"strategy": "bonus"},
+    )
+    session_key = "agent:main:pool"
+    seeded = await _seed_single_affinity_state(
+        runner,
+        policy,
+        session_key=session_key,
+        decision_id=f"pool-{code}",
+    )
+    generation_before_failure = runner._router_dynamic_cache_generation(session_key)
     metadata = {
         "_router_single_provider_finalized": True,
         "routed_provider_applied": "openrouter",
         "credential_pool": {
             "provider": "openrouter",
-            "session_key": "agent:main:pool",
+            "session_key": session_key,
         },
     }
+    purges: list[str] = []
     wrapped = _SelectorFallbackProvider(
         _ErrorProvider(code),
         _OneModelSelector(),
         turn_metadata=metadata,
+        cache_affinity_credential_failure_callback=lambda: (
+            purges.append(code),
+            runner._invalidate_router_dynamic_cache_affinity(
+                session_key=session_key,
+                reason="credential_pool_failure",
+            ),
+        ),
     )
 
     await _collect(wrapped.chat([], config=ChatConfig()))
 
     assert reports == [("openrouter", "agent:main:pool", expected)]
+    assert purges == [code]
+    assert runner._router_dynamic_cache_generation(session_key) > (generation_before_failure)
+    assert not runner._router_single_cache_continuity_snapshot(
+        session_key=session_key,
+        session_epoch=seeded.session_epoch,
+        policy=policy,
+    )[0]
 
 
 def test_single_resolver_requires_authoritative_catalog_before_ranking(
@@ -1811,10 +2026,7 @@ def test_managed_thinking_uses_selected_adapter_execution_contract(
                 requires_tools=False,
                 model_catalog=EndpointCatalog(),
             )
-        assert (
-            raised.value.reason
-            == "router_single_selected_model_reasoning_unavailable"
-        )
+        assert raised.value.reason == "router_single_selected_model_reasoning_unavailable"
     else:
         route = resolve_router_single_route(
             config=config,
@@ -1895,9 +2107,7 @@ def test_single_allowlist_candidates_still_receive_rank_time_health_facts(
     ) -> dict[str, Any]:
         del kwargs
         health_calls.append(model)
-        row = _health_row(
-            state="benched" if model == "openai/gpt-5.5" else "healthy"
-        )
+        row = _health_row(state="benched" if model == "openai/gpt-5.5" else "healthy")
         row.update({"provider": provider, "model": model})
         return row
 
@@ -1985,7 +2195,6 @@ async def test_direct_terminal_without_aclose_is_a_valid_stream_boundary() -> No
         frozen_catalog={},
         enforces_routed_thinking_policy=False,
     )
-
     events = await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
     facts = _facts_for(ledger, config)
 
@@ -2042,9 +2251,7 @@ async def test_direct_stops_at_terminal_and_withholds_it_until_close_returns() -
         frozen_catalog={},
         enforces_routed_thinking_policy=False,
     )
-    task = asyncio.create_task(
-        _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
-    )
+    task = asyncio.create_task(_collect(provider.chat([], config=ChatConfig(timeout=30.0))))
 
     await asyncio.wait_for(raw.stream.close_started.wait(), timeout=0.5)
     assert task.done() is False
@@ -2498,6 +2705,17 @@ async def test_run_turn_scopes_private_freeze_after_router_event_and_uses_it(
         },
         enforces_routed_thinking_policy=False,
     )
+    finalized_observability: list[bool] = []
+
+    def unexpected_reroute() -> Any:
+        raise AssertionError("unchanged generation must not reroute")
+
+    direct._router_dynamic_cache_reroute_plan = _RouterDynamicCacheReroutePlan(
+        session_key="agent:main:single-freeze-scope",
+        selection_generation=0,
+        reroute_without_affinity=unexpected_reroute,
+        finalize_observability=lambda: finalized_observability.append(True),
+    )
 
     async def routed_pipeline(
         self: TurnRunner,
@@ -2541,6 +2759,20 @@ async def test_run_turn_scopes_private_freeze_after_router_event_and_uses_it(
         )
 
     monkeypatch.setattr(TurnRunner, "_run_pipeline", routed_pipeline)
+    logger_writes: list[str] = []
+
+    class _RecordingTurnCallLogger:
+        def __init__(self, **kwargs: Any) -> None:
+            del kwargs
+
+        def write(self, kind: str, payload: Any) -> None:
+            del payload
+            logger_writes.append(kind)
+
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime.TurnCallLogger",
+        _RecordingTurnCallLogger,
+    )
     runner = TurnRunner(
         provider_selector=RunSelector(selected),
         config=GatewayConfig(
@@ -2548,6 +2780,9 @@ async def test_run_turn_scopes_private_freeze_after_router_event_and_uses_it(
             llm={"max_tokens": 0, "context_window_tokens": 0},
         ),
         model_catalog=ExplodingLiveCatalog(),
+        diagnostics_state=SimpleNamespace(
+            raw_turn_call_enabled=lambda: True,
+        ),
     )
     frozen_during_bootstrap: list[dict[str, Any] | None] = []
     resolved_capabilities: list[Any] = []
@@ -2612,10 +2847,3367 @@ async def test_run_turn_scopes_private_freeze_after_router_event_and_uses_it(
         }
     ]
     assert resolved_capabilities == [capabilities]
+    assert finalized_observability == [True]
+    assert logger_writes.count("prompt_report") == 1
+    assert logger_writes.count("turn_start") == 1
+    assert logger_writes.count("agent_runtime_budget") == 1
     assert _ROUTER_SINGLE_FROZEN_CATALOG.get() is None
     assert any(getattr(event, "kind", "") == "done" for event in remaining_events)
-    projected = repr([router_event, *remaining_events]) + repr(
-        frozen_during_bootstrap
-    )
+    projected = repr([router_event, *remaining_events]) + repr(frozen_during_bootstrap)
     assert selected.base_url not in projected
     assert selected.api_key not in projected
+
+
+async def test_compaction_generation_drift_reroutes_before_history_and_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.pipeline import TurnContext
+    from opensquilla.engine.types import RouterDecisionEvent
+    from opensquilla.provider import ModelCapabilities
+    from opensquilla.tools.types import CallerKind, ToolContext
+
+    session_key = "agent:main:compaction-reroute"
+    initial = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic-initial",
+    )
+    final = ProviderConfig(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4.5",
+        api_key="synthetic-final",
+    )
+    capabilities = ModelCapabilities(
+        supports_tools=True,
+        supports_streaming=True,
+    )
+
+    class RunSelector(_Selector):
+        def clone(self) -> RunSelector:
+            return RunSelector(self._cfg)
+
+    class FinalProvider:
+        provider_name = "openrouter"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(
+            self,
+            messages: list[Any],
+            tools: Any = None,
+            config: Any = None,
+        ) -> AsyncIterator[Any]:
+            del messages, tools, config
+            self.calls += 1
+
+            async def stream() -> AsyncIterator[Any]:
+                yield ProviderText(text="final")
+                yield ProviderDone(
+                    provider=final.provider,
+                    model=final.model,
+                    stop_reason="stop",
+                    input_tokens=4,
+                    output_tokens=1,
+                )
+
+            return stream()
+
+    old_raw = _NoChatProvider()
+    final_raw = FinalProvider()
+    initial_selector = _Selector(initial)
+    initial_direct = _RouterSingleDirectProvider(
+        old_raw,
+        initial,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={
+            "provider": initial.provider,
+            "model": initial.model,
+            "max_tokens": 4_096,
+            "context_window": 128_000,
+            "capabilities": capabilities,
+        },
+        enforces_routed_thinking_policy=False,
+    )
+    initial_provider = _SelectorFallbackProvider(
+        initial_direct,
+        initial_selector,
+    )
+    turn_holder: dict[str, Any] = {}
+    analyzer_calls = 0
+
+    def reroute() -> _RouterDynamicCacheRerouteResult:
+        turn = turn_holder["turn"]
+        selector = turn_holder["selector"]
+        selector.override_provider_config(final)
+        turn.model = final.model
+        turn.metadata.update(
+            {
+                "routed_model": final.model,
+                "executed_provider": final.provider,
+                "executed_model": final.model,
+                "resolved_model": final.model,
+                "alias_resolution_chain": [final.model],
+                "provider_after_rewrite": final.provider,
+                "router_single_selected_provider": final.provider,
+                "router_single_selected_model": final.model,
+                "_router_single_frozen_catalog": {
+                    "provider": final.provider,
+                    "model": final.model,
+                    "max_tokens": 8_192,
+                    "context_window": 200_000,
+                },
+            }
+        )
+        final_selector = _Selector(final)
+        final_direct = _RouterSingleDirectProvider(
+            final_raw,
+            final,
+            health_ledger=None,
+            absolute_deadline=None,
+            frozen_catalog={
+                "provider": final.provider,
+                "model": final.model,
+                "max_tokens": 8_192,
+                "context_window": 200_000,
+                "capabilities": capabilities,
+            },
+            enforces_routed_thinking_policy=False,
+        )
+        return _RouterDynamicCacheRerouteResult(
+            provider=_SelectorFallbackProvider(final_direct, final_selector),
+            resolved_model=final.model,
+            provider_name=final.provider,
+            active_provider_id=final.provider,
+        )
+
+    initial_provider._router_dynamic_cache_reroute_plan = _RouterDynamicCacheReroutePlan(
+        session_key=session_key,
+        selection_generation=0,
+        reroute_without_affinity=reroute,
+    )
+
+    async def routed_pipeline(
+        self: TurnRunner,
+        message: str,
+        session_key: str,
+        provider: Any,
+        cloned_selector: Any,
+        tool_defs: list[Any],
+        base_prompt: str | tuple[str, str],
+        attachments: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> tuple[TurnContext, Any]:
+        nonlocal analyzer_calls
+        del provider, kwargs
+        analyzer_calls += 1
+        turn = TurnContext(
+            message=message,
+            session_key=session_key,
+            config=self._config,
+            provider=initial_provider,
+            model=initial.model,
+            tool_defs=tool_defs,
+            system_prompt=base_prompt,
+            attachments=attachments,
+            metadata={
+                "_router_single_provider_finalized": True,
+                "_router_single_frozen_catalog": {
+                    "provider": initial.provider,
+                    "model": initial.model,
+                    "max_tokens": 4_096,
+                    "context_window": 128_000,
+                },
+                "routed_tier": "c2",
+                "routed_model": initial.model,
+                "routing_source": "router_single",
+                "routing_confidence": 0.9,
+                "executed_provider": initial.provider,
+                "executed_model": initial.model,
+            },
+        )
+        turn_holder.update(turn=turn, selector=cloned_selector)
+        return turn, initial_provider
+
+    monkeypatch.setattr(TurnRunner, "_run_pipeline", routed_pipeline)
+    logger_instances: list[Any] = []
+
+    class RecordingLogger:
+        def __init__(self, **kwargs: Any) -> None:
+            self.provider = kwargs["provider"]
+            self.model = kwargs["model"]
+            self.writes: list[tuple[str, Any]] = []
+            logger_instances.append(self)
+
+        def write(self, kind: str, payload: Any) -> None:
+            self.writes.append((kind, payload))
+
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime.TurnCallLogger",
+        RecordingLogger,
+    )
+    runner = TurnRunner(
+        provider_selector=RunSelector(initial),
+        config=GatewayConfig(
+            squilla_router=SquillaRouterConfig(enabled=False),
+            llm={"max_tokens": 0, "context_window_tokens": 0},
+        ),
+        model_catalog=_Catalog(),
+        diagnostics_state=SimpleNamespace(
+            raw_turn_call_enabled=lambda: True,
+        ),
+    )
+    runner._router_dynamic_cache_affinity_generation = {session_key: 1}
+    bootstrap_models: list[str] = []
+    original_bootstrap = runner._agent_bootstrap_stage.run
+
+    async def observe_bootstrap(inp: Any) -> Any:
+        bootstrap_models.append(inp.resolved_model)
+        return await original_bootstrap(inp)
+
+    monkeypatch.setattr(runner._agent_bootstrap_stage, "run", observe_bootstrap)
+    events = [
+        event
+        async for event in runner.run(
+            "hello",
+            session_key,
+            tool_context=ToolContext(
+                is_owner=True,
+                caller_kind=CallerKind.CLI,
+            ),
+            history_has_persisted_user=False,
+            no_memory_capture=True,
+        )
+    ]
+
+    router_events = [event for event in events if isinstance(event, RouterDecisionEvent)]
+    assert analyzer_calls == 1
+    assert bootstrap_models == [initial.model, final.model]
+    assert old_raw.calls == 0
+    assert final_raw.calls == 1
+    assert len(router_events) == 1
+    assert router_events[0].model == final.model
+    assert turn_holder["turn"].metadata["executed_model"] == final.model
+    written_loggers = [logger for logger in logger_instances if logger.writes]
+    assert len(written_loggers) == 1
+    assert written_loggers[0].provider == final.provider
+    assert written_loggers[0].model == final.model
+    prompt_payload = next(
+        payload for kind, payload in written_loggers[0].writes if kind == "prompt_report"
+    )
+    assert prompt_payload["resolved_model"] == final.model
+    assert prompt_payload["provider_after_rewrite"] == final.provider
+
+
+async def test_single_compaction_reroute_disables_scoring_but_collects_fresh_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.provider.ensemble as ensemble_module
+    import opensquilla.provider.ranking_router as ranking_module
+    import opensquilla.provider.selector as selector_module
+    from opensquilla.engine.pipeline import TurnContext
+    from opensquilla.provider import ModelCapabilities
+
+    session_key = "agent:main:single-compaction-collection"
+    selected = _affinity_direct_config("anthropic/single-compaction-collection")
+    policy_override = {
+        "session": {
+            "kv_cache_affinity": {
+                "strategy": "bonus",
+                "topologies": ["single"],
+                "ttl_seconds": 300,
+                "age_decay": "linear",
+                "bonus_by_evidence": {
+                    "read_hit": 0.05,
+                    "write_only": 0.025,
+                },
+            }
+        }
+    }
+    config = GatewayConfig(
+        squilla_router=SquillaRouterConfig(enabled=False),
+        llm={
+            "provider": selected.provider,
+            "model": selected.model,
+            "api_key": selected.api_key,
+            "base_url": selected.base_url,
+            "max_tokens": 4_096,
+            "context_window_tokens": 128_000,
+        },
+        llm_ensemble={
+            "enabled": True,
+            "mode": "single",
+            "selection_mode": "router_dynamic",
+            "ranking_config_override": policy_override,
+            "ranking_thinking_assignment_enabled": False,
+            "latency_class": "experiment",
+        },
+    )
+    runner = TurnRunner(
+        provider_selector=_Selector(selected),
+        config=config,
+        model_catalog=_Catalog(),
+        session_manager=object(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.session_services.get_session_epoch",
+        lambda manager, key: 0,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_router_dynamic_task_analyzer_provider",
+        lambda *args, **kwargs: None,
+    )
+    task_analysis = TaskAnalysisResult(
+        profile={
+            "capability_dist": {"reasoning": 1.0},
+            "domain_dist": {"software_engineering": 1.0},
+            "tier_dist": {"3": 1.0},
+            "constraints": {
+                "cost": "medium",
+                "latency": "normal",
+                "context": "short",
+                "modality": ["text"],
+                "risk": "medium",
+            },
+            "optional_constraints": {},
+            "session_intent": {"type": "continue", "confidence": 1.0},
+        },
+        source="single_compaction_collection_test",
+        schema_valid=True,
+        confidence=1.0,
+    )
+
+    async def analyze_task(**kwargs: Any) -> TaskAnalysisResult:
+        del kwargs
+        return task_analysis
+
+    monkeypatch.setattr(ranking_module, "analyze_task_with_provider", analyze_task)
+    monkeypatch.setattr(
+        ranking_module,
+        "analyze_task_with_fallback_chain",
+        analyze_task,
+    )
+    ranking_inputs_seen: list[dict[str, Any]] = []
+    credential_token = _affinity_credential_token(selected)
+
+    def resolve_route(**kwargs: Any) -> Any:
+        inputs = kwargs["ranking_inputs"]
+        assert isinstance(inputs, dict)
+        ranking_inputs_seen.append(dict(inputs))
+        return SimpleNamespace(
+            provider_config=selected,
+            effective_tier=2,
+            trace={
+                "strategy": "router_dynamic",
+                "execution_mode": "router_single",
+                "selected_model": f"{selected.provider}:{selected.model}",
+                "selected_P": [f"{selected.provider}:{selected.model}"],
+            },
+            direct_output_tokens=4_096,
+            context_window_tokens=128_000,
+            model_capabilities=ModelCapabilities(
+                supports_tools=True,
+                supports_streaming=True,
+            ),
+            thinking=None,
+            requested_thinking_level=None,
+            effective_thinking_level=None,
+            thinking_fallback_reason="",
+            thinking_policy_version="",
+            actual_model_aliases=(selected.model,),
+            credential_namespace_token=credential_token,
+        )
+
+    monkeypatch.setattr(ensemble_module, "resolve_router_single_route", resolve_route)
+    physical_providers: list[_AffinityDoneProvider] = []
+
+    def resolve_physical(selector: Any) -> _AffinityDoneProvider:
+        del selector
+        physical = _AffinityDoneProvider(
+            [
+                ProviderDone(
+                    provider=selected.provider,
+                    model=selected.model,
+                    cached_tokens=31,
+                    cache_write_tokens=0,
+                )
+            ]
+        )
+        physical_providers.append(physical)
+        return physical
+
+    monkeypatch.setattr(selector_module.ModelSelector, "resolve", resolve_physical)
+    turn = TurnContext(
+        message="continue",
+        session_key=session_key,
+        config=config,
+        provider=_NoChatProvider(),
+        model=selected.model,
+        tool_defs=[],
+        system_prompt="system",
+        attachments=[],
+        metadata={
+            "routed_tier": "c2",
+            "routing_confidence": 0.9,
+        },
+    )
+
+    initial_provider = await runner._resolve_router_single_provider(
+        turn=turn,
+        provider=turn.provider,
+        cloned_selector=_Selector(selected),
+        turn_config=config,
+        ensemble_cfg=config.llm_ensemble,
+        turn_absolute_deadline=None,
+    )
+    reroute_plan = getattr(
+        initial_provider,
+        "_router_dynamic_cache_reroute_plan",
+        None,
+    )
+    assert isinstance(reroute_plan, _RouterDynamicCacheReroutePlan)
+    runner._invalidate_router_dynamic_cache_affinity(
+        session_key=session_key,
+        reason="compaction",
+    )
+
+    rerouted = reroute_plan.reroute_without_affinity()
+
+    assert len(ranking_inputs_seen) == 2
+    assert "cache_affinity_policy" in ranking_inputs_seen[0]
+    assert ranking_inputs_seen[1]["cache_affinity_collection_enabled"] is True
+    assert "cache_affinity_policy" not in ranking_inputs_seen[1]
+    assert "cache_affinity_receipts" not in ranking_inputs_seen[1]
+    final_direct = rerouted.provider._provider
+    assert isinstance(final_direct, _RouterSingleDirectProvider)
+    assert final_direct._cache_affinity_credential_namespace_token is credential_token
+    assert physical_providers[0].calls == 0
+    events = await _collect(rerouted.provider.chat([], config=ChatConfig(timeout=30.0)))
+    assert [event.kind for event in events] == ["done"]
+    assert physical_providers[1].calls == 1
+    assert runner._commit_pending_router_dynamic_cache_affinity(turn, EngineDone())
+    available, receipts, _ = runner._router_single_cache_continuity_snapshot(
+        session_key=session_key,
+        session_epoch=0,
+        policy=_router_dynamic_cache_affinity_policy(
+            config.llm_ensemble.prepared_ranking_config(),
+            topology="single",
+        ),
+    )
+    assert available is True
+    assert len(receipts) == 1
+    assert receipts[0].cached_tokens == 31
+
+
+async def test_multiple_compaction_generation_drift_rebuilds_final_plan_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.provider.ensemble as ensemble_module
+    import opensquilla.provider.ranking_router as ranking_module
+    from opensquilla.engine.pipeline import TurnContext
+    from opensquilla.engine.types import RouterDecisionEvent
+    from opensquilla.tools.types import CallerKind, ToolContext
+
+    session_key = "agent:main:multiple-compaction-reroute"
+    initial_model = "synthetic/aggregator-affinity"
+    final_model = "synthetic/aggregator-neutral"
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model="openai/gpt-5.5",
+        api_key="synthetic-multiple-compaction",
+    )
+    policy_override = {
+        "session": {
+            "kv_cache_affinity": {
+                "strategy": "bonus",
+                "topologies": ["multiple"],
+                "ttl_seconds": 300,
+                "age_decay": "linear",
+                "bonus_by_evidence": {
+                    "read_hit": 0.05,
+                    "write_only": 0.025,
+                },
+            }
+        }
+    }
+
+    class RunSelector(_Selector):
+        def clone(self) -> RunSelector:
+            return RunSelector(self._cfg)
+
+    class SyntheticEnsembleProvider:
+        provider_name = "openrouter"
+        profile_name = "router_dynamic/c2"
+
+        def __init__(
+            self,
+            *,
+            aggregator_model: str,
+            decision_id: str,
+            turn_metadata: dict[str, Any],
+        ) -> None:
+            self.aggregator_model = aggregator_model
+            self.turn_metadata = turn_metadata
+            self.calls = 0
+            self.pending_plan_matched_at_dispatch = False
+            self.selection_plan = {
+                "strategy": "router_dynamic",
+                "selection_mode": "router_dynamic",
+                "decision_id": decision_id,
+                "ranking_version": "multiple-compaction-test-v1",
+                "registry_snapshot_version": "multiple-compaction-test-v1",
+                "registry_snapshot_hash": f"hash-{aggregator_model}",
+                "selected_P": [
+                    "openrouter:synthetic/proposer-a",
+                    "openrouter:synthetic/proposer-b",
+                ],
+                "selected_A": f"openrouter:{aggregator_model}",
+                "effective_tier": 2,
+                "session": {
+                    "intent": "continue",
+                    "cache_continuity_available": aggregator_model == initial_model,
+                },
+            }
+
+        def chat(
+            self,
+            messages: list[Any],
+            tools: Any = None,
+            config: Any = None,
+        ) -> AsyncIterator[Any]:
+            del messages, tools, config
+            self.calls += 1
+            self.pending_plan_matched_at_dispatch = (
+                self.turn_metadata.get("router_dynamic_pending_route_plan") is self.selection_plan
+            )
+
+            async def stream() -> AsyncIterator[Any]:
+                yield ProviderText(text=f"answer from {self.aggregator_model}")
+                yield ProviderDone(
+                    provider="openrouter",
+                    model=self.aggregator_model,
+                    stop_reason="stop",
+                    input_tokens=4,
+                    output_tokens=1,
+                )
+
+            return stream()
+
+    built: list[SyntheticEnsembleProvider] = []
+    built_ranking_inputs: list[dict[str, Any]] = []
+
+    def build_provider(**kwargs: Any) -> SyntheticEnsembleProvider:
+        inputs = kwargs.get("ranking_inputs")
+        assert isinstance(inputs, dict)
+        built_ranking_inputs.append(dict(inputs))
+        decision_id = str(inputs["decision_id"])
+        affinity_active = "cache_affinity_policy" in inputs
+        provider = SyntheticEnsembleProvider(
+            aggregator_model=(initial_model if affinity_active else final_model),
+            decision_id=decision_id,
+            turn_metadata=kwargs["turn_metadata"],
+        )
+        built.append(provider)
+        return provider
+
+    monkeypatch.setattr(
+        ensemble_module,
+        "build_ensemble_provider_from_config",
+        build_provider,
+    )
+
+    task_analysis = TaskAnalysisResult(
+        profile={
+            "capability_dist": {"reasoning": 1.0},
+            "domain_dist": {"software_engineering": 1.0},
+            "tier_dist": {"3": 1.0},
+            "constraints": {
+                "cost": "medium",
+                "latency": "normal",
+                "context": "short",
+                "modality": ["text"],
+                "risk": "medium",
+            },
+            "optional_constraints": {},
+            "session_intent": {"type": "continue", "confidence": 1.0},
+        },
+        source="multiple_compaction_test",
+        schema_valid=True,
+        confidence=1.0,
+    )
+
+    async def analyze_task(**kwargs: Any) -> TaskAnalysisResult:
+        del kwargs
+        return task_analysis
+
+    monkeypatch.setattr(
+        ranking_module,
+        "analyze_task_with_provider",
+        analyze_task,
+    )
+    monkeypatch.setattr(
+        ranking_module,
+        "analyze_task_with_fallback_chain",
+        analyze_task,
+    )
+
+    config = GatewayConfig(
+        squilla_router=SquillaRouterConfig(enabled=False),
+        llm={
+            "provider": inherited.provider,
+            "model": inherited.model,
+            "api_key": inherited.api_key,
+            "max_tokens": 4_096,
+            "context_window_tokens": 128_000,
+        },
+        llm_ensemble={
+            "enabled": True,
+            "mode": "multiple",
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+            "ranking_thinking_assignment_enabled": False,
+            "ranking_config_override": policy_override,
+            "aggregator_recovery_mode": "experiment",
+            "latency_class": "experiment",
+        },
+    )
+    runner = TurnRunner(
+        provider_selector=RunSelector(inherited),
+        config=config,
+        model_catalog=_Catalog(),
+    )
+    runner._session_manager = object()
+    monkeypatch.setattr(
+        "opensquilla.gateway.session_services.get_session_epoch",
+        lambda manager, key: 0,
+    )
+    selector = RunSelector(inherited)
+    turn, initial_provider = await runner._run_pipeline(
+        "continue",
+        session_key,
+        _NoChatProvider(),
+        selector,
+        [],
+        "system",
+        [],
+        usage_execution_context=SimpleNamespace(
+            turn_id="turn-multiple-compaction",
+        ),
+    )
+    assert isinstance(turn, TurnContext)
+    assert len(built) == 1
+    assert initial_provider is built[0]
+    assert built[0].aggregator_model == initial_model
+    initial_decision_id = turn.metadata["ensemble_decision_id"]
+    runner._session_manager = None
+    turn.metadata.update(
+        {
+            "routed_tier": "c2",
+            "routed_model": inherited.model,
+            "routing_source": "router_dynamic",
+            "routing_confidence": 0.9,
+        }
+    )
+
+    # The route froze generation zero. Compaction invalidates continuity before
+    # history/dispatch, so the retained Analyzer result must rebuild once with
+    # all affinity inputs removed.
+    runner._router_dynamic_cache_affinity_generation = {session_key: 1}
+    reroute_plan = getattr(
+        initial_provider,
+        "_router_dynamic_cache_reroute_plan",
+        None,
+    )
+    assert isinstance(reroute_plan, _RouterDynamicCacheReroutePlan)
+    assert reroute_plan.selection_generation == 0
+    assert runner._router_dynamic_cache_generation(session_key) == 1
+
+    async def prebuilt_pipeline(
+        self: TurnRunner,
+        message: str,
+        requested_session_key: str,
+        provider: Any,
+        cloned_selector: Any,
+        tool_defs: list[Any],
+        base_prompt: str | tuple[str, str],
+        attachments: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> tuple[TurnContext, Any]:
+        del (
+            self,
+            message,
+            requested_session_key,
+            provider,
+            cloned_selector,
+            tool_defs,
+            base_prompt,
+            attachments,
+            kwargs,
+        )
+        return turn, initial_provider
+
+    monkeypatch.setattr(TurnRunner, "_run_pipeline", prebuilt_pipeline)
+    events = [
+        event
+        async for event in runner.run(
+            "continue",
+            session_key,
+            tool_context=ToolContext(
+                is_owner=True,
+                caller_kind=CallerKind.CLI,
+            ),
+            history_has_persisted_user=False,
+            no_memory_capture=True,
+        )
+    ]
+
+    assert len(built) == 2
+    assert "cache_affinity_policy" in built_ranking_inputs[0]
+    assert built_ranking_inputs[1]["cache_affinity_collection_enabled"] is True
+    assert "cache_affinity_policy" not in built_ranking_inputs[1]
+    assert "cache_affinity_receipts" not in built_ranking_inputs[1]
+    final_provider = built[1]
+    assert built[0].calls == 0
+    assert final_provider.calls == 1
+    assert final_provider.aggregator_model == final_model
+    assert final_provider.selection_plan["decision_id"] == initial_decision_id
+    final_projection = turn.metadata["router_dynamic_decision"]
+    assert final_projection["decision_id"] == initial_decision_id
+    assert final_projection["selected_P"] == (final_provider.selection_plan["selected_P"])
+    assert final_projection["selected_A"] == (final_provider.selection_plan["selected_A"])
+    assert final_provider.pending_plan_matched_at_dispatch is True
+    assert "router_dynamic_pending_route_plan" not in turn.metadata
+    router_events = [event for event in events if isinstance(event, RouterDecisionEvent)]
+    assert len(router_events) == 1
+    assert router_events[0].model == inherited.model
+
+
+class _AffinityDoneProvider:
+    provider_name = "openrouter"
+    _provider_routing_strict = True
+
+    def __init__(self, events: list[ProviderDone]) -> None:
+        self._events = list(events)
+        self.calls = 0
+
+    def chat(self, messages: list[Any], tools: Any = None, config: Any = None) -> Any:
+        del messages, tools, config
+        event = self._events[self.calls]
+        self.calls += 1
+
+        async def stream() -> AsyncIterator[Any]:
+            yield event
+
+        return stream()
+
+
+def _affinity_direct_config(model: str = "anthropic/affinity-model") -> ProviderConfig:
+    return ProviderConfig(
+        provider="openrouter",
+        model=model,
+        api_key="synthetic-affinity-secret",
+        base_url="https://openrouter.ai/api/v1",
+        org_id="synthetic-tenant",
+        provider_routing={model: "anthropic"},
+        _provider_routing_strict_override=True,
+    )
+
+
+def _affinity_credential_token(config: ProviderConfig) -> object:
+    token = build_credential_namespace_token(
+        provider=config.provider,
+        resolved_secret=config.api_key,
+        org_id=config.org_id,
+    )
+    assert token is not None
+    return token
+
+
+def _affinity_context(
+    *,
+    decision_id: str = "decision-affinity",
+    provider_instance_token: str = "provider-affinity",
+    generation: int = 0,
+    session_key: str = "agent:main:affinity",
+    session_epoch: int = 7,
+) -> _RouterDynamicCacheAffinityCollectionContext:
+    return _RouterDynamicCacheAffinityCollectionContext(
+        turn_id="turn-affinity",
+        decision_id=decision_id,
+        provider_instance_token=provider_instance_token,
+        provider_instance_generation=0,
+        session_key=session_key,
+        session_epoch=session_epoch,
+        selection_generation=generation,
+        topology="single",
+    )
+
+
+async def _seed_single_affinity_state(
+    runner: TurnRunner,
+    policy: _RouterDynamicCacheAffinityPolicy,
+    *,
+    session_key: str,
+    decision_id: str,
+    session_epoch: int = 7,
+) -> _RouterDynamicCacheAffinityCollectionContext:
+    config = _affinity_direct_config(f"anthropic/{decision_id}")
+    context = _affinity_context(
+        decision_id=decision_id,
+        provider_instance_token=f"provider-{decision_id}",
+        session_key=session_key,
+        session_epoch=session_epoch,
+    )
+    batches: list[_RouterDynamicCacheAffinityReceiptBatch] = []
+    provider = _RouterSingleDirectProvider(
+        _AffinityDoneProvider(
+            [
+                ProviderDone(
+                    provider=config.provider,
+                    model=config.model,
+                    cached_tokens=17,
+                    cache_write_tokens=0,
+                )
+            ]
+        ),
+        config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=context,
+        cache_affinity_receipt_sink=batches.append,
+        cache_affinity_generation_getter=lambda: 0,
+        cache_affinity_credential_namespace_token=(_affinity_credential_token(config)),
+    )
+    await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+    assert len(batches) == 1
+    key = runner._register_router_dynamic_cache_sidecar(
+        context=context,
+        policy=policy,
+    )
+    assert runner._stage_router_dynamic_cache_affinity_batch(key, batches[0])
+    turn = SimpleNamespace(
+        session_key=session_key,
+        metadata={"router_single_decision_id": decision_id},
+    )
+    assert runner._commit_pending_router_dynamic_cache_affinity(
+        turn,
+        EngineDone(),
+    )
+    return context
+
+
+async def _seed_multiple_affinity_state(
+    runner: TurnRunner,
+    policy: _RouterDynamicCacheAffinityPolicy,
+    *,
+    session_key: str,
+    decision_id: str,
+    session_epoch: int = 7,
+) -> _RouterDynamicCacheAffinityCollectionContext:
+    context = _RouterDynamicCacheAffinityCollectionContext(
+        turn_id=f"turn-{decision_id}",
+        decision_id=decision_id,
+        provider_instance_token=f"provider-{decision_id}",
+        provider_instance_generation=0,
+        session_key=session_key,
+        session_epoch=session_epoch,
+        selection_generation=0,
+        topology="multiple",
+    )
+    receipt = build_cache_affinity_receipt(
+        physical_attempt_id=f"attempt-{decision_id}",
+        role="proposer",
+        topology="multiple",
+        execution_slot="proposer:0:0",
+        requested_identity="openrouter:anthropic/model",
+        actual_identity="openrouter:anthropic/model",
+        cache_domain_guard=CacheDomainGuard(b"p" * 32),
+        cached_tokens=17,
+        cache_write_tokens=0,
+        observed_at_monotonic=time.monotonic(),
+    )
+    assert receipt is not None
+    key = runner._register_router_dynamic_cache_sidecar(
+        context=context,
+        policy=policy,
+    )
+    assert runner._stage_router_dynamic_cache_affinity_batch(
+        key,
+        _RouterDynamicCacheAffinityReceiptBatch(
+            turn_id=context.turn_id,
+            decision_id=context.decision_id,
+            provider_instance_token=context.provider_instance_token,
+            provider_instance_generation=0,
+            chat_call_id=f"chat-{decision_id}",
+            chat_call_sequence=1,
+            runtime_generation=0,
+            topology="multiple",
+            receipts=(receipt,),
+        ),
+    )
+    turn = SimpleNamespace(
+        session_key=session_key,
+        metadata={"ensemble_decision_id": decision_id},
+    )
+    assert runner._commit_pending_router_dynamic_cache_affinity(turn, EngineDone())
+    return context
+
+
+async def test_direct_affinity_uses_raw_done_and_latest_chat_overwrites_receipt() -> None:
+    config = _affinity_direct_config()
+    raw = _AffinityDoneProvider(
+        [
+            ProviderDone(
+                provider=config.provider,
+                model=config.model,
+                cached_tokens=23,
+                cache_write_tokens=0,
+            ),
+            ProviderDone(
+                provider=config.provider,
+                model=config.model,
+                cached_tokens=0,
+                cache_write_tokens=0,
+            ),
+        ]
+    )
+    batches: list[_RouterDynamicCacheAffinityReceiptBatch] = []
+    provider = _RouterSingleDirectProvider(
+        raw,
+        config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=_affinity_context(),
+        cache_affinity_receipt_sink=batches.append,
+        cache_affinity_generation_getter=lambda: 0,
+        cache_affinity_credential_namespace_token=(_affinity_credential_token(config)),
+    )
+
+    first = await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+    second = await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+
+    assert [event.kind for event in first] == ["done"]
+    assert [event.kind for event in second] == ["done"]
+    assert [batch.chat_call_sequence for batch in batches] == [1, 2]
+    assert len(batches[0].receipts) == 1
+    receipt = batches[0].receipts[0]
+    assert receipt.role == "single"
+    assert receipt.execution_slot == "0"
+    assert receipt.requested_identity == f"{config.provider}:{config.model}"
+    assert receipt.actual_identity == receipt.requested_identity
+    assert receipt.evidence_kind == "read_hit"
+    assert receipt.cached_tokens == 23
+    assert batches[1].receipts == ()
+    assert "synthetic-affinity-secret" not in repr(batches)
+
+
+async def test_direct_affinity_consumes_frozen_credential_token_without_reopening_secret() -> None:
+    config = _affinity_direct_config("anthropic/frozen-credential-model")
+    credential_token = _affinity_credential_token(config)
+
+    class SecretForbiddenConfig:
+        provider = config.provider
+        model = config.model
+        base_url = config.base_url
+        org_id = config.org_id
+        provider_routing = config.provider_routing
+
+        @property
+        def api_key(self) -> str:
+            raise AssertionError("physical receipt collection reopened the credential secret")
+
+    batches: list[_RouterDynamicCacheAffinityReceiptBatch] = []
+    provider = _RouterSingleDirectProvider(
+        _AffinityDoneProvider(
+            [
+                ProviderDone(
+                    provider=config.provider,
+                    model=config.model,
+                    cached_tokens=29,
+                    cache_write_tokens=0,
+                )
+            ]
+        ),
+        SecretForbiddenConfig(),
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=_affinity_context(),
+        cache_affinity_receipt_sink=batches.append,
+        cache_affinity_generation_getter=lambda: 0,
+        cache_affinity_credential_namespace_token=credential_token,
+    )
+
+    events = await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+
+    assert [event.kind for event in events] == ["done"]
+    assert len(batches) == 1
+    assert len(batches[0].receipts) == 1
+    assert batches[0].receipts[0].cached_tokens == 29
+
+
+async def test_direct_affinity_ttl_starts_at_done_and_survives_optional_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.engine.runtime as runtime_module
+
+    config = _affinity_direct_config("anthropic/terminal-clock-model")
+    clock = [10.0]
+
+    class TerminalThenAdvancingCloseStream:
+        def __init__(self) -> None:
+            self.sent = False
+
+        def __aiter__(self) -> TerminalThenAdvancingCloseStream:
+            return self
+
+        async def __anext__(self) -> Any:
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return ProviderDone(
+                provider=config.provider,
+                model=config.model,
+                cached_tokens=19,
+                cache_write_tokens=0,
+            )
+
+        async def aclose(self) -> None:
+            clock[0] = 99.0
+            raise RuntimeError("synthetic optional close failure")
+
+    class TerminalThenAdvancingCloseProvider:
+        provider_name = "openrouter"
+        _provider_routing_strict = True
+
+        def chat(
+            self,
+            messages: list[Any],
+            tools: Any = None,
+            config: Any = None,
+        ) -> TerminalThenAdvancingCloseStream:
+            del messages, tools, config
+            return TerminalThenAdvancingCloseStream()
+
+    monkeypatch.setattr(runtime_module.time, "monotonic", lambda: clock[0])
+    batches: list[_RouterDynamicCacheAffinityReceiptBatch] = []
+    provider = _RouterSingleDirectProvider(
+        TerminalThenAdvancingCloseProvider(),
+        config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=_affinity_context(),
+        cache_affinity_receipt_sink=batches.append,
+        cache_affinity_generation_getter=lambda: 0,
+        cache_affinity_credential_namespace_token=(_affinity_credential_token(config)),
+    )
+
+    events = await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+
+    assert [event.kind for event in events] == ["done"]
+    assert clock[0] == 99.0
+    assert len(batches) == 1
+    assert len(batches[0].receipts) == 1
+    assert batches[0].receipts[0].observed_at_monotonic == 10.0
+
+
+async def test_direct_affinity_rejects_unattested_identity_and_missing_terminal() -> None:
+    config = _affinity_direct_config("anthropic/identity-model")
+    raw = _AffinityDoneProvider(
+        [
+            ProviderDone(
+                provider="openrouter",
+                model="anthropic/different-model",
+                cached_tokens=11,
+                cache_write_tokens=0,
+            )
+        ]
+    )
+    batches: list[_RouterDynamicCacheAffinityReceiptBatch] = []
+    provider = _RouterSingleDirectProvider(
+        raw,
+        config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=_affinity_context(),
+        cache_affinity_receipt_sink=batches.append,
+        cache_affinity_actual_model_aliases=(
+            config.model,
+            "anthropic/identity-model-20260801",
+        ),
+        cache_affinity_credential_namespace_token=(_affinity_credential_token(config)),
+    )
+
+    await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+
+    assert len(batches) == 1
+    assert batches[0].receipts == ()
+
+    missing_batches: list[_RouterDynamicCacheAffinityReceiptBatch] = []
+    missing = _RouterSingleDirectProvider(
+        _MissingTerminalProvider(),
+        _affinity_direct_config("anthropic/missing-terminal-affinity"),
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=_affinity_context(),
+        cache_affinity_receipt_sink=missing_batches.append,
+    )
+    await _collect(missing.chat([], config=ChatConfig(timeout=30.0)))
+    assert missing_batches == []
+
+
+async def test_direct_affinity_accepts_frozen_serving_alias_and_canonicalizes_receipt() -> None:
+    config = _affinity_direct_config("anthropic/alias-model")
+    serving_alias = "anthropic/alias-model-20260801"
+    batches: list[_RouterDynamicCacheAffinityReceiptBatch] = []
+    provider = _RouterSingleDirectProvider(
+        _AffinityDoneProvider(
+            [
+                ProviderDone(
+                    provider=config.provider,
+                    model=serving_alias,
+                    cached_tokens=13,
+                    cache_write_tokens=0,
+                )
+            ]
+        ),
+        config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=_affinity_context(),
+        cache_affinity_receipt_sink=batches.append,
+        cache_affinity_actual_model_aliases=(config.model, serving_alias),
+        cache_affinity_credential_namespace_token=(_affinity_credential_token(config)),
+    )
+
+    events = await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+
+    assert [event.kind for event in events] == ["done"]
+    assert len(batches) == 1
+    assert len(batches[0].receipts) == 1
+    receipt = batches[0].receipts[0]
+    assert receipt.requested_identity == f"{config.provider}:{config.model}"
+    assert receipt.actual_identity == receipt.requested_identity
+
+
+async def test_direct_affinity_sink_failure_never_fails_successful_turn() -> None:
+    config = _affinity_direct_config("anthropic/sink-failure-model")
+    raw = _AffinityDoneProvider(
+        [
+            ProviderDone(
+                provider=config.provider,
+                model=config.model,
+                cached_tokens=0,
+                cache_write_tokens=19,
+            )
+        ]
+    )
+
+    def broken_sink(batch: _RouterDynamicCacheAffinityReceiptBatch) -> None:
+        del batch
+        raise RuntimeError("synthetic evidence sink failure")
+
+    provider = _RouterSingleDirectProvider(
+        raw,
+        config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=_affinity_context(),
+        cache_affinity_receipt_sink=broken_sink,
+        cache_affinity_credential_namespace_token=(_affinity_credential_token(config)),
+    )
+
+    events = await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+    assert [event.kind for event in events] == ["done"]
+
+
+async def test_direct_affinity_generation_guard_blocks_stale_physical_dispatch() -> None:
+    config = _affinity_direct_config("anthropic/stale-generation-model")
+    raw = _AffinityDoneProvider(
+        [
+            ProviderDone(
+                provider=config.provider,
+                model=config.model,
+                cached_tokens=1,
+            )
+        ]
+    )
+    generation = 1
+    provider = _RouterSingleDirectProvider(
+        raw,
+        config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=_affinity_context(generation=0),
+        cache_affinity_receipt_sink=lambda batch: None,
+        cache_affinity_generation_getter=lambda: generation,
+    )
+
+    events = await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+
+    assert raw.calls == 0
+    assert len(events) == 1
+    assert events[0].code == "router_dynamic_cache_generation_changed"
+    assert events[0].request_started is False
+    assert events[0].physical_request_count == 0
+
+
+async def test_single_affinity_sidecar_commits_only_latest_successful_batch() -> None:
+    config = _affinity_direct_config("anthropic/sidecar-model")
+    context = _affinity_context()
+    raw = _AffinityDoneProvider(
+        [
+            ProviderDone(
+                provider=config.provider,
+                model=config.model,
+                cached_tokens=31,
+                cache_write_tokens=0,
+            )
+        ]
+    )
+    captured: list[_RouterDynamicCacheAffinityReceiptBatch] = []
+    provider = _RouterSingleDirectProvider(
+        raw,
+        config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=context,
+        cache_affinity_receipt_sink=captured.append,
+        cache_affinity_generation_getter=lambda: 0,
+        cache_affinity_credential_namespace_token=(_affinity_credential_token(config)),
+    )
+    await _collect(provider.chat([], config=ChatConfig(timeout=30.0)))
+    assert len(captured) == 1
+
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    assert runner._router_dynamic_cache_affinity is None
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology="single",
+        ttl_seconds=60.0,
+        route_cache_max_entries=2,
+        source={"enabled": True},
+    )
+    sidecar_key = runner._register_router_dynamic_cache_sidecar(
+        context=context,
+        policy=policy,
+    )
+    assert runner._stage_router_dynamic_cache_affinity_batch(
+        sidecar_key,
+        captured[0],
+    )
+    turn = SimpleNamespace(
+        session_key=context.session_key,
+        metadata={"router_single_decision_id": context.decision_id},
+    )
+    assert runner._commit_pending_router_dynamic_cache_affinity(
+        turn,
+        EngineDone(),
+    )
+    available, receipts, generation = runner._router_single_cache_continuity_snapshot(
+        session_key=context.session_key,
+        session_epoch=context.session_epoch,
+        policy=policy,
+        now=captured[0].receipts[0].observed_at_monotonic + 1.0,
+    )
+    assert available is True
+    assert receipts == captured[0].receipts
+    assert generation == 0
+
+    next_context = _affinity_context(
+        decision_id="decision-affinity-empty",
+        provider_instance_token="provider-affinity-empty",
+    )
+    empty_key = runner._register_router_dynamic_cache_sidecar(
+        context=next_context,
+        policy=policy,
+    )
+    empty_batch = _RouterDynamicCacheAffinityReceiptBatch(
+        turn_id=next_context.turn_id,
+        decision_id=next_context.decision_id,
+        provider_instance_token=next_context.provider_instance_token,
+        provider_instance_generation=0,
+        chat_call_id="chat-empty",
+        chat_call_sequence=1,
+        runtime_generation=0,
+        topology="single",
+        receipts=(),
+    )
+    assert runner._stage_router_dynamic_cache_affinity_batch(empty_key, empty_batch)
+    empty_turn = SimpleNamespace(
+        session_key=next_context.session_key,
+        metadata={"router_single_decision_id": next_context.decision_id},
+    )
+    assert not runner._commit_pending_router_dynamic_cache_affinity(
+        empty_turn,
+        EngineDone(),
+    )
+    assert not runner._router_single_cache_continuity_snapshot(
+        session_key=context.session_key,
+        session_epoch=context.session_epoch,
+        policy=policy,
+    )[0]
+
+
+async def test_cache_affinity_state_is_not_shared_with_a_new_runner() -> None:
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology="single",
+        ttl_seconds=60.0,
+        route_cache_max_entries=2,
+        source={"strategy": "bonus"},
+    )
+    original = TurnRunner(provider_selector=None, config=_router_single_config())
+    context = await _seed_single_affinity_state(
+        original,
+        policy,
+        session_key="agent:main:process-restart",
+        decision_id="process-restart-seed",
+    )
+    assert original._router_single_cache_continuity_snapshot(
+        session_key=context.session_key,
+        session_epoch=context.session_epoch,
+        policy=policy,
+    )[0]
+
+    replacement = TurnRunner(provider_selector=None, config=_router_single_config())
+
+    assert replacement._router_dynamic_cache_affinity is None
+    assert not replacement._router_single_cache_continuity_snapshot(
+        session_key=context.session_key,
+        session_epoch=context.session_epoch,
+        policy=policy,
+    )[0]
+
+async def test_single_affinity_failed_turn_and_missing_batch_clear_previous() -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology="single",
+        ttl_seconds=60.0,
+        route_cache_max_entries=4,
+        source={"strategy": "bonus"},
+    )
+    context = await _seed_single_affinity_state(
+        runner,
+        policy,
+        session_key="agent:main:preserve",
+        decision_id="preserve-seed",
+    )
+
+    missing_context = _affinity_context(
+        decision_id="preserve-missing",
+        provider_instance_token="provider-preserve-missing",
+        session_key=context.session_key,
+    )
+    runner._register_router_dynamic_cache_sidecar(
+        context=missing_context,
+        policy=policy,
+    )
+    missing_turn = SimpleNamespace(
+        session_key=context.session_key,
+        metadata={"router_single_decision_id": missing_context.decision_id},
+    )
+    assert not runner._commit_pending_router_dynamic_cache_affinity(
+        missing_turn,
+        EngineDone(),
+    )
+    assert not runner._router_single_cache_continuity_snapshot(
+        session_key=context.session_key,
+        session_epoch=context.session_epoch,
+        policy=policy,
+    )[0]
+
+    await _seed_single_affinity_state(
+        runner,
+        policy,
+        session_key=context.session_key,
+        decision_id="clear-reseed",
+    )
+    failed_context = _affinity_context(
+        decision_id="clear-failed",
+        provider_instance_token="provider-clear-failed",
+        session_key=context.session_key,
+    )
+    runner._register_router_dynamic_cache_sidecar(
+        context=failed_context,
+        policy=policy,
+    )
+    failed_turn = SimpleNamespace(
+        session_key=context.session_key,
+        metadata={"router_single_decision_id": failed_context.decision_id},
+    )
+    runner._discard_pending_router_dynamic_cache_affinity(
+        failed_turn,
+        session_key=context.session_key,
+    )
+    assert not runner._router_single_cache_continuity_snapshot(
+        session_key=context.session_key,
+        session_epoch=context.session_epoch,
+        policy=policy,
+    )[0]
+
+
+@pytest.mark.parametrize("topology", ["single", "multiple"])
+@pytest.mark.parametrize("session_epoch_available", [True, False])
+async def test_affinity_analyzer_failure_before_materialization_clears_previous(
+    monkeypatch: pytest.MonkeyPatch,
+    topology: str,
+    session_epoch_available: bool,
+) -> None:
+    import opensquilla.provider.ranking_router as ranking_module
+    from opensquilla.engine.pipeline import TurnContext
+
+    selected = _affinity_direct_config(f"anthropic/pre-materialize-{topology}")
+    session_key = f"agent:main:pre-materialize-{topology}"
+    session_epoch = 7
+    policy_override = {
+        "session": {
+            "kv_cache_affinity": {
+                "strategy": "bonus",
+                "topologies": [topology],
+                "ttl_seconds": 300,
+                "age_decay": "linear",
+                "bonus_by_evidence": {
+                    "read_hit": 0.05,
+                    "write_only": 0.025,
+                },
+            }
+        }
+    }
+    config = GatewayConfig(
+        squilla_router=SquillaRouterConfig(enabled=False),
+        llm={
+            "provider": selected.provider,
+            "model": selected.model,
+            "api_key": selected.api_key,
+            "base_url": selected.base_url,
+            "max_tokens": 4_096,
+            "context_window_tokens": 128_000,
+        },
+        llm_ensemble={
+            "enabled": True,
+            "mode": topology,
+            "selection_mode": "router_dynamic",
+            "ranking_config_override": policy_override,
+            "ranking_thinking_assignment_enabled": False,
+            "latency_class": "experiment",
+        },
+    )
+    runner = TurnRunner(
+        provider_selector=_Selector(selected),
+        config=config,
+        model_catalog=_Catalog(),
+        session_manager=object(),
+    )
+    monkeypatch.setattr(
+        "opensquilla.gateway.session_services.get_session_epoch",
+        lambda manager, key: session_epoch if session_epoch_available else None,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_router_dynamic_task_analyzer_provider",
+        lambda *args, **kwargs: None,
+    )
+
+    async def fail_analyzer(**kwargs: Any) -> Any:
+        del kwargs
+        raise RuntimeError("synthetic analyzer failure before provider materialization")
+
+    monkeypatch.setattr(ranking_module, "analyze_task_with_provider", fail_analyzer)
+    monkeypatch.setattr(
+        ranking_module,
+        "analyze_task_with_fallback_chain",
+        fail_analyzer,
+    )
+    policy = _router_dynamic_cache_affinity_policy(
+        config.llm_ensemble.prepared_ranking_config(),
+        topology=topology,
+    )
+    if topology == "single":
+        await _seed_single_affinity_state(
+            runner,
+            policy,
+            session_key=session_key,
+            decision_id="pre-materialize-seed-single",
+            session_epoch=session_epoch,
+        )
+        turn = TurnContext(
+            message="continue",
+            session_key=session_key,
+            config=config,
+            provider=_NoChatProvider(),
+            model=selected.model,
+            tool_defs=[],
+            system_prompt="system",
+            attachments=[],
+            metadata={"routed_tier": "c2", "routing_confidence": 0.9},
+        )
+        with pytest.raises(RuntimeError, match="synthetic analyzer failure"):
+            await runner._resolve_router_single_provider(
+                turn=turn,
+                provider=turn.provider,
+                cloned_selector=_Selector(selected),
+                turn_config=config,
+                ensemble_cfg=config.llm_ensemble,
+                turn_absolute_deadline=None,
+            )
+        assert bool(turn.metadata.get("router_single_decision_id")) is (
+            session_epoch_available
+        )
+        cleanup_turn: object | None = turn
+    else:
+        await _seed_multiple_affinity_state(
+            runner,
+            policy,
+            session_key=session_key,
+            decision_id="pre-materialize-seed-multiple",
+            session_epoch=session_epoch,
+        )
+        turn, _ = await runner._run_pipeline(
+            "continue",
+            session_key,
+            _NoChatProvider(),
+            _Selector(selected),
+            [],
+            "system",
+            [],
+        )
+        assert turn.metadata["ensemble_wrap_skipped_reason"] == (
+            "router_dynamic_ranking_unavailable"
+        )
+        cleanup_turn = turn
+
+    sidecars = runner._router_dynamic_cache_affinity_sidecars
+    assert sidecars is not None
+    if session_epoch_available:
+        assert any(key[0] == session_key for key in sidecars)
+        runner._discard_pending_router_dynamic_cache_affinity(
+            cleanup_turn,
+            session_key=session_key,
+        )
+    else:
+        assert not any(key[0] == session_key for key in sidecars)
+    assert not runner._router_dynamic_cache_continuity_snapshot(
+        session_key=session_key,
+        session_epoch=session_epoch,
+        policy=policy,
+    )[0]
+
+@pytest.mark.parametrize("topology", ["single", "multiple"])
+async def test_successful_selector_fallback_clears_old_and_earlier_chat_affinity(
+    topology: str,
+) -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology=topology,
+        ttl_seconds=60.0,
+        route_cache_max_entries=4,
+        source={"strategy": "bonus"},
+    )
+    session_key = f"agent:main:fallback-clears-{topology}"
+    session_epoch = 23
+    role = "single" if topology == "single" else "proposer"
+    seed_context = _RouterDynamicCacheAffinityCollectionContext(
+        turn_id=f"turn-seed-{topology}",
+        decision_id=f"decision-seed-{topology}",
+        provider_instance_token=f"provider-seed-{topology}",
+        provider_instance_generation=0,
+        session_key=session_key,
+        session_epoch=session_epoch,
+        selection_generation=0,
+        topology=topology,
+    )
+    seed_receipt = build_cache_affinity_receipt(
+        physical_attempt_id=f"attempt-seed-{topology}",
+        role=role,
+        topology=topology,
+        execution_slot="0" if topology == "single" else "0:0",
+        requested_identity="openrouter:seed/model",
+        actual_identity="openrouter:seed/model",
+        cache_domain_guard=CacheDomainGuard(b"f" * 32),
+        cached_tokens=17,
+        cache_write_tokens=0,
+        observed_at_monotonic=time.monotonic(),
+    )
+    assert seed_receipt is not None
+    seed_key = runner._register_router_dynamic_cache_sidecar(
+        context=seed_context,
+        policy=policy,
+    )
+    assert runner._stage_router_dynamic_cache_affinity_batch(
+        seed_key,
+        _RouterDynamicCacheAffinityReceiptBatch(
+            turn_id=seed_context.turn_id,
+            decision_id=seed_context.decision_id,
+            provider_instance_token=seed_context.provider_instance_token,
+            provider_instance_generation=0,
+            chat_call_id=f"chat-seed-{topology}",
+            chat_call_sequence=1,
+            runtime_generation=0,
+            topology=topology,
+            receipts=(seed_receipt,),
+        ),
+    )
+    seed_metadata_key = (
+        "router_single_decision_id" if topology == "single" else "ensemble_decision_id"
+    )
+    assert runner._commit_pending_router_dynamic_cache_affinity(
+        SimpleNamespace(
+            session_key=session_key,
+            metadata={seed_metadata_key: seed_context.decision_id},
+        ),
+        EngineDone(),
+    )
+    assert runner._router_dynamic_cache_continuity_snapshot(
+        session_key=session_key,
+        session_epoch=session_epoch,
+        policy=policy,
+    )[0]
+
+    # A cancelled/failed turn is authoritative negative evidence for the
+    # selected topology even though it never reaches Engine Done.
+    cancelled_context = replace(
+        seed_context,
+        turn_id=f"turn-cancelled-{topology}",
+        decision_id=f"decision-cancelled-{topology}",
+        provider_instance_token=f"provider-cancelled-{topology}",
+    )
+    runner._register_router_dynamic_cache_sidecar(
+        context=cancelled_context,
+        policy=policy,
+    )
+    runner._discard_pending_router_dynamic_cache_affinity(
+        SimpleNamespace(
+            session_key=session_key,
+            metadata={
+                seed_metadata_key: cancelled_context.decision_id,
+                "router_fallback_hops": 1,
+            },
+        ),
+        session_key=session_key,
+    )
+    assert not runner._router_dynamic_cache_continuity_snapshot(
+        session_key=session_key,
+        session_epoch=session_epoch,
+        policy=policy,
+    )[0]
+
+    fallback_context = replace(
+        seed_context,
+        turn_id=f"turn-fallback-{topology}",
+        decision_id=f"decision-fallback-{topology}",
+        provider_instance_token=f"provider-fallback-{topology}",
+    )
+    fallback_sidecar_key = runner._register_router_dynamic_cache_sidecar(
+        context=fallback_context,
+        policy=policy,
+    )
+    first_chat_receipt = build_cache_affinity_receipt(
+        physical_attempt_id=f"attempt-first-chat-{topology}",
+        role=role,
+        topology=topology,
+        execution_slot="0" if topology == "single" else "0:0",
+        requested_identity="openrouter:first-chat/model",
+        actual_identity="openrouter:first-chat/model",
+        cache_domain_guard=CacheDomainGuard(b"g" * 32),
+        cached_tokens=29,
+        cache_write_tokens=0,
+        observed_at_monotonic=time.monotonic(),
+    )
+    assert first_chat_receipt is not None
+    assert runner._stage_router_dynamic_cache_affinity_batch(
+        fallback_sidecar_key,
+        _RouterDynamicCacheAffinityReceiptBatch(
+            turn_id=fallback_context.turn_id,
+            decision_id=fallback_context.decision_id,
+            provider_instance_token=fallback_context.provider_instance_token,
+            provider_instance_generation=0,
+            chat_call_id=f"chat-first-{topology}",
+            chat_call_sequence=1,
+            runtime_generation=0,
+            topology=topology,
+            receipts=(first_chat_receipt,),
+        ),
+    )
+
+    class SuccessfulFallbackProvider:
+        provider_name = "openrouter"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(
+            self,
+            messages: list[Any],
+            tools: Any = None,
+            config: Any = None,
+        ) -> AsyncIterator[Any]:
+            del messages, tools, config
+            self.calls += 1
+
+            async def stream() -> AsyncIterator[Any]:
+                yield ProviderText(text="fallback success")
+                yield ProviderDone(
+                    provider="openrouter",
+                    model="fallback/model",
+                )
+
+            return stream()
+
+    class SuccessfulFallbackSelector:
+        def __init__(self, fallback: SuccessfulFallbackProvider) -> None:
+            self._fallback = fallback
+            self.current_config = ProviderConfig(
+                provider="openrouter",
+                model="seed/model",
+                api_key="synthetic",
+            )
+
+        @property
+        def active_provider_id(self) -> str:
+            return self.current_config.provider
+
+        def next_fallback_after_failure(
+            self,
+            error: Exception,
+        ) -> SuccessfulFallbackProvider:
+            del error
+            self.current_config = replace(
+                self.current_config,
+                model="fallback/model",
+            )
+            return self._fallback
+
+    metadata = {seed_metadata_key: fallback_context.decision_id}
+    fallback = SuccessfulFallbackProvider()
+    wrapped = _SelectorFallbackProvider(
+        _ErrorProvider("429"),
+        SuccessfulFallbackSelector(fallback),
+        turn_metadata=metadata,
+    )
+
+    events = await _collect(wrapped.chat([], config=ChatConfig()))
+
+    assert fallback.calls == 1
+    assert any(getattr(event, "kind", "") == "done" for event in events)
+    assert metadata["router_fallback_hops"] == 1
+    assert not runner._commit_pending_router_dynamic_cache_affinity(
+        SimpleNamespace(session_key=session_key, metadata=metadata),
+        EngineDone(),
+    )
+    assert not runner._router_dynamic_cache_continuity_snapshot(
+        session_key=session_key,
+        session_epoch=session_epoch,
+        policy=policy,
+    )[0]
+
+
+async def test_single_affinity_read_enforces_current_effective_lru_capacity() -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    wide_policy = _RouterDynamicCacheAffinityPolicy(
+        topology="single",
+        ttl_seconds=60.0,
+        route_cache_max_entries=3,
+        source={"strategy": "bonus"},
+    )
+    for index in range(3):
+        await _seed_single_affinity_state(
+            runner,
+            wide_policy,
+            session_key=f"agent:main:lru-{index}",
+            decision_id=f"lru-{index}",
+        )
+
+    narrow_policy = _RouterDynamicCacheAffinityPolicy(
+        topology="single",
+        ttl_seconds=60.0,
+        route_cache_max_entries=1,
+        source={"strategy": "bonus"},
+    )
+    assert runner._router_single_cache_continuity_snapshot(
+        session_key="agent:main:lru-2",
+        session_epoch=7,
+        policy=narrow_policy,
+    )[0]
+    assert runner._router_dynamic_cache_affinity is not None
+    assert len(runner._router_dynamic_cache_affinity) == 1
+
+
+async def test_affinity_control_state_is_bounded_and_keeps_live_dispatch_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    runner._session_manager = object()
+    epochs: dict[str, int] = {}
+    monkeypatch.setattr(
+        "opensquilla.gateway.session_services.get_session_epoch",
+        lambda manager, key: epochs.get(key),
+    )
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology="single",
+        ttl_seconds=60.0,
+        route_cache_max_entries=2,
+        source={"strategy": "bonus"},
+    )
+    runner._ensure_router_dynamic_cache_affinity_state()
+
+    for index in range(12):
+        session_key = f"agent:main:control-{index}"
+        epochs[session_key] = index
+        assert await runner._resolve_router_dynamic_session_epoch(session_key) == index
+        runner._router_dynamic_cache_continuity_snapshot(
+            session_key=session_key,
+            session_epoch=index,
+            policy=policy,
+        )
+
+    assert runner._router_dynamic_cache_affinity_generation is not None
+    assert runner._router_dynamic_cache_affinity_epoch_by_key is not None
+    assert len(runner._router_dynamic_cache_affinity_generation) <= 2
+    assert len(runner._router_dynamic_cache_affinity_epoch_by_key) <= 2
+
+    active_session = "agent:main:control-active"
+    epochs[active_session] = 23
+    assert await runner._resolve_router_dynamic_session_epoch(active_session) == 23
+    _, _, selected_generation = runner._router_dynamic_cache_continuity_snapshot(
+        session_key=active_session,
+        session_epoch=23,
+        policy=policy,
+    )
+    context = _affinity_context(
+        decision_id="control-active",
+        provider_instance_token="provider-control-active",
+        generation=selected_generation,
+        session_key=active_session,
+        session_epoch=23,
+    )
+    runner._register_router_dynamic_cache_sidecar(context=context, policy=policy)
+    runner._invalidate_router_dynamic_cache_affinity(
+        session_key=active_session,
+        reason="test_live_fence",
+    )
+    invalidated_generation = runner._router_dynamic_cache_generation(active_session)
+    assert invalidated_generation != selected_generation
+
+    for index in range(20):
+        runner._invalidate_router_dynamic_cache_affinity(
+            session_key=f"agent:main:invalidated-{index}",
+            reason="test_control_capacity",
+        )
+
+    assert runner._router_dynamic_cache_generation(active_session) == invalidated_generation
+    assert active_session in runner._router_dynamic_cache_affinity_generation
+    assert len(runner._router_dynamic_cache_affinity_generation) <= 2
+    assert len(runner._router_dynamic_cache_affinity_epoch_by_key) <= 2
+
+    raw = _AffinityDoneProvider(
+        [
+            ProviderDone(
+                provider="openrouter",
+                model="anthropic/control-active",
+                cached_tokens=1,
+            )
+        ]
+    )
+    direct = _RouterSingleDirectProvider(
+        raw,
+        _affinity_direct_config("anthropic/control-active"),
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=context,
+        cache_affinity_receipt_sink=lambda batch: None,
+        cache_affinity_generation_getter=(
+            lambda: runner._router_dynamic_cache_generation(active_session)
+        ),
+    )
+    events = await _collect(direct.chat([], config=ChatConfig(timeout=30.0)))
+    assert raw.calls == 0
+    assert len(events) == 1
+    assert events[0].code == "router_dynamic_cache_generation_changed"
+
+    runner._discard_pending_router_dynamic_cache_affinity(
+        SimpleNamespace(
+            session_key=active_session,
+            metadata={"router_single_decision_id": context.decision_id},
+        ),
+        session_key=active_session,
+    )
+    for index in range(12, 18):
+        session_key = f"agent:main:control-{index}"
+        epochs[session_key] = index
+        assert await runner._resolve_router_dynamic_session_epoch(session_key) == index
+        runner._router_dynamic_cache_continuity_snapshot(
+            session_key=session_key,
+            session_epoch=index,
+            policy=policy,
+        )
+
+    assert active_session not in runner._router_dynamic_cache_affinity_generation
+    assert active_session not in runner._router_dynamic_cache_affinity_epoch_by_key
+    assert len(runner._router_dynamic_cache_affinity_generation) <= 2
+    assert len(runner._router_dynamic_cache_affinity_epoch_by_key) <= 2
+
+
+def test_affinity_compaction_listener_is_singleton_and_removed_after_hot_rebuild() -> None:
+    import opensquilla.engine.cache_break_monitor as monitor_module
+
+    gc.collect()
+    baseline = len(monitor_module._compaction_listeners)
+    for index in range(4):
+        runner = TurnRunner(provider_selector=None, config=_router_single_config())
+        runner._ensure_router_dynamic_cache_compaction_listener(
+            route_cache_max_entries=2,
+        )
+        runner._ensure_router_dynamic_cache_compaction_listener(
+            route_cache_max_entries=2,
+        )
+        assert len(monitor_module._compaction_listeners) == baseline + 1
+        runner_ref = weakref.ref(runner)
+        del runner
+        gc.collect()
+        assert runner_ref() is None, index
+        assert len(monitor_module._compaction_listeners) == baseline
+
+
+def test_affinity_session_delete_listener_is_singleton_and_removed_after_hot_rebuild() -> None:
+    class DeleteAwareStorage:
+        def __init__(self) -> None:
+            self.listeners: list[Any] = []
+
+        def add_session_delete_listener(self, listener: Any) -> Any:
+            self.listeners.append(listener)
+
+            def remove() -> None:
+                if listener in self.listeners:
+                    self.listeners.remove(listener)
+
+            return remove
+
+    storage = DeleteAwareStorage()
+    manager = SimpleNamespace(storage=storage)
+    for index in range(4):
+        runner = TurnRunner(
+            provider_selector=None,
+            config=_router_single_config(),
+            session_manager=manager,
+        )
+        runner._ensure_router_dynamic_cache_compaction_listener(
+            route_cache_max_entries=2,
+        )
+        runner._ensure_router_dynamic_cache_compaction_listener(
+            route_cache_max_entries=2,
+        )
+        assert len(storage.listeners) == 1
+        runner_ref = weakref.ref(runner)
+        del runner
+        gc.collect()
+        assert runner_ref() is None, index
+        assert storage.listeners == []
+
+
+async def test_single_affinity_epoch_is_fail_closed_and_independent() -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+
+    assert await runner._resolve_router_dynamic_session_epoch("agent:main:none") is None
+    assert runner._router_dynamic_cache_affinity_epoch_by_key is None
+    assert runner._usage_session_epoch_by_key == {}
+
+    runner._ensure_router_dynamic_cache_affinity_state()
+    assert runner._router_dynamic_cache_affinity_epoch_by_key == {}
+
+
+async def test_session_delete_purges_sidecar_epoch_and_same_key_recreate_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology="single",
+        ttl_seconds=60.0,
+        route_cache_max_entries=4,
+        source={"strategy": "bonus"},
+    )
+    session_key = "agent:main:delete-recreate"
+    await _seed_single_affinity_state(
+        runner,
+        policy,
+        session_key=session_key,
+        decision_id="delete-recreate-seed",
+        session_epoch=0,
+    )
+    assert runner._router_dynamic_cache_affinity_epoch_by_key is not None
+    runner._router_dynamic_cache_affinity_epoch_by_key[session_key] = 0
+    generation_before_delete = runner._router_dynamic_cache_generation(session_key)
+    pending_context = _affinity_context(
+        decision_id="delete-recreate-pending",
+        provider_instance_token="provider-delete-recreate-pending",
+        generation=generation_before_delete,
+        session_key=session_key,
+        session_epoch=0,
+    )
+    pending_key = runner._register_router_dynamic_cache_sidecar(
+        context=pending_context,
+        policy=policy,
+    )
+
+    runner._invalidate_router_dynamic_cache_affinity(
+        session_key=session_key,
+        reason="session_deleted",
+    )
+
+    assert runner._router_dynamic_cache_generation(session_key) > generation_before_delete
+    assert runner._router_dynamic_cache_affinity_sidecars is not None
+    assert pending_key not in runner._router_dynamic_cache_affinity_sidecars
+    assert session_key not in runner._router_dynamic_cache_affinity_epoch_by_key
+    assert not runner._router_dynamic_cache_continuity_snapshot(
+        session_key=session_key,
+        session_epoch=0,
+        policy=policy,
+    )[0]
+
+    runner._session_manager = object()
+    monkeypatch.setattr(
+        "opensquilla.gateway.session_services.get_session_epoch",
+        lambda manager, key: 0,
+    )
+    assert await runner._resolve_router_dynamic_session_epoch(session_key) == 0
+    assert not runner._router_dynamic_cache_continuity_snapshot(
+        session_key=session_key,
+        session_epoch=0,
+        policy=policy,
+    )[0]
+
+
+async def test_durable_storage_delete_notifies_runtime_affinity_owner() -> None:
+    from opensquilla.session.manager import SessionManager
+    from opensquilla.session.storage import SessionStorage
+
+    storage = SessionStorage()
+    await storage.connect()
+    manager = SessionManager(storage)
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_router_single_config(),
+        session_manager=manager,
+    )
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology="single",
+        ttl_seconds=60.0,
+        route_cache_max_entries=4,
+        source={"strategy": "bonus"},
+    )
+    session_key = "agent:main:durable-delete-recreate"
+    try:
+        await manager.create(session_key)
+        runner._ensure_router_dynamic_cache_compaction_listener(
+            route_cache_max_entries=policy.route_cache_max_entries,
+        )
+        seeded = await _seed_single_affinity_state(
+            runner,
+            policy,
+            session_key=session_key,
+            decision_id="durable-delete-seed",
+            session_epoch=0,
+        )
+        manager.set_cached_epoch(session_key, 0)
+        assert runner._router_dynamic_cache_affinity_epoch_by_key is not None
+        runner._router_dynamic_cache_affinity_epoch_by_key[session_key] = 0
+        generation_before_delete = runner._router_dynamic_cache_generation(session_key)
+        pending_context = _affinity_context(
+            decision_id="durable-delete-pending",
+            provider_instance_token="provider-durable-delete-pending",
+            generation=generation_before_delete,
+            session_key=session_key,
+            session_epoch=0,
+        )
+        pending_key = runner._register_router_dynamic_cache_sidecar(
+            context=pending_context,
+            policy=policy,
+        )
+
+        await storage.delete_session(session_key)
+
+        assert manager.get_cached_epoch(session_key) is None
+        assert runner._router_dynamic_cache_generation(session_key) > generation_before_delete
+        assert runner._router_dynamic_cache_affinity_sidecars is not None
+        assert pending_key not in runner._router_dynamic_cache_affinity_sidecars
+        assert session_key not in runner._router_dynamic_cache_affinity_epoch_by_key
+        assert not runner._router_single_cache_continuity_snapshot(
+            session_key=session_key,
+            session_epoch=seeded.session_epoch,
+            policy=policy,
+        )[0]
+
+        recreated = await manager.create(session_key)
+        assert recreated.epoch == 0
+        assert await runner._resolve_router_dynamic_session_epoch(session_key) == 0
+        assert not runner._router_single_cache_continuity_snapshot(
+            session_key=session_key,
+            session_epoch=0,
+            policy=policy,
+        )[0]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.parametrize("delete_path", ["prune", "cap"])
+async def test_manager_maintenance_delete_invalidates_runtime_affinity(
+    delete_path: str,
+) -> None:
+    from opensquilla.session.manager import SessionManager
+    from opensquilla.session.storage import SessionStorage
+
+    storage = SessionStorage()
+    await storage.connect()
+    manager = SessionManager(storage)
+    runner = TurnRunner(
+        provider_selector=None,
+        config=_router_single_config(),
+        session_manager=manager,
+    )
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology="single",
+        ttl_seconds=60.0,
+        route_cache_max_entries=4,
+        source={"strategy": "bonus"},
+    )
+    session_key = f"agent:main:maintenance-{delete_path}"
+    try:
+        node = await manager.create(session_key)
+        await storage.upsert_session(node.model_copy(update={"updated_at": 1}))
+        if delete_path == "cap":
+            await manager.create(f"agent:main:maintenance-{delete_path}-keeper")
+        runner._ensure_router_dynamic_cache_compaction_listener(
+            route_cache_max_entries=policy.route_cache_max_entries,
+        )
+        seeded = await _seed_single_affinity_state(
+            runner,
+            policy,
+            session_key=session_key,
+            decision_id=f"maintenance-{delete_path}-seed",
+            session_epoch=0,
+        )
+        manager.set_cached_epoch(session_key, 0)
+        assert runner._router_dynamic_cache_affinity_epoch_by_key is not None
+        runner._router_dynamic_cache_affinity_epoch_by_key[session_key] = 0
+        generation_before_delete = runner._router_dynamic_cache_generation(session_key)
+
+        if delete_path == "prune":
+            assert await manager.prune_stale(max_age_ms=1) == 1
+        else:
+            assert await manager.cap_entries(max_entries=1) == 1
+
+        assert await storage.get_session(session_key) is None
+        assert manager.get_cached_epoch(session_key) is None
+        assert runner._router_dynamic_cache_generation(session_key) > generation_before_delete
+        assert not runner._router_single_cache_continuity_snapshot(
+            session_key=session_key,
+            session_epoch=seeded.session_epoch,
+            policy=policy,
+        )[0]
+
+        recreated = await manager.create(session_key)
+        assert recreated.epoch == 0
+        assert await runner._resolve_router_dynamic_session_epoch(session_key) == 0
+        assert not runner._router_single_cache_continuity_snapshot(
+            session_key=session_key,
+            session_epoch=0,
+            policy=policy,
+        )[0]
+    finally:
+        await storage.close()
+
+
+def test_runtime_affinity_outer_thinking_projection_matches_agent_chat_config() -> None:
+    runner = TurnRunner(
+        provider_selector=None,
+        config=GatewayConfig(
+            llm={"thinking": None},
+            squilla_router=SquillaRouterConfig(enabled=False),
+        ),
+    )
+    enabled_turn = SimpleNamespace(
+        semantic_message="reason carefully",
+        metadata={"thinking_requested": True, "thinking_level": "low"},
+    )
+    disabled_turn = SimpleNamespace(
+        semantic_message="answer",
+        metadata={},
+    )
+
+    assert runner._router_dynamic_outer_thinking_projection(enabled_turn) == {
+        "thinking_enabled": True,
+        "effective_thinking_level": "low",
+        "thinking_budget_tokens": AgentConfig(thinking=ThinkingLevel.LOW).resolve_thinking(
+            prompt="reason carefully"
+        )[1],
+    }
+    assert runner._router_dynamic_outer_thinking_projection(disabled_turn) == {
+        "thinking_enabled": False,
+        "effective_thinking_level": "off",
+        "thinking_budget_tokens": 0,
+    }
+
+
+def test_runtime_affinity_policy_uses_authoritative_validator_and_absent_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.provider.ranking_router as ranking_router
+
+    baseline = ranking_config_snapshot()
+
+    def fail_if_called(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("absent affinity must not call the policy helper")
+
+    monkeypatch.setattr(
+        ranking_router,
+        "router_dynamic_cache_affinity_policy",
+        fail_if_called,
+    )
+    assert (
+        _router_dynamic_cache_affinity_policy(
+            baseline,
+            topology="single",
+        )
+        is None
+    )
+
+    calls: list[str] = []
+    enabled = ranking_config_snapshot(
+        override={
+            "session": {
+                "kv_cache_affinity": {
+                    "strategy": "bonus",
+                    "topologies": ["single"],
+                    "ttl_seconds": 45,
+                    "age_decay": "linear",
+                    "bonus_by_evidence": {
+                        "read_hit": 0.01,
+                        "write_only": 0.005,
+                    },
+                }
+            }
+        }
+    )
+
+    def authoritative(
+        config: Any,
+        *,
+        topology: str,
+    ) -> dict[str, Any]:
+        assert config is enabled
+        calls.append(topology)
+        return dict(enabled["session"]["kv_cache_affinity"])
+
+    monkeypatch.setattr(
+        ranking_router,
+        "router_dynamic_cache_affinity_policy",
+        authoritative,
+    )
+    policy = _router_dynamic_cache_affinity_policy(enabled, topology="single")
+
+    assert calls == ["single"]
+    assert policy is not None
+    assert policy.ttl_seconds == 45.0
+    assert policy.route_cache_max_entries == enabled["session"]["route_cache_max_entries"]
+
+
+def _multiple_affinity_receipt(
+    attempt_id: str,
+    *,
+    cached_tokens: int = 1,
+) -> Any:
+    receipt = build_cache_affinity_receipt(
+        physical_attempt_id=attempt_id,
+        role="proposer",
+        topology="multiple",
+        execution_slot="proposer:0:0",
+        requested_identity="openrouter:anthropic/model",
+        actual_identity="openrouter:anthropic/model",
+        cache_domain_guard=CacheDomainGuard(b"m" * 32),
+        cached_tokens=cached_tokens,
+        cache_write_tokens=0,
+        observed_at_monotonic=10.0 + cached_tokens,
+    )
+    assert receipt is not None
+    return receipt
+
+
+def _multiple_affinity_context(
+    *,
+    decision_id: str,
+    provider_token: str,
+    generation: int = 0,
+) -> _RouterDynamicCacheAffinityCollectionContext:
+    return _RouterDynamicCacheAffinityCollectionContext(
+        turn_id="turn-multiple",
+        decision_id=decision_id,
+        provider_instance_token=provider_token,
+        provider_instance_generation=0,
+        session_key="agent:main:multiple-affinity",
+        session_epoch=3,
+        selection_generation=generation,
+        topology="multiple",
+    )
+
+
+def _multiple_affinity_batch(
+    context: _RouterDynamicCacheAffinityCollectionContext,
+    *,
+    provider_token: str,
+    provider_generation: int,
+    chat_sequence: int,
+    receipts: tuple[Any, ...],
+) -> _RouterDynamicCacheAffinityReceiptBatch:
+    return _RouterDynamicCacheAffinityReceiptBatch(
+        turn_id=context.turn_id,
+        decision_id=context.decision_id,
+        provider_instance_token=provider_token,
+        provider_instance_generation=provider_generation,
+        chat_call_id=f"chat-{provider_generation}-{chat_sequence}",
+        chat_call_sequence=chat_sequence,
+        runtime_generation=context.selection_generation,
+        topology="multiple",
+        receipts=receipts,
+    )
+
+
+def test_multiple_affinity_retry_generation_dominates_old_provider_batches() -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology="multiple",
+        ttl_seconds=60.0,
+        route_cache_max_entries=4,
+        source={"strategy": "bonus"},
+    )
+    context = _multiple_affinity_context(
+        decision_id="multiple-retry",
+        provider_token="provider-generation-0",
+    )
+    key = runner._register_router_dynamic_cache_sidecar(
+        context=context,
+        policy=policy,
+    )
+    first_receipt = _multiple_affinity_receipt("attempt-first")
+    final_receipt = _multiple_affinity_receipt(
+        "attempt-final",
+        cached_tokens=7,
+    )
+    assert runner._stage_router_dynamic_cache_affinity_batch(
+        key,
+        _multiple_affinity_batch(
+            context,
+            provider_token="provider-generation-0",
+            provider_generation=0,
+            chat_sequence=0,
+            receipts=(first_receipt,),
+        ),
+    )
+    assert runner._stage_router_dynamic_cache_affinity_batch(
+        key,
+        _multiple_affinity_batch(
+            context,
+            provider_token="provider-generation-1",
+            provider_generation=1,
+            chat_sequence=1,
+            receipts=(final_receipt,),
+        ),
+    )
+    # A late callback from the retired provider cannot win even with a newer
+    # apparent chat sequence, and the active generation's token is immutable.
+    assert not runner._stage_router_dynamic_cache_affinity_batch(
+        key,
+        _multiple_affinity_batch(
+            context,
+            provider_token="provider-generation-0",
+            provider_generation=0,
+            chat_sequence=2,
+            receipts=(first_receipt,),
+        ),
+    )
+    assert not runner._stage_router_dynamic_cache_affinity_batch(
+        key,
+        _multiple_affinity_batch(
+            context,
+            provider_token="wrong-token-generation-1",
+            provider_generation=1,
+            chat_sequence=2,
+            receipts=(first_receipt,),
+        ),
+    )
+    turn = SimpleNamespace(
+        session_key=context.session_key,
+        metadata={"ensemble_decision_id": context.decision_id},
+    )
+    assert runner._commit_pending_router_dynamic_cache_affinity(
+        turn,
+        EngineDone(),
+    )
+    available, receipts, _ = runner._router_dynamic_cache_continuity_snapshot(
+        session_key=context.session_key,
+        session_epoch=context.session_epoch,
+        policy=policy,
+        now=18.0,
+    )
+    assert available is True
+    assert receipts == (final_receipt,)
+
+
+def test_multiple_final_malformed_receipt_becomes_empty_and_clears_old_hit() -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    policy = _RouterDynamicCacheAffinityPolicy(
+        topology="multiple",
+        ttl_seconds=60.0,
+        route_cache_max_entries=4,
+        source={"strategy": "bonus"},
+    )
+    context = _multiple_affinity_context(
+        decision_id="multiple-malformed-final",
+        provider_token="provider-generation-0",
+    )
+    key = runner._register_router_dynamic_cache_sidecar(
+        context=context,
+        policy=policy,
+    )
+    assert runner._stage_router_dynamic_cache_affinity_batch(
+        key,
+        _multiple_affinity_batch(
+            context,
+            provider_token="provider-generation-0",
+            provider_generation=0,
+            chat_sequence=0,
+            receipts=(_multiple_affinity_receipt("attempt-old"),),
+        ),
+    )
+    malformed = SimpleNamespace(
+        physical_attempt_id="attempt-malformed",
+        role="proposer",
+        execution_slot="proposer:0:0",
+        requested_identity="openrouter:anthropic/model",
+        actual_identity="openrouter:anthropic/model",
+        cache_domain_guard=None,
+        cached_tokens=9,
+        cache_write_tokens=0,
+        observed_at_monotonic=20.0,
+    )
+    raw_final_batch = SimpleNamespace(
+        turn_id=context.turn_id,
+        decision_id=context.decision_id,
+        provider_instance_token="provider-generation-1",
+        provider_instance_generation=1,
+        chat_sequence=1,
+        chat_call_id="chat-final-malformed",
+        topology="multiple",
+        receipts=(malformed,),
+    )
+    normalized = runner._normalize_multiple_cache_affinity_batch(
+        context=context,
+        batch=raw_final_batch,
+    )
+    assert normalized is not None
+    assert normalized.receipts == ()
+    assert runner._stage_router_dynamic_cache_affinity_batch(key, normalized)
+    turn = SimpleNamespace(
+        session_key=context.session_key,
+        metadata={"ensemble_decision_id": context.decision_id},
+    )
+    assert not runner._commit_pending_router_dynamic_cache_affinity(
+        turn,
+        EngineDone(),
+    )
+    assert not runner._router_dynamic_cache_continuity_snapshot(
+        session_key=context.session_key,
+        session_epoch=context.session_epoch,
+        policy=policy,
+    )[0]
+
+
+def test_multiple_frozen_serving_alias_is_canonicalized_and_unknown_alias_is_empty() -> None:
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    context = _multiple_affinity_context(
+        decision_id="multiple-serving-alias",
+        provider_token="provider-alias",
+    )
+    requested_model = "anthropic/alias-model"
+    serving_alias = "anthropic/alias-model-20260801"
+
+    def raw_batch(actual_model: str, *, chat_sequence: int) -> Any:
+        receipt = SimpleNamespace(
+            physical_attempt_id=f"attempt-alias-{chat_sequence}",
+            role="proposer",
+            execution_slot="proposer:0:0",
+            requested_provider="openrouter",
+            requested_model=requested_model,
+            actual_provider="openrouter",
+            actual_model=actual_model,
+            actual_model_aliases=(requested_model, serving_alias),
+            cache_domain_guard=CacheDomainGuard(b"a" * 32),
+            cached_tokens=9,
+            cache_write_tokens=0,
+            observed_at_monotonic=20.0,
+        )
+        return SimpleNamespace(
+            turn_id=context.turn_id,
+            decision_id=context.decision_id,
+            provider_instance_token="provider-alias",
+            provider_instance_generation=0,
+            chat_sequence=chat_sequence,
+            chat_call_id=f"chat-alias-{chat_sequence}",
+            topology="multiple",
+            receipts=(receipt,),
+        )
+
+    accepted = runner._normalize_multiple_cache_affinity_batch(
+        context=context,
+        batch=raw_batch(serving_alias, chat_sequence=0),
+    )
+    rejected = runner._normalize_multiple_cache_affinity_batch(
+        context=context,
+        batch=raw_batch("anthropic/unknown-serving-model", chat_sequence=1),
+    )
+
+    assert accepted is not None
+    assert len(accepted.receipts) == 1
+    assert accepted.receipts[0].requested_identity == (f"openrouter:{requested_model}")
+    assert accepted.receipts[0].actual_identity == accepted.receipts[0].requested_identity
+    assert rejected is not None
+    assert rejected.receipts == ()
+
+
+@pytest.mark.parametrize("feature_enabled", [False, True])
+async def test_single_physical_receipt_commit_changes_next_real_ranking_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    feature_enabled: bool,
+) -> None:
+    import opensquilla.engine.runtime as runtime_module
+    import opensquilla.provider.ensemble as ensemble_module
+    import opensquilla.provider.ranking_router as ranking_module
+    from opensquilla.provider.cache_affinity import (
+        build_credential_namespace_token,
+    )
+
+    cached_model = "openai/gpt-5.5"
+    baseline_model = "anthropic/claude-sonnet-4.5"
+    session_key = f"agent:main:affinity-e2e-{feature_enabled}"
+    session_epoch = 41
+    decision_id = "affinity-e2e-seed"
+    policy_override = {
+        "session": {
+            "kv_cache_affinity": {
+                "strategy": "bonus",
+                "topologies": ["single"],
+                "ttl_seconds": 300,
+                "age_decay": "linear",
+                "bonus_by_evidence": {
+                    "read_hit": 0.05,
+                    "write_only": 0.025,
+                },
+            }
+        }
+    }
+    ranking_config = ranking_config_snapshot(override=policy_override if feature_enabled else None)
+    policy = (
+        _router_dynamic_cache_affinity_policy(
+            ranking_config,
+            topology="single",
+        )
+        if feature_enabled
+        else None
+    )
+    cached_config = _affinity_direct_config(cached_model)
+    baseline_config = replace(
+        cached_config,
+        model=baseline_model,
+        provider_routing={
+            cached_model: "anthropic",
+            baseline_model: "anthropic",
+        },
+    )
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "true")
+
+    def registry_model(model_id: str, capability: float) -> dict[str, Any]:
+        return {
+            "source": "affinity_e2e_registry",
+            "runtime": {"thinking": "off"},
+            "registry_facts": {
+                "model_id": model_id,
+                "version": f"{model_id}-20260818",
+                "provider": "openrouter",
+                "vendor": "synthetic",
+                "family": model_id,
+                "is_open_source": False,
+                "is_chinese_model": False,
+                "status": "enabled",
+                "roles": ["proposer"],
+                "context_window": 200_000,
+                "effective_context_bucket": "extra_long",
+                "modalities": ["text"],
+                "tools": [],
+                "price": {
+                    "input_per_million": 1.0,
+                    "output_per_million": 1.0,
+                },
+                "latency_p50_ms": 1_000,
+                "latency_p95_ms": 2_000,
+                "quota": "available",
+                "rate_limit": "available",
+                "health": "healthy",
+                "credential_available": True,
+            },
+            "static_profile": {
+                "capability_dist_prior": {
+                    "reasoning": capability,
+                    "code_generation": capability,
+                    "format_following": capability,
+                },
+                "domain_dist_prior": {"software_engineering": capability},
+                "tier_dist_prior": {
+                    "1": capability,
+                    "2": capability,
+                    "3": capability,
+                    "4": capability,
+                },
+                "role_fit_prior": {
+                    "proposer": capability,
+                    "aggregator": capability,
+                },
+            },
+            "online_profile": {
+                "error_rates": {
+                    "hallucination": max(0.0, 1.0 - capability),
+                    "omission": max(0.0, 0.9 - capability),
+                }
+            },
+        }
+
+    monkeypatch.setattr(
+        ranking_module,
+        "_legacy_registry_snapshot_projection",
+        lambda snapshot: snapshot,
+    )
+    monkeypatch.setattr(
+        ranking_module,
+        "build_model_registry_snapshot",
+        lambda **kwargs: {
+            "schema_version": "affinity-e2e",
+            "snapshot_version": "affinity-e2e-v1",
+            "models": [
+                registry_model(baseline_model, 0.9),
+                registry_model(cached_model, 0.899),
+            ],
+        },
+    )
+    monkeypatch.setattr(ensemble_module, "_member_from_ref", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        ensemble_module,
+        "_member_model_capabilities",
+        lambda member: SimpleNamespace(supports_vision=False),
+    )
+
+    def resolution_for(model_id: str) -> ProviderDeploymentResolution:
+        config = cached_config if model_id == cached_model else baseline_config
+        return ProviderDeploymentResolution(
+            provider=config.provider,
+            model=model_id,
+            ready=True,
+            provider_config=config,
+        )
+
+    def resolve_member(ref: Any, inherited: Any, **kwargs: Any) -> Any:
+        del inherited, kwargs
+        return resolution_for(str(ref.model))
+
+    def resolve_deployment(
+        config: Any,
+        provider_id: str,
+        model: str,
+        **kwargs: Any,
+    ) -> ProviderDeploymentResolution:
+        del config, provider_id, kwargs
+        return resolution_for(model)
+
+    def resolve_cache_identity(
+        config: Any,
+        provider_id: str,
+        model: str,
+        **kwargs: Any,
+    ) -> tuple[ProviderDeploymentResolution, object | None]:
+        del config, provider_id, kwargs
+        resolution = resolution_for(model)
+        provider_config = resolution.provider_config
+        assert provider_config is not None
+        return (
+            resolution,
+            build_credential_namespace_token(
+                provider=provider_config.provider,
+                resolved_secret=provider_config.api_key,
+                org_id=provider_config.org_id,
+            ),
+        )
+
+    monkeypatch.setattr(ensemble_module, "_resolve_member_deployment", resolve_member)
+    monkeypatch.setattr(
+        ensemble_module,
+        "resolve_provider_deployment",
+        resolve_deployment,
+    )
+    monkeypatch.setattr(
+        ensemble_module,
+        "resolve_provider_deployment_cache_identity",
+        resolve_cache_identity,
+    )
+
+    if not feature_enabled:
+
+        def unexpected_runtime_affinity(*args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            raise AssertionError("feature-absent physical turn touched cache affinity")
+
+        def unexpected_ranking_affinity(*args: Any, **kwargs: Any) -> None:
+            del args, kwargs
+            raise AssertionError("feature-absent ranking touched cache affinity")
+
+        monkeypatch.setattr(
+            runtime_module,
+            "_router_dynamic_cache_domain_guard",
+            unexpected_runtime_affinity,
+        )
+        monkeypatch.setattr(
+            ensemble_module,
+            "_cache_affinity_private_inputs",
+            unexpected_ranking_affinity,
+        )
+
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    captured_batches: list[_RouterDynamicCacheAffinityReceiptBatch] = []
+    affinity_context: _RouterDynamicCacheAffinityCollectionContext | None = None
+    affinity_sink: Any = None
+    if policy is not None:
+        affinity_context = _affinity_context(
+            decision_id=decision_id,
+            provider_instance_token="affinity-e2e-provider",
+            generation=0,
+            session_key=session_key,
+            session_epoch=session_epoch,
+        )
+        sidecar_key = runner._register_router_dynamic_cache_sidecar(
+            context=affinity_context,
+            policy=policy,
+        )
+
+        def stage_batch(batch: _RouterDynamicCacheAffinityReceiptBatch) -> None:
+            captured_batches.append(batch)
+            assert runner._stage_router_dynamic_cache_affinity_batch(
+                sidecar_key,
+                batch,
+            )
+
+        affinity_sink = stage_batch
+
+    physical = _RouterSingleDirectProvider(
+        _AffinityDoneProvider(
+            [
+                ProviderDone(
+                    provider=cached_config.provider,
+                    model=cached_model,
+                    input_tokens=1_000,
+                    cached_tokens=1_000,
+                    cache_write_tokens=0,
+                )
+            ]
+        ),
+        cached_config,
+        health_ledger=None,
+        absolute_deadline=None,
+        frozen_catalog={},
+        enforces_routed_thinking_policy=False,
+        cache_affinity_context=affinity_context,
+        cache_affinity_receipt_sink=affinity_sink,
+        cache_affinity_generation_getter=(
+            lambda: runner._router_dynamic_cache_generation(session_key)
+        ),
+        cache_affinity_credential_namespace_token=(
+            _affinity_credential_token(cached_config) if policy is not None else None
+        ),
+    )
+    physical_events = await _collect(physical.chat([], config=ChatConfig(timeout=30.0)))
+    assert [event.kind for event in physical_events] == ["done"]
+
+    if policy is None:
+        assert captured_batches == []
+        assert runner._router_dynamic_cache_affinity is None
+        cache_available = False
+        receipts: tuple[Any, ...] = ()
+    else:
+        assert len(captured_batches) == 1
+        seed_turn = SimpleNamespace(
+            session_key=session_key,
+            metadata={"router_single_decision_id": decision_id},
+        )
+        assert runner._commit_pending_router_dynamic_cache_affinity(
+            seed_turn,
+            EngineDone(),
+        )
+        cache_available, receipts, _ = runner._router_single_cache_continuity_snapshot(
+            session_key=session_key,
+            session_epoch=session_epoch,
+            policy=policy,
+        )
+        assert cache_available is True
+        assert len(receipts) == 1
+        assert receipts[0].requested_identity == f"openrouter:{cached_model}"
+
+    from opensquilla.provider.ranking_router import (
+        build_single_model_request_context,
+    )
+
+    request_context = build_single_model_request_context(
+        message="continue the previous task",
+        turn_metadata={"input_tokens": 1_000},
+        attachments=[],
+        output_tokens=4_096,
+        ranking_config=ranking_config,
+    )
+    task_analysis = TaskAnalysisResult(
+        profile={
+            "capability_dist": {"reasoning": 0.6, "code_generation": 0.4},
+            "domain_dist": {"software_engineering": 1.0},
+            "tier_dist": {"3": 1.0},
+            "constraints": {
+                "cost": "medium",
+                "latency": "normal",
+                "context": "short",
+                "modality": ["text"],
+                "risk": "medium",
+            },
+            "optional_constraints": {"format": "patch"},
+            "session_intent": {"type": "continue", "confidence": 1.0},
+        },
+        source="affinity_e2e",
+        schema_valid=True,
+        confidence=1.0,
+    )
+    ensemble_config = SimpleNamespace(
+        selection_mode="router_dynamic",
+        prepared_ranking_config=lambda: ranking_config,
+        ranking_user_profile_enabled=False,
+        candidates=[],
+        model_options=[],
+        ranking_thinking_assignment_enabled=False,
+    )
+    resolver_config = SimpleNamespace(
+        llm_ensemble=ensemble_config,
+        llm=SimpleNamespace(
+            max_tokens=0,
+            context_window_tokens=0,
+            temperature=None,
+        ),
+        squilla_router=SimpleNamespace(tiers={}),
+    )
+    ranking_inputs: dict[str, Any] = {
+        "decision_id": "affinity-e2e-next",
+        "task_analysis": task_analysis,
+        "request_context": request_context,
+        "ranking_config": ranking_config,
+    }
+    if policy is not None:
+        ranking_inputs.update(
+            {
+                "cache_continuity_available": cache_available,
+                "cache_affinity_policy": policy.source,
+                "cache_affinity_receipts": receipts,
+                "cache_affinity_session_epoch": session_epoch,
+                "cache_affinity_now_monotonic": time.monotonic(),
+                "cache_affinity_outer_thinking_projection": {
+                    "thinking_enabled": False,
+                    "effective_thinking_level": "off",
+                    "thinking_budget_tokens": 0,
+                },
+            }
+        )
+    route = resolve_router_single_route(
+        config=resolver_config,
+        inherited_provider_config=cached_config,
+        turn_metadata={
+            "routed_tier": "c2",
+            "routing_confidence": 0.9,
+        },
+        ranking_inputs=ranking_inputs,
+        requires_tools=False,
+        session_key=session_key,
+        model_catalog=_Catalog(),
+    )
+
+    expected_model = cached_model if feature_enabled else baseline_model
+    assert route.provider_config.model == expected_model
+    scores = {row["identity"]: row for row in route.trace["model_scores"]}
+    cached_score = scores[f"openrouter:{cached_model}"]
+    if feature_enabled:
+        assert cached_score["cache_affinity"]["score_adjustment"] > 0.0
+        assert route.trace["selection_policy"] == "cache_adjusted_base_score_top1"
+    else:
+        assert "cache_affinity" not in cached_score
+
+
+async def test_multiple_physical_receipt_commit_flips_next_real_aggregator_ranking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import opensquilla.provider.ensemble as ensemble_module
+    import opensquilla.provider.ranking_router as ranking_module
+    from opensquilla.provider.cache_affinity import (
+        build_credential_namespace_token,
+    )
+    from opensquilla.provider.ensemble import (
+        build_ensemble_provider_from_config,
+    )
+    from opensquilla.provider.types import ProviderMessageCountProjection
+
+    proposer_models = ("synthetic/proposer-a", "synthetic/proposer-b")
+    cached_aggregator = "synthetic/aggregator-cached"
+    baseline_aggregator = "synthetic/aggregator-baseline"
+    all_models = (*proposer_models, cached_aggregator, baseline_aggregator)
+    session_key = "agent:main:affinity-multiple-e2e"
+    session_epoch = 53
+    decision_id = "affinity-multiple-seed"
+    policy_override = {
+        "session": {
+            "kv_cache_affinity": {
+                "strategy": "bonus",
+                "topologies": ["multiple"],
+                "ttl_seconds": 300,
+                "age_decay": "linear",
+                "bonus_by_evidence": {
+                    "read_hit": 0.05,
+                    "write_only": 0.025,
+                },
+            }
+        }
+    }
+    ranking_config = ranking_config_snapshot(override=policy_override)
+    policy = _router_dynamic_cache_affinity_policy(
+        ranking_config,
+        topology="multiple",
+    )
+    assert policy is not None
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model=proposer_models[0],
+        api_key="synthetic-multiple-affinity-secret",
+        base_url="https://openrouter.ai/api/v1",
+        org_id="synthetic-tenant",
+        provider_routing={model: "anthropic" for model in all_models},
+        _provider_routing_strict_override=True,
+    )
+    model_configs = {model: replace(inherited, model=model) for model in all_models}
+    ranking_phase = {"name": "seed"}
+
+    def registry_model(
+        model_id: str,
+        *,
+        role: str,
+        capability: float,
+    ) -> dict[str, Any]:
+        return {
+            "source": "affinity_multiple_e2e_registry",
+            "runtime": {"thinking": "off"},
+            "registry_facts": {
+                "model_id": model_id,
+                "version": f"{model_id}-20260818",
+                "provider": "openrouter",
+                "vendor": "synthetic",
+                "family": model_id,
+                "is_open_source": False,
+                "is_chinese_model": False,
+                "status": "enabled",
+                "roles": [role],
+                "context_window": 200_000,
+                "effective_context_bucket": "extra_long",
+                "modalities": ["text"],
+                "tools": [],
+                "price": {
+                    "input_per_million": 1.0,
+                    "output_per_million": 1.0,
+                },
+                "latency_p50_ms": 1_000,
+                "latency_p95_ms": 2_000,
+                "quota": "available",
+                "rate_limit": "available",
+                "health": "healthy",
+                "credential_available": True,
+            },
+            "static_profile": {
+                "capability_dist_prior": {
+                    "reasoning": capability,
+                    "code_generation": capability,
+                    "format_following": capability,
+                },
+                "domain_dist_prior": {
+                    "software_engineering": capability,
+                },
+                "tier_dist_prior": {
+                    "1": capability,
+                    "2": capability,
+                    "3": capability,
+                    "4": capability,
+                },
+                "role_fit_prior": {role: capability},
+            },
+            "online_profile": {
+                "error_rates": {
+                    "hallucination": max(0.0, 1.0 - capability),
+                    "omission": max(0.0, 0.9 - capability),
+                }
+            },
+        }
+
+    def registry_snapshot(**kwargs: Any) -> dict[str, Any]:
+        del kwargs
+        seed = ranking_phase["name"] == "seed"
+        return {
+            "schema_version": "affinity-multiple-e2e",
+            "snapshot_version": f"affinity-multiple-{ranking_phase['name']}",
+            "models": [
+                registry_model(
+                    proposer_models[0],
+                    role="proposer",
+                    capability=0.95,
+                ),
+                registry_model(
+                    proposer_models[1],
+                    role="proposer",
+                    capability=0.94,
+                ),
+                registry_model(
+                    baseline_aggregator,
+                    role="aggregator",
+                    capability=0.90,
+                ),
+                registry_model(
+                    cached_aggregator,
+                    role="aggregator",
+                    capability=0.901 if seed else 0.899,
+                ),
+            ],
+        }
+
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "true")
+    monkeypatch.setattr(
+        ranking_module,
+        "_legacy_registry_snapshot_projection",
+        lambda snapshot: snapshot,
+    )
+    monkeypatch.setattr(
+        ranking_module,
+        "build_model_registry_snapshot",
+        registry_snapshot,
+    )
+
+    def resolution_for(model_id: str) -> ProviderDeploymentResolution:
+        config = model_configs[model_id]
+        return ProviderDeploymentResolution(
+            provider=config.provider,
+            model=model_id,
+            ready=True,
+            provider_config=config,
+        )
+
+    def resolve_member(ref: Any, inherited_config: Any, **kwargs: Any) -> Any:
+        del inherited_config, kwargs
+        return resolution_for(str(ref.model))
+
+    def resolve_cache_identity(
+        config: Any,
+        provider_id: str,
+        model: str,
+        **kwargs: Any,
+    ) -> tuple[ProviderDeploymentResolution, object]:
+        del config, provider_id, kwargs
+        resolution = resolution_for(model)
+        provider_config = resolution.provider_config
+        assert provider_config is not None
+        return (
+            resolution,
+            build_credential_namespace_token(
+                provider=provider_config.provider,
+                resolved_secret=provider_config.api_key,
+                org_id=provider_config.org_id,
+            ),
+        )
+
+    monkeypatch.setattr(
+        ensemble_module,
+        "_resolve_member_deployment",
+        resolve_member,
+    )
+    monkeypatch.setattr(
+        ensemble_module,
+        "resolve_provider_deployment_cache_identity",
+        resolve_cache_identity,
+    )
+
+    class SyntheticMemberProvider:
+        def __init__(self, provider_config: ProviderConfig) -> None:
+            self._config = provider_config
+            self.provider_name = provider_config.provider
+
+        def chat(
+            self,
+            messages: list[Any],
+            tools: Any = None,
+            config: Any = None,
+        ) -> AsyncIterator[Any]:
+            del messages, tools, config
+
+            async def stream() -> AsyncIterator[Any]:
+                yield ProviderText(text=f"answer from {self._config.model}")
+                yield ProviderDone(
+                    provider=self._config.provider,
+                    model=self._config.model,
+                    stop_reason="stop",
+                    input_tokens=1_000,
+                    output_tokens=10,
+                    cached_tokens=(1_000 if self._config.model == cached_aggregator else 0),
+                    cache_write_tokens=0,
+                )
+
+            return stream()
+
+        def project_message_count(
+            self,
+            messages: list[Any],
+            config: Any = None,
+            *,
+            additional_messages: int = 0,
+        ) -> ProviderMessageCountProjection:
+            system_messages = int(bool(config is not None and config.system))
+            return ProviderMessageCountProjection(
+                actual_wire_messages=(len(messages) + system_messages + additional_messages),
+                logical_messages=len(messages) + additional_messages,
+                system_messages=system_messages,
+                tool_result_messages=0,
+                additional_messages=additional_messages,
+                provider_kind=self._config.provider,
+                model=self._config.model,
+            )
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+    monkeypatch.setattr(
+        ensemble_module,
+        "_build_provider",
+        lambda provider_config: SyntheticMemberProvider(provider_config),
+    )
+
+    config = GatewayConfig(
+        llm={
+            "provider": "openrouter",
+            "model": proposer_models[0],
+            "api_key": "synthetic-multiple-affinity-secret",
+            "base_url": "https://openrouter.ai/api/v1",
+            "max_tokens": 16_384,
+        },
+        llm_ensemble={
+            "enabled": True,
+            "selection_mode": "router_dynamic",
+            "shuffle_candidates": False,
+            "ranking_thinking_assignment_enabled": False,
+            "ranking_config_override": policy_override,
+            "aggregator_recovery_mode": "experiment",
+            "all_failed_policy": "error",
+        },
+    )
+    runner = TurnRunner(provider_selector=None, config=_router_single_config())
+    context = _RouterDynamicCacheAffinityCollectionContext(
+        turn_id="turn-affinity-multiple-e2e",
+        decision_id=decision_id,
+        provider_instance_token="provider-affinity-multiple-e2e",
+        provider_instance_generation=0,
+        session_key=session_key,
+        session_epoch=session_epoch,
+        selection_generation=0,
+        topology="multiple",
+    )
+    sidecar_key = runner._register_router_dynamic_cache_sidecar(
+        context=context,
+        policy=policy,
+    )
+    physical_batches: list[Any] = []
+    task_analysis = TaskAnalysisResult(
+        profile={
+            "capability_dist": {
+                "reasoning": 0.6,
+                "code_generation": 0.4,
+            },
+            "domain_dist": {"software_engineering": 1.0},
+            "tier_dist": {"3": 1.0},
+            "constraints": {
+                "cost": "medium",
+                "latency": "normal",
+                "context": "short",
+                "modality": ["text"],
+                "risk": "medium",
+            },
+            "optional_constraints": {"format": "comparison"},
+            "session_intent": {"type": "continue", "confidence": 1.0},
+        },
+        source="frozen_replay",
+        schema_valid=True,
+        confidence=1.0,
+    )
+
+    def stage_physical_batch(batch: object) -> None:
+        physical_batches.append(batch)
+        normalized = runner._normalize_multiple_cache_affinity_batch(
+            context=context,
+            batch=batch,
+        )
+        assert normalized is not None
+        assert runner._stage_router_dynamic_cache_affinity_batch(
+            sidecar_key,
+            normalized,
+        )
+
+    def ranking_inputs(
+        *,
+        current_decision_id: str,
+        receipts: tuple[Any, ...],
+    ) -> dict[str, Any]:
+        return {
+            "decision_id": current_decision_id,
+            "ranking_config": ranking_config,
+            "task_analysis": task_analysis,
+            "cache_continuity_available": True,
+            "cache_affinity_policy": policy.source,
+            "cache_affinity_receipts": receipts,
+            "cache_affinity_session_epoch": session_epoch,
+            "cache_affinity_now_monotonic": time.monotonic(),
+            "cache_affinity_outer_thinking_projection": {
+                "thinking_enabled": False,
+                "effective_thinking_level": "off",
+                "thinking_budget_tokens": 0,
+            },
+        }
+
+    seed_provider = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=inherited,
+        fallback_provider=None,
+        turn_metadata={
+            "routed_tier": "c2",
+            "routing_confidence": 0.9,
+            "router_dynamic_task_text": "compare two technical systems",
+        },
+        ranking_inputs=ranking_inputs(
+            current_decision_id=decision_id,
+            receipts=(),
+        ),
+        _cache_affinity_receipt_callback=stage_physical_batch,
+        _cache_affinity_turn_id=context.turn_id,
+        _cache_affinity_provider_instance_token=(context.provider_instance_token),
+        _cache_affinity_session_epoch=session_epoch,
+    )
+    assert seed_provider.selection_plan["selected_A"] == (f"openrouter:{cached_aggregator}")
+    seed_events = await _collect(
+        seed_provider.chat(
+            [Message(role="user", content="continue")],
+            config=ChatConfig(
+                timeout=30.0,
+                thinking=False,
+                thinking_budget_tokens=0,
+            ),
+        )
+    )
+    assert any(event.kind == "done" for event in seed_events)
+    assert len(physical_batches) == 1
+    assert len(physical_batches[0].receipts) == 1
+    assert runner._commit_pending_router_dynamic_cache_affinity(
+        SimpleNamespace(
+            session_key=session_key,
+            metadata={"ensemble_decision_id": decision_id},
+        ),
+        EngineDone(),
+    )
+    available, receipts, _ = runner._router_dynamic_cache_continuity_snapshot(
+        session_key=session_key,
+        session_epoch=session_epoch,
+        policy=policy,
+    )
+    assert available is True
+    assert len(receipts) == 1
+    assert receipts[0].role == "aggregator"
+    assert receipts[0].requested_identity == (f"openrouter:{cached_aggregator}")
+    expected_guard = ensemble_module._cache_affinity_guard_for_resolution(
+        resolution_for(cached_aggregator),
+        build_credential_namespace_token(
+            provider=inherited.provider,
+            resolved_secret=inherited.api_key,
+            org_id=inherited.org_id,
+        ),
+        role="aggregator",
+        topology="multiple",
+        session_epoch=session_epoch,
+        upstream="anthropic",
+        thinking_enabled=False,
+        effective_thinking_level="off",
+        thinking_budget_tokens=0,
+    )
+    assert receipts[0].cache_domain_guard == expected_guard
+
+    ranking_phase["name"] = "next"
+    common_turn_metadata = {
+        "routed_tier": "c2",
+        "routing_confidence": 0.9,
+        "router_dynamic_task_text": "continue the comparison",
+    }
+    control = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=inherited,
+        fallback_provider=None,
+        turn_metadata=common_turn_metadata,
+        ranking_inputs=ranking_inputs(
+            current_decision_id="affinity-multiple-control",
+            receipts=(),
+        ),
+    )
+    affinity = build_ensemble_provider_from_config(
+        config=config,
+        inherited_provider_config=inherited,
+        fallback_provider=None,
+        turn_metadata=common_turn_metadata,
+        ranking_inputs=ranking_inputs(
+            current_decision_id="affinity-multiple-next",
+            receipts=receipts,
+        ),
+    )
+
+    assert control.selection_plan["selected_A"] == (f"openrouter:{baseline_aggregator}")
+    assert affinity.selection_plan["cache_affinity_inputs"], affinity.selection_plan.get(
+        "cache_affinity_unavailable_reasons"
+    )
+    assert affinity.selection_plan["selected_A"] == (f"openrouter:{cached_aggregator}")
+    affinity_scores = {
+        row["identity"]: row for row in affinity.selection_plan["aggregator"]["scores"]
+    }
+    cached_row = affinity_scores[f"openrouter:{cached_aggregator}"]
+    assert cached_row["cache_affinity"]["score_adjustment"] > 0.0

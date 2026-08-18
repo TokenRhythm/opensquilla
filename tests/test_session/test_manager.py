@@ -2,10 +2,12 @@
 
 import asyncio
 import contextlib
+import gc
 import json
 import os
 import sqlite3
 import stat
+import weakref
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
@@ -36,6 +38,21 @@ async def manager():
     mgr = SessionManager(storage, inject_time_prefix=False)
     yield mgr
     await storage.close()
+
+
+def test_session_manager_delete_listener_does_not_accumulate_after_gc() -> None:
+    storage = SessionStorage(":memory:")
+
+    for _ in range(3):
+        manager = SessionManager(storage, inject_time_prefix=False)
+        manager_ref = weakref.ref(manager)
+        assert len(storage._session_delete_listeners) == 1
+
+        del manager
+        gc.collect()
+
+        assert manager_ref() is None
+        assert storage._session_delete_listeners == []
 
 
 @pytest.mark.asyncio
@@ -2306,21 +2323,70 @@ async def test_persist_compaction_result_without_summary_does_not_rewrite_transc
 @pytest.mark.asyncio
 async def test_prune_stale(manager):
     node = await manager.create("agent:main:main")
+    manager.set_cached_epoch(node.session_key, 7)
     # force old timestamp
     node.updated_at = 1
     await manager._storage.upsert_session(node)
     pruned = await manager.prune_stale(max_age_ms=1000)
     assert pruned == 1
+    assert manager.get_cached_epoch(node.session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_storage_delete_listener_is_removable_and_fail_open(manager):
+    first = await manager.create("agent:main:first")
+    observed: list[str] = []
+    remove = manager._storage.add_session_delete_listener(observed.append)
+    manager._storage.add_session_delete_listener(
+        lambda _key: (_ for _ in ()).throw(RuntimeError("listener failure"))
+    )
+
+    await manager._storage.delete_session(first.session_key)
+    remove()
+    second = await manager.create("agent:main:second")
+    await manager._storage.delete_session(second.session_key)
+
+    assert observed == [first.session_key]
+    assert await manager._storage.get_session(first.session_key) is None
+    assert await manager._storage.get_session(second.session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_storage_delete_listener_runs_only_after_durable_commit(
+    manager,
+    monkeypatch,
+):
+    node = await manager.create("agent:main:delete-commit-boundary")
+    observed: list[str] = []
+    manager._storage.add_session_delete_listener(observed.append)
+
+    async def fail_commit(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        raise RuntimeError("synthetic commit failure")
+
+    monkeypatch.setattr(manager._storage, "_commit_transaction", fail_commit)
+
+    with pytest.raises(RuntimeError, match="synthetic commit failure"):
+        await manager._storage.delete_session(node.session_key)
+
+    assert observed == []
+    restored = await manager._storage.get_session(node.session_key)
+    assert restored is not None
+    assert restored.session_id == node.session_id
 
 
 @pytest.mark.asyncio
 async def test_cap_entries(manager):
     for i in range(10):
-        await manager.create(f"agent:main:direct:u{i}")
+        key = f"agent:main:direct:u{i}"
+        await manager.create(key)
+        manager.set_cached_epoch(key, i)
     deleted = await manager.cap_entries(max_entries=5)
     assert deleted == 5
-    remaining = await manager._storage.count_sessions()
-    assert remaining == 5
+    remaining = await manager._storage.list_sessions(limit=10)
+    assert len(remaining) == 5
+    remaining_keys = {node.session_key for node in remaining}
+    assert set(manager._epoch_cache) == remaining_keys
 
 
 @pytest.mark.asyncio

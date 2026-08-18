@@ -12,6 +12,7 @@ import weakref
 from collections.abc import AsyncIterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy, deepcopy
+from importlib import resources
 from typing import Any
 
 import pytest
@@ -26,6 +27,10 @@ from opensquilla.engine.usage_accounting import (
 from opensquilla.provider.admission import (
     ProviderAdmissionController,
     ProviderAdmissionSettings,
+)
+from opensquilla.provider.cache_affinity import (
+    CacheAffinityEvidenceInput,
+    CachePriceQuote,
 )
 from opensquilla.provider.ranking_router import (
     CAPABILITIES,
@@ -56,6 +61,7 @@ from opensquilla.provider.ranking_router import (
     ranking_config_resolution,
     ranking_config_snapshot,
     ranking_trace_replay_reasons,
+    single_ranking_trace_replay_reasons,
     task_analyzer_chain_policy,
     task_analyzer_policy,
 )
@@ -141,6 +147,7 @@ def _model(
     capability: float = 0.8,
     aggregator_fit: float = 0.8,
     price: float = 1.0,
+    price_source: str | None = None,
     latency_ms: int = 2_000,
 ) -> dict[str, Any]:
     return {
@@ -163,6 +170,11 @@ def _model(
             "price": {
                 "input_per_million": price,
                 "output_per_million": price,
+                **(
+                    {"price_source": price_source}
+                    if price_source is not None
+                    else {}
+                ),
             },
             "latency_p50_ms": latency_ms // 2,
             "latency_p95_ms": latency_ms,
@@ -256,6 +268,53 @@ def _snapshot(*models: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _cache_ranking_config(
+    *,
+    strategy: str = "bonus",
+    topologies: list[str] | None = None,
+) -> dict[str, Any]:
+    policy: dict[str, Any] = {
+        "strategy": strategy,
+        "topologies": topologies or ["single", "multiple"],
+        "ttl_seconds": 300,
+        "age_decay": "linear",
+    }
+    if strategy == "bonus":
+        policy["bonus_by_evidence"] = {
+            "read_hit": 0.05,
+            "write_only": 0.025,
+        }
+    else:
+        policy["hit_probability_by_evidence"] = {
+            "read_hit": 0.8,
+            "write_only": 0.5,
+        }
+    return ranking_config_snapshot(
+        override={"session": {"kv_cache_affinity": policy}}
+    )
+
+
+def _cache_evidence(
+    identity: str,
+    *,
+    role: str,
+    price_quote: CachePriceQuote | None = None,
+    decay_factor: float = 1.0,
+) -> CacheAffinityEvidenceInput:
+    return CacheAffinityEvidenceInput(
+        identity=identity,
+        role=role,  # type: ignore[arg-type]
+        evidence_kind="read_hit",
+        cached_tokens=1_000,
+        cache_write_tokens=1_000,
+        decay_factor=decay_factor,
+        price_quote=price_quote,
+        ranking_price_source=(price_quote.price_source if price_quote else ""),
+        endpoint_scope=(price_quote.endpoint_scope if price_quote else ""),
+        upstream_scope=(price_quote.upstream_scope if price_quote else ""),
+    )
+
+
 def _decision(
     *models: dict[str, Any],
     analysis: TaskAnalysisResult | None = None,
@@ -266,6 +325,9 @@ def _decision(
     proposer_recovery_quorum: int | None = None,
     user_profile_enabled: bool = True,
     stage_observability_out: dict[str, Any] | None = None,
+    cache_continuity_available: bool = False,
+    cache_affinity_inputs: Any = None,
+    cache_affinity_unavailable_reasons: Any = None,
 ):
     return rank_models(
         task_analysis=analysis or _analysis(),
@@ -281,6 +343,11 @@ def _decision(
         ranking_config=ranking_config,
         ranking_thinking_assignment_enabled=thinking_assignment_enabled,
         proposer_recovery_quorum=proposer_recovery_quorum,
+        cache_continuity_available=cache_continuity_available,
+        cache_affinity_inputs=cache_affinity_inputs,
+        _cache_affinity_unavailable_reasons=(
+            cache_affinity_unavailable_reasons
+        ),
         _stage_observability_out=stage_observability_out,
     )
 
@@ -6827,6 +6894,9 @@ def _single_decision(
     ranking_config: dict[str, Any] | None = None,
     requires_tools: bool = False,
     thinking_assignment_enabled: bool = False,
+    cache_continuity_available: bool = False,
+    cache_affinity_inputs: Any = None,
+    cache_affinity_unavailable_reasons: Any = None,
 ):
     return rank_single_model(
         task_analysis=analysis or _analysis(),
@@ -6839,6 +6909,11 @@ def _single_decision(
         ranking_config=ranking_config,
         decision_id="single-test",
         ranking_thinking_assignment_enabled=thinking_assignment_enabled,
+        cache_continuity_available=cache_continuity_available,
+        cache_affinity_inputs=cache_affinity_inputs,
+        _cache_affinity_unavailable_reasons=(
+            cache_affinity_unavailable_reasons
+        ),
     )
 
 
@@ -6926,6 +7001,1181 @@ def test_single_context_ignores_stale_fusion_route_in_hash_and_score() -> None:
     stale_decision = _single_decision(*models, analysis=analysis, context=stale)
     assert stale_decision.model.identity == clean_decision.model.identity
     assert stale_decision.trace["model_scores"] == clean_decision.trace["model_scores"]
+
+
+def test_cache_affinity_absent_is_a_true_ranking_noop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    models = (
+        _model("alpha", capability=0.9),
+        _model("beta", capability=0.9),
+    )
+    baseline = _single_decision(*models)
+
+    def fail_if_called(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("disabled cache affinity must not call its scorer")
+
+    monkeypatch.setattr(
+        ranking_router,
+        "cache_affinity_score_adjustment",
+        fail_if_called,
+    )
+    with_unused_private_input = _single_decision(
+        *models,
+        cache_affinity_inputs="malformed-but-disabled",
+    )
+
+    assert with_unused_private_input == baseline
+    assert "cache_affinity_inputs" not in baseline.trace
+    assert "cache_affinity" not in baseline.trace["model_scores"][0]
+
+
+def test_packaged_ranking_config_without_affinity_preserves_golden_bytes_and_hashes() -> None:
+    packaged = resources.files("opensquilla.provider").joinpath(
+        "router_dynamic_ranking_config.json"
+    )
+    raw_payload = packaged.read_bytes()
+    loaded = load_ranking_config()
+    resolution = ranking_config_resolution()
+
+    assert hashlib.sha256(raw_payload).hexdigest() == (
+        "10cf953095ecc030569c1fcce0ffaa3dc3fa3e92769a055c02ce541524fd5e27"
+    )
+    assert canonical_json_sha256(loaded) == (
+        "8b80aec8674c4faef098d1d281ab8208d39ba52ba91fa14edce0f7cbe35039bc"
+    )
+    assert resolution["base_sha256"] == (
+        "cdb2727e95533d9c49579b9bb82b40ad801f816e2f151b8bc4e8f1540bbb7fbe"
+    )
+    assert resolution["effective_sha256"] == resolution["base_sha256"]
+    assert "kv_cache_affinity" not in loaded["session"]
+    assert "kv_cache_affinity" not in resolution["effective_config"]["session"]
+
+
+def test_cache_continuity_is_ignored_when_policy_is_absent_or_topology_off() -> None:
+    models = (
+        _model("alpha", capability=0.9),
+        _model("beta", capability=0.8),
+    )
+    analysis = _analysis(intent="continue", intent_confidence=1.0)
+    absent_false = _single_decision(*models, analysis=analysis)
+    absent_true = _single_decision(
+        *models,
+        analysis=analysis,
+        cache_continuity_available=True,
+    )
+    single_off_config = _cache_ranking_config(
+        strategy="bonus",
+        topologies=["multiple"],
+    )
+    topology_false = _single_decision(
+        *models,
+        analysis=analysis,
+        ranking_config=single_off_config,
+    )
+    topology_true = _single_decision(
+        *models,
+        analysis=analysis,
+        ranking_config=single_off_config,
+        cache_continuity_available=True,
+    )
+
+    assert absent_true == absent_false
+    assert topology_true == topology_false
+
+    multiple_off_config = _cache_ranking_config(
+        strategy="bonus",
+        topologies=["single"],
+    )
+    multiple_false = _decision(
+        *models,
+        analysis=analysis,
+        ranking_config=multiple_off_config,
+    )
+    multiple_true = _decision(
+        *models,
+        analysis=analysis,
+        ranking_config=multiple_off_config,
+        cache_continuity_available=True,
+    )
+    assert multiple_true == multiple_false
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        {
+            "strategy": "bonus",
+            "topologies": [],
+            "ttl_seconds": 300,
+            "age_decay": "linear",
+            "bonus_by_evidence": {"read_hit": 0.01, "write_only": 0.01},
+        },
+        {
+            "strategy": "bonus",
+            "topologies": ["single", "single"],
+            "ttl_seconds": 300,
+            "age_decay": "linear",
+            "bonus_by_evidence": {"read_hit": 0.01, "write_only": 0.01},
+        },
+        {
+            "strategy": "bonus",
+            "topologies": ["single"],
+            "ttl_seconds": 0,
+            "age_decay": "linear",
+            "bonus_by_evidence": {"read_hit": 0.01, "write_only": 0.01},
+        },
+        {
+            "strategy": "bonus",
+            "topologies": ["single"],
+            "ttl_seconds": 300,
+            "age_decay": "exponential",
+            "bonus_by_evidence": {"read_hit": 0.01, "write_only": 0.01},
+        },
+        {
+            "strategy": "bonus",
+            "topologies": ["single"],
+            "ttl_seconds": 300,
+            "age_decay": "linear",
+            "bonus_by_evidence": {"read_hit": 1.0, "write_only": 0.01},
+        },
+        {
+            "strategy": "expected_cost",
+            "topologies": ["single"],
+            "ttl_seconds": 300,
+            "age_decay": "linear",
+            "hit_probability_by_evidence": {
+                "read_hit": 1.1,
+                "write_only": 0.5,
+            },
+        },
+        {
+            "strategy": "bonus",
+            "topologies": ["single"],
+            "ttl_seconds": 300,
+            "age_decay": "linear",
+            "bonus_by_evidence": {"read_hit": 0.01, "write_only": 0.01},
+            "hit_probability_by_evidence": {
+                "read_hit": 0.8,
+                "write_only": 0.5,
+            },
+        },
+    ],
+)
+def test_cache_affinity_config_is_strict_and_discriminated(
+    policy: dict[str, Any],
+) -> None:
+    with pytest.raises(DynamicRankingError):
+        ranking_config_snapshot(
+            override={"session": {"kv_cache_affinity": policy}}
+        )
+
+
+def test_single_cache_continuity_only_preserves_analyzer_continue() -> None:
+    context = _single_context()
+    config = _cache_ranking_config(strategy="bonus", topologies=["single"])
+    continued, valid, _ = normalize_task_profile(
+        _task_profile(intent="continue", intent_confidence=1.0),
+        routed_tier="c2",
+        request_context=context,
+        ranking_config=config,
+        cache_continuity_available=True,
+    )
+    downgraded, downgraded_valid, _ = normalize_task_profile(
+        _task_profile(intent="continue", intent_confidence=1.0),
+        routed_tier="c2",
+        request_context=context,
+    )
+    new_task, new_task_valid, _ = normalize_task_profile(
+        _task_profile(intent="new_task", intent_confidence=1.0),
+        routed_tier="c2",
+        request_context=context,
+        cache_continuity_available=True,
+    )
+
+    assert valid and downgraded_valid and new_task_valid
+    assert continued["session_intent"]["type"] == "continue"
+    assert downgraded["session_intent"]["type"] == "new_task"
+    assert new_task["session_intent"]["type"] == "new_task"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("analyzer_path", ["primary", "retry", "fallback_chain"])
+@pytest.mark.parametrize(
+    ("cache_continuity_available", "expected_intent"),
+    [(False, "new_task"), (True, "continue")],
+)
+async def test_cache_continuity_flag_reaches_every_live_analyzer_path(
+    analyzer_path: str,
+    cache_continuity_available: bool,
+    expected_intent: str,
+) -> None:
+    ranking_config = _cache_ranking_config(
+        strategy="bonus",
+        topologies=["single"],
+    )
+    response = json.dumps(
+        _task_profile(intent="continue", intent_confidence=1.0)
+    )
+    if analyzer_path == "retry":
+        ranking_config["task_analyzer"]["max_retries"] = 1
+        provider = _AnalyzerProvider(["not-json", response])
+        result = await analyze_task_with_provider(
+            provider=provider,
+            message="continue the prior task",
+            user_profile_enabled=False,
+            request_context=_single_context(),
+            routed_tier="c2",
+            routing_confidence=0.9,
+            ranking_config=ranking_config,
+            cache_continuity_available=cache_continuity_available,
+        )
+        assert len(provider.calls) == 2
+    elif analyzer_path == "fallback_chain":
+        provider = _AnalyzerProvider(response)
+        result = await analyze_task_with_fallback_chain(
+            candidates=_task_analyzer_chain_candidates([None, provider, None]),
+            message="continue the prior task",
+            user_profile_enabled=False,
+            request_context=_single_context(),
+            routed_tier="c2",
+            routing_confidence=0.9,
+            ranking_config=ranking_config,
+            cache_continuity_available=cache_continuity_available,
+            decision_id="c" * 32,
+        )
+        assert len(provider.calls) == 1
+    else:
+        provider = _AnalyzerProvider(response)
+        result = await analyze_task_with_provider(
+            provider=provider,
+            message="continue the prior task",
+            user_profile_enabled=False,
+            request_context=_single_context(),
+            routed_tier="c2",
+            routing_confidence=0.9,
+            ranking_config=ranking_config,
+            cache_continuity_available=cache_continuity_available,
+        )
+        assert len(provider.calls) == 1
+
+    assert result.schema_valid is True
+    assert result.profile["session_intent"]["type"] == expected_intent
+
+
+@pytest.mark.parametrize("topology", ["single", "multiple"])
+def test_schema_invalid_high_confidence_continue_cannot_apply_cache_live_or_replay(
+    topology: str,
+) -> None:
+    invalid_analysis = TaskAnalysisResult(
+        profile=_task_profile(
+            tier=1,
+            intent="continue",
+            intent_confidence=1.0,
+        ),
+        source="llm_provider",
+        schema_valid=False,
+        confidence=1.0,
+        fallback_reason="TimeoutError",
+    )
+
+    if topology == "single":
+        alpha = _model("alpha", capability=0.9)
+        beta = _model("beta", capability=0.9)
+        beta_identity = "test-provider:beta"
+        config = _cache_ranking_config(
+            strategy="bonus",
+            topologies=["single"],
+        )
+        affinity_inputs = {
+            "single": {
+                beta_identity: _cache_evidence(beta_identity, role="single")
+            }
+        }
+        valid = _single_decision(
+            alpha,
+            beta,
+            analysis=_analysis(
+                tier=1,
+                intent="continue",
+                intent_confidence=1.0,
+            ),
+            ranking_config=config,
+            cache_continuity_available=True,
+            cache_affinity_inputs=affinity_inputs,
+        )
+        invalid = _single_decision(
+            alpha,
+            beta,
+            analysis=invalid_analysis,
+            ranking_config=config,
+            cache_continuity_available=True,
+            cache_affinity_inputs=affinity_inputs,
+        )
+
+        assert valid.model.identity == beta_identity
+        assert invalid.model.identity == "test-provider:alpha"
+        replay_reasons = single_ranking_trace_replay_reasons
+        expected_tamper_reasons = [
+            "invalid_single_ranking_replay_cache_affinity_inputs"
+        ]
+        score_rows = invalid.trace["model_scores"]
+    else:
+        proposer_alpha = _model(
+            "p-alpha",
+            roles=["proposer"],
+            capability=0.9,
+        )
+        proposer_beta = _model(
+            "p-beta",
+            roles=["proposer"],
+            capability=0.9,
+        )
+        aggregator_alpha = _model(
+            "a-alpha",
+            roles=["aggregator"],
+            capability=0.8,
+            aggregator_fit=0.9,
+        )
+        aggregator_beta = _model(
+            "a-beta",
+            roles=["aggregator"],
+            capability=0.8,
+            aggregator_fit=0.9,
+        )
+        proposer_identity = "test-provider:p-beta"
+        aggregator_identity = "test-provider:a-beta"
+        config = _cache_ranking_config(
+            strategy="bonus",
+            topologies=["multiple"],
+        )
+        affinity_inputs = {
+            "proposer": {
+                proposer_identity: _cache_evidence(
+                    proposer_identity,
+                    role="proposer",
+                )
+            },
+            "aggregator": {
+                aggregator_identity: _cache_evidence(
+                    aggregator_identity,
+                    role="aggregator",
+                )
+            },
+        }
+        context = _context(
+            last_route={
+                "selected_P": ["unrelated:old"],
+                "selected_A": "unrelated:old-aggregator",
+            }
+        )
+        models = (
+            proposer_alpha,
+            proposer_beta,
+            aggregator_alpha,
+            aggregator_beta,
+        )
+        valid = _decision(
+            *models,
+            analysis=_analysis(
+                tier=1,
+                intent="continue",
+                intent_confidence=1.0,
+            ),
+            context=context,
+            ranking_config=config,
+            cache_affinity_inputs=affinity_inputs,
+            user_profile_enabled=False,
+        )
+        invalid = _decision(
+            *models,
+            analysis=invalid_analysis,
+            context=context,
+            ranking_config=config,
+            cache_affinity_inputs=affinity_inputs,
+            user_profile_enabled=False,
+        )
+
+        assert valid.proposers[0].identity == proposer_identity
+        assert valid.aggregator.identity == aggregator_identity
+        assert invalid.proposers[0].identity == "test-provider:p-alpha"
+        assert invalid.aggregator.identity == "test-provider:a-alpha"
+        replay_reasons = ranking_trace_replay_reasons
+        expected_tamper_reasons = [
+            "g1_frozen_ranker_replay_failed"
+        ]
+        score_rows = [
+            *invalid.trace["model_scores"],
+            *invalid.trace["aggregator"]["scores"],
+        ]
+
+    assert invalid.trace["task_analyzer"]["schema_valid"] is False
+    assert invalid.trace["cache_affinity_inputs"] == []
+    assert all("cache_affinity" not in row for row in score_rows)
+    assert replay_reasons(invalid.trace) == []
+
+    tampered = deepcopy(valid.trace)
+    tampered["task_analyzer"]["schema_valid"] = False
+    assert replay_reasons(tampered) == expected_tamper_reasons
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_mode", "expected_reason"),
+    [
+        ("provider_unavailable", "provider_unavailable"),
+        ("timeout", "TimeoutError"),
+    ],
+)
+async def test_configured_continue_fallback_never_applies_cache_after_analyzer_failure(
+    failure_mode: str,
+    expected_reason: str,
+) -> None:
+    config = _cache_ranking_config(
+        strategy="bonus",
+        topologies=["single"],
+    )
+    config["fallback_task_profile"]["session_intent"] = {
+        "type": "continue",
+        "confidence": 1.0,
+    }
+
+    class TimeoutAnalyzerProvider:
+        accounts_physical_usage = True
+
+        def chat(
+            self,
+            messages: list[Message],
+            tools: list[Any] | None = None,
+            config: ChatConfig | None = None,
+        ) -> AsyncIterator[Any]:
+            del messages, tools, config
+
+            async def stream() -> AsyncIterator[Any]:
+                await asyncio.Event().wait()
+                yield TextDeltaEvent(text="unreachable")
+
+            return stream()
+
+    provider = (
+        None
+        if failure_mode == "provider_unavailable"
+        else TimeoutAnalyzerProvider()
+    )
+    analysis = await analyze_task_with_provider(
+        provider=provider,
+        message="continue the previous task",
+        user_profile_enabled=False,
+        request_context=_single_context(),
+        routed_tier="c2",
+        routing_confidence=0.9,
+        ranking_config=config,
+        cache_continuity_available=True,
+        timeout_seconds=0.01 if failure_mode == "timeout" else None,
+    )
+    beta_identity = "test-provider:beta"
+    decision = _single_decision(
+        _model("alpha", capability=0.9),
+        _model("beta", capability=0.9),
+        analysis=analysis,
+        ranking_config=config,
+        cache_continuity_available=True,
+        cache_affinity_inputs={
+            "single": {
+                beta_identity: _cache_evidence(beta_identity, role="single")
+            }
+        },
+    )
+
+    assert analysis.source == "router_fallback"
+    assert analysis.schema_valid is False
+    assert analysis.fallback_reason == expected_reason
+    assert analysis.profile["session_intent"] == {
+        "type": "continue",
+        "confidence": 1.0,
+    }
+    assert decision.model.identity == "test-provider:alpha"
+    assert decision.trace["cache_affinity_inputs"] == []
+    assert all(
+        "cache_affinity" not in row
+        for row in decision.trace["model_scores"]
+    )
+    assert single_ranking_trace_replay_reasons(decision.trace) == []
+
+
+def test_single_bonus_applies_after_hard_filter_before_top1() -> None:
+    alpha = _model("alpha", capability=0.9)
+    beta = _model("beta", capability=0.9)
+    beta_identity = "test-provider:beta"
+    config = _cache_ranking_config(strategy="bonus", topologies=["single"])
+    decision = _single_decision(
+        alpha,
+        beta,
+        analysis=_analysis(intent="continue", intent_confidence=1.0),
+        ranking_config=config,
+        cache_continuity_available=True,
+        cache_affinity_inputs={
+            "single": {
+                beta_identity: _cache_evidence(beta_identity, role="single")
+            }
+        },
+    )
+
+    assert decision.model.identity == beta_identity
+    assert decision.trace["selection_policy"] == "cache_adjusted_base_score_top1"
+    scores = {row["identity"]: row for row in decision.trace["model_scores"]}
+    alpha_score = scores["test-provider:alpha"]
+    beta_score = scores[beta_identity]
+    assert alpha_score["S_base_clean"] == beta_score["S_base_clean"]
+    assert beta_score["cache_affinity"]["score_adjustment"] == pytest.approx(0.05)
+
+
+def test_single_cache_bonus_is_soft_and_cannot_overcome_a_larger_score_gap() -> None:
+    alpha = _model("alpha", capability=0.99)
+    beta = _model("beta", capability=0.50)
+    beta_identity = "test-provider:beta"
+    decision = _single_decision(
+        alpha,
+        beta,
+        analysis=_analysis(intent="continue", intent_confidence=1.0),
+        ranking_config=_cache_ranking_config(
+            strategy="bonus",
+            topologies=["single"],
+        ),
+        cache_continuity_available=True,
+        cache_affinity_inputs={
+            "single": {
+                beta_identity: _cache_evidence(beta_identity, role="single")
+            }
+        },
+    )
+
+    assert decision.model.identity == "test-provider:alpha"
+
+
+def test_cache_intent_gate_includes_threshold_and_rejects_other_intents() -> None:
+    alpha = _model("alpha", capability=0.9)
+    beta = _model("beta", capability=0.9)
+    beta_identity = "test-provider:beta"
+    config = _cache_ranking_config(strategy="bonus", topologies=["single"])
+    threshold = config["session"]["intent_confidence_threshold"]
+    evidence = {
+        "single": {
+            beta_identity: _cache_evidence(beta_identity, role="single")
+        }
+    }
+
+    at_threshold = _single_decision(
+        alpha,
+        beta,
+        analysis=_analysis(intent="continue", intent_confidence=threshold),
+        ranking_config=config,
+        cache_continuity_available=True,
+        cache_affinity_inputs=evidence,
+    )
+    below_threshold = _single_decision(
+        alpha,
+        beta,
+        analysis=_analysis(
+            intent="continue",
+            intent_confidence=threshold - 1e-9,
+        ),
+        ranking_config=config,
+        cache_continuity_available=True,
+        cache_affinity_inputs=evidence,
+    )
+
+    assert at_threshold.model.identity == beta_identity
+    assert below_threshold.model.identity == "test-provider:alpha"
+    for intent in ("new_task", "redo", "unknown"):
+        rejected = _single_decision(
+            alpha,
+            beta,
+            analysis=_analysis(intent=intent, intent_confidence=1.0),
+            ranking_config=config,
+            cache_continuity_available=True,
+            cache_affinity_inputs=evidence,
+        )
+        assert rejected.model.identity == "test-provider:alpha"
+
+
+def test_single_expected_cost_replaces_only_input_cost_component() -> None:
+    alpha = _model("alpha", capability=0.9, price=2.0)
+    beta = _model(
+        "beta",
+        capability=0.9,
+        price=2.0,
+        price_source="synthetic_exact",
+    )
+    beta_identity = "test-provider:beta"
+    quote = CachePriceQuote(
+        provider="test-provider",
+        canonical_model="beta",
+        endpoint_scope="https://provider.test:443/v1",
+        upstream_scope="test-provider",
+        price_source="synthetic_exact",
+        normal_input_per_million=2.0,
+        normal_output_per_million=2.0,
+        cache_read_per_million=0.2,
+        cache_write_per_million=2.5,
+    )
+    decision = _single_decision(
+        alpha,
+        beta,
+        analysis=_analysis(intent="continue", intent_confidence=1.0),
+        ranking_config=_cache_ranking_config(
+            strategy="expected_cost",
+            topologies=["single"],
+        ),
+        cache_continuity_available=True,
+        cache_affinity_inputs={
+            "single": {
+                beta_identity: _cache_evidence(
+                    beta_identity,
+                    role="single",
+                    price_quote=quote,
+                )
+            }
+        },
+    )
+
+    assert decision.model.identity == beta_identity
+    beta_score = next(
+        row
+        for row in decision.trace["model_scores"]
+        if row["identity"] == beta_identity
+    )
+    assert beta_score["S_base"] == beta_score["S_base_clean"]
+    assert beta_score["cache_affinity"]["N"] == 1_000
+    assert beta_score["cache_affinity"]["K"] == 1_000
+    assert beta_score["cache_affinity"]["score_adjustment"] > 0.0
+
+
+def test_expected_cost_unavailable_reason_is_safe_replayable_and_tamper_bound() -> None:
+    identity = "test-provider:beta"
+    reason = (
+        ranking_router.CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
+    )
+    reasons = [
+        {"role": "single", "identity": identity, "reason": reason}
+    ]
+    decision = _single_decision(
+        _model("alpha", capability=0.9, price=2.0),
+        _model("beta", capability=0.9, price=2.0),
+        analysis=_analysis(intent="continue", intent_confidence=1.0),
+        ranking_config=_cache_ranking_config(
+            strategy="expected_cost",
+            topologies=["single"],
+        ),
+        cache_continuity_available=True,
+        cache_affinity_unavailable_reasons=reasons,
+    )
+
+    assert decision.trace["cache_affinity_unavailable_reasons"] == reasons
+    assert single_ranking_trace_replay_reasons(decision.trace) == []
+    tampered = deepcopy(decision.trace)
+    tampered["cache_affinity_unavailable_reasons"][0]["reason"] = (
+        "untrusted_reason"
+    )
+    assert single_ranking_trace_replay_reasons(tampered) == [
+        "invalid_single_ranking_replay_cache_affinity_inputs"
+    ]
+
+
+def test_multiple_expected_cost_unavailable_reason_is_replayable() -> None:
+    identity = "test-provider:p-beta"
+    reason = (
+        ranking_router.CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
+    )
+    reasons = [
+        {"role": "proposer", "identity": identity, "reason": reason}
+    ]
+    decision = _decision(
+        _model("p-alpha", roles=["proposer"], capability=0.9, price=2.0),
+        _model("p-beta", roles=["proposer"], capability=0.9, price=2.0),
+        _model(
+            "a-alpha",
+            roles=["aggregator"],
+            capability=0.8,
+            aggregator_fit=0.9,
+            price=2.0,
+        ),
+        analysis=_analysis(tier=1, intent="continue", intent_confidence=1.0),
+        ranking_config=_cache_ranking_config(
+            strategy="expected_cost",
+            topologies=["multiple"],
+        ),
+        cache_continuity_available=True,
+        cache_affinity_unavailable_reasons=reasons,
+        user_profile_enabled=False,
+    )
+
+    assert decision.trace["cache_affinity_unavailable_reasons"] == reasons
+    assert ranking_trace_replay_reasons(decision.trace) == []
+    tampered = deepcopy(decision.trace)
+    tampered["cache_affinity_unavailable_reasons"][0]["identity"] = (
+        "test-provider:unknown"
+    )
+    assert ranking_trace_replay_reasons(tampered) == [
+        "g1_frozen_ranker_replay_failed"
+    ]
+
+
+def test_cache_unavailable_reason_is_absent_for_bonus_and_disabled_policy() -> None:
+    models = (
+        _model("alpha", capability=0.9),
+        _model("beta", capability=0.8),
+    )
+    absent = _single_decision(*models)
+    bonus = _single_decision(
+        *models,
+        ranking_config=_cache_ranking_config(
+            strategy="bonus",
+            topologies=["single"],
+        ),
+    )
+    absent_without_private_input = rank_single_model(
+        task_analysis=_analysis(),
+        user_profile=None,
+        request_context=_single_context(),
+        registry_snapshot=_snapshot(*models),
+        routed_tier="c2",
+        routing_confidence=0.9,
+        requires_tools=False,
+        decision_id="single-test",
+    )
+    bonus_config = _cache_ranking_config(
+        strategy="bonus",
+        topologies=["single"],
+    )
+    bonus_without_private_input = rank_single_model(
+        task_analysis=_analysis(),
+        user_profile=None,
+        request_context=_single_context(),
+        registry_snapshot=_snapshot(*models),
+        routed_tier="c2",
+        routing_confidence=0.9,
+        requires_tools=False,
+        ranking_config=bonus_config,
+        decision_id="single-test",
+    )
+    bonus_with_explicit_none = _single_decision(
+        *models,
+        ranking_config=bonus_config,
+        cache_affinity_unavailable_reasons=None,
+    )
+
+    assert "cache_affinity_unavailable_reasons" not in absent.trace
+    assert "cache_affinity_unavailable_reasons" not in bonus.trace
+    assert absent.trace == absent_without_private_input.trace
+    assert bonus_with_explicit_none.trace == bonus_without_private_input.trace
+    with pytest.raises(
+        DynamicRankingError,
+        match="require an active expected_cost policy",
+    ):
+        _single_decision(
+            *models,
+            ranking_config=_cache_ranking_config(
+                strategy="bonus",
+                topologies=["single"],
+            ),
+            cache_affinity_unavailable_reasons=[
+                {
+                    "role": "single",
+                    "identity": "test-provider:alpha",
+                    "reason": (
+                        ranking_router.CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
+                    ),
+                }
+            ],
+        )
+
+
+@pytest.mark.parametrize("strategy", ["bonus", "expected_cost"])
+def test_single_cache_aware_trace_replay_and_tamper_rejection(
+    strategy: str,
+) -> None:
+    alpha = _model("alpha", capability=0.9, price=2.0)
+    beta = _model(
+        "beta",
+        capability=0.9,
+        price=2.0,
+        price_source=("synthetic_exact" if strategy == "expected_cost" else None),
+    )
+    beta_identity = "test-provider:beta"
+    quote = (
+        CachePriceQuote(
+            provider="test-provider",
+            canonical_model="beta",
+            endpoint_scope="https://provider.test:443/v1",
+            upstream_scope="test-provider",
+            price_source="synthetic_exact",
+            normal_input_per_million=2.0,
+            normal_output_per_million=2.0,
+            cache_read_per_million=0.2,
+            cache_write_per_million=2.5,
+        )
+        if strategy == "expected_cost"
+        else None
+    )
+    decision = _single_decision(
+        alpha,
+        beta,
+        analysis=_analysis(intent="continue", intent_confidence=1.0),
+        ranking_config=_cache_ranking_config(
+            strategy=strategy,
+            topologies=["single"],
+        ),
+        cache_continuity_available=True,
+        cache_affinity_inputs={
+            "single": {
+                beta_identity: _cache_evidence(
+                    beta_identity,
+                    role="single",
+                    price_quote=quote,
+                )
+            }
+        },
+    )
+
+    assert single_ranking_trace_replay_reasons(decision.trace) == []
+    tampered = deepcopy(decision.trace)
+    tampered["cache_affinity_inputs"][0]["score_adjustment"] += 0.001
+    assert single_ranking_trace_replay_reasons(tampered)
+
+
+def test_multiple_bonus_applies_only_at_proposer_marginal_and_aggregator_score() -> None:
+    proposer_alpha = _model(
+        "p-alpha",
+        roles=["proposer"],
+        capability=0.9,
+    )
+    proposer_beta = _model(
+        "p-beta",
+        roles=["proposer"],
+        capability=0.9,
+    )
+    aggregator_alpha = _model(
+        "a-alpha",
+        roles=["aggregator"],
+        capability=0.8,
+        aggregator_fit=0.9,
+    )
+    aggregator_beta = _model(
+        "a-beta",
+        roles=["aggregator"],
+        capability=0.8,
+        aggregator_fit=0.9,
+    )
+    proposer_identity = "test-provider:p-beta"
+    aggregator_identity = "test-provider:a-beta"
+    decision = _decision(
+        proposer_alpha,
+        proposer_beta,
+        aggregator_alpha,
+        aggregator_beta,
+        analysis=_analysis(tier=1, intent="continue", intent_confidence=1.0),
+        context=_context(
+            last_route={
+                "selected_P": ["unrelated:old"],
+                "selected_A": "unrelated:old-aggregator",
+            }
+        ),
+        ranking_config=_cache_ranking_config(
+            strategy="bonus",
+            topologies=["multiple"],
+        ),
+        cache_affinity_inputs={
+            "proposer": {
+                proposer_identity: _cache_evidence(
+                    proposer_identity,
+                    role="proposer",
+                )
+            },
+            "aggregator": {
+                aggregator_identity: _cache_evidence(
+                    aggregator_identity,
+                    role="aggregator",
+                )
+            },
+        },
+    )
+
+    assert decision.proposers[0].identity == proposer_identity
+    assert decision.aggregator.identity == aggregator_identity
+    proposer_scores = {
+        row["identity"]: row for row in decision.trace["model_scores"]
+    }
+    assert (
+        proposer_scores["test-provider:p-alpha"]["S_base_clean"]
+        == proposer_scores[proposer_identity]["S_base_clean"]
+    )
+    assert decision.trace["selection_steps"][0]["cache_affinity"][
+        "score_adjustment"
+    ] == pytest.approx(0.05)
+    assert decision.trace["aggregator"]["selected"]["cache_affinity"][
+        "score_adjustment"
+    ] == pytest.approx(0.05)
+
+
+def test_multiple_cache_affinity_preserves_bounds_quorum_and_backup_contracts() -> None:
+    models = (
+        _model("p-alpha", roles=["proposer"], capability=0.9),
+        _model("p-beta", roles=["proposer"], capability=0.9),
+        _model("p-gamma", roles=["proposer"], capability=0.85),
+        _model(
+            "a-alpha",
+            roles=["aggregator"],
+            capability=0.8,
+            aggregator_fit=0.9,
+        ),
+        _model(
+            "a-beta",
+            roles=["aggregator"],
+            capability=0.8,
+            aggregator_fit=0.9,
+        ),
+    )
+    analysis = _analysis(tier=1, intent="continue", intent_confidence=1.0)
+    context = _context(
+        last_route={
+            "selected_P": ["unrelated:old"],
+            "selected_A": "unrelated:old-aggregator",
+        }
+    )
+    baseline = _decision(*models, analysis=analysis, context=context)
+    adjusted = _decision(
+        *models,
+        analysis=analysis,
+        context=context,
+        ranking_config=_cache_ranking_config(
+            strategy="bonus",
+            topologies=["multiple"],
+        ),
+        cache_affinity_inputs={
+            "proposer": {
+                "test-provider:p-beta": _cache_evidence(
+                    "test-provider:p-beta",
+                    role="proposer",
+                )
+            },
+            "aggregator": {
+                "test-provider:a-beta": _cache_evidence(
+                    "test-provider:a-beta",
+                    role="aggregator",
+                )
+            },
+        },
+    )
+
+    for field in (
+        "N_min",
+        "N_max",
+        "configured_proposer_backup_count",
+        "effective_proposer_backup_count",
+        "proposer_recovery_policy",
+    ):
+        assert adjusted.trace[field] == baseline.trace[field]
+
+
+def test_cache_aware_trace_replay_consumes_only_frozen_adjustments() -> None:
+    proposer_alpha = _model(
+        "p-alpha",
+        roles=["proposer"],
+        capability=0.9,
+    )
+    proposer_beta = _model(
+        "p-beta",
+        roles=["proposer"],
+        capability=0.9,
+    )
+    aggregator_alpha = _model(
+        "a-alpha",
+        roles=["aggregator"],
+        capability=0.8,
+        aggregator_fit=0.9,
+    )
+    aggregator_beta = _model(
+        "a-beta",
+        roles=["aggregator"],
+        capability=0.8,
+        aggregator_fit=0.9,
+    )
+    decision = _decision(
+        proposer_alpha,
+        proposer_beta,
+        aggregator_alpha,
+        aggregator_beta,
+        analysis=_analysis(tier=1, intent="continue", intent_confidence=1.0),
+        context=_context(
+            last_route={
+                "selected_P": ["unrelated:old"],
+                "selected_A": "unrelated:old-aggregator",
+            }
+        ),
+        ranking_config=_cache_ranking_config(
+            strategy="bonus",
+            topologies=["multiple"],
+        ),
+        cache_affinity_inputs={
+            "proposer": {
+                "test-provider:p-beta": _cache_evidence(
+                    "test-provider:p-beta",
+                    role="proposer",
+                )
+            },
+            "aggregator": {
+                "test-provider:a-beta": _cache_evidence(
+                    "test-provider:a-beta",
+                    role="aggregator",
+                )
+            },
+        },
+        user_profile_enabled=False,
+    )
+
+    assert ranking_trace_replay_reasons(decision.trace) == []
+    tampered = deepcopy(decision.trace)
+    tampered["cache_affinity_inputs"][0]["score_adjustment"] += 0.001
+    assert ranking_trace_replay_reasons(tampered) == [
+        "invalid_g1_replay_cache_affinity_inputs"
+    ]
+
+
+def test_expected_cost_trace_replay_uses_frozen_safe_table() -> None:
+    proposer_alpha = _model(
+        "p-alpha",
+        roles=["proposer"],
+        capability=0.9,
+        price=2.0,
+    )
+    proposer_beta = _model(
+        "p-beta",
+        roles=["proposer"],
+        capability=0.9,
+        price=2.0,
+        price_source="synthetic_exact",
+    )
+    aggregator_alpha = _model(
+        "a-alpha",
+        roles=["aggregator"],
+        capability=0.8,
+        aggregator_fit=0.9,
+        price=2.0,
+    )
+    aggregator_beta = _model(
+        "a-beta",
+        roles=["aggregator"],
+        capability=0.8,
+        aggregator_fit=0.9,
+        price=2.0,
+        price_source="synthetic_exact",
+    )
+
+    def quote(model: str) -> CachePriceQuote:
+        return CachePriceQuote(
+            provider="test-provider",
+            canonical_model=model,
+            endpoint_scope="https://provider.test:443/v1",
+            upstream_scope="test-provider",
+            price_source="synthetic_exact",
+            normal_input_per_million=2.0,
+            normal_output_per_million=2.0,
+            cache_read_per_million=0.2,
+            cache_write_per_million=2.5,
+        )
+
+    decision = _decision(
+        proposer_alpha,
+        proposer_beta,
+        aggregator_alpha,
+        aggregator_beta,
+        analysis=_analysis(tier=1, intent="continue", intent_confidence=1.0),
+        context=_context(
+            last_route={
+                "selected_P": ["unrelated:old"],
+                "selected_A": "unrelated:old-aggregator",
+            }
+        ),
+        ranking_config=_cache_ranking_config(
+            strategy="expected_cost",
+            topologies=["multiple"],
+        ),
+        cache_affinity_inputs={
+            "proposer": {
+                "test-provider:p-beta": _cache_evidence(
+                    "test-provider:p-beta",
+                    role="proposer",
+                    price_quote=quote("p-beta"),
+                )
+            },
+            "aggregator": {
+                "test-provider:a-beta": _cache_evidence(
+                    "test-provider:a-beta",
+                    role="aggregator",
+                    price_quote=quote("a-beta"),
+                )
+            },
+        },
+        user_profile_enabled=False,
+    )
+
+    assert ranking_trace_replay_reasons(decision.trace) == []
+    tampered = deepcopy(decision.trace)
+    tampered["cache_affinity_inputs"][0]["p"] = float("nan")
+    assert ranking_trace_replay_reasons(tampered) == [
+        "invalid_g1_replay_cache_affinity_inputs"
+    ]
+
+    coordinated = deepcopy(decision.trace)
+    target_identity = coordinated["cache_affinity_inputs"][0]["identity"]
+    changed = 0
+
+    def tamper_price_source(value: object) -> None:
+        nonlocal changed
+        if isinstance(value, dict):
+            if (
+                value.get("identity") == target_identity
+                and "price_source" in value
+            ):
+                value["price_source"] = "forged_price_source"
+                changed += 1
+            for child in value.values():
+                tamper_price_source(child)
+        elif isinstance(value, list):
+            for child in value:
+                tamper_price_source(child)
+
+    for field_name, field_value in coordinated.items():
+        if field_name != "registry_snapshot":
+            tamper_price_source(field_value)
+    assert changed >= 2  # frozen input plus its nested score/selection projection
+    assert ranking_trace_replay_reasons(coordinated) == [
+        "g1_frozen_ranker_replay_failed"
+    ]
+
+    coordinated_k = deepcopy(decision.trace)
+    changed_k = 0
+
+    def tamper_cache_tokens(value: object) -> None:
+        nonlocal changed_k
+        if isinstance(value, dict):
+            if value.get("identity") == target_identity and "K" in value:
+                value["K"] -= 1
+                changed_k += 1
+            for child in value.values():
+                tamper_cache_tokens(child)
+        elif isinstance(value, list):
+            for child in value:
+                tamper_cache_tokens(child)
+
+    for field_name, field_value in coordinated_k.items():
+        if field_name != "registry_snapshot":
+            tamper_cache_tokens(field_value)
+    assert changed_k >= 2
+    assert ranking_trace_replay_reasons(coordinated_k) == [
+        "invalid_g1_replay_cache_affinity_inputs"
+    ]
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+import opensquilla.provider.ranking_router as ranking_router
 from opensquilla.eval.draco_experiment_config import (
     DracoFrozenTaskAnalysisExecutionConfig,
     DracoFrozenTaskAnalysisExecutionV2Config,
@@ -213,6 +214,40 @@ def test_replay_contract_materializes_bound_profile_with_zero_usage() -> None:
             "task_profile_pre_escalation_sha256"
         ]
     )
+
+
+@pytest.mark.parametrize("cache_continuity_available", [False, True])
+def test_frozen_replay_forwards_cache_continuity_without_manufacturing_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    cache_continuity_available: bool,
+) -> None:
+    contract, _, request_context, task_id, input_sha, prompt_sha = _fixture()
+    ranking_config = ranking_config_resolution()["effective_config"]
+    observed: list[bool] = []
+    original_normalize = ranking_router.normalize_task_profile
+
+    def capture_continuity(*args: Any, **kwargs: Any):
+        observed.append(kwargs.get("cache_continuity_available"))
+        return original_normalize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        ranking_router,
+        "normalize_task_profile",
+        capture_continuity,
+    )
+    result = frozen_task_analysis_result(
+        contract,
+        task_id=task_id,
+        task_input_sha256=input_sha,
+        prompt_sha256=prompt_sha,
+        routed_tier="c1",
+        request_context=request_context,
+        ranking_config=ranking_config,
+        cache_continuity_available=cache_continuity_available,
+    )
+
+    assert observed == [cache_continuity_available]
+    assert result.profile["session_intent"]["type"] == "new_task"
 
 
 def test_replay_accepts_selected_fallback_route_with_zero_usage() -> None:

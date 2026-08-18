@@ -29,6 +29,7 @@ from opensquilla.gateway.input_normalization import (
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcUnavailableError, get_dispatcher
 from opensquilla.gateway.session_events import build_sessions_changed_payload
 from opensquilla.gateway.session_services import (
+    clear_session_epoch,
     get_session_epoch,
     get_session_lock,
     get_session_storage,
@@ -3727,11 +3728,31 @@ async def _handle_sessions_delete(params: dict | None, ctx: RpcContext) -> dict:
         try:
             canonical_key = canonicalize_session_key(k)
             lock = get_session_lock(ctx.turn_runner, canonical_key)
+
+            def _clear_runtime_state() -> None:
+                # Current SessionStorage instances notify runtime listeners at
+                # the durable delete boundary. Keep an explicit fallback for
+                # older/custom stores and lightweight test doubles.
+                if not callable(getattr(storage, "add_session_delete_listener", None)):
+                    invalidator = getattr(
+                        ctx.turn_runner,
+                        "_invalidate_router_dynamic_cache_affinity",
+                        None,
+                    )
+                    if callable(invalidator):
+                        invalidator(
+                            session_key=canonical_key,
+                            reason="session_deleted",
+                        )
+                    clear_session_epoch(ctx.session_manager, canonical_key)
+
             if lock is None:
                 await storage.delete_session(canonical_key)
+                _clear_runtime_state()
             else:
                 async with lock:
                     await storage.delete_session(canonical_key)
+                    _clear_runtime_state()
             deleted.append(k)
         except Exception as exc:
             errors.append(f"{k}: {exc}")

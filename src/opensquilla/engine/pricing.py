@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -13,6 +14,10 @@ import structlog
 
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
+from opensquilla.provider.cache_affinity import (
+    CachePriceQuote,
+    canonical_cache_endpoint,
+)
 from opensquilla.secrets import clean_header_secret
 
 log = structlog.get_logger(__name__)
@@ -588,6 +593,14 @@ _DEFAULT_PRICING = PriceEntry(3.0, 15.0)
 # pricing table misses the ``ollama/`` free entry and applies the cloud default.
 _LOCAL_FREE_PROVIDERS = frozenset({"ollama", "lm_studio", "ovms", "vllm", "local"})
 
+# The general static table mixes first-party prices, marketplace estimates,
+# and offline fallbacks. These are the only model namespaces whose cache rates
+# currently carry enough provenance to bind them to a provider's canonical
+# first-party endpoint. Extend only alongside source/provenance tests.
+_EXACT_STATIC_CACHE_NAMESPACES_BY_PROVIDER: dict[str, frozenset[str]] = {
+    "anthropic": frozenset({"anthropic"}),
+}
+
 
 def _lookup_static_price_ex(model_id: str) -> tuple[PriceEntry, bool]:
     """Static-table price plus whether a row actually matched.
@@ -712,6 +725,128 @@ def resolve_model_price(model_id: str, provider: str = "") -> ResolvedModelPrice
             return ResolvedModelPrice(live, "live_openrouter")
     static, matched = _lookup_static_price_ex(model_id)
     return ResolvedModelPrice(static, "static_table" if matched else "default")
+
+
+def resolve_cache_price_quote_exact(
+    *,
+    provider: str,
+    model_id: str,
+    endpoint_scope: str,
+    upstream_scope: str = "",
+    ranking_price_source: str,
+    ranking_input_per_million: float,
+    ranking_output_per_million: float,
+) -> CachePriceQuote | None:
+    """Return a no-network, deployment-bound total-bucket cache quote.
+
+    This intentionally does not call :func:`resolve_model_price`: that resolver
+    may synchronously refresh OpenRouter pricing.  OpenRouter's model-level
+    catalog also cannot prove the price of one strict upstream, so routed
+    OpenRouter deployments fail closed until an upstream-scoped catalog exists.
+
+    V1 accepts only immutable local/static pricing layers.  Catalog entries are
+    excluded because their current ``source`` records the highest-authority
+    contributor to the whole model row, not per-price-field provenance.
+    """
+
+    provider_id = str(provider or "").strip().casefold()
+    canonical_model = str(model_id or "").strip()
+    endpoint = canonical_cache_endpoint(endpoint_scope)
+    upstream = str(upstream_scope or provider_id).strip().casefold()
+    expected_source = str(ranking_price_source or "").strip()
+    if (
+        not provider_id
+        or not canonical_model
+        or endpoint is None
+        or not expected_source
+        or provider_id == "openrouter"
+    ):
+        return None
+    for value in (ranking_input_per_million, ranking_output_per_million):
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0.0
+        ):
+            return None
+
+    if provider_id in _LOCAL_FREE_PROVIDERS:
+        resolved = PriceEntry(0.0, 0.0, 0.0, 0.0)
+        source = "local_free"
+    else:
+        # A global static model table is not, by itself, deployment-scoped
+        # pricing evidence. Only accept it for the provider's canonical
+        # first-party endpoint and an explicitly provenance-approved
+        # provider/model namespace. Custom/proxy endpoints, providers with no
+        # canonical endpoint, and unapproved model ids fail closed.
+        try:
+            from opensquilla.provider.registry import get_provider_spec
+
+            provider_spec = get_provider_spec(provider_id)
+        except Exception:  # noqa: BLE001 - exact quote is optional/fail-closed
+            return None
+        default_endpoint = canonical_cache_endpoint(
+            provider_spec.default_base_url
+        )
+        model_namespace = (
+            canonical_model.split("/", 1)[0].strip().casefold()
+            if "/" in canonical_model
+            else ""
+        )
+        exact_static_namespaces = _EXACT_STATIC_CACHE_NAMESPACES_BY_PROVIDER.get(
+            provider_id,
+            frozenset(),
+        )
+        if (
+            default_endpoint is None
+            or endpoint != default_endpoint
+            or upstream != provider_id
+            or not model_namespace
+            or model_namespace not in exact_static_namespaces
+        ):
+            return None
+        override = _lookup_price_override(canonical_model)
+        if override is not None:
+            resolved = override
+            source = "static_table"
+        else:
+            resolved, matched = _lookup_static_price_ex(canonical_model)
+            if not matched:
+                return None
+            source = "static_table"
+    if source != expected_source:
+        return None
+    rates = (
+        resolved.input_per_m,
+        resolved.output_per_m,
+        resolved.cache_read_per_m,
+        resolved.cache_write_per_m,
+    )
+    if any(
+        value is None
+        or isinstance(value, bool)
+        or not math.isfinite(float(value))
+        or float(value) < 0.0
+        for value in rates
+    ):
+        return None
+    if (
+        float(resolved.input_per_m) != float(ranking_input_per_million)
+        or float(resolved.output_per_m) != float(ranking_output_per_million)
+    ):
+        return None
+    return CachePriceQuote(
+        provider=provider_id,
+        canonical_model=canonical_model,
+        endpoint_scope=endpoint,
+        upstream_scope=upstream,
+        price_source=source,
+        normal_input_per_million=float(resolved.input_per_m),
+        normal_output_per_million=float(resolved.output_per_m),
+        cache_read_per_million=float(resolved.cache_read_per_m),
+        cache_write_per_million=float(resolved.cache_write_per_m),
+    )
 
 
 def lookup_price(model_id: str, provider: str = "") -> PriceEntry:

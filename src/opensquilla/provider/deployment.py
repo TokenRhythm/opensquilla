@@ -13,8 +13,9 @@ environment-backed credentials, the environment-variable *name*.
 
 from __future__ import annotations
 
-from collections.abc import Callable, MutableMapping
-from dataclasses import dataclass, field
+import os
+from collections.abc import Callable, Mapping, MutableMapping
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import structlog
@@ -24,6 +25,10 @@ from opensquilla.routing_identity import (
     canonicalize_provider_routing_upstream as canonicalize_provider_routing_upstream,
 )
 
+from .cache_affinity import (
+    CredentialNamespaceToken,
+    build_credential_namespace_token,
+)
 from .environment import environment_value
 from .registry import UnknownProviderError, get_provider_spec
 from .selector import ProviderConfig
@@ -341,3 +346,61 @@ def resolve_provider_deployment(
         proxy_source=proxy_source,
         provider_config=provider_config,
     )
+
+
+def resolve_provider_deployment_cache_identity(
+    config: Any,
+    provider_id: str,
+    model: str,
+    *,
+    inherited_provider_config: ProviderConfig | None = None,
+    overrides: Any | None = None,
+    session_key: str = "",
+    turn_metadata: MutableMapping[str, Any] | None = None,
+    replay_provider_state: bool | None = None,
+    credential_pool_acquirer: CredentialPoolAcquirer | None = None,
+    environment_reader: EnvironmentReader | None = None,
+    tenant_headers: Mapping[str, str] | None = None,
+) -> tuple[ProviderDeploymentResolution, CredentialNamespaceToken | None]:
+    """Resolve a deployment and its private process-local credential token.
+
+    The ordinary resolver remains byte-for-byte compatible and does not pay
+    the HMAC cost.  Cache-aware callers opt into this wrapper, and must keep the
+    returned token out of public/serialized dataclass surfaces, traces, logs,
+    and persistence. Private execution dataclasses may carry it only with
+    repr/compare/serialization exclusion.
+    """
+
+    resolution = resolve_provider_deployment(
+        config,
+        provider_id,
+        model,
+        inherited_provider_config=inherited_provider_config,
+        overrides=overrides,
+        session_key=session_key,
+        turn_metadata=turn_metadata,
+        replay_provider_state=replay_provider_state,
+        credential_pool_acquirer=credential_pool_acquirer,
+        environment_reader=environment_reader,
+    )
+    provider_config = resolution.provider_config
+    if not resolution.ready or provider_config is None:
+        return resolution, None
+    strict_routing = (
+        os.environ.get("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "")
+        .strip()
+        .casefold()
+        in {"1", "true", "yes", "on", "enabled"}
+    )
+    provider_config = replace(
+        provider_config,
+        _provider_routing_strict_override=strict_routing,
+    )
+    resolution = replace(resolution, provider_config=provider_config)
+    token = build_credential_namespace_token(
+        provider=resolution.provider,
+        resolved_secret=provider_config.api_key,
+        org_id=provider_config.org_id,
+        tenant_headers=tenant_headers,
+    )
+    return resolution, token

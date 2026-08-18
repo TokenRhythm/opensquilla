@@ -16,12 +16,15 @@ import copy
 import hashlib
 import inspect
 import json
+import math
 import os
 import platform
 import re
 import threading
 import time
 import uuid
+import weakref
+from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable, Hashable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
@@ -198,6 +201,7 @@ from opensquilla.provider import (
     ErrorEvent as ProviderErrorEvent,
 )
 from opensquilla.provider import (
+    ProviderFailureKind,
     ProviderHeartbeatEvent,
     ProviderRecoveryAction,
     ProviderRetryTransition,
@@ -205,11 +209,21 @@ from opensquilla.provider import (
     decide_recovery_action,
     prepare_provider_retry_after_failure,
 )
+from opensquilla.provider.cache_affinity import (
+    CacheAffinityReceipt as _RouterDynamicCacheAffinityReceipt,
+)
+from opensquilla.provider.cache_affinity import (
+    build_cache_affinity_receipt,
+    build_cache_domain_guard,
+)
 from opensquilla.provider.model_catalog import resolve_effective_context_window
 from opensquilla.provider.protocol import (
     ProviderRetryScopeError,
     reserve_provider_retry_physical_request,
     validate_provider_chat_request,
+)
+from opensquilla.provider.types import (
+    DoneEvent as ProviderDoneEvent,
 )
 from opensquilla.provider.types import (
     EnsembleProgressEvent as ProviderEnsembleProgressEvent,
@@ -405,6 +419,8 @@ _IMAGE_ANALYSIS_TOOL_POLICY = _ToolConcurrencyPolicy(
     max_inflight=2,
     limit_key=("media", "image_analysis"),
 )
+
+
 def _get_tool_concurrency_policy(
     tool_name: str,
     arguments: Mapping[str, Any] | None = None,
@@ -461,11 +477,11 @@ _ACCEPTED_TURN_CONFIG: contextvars.ContextVar[Any | None] = contextvars.ContextV
 # One router_single route freezes the two catalog budgets used for ranking.
 # The ContextVar carries those values across the pipeline -> AgentBootstrap
 # boundary without sharing mutable per-turn state between concurrent sessions.
-_ROUTER_SINGLE_FROZEN_CATALOG: contextvars.ContextVar[
-    dict[str, Any] | None
-] = contextvars.ContextVar(
-    "_router_single_frozen_catalog",
-    default=None,
+_ROUTER_SINGLE_FROZEN_CATALOG: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar(
+        "_router_single_frozen_catalog",
+        default=None,
+    )
 )
 
 
@@ -921,9 +937,8 @@ def _bounded_tool_result_metadata(
             _add_bounded_tool_result_metadata(metadata, key, diagnostics[key])
 
         diagnostic_attempts = diagnostics.get("provider_attempts")
-        if (
-            "provider_attempt_count" not in metadata
-            and isinstance(diagnostic_attempts, list | tuple)
+        if "provider_attempt_count" not in metadata and isinstance(
+            diagnostic_attempts, list | tuple
         ):
             metadata["provider_attempt_count"] = len(diagnostic_attempts)
 
@@ -1242,11 +1257,7 @@ def _artifact_delivery_effective_publish_name(
         raw_name = arguments.get("name")
         requested_name = raw_name if isinstance(raw_name, str) else None
         artifact_name = (requested_name or target_name).strip() or target_name
-        if (
-            requested_name
-            and not Path(artifact_name).suffix
-            and Path(target_name).suffix
-        ):
+        if requested_name and not Path(artifact_name).suffix and Path(target_name).suffix:
             artifact_name = f"{artifact_name}{Path(target_name).suffix}"
     except (OSError, RuntimeError, ValueError):
         return None
@@ -1318,6 +1329,7 @@ def _artifact_delivery_target_keys(
         if root_path_key is not None:
             keys.append(root_path_key)
     return tuple(dict.fromkeys(keys))
+
 
 def _artifact_delivery_failure_notice(*, partial: bool = False) -> str:
     if partial:
@@ -1404,7 +1416,7 @@ def _report_credential_pool_failure(
     provider_name: str,
     turn_metadata: dict[str, Any] | None,
     event: ProviderErrorEvent,
-) -> None:
+) -> bool:
     """Park a pool-served profile key on rate-limit / credits / auth failures.
 
     No-op unless this turn's provider was resolved through a profile
@@ -1418,15 +1430,16 @@ def _report_credential_pool_failure(
     break the turn loop.
     """
     if not turn_metadata:
-        return
+        return False
     pool_info = turn_metadata.get("credential_pool")
     if not isinstance(pool_info, dict):
-        return
+        return False
     pool_provider = str(pool_info.get("provider") or "")
     if not pool_provider:
-        return
+        return False
     if str(turn_metadata.get("routed_provider_applied") or "") != pool_provider:
-        return
+        return False
+    should_purge = False
     try:
         kind = classify_provider_error(
             provider_name=provider_name,
@@ -1434,6 +1447,13 @@ def _report_credential_pool_failure(
             raw_code=event.code,
             message=event.message,
         )
+        if kind not in {
+            ProviderFailureKind.RATE_LIMITED,
+            ProviderFailureKind.INSUFFICIENT_CREDITS,
+            ProviderFailureKind.AUTH_INVALID,
+        }:
+            return False
+        should_purge = True
         from opensquilla.gateway.llm_runtime import profile_credential_pools
 
         profile_credential_pools().report_failure(
@@ -1442,8 +1462,10 @@ def _report_credential_pool_failure(
             kind,
             retry_after_seconds=getattr(event, "retry_after_s", None),
         )
+        return True
     except Exception:  # noqa: BLE001 — credential bookkeeping only
         log.debug("credential_pool.report_failed", provider=pool_provider)
+        return should_purge
 
 
 def _normalize_heartbeat_text(
@@ -1592,11 +1614,261 @@ def _router_dynamic_decision_projection(
     return projection
 
 
+@dataclass(frozen=True, slots=True)
+class _RouterDynamicCacheAffinityPolicy:
+    """Runtime-only projection of the validated ranking policy."""
+
+    topology: Literal["single", "multiple"]
+    ttl_seconds: float
+    route_cache_max_entries: int
+    source: object = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _RouterDynamicCacheAffinityReceiptBatch:
+    turn_id: str
+    decision_id: str
+    provider_instance_token: str
+    provider_instance_generation: int
+    chat_call_id: str
+    chat_call_sequence: int
+    runtime_generation: int
+    topology: Literal["single", "multiple"]
+    receipts: tuple[_RouterDynamicCacheAffinityReceipt, ...]
+
+    def __repr__(self) -> str:
+        return (
+            "_RouterDynamicCacheAffinityReceiptBatch("
+            f"turn_id={self.turn_id!r}, decision_id={self.decision_id!r}, "
+            f"chat_call_sequence={self.chat_call_sequence!r}, "
+            f"runtime_generation={self.runtime_generation!r}, "
+            f"receipt_count={len(self.receipts)})"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _RouterDynamicCacheAffinityCollectionContext:
+    turn_id: str
+    decision_id: str
+    provider_instance_token: str
+    provider_instance_generation: int
+    session_key: str
+    session_epoch: int
+    selection_generation: int
+    topology: Literal["single", "multiple"]
+
+
+@dataclass(frozen=True, slots=True)
+class _RouterDynamicCacheAffinityStateKey:
+    session_key: str
+    session_epoch: int
+    topology: Literal["single", "multiple"]
+
+
+@dataclass(slots=True, repr=False)
+class _RouterDynamicCacheAffinitySessionState:
+    receipts: dict[
+        tuple[Literal["single", "proposer", "aggregator"], str, str],
+        _RouterDynamicCacheAffinityReceipt,
+    ] = field(default_factory=dict)
+
+
+@dataclass(slots=True, repr=False)
+class _RouterDynamicCacheAffinityPendingSidecar:
+    context: _RouterDynamicCacheAffinityCollectionContext
+    policy: _RouterDynamicCacheAffinityPolicy
+    active_provider_instance_token: str
+    active_provider_instance_generation: int
+    latest_chat_sequence: int = -1
+    latest_batch: _RouterDynamicCacheAffinityReceiptBatch | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RouterDynamicCacheRerouteResult:
+    provider: Any
+    resolved_model: str
+    provider_name: str
+    active_provider_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _RouterDynamicCacheReroutePlan:
+    session_key: str
+    selection_generation: int
+    reroute_without_affinity: Callable[[], _RouterDynamicCacheRerouteResult]
+    finalize_observability: Callable[[], None] | None = None
+
+
+def _router_dynamic_cache_affinity_policy(
+    ranking_config: Mapping[str, Any],
+    *,
+    topology: Literal["single", "multiple"],
+) -> _RouterDynamicCacheAffinityPolicy | None:
+    """Return the enabled policy without touching helpers on the absent path."""
+
+    session = ranking_config.get("session")
+    if not isinstance(session, Mapping):
+        return None
+    if not isinstance(session.get("kv_cache_affinity"), Mapping):
+        return None
+
+    from opensquilla.provider.ranking_router import (
+        router_dynamic_cache_affinity_policy,
+    )
+
+    policy = router_dynamic_cache_affinity_policy(
+        ranking_config,
+        topology=topology,
+    )
+    if policy is None:
+        return None
+    raw_ttl = policy.get("ttl_seconds")
+    if isinstance(raw_ttl, bool) or not isinstance(raw_ttl, int | float):
+        return None
+    ttl_seconds = float(raw_ttl)
+    if not math.isfinite(ttl_seconds) or ttl_seconds <= 0.0:
+        return None
+    raw_max_entries = session.get("route_cache_max_entries")
+    if (
+        isinstance(raw_max_entries, bool)
+        or not isinstance(raw_max_entries, int)
+        or raw_max_entries <= 0
+    ):
+        return None
+    return _RouterDynamicCacheAffinityPolicy(
+        topology=topology,
+        ttl_seconds=ttl_seconds,
+        route_cache_max_entries=raw_max_entries,
+        source=policy,
+    )
+
+
+def _router_dynamic_cache_price_quote_resolver(request: object) -> object | None:
+    """Resolve one frozen no-network quote without inventing provenance."""
+
+    from opensquilla.engine.pricing import resolve_cache_price_quote_exact
+
+    try:
+        return resolve_cache_price_quote_exact(
+            provider=str(getattr(request, "provider")),
+            model_id=str(getattr(request, "model_id")),
+            endpoint_scope=str(getattr(request, "endpoint_scope")),
+            upstream_scope=str(getattr(request, "upstream_scope")),
+            ranking_price_source=str(getattr(request, "ranking_price_source")),
+            ranking_input_per_million=getattr(
+                request,
+                "ranking_input_per_million",
+            ),
+            ranking_output_per_million=getattr(
+                request,
+                "ranking_output_per_million",
+            ),
+        )
+    except Exception:  # noqa: BLE001 - optional cost evidence fails closed
+        return None
+
+
+def _router_dynamic_cache_domain_guard(
+    provider_config: object,
+    *,
+    session_epoch: int,
+    upstream: str,
+    provider_routing_strict: bool,
+    chat_config: object,
+    credential_namespace_token: object | None,
+) -> object | None:
+    provider = str(getattr(provider_config, "provider", "") or "").strip()
+    model = str(getattr(provider_config, "model", "") or "").strip()
+    normalized_upstream = str(upstream or "").strip().casefold()
+    thinking_enabled = bool(getattr(chat_config, "thinking", False))
+    raw_thinking_level = getattr(chat_config, "thinking_level", None)
+    effective_thinking_level = str(
+        getattr(raw_thinking_level, "value", raw_thinking_level) or ""
+    ).strip()
+    if not thinking_enabled:
+        effective_thinking_level = "off"
+    elif not effective_thinking_level:
+        effective_thinking_level = "enabled"
+    raw_thinking_budget = getattr(chat_config, "thinking_budget_tokens", None)
+    thinking_budget_tokens = (
+        0
+        if not thinking_enabled
+        else (
+            raw_thinking_budget
+            if type(raw_thinking_budget) is int and raw_thinking_budget >= 0
+            else None
+        )
+    )
+    return build_cache_domain_guard(
+        session_epoch=session_epoch,
+        role="single",
+        topology="single",
+        provider=provider,
+        requested_model=model,
+        base_url=str(getattr(provider_config, "base_url", "") or ""),
+        upstream_provider=normalized_upstream,
+        provider_routing_strict=provider_routing_strict,
+        allow_fallbacks=not provider_routing_strict,
+        thinking_enabled=thinking_enabled,
+        effective_thinking_level=effective_thinking_level,
+        thinking_budget_tokens=thinking_budget_tokens,
+        credential_namespace_token=credential_namespace_token,
+    )
+
+
+def _router_dynamic_model_matches_frozen_alias(
+    requested_model: str,
+    actual_model: str,
+    actual_model_aliases: Sequence[str],
+) -> bool:
+    if not isinstance(actual_model_aliases, Sequence) or isinstance(
+        actual_model_aliases,
+        (str, bytes, bytearray),
+    ):
+        return False
+    normalized_aliases: set[str] = {requested_model.casefold()}
+    for alias in actual_model_aliases:
+        if not isinstance(alias, str) or not alias.strip():
+            return False
+        normalized_aliases.add(alias.strip().casefold())
+    return bool(actual_model and actual_model.casefold() in normalized_aliases)
+
+
+def _router_dynamic_actual_identity_matches(
+    event: ProviderDoneEvent,
+    provider_config: object,
+    *,
+    actual_model_aliases: Sequence[str] = (),
+) -> tuple[str, str] | None:
+    actual_provider = str(getattr(event, "provider", "") or "").strip().casefold()
+    actual_model = str(getattr(event, "model", "") or "").strip()
+    requested_provider = str(getattr(provider_config, "provider", "") or "").strip().casefold()
+    requested_model = str(getattr(provider_config, "model", "") or "").strip()
+    if (
+        not actual_provider
+        or not requested_provider
+        or not requested_model
+        or actual_provider != requested_provider
+        or not _router_dynamic_model_matches_frozen_alias(
+            requested_model,
+            actual_model,
+            actual_model_aliases,
+        )
+    ):
+        return None
+    # Alias equivalence was proven against the route's frozen registry row.
+    # Canonicalize before crossing into the neutral receipt contract, which
+    # intentionally requires exact requested/actual identity equality.
+    requested_identity = f"{requested_provider}:{requested_model}"
+    return (
+        requested_identity,
+        requested_identity,
+    )
+
+
 _RouterSingleCleanupKey = tuple[str, str, str]
 _ROUTER_SINGLE_CLEANUP_LOCK = threading.Lock()
-_ROUTER_SINGLE_PENDING_CLEANUPS: dict[
-    _RouterSingleCleanupKey, set[asyncio.Future[Any]]
-] = {}
+_ROUTER_SINGLE_PENDING_CLEANUPS: dict[_RouterSingleCleanupKey, set[asyncio.Future[Any]]] = {}
 _ROUTER_SINGLE_POISONED_CLEANUPS: set[_RouterSingleCleanupKey] = set()
 _ROUTER_SINGLE_FINISHED_CLEANUPS: set[asyncio.Future[Any]] = set()
 
@@ -1700,6 +1972,13 @@ class _RouterSingleDirectProvider:
         absolute_deadline: float | None,
         frozen_catalog: Mapping[str, Any],
         enforces_routed_thinking_policy: bool,
+        cache_affinity_context: _RouterDynamicCacheAffinityCollectionContext | None = None,
+        cache_affinity_receipt_sink: (
+            Callable[[_RouterDynamicCacheAffinityReceiptBatch], None] | None
+        ) = None,
+        cache_affinity_generation_getter: Callable[[], int] | None = None,
+        cache_affinity_actual_model_aliases: Sequence[str] = (),
+        cache_affinity_credential_namespace_token: object | None = None,
     ) -> None:
         from opensquilla.provider.deployment import (
             canonicalize_provider_routing_upstream,
@@ -1710,9 +1989,13 @@ class _RouterSingleDirectProvider:
         self._health_ledger = health_ledger
         self._absolute_deadline = absolute_deadline
         self._router_single_frozen_catalog = dict(frozen_catalog)
-        self._enforces_routed_thinking_policy = bool(
-            enforces_routed_thinking_policy
-        )
+        self._enforces_routed_thinking_policy = bool(enforces_routed_thinking_policy)
+        self._cache_affinity_context = cache_affinity_context
+        self._cache_affinity_receipt_sink = cache_affinity_receipt_sink
+        self._cache_affinity_generation_getter = cache_affinity_generation_getter
+        self._cache_affinity_actual_model_aliases = cache_affinity_actual_model_aliases
+        self._cache_affinity_credential_namespace_token = cache_affinity_credential_namespace_token
+        self._cache_affinity_chat_sequence = 0
         self._local_dispatch_blocked = False
         self._upstream = canonicalize_provider_routing_upstream(
             provider_config.provider_routing.get(provider_config.model, "")
@@ -1928,6 +2211,21 @@ class _RouterSingleDirectProvider:
         config: Any = None,
     ) -> AsyncIterator[Any]:
         self._local_dispatch_blocked = False
+        affinity_context = self._cache_affinity_context
+        generation_getter = self._cache_affinity_generation_getter
+        if (
+            affinity_context is not None
+            and generation_getter is not None
+            and generation_getter() != affinity_context.selection_generation
+        ):
+            self._local_dispatch_blocked = True
+            yield ProviderErrorEvent(
+                message=("router_dynamic cache continuity changed before dispatch"),
+                code="router_dynamic_cache_generation_changed",
+                request_started=False,
+                physical_request_count=0,
+            )
+            return
         remaining = self._remaining_seconds()
         if remaining is not None and remaining <= 0:
             self._local_dispatch_blocked = True
@@ -1943,9 +2241,7 @@ class _RouterSingleDirectProvider:
         if remaining is not None:
             model_copy = getattr(config, "model_copy", None)
             if callable(model_copy):
-                configured_timeout = float(
-                    getattr(config, "timeout", remaining) or remaining
-                )
+                configured_timeout = float(getattr(config, "timeout", remaining) or remaining)
                 effective_config = model_copy(
                     update={"timeout": min(configured_timeout, remaining)}
                 )
@@ -1978,10 +2274,7 @@ class _RouterSingleDirectProvider:
             self._local_dispatch_blocked = True
             yield ProviderErrorEvent(
                 message="router_single selected deployment is not healthy",
-                code=str(
-                    admission.get("reason")
-                    or "router_single_health_admission_rejected"
-                ),
+                code=str(admission.get("reason") or "router_single_health_admission_rejected"),
                 request_started=False,
                 physical_request_count=0,
             )
@@ -1993,8 +2286,15 @@ class _RouterSingleDirectProvider:
         close_attempted = False
         close_proven = False
         terminal_event: Any = None
+        terminal_observed_at_monotonic: float | None = None
         stream_boundary_observed = False
         cleanup_ownership: list[asyncio.Future[Any]] = []
+        affinity_batch: _RouterDynamicCacheAffinityReceiptBatch | None = None
+        affinity_batch_published = False
+        affinity_chat_call_id = ""
+        affinity_chat_call_sequence = -1
+        affinity_physical_attempt_id = ""
+        affinity_runtime_generation = -1
 
         def incomplete_stream_event(message: str) -> ProviderErrorEvent:
             return ProviderErrorEvent(
@@ -2007,9 +2307,7 @@ class _RouterSingleDirectProvider:
         def explicit_zero_request_error(event: ProviderErrorEvent) -> bool:
             count = event.physical_request_count
             valid_zero_count = count is None or (
-                isinstance(count, int)
-                and not isinstance(count, bool)
-                and count == 0
+                isinstance(count, int) and not isinstance(count, bool) and count == 0
             )
             return event.request_started is False and valid_zero_count
 
@@ -2033,6 +2331,12 @@ class _RouterSingleDirectProvider:
                 )
 
         try:
+            if affinity_context is not None and self._cache_affinity_receipt_sink is not None:
+                self._cache_affinity_chat_sequence += 1
+                affinity_chat_call_sequence = self._cache_affinity_chat_sequence
+                affinity_chat_call_id = uuid.uuid4().hex
+                affinity_physical_attempt_id = uuid.uuid4().hex
+                affinity_runtime_generation = affinity_context.selection_generation
             stream = self._provider.chat(
                 messages,
                 tools=tools,
@@ -2040,7 +2344,10 @@ class _RouterSingleDirectProvider:
             )
 
             async def forward() -> AsyncIterator[Any]:
-                nonlocal physical_started, stream_boundary_observed, terminal_event
+                nonlocal physical_started
+                nonlocal stream_boundary_observed
+                nonlocal terminal_event
+                nonlocal terminal_observed_at_monotonic
                 iterator = stream.__aiter__()
                 while True:
                     # Crossing the first __anext__ boundary is the earliest
@@ -2061,6 +2368,7 @@ class _RouterSingleDirectProvider:
                         # boundary; optional aclose remains bounded resource
                         # cleanup and completes before the terminal is exposed.
                         terminal_event = event
+                        terminal_observed_at_monotonic = time.monotonic()
                         stream_boundary_observed = True
                         return
                     yield event
@@ -2114,16 +2422,12 @@ class _RouterSingleDirectProvider:
                 if terminal_event is None:
                     self._record_health_failure(
                         admission,
-                        incomplete_stream_event(
-                            "provider stream ended before terminal event"
-                        ),
+                        incomplete_stream_event("provider stream ended before terminal event"),
                     )
                     settled = True
                 elif not close_proven:
                     self._local_dispatch_blocked = True
-                    failure = incomplete_stream_event(
-                        "provider stream could not be closed"
-                    )
+                    failure = incomplete_stream_event("provider stream could not be closed")
                     self._record_health_failure(admission, failure)
                     settled = True
                     yield failure
@@ -2137,6 +2441,64 @@ class _RouterSingleDirectProvider:
                 else:
                     self._record_health_success(admission)
                     settled = True
+                    if (
+                        affinity_context is not None
+                        and self._cache_affinity_receipt_sink is not None
+                    ):
+                        receipts: tuple[_RouterDynamicCacheAffinityReceipt, ...] = ()
+                        if isinstance(terminal_event, ProviderDoneEvent):
+                            actual_identity = _router_dynamic_actual_identity_matches(
+                                terminal_event,
+                                self._provider_config,
+                                actual_model_aliases=(self._cache_affinity_actual_model_aliases),
+                            )
+                            domain_guard = _router_dynamic_cache_domain_guard(
+                                self._provider_config,
+                                session_epoch=affinity_context.session_epoch,
+                                upstream=self._upstream,
+                                provider_routing_strict=bool(
+                                    getattr(
+                                        self._provider,
+                                        "_provider_routing_strict",
+                                        False,
+                                    )
+                                ),
+                                chat_config=effective_config,
+                                credential_namespace_token=(
+                                    self._cache_affinity_credential_namespace_token
+                                ),
+                            )
+                            receipt = (
+                                build_cache_affinity_receipt(
+                                    physical_attempt_id=(affinity_physical_attempt_id),
+                                    role="single",
+                                    topology="single",
+                                    execution_slot=0,
+                                    requested_identity=actual_identity[0],
+                                    actual_identity=actual_identity[1],
+                                    cache_domain_guard=domain_guard,
+                                    cached_tokens=terminal_event.cached_tokens,
+                                    cache_write_tokens=(terminal_event.cache_write_tokens),
+                                    observed_at_monotonic=(terminal_observed_at_monotonic),
+                                )
+                                if actual_identity is not None
+                                else None
+                            )
+                            if receipt is not None:
+                                receipts = (receipt,)
+                        affinity_batch = _RouterDynamicCacheAffinityReceiptBatch(
+                            turn_id=affinity_context.turn_id,
+                            decision_id=affinity_context.decision_id,
+                            provider_instance_token=(affinity_context.provider_instance_token),
+                            provider_instance_generation=(
+                                affinity_context.provider_instance_generation
+                            ),
+                            chat_call_id=affinity_chat_call_id,
+                            chat_call_sequence=affinity_chat_call_sequence,
+                            runtime_generation=affinity_runtime_generation,
+                            topology="single",
+                            receipts=receipts,
+                        )
                     yield terminal_event
         except Exception:
             if physical_started and not settled:
@@ -2145,36 +2507,37 @@ class _RouterSingleDirectProvider:
                 finally:
                     self._record_health_failure(
                         admission,
-                        incomplete_stream_event(
-                            "provider stream raised before terminal event"
-                        ),
+                        incomplete_stream_event("provider stream raised before terminal event"),
                     )
                     settled = True
             raise
         finally:
             try:
-                await close_once(
-                    require_aclose=(
-                        physical_started and not stream_boundary_observed
-                    )
-                )
+                await close_once(require_aclose=(physical_started and not stream_boundary_observed))
             finally:
                 if not settled:
-                    if (
-                        physical_started
-                        and not stream_boundary_observed
-                        and not close_proven
-                    ):
+                    if physical_started and not stream_boundary_observed and not close_proven:
                         self._record_health_failure(
                             admission,
-                            incomplete_stream_event(
-                                "provider stream could not be closed"
-                            ),
+                            incomplete_stream_event("provider stream could not be closed"),
                         )
                         settled = True
                     else:
                         self._cancel_health_attempt(admission)
                 finish_cleanup_ownership()
+                if affinity_batch is not None and not affinity_batch_published:
+                    affinity_batch_published = True
+                    receipt_sink = self._cache_affinity_receipt_sink
+                    if receipt_sink is not None:
+                        try:
+                            receipt_sink(affinity_batch)
+                        except Exception:  # noqa: BLE001 - evidence must not fail a turn
+                            log.warning(
+                                "router_single.cache_affinity_receipt_sink_failed",
+                                provider=self.active_provider_id,
+                                model=self.active_model_id,
+                                exc_info=True,
+                            )
 
 
 class _SelectorFallbackProvider:
@@ -2187,6 +2550,7 @@ class _SelectorFallbackProvider:
         turn_metadata: dict[str, Any] | None = None,
         *,
         health_ledger: ProviderHealthLedger | None = None,
+        cache_affinity_credential_failure_callback: Callable[[], None] | None = None,
     ) -> None:
         self._provider = provider
         self._selector = selector
@@ -2206,6 +2570,9 @@ class _SelectorFallbackProvider:
         # the default everywhere today — makes every ledger hook below a
         # no-op, keeping the default fallback path byte-identical.
         self._health_ledger = health_ledger
+        self._cache_affinity_credential_failure_callback = (
+            cache_affinity_credential_failure_callback
+        )
         self._pending_retry_metadata_update: dict[str, Any] | None = None
         self._retry_scope_provider_bindings: dict[str, Any | None] = {}
         self._retry_scope_local_remaining: dict[str, int | None] = {}
@@ -2485,9 +2852,7 @@ class _SelectorFallbackProvider:
     @property
     def active_provider_id(self) -> str:
         """Configured identity of the selector deployment serving this turn."""
-        return str(
-            getattr(self._selector, "active_provider_id", "") or self.provider_name
-        )
+        return str(getattr(self._selector, "active_provider_id", "") or self.provider_name)
 
     @property
     def active_model_id(self) -> str:
@@ -2553,9 +2918,7 @@ class _SelectorFallbackProvider:
 
     def _active_deployment(self) -> tuple[str, str]:
         """(provider id, model) of the selector's currently-active chain link."""
-        provider_id = str(
-            getattr(self._selector, "active_provider_id", "") or self.provider_name
-        )
+        provider_id = str(getattr(self._selector, "active_provider_id", "") or self.provider_name)
         current_config = getattr(self._selector, "current_config", None)
         model = str(getattr(current_config, "model", "") or "")
         return provider_id, model
@@ -2705,17 +3068,13 @@ class _SelectorFallbackProvider:
         if self._managed_policy_blocks_fallback():
             return False
         try:
-            fallback_provider = self._selector.next_fallback_after_failure(
-                RuntimeError(reason)
-            )
+            fallback_provider = self._selector.next_fallback_after_failure(RuntimeError(reason))
         except Exception:
             return False
         if self._live_canary_policy_blocks_active_fallback():
             self._selector_canary_route_blocked = True
             return False
-        fallback_provider, blocked, skipped_hops = (
-            self._skip_benched_fallbacks(fallback_provider)
-        )
+        fallback_provider, blocked, skipped_hops = self._skip_benched_fallbacks(fallback_provider)
         if blocked:
             return False
         self._provider = fallback_provider
@@ -2738,16 +3097,36 @@ class _SelectorFallbackProvider:
         tools: Any = None,
         config: Any = None,
     ) -> AsyncIterator[Any]:
+        dispatch_generation_guard = getattr(
+            self._provider,
+            "_router_dynamic_cache_dispatch_generation_guard",
+            None,
+        )
+
+        def dispatch_generation_is_current() -> bool:
+            if not callable(dispatch_generation_guard):
+                return True
+            try:
+                return dispatch_generation_guard() is True
+            except Exception:  # noqa: BLE001 - missing proof must fail closed
+                return False
+
+        async def generation_blocked_stream() -> AsyncIterator[Any]:
+            yield ProviderErrorEvent(
+                message=("router_dynamic cache continuity changed before dispatch"),
+                code="router_dynamic_cache_generation_changed",
+                request_started=False,
+                physical_request_count=0,
+            )
+
+        if not dispatch_generation_is_current():
+            async for blocked_event in generation_blocked_stream():
+                yield blocked_event
+            return
         validation_error = validate_provider_chat_request(self._provider, messages)
         if validation_error is not None:
             yield validation_error
             return
-
-        # A prepared retry route is only observable once this replacement is
-        # actually committed to a physical provider call. Merely obtaining an
-        # async iterator (or failing local request validation) must leave the
-        # source route metadata intact.
-        self._activate_pending_retry_metadata()
 
         emitted_user_visible_content = False
         pre_text_buffer: list[Any] = []
@@ -2764,15 +3143,26 @@ class _SelectorFallbackProvider:
             "usage_accounting_snapshot",
             None,
         )
+
+        def dispatch_primary_stream() -> AsyncIterator[Any]:
+            # account_provider_stream may await durable accounting setup before
+            # invoking this lazy factory. Re-prove continuity immediately beside
+            # provider.chat so compaction invalidation in that window cannot
+            # dispatch the stale affinity route.
+            if not dispatch_generation_is_current():
+                return generation_blocked_stream()
+            # A prepared retry route is only observable once this replacement is
+            # actually committed to a physical provider call. Merely obtaining
+            # an async iterator (or failing local request validation/accounting
+            # setup) must leave the source route metadata intact.
+            self._activate_pending_retry_metadata()
+            return active_provider.chat(messages, tools=tools, config=config)
+
         primary_stream = account_provider_stream(
-            lambda: active_provider.chat(messages, tools=tools, config=config),
+            dispatch_primary_stream,
             provider=active_provider_id,
             model=active_model,
-            usage_snapshot=(
-                active_usage_snapshot
-                if callable(active_usage_snapshot)
-                else None
-            ),
+            usage_snapshot=(active_usage_snapshot if callable(active_usage_snapshot) else None),
         )
         try:
             async for event in primary_stream:
@@ -2787,23 +3177,34 @@ class _SelectorFallbackProvider:
                     credential_provider_name = self.provider_name
                     if (
                         self._turn_metadata is not None
-                        and self._turn_metadata.get(
-                            "_router_single_provider_finalized"
-                        )
-                        is True
+                        and self._turn_metadata.get("_router_single_provider_finalized") is True
                     ):
                         configured_provider, _ = self._active_deployment()
-                        credential_provider_name = (
-                            configured_provider or credential_provider_name
-                        )
-                    _report_credential_pool_failure(
+                        credential_provider_name = configured_provider or credential_provider_name
+                    credential_failed = _report_credential_pool_failure(
                         credential_provider_name,
                         self._turn_metadata,
                         event,
                     )
+                    if credential_failed:
+                        callback = self._cache_affinity_credential_failure_callback
+                        if callback is not None:
+                            try:
+                                callback()
+                            except Exception:  # noqa: BLE001 - evidence is fail-closed
+                                log.debug("router_single.cache_affinity_credential_purge_failed")
                 if emitted_user_visible_content:
                     yield event
                     continue
+
+                if (
+                    isinstance(event, ProviderErrorEvent)
+                    and event.code == "router_dynamic_cache_generation_changed"
+                ):
+                    for buffered_event in drain_pre_text_buffer():
+                        yield buffered_event
+                    yield event
+                    return
 
                 if isinstance(event, ProviderErrorEvent) and _should_use_selector_fallback(
                     self.provider_name, event
@@ -2829,8 +3230,8 @@ class _SelectorFallbackProvider:
                             yield buffered_event
                         yield event
                         return
-                    fallback_provider, blocked, skipped_hops = (
-                        self._skip_benched_fallbacks(fallback_provider)
+                    fallback_provider, blocked, skipped_hops = self._skip_benched_fallbacks(
+                        fallback_provider
                     )
                     if blocked:
                         for buffered_event in drain_pre_text_buffer():
@@ -2883,16 +3284,18 @@ class _SelectorFallbackProvider:
 
                     async def canary_blocked_stream() -> AsyncIterator[Any]:
                         yield ProviderErrorEvent(
-                            message=(
-                                "selector fallback was blocked by live canary "
-                                "governance"
-                            ),
+                            message=("selector fallback was blocked by live canary governance"),
                             code="ensemble_canary_fallback_blocked",
                             request_started=False,
                             physical_request_count=0,
                         )
 
                     def dispatch_fallback_stream() -> AsyncIterator[Any]:
+                        # The fallback accounting envelope is independently
+                        # lazy. Re-prove the original affinity generation before
+                        # committing fallback metadata or calling the provider.
+                        if not dispatch_generation_is_current():
+                            return generation_blocked_stream()
                         if self._live_canary_policy_blocks_active_fallback():
                             self._selector_canary_route_blocked = True
                             return canary_blocked_stream()
@@ -2911,9 +3314,7 @@ class _SelectorFallbackProvider:
                         provider=fallback_provider_id,
                         model=fallback_model,
                         usage_snapshot=(
-                            fallback_usage_snapshot
-                            if callable(fallback_usage_snapshot)
-                            else None
+                            fallback_usage_snapshot if callable(fallback_usage_snapshot) else None
                         ),
                     )
                     try:
@@ -3108,9 +3509,7 @@ def _render_preview_only_attachment_text(
         else "read_full: material path unavailable."
     )
     truncation = (
-        f"\n\n[attachment preview truncated: {len(decoded)} chars total]"
-        if truncated
-        else ""
+        f"\n\n[attachment preview truncated: {len(decoded)} chars total]" if truncated else ""
     )
     return (
         "[large text attachment materialized]\n"
@@ -3230,10 +3629,7 @@ def _extract_xlsx_text(raw_bytes: bytes) -> str:
                 if row_index >= _XLSX_MAX_ROWS_PER_SHEET:
                     rows.append(f"[sheet truncated at {_XLSX_MAX_ROWS_PER_SHEET} rows]")
                     break
-                cells = [
-                    "" if value is None else str(value)
-                    for value in row[:_XLSX_MAX_COLS]
-                ]
+                cells = ["" if value is None else str(value) for value in row[:_XLSX_MAX_COLS]]
                 if any(cells):
                     rows.append(",".join(cells))
             if rows:
@@ -3280,9 +3676,7 @@ _OFFICE_EXTRACTORS: dict[str, Callable[[bytes], str]] = {
 }
 
 
-def _extract_office_attachment_text(
-    raw_bytes: bytes, filename: str, media_type: str
-) -> str:
+def _extract_office_attachment_text(raw_bytes: bytes, filename: str, media_type: str) -> str:
     """Extract text from an OOXML office attachment before it reaches any provider.
 
     docx/xlsx/pptx are zip containers that no provider adapter can encode, so they
@@ -3298,13 +3692,9 @@ def _extract_office_attachment_text(
     except ValueError:
         raise
     except ImportError as exc:  # pragma: no cover - dependency is declared
-        raise ValueError(
-            f"office text extraction requires a missing dependency: {exc}"
-        ) from exc
+        raise ValueError(f"office text extraction requires a missing dependency: {exc}") from exc
     except Exception as exc:  # noqa: BLE001 - parsers raise many error types
-        raise ValueError(
-            f"office attachment {filename!r} could not be read: {exc}"
-        ) from exc
+        raise ValueError(f"office attachment {filename!r} could not be read: {exc}") from exc
     if not extracted:
         raise ValueError(f"office attachment {filename!r} has no extractable text")
     return _truncate_attachment_text(extracted)
@@ -3450,9 +3840,7 @@ def _extract_msg_text(raw_bytes: bytes) -> str:
     return rendered.strip()
 
 
-def _extract_email_attachment_text(
-    raw_bytes: bytes, filename: str, media_type: str
-) -> str:
+def _extract_email_attachment_text(raw_bytes: bytes, filename: str, media_type: str) -> str:
     """Extract text from an email attachment.
 
     .eml/.mbox use the stdlib email/mailbox parsers (zero dependency); .msg uses
@@ -3467,9 +3855,7 @@ def _extract_email_attachment_text(
     except ValueError:
         raise
     except Exception as exc:  # noqa: BLE001 - email parsers raise many error types
-        raise ValueError(
-            f"email attachment {filename!r} could not be read: {exc}"
-        ) from exc
+        raise ValueError(f"email attachment {filename!r} could not be read: {exc}") from exc
     if not extracted:
         raise ValueError(f"email attachment {filename!r} has no extractable text")
     return _truncate_attachment_text(extracted)
@@ -3551,17 +3937,14 @@ def _resolve_identity_prompt_mode(config: object) -> str:
     if env_prompt_mode:
         if env_prompt_mode not in allowed_modes:
             raise ValueError(
-                "OPENSQUILLA_PROMPT_MODE must be one of: "
-                + ", ".join(sorted(allowed_modes))
+                "OPENSQUILLA_PROMPT_MODE must be one of: " + ", ".join(sorted(allowed_modes))
             )
         return env_prompt_mode
 
     prompt_cfg = getattr(config, "prompt", None)
     prompt_mode = str(getattr(prompt_cfg, "mode", "auto") or "auto")
     if prompt_mode not in allowed_modes:
-        raise ValueError(
-            "prompt.mode must be one of: " + ", ".join(sorted(allowed_modes))
-        )
+        raise ValueError("prompt.mode must be one of: " + ", ".join(sorted(allowed_modes)))
     if prompt_mode != "auto":
         return prompt_mode
 
@@ -3592,9 +3975,7 @@ def _resolve_patch_evidence_protocol(config: object) -> bool:
             return False
         raise ValueError(
             f"{_PATCH_EVIDENCE_PROTOCOL_ENV} must be one of: "
-            + ", ".join(
-                sorted(_PATCH_EVIDENCE_PROTOCOL_ON | _PATCH_EVIDENCE_PROTOCOL_OFF)
-            )
+            + ", ".join(sorted(_PATCH_EVIDENCE_PROTOCOL_ON | _PATCH_EVIDENCE_PROTOCOL_OFF))
         )
 
     prompt_cfg = getattr(config, "prompt", None)
@@ -3624,9 +4005,7 @@ def _resolve_finalize_evidence_gate(config: object) -> bool:
             return False
         raise ValueError(
             f"{_FINALIZE_EVIDENCE_GATE_ENV} must be one of: "
-            + ", ".join(
-                sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF)
-            )
+            + ", ".join(sorted(_FINALIZE_EVIDENCE_GATE_ON | _FINALIZE_EVIDENCE_GATE_OFF))
         )
 
     prompt_cfg = getattr(config, "prompt", None)
@@ -3774,6 +4153,31 @@ class TurnRunner:
         # It stores route identifiers only; prompt and candidate content never
         # enter this cache.
         self._router_dynamic_last_routes: dict[str, dict[str, Any]] = {}
+        # Optional KV-affinity evidence is intentionally isolated from B5 route
+        # continuity. Both containers are process-local and non-persistent, but
+        # this state is epoch/topology keyed and never enters TurnContext metadata.
+        self._router_dynamic_cache_affinity: (
+            OrderedDict[
+                _RouterDynamicCacheAffinityStateKey,
+                _RouterDynamicCacheAffinitySessionState,
+            ]
+            | None
+        ) = None
+        self._router_dynamic_cache_affinity_sidecars: (
+            dict[
+                tuple[str, str],
+                _RouterDynamicCacheAffinityPendingSidecar,
+            ]
+            | None
+        ) = None
+        self._router_dynamic_cache_affinity_generation: dict[str, int] | None = None
+        self._router_dynamic_cache_affinity_epoch_by_key: dict[str, int] | None = None
+        self._router_dynamic_cache_affinity_generation_clock = 0
+        self._router_dynamic_cache_affinity_control_max_entries: int | None = None
+        self._router_dynamic_cache_affinity_compaction_remove: Callable[[], None] | None = None
+        self._router_dynamic_cache_affinity_compaction_finalizer: weakref.finalize | None = None
+        self._router_dynamic_cache_affinity_session_delete_remove: Callable[[], None] | None = None
+        self._router_dynamic_cache_affinity_session_delete_finalizer: weakref.finalize | None = None
         # A TurnRunner may serve concurrent sessions, but every live canary
         # turn in the process must share one same-host durable rollout ledger.
         # Bind the state path on first explicit enablement; a hot state_dir
@@ -4120,9 +4524,7 @@ class TurnRunner:
                     registry_rows,
                     (str, bytes),
                 ):
-                    raise ValueError(
-                        "authoritative model registry has no model rows"
-                    )
+                    raise ValueError("authoritative model registry has no model rows")
                 for registry_row in registry_rows:
                     facts = (
                         registry_row.get("registry_facts")
@@ -4132,12 +4534,9 @@ class TurnRunner:
                     if not isinstance(facts, Mapping):
                         continue
                     if (
-                        str(facts.get("provider") or "").strip().casefold()
-                        == analyzer_provider_id
-                        and str(facts.get("model_id") or "").strip().casefold()
-                        == analyzer_model_id
-                        and str(facts.get("status") or "").strip().casefold()
-                        == "canary"
+                        str(facts.get("provider") or "").strip().casefold() == analyzer_provider_id
+                        and str(facts.get("model_id") or "").strip().casefold() == analyzer_model_id
+                        and str(facts.get("status") or "").strip().casefold() == "canary"
                     ):
                         log.warning(
                             "llm_ensemble.router_dynamic.task_analyzer_canary_blocked",
@@ -4147,35 +4546,30 @@ class TurnRunner:
                         return None
             spec = get_provider_spec(analyzer_provider_id)
             turn_config = self._turn_config()
-            inherited_provider = str(
-                getattr(inherited_provider_config, "provider", "") or ""
-            ).strip().lower()
+            inherited_provider = (
+                str(getattr(inherited_provider_config, "provider", "") or "").strip().lower()
+            )
             analyzer_config: ProviderConfig | None = None
             if inherited_provider == analyzer_provider_id:
-                inherited_api_key = str(
-                    getattr(inherited_provider_config, "api_key", "") or ""
-                ).strip() or os.environ.get(spec.env_key, "").strip()
+                inherited_api_key = (
+                    str(getattr(inherited_provider_config, "api_key", "") or "").strip()
+                    or os.environ.get(spec.env_key, "").strip()
+                )
                 analyzer_config = replace(
                     inherited_provider_config,
                     model=analyzer_model_id,
                     api_key=inherited_api_key,
-                    base_url=str(
-                        getattr(inherited_provider_config, "base_url", "") or ""
-                    ).strip()
+                    base_url=str(getattr(inherited_provider_config, "base_url", "") or "").strip()
                     or spec.default_base_url,
                     replay_provider_state=False,
                 )
             else:
                 primary = getattr(turn_config, "llm", None)
-                primary_provider = str(
-                    getattr(primary, "provider", "") or ""
-                ).strip().lower()
+                primary_provider = str(getattr(primary, "provider", "") or "").strip().lower()
                 if primary_provider == analyzer_provider_id:
                     api_key = str(getattr(primary, "api_key", "") or "").strip()
                     if not api_key:
-                        env_name = str(
-                            getattr(primary, "api_key_env", "") or ""
-                        ).strip()
+                        env_name = str(getattr(primary, "api_key_env", "") or "").strip()
                         api_key = os.environ.get(env_name or spec.env_key, "").strip()
                     analyzer_config = ProviderConfig(
                         provider=analyzer_provider_id,
@@ -4184,9 +4578,7 @@ class TurnRunner:
                         base_url=str(getattr(primary, "base_url", "") or "").strip()
                         or spec.default_base_url,
                         proxy=str(getattr(primary, "proxy", "") or "").strip(),
-                        provider_routing=dict(
-                            getattr(primary, "provider_routing", {}) or {}
-                        ),
+                        provider_routing=dict(getattr(primary, "provider_routing", {}) or {}),
                         replay_provider_state=False,
                     )
                 else:
@@ -4198,12 +4590,9 @@ class TurnRunner:
                     )
 
             if analyzer_config is not None and (
-                str(analyzer_config.provider or "").strip().casefold()
-                != analyzer_provider_id
+                str(analyzer_config.provider or "").strip().casefold() != analyzer_provider_id
             ):
-                raise ValueError(
-                    "task analyzer credential resolver returned a different provider"
-                )
+                raise ValueError("task analyzer credential resolver returned a different provider")
             if analyzer_config is not None:
                 analyzer_routing = dict(analyzer_config.provider_routing)
                 analyzer_routing[analyzer_model_id] = analyzer_upstream_provider
@@ -4239,6 +4628,652 @@ class TurnRunner:
             )
             return None
 
+    def _router_dynamic_cache_generation(self, session_key: str) -> int:
+        generations = self._router_dynamic_cache_affinity_generation
+        if generations is not None and session_key in generations:
+            return generations[session_key]
+        # Missing per-session state must not recreate generation zero after an
+        # LRU eviction.  The process-local clock makes eviction conservative:
+        # an unpinned selection can be invalidated spuriously, but a stale
+        # selection can never regain an earlier generation through ABA.
+        return self._router_dynamic_cache_affinity_generation_clock
+
+    def _ensure_router_dynamic_cache_affinity_state(self) -> None:
+        """Lazily allocate private state only after explicit feature enablement."""
+
+        if self._router_dynamic_cache_affinity is None:
+            self._router_dynamic_cache_affinity = OrderedDict()
+        if self._router_dynamic_cache_affinity_sidecars is None:
+            self._router_dynamic_cache_affinity_sidecars = {}
+        if self._router_dynamic_cache_affinity_generation is None:
+            self._router_dynamic_cache_affinity_generation = {}
+        if self._router_dynamic_cache_affinity_epoch_by_key is None:
+            self._router_dynamic_cache_affinity_epoch_by_key = {}
+
+    def _prune_router_dynamic_cache_affinity_control_state(
+        self,
+        *,
+        route_cache_max_entries: int | None = None,
+        preserve_session_key: str | None = None,
+    ) -> None:
+        """Bound auxiliary maps while retaining every live dispatch fence."""
+
+        if type(route_cache_max_entries) is int and route_cache_max_entries > 0:
+            self._router_dynamic_cache_affinity_control_max_entries = route_cache_max_entries
+        capacity = self._router_dynamic_cache_affinity_control_max_entries
+        if capacity is None:
+            return
+        states = self._router_dynamic_cache_affinity
+        sidecars = self._router_dynamic_cache_affinity_sidecars
+        protected_sessions = {key.session_key for key in states or ()}
+        protected_sessions.update(
+            sidecar.context.session_key for sidecar in (sidecars or {}).values()
+        )
+        if preserve_session_key:
+            protected_sessions.add(preserve_session_key)
+        target_size = max(capacity, len(protected_sessions))
+        for control_state in (
+            self._router_dynamic_cache_affinity_generation,
+            self._router_dynamic_cache_affinity_epoch_by_key,
+        ):
+            if control_state is None:
+                continue
+            while len(control_state) > target_size:
+                evictable = next(
+                    (key for key in control_state if key not in protected_sessions),
+                    None,
+                )
+                if evictable is None:
+                    break
+                control_state.pop(evictable, None)
+
+    def _ensure_router_dynamic_cache_compaction_listener(
+        self,
+        *,
+        route_cache_max_entries: int,
+    ) -> None:
+        self._ensure_router_dynamic_cache_affinity_state()
+        self._prune_router_dynamic_cache_affinity_control_state(
+            route_cache_max_entries=route_cache_max_entries,
+        )
+        self._ensure_router_dynamic_cache_session_delete_listener()
+        if self._router_dynamic_cache_affinity_compaction_remove is not None:
+            return
+        from opensquilla.engine.cache_break_monitor import add_compaction_listener
+
+        runner_ref = weakref.ref(self)
+
+        def _on_compaction(session_key: str, payload: dict[str, Any]) -> None:
+            runner = runner_ref()
+            if runner is None:
+                return
+            if str(payload.get("status") or "").strip().casefold() != "completed":
+                return
+            runner._invalidate_router_dynamic_cache_affinity(
+                session_key=session_key,
+                reason="compaction",
+            )
+
+        remove = add_compaction_listener(_on_compaction)
+        self._router_dynamic_cache_affinity_compaction_remove = remove
+        self._router_dynamic_cache_affinity_compaction_finalizer = weakref.finalize(
+            self,
+            remove,
+        )
+
+    def _ensure_router_dynamic_cache_session_delete_listener(self) -> None:
+        """Bind private affinity state to every durable session-delete path."""
+
+        if self._router_dynamic_cache_affinity_session_delete_remove is not None:
+            return
+        try:
+            from opensquilla.gateway.session_services import get_session_storage
+
+            storage = get_session_storage(self._session_manager)
+            add_listener = getattr(storage, "add_session_delete_listener", None)
+        except Exception:  # noqa: BLE001 - optional lifecycle seam fails closed
+            return
+        if not callable(add_listener):
+            return
+
+        runner_ref = weakref.ref(self)
+
+        def _on_session_deleted(session_key: str) -> None:
+            runner = runner_ref()
+            if runner is None:
+                return
+            runner._invalidate_router_dynamic_cache_affinity(
+                session_key=session_key,
+                reason="session_deleted",
+            )
+
+        try:
+            remove = add_listener(_on_session_deleted)
+        except Exception:  # noqa: BLE001 - affinity remains fail-closed by epoch lookup
+            return
+        if not callable(remove):
+            return
+        self._router_dynamic_cache_affinity_session_delete_remove = remove
+        self._router_dynamic_cache_affinity_session_delete_finalizer = weakref.finalize(
+            self,
+            remove,
+        )
+
+    def _invalidate_router_dynamic_cache_affinity(
+        self,
+        *,
+        session_key: str | None = None,
+        credential_namespace: object | None = None,
+        reason: str,
+    ) -> None:
+        """Purge private affinity state and advance its dispatch generation."""
+
+        delete_session_lifecycle = reason == "session_deleted" and session_key is not None
+        del credential_namespace  # opaque guards require conservative scope purge
+        states = self._router_dynamic_cache_affinity
+        generations = self._router_dynamic_cache_affinity_generation
+        if states is None or generations is None:
+            return
+        affected_sessions: set[str] = set()
+        for key in list(states):
+            if session_key is not None and key.session_key != session_key:
+                continue
+            # Cache-domain guards deliberately expose no credential material.
+            # A credential-rotation callback therefore invalidates the whole
+            # selected scope rather than introspecting or persisting a token.
+            affected_sessions.add(key.session_key)
+            states.pop(key, None)
+        if session_key is not None:
+            affected_sessions.add(session_key)
+        if not affected_sessions:
+            return
+        next_generation = (
+            max(
+                [
+                    self._router_dynamic_cache_affinity_generation_clock,
+                    *generations.values(),
+                ]
+            )
+            + 1
+        )
+        self._router_dynamic_cache_affinity_generation_clock = next_generation
+        for affected in affected_sessions:
+            generations.pop(affected, None)
+            generations[affected] = next_generation
+        if delete_session_lifecycle:
+            sidecars = self._router_dynamic_cache_affinity_sidecars
+            if sidecars is not None:
+                for sidecar_key in list(sidecars):
+                    if sidecar_key[0] == session_key:
+                        sidecars.pop(sidecar_key, None)
+            epoch_by_key = self._router_dynamic_cache_affinity_epoch_by_key
+            if epoch_by_key is not None:
+                epoch_by_key.pop(session_key, None)
+        self._prune_router_dynamic_cache_affinity_control_state(
+            preserve_session_key=session_key,
+        )
+
+    async def _resolve_router_dynamic_session_epoch(
+        self,
+        session_key: str,
+    ) -> int | None:
+        """Resolve reset fencing only on an enabled affinity path."""
+
+        if self._session_manager is None:
+            return None
+        try:
+            from opensquilla.gateway.session_services import (
+                get_session_epoch,
+                get_session_storage,
+            )
+
+            raw_epoch = get_session_epoch(self._session_manager, session_key)
+            if raw_epoch is None:
+                get_session = getattr(self._session_manager, "get_session", None)
+                if callable(get_session):
+                    node = await get_session(session_key)
+                else:
+                    storage = get_session_storage(self._session_manager)
+                    node = await storage.get_session(session_key) if storage is not None else None
+                if node is None:
+                    return None
+                raw_epoch = getattr(node, "epoch", None)
+            if type(raw_epoch) is not int:
+                return None
+            epoch = raw_epoch
+            if epoch < 0:
+                return None
+        except Exception:  # noqa: BLE001 - continuity is fail-closed
+            return None
+
+        epoch_by_key = self._router_dynamic_cache_affinity_epoch_by_key
+        if epoch_by_key is None:
+            return None
+        previous_epoch = epoch_by_key.get(session_key)
+        if previous_epoch is not None and previous_epoch != epoch:
+            self._invalidate_router_dynamic_cache_affinity(
+                session_key=session_key,
+                reason="session_epoch_changed",
+            )
+        epoch_by_key.pop(session_key, None)
+        epoch_by_key[session_key] = epoch
+        self._prune_router_dynamic_cache_affinity_control_state(
+            preserve_session_key=session_key,
+        )
+        return epoch
+
+    def _router_dynamic_cache_continuity_snapshot(
+        self,
+        *,
+        session_key: str,
+        session_epoch: int,
+        policy: _RouterDynamicCacheAffinityPolicy,
+        now: float | None = None,
+    ) -> tuple[bool, tuple[_RouterDynamicCacheAffinityReceipt, ...], int]:
+        """Freeze unexpired receipts before Analyzer execution."""
+
+        self._ensure_router_dynamic_cache_affinity_state()
+        states = self._router_dynamic_cache_affinity
+        generations = self._router_dynamic_cache_affinity_generation
+        assert states is not None
+        assert generations is not None
+        generation = self._router_dynamic_cache_generation(session_key)
+        generations.pop(session_key, None)
+        generations[session_key] = generation
+        while len(states) > policy.route_cache_max_entries:
+            states.popitem(last=False)
+        for key in list(states):
+            if key.session_key == session_key and key.session_epoch != session_epoch:
+                states.pop(key, None)
+        state_key = _RouterDynamicCacheAffinityStateKey(
+            session_key=session_key,
+            session_epoch=session_epoch,
+            topology=policy.topology,
+        )
+        state = states.get(state_key)
+        if state is None:
+            self._prune_router_dynamic_cache_affinity_control_state(
+                route_cache_max_entries=policy.route_cache_max_entries,
+                preserve_session_key=session_key,
+            )
+            return False, (), generation
+        observed_at = time.monotonic() if now is None else now
+        for receipt_key, receipt in list(state.receipts.items()):
+            age = observed_at - receipt.observed_at_monotonic
+            if (
+                receipt.topology != policy.topology
+                or (policy.topology == "single" and receipt.role != "single")
+                or (
+                    policy.topology == "multiple" and receipt.role not in {"proposer", "aggregator"}
+                )
+                or not math.isfinite(age)
+                or age < 0.0
+                or age > policy.ttl_seconds
+            ):
+                state.receipts.pop(receipt_key, None)
+        if not state.receipts:
+            states.pop(state_key, None)
+            self._prune_router_dynamic_cache_affinity_control_state(
+                route_cache_max_entries=policy.route_cache_max_entries,
+                preserve_session_key=session_key,
+            )
+            return False, (), generation
+        states.move_to_end(state_key)
+        receipts = tuple(state.receipts.values())
+        self._prune_router_dynamic_cache_affinity_control_state(
+            route_cache_max_entries=policy.route_cache_max_entries,
+            preserve_session_key=session_key,
+        )
+        return True, receipts, generation
+
+    def _router_single_cache_continuity_snapshot(
+        self,
+        *,
+        session_key: str,
+        session_epoch: int,
+        policy: _RouterDynamicCacheAffinityPolicy,
+        now: float | None = None,
+    ) -> tuple[bool, tuple[_RouterDynamicCacheAffinityReceipt, ...], int]:
+        if policy.topology != "single":
+            return False, (), self._router_dynamic_cache_generation(session_key)
+        return self._router_dynamic_cache_continuity_snapshot(
+            session_key=session_key,
+            session_epoch=session_epoch,
+            policy=policy,
+            now=now,
+        )
+
+    @staticmethod
+    def _router_dynamic_cache_sidecar_key(
+        turn: object,
+    ) -> tuple[str, str] | None:
+        metadata = getattr(turn, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            return None
+        decision_id = str(
+            metadata.get("router_single_decision_id") or metadata.get("ensemble_decision_id") or ""
+        ).strip()
+        session_key = str(getattr(turn, "session_key", "") or "")
+        if not decision_id or not session_key:
+            return None
+        return session_key, decision_id
+
+    def _register_router_dynamic_cache_sidecar(
+        self,
+        *,
+        context: _RouterDynamicCacheAffinityCollectionContext,
+        policy: _RouterDynamicCacheAffinityPolicy,
+    ) -> tuple[str, str]:
+        self._ensure_router_dynamic_cache_affinity_state()
+        sidecars = self._router_dynamic_cache_affinity_sidecars
+        generations = self._router_dynamic_cache_affinity_generation
+        assert sidecars is not None
+        assert generations is not None
+        key = (context.session_key, context.decision_id)
+        for existing in list(sidecars):
+            if existing[0] == context.session_key:
+                sidecars.pop(existing, None)
+        sidecars[key] = _RouterDynamicCacheAffinityPendingSidecar(
+            context=context,
+            policy=policy,
+            active_provider_instance_token=(context.provider_instance_token),
+            active_provider_instance_generation=(context.provider_instance_generation),
+        )
+        current_generation = self._router_dynamic_cache_generation(context.session_key)
+        if current_generation == context.selection_generation:
+            generations.pop(context.session_key, None)
+            generations[context.session_key] = current_generation
+        self._prune_router_dynamic_cache_affinity_control_state(
+            route_cache_max_entries=policy.route_cache_max_entries,
+        )
+        return key
+
+    def _stage_router_dynamic_cache_affinity_batch(
+        self,
+        sidecar_key: tuple[str, str],
+        batch: _RouterDynamicCacheAffinityReceiptBatch,
+    ) -> bool:
+        sidecars = self._router_dynamic_cache_affinity_sidecars
+        if sidecars is None:
+            return False
+        sidecar = sidecars.get(sidecar_key)
+        if sidecar is None:
+            return False
+        context = sidecar.context
+        if (
+            batch.turn_id != context.turn_id
+            or batch.decision_id != context.decision_id
+            or batch.topology != context.topology
+            or not batch.provider_instance_token
+            or type(batch.provider_instance_generation) is not int
+            or batch.provider_instance_generation < 0
+            or not batch.chat_call_id
+            or type(batch.chat_call_sequence) is not int
+            or batch.chat_call_sequence <= sidecar.latest_chat_sequence
+        ):
+            return False
+        if batch.provider_instance_generation < sidecar.active_provider_instance_generation:
+            return False
+        if batch.provider_instance_generation > sidecar.active_provider_instance_generation:
+            if context.topology != "multiple":
+                return False
+            sidecar.active_provider_instance_token = batch.provider_instance_token
+            sidecar.active_provider_instance_generation = batch.provider_instance_generation
+        elif batch.provider_instance_token != sidecar.active_provider_instance_token:
+            return False
+        sidecar.latest_chat_sequence = batch.chat_call_sequence
+        sidecar.latest_batch = batch
+        return True
+
+    @staticmethod
+    def _normalize_multiple_cache_affinity_batch(
+        *,
+        context: _RouterDynamicCacheAffinityCollectionContext,
+        batch: object,
+    ) -> _RouterDynamicCacheAffinityReceiptBatch | None:
+        """Project one closed ensemble batch onto the neutral state contract."""
+
+        if (
+            context.topology != "multiple"
+            or getattr(batch, "topology", None) != "multiple"
+            or str(getattr(batch, "turn_id", "") or "") != context.turn_id
+            or str(getattr(batch, "decision_id", "") or "") != context.decision_id
+        ):
+            return None
+        provider_instance_token = str(getattr(batch, "provider_instance_token", "") or "").strip()
+        chat_call_id = str(getattr(batch, "chat_call_id", "") or "").strip()
+        provider_instance_generation = getattr(
+            batch,
+            "provider_instance_generation",
+            None,
+        )
+        chat_call_sequence = getattr(batch, "chat_sequence", None)
+        raw_receipts = getattr(batch, "receipts", None)
+        if (
+            not provider_instance_token
+            or not chat_call_id
+            or type(provider_instance_generation) is not int
+            or provider_instance_generation < 0
+            or type(chat_call_sequence) is not int
+            or chat_call_sequence < 0
+            or not isinstance(raw_receipts, Sequence)
+            or isinstance(raw_receipts, (str, bytes, bytearray))
+        ):
+            return None
+        receipts: list[_RouterDynamicCacheAffinityReceipt] = []
+        for raw_receipt in raw_receipts:
+            requested_provider = str(getattr(raw_receipt, "requested_provider", "") or "").strip()
+            requested_model = str(getattr(raw_receipt, "requested_model", "") or "").strip()
+            actual_provider = str(getattr(raw_receipt, "actual_provider", "") or "").strip()
+            actual_model = str(getattr(raw_receipt, "actual_model", "") or "").strip()
+            if (
+                not requested_provider
+                or not requested_model
+                or requested_provider.casefold() != actual_provider.casefold()
+                or not _router_dynamic_model_matches_frozen_alias(
+                    requested_model,
+                    actual_model,
+                    getattr(raw_receipt, "actual_model_aliases", ()),
+                )
+            ):
+                # The envelope still authoritatively closes the newest chat,
+                # but an unknown serving alias is not continuity evidence.
+                receipts.clear()
+                break
+            canonical_identity = f"{requested_provider}:{requested_model}"
+            receipt = build_cache_affinity_receipt(
+                physical_attempt_id=str(getattr(raw_receipt, "physical_attempt_id", "") or ""),
+                role=str(getattr(raw_receipt, "role", "") or ""),
+                topology="multiple",
+                execution_slot=str(getattr(raw_receipt, "execution_slot", "") or ""),
+                requested_identity=canonical_identity,
+                actual_identity=canonical_identity,
+                cache_domain_guard=getattr(
+                    raw_receipt,
+                    "cache_domain_guard",
+                    None,
+                ),
+                cached_tokens=getattr(raw_receipt, "cached_tokens", None),
+                cache_write_tokens=getattr(
+                    raw_receipt,
+                    "cache_write_tokens",
+                    None,
+                ),
+                observed_at_monotonic=getattr(
+                    raw_receipt,
+                    "observed_at_monotonic",
+                    None,
+                ),
+            )
+            if receipt is None:
+                # The envelope still proves this is the newest closed chat.
+                # Publish an empty authoritative batch so malformed receipt
+                # evidence cannot leave a previous chat's hit staged.
+                receipts.clear()
+                break
+            receipts.append(receipt)
+        return _RouterDynamicCacheAffinityReceiptBatch(
+            turn_id=context.turn_id,
+            decision_id=context.decision_id,
+            provider_instance_token=provider_instance_token,
+            provider_instance_generation=provider_instance_generation,
+            chat_call_id=chat_call_id,
+            chat_call_sequence=chat_call_sequence,
+            runtime_generation=context.selection_generation,
+            topology="multiple",
+            receipts=tuple(receipts),
+        )
+
+    def _clear_router_dynamic_cache_affinity_state(
+        self,
+        *,
+        session_key: str,
+        session_epoch: int,
+        topology: Literal["single", "multiple"],
+    ) -> None:
+        key = _RouterDynamicCacheAffinityStateKey(
+            session_key=session_key,
+            session_epoch=session_epoch,
+            topology=topology,
+        )
+        states = self._router_dynamic_cache_affinity
+        if states is None:
+            return
+        state = states.get(key)
+        if state is None:
+            return
+        states.pop(key, None)
+
+    def _clear_router_single_cache_affinity_state(
+        self,
+        *,
+        session_key: str,
+        session_epoch: int,
+    ) -> None:
+        self._clear_router_dynamic_cache_affinity_state(
+            session_key=session_key,
+            session_epoch=session_epoch,
+            topology="single",
+        )
+
+    def _commit_pending_router_dynamic_cache_affinity(
+        self,
+        turn: TurnContext,
+        done_event: DoneEvent | None,
+    ) -> bool:
+        sidecar_key = self._router_dynamic_cache_sidecar_key(turn)
+        turn_metadata = getattr(turn, "metadata", None)
+        sidecars = self._router_dynamic_cache_affinity_sidecars
+        states = self._router_dynamic_cache_affinity
+        if sidecar_key is None or sidecars is None or states is None:
+            return False
+        sidecar = sidecars.pop(sidecar_key, None)
+        if sidecar is None:
+            return False
+        context = sidecar.context
+        # A turn terminal is authoritative for its topology.  Clear the last
+        # committed evidence before considering the new batch so failures,
+        # cancellation, fallback, and successful turns without complete cache
+        # evidence all produce S_cache=0.
+        self._clear_router_dynamic_cache_affinity_state(
+            session_key=context.session_key,
+            session_epoch=context.session_epoch,
+            topology=context.topology,
+        )
+
+        def reject_batch() -> bool:
+            self._prune_router_dynamic_cache_affinity_control_state(
+                route_cache_max_entries=sidecar.policy.route_cache_max_entries,
+            )
+            return False
+
+        if done_event is None:
+            return reject_batch()
+        fallback_hops = (
+            turn_metadata.get("router_fallback_hops")
+            if isinstance(turn_metadata, Mapping)
+            else None
+        )
+        if type(fallback_hops) is int and fallback_hops > 0:
+            # A successful selector fallback proves the selected affinity
+            # route did not serve the final chat. Discard every staged batch,
+            # including a valid earlier tool-loop chat, because no receipt can
+            # bind the eventual fallback deployment.
+            return reject_batch()
+        batch = sidecar.latest_batch
+        if batch is None:
+            return reject_batch()
+        if batch.runtime_generation != self._router_dynamic_cache_generation(context.session_key):
+            return reject_batch()
+
+        valid_roles = {"single"} if context.topology == "single" else {"proposer", "aggregator"}
+        receipts = tuple(
+            receipt
+            for receipt in batch.receipts
+            if receipt.role in valid_roles and receipt.topology == context.topology
+        )
+        if not receipts:
+            return reject_batch()
+        state_key = _RouterDynamicCacheAffinityStateKey(
+            session_key=context.session_key,
+            session_epoch=context.session_epoch,
+            topology=context.topology,
+        )
+        state = states.setdefault(
+            state_key,
+            _RouterDynamicCacheAffinitySessionState(),
+        )
+        seen_attempts: set[str] = set()
+        for receipt in receipts:
+            if not receipt.physical_attempt_id or receipt.physical_attempt_id in seen_attempts:
+                continue
+            seen_attempts.add(receipt.physical_attempt_id)
+            state.receipts[
+                (
+                    receipt.role,
+                    receipt.execution_slot,
+                    receipt.requested_identity,
+                )
+            ] = receipt
+        if not state.receipts:
+            states.pop(state_key, None)
+            return reject_batch()
+        states.move_to_end(state_key)
+        while len(states) > sidecar.policy.route_cache_max_entries:
+            states.popitem(last=False)
+        self._prune_router_dynamic_cache_affinity_control_state(
+            route_cache_max_entries=sidecar.policy.route_cache_max_entries,
+        )
+        return True
+
+    def _discard_pending_router_dynamic_cache_affinity(
+        self,
+        turn: object | None,
+        *,
+        session_key: str,
+    ) -> None:
+        sidecar_key = self._router_dynamic_cache_sidecar_key(turn) if turn is not None else None
+        sidecars = self._router_dynamic_cache_affinity_sidecars
+        if sidecars is None:
+            return
+        sidecar = sidecars.pop(sidecar_key, None) if sidecar_key is not None else None
+        if sidecar is None:
+            for key in list(sidecars):
+                if key[0] == session_key:
+                    sidecar = sidecars.pop(key)
+                    break
+        if sidecar is None:
+            return
+        context = sidecar.context
+        self._clear_router_dynamic_cache_affinity_state(
+            session_key=context.session_key,
+            session_epoch=context.session_epoch,
+            topology=context.topology,
+        )
+        self._prune_router_dynamic_cache_affinity_control_state(
+            route_cache_max_entries=sidecar.policy.route_cache_max_entries,
+        )
+
     def _remember_router_dynamic_route(
         self, session_key: str, selection_plan: Mapping[str, Any]
     ) -> None:
@@ -4257,20 +5292,13 @@ class TurnRunner:
             "quality_feedback": default_session_quality_feedback(),
             "escalation_level": int(session_map.get("escalation_level") or 0),
         }
-        thinking_assignment = selection_plan.get(
-            "executed_thinking_assignment"
-        )
+        thinking_assignment = selection_plan.get("executed_thinking_assignment")
         if not isinstance(thinking_assignment, Mapping):
             thinking_assignment = selection_plan.get("thinking_assignment")
         if isinstance(thinking_assignment, Mapping):
-            remembered_route["thinking_assignment"] = copy.deepcopy(
-                dict(thinking_assignment)
-            )
+            remembered_route["thinking_assignment"] = copy.deepcopy(dict(thinking_assignment))
         self._router_dynamic_last_routes[session_key] = remembered_route
-        while (
-            len(self._router_dynamic_last_routes)
-            > router_dynamic_route_cache_max_entries()
-        ):
+        while len(self._router_dynamic_last_routes) > router_dynamic_route_cache_max_entries():
             oldest_session = next(iter(self._router_dynamic_last_routes))
             self._router_dynamic_last_routes.pop(oldest_session, None)
 
@@ -4976,6 +6004,16 @@ class TurnRunner:
             session_id_for_log = pa_out.session_id_for_log
             prompt_report_for_log = pa_out.prompt_report
             selector_model = pa_out.selector_model
+            cache_reroute_plan = getattr(
+                provider,
+                "_router_dynamic_cache_reroute_plan",
+                None,
+            )
+            if not isinstance(
+                cache_reroute_plan,
+                _RouterDynamicCacheReroutePlan,
+            ):
+                cache_reroute_plan = None
             trace_context = replace(
                 trace_context,
                 session_id=pa_out.trace_context_session_id,
@@ -4996,19 +6034,20 @@ class TurnRunner:
                         run_kind=run_kind,
                     ),
                 )
-                turn_call_logger.write(
-                    "prompt_report",
-                    asdict(prompt_report_for_log),
-                )
-                turn_call_logger.write(
-                    "turn_start",
-                    {
-                        "input_mode": input_mode,
-                        "message": effective_runtime_message,
-                        "attachment_count": len(attachments),
-                        "tool_names": [getattr(td, "name", "") for td in turn.tool_defs],
-                    },
-                )
+                if cache_reroute_plan is None:
+                    turn_call_logger.write(
+                        "prompt_report",
+                        asdict(prompt_report_for_log),
+                    )
+                    turn_call_logger.write(
+                        "turn_start",
+                        {
+                            "input_mode": input_mode,
+                            "message": effective_runtime_message,
+                            "attachment_count": len(attachments),
+                            "tool_names": [getattr(td, "name", "") for td in turn.tool_defs],
+                        },
+                    )
             log.debug(
                 "turn_runner.model_resolved",
                 explicit_model=model,
@@ -5031,9 +6070,7 @@ class TurnRunner:
                 router_event is not None
                 and turn.metadata.get("_router_single_provider_finalized") is True
             ):
-                frozen_event_catalog = turn.metadata.get(
-                    "_router_single_frozen_catalog"
-                )
+                frozen_event_catalog = turn.metadata.get("_router_single_frozen_catalog")
                 if isinstance(frozen_event_catalog, Mapping):
                     frozen_window = frozen_event_catalog.get("context_window")
                     if isinstance(frozen_window, int) and not isinstance(
@@ -5041,11 +6078,9 @@ class TurnRunner:
                         bool,
                     ):
                         router_event = replace(router_event, context_window=frozen_window)
-            if router_event is not None:
+            if router_event is not None and cache_reroute_plan is None:
                 yield router_event
-            active_provider_id = (
-                getattr(cloned_selector, "active_provider_id", "") or provider_name
-            )
+            active_provider_id = getattr(cloned_selector, "active_provider_id", "") or provider_name
             runtime_timeout_override = self._web_chat_runtime_timeout_override(
                 session_key,
                 explicit=timeout,
@@ -5062,9 +6097,7 @@ class TurnRunner:
                 )
                 if not isinstance(frozen_catalog, Mapping):
                     raise RuntimeError("router_single frozen catalog is unavailable")
-                frozen_catalog_token = _ROUTER_SINGLE_FROZEN_CATALOG.set(
-                    dict(frozen_catalog)
-                )
+                frozen_catalog_token = _ROUTER_SINGLE_FROZEN_CATALOG.set(dict(frozen_catalog))
             try:
                 ab_outcome = await self._agent_bootstrap_stage.run(
                     AgentBootstrapStageInput(
@@ -5112,7 +6145,7 @@ class TurnRunner:
             model_caps = ab_out.model_capabilities  # noqa: F841
             private_memory_allowed = ab_out.private_memory_allowed
             sync_manager = ab_out.sync_manager
-            if turn_call_logger is not None:
+            if turn_call_logger is not None and cache_reroute_plan is None:
                 turn_call_logger.write(
                     "agent_runtime_budget",
                     {
@@ -5120,6 +6153,170 @@ class TurnRunner:
                         "max_iterations_source": effective_max_iterations_source,
                     },
                 )
+
+            post_compaction_agent_resolver: Callable[[], Awaitable[Agent]] | None = None
+            if cache_reroute_plan is not None:
+
+                async def _resolve_post_compaction_agent() -> Agent:
+                    nonlocal active_provider_id
+                    nonlocal agent
+                    nonlocal agent_config
+                    nonlocal effective_agent_request_timeout
+                    nonlocal effective_iteration_timeout
+                    nonlocal effective_max_iterations
+                    nonlocal effective_max_iterations_source
+                    nonlocal effective_max_provider_retries
+                    nonlocal effective_runtime_timeout
+                    nonlocal effective_tool_timeout
+                    nonlocal model_caps
+                    nonlocal private_memory_allowed
+                    nonlocal prompt_report_for_log
+                    nonlocal provider
+                    nonlocal provider_for_log
+                    nonlocal provider_name
+                    nonlocal resolved_model
+                    nonlocal sync_manager
+                    nonlocal turn_call_logger
+
+                    rerouted = False
+                    if (
+                        self._router_dynamic_cache_generation(cache_reroute_plan.session_key)
+                        != cache_reroute_plan.selection_generation
+                    ):
+                        reroute_result = cache_reroute_plan.reroute_without_affinity()
+                        provider = reroute_result.provider
+                        provider_for_log = provider
+                        resolved_model = reroute_result.resolved_model
+                        provider_name = reroute_result.provider_name
+                        active_provider_id = reroute_result.active_provider_id
+                        turn.metadata["resolved_model"] = resolved_model
+                        turn.metadata["alias_resolution_chain"] = [resolved_model]
+                        turn.metadata["provider_after_rewrite"] = provider_name
+                        prompt_report_for_log = replace(
+                            prompt_report_for_log,
+                            resolved_model=resolved_model,
+                            alias_resolution_chain=[resolved_model],
+                            provider_after_rewrite=provider_name,
+                        )
+                        rerouted = True
+
+                    if cache_reroute_plan.finalize_observability is not None:
+                        cache_reroute_plan.finalize_observability()
+
+                    if is_turn_call_log_enabled(self._diagnostics_state):
+                        if rerouted:
+                            turn_call_logger = TurnCallLogger(
+                                trace_id=trace_context.trace_id,
+                                turn_id=turn_id,
+                                session_key=session_key,
+                                session_id=session_id_for_log,
+                                session_intent=session_intent,
+                                agent_id=agent_id,
+                                provider=provider_name,
+                                model=resolved_model,
+                                source=self._build_turn_call_source(
+                                    tool_context,
+                                    input_provenance,
+                                    run_kind=run_kind,
+                                ),
+                            )
+                        assert turn_call_logger is not None
+                        turn_call_logger.write(
+                            "prompt_report",
+                            asdict(prompt_report_for_log),
+                        )
+                        turn_call_logger.write(
+                            "turn_start",
+                            {
+                                "input_mode": input_mode,
+                                "message": effective_runtime_message,
+                                "attachment_count": len(attachments),
+                                "tool_names": [getattr(td, "name", "") for td in turn.tool_defs],
+                            },
+                        )
+
+                    if not rerouted:
+                        if turn_call_logger is not None:
+                            turn_call_logger.write(
+                                "agent_runtime_budget",
+                                {
+                                    "max_iterations": effective_max_iterations,
+                                    "max_iterations_source": (effective_max_iterations_source),
+                                },
+                            )
+                        return agent
+
+                    final_catalog_token: contextvars.Token[dict[str, Any] | None] | None = None
+                    if turn.metadata.get("_router_single_provider_finalized") is True:
+                        final_catalog = getattr(
+                            provider,
+                            "router_single_frozen_catalog",
+                            None,
+                        )
+                        if not isinstance(final_catalog, Mapping):
+                            raise RuntimeError("router_single frozen catalog is unavailable")
+                        final_catalog_token = _ROUTER_SINGLE_FROZEN_CATALOG.set(dict(final_catalog))
+                    try:
+                        final_ab_outcome = await self._agent_bootstrap_stage.run(
+                            AgentBootstrapStageInput(
+                                provider=provider,
+                                cloned_selector=cloned_selector,
+                                turn=turn,
+                                final_prompt=final_prompt,
+                                cache_breakpoints=cache_breakpoints,
+                                request_context_prompt=request_context_prompt,
+                                resolved_model=resolved_model,
+                                session_id_for_log=session_id_for_log,
+                                tool_handler=tool_handler,
+                                turn_call_logger=turn_call_logger,
+                                tool_context=tool_context,
+                                session_key=session_key,
+                                agent_id=agent_id,
+                                timeout=runtime_timeout_override,
+                                max_iterations=max_iterations,
+                                iteration_timeout=iteration_timeout,
+                                tool_timeout=tool_timeout,
+                                request_timeout=request_timeout,
+                                max_provider_retries=max_provider_retries,
+                                length_capped_continuations=(length_capped_continuations),
+                                active_provider_id=active_provider_id,
+                                turn_id=turn_id,
+                                run_kind=run_kind,
+                                session_epoch=(
+                                    self._usage_session_epoch_by_key.get(
+                                        session_key,
+                                        0,
+                                    )
+                                ),
+                            )
+                        )
+                    finally:
+                        if final_catalog_token is not None:
+                            _ROUTER_SINGLE_FROZEN_CATALOG.reset(final_catalog_token)
+                    final_ab_out = final_ab_outcome.require_output()
+                    agent = final_ab_out.agent
+                    agent_config = final_ab_out.agent_config
+                    effective_runtime_timeout = final_ab_out.effective_runtime_timeout
+                    effective_max_iterations = final_ab_out.effective_max_iterations
+                    effective_max_iterations_source = final_ab_out.effective_max_iterations_source
+                    effective_iteration_timeout = final_ab_out.effective_iteration_timeout
+                    effective_tool_timeout = final_ab_out.effective_tool_timeout
+                    effective_agent_request_timeout = final_ab_out.effective_request_timeout
+                    effective_max_provider_retries = final_ab_out.effective_max_provider_retries
+                    model_caps = final_ab_out.model_capabilities
+                    private_memory_allowed = final_ab_out.private_memory_allowed
+                    sync_manager = final_ab_out.sync_manager
+                    if turn_call_logger is not None:
+                        turn_call_logger.write(
+                            "agent_runtime_budget",
+                            {
+                                "max_iterations": effective_max_iterations,
+                                "max_iterations_source": (effective_max_iterations_source),
+                            },
+                        )
+                    return agent
+
+                post_compaction_agent_resolver = _resolve_post_compaction_agent
 
             # 6. Compaction (t3 + preflight) + history load + request-context
             # prepend. CompactionAndHistoryStage owns the four-call sequence
@@ -5155,6 +6352,7 @@ class TurnRunner:
                         agent_id=agent_id,
                         history_has_persisted_user=history_has_persisted_user,
                         bound_user_message_id=bound_user_message_id,
+                        post_compaction_agent_resolver=(post_compaction_agent_resolver),
                     )
                 )
             ch_out = ch_outcome.require_output()
@@ -5222,12 +6420,49 @@ class TurnRunner:
                 pending_input_provider=pending_input_provider,
             )
             router_control_replay_event: RouterControlReplayEvent | None = None
+            deferred_router_event_pending = cache_reroute_plan is not None
             with bind_usage_accounting_scope(turn_usage_scope):
                 async for event in self._stream_consumer_stage.run(stream_inp):
                     if isinstance(event, RouterControlReplayEvent):
                         router_control_replay_event = event
                         yield event
                         break
+                    if deferred_router_event_pending and getattr(event, "kind", "") not in {
+                        "heartbeat",
+                        "ensemble_progress",
+                    }:
+                        deferred_router_event_pending = False
+                        generation_guard_failed = (
+                            isinstance(event, ErrorEvent)
+                            and event.code == "router_dynamic_cache_generation_changed"
+                        )
+                        if not generation_guard_failed:
+                            router_event = build_router_decision_event(turn)
+                            if (
+                                router_event is not None
+                                and turn.metadata.get("_router_single_provider_finalized") is True
+                            ):
+                                frozen_event_catalog = turn.metadata.get(
+                                    "_router_single_frozen_catalog"
+                                )
+                                if isinstance(
+                                    frozen_event_catalog,
+                                    Mapping,
+                                ):
+                                    frozen_window = frozen_event_catalog.get("context_window")
+                                    if isinstance(
+                                        frozen_window,
+                                        int,
+                                    ) and not isinstance(
+                                        frozen_window,
+                                        bool,
+                                    ):
+                                        router_event = replace(
+                                            router_event,
+                                            context_window=frozen_window,
+                                        )
+                            if router_event is not None:
+                                yield router_event
                     yield event
             if router_control_replay_event is not None:
                 async for replayed_event in self._run_turn(
@@ -5406,13 +6641,22 @@ class TurnRunner:
                 message=message,
             )
             if pending_error_event is None:
+                self._commit_pending_router_dynamic_cache_affinity(turn, done_event)
                 self._commit_pending_router_dynamic_route(turn, done_event)
             else:
+                self._discard_pending_router_dynamic_cache_affinity(
+                    turn,
+                    session_key=session_key,
+                )
                 turn.metadata.pop("router_dynamic_pending_route_plan", None)
             if pending_error_event is not None:
                 yield pending_error_event
 
         except asyncio.CancelledError:
+            self._discard_pending_router_dynamic_cache_affinity(
+                turn_obj,
+                session_key=session_key,
+            )
             # Bug 2 partial-persistence: preserve whatever assistant text has
             # already streamed back so a cancelled turn does not leave the
             # transcript with an orphan user message. Marker `[interrupted]`
@@ -5490,6 +6734,10 @@ class TurnRunner:
             raise
 
         except Exception as exc:
+            self._discard_pending_router_dynamic_cache_affinity(
+                turn_obj,
+                session_key=session_key,
+            )
             error_code, error_message = sanitize_agent_error(
                 {
                     "status": "failed",
@@ -5509,8 +6757,7 @@ class TurnRunner:
             else:
                 event_code = (
                     error_code
-                    if error_code
-                    in {"provider_request_too_large", "provider_output_truncated"}
+                    if error_code in {"provider_request_too_large", "provider_output_truncated"}
                     else "agent_error"
                 )
             log.error(
@@ -5523,9 +6770,7 @@ class TurnRunner:
             if turn_obj is not None:
                 try:
                     fallback_hops = int(
-                        (getattr(turn_obj, "metadata", None) or {}).get(
-                            "router_fallback_hops", 0
-                        )
+                        (getattr(turn_obj, "metadata", None) or {}).get("router_fallback_hops", 0)
                     )
                 except (TypeError, ValueError):
                     fallback_hops = 0
@@ -5538,9 +6783,7 @@ class TurnRunner:
                 message=error_message,
                 exc=exc,
                 provider=(
-                    type(provider_for_log).__name__
-                    if provider_for_log is not None
-                    else None
+                    type(provider_for_log).__name__ if provider_for_log is not None else None
                 ),
                 model=resolved_model or None,
                 fallback_hops=fallback_hops,
@@ -6295,9 +7538,7 @@ class TurnRunner:
         """Resolve explicit config thinking before squilla-router suggestions."""
 
         metadata = getattr(turn, "metadata", {}) or {}
-        managed_native_level = metadata.get(
-            "_router_single_managed_provider_thinking_level"
-        )
+        managed_native_level = metadata.get("_router_single_managed_provider_thinking_level")
         if managed_native_level is not None:
             if isinstance(managed_native_level, ThinkingLevel):
                 return managed_native_level
@@ -6330,6 +7571,28 @@ class TurnRunner:
             source="squilla_router",
         )
         return parsed if parsed is not None else False
+
+    def _router_dynamic_outer_thinking_projection(
+        self,
+        turn: Any,
+    ) -> dict[str, bool | str | int]:
+        """Freeze the exact outer Agent ChatConfig thinking domain."""
+
+        setting = self._resolve_turn_thinking(turn)
+        thinking_enabled, thinking_budget = AgentConfig(thinking=setting).resolve_thinking(
+            prompt=str(getattr(turn, "semantic_message", "") or "")
+        )
+        if not thinking_enabled:
+            effective_level = "off"
+        elif isinstance(setting, ThinkingLevel):
+            effective_level = setting.value
+        else:
+            effective_level = "enabled"
+        return {
+            "thinking_enabled": thinking_enabled,
+            "effective_thinking_level": effective_level,
+            "thinking_budget_tokens": thinking_budget,
+        }
 
     @staticmethod
     def _parse_thinking_level(value: Any, *, source: str) -> bool | ThinkingLevel | None:
@@ -6435,9 +7698,7 @@ class TurnRunner:
         if metadata is not None:
             metadata["meta_skill_enabled"] = meta_skill_enabled
             if skill_catalog is not None:
-                metadata["skill_catalog_generation"] = int(
-                    getattr(skill_catalog, "generation", 0)
-                )
+                metadata["skill_catalog_generation"] = int(getattr(skill_catalog, "generation", 0))
 
         if ctx is not None:
             caller_ctx = ctx
@@ -6497,10 +7758,7 @@ class TurnRunner:
             skill.name
             for skill in loaded_skills
             if not getattr(skill, "disable_model_invocation", False)
-            and (
-                meta_skill_enabled
-                or getattr(skill, "kind", "skill") != "meta"
-            )
+            and (meta_skill_enabled or getattr(skill, "kind", "skill") != "meta")
         }
         tool_handler = build_tool_handler(
             self._tool_registry,
@@ -7034,9 +8292,7 @@ class TurnRunner:
         router_cfg = getattr(self._turn_config(), "squilla_router", None)
         if router_cfg is None:
             return None
-        configured_model = str(
-            getattr(router_cfg, "vision_followup_gate_model", "") or ""
-        ).strip()
+        configured_model = str(getattr(router_cfg, "vision_followup_gate_model", "") or "").strip()
         if configured_model:
             return configured_model
         tier_name = str(getattr(router_cfg, "vision_followup_gate_tier", "c0") or "").strip()
@@ -7087,9 +8343,7 @@ class TurnRunner:
                         agent_run_id=execution_id,
                         turn_id=execution_id,
                         parent_turn_id=(
-                            parent.turn_id or parent.execution_id
-                            if parent is not None
-                            else None
+                            parent.turn_id or parent.execution_id if parent is not None else None
                         ),
                         session_id=parent.session_id if parent is not None else None,
                         session_epoch=parent.session_epoch if parent is not None else 0,
@@ -7105,8 +8359,7 @@ class TurnRunner:
             with bind_usage_accounting_scope(scope):
                 stream = (
                     gate_provider.chat(messages, tools=tools, config=config)
-                    if scope is not None
-                    and provider_accounts_physical_usage(gate_provider)
+                    if scope is not None and provider_accounts_physical_usage(gate_provider)
                     else account_provider_stream(
                         lambda: gate_provider.chat(
                             messages,
@@ -7141,6 +8394,7 @@ class TurnRunner:
         turn_config: Any,
         ensemble_cfg: Any,
         turn_absolute_deadline: float | None,
+        usage_execution_context: UsageExecutionContext | None = None,
     ) -> Any:
         """Resolve router_dynamic Top-1 onto an ordinary provider."""
 
@@ -7195,13 +8449,10 @@ class TurnRunner:
         if callable(prepared_ranking_config):
             ranking_config = prepared_ranking_config()
             if not isinstance(ranking_config, Mapping):
-                raise DynamicRankingError(
-                    "prepared router_single ranking config is unavailable"
-                )
+                raise DynamicRankingError("prepared router_single ranking config is unavailable")
             thinking_policy = ranking_config.get("thinking_assignment")
             thinking_assignment_enabled = bool(
-                ranking_config.get("schema_version")
-                == RANKING_CONFIG_SCHEMA_VERSION
+                ranking_config.get("schema_version") == RANKING_CONFIG_SCHEMA_VERSION
                 and isinstance(thinking_policy, Mapping)
                 and thinking_policy.get("enabled") is True
             )
@@ -7209,9 +8460,7 @@ class TurnRunner:
             frozen_resolution = frozen_resolution_snapshot()
             ranking_config = frozen_resolution.get("effective_config")
             if not isinstance(ranking_config, Mapping):
-                raise DynamicRankingError(
-                    "frozen router_single ranking config is unavailable"
-                )
+                raise DynamicRankingError("frozen router_single ranking config is unavailable")
             thinking_assignment_enabled = (
                 frozen_resolution.get("thinking_assignment_enabled") is True
             )
@@ -7225,23 +8474,86 @@ class TurnRunner:
             )
             ranking_config = ranking_config_snapshot(
                 thinking_assignment_enabled=thinking_assignment_enabled,
-                override=(
-                    getattr(ensemble_cfg, "ranking_config_override", None)
-                    or None
-                ),
+                override=(getattr(ensemble_cfg, "ranking_config_override", None) or None),
             )
         ranking_config = _prepare_effective_ranking_config(
             ranking_config,
             thinking_assignment_enabled=thinking_assignment_enabled,
         )
+        cache_affinity_policy: _RouterDynamicCacheAffinityPolicy | None = None
+        cache_affinity_session_epoch: int | None = None
+        cache_continuity_available = False
+        cache_affinity_receipts: tuple[_RouterDynamicCacheAffinityReceipt, ...] = ()
+        cache_affinity_generation = 0
+        cache_affinity_now_monotonic: float | None = None
+        cache_affinity_outer_thinking_projection: dict[str, bool | str | int] | None = None
+        cache_affinity_turn_id = ""
+        decision_id = str(turn.metadata.get("router_decision_id") or uuid.uuid4().hex)
+        ranking_session = ranking_config.get("session")
+        if isinstance(ranking_session, Mapping) and isinstance(
+            ranking_session.get("kv_cache_affinity"),
+            Mapping,
+        ):
+            cache_affinity_policy = _router_dynamic_cache_affinity_policy(
+                ranking_config,
+                topology="single",
+            )
+        if cache_affinity_policy is not None:
+            cache_affinity_outer_thinking_projection = (
+                self._router_dynamic_outer_thinking_projection(turn)
+            )
+            self._ensure_router_dynamic_cache_compaction_listener(
+                route_cache_max_entries=(cache_affinity_policy.route_cache_max_entries),
+            )
+            cache_affinity_session_epoch = await self._resolve_router_dynamic_session_epoch(
+                turn.session_key
+            )
+            if cache_affinity_session_epoch is None:
+                self._invalidate_router_dynamic_cache_affinity(
+                    session_key=turn.session_key,
+                    reason="session_epoch_unavailable",
+                )
+            else:
+                cache_affinity_now_monotonic = time.monotonic()
+                (
+                    cache_continuity_available,
+                    cache_affinity_receipts,
+                    cache_affinity_generation,
+                ) = self._router_single_cache_continuity_snapshot(
+                    session_key=turn.session_key,
+                    session_epoch=cache_affinity_session_epoch,
+                    policy=cache_affinity_policy,
+                    now=cache_affinity_now_monotonic,
+                )
+                # Register an empty terminal sidecar before any Analyzer or
+                # ranking work. If that work fails, the turn-level exception
+                # cleanup can still invalidate the previous successful
+                # affinity evidence for this topology.
+                cache_affinity_turn_id = str(
+                    getattr(usage_execution_context, "turn_id", "")
+                    or getattr(usage_execution_context, "execution_id", "")
+                    or uuid.uuid4().hex
+                )
+                turn.metadata["router_single_decision_id"] = decision_id
+                self._register_router_dynamic_cache_sidecar(
+                    context=_RouterDynamicCacheAffinityCollectionContext(
+                        turn_id=cache_affinity_turn_id,
+                        decision_id=decision_id,
+                        provider_instance_token=uuid.uuid4().hex,
+                        provider_instance_generation=0,
+                        session_key=turn.session_key,
+                        session_epoch=cache_affinity_session_epoch,
+                        selection_generation=cache_affinity_generation,
+                        topology="single",
+                    ),
+                    policy=cache_affinity_policy,
+                )
         analyzer_policy = task_analyzer_policy(ranking_config)
         analyzer_chain = task_analyzer_chain_policy(ranking_config)
         analyzer_provider_id = str(analyzer_policy["provider"])
         analyzer_model_id = str(analyzer_policy["model"])
         routing_extra = turn.metadata.get("routing_extra")
-        routing_extra_map = (
-            routing_extra if isinstance(routing_extra, Mapping) else {}
-        )
+        routing_extra_map = routing_extra if isinstance(routing_extra, Mapping) else {}
         routed_tier = str(
             turn.metadata.get("routed_tier")
             or routing_extra_map.get("final_tier")
@@ -7249,9 +8561,7 @@ class TurnRunner:
             or "c1"
         )
         try:
-            routing_confidence = float(
-                turn.metadata.get("routing_confidence") or 0.0
-            )
+            routing_confidence = float(turn.metadata.get("routing_confidence") or 0.0)
         except (TypeError, ValueError):
             routing_confidence = 0.0
         configured_output_tokens = int(
@@ -7259,13 +8569,9 @@ class TurnRunner:
         )
         if configured_output_tokens <= 0:
             context_policy = ranking_config.get("context")
-            context_policy_map = (
-                context_policy if isinstance(context_policy, Mapping) else {}
-            )
+            context_policy_map = context_policy if isinstance(context_policy, Mapping) else {}
             output_policy = context_policy_map.get("output_budget")
-            output_policy_map = (
-                output_policy if isinstance(output_policy, Mapping) else {}
-            )
+            output_policy_map = output_policy if isinstance(output_policy, Mapping) else {}
             configured_output_tokens = output_policy_map.get("default_tokens")
             if (
                 isinstance(configured_output_tokens, bool)
@@ -7295,19 +8601,11 @@ class TurnRunner:
             if user_profile_enabled
             else None
         )
-        decision_id = str(
-            turn.metadata.get("router_decision_id") or uuid.uuid4().hex
-        )
-
         analyzer_admission_controller = None
         analyzer_admission_deadline = None
         admission_config = getattr(ensemble_cfg, "admission", None)
         if (
-            str(
-                getattr(ensemble_cfg, "latency_class", "normal")
-                or "normal"
-            )
-            != "experiment"
+            str(getattr(ensemble_cfg, "latency_class", "normal") or "normal") != "experiment"
             and admission_config is not None
             and bool(getattr(admission_config, "enabled", True))
         ):
@@ -7316,29 +8614,22 @@ class TurnRunner:
                 provider_admission_settings_from_config,
             )
 
-            analyzer_admission_controller = (
-                get_shared_provider_admission_controller(
-                    provider_admission_settings_from_config(admission_config)
-                )
+            analyzer_admission_controller = get_shared_provider_admission_controller(
+                provider_admission_settings_from_config(admission_config)
             )
             analyzer_admission_timeout = float(
                 analyzer_chain["total_timeout_seconds"]
                 if analyzer_chain["configured"]
                 else analyzer_policy["timeout_seconds"]
             )
-            analyzer_admission_deadline = (
-                time.monotonic() + analyzer_admission_timeout
-            )
+            analyzer_admission_deadline = time.monotonic() + analyzer_admission_timeout
             if turn_absolute_deadline is not None:
                 analyzer_admission_deadline = min(
                     analyzer_admission_deadline,
                     turn_absolute_deadline,
                 )
         allow_canary_analyzer_route = bool(
-            str(
-                getattr(ensemble_cfg, "latency_class", "normal")
-                or "normal"
-            ).strip().casefold()
+            str(getattr(ensemble_cfg, "latency_class", "normal") or "normal").strip().casefold()
             == "experiment"
         )
         if analyzer_chain["configured"]:
@@ -7357,6 +8648,12 @@ class TurnRunner:
                 )
                 for route in analyzer_chain["routes"]
             ]
+            analyzer_cache_kwargs: dict[str, Any] = {}
+            if _accepts_keyword_arg(
+                analyze_task_with_fallback_chain,
+                "cache_continuity_available",
+            ):
+                analyzer_cache_kwargs["cache_continuity_available"] = cache_continuity_available
             task_analysis = await analyze_task_with_fallback_chain(
                 candidates=analyzer_candidates,
                 message=turn.semantic_message,
@@ -7371,6 +8668,7 @@ class TurnRunner:
                 absolute_deadline=turn_absolute_deadline,
                 admission_controller=analyzer_admission_controller,
                 admission_deadline=analyzer_admission_deadline,
+                **analyzer_cache_kwargs,
             )
         else:
             analyzer_provider = self._router_dynamic_task_analyzer_provider(
@@ -7379,6 +8677,12 @@ class TurnRunner:
                 ranking_config=ranking_config,
                 allow_canary_route=allow_canary_analyzer_route,
             )
+            analyzer_cache_kwargs = {}
+            if _accepts_keyword_arg(
+                analyze_task_with_provider,
+                "cache_continuity_available",
+            ):
+                analyzer_cache_kwargs["cache_continuity_available"] = cache_continuity_available
             task_analysis = await analyze_task_with_provider(
                 provider=analyzer_provider,
                 message=turn.semantic_message,
@@ -7395,20 +8699,43 @@ class TurnRunner:
                 admission_controller=analyzer_admission_controller,
                 admission_deadline=analyzer_admission_deadline,
                 _absolute_deadline=turn_absolute_deadline,
+                **analyzer_cache_kwargs,
             )
 
+        # Analyzer latency must not extend receipt lifetime. Intent continuity
+        # uses the pre-Analyzer snapshot, while ranking re-evaluates TTL/decay
+        # against a fresh monotonic instant immediately before mapping.
+        if cache_affinity_session_epoch is not None:
+            cache_affinity_now_monotonic = time.monotonic()
         provider_health_ledger = get_provider_health_ledger()
+        ranking_inputs: dict[str, Any] = {
+            "decision_id": decision_id,
+            "task_analysis": task_analysis,
+            "user_profile": user_profile,
+            "request_context": request_context,
+            "ranking_config": ranking_config,
+        }
+        if cache_affinity_policy is not None:
+            ranking_inputs.update(
+                {
+                    "cache_continuity_available": cache_continuity_available,
+                    "cache_affinity_receipts": cache_affinity_receipts,
+                    "cache_affinity_policy": cache_affinity_policy.source,
+                    "cache_affinity_session_epoch": cache_affinity_session_epoch,
+                    "cache_affinity_now_monotonic": cache_affinity_now_monotonic,
+                    "cache_affinity_price_quote_resolver": (
+                        _router_dynamic_cache_price_quote_resolver
+                    ),
+                    "cache_affinity_outer_thinking_projection": (
+                        cache_affinity_outer_thinking_projection
+                    ),
+                }
+            )
         route = resolve_router_single_route(
             config=turn_config,
             inherited_provider_config=current_provider_config,
             turn_metadata=turn.metadata,
-            ranking_inputs={
-                "decision_id": decision_id,
-                "task_analysis": task_analysis,
-                "user_profile": user_profile,
-                "request_context": request_context,
-                "ranking_config": ranking_config,
-            },
+            ranking_inputs=ranking_inputs,
             requires_tools=bool(turn.tool_defs),
             credential_pool_acquirer=acquire_profile_credential,
             session_key=turn.session_key,
@@ -7416,73 +8743,187 @@ class TurnRunner:
             model_catalog=self._model_catalog,
         )
 
-        selected_config = route.provider_config
-        direct_selector = ModelSelector(
-            SelectorConfig(primary=selected_config, fallbacks=[])
-        )
-        direct_provider = _RouterSingleDirectProvider(
-            direct_selector.resolve(),
-            selected_config,
-            health_ledger=provider_health_ledger,
-            absolute_deadline=turn_absolute_deadline,
-            frozen_catalog={
-                "provider": selected_config.provider,
-                "model": selected_config.model,
-                "max_tokens": route.direct_output_tokens,
-                "context_window": route.context_window_tokens,
-                "capabilities": route.model_capabilities,
-            },
-            enforces_routed_thinking_policy=bool(
-                route.thinking_policy_version
-            ),
-        )
-        direct_provider = _SelectorFallbackProvider(
-            direct_provider,
-            direct_selector,
-            turn_metadata=turn.metadata,
-        )
-        cloned_selector.override_provider_config(selected_config)
-        turn.model = selected_config.model
-        turn.metadata.update(
-            {
-                "_router_single_provider_finalized": True,
-                "router_single_decision_id": decision_id,
-                "router_single_task_profile": task_analysis.profile,
-                "router_single_task_analyzer": task_analysis.trace(
-                    ranking_config
-                ),
-                "router_single_request_context_hash": request_context.get(
-                    "snapshot_hash"
-                ),
-                "router_single_decision": route.trace,
-                "router_single_selected_provider": selected_config.provider,
-                "router_single_selected_model": selected_config.model,
-                "executed_provider": selected_config.provider,
-                "executed_model": selected_config.model,
-                "routed_provider_applied": selected_config.provider,
-                "_router_single_frozen_catalog": {
+        affinity_enabled = bool(cache_affinity_turn_id)
+
+        def _materialize_route(
+            selected_route: Any,
+            *,
+            selection_generation: int,
+        ) -> Any:
+            selected_config = selected_route.provider_config
+            direct_selector = ModelSelector(SelectorConfig(primary=selected_config, fallbacks=[]))
+            affinity_context: _RouterDynamicCacheAffinityCollectionContext | None = None
+            affinity_sink: Callable[[_RouterDynamicCacheAffinityReceiptBatch], None] | None = None
+            affinity_generation_getter: Callable[[], int] | None = None
+            if affinity_enabled:
+                assert cache_affinity_policy is not None
+                assert cache_affinity_session_epoch is not None
+                provider_instance_token = uuid.uuid4().hex
+                affinity_context = _RouterDynamicCacheAffinityCollectionContext(
+                    turn_id=cache_affinity_turn_id,
+                    decision_id=decision_id,
+                    provider_instance_token=provider_instance_token,
+                    provider_instance_generation=0,
+                    session_key=turn.session_key,
+                    session_epoch=cache_affinity_session_epoch,
+                    selection_generation=selection_generation,
+                    topology="single",
+                )
+                affinity_sidecar_key = self._register_router_dynamic_cache_sidecar(
+                    context=affinity_context,
+                    policy=cache_affinity_policy,
+                )
+
+                def _stage_affinity(
+                    batch: _RouterDynamicCacheAffinityReceiptBatch,
+                    *,
+                    _key: tuple[str, str] = affinity_sidecar_key,
+                ) -> None:
+                    self._stage_router_dynamic_cache_affinity_batch(_key, batch)
+
+                affinity_sink = _stage_affinity
+
+                def _current_affinity_generation() -> int:
+                    return self._router_dynamic_cache_generation(turn.session_key)
+
+                affinity_generation_getter = _current_affinity_generation
+            resolved_provider = _RouterSingleDirectProvider(
+                direct_selector.resolve(),
+                selected_config,
+                health_ledger=provider_health_ledger,
+                absolute_deadline=turn_absolute_deadline,
+                frozen_catalog={
                     "provider": selected_config.provider,
                     "model": selected_config.model,
-                    "max_tokens": route.direct_output_tokens,
-                    "context_window": route.context_window_tokens,
+                    "max_tokens": selected_route.direct_output_tokens,
+                    "context_window": selected_route.context_window_tokens,
+                    "capabilities": selected_route.model_capabilities,
                 },
-            }
-        )
-        # Align RouterDecisionEvent and savings telemetry with the direct model
-        # that will actually execute, clearing savings computed for V4's prior
-        # recommendation when the model changed.
-        direct_provider._realign_routed_model_after_fallback()
-        if route.thinking_policy_version:
-            if not str(route.thinking or "").strip():
-                raise DynamicRankingError(
-                    "router_single managed thinking is missing provider-native level",
-                    reason="thinking_level_unavailable",
+                enforces_routed_thinking_policy=bool(selected_route.thinking_policy_version),
+                cache_affinity_context=affinity_context,
+                cache_affinity_receipt_sink=affinity_sink,
+                cache_affinity_generation_getter=affinity_generation_getter,
+                cache_affinity_actual_model_aliases=getattr(
+                    selected_route,
+                    "actual_model_aliases",
+                    (),
+                ),
+                cache_affinity_credential_namespace_token=getattr(
+                    selected_route,
+                    "credential_namespace_token",
+                    None,
+                ),
+            )
+            resolved_provider = _SelectorFallbackProvider(
+                resolved_provider,
+                direct_selector,
+                turn_metadata=turn.metadata,
+                cache_affinity_credential_failure_callback=(
+                    (
+                        lambda: self._invalidate_router_dynamic_cache_affinity(
+                            session_key=turn.session_key,
+                            reason="credential_failure",
+                        )
+                    )
+                    if affinity_context is not None
+                    else None
+                ),
+            )
+            cloned_selector.override_provider_config(selected_config)
+            turn.model = selected_config.model
+            turn.metadata.update(
+                {
+                    "_router_single_provider_finalized": True,
+                    "router_single_decision_id": decision_id,
+                    "router_single_task_profile": task_analysis.profile,
+                    "router_single_task_analyzer": task_analysis.trace(ranking_config),
+                    "router_single_request_context_hash": request_context.get("snapshot_hash"),
+                    "router_single_decision": selected_route.trace,
+                    "router_single_selected_provider": selected_config.provider,
+                    "router_single_selected_model": selected_config.model,
+                    "executed_provider": selected_config.provider,
+                    "executed_model": selected_config.model,
+                    "routed_provider_applied": selected_config.provider,
+                    "resolved_model": selected_config.model,
+                    "alias_resolution_chain": [selected_config.model],
+                    "provider_after_rewrite": selected_config.provider,
+                    "_router_single_frozen_catalog": {
+                        "provider": selected_config.provider,
+                        "model": selected_config.model,
+                        "max_tokens": selected_route.direct_output_tokens,
+                        "context_window": selected_route.context_window_tokens,
+                    },
+                }
+            )
+            # Align RouterDecisionEvent and savings telemetry with the direct
+            # model that will actually execute.
+            resolved_provider._realign_routed_model_after_fallback()
+            if selected_route.thinking_policy_version:
+                if not str(selected_route.thinking or "").strip():
+                    raise DynamicRankingError(
+                        "router_single managed thinking is missing provider-native level",
+                        reason="thinking_level_unavailable",
+                    )
+                turn.metadata["thinking_requested"] = True
+                turn.metadata["thinking_level"] = selected_route.thinking
+                turn.metadata["_router_single_managed_provider_thinking_level"] = (
+                    selected_route.thinking
                 )
-            turn.metadata["thinking_requested"] = True
-            turn.metadata["thinking_level"] = route.thinking
-            turn.metadata[
-                "_router_single_managed_provider_thinking_level"
-            ] = route.thinking
+            return resolved_provider
+
+        direct_provider = _materialize_route(
+            route,
+            selection_generation=cache_affinity_generation,
+        )
+        if affinity_enabled:
+            no_affinity_inputs = dict(ranking_inputs)
+            for affinity_key in (
+                "cache_affinity_policy",
+                "cache_affinity_receipts",
+                "cache_affinity_session_epoch",
+                "cache_affinity_now_monotonic",
+                "cache_affinity_price_quote_resolver",
+                "cache_affinity_outer_thinking_projection",
+            ):
+                no_affinity_inputs.pop(affinity_key, None)
+            no_affinity_inputs["cache_continuity_available"] = False
+            # Compaction invalidates every pre-compaction affinity score, but
+            # the freshly selected deployment must still be able to publish
+            # evidence for this physical post-compaction request.  The
+            # collection-only seam performs no receipt lookup/ranking work and
+            # carries only the freshly resolved opaque credential token into
+            # final materialization.
+            no_affinity_inputs["cache_affinity_collection_enabled"] = True
+
+            def _reroute_without_affinity() -> _RouterDynamicCacheRerouteResult:
+                rerouted = resolve_router_single_route(
+                    config=turn_config,
+                    inherited_provider_config=current_provider_config,
+                    turn_metadata=turn.metadata,
+                    ranking_inputs=no_affinity_inputs,
+                    requires_tools=bool(turn.tool_defs),
+                    credential_pool_acquirer=acquire_profile_credential,
+                    session_key=turn.session_key,
+                    provider_health_ledger=provider_health_ledger,
+                    model_catalog=self._model_catalog,
+                )
+                final_provider = _materialize_route(
+                    rerouted,
+                    selection_generation=(self._router_dynamic_cache_generation(turn.session_key)),
+                )
+                final_config = rerouted.provider_config
+                return _RouterDynamicCacheRerouteResult(
+                    provider=final_provider,
+                    resolved_model=str(final_config.model or ""),
+                    provider_name=str(final_config.provider or ""),
+                    active_provider_id=str(final_config.provider or ""),
+                )
+
+            direct_provider._router_dynamic_cache_reroute_plan = _RouterDynamicCacheReroutePlan(
+                session_key=turn.session_key,
+                selection_generation=cache_affinity_generation,
+                reroute_without_affinity=_reroute_without_affinity,
+            )
         return direct_provider
 
     async def _run_pipeline(
@@ -7679,19 +9120,13 @@ class TurnRunner:
                 1,
             )
         if vision_sticky_remaining > 0:
-            initial_metadata["router_vision_sticky_remaining"] = int(
-                vision_sticky_remaining
-            )
+            initial_metadata["router_vision_sticky_remaining"] = int(vision_sticky_remaining)
         if turns_since_last_image is not None:
-            initial_metadata["router_turns_since_last_image"] = int(
-                turns_since_last_image
-            )
+            initial_metadata["router_turns_since_last_image"] = int(turns_since_last_image)
         if last_image_turn_text:
             initial_metadata["router_last_image_turn_text"] = last_image_turn_text
         if vision_candidate_turns > 0:
-            initial_metadata["router_vision_candidate_turns"] = int(
-                vision_candidate_turns
-            )
+            initial_metadata["router_vision_candidate_turns"] = int(vision_candidate_turns)
         if flags_text_override:
             initial_metadata["router_flags_text_override"] = flags_text_override
         if tool_context is not None:
@@ -7782,8 +9217,7 @@ class TurnRunner:
         ensemble_cfg = getattr(turn_config, "llm_ensemble", None)
         router_single_mode = bool(
             getattr(ensemble_cfg, "enabled", False)
-            and str(getattr(ensemble_cfg, "mode", "multiple") or "multiple")
-            == "single"
+            and str(getattr(ensemble_cfg, "mode", "multiple") or "multiple") == "single"
         )
         if router_single_mode:
             # Explicit per-turn model selection has higher priority than the
@@ -7801,6 +9235,7 @@ class TurnRunner:
                 turn_config=turn_config,
                 ensemble_cfg=ensemble_cfg,
                 turn_absolute_deadline=turn_absolute_deadline,
+                usage_execution_context=usage_execution_context,
             )
             return turn, provider
 
@@ -7823,6 +9258,7 @@ class TurnRunner:
                 log_ensemble_decision_started,
                 log_ensemble_decision_steps,
             )
+
             current_provider_config = (
                 getattr(cloned_selector, "current_config", None)
                 if cloned_selector is not None
@@ -7843,9 +9279,7 @@ class TurnRunner:
                 )
 
                 provider_health_ledger = get_provider_health_ledger()
-                canary_rollout_ledger = (
-                    self._persistent_canary_rollout_ledger(turn_config)
-                )
+                canary_rollout_ledger = self._persistent_canary_rollout_ledger(turn_config)
             dynamic_cleanup_errors: tuple[type[Exception], ...] = ()
             dynamic_selection_errors: tuple[type[Exception], ...] = ()
             if selection_mode == "router_dynamic":
@@ -7871,16 +9305,13 @@ class TurnRunner:
                     getattr(candidate, "enabled", True) is not False
                     and str(getattr(candidate, "provider", "") or "").strip()
                     and str(getattr(candidate, "model", "") or "").strip()
-                    and str(getattr(candidate, "role", "") or "").strip().lower()
-                    != "aggregator"
+                    and str(getattr(candidate, "role", "") or "").strip().lower() != "aggregator"
                     for candidate in (getattr(ensemble_cfg, "candidates", None) or [])
                 )
                 if selection_mode == CUSTOM_B5_SELECTION_MODE
                 else True
             )
-            ensemble_decision_id = str(
-                turn.metadata.get("router_decision_id") or uuid.uuid4().hex
-            )
+            ensemble_decision_id = str(turn.metadata.get("router_decision_id") or uuid.uuid4().hex)
             turn.metadata["ensemble_decision_id"] = ensemble_decision_id
             ranking_user_profile_application_enabled = (
                 bool(
@@ -7968,8 +9399,8 @@ class TurnRunner:
                 )
             else:
                 turn.metadata["ensemble_enabled"] = True
-                turn.metadata["routed_model_before_ensemble"] = (
-                    turn.model or getattr(current_provider_config, "model", "")
+                turn.metadata["routed_model_before_ensemble"] = turn.model or getattr(
+                    current_provider_config, "model", ""
                 )
                 # The mode belongs to this turn's immutable ranking root. Keep
                 # it stable through error classification even if a concurrent
@@ -7977,6 +9408,24 @@ class TurnRunner:
                 thinking_assignment_enabled = False
                 try:
                     ranking_inputs: dict[str, Any] | None = None
+                    multiple_cache_policy: _RouterDynamicCacheAffinityPolicy | None = None
+                    multiple_cache_session_epoch: int | None = None
+                    multiple_cache_receipts: tuple[
+                        _RouterDynamicCacheAffinityReceipt,
+                        ...,
+                    ] = ()
+                    multiple_cache_continuity = False
+                    multiple_cache_generation = 0
+                    multiple_cache_now: float | None = None
+                    multiple_cache_outer_thinking_projection: dict[str, bool | str | int] | None = (
+                        None
+                    )
+                    multiple_affinity_callback: Callable[[object], None] | None = None
+                    multiple_credential_failure_reporter = report_profile_credential_failure
+                    multiple_affinity_turn_id = ""
+                    multiple_affinity_provider_token = ""
+                    multiple_context: _RouterDynamicCacheAffinityCollectionContext | None = None
+                    multiple_sidecar_key: tuple[str, str] | None = None
                     if selection_mode == "router_dynamic":
                         from opensquilla.provider.ranking_router import (
                             RANKING_CONFIG_SCHEMA_VERSION,
@@ -8007,9 +9456,7 @@ class TurnRunner:
                             # Derive the mode from the same immutable root. A
                             # concurrent refreeze may update the config object,
                             # but an in-flight turn must keep its old pair.
-                            thinking_policy = ranking_config.get(
-                                "thinking_assignment"
-                            )
+                            thinking_policy = ranking_config.get("thinking_assignment")
                             thinking_assignment_enabled = bool(
                                 ranking_config.get("schema_version")
                                 == RANKING_CONFIG_SCHEMA_VERSION
@@ -8022,23 +9469,17 @@ class TurnRunner:
                                 "ranking_config_resolution_snapshot",
                                 None,
                             )
-                        if (
-                            not callable(prepared_ranking_config)
-                            and callable(frozen_resolution_snapshot)
+                        if not callable(prepared_ranking_config) and callable(
+                            frozen_resolution_snapshot
                         ):
                             frozen_resolution = frozen_resolution_snapshot()
-                            ranking_config = frozen_resolution.get(
-                                "effective_config"
-                            )
+                            ranking_config = frozen_resolution.get("effective_config")
                             if not isinstance(ranking_config, Mapping):
                                 raise DynamicRankingError(
                                     "frozen router_dynamic ranking config is unavailable"
                                 )
                             thinking_assignment_enabled = (
-                                frozen_resolution.get(
-                                    "thinking_assignment_enabled"
-                                )
-                                is True
+                                frozen_resolution.get("thinking_assignment_enabled") is True
                             )
                         elif not callable(prepared_ranking_config):
                             thinking_assignment_enabled = bool(
@@ -8049,9 +9490,7 @@ class TurnRunner:
                                 )
                             )
                             ranking_config = ranking_config_snapshot(
-                                thinking_assignment_enabled=(
-                                    thinking_assignment_enabled
-                                ),
+                                thinking_assignment_enabled=(thinking_assignment_enabled),
                                 override=(
                                     getattr(
                                         ensemble_cfg,
@@ -8063,10 +9502,81 @@ class TurnRunner:
                             )
                         ranking_config = _prepare_effective_ranking_config(
                             ranking_config,
-                            thinking_assignment_enabled=(
-                                thinking_assignment_enabled
-                            ),
+                            thinking_assignment_enabled=(thinking_assignment_enabled),
                         )
+                        ranking_session = ranking_config.get("session")
+                        if (
+                            not str(explicit_model or "").strip()
+                            and isinstance(ranking_session, Mapping)
+                            and isinstance(
+                                ranking_session.get("kv_cache_affinity"),
+                                Mapping,
+                            )
+                        ):
+                            multiple_cache_policy = _router_dynamic_cache_affinity_policy(
+                                ranking_config,
+                                topology="multiple",
+                            )
+                        if multiple_cache_policy is not None:
+                            multiple_cache_outer_thinking_projection = (
+                                self._router_dynamic_outer_thinking_projection(turn)
+                            )
+                            self._ensure_router_dynamic_cache_compaction_listener(
+                                route_cache_max_entries=(
+                                    multiple_cache_policy.route_cache_max_entries
+                                ),
+                            )
+                            multiple_cache_session_epoch = (
+                                await self._resolve_router_dynamic_session_epoch(turn.session_key)
+                            )
+                            if multiple_cache_session_epoch is None:
+                                self._invalidate_router_dynamic_cache_affinity(
+                                    session_key=turn.session_key,
+                                    reason="session_epoch_unavailable",
+                                )
+                            else:
+                                multiple_cache_now = time.monotonic()
+                                (
+                                    multiple_cache_continuity,
+                                    multiple_cache_receipts,
+                                    multiple_cache_generation,
+                                ) = self._router_dynamic_cache_continuity_snapshot(
+                                    session_key=turn.session_key,
+                                    session_epoch=multiple_cache_session_epoch,
+                                    policy=multiple_cache_policy,
+                                    now=multiple_cache_now,
+                                )
+                                # Install an empty sidecar before Analyzer and
+                                # ranking. Any failure before provider
+                                # materialization then clears the prior
+                                # topology evidence instead of silently
+                                # retaining a stale successful receipt.
+                                multiple_affinity_turn_id = str(
+                                    getattr(usage_execution_context, "turn_id", "")
+                                    or getattr(
+                                        usage_execution_context,
+                                        "execution_id",
+                                        "",
+                                    )
+                                    or uuid.uuid4().hex
+                                )
+                                multiple_affinity_provider_token = uuid.uuid4().hex
+                                multiple_context = _RouterDynamicCacheAffinityCollectionContext(
+                                    turn_id=multiple_affinity_turn_id,
+                                    decision_id=ensemble_decision_id,
+                                    provider_instance_token=(multiple_affinity_provider_token),
+                                    provider_instance_generation=0,
+                                    session_key=turn.session_key,
+                                    session_epoch=multiple_cache_session_epoch,
+                                    selection_generation=multiple_cache_generation,
+                                    topology="multiple",
+                                )
+                                multiple_sidecar_key = (
+                                    self._register_router_dynamic_cache_sidecar(
+                                        context=multiple_context,
+                                        policy=multiple_cache_policy,
+                                    )
+                                )
                         analyzer_policy = task_analyzer_policy(ranking_config)
                         analyzer_chain = task_analyzer_chain_policy(ranking_config)
                         analyzer_provider_id = str(analyzer_policy["provider"])
@@ -8088,10 +9598,7 @@ class TurnRunner:
                         except (TypeError, ValueError):
                             routing_confidence = 0.0
                         configured_output_tokens = int(
-                            getattr(
-                                getattr(turn_config, "llm", None), "max_tokens", 0
-                            )
-                            or 0
+                            getattr(getattr(turn_config, "llm", None), "max_tokens", 0) or 0
                         )
                         candidate_max_chars = int(
                             getattr(ensemble_cfg, "candidate_max_chars", 24_000) or 0
@@ -8110,9 +9617,7 @@ class TurnRunner:
                             ranking_config=ranking_config,
                         )
                         if "router_dynamic_last_route" not in turn.metadata:
-                            previous_route = self._previous_router_dynamic_route(
-                                turn.session_key
-                            )
+                            previous_route = self._previous_router_dynamic_route(turn.session_key)
                             if previous_route is not None:
                                 turn.metadata["router_dynamic_last_route"] = previous_route
                         request_context = build_request_context(
@@ -8161,9 +9666,7 @@ class TurnRunner:
 
                             analyzer_admission_controller = (
                                 get_shared_provider_admission_controller(
-                                    provider_admission_settings_from_config(
-                                        admission_config
-                                    )
+                                    provider_admission_settings_from_config(admission_config)
                                 )
                             )
                             analyzer_admission_timeout = float(
@@ -8187,7 +9690,9 @@ class TurnRunner:
                                     "normal",
                                 )
                                 or "normal"
-                            ).strip().casefold()
+                            )
+                            .strip()
+                            .casefold()
                             == "experiment"
                         )
                         if analyzer_chain["configured"]:
@@ -8198,9 +9703,7 @@ class TurnRunner:
                                         session_key=turn.session_key,
                                         ranking_config=ranking_config,
                                         analyzer_route=route,
-                                        allow_canary_route=(
-                                            allow_canary_analyzer_route
-                                        ),
+                                        allow_canary_route=(allow_canary_analyzer_route),
                                     ),
                                     provider_id=str(route["provider"]),
                                     model_id=str(route["model"]),
@@ -8220,19 +9723,16 @@ class TurnRunner:
                                 ranking_config=ranking_config,
                                 decision_id=ensemble_decision_id,
                                 absolute_deadline=turn_absolute_deadline,
-                                admission_controller=(
-                                    analyzer_admission_controller
-                                ),
+                                admission_controller=(analyzer_admission_controller),
                                 admission_deadline=analyzer_admission_deadline,
+                                cache_continuity_available=(multiple_cache_continuity),
                             )
                         else:
                             analyzer_provider = self._router_dynamic_task_analyzer_provider(
                                 current_provider_config,
                                 session_key=turn.session_key,
                                 ranking_config=ranking_config,
-                                allow_canary_route=(
-                                    allow_canary_analyzer_route
-                                ),
+                                allow_canary_route=(allow_canary_analyzer_route),
                             )
                             task_analysis = await analyze_task_with_provider(
                                 provider=analyzer_provider,
@@ -8247,12 +9747,16 @@ class TurnRunner:
                                 analyzer_model_id=analyzer_model_id,
                                 ranking_config=ranking_config,
                                 decision_id=ensemble_decision_id,
-                                admission_controller=(
-                                    analyzer_admission_controller
-                                ),
+                                admission_controller=(analyzer_admission_controller),
                                 admission_deadline=analyzer_admission_deadline,
                                 _absolute_deadline=turn_absolute_deadline,
+                                cache_continuity_available=(multiple_cache_continuity),
                             )
+                        # Keep the Analyzer's frozen intent input, but do not
+                        # let its latency extend affinity TTL or decay at
+                        # candidate-mapping time.
+                        if multiple_cache_session_epoch is not None:
+                            multiple_cache_now = time.monotonic()
                         ranking_inputs = {
                             "decision_id": ensemble_decision_id,
                             "task_analysis": task_analysis,
@@ -8260,14 +9764,28 @@ class TurnRunner:
                             "request_context": request_context,
                             "ranking_config": ranking_config,
                         }
-                        turn.metadata["router_dynamic_task_profile"] = (
-                            task_analysis.profile
+                        if multiple_cache_policy is not None:
+                            ranking_inputs.update(
+                                {
+                                    "cache_continuity_available": (multiple_cache_continuity),
+                                    "cache_affinity_policy": (multiple_cache_policy.source),
+                                    "cache_affinity_receipts": (multiple_cache_receipts),
+                                    "cache_affinity_session_epoch": (multiple_cache_session_epoch),
+                                    "cache_affinity_now_monotonic": (multiple_cache_now),
+                                    "cache_affinity_price_quote_resolver": (
+                                        _router_dynamic_cache_price_quote_resolver
+                                    ),
+                                    "cache_affinity_outer_thinking_projection": (
+                                        multiple_cache_outer_thinking_projection
+                                    ),
+                                }
+                            )
+                        turn.metadata["router_dynamic_task_profile"] = task_analysis.profile
+                        turn.metadata["router_dynamic_task_analyzer"] = task_analysis.trace(
+                            ranking_config
                         )
-                        turn.metadata["router_dynamic_task_analyzer"] = (
-                            task_analysis.trace(ranking_config)
-                        )
-                        turn.metadata["router_dynamic_request_context_hash"] = (
-                            request_context.get("snapshot_hash")
+                        turn.metadata["router_dynamic_request_context_hash"] = request_context.get(
+                            "snapshot_hash"
                         )
                         turn.metadata["router_dynamic_user_profile"] = {
                             "enabled": ranking_user_profile_application_enabled,
@@ -8283,27 +9801,87 @@ class TurnRunner:
                             ),
                         }
 
+                    if (
+                        multiple_cache_policy is not None
+                        and multiple_cache_session_epoch is not None
+                    ):
+                        assert multiple_context is not None
+                        assert multiple_sidecar_key is not None
+
+                        def _stage_multiple_affinity(batch: object) -> None:
+                            normalized = self._normalize_multiple_cache_affinity_batch(
+                                context=multiple_context,
+                                batch=batch,
+                            )
+                            if normalized is not None:
+                                self._stage_router_dynamic_cache_affinity_batch(
+                                    multiple_sidecar_key,
+                                    normalized,
+                                )
+
+                        multiple_affinity_callback = _stage_multiple_affinity
+
+                        def _report_multiple_credential_failure(
+                            provider_id: str,
+                            credential_session_key: str,
+                            failure_kind: object,
+                            retry_after_s: float | None = None,
+                        ) -> None:
+                            report_profile_credential_failure(
+                                provider_id,
+                                credential_session_key,
+                                failure_kind,
+                                retry_after_s,
+                            )
+                            if failure_kind in {
+                                ProviderFailureKind.RATE_LIMITED,
+                                ProviderFailureKind.INSUFFICIENT_CREDITS,
+                                ProviderFailureKind.AUTH_INVALID,
+                            }:
+                                self._invalidate_router_dynamic_cache_affinity(
+                                    session_key=turn.session_key,
+                                    reason="credential_failure",
+                                )
+
+                        multiple_credential_failure_reporter = _report_multiple_credential_failure
+
+                    multiple_base_fallback_provider = provider
                     ensemble_provider = build_ensemble_provider_from_config(
                         config=turn_config,
                         inherited_provider_config=current_provider_config,
-                        fallback_provider=provider,
+                        fallback_provider=multiple_base_fallback_provider,
                         turn_metadata=turn.metadata,
                         ranking_inputs=ranking_inputs,
                         _enable_member_request_budget_rebinding=True,
                         _model_catalog=self._model_catalog,
-                        _context_overflow_threshold=(
-                            AgentConfig().context_overflow_threshold
-                        ),
+                        _context_overflow_threshold=(AgentConfig().context_overflow_threshold),
                         _credential_pool_acquirer=acquire_profile_credential,
-                        _credential_pool_failure_reporter=(
-                            report_profile_credential_failure
-                        ),
+                        _credential_pool_failure_reporter=(multiple_credential_failure_reporter),
                         _session_key=turn.session_key,
                         _fallback_selector=cloned_selector,
                         _provider_health_ledger=provider_health_ledger,
                         _canary_rollout_ledger=canary_rollout_ledger,
                         _absolute_deadline=turn_absolute_deadline,
+                        _cache_affinity_receipt_callback=(multiple_affinity_callback),
+                        _cache_affinity_turn_id=multiple_affinity_turn_id,
+                        _cache_affinity_provider_instance_token=(multiple_affinity_provider_token),
+                        _cache_affinity_session_epoch=(
+                            multiple_cache_session_epoch
+                            if multiple_affinity_callback is not None
+                            else None
+                        ),
                     )
+                    if multiple_affinity_callback is not None:
+
+                        def _initial_multiple_generation_is_current() -> bool:
+                            return (
+                                self._router_dynamic_cache_generation(turn.session_key)
+                                == multiple_cache_generation
+                            )
+
+                        ensemble_provider._router_dynamic_cache_dispatch_generation_guard = (
+                            _initial_multiple_generation_is_current
+                        )
                 except dynamic_cleanup_errors as exc:
                     log_ensemble_decision_failed(
                         decision_id=ensemble_decision_id,
@@ -8313,13 +9891,9 @@ class TurnRunner:
                     )
                     raise
                 except dynamic_selection_errors as exc:
-                    thinking_fail_closed = (
-                        thinking_assignment_enabled
-                        and (
-                            getattr(exc, "reason", "")
-                            == "thinking_level_unavailable"
-                            or "thinking" in str(exc).casefold()
-                        )
+                    thinking_fail_closed = thinking_assignment_enabled and (
+                        getattr(exc, "reason", "") == "thinking_level_unavailable"
+                        or "thinking" in str(exc).casefold()
                     )
                     log_ensemble_decision_failed(
                         decision_id=ensemble_decision_id,
@@ -8333,9 +9907,7 @@ class TurnRunner:
                     )
                     if thinking_fail_closed:
                         turn.metadata["router_dynamic_ranking_error"] = str(exc)
-                        turn.metadata[
-                            "router_dynamic_thinking_assignment_error"
-                        ] = str(exc)
+                        turn.metadata["router_dynamic_thinking_assignment_error"] = str(exc)
                         raise
                     log.warning(
                         "llm_ensemble.wrap_skipped",
@@ -8378,12 +9950,6 @@ class TurnRunner:
                     provider = ensemble_provider
                     plan = ensemble_provider.selection_plan
                     plan["decision_id"] = ensemble_decision_id
-                    log_ensemble_decision_steps(
-                        decision_id=ensemble_decision_id,
-                        selection_mode=selection_mode,
-                        profile_name=ensemble_provider.profile_name,
-                        selection_plan=plan,
-                    )
                     if selection_mode == "router_dynamic":
                         turn.metadata["router_dynamic_pending_route_plan"] = plan
                         router_dynamic_decision = _router_dynamic_decision_projection(plan)
@@ -8392,10 +9958,177 @@ class TurnRunner:
                                 "router_dynamic selection plan cannot be "
                                 "projected into runtime audit metadata"
                             )
-                        turn.metadata["router_dynamic_decision"] = (
-                            router_dynamic_decision
-                        )
+                        turn.metadata["router_dynamic_decision"] = router_dynamic_decision
+                        if (
+                            multiple_cache_policy is not None
+                            and multiple_cache_session_epoch is not None
+                            and isinstance(ranking_inputs, Mapping)
+                        ):
+                            no_affinity_inputs = dict(ranking_inputs)
+                            for affinity_key in (
+                                "cache_affinity_policy",
+                                "cache_affinity_receipts",
+                                "cache_affinity_session_epoch",
+                                "cache_affinity_now_monotonic",
+                                "cache_affinity_price_quote_resolver",
+                                "cache_affinity_outer_thinking_projection",
+                            ):
+                                no_affinity_inputs.pop(affinity_key, None)
+                            no_affinity_inputs["cache_continuity_available"] = False
+                            no_affinity_inputs["cache_affinity_collection_enabled"] = True
+                            final_provider_holder = {
+                                "provider": ensemble_provider,
+                            }
+
+                            def _reroute_multiple_without_affinity() -> (
+                                _RouterDynamicCacheRerouteResult
+                            ):
+                                final_generation = self._router_dynamic_cache_generation(
+                                    turn.session_key
+                                )
+                                final_provider_token = uuid.uuid4().hex
+                                final_context = _RouterDynamicCacheAffinityCollectionContext(
+                                    turn_id=multiple_affinity_turn_id,
+                                    decision_id=ensemble_decision_id,
+                                    provider_instance_token=(final_provider_token),
+                                    provider_instance_generation=0,
+                                    session_key=turn.session_key,
+                                    session_epoch=(multiple_cache_session_epoch),
+                                    selection_generation=final_generation,
+                                    topology="multiple",
+                                )
+                                final_sidecar_key = self._register_router_dynamic_cache_sidecar(
+                                    context=final_context,
+                                    policy=multiple_cache_policy,
+                                )
+
+                                def _stage_final_multiple_affinity(
+                                    batch: object,
+                                ) -> None:
+                                    normalized = self._normalize_multiple_cache_affinity_batch(
+                                        context=final_context,
+                                        batch=batch,
+                                    )
+                                    if normalized is not None:
+                                        self._stage_router_dynamic_cache_affinity_batch(
+                                            final_sidecar_key,
+                                            normalized,
+                                        )
+
+                                final_provider = build_ensemble_provider_from_config(
+                                    config=turn_config,
+                                    inherited_provider_config=(current_provider_config),
+                                    fallback_provider=(multiple_base_fallback_provider),
+                                    turn_metadata=turn.metadata,
+                                    ranking_inputs=no_affinity_inputs,
+                                    _enable_member_request_budget_rebinding=True,
+                                    _model_catalog=self._model_catalog,
+                                    _context_overflow_threshold=(
+                                        AgentConfig().context_overflow_threshold
+                                    ),
+                                    _credential_pool_acquirer=(acquire_profile_credential),
+                                    _credential_pool_failure_reporter=(
+                                        multiple_credential_failure_reporter
+                                    ),
+                                    _session_key=turn.session_key,
+                                    _fallback_selector=cloned_selector,
+                                    _provider_health_ledger=(provider_health_ledger),
+                                    _canary_rollout_ledger=(canary_rollout_ledger),
+                                    _absolute_deadline=turn_absolute_deadline,
+                                    _cache_affinity_receipt_callback=(
+                                        _stage_final_multiple_affinity
+                                    ),
+                                    _cache_affinity_turn_id=(multiple_affinity_turn_id),
+                                    _cache_affinity_provider_instance_token=(final_provider_token),
+                                    _cache_affinity_session_epoch=(multiple_cache_session_epoch),
+                                )
+
+                                def _final_multiple_generation_is_current() -> bool:
+                                    return (
+                                        self._router_dynamic_cache_generation(turn.session_key)
+                                        == final_generation
+                                    )
+
+                                final_provider._router_dynamic_cache_dispatch_generation_guard = (
+                                    _final_multiple_generation_is_current
+                                )
+                                final_plan = final_provider.selection_plan
+                                final_plan["decision_id"] = ensemble_decision_id
+                                final_projection = _router_dynamic_decision_projection(final_plan)
+                                if final_projection is None:
+                                    raise ValueError(
+                                        "router_dynamic reroute plan cannot be "
+                                        "projected into runtime audit metadata"
+                                    )
+                                turn.metadata["router_dynamic_pending_route_plan"] = final_plan
+                                turn.metadata["router_dynamic_decision"] = final_projection
+                                final_provider_holder["provider"] = final_provider
+                                final_runtime_provider = _SelectorFallbackProvider(
+                                    final_provider,
+                                    cloned_selector,
+                                    turn.metadata,
+                                )
+                                final_config = getattr(
+                                    cloned_selector,
+                                    "current_config",
+                                    None,
+                                )
+                                final_provider_id = str(
+                                    getattr(
+                                        cloned_selector,
+                                        "active_provider_id",
+                                        "",
+                                    )
+                                    or getattr(
+                                        final_config,
+                                        "provider",
+                                        "",
+                                    )
+                                    or ""
+                                )
+                                final_model = str(
+                                    getattr(turn, "model", "")
+                                    or getattr(final_config, "model", "")
+                                    or ""
+                                )
+                                return _RouterDynamicCacheRerouteResult(
+                                    provider=final_runtime_provider,
+                                    resolved_model=final_model,
+                                    provider_name=final_provider_id,
+                                    active_provider_id=final_provider_id,
+                                )
+
+                            def _finalize_multiple_observability() -> None:
+                                final_provider = final_provider_holder["provider"]
+                                log_ensemble_decision_steps(
+                                    decision_id=ensemble_decision_id,
+                                    selection_mode=selection_mode,
+                                    profile_name=final_provider.profile_name,
+                                    selection_plan=(final_provider.selection_plan),
+                                )
+
+                            ensemble_provider._router_dynamic_cache_reroute_plan = (
+                                _RouterDynamicCacheReroutePlan(
+                                    session_key=turn.session_key,
+                                    selection_generation=(multiple_cache_generation),
+                                    reroute_without_affinity=(_reroute_multiple_without_affinity),
+                                    finalize_observability=(_finalize_multiple_observability),
+                                )
+                            )
+                        else:
+                            log_ensemble_decision_steps(
+                                decision_id=ensemble_decision_id,
+                                selection_mode=selection_mode,
+                                profile_name=ensemble_provider.profile_name,
+                                selection_plan=plan,
+                            )
                     elif selection_mode == TREE_BASELINE_SELECTION_MODE:
+                        log_ensemble_decision_steps(
+                            decision_id=ensemble_decision_id,
+                            selection_mode=selection_mode,
+                            profile_name=ensemble_provider.profile_name,
+                            selection_plan=plan,
+                        )
                         turn.metadata["router_tree_baseline_decision"] = {
                             "decision_id": ensemble_decision_id,
                             "algorithm_version": plan.get("algorithm_version"),
@@ -8406,6 +10139,13 @@ class TurnRunner:
                             "selected_P": list(plan.get("selected_P") or []),
                             "selected_A": plan.get("selected_A"),
                         }
+                    else:
+                        log_ensemble_decision_steps(
+                            decision_id=ensemble_decision_id,
+                            selection_mode=selection_mode,
+                            profile_name=ensemble_provider.profile_name,
+                            selection_plan=plan,
+                        )
 
         return turn, provider
 
@@ -8494,9 +10234,7 @@ class TurnRunner:
             if image_turn_count:
                 context["history_has_recent_image"] = True
                 context["history_image_turn_count"] = image_turn_count
-                turns_since_last_image = (
-                    len(recent_user_contents) - image_positions[-1] - 1
-                )
+                turns_since_last_image = len(recent_user_contents) - image_positions[-1] - 1
                 context["turns_since_last_image"] = turns_since_last_image
                 context["vision_candidate_turns"] = candidate_turns
                 absolute_image_index = (
@@ -8513,9 +10251,7 @@ class TurnRunner:
                     or 0
                 )
                 if sticky_turns > 0 and turns_since_last_image < sticky_turns:
-                    context["vision_sticky_remaining"] = (
-                        sticky_turns - turns_since_last_image
-                    )
+                    context["vision_sticky_remaining"] = sticky_turns - turns_since_last_image
 
         for entry in reversed(entries):
             if getattr(entry, "role", None) != "assistant":
@@ -8833,9 +10569,7 @@ class TurnRunner:
                 intent_summary=build_intent_summary(message),
                 trace_id=trace_id or turn_id,
                 decision_id=(
-                    turn_obj.metadata.get("router_decision_id")
-                    if turn_obj is not None
-                    else None
+                    turn_obj.metadata.get("router_decision_id") if turn_obj is not None else None
                 ),
                 tool_profile=prompt_report.tool_profile if prompt_report else None,
                 prompt_hash=prompt_hash,
@@ -8857,9 +10591,7 @@ class TurnRunner:
                 skill_count=prompt_report.skill_count if prompt_report else 0,
                 skills_prompt_chars=prompt_report.skills_prompt_chars if prompt_report else 0,
                 memory_md_present=prompt_report.memory_md_present if prompt_report else False,
-                daily_notes_omitted=(
-                    prompt_report.daily_notes_omitted if prompt_report else False
-                ),
+                daily_notes_omitted=(prompt_report.daily_notes_omitted if prompt_report else False),
                 daily_notes_count_before_omit=(
                     prompt_report.daily_notes_count_before_omit if prompt_report else 0
                 ),
@@ -8920,9 +10652,7 @@ class TurnRunner:
                     prompt_report.session_flush_fallback_reason if prompt_report else None
                 ),
                 image_route_reason=(
-                    turn_obj.metadata.get("image_route_reason")
-                    if turn_obj is not None
-                    else None
+                    turn_obj.metadata.get("image_route_reason") if turn_obj is not None else None
                 ),
                 vision_followup_gate_decision=(
                     turn_obj.metadata.get("router_vision_followup_gate_decision")
@@ -8936,9 +10666,7 @@ class TurnRunner:
                 ),
                 vision_followup_gate_reason=(
                     build_vision_followup_gate_reason_code(
-                        decision=turn_obj.metadata.get(
-                            "router_vision_followup_gate_decision"
-                        ),
+                        decision=turn_obj.metadata.get("router_vision_followup_gate_decision"),
                         source=turn_obj.metadata.get("router_vision_followup_gate_source"),
                         reason=turn_obj.metadata.get("router_vision_followup_gate_reason"),
                         fallback=turn_obj.metadata.get("router_vision_followup_fallback"),
@@ -9092,11 +10820,7 @@ class TurnRunner:
 
         compaction_config = None
         configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
-        if (
-            compaction_provider is not None
-            or compaction_model
-            or configured_compaction is not None
-        ):
+        if compaction_provider is not None or compaction_model or configured_compaction is not None:
             from opensquilla.session.compaction import build_compaction_config_from_provider
 
             compaction_config = build_compaction_config_from_provider(
@@ -9187,10 +10911,7 @@ class TurnRunner:
                 deterministic_receipt_safe=checkpoint_saved and not requires_safe_receipt,
                 required=self._pre_compaction_flush_enabled(),
             )
-            if (
-                requires_safe_receipt
-                and not memory_status.allows_destructive_compaction
-            ):
+            if requires_safe_receipt and not memory_status.allows_destructive_compaction:
                 log.warning(
                     "t3_upgrade_compaction.skipped",
                     session_key=session_key,
@@ -9467,10 +11188,7 @@ class TurnRunner:
                 deterministic_receipt_safe=checkpoint_saved and not requires_safe_receipt,
                 required=self._pre_compaction_flush_enabled(),
             )
-            if (
-                requires_safe_receipt
-                and not memory_status.allows_destructive_compaction
-            ):
+            if requires_safe_receipt and not memory_status.allows_destructive_compaction:
                 log.warning(
                     "preflight_compaction.skipped",
                     session_key=session_key,
@@ -9500,11 +11218,7 @@ class TurnRunner:
         skip_reason = "empty_summary"
         compaction_config = None
         configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
-        if (
-            compaction_provider is not None
-            or compaction_model
-            or configured_compaction is not None
-        ):
+        if compaction_provider is not None or compaction_model or configured_compaction is not None:
             from opensquilla.session.compaction import build_compaction_config_from_provider
 
             compaction_config = build_compaction_config_from_provider(
@@ -9606,9 +11320,7 @@ class TurnRunner:
             )
             return
         if not result:
-            skip_reason = str(
-                getattr(compaction_result, "skip_reason", None) or "empty_summary"
-            )
+            skip_reason = str(getattr(compaction_result, "skip_reason", None) or "empty_summary")
             if skip_reason == "stale_preimage":
                 notify_compaction(
                     session_key,
@@ -10055,11 +11767,7 @@ class TurnRunner:
         kept_entries = [self._emergency_replay_entry(raw) for raw in result.kept_entries]
         if not kept_entries or len(kept_entries) >= len(transcript):
             return False
-        summary = (
-            "Emergency request-scoped compaction\n"
-            f"Reason: {reason}\n\n"
-            f"{result.summary}"
-        )
+        summary = f"Emergency request-scoped compaction\nReason: {reason}\n\n{result.summary}"
         self._emergency_compaction_overrides[session_key] = _EmergencyCompactionOverride(
             summary=summary,
             kept_entries=kept_entries,
@@ -10387,9 +12095,7 @@ class TurnRunner:
                 )
             )
             replay_compaction_id = (
-                replayed_compaction_ids[0]
-                if replayed_compaction_ids
-                else new_compaction_id()
+                replayed_compaction_ids[0] if replayed_compaction_ids else new_compaction_id()
             )
             notify_compaction(
                 session_key,
@@ -10525,9 +12231,7 @@ class TurnRunner:
                     except (binascii.Error, ValueError):
                         omitted.append(f"[attachment unavailable: {label} ({media_type})]")
                     else:
-                        replay_blocks.append(
-                            ContentBlockImage(media_type=media_type, data=data)
-                        )
+                        replay_blocks.append(ContentBlockImage(media_type=media_type, data=data))
                         preserved_image = True
                     continue
                 if isinstance(sha_ref, str) and sha_ref and media_root and session_id:
@@ -10724,10 +12428,7 @@ class TurnRunner:
                     raise ValueError(f"attachments[{index}].data must be valid base64") from exc
             max_bytes = _attachment_size_limit_for_mime(
                 media_type,
-                staged=(
-                    att.get("_was_staged") is True
-                    and _can_stage_attachment_mime(media_type)
-                ),
+                staged=(att.get("_was_staged") is True and _can_stage_attachment_mime(media_type)),
             )
             if len(raw_bytes) > max_bytes:
                 raise ValueError(f"attachments[{index}] exceeds the {max_bytes} byte limit")
@@ -10735,10 +12436,7 @@ class TurnRunner:
             name_raw = att.get("name")
             filename = _sanitize_attachment_filename(name_raw)
             material_marker = ""
-            if (
-                turn_materializer is not None
-                and _is_materializable_attachment_mime(media_type)
-            ):
+            if turn_materializer is not None and _is_materializable_attachment_mime(media_type):
                 materializer = turn_materializer
                 if is_attachment_ref(att):
                     result = materializer.materialize(att, session_id=session_id)
@@ -10749,11 +12447,7 @@ class TurnRunner:
                         mime=media_type,
                         session_id=session_id,
                     )
-                prefix = (
-                    "attachment available"
-                    if result.available
-                    else "attachment unavailable"
-                )
+                prefix = "attachment available" if result.available else "attachment unavailable"
                 material_marker = render_attachment_material_marker(result, prefix=prefix)
             if missing_ref_marker:
                 missing_text = (
@@ -10795,16 +12489,11 @@ class TurnRunner:
                     )
                 except ValueError as exc:
                     extracted_office_text = (
-                        "[attachment unavailable: document text could not be "
-                        f"extracted: {exc}]"
+                        f"[attachment unavailable: document text could not be extracted: {exc}]"
                     )
                 if material_marker:
-                    extracted_office_text = "\n\n".join(
-                        [extracted_office_text, material_marker]
-                    )
-                wrapped = _render_file_context_block(
-                    filename, media_type, extracted_office_text
-                )
+                    extracted_office_text = "\n\n".join([extracted_office_text, material_marker])
+                wrapped = _render_file_context_block(filename, media_type, extracted_office_text)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _EMAIL_ATTACHMENT_MIMES:
                 try:
@@ -10813,22 +12502,14 @@ class TurnRunner:
                     )
                 except ValueError as exc:
                     extracted_email_text = (
-                        "[attachment unavailable: email could not be "
-                        f"extracted: {exc}]"
+                        f"[attachment unavailable: email could not be extracted: {exc}]"
                     )
                 if material_marker:
-                    extracted_email_text = "\n\n".join(
-                        [extracted_email_text, material_marker]
-                    )
-                wrapped = _render_file_context_block(
-                    filename, media_type, extracted_email_text
-                )
+                    extracted_email_text = "\n\n".join([extracted_email_text, material_marker])
+                wrapped = _render_file_context_block(filename, media_type, extracted_email_text)
                 attachment_blocks.append(ContentBlockText(text=wrapped))
             elif media_type in _ENGINE_TEXT_FAMILY_MIMES:
-                if (
-                    is_attachment_ref(att)
-                    and att.get("_provider_inline_policy") == "preview_only"
-                ):
+                if is_attachment_ref(att) and att.get("_provider_inline_policy") == "preview_only":
                     decoded_text = _render_preview_only_attachment_text(
                         att,
                         filename=filename,

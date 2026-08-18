@@ -5402,6 +5402,59 @@ def test_openrouter_routing_pin_default_keeps_order_with_fallbacks(
     assert done.stop_reason == "stop"
 
 
+@pytest.mark.parametrize(
+    ("frozen_strict", "late_env", "expected_provider_policy"),
+    [
+        (
+            True,
+            "0",
+            {"only": ["deepseek"], "allow_fallbacks": False},
+        ),
+        (
+            False,
+            "1",
+            {"order": ["deepseek"], "allow_fallbacks": True},
+        ),
+    ],
+)
+def test_openrouter_frozen_routing_policy_overrides_late_environment(
+    monkeypatch: Any,
+    frozen_strict: bool,
+    late_env: str,
+    expected_provider_policy: dict[str, Any],
+) -> None:
+    captured: dict[str, Any] = {}
+    chunks = [
+        {
+            "model": "deepseek/deepseek-v4-flash",
+            "choices": [{"delta": {"content": "ok"}, "finish_reason": None}],
+        },
+        {
+            "model": "deepseek/deepseek-v4-flash",
+            "choices": [{"delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+        },
+    ]
+    body = b"".join(
+        f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks
+    )
+    body += b"data: [DONE]\n\n"
+    _patch_transport_body(monkeypatch, captured, body)
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", late_env)
+    provider = OpenAIProvider(
+        api_key="test",
+        model="deepseek/deepseek-v4-flash",
+        base_url="https://openrouter.ai/api/v1",
+        provider_kind="openrouter",
+        provider_routing={"deepseek/deepseek-v4-flash": "deepseek"},
+        provider_routing_strict=frozen_strict,
+    )
+
+    _collect(provider, ChatConfig())
+
+    assert captured["payload"]["provider"] == expected_provider_policy
+
+
 def test_openrouter_require_parameters_applies_without_provider_pin(
     monkeypatch: Any,
 ) -> None:

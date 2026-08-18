@@ -9,6 +9,7 @@ tier's provider.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from types import SimpleNamespace
 
 from opensquilla.engine.selector_override import (
@@ -19,7 +20,10 @@ from opensquilla.engine.selector_override import (
 from opensquilla.gateway.config import GatewayConfig, LlmProviderProfile
 from opensquilla.provider.anthropic import _build_message_payload
 from opensquilla.provider.compat_policy import compat_policy_for_kind
-from opensquilla.provider.deployment import resolve_provider_deployment
+from opensquilla.provider.deployment import (
+    resolve_provider_deployment,
+    resolve_provider_deployment_cache_identity,
+)
 from opensquilla.provider.environment import environment_value
 from opensquilla.provider.openai import _build_openai_messages, _build_openai_wire_messages
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
@@ -137,6 +141,107 @@ def test_shared_resolution_reports_only_redacted_profile_provenance(monkeypatch)
     assert resolution.endpoint_source == "profile"
     assert resolution.proxy_source == "profile"
     assert secret not in repr(resolution)
+
+
+def test_cache_credential_token_is_opt_in_opaque_and_org_specific() -> None:
+    secret = "synthetic-secret-never-render"
+
+    def resolve(org_id: str):
+        inherited = ProviderConfig(
+            provider="openai",
+            model="primary",
+            api_key=secret,
+            base_url="https://api.openai.com/v1",
+            org_id=org_id,
+        )
+        return resolve_provider_deployment_cache_identity(
+            _config_with_flag(),
+            "openai",
+            "gpt-test",
+            inherited_provider_config=inherited,
+        )
+
+    first_resolution, first_token = resolve("org-a")
+    same_resolution, same_token = resolve("org-a")
+    _, other_org_token = resolve("org-b")
+
+    assert first_resolution.ready is True
+    assert same_resolution.ready is True
+    assert first_token is not None
+    assert first_token == same_token
+    assert first_token != other_org_token
+    assert secret not in repr((first_resolution, first_token))
+    assert not hasattr(first_resolution, "credential_namespace_token")
+
+
+def test_cache_identity_freezes_strict_routing_enabled_across_env_drift(
+    monkeypatch,
+) -> None:
+    model = "deepseek/deepseek-v4-flash"
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model=model,
+        api_key="synthetic-openrouter-key",
+        base_url="https://openrouter.ai/api/v1",
+        provider_routing={model: "deepseek"},
+    )
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
+
+    resolution, token = resolve_provider_deployment_cache_identity(
+        _config_with_flag(),
+        "openrouter",
+        model,
+        inherited_provider_config=inherited,
+    )
+
+    assert resolution.ready is True
+    assert token is not None
+    assert resolution.provider_config is not None
+    assert resolution.provider_config._provider_routing_strict_override is True
+    assert "_provider_routing_strict_override" not in asdict(
+        resolution.provider_config
+    )
+    assert "provider_routing_strict" not in repr(resolution.provider_config)
+
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "0")
+    provider = ModelSelector(
+        SelectorConfig(primary=resolution.provider_config)
+    ).resolve()
+
+    assert provider._provider_routing_strict is True
+
+
+def test_cache_identity_freezes_strict_routing_disabled_across_env_drift(
+    monkeypatch,
+) -> None:
+    model = "deepseek/deepseek-v4-flash"
+    inherited = ProviderConfig(
+        provider="openrouter",
+        model=model,
+        api_key="synthetic-openrouter-key",
+        base_url="https://openrouter.ai/api/v1",
+        provider_routing={model: "deepseek"},
+    )
+    assert "_provider_routing_strict_override" not in vars(inherited)
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "0")
+    resolution, token = resolve_provider_deployment_cache_identity(
+        _config_with_flag(),
+        "openrouter",
+        model,
+        inherited_provider_config=inherited,
+    )
+    assert resolution.provider_config is not None
+    assert token is not None
+    assert resolution.provider_config._provider_routing_strict_override is False
+
+    monkeypatch.setenv("OPENSQUILLA_PROVIDER_ROUTING_STRICT", "1")
+    provider = ModelSelector(
+        SelectorConfig(primary=resolution.provider_config)
+    ).resolve()
+
+    assert provider._provider_routing_strict is False
+    ordinary = ModelSelector(SelectorConfig(primary=inherited)).resolve()
+    assert ordinary._provider_routing_strict is True
 
 
 def test_profile_env_precedes_registry_env(monkeypatch) -> None:

@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field, fields, replace
 from functools import cache
@@ -62,11 +63,22 @@ from .admission import (
     provider_admission_settings_from_config,
 )
 from .anthropic import uses_adaptive_thinking
+from .cache_affinity import (
+    CacheAffinityEvidenceInput,
+    CacheAffinityReceipt,
+    CacheDomainGuard,
+    CachePriceQuote,
+    CredentialNamespaceToken,
+    build_cache_domain_guard,
+    cache_affinity_decay_factor,
+    canonical_cache_endpoint,
+)
 from .deployment import (
     CredentialPoolAcquirer,
     ProviderDeploymentResolution,
     canonicalize_provider_routing_upstream,
     resolve_provider_deployment,
+    resolve_provider_deployment_cache_identity,
 )
 from .error_redaction import redact_upstream_error_code, redact_upstream_error_text
 from .failures import ProviderFailureKind, classify_provider_error
@@ -1038,6 +1050,155 @@ class _UsageAccountingSnapshotState:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _EnsembleCacheAffinityReceipt:
+    """Private proof for one successful router-dynamic physical request."""
+
+    physical_attempt_id: str
+    topology: Literal["multiple"]
+    role: Literal["proposer", "aggregator"]
+    slot: int
+    sample_index: int
+    requested_provider: str
+    requested_model: str
+    actual_provider: str
+    actual_model: str
+    input_tokens: int
+    cached_tokens: int
+    cache_write_tokens: int
+    evidence_kind: Literal["read_hit", "write_only"]
+    terminal_monotonic: float
+    cache_domain_guard: CacheDomainGuard = field(repr=False, compare=False)
+    actual_model_aliases: tuple[str, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
+
+    @property
+    def execution_slot(self) -> str:
+        """Expose the neutral receipt contract without losing sample identity."""
+
+        return f"{self.slot}:{self.sample_index}"
+
+    @property
+    def requested_identity(self) -> str:
+        return f"{self.requested_provider}:{self.requested_model}"
+
+    @property
+    def actual_identity(self) -> str:
+        return f"{self.actual_provider}:{self.actual_model}"
+
+    @property
+    def observed_at_monotonic(self) -> float:
+        return self.terminal_monotonic
+
+
+@dataclass(frozen=True, slots=True)
+class _EnsembleCacheAffinityReceiptBatch:
+    """One closed ``EnsembleProvider.chat`` call's private receipt batch."""
+
+    turn_id: str
+    decision_id: str
+    provider_instance_token: str
+    provider_instance_generation: int
+    chat_sequence: int
+    chat_call_id: str
+    topology: Literal["multiple"]
+    execution_mode: str
+    receipts: tuple[_EnsembleCacheAffinityReceipt, ...]
+
+
+_EnsembleCacheAffinityReceiptCallback = Callable[
+    [_EnsembleCacheAffinityReceiptBatch],
+    None,
+]
+
+
+@dataclass(slots=True)
+class _EnsembleCacheAffinitySequenceAllocator:
+    """Share monotonic batch ordering across router-dynamic retry instances."""
+
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+        compare=False,
+    )
+    _next_provider_generation: int = 0
+    _next_chat_sequence: int = 0
+
+    def allocate_provider_generation(self) -> int:
+        with self._lock:
+            generation = self._next_provider_generation
+            self._next_provider_generation += 1
+            return generation
+
+    def allocate_chat_sequence(self) -> int:
+        with self._lock:
+            sequence = self._next_chat_sequence
+            self._next_chat_sequence += 1
+            return sequence
+
+
+@dataclass(slots=True)
+class _EnsembleCacheAffinityReceiptCollector:
+    """Call-local staging area inherited by proposer child tasks."""
+
+    turn_id: str
+    decision_id: str
+    provider_instance_token: str
+    provider_instance_generation: int
+    chat_sequence: int
+    chat_call_id: str
+    execution_mode: str
+    session_epoch: int | None
+    receipts: list[_EnsembleCacheAffinityReceipt] = field(default_factory=list)
+    sealed: bool = False
+
+    def stage(self, receipt: _EnsembleCacheAffinityReceipt) -> None:
+        if not self.sealed:
+            self.receipts.append(receipt)
+
+    def batch(self, event: DoneEvent) -> _EnsembleCacheAffinityReceiptBatch:
+        self.sealed = True
+        return _EnsembleCacheAffinityReceiptBatch(
+            turn_id=self.turn_id,
+            decision_id=self.decision_id,
+            provider_instance_token=self.provider_instance_token,
+            provider_instance_generation=self.provider_instance_generation,
+            chat_sequence=self.chat_sequence,
+            chat_call_id=self.chat_call_id,
+            topology="multiple",
+            execution_mode=self.execution_mode,
+            receipts=_validated_final_cache_affinity_receipts(
+                event,
+                self.receipts,
+            ),
+        )
+
+    def empty_batch(self) -> _EnsembleCacheAffinityReceiptBatch:
+        self.sealed = True
+        return _EnsembleCacheAffinityReceiptBatch(
+            turn_id=self.turn_id,
+            decision_id=self.decision_id,
+            provider_instance_token=self.provider_instance_token,
+            provider_instance_generation=self.provider_instance_generation,
+            chat_sequence=self.chat_sequence,
+            chat_call_id=self.chat_call_id,
+            topology="multiple",
+            execution_mode=self.execution_mode,
+            receipts=(),
+        )
+
+
+_CACHE_AFFINITY_RECEIPT_COLLECTOR: ContextVar[
+    _EnsembleCacheAffinityReceiptCollector | None
+] = ContextVar(
+    "opensquilla_ensemble_cache_affinity_receipt_collector",
+    default=None,
+)
+
+
 class _EnsembleChatStream:
     """Async stream carrying usage evidence for exactly one ensemble call."""
 
@@ -1687,6 +1848,16 @@ class EnsembleMemberConfig:
     # experiment rosters never set it even if their historical status was
     # ``canary``.
     canary_runtime_managed: bool = False
+    # Frozen aliases attested by the exact registry row used for this route.
+    # They are private execution evidence and never broaden model selection.
+    _cache_affinity_actual_model_aliases: tuple[str, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
+    _cache_affinity_credential_namespace_token: (
+        CredentialNamespaceToken | None
+    ) = field(default=None, repr=False, compare=False)
 
 
 def _detached_ensemble_member(
@@ -1733,6 +1904,7 @@ def _ensemble_member_runtime_guard_row(
         provider_config.org_id,
         provider_config.proxy,
         routing,
+        getattr(provider_config, "_provider_routing_strict_override", None),
         provider_config.replay_provider_state,
         member.k,
         member.ready,
@@ -1740,6 +1912,8 @@ def _ensemble_member_runtime_guard_row(
         member.runtime_health_upstream,
         member.runtime_health_never_strand,
         member.canary_runtime_managed,
+        tuple(member._cache_affinity_actual_model_aliases),
+        member._cache_affinity_credential_namespace_token,
     )
 
 
@@ -4622,6 +4796,1168 @@ def _is_missing_request_placeholder(row: Mapping[str, Any]) -> bool:
     return is_missing_usage_placeholder(row)
 
 
+def _valid_managed_physical_attempt_id(value: object) -> str:
+    attempt_id = str(value or "").strip()
+    if len(attempt_id) != 32 or any(
+        character not in "0123456789abcdef" for character in attempt_id
+    ):
+        return ""
+    return attempt_id
+
+
+def _frozen_cache_affinity_model_aliases(
+    registry_facts: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Return only model aliases explicitly frozen in one ranking row."""
+
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for field_name in ("model_id", "version"):
+        value = str(registry_facts.get(field_name) or "").strip()
+        normalized = value.casefold()
+        if value and normalized not in seen:
+            aliases.append(value)
+            seen.add(normalized)
+    return tuple(aliases)
+
+
+def _cache_affinity_actual_model_matches(
+    requested_model: str,
+    actual_model: str,
+    aliases: Sequence[str],
+) -> bool:
+    requested = str(requested_model or "").strip().casefold()
+    actual = str(actual_model or "").strip().casefold()
+    allowed = {
+        requested,
+        *(
+            str(alias or "").strip().casefold()
+            for alias in aliases
+            if str(alias or "").strip()
+        ),
+    }
+    return bool(requested and actual and actual in allowed)
+
+
+def _exact_cache_affinity_token_count(value: object) -> int | None:
+    if (
+        type(value) is not int
+        or value < 0
+        or value > _MAX_TRACE_NUMERIC_VALUE
+    ):
+        return None
+    return value
+
+
+def _cache_affinity_usage_proof(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    physical_attempt_id: str,
+    role: Literal["proposer", "aggregator"],
+    requested_provider: str,
+    requested_model: str,
+    actual_provider: str,
+    actual_model: str,
+) -> tuple[int, int, int] | None:
+    """Return exact canonical tokens for one uniquely bound usage row."""
+
+    matches = [
+        row
+        for row in rows
+        if str(row.get("physical_attempt_id") or "").strip()
+        == physical_attempt_id
+    ]
+    if len(matches) != 1:
+        return None
+    row = matches[0]
+    if _is_missing_request_placeholder(row) or row.get("usage_unknown") is True:
+        return None
+    provider_usage = row.get("provider_usage")
+    if (
+        not isinstance(provider_usage, Mapping)
+        or str(provider_usage.get("physical_attempt_id") or "").strip()
+        != physical_attempt_id
+    ):
+        return None
+    row_role = str(row.get("role") or "").strip().casefold()
+    if row_role != role:
+        return None
+
+    expected_identity_parts = (
+        ("requested_provider", requested_provider),
+        ("requested_model", requested_model),
+        ("provider", actual_provider),
+        ("model", actual_model),
+    )
+    for field_name, expected in expected_identity_parts:
+        observed = str(row.get(field_name) or "").strip()
+        if observed and observed.casefold() != str(expected or "").strip().casefold():
+            return None
+
+    input_tokens = _exact_cache_affinity_token_count(row.get("input_tokens"))
+    cached_tokens = _exact_cache_affinity_token_count(row.get("cached_tokens"))
+    cache_write_tokens = _exact_cache_affinity_token_count(
+        row.get("cache_write_tokens")
+    )
+    if (
+        input_tokens is None
+        or cached_tokens is None
+        or cache_write_tokens is None
+    ):
+        return None
+    return input_tokens, cached_tokens, cache_write_tokens
+
+
+def _cache_affinity_domain_guard_for_member(
+    member: EnsembleMemberConfig,
+    *,
+    collector: _EnsembleCacheAffinityReceiptCollector,
+    role: Literal["proposer", "aggregator"],
+    chat_config: ChatConfig,
+) -> CacheDomainGuard | None:
+    """Bind a receipt to the exact resolved member without serializing secrets."""
+
+    session_epoch = collector.session_epoch
+    if type(session_epoch) is not int or session_epoch < 0:
+        return None
+    provider_config = member.provider_config
+    credential_namespace_token = (
+        member._cache_affinity_credential_namespace_token
+    )
+    strict_routing = getattr(
+        provider_config,
+        "_provider_routing_strict_override",
+        None,
+    )
+    if not isinstance(strict_routing, bool):
+        return None
+    upstream = str(
+        member.runtime_health_upstream
+        or provider_config.provider_routing.get(provider_config.model)
+        or ""
+    ).strip()
+    thinking_projection = _cache_affinity_thinking_projection(
+        thinking_enabled=chat_config.thinking is True,
+        effective_thinking_level=(
+            str(chat_config.thinking_level or "enabled")
+            if chat_config.thinking is True
+            else "off"
+        ),
+        thinking_budget_tokens=(
+            chat_config.thinking_budget_tokens
+            if chat_config.thinking is True
+            else 0
+        ),
+    )
+    if thinking_projection is None:
+        return None
+    try:
+        return build_cache_domain_guard(
+            session_epoch=session_epoch,
+            role=role,
+            topology="multiple",
+            provider=provider_config.provider,
+            requested_model=provider_config.model,
+            base_url=provider_config.base_url,
+            upstream_provider=upstream,
+            provider_routing_strict=strict_routing,
+            allow_fallbacks=not strict_routing,
+            thinking_enabled=thinking_projection.thinking_enabled,
+            effective_thinking_level=(
+                thinking_projection.effective_thinking_level
+            ),
+            thinking_budget_tokens=(
+                thinking_projection.thinking_budget_tokens
+            ),
+            credential_namespace_token=credential_namespace_token,
+        )
+    except Exception:  # noqa: BLE001 - optional evidence must fail closed
+        return None
+
+
+@dataclass(frozen=True)
+class _CacheAffinityPriceQuoteRequest:
+    """Frozen ranking-row facts required to resolve one exact cache quote."""
+
+    provider: str
+    model_id: str
+    endpoint_scope: str
+    upstream_scope: str
+    ranking_price_source: str
+    ranking_input_per_million: float
+    ranking_output_per_million: float
+
+
+_CacheAffinityPriceQuoteResolver = Callable[
+    [_CacheAffinityPriceQuoteRequest],
+    CachePriceQuote | None,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _CacheAffinityThinkingProjection:
+    """Exact provider-facing thinking fields that participate in a guard."""
+
+    thinking_enabled: bool
+    effective_thinking_level: str
+    thinking_budget_tokens: int
+
+
+def _cache_affinity_thinking_projection(
+    *,
+    thinking_enabled: object,
+    effective_thinking_level: object,
+    thinking_budget_tokens: object,
+) -> _CacheAffinityThinkingProjection | None:
+    """Normalize one exact physical thinking projection, failing closed."""
+
+    if type(thinking_enabled) is not bool:
+        return None
+    level = str(effective_thinking_level or "").strip().casefold()
+    if (
+        type(thinking_budget_tokens) is not int
+        or thinking_budget_tokens < 0
+    ):
+        return None
+    if thinking_enabled:
+        if not level or level in {"off", "none", "false"}:
+            return None
+    elif level != "off" or thinking_budget_tokens != 0:
+        return None
+    return _CacheAffinityThinkingProjection(
+        thinking_enabled=thinking_enabled,
+        effective_thinking_level=level,
+        thinking_budget_tokens=thinking_budget_tokens,
+    )
+
+
+def _cache_affinity_outer_thinking_projection(
+    inputs: Mapping[str, Any],
+) -> _CacheAffinityThinkingProjection | None:
+    raw = inputs.get("cache_affinity_outer_thinking_projection")
+    if not isinstance(raw, Mapping) or set(raw) != {
+        "thinking_enabled",
+        "effective_thinking_level",
+        "thinking_budget_tokens",
+    }:
+        return None
+    return _cache_affinity_thinking_projection(
+        thinking_enabled=raw.get("thinking_enabled"),
+        effective_thinking_level=raw.get("effective_thinking_level"),
+        thinking_budget_tokens=raw.get("thinking_budget_tokens"),
+    )
+
+
+def _cache_affinity_private_inputs(
+    inputs: Mapping[str, Any],
+    *,
+    topology: Literal["single", "multiple"],
+) -> tuple[
+    Mapping[str, Any] | None,
+    tuple[CacheAffinityReceipt, ...],
+    int | None,
+    float | None,
+    _CacheAffinityPriceQuoteResolver | None,
+    _CacheAffinityThinkingProjection | None,
+]:
+    policy = inputs.get("cache_affinity_policy")
+    if not isinstance(policy, Mapping):
+        return None, (), None, None, None, None
+    topologies = policy.get("topologies")
+    if (
+        not isinstance(topologies, Sequence)
+        or isinstance(topologies, (str, bytes, bytearray))
+        or topology not in {str(value) for value in topologies}
+    ):
+        return None, (), None, None, None, None
+    raw_receipts = inputs.get("cache_affinity_receipts")
+    if not isinstance(raw_receipts, Sequence) or isinstance(
+        raw_receipts,
+        (str, bytes, bytearray),
+    ):
+        return None, (), None, None, None, None
+    receipts = tuple(
+        receipt
+        for receipt in raw_receipts
+        if isinstance(receipt, CacheAffinityReceipt)
+        and receipt.topology == topology
+    )
+    session_epoch = inputs.get("cache_affinity_session_epoch")
+    now_monotonic = inputs.get("cache_affinity_now_monotonic")
+    if (
+        isinstance(session_epoch, bool)
+        or not isinstance(session_epoch, int)
+        or session_epoch < 0
+        or isinstance(now_monotonic, bool)
+        or not isinstance(now_monotonic, (int, float))
+        or not math.isfinite(float(now_monotonic))
+    ):
+        return None, (), None, None, None, None
+    quote_resolver = inputs.get("cache_affinity_price_quote_resolver")
+    if quote_resolver is not None and not callable(quote_resolver):
+        return None, (), None, None, None, None
+    return (
+        policy,
+        receipts,
+        session_epoch,
+        float(now_monotonic),
+        quote_resolver,
+        _cache_affinity_outer_thinking_projection(inputs),
+    )
+
+
+def _cache_affinity_price_quote_request(
+    *,
+    identity: str,
+    row: Mapping[str, Any],
+    resolution: ProviderDeploymentResolution,
+    upstream: str,
+) -> _CacheAffinityPriceQuoteRequest | None:
+    """Bind an engine quote request to independent, frozen ranking facts."""
+
+    provider_config = resolution.provider_config
+    facts = row.get("registry_facts")
+    price = facts.get("price") if isinstance(facts, Mapping) else None
+    if provider_config is None or not isinstance(price, Mapping):
+        return None
+    raw_input = price.get("input_per_million")
+    raw_output = price.get("output_per_million")
+    values = (raw_input, raw_output)
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0.0
+        for value in values
+    ):
+        return None
+    price_source = str(price.get("price_source") or "").strip()
+    endpoint_scope = canonical_cache_endpoint(provider_config.base_url)
+    if not price_source or endpoint_scope is None:
+        return None
+    provider = str(provider_config.provider or "").strip().casefold()
+    model_id = str(provider_config.model or "").strip()
+    upstream_scope = str(upstream or provider).strip().casefold()
+    row_provider = str(facts.get("provider") or "").strip().casefold()
+    row_model = str(facts.get("model_id") or "").strip()
+    if (
+        not provider
+        or not model_id
+        or not upstream_scope
+        or identity.casefold() != f"{row_provider}:{row_model}".casefold()
+        or provider != row_provider
+        or model_id.casefold() != row_model.casefold()
+    ):
+        return None
+    return _CacheAffinityPriceQuoteRequest(
+        provider=provider,
+        model_id=model_id,
+        endpoint_scope=endpoint_scope,
+        upstream_scope=upstream_scope,
+        ranking_price_source=price_source,
+        ranking_input_per_million=float(raw_input),
+        ranking_output_per_million=float(raw_output),
+    )
+
+
+def _cache_affinity_thinking_modes(
+    row: Mapping[str, Any],
+    *,
+    topology: Literal["single", "multiple"],
+    thinking_assignment_enabled: bool,
+    outer_projection: _CacheAffinityThinkingProjection,
+) -> tuple[_CacheAffinityThinkingProjection, ...]:
+    if thinking_assignment_enabled:
+        facts = row.get("registry_facts")
+        mapping = (
+            facts.get("thinking_level_mapping")
+            if isinstance(facts, Mapping)
+            else None
+        )
+        if not isinstance(mapping, Mapping):
+            return ()
+        projections: set[_CacheAffinityThinkingProjection] = set()
+        for raw_native_level in mapping.values():
+            native_level = str(raw_native_level or "").strip().casefold()
+            try:
+                native_budget = _policy_thinking_budget_tokens(native_level)
+            except ValueError:
+                continue
+            projection = _cache_affinity_thinking_projection(
+                thinking_enabled=native_level != "off",
+                effective_thinking_level=native_level,
+                thinking_budget_tokens=native_budget,
+            )
+            if projection is not None:
+                projections.add(projection)
+        return tuple(
+            sorted(
+                projections,
+                key=lambda projection: (
+                    projection.effective_thinking_level,
+                    projection.thinking_budget_tokens,
+                ),
+            )
+        )
+    if topology == "single":
+        return (outer_projection,)
+    runtime = row.get("runtime")
+    runtime_map = runtime if isinstance(runtime, Mapping) else {}
+    raw_runtime_thinking = runtime_map.get("thinking")
+    runtime_thinking = str(raw_runtime_thinking or "").strip().casefold()
+    if not runtime_thinking:
+        return (outer_projection,)
+    if runtime_thinking in {"off", "none", "false"}:
+        off = _cache_affinity_thinking_projection(
+            thinking_enabled=False,
+            effective_thinking_level="off",
+            thinking_budget_tokens=0,
+        )
+        return (off,) if off is not None else ()
+    native = _cache_affinity_thinking_projection(
+        thinking_enabled=True,
+        effective_thinking_level=runtime_thinking,
+        thinking_budget_tokens=outer_projection.thinking_budget_tokens,
+    )
+    return (native,) if native is not None else ()
+
+
+def _cache_affinity_guard_for_resolution(
+    resolution: ProviderDeploymentResolution,
+    credential_namespace_token: object,
+    *,
+    role: Literal["single", "proposer", "aggregator"],
+    topology: Literal["single", "multiple"],
+    session_epoch: int,
+    upstream: str,
+    thinking_enabled: bool,
+    effective_thinking_level: str,
+    thinking_budget_tokens: int,
+) -> CacheDomainGuard | None:
+    provider_config = resolution.provider_config
+    if not resolution.ready or provider_config is None:
+        return None
+    strict_routing = getattr(
+        provider_config,
+        "_provider_routing_strict_override",
+        None,
+    )
+    if not isinstance(strict_routing, bool):
+        return None
+    try:
+        return build_cache_domain_guard(
+            session_epoch=session_epoch,
+            role=role,
+            topology=topology,
+            provider=provider_config.provider,
+            requested_model=provider_config.model,
+            base_url=provider_config.base_url,
+            upstream_provider=upstream,
+            provider_routing_strict=strict_routing,
+            allow_fallbacks=not strict_routing,
+            thinking_enabled=thinking_enabled,
+            effective_thinking_level=effective_thinking_level,
+            thinking_budget_tokens=thinking_budget_tokens,
+            credential_namespace_token=credential_namespace_token,
+        )
+    except Exception:  # noqa: BLE001 - optional ranking evidence fails closed
+        return None
+
+
+def _cache_affinity_adjusted_trace_identities(
+    trace: Mapping[str, Any],
+    *,
+    role: Literal["single", "proposer", "aggregator"],
+) -> set[str]:
+    """Return identities whose frozen ranking trace has a real adjustment."""
+
+    if role == "aggregator":
+        aggregator = trace.get("aggregator")
+        aggregator_map = aggregator if isinstance(aggregator, Mapping) else {}
+        raw_rows = aggregator_map.get("scores")
+    else:
+        raw_rows = trace.get("model_scores")
+    if not isinstance(raw_rows, Sequence) or isinstance(
+        raw_rows,
+        (str, bytes, bytearray),
+    ):
+        return set()
+    adjusted: set[str] = set()
+    for row in raw_rows:
+        if not isinstance(row, Mapping):
+            continue
+        cache_affinity = row.get("cache_affinity")
+        if not isinstance(cache_affinity, Mapping):
+            continue
+        raw_adjustment = cache_affinity.get("score_adjustment")
+        if (
+            isinstance(raw_adjustment, bool)
+            or not isinstance(raw_adjustment, (int, float))
+            or not math.isfinite(float(raw_adjustment))
+            or float(raw_adjustment) == 0.0
+        ):
+            continue
+        identity = str(row.get("identity") or "").strip().casefold()
+        if identity:
+            adjusted.add(identity)
+    return adjusted
+
+
+def _fresh_runtime_health_unavailable_reason(
+    health: Mapping[str, Any],
+) -> str:
+    if health.get("fresh") is not True:
+        return ""
+    if health.get("half_open_inflight") is True:
+        return _RUNTIME_HEALTH_HALF_OPEN_BUSY_REASON
+    if str(health.get("state") or "").strip().casefold() == "benched":
+        return _RUNTIME_HEALTH_BENCHED_REASON
+    return ""
+
+
+def _cache_affinity_evidence_for_candidate(
+    *,
+    identity: str,
+    role: Literal["single", "proposer", "aggregator"],
+    topology: Literal["single", "multiple"],
+    resolution: ProviderDeploymentResolution,
+    credential_namespace_token: object,
+    upstream: str,
+    row: Mapping[str, Any],
+    thinking_modes: Sequence[_CacheAffinityThinkingProjection],
+    receipts: Sequence[CacheAffinityReceipt],
+    policy: Mapping[str, Any],
+    session_epoch: int,
+    now_monotonic: float,
+    quote_resolver: _CacheAffinityPriceQuoteResolver | None,
+) -> tuple[CacheAffinityEvidenceInput | None, CacheAffinityReceipt | None]:
+    candidates = sorted(
+        (
+            receipt
+            for receipt in receipts
+            if receipt.role == role
+            and receipt.topology == topology
+            and receipt.requested_identity.casefold() == identity.casefold()
+        ),
+        key=lambda receipt: receipt.observed_at_monotonic,
+        reverse=True,
+    )
+    for receipt in candidates:
+        matched = any(
+            _cache_affinity_guard_for_resolution(
+                resolution,
+                credential_namespace_token,
+                role=role,
+                topology=topology,
+                session_epoch=session_epoch,
+                upstream=upstream,
+                thinking_enabled=projection.thinking_enabled,
+                effective_thinking_level=(
+                    projection.effective_thinking_level
+                ),
+                thinking_budget_tokens=projection.thinking_budget_tokens,
+            )
+            == receipt.cache_domain_guard
+            for projection in thinking_modes
+        )
+        if not matched:
+            continue
+        decay = cache_affinity_decay_factor(
+            observed_at_monotonic=receipt.observed_at_monotonic,
+            now_monotonic=now_monotonic,
+            ttl_seconds=policy.get("ttl_seconds"),
+            age_decay=str(policy.get("age_decay") or ""),
+        )
+        if decay <= 0.0:
+            continue
+        quote: CachePriceQuote | None = None
+        quote_request = _cache_affinity_price_quote_request(
+            identity=identity,
+            row=row,
+            resolution=resolution,
+            upstream=upstream,
+        )
+        provider_config = resolution.provider_config
+        endpoint_scope = (
+            canonical_cache_endpoint(provider_config.base_url)
+            if provider_config is not None
+            else None
+        )
+        upstream_scope = str(
+            upstream
+            or (
+                provider_config.provider
+                if provider_config is not None
+                else ""
+            )
+        ).strip().casefold()
+        ranking_price_source = (
+            quote_request.ranking_price_source
+            if quote_request is not None
+            else ""
+        )
+        if (
+            quote_resolver is not None
+            and quote_request is not None
+            and str(policy.get("strategy") or "") == "expected_cost"
+        ):
+            try:
+                quote = quote_resolver(quote_request)
+            except Exception:  # noqa: BLE001 - quote evidence fails closed
+                quote = None
+            if quote is not None and (
+                quote.provider != quote_request.provider
+                or quote.canonical_model.casefold()
+                != quote_request.model_id.casefold()
+                or quote.endpoint_scope != quote_request.endpoint_scope
+                or quote.upstream_scope != quote_request.upstream_scope
+                or quote.price_source != quote_request.ranking_price_source
+                or quote.normal_input_per_million
+                != quote_request.ranking_input_per_million
+                or quote.normal_output_per_million
+                != quote_request.ranking_output_per_million
+            ):
+                quote = None
+        try:
+            return (
+                CacheAffinityEvidenceInput(
+                    identity=identity,
+                    role=role,
+                    evidence_kind=receipt.evidence_kind,
+                    cached_tokens=receipt.cached_tokens,
+                    cache_write_tokens=receipt.cache_write_tokens,
+                    decay_factor=decay,
+                    price_quote=quote,
+                    ranking_price_source=ranking_price_source,
+                    endpoint_scope=endpoint_scope or "",
+                    upstream_scope=upstream_scope,
+                ),
+                receipt,
+            )
+        except ValueError:
+            continue
+    return None, None
+
+
+def _cache_affinity_selected_mode(
+    model: Any,
+    *,
+    topology: Literal["single", "multiple"],
+    thinking_assignment_enabled: bool,
+    outer_projection: _CacheAffinityThinkingProjection,
+) -> _CacheAffinityThinkingProjection | None:
+    if not thinking_assignment_enabled:
+        if topology == "single":
+            return outer_projection
+        native_level = str(
+            getattr(model, "thinking", None) or ""
+        ).strip().casefold()
+        if not native_level:
+            return outer_projection
+        if native_level in {"off", "none", "false"}:
+            return _cache_affinity_thinking_projection(
+                thinking_enabled=False,
+                effective_thinking_level="off",
+                thinking_budget_tokens=0,
+            )
+        return _cache_affinity_thinking_projection(
+            thinking_enabled=True,
+            effective_thinking_level=native_level,
+            thinking_budget_tokens=outer_projection.thinking_budget_tokens,
+        )
+    native_level = str(
+        getattr(model, "thinking", None) or ""
+    ).strip().casefold()
+    if not native_level:
+        return None
+    try:
+        native_budget = _policy_thinking_budget_tokens(native_level)
+    except ValueError:
+        return None
+    return _cache_affinity_thinking_projection(
+        thinking_enabled=native_level != "off",
+        effective_thinking_level=native_level,
+        thinking_budget_tokens=native_budget,
+    )
+
+
+def _stage_ensemble_cache_affinity_receipt(
+    *,
+    member: EnsembleMemberConfig,
+    role: Literal["proposer", "aggregator"],
+    slot: int,
+    sample_index: int,
+    physical_attempt_id: str,
+    actual_provider: str,
+    actual_model: str,
+    rows: Sequence[Mapping[str, Any]],
+    chat_config: ChatConfig,
+    terminal_monotonic: float,
+) -> None:
+    collector = _CACHE_AFFINITY_RECEIPT_COLLECTOR.get()
+    if collector is None or collector.sealed:
+        return
+    attempt_id = _valid_managed_physical_attempt_id(physical_attempt_id)
+    requested_provider = str(member.provider_config.provider or "").strip()
+    requested_model = str(member.provider_config.model or "").strip()
+    actual_provider = str(actual_provider or "").strip()
+    actual_model = str(actual_model or "").strip()
+    requested_identity = _normalized_provider_model_identity(
+        requested_provider,
+        requested_model,
+    )
+    if (
+        isinstance(terminal_monotonic, bool)
+        or not isinstance(terminal_monotonic, (int, float))
+        or not math.isfinite(terminal_monotonic)
+        or terminal_monotonic < 0
+    ):
+        return
+    actual_model_aliases = member._cache_affinity_actual_model_aliases
+    if (
+        not attempt_id
+        or type(slot) is not int
+        or slot < 0
+        or type(sample_index) is not int
+        or sample_index < 0
+        or not requested_identity
+        or requested_provider.casefold() != actual_provider.casefold()
+        or not _cache_affinity_actual_model_matches(
+            requested_model,
+            actual_model,
+            actual_model_aliases,
+        )
+    ):
+        return
+    usage = _cache_affinity_usage_proof(
+        rows,
+        physical_attempt_id=attempt_id,
+        role=role,
+        requested_provider=requested_provider,
+        requested_model=requested_model,
+        actual_provider=actual_provider,
+        actual_model=actual_model,
+    )
+    if usage is None:
+        return
+    input_tokens, cached_tokens, cache_write_tokens = usage
+    if cached_tokens > 0:
+        evidence_kind: Literal["read_hit", "write_only"] = "read_hit"
+    elif cache_write_tokens > 0:
+        evidence_kind = "write_only"
+    else:
+        return
+    cache_domain_guard = _cache_affinity_domain_guard_for_member(
+        member,
+        collector=collector,
+        role=role,
+        chat_config=chat_config,
+    )
+    if cache_domain_guard is None:
+        return
+    collector.stage(
+        _EnsembleCacheAffinityReceipt(
+            physical_attempt_id=attempt_id,
+            topology="multiple",
+            role=role,
+            slot=slot,
+            sample_index=sample_index,
+            requested_provider=requested_provider,
+            requested_model=requested_model,
+            actual_provider=actual_provider,
+            actual_model=actual_model,
+            input_tokens=input_tokens,
+            cached_tokens=cached_tokens,
+            cache_write_tokens=cache_write_tokens,
+            evidence_kind=evidence_kind,
+            terminal_monotonic=float(terminal_monotonic),
+            cache_domain_guard=cache_domain_guard,
+            actual_model_aliases=actual_model_aliases,
+        )
+    )
+
+
+def _candidate_final_cache_affinity_binding(
+    candidate: Mapping[str, Any],
+) -> tuple[str, int, int, str, str, str, str] | None:
+    if (
+        candidate.get("selected_for_aggregation") is not True
+        or candidate.get("ok") is not True
+        or candidate.get("completion_outcome") != "complete"
+        or candidate.get("request_started") is not True
+        or candidate.get("stream_closed") is not True
+        or candidate.get("usage_reported") is not True
+    ):
+        return None
+    slot = candidate.get("index")
+    sample_index = candidate.get("sample_index")
+    if (
+        type(slot) is not int
+        or slot < 0
+        or type(sample_index) is not int
+        or sample_index < 0
+    ):
+        return None
+    execution = candidate.get("execution")
+    attempts = execution.get("physical_attempts") if isinstance(execution, Mapping) else None
+    if not isinstance(attempts, list) or not attempts:
+        return None
+    final_attempt = attempts[-1]
+    if (
+        not isinstance(final_attempt, Mapping)
+        or final_attempt.get("request_started") is not True
+        or final_attempt.get("stream_closed") is not True
+        or final_attempt.get("outcome") != "succeeded"
+    ):
+        return None
+    attempt_id = _valid_managed_physical_attempt_id(
+        final_attempt.get("physical_attempt_id")
+    )
+    requested_provider = str(candidate.get("requested_provider") or "").strip()
+    requested_model = str(candidate.get("requested_model") or "").strip()
+    actual_provider = str(candidate.get("provider") or "").strip()
+    actual_model = str(candidate.get("model") or "").strip()
+    if (
+        not attempt_id
+        or not requested_provider
+        or not requested_model
+        or not actual_provider
+        or not actual_model
+        or requested_provider.casefold() != actual_provider.casefold()
+    ):
+        return None
+    attempt_identity = str(final_attempt.get("identity") or "").strip()
+    if attempt_identity and attempt_identity.casefold() != (
+        f"{requested_provider}:{requested_model}".casefold()
+    ):
+        return None
+    return (
+        attempt_id,
+        slot,
+        sample_index,
+        requested_provider,
+        requested_model,
+        actual_provider,
+        actual_model,
+    )
+
+
+def _aggregator_final_cache_affinity_binding(
+    trace: Mapping[str, Any],
+) -> tuple[str, int, int, str, str, str, str] | None:
+    recovery = trace.get("aggregator_recovery")
+    if (
+        trace.get("final_request_role") != "aggregator"
+        or trace.get("delivery_outcome") != "complete"
+        or not isinstance(recovery, Mapping)
+        or recovery.get("success") is not True
+    ):
+        return None
+    selected_attempt = recovery.get("selected_attempt")
+    attempts = recovery.get("attempts")
+    if type(selected_attempt) is not int or not isinstance(attempts, list):
+        return None
+    selected_rows = [
+        row
+        for row in attempts
+        if isinstance(row, Mapping) and row.get("attempt") == selected_attempt
+    ]
+    if len(selected_rows) != 1:
+        return None
+    selected = selected_rows[0]
+    if (
+        selected.get("request_started") is not True
+        or selected.get("stream_closed") is not True
+        or selected.get("outcome") != "succeeded"
+    ):
+        return None
+    usage = selected.get("usage")
+    if (
+        not isinstance(usage, Mapping)
+        or usage.get("usage_missing_count") != 0
+        or usage.get("usage_row_count") != 1
+    ):
+        return None
+    attempt_id = _valid_managed_physical_attempt_id(
+        selected.get("physical_attempt_id")
+    )
+    slot = selected.get("fallback_index")
+    requested_provider = str(selected.get("requested_provider") or "").strip()
+    requested_model = str(selected.get("requested_model") or "").strip()
+    actual_provider = str(selected.get("actual_provider") or "").strip()
+    actual_model = str(selected.get("actual_model") or "").strip()
+    requested_identity = _normalized_provider_model_identity(
+        requested_provider,
+        requested_model,
+    )
+    if (
+        not attempt_id
+        or type(slot) is not int
+        or slot < 0
+        or not requested_identity
+        or not actual_provider
+        or not actual_model
+        or requested_provider.casefold() != actual_provider.casefold()
+        or str(recovery.get("executed_A") or "").strip().casefold()
+        != requested_identity
+    ):
+        return None
+    return (
+        attempt_id,
+        slot,
+        0,
+        requested_provider,
+        requested_model,
+        actual_provider,
+        actual_model,
+    )
+
+
+def _validated_final_cache_affinity_receipts(
+    event: DoneEvent,
+    staged: Sequence[_EnsembleCacheAffinityReceipt],
+) -> tuple[_EnsembleCacheAffinityReceipt, ...]:
+    """Keep only receipts selected by the final, complete execution trace."""
+
+    trace = event.ensemble_trace
+    if (
+        not isinstance(trace, Mapping)
+        or trace.get("delivery_outcome") != "complete"
+        or trace.get("final_request_role") != "aggregator"
+    ):
+        return ()
+    if trace.get("fallback_used") not in {False, True}:
+        return ()
+    if trace.get("fallback_used") is True:
+        recovery = trace.get("aggregator_recovery")
+        if (
+            not isinstance(recovery, Mapping)
+            or recovery.get("success") is not True
+            or not str(recovery.get("executed_A") or "").strip()
+        ):
+            return ()
+    effective_plan = trace.get("effective_selection_plan")
+    if not isinstance(effective_plan, Mapping):
+        effective_plan = trace.get("selection_plan")
+    if not isinstance(effective_plan, Mapping):
+        return ()
+    raw_selected_proposers = effective_plan.get("selected_P")
+    selected_aggregator = str(effective_plan.get("selected_A") or "").strip()
+    if (
+        not isinstance(raw_selected_proposers, Sequence)
+        or isinstance(raw_selected_proposers, (str, bytes, bytearray))
+        or not raw_selected_proposers
+        or not selected_aggregator
+    ):
+        return ()
+    selected_proposers = tuple(
+        str(identity or "").strip().casefold()
+        for identity in raw_selected_proposers
+    )
+    if any(not identity for identity in selected_proposers):
+        return ()
+    raw_aggregator_candidates = effective_plan.get("aggregator_candidates")
+    if raw_aggregator_candidates is None:
+        raw_aggregator_candidates = trace.get("aggregator_candidates")
+    if raw_aggregator_candidates is None:
+        raw_aggregator_candidates = (selected_aggregator,)
+    if (
+        not isinstance(raw_aggregator_candidates, Sequence)
+        or isinstance(
+            raw_aggregator_candidates,
+            (str, bytes, bytearray),
+        )
+    ):
+        return ()
+    allowed_aggregators = {
+        str(identity or "").strip().casefold()
+        for identity in raw_aggregator_candidates
+    }
+    if (
+        not allowed_aggregators
+        or "" in allowed_aggregators
+        or selected_aggregator.casefold() not in allowed_aggregators
+    ):
+        return ()
+    aggregator_recovery = trace.get("aggregator_recovery")
+    executed_aggregator = (
+        str(aggregator_recovery.get("executed_A") or "").strip()
+        if isinstance(aggregator_recovery, Mapping)
+        else ""
+    )
+    final_selected_aggregator = executed_aggregator or selected_aggregator
+    if final_selected_aggregator.casefold() not in allowed_aggregators:
+        return ()
+    aggregator_changed = (
+        final_selected_aggregator.casefold() != selected_aggregator.casefold()
+    )
+    if (trace.get("fallback_used") is True) != aggregator_changed:
+        return ()
+    raw_backup_proposers = effective_plan.get("backup_P") or ()
+    if (
+        not isinstance(raw_backup_proposers, Sequence)
+        or isinstance(raw_backup_proposers, (str, bytes, bytearray))
+    ):
+        return ()
+    backup_proposers = tuple(
+        str(identity or "").strip().casefold()
+        for identity in raw_backup_proposers
+    )
+    if any(not identity for identity in backup_proposers):
+        return ()
+    recovery = trace.get("proposer_recovery")
+    executed_proposers = (
+        recovery.get("executed_proposer_roster_after")
+        if isinstance(recovery, Mapping)
+        else None
+    )
+    if isinstance(executed_proposers, Sequence) and not isinstance(
+        executed_proposers,
+        (str, bytes, bytearray),
+    ) and executed_proposers:
+        effective_proposer_slots = tuple(
+            str(identity or "").strip().casefold()
+            for identity in executed_proposers
+        )
+    else:
+        effective_proposer_slots = selected_proposers
+    allowed_proposers = {*selected_proposers, *backup_proposers}
+    if any(
+        not identity or identity not in allowed_proposers
+        for identity in effective_proposer_slots
+    ):
+        return ()
+    bindings: dict[
+        str,
+        tuple[
+            Literal["proposer", "aggregator"],
+            int,
+            int,
+            str,
+            str,
+            str,
+            str,
+        ],
+    ] = {}
+    duplicate_binding_ids: set[str] = set()
+
+    candidates = trace.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            binding = _candidate_final_cache_affinity_binding(candidate)
+            if binding is None:
+                continue
+            attempt_id, slot, sample_index, *identities = binding
+            candidate_identity = (
+                f"{identities[0]}:{identities[1]}".casefold()
+            )
+            if (
+                slot >= len(effective_proposer_slots)
+                or candidate_identity != effective_proposer_slots[slot]
+            ):
+                continue
+            if attempt_id in bindings:
+                duplicate_binding_ids.add(attempt_id)
+            bindings[attempt_id] = (
+                "proposer",
+                slot,
+                sample_index,
+                *identities,
+            )
+
+    aggregator_binding = _aggregator_final_cache_affinity_binding(trace)
+    if aggregator_binding is not None:
+        attempt_id, slot, sample_index, *identities = aggregator_binding
+        aggregator_identity = f"{identities[0]}:{identities[1]}".casefold()
+        if aggregator_identity != final_selected_aggregator.casefold():
+            aggregator_binding = None
+    if aggregator_binding is not None:
+        attempt_id, slot, sample_index, *identities = aggregator_binding
+        if attempt_id in bindings:
+            duplicate_binding_ids.add(attempt_id)
+        bindings[attempt_id] = (
+            "aggregator",
+            slot,
+            sample_index,
+            *identities,
+        )
+
+    staged_counts: dict[str, int] = {}
+    for receipt in staged:
+        staged_counts[receipt.physical_attempt_id] = (
+            staged_counts.get(receipt.physical_attempt_id, 0) + 1
+        )
+
+    final_rows = [
+        row
+        for row in event.model_usage_breakdown
+        if isinstance(row, Mapping)
+    ]
+    validated: list[_EnsembleCacheAffinityReceipt] = []
+    for receipt in staged:
+        attempt_id = receipt.physical_attempt_id
+        binding = bindings.get(attempt_id)
+        if (
+            binding is None
+            or attempt_id in duplicate_binding_ids
+            or staged_counts.get(attempt_id) != 1
+            or not isinstance(receipt.cache_domain_guard, CacheDomainGuard)
+        ):
+            continue
+        (
+            role,
+            slot,
+            sample_index,
+            requested_provider,
+            requested_model,
+            actual_provider,
+            actual_model,
+        ) = binding
+        if (
+            receipt.role != role
+            or receipt.slot != slot
+            or receipt.sample_index != sample_index
+            or receipt.requested_provider.casefold()
+            != requested_provider.casefold()
+            or receipt.requested_model.casefold() != requested_model.casefold()
+            or receipt.actual_provider.casefold() != actual_provider.casefold()
+            or receipt.actual_model.casefold() != actual_model.casefold()
+            or not _cache_affinity_actual_model_matches(
+                receipt.requested_model,
+                receipt.actual_model,
+                receipt.actual_model_aliases,
+            )
+        ):
+            continue
+        final_usage = _cache_affinity_usage_proof(
+            final_rows,
+            physical_attempt_id=attempt_id,
+            role=role,
+            requested_provider=requested_provider,
+            requested_model=requested_model,
+            actual_provider=actual_provider,
+            actual_model=actual_model,
+        )
+        if final_usage != (
+            receipt.input_tokens,
+            receipt.cached_tokens,
+            receipt.cache_write_tokens,
+        ):
+            continue
+        validated.append(receipt)
+    validated.sort(
+        key=lambda receipt: (
+            0 if receipt.role == "proposer" else 1,
+            receipt.slot,
+            receipt.sample_index,
+            receipt.physical_attempt_id,
+        )
+    )
+    return tuple(validated)
+
+
 def _usage_rows_physical_request_count(
     rows: Sequence[Mapping[str, Any]],
     missing_count: int,
@@ -5330,6 +6666,16 @@ class EnsembleProvider:
         _admission_settings: ProviderAdmissionSettings | None = None,
         _admission_before_release: Callable[[str], None] | None = None,
         _absolute_deadline: float | None = None,
+        _cache_affinity_receipt_callback: (
+            _EnsembleCacheAffinityReceiptCallback | None
+        ) = None,
+        _cache_affinity_turn_id: str = "",
+        _cache_affinity_provider_instance_token: str = "",
+        _cache_affinity_session_epoch: int | None = None,
+        _cache_affinity_sequence_allocator: (
+            _EnsembleCacheAffinitySequenceAllocator | None
+        ) = None,
+        _cache_affinity_provider_instance_generation: int | None = None,
     ) -> None:
         self.profile_name = profile_name
         self.proposers = [
@@ -5375,6 +6721,51 @@ class EnsembleProvider:
         self._admission_controller = _admission_controller
         self._admission_settings = _admission_settings
         self._admission_before_release = _admission_before_release
+        if (
+            _cache_affinity_receipt_callback is not None
+            and not callable(_cache_affinity_receipt_callback)
+        ):
+            raise TypeError("cache affinity receipt callback must be callable")
+        if (
+            _cache_affinity_session_epoch is not None
+            and (
+                type(_cache_affinity_session_epoch) is not int
+                or _cache_affinity_session_epoch < 0
+            )
+        ):
+            raise ValueError("cache affinity session epoch must be non-negative")
+        self._cache_affinity_receipt_callback = (
+            _cache_affinity_receipt_callback
+        )
+        self._cache_affinity_turn_id = str(_cache_affinity_turn_id or "")
+        if _cache_affinity_receipt_callback is None:
+            self._cache_affinity_sequence_allocator = None
+            self._cache_affinity_provider_instance_generation = -1
+            self._cache_affinity_provider_instance_token = ""
+        else:
+            self._cache_affinity_sequence_allocator = (
+                _cache_affinity_sequence_allocator
+                or _EnsembleCacheAffinitySequenceAllocator()
+            )
+            if _cache_affinity_provider_instance_generation is None:
+                _cache_affinity_provider_instance_generation = (
+                    self._cache_affinity_sequence_allocator.allocate_provider_generation()
+                )
+            if (
+                type(_cache_affinity_provider_instance_generation) is not int
+                or _cache_affinity_provider_instance_generation < 0
+            ):
+                raise ValueError(
+                    "cache affinity provider instance generation must be non-negative"
+                )
+            self._cache_affinity_provider_instance_generation = (
+                _cache_affinity_provider_instance_generation
+            )
+            self._cache_affinity_provider_instance_token = (
+                str(_cache_affinity_provider_instance_token or "")
+                or uuid.uuid4().hex
+            )
+        self._cache_affinity_session_epoch = _cache_affinity_session_epoch
         self.candidate_max_chars = int(candidate_max_chars or 0)
         self.shuffle_candidates = bool(shuffle_candidates)
         if (
@@ -8416,12 +9807,19 @@ class EnsembleProvider:
         config: ChatConfig | None = None,
     ) -> AsyncIterator[StreamEvent]:
         accounting_state = _UsageAccountingSnapshotState()
+        cache_affinity_chat_call_id = (
+            uuid.uuid4().hex
+            if self._cache_affinity_receipt_callback is not None
+            and self._router_dynamic_selection()
+            else ""
+        )
         return _EnsembleChatStream(
             self._chat(
                 messages,
                 tools=tools,
                 config=config,
                 accounting_state=accounting_state,
+                cache_affinity_chat_call_id=cache_affinity_chat_call_id,
             ),
             accounting_state,
         )
@@ -8433,6 +9831,7 @@ class EnsembleProvider:
         config: ChatConfig | None = None,
         *,
         accounting_state: _UsageAccountingSnapshotState,
+        cache_affinity_chat_call_id: str = "",
     ) -> AsyncIterator[StreamEvent]:
         if (
             self._admission_controller is None
@@ -8529,14 +9928,76 @@ class EnsembleProvider:
         self._canary_rollout_receipt_count = 0
         self._current_proposer_recovery_trace = None
         self._current_proposer_quorum_trace = None
+        receipt_callback = self._cache_affinity_receipt_callback
+        sequence_allocator = self._cache_affinity_sequence_allocator
+        receipt_collector = (
+            _EnsembleCacheAffinityReceiptCollector(
+                turn_id=self._cache_affinity_turn_id,
+                decision_id=str(
+                    self.selection_plan.get("decision_id") or ""
+                ),
+                provider_instance_token=(
+                    self._cache_affinity_provider_instance_token
+                ),
+                provider_instance_generation=(
+                    self._cache_affinity_provider_instance_generation
+                ),
+                chat_sequence=(
+                    sequence_allocator.allocate_chat_sequence()
+                ),
+                chat_call_id=cache_affinity_chat_call_id,
+                execution_mode=str(
+                    config.ensemble_execution_mode
+                    if config is not None
+                    else "full"
+                ),
+                session_epoch=self._cache_affinity_session_epoch,
+            )
+            if (
+                receipt_callback is not None
+                and sequence_allocator is not None
+                and cache_affinity_chat_call_id
+            )
+            else None
+        )
+        terminal_event_observed = False
+        terminal_done: DoneEvent | None = None
+
         self._active_chat = True
         try:
             async with _closing_async_iterator(
                 self._chat_owned(messages, tools=tools, config=config),
                 phase="ensemble_owned_chat",
                 pending_cleanup_tracker=self._track_pending_cleanup,
+                terminal_observed=(
+                    (lambda: terminal_event_observed)
+                    if receipt_collector is not None
+                    else None
+                ),
             ) as owned_stream:
-                async for event in owned_stream:
+                while True:
+                    collector_token = (
+                        _CACHE_AFFINITY_RECEIPT_COLLECTOR.set(
+                            receipt_collector
+                        )
+                        if receipt_collector is not None
+                        else None
+                    )
+                    try:
+                        event = await anext(owned_stream)
+                    except StopAsyncIteration:
+                        break
+                    finally:
+                        if collector_token is not None:
+                            _CACHE_AFFINITY_RECEIPT_COLLECTOR.reset(
+                                collector_token
+                            )
+                    if receipt_collector is not None and isinstance(
+                        event,
+                        (DoneEvent, ErrorEvent),
+                    ):
+                        terminal_event_observed = True
+                        terminal_done = event if isinstance(event, DoneEvent) else None
                     yield event
         except _EnsembleStreamCloseError as exc:
             self._mark_cleanup_unproven(exc.phase)
@@ -8560,6 +10021,21 @@ class EnsembleProvider:
             self._current_absolute_deadline = None
             self._current_proposer_phase_deadline = None
             self._current_proposer_dispatch_deadline = None
+            if receipt_collector is not None:
+                if terminal_done is not None:
+                    try:
+                        receipt_batch = receipt_collector.batch(terminal_done)
+                    except Exception:  # noqa: BLE001 - sidecar fails closed
+                        receipt_batch = receipt_collector.empty_batch()
+                    try:
+                        assert receipt_callback is not None
+                        receipt_callback(receipt_batch)
+                    except Exception:  # noqa: BLE001 - never change chat outcome
+                        log.warning(
+                            "ensemble.cache_affinity_receipt_callback_failed"
+                        )
+                else:
+                    receipt_collector.sealed = True
 
     async def _chat_owned(
         self,
@@ -13430,6 +14906,7 @@ class EnsembleProvider:
         response_observed = False
         reasoning_observed = False
         terminal_event_observed = False
+        terminal_monotonic: float | None = None
         current_physical_attempt: dict[str, Any] | None = None
 
         def mark_request_started() -> None:
@@ -13685,6 +15162,7 @@ class EnsembleProvider:
                     result.error_code = "candidate_mode_contract_violation"
                     break
                 elif isinstance(event, DoneEvent):
+                    terminal_monotonic = time.monotonic()
                     response_observed = True
                     terminal_event_observed = True
                     got_done = True
@@ -13930,6 +15408,32 @@ class EnsembleProvider:
         if current_physical_attempt is not None:
             current_physical_attempt["stream_closed"] = True
         _finalize_candidate_text_buffer(result)
+        if (
+            self._cache_affinity_receipt_callback is not None
+            and got_done
+            and result.ok
+            and result.completion_outcome == "complete"
+            and result.usage_reported
+            and result.usage_missing_count == 0
+            and current_physical_attempt is not None
+            and current_physical_attempt.get("outcome") == "succeeded"
+            and current_physical_attempt.get("stream_closed") is True
+            and terminal_monotonic is not None
+        ):
+            _stage_ensemble_cache_affinity_receipt(
+                member=member,
+                role="proposer",
+                slot=result.index,
+                sample_index=result.sample_index,
+                physical_attempt_id=str(
+                    current_physical_attempt.get("physical_attempt_id") or ""
+                ),
+                actual_provider=result.provider,
+                actual_model=result.model,
+                rows=result.model_usage_breakdown,
+                chat_config=chat_cfg,
+                terminal_monotonic=terminal_monotonic,
+            )
         rejected_thinking_level = (
             result.error
             and not response_observed
@@ -15144,6 +16648,7 @@ class EnsembleProvider:
             event: DoneEvent,
             *,
             aggregator_elapsed_ms: int,
+            terminal_monotonic: float | None = None,
             include_event_usage: bool = True,
             record_success_attempt: bool = True,
             recovery_success: bool = True,
@@ -15397,6 +16902,27 @@ class EnsembleProvider:
                         ),
                     )
                 selected_attempt = append_recovery_attempt(success_attempt)
+                if (
+                    self._cache_affinity_receipt_callback is not None
+                    and recovery_success
+                    and include_event_usage
+                    and event_missing_count == 0
+                    and current_physical_attempt_id
+                    and stream_closed
+                    and terminal_monotonic is not None
+                ):
+                    _stage_ensemble_cache_affinity_receipt(
+                        member=active_member,
+                        role="aggregator",
+                        slot=active_fallback_index,
+                        sample_index=0,
+                        physical_attempt_id=current_physical_attempt_id,
+                        actual_provider=acc.provider,
+                        actual_model=acc.model,
+                        rows=aggregator_rows,
+                        chat_config=active_config,
+                        terminal_monotonic=terminal_monotonic,
+                    )
                 append_output_component(
                     attempt_number=selected_attempt,
                     kind=selected_kind,
@@ -16123,6 +17649,7 @@ class EnsembleProvider:
             thinking_retry_target: tuple[str, str] | None = None
             terminal_stream_error: ErrorEvent | None = None
             completed_provider_event: DoneEvent | None = None
+            completed_provider_terminal_monotonic: float | None = None
             heartbeat_stream: AsyncIterator[StreamEvent] | None = None
             heartbeat_close_status: _StreamCloseStatus | None = None
             admission_lease: ProviderAdmissionLease | None = None
@@ -16470,6 +17997,7 @@ class EnsembleProvider:
                 )
                 async for event in heartbeat_stream:
                     if isinstance(event, DoneEvent):
+                        completed_provider_terminal_monotonic = time.monotonic()
                         response_observed = True
                         # A terminal event is not safe to hand to Agent until
                         # the underlying provider iterator has really closed.
@@ -17407,6 +18935,9 @@ class EnsembleProvider:
                     done_event = ensemble_done(
                         completed_provider_event,
                         aggregator_elapsed_ms=aggregator_elapsed_ms,
+                        terminal_monotonic=(
+                            completed_provider_terminal_monotonic
+                        ),
                         physical_output_text="".join(attempt_text_parts),
                         assembled_contribution_text=attempt_visible_text,
                     )
@@ -20925,6 +22456,7 @@ def _build_router_dynamic_members(
 
     from .ranking_router import (
         RANKING_CONFIG_SCHEMA_VERSION,
+        CacheAffinityUnavailableReason,
         DynamicRankingError,
         TaskAnalysisResult,
         _canonical_hash,
@@ -21001,6 +22533,9 @@ def _build_router_dynamic_members(
             is True
         )
     inputs = dict(ranking_inputs or {})
+    cache_affinity_collection_enabled = (
+        inputs.get("cache_affinity_collection_enabled") is True
+    )
     raw_generation_policy = inputs.get("generation_policy")
     generation_policy = (
         raw_generation_policy
@@ -21834,6 +23369,38 @@ def _build_router_dynamic_members(
     matched_retry_exclusions: set[str] = set()
     from .compat_policy import compat_policy_for_kind, model_matches_policy_prefix
 
+    if isinstance(inputs.get("cache_affinity_policy"), Mapping):
+        (
+            cache_affinity_policy,
+            cache_affinity_receipts,
+            cache_affinity_session_epoch,
+            cache_affinity_now,
+            cache_affinity_quote_resolver,
+            cache_affinity_outer_projection,
+        ) = _cache_affinity_private_inputs(inputs, topology="multiple")
+    else:
+        cache_affinity_policy = None
+        cache_affinity_receipts = ()
+        cache_affinity_session_epoch = None
+        cache_affinity_now = None
+        cache_affinity_quote_resolver = None
+        cache_affinity_outer_projection = None
+    cache_affinity_inputs: dict[
+        str,
+        dict[str, CacheAffinityEvidenceInput],
+    ] = {"proposer": {}, "aggregator": {}}
+    cache_affinity_matched_receipts: dict[
+        tuple[str, str],
+        CacheAffinityReceipt,
+    ] = {}
+    cache_affinity_unavailable_reasons: list[dict[str, str]] = []
+    cache_affinity_deployments: dict[
+        str,
+        tuple[ProviderDeploymentResolution, object, str],
+    ] = {}
+    cache_affinity_rows: dict[str, dict[str, Any]] = {}
+    cache_affinity_refresh_attempted: set[str] = set()
+
     for row in snapshot["models"]:
         facts = row.get("registry_facts")
         if not isinstance(facts, dict):
@@ -21874,20 +23441,159 @@ def _build_router_dynamic_members(
                 sends_temperature = False
             facts["runtime_temperature_parameter_required"] = sends_temperature
         identity = f"{provider_id}:{model_id}".strip().lower()
+        cache_affinity_rows[identity] = row
         if identity in retry_exclusions:
             matched_retry_exclusions.add(identity)
             facts["retry_excluded_proposer"] = True
-        try:
-            credential_available = _resolve_member_deployment(
-                _EnsembleModelRef(provider=provider_id, model=model_id),
-                inherited_provider_config,
-                config=config,
-                credential_pool_acquirer=credential_pool_acquirer,
-                session_key=session_key,
-            ).ready
-        except Exception:  # noqa: BLE001 - invalid deployments stay traceable
-            credential_available = False
+        ref = _EnsembleModelRef(provider=provider_id, model=model_id)
+        if cache_affinity_policy is not None:
+            try:
+                resolution, credential_token = (
+                    resolve_provider_deployment_cache_identity(
+                        config,
+                        provider_id,
+                        model_id,
+                        inherited_provider_config=inherited_provider_config,
+                        overrides=ref,
+                        credential_pool_acquirer=credential_pool_acquirer,
+                        session_key=session_key,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - readiness stays hard-filter evidence
+                credential_available = False
+            else:
+                credential_available = resolution.ready
+                identity = f"{provider_id}:{model_id}".strip().lower()
+                upstream = canonicalize_provider_routing_upstream(
+                    facts.get("endpoint_provider_pin")
+                    or inherited_provider_config.provider_routing.get(model_id, "")
+                )
+                cache_affinity_deployments[identity] = (
+                    resolution,
+                    credential_token,
+                    upstream,
+                )
+                if (
+                    credential_available
+                    and credential_token is not None
+                    and cache_affinity_session_epoch is not None
+                    and cache_affinity_now is not None
+                    and cache_affinity_outer_projection is not None
+                ):
+                    try:
+                        thinking_modes = _cache_affinity_thinking_modes(
+                            row,
+                            topology="multiple",
+                            thinking_assignment_enabled=(
+                                thinking_assignment_enabled
+                            ),
+                            outer_projection=(
+                                cache_affinity_outer_projection
+                            ),
+                        )
+                        for role in ("proposer", "aggregator"):
+                            evidence, receipt = (
+                                _cache_affinity_evidence_for_candidate(
+                                    identity=identity,
+                                    role=role,
+                                    topology="multiple",
+                                    resolution=resolution,
+                                    credential_namespace_token=credential_token,
+                                    upstream=upstream,
+                                    row=row,
+                                    thinking_modes=thinking_modes,
+                                    receipts=cache_affinity_receipts,
+                                    policy=cache_affinity_policy,
+                                    session_epoch=cache_affinity_session_epoch,
+                                    now_monotonic=cache_affinity_now,
+                                    quote_resolver=(
+                                        cache_affinity_quote_resolver
+                                    ),
+                                )
+                            )
+                            if evidence is not None and receipt is not None:
+                                cache_affinity_inputs[role][identity] = evidence
+                                cache_affinity_matched_receipts[
+                                    (role, identity)
+                                ] = receipt
+                                if (
+                                    str(
+                                        cache_affinity_policy.get("strategy")
+                                        or ""
+                                    )
+                                    == "expected_cost"
+                                    and evidence.price_quote is None
+                                ):
+                                    cache_affinity_unavailable_reasons.append(
+                                        {
+                                            "role": role,
+                                            "identity": identity,
+                                            "reason": (
+                                                CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
+                                            ),
+                                        }
+                                    )
+                    except Exception:  # noqa: BLE001 - optional evidence fails closed
+                        pass
+        else:
+            try:
+                credential_available = _resolve_member_deployment(
+                    ref,
+                    inherited_provider_config,
+                    config=config,
+                    credential_pool_acquirer=credential_pool_acquirer,
+                    session_key=session_key,
+                ).ready
+            except Exception:  # noqa: BLE001 - invalid deployments stay traceable
+                credential_available = False
         facts["credential_available"] = credential_available
+
+    def refresh_cache_affinity_deployment(
+        model: Any,
+    ) -> tuple[ProviderDeploymentResolution, object, str]:
+        identity = str(model.identity).strip().casefold()
+        if identity in cache_affinity_refresh_attempted:
+            return cache_affinity_deployments[identity]
+        cache_affinity_refresh_attempted.add(identity)
+        row = cache_affinity_rows.get(identity)
+        facts = row.get("registry_facts") if isinstance(row, Mapping) else None
+        fact_map = facts if isinstance(facts, dict) else {}
+        provider_id = str(model.provider or "").strip()
+        model_id = str(model.model_id or "").strip()
+        try:
+            resolution, credential_token = (
+                resolve_provider_deployment_cache_identity(
+                    config,
+                    provider_id,
+                    model_id,
+                    inherited_provider_config=inherited_provider_config,
+                    overrides=_EnsembleModelRef(
+                        provider=provider_id,
+                        model=model_id,
+                        thinking=getattr(model, "thinking", None),
+                    ),
+                    credential_pool_acquirer=credential_pool_acquirer,
+                    session_key=session_key,
+                )
+            )
+        except Exception:  # noqa: BLE001 - selected readiness fails closed
+            resolution = ProviderDeploymentResolution(
+                provider=provider_id,
+                model=model_id,
+                ready=False,
+                reason="deployment_resolution_failed",
+            )
+            credential_token = None
+        upstream = canonicalize_provider_routing_upstream(
+            fact_map.get("endpoint_provider_pin")
+            or inherited_provider_config.provider_routing.get(model_id, "")
+        )
+        deployment = (resolution, credential_token, upstream)
+        cache_affinity_deployments[identity] = deployment
+        if fact_map:
+            fact_map["credential_available"] = resolution.ready
+        return deployment
+
     if matched_retry_exclusions != retry_exclusions:
         unknown = ", ".join(sorted(retry_exclusions - matched_retry_exclusions))
         raise DynamicRankingError(
@@ -21936,78 +23642,239 @@ def _build_router_dynamic_members(
         or 4_096
     )
 
-    def rank_snapshot(*, emit_logs: bool) -> Any:
-        return rank_models(
-            task_analysis=task_analysis,
-            user_profile=user_profile,
-            request_context=request_context,
-            registry_snapshot=snapshot,
-            routed_tier=routed_tier,
-            routing_confidence=routing_confidence,
-            ranking_config=ranking_config,
-            decision_id=decision_id,
-            ranking_thinking_assignment_enabled=(
+    def rank_snapshot(*, emit_logs: bool, use_cache_affinity: bool) -> Any:
+        rank_kwargs: dict[str, Any] = {
+            "task_analysis": task_analysis,
+            "user_profile": user_profile,
+            "request_context": request_context,
+            "registry_snapshot": snapshot,
+            "routed_tier": routed_tier,
+            "routing_confidence": routing_confidence,
+            "ranking_config": ranking_config,
+            "decision_id": decision_id,
+            "ranking_thinking_assignment_enabled": (
                 thinking_assignment_enabled
             ),
-            proposer_recovery_max_additional_calls=(
+            "proposer_recovery_max_additional_calls": (
                 proposer_recovery_max_additional_calls
             ),
-            proposer_max_tokens_cap=proposer_max_tokens_cap,
-            proposer_visible_answer_reserve_tokens=(
+            "proposer_max_tokens_cap": proposer_max_tokens_cap,
+            "proposer_visible_answer_reserve_tokens": (
                 proposer_visible_answer_reserve_tokens
             ),
-            proposer_recovery_quorum=(
+            "proposer_recovery_quorum": (
                 configured_min_success if min_success_explicit else None
             ),
-            _emit_logs=emit_logs,
-            _stage_observability_out=(
+            "cache_continuity_available": (
+                bool(inputs.get("cache_continuity_available"))
+                if use_cache_affinity
+                else False
+            ),
+            "cache_affinity_inputs": (
+                cache_affinity_inputs
+                if use_cache_affinity and cache_affinity_policy is not None
+                else None
+            ),
+            "_emit_logs": emit_logs,
+            "_stage_observability_out": (
                 ranking_stage_observability_out if emit_logs else None
             ),
-        )
+        }
+        if use_cache_affinity and cache_affinity_unavailable_reasons:
+            rank_kwargs["_cache_affinity_unavailable_reasons"] = (
+                cache_affinity_unavailable_reasons
+            )
+        return rank_models(**rank_kwargs)
 
     runtime_health_filter_trace = None
     runtime_health_enabled = bool(
         not isinstance(registry_allowlist, Mapping)
         and callable(getattr(provider_health_ledger, "runtime_facts", None))
     )
-    if runtime_health_enabled:
-        baseline_decision = rank_snapshot(emit_logs=False)
-        hard_filter = baseline_decision.trace.get("hard_filter")
+    runtime_health_baseline_decision = None
+
+    def refresh_runtime_health_filter() -> dict[str, Any] | None:
+        if runtime_health_baseline_decision is None:
+            return None
+        hard_filter = runtime_health_baseline_decision.trace.get("hard_filter")
         hard_filter_map = (
             hard_filter if isinstance(hard_filter, Mapping) else {}
         )
-        runtime_health_filter_trace = (
-            _apply_runtime_health_candidate_filter(
-                snapshot,
-                health_ledger=provider_health_ledger,
-                inherited_provider_config=inherited_provider_config,
-                eligible_identities_by_role={
-                    "proposer": list(
-                        hard_filter_map.get("eligible_proposer_ids") or []
-                    ),
-                    "aggregator": list(
-                        hard_filter_map.get("eligible_aggregator_ids") or []
-                    ),
-                },
-                preferred_identities_by_role={
-                    "proposer": [
-                        *(baseline_decision.trace.get("selected_P") or []),
-                        *(baseline_decision.trace.get("backup_P") or []),
-                    ],
-                    "aggregator": list(
-                        baseline_decision.trace.get("aggregator_candidates")
+        return _apply_runtime_health_candidate_filter(
+            snapshot,
+            health_ledger=provider_health_ledger,
+            inherited_provider_config=inherited_provider_config,
+            eligible_identities_by_role={
+                "proposer": list(
+                    hard_filter_map.get("eligible_proposer_ids") or []
+                ),
+                "aggregator": list(
+                    hard_filter_map.get("eligible_aggregator_ids") or []
+                ),
+            },
+            preferred_identities_by_role={
+                "proposer": [
+                    *(
+                        runtime_health_baseline_decision.trace.get(
+                            "selected_P"
+                        )
                         or []
                     ),
-                },
-                minimum_by_role={
-                    "proposer": int(
-                        baseline_decision.trace.get("N_min") or 1
+                    *(
+                        runtime_health_baseline_decision.trace.get("backup_P")
+                        or []
                     ),
-                    "aggregator": 1,
-                },
-            )
+                ],
+                "aggregator": list(
+                    runtime_health_baseline_decision.trace.get(
+                        "aggregator_candidates"
+                    )
+                    or []
+                ),
+            },
+            minimum_by_role={
+                "proposer": int(
+                    runtime_health_baseline_decision.trace.get("N_min") or 1
+                ),
+                "aggregator": 1,
+            },
         )
-    decision = rank_snapshot(emit_logs=True)
+
+    if runtime_health_enabled:
+        runtime_health_baseline_decision = rank_snapshot(
+            emit_logs=False,
+            use_cache_affinity=False,
+        )
+        runtime_health_filter_trace = refresh_runtime_health_filter()
+    decision = rank_snapshot(
+        emit_logs=True,
+        use_cache_affinity=cache_affinity_policy is not None,
+    )
+
+    def selected_cache_guards_match() -> bool:
+        if cache_affinity_policy is None or cache_affinity_session_epoch is None:
+            return True
+        selected: list[
+            tuple[Literal["proposer", "aggregator"], Any]
+        ] = [
+            *(("proposer", model) for model in decision.proposers),
+            *(("proposer", model) for model in decision.backup_proposers),
+            *(("aggregator", model) for model in decision.aggregator_candidates),
+        ]
+        for role, model in selected:
+            identity = str(model.identity).casefold()
+            receipt = cache_affinity_matched_receipts.get((role, identity))
+            if receipt is None:
+                continue
+            deployment = refresh_cache_affinity_deployment(model)
+            resolution, credential_token, upstream = deployment
+            if cache_affinity_outer_projection is None:
+                return False
+            thinking_projection = _cache_affinity_selected_mode(
+                model,
+                topology="multiple",
+                thinking_assignment_enabled=thinking_assignment_enabled,
+                outer_projection=cache_affinity_outer_projection,
+            )
+            if thinking_projection is None:
+                return False
+            current_guard = _cache_affinity_guard_for_resolution(
+                resolution,
+                credential_token,
+                role=role,
+                topology="multiple",
+                session_epoch=cache_affinity_session_epoch,
+                upstream=upstream,
+                thinking_enabled=thinking_projection.thinking_enabled,
+                effective_thinking_level=(
+                    thinking_projection.effective_thinking_level
+                ),
+                thinking_budget_tokens=(
+                    thinking_projection.thinking_budget_tokens
+                ),
+            )
+            if current_guard != receipt.cache_domain_guard:
+                return False
+        return True
+
+    def selected_adjusted_cache_health_is_unavailable() -> bool:
+        runtime_facts = getattr(provider_health_ledger, "runtime_facts", None)
+        if (
+            not runtime_health_enabled
+            or cache_affinity_policy is None
+            or not callable(runtime_facts)
+        ):
+            return False
+        adjusted_by_role = {
+            "proposer": _cache_affinity_adjusted_trace_identities(
+                decision.trace,
+                role="proposer",
+            ),
+            "aggregator": _cache_affinity_adjusted_trace_identities(
+                decision.trace,
+                role="aggregator",
+            ),
+        }
+        selected = [
+            *(("proposer", model) for model in decision.proposers),
+            *(("proposer", model) for model in decision.backup_proposers),
+            *(
+                ("aggregator", model)
+                for model in decision.aggregator_candidates
+            ),
+        ]
+        checked_deployments: set[tuple[str, str, str]] = set()
+        for role, model in selected:
+            identity = str(model.identity).strip().casefold()
+            if (
+                identity not in adjusted_by_role[role]
+                or (role, identity) not in cache_affinity_matched_receipts
+            ):
+                continue
+            resolution, _, upstream = refresh_cache_affinity_deployment(model)
+            provider_config = resolution.provider_config
+            if not resolution.ready or provider_config is None:
+                continue
+            binding = (
+                str(provider_config.provider or "").strip().casefold(),
+                str(provider_config.model or "").strip(),
+                upstream,
+            )
+            if binding in checked_deployments:
+                continue
+            checked_deployments.add(binding)
+            try:
+                fresh_health = runtime_facts(
+                    provider_config.provider,
+                    provider_config.model,
+                    upstream=upstream,
+                )
+            except Exception:  # noqa: BLE001 - health telemetry fails open
+                log.debug(
+                    "llm_ensemble.runtime_health_snapshot_failed",
+                    provider=provider_config.provider,
+                    model=provider_config.model,
+                    exc_info=True,
+                )
+                continue
+            if isinstance(
+                fresh_health, Mapping
+            ) and _fresh_runtime_health_unavailable_reason(fresh_health):
+                return True
+        return False
+
+    cache_guards_match = selected_cache_guards_match()
+    cache_health_unavailable = bool(
+        cache_guards_match
+        and selected_adjusted_cache_health_is_unavailable()
+    )
+    if not cache_guards_match or cache_health_unavailable:
+        if cache_health_unavailable:
+            runtime_health_filter_trace = refresh_runtime_health_filter()
+        decision = rank_snapshot(
+            emit_logs=True,
+            use_cache_affinity=False,
+        )
     if generation_filter_trace is not None:
         decision.trace["generation_policy_filter"] = generation_filter_trace
     if canary_filter_trace is not None:
@@ -22176,25 +24043,58 @@ def _build_router_dynamic_members(
             ),
         )
 
-    proposers = [
-        _member_from_ref(
-            ranked_ref(model, role="proposer"),
+    def materialize_ranked_member(
+        model: Any,
+        *,
+        role: Literal["proposer", "aggregator"],
+        label: str,
+    ) -> EnsembleMemberConfig:
+        deployment = (
+            refresh_cache_affinity_deployment(model)
+            if cache_affinity_policy is not None
+            or cache_affinity_collection_enabled
+            else cache_affinity_deployments.get(
+                str(model.identity).casefold()
+            )
+        )
+        member = _member_from_ref(
+            ranked_ref(model, role=role),
             config=config,
             inherited=inherited_provider_config,
-            label=f"proposer_{index + 1}",
+            label=label,
             credential_pool_acquirer=credential_pool_acquirer,
             session_key=session_key,
+            _resolved_deployment=(deployment[0] if deployment is not None else None),
+        )
+        registry_facts = getattr(model, "registry_facts", None)
+        return replace(
+            member,
+            _cache_affinity_actual_model_aliases=(
+                _frozen_cache_affinity_model_aliases(registry_facts)
+                if isinstance(registry_facts, Mapping)
+                else ()
+            ),
+            _cache_affinity_credential_namespace_token=(
+                deployment[1]
+                if deployment is not None
+                and isinstance(deployment[1], CredentialNamespaceToken)
+                else None
+            ),
+        )
+
+    proposers = [
+        materialize_ranked_member(
+            model,
+            role="proposer",
+            label=f"proposer_{index + 1}",
         )
         for index, model in enumerate(decision.proposers)
     ]
     proposer_backups = [
-        _member_from_ref(
-            ranked_ref(model, role="proposer"),
-            config=config,
-            inherited=inherited_provider_config,
+        materialize_ranked_member(
+            model,
+            role="proposer",
             label=f"proposer_backup_{index}",
-            credential_pool_acquirer=credential_pool_acquirer,
-            session_key=session_key,
         )
         for index, model in enumerate(
             decision.backup_proposers,
@@ -22203,22 +24103,16 @@ def _build_router_dynamic_members(
     ]
     if proposer_backups_out is not None:
         proposer_backups_out.extend(proposer_backups)
-    aggregator = _member_from_ref(
-        ranked_ref(decision.aggregator, role="aggregator"),
-        config=config,
-        inherited=inherited_provider_config,
+    aggregator = materialize_ranked_member(
+        decision.aggregator,
+        role="aggregator",
         label="aggregator",
-        credential_pool_acquirer=credential_pool_acquirer,
-        session_key=session_key,
     )
     aggregator_fallbacks = [
-        _member_from_ref(
-            ranked_ref(model, role="aggregator"),
-            config=config,
-            inherited=inherited_provider_config,
+        materialize_ranked_member(
+            model,
+            role="aggregator",
             label=f"aggregator_fallback_{index}",
-            credential_pool_acquirer=credential_pool_acquirer,
-            session_key=session_key,
         )
         for index, model in enumerate(decision.aggregator_candidates[1:], start=1)
     ]
@@ -22279,6 +24173,12 @@ class RouterSingleRoute:
     effective_thinking_level: str | None = None
     thinking_fallback_reason: str = ""
     thinking_policy_version: str = ""
+    actual_model_aliases: tuple[str, ...] = field(default=(), repr=False)
+    credential_namespace_token: CredentialNamespaceToken | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 def _router_single_managed_thinking_is_executable(
@@ -22340,6 +24240,7 @@ def resolve_router_single_route(
     from .compat_policy import compat_policy_for_kind, model_matches_policy_prefix
     from .ranking_router import (
         RANKING_CONFIG_SCHEMA_VERSION,
+        CacheAffinityUnavailableReason,
         DynamicRankingError,
         TaskAnalysisResult,
         _is_validated_ranking_config,
@@ -22376,6 +24277,9 @@ def resolve_router_single_route(
         )
 
     inputs = dict(ranking_inputs or {})
+    cache_affinity_collection_enabled = (
+        inputs.get("cache_affinity_collection_enabled") is True
+    )
     prepared_ranking_config = getattr(ensemble_cfg, "prepared_ranking_config", None)
     frozen_resolution = None
     if callable(prepared_ranking_config):
@@ -22675,12 +24579,42 @@ def resolve_router_single_route(
         facts["runtime_context_window_source"] = str(context_source)
 
     candidate_deployments: list[tuple[str, str, str]] = []
+    if isinstance(inputs.get("cache_affinity_policy"), Mapping):
+        (
+            cache_affinity_policy,
+            cache_affinity_receipts,
+            cache_affinity_session_epoch,
+            cache_affinity_now,
+            cache_affinity_quote_resolver,
+            cache_affinity_outer_projection,
+        ) = _cache_affinity_private_inputs(inputs, topology="single")
+    else:
+        cache_affinity_policy = None
+        cache_affinity_receipts = ()
+        cache_affinity_session_epoch = None
+        cache_affinity_now = None
+        cache_affinity_quote_resolver = None
+        cache_affinity_outer_projection = None
+    cache_affinity_inputs: dict[
+        str,
+        dict[str, CacheAffinityEvidenceInput],
+    ] = {"single": {}}
+    cache_affinity_matched_receipts: dict[str, CacheAffinityReceipt] = {}
+    cache_affinity_unavailable_reasons: list[dict[str, str]] = []
+    cache_affinity_deployments: dict[
+        str,
+        tuple[ProviderDeploymentResolution, object, str],
+    ] = {}
+    cache_affinity_rows: dict[str, dict[str, Any]] = {}
+    cache_affinity_refresh_attempted: set[str] = set()
     for row in snapshot["models"]:
         facts = row.get("registry_facts")
         if not isinstance(facts, dict):
             continue
         provider_id = str(facts.get("provider") or "")
         model_id = str(facts.get("model_id") or "")
+        identity = f"{provider_id}:{model_id}".strip().casefold()
+        cache_affinity_rows[identity] = row
         if thinking_assignment_enabled and provider_id.strip().lower() == "openrouter":
             provider_policy = compat_policy_for_kind("openrouter")
             upstream = canonicalize_provider_routing_upstream(
@@ -22709,22 +24643,179 @@ def resolve_router_single_route(
             ):
                 sends_temperature = False
             facts["runtime_temperature_parameter_required"] = sends_temperature
-        try:
-            credential_available = _resolve_member_deployment(
-                _EnsembleModelRef(provider=provider_id, model=model_id),
-                inherited_provider_config,
-                config=config,
-                credential_pool_acquirer=credential_pool_acquirer,
-                session_key=session_key,
-            ).ready
-        except Exception:  # noqa: BLE001 - retained as hard-filter evidence
-            credential_available = False
+        ref = _EnsembleModelRef(provider=provider_id, model=model_id)
+        if cache_affinity_policy is not None:
+            try:
+                inherited_identity_matches = bool(
+                    str(inherited_provider_config.provider or "").strip().casefold()
+                    == provider_id.strip().casefold()
+                    and str(inherited_provider_config.model or "").strip()
+                    == model_id.strip()
+                )
+                resolution, credential_token = (
+                    resolve_provider_deployment_cache_identity(
+                        config,
+                        provider_id,
+                        model_id,
+                        inherited_provider_config=inherited_provider_config,
+                        overrides=ref,
+                        session_key=session_key,
+                        turn_metadata=turn_metadata,
+                        replay_provider_state=(
+                            bool(inherited_provider_config.replay_provider_state)
+                            if inherited_identity_matches
+                            else False
+                        ),
+                        credential_pool_acquirer=credential_pool_acquirer,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - readiness stays hard-filter evidence
+                credential_available = False
+            else:
+                credential_available = resolution.ready
+                upstream = canonicalize_provider_routing_upstream(
+                    facts.get("endpoint_provider_pin")
+                    or inherited_provider_config.provider_routing.get(model_id, "")
+                )
+                cache_affinity_deployments[identity] = (
+                    resolution,
+                    credential_token,
+                    upstream,
+                )
+                if (
+                    credential_available
+                    and credential_token is not None
+                    and cache_affinity_session_epoch is not None
+                    and cache_affinity_now is not None
+                    and cache_affinity_outer_projection is not None
+                ):
+                    try:
+                        thinking_modes = _cache_affinity_thinking_modes(
+                            row,
+                            topology="single",
+                            thinking_assignment_enabled=(
+                                thinking_assignment_enabled
+                            ),
+                            outer_projection=(
+                                cache_affinity_outer_projection
+                            ),
+                        )
+                        evidence, receipt = (
+                            _cache_affinity_evidence_for_candidate(
+                                identity=identity,
+                                role="single",
+                                topology="single",
+                                resolution=resolution,
+                                credential_namespace_token=credential_token,
+                                upstream=upstream,
+                                row=row,
+                                thinking_modes=thinking_modes,
+                                receipts=cache_affinity_receipts,
+                                policy=cache_affinity_policy,
+                                session_epoch=cache_affinity_session_epoch,
+                                now_monotonic=cache_affinity_now,
+                                quote_resolver=(
+                                    cache_affinity_quote_resolver
+                                ),
+                            )
+                        )
+                        if evidence is not None and receipt is not None:
+                            cache_affinity_inputs["single"][identity] = evidence
+                            cache_affinity_matched_receipts[identity] = receipt
+                            if (
+                                str(
+                                    cache_affinity_policy.get("strategy")
+                                    or ""
+                                )
+                                == "expected_cost"
+                                and evidence.price_quote is None
+                            ):
+                                cache_affinity_unavailable_reasons.append(
+                                    {
+                                        "role": "single",
+                                        "identity": identity,
+                                        "reason": (
+                                            CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
+                                        ),
+                                    }
+                                )
+                    except Exception:  # noqa: BLE001 - optional evidence fails closed
+                        pass
+        else:
+            try:
+                credential_available = _resolve_member_deployment(
+                    ref,
+                    inherited_provider_config,
+                    config=config,
+                    credential_pool_acquirer=credential_pool_acquirer,
+                    session_key=session_key,
+                ).ready
+            except Exception:  # noqa: BLE001 - retained as hard-filter evidence
+                credential_available = False
         facts["credential_available"] = credential_available
         upstream = canonicalize_provider_routing_upstream(
             facts.get("endpoint_provider_pin")
             or inherited_provider_config.provider_routing.get(model_id, "")
         )
         candidate_deployments.append((provider_id, model_id, upstream))
+
+    def refresh_cache_affinity_deployment(
+        model: Any,
+    ) -> tuple[ProviderDeploymentResolution, object, str]:
+        identity = str(model.identity).strip().casefold()
+        if identity in cache_affinity_refresh_attempted:
+            return cache_affinity_deployments[identity]
+        cache_affinity_refresh_attempted.add(identity)
+        row = cache_affinity_rows.get(identity)
+        facts = row.get("registry_facts") if isinstance(row, Mapping) else None
+        fact_map = facts if isinstance(facts, dict) else {}
+        provider_id = str(model.provider or "").strip()
+        model_id = str(model.model_id or "").strip()
+        inherited_identity_matches = bool(
+            str(inherited_provider_config.provider or "").strip().casefold()
+            == provider_id.casefold()
+            and str(inherited_provider_config.model or "").strip()
+            == model_id
+        )
+        try:
+            resolution, credential_token = (
+                resolve_provider_deployment_cache_identity(
+                    config,
+                    provider_id,
+                    model_id,
+                    inherited_provider_config=inherited_provider_config,
+                    overrides=_EnsembleModelRef(
+                        provider=provider_id,
+                        model=model_id,
+                        thinking=getattr(model, "thinking", None),
+                    ),
+                    session_key=session_key,
+                    turn_metadata=turn_metadata,
+                    replay_provider_state=(
+                        bool(inherited_provider_config.replay_provider_state)
+                        if inherited_identity_matches
+                        else False
+                    ),
+                    credential_pool_acquirer=credential_pool_acquirer,
+                )
+            )
+        except Exception:  # noqa: BLE001 - selected readiness fails closed
+            resolution = ProviderDeploymentResolution(
+                provider=provider_id,
+                model=model_id,
+                ready=False,
+                reason="deployment_resolution_failed",
+            )
+            credential_token = None
+        upstream = canonicalize_provider_routing_upstream(
+            fact_map.get("endpoint_provider_pin")
+            or inherited_provider_config.provider_routing.get(model_id, "")
+        )
+        deployment = (resolution, credential_token, upstream)
+        cache_affinity_deployments[identity] = deployment
+        if fact_map:
+            fact_map["credential_available"] = resolution.ready
+        return deployment
 
     generation_filter_trace = _apply_strict_generation_policy_candidate_filter(
         snapshot,
@@ -22770,18 +24861,150 @@ def resolve_router_single_route(
                 if unavailable_reason not in proposer_reasons:
                     proposer_reasons.append(unavailable_reason)
 
-    decision = rank_single_model(
-        task_analysis=task_analysis,
-        user_profile=user_profile,
-        request_context=request_context,
-        registry_snapshot=snapshot,
-        routed_tier=routed_tier,
-        routing_confidence=routing_confidence,
-        requires_tools=requires_tools,
-        ranking_config=ranking_config,
-        decision_id=decision_id,
-        ranking_thinking_assignment_enabled=thinking_assignment_enabled,
+    def rank_single_snapshot(*, use_cache_affinity: bool) -> Any:
+        rank_kwargs: dict[str, Any] = {
+            "task_analysis": task_analysis,
+            "user_profile": user_profile,
+            "request_context": request_context,
+            "registry_snapshot": snapshot,
+            "routed_tier": routed_tier,
+            "routing_confidence": routing_confidence,
+            "requires_tools": requires_tools,
+            "ranking_config": ranking_config,
+            "decision_id": decision_id,
+            "ranking_thinking_assignment_enabled": (
+                thinking_assignment_enabled
+            ),
+            "cache_continuity_available": (
+                bool(inputs.get("cache_continuity_available"))
+                if use_cache_affinity
+                else False
+            ),
+            "cache_affinity_inputs": (
+                cache_affinity_inputs
+                if use_cache_affinity and cache_affinity_policy is not None
+                else None
+            ),
+        }
+        if use_cache_affinity and cache_affinity_unavailable_reasons:
+            rank_kwargs["_cache_affinity_unavailable_reasons"] = (
+                cache_affinity_unavailable_reasons
+            )
+        return rank_single_model(**rank_kwargs)
+
+    decision = rank_single_snapshot(
+        use_cache_affinity=cache_affinity_policy is not None,
     )
+    selected_receipt = cache_affinity_matched_receipts.get(
+        str(decision.model.identity).casefold()
+    )
+    selected_cache_guard_matches = True
+    selected_cache_deployment: (
+        tuple[ProviderDeploymentResolution, object, str] | None
+    ) = None
+    if (
+        selected_receipt is not None
+        and cache_affinity_session_epoch is not None
+    ):
+        selected_cache_deployment = refresh_cache_affinity_deployment(
+            decision.model
+        )
+        thinking_projection = (
+            _cache_affinity_selected_mode(
+                decision.model,
+                topology="single",
+                thinking_assignment_enabled=thinking_assignment_enabled,
+                outer_projection=cache_affinity_outer_projection,
+            )
+            if cache_affinity_outer_projection is not None
+            else None
+        )
+        selected_guard = (
+            _cache_affinity_guard_for_resolution(
+                selected_cache_deployment[0],
+                selected_cache_deployment[1],
+                role="single",
+                topology="single",
+                session_epoch=cache_affinity_session_epoch,
+                upstream=selected_cache_deployment[2],
+                thinking_enabled=thinking_projection.thinking_enabled,
+                effective_thinking_level=(
+                    thinking_projection.effective_thinking_level
+                ),
+                thinking_budget_tokens=(
+                    thinking_projection.thinking_budget_tokens
+                ),
+            )
+            if thinking_projection is not None
+            else None
+        )
+        selected_cache_guard_matches = bool(
+            selected_guard == selected_receipt.cache_domain_guard
+        )
+
+    selected_cache_health_unavailable = False
+    selected_identity = str(decision.model.identity).strip().casefold()
+    if (
+        selected_cache_guard_matches
+        and selected_receipt is not None
+        and selected_cache_deployment is not None
+        and selected_identity
+        in _cache_affinity_adjusted_trace_identities(
+            decision.trace,
+            role="single",
+        )
+        and callable(runtime_facts)
+    ):
+        resolution, _, upstream = selected_cache_deployment
+        provider_config = resolution.provider_config
+        if resolution.ready and provider_config is not None:
+            try:
+                fresh_health = runtime_facts(
+                    provider_config.provider,
+                    provider_config.model,
+                    upstream=upstream,
+                    candidate_deployments=candidate_deployments,
+                )
+            except Exception:  # noqa: BLE001 - health telemetry fails open
+                log.debug(
+                    "llm_ensemble.runtime_health_snapshot_failed",
+                    provider=provider_config.provider,
+                    model=provider_config.model,
+                    exc_info=True,
+                )
+            else:
+                if isinstance(fresh_health, Mapping):
+                    health_row = dict(fresh_health)
+                    runtime_health_trace.append(health_row)
+                    row = cache_affinity_rows.get(selected_identity)
+                    facts = (
+                        row.get("registry_facts")
+                        if isinstance(row, Mapping)
+                        else None
+                    )
+                    reason = _fresh_runtime_health_unavailable_reason(
+                        fresh_health
+                    )
+                    if isinstance(facts, dict):
+                        facts[_RUNTIME_HEALTH_FACTS_FIELD] = health_row
+                        if reason:
+                            reasons_by_role = facts.setdefault(
+                                _RUNTIME_HARD_FILTER_REASONS_BY_ROLE_FIELD,
+                                {},
+                            )
+                            proposer_reasons = reasons_by_role.setdefault(
+                                "proposer",
+                                [],
+                            )
+                            if reason not in proposer_reasons:
+                                proposer_reasons.append(reason)
+                    selected_cache_health_unavailable = bool(reason)
+
+    if (
+        not selected_cache_guard_matches
+        or selected_cache_health_unavailable
+    ):
+        decision = rank_single_snapshot(use_cache_affinity=False)
     if allowlist_trace is not None:
         decision.trace["candidate_allowlist"] = allowlist_trace
     if generation_filter_trace is not None:
@@ -22812,24 +25035,34 @@ def resolve_router_single_route(
         and str(inherited_provider_config.model or "").strip()
         == str(model.model_id or "").strip()
     )
-    resolution = resolve_provider_deployment(
-        config,
-        model.provider,
-        model.model_id,
-        inherited_provider_config=inherited_provider_config,
-        overrides=_EnsembleModelRef(
-            provider=model.provider,
-            model=model.model_id,
-            thinking=model.thinking,
-        ),
-        session_key=session_key,
-        turn_metadata=turn_metadata,
-        replay_provider_state=(
-            bool(inherited_provider_config.replay_provider_state)
-            if inherited_identity_matches
-            else False
-        ),
-        credential_pool_acquirer=credential_pool_acquirer,
+    cached_deployment = (
+        refresh_cache_affinity_deployment(model)
+        if cache_affinity_policy is not None
+        or cache_affinity_collection_enabled
+        else cache_affinity_deployments.get(str(model.identity).casefold())
+    )
+    resolution = (
+        cached_deployment[0]
+        if cached_deployment is not None
+        else resolve_provider_deployment(
+            config,
+            model.provider,
+            model.model_id,
+            inherited_provider_config=inherited_provider_config,
+            overrides=_EnsembleModelRef(
+                provider=model.provider,
+                model=model.model_id,
+                thinking=model.thinking,
+            ),
+            session_key=session_key,
+            turn_metadata=turn_metadata,
+            replay_provider_state=(
+                bool(inherited_provider_config.replay_provider_state)
+                if inherited_identity_matches
+                else False
+            ),
+            credential_pool_acquirer=credential_pool_acquirer,
+        )
     )
     if not resolution.ready or resolution.provider_config is None:
         raise DynamicRankingError(
@@ -22933,6 +25166,15 @@ def resolve_router_single_route(
         effective_thinking_level=model.effective_thinking_level,
         thinking_fallback_reason=model.thinking_fallback_reason,
         thinking_policy_version=model.thinking_policy_version,
+        actual_model_aliases=_frozen_cache_affinity_model_aliases(
+            model.registry_facts
+        ),
+        credential_namespace_token=(
+            cached_deployment[1]
+            if cached_deployment is not None
+            and isinstance(cached_deployment[1], CredentialNamespaceToken)
+            else None
+        ),
     )
 
 
@@ -23309,8 +25551,9 @@ def _member_from_ref(
     label: str,
     credential_pool_acquirer: CredentialPoolAcquirer | None = None,
     session_key: str = "",
+    _resolved_deployment: ProviderDeploymentResolution | None = None,
 ) -> EnsembleMemberConfig:
-    resolution = _resolve_member_deployment(
+    resolution = _resolved_deployment or _resolve_member_deployment(
         ref,
         inherited,
         config=config,
@@ -23494,11 +25737,29 @@ class _DefaultRouterDynamicRetryFactory:
         compare=False,
     )
     absolute_deadline: float | None = None
+    cache_affinity_receipt_callback: (
+        _EnsembleCacheAffinityReceiptCallback | None
+    ) = field(default=None, repr=False, compare=False)
+    cache_affinity_turn_id: str = ""
+    cache_affinity_provider_instance_token: str = field(
+        default="",
+        repr=False,
+        compare=False,
+    )
+    cache_affinity_session_epoch: int | None = None
+    cache_affinity_sequence_allocator: (
+        _EnsembleCacheAffinitySequenceAllocator | None
+    ) = field(default=None, repr=False, compare=False)
 
     def __call__(
         self,
         ranking_inputs: Mapping[str, Any],
     ) -> EnsembleProvider:
+        provider_instance_token = (
+            uuid.uuid4().hex
+            if self.cache_affinity_receipt_callback is not None
+            else ""
+        )
         return build_ensemble_provider_from_config(
             config=self.config,
             inherited_provider_config=self.inherited_provider_config,
@@ -23520,6 +25781,17 @@ class _DefaultRouterDynamicRetryFactory:
             _provider_health_ledger=self.provider_health_ledger,
             _canary_rollout_ledger=self.canary_rollout_ledger,
             _absolute_deadline=self.absolute_deadline,
+            _cache_affinity_receipt_callback=(
+                self.cache_affinity_receipt_callback
+            ),
+            _cache_affinity_turn_id=self.cache_affinity_turn_id,
+            _cache_affinity_provider_instance_token=(
+                provider_instance_token
+            ),
+            _cache_affinity_session_epoch=self.cache_affinity_session_epoch,
+            _cache_affinity_sequence_allocator=(
+                self.cache_affinity_sequence_allocator
+            ),
         )
 
 
@@ -23541,6 +25813,16 @@ def build_ensemble_provider_from_config(
     _provider_health_ledger: Any | None = None,
     _canary_rollout_ledger: CanaryRolloutLedger | None = None,
     _absolute_deadline: float | None = None,
+    _cache_affinity_receipt_callback: (
+        _EnsembleCacheAffinityReceiptCallback | None
+    ) = None,
+    _cache_affinity_turn_id: str = "",
+    _cache_affinity_provider_instance_token: str = "",
+    _cache_affinity_session_epoch: int | None = None,
+    _cache_affinity_sequence_allocator: (
+        _EnsembleCacheAffinitySequenceAllocator | None
+    ) = None,
+    _cache_affinity_provider_instance_generation: int | None = None,
 ) -> EnsembleProvider:
     ensemble_cfg = getattr(config, "llm_ensemble", None)
     if ensemble_cfg is None:
@@ -24037,6 +26319,20 @@ def build_ensemble_provider_from_config(
         ),
         _admission_settings=admission_settings,
         _absolute_deadline=_absolute_deadline,
+        _cache_affinity_receipt_callback=(
+            _cache_affinity_receipt_callback
+        ),
+        _cache_affinity_turn_id=_cache_affinity_turn_id,
+        _cache_affinity_provider_instance_token=(
+            _cache_affinity_provider_instance_token
+        ),
+        _cache_affinity_session_epoch=_cache_affinity_session_epoch,
+        _cache_affinity_sequence_allocator=(
+            _cache_affinity_sequence_allocator
+        ),
+        _cache_affinity_provider_instance_generation=(
+            _cache_affinity_provider_instance_generation
+        ),
     )
     if selection_mode == "router_dynamic":
         if router_dynamic_retry_factory is None:
@@ -24077,6 +26373,19 @@ def build_ensemble_provider_from_config(
                     provider_health_ledger=_provider_health_ledger,
                     canary_rollout_ledger=_canary_rollout_ledger,
                     absolute_deadline=_absolute_deadline,
+                    cache_affinity_receipt_callback=(
+                        _cache_affinity_receipt_callback
+                    ),
+                    cache_affinity_turn_id=_cache_affinity_turn_id,
+                    cache_affinity_provider_instance_token=(
+                        _cache_affinity_provider_instance_token
+                    ),
+                    cache_affinity_session_epoch=(
+                        _cache_affinity_session_epoch
+                    ),
+                    cache_affinity_sequence_allocator=(
+                        provider._cache_affinity_sequence_allocator
+                    ),
                 )
             )
         initial_plan = provider.selection_plan_execution_snapshot()

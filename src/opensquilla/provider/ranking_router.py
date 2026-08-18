@@ -22,6 +22,7 @@ import weakref
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from enum import StrEnum
 from functools import cache, wraps
 from importlib import resources
 from types import MappingProxyType
@@ -36,12 +37,27 @@ from .admission import (
     ProviderAdmissionLeaseGuard,
     ProviderAdmissionTimeoutError,
 )
+from .cache_affinity import (
+    CacheAffinityEvidenceInput,
+    CacheAffinityScoreAdjustment,
+    CacheRole,
+    CacheTopology,
+    cache_affinity_score_adjustment,
+)
 from .failures import ProviderFailureKind, classify_provider_error
 from .protocol import LLMProvider
 from .thinking_execution import THINKING_PHYSICAL_EVIDENCE_SCHEMA
 from .types import ChatConfig, DoneEvent, ErrorEvent, Message, TextDeltaEvent
 
 log = structlog.get_logger(__name__)
+
+
+class CacheAffinityUnavailableReason(StrEnum):
+    """Safe, replayable reasons why cache evidence could not affect ranking."""
+
+    EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE = (
+        "exact_cache_price_quote_unavailable"
+    )
 
 RANKING_VERSION = "step2-ranking-v4"
 SINGLE_MODEL_RANKING_VERSION = "router-single-ranking-v1"
@@ -810,7 +826,10 @@ def _json_number(value: Any) -> float | None:
 
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
     return number if math.isfinite(number) else None
 
 
@@ -1137,7 +1156,13 @@ def _ranking_number(config: Mapping[str, Any], *path: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         dotted = ".".join(path)
         raise DynamicRankingError(f"router_dynamic ranking config {dotted} must be numeric")
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        dotted = ".".join(path)
+        raise DynamicRankingError(
+            f"router_dynamic ranking config {dotted} must be finite"
+        ) from exc
     if not math.isfinite(number):
         dotted = ".".join(path)
         raise DynamicRankingError(f"router_dynamic ranking config {dotted} must be finite")
@@ -1228,6 +1253,96 @@ def _require_exact_config_keys(
         f"{'.'.join(path)} has unknown or missing keys "
         f"(missing={missing}, unknown={unknown})"
     )
+
+
+def _validate_cache_affinity_config(config: Mapping[str, Any]) -> None:
+    session = _ranking_mapping(config, "session")
+    if "kv_cache_affinity" not in session:
+        return
+    _ranking_mapping(config, "session", "kv_cache_affinity")
+    strategy = _ranking_string(config, "session", "kv_cache_affinity", "strategy")
+    common_keys = {"strategy", "topologies", "ttl_seconds", "age_decay"}
+    if strategy == "bonus":
+        strategy_key = "bonus_by_evidence"
+    elif strategy == "expected_cost":
+        strategy_key = "hit_probability_by_evidence"
+    else:
+        raise DynamicRankingError(
+            "router_dynamic ranking config session.kv_cache_affinity.strategy "
+            "must be bonus or expected_cost"
+        )
+    _require_exact_config_keys(
+        config,
+        ("session", "kv_cache_affinity"),
+        {*common_keys, strategy_key},
+    )
+    topologies = _ranking_string_list(
+        config,
+        "session",
+        "kv_cache_affinity",
+        "topologies",
+    )
+    if not topologies or not set(topologies).issubset({"single", "multiple"}):
+        raise DynamicRankingError(
+            "router_dynamic ranking config session.kv_cache_affinity.topologies "
+            "must be a non-empty unique list of single or multiple"
+        )
+    if _ranking_number(
+        config,
+        "session",
+        "kv_cache_affinity",
+        "ttl_seconds",
+    ) <= 0.0:
+        raise DynamicRankingError(
+            "router_dynamic ranking config session.kv_cache_affinity.ttl_seconds "
+            "must be positive"
+        )
+    age_decay = _ranking_string(
+        config,
+        "session",
+        "kv_cache_affinity",
+        "age_decay",
+    )
+    if age_decay not in {"none", "linear"}:
+        raise DynamicRankingError(
+            "router_dynamic ranking config session.kv_cache_affinity.age_decay "
+            "must be none or linear"
+        )
+    evidence_values = _ranking_mapping(
+        config,
+        "session",
+        "kv_cache_affinity",
+        strategy_key,
+    )
+    if set(evidence_values) != {"read_hit", "write_only"}:
+        raise DynamicRankingError(
+            "router_dynamic ranking config session.kv_cache_affinity."
+            f"{strategy_key} must contain read_hit and write_only"
+        )
+    maximum_bonus = _ranking_number(config, "session", "score_delta")
+    for evidence_kind in ("read_hit", "write_only"):
+        value = _ranking_number(
+            config,
+            "session",
+            "kv_cache_affinity",
+            strategy_key,
+            evidence_kind,
+        )
+        if value < 0.0 or (strategy == "bonus" and value > maximum_bonus):
+            suffix = (
+                "must be non-negative and no greater than session.score_delta"
+                if strategy == "bonus"
+                else "must be between 0 and 1"
+            )
+            raise DynamicRankingError(
+                "router_dynamic ranking config session.kv_cache_affinity."
+                f"{strategy_key}.{evidence_kind} {suffix}"
+            )
+        if strategy == "expected_cost" and value > 1.0:
+            raise DynamicRankingError(
+                "router_dynamic ranking config session.kv_cache_affinity."
+                f"{strategy_key}.{evidence_kind} must be between 0 and 1"
+            )
 
 
 def _thinking_assignment_policy(
@@ -1469,6 +1584,8 @@ def _validate_ranking_config(
         )
     proposer_count_config = _ranking_mapping(config, "proposer_count")
     aggregator_config = _ranking_mapping(config, "aggregator")
+    session_config = _ranking_mapping(config, "session")
+    has_cache_affinity = "kv_cache_affinity" in session_config
     has_backup_count = "backup_count" in proposer_count_config
     has_aggregator_candidate_count = "candidate_count" in aggregator_config
     if has_backup_count != has_aggregator_candidate_count:
@@ -1705,6 +1822,7 @@ def _validate_ranking_config(
             "max_escalation_level",
             "default_quality_feedback",
             "route_cache_max_entries",
+            *(("kv_cache_affinity",) if has_cache_affinity else ()),
         },
         ("proposer_count",): {
             "effective_tier_rounding_offset",
@@ -1756,6 +1874,7 @@ def _validate_ranking_config(
         }
     for object_path, expected_keys in fixed_object_keys.items():
         _require_exact_config_keys(config, object_path, expected_keys)
+    _validate_cache_affinity_config(config)
     if "prompt_version" in aggregator_config:
         from .aggregator_prompt import AGGREGATOR_PROMPT_VERSIONS
 
@@ -2849,6 +2968,24 @@ def _resolve_ranking_config(
     ranking_config: Mapping[str, Any] | None,
 ) -> Mapping[str, Any]:
     return _prepare_ranking_config(ranking_config)
+
+
+def router_dynamic_cache_affinity_policy(
+    ranking_config: Mapping[str, Any] | None = None,
+    *,
+    topology: CacheTopology,
+) -> dict[str, Any] | None:
+    """Return a detached policy only when cache affinity is enabled here."""
+
+    if topology not in {"single", "multiple"}:
+        raise DynamicRankingError(
+            "router_dynamic cache affinity topology must be single or multiple"
+        )
+    policy = _cache_affinity_policy_for_topology(
+        _resolve_ranking_config(ranking_config),
+        topology,
+    )
+    return copy.deepcopy(dict(policy)) if policy is not None else None
 
 
 def task_analyzer_policy(
@@ -4126,9 +4263,14 @@ def normalize_task_profile(
     routed_tier: str,
     request_context: Mapping[str, Any],
     ranking_config: Mapping[str, Any] | None = None,
+    cache_continuity_available: bool = False,
 ) -> tuple[dict[str, Any], bool, list[str]]:
     """Validate and normalize a task-analyzer payload into the Step2 schema."""
 
+    if not isinstance(cache_continuity_available, bool):
+        raise DynamicRankingError(
+            "router_dynamic cache_continuity_available must be a boolean"
+        )
     effective_config = _resolve_ranking_config(ranking_config)
     fallback = fallback_task_profile(
         routed_tier=routed_tier,
@@ -4264,10 +4406,23 @@ def normalize_task_profile(
     else:
         intent_confidence = parsed_intent_confidence
     last_route = request_context.get("last_route")
-    if intent_type != default_intent and not isinstance(last_route, Mapping):
-        intent_type = default_intent
-        intent_confidence = 0.0
-    elif intent_type != default_intent and not last_route:
+    cache_can_preserve_continue = (
+        cache_continuity_available
+        and _cache_affinity_policy_for_topology(effective_config, "single")
+        is not None
+        and intent_type == "continue"
+        and intent_confidence
+        >= _ranking_number(
+            effective_config,
+            "session",
+            "intent_confidence_threshold",
+        )
+    )
+    if (
+        intent_type != default_intent
+        and (not isinstance(last_route, Mapping) or not last_route)
+        and not cache_can_preserve_continue
+    ):
         intent_type = default_intent
         intent_confidence = 0.0
 
@@ -4677,6 +4832,7 @@ def frozen_task_analysis_result(
     routed_tier: str,
     request_context: Mapping[str, Any],
     ranking_config: Mapping[str, Any] | None = None,
+    cache_continuity_available: bool = False,
 ) -> TaskAnalysisResult:
     """Materialize a validated frozen profile without starting an LLM request."""
 
@@ -4698,6 +4854,7 @@ def frozen_task_analysis_result(
         routed_tier=routed_tier,
         request_context=request_context,
         ranking_config=ranking_config,
+        cache_continuity_available=cache_continuity_available,
     )
     origin_outcome = (
         entry.get("origin_outcome")
@@ -5026,6 +5183,7 @@ async def analyze_task_with_provider(
     admission_controller: ProviderAdmissionController | None = None,
     admission_deadline: float | None = None,
     admission_before_release: Callable[[str], None] | None = None,
+    cache_continuity_available: bool = False,
     _attempt: int = 1,
     _retry_feedback: str = "",
     _accumulated_usage: Mapping[str, Any] | None = None,
@@ -5035,6 +5193,10 @@ async def analyze_task_with_provider(
 ) -> TaskAnalysisResult:
     """Use the caller-supplied dedicated provider as the task analyzer."""
 
+    if not isinstance(cache_continuity_available, bool):
+        raise DynamicRankingError(
+            "router_dynamic cache_continuity_available must be a boolean"
+        )
     effective_config = _resolve_ranking_config(ranking_config)
     configured_policy = task_analyzer_policy(effective_config)
     configured_provider_id = str(configured_policy["provider"])
@@ -5628,6 +5790,7 @@ async def analyze_task_with_provider(
             routed_tier=routed_tier,
             request_context=request_context,
             ranking_config=effective_config,
+            cache_continuity_available=cache_continuity_available,
         )
         if not schema_valid:
             raise TaskAnalyzerSchemaError(
@@ -5739,6 +5902,7 @@ async def analyze_task_with_provider(
                 admission_controller=admission_controller,
                 admission_deadline=admission_deadline,
                 admission_before_release=admission_before_release,
+                cache_continuity_available=cache_continuity_available,
                 _attempt=_attempt + 1,
                 _retry_feedback=(
                     exc.feedback if schema_error and _schema_repair_only else reason
@@ -5964,6 +6128,7 @@ async def analyze_task_with_fallback_chain(
     admission_controller: ProviderAdmissionController | None = None,
     admission_deadline: float | None = None,
     admission_before_release: Callable[[str], None] | None = None,
+    cache_continuity_available: bool = False,
 ) -> TaskAnalysisResult:
     """Try an ordered Analyzer chain under one absolute deadline.
 
@@ -5974,6 +6139,10 @@ async def analyze_task_with_fallback_chain(
     identity is contradictory.
     """
 
+    if not isinstance(cache_continuity_available, bool):
+        raise DynamicRankingError(
+            "router_dynamic cache_continuity_available must be a boolean"
+        )
     normalized_candidates = _normalize_task_analyzer_chain_candidates(candidates)
     effective_config = _resolve_ranking_config(ranking_config)
     chain_policy = task_analyzer_chain_policy(effective_config)
@@ -6083,6 +6252,7 @@ async def analyze_task_with_fallback_chain(
             admission_controller=admission_controller,
             admission_deadline=admission_deadline,
             admission_before_release=admission_before_release,
+            cache_continuity_available=cache_continuity_available,
             _accumulated_usage=accumulated_usage,
             _allow_provider_stream_fallback=False,
             _absolute_deadline=chain_absolute_deadline,
@@ -7693,6 +7863,650 @@ def _model_price(model: RankedModel, ranking_config: Mapping[str, Any]) -> float
     return max(0.0, _as_float(raw, 0.0))
 
 
+def _model_price_components(model: RankedModel) -> tuple[float, float] | None:
+    """Return the exact decomposable rates used by ``_model_price``."""
+
+    raw = model.registry_facts.get("price")
+    if not isinstance(raw, Mapping):
+        return None
+    raw_input = raw.get("input_per_million", raw.get("input", raw.get("prompt")))
+    raw_output = raw.get(
+        "output_per_million",
+        raw.get("output", raw.get("completion")),
+    )
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        or float(value) < 0.0
+        for value in (raw_input, raw_output)
+    ):
+        return None
+    return float(raw_input), float(raw_output)
+
+
+def _model_price_source(model: RankedModel) -> str | None:
+    """Return the frozen registry provenance for decomposable model pricing."""
+
+    raw = model.registry_facts.get("price")
+    if not isinstance(raw, Mapping):
+        return None
+    value = raw.get("price_source")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def _cache_affinity_policy_for_topology(
+    ranking_config: Mapping[str, Any],
+    topology: CacheTopology,
+) -> Mapping[str, Any] | None:
+    session = _ranking_mapping(ranking_config, "session")
+    raw_policy = session.get("kv_cache_affinity")
+    if raw_policy is None:
+        return None
+    if not isinstance(raw_policy, Mapping):
+        raise DynamicRankingError(
+            "router_dynamic ranking config session.kv_cache_affinity must be an object"
+        )
+    topologies = raw_policy.get("topologies")
+    if not isinstance(topologies, Sequence) or isinstance(
+        topologies,
+        (str, bytes, bytearray),
+    ):
+        raise DynamicRankingError(
+            "router_dynamic ranking config session.kv_cache_affinity.topologies "
+            "must be a list"
+        )
+    return raw_policy if topology in topologies else None
+
+
+def _cache_affinity_unavailable_reason_trace(
+    raw_reasons: Sequence[Mapping[str, Any]] | None,
+    *,
+    policy: Mapping[str, Any] | None,
+    topology: CacheTopology,
+    candidate_identities: Sequence[str],
+) -> list[dict[str, str]]:
+    """Validate safe diagnostics supplied by the deployment-aware caller."""
+
+    if raw_reasons is None:
+        return []
+    if (
+        policy is None
+        or str(policy.get("strategy") or "") != "expected_cost"
+    ):
+        raise DynamicRankingError(
+            "router_dynamic cache affinity unavailable reasons require an "
+            "active expected_cost policy"
+        )
+    if not isinstance(raw_reasons, Sequence) or isinstance(
+        raw_reasons,
+        (str, bytes, bytearray),
+    ):
+        raise DynamicRankingError(
+            "router_dynamic cache affinity unavailable reasons must be a list"
+        )
+    allowed_roles = (
+        {"single"}
+        if topology == "single"
+        else {"proposer", "aggregator"}
+    )
+    allowed_identities = set(candidate_identities)
+    allowed_reason = (
+        CacheAffinityUnavailableReason.EXACT_CACHE_PRICE_QUOTE_UNAVAILABLE.value
+    )
+    normalized: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for raw in raw_reasons:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "role",
+            "identity",
+            "reason",
+        }:
+            raise DynamicRankingError(
+                "router_dynamic cache affinity unavailable reason is malformed"
+            )
+        role = str(raw.get("role") or "")
+        identity = str(raw.get("identity") or "")
+        reason = str(raw.get("reason") or "")
+        key = (role, identity, reason)
+        if (
+            role not in allowed_roles
+            or identity not in allowed_identities
+            or reason != allowed_reason
+            or key in seen
+        ):
+            raise DynamicRankingError(
+                "router_dynamic cache affinity unavailable reason is invalid"
+            )
+        seen.add(key)
+        normalized.append(
+            {"role": role, "identity": identity, "reason": reason}
+        )
+    normalized.sort(
+        key=lambda row: (row["role"], row["identity"], row["reason"])
+    )
+    return normalized
+
+
+def _cache_affinity_evidence(
+    cache_affinity_inputs: Mapping[
+        str,
+        Mapping[str, CacheAffinityEvidenceInput],
+    ]
+    | None,
+    *,
+    role: CacheRole,
+    identity: str,
+) -> CacheAffinityEvidenceInput | None:
+    if cache_affinity_inputs is None:
+        return None
+    if not isinstance(cache_affinity_inputs, Mapping):
+        raise DynamicRankingError(
+            "router_dynamic cache_affinity_inputs must be a role mapping"
+        )
+    role_inputs = cache_affinity_inputs.get(role)
+    if role_inputs is None:
+        return None
+    if not isinstance(role_inputs, Mapping):
+        raise DynamicRankingError(
+            f"router_dynamic cache_affinity_inputs.{role} must be an identity mapping"
+        )
+    evidence = role_inputs.get(identity)
+    if evidence is None:
+        return None
+    if (
+        not isinstance(evidence, CacheAffinityEvidenceInput)
+        or evidence.identity != identity
+        or evidence.role != role
+    ):
+        raise DynamicRankingError(
+            "router_dynamic cache affinity evidence identity or role is invalid"
+        )
+    return evidence
+
+
+def _cache_affinity_adjustment_for_model(
+    *,
+    policy: Mapping[str, Any],
+    cache_affinity_inputs: Mapping[
+        str,
+        Mapping[str, CacheAffinityEvidenceInput],
+    ]
+    | None,
+    role: CacheRole,
+    topology: CacheTopology,
+    model: RankedModel,
+    task_profile: Mapping[str, Any],
+    analyzer_schema_valid: bool,
+    session_intent: str,
+    request_context: Mapping[str, Any],
+    proposer_count: int,
+    cost_weight: float,
+    ranking_config: Mapping[str, Any],
+    frozen_adjustments: Mapping[
+        str,
+        Mapping[str, CacheAffinityScoreAdjustment],
+    ]
+    | None = None,
+) -> CacheAffinityScoreAdjustment | None:
+    intent = task_profile.get("session_intent")
+    intent_map = intent if isinstance(intent, Mapping) else {}
+    if frozen_adjustments is not None:
+        role_adjustments = frozen_adjustments.get(role)
+        if role_adjustments is not None and not isinstance(
+            role_adjustments, Mapping
+        ):
+            raise DynamicRankingError(
+                "router_dynamic frozen cache adjustments must be role mappings"
+            )
+        frozen = (
+            role_adjustments.get(model.identity)
+            if isinstance(role_adjustments, Mapping)
+            else None
+        )
+        if frozen is not None:
+            _validate_frozen_cache_adjustment_for_model(
+                frozen,
+                policy=policy,
+                role=role,
+                model=model,
+                task_profile=task_profile,
+                analyzer_schema_valid=analyzer_schema_valid,
+                session_intent=session_intent,
+                request_context=request_context,
+                proposer_count=proposer_count,
+                cost_weight=cost_weight,
+                ranking_config=ranking_config,
+            )
+            return frozen
+    if (
+        analyzer_schema_valid is not True
+        or session_intent != "continue"
+        or _as_float(intent_map.get("confidence"), 0.0)
+        < _ranking_number(
+            ranking_config,
+            "session",
+            "intent_confidence_threshold",
+        )
+    ):
+        return None
+    evidence = _cache_affinity_evidence(
+        cache_affinity_inputs,
+        role=role,
+        identity=model.identity,
+    )
+    if evidence is None:
+        return None
+    budget = _routing_budget(request_context, ranking_config)
+    price_components = _model_price_components(model)
+    input_price, output_price = (
+        price_components if price_components is not None else (None, None)
+    )
+    ranking_price_source = _model_price_source(model)
+    if str(policy.get("strategy") or "") == "expected_cost" and (
+        ranking_price_source is None
+        or evidence.ranking_price_source != ranking_price_source
+    ):
+        return None
+    adjustment = cache_affinity_score_adjustment(
+        policy=policy,
+        evidence=evidence,
+        role=role,
+        topology=topology,
+        intent_type=session_intent,
+        intent_confidence=_as_float(intent_map.get("confidence"), 0.0),
+        intent_confidence_threshold=_ranking_number(
+            ranking_config,
+            "session",
+            "intent_confidence_threshold",
+        ),
+        estimated_input_tokens=budget["input"],
+        tool_log_tokens=budget["tools"],
+        candidate_output_tokens=budget["candidate"],
+        proposer_count=proposer_count,
+        ranking_input_per_million=input_price,
+        ranking_output_per_million=output_price,
+        ranking_price_source=ranking_price_source,
+        price_input_weight=_ranking_number(
+            ranking_config,
+            "normalization",
+            "price_input_weight",
+        ),
+        price_output_weight=_ranking_number(
+            ranking_config,
+            "normalization",
+            "price_output_weight",
+        ),
+        price_reference_usd_per_million=_ranking_number(
+            ranking_config,
+            "normalization",
+            "price_reference_usd_per_million",
+        ),
+        cost_weight=cost_weight,
+    )
+    if adjustment.strategy == "expected_cost" and not adjustment.price_source:
+        return None
+    return adjustment
+
+
+def _cache_affinity_trace_number(
+    raw: Mapping[str, Any],
+    key: str,
+    *,
+    minimum: float = 0.0,
+    maximum: float | None = None,
+) -> float:
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise DynamicRankingError(
+            f"router_dynamic frozen cache adjustment {key} must be numeric"
+        )
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise DynamicRankingError(
+            f"router_dynamic frozen cache adjustment {key} must be finite"
+        ) from exc
+    if (
+        not math.isfinite(number)
+        or number < minimum
+        or (maximum is not None and number > maximum)
+    ):
+        raise DynamicRankingError(
+            f"router_dynamic frozen cache adjustment {key} is out of range"
+        )
+    return number
+
+
+def _cache_affinity_trace_int(
+    raw: Mapping[str, Any],
+    key: str,
+) -> int:
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DynamicRankingError(
+            f"router_dynamic frozen cache adjustment {key} must be an exact integer"
+        )
+    return value
+
+
+def _cache_affinity_adjustment_from_trace(
+    raw: Mapping[str, Any],
+    *,
+    policy: Mapping[str, Any],
+) -> CacheAffinityScoreAdjustment:
+    strategy = str(policy.get("strategy") or "")
+    common_keys = {
+        "identity",
+        "role",
+        "strategy",
+        "evidence_kind",
+        "decay_factor",
+        "score_adjustment",
+    }
+    expected_cost_keys = {
+        "N",
+        "K",
+        "cache_evidence_tokens",
+        "p",
+        "price_source",
+        "cache_read_per_million",
+        "cache_write_per_million",
+        "C0",
+        "Chit",
+        "Cmiss",
+        "r_input_eff",
+        "cost_normalized_before",
+        "cost_normalized_after",
+    }
+    expected_keys = common_keys | (
+        expected_cost_keys if strategy == "expected_cost" else set()
+    )
+    if set(raw) != expected_keys:
+        raise DynamicRankingError(
+            "router_dynamic frozen cache adjustment has unknown or missing keys"
+        )
+    identity = str(raw.get("identity") or "").strip()
+    role = str(raw.get("role") or "")
+    evidence_kind = str(raw.get("evidence_kind") or "")
+    if (
+        not identity
+        or role not in {"single", "proposer", "aggregator"}
+        or raw.get("strategy") != strategy
+        or evidence_kind not in {"read_hit", "write_only"}
+    ):
+        raise DynamicRankingError(
+            "router_dynamic frozen cache adjustment identity or discriminator is invalid"
+        )
+    decay_factor = _cache_affinity_trace_number(
+        raw,
+        "decay_factor",
+        maximum=1.0,
+    )
+    score_adjustment = _cache_affinity_trace_number(
+        raw,
+        "score_adjustment",
+        minimum=-math.inf,
+    )
+    if strategy == "bonus":
+        configured = policy.get("bonus_by_evidence")
+        if not isinstance(configured, Mapping):
+            raise DynamicRankingError(
+                "router_dynamic frozen cache bonus policy is invalid"
+            )
+        expected_score = float(configured[evidence_kind]) * decay_factor
+        if score_adjustment != expected_score or not math.isfinite(expected_score):
+            raise DynamicRankingError(
+                "router_dynamic frozen cache bonus does not match the policy"
+            )
+        return CacheAffinityScoreAdjustment(
+            identity=identity,
+            role=role,  # type: ignore[arg-type]
+            strategy=strategy,
+            evidence_kind=evidence_kind,  # type: ignore[arg-type]
+            decay_factor=decay_factor,
+            score_adjustment=score_adjustment,
+        )
+    if strategy != "expected_cost":
+        raise DynamicRankingError(
+            "router_dynamic frozen cache strategy is invalid"
+        )
+    input_tokens = _cache_affinity_trace_int(raw, "N")
+    cache_tokens = _cache_affinity_trace_int(raw, "K")
+    observed_cache_tokens = _cache_affinity_trace_int(
+        raw,
+        "cache_evidence_tokens",
+    )
+    if (
+        input_tokens <= 0
+        or cache_tokens <= 0
+        or observed_cache_tokens <= 0
+        or cache_tokens > input_tokens
+        or cache_tokens != min(input_tokens, observed_cache_tokens)
+    ):
+        raise DynamicRankingError(
+            "router_dynamic frozen cache token projection is invalid"
+        )
+    price_source = str(raw.get("price_source") or "").strip()
+    if not price_source:
+        raise DynamicRankingError(
+            "router_dynamic frozen cache price source is missing"
+        )
+    return CacheAffinityScoreAdjustment(
+        identity=identity,
+        role=role,  # type: ignore[arg-type]
+        strategy=strategy,
+        evidence_kind=evidence_kind,  # type: ignore[arg-type]
+        decay_factor=decay_factor,
+        score_adjustment=score_adjustment,
+        input_tokens=input_tokens,
+        cache_tokens=cache_tokens,
+        observed_cache_tokens=observed_cache_tokens,
+        hit_probability=_cache_affinity_trace_number(
+            raw,
+            "p",
+            maximum=1.0,
+        ),
+        price_source=price_source,
+        cache_read_per_million=_cache_affinity_trace_number(
+            raw,
+            "cache_read_per_million",
+        ),
+        cache_write_per_million=_cache_affinity_trace_number(
+            raw,
+            "cache_write_per_million",
+        ),
+        baseline_input_cost_usd=_cache_affinity_trace_number(raw, "C0"),
+        cache_hit_input_cost_usd=_cache_affinity_trace_number(raw, "Chit"),
+        cache_miss_input_cost_usd=_cache_affinity_trace_number(raw, "Cmiss"),
+        effective_input_per_million=_cache_affinity_trace_number(
+            raw,
+            "r_input_eff",
+        ),
+        cost_normalized_before=_cache_affinity_trace_number(
+            raw,
+            "cost_normalized_before",
+            maximum=1.0,
+        ),
+        cost_normalized_after=_cache_affinity_trace_number(
+            raw,
+            "cost_normalized_after",
+            maximum=1.0,
+        ),
+    )
+
+
+def _validate_frozen_cache_adjustment_for_model(
+    adjustment: CacheAffinityScoreAdjustment,
+    *,
+    policy: Mapping[str, Any],
+    role: CacheRole,
+    model: RankedModel,
+    task_profile: Mapping[str, Any],
+    analyzer_schema_valid: bool,
+    session_intent: str,
+    request_context: Mapping[str, Any],
+    proposer_count: int,
+    cost_weight: float,
+    ranking_config: Mapping[str, Any],
+) -> None:
+    if (
+        adjustment.identity != model.identity
+        or adjustment.role != role
+        or adjustment.strategy != str(policy.get("strategy") or "")
+    ):
+        raise DynamicRankingError(
+            "router_dynamic frozen cache adjustment model binding is invalid"
+        )
+    intent = task_profile.get("session_intent")
+    intent_map = intent if isinstance(intent, Mapping) else {}
+    if (
+        analyzer_schema_valid is not True
+        or session_intent != "continue"
+        or _as_float(intent_map.get("confidence"), 0.0)
+        < _ranking_number(
+            ranking_config,
+            "session",
+            "intent_confidence_threshold",
+        )
+        or adjustment.decay_factor <= 0.0
+    ):
+        raise DynamicRankingError(
+            "router_dynamic frozen cache adjustment violates the intent gate"
+        )
+    if adjustment.strategy == "bonus":
+        configured = policy.get("bonus_by_evidence")
+        expected = (
+            float(configured[adjustment.evidence_kind])
+            * adjustment.decay_factor
+            if isinstance(configured, Mapping)
+            else math.nan
+        )
+        if adjustment.score_adjustment != expected:
+            raise DynamicRankingError(
+                "router_dynamic frozen cache bonus does not match the model"
+            )
+        return
+    budget = _routing_budget(request_context, ranking_config)
+    expected_input_tokens = budget["input"] + budget["tools"]
+    if role == "aggregator":
+        expected_input_tokens += proposer_count * budget["candidate"]
+    probabilities = policy.get("hit_probability_by_evidence")
+    expected_probability = (
+        float(probabilities[adjustment.evidence_kind])
+        * adjustment.decay_factor
+        if isinstance(probabilities, Mapping)
+        else math.nan
+    )
+    expected_score = cost_weight * (
+        adjustment.cost_normalized_before
+        - adjustment.cost_normalized_after
+    )
+    price_components = _model_price_components(model)
+    if price_components is None:
+        raise DynamicRankingError(
+            "router_dynamic frozen expected-cost adjustment lacks decomposable pricing"
+        )
+    ranking_price_source = _model_price_source(model)
+    if (
+        ranking_price_source is None
+        or adjustment.price_source != ranking_price_source
+    ):
+        raise DynamicRankingError(
+            "router_dynamic frozen expected-cost adjustment price source does not match the model"
+        )
+    input_price, output_price = price_components
+    input_weight = _ranking_number(
+        ranking_config,
+        "normalization",
+        "price_input_weight",
+    )
+    output_weight = _ranking_number(
+        ranking_config,
+        "normalization",
+        "price_output_weight",
+    )
+    price_reference = _ranking_number(
+        ranking_config,
+        "normalization",
+        "price_reference_usd_per_million",
+    )
+    expected_baseline = expected_input_tokens * input_price / 1_000_000
+    expected_cache_tokens = min(
+        expected_input_tokens,
+        adjustment.observed_cache_tokens,
+    )
+    expected_normal_tokens = expected_input_tokens - expected_cache_tokens
+    expected_hit = (
+        expected_normal_tokens * input_price
+        + expected_cache_tokens * adjustment.cache_read_per_million
+    ) / 1_000_000
+    expected_miss = (
+        expected_normal_tokens * input_price
+        + expected_cache_tokens * adjustment.cache_write_per_million
+    ) / 1_000_000
+    expected_input_cost = (
+        adjustment.hit_probability * expected_hit
+        + (1.0 - adjustment.hit_probability)
+        * expected_miss
+    )
+    expected_effective_rate = (
+        expected_input_cost / expected_input_tokens * 1_000_000
+    )
+    old_rate = input_weight * input_price + output_weight * output_price
+    new_rate = old_rate + input_weight * (
+        expected_effective_rate - input_price
+    )
+    expected_normalized_before = _clamp(old_rate / price_reference)
+    expected_normalized_after = _clamp(new_rate / price_reference)
+    if (
+        adjustment.input_tokens != expected_input_tokens
+        or adjustment.cache_tokens != expected_cache_tokens
+        or adjustment.hit_probability != expected_probability
+        or adjustment.baseline_input_cost_usd != expected_baseline
+        or adjustment.cache_hit_input_cost_usd != expected_hit
+        or adjustment.cache_miss_input_cost_usd != expected_miss
+        or adjustment.effective_input_per_million
+        != expected_effective_rate
+        or adjustment.cost_normalized_before
+        != expected_normalized_before
+        or adjustment.cost_normalized_after
+        != expected_normalized_after
+        or adjustment.score_adjustment != expected_score
+    ):
+        raise DynamicRankingError(
+            "router_dynamic frozen expected-cost adjustment does not match ranking inputs"
+        )
+
+
+def _cache_affinity_adjustments_from_trace(
+    raw_inputs: object,
+    *,
+    policy: Mapping[str, Any],
+    candidate_pool_size: int,
+) -> dict[str, dict[str, CacheAffinityScoreAdjustment]]:
+    if not isinstance(raw_inputs, list) or len(raw_inputs) > 2 * candidate_pool_size:
+        raise DynamicRankingError(
+            "router_dynamic frozen cache adjustment table is invalid or unbounded"
+        )
+    result: dict[str, dict[str, CacheAffinityScoreAdjustment]] = {}
+    for raw in raw_inputs:
+        if not isinstance(raw, Mapping):
+            raise DynamicRankingError(
+                "router_dynamic frozen cache adjustment row must be an object"
+            )
+        adjustment = _cache_affinity_adjustment_from_trace(raw, policy=policy)
+        role_rows = result.setdefault(adjustment.role, {})
+        if adjustment.identity in role_rows:
+            raise DynamicRankingError(
+                "router_dynamic frozen cache adjustment table has duplicates"
+            )
+        role_rows[adjustment.identity] = adjustment
+    return result
+
+
 def _cost_latency_weights(
     task_profile: Mapping[str, Any],
     user_profile: Mapping[str, Any] | None,
@@ -7813,6 +8627,14 @@ def _score_trace(row: Mapping[str, Any], ranking_config: Mapping[str, Any]) -> d
         "S_base_clean": round(_as_float(row.get("base_clean")), decimal_places),
         "S_base": round(_as_float(row.get("base")), decimal_places),
     }
+    cache_adjustment = row.get("cache_affinity_adjustment")
+    if isinstance(cache_adjustment, CacheAffinityScoreAdjustment):
+        trace["cache_affinity"] = cache_adjustment.trace()
+        if "final_score" in row:
+            trace["S_final"] = round(
+                _as_float(row.get("final_score")),
+                decimal_places,
+            )
     if "role_reliability" in ranking_config:
         trace.update(
             {
@@ -7852,7 +8674,13 @@ def _apply_session_adjustment(
     task_profile: Mapping[str, Any],
     request_context: Mapping[str, Any],
     ranking_config: Mapping[str, Any],
+    *,
+    cache_continuity_available: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if not isinstance(cache_continuity_available, bool):
+        raise DynamicRankingError(
+            "router_dynamic cache_continuity_available must be a boolean"
+        )
     before = copy.deepcopy(dict(task_profile))
     adjusted = copy.deepcopy(dict(task_profile))
     intent = adjusted.get("session_intent")
@@ -7866,7 +8694,15 @@ def _apply_session_adjustment(
         intent_type = "new_task"
     last_route = request_context.get("last_route")
     last_route_map = last_route if isinstance(last_route, Mapping) else {}
-    if intent_type != "new_task" and not last_route_map:
+    if (
+        intent_type != "new_task"
+        and not last_route_map
+        and not (
+            cache_continuity_available
+            and intent_type == "continue"
+            and intent_confidence >= confidence_threshold
+        )
+    ):
         intent_type = "new_task"
     previous_escalation = max(0, _as_int(last_route_map.get("escalation_level"), 0))
     escalation_level = previous_escalation
@@ -8411,6 +9247,19 @@ def _aggregator_rows(
     request_context: Mapping[str, Any],
     ranking_config: Mapping[str, Any],
     thinking_policy: Mapping[str, Any] | None = None,
+    cache_affinity_policy: Mapping[str, Any] | None = None,
+    cache_affinity_inputs: Mapping[
+        str,
+        Mapping[str, CacheAffinityEvidenceInput],
+    ]
+    | None = None,
+    cache_analyzer_schema_valid: bool = False,
+    cache_session_intent: str = "new_task",
+    frozen_cache_adjustments: Mapping[
+        str,
+        Mapping[str, CacheAffinityScoreAdjustment],
+    ]
+    | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     scored: list[dict[str, Any]] = []
     eligible, filters = _aggregator_filter_rows(
@@ -8454,27 +9303,45 @@ def _aggregator_rows(
             / latency_reference
         )
         score = quality + session_score - bias - cost_weight * cost - latency_weight * latency
-        scored.append(
-            {
-                "model": model,
-                "score": score,
-                "quality": quality,
-                "quality_before_reliability": quality_before_reliability,
-                "reliability": reliability,
-                "task_match": task_match,
-                "role_fit": role_fit,
-                "session_score": session_score,
-                "bias": bias,
-                "self_overlap": self_overlap,
-                "family_overlap": family_overlap,
-                "vendor_overlap": vendor_overlap,
-                "cost": cost,
-                "latency": latency,
-                "cost_weight": cost_weight,
-                "latency_weight": latency_weight,
-                "context_need_tokens": context_need,
-            }
-        )
+        row: dict[str, Any] = {
+            "model": model,
+            "score": score,
+            "quality": quality,
+            "quality_before_reliability": quality_before_reliability,
+            "reliability": reliability,
+            "task_match": task_match,
+            "role_fit": role_fit,
+            "session_score": session_score,
+            "bias": bias,
+            "self_overlap": self_overlap,
+            "family_overlap": family_overlap,
+            "vendor_overlap": vendor_overlap,
+            "cost": cost,
+            "latency": latency,
+            "cost_weight": cost_weight,
+            "latency_weight": latency_weight,
+            "context_need_tokens": context_need,
+        }
+        if cache_affinity_policy is not None:
+            adjustment = _cache_affinity_adjustment_for_model(
+                policy=cache_affinity_policy,
+                cache_affinity_inputs=cache_affinity_inputs,
+                role="aggregator",
+                topology="multiple",
+                model=model,
+                task_profile=task_profile,
+                analyzer_schema_valid=cache_analyzer_schema_valid,
+                session_intent=cache_session_intent,
+                request_context=request_context,
+                proposer_count=len(proposers),
+                cost_weight=cost_weight,
+                ranking_config=ranking_config,
+                frozen_adjustments=frozen_cache_adjustments,
+            )
+            if adjustment is not None:
+                row["cache_affinity_adjustment"] = adjustment
+                row["score"] = score + adjustment.score_adjustment
+        scored.append(row)
     scored.sort(
         key=lambda row: (
             -_as_float(row["score"]),
@@ -8509,6 +9376,9 @@ def _aggregator_score_trace(
         "family_overlap": bool(row.get("family_overlap")),
         "vendor_overlap": bool(row.get("vendor_overlap")),
     }
+    cache_adjustment = row.get("cache_affinity_adjustment")
+    if isinstance(cache_adjustment, CacheAffinityScoreAdjustment):
+        trace["cache_affinity"] = cache_adjustment.trace()
     if "role_reliability" in ranking_config:
         trace.update(
             {
@@ -8668,6 +9538,21 @@ def rank_single_model(
     ranking_config: Mapping[str, Any] | None = None,
     decision_id: str = "",
     ranking_thinking_assignment_enabled: bool = False,
+    cache_continuity_available: bool = False,
+    cache_affinity_inputs: Mapping[
+        str,
+        Mapping[str, CacheAffinityEvidenceInput],
+    ]
+    | None = None,
+    _cache_affinity_unavailable_reasons: Sequence[
+        Mapping[str, Any]
+    ]
+    | None = None,
+    _cache_affinity_replay_adjustments: Mapping[
+        str,
+        Mapping[str, CacheAffinityScoreAdjustment],
+    ]
+    | None = None,
 ) -> SingleModelRankingDecision:
     """Select one enabled direct-call model by proposer base score."""
 
@@ -8688,6 +9573,17 @@ def rank_single_model(
         ranking_config,
         thinking_assignment_enabled=ranking_thinking_assignment_enabled,
     )
+    cache_affinity_policy = _cache_affinity_policy_for_topology(
+        effective_ranking_config,
+        "single",
+    )
+    if (
+        _cache_affinity_replay_adjustments is not None
+        and cache_affinity_policy is None
+    ):
+        raise DynamicRankingError(
+            "router_dynamic frozen cache adjustments require an enabled single policy"
+        )
     model_registry_snapshot = {
         "schema_version": copy.deepcopy(registry_snapshot.get("schema_version")),
         "snapshot_version": copy.deepcopy(registry_snapshot.get("snapshot_version")),
@@ -8754,6 +9650,14 @@ def rank_single_model(
             "router_dynamic single-model registry snapshot contains duplicate "
             "model identities"
         )
+    cache_affinity_unavailable_reasons = (
+        _cache_affinity_unavailable_reason_trace(
+            _cache_affinity_unavailable_reasons,
+            policy=cache_affinity_policy,
+            topology="single",
+            candidate_identities=[model.identity for model in models],
+        )
+    )
 
     user_profile_enabled = user_profile is not None
     effective_user_profile = user_profile if user_profile is not None else {}
@@ -8761,6 +9665,9 @@ def rank_single_model(
         task_analysis.profile,
         request_context,
         effective_ranking_config,
+        cache_continuity_available=(
+            cache_continuity_available and cache_affinity_policy is not None
+        ),
     )
     effective_tier = _effective_tier(task_profile, effective_ranking_config)
 
@@ -8823,9 +9730,31 @@ def rank_single_model(
         )
         for model in eligible
     ]
+    if cache_affinity_policy is not None:
+        for row in score_rows:
+            adjustment = _cache_affinity_adjustment_for_model(
+                policy=cache_affinity_policy,
+                cache_affinity_inputs=cache_affinity_inputs,
+                role="single",
+                topology="single",
+                model=row["model"],
+                task_profile=task_profile,
+                analyzer_schema_valid=task_analysis.schema_valid,
+                session_intent=str(session_trace["intent"]),
+                request_context=request_context,
+                proposer_count=1,
+                cost_weight=_as_float(row["cost_weight"]),
+                ranking_config=effective_ranking_config,
+                frozen_adjustments=_cache_affinity_replay_adjustments,
+            )
+            if adjustment is not None:
+                row["cache_affinity_adjustment"] = adjustment
+                row["final_score"] = (
+                    _as_float(row["base"]) + adjustment.score_adjustment
+                )
     score_rows.sort(
         key=lambda row: (
-            -_as_float(row["base"]),
+            -_as_float(row.get("final_score"), row["base"]),
             -_as_float(row["quality"]),
             row["model"].identity,
         )
@@ -8980,6 +9909,31 @@ def rank_single_model(
         "proposer_count": 1,
         "stop_reason": "single_model_top1_selected",
     }
+    if cache_affinity_policy is not None:
+        trace["ranking_parameters"] = _detached_ranking_config(
+            effective_ranking_config
+        )
+        trace["requires_tools"] = requires_tools
+        trace["ranking_thinking_assignment_enabled"] = (
+            ranking_thinking_assignment_enabled
+        )
+        trace["cache_continuity_available"] = bool(
+            cache_continuity_available
+        )
+        trace["cache_affinity_inputs"] = [
+            adjustment.trace()
+            for row in score_rows
+            if isinstance(
+                adjustment := row.get("cache_affinity_adjustment"),
+                CacheAffinityScoreAdjustment,
+            )
+        ]
+        trace["selection_policy"] = "cache_adjusted_base_score_top1"
+        trace["selection_tie_breakers"][0] = "S_final_desc"
+        if cache_affinity_unavailable_reasons:
+            trace["cache_affinity_unavailable_reasons"] = (
+                cache_affinity_unavailable_reasons
+            )
     if thinking_policy is not None:
         trace.update(
             {
@@ -9086,6 +10040,21 @@ def rank_models(
     proposer_max_tokens_cap: int = 65_536,
     proposer_visible_answer_reserve_tokens: int = 4_096,
     proposer_recovery_quorum: int | None = None,
+    cache_continuity_available: bool = False,
+    cache_affinity_inputs: Mapping[
+        str,
+        Mapping[str, CacheAffinityEvidenceInput],
+    ]
+    | None = None,
+    _cache_affinity_unavailable_reasons: Sequence[
+        Mapping[str, Any]
+    ]
+    | None = None,
+    _cache_affinity_replay_adjustments: Mapping[
+        str,
+        Mapping[str, CacheAffinityScoreAdjustment],
+    ]
+    | None = None,
     _emit_logs: bool = True,
     _stage_observability_out: dict[str, Any] | None = None,
 ) -> RankingDecision:
@@ -9150,6 +10119,17 @@ def rank_models(
         ranking_config,
         thinking_assignment_enabled=ranking_thinking_assignment_enabled,
     )
+    cache_affinity_policy = _cache_affinity_policy_for_topology(
+        effective_ranking_config,
+        "multiple",
+    )
+    if (
+        _cache_affinity_replay_adjustments is not None
+        and cache_affinity_policy is None
+    ):
+        raise DynamicRankingError(
+            "router_dynamic frozen cache adjustments require an enabled multiple policy"
+        )
     if not ranking_thinking_assignment_enabled:
         registry_snapshot = _legacy_registry_snapshot_projection(registry_snapshot)
     if (
@@ -9224,12 +10204,25 @@ def rank_models(
         raise DynamicRankingError(
             "router_dynamic registry snapshot contains duplicate model identities"
         )
+    cache_affinity_unavailable_reasons = (
+        _cache_affinity_unavailable_reason_trace(
+            _cache_affinity_unavailable_reasons,
+            policy=cache_affinity_policy,
+            topology="multiple",
+            candidate_identities=[model.identity for model in models],
+        )
+    )
     registry_snapshot_hash = _canonical_hash(registry_snapshot)
     user_profile_enabled = user_profile is not None
     effective_user_profile = user_profile if user_profile is not None else {}
 
     task_profile, session_trace = _apply_session_adjustment(
-        task_analysis.profile, request_context, effective_ranking_config
+        task_analysis.profile,
+        request_context,
+        effective_ranking_config,
+        cache_continuity_available=(
+            cache_continuity_available and cache_affinity_policy is not None
+        ),
     )
     effective_tier = _effective_tier(task_profile, effective_ranking_config)
     minimum, maximum, bound_reasons = _proposer_bounds(
@@ -9423,6 +10416,26 @@ def rank_models(
         if passes_quality_floor:
             quality_candidate_rows.append(row)
 
+    if cache_affinity_policy is not None:
+        for row in quality_candidate_rows:
+            adjustment = _cache_affinity_adjustment_for_model(
+                policy=cache_affinity_policy,
+                cache_affinity_inputs=cache_affinity_inputs,
+                role="proposer",
+                topology="multiple",
+                model=row["model"],
+                task_profile=task_profile,
+                analyzer_schema_valid=task_analysis.schema_valid,
+                session_intent=str(session_trace["intent"]),
+                request_context=request_context,
+                proposer_count=0,
+                cost_weight=_as_float(row["cost_weight"]),
+                ranking_config=effective_ranking_config,
+                frozen_adjustments=_cache_affinity_replay_adjustments,
+            )
+            if adjustment is not None:
+                row["cache_affinity_adjustment"] = adjustment
+
     if (
         proposer_recovery_quorum is not None
         and len(quality_candidate_rows) < proposer_recovery_quorum
@@ -9491,18 +10504,22 @@ def rank_models(
                 + rerank_error_weight * error_complementarity
                 - rerank_similarity_penalty * similarity
             )
-            marginal_rows.append(
-                {
-                    "model": model,
-                    "marginal": marginal,
-                    "quality": row["quality"],
-                    "coverage_gain": coverage,
-                    "max_similarity": similarity,
-                    "error_complementarity": error_complementarity,
-                    "base_clean": row["base_clean"],
-                    "reliability": row["reliability"],
-                }
-            )
+            cache_adjustment = row.get("cache_affinity_adjustment")
+            if isinstance(cache_adjustment, CacheAffinityScoreAdjustment):
+                marginal += cache_adjustment.score_adjustment
+            marginal_row = {
+                "model": model,
+                "marginal": marginal,
+                "quality": row["quality"],
+                "coverage_gain": coverage,
+                "max_similarity": similarity,
+                "error_complementarity": error_complementarity,
+                "base_clean": row["base_clean"],
+                "reliability": row["reliability"],
+            }
+            if isinstance(cache_adjustment, CacheAffinityScoreAdjustment):
+                marginal_row["cache_affinity_adjustment"] = cache_adjustment
+            marginal_rows.append(marginal_row)
         marginal_rows.sort(
             key=lambda row: (
                 -_as_float(row["marginal"]),
@@ -9548,6 +10565,14 @@ def rank_models(
                 ),
                 "candidate_count": len(marginal_rows),
                 "eligible_aggregator_count": len(feasible_aggregators),
+                **(
+                    {"cache_affinity": best["cache_affinity_adjustment"].trace()}
+                    if isinstance(
+                        best.get("cache_affinity_adjustment"),
+                        CacheAffinityScoreAdjustment,
+                    )
+                    else {}
+                ),
                 "top_candidates": [
                     {
                         "identity": candidate["model"].identity,
@@ -9578,6 +10603,18 @@ def rank_models(
                         "error_complementarity": round(
                             _as_float(candidate["error_complementarity"]),
                             score_decimal_places,
+                        ),
+                        **(
+                            {
+                                "cache_affinity": candidate[
+                                    "cache_affinity_adjustment"
+                                ].trace()
+                            }
+                            if isinstance(
+                                candidate.get("cache_affinity_adjustment"),
+                                CacheAffinityScoreAdjustment,
+                            )
+                            else {}
                         ),
                     }
                     for candidate in marginal_rows[:trace_top_candidates]
@@ -9647,6 +10684,11 @@ def rank_models(
         request_context=request_context,
         ranking_config=effective_ranking_config,
         thinking_policy=thinking_policy,
+        cache_affinity_policy=cache_affinity_policy,
+        cache_affinity_inputs=cache_affinity_inputs,
+        cache_analyzer_schema_valid=task_analysis.schema_valid,
+        cache_session_intent=str(session_trace["intent"]),
+        frozen_cache_adjustments=_cache_affinity_replay_adjustments,
     )
     aggregator_filter_ms = (
         _ranking_stage_elapsed_ms(aggregator_filter_started_ns)
@@ -9940,6 +10982,22 @@ def rank_models(
             "requires_order_randomization": overlap,
         },
     }
+    if cache_affinity_policy is not None:
+        trace["cache_continuity_available"] = bool(
+            cache_continuity_available
+        )
+        trace["cache_affinity_inputs"] = [
+            adjustment.trace()
+            for row in [*quality_candidate_rows, *aggregator_rows]
+            if isinstance(
+                adjustment := row.get("cache_affinity_adjustment"),
+                CacheAffinityScoreAdjustment,
+            )
+        ]
+        if cache_affinity_unavailable_reasons:
+            trace["cache_affinity_unavailable_reasons"] = (
+                cache_affinity_unavailable_reasons
+            )
     if thinking_policy is not None:
         trace.update(
             {
@@ -10039,6 +11097,145 @@ def rank_models(
     )
 
 
+def single_ranking_trace_replay_reasons(trace: Mapping[str, Any]) -> list[str]:
+    """Replay one cache-aware router-single trace from frozen safe evidence."""
+
+    if (
+        trace.get("execution_mode") != "router_single"
+        or trace.get("ranking_version") != SINGLE_MODEL_RANKING_VERSION
+    ):
+        return ["wrong_single_ranking_replay_mode"]
+    if trace.get("user_profile_enabled") is not False:
+        return ["single_ranking_replay_requires_disabled_user_profile"]
+    registry_snapshot = trace.get("registry_snapshot")
+    request_context = trace.get("request_context")
+    ranking_parameters = trace.get("ranking_parameters")
+    raw_profile = trace.get("task_profile_pre_escalation")
+    analyzer = trace.get("task_analyzer")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (
+            registry_snapshot,
+            request_context,
+            ranking_parameters,
+            raw_profile,
+            analyzer,
+        )
+    ):
+        return ["missing_single_ranking_replay_evidence"]
+    assert isinstance(registry_snapshot, Mapping)
+    assert isinstance(request_context, Mapping)
+    assert isinstance(ranking_parameters, Mapping)
+    assert isinstance(raw_profile, Mapping)
+    assert isinstance(analyzer, Mapping)
+    try:
+        _assert_public_ranking_trace_payload(
+            registry_snapshot,
+            label="registry_snapshot",
+        )
+        _assert_public_ranking_trace_payload(
+            request_context,
+            label="request_context",
+        )
+    except DynamicRankingError:
+        return ["single_ranking_replay_secret_evidence"]
+    if (
+        _canonical_hash(registry_snapshot)
+        != str(trace.get("registry_snapshot_hash") or "")
+    ):
+        return ["single_replay_registry_snapshot_hash_mismatch"]
+    context_hash = _request_context_hash(request_context)
+    if (
+        str(request_context.get("snapshot_hash") or "") != context_hash
+        or str(trace.get("request_context_hash") or "") != context_hash
+    ):
+        return ["single_replay_request_context_hash_mismatch"]
+    if (
+        _canonical_hash(ranking_parameters)
+        != str(trace.get("ranking_config_hash") or "")
+    ):
+        return ["single_replay_ranking_config_hash_mismatch"]
+    cache_policy = _cache_affinity_policy_for_topology(
+        ranking_parameters,
+        "single",
+    )
+    raw_continuity = trace.get("cache_continuity_available")
+    requires_tools = trace.get("requires_tools")
+    thinking_enabled = trace.get("ranking_thinking_assignment_enabled")
+    if (
+        cache_policy is None
+        or not isinstance(raw_continuity, bool)
+        or not isinstance(requires_tools, bool)
+        or not isinstance(thinking_enabled, bool)
+    ):
+        return ["invalid_single_ranking_replay_cache_policy"]
+    try:
+        frozen_adjustments = _cache_affinity_adjustments_from_trace(
+            trace.get("cache_affinity_inputs"),
+            policy=cache_policy,
+            candidate_pool_size=len(registry_snapshot.get("models") or []),
+        )
+        analysis = TaskAnalysisResult(
+            profile=copy.deepcopy(dict(raw_profile)),
+            source=str(analyzer.get("source") or "replay"),
+            schema_valid=analyzer.get("schema_valid") is True,
+            confidence=_clamp(_as_float(analyzer.get("confidence"), 0.0)),
+            analyzer_version=str(
+                analyzer.get("analyzer_version") or TASK_ANALYZER_VERSION
+            ),
+            fallback_reason=str(analyzer.get("fallback_reason") or ""),
+            usage=(
+                copy.deepcopy(dict(analyzer["usage"]))
+                if isinstance(analyzer.get("usage"), Mapping)
+                else {}
+            ),
+            provider_id=str(analyzer.get("provider") or ""),
+            model_id=str(analyzer.get("model") or ""),
+            normalization_warnings=tuple(
+                str(value)
+                for value in analyzer.get("normalization_warnings") or []
+            ),
+            replay=(
+                copy.deepcopy(dict(analyzer["replay"]))
+                if isinstance(analyzer.get("replay"), Mapping)
+                else {}
+            ),
+            chain_trace=(
+                copy.deepcopy(dict(analyzer["chain"]))
+                if isinstance(analyzer.get("chain"), Mapping)
+                else {}
+            ),
+        )
+        replayed = rank_single_model(
+            task_analysis=analysis,
+            user_profile=None,
+            request_context=copy.deepcopy(dict(request_context)),
+            registry_snapshot=copy.deepcopy(dict(registry_snapshot)),
+            routed_tier=str(trace.get("routed_tier") or ""),
+            routing_confidence=_as_float(trace.get("routing_confidence"), 0.0),
+            requires_tools=requires_tools,
+            ranking_config=copy.deepcopy(dict(ranking_parameters)),
+            decision_id=str(trace.get("decision_id") or ""),
+            ranking_thinking_assignment_enabled=thinking_enabled,
+            cache_continuity_available=raw_continuity,
+            _cache_affinity_unavailable_reasons=trace.get(
+                "cache_affinity_unavailable_reasons"
+            ),
+            _cache_affinity_replay_adjustments=frozen_adjustments,
+        ).trace
+    except (
+        DynamicRankingError,
+        KeyError,
+        OverflowError,
+        TypeError,
+        ValueError,
+    ):
+        return ["invalid_single_ranking_replay_cache_affinity_inputs"]
+    if dict(trace) != replayed:
+        return ["single_frozen_ranker_replay_mismatch"]
+    return []
+
+
 _RANKING_REPLAY_FIELDS = (
     "strategy",
     "decision_id",
@@ -10061,6 +11258,9 @@ _RANKING_REPLAY_FIELDS = (
     "task_profile_post_escalation",
     "task_analyzer",
     "session",
+    "cache_continuity_available",
+    "cache_affinity_inputs",
+    "cache_affinity_unavailable_reasons",
     "user_profile_enabled",
     "user_profile_version",
     "user_profile_source",
@@ -10200,6 +11400,41 @@ def ranking_trace_replay_reasons(
     if reasons:
         return list(dict.fromkeys(reasons))
 
+    frozen_cache_adjustments: dict[
+        str,
+        dict[str, CacheAffinityScoreAdjustment],
+    ] | None = None
+    frozen_cache_continuity = False
+    replay_cache_policy = _cache_affinity_policy_for_topology(
+        ranking_parameters,
+        "multiple",
+    )
+    if replay_cache_policy is not None:
+        raw_continuity = trace.get("cache_continuity_available")
+        if not isinstance(raw_continuity, bool):
+            return ["invalid_g1_replay_cache_continuity"]
+        frozen_cache_continuity = raw_continuity
+        try:
+            frozen_cache_adjustments = _cache_affinity_adjustments_from_trace(
+                trace.get("cache_affinity_inputs"),
+                policy=replay_cache_policy,
+                candidate_pool_size=len(registry_snapshot.get("models") or []),
+            )
+        except (
+            DynamicRankingError,
+            KeyError,
+            OverflowError,
+            TypeError,
+            ValueError,
+        ):
+            return ["invalid_g1_replay_cache_affinity_inputs"]
+    elif (
+        "cache_continuity_available" in trace
+        or "cache_affinity_inputs" in trace
+        or "cache_affinity_unavailable_reasons" in trace
+    ):
+        return ["unexpected_g1_replay_cache_affinity_inputs"]
+
     ranking_proposer_policy = ranking_parameters.get("proposer_count")
     ranking_proposer_policy = (
         ranking_proposer_policy
@@ -10260,6 +11495,11 @@ def ranking_trace_replay_reasons(
             ranking_config=copy.deepcopy(dict(ranking_parameters)),
             decision_id=str(trace.get("decision_id") or ""),
             ranking_thinking_assignment_enabled=thinking_assignment_enabled,
+            cache_continuity_available=frozen_cache_continuity,
+            _cache_affinity_unavailable_reasons=trace.get(
+                "cache_affinity_unavailable_reasons"
+            ),
+            _cache_affinity_replay_adjustments=frozen_cache_adjustments,
             legacy_proposer_backup_count=legacy_replay_backup_count,
             proposer_recovery_max_additional_calls=(
                 int(

@@ -42,6 +42,7 @@ cache-friendly system-prompt-rebuild contract.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -59,6 +60,7 @@ _T3_FLUSH_FAILED: str = "flush_failed"
 # ---------------------------------------------------------------------------
 # Ports — four narrow Protocols
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class T3UpgradeCompactionPort(Protocol):
@@ -93,6 +95,7 @@ class T3UpgradeCompactionPort(Protocol):
         compaction_model: str | None,
     ) -> str: ...
 
+
 @runtime_checkable
 class PreflightCompactionPort(Protocol):
     """Wraps ``TurnRunner._maybe_preflight_compact``.
@@ -116,6 +119,7 @@ class PreflightCompactionPort(Protocol):
         compaction_provider: Any | None,
         compaction_model: str | None,
     ) -> None: ...
+
 
 @runtime_checkable
 class HistoryLoaderPort(Protocol):
@@ -143,6 +147,7 @@ class HistoryLoaderPort(Protocol):
         bound_user_message_id: str | None = None,
     ) -> str | None: ...
 
+
 @runtime_checkable
 class RequestContextPrependPort(Protocol):
     """Wraps ``_prepend_request_context_prompt`` (module-level pure helper).
@@ -165,9 +170,11 @@ class RequestContextPrependPort(Protocol):
         prepended: str | None,
     ) -> str | None: ...
 
+
 # ---------------------------------------------------------------------------
 # Stage I/O dataclasses (frozen)
 # ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class CompactionAndHistoryStageInput:
@@ -196,6 +203,8 @@ class CompactionAndHistoryStageInput:
     compaction_provider: Any | None = None
     compaction_model: str | None = None
     bound_user_message_id: str | None = None
+    post_compaction_agent_resolver: Callable[[], Awaitable[Agent]] | None = None
+
 
 @dataclass(frozen=True)
 class CompactionAndHistoryStageOutput:
@@ -224,9 +233,11 @@ class CompactionAndHistoryStageOutput:
     compaction_summary_context: str | None
     final_request_context_prompt: str | None
 
+
 # ---------------------------------------------------------------------------
 # Stage
 # ---------------------------------------------------------------------------
+
 
 class CompactionAndHistoryStage:
     """Compact (if needed), load history, prepend compaction context.
@@ -325,9 +336,17 @@ class CompactionAndHistoryStage:
             )
             await self._fire_after_compact(preflight_state, {"status": "ran"})
 
+        # Optional route materialization fence.  The default None path keeps
+        # the historical four-port ordering byte-for-byte; router-dynamic
+        # cache affinity uses this seam to revalidate after compaction and
+        # before any provider-specific history is loaded.
+        history_agent = inp.agent
+        if inp.post_compaction_agent_resolver is not None:
+            history_agent = await inp.post_compaction_agent_resolver()
+
         # 3. Load history (transcript + reconstructed messages + durable summary).
         compaction_summary_context = await self._history_loader.load(
-            agent=inp.agent,
+            agent=history_agent,
             session_key=inp.session_key,
             trim_last_user=inp.history_has_persisted_user,
             bound_user_message_id=inp.bound_user_message_id,
@@ -335,7 +354,7 @@ class CompactionAndHistoryStage:
 
         # 4. Prepend compaction summary context to request_context_prompt (pure).
         final_request_context_prompt = self._request_context_prepender.prepend(
-            existing=inp.agent.config.request_context_prompt,
+            existing=history_agent.config.request_context_prompt,
             prepended=compaction_summary_context,
         )
 

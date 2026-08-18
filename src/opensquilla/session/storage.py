@@ -940,6 +940,23 @@ class SessionStorage:
         self._sleep = asyncio.sleep
         self._monotonic = time.monotonic
         self._random = random.random
+        self._session_delete_listeners: list[Callable[[str], None]] = []
+
+    def add_session_delete_listener(
+        self,
+        listener: Callable[[str], None],
+    ) -> Callable[[], None]:
+        """Register a process-local callback for durable session deletion."""
+
+        self._session_delete_listeners.append(listener)
+
+        def remove() -> None:
+            try:
+                self._session_delete_listeners.remove(listener)
+            except ValueError:
+                pass
+
+        return remove
 
     async def connect(self) -> None:
         self._conn = await aiosqlite.connect(self._db_path, isolation_level=None)
@@ -2810,6 +2827,15 @@ class SessionStorage:
             await conn.execute("DELETE FROM sessions WHERE session_key = ?", (session_key,))
 
         assert session is not None
+
+        # The durable row is gone at this point. Notify process-local owners
+        # before slower best-effort material cleanup so stale routing/session
+        # state cannot survive a same-key recreation in the meantime.
+        for listener in tuple(self._session_delete_listeners):
+            try:
+                listener(session_key)
+            except Exception:  # noqa: BLE001 - deletion must remain durable
+                log.exception("session_delete.listener_failed")
 
         # Cascade the on-disk session material (transcript media + workspace
         # attachment copies). DB-only deletion otherwise leaks both stores until
