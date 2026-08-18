@@ -996,14 +996,14 @@ def test_ranking_snapshot_none_tracks_the_packaged_thinking_default(
         (
             False,
             "step2-ranking-config-v3",
-            "step2-ranking-2026-08-11.2",
-            "cdb2727e95533d9c49579b9bb82b40ad801f816e2f151b8bc4e8f1540bbb7fbe",
+            "step2-ranking-2026-08-18.2",
+            "96a8c24133d22cc5af204d212379193d6a7a8839048139fd41a83d58384b56bf",
         ),
         (
             True,
             "step2-ranking-config-v4",
-            "step2-ranking-2026-08-11.2",
-            "a3a5076a5019d66ee21b23a94853ebf3832f81bf7e85484f9cdd97c5c5927e73",
+            "step2-ranking-2026-08-18.2",
+            "5b9039dd50ec5c46aacd710214673a65e833f439ab7c1343c2f07205c3325281",
         ),
     ],
 )
@@ -1032,6 +1032,7 @@ def test_ranking_config_resolution_without_override_preserves_packaged_identity(
     assert resolution["effective_sha256"] == sha256
     assert resolution["effective_config"]["schema_version"] == schema_version
     assert resolution["effective_config"]["config_version"] == config_version
+    assert resolution["effective_config"]["task_analyzer"]["max_retries"] == 1
     assert empty_resolution == resolution
     assert ranking_config_snapshot(
         thinking_assignment_enabled=thinking_assignment_enabled,
@@ -1096,8 +1097,47 @@ def test_historical_ranking_base_reconstructs_frozen_draco_identity() -> None:
     assert historical["base_sha256"] == (
         "71be283f94095bc3ced34d39ae9ed58abbaa7e4d273b0a074e7e8a4a6e4b5fc6"
     )
-    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-11.2"
+    assert default["base_config"]["config_version"] == "step2-ranking-2026-08-18.2"
     assert "role_reliability" in default["base_config"]
+    assert default["base_config"]["penalties"]["task_cost_weights"] == {
+        "low": pytest.approx(0.20),
+        "medium": pytest.approx(0.10),
+        "high": pytest.approx(0.04),
+        "hard_limit": pytest.approx(0.28),
+    }
+    assert default["base_config"]["rerank"]["top_l_min"] == 8
+    assert default["base_config"]["task_analyzer"]["max_retries"] == 1
+
+    previous_packaged = ranking_config_resolution(
+        thinking_assignment_enabled=False,
+        base_version="step2-ranking-2026-08-18.1",
+    )
+    assert previous_packaged["base_config"]["penalties"]["task_cost_weights"] == {
+        "low": pytest.approx(0.28),
+        "medium": pytest.approx(0.20),
+        "high": pytest.approx(0.10),
+        "hard_limit": pytest.approx(0.40),
+    }
+    assert previous_packaged["base_config"]["rerank"]["top_l_min"] == 15
+    assert previous_packaged["base_config"]["task_analyzer"]["max_retries"] == 3
+    assert previous_packaged["base_sha256"] == (
+        "2e04d910089c772e6001076b406ebc56b83471bef8041078134c18c5b81b1d71"
+    )
+
+    previous_cost_balance = ranking_config_resolution(
+        thinking_assignment_enabled=False,
+        base_version="step2-ranking-2026-08-11.2",
+    )
+    assert previous_cost_balance["base_config"]["penalties"]["task_cost_weights"] == {
+        "low": pytest.approx(0.20),
+        "medium": pytest.approx(0.10),
+        "high": pytest.approx(0.04),
+        "hard_limit": pytest.approx(0.28),
+    }
+    assert previous_cost_balance["base_config"]["rerank"]["top_l_min"] == 8
+    assert previous_cost_balance["base_sha256"] == (
+        "cdb2727e95533d9c49579b9bb82b40ad801f816e2f151b8bc4e8f1540bbb7fbe"
+    )
 
     previous_reliability = ranking_config_resolution(
         thinking_assignment_enabled=False,
@@ -1200,7 +1240,7 @@ def test_ranking_config_resolution_deep_merges_sparse_nested_override() -> None:
     }
     assert snapshot == resolution["effective_config"]
     assert resolution["effective_config"]["config_version"] == (
-        "step2-ranking-2026-08-11.2+override."
+        "step2-ranking-2026-08-18.2+override."
         f"{resolution['override_sha256'][:12]}"
     )
     assert resolution["effective_sha256"] != resolution["base_sha256"]
@@ -1372,10 +1412,10 @@ def test_ranking_config_override_resolves_against_selected_thinking_base() -> No
     assert "thinking_assignment" in thinking["effective_config"]
     suffix = legacy["override_sha256"][:12]
     assert legacy["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-11.2+override.{suffix}"
+        f"step2-ranking-2026-08-18.2+override.{suffix}"
     )
     assert thinking["effective_config"]["config_version"] == (
-        f"step2-ranking-2026-08-11.2+override.{suffix}"
+        f"step2-ranking-2026-08-18.2+override.{suffix}"
     )
 
 
@@ -1602,6 +1642,32 @@ def test_packaged_curated_registry_has_versioned_step2_profiles() -> None:
     ]
     assert len(curated_models) == 79
     by_model_id = {model["registry_facts"]["model_id"]: model for model in curated_models}
+    assert by_model_id["z-ai/glm-5.2"]["registry_facts"]["price"] == {
+        "input_per_million": 1.4,
+        "output_per_million": 4.4,
+    }
+    assert by_model_id["deepseek/deepseek-v4-pro"]["registry_facts"]["price"] == {
+        "input_per_million": 1.32,
+        "output_per_million": 3.96,
+    }
+    assert by_model_id["moonshotai/kimi-k2.6"]["registry_facts"]["price"] == {
+        "input_per_million": 0.95,
+        "output_per_million": 4.0,
+    }
+    assert by_model_id["nvidia/nemotron-3-ultra-550b-a55b"]["registry_facts"][
+        "price"
+    ] == {
+        "input_per_million": 0.6,
+        "output_per_million": 3.6,
+    }
+    assert by_model_id["moonshotai/kimi-k3"]["registry_facts"]["modalities"] == [
+        "text",
+        "image",
+        "video",
+    ]
+    assert by_model_id["moonshotai/kimi-k3"]["static_profile"]["tier_dist_prior"][
+        "4"
+    ] == pytest.approx(0.85)
     assert {
         model_id
         for model_id, model in by_model_id.items()
@@ -1653,11 +1719,14 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
     frozen = ranking_router._legacy_registry_snapshot_projection(historical)
 
     assert current["snapshot_version"].startswith(
-        "curated-openrouter-step2-2026-07-31.1-reliability-"
+        "curated-openrouter-step2-2026-08-18.1-reliability-"
     )
     assert "role_reliability_snapshot" in current
     provenance = current["role_reliability_snapshot"]
     assert provenance["schema_version"] == "role-reliability-snapshot-v2"
+    assert provenance["base_snapshot_version"] == (
+        "curated-openrouter-step2-2026-08-18.1"
+    )
     assert provenance["observation_policy"] == "aef-physical-model-calls-v5"
     assert provenance["completion_gate"] == "manual_thresholded_draco_audit"
     assert set(provenance) == {
@@ -1691,15 +1760,43 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
         "anthropic/claude-opus-4.8",
         "anthropic/claude-sonnet-5",
         "google/gemini-3.1-pro-preview",
+        "inclusionai/ring-2.6-1t",
+        "moonshotai/kimi-k3",
         "openai/gpt-5.3-codex",
         "openai/gpt-5.5",
         "openai/gpt-5.6-sol",
+        "qwen/qwen3.7-max",
         "x-ai/grok-4.5",
+        "z-ai/glm-5.2",
     }
     assert selected_rows["anthropic/claude-sonnet-5"] == {
         "window_size": 50,
         "proposer": {"success": 27, "failure": 23},
         "aggregator": {"success": 48, "failure": 2},
+        "source": "aef_experiment_artifacts_thresholded",
+    }
+    assert selected_rows["qwen/qwen3.7-max"] == {
+        "window_size": 50,
+        "proposer": {"success": 8, "failure": 0},
+        "aggregator": {"success": 0, "failure": 0},
+        "source": "aef_experiment_artifacts_thresholded",
+    }
+    assert selected_rows["z-ai/glm-5.2"] == {
+        "window_size": 50,
+        "proposer": {"success": 13, "failure": 1},
+        "aggregator": {"success": 4, "failure": 0},
+        "source": "aef_experiment_artifacts_thresholded",
+    }
+    assert selected_rows["moonshotai/kimi-k3"] == {
+        "window_size": 50,
+        "proposer": {"success": 17, "failure": 0},
+        "aggregator": {"success": 0, "failure": 0},
+        "source": "aef_experiment_artifacts_thresholded",
+    }
+    assert selected_rows["inclusionai/ring-2.6-1t"] == {
+        "window_size": 50,
+        "proposer": {"success": 0, "failure": 0},
+        "aggregator": {"success": 14, "failure": 0},
         "source": "aef_experiment_artifacts_thresholded",
     }
     current_model = ranking_router._normalize_model(
@@ -1722,6 +1819,32 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
     historical_by_model = {
         row["registry_facts"]["model_id"]: row for row in historical["models"]
     }
+    assert historical_by_model["z-ai/glm-5.2"]["registry_facts"]["price"] == {
+        "input_per_million": 0.8246,
+        "output_per_million": 2.5916,
+    }
+    assert historical_by_model["deepseek/deepseek-v4-pro"]["registry_facts"][
+        "price"
+    ] == {
+        "input_per_million": 0.435,
+        "output_per_million": 0.87,
+    }
+    assert historical_by_model["moonshotai/kimi-k2.6"]["registry_facts"]["price"] == {
+        "input_per_million": 0.684,
+        "output_per_million": 3.42,
+    }
+    assert historical_by_model["nvidia/nemotron-3-ultra-550b-a55b"]["registry_facts"][
+        "price"
+    ] == {
+        "input_per_million": 0.5,
+        "output_per_million": 2.2,
+    }
+    assert historical_by_model["moonshotai/kimi-k3"]["registry_facts"][
+        "modalities"
+    ] == ["text", "image"]
+    assert historical_by_model["moonshotai/kimi-k3"]["static_profile"][
+        "tier_dist_prior"
+    ]["4"] == pytest.approx(0.79)
     assert all(
         historical_by_model[model_id]["registry_facts"]["status"] == "enabled"
         for model_id in {
@@ -1747,10 +1870,28 @@ def test_historical_registry_base_reconstructs_frozen_draco_identity() -> None:
             "z-ai/glm-5.1",
         }
     )
+    assert canonical_json_sha256(historical) == (
+        "b51b64d7880472e47f8a5f954b1a76eaee440d6cd59d28f9dc2579f876bac1ea"
+    )
     assert frozen["schema_version"] == "step2-model-registry-v1"
     assert canonical_json_sha256(frozen) == (
         "9f76c7f96e5cb22c05b615f69b71ca633965e5039fbec9673f0a5edf9b45078a"
     )
+    current_base = load_model_registry_snapshot(
+        base_version="curated-openrouter-step2-2026-08-18.1"
+    )
+    assert current_base["snapshot_version"] == "curated-openrouter-step2-2026-08-18.1"
+    assert current_base["models"] == [
+        {
+            **row,
+            "online_profile": {
+                key: value
+                for key, value in row["online_profile"].items()
+                if key != "role_reliability"
+            },
+        }
+        for row in current["models"]
+    ]
 
 
 def test_packaged_registry_rejects_obsolete_or_tampered_statistics() -> None:
@@ -4246,6 +4387,7 @@ async def test_task_analyzer_retries_three_times_before_succeeding() -> None:
             request_context=_context(),
             routed_tier="c2",
             routing_confidence=0.77,
+            ranking_config=load_ranking_config(base_version="step2-ranking-2026-08-18.1"),
         )
 
     assert result.source == "llm_provider"
@@ -4635,10 +4777,10 @@ async def test_task_analyzer_malformed_output_falls_back_to_tree_router_profile(
     assert result.schema_valid is False
     assert result.profile["tier_dist"] == {"3": 1.0}
     assert result.confidence == pytest.approx(0.77)
-    assert len(provider.calls) == 4
-    assert result.usage["attempt_count"] == 4
-    assert result.usage["billed_cost"] == pytest.approx(0.048)
-    assert len(result.usage["physical_attempts"]) == 4
+    assert len(provider.calls) == 2
+    assert result.usage["attempt_count"] == 2
+    assert result.usage["billed_cost"] == pytest.approx(0.024)
+    assert len(result.usage["physical_attempts"]) == 2
 
 
 @pytest.mark.asyncio
@@ -6087,7 +6229,7 @@ def test_disabled_thinking_assignment_preserves_exact_legacy_trace_shape() -> No
     assert disabled.trace["ranking_version"] == "step2-ranking-v2"
     assert (
         disabled.trace["ranking_config_hash"]
-        == "cdb2727e95533d9c49579b9bb82b40ad801f816e2f151b8bc4e8f1540bbb7fbe"
+        == "96a8c24133d22cc5af204d212379193d6a7a8839048139fd41a83d58384b56bf"
     )
     for field in (
         "ranking_thinking_assignment_enabled",
@@ -7039,13 +7181,13 @@ def test_packaged_ranking_config_without_affinity_preserves_golden_bytes_and_has
     resolution = ranking_config_resolution()
 
     assert hashlib.sha256(raw_payload).hexdigest() == (
-        "10cf953095ecc030569c1fcce0ffaa3dc3fa3e92769a055c02ce541524fd5e27"
+        "30c5970ecd584072ea4ce799d5c93f3b5f3270dd2bd326e6b5fc7a6600d489d0"
     )
     assert canonical_json_sha256(loaded) == (
-        "8b80aec8674c4faef098d1d281ab8208d39ba52ba91fa14edce0f7cbe35039bc"
+        "1b4a54f6de1e381437c058565bb98d1fe40d9232b717ceddee21b8cb891f047c"
     )
     assert resolution["base_sha256"] == (
-        "cdb2727e95533d9c49579b9bb82b40ad801f816e2f151b8bc4e8f1540bbb7fbe"
+        "96a8c24133d22cc5af204d212379193d6a7a8839048139fd41a83d58384b56bf"
     )
     assert resolution["effective_sha256"] == resolution["base_sha256"]
     assert "kv_cache_affinity" not in loaded["session"]

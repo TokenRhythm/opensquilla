@@ -216,7 +216,7 @@ def test_cache_quote_rejects_static_entry_without_provider_price_provenance() ->
         ("deepseek-chat", 0.14, 0.28),
         ("deepseek-reasoner", 0.26, 0.38),
         ("glm-5.2", 1.40, 4.40),
-        ("qwen3.7-max", 1.25, 3.75),
+        ("qwen3.7-max", 1.475, 4.425),
         ("qwen3.7-plus", 0.40, 1.60),
     ],
 )
@@ -251,7 +251,7 @@ def test_glm_5_static_price_matches_openrouter_native_provider(
     ("model", "input_per_m", "output_per_m"),
     [
         ("qwen/qwen3.7-plus-20260602", 0.40, 1.60),
-        ("qwen/qwen3.7-max", 1.25, 3.75),
+        ("qwen/qwen3.7-max", 1.475, 4.425),
         ("qwen/qwen3.8-max", 2.0, 6.0),
         ("google/gemini-3-flash-preview-20251217", 0.50, 3.0),
         ("mistralai/mistral-large-2512", 0.50, 1.50),

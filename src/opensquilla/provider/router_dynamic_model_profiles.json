@@ -1,6 +1,6 @@
 {
   "schema_version": "step2-model-registry-v2",
-  "snapshot_version": "curated-openrouter-step2-2026-07-31.1-reliability-20260810T093908Z-199bd26b2821",
+  "snapshot_version": "curated-openrouter-step2-2026-08-18.1-reliability-20260818T104001Z-75215e083f8a",
   "models": [
     {
       "source": "curated_openrouter_profile",
@@ -151,8 +151,8 @@
           "api_call"
         ],
         "price": {
-          "input_per_million": 0.435,
-          "output_per_million": 0.87
+          "input_per_million": 1.32,
+          "output_per_million": 3.96
         },
         "latency_p50_ms": 1800,
         "latency_p95_ms": 5200,
@@ -407,8 +407,8 @@
           "api_call"
         ],
         "price": {
-          "input_per_million": 0.8246,
-          "output_per_million": 2.5916
+          "input_per_million": 1.4,
+          "output_per_million": 4.4
         },
         "latency_p50_ms": 1700,
         "latency_p95_ms": 4800,
@@ -491,14 +491,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
-            "failure": 0
+            "success": 13,
+            "failure": 1
           },
           "aggregator": {
-            "success": 0,
+            "success": 4,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -854,14 +854,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
+            "success": 8,
             "failure": 0
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -3800,7 +3800,8 @@
         "effective_context_bucket": "extra_long",
         "modalities": [
           "text",
-          "image"
+          "image",
+          "video"
         ],
         "tools": [
           "code_execution",
@@ -3878,7 +3879,7 @@
           "1": 0.97,
           "2": 0.94,
           "3": 0.9,
-          "4": 0.79
+          "4": 0.85
         },
         "role_fit_prior": {
           "proposer": 0.97,
@@ -3897,14 +3898,14 @@
         "role_reliability": {
           "window_size": 50,
           "proposer": {
-            "success": 0,
+            "success": 17,
             "failure": 0
           },
           "aggregator": {
             "success": 0,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -4752,10 +4753,10 @@
             "failure": 0
           },
           "aggregator": {
-            "success": 0,
+            "success": 14,
             "failure": 0
           },
-          "source": "legacy_statistics_invalidated"
+          "source": "aef_experiment_artifacts_thresholded"
         }
       }
     },
@@ -4910,8 +4911,8 @@
           "api_call"
         ],
         "price": {
-          "input_per_million": 0.684,
-          "output_per_million": 3.42
+          "input_per_million": 0.95,
+          "output_per_million": 4.0
         },
         "latency_p50_ms": 1045,
         "latency_p95_ms": 3420,
@@ -5031,8 +5032,8 @@
           "api_call"
         ],
         "price": {
-          "input_per_million": 0.5,
-          "output_per_million": 2.2
+          "input_per_million": 0.6,
+          "output_per_million": 3.6
         },
         "latency_p50_ms": 2250,
         "latency_p95_ms": 6500,
@@ -9730,11 +9731,11 @@
   ],
   "role_reliability_snapshot": {
     "schema_version": "role-reliability-snapshot-v2",
-    "generated_at": "2026-08-10T09:39:08+00:00",
-    "base_snapshot_version": "curated-openrouter-step2-2026-07-31.1",
+    "generated_at": "2026-08-18T10:40:01+00:00",
+    "base_snapshot_version": "curated-openrouter-step2-2026-08-18.1",
     "window_size": 50,
     "observation_policy": "aef-physical-model-calls-v5",
     "completion_gate": "manual_thresholded_draco_audit",
-    "content_sha256": "199bd26b28215c9f751c723e0655fe06784d6aa991eb1b1879752f267fcacfd6"
+    "content_sha256": "75215e083f8a7903f21a0da3d4b669da666a509ace20faf4a7a02c8c52c00306"
   }
 }

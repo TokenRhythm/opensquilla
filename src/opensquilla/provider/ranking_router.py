@@ -67,8 +67,10 @@ RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v4"
 LEGACY_RANKING_CONFIG_SCHEMA_VERSION = "step2-ranking-config-v3"
 MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v2"
 LEGACY_MODEL_REGISTRY_SCHEMA_VERSION = "step2-model-registry-v1"
-_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.2"
-_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.2"
+_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.2"
+_LEGACY_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.2"
+_PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-18.1"
+_PREVIOUS_COST_BALANCE_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.2"
 _PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-11.1"
 _PRE_ANALYZER_CHAIN_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-10.1"
 _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION = "step2-ranking-2026-08-05.1"
@@ -84,13 +86,49 @@ _PRE_RELIABILITY_RANKING_CONFIG_VERSIONS = frozenset(
 )
 _HISTORICAL_RANKING_CONFIG_BASE_VERSIONS = frozenset(
     {
+        _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION,
+        _PREVIOUS_COST_BALANCE_RANKING_CONFIG_VERSION,
         _PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION,
         _PRE_ANALYZER_CHAIN_RANKING_CONFIG_VERSION,
         "step2-ranking-2026-08-02.2",
         _PREVIOUS_RELIABILITY_RANKING_CONFIG_VERSION,
     }
 )
-_HISTORICAL_REGISTRY_BASE_VERSIONS = frozenset({"curated-openrouter-step2-2026-07-31.1"})
+_CURRENT_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-08-18.1"
+_PREVIOUS_REGISTRY_BASE_VERSION = "curated-openrouter-step2-2026-07-31.1"
+_HISTORICAL_REGISTRY_BASE_VERSIONS = frozenset(
+    {_CURRENT_REGISTRY_BASE_VERSION, _PREVIOUS_REGISTRY_BASE_VERSION}
+)
+_POST_BASE_REGISTRY_FACT_OVERRIDES = {
+    "deepseek/deepseek-v4-pro": {
+        "price": {
+            "input_per_million": 0.435,
+            "output_per_million": 0.87,
+        }
+    },
+    "moonshotai/kimi-k2.6": {
+        "price": {
+            "input_per_million": 0.684,
+            "output_per_million": 3.42,
+        }
+    },
+    "moonshotai/kimi-k3": {"modalities": ["text", "image"]},
+    "nvidia/nemotron-3-ultra-550b-a55b": {
+        "price": {
+            "input_per_million": 0.5,
+            "output_per_million": 2.2,
+        }
+    },
+    "z-ai/glm-5.2": {
+        "price": {
+            "input_per_million": 0.8246,
+            "output_per_million": 2.5916,
+        }
+    }
+}
+_POST_BASE_STATIC_PROFILE_OVERRIDES = {
+    "moonshotai/kimi-k3": {"tier_dist_prior": {"4": 0.79}}
+}
 _POST_BASE_DISABLED_MODEL_IDS = frozenset(
     {
         "anthropic/claude-fable-5",
@@ -2659,7 +2697,41 @@ def _ranking_config_for_base_version(
         )
     historical = _detached_ranking_config(packaged)
     historical["config_version"] = requested
-    if requested != _PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION:
+    historical["task_analyzer"]["max_retries"] = 3
+    historical["penalties"]["task_cost_weights"] = {
+        "low": 0.20,
+        "medium": 0.10,
+        "high": 0.04,
+        "hard_limit": 0.28,
+    }
+    historical["penalties"]["user_cost_sensitivity_weights"] = {
+        "low": 0.04,
+        "medium": 0.10,
+        "high": 0.20,
+        "hard_limit": 0.28,
+    }
+    historical["penalties"]["default_cost_weight"] = 0.10
+    historical["rerank"]["top_l_min"] = 8
+    if requested == _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION:
+        historical["penalties"]["task_cost_weights"] = {
+            "low": 0.28,
+            "medium": 0.20,
+            "high": 0.10,
+            "hard_limit": 0.40,
+        }
+        historical["penalties"]["user_cost_sensitivity_weights"] = {
+            "low": 0.04,
+            "medium": 0.20,
+            "high": 0.28,
+            "hard_limit": 0.40,
+        }
+        historical["penalties"]["default_cost_weight"] = 0.20
+        historical["rerank"]["top_l_min"] = 15
+    if requested not in {
+        _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION,
+        _PREVIOUS_COST_BALANCE_RANKING_CONFIG_VERSION,
+        _PREVIOUS_ZERO_FAILURE_PRIOR_RANKING_CONFIG_VERSION,
+    }:
         analyzer = historical.get("task_analyzer")
         if isinstance(analyzer, dict):
             for key in (
@@ -2686,7 +2758,10 @@ def _ranking_config_for_base_version(
             "prior_success": 9,
             "prior_failure": 1,
         }
-    else:
+    elif requested not in {
+        _PREVIOUS_PACKAGED_RANKING_CONFIG_VERSION,
+        _PREVIOUS_COST_BALANCE_RANKING_CONFIG_VERSION,
+    }:
         historical.pop("role_reliability", None)
     return _validate_ranking_config(historical)
 
@@ -6529,10 +6604,7 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
             f"router_dynamic model registry base_version {requested!r} is not available"
         )
     provenance = packaged.get("role_reliability_snapshot")
-    if (
-        not packaged_version.startswith(f"{requested}-reliability-")
-        or not isinstance(provenance, Mapping)
-    ):
+    if not isinstance(provenance, Mapping):
         raise DynamicRankingError(
             "router_dynamic model registry cannot reconstruct the requested base snapshot"
         )
@@ -6542,7 +6614,15 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
             "router_dynamic model registry reliability provenance schema is unsupported"
         )
     recorded_base = str(provenance.get("base_snapshot_version") or "").strip()
-    if recorded_base != requested:
+    if recorded_base not in _HISTORICAL_REGISTRY_BASE_VERSIONS:
+        raise DynamicRankingError(
+            "router_dynamic model registry reliability provenance has a different base"
+        )
+    if not packaged_version.startswith(f"{recorded_base}-reliability-"):
+        raise DynamicRankingError(
+            "router_dynamic model registry cannot reconstruct the requested base snapshot"
+        )
+    if requested not in {recorded_base, _PREVIOUS_REGISTRY_BASE_VERSION}:
         raise DynamicRankingError(
             "router_dynamic model registry reliability provenance has a different base"
         )
@@ -6559,12 +6639,24 @@ def _registry_snapshot_for_base_version(base_version: str | None) -> dict[str, A
         if isinstance(online_profile, dict):
             online_profile.pop("role_reliability", None)
         facts = row.get("registry_facts")
-        if (
-            isinstance(facts, dict)
-            and str(facts.get("model_id") or "").strip()
-            in _POST_BASE_DISABLED_MODEL_IDS
-        ):
-            facts["status"] = "enabled"
+        if not isinstance(facts, dict):
+            continue
+        model_id = str(facts.get("model_id") or "").strip()
+        if requested == _PREVIOUS_REGISTRY_BASE_VERSION:
+            if model_id in _POST_BASE_DISABLED_MODEL_IDS:
+                facts["status"] = "enabled"
+            for key, value in _POST_BASE_REGISTRY_FACT_OVERRIDES.get(model_id, {}).items():
+                facts[key] = copy.deepcopy(value)
+        static_profile = row.get("static_profile")
+        if not isinstance(static_profile, dict):
+            continue
+        if requested == _PREVIOUS_REGISTRY_BASE_VERSION:
+            for profile_key, values in _POST_BASE_STATIC_PROFILE_OVERRIDES.get(
+                model_id, {}
+            ).items():
+                profile = static_profile.get(profile_key)
+                if isinstance(profile, dict):
+                    profile.update(copy.deepcopy(values))
     return _validate_registry_snapshot(historical)
 
 
