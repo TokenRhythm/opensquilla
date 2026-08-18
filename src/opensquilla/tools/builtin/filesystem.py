@@ -3074,7 +3074,6 @@ async def edit_source(
                 _notify_bootstrap_source_write(p)
 
         await _run_executor_mutation(_write, settle=_settle_edit)
-        after_fingerprint = settled_edit["after_fingerprint"]
         after_revision = settled_edit["after_revision"]
         receipt = settled_edit["receipt"]
     else:

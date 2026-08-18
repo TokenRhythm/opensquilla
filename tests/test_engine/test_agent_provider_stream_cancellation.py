@@ -4,7 +4,6 @@ from types import SimpleNamespace
 import pytest
 
 import opensquilla.engine.agent as agent_module
-from opensquilla.engine.agent import Agent, _IterationStreamTimeoutError
 
 
 class _BlockingProviderStream:
@@ -53,12 +52,12 @@ class _StubbornProviderStream:
 
 @pytest.mark.asyncio
 async def test_provider_next_event_is_cancelled_when_turn_stream_is_cancelled() -> None:
-    agent = Agent.__new__(Agent)
+    agent = agent_module.Agent.__new__(agent_module.Agent)
     agent.config = SimpleNamespace(iteration_timeout=60.0, timeout=60.0)
     stream = _BlockingProviderStream()
 
     async def consume() -> None:
-        async for _event in Agent._stream_provider_events_with_deadline(
+        async for _event in agent_module.Agent._stream_provider_events_with_deadline(
             agent,
             stream,
             loop=asyncio.get_running_loop(),
@@ -84,7 +83,7 @@ async def test_stubborn_provider_timeout_is_bounded_and_close_is_deferred(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(agent_module, "TIMEOUT_CANCEL_GRACE_SECONDS", 0.02)
-    agent = Agent.__new__(Agent)
+    agent = agent_module.Agent.__new__(agent_module.Agent)
     agent.config = SimpleNamespace(iteration_timeout=0.01, timeout=1.0)
     stream = _StubbornProviderStream()
 
@@ -96,7 +95,7 @@ async def test_stubborn_provider_timeout_is_bounded_and_close_is_deferred(
         ):
             pass
 
-    with pytest.raises(_IterationStreamTimeoutError):
+    with pytest.raises(agent_module._IterationStreamTimeoutError):
         await asyncio.wait_for(consume(), timeout=0.2)
 
     assert stream.cancelled.is_set()
@@ -112,7 +111,7 @@ async def test_stubborn_provider_stop_uses_short_grace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(agent_module, "STOP_CANCEL_GRACE_SECONDS", 0.02)
-    agent = Agent.__new__(Agent)
+    agent = agent_module.Agent.__new__(agent_module.Agent)
     agent.config = SimpleNamespace(iteration_timeout=60.0, timeout=60.0)
     stream = _StubbornProviderStream()
 
@@ -141,7 +140,7 @@ async def test_stubborn_provider_total_deadline_uses_timeout_grace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(agent_module, "TIMEOUT_CANCEL_GRACE_SECONDS", 0.02)
-    agent = Agent.__new__(Agent)
+    agent = agent_module.Agent.__new__(agent_module.Agent)
     agent.config = SimpleNamespace(iteration_timeout=60.0, timeout=0.01)
     stream = _StubbornProviderStream()
     loop = asyncio.get_running_loop()
