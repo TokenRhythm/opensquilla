@@ -620,12 +620,21 @@ onBeforeUnmount(() => {
   min-width: 0;
   flex: 1;
   margin: 0;
-  overflow: hidden;
   color: var(--text);
   font-size: var(--fs-sm);
   line-height: 1.45;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  /* Long queued text wraps inside the dialog instead of spilling past it.
+     `anywhere` breaks unbroken runs (URLs, repeated punctuation) so the
+     card width can never exceed the conversation column. The card stays
+     compact via a 3-line clamp; the full text remains available on hover
+     through the `title` attribute rendered by the template. */
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 
 .chat-pending-attachments {
