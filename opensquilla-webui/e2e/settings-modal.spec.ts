@@ -1,13 +1,18 @@
 import { test, expect } from '@playwright/test'
 
 const CONTROL_URL = '/control/'
-// Backend-config sections carry a readiness/status dot; Connection is the first
-// entry (live socket state). Memory & Profile is an RPC action surface that
-// deliberately stays outside config save state; the remaining entries below
-// are ordinary client-only preferences.
-// (Runtime exists too, but it is desktop-only so the web rail hides it.)
-const SECTIONS = ['Connection', 'Model Service', 'Model Routing', 'Capabilities', 'Behavior', 'Privacy']
-const CLIENT_SECTIONS = ['Sandbox', 'Memory & Profile', 'Appearance', 'Keyboard', 'Advanced']
+// Gateway and config-backed pages expose live/save status in their accessible
+// tab names. Interface, Shortcuts, and Advanced are browser-local pages.
+const SECTIONS = [
+  'Gateway',
+  'Model Service',
+  'Model Routing',
+  'Capabilities',
+  'General',
+  'Security & Privacy',
+  'Memory',
+]
+const CLIENT_SECTIONS = ['Interface', 'Shortcuts', 'Advanced']
 
 const settingsRow = (page: import('@playwright/test').Page) =>
   page.locator('.sidebar-foot button')
@@ -26,6 +31,10 @@ async function openFromSidebar(page: import('@playwright/test').Page) {
 }
 
 test.describe('Settings modal', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  })
+
   test('opens from the sidebar with the curated section rail and readiness banner', async ({ page }) => {
     await openFromSidebar(page)
 
@@ -100,18 +109,23 @@ test.describe('Settings modal', () => {
     await expect(page).not.toHaveURL(/\/settings/)
   })
 
-  test('opens Memory & Profile as a first-level action route without global save state', async ({ page }) => {
+  test('opens Memory as a first-level page and profile import as its nested route', async ({ page }) => {
     await openFromSidebar(page)
 
-    const memoryTab = dialog(page).getByRole('tab', { name: 'Memory & Profile', exact: true })
+    const memoryTab = railTab(page, 'Memory')
     await memoryTab.click()
 
     await expect(memoryTab).toHaveAttribute('aria-selected', 'true')
     await expect(page).toHaveURL(/\/settings\/memory$/)
+    await expect(dialog(page).getByRole('heading', { name: 'Memory', exact: true })).toBeVisible()
+    const profileRow = dialog(page).locator('.control-row', { hasText: 'Profile import' })
+    await profileRow.getByRole('button', { name: 'Open' }).click()
+    await expect(page).toHaveURL(/\/settings\/profileImport$/)
     await expect(
       dialog(page).getByRole('heading', { name: 'Import memory from another AI' }),
     ).toBeVisible()
     await expect(dialog(page).locator('[data-testid="settings-memory-panel"]')).toBeVisible()
+    await expect(memoryTab).toHaveAttribute('aria-selected', 'true')
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
   })
 
@@ -283,12 +297,13 @@ test.describe('Settings modal', () => {
     await expect(page.getByLabel('Message to send')).toBeVisible()
   })
 
-  test('cold deep link to /settings/connection closes home and moves focus to the sidebar', async ({ page }) => {
+  test('legacy /settings/connection deep link opens Gateway and preserves its subsection', async ({ page }) => {
     // Land directly on a section with no in-app invoker.
     await page.goto(CONTROL_URL + 'settings/connection')
     await page.waitForSelector('.conn-pill', { timeout: 10000 })
     await expect(dialog(page)).toBeVisible()
-    await expect(railTab(page, 'Connection')).toHaveAttribute('aria-selected', 'true')
+    await expect(railTab(page, 'Gateway')).toHaveAttribute('aria-selected', 'true')
+    await expect(page).toHaveURL(/\/settings\/gateway#connection$/)
     // Connection renders even before/without a loaded config gate.
     await expect(dialog(page).getByRole('heading', { name: 'Connection' })).toBeVisible()
 

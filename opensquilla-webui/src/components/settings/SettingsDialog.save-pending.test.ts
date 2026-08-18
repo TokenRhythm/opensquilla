@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, reactive, ref, type App } from 'vue'
+import { createPinia } from 'pinia'
 import i18n, { loadLocaleMessages } from '@/i18n'
 import SettingsDialog from './SettingsDialog.vue'
 
@@ -13,8 +14,8 @@ const confirmAction = vi.fn()
 
 vi.mock('@/composables/setup/useSetupCatalog', () => ({
   SETTINGS_SECTIONS: [
-    { id: 'behavior', label: 'Behavior', icon: 'chat', group: 'preferences' },
-    { id: 'capabilities', label: 'Capabilities', icon: 'star', group: 'capabilities' },
+    { id: 'general', label: 'General', icon: 'settings', client: false, group: 'preferences' },
+    { id: 'capabilities', label: 'Capabilities', icon: 'skills', client: false, group: 'ai' },
   ],
   useSetupCatalog: () => catalogApi,
 }))
@@ -37,7 +38,7 @@ vi.mock('@/platform', () => ({
 let app: App<Element> | null = null
 
 function mockCatalog() {
-  const section = ref('behavior')
+  const section = ref('general')
   const saveAllPending = ref(true)
   const providerSavePending = ref(false)
   const providerDraftDirty = ref(false)
@@ -57,6 +58,7 @@ function mockCatalog() {
       statusText: 'Automatic titles are off.',
     }),
     privacyPanel: ref({}),
+    memoryPanel: ref({ autoCapture: true }),
     modelStrategyPanel: ref({}),
     presetPanel: ref(null),
     channelsPanel: ref({}),
@@ -72,7 +74,7 @@ function mockCatalog() {
     sectionStatus: () => ({ label: 'Ready', tone: 'is-ok' }),
     sectionDirty: () => true,
     providerDraftDirty,
-    dirtySections: ref([{ id: 'behavior', label: 'Behavior' }]),
+    dirtySections: ref([{ id: 'general', label: 'General' }]),
     hasUnsavedChanges,
     saveAllPending,
     providerSavePending,
@@ -104,6 +106,7 @@ async function mountDialog() {
   document.body.appendChild(el)
   app = createApp(SettingsDialog)
   app.use(i18n)
+  app.use(createPinia())
   app.mount(el)
   await nextTick()
   await nextTick()
@@ -117,9 +120,9 @@ beforeEach(() => {
   confirmAction.mockResolvedValue(true)
   leaveGuard = null
   routeState = reactive({
-    params: { section: 'behavior' },
+    params: { section: 'general' },
     hash: '',
-    path: '/settings/behavior',
+    path: '/settings/general',
   })
   routerMock = {
     options: { history: { state: { back: '/sessions' } } },

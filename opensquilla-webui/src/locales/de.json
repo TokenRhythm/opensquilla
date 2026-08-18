@@ -283,8 +283,8 @@
   },
   "settings": {
     "appearance": {
-      "title": "Darstellung",
-      "desc": "Design, Sprache und lokale Oberflächeneinstellungen für diesen Browser. Voreinstellungen werden sofort übernommen; eine benutzerdefinierte Breite wird mit Anwenden bestätigt.",
+      "title": "Oberfläche",
+      "desc": "Design und lokale Oberflächeneinstellungen für diesen Browser. Voreinstellungen werden sofort übernommen; eine benutzerdefinierte Breite wird mit Anwenden bestätigt.",
       "themeLabel": "Design",
       "themeDesc": "Dem System folgen oder hell bzw. dunkel erzwingen. Der Schalter in der Seitenleiste ist eine Verknüpfung zu dieser Einstellung.",
       "languageLabel": "Sprache",
@@ -533,26 +533,44 @@
       "discardBody": "Es gibt ungespeicherte Änderungen. Beim Schließen gehen sie verloren.",
       "discardConfirmPrimary": "Änderungen verwerfen"
     },
+    "gateway": {
+      "title": "Gateway",
+      "desc": "Mit dem Gateway verbinden und auf dem Desktop die lokale Laufzeit verwalten."
+    },
+    "general": {
+      "title": "Allgemein",
+      "desc": "App-weite Sprache, Sitzungs- und Desktop-Fensterstandards festlegen."
+    },
+    "securityPrivacy": {
+      "title": "Sicherheit & Datenschutz",
+      "desc": "Diagnoseeinstellungen, Desktop-Vorschauen und Werkzeugisolierung verwalten."
+    },
+    "memoryOverview": {
+      "title": "Speicher",
+      "desc": "Festlegen, was OpenSquilla speichert, und optionale Lernfunktionen verwalten.",
+      "autoCaptureLabel": "Automatisches Speichern",
+      "autoCaptureDesc": "OpenSquilla darf nützliche Gesprächsinhalte im Langzeitspeicher sichern.",
+      "learningSummary": "Speicher und Selbstlernen (erweitert)",
+      "learningDesc": "Optionale Lernfunktionen können zusätzliche Modell-Tokens verwenden und einen Neustart erfordern.",
+      "profileImportLabel": "Profilimport",
+      "profileImportDesc": "Kompatible Identitäts- und Speicherdaten prüfen und importieren.",
+      "profileImportAction": "Öffnen"
+    },
     "rail": {
-      "connection": "Verbindung",
-      "runtime": "Laufzeit",
+      "gateway": "Gateway",
       "provider": "Modelldienst",
       "modelStrategy": "Modellrouting",
-      "behavior": "Verhalten",
-      "privacy": "Datenschutz",
-      "sandbox": "Sandbox",
-      "memory": "Gedächtnis und Profil",
-      "router": "Router",
-      "ensemble": "Ensemble",
       "capabilities": "Fähigkeiten",
-      "appearance": "Darstellung",
-      "keyboard": "Tastatur",
+      "general": "Allgemein",
+      "interface": "Oberfläche",
+      "shortcuts": "Tastenkürzel",
+      "securityPrivacy": "Sicherheit & Datenschutz",
+      "memory": "Speicher",
       "advanced": "Erweitert",
       "groups": {
-        "gateway": "Gateway",
         "ai": "AI-Konfiguration",
         "preferences": "Einstellungen",
-        "capabilities": "Fähigkeiten"
+        "safetyData": "Sicherheit & Daten"
       }
     }
   },
@@ -585,7 +603,7 @@
       "advancedTitle": "Erweitert · integrierte CLI",
       "hintBundled": "Diese Befehle verwenden die in der App integrierte CLI; zum Ausführen in ein Terminal einfügen.",
       "hintDev": "Dev-Modus: Befehle laufen über uv aus dem Quell-Checkout.",
-      "restartHint": "Zum Anwenden Einstellungen → Runtime → Neu starten der App verwenden."
+      "restartHint": "Zum Anwenden Einstellungen → Gateway → Neu starten verwenden."
     },
     "common": {
       "apiKey": "API-Schlüssel",
@@ -1520,7 +1538,7 @@
       "migrationCompleteDismiss": "Ausblenden"
     },
     "keyboard": {
-      "title": "Tastatur",
+      "title": "Tastenkürzel",
       "desc": "Globale Tastenkürzel für diesen Browser. Änderungen werden sofort übernommen — kein Speichern nötig.",
       "addModifier": "{modifier} (und optional ⇧ / ⌥) zur Taste hinzufügen.",
       "conflict": "Bereits verwendet von „{label}“.",
@@ -1534,6 +1552,8 @@
       "desc": "Experimentelle Client-Einstellungen für diesen Browser. Sie werden sofort übernommen — kein Speichern nötig. Markierte Elemente",
       "reload": "neu laden",
       "descReloadSuffix": "werden nach einer Seitenaktualisierung wirksam.",
+      "experimentsGroup": "Experimente",
+      "managementGroup": "Verwaltung",
       "foldLabel": "Neue Live-Turn-Darstellung",
       "foldDesc": "Erstellt die gestreamte Arbeitskarte aus einem geordneten Ereignisprotokoll. Nur zur vorübergehenden Rückkehr zur kompatiblen Darstellung ausschalten.",
       "foldAria": "Neue Live-Turn-Darstellung (wird nach dem Neuladen wirksam)",
@@ -1560,15 +1580,9 @@
       "runTraceAria": "Run-Trace-Schublade in Protokollen (wird nach dem Neuladen wirksam)"
     },
     "privacy": {
-      "title": "Datenschutz",
-      "statusEnabled": "Netzwerkberichte sind eingeschaltet.",
-      "statusDisabled": "Netzwerkberichte sind ausgeschaltet.",
-      "statusDisabledByEnv": "Netzwerkberichte sind ausgeschaltet, weil eine Umgebungsvariable sie deaktiviert.",
-      "disableNetworkObservabilityLabel": "Netzwerkberichte ausschalten",
-      "disableNetworkObservabilityDesc": "Stoppt Installations- und tägliche Nutzungstelemetrie, Updateprüfungen im Hintergrund sowie pseudonyme Sitzungskennungen und den standardmäßig gesendeten optionalen sitzungsübergreifenden Header X-OpenSquilla-Install-Id, die ausschließlich an die offizielle TokenRhythm-HTTPS-API gesendet werden. Die persistierte Installationskennung kann aus lokalen MAC-/IP-Daten abgeleitet werden; Rohadressen werden nie gesendet. CI/Tests und der alte Telemetrie-Opt-out unterdrücken sie ebenfalls, der reine Update-Opt-out dagegen nicht. Ihre eigenen Modellanfragen funktionieren weiterhin.",
-      "memoryAutoCaptureLabel": "Automatisches Speichern",
-      "memoryAutoCaptureDesc": "OpenSquilla darf nützliche Gesprächsinhalte im Langzeitspeicher sichern.",
-      "save": "Datenschutz speichern"
+      "statusDisabledByEnv": "Durch eine Umgebungseinstellung deaktiviert.",
+      "networkReportingLabel": "Diagnose und Updates",
+      "networkReportingDesc": "Begrenzte Produktdiagnosedaten senden und nach Updates suchen. Gesprächsinhalte, Dateien und Inhalte von Modellanfragen werden nicht hochgeladen."
     },
     "toast": {
       "loadFailed": "Einstellungen konnten nicht geladen werden: {error}",

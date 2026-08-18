@@ -327,7 +327,6 @@ describe('catalog parity', () => {
       'chat.routeFeedback.',
     ]
     const ensembleKeys = new Set([
-      'settings.rail.ensemble',
       'setup.provider.activateEnsembleOnPreserved',
       'setup.provider.routingDesc',
       'setup.toast.ensembleSaved',
@@ -343,12 +342,10 @@ describe('catalog parity', () => {
 
     expect(deprecated).toEqual([])
     expect({
-      rail: zhHans.settings.rail.ensemble,
       setup: zhHans.setup.router.summaryEnsemble,
       composer: zhHans.chat.composer.modelRoutingEnsemble,
       runtime: zhHans.chat.routerFx.ensembleSelecting,
     }).toEqual({
-      rail: '模型融合',
       setup: 'AI 智能融合路由',
       composer: 'AI 智能融合路由',
       runtime: 'AI 智能融合路由 · 正在选择候选',

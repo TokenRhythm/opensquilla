@@ -21,7 +21,7 @@
                  tab stop. Rendered when the group changes so each bin is headed
                  once. Hidden on the mobile horizontal strip. -->
             <span
-              v-if="i === 0 || s.group !== visibleSections[i - 1].group"
+              v-if="s.group && (i === 0 || s.group !== visibleSections[i - 1]?.group)"
               class="settings-rail__group"
               role="presentation"
               aria-hidden="true"
@@ -40,7 +40,7 @@
               <Icon :name="s.icon" :size="16" aria-hidden="true" />
               <span class="settings-rail__label">{{ t('settings.rail.' + s.id) }}</span>
               <span v-if="sectionDirty(s.id)" class="settings-rail__dirty" aria-hidden="true"></span>
-              <span v-if="!s.client && s.id === 'connection'" class="settings-rail__dot" :class="sectionStatus(s.id).tone" aria-hidden="true"></span>
+              <span v-if="s.id === 'gateway'" class="settings-rail__dot" :class="sectionStatus(s.id).tone" aria-hidden="true"></span>
               <span v-else-if="!s.client && sectionStatus(s.id).tone === 'is-warn'" class="settings-rail__warn" aria-hidden="true">!</span>
             </button>
           </template>
@@ -74,29 +74,53 @@
             :disabled="saveAllPending"
             :aria-busy="saveAllPending ? 'true' : undefined"
           >
-          <!-- Connection renders regardless of load state: it is how you point
-               the UI at a reachable gateway when nothing has loaded yet. -->
-          <SetupConnectionPanel v-if="section === 'connection'" />
+          <!-- Gateway remains available even when config readiness cannot load,
+               because this is where users recover the connection/runtime. -->
+          <SettingsGatewayPanel
+            v-if="section === 'gateway'"
+            :is-desktop="isDesktop"
+          />
 
-          <!-- Runtime (desktop only) also renders regardless of load state: it
-               reports the owned gateway and offers logs/restart precisely for
-               when the gateway is down and config never loaded. -->
-          <DesktopRuntimePanel v-else-if="section === 'runtime' && isDesktop" />
-
-          <!-- Memory import is an action flow with its own RPC capability gate,
-               rather than a config-backed form. It remains usable even when
-               readiness catalog loading is unavailable. -->
-          <SettingsMemoryPanel v-else-if="section === 'memory'" />
-
-          <SandboxSettingsPanel v-else-if="section === 'sandbox'" />
+          <!-- Profile import is nested under Memory and owns its RPC gate. -->
+          <SettingsMemoryPanel v-else-if="section === 'profileImport'" />
 
           <!-- Optional cross-installation discovery is deliberately mounted
                only when the user opens this section. It never runs at app or
                Settings-dialog startup. -->
           <DataMigrationPanel v-else-if="section === 'dataMigration'" />
 
-          <!-- Config-backed sections wait for readiness so their baselines are
-               final before any field can be edited. -->
+          <!-- Mixed pages render their local controls immediately and gate only
+               the config-backed rows on catalog readiness. -->
+          <SettingsGeneralPanel
+            v-else-if="section === 'general'"
+            :panel="behaviorPanel"
+            :loaded="loaded"
+            :is-desktop="isDesktop"
+            @update-auto-session-titles="setAutoSessionTitles"
+          />
+          <SettingsSecurityPrivacyPanel
+            v-else-if="section === 'securityPrivacy'"
+            :panel="privacyPanel"
+            :loaded="loaded"
+            :is-desktop="isDesktop"
+            @update-network-reporting-enabled="setNetworkReportingEnabled"
+          />
+          <SettingsMemoryOverviewPanel
+            v-else-if="section === 'memory'"
+            :auto-capture="memoryPanel.autoCapture"
+            :loaded="loaded"
+            @update-auto-capture="setMemoryAutoCapture"
+            @open-profile-import="openProfileImport"
+          />
+          <SettingsAppearancePanel v-else-if="section === 'interface'" />
+          <SettingsKeyboardPanel v-else-if="section === 'shortcuts'" />
+          <SettingsAdvancedPanel
+            v-else-if="section === 'advanced'"
+            @open-agent-configuration="openAgentConfiguration"
+            @open-data-maintenance="openDataMaintenance"
+          />
+
+          <!-- AI configuration pages wait for complete readiness baselines. -->
           <div v-else-if="!loaded" class="settings-loading" role="status">
             <LoadingSpinner />
             <strong>{{ t('settings.rail.' + section) }}</strong>
@@ -128,17 +152,6 @@
               @activate-provider="activateProvider"
               @update-image-generation-opt-in="setProviderImageGenerationOptIn"
             />
-            <SetupBehaviorPanel
-              v-else-if="section === 'behavior'"
-              :panel="behaviorPanel"
-              @update-auto-session-titles="setAutoSessionTitles"
-            />
-            <SettingsPrivacyPanel
-              v-else-if="section === 'privacy'"
-              :panel="privacyPanel"
-              @update-disable-network-observability="setDisableNetworkObservability"
-              @update-memory-auto-capture="setMemoryAutoCapture"
-            />
             <SetupModelStrategyPanel
               v-else-if="section === 'modelStrategy'"
               :panel="modelStrategyPanel"
@@ -169,13 +182,6 @@
               @image-provider-change="onImageProviderChange"
               @use-image-recommendation="useImageRecommendation"
               @reset-capability="resetCapability"
-            />
-            <SettingsAppearancePanel v-else-if="section === 'appearance'" />
-            <SettingsKeyboardPanel v-else-if="section === 'keyboard'" />
-            <SettingsAdvancedPanel
-              v-else-if="section === 'advanced'"
-              @open-agent-configuration="openAgentConfiguration"
-              @open-data-maintenance="openDataMaintenance"
             />
           </template>
           </fieldset>
@@ -232,21 +238,24 @@ import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
-import SetupBehaviorPanel from '@/components/setup/SetupBehaviorPanel.vue'
-import SetupConnectionPanel from '@/components/settings/SetupConnectionPanel.vue'
 import SetupProviderPanel from '@/components/setup/SetupProviderPanel.vue'
 import SetupModelStrategyPanel from '@/components/setup/SetupModelStrategyPanel.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
-import SettingsPrivacyPanel from '@/components/settings/SettingsPrivacyPanel.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
-import SandboxSettingsPanel from '@/components/settings/SandboxSettingsPanel.vue'
-import DesktopRuntimePanel from '@/components/settings/DesktopRuntimePanel.vue'
+import SettingsGatewayPanel from '@/components/settings/SettingsGatewayPanel.vue'
+import SettingsGeneralPanel from '@/components/settings/SettingsGeneralPanel.vue'
+import SettingsSecurityPrivacyPanel from '@/components/settings/SettingsSecurityPrivacyPanel.vue'
+import SettingsMemoryOverviewPanel from '@/components/settings/SettingsMemoryOverviewPanel.vue'
 import DataMigrationPanel from '@/components/settings/DataMigrationPanel.vue'
 import { useSetupCatalog, SETTINGS_SECTIONS } from '@/composables/setup/useSetupCatalog'
-import { parseProviderHash, sectionFromRouteParam } from '@/composables/setup/useSettingsSection'
+import {
+  parseProviderHash,
+  sectionFromRouteParam,
+  settingsSectionAliasFor,
+} from '@/composables/setup/useSettingsSection'
 import { useConfirm } from '@/composables/useConfirm'
 import { usePlatform } from '@/platform'
 import '@/styles/settings-forms.css'
@@ -256,8 +265,8 @@ const router = useRouter()
 const { t } = useI18n()
 const { confirm, confirmState } = useConfirm()
 
-// Desktop owns a local gateway, so it exposes a Runtime section the web build
-// hides. `desktopOnly` sections are filtered out everywhere else.
+// The catalog retains the desktopOnly capability for future destinations. The
+// consolidated rail currently shares all ten destinations across surfaces.
 const isDesktop = usePlatform().capabilities.isDesktop
 const visibleSections = computed(() => SETTINGS_SECTIONS.filter(s => !s.desktopOnly || isDesktop))
 
@@ -268,6 +277,7 @@ const {
   providerPanel,
   behaviorPanel,
   privacyPanel,
+  memoryPanel,
   modelStrategyPanel,
   presetPanel,
   capabilitiesPanel,
@@ -287,7 +297,7 @@ const {
   requestAddProvider,
   cancelProviderEdit,
   setAutoSessionTitles,
-  setDisableNetworkObservability,
+  setNetworkReportingEnabled,
   setMemoryAutoCapture,
   setProviderImageGenerationOptIn,
   setModelStrategy,
@@ -331,7 +341,9 @@ const {
 // the parent selected while its nested route is open so the rail communicates
 // hierarchy without advertising migration during normal Settings use.
 const activeRailSection = computed(() => (
-  section.value === 'dataMigration' ? 'advanced' : section.value
+  section.value === 'dataMigration'
+    ? 'advanced'
+    : section.value === 'profileImport' ? 'memory' : section.value
 ))
 
 const modalRef = ref<HTMLElement | null>(null)
@@ -455,6 +467,13 @@ const routeParam = computed(() => route.params.section)
 // readiness is known; it is a routing sentinel, never a real rail section.
 const wantsAutoSection = computed(() => routeParam.value === 'auto')
 
+const COMPOSITE_HASH_TARGETS: Record<string, string> = {
+  '#connection': 'settings-gateway-connection',
+  '#runtime': 'settings-gateway-runtime',
+  '#privacy': 'settings-security-privacy',
+  '#sandbox': 'settings-security-sandbox',
+}
+
 // Reflect the active section in the URL with replace (not push) so the browser
 // Back button exits Settings in one step rather than walking section history.
 // Only replace when the section actually changes — an unconditional replace on
@@ -468,23 +487,42 @@ function selectSection(id: string) {
   }
 }
 
-// Resolve the section the route is asking for. Connection works before config
-// loads; the auto sentinel waits for readiness; everything else maps the param
-// (or the default) straight through.
+// Resolve aliases and nested destinations. Old URLs are canonicalized with a
+// subsection hash so bookmarks keep landing on their original content.
 function applyRouteSection() {
   if (wantsAutoSection.value) {
     if (loaded.value && !userNavigated) selectInitialSection('auto')
     return
   }
   const resolved = sectionFromRouteParam(routeParam.value)
-  if (resolved === 'dataMigration') {
+  const alias = settingsSectionAliasFor(routeParam.value)
+  if (alias) {
+    void router.replace({
+      path: `/settings/${alias.section}`,
+      hash: route.hash || alias.hash || '',
+    })
+  }
+  if (resolved === 'dataMigration' || resolved === 'profileImport') {
     setSection(resolved)
     return
   }
-  // A desktopOnly section requested where it is unavailable (e.g. a stale
-  // /settings/runtime deep link on web) has no rail entry or panel branch; fall
-  // back to the default so the dialog never renders an empty body.
+  // A future surface-specific destination requested where unavailable has no
+  // rail entry or panel branch; fall back so the dialog never renders empty.
   setSection(visibleSections.value.some(s => s.id === resolved) ? resolved : 'provider')
+}
+
+function focusCompositeHash(): boolean {
+  const targetId = COMPOSITE_HASH_TARGETS[route.hash]
+  if (!targetId) return false
+  const target = document.getElementById(targetId)
+  if (!target) return false
+  target.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' })
+  target.focus({ preventScroll: true })
+  return true
+}
+
+function applyCompositeHash() {
+  void nextTick(() => { focusCompositeHash() })
 }
 
 // `#provider-<id>` deep links land on the Provider section with that provider
@@ -608,6 +646,12 @@ async function openDataMaintenance() {
   panelRef.value?.querySelector<HTMLElement>('[data-testid="data-migration-heading"]')?.focus()
 }
 
+async function openProfileImport() {
+  selectSection('profileImport')
+  await nextTick()
+  panelRef.value?.querySelector<HTMLElement>('[data-testid="memory-import-heading"]')?.focus()
+}
+
 // One discard prompt shared by every exit path: requestClose (Escape, the
 // close button, backdrop click) and the history-back leave guard below.
 function confirmDiscard(): Promise<boolean> {
@@ -690,7 +734,10 @@ watch(routeParam, () => applyRouteSection())
 // A provider deep-link hash can arrive (or change) after mount. (Legacy
 // #channel- hashes never reach this dialog: a router guard rewrites them to
 // the /channels workspace before the settings route resolves.)
-watch(() => route.hash, () => { applyProviderHash() })
+watch(() => route.hash, () => {
+  applyProviderHash()
+  applyCompositeHash()
+})
 
 // Whenever the active section changes (rail click, deep link, Back), bring its
 // tab into view on the horizontally-scrolling mobile rail.
@@ -698,6 +745,7 @@ watch(section, () => {
   scrollActiveTabIntoView()
   resetActivePanelScroll()
   applyProviderHash()
+  applyCompositeHash()
 })
 
 // The auto deep link lands on its readiness-derived section once config is
@@ -705,7 +753,10 @@ watch(section, () => {
 watch(loaded, (isLoaded) => {
   if (isLoaded && wantsAutoSection.value && !userNavigated) selectInitialSection('auto')
   // Catalog data is required to validate a provider hash, so (re)try now.
-  if (isLoaded) { applyProviderHash() }
+  if (isLoaded) {
+    applyProviderHash()
+    applyCompositeHash()
+  }
 })
 
 onMounted(() => {
@@ -721,7 +772,9 @@ onMounted(() => {
   document.addEventListener('keydown', onDocumentKeydown)
   mq = window.matchMedia('(max-width: 768px)')
   mq.addEventListener('change', onViewportChange)
-  nextTick(() => closeBtn.value?.focus())
+  nextTick(() => {
+    if (!focusCompositeHash()) closeBtn.value?.focus()
+  })
 })
 
 onUnmounted(() => {

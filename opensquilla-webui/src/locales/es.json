@@ -283,8 +283,8 @@
   },
   "settings": {
     "appearance": {
-      "title": "Apariencia",
-      "desc": "Tema, idioma y preferencias de interfaz locales de este navegador. Los preajustes se aplican al instante; usa Aplicar para un ancho personalizado.",
+      "title": "Interfaz",
+      "desc": "Tema y preferencias de interfaz locales de este navegador. Los preajustes se aplican al instante; usa Aplicar para un ancho personalizado.",
       "themeLabel": "Tema",
       "themeDesc": "Sigue tu sistema o fuerza el modo claro u oscuro. El conmutador de la barra lateral es un atajo a este mismo ajuste.",
       "languageLabel": "Idioma",
@@ -533,26 +533,44 @@
       "discardBody": "Tienes ediciones sin guardar. Si cierras ahora se perderán.",
       "discardConfirmPrimary": "Descartar cambios"
     },
+    "gateway": {
+      "title": "Puerta de enlace",
+      "desc": "Conecta con la puerta de enlace y, en escritorio, gestiona el entorno local."
+    },
+    "general": {
+      "title": "General",
+      "desc": "Configura el idioma, las sesiones y las ventanas para toda la aplicación."
+    },
+    "securityPrivacy": {
+      "title": "Seguridad y privacidad",
+      "desc": "Gestiona las preferencias de diagnóstico, las vistas previas y el aislamiento de herramientas."
+    },
+    "memoryOverview": {
+      "title": "Memoria",
+      "desc": "Elige qué recuerda OpenSquilla y gestiona las funciones opcionales de aprendizaje.",
+      "autoCaptureLabel": "Captura automática de memoria",
+      "autoCaptureDesc": "Permite que OpenSquilla guarde información útil de las conversaciones en la memoria a largo plazo.",
+      "learningSummary": "Memoria y autoaprendizaje (avanzado)",
+      "learningDesc": "Las funciones de aprendizaje opcionales pueden usar tokens adicionales y requerir un reinicio.",
+      "profileImportLabel": "Importación del perfil",
+      "profileImportDesc": "Revisa e importa datos compatibles de identidad y memoria.",
+      "profileImportAction": "Abrir"
+    },
     "rail": {
-      "connection": "Conexión",
-      "runtime": "Tiempo de ejecución",
+      "gateway": "Puerta de enlace",
       "provider": "Servicio de modelos",
       "modelStrategy": "Enrutamiento de modelos",
-      "behavior": "Comportamiento",
-      "privacy": "Privacidad",
-      "sandbox": "Sandbox",
-      "memory": "Memoria y perfil",
-      "router": "Enrutador",
-      "ensemble": "Conjunto",
       "capabilities": "Capacidades",
-      "appearance": "Apariencia",
-      "keyboard": "Teclado",
+      "general": "General",
+      "interface": "Interfaz",
+      "shortcuts": "Atajos",
+      "securityPrivacy": "Seguridad y privacidad",
+      "memory": "Memoria",
       "advanced": "Avanzado",
       "groups": {
-        "gateway": "Puerta de enlace",
         "ai": "Configuración de IA",
         "preferences": "Preferencias",
-        "capabilities": "Capacidades"
+        "safetyData": "Seguridad y datos"
       }
     }
   },
@@ -585,7 +603,7 @@
       "advancedTitle": "Avanzado · CLI integrada",
       "hintBundled": "Estos comandos usan la CLI integrada en la aplicación; pégalos en una terminal para ejecutarlos.",
       "hintDev": "Modo dev: los comandos se ejecutan desde el checkout del código fuente vía uv.",
-      "restartHint": "Usa Ajustes → Runtime → Reiniciar de la aplicación para aplicar."
+      "restartHint": "Usa Ajustes → Puerta de enlace → Reiniciar para aplicar."
     },
     "common": {
       "apiKey": "Clave de API",
@@ -1520,7 +1538,7 @@
       "migrationCompleteDismiss": "Cerrar"
     },
     "keyboard": {
-      "title": "Teclado",
+      "title": "Atajos",
       "desc": "Atajos globales para este navegador. Los cambios se aplican al instante; no es necesario guardar.",
       "addModifier": "Añade {modifier} (y opcionalmente ⇧ / ⌥) a la tecla.",
       "conflict": "Ya lo usa «{label}».",
@@ -1534,6 +1552,8 @@
       "desc": "Preferencias experimentales del cliente para este navegador. Se aplican al instante; no es necesario guardar. Los elementos marcados con",
       "reload": "recargar",
       "descReloadSuffix": "surten efecto tras actualizar la página.",
+      "experimentsGroup": "Experimentos",
+      "managementGroup": "Gestión",
       "foldLabel": "Nuevo renderizado de turnos en vivo",
       "foldDesc": "Construye la tarjeta de trabajo en streaming desde un registro ordenado de eventos. Desactívalo solo para restaurar temporalmente el renderizado compatible.",
       "foldAria": "Nuevo renderizado de turnos en vivo (surte efecto tras recargar)",
@@ -1560,15 +1580,9 @@
       "runTraceAria": "Panel de traza de ejecución en Registros (surte efecto tras recargar)"
     },
     "privacy": {
-      "title": "Privacidad",
-      "statusEnabled": "Los informes de red están activados.",
-      "statusDisabled": "Los informes de red están desactivados.",
-      "statusDisabledByEnv": "Los informes de red están desactivados por una variable de entorno.",
-      "disableNetworkObservabilityLabel": "Desactivar los informes de red",
-      "disableNetworkObservabilityDesc": "Detiene la telemetría de instalación y de uso diario, las comprobaciones de actualizaciones en segundo plano, los identificadores seudónimos de sesión y la cabecera opcional X-OpenSquilla-Install-Id entre sesiones, enviada de forma predeterminada solo a la API HTTPS oficial de TokenRhythm. El ID de instalación persistente puede derivarse de datos MAC/IP locales; nunca se envían las direcciones originales. Los entornos CI/pruebas y la exclusión heredada de telemetría también lo suprimen; desactivar solo las actualizaciones no. Tus propias solicitudes de modelo siguen funcionando.",
-      "memoryAutoCaptureLabel": "Captura automática de memoria",
-      "memoryAutoCaptureDesc": "Permite que OpenSquilla guarde información útil de las conversaciones en la memoria a largo plazo.",
-      "save": "Guardar privacidad"
+      "statusDisabledByEnv": "Desactivados por una configuración del entorno.",
+      "networkReportingLabel": "Diagnóstico y actualizaciones",
+      "networkReportingDesc": "Comparte datos limitados de diagnóstico del producto y busca actualizaciones. No se suben conversaciones, archivos ni el contenido de solicitudes al modelo."
     },
     "toast": {
       "loadFailed": "No se pudieron cargar los ajustes: {error}",

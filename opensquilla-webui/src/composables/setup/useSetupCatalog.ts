@@ -1378,14 +1378,6 @@ const networkObservabilityDisabledByEnvironment = computed(() => (
   currentEffectiveNetworkObservabilityDisabled.value && !currentDisableNetworkObservability.value
 ))
 const privacyDirty = computed(() => disableNetworkObservability.value !== currentDisableNetworkObservability.value)
-const privacyStatusText = computed(() => {
-  if (networkObservabilityDisabledByEnvironment.value && !disableNetworkObservability.value) {
-    return t('setup.privacy.statusDisabledByEnv')
-  }
-  return disableNetworkObservability.value
-    ? t('setup.privacy.statusDisabled')
-    : t('setup.privacy.statusEnabled')
-})
 
 
 const modelSummary = computed(() => {
@@ -1865,11 +1857,15 @@ const behaviorPanel = behaviorForm.createPanel({
 })
 
 const privacyPanel = computed(() => ({
-  disableNetworkObservability: disableNetworkObservability.value,
-  disableNetworkObservabilityDirty: privacyDirty.value,
-  memoryAutoCapture: promotedForm.memoryAutoCapture.value,
-  memoryAutoCaptureDirty: promotedForm.captureDirty.value,
-  statusText: privacyStatusText.value,
+  networkReportingEnabled: !(
+    disableNetworkObservability.value || networkObservabilityDisabledByEnvironment.value
+  ),
+  networkReportingForcedOff: networkObservabilityDisabledByEnvironment.value,
+}))
+
+const memoryPanel = computed(() => ({
+  autoCapture: promotedForm.memoryAutoCapture.value,
+  autoCaptureDirty: promotedForm.captureDirty.value,
 }))
 
 const isOpenrouterProvider = computed(() => currentProvider.value.toLowerCase() === 'openrouter')
@@ -2229,7 +2225,7 @@ function firstActionSection(): SettingsSectionId {
 }
 
 function sectionStatus(sectionId: string): { label: string; tone: string } {
-  if (sectionId === 'connection') {
+  if (sectionId === 'gateway') {
     if (rpc.isConnected) return { label: t('setup.connection.connected'), tone: 'is-ok' }
     if (rpc.isConnecting) return { label: t('setup.connection.connecting'), tone: 'is-muted' }
     return { label: t('setup.connection.disconnected'), tone: 'is-warn' }
@@ -2238,11 +2234,16 @@ function sectionStatus(sectionId: string): { label: string; tone: string } {
     if (providerEnvMissing.value) return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
     return detailStepStatus((status.value.sectionDetails || {}).llm || (status.value.sectionDetails || {}).provider)
   }
-  // Behavior/Privacy/Ensemble are always-valid preference toggles, not
+  // General/Security/Memory are always-valid preference toggles, not
   // readiness milestones — a neutral dot (rather than a green "Live" that
   // overstates earned readiness) is honest; the dirty pip already signals
   // unsaved edits.
-  if (sectionId === 'behavior' || sectionId === 'privacy' || sectionId === 'ensemble') {
+  if (
+    sectionId === 'general'
+    || sectionId === 'securityPrivacy'
+    || sectionId === 'memory'
+    || sectionId === 'ensemble'
+  ) {
     return { label: t('setup.status.appliesOnSave'), tone: 'is-muted' }
   }
   if (sectionId === 'modelStrategy' && !hasSavedProvider.value) {
@@ -2306,7 +2307,8 @@ const providerDirty = computed(() => (
   || (editingPrimaryProvider.value && promotedForm.contextWindowDirty.value)
 ))
 const behaviorDirty = computed(() => behaviorForm.isDirty.value)
-const privacySectionDirty = computed(() => privacyDirty.value || promotedForm.captureDirty.value)
+const securityPrivacyDirty = computed(() => privacyDirty.value)
+const memorySettingsDirty = computed(() => promotedForm.captureDirty.value)
 const modelStrategyDirty = computed(() => (
   routerForm.isDirty.value
   || ensembleForm.isDirty.value
@@ -2324,8 +2326,9 @@ function sectionDirty(sectionId: string): boolean {
   // Provider drafts are intentionally absent from the global settings dirty
   // state. Their editor owns an explicit Save changes action.
   if (sectionId === 'provider') return false
-  if (sectionId === 'behavior') return behaviorDirty.value
-  if (sectionId === 'privacy') return privacySectionDirty.value
+  if (sectionId === 'general') return behaviorDirty.value
+  if (sectionId === 'securityPrivacy') return securityPrivacyDirty.value
+  if (sectionId === 'memory') return memorySettingsDirty.value
   if (sectionId === 'modelStrategy') return modelStrategyDirty.value
   if (sectionId === 'capabilities') return capabilitiesDirty.value
   return false
@@ -2343,7 +2346,8 @@ async function saveDirtySections() {
     // otherwise refresh the catalog and make later dirty flags disappear while
     // their drafts are still waiting to be persisted.
     const work = {
-      privacy: privacySectionDirty.value,
+      privacy: securityPrivacyDirty.value,
+      memoryCapture: memorySettingsDirty.value,
       provider: false,
       behavior: behaviorDirty.value,
       modelStrategy: modelStrategyDirty.value,
@@ -2371,6 +2375,7 @@ async function saveDirtySections() {
     const selectedProviderId = normalizeProviderId(providerForm.selectedProvider.value)
     const restoreProfileSelection = providerSelectionKind.value !== 'primary'
     if (work.privacy && !(await savePrivacy(disableNetworkObservability.value, { reload: false }))) return
+    if (work.memoryCapture && !(await saveMemoryAutoCapture({ reload: false }))) return
     if (work.behavior && !(await saveBehavior({ reload: false }))) return
     if (work.modelStrategy && !(await saveModelStrategy({
       reload: false,
@@ -2682,6 +2687,11 @@ function setAutoSessionTitles(enabled: boolean) {
 
 function setDisableNetworkObservability(enabled: boolean) {
   disableNetworkObservability.value = enabled
+}
+
+function setNetworkReportingEnabled(enabled: boolean) {
+  if (networkObservabilityDisabledByEnvironment.value) return
+  setDisableNetworkObservability(!enabled)
 }
 
 function setMemoryAutoCapture(enabled: boolean) {
@@ -3628,7 +3638,6 @@ async function savePrivacy(
   try {
     const restart = await safePatchConfig({
       'privacy.disable_network_observability': value,
-      ...promotedForm.memoryPatches(),
     })
     if (options.reload === false) {
       config.value = {
@@ -3644,6 +3653,29 @@ async function savePrivacy(
       await loadData()
     }
     pushToast(restart ? t('setup.toast.privacySavedRestart') : t('setup.toast.privacySaved'))
+    return true
+  } catch (err) {
+    pushToast(saveFailedMessage(err), { tone: 'danger' })
+    return false
+  }
+}
+
+async function saveMemoryAutoCapture(options: SaveOptions = {}): Promise<boolean> {
+  try {
+    const restart = await safePatchConfig(promotedForm.memoryPatches())
+    if (options.reload === false) {
+      config.value = {
+        ...config.value,
+        memory: {
+          ...(config.value.memory || {}),
+          auto_capture_enabled: promotedForm.memoryAutoCapture.value,
+        },
+      }
+      promotedForm.initMemoryCaptureFromConfig(config.value)
+    } else {
+      await loadData()
+    }
+    pushToast(restart ? t('setup.toast.memorySavedRestart') : t('setup.toast.memorySaved'))
     return true
   } catch (err) {
     pushToast(saveFailedMessage(err), { tone: 'danger' })
@@ -3919,6 +3951,7 @@ async function copyConfigPath() {
     providerPanel,
     behaviorPanel,
     privacyPanel,
+    memoryPanel,
     modelStrategyPanel,
     routerPanel,
     presetPanel,
@@ -3952,6 +3985,7 @@ async function copyConfigPath() {
     cancelProviderEdit,
     setAutoSessionTitles,
     setDisableNetworkObservability,
+    setNetworkReportingEnabled,
     setMemoryAutoCapture,
     setProviderImageGenerationOptIn,
     setModelStrategy: modelStrategyForm.setStrategy,
@@ -3998,6 +4032,7 @@ async function copyConfigPath() {
     saveProvider,
     saveBehavior,
     savePrivacy,
+    saveMemoryAutoCapture,
     saveRouter,
     saveEnsemble,
     saveModelStrategy,

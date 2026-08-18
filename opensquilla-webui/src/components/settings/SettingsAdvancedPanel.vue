@@ -2,7 +2,6 @@
 import { computed, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
-import MemoryLearningGroup from '@/components/settings/MemoryLearningGroup.vue'
 
 const { t } = useI18n()
 const emit = defineEmits<{
@@ -83,6 +82,8 @@ const agentConfigAriaLabel = computed(() =>
       <p class="control-section__desc">{{ t('setup.advanced.desc') }} <em>{{ t('setup.advanced.reload') }}</em> {{ t('setup.advanced.descReloadSuffix') }}</p>
     </div>
 
+    <h4 class="advanced-group">{{ t('setup.advanced.experimentsGroup') }}</h4>
+
     <label class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('setup.advanced.foldLabel') }}</span>
@@ -135,8 +136,6 @@ const agentConfigAriaLabel = computed(() =>
       </div>
     </label>
 
-    <MemoryLearningGroup />
-
     <label class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('setup.advanced.runTraceLabel') }}</span>
@@ -147,6 +146,8 @@ const agentConfigAriaLabel = computed(() =>
         <ControlSwitch name="labs_run_trace" :checked="runTrace" :aria-label="t('setup.advanced.runTraceAria')" @change="setRunTrace" />
       </div>
     </label>
+
+    <h4 class="advanced-group advanced-group--management">{{ t('setup.advanced.managementGroup') }}</h4>
 
     <div class="control-row">
       <div class="control-row__label-block">
@@ -185,6 +186,16 @@ const agentConfigAriaLabel = computed(() =>
 </template>
 
 <style scoped>
+.advanced-group {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  letter-spacing: 0.08em;
+  margin: var(--sp-4) 0 var(--sp-1);
+  text-transform: uppercase;
+}
+
+.advanced-group--management { margin-top: var(--sp-6); }
+
 .labs-hint {
   border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--border));
   border-radius: var(--radius-full);

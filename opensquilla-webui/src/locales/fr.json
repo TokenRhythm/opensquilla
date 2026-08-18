@@ -283,8 +283,8 @@
   },
   "settings": {
     "appearance": {
-      "title": "Apparence",
-      "desc": "Thème, langue et préférences d'interface locales à ce navigateur. Les préréglages s'appliquent immédiatement ; utilisez Appliquer pour une largeur personnalisée.",
+      "title": "Interface",
+      "desc": "Thème et préférences d'interface locales à ce navigateur. Les préréglages s'appliquent immédiatement ; utilisez Appliquer pour une largeur personnalisée.",
       "themeLabel": "Thème",
       "themeDesc": "Suivez votre système, ou forcez le mode clair ou sombre. Le bouton de la barre latérale est un raccourci vers ce même paramètre.",
       "languageLabel": "Langue",
@@ -533,26 +533,44 @@
       "discardBody": "Vous avez des modifications non enregistrées. Fermer maintenant les perdra.",
       "discardConfirmPrimary": "Abandonner les modifications"
     },
+    "gateway": {
+      "title": "Passerelle",
+      "desc": "Connectez-vous à la passerelle et, sur ordinateur, gérez l'environnement local."
+    },
+    "general": {
+      "title": "Général",
+      "desc": "Définissez la langue, les sessions et le comportement des fenêtres pour toute l'application."
+    },
+    "securityPrivacy": {
+      "title": "Sécurité et confidentialité",
+      "desc": "Gérez les préférences de diagnostic, les aperçus sur ordinateur et l'isolation des outils."
+    },
+    "memoryOverview": {
+      "title": "Mémoire",
+      "desc": "Choisissez ce qu'OpenSquilla mémorise et gérez les fonctions d'apprentissage facultatives.",
+      "autoCaptureLabel": "Capture automatique de la mémoire",
+      "autoCaptureDesc": "Autorise OpenSquilla à enregistrer les informations utiles des conversations dans la mémoire à long terme.",
+      "learningSummary": "Mémoire et auto-apprentissage (avancé)",
+      "learningDesc": "Les fonctions d'apprentissage facultatives peuvent utiliser des jetons supplémentaires et nécessiter un redémarrage.",
+      "profileImportLabel": "Importation du profil",
+      "profileImportDesc": "Examinez et importez des données d'identité et de mémoire compatibles.",
+      "profileImportAction": "Ouvrir"
+    },
     "rail": {
-      "connection": "Connexion",
-      "runtime": "Environnement d'exécution",
+      "gateway": "Passerelle",
       "provider": "Service de modèles",
       "modelStrategy": "Routage des modèles",
-      "behavior": "Comportement",
-      "privacy": "Confidentialité",
-      "sandbox": "Bac à sable",
-      "memory": "Mémoire et profil",
-      "router": "Routeur",
-      "ensemble": "Ensemble",
       "capabilities": "Capacités",
-      "appearance": "Apparence",
-      "keyboard": "Clavier",
+      "general": "Général",
+      "interface": "Interface",
+      "shortcuts": "Raccourcis",
+      "securityPrivacy": "Sécurité et confidentialité",
+      "memory": "Mémoire",
       "advanced": "Avancé",
       "groups": {
-        "gateway": "Passerelle",
         "ai": "Configuration IA",
         "preferences": "Préférences",
-        "capabilities": "Capacités"
+        "safetyData": "Sécurité et données"
       }
     }
   },
@@ -585,7 +603,7 @@
       "advancedTitle": "Avancé · CLI intégrée",
       "hintBundled": "Ces commandes utilisent la CLI intégrée à l'application ; collez-les dans un terminal pour les exécuter.",
       "hintDev": "Mode dev : les commandes s'exécutent depuis la copie source via uv.",
-      "restartHint": "Utilisez Réglages → Runtime → Redémarrer de l'application pour appliquer."
+      "restartHint": "Utilisez Réglages → Passerelle → Redémarrer pour appliquer."
     },
     "common": {
       "apiKey": "Clé API",
@@ -1520,7 +1538,7 @@
       "migrationCompleteDismiss": "Fermer"
     },
     "keyboard": {
-      "title": "Clavier",
+      "title": "Raccourcis",
       "desc": "Raccourcis globaux pour ce navigateur. Les changements s'appliquent immédiatement — aucun enregistrement nécessaire.",
       "addModifier": "Ajoutez {modifier} (et éventuellement ⇧ / ⌥) à la touche.",
       "conflict": "Déjà utilisé par « {label} ».",
@@ -1534,6 +1552,8 @@
       "desc": "Préférences client expérimentales pour ce navigateur. Elles s'appliquent immédiatement — aucun enregistrement nécessaire. Les éléments marqués",
       "reload": "recharger",
       "descReloadSuffix": "prennent effet après un rafraîchissement de la page.",
+      "experimentsGroup": "Expériences",
+      "managementGroup": "Gestion",
       "foldLabel": "Nouveau rendu des tours en direct",
       "foldDesc": "Construit la carte de travail en streaming à partir d'un journal d'événements ordonné. Désactivez-le uniquement pour rétablir temporairement le rendu compatible.",
       "foldAria": "Nouveau rendu des tours en direct (prend effet après rechargement)",
@@ -1560,15 +1580,9 @@
       "runTraceAria": "Tiroir de trace d'exécution dans les Journaux (prend effet après rechargement)"
     },
     "privacy": {
-      "title": "Confidentialité",
-      "statusEnabled": "Les rapports réseau sont activés.",
-      "statusDisabled": "Les rapports réseau sont désactivés.",
-      "statusDisabledByEnv": "Les rapports réseau sont désactivés par une variable d'environnement.",
-      "disableNetworkObservabilityLabel": "Désactiver les rapports réseau",
-      "disableNetworkObservabilityDesc": "Arrête la télémétrie d'installation et d'usage quotidien, les vérifications de mise à jour en arrière-plan, les identifiants pseudonymes de session et l'en-tête intersession facultatif X-OpenSquilla-Install-Id, envoyé par défaut uniquement à l'API HTTPS officielle de TokenRhythm. L'identifiant d'installation persistant peut être dérivé de données MAC/IP locales ; les adresses brutes ne sont jamais envoyées. Les environnements CI/test et l'ancien refus de télémétrie le suppriment aussi ; le refus des seules mises à jour ne le fait pas. Vos propres requêtes de modèle continuent de fonctionner.",
-      "memoryAutoCaptureLabel": "Capture automatique de la mémoire",
-      "memoryAutoCaptureDesc": "Autorise OpenSquilla à enregistrer les informations utiles des conversations dans la mémoire à long terme.",
-      "save": "Enregistrer la confidentialité"
+      "statusDisabledByEnv": "Désactivés par un paramètre d’environnement.",
+      "networkReportingLabel": "Diagnostics et mises à jour",
+      "networkReportingDesc": "Partage des données de diagnostic produit limitées et recherche les mises à jour. Le contenu des conversations, les fichiers et les requêtes de modèle ne sont pas envoyés."
     },
     "toast": {
       "loadFailed": "Échec du chargement des paramètres : {error}",

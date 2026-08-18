@@ -283,8 +283,8 @@
   },
   "settings": {
     "appearance": {
-      "title": "外観",
-      "desc": "このブラウザーのテーマ、言語、ローカルの表示設定です。プリセットは即時に反映され、カスタム幅は「適用」で確定します。",
+      "title": "インターフェース",
+      "desc": "このブラウザーのテーマとローカルの表示設定です。プリセットは即時に反映され、カスタム幅は「適用」で確定します。",
       "themeLabel": "テーマ",
       "themeDesc": "システムに従うか、ライトまたはダークを指定します。サイドバーの切り替えはこの設定へのショートカットです。",
       "languageLabel": "言語",
@@ -533,26 +533,44 @@
       "discardBody": "未保存の編集があります。今閉じると失われます。",
       "discardConfirmPrimary": "変更を破棄"
     },
+    "gateway": {
+      "title": "ゲートウェイ",
+      "desc": "ゲートウェイへ接続し、デスクトップではローカルランタイムも管理します。"
+    },
+    "general": {
+      "title": "一般",
+      "desc": "アプリ全体の言語、セッション、デスクトップウィンドウの既定値を設定します。"
+    },
+    "securityPrivacy": {
+      "title": "セキュリティとプライバシー",
+      "desc": "診断設定、デスクトッププレビュー、ツール分離を管理します。"
+    },
+    "memoryOverview": {
+      "title": "メモリ",
+      "desc": "OpenSquilla が記憶する内容と任意の学習機能を管理します。",
+      "autoCaptureLabel": "自動メモリ",
+      "autoCaptureDesc": "OpenSquilla が会話の有用な情報を長期メモリに保存することを許可します。",
+      "learningSummary": "メモリと自己学習（詳細）",
+      "learningDesc": "任意の学習機能は追加のモデルトークンを使い、再起動が必要な場合があります。",
+      "profileImportLabel": "プロフィールのインポート",
+      "profileImportDesc": "互換性のある ID とメモリのデータを確認して取り込みます。",
+      "profileImportAction": "開く"
+    },
     "rail": {
-      "connection": "接続",
-      "runtime": "ランタイム",
+      "gateway": "ゲートウェイ",
       "provider": "モデルサービス",
       "modelStrategy": "モデルルーティング",
-      "behavior": "動作",
-      "privacy": "プライバシー",
-      "sandbox": "サンドボックス",
-      "memory": "メモリとプロフィール",
-      "router": "ルーター",
-      "ensemble": "アンサンブル",
       "capabilities": "機能",
-      "appearance": "外観",
-      "keyboard": "キーボード",
+      "general": "一般",
+      "interface": "インターフェース",
+      "shortcuts": "ショートカット",
+      "securityPrivacy": "セキュリティとプライバシー",
+      "memory": "メモリ",
       "advanced": "詳細設定",
       "groups": {
-        "gateway": "ゲートウェイ",
         "ai": "AI 設定",
         "preferences": "環境設定",
-        "capabilities": "機能"
+        "safetyData": "セキュリティとデータ"
       }
     }
   },
@@ -585,7 +603,7 @@
       "advancedTitle": "詳細 · 内蔵 CLI",
       "hintBundled": "これらのコマンドはアプリ内蔵の CLI を使用します。ターミナルに貼り付けて実行できます。",
       "hintDev": "開発モード：コマンドは uv 経由でソースチェックアウトから実行されます。",
-      "restartHint": "アプリの「設定 → ランタイム → 再起動」で反映してください。"
+      "restartHint": "アプリの「設定 → ゲートウェイ → 再起動」で反映してください。"
     },
     "common": {
       "apiKey": "API キー",
@@ -1520,7 +1538,7 @@
       "migrationCompleteDismiss": "閉じる"
     },
     "keyboard": {
-      "title": "キーボード",
+      "title": "ショートカット",
       "desc": "このブラウザーのグローバルショートカットです。変更は即時に反映され、保存は不要です。",
       "addModifier": "キーに {modifier}（および任意で ⇧ / ⌥）を追加します。",
       "conflict": "すでに「{label}」で使用されています。",
@@ -1534,6 +1552,8 @@
       "desc": "このブラウザー向けの実験的なクライアント設定です。即時に反映されます。次のマークが付いた項目は",
       "reload": "再読み込み",
       "descReloadSuffix": "ページ更新後に有効になります。",
+      "experimentsGroup": "実験機能",
+      "managementGroup": "管理",
       "foldLabel": "新しいライブターン描画",
       "foldDesc": "順序付きイベントログからストリーミング中の作業カードを描画します。互換描画へ一時的に戻す場合のみオフにします。",
       "foldAria": "新しいライブターン描画（再読み込み後に有効）",
@@ -1560,15 +1580,9 @@
       "runTraceAria": "ログの実行トレースドロワー（再読み込み後に有効）"
     },
     "privacy": {
-      "title": "プライバシー",
-      "statusEnabled": "ネットワーク報告はオンです。",
-      "statusDisabled": "ネットワーク報告はオフです。",
-      "statusDisabledByEnv": "環境変数の設定により、ネットワーク報告はオフになっています。",
-      "disableNetworkObservabilityLabel": "ネットワーク報告をオフにする",
-      "disableNetworkObservabilityDesc": "インストールおよび日次使用量テレメトリ、バックグラウンドの更新確認、公式 TokenRhythm HTTPS API にのみ送信されるセッション用の仮名識別子と、デフォルトで送信されるセッションをまたぐ任意の X-OpenSquilla-Install-Id ヘッダーを停止します。永続化されたインストール ID はローカルの MAC/IP データから派生する場合がありますが、生のアドレスは送信されません。CI/テスト環境および旧テレメトリ拒否設定でも抑制されますが、更新確認だけを無効にしても抑制されません。自分で開始したモデルリクエストはそのまま動作します。",
-      "memoryAutoCaptureLabel": "自動メモリ",
-      "memoryAutoCaptureDesc": "OpenSquilla が会話の有用な情報を長期メモリに保存することを許可します。",
-      "save": "プライバシーを保存"
+      "statusDisabledByEnv": "環境設定により無効になっています。",
+      "networkReportingLabel": "診断とアップデート",
+      "networkReportingDesc": "限定的な製品診断データを送信してアップデートを確認します。会話内容、ファイル、モデルリクエストの内容はアップロードされません。"
     },
     "toast": {
       "loadFailed": "設定の読み込みに失敗しました: {error}",
