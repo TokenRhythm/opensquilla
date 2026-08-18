@@ -58,6 +58,7 @@ const TIMEOUT_MS = 60_000
 // source Gateway. Keep functional assertions at 60 seconds, but allow this
 // one-time startup phase to complete on slower CI and developer machines.
 const STARTUP_TIMEOUT_MS = 180_000
+const MANUAL_SETUP_TIMEOUT_MS = 30 * 60_000
 const MANUAL_MODE = process.env.OPENSQUILLA_MANUAL_V1_HTML_EDIT === '1'
 const MANUAL_REAL_PROVIDER = process.env.OPENSQUILLA_MANUAL_REAL_PROVIDER === '1'
 const MANUAL_REUSE_PROFILE = process.env.OPENSQUILLA_MANUAL_V1_PROFILE_ROOT?.trim() || ''
@@ -882,6 +883,8 @@ const evidence = {
   changesAfterAgentPatch: '',
   previewHeading: '',
   annotationModeExitedAfterAcceptance: false,
+  annotationAcceptanceEvents: [],
+  annotationModeAfterAcceptance: null,
   annotationRequests: 0,
   currentDocumentToolRequests: 0,
   toolFreeMutationFinalizations: 0,
@@ -929,10 +932,39 @@ try {
   page.on('console', message => {
     if (message.type() === 'error') consoleErrors.push(message.text())
   })
-  // A fresh real-provider profile intentionally opens the native provider
-  // setup window before the Gateway-backed /control/chat page exists. Hand
-  // control to the tester at that first window instead of timing out while
-  // waiting for configuration that only the tester can enter.
+  // A fresh real-provider profile intentionally opens native setup before the
+  // Gateway-backed Control UI exists. Report that setup is interactive, but do
+  // not claim the feature client is ready until the Gateway and renderer are
+  // both connected.
+  if (MANUAL_MODE && MANUAL_REAL_PROVIDER) {
+    console.log(JSON.stringify({
+      ready: false,
+      phase: 'provider-setup',
+      isolationRoot,
+      gatewayPort,
+      debugPort: manualDebugPort,
+      credentials: MANUAL_REUSE_PROFILE
+        ? 'existing isolated Desktop credential retained'
+        : 'none preconfigured; enter the API key in Desktop settings',
+      next: 'The harness will report ready only after the Control UI is connected.',
+    }, null, 2))
+  }
+  await waitFor(
+    () => page.url().includes('/control/chat'),
+    'owned-Gateway Control UI',
+    MANUAL_MODE && MANUAL_REAL_PROVIDER ? MANUAL_SETUP_TIMEOUT_MS : STARTUP_TIMEOUT_MS,
+  )
+  await page.locator('.conn-pill.connected').waitFor({
+    state: 'visible',
+    timeout: MANUAL_MODE && MANUAL_REAL_PROVIDER ? MANUAL_SETUP_TIMEOUT_MS : STARTUP_TIMEOUT_MS,
+  })
+  await delay(500)
+  // Source startup can complete optional session-recovery probes just after the
+  // connection indicator appears. They are outside this feature journey; start
+  // the renderer-error assertion at the first user interaction boundary.
+  pageErrors.length = 0
+  consoleErrors.length = 0
+
   if (MANUAL_MODE && MANUAL_REAL_PROVIDER) {
     console.log(JSON.stringify({
       ready: true,
@@ -941,7 +973,7 @@ try {
       isolationRoot,
       gatewayPort,
       debugPort: manualDebugPort,
-      credentials: 'none preconfigured; enter the API key in Desktop settings',
+      instruction: 'The real-provider HTML workflow is ready for manual testing.',
       shutdown: 'Close the Electron window.',
     }, null, 2))
     const electronProcess = app.process()
@@ -950,21 +982,6 @@ try {
     }
     break desktopJourney
   }
-  await waitFor(
-    () => page.url().includes('/control/chat'),
-    'owned-Gateway Control UI',
-    STARTUP_TIMEOUT_MS,
-  )
-  await page.locator('.conn-pill.connected').waitFor({
-    state: 'visible',
-    timeout: STARTUP_TIMEOUT_MS,
-  })
-  await delay(500)
-  // Source startup can complete optional session-recovery probes just after the
-  // connection indicator appears. They are outside this feature journey; start
-  // the renderer-error assertion at the first user interaction boundary.
-  pageErrors.length = 0
-  consoleErrors.length = 0
 
   if (MANUAL_MODE && MANUAL_REUSE_PROFILE) {
     console.log(JSON.stringify({
@@ -1072,6 +1089,23 @@ try {
   await page.locator('.chat-prompt-annotation-chip').filter({
     hasText: ANNOTATION_BODY,
   }).waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  const activeAnnotationButton = page.getByRole('button', { name: 'Stop annotating' })
+  await activeAnnotationButton.waitFor({ state: 'visible', timeout: TIMEOUT_MS })
+  assert.equal(
+    await activeAnnotationButton.getAttribute('aria-pressed'),
+    'true',
+    'adding a draft must keep element selection active until the chat send is accepted',
+  )
+  await page.getByTestId('workbench-annotation-mode-status').waitFor({
+    state: 'visible',
+    timeout: TIMEOUT_MS,
+  })
+  await page.evaluate(() => {
+    window.__opensquillaV1AnnotationAcceptanceEvents = []
+    window.addEventListener('opensquilla:artifact-prompt-annotations-accepted', (event) => {
+      window.__opensquillaV1AnnotationAcceptanceEvents.push(event.detail)
+    })
+  })
   const annotationRequestStart = provider.requests.length
   await page.locator('.chat-textarea').fill(ANNOTATION_MESSAGE)
   await page.locator('.chat-send-btn.btn--primary').click()
@@ -1083,7 +1117,23 @@ try {
   )
   await waitForSettledTurn(page)
   await waitFor(
-    async () => await annotationButton.getAttribute('aria-pressed') === 'false',
+    async () => {
+      const state = await page.evaluate(() => ({
+        acceptedEvents: window.__opensquillaV1AnnotationAcceptanceEvents || [],
+        statusCount: document.querySelectorAll(
+          '[data-testid="workbench-annotation-mode-status"]',
+        ).length,
+        stopButtonCount: [...document.querySelectorAll('button')]
+          .filter(button => button.getAttribute('aria-label') === 'Stop annotating')
+          .length,
+      }))
+      evidence.annotationAcceptanceEvents = state.acceptedEvents
+      evidence.annotationModeAfterAcceptance = {
+        statusCount: state.statusCount,
+        stopButtonCount: state.stopButtonCount,
+      }
+      return state.stopButtonCount === 0 && state.statusCount === 0
+    },
     'annotation mode exit after accepted send',
     TIMEOUT_MS,
   )

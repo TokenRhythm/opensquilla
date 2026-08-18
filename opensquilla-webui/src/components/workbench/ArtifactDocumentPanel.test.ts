@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { createApp, nextTick } from 'vue'
+import { createApp, h, nextTick, ref } from 'vue'
 import { createI18n } from 'vue-i18n'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createPinia } from 'pinia'
@@ -136,6 +136,72 @@ describe('ArtifactDocumentPanel', () => {
     expect(mounted.element.querySelector('[role="tab"][aria-selected="true"]')?.textContent)
       .toContain('Source')
     mounted.unmount()
+  })
+
+  it('reapplies Preview when an already-open document is opened again', async () => {
+    const htmlArtifact: ArtifactPayload = {
+      id: 'artifact-html',
+      documentId: 'document-html',
+      revisionId: 'revision-head',
+      name: 'page.html',
+      mime: 'text/html',
+      download_url: '/api/v1/artifacts/artifact-html',
+    }
+    const legacy = createLegacyArtifactWorkspace(htmlArtifact, 'session-a')
+    const initialSectionRequestId = ref(1)
+    const element = document.createElement('div')
+    document.body.append(element)
+    const app = createApp({
+      setup() {
+        return () => h(ArtifactDocumentPanel, {
+          artifact: htmlArtifact,
+          documentSnapshot: {
+            key: 'fixture-reopen',
+            loading: false,
+            loaded: true,
+            stale: false,
+            error: null,
+            workspace: {
+              ...legacy,
+              source: 'document-api',
+              document: {
+                ...legacy.document,
+                documentId: 'document-html',
+                headRevisionId: 'revision-head',
+                capabilities: {
+                  ...legacy.document.capabilities,
+                  edit: true,
+                  source: true,
+                },
+              },
+            },
+          } satisfies ArtifactDocumentWorkspaceSnapshot,
+          initialSection: 'preview',
+          initialSectionRequestId: initialSectionRequestId.value,
+          sessionKey: 'session-a',
+          suspended: true,
+        })
+      },
+    })
+    app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
+    app.use(createPinia())
+    app.mount(element)
+    await nextTick()
+
+    const sourceTab = [...element.querySelectorAll<HTMLButtonElement>('[role="tab"]')]
+      .find(tab => tab.textContent?.includes('Source'))
+    sourceTab?.click()
+    await nextTick()
+    expect(element.querySelector('[role="tab"][aria-selected="true"]')?.textContent)
+      .toContain('Source')
+
+    initialSectionRequestId.value = 2
+    await nextTick()
+    expect(element.querySelector('[role="tab"][aria-selected="true"]')?.textContent)
+      .toContain('Preview')
+
+    app.unmount()
+    element.remove()
   })
 
   it('keeps publishing out of the V1 document surface', async () => {

@@ -7,9 +7,11 @@ import {
   createArtifactCollectionWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
   initialSectionFromWorkbenchItem,
+  initialSectionRequestIdFromWorkbenchItem,
   navigationArtifactsFromWorkbenchItem,
   preparedPreviewFromWorkbenchItem,
   previewableNavigationArtifactsFromWorkbenchItem,
+  requestInitialSectionForWorkbenchItem,
 } from './artifactItems'
 
 const artifact: ArtifactPayload = {
@@ -78,6 +80,52 @@ describe('artifact Workbench items', () => {
 
     expect(initialSectionFromWorkbenchItem(source)).toBe('source')
     expect(initialSectionFromWorkbenchItem(preview)).toBe('preview')
+  })
+
+  it('preserves repeated section requests for an already-open document', () => {
+    const item = createArtifactPreviewWorkbenchItem({
+      artifact,
+      initialSection: 'preview',
+      initialSectionRequestId: 2,
+      nativeHtml: false,
+      sessionKey: 'session-a',
+    })
+
+    expect(initialSectionRequestIdFromWorkbenchItem(item)).toBe(2)
+  })
+
+  it('increments section requests only for the same logical Workbench item', () => {
+    const first = requestInitialSectionForWorkbenchItem(
+      createArtifactPreviewWorkbenchItem({
+        artifact,
+        initialSection: 'preview',
+        nativeHtml: false,
+        sessionKey: 'session-a',
+      }),
+      null,
+    )
+    const second = requestInitialSectionForWorkbenchItem(
+      createArtifactPreviewWorkbenchItem({
+        artifact,
+        initialSection: 'preview',
+        nativeHtml: false,
+        sessionKey: 'session-a',
+      }),
+      first,
+    )
+    const unrelated = requestInitialSectionForWorkbenchItem(
+      createArtifactPreviewWorkbenchItem({
+        artifact: { ...artifact, id: 'artifact-2' },
+        initialSection: 'preview',
+        nativeHtml: false,
+        sessionKey: 'session-a',
+      }),
+      second,
+    )
+
+    expect(initialSectionRequestIdFromWorkbenchItem(first)).toBe(1)
+    expect(initialSectionRequestIdFromWorkbenchItem(second)).toBe(2)
+    expect(initialSectionRequestIdFromWorkbenchItem(unrelated)).toBe(1)
   })
 
   it('preserves only a validated opaque-offline prepared preview policy', () => {

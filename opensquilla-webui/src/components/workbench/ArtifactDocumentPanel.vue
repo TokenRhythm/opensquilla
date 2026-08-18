@@ -303,6 +303,7 @@ const props = withDefaults(defineProps<{
   documentFeatures?: boolean
   documentSnapshot?: ArtifactDocumentWorkspaceSnapshot
   initialSection?: 'preview' | 'source'
+  initialSectionRequestId?: number
   authToken?: string
   baseOrigin?: string
   nativeHtml?: boolean
@@ -336,6 +337,7 @@ const props = withDefaults(defineProps<{
   documentActions: null,
   documentFeatures: true,
   initialSection: 'preview',
+  initialSectionRequestId: 0,
   authToken: '',
   baseOrigin: '',
   nativeHtml: false,
@@ -488,8 +490,8 @@ watch(
 )
 
 watch(
-  () => props.initialSection,
-  (section) => {
+  () => [props.initialSection, props.initialSectionRequestId] as const,
+  ([section]) => {
     activeTab.value = section
     if (section === 'source') sourceActivated.value = true
   },

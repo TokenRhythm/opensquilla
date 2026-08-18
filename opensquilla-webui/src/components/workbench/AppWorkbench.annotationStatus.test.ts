@@ -88,6 +88,16 @@ describe('AppWorkbench annotation mode status', () => {
     expect(importSource).not.toContain("undefined, 'source'")
   })
 
+  it('creates a fresh section request for every explicit artifact open path', () => {
+    const explicitOpenCalls = appWorkbenchSource.match(
+      /store\.openItem\(artifactPreviewItemForExplicitOpen\(/g,
+    ) || []
+
+    expect(appWorkbenchSource).toContain('function artifactPreviewItemForExplicitOpen(')
+    expect(explicitOpenCalls).toHaveLength(3)
+    expect(appWorkbenchSource).not.toContain('let artifactSectionRequestId')
+  })
+
   it('contains expected resource refresh aborts at every fire-and-forget call site', () => {
     const guardedLoads = appWorkbenchSource.match(
       /void workbenchResources\.load\([^;]+?\.catch\(\(\) => undefined\)/gs,

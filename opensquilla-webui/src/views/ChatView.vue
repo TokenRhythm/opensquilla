@@ -952,6 +952,8 @@ import {
   artifactFromWorkbenchItem,
   createArtifactPreviewWorkbenchItem,
   initialSectionFromWorkbenchItem,
+  initialSectionRequestIdFromWorkbenchItem,
+  requestInitialSectionForWorkbenchItem,
 } from '@/workbench/artifactItems'
 import { artifactPayloadFromRevision } from '@/workbench/artifactDocumentProvider'
 import {
@@ -1079,6 +1081,17 @@ let releaseOptionalRpcAdmission: (() => void) | null =
 let optionalRpcAdmissionGeneration = 0
 const appStore = useAppStore()
 const workbenchStore = useWorkbenchStore()
+
+function artifactPreviewItemForExplicitOpen(
+  options: Parameters<typeof createArtifactPreviewWorkbenchItem>[0],
+) {
+  const item = createArtifactPreviewWorkbenchItem(options)
+  return requestInitialSectionForWorkbenchItem(
+    item,
+    workbenchStore.items.find(candidate => candidate.id === item.id) || null,
+  )
+}
+
 const artifactPromptAnnotationsStore = useArtifactPromptAnnotationsStore()
 const workbenchDocumentContextStore = useWorkbenchDocumentContextStore()
 const workbenchResourcesStore = useWorkbenchResourcesStore()
@@ -4194,7 +4207,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
   )
   if (!preview) return
   const preparedResource = resourceFromPreparedPreview(preview)
-  const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+  const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
     artifact: artifactPayloadFromWorkbenchResource(preparedResource),
     nativeHtml: false,
     preparedPreview: preview.preview,
@@ -4224,7 +4237,7 @@ async function editAttachmentResource(attachment: DisplayAttachment) {
     const artifact = artifactPayloadFromRevision(imported.revision)
     artifact.documentId = imported.document.documentId
     artifact.revisionId = imported.revision.revisionId
-    const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact,
       nativeHtml: Boolean(
         platform.capabilities.hasNativeWorkbenchSurfaces
@@ -4399,6 +4412,7 @@ watch(sessionArtifacts, artifacts => {
     workbenchStore.updateItem(createArtifactPreviewWorkbenchItem({
       artifact,
       initialSection: initialSectionFromWorkbenchItem(item),
+      initialSectionRequestId: initialSectionRequestIdFromWorkbenchItem(item),
       navigationArtifacts: artifacts,
       nativeHtml: item.hostKind === 'native-webcontents',
       resourceIdentity: typeof item.payload.resourceIdentity === 'string'
@@ -4413,7 +4427,7 @@ function openLegacyArtifactWorkbench(
   artifact: ArtifactPayload,
   initialSection: 'preview' | 'source' = 'preview',
 ): boolean {
-  const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+  const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     initialSection,
     navigationArtifacts: sessionArtifacts.value,
@@ -4452,7 +4466,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       const currentArtifact = artifactPayloadFromRevision(current.revision)
       currentArtifact.documentId = current.document.documentId
       currentArtifact.revisionId = current.revision.revisionId
-      const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: currentArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -4489,7 +4503,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       const importedArtifact = artifactPayloadFromRevision(imported.revision)
       importedArtifact.documentId = imported.document.documentId
       importedArtifact.revisionId = imported.revision.revisionId
-      const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: importedArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -4525,7 +4539,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       return
     }
     const preparedResource = resourceFromPreparedPreview(preview)
-    const opened = workbenchStore.openItem(createArtifactPreviewWorkbenchItem({
+    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       navigationArtifacts: sessionArtifacts.value,
       nativeHtml: false,

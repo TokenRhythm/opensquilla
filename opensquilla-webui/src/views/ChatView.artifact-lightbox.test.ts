@@ -69,4 +69,20 @@ describe('ChatView artifact preview routing', () => {
     expect(source).toContain('watch(sessionArtifacts, artifacts => {')
     expect(source).toContain('workbenchResourcesStore.load(sessionKey.value, true)')
   })
+
+  it('treats every user open as a fresh section request without resetting on metadata refresh', () => {
+    const explicitOpenCalls = chatViewSource.match(
+      /workbenchStore\.openItem\(artifactPreviewItemForExplicitOpen\(/g,
+    ) || []
+    const refreshStart = chatViewSource.indexOf('watch(sessionArtifacts, artifacts => {')
+    const refreshEnd = chatViewSource.indexOf('\nfunction openLegacyArtifactWorkbench', refreshStart)
+    const refreshSource = chatViewSource.slice(refreshStart, refreshEnd)
+
+    expect(explicitOpenCalls).toHaveLength(6)
+    expect(chatViewSource).toContain('function artifactPreviewItemForExplicitOpen(')
+    expect(refreshSource).toContain(
+      'initialSectionRequestId: initialSectionRequestIdFromWorkbenchItem(item)',
+    )
+    expect(refreshSource).not.toContain('artifactPreviewItemForExplicitOpen(')
+  })
 })

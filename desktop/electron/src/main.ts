@@ -35,6 +35,7 @@ import {
   DesktopGatewayOwnershipVerificationCoordinator,
 } from './desktop-gateway-ownership-verification.js'
 import {
+  DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
@@ -7921,7 +7922,7 @@ async function waitForGateway(url: string, earlyExitMessage?: () => string | nul
     probe: (remainingMs) => healthCheck(url, remainingMs),
     exitMessage: earlyExitMessage,
     primaryTimeoutMs: 45_000,
-    lateGraceMs: 15_000,
+    lateGraceMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS - 45_000,
     pollIntervalMs: 500,
   })
   if (result.status === 'ready') {

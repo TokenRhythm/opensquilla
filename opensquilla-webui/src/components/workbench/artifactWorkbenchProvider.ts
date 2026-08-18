@@ -26,6 +26,7 @@ import {
   artifactFromWorkbenchItem,
   artifactsFromWorkbenchItem,
   initialSectionFromWorkbenchItem,
+  initialSectionRequestIdFromWorkbenchItem,
   preparedPreviewFromWorkbenchItem,
   sessionKeyFromWorkbenchItem,
 } from '@/workbench/artifactItems'
@@ -906,6 +907,19 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     if (!this.annotationMode || this.annotationOverlayId || this.annotationSelectionPending) {
       return false
     }
+    const fence = {
+      operation: this.annotationModeOperation,
+      generation: this.generation,
+      surfaceId: this.item.id,
+    }
+    const fenceCurrent = () => (
+      fence.operation === this.annotationModeOperation
+      && fence.generation === this.generation
+      && fence.surfaceId === this.item.id
+      && this.annotationMode
+      && this.createdSurface
+      && this.context.isItemOpen()
+    )
     const setMode = this.context.nativeWorkbenchApi?.setArtifactAnnotationMode
     if (
       !setMode
@@ -922,6 +936,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         surfaceId: this.item.id,
         enabled: true,
       })
+      // A main chat send acceptance, toolbar stop, refresh, or surface
+      // replacement may overtake this one-shot rearm while Desktop is
+      // responding. That newer intent owns both native and rendered state.
+      if (!fenceCurrent()) return false
       if (result.ok) {
         this.annotationPickerArmed = true
         this.context.updateRenderState({
@@ -935,6 +953,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         { tone: 'danger', duration: 9000 },
       )
     } catch {
+      if (!fenceCurrent()) return false
       this.options.pushToast(
         this.options.t('workbench.artifactAnnotation.rearmFailed'),
         { tone: 'danger', duration: 9000 },
@@ -1363,10 +1382,11 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       }
       this.options.promptAnnotations?.completeOverlayEdit?.(annotationId)
       if (!this.clearAnnotationOverlayState(fence)) return
-      // Native inspection is a one-shot picker. A submitted instruction is a
-      // completed interaction, so release the pressed toolbar state instead
-      // of silently starting another inspection session.
-      this.updateAnnotationModeState(false)
+      // Adding one draft only completes that element's editor. Keep the
+      // explicit annotation session active so the user can select more page
+      // elements; the main chat send acceptance is the terminal boundary that
+      // releases the picker and pressed toolbar state.
+      await this.rearmAnnotationPickerIfNeeded()
     } finally {
       if (this.annotationOverlayOperation === operation) {
         this.annotationOverlayOperation = null
@@ -2446,6 +2466,7 @@ export function createArtifactWorkbenchDefinitions(
           ).workspace?.source === 'document-api'
         })(),
         initialSection: initialSectionFromWorkbenchItem(item),
+        initialSectionRequestId: initialSectionRequestIdFromWorkbenchItem(item),
         authToken: options.authToken(),
         baseOrigin: options.baseOrigin,
         nativeHtml: state.nativeSurface,

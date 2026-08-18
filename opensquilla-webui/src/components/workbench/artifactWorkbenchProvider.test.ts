@@ -1805,6 +1805,16 @@ describe('artifact Workbench provider', () => {
       _request: Parameters<NonNullable<NativeWorkbenchApi['closeArtifactAnnotationOverlay']>>[0],
     ): Promise<{ ok: boolean; message?: string }> => ({ ok: true }))
     type AnnotationModeResult = { ok: boolean; message?: string }
+    let deferNextModeEnable = false
+    let resolveDeferredModeEnable: ((result: AnnotationModeResult) => void) | null = null
+    const finishDeferredModeEnable = (
+      result: AnnotationModeResult = { ok: true },
+    ) => {
+      const resolve = resolveDeferredModeEnable
+      if (!resolve) throw new Error('deferred annotation-mode enable is not pending')
+      resolve(result)
+      resolveDeferredModeEnable = null
+    }
     let deferNextModeDisable = false
     let resolveDeferredModeDisable: ((result: AnnotationModeResult) => void) | null = null
     const finishDeferredModeDisable = (
@@ -1818,6 +1828,12 @@ describe('artifact Workbench provider', () => {
     const setMode = vi.fn(async (
       request: Parameters<NonNullable<NativeWorkbenchApi['setArtifactAnnotationMode']>>[0],
     ): Promise<AnnotationModeResult> => {
+      if (request.enabled && deferNextModeEnable) {
+        deferNextModeEnable = false
+        return await new Promise<AnnotationModeResult>((resolve) => {
+          resolveDeferredModeEnable = resolve
+        })
+      }
       if (!request.enabled && deferNextModeDisable) {
         deferNextModeDisable = false
         return await new Promise<AnnotationModeResult>((resolve) => {
@@ -2036,8 +2052,9 @@ describe('artifact Workbench provider', () => {
       { tone: 'danger' },
     )
 
-    // After persistence succeeds, explicit close acknowledges the intent and
-    // the one-shot picker releases the toolbar instead of silently rearming.
+    // After persistence succeeds, explicit close acknowledges this element's
+    // editor and rearms the one-shot picker for another annotation. Only the
+    // later accepted chat send may release the toolbar.
     await runtime.handleNativeSurfaceEvent?.({
       version: 3,
       surfaceId: item.id,
@@ -2049,16 +2066,14 @@ describe('artifact Workbench provider', () => {
       surfaceId: item.id,
       annotationId,
     })
-    expect(setMode.mock.calls.map(([request]) => request.enabled)).toEqual([true])
+    expect(setMode.mock.calls.map(([request]) => request.enabled)).toEqual([true, true])
     expect(setMode).not.toHaveBeenCalledWith(expect.objectContaining({ enabled: false }))
-    expect(renderState.annotationMode).toBe(false)
+    expect(renderState.annotationMode).toBe(true)
     expect(completeOverlayEdit).toHaveBeenCalledWith(annotationId)
     expect(releaseOverlayEdit).toHaveBeenCalledWith(annotationId)
 
     // A typed, recoverable selection rejection stays visible and actionable;
-    // it must not open an editor or silently release the explicitly restarted
-    // one-shot mode.
-    await runtime.performAction?.('toggle-annotation-mode', item)
+    // it must not open an editor or silently release the rearmed one-shot mode.
     expect(renderState.annotationMode).toBe(true)
     rejectNextCreate = Object.assign(new Error('selected element changed'), {
       code: 'ARTIFACT_ELEMENT_CHANGED',
@@ -2507,10 +2522,34 @@ describe('artifact Workbench provider', () => {
 
     // Once the Gateway has accepted the prompt annotations, the renderer must
     // release the native picker instead of leaving the toolbar visibly pressed.
+    // A slower rearm from the just-closed element editor must not resurrect the
+    // mode after that newer accepted-send intent wins.
+    await runtime.performAction?.('toggle-annotation-mode', item)
+    await runtime.performAction?.('toggle-annotation-mode', item)
+    await runtime.handleNativeSurfaceEvent?.(
+      lateSelection('selection-acceptance-race', 'a'),
+      item,
+    )
+    const acceptanceRaceAnnotationId = String(
+      showOverlay.mock.calls[showOverlay.mock.calls.length - 1]?.[0].annotationId || '',
+    )
+    deferNextModeEnable = true
+    const pendingAcceptedSubmit = runtime.handleNativeSurfaceEvent?.({
+      version: 3,
+      surfaceId: item.id,
+      type: 'annotation-submit',
+      detail: {
+        annotationId: acceptanceRaceAnnotationId,
+        body: 'Keep selection active only until this batch is accepted.',
+      },
+    }, item)
+    await vi.waitFor(() => expect(resolveDeferredModeEnable).toBeTypeOf('function'))
     await runtime.handleComponentEvent?.({
       type: 'artifact-prompt-annotations-accepted',
       payload: { acceptedIds: ['annotation-accepted'] },
     }, item)
+    finishDeferredModeEnable()
+    await pendingAcceptedSubmit
     expect(setMode).toHaveBeenLastCalledWith({
       version: 3,
       surfaceId: item.id,

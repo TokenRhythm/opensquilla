@@ -110,6 +110,7 @@ export function createArtifactCollectionWorkbenchItem(options: {
 export function createArtifactPreviewWorkbenchItem(options: {
   artifact: ArtifactPayload
   initialSection?: 'preview' | 'source'
+  initialSectionRequestId?: number
   navigationArtifacts?: readonly ArtifactPayload[]
   nativeHtml: boolean
   preparedPreview?: WorkbenchPreviewDescriptor
@@ -120,6 +121,7 @@ export function createArtifactPreviewWorkbenchItem(options: {
   const {
     artifact,
     initialSection = 'preview',
+    initialSectionRequestId = 0,
     navigationArtifacts = [],
     nativeHtml,
     preparedPreview,
@@ -141,6 +143,7 @@ export function createArtifactPreviewWorkbenchItem(options: {
     payload: {
       artifact,
       initialSection,
+      initialSectionRequestId,
       navigationArtifacts: [...navigationArtifacts],
       ...(preparedPreview
         ? {
@@ -166,6 +169,40 @@ export function initialSectionFromWorkbenchItem(
   return item?.kind === 'artifact-preview' && item.payload.initialSection === 'source'
     ? 'source'
     : 'preview'
+}
+
+export function initialSectionRequestIdFromWorkbenchItem(
+  item: WorkbenchItem | null,
+): number {
+  const value = item?.kind === 'artifact-preview'
+    ? item.payload.initialSectionRequestId
+    : 0
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+    ? value
+    : 0
+}
+
+/**
+ * Mark an explicit user request to open a preview section. Metadata-only item
+ * refreshes must preserve the existing request id instead of calling this.
+ */
+export function requestInitialSectionForWorkbenchItem(
+  item: WorkbenchItem,
+  existing: WorkbenchItem | null,
+): WorkbenchItem {
+  const previousRequestId = existing?.id === item.id
+    ? initialSectionRequestIdFromWorkbenchItem(existing)
+    : 0
+  const initialSectionRequestId = previousRequestId < Number.MAX_SAFE_INTEGER
+    ? previousRequestId + 1
+    : 1
+  return {
+    ...item,
+    payload: {
+      ...item.payload,
+      initialSectionRequestId,
+    },
+  }
 }
 
 /**

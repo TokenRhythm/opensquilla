@@ -199,6 +199,7 @@ import {
   createArtifactPreviewWorkbenchItem,
   navigationArtifactsFromWorkbenchItem,
   previewableNavigationArtifactsFromWorkbenchItem,
+  requestInitialSectionForWorkbenchItem,
   sessionKeyFromWorkbenchItem,
 } from '@/workbench/artifactItems'
 import {
@@ -312,6 +313,16 @@ const documentContextController = workbenchDocumentContext.attachController(
   prepareActiveDocumentContext,
 )
 
+function artifactPreviewItemForExplicitOpen(
+  options: Parameters<typeof createArtifactPreviewWorkbenchItem>[0],
+): WorkbenchItem {
+  const item = createArtifactPreviewWorkbenchItem(options)
+  return requestInitialSectionForWorkbenchItem(
+    item,
+    store.items.find(candidate => candidate.id === item.id) || null,
+  )
+}
+
 function readAuthToken(): string {
   if (typeof sessionStorage === 'undefined') return ''
   try {
@@ -400,7 +411,7 @@ for (const definition of createArtifactWorkbenchDefinitions({
       })
       return
     }
-    const opened = store.openItem(createArtifactPreviewWorkbenchItem({
+    const opened = store.openItem(artifactPreviewItemForExplicitOpen({
       artifact,
       navigationArtifacts,
       nativeHtml: Boolean(
@@ -464,7 +475,7 @@ function openResourceArtifact(
   initialSection: 'preview' | 'source' = 'preview',
 ) {
   const nativeArtifact = resourceUsesNativeHtmlPreview(resource)
-  const opened = store.openItem(createArtifactPreviewWorkbenchItem({
+  const opened = store.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     initialSection,
     nativeHtml: Boolean(
@@ -755,7 +766,7 @@ function selectNavigationArtifact(
   if (!artifact || select.value === item.id) return
   const navigationArtifacts = navigationArtifactsFromWorkbenchItem(item)
   const sessionKey = sessionKeyFromWorkbenchItem(item)
-  const opened = store.openItem(createArtifactPreviewWorkbenchItem({
+  const opened = store.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     navigationArtifacts,
     nativeHtml: Boolean(
@@ -981,9 +992,14 @@ async function onPromptAnnotationReuse(event: Event) {
   detail.complete?.(true)
 }
 
-function onPromptAnnotationsAccepted(event: Event) {
+async function onPromptAnnotationsAccepted(event: Event) {
   const detail = (event as CustomEvent<ArtifactPromptAnnotationsAcceptedDetail>).detail
   if (!detail?.sessionKey || detail.acceptedIds.length === 0) return
+  // Chat acceptance can update the resource descriptor in the same render
+  // tick. Resolve the authoritative item after that update; RuntimeManager
+  // intentionally drops events carrying a stale descriptor identity.
+  await nextTick()
+  const pendingFlushes: Promise<void>[] = []
   for (const item of store.items) {
     if (
       item.kind !== 'artifact-preview'
@@ -993,7 +1009,9 @@ function onPromptAnnotationsAccepted(event: Event) {
       type: 'artifact-prompt-annotations-accepted',
       payload: { acceptedIds: [...detail.acceptedIds] },
     })
+    pendingFlushes.push(runtimeManager.flush(item.id))
   }
+  await Promise.all(pendingFlushes)
 }
 
 async function beforeCloseItem(
