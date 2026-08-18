@@ -501,6 +501,12 @@ function invalidateDesktopOpenFlow(): number {
   return desktopOpenFlowRevision
 }
 
+function desktopOpenAuthorityIsCurrent(revision: number, profileKey: string): boolean {
+  return !isQuitting
+    && revision === desktopOpenFlowRevision
+    && profileKey === desktopProfileKey()
+}
+
 function beginDesktopWriterOperation(label: string): () => void {
   return desktopWriters.begin(label)
 }
@@ -7723,7 +7729,9 @@ function liveLifecycleOwnedGatewayProcesses(): ChildProcessWithoutNullStreams[] 
   return [...children].filter((child) => !hasGatewayProcessExited(child))
 }
 
-async function reuseHealthyGatewayState(): Promise<GatewayState | null> {
+async function reuseHealthyGatewayState(
+  isCurrent: () => boolean,
+): Promise<GatewayState | null> {
   if (gatewayProfileKey !== desktopProfileKey()) return null
   if (!gatewayState.url) return null
   if (gatewayState.status !== 'ready' && !gatewayProcess) return null
@@ -7731,7 +7739,9 @@ async function reuseHealthyGatewayState(): Promise<GatewayState | null> {
   // resumeOwnedGatewayStartup; a healthy port alone is not ownership proof.
   if (gatewayProcess && gatewayState.owned) return null
 
-  if (await healthCheck(gatewayState.url)) {
+  const healthy = await healthCheck(gatewayState.url)
+  if (!isCurrent()) return null
+  if (healthy) {
     gatewayState.status = 'ready'
     gatewayState.error = undefined
     sendBootStatus('control')
@@ -7779,7 +7789,10 @@ async function discardUnverifiedOwnedGatewayChild(
   return true
 }
 
-async function resumeOwnedGatewayStartup(): Promise<GatewayState | null> {
+async function resumeOwnedGatewayStartup(
+  isCurrent: () => boolean,
+): Promise<GatewayState | null> {
+  if (!isCurrent()) throw new Error('Desktop startup was superseded by a newer lifecycle operation.')
   const child = gatewayProcess
   if (
     !child
@@ -7798,6 +7811,7 @@ async function resumeOwnedGatewayStartup(): Promise<GatewayState | null> {
   gatewayState.error = undefined
   sendBootStatus('gateway-health')
   await waitForGateway(url, childExitMessage)
+  if (!isCurrent()) throw new Error('Desktop startup was superseded during health verification.')
   await waitForControlUi(url, childExitMessage)
 
   // Health alone never grants ownership. The same exact child and profile that
@@ -7807,6 +7821,7 @@ async function resumeOwnedGatewayStartup(): Promise<GatewayState | null> {
     gatewayProcess !== child
     || hasGatewayProcessExited(child)
     || gatewayProfileKey !== desktopProfileKey()
+    || !isCurrent()
   ) {
     throw new Error(childExitMessage() || 'Desktop gateway changed while startup resumed.')
   }
@@ -7820,6 +7835,7 @@ async function resumeOwnedGatewayStartup(): Promise<GatewayState | null> {
     gatewayProcess !== child
     || hasGatewayProcessExited(child)
     || gatewayProfileKey !== desktopProfileKey()
+    || !isCurrent()
   ) {
     throw new Error(childExitMessage() || 'Desktop gateway changed during ownership verification.')
   }
@@ -7915,8 +7931,14 @@ async function recoverVerifiedOrphanGatewayBeforeSpawn(
 }
 
 async function startGateway(): Promise<GatewayState> {
-  const reusableGateway = forceOnboardingOnNextStartup ? null : await reuseHealthyGatewayState()
+  const startupRevision = desktopOpenFlowRevision
+  const startupProfileKey = desktopProfileKey()
+  const isCurrent = () => desktopOpenAuthorityIsCurrent(startupRevision, startupProfileKey)
+  const reusableGateway = forceOnboardingOnNextStartup
+    ? null
+    : await reuseHealthyGatewayState(isCurrent)
   if (reusableGateway) return reusableGateway
+  if (!isCurrent()) throw new Error('Desktop startup was superseded by a newer open request.')
   artifactPreviewLeaseBroker.clear()
 
   assertSupportedMacInstallLocation()
@@ -7938,7 +7960,7 @@ async function startGateway(): Promise<GatewayState> {
 
   const resumedGateway = forceOnboardingOnNextStartup
     ? null
-    : await resumeOwnedGatewayStartup()
+    : await resumeOwnedGatewayStartup(isCurrent)
   if (resumedGateway) return resumedGateway
 
   if (gatewayProcess && gatewayState.owned) {
@@ -7964,12 +7986,15 @@ async function startGateway(): Promise<GatewayState> {
   const activeProfile = activeDesktopProfile()
   const overrideUrl = process.env.OPENSQUILLA_DESKTOP_GATEWAY_URL
   if (overrideUrl) {
+    if (!isCurrent()) throw new Error('Desktop startup was superseded before Gateway override validation.')
     sendBootStatus('gateway-health')
     gatewayState.url = overrideUrl.replace(/\/$/, '')
     gatewayState.port = Number(new URL(gatewayState.url).port || 0)
     gatewayState.owned = false
     gatewayProfileKey = desktopProfileKey(activeProfile)
-    gatewayState.status = (await healthCheck(gatewayState.url)) ? 'ready' : 'error'
+    const overrideReady = await healthCheck(gatewayState.url)
+    if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway override validation.')
+    gatewayState.status = overrideReady ? 'ready' : 'error'
     if (gatewayState.status !== 'ready') {
       throw new Error(`Configured gateway is not healthy: ${gatewayState.url}`)
     }
@@ -7978,9 +8003,11 @@ async function startGateway(): Promise<GatewayState> {
 
   sendBootStatus('gateway-health')
   await recoverVerifiedOrphanGatewayBeforeSpawn()
+  if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway recovery.')
 
   sendBootStatus('profile')
   const connection = await runOnboarding()
+  if (!isCurrent()) throw new Error('Desktop startup was superseded during profile setup.')
   forceOnboardingOnNextStartup = false
   const apiKey = decryptApiKey(connection)
   // Keyless providers (e.g. Ollama) ship requiresApiKey=false and are accepted
@@ -8013,6 +8040,7 @@ async function startGateway(): Promise<GatewayState> {
     }
     throw new Error('Gateway startup was cancelled by an active lifecycle or profile operation.')
   }
+  if (!isCurrent()) throw new Error('Desktop startup was superseded before Gateway spawn.')
   const url = `http://127.0.0.1:${port}`
   const logDir = desktopLogsDir()
   mkdirSync(logDir, { recursive: true })
@@ -8157,7 +8185,7 @@ async function startGateway(): Promise<GatewayState> {
   // endpoint belongs to someone else (e.g. a CLI `opensquilla gateway run` on the
   // same port). Surface it as a port conflict so recovery advances to the next
   // port instead of silently attaching the window to the wrong profile.
-  if (hasGatewayProcessExited(child) || gatewayProcess !== child) {
+  if (hasGatewayProcessExited(child) || gatewayProcess !== child || !isCurrent()) {
     throw new Error(childExitMessage
       || 'OPENSQUILLA_GATEWAY_PORT_IN_USE: desktop gateway did not keep the port bind.')
   }
@@ -8170,7 +8198,7 @@ async function startGateway(): Promise<GatewayState> {
       'OPENSQUILLA_GATEWAY_PORT_IN_USE: Gateway port is already in use by an unverified listener.',
     )
   }
-  if (hasGatewayProcessExited(child) || gatewayProcess !== child) {
+  if (hasGatewayProcessExited(child) || gatewayProcess !== child || !isCurrent()) {
     throw new Error(childExitMessage
       || 'OPENSQUILLA_GATEWAY_PORT_IN_USE: desktop gateway changed during ownership verification.')
   }
@@ -8439,7 +8467,7 @@ function ensureGatewayStarted(): Promise<GatewayState> {
 
 async function loadControlUiIntoCurrentWindow(
   gatewayUrl: string,
-  isCurrent: () => boolean = () => true,
+  isCurrent: () => boolean,
 ): Promise<boolean> {
   if (!isCurrent()) return false
   const window = currentMainWindow()
@@ -8669,17 +8697,23 @@ async function openOrResumeDesktopApp(): Promise<void> {
           if (revision === desktopOpenFlowRevision && requestedProfileKey === desktopProfileKey()) {
             const reusableGateway = forceOnboardingOnNextStartup
               ? null
-              : await reuseHealthyGatewayState()
+              : await reuseHealthyGatewayState(
+                () => desktopOpenAuthorityIsCurrent(revision, requestedProfileKey),
+              )
+            if (!desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) {
+              throw new Error('Desktop startup was superseded by a newer open request.')
+            }
             const gateway = reusableGateway ?? await ensureGatewayStarted()
-            if (revision === desktopOpenFlowRevision && requestedProfileKey === desktopProfileKey()) {
-              await loadControlUiIntoCurrentWindow(gateway.url)
+            if (desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) {
+              await loadControlUiIntoCurrentWindow(
+                gateway.url,
+                () => desktopOpenAuthorityIsCurrent(revision, requestedProfileKey),
+              )
             }
           }
         }
       } catch (error) {
-        const authoritative = !isQuitting
-          && revision === desktopOpenFlowRevision
-          && requestedProfileKey === desktopProfileKey()
+        const authoritative = desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)
         if (authoritative) {
           if (gatewayState.status !== 'ready') {
             gatewayState.status = 'error'
@@ -8694,10 +8728,7 @@ async function openOrResumeDesktopApp(): Promise<void> {
           if (currentMainWindow()) sendBootError(error)
         }
       }
-      if (
-        revision === desktopOpenFlowRevision
-        && requestedProfileKey === desktopProfileKey()
-      ) return
+      if (desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) return
       if (gatewayProfileKey && gatewayProfileKey !== desktopProfileKey()) {
         if (gatewayProcess && gatewayState.owned) await stopOwnedGatewayAndWait()
         else clearReusableGatewayState()
@@ -12601,7 +12632,11 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string }> {
   try {
     const gateway = pendingStart
       ? await pendingStart
-      : await resumeOwnedGatewayStartup()
+      : initialAuthority
+        ? await resumeOwnedGatewayStartup(
+          () => bootResumeAuthorityIsCurrent(initialAuthority),
+        )
+        : null
     if (!gateway) {
       // With no exact live child to resume, use the normal open flow so profile
       // inspection and recovery gates still run before any replacement spawn.
