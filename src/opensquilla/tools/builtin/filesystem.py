@@ -187,9 +187,11 @@ async def _run_executor_mutation[ExecutorResult](
     then run the caller's disk/receipt reconciliation before propagating the
     first cancellation.
     """
-    loop = asyncio.get_running_loop()
+    # Keep the historical event-loop injection seam used by race tests and
+    # embedders while normal async callers still receive the running loop.
+    loop = asyncio.get_event_loop()
     started_at = time.monotonic()
-    future = loop.run_in_executor(None, worker)
+    future = asyncio.ensure_future(loop.run_in_executor(None, worker))
     pending_cancel: asyncio.CancelledError | None = None
     worker_error: BaseException | None = None
     result: ExecutorResult | None = None
@@ -2450,6 +2452,11 @@ async def create_source(path: str, content: str, approval_id: str | None = None)
     display_path = _workspace_display_path(p, path)
 
     def _settle_create(error: BaseException | None) -> None:
+        if isinstance(error, FileExistsError):
+            # Exclusive open proves this worker did not create or write the
+            # file. A racing external writer must not be attributed to the
+            # tool through a synthetic mutation receipt.
+            return
         after_fingerprint = fingerprint_path(p)
         after_revision = (
             source_revision_for_path(p)
